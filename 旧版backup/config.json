@@ -1,0 +1,31 @@
+{
+    "processes": [
+        {
+            "process_name": "WeChat",
+            "software_name": "微信",
+            "volume_action": "max",
+            "notification": {
+                "title": "微信正在运行",
+                "message": "音量已设置为100%"
+            }
+        },
+        {
+            "process_name": "POWERPNT",
+            "software_name": "PowerPoint",
+            "volume_action": "max",
+            "notification": {
+                "title": "PowerPoint正在运行",
+                "message": "音量已设置为100%"
+            }
+        },
+        {
+            "process_name": "wmplayer",
+            "software_name": "Windows Media Player",
+            "volume_action": "half",
+            "notification": {
+                "title": "媒体播放器检测",
+                "message": "音量已调整为50%"
+            }
+        }
+    ]
+}
