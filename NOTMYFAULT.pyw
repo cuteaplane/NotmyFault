@@ -1,5 +1,4 @@
 # NotmyFault By cuteaplane
-# My Github: https://github.com/cuteaplane
 # -*- coding: utf-8 -*-
 # Open Source in GPL-3（after complete）
 
