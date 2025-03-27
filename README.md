@@ -3,8 +3,12 @@
 # NotmyFault
 
 **NotmyFault** 是一款用于监控特定进程并自动调整系统音量的 Windows 工具，同时通过 Windows Toast 通知实时反馈进程状态。 
+
 其初衷为解决某些尴尬的英语听力问题。。。。。。
+
 开源，采用 GPL-3 许可协议
+
+** 本项目的图标直接使用了WindowsToast的图标用来占位，侵权请联系删除 **
 
 ## 功能简介
 
@@ -61,8 +65,8 @@ pip install psutil PyQt5 pywin32 windows-toasts
 
 ## 系统要求
 
-- Windows 系统（由于依赖 win32 API 和 Windows Toast 通知）。
-- 安装了 OPPO Sans 字体（可根据需要修改为其他字体）。
+- Windows 10 22H2及以上（由于依赖 win32 API 和 Windows Toast 通知）。
+- 安装 OPPO Sans 字体
 
 ## 开发与贡献
 
@@ -72,4 +76,4 @@ pip install psutil PyQt5 pywin32 windows-toasts
 
 本项目采用 **GPL-3** 开源许可协议。在完善后，完整的许可证文本将包含在项目中
 
-祝你有美好的一天~
+* 祝你有美好的一天~ *
