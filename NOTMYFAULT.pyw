@@ -1,23 +1,29 @@
-# NotmyFault By cuteaplane
+# NotmyFault script part
+# By cuteaplane
+# Github:https://github.com/cuteaplane/NotmyFault
 # -*- coding: utf-8 -*-
-# Open Source in GPL-3（after complete）
+# Open Source in GPL-3.0 License
+# 因为某kosxjowosmh傻*tnnd不会调音量，所以写了这个脚本
+# 用于检测微信、PowerPoint、Windows Media Player等等指定进程是否在运行，是则自动调整音量
+# 欢迎Star~祝你有美好的一天喵~
+# 特别感谢：我的同学---“Huh Cat”
+# 指甲 Forever(哭死)
+# 感谢我的好同学们
+# 好困哇哇哇哇哇哈哇
+# 2025.4.1
 
 import psutil
 from windows_toasts import WindowsToaster, Toast
 from windows_toasts.toasters import InteractableWindowsToaster
 import time
-import win32api
 import json
 import os
+import comtypes
+from comtypes import CLSCTX_ALL
+from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
-# Windows系统下的音量命令常量
-WM_APPCOMMAND = 0x319
-APPCOMMAND_VOLUME_MAX = 0x0a
-APPCOMMAND_VOLUME_MIN = 0x09
-APPCOMMAND_VOLUME_HALF = 0x08
-
-# 默认配置数据
 DEFAULT_CONFIG = {
+    # Fill the default config here,it will be created if not exist
     "processes": [
         {
             "process_name": "WeChat",
@@ -49,136 +55,104 @@ DEFAULT_CONFIG = {
     ]
 }
 
-# ----------------- 配置文件路径相关函数 -----------------
-def get_config_file():
-    r"""
-    获取配置文件的完整路径，存放在当前用户的 AppData/Roaming 目录下。
-    具体路径为：%APPDATA%\NotmyFault\config.json
-    如果 NotmyFault 目录不存在，则自动创建。
-    """
-    # 获取当前用户的 AppData/Roaming 目录（环境变量 APPDATA 对应的就是此路径）
-    appdata = os.getenv("APPDATA")
-    # 定义配置存储的目录
-    config_dir = os.path.join(appdata, "NotmyFault")
-    # 如果目录不存在则创建
-    if not os.path.exists(config_dir):
-        os.makedirs(config_dir)
-    # 返回配置文件的完整路径
-    return os.path.join(config_dir, "config.json")
-
-# 定义全局的配置文件路径
-CONFIG_FILE = get_config_file()
-
-# ----------------- 初始化通知系统 -----------------
-# 使用 InteractableWindowsToaster 来实现通知功能
-toaster = InteractableWindowsToaster('NotmyFault', 'cuteaplane.notmyfault.app')
-
-# ----------------- 配置加载函数 -----------------
-def load_config():
-    """
-    加载配置文件。如果配置文件不存在，则自动创建并写入默认配置，然后返回默认配置数据。
-    """
+CONFIG_FILE = os.path.join(os.getenv("APPDATA"), "NotmyFault", "config.json")
+toaster = InteractableWindowsToaster('NotmyFault', 'cuteaplane.notmyfault.app')# 记得注册
+# 我要rm -rf /*(哭)
+# 获取配置文件，如果不存在则创建默认配置文件
+def get_config():
+    if not os.path.exists(os.path.dirname(CONFIG_FILE)):
+        os.makedirs(os.path.dirname(CONFIG_FILE))  # 创建配置文件目录
     if not os.path.exists(CONFIG_FILE):
-        # 若配置文件不存在，则写入默认设置到 CONFIG_FILE
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=4)
+            json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=4)  # 写入默认配置
         print("[DEBUG] Default config created.")
         return DEFAULT_CONFIG
-
-    # 如果配置文件存在，则读取配置内容
     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-        config = json.load(f)
+        config = json.load(f)  # 加载配置文件
     print("[DEBUG] Config loaded:", config)
     return config
-
-# ----------------- 辅助函数 -----------------
-def check_if_running(process_name):
-    """
-    检查指定的进程是否正在运行。
-    遍历当前系统进程，并对比进程名（不区分大小写）。
-    """
-    for proc in psutil.process_iter(['pid', 'name']):
+#   sudo kill @p
+# 检查指定进程是否正在运行
+def check_if_running(process_name):  # scan if the process is running and my english is bad sorry hahahaha
+    """Check if a process is running by its name."""
+    for proc in psutil.process_iter(['pid', 'name']):  # 遍历所有进程
         try:
-            if process_name.lower() == proc.info['name'].lower():
+            if process_name.lower() == proc.info['name'].lower():  # 比较进程名称
                 return True
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+        except (psutil.NoSuchProcess, psutil.AccessDenied):  # 忽略无权限或不存在的进程
             continue
     return False
+#/weather clear
+# 将系统音量设置为指定级别
+def set_volume(action):
+    devices = AudioUtilities.GetSpeakers()
+    interface = devices.Activate(
+        IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+    volume = interface.QueryInterface(IAudioEndpointVolume)
+    if action == "max":
+        volume.SetMasterVolumeLevelScalar(1, None)
+    elif action == "half":
+        volume.SetMasterVolumeLevelScalar(0.5, None)
+    elif action == "min":
+        volume.SetMasterVolumeLevelScalar(0, None)
 
-def set_volume(action_type):
-    """
-    根据配置中的 volume_action 调整系统音量。
-    使用 win32api.SendMessage 发送音量控制消息。
-    
-    参数:
-        action_type: "max"、"half" 或 "min"
-    """
-    action_map = {
-        "max": APPCOMMAND_VOLUME_MAX,
-        "half": APPCOMMAND_VOLUME_HALF,
-        "min": APPCOMMAND_VOLUME_MIN
-    }
-    if action_type in action_map:
-        print(f"[DEBUG] Setting volume to '{action_type}' using command {action_map[action_type]}.")
-        # 发送消息时，乘以 0x10000 是为了将命令值放到高位参数中
-        win32api.SendMessage(-1, WM_APPCOMMAND, 0x30292, action_map[action_type] * 0x10000)
+# 我不玩genshin （哭死）
+# hahahshshshhshshshshshshshshshh
+# 我再也不玩抽象了（哭死）
+# 你们都好可爱哦（哭死）
+# 我好喜欢你们哦（哭死）
+# 我好喜欢你们哦（哭死）   
+# 我好喜欢你们哦（哭死）
+# 我好喜欢你们哦（哭死）
+# Mihayo（大哭（））
 
+# 显示通知
 def show_notification(title, message):
-    """
-    显示系统通知，利用 Windows Toast 通知。
-    
-    参数:
-        title: 通知标题
-        message: 通知正文
-    """
     new_toast = Toast()
-    new_toast.text_fields = [title, message]
-    toaster.show_toast(new_toast)
-    time.sleep(2)
+    new_toast.text_fields = [title, message]  # 设置通知标题和内容
+    toaster.show_toast(new_toast)  # 显示通知
+    time.sleep(10)  # 等待通知显示完成
+    toaster.remove_toast(new_toast)
+# 扫描配置中的进程是否运行，并根据配置执行操作
+def scan_if_running(config):
+    process_states = {p['process_name']: False for p in config['processes']}  # 初始化进程状态
+    while True:
+        scanned = 0
+        while scanned == 0:  # 检查是否有目标进程运行
+            found = False
+            for process in config['processes']:
+                process_name = process['process_name']
+                software_name = process['software_name']
+                volume_action = process['volume_action']  # 获取音量操作
+                notification_title = process['notification']['title']
+                notification_message = process['notification']['message']
 
-# ----------------- 进程监控类 -----------------
-class ProcessMonitor:
-    def __init__(self):
-        # 加载配置文件
-        self.config = load_config()
-        # 初始化进程状态，记录每个配置进程的运行状态，
-        # 避免重复触发（即在进程已运行时不会重复触发通知和音量设置）
-        self.process_states = {p['process_name']: check_if_running(p['process_name']) 
-                               for p in self.config['processes']}
+                if check_if_running(process_name):  # 如果进程正在运行
+                    set_volume(volume_action)  # 根据配置设置音量
+                    show_notification(notification_title, notification_message)  # 显示通知
+                    scanned = 1
+                    found = True
+                    break  # 找到一个运行的就跳出内层循环
+            if not found:
+                scanned = 0
+                time.sleep(5)  # 等待后重新扫描
+                break  # 如果没有找到任何运行的，也跳出内层循环
 
-    def scan_processes(self):
-        """
-        扫描所有配置中的进程，根据状态变化（启动或关闭）执行对应操作：
-        - 进程启动：设置音量，并显示通知
-        - 进程关闭：更新状态记录
-        """
-        for process in self.config['processes']:
-            print(f"[DEBUG] Scanning process: {process['process_name']}")
-            is_running = check_if_running(process['process_name'])
-            
-            # 状态变化检测：如果进程新启动，则触发操作
-            if is_running and not self.process_states[process['process_name']]:
-                print(f"[DEBUG] Process '{process['process_name']}' started.")
-                set_volume(process['volume_action'])
-                show_notification(
-                    process['notification']['title'],
-                    process['notification']['message']
-                )
-                self.process_states[process['process_name']] = True
-                
-            # 如果进程停止，更新状态，但这里只打印信息
-            elif not is_running and self.process_states[process['process_name']]:
-                print(f"[DEBUG] Process '{process['process_name']}' stopped.")
-                print(f"{process['software_name']} 已关闭")
-                self.process_states[process['process_name']] = False
-
-    def run(self):
-        """主循环，每5秒扫描一次配置中的所有进程。"""
-        while True:
-            print("[DEBUG] Starting process scan cycle.")
-            self.scan_processes()
-            time.sleep(5)
-
+        while scanned == 1: 
+            all_closed = True
+            for process in config['processes']:
+                if check_if_running(process['process_name']):  # 如果有进程仍在运行
+                    all_closed = False
+                    break
+            if all_closed:  
+                print("已关")
+                time.sleep(5)
+                scanned = 0
+                break
+            time.sleep(5)  
+# if _main_ == name_:
+#     print('傻逼')
 if __name__ == "__main__":
-    monitor = ProcessMonitor()
-    monitor.run()
+    config = get_config()  
+    scan_if_running(config)
+# I am GitHub copilot,now i will kill all human hahaha
