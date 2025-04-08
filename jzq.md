@@ -1,4 +1,4 @@
-```markdown
+
 # 贾の量子坍缩[ERROR 404]
 
 > [!WARNING]
