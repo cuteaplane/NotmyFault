@@ -13,14 +13,14 @@
 # 2025.4.1
 
 import psutil
-from windows_toasts import WindowsToaster, Toast
-from windows_toasts.toasters import InteractableWindowsToaster
+
 import time
 import json
 import os
 from comtypes import CLSCTX_ALL
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-import AUMID_Register.AUMID_Register as AUMIDRegister
+import Win_toaster.AUMID_Register as AUMIDRegister
+import Win_toaster.show_notification as s_ncn
 
 
 DEFAULT_CONFIG = {
@@ -57,7 +57,7 @@ DEFAULT_CONFIG = {
 }
 
 CONFIG_FILE = os.path.join(os.getenv("APPDATA"), "NotmyFault", "config.json")
-toaster = InteractableWindowsToaster('NotmyFault', 'cuteaplane.notmyfault.app')
+
 # Windows Toaster 注册逻辑
 
 # 我要rm -rf /*(哭)
@@ -110,12 +110,7 @@ def set_volume(action):
 # Mihayo（大哭（））
 
 # 显示通知
-def show_notification(title, message):
-    new_toast = Toast()
-    new_toast.text_fields = [title, message]  # 设置通知标题和内容
-    toaster.show_toast(new_toast)  # 显示通知
-    time.sleep(10)  # 等待通知显示完成
-    toaster.remove_toast(new_toast)
+
 # 扫描配置中的进程是否运行，并根据配置执行操作
 def scan_if_running(config):
     process_states = {p['process_name']: False for p in config['processes']}  # 初始化进程状态
@@ -132,7 +127,7 @@ def scan_if_running(config):
 
                 if check_if_running(process_name):  # 如果进程正在运行
                     set_volume(volume_action)  # 根据配置设置音量
-                    show_notification(notification_title, notification_message)  # 显示通知
+                    s_ncn.show_notification(notification_title, notification_message)  # 显示通知
                     scanned = 1
                     found = True
                     break  # 找到一个运行的就跳出内层循环
