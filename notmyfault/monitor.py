@@ -27,7 +27,7 @@ def scan_processes(config: Dict[str, Any]) -> None:
 
             running = is_process_running(process_name)
             if running and process_name not in notified_processes:
-                #set_volume(process.get("volume_action", "max"))
+                set_volume(process.get("volume_action", "max"))
                 notification = process.get("notification", {})
                 show_notification(
                     notification.get("title", process_name),
