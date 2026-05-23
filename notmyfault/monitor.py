@@ -7,6 +7,8 @@ import Win_toaster.show_notification as show_notification
 
 
 def is_process_running(process_name: str) -> bool:
+    if not process_name.lower().endswith('.exe'):
+        process_name += '.exe'
     for proc in psutil.process_iter(["pid", "name"]):
         try:
             if proc.info["name"] and process_name.lower() == proc.info["name"].lower():
