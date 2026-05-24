@@ -6,10 +6,11 @@ from typing import Any, Dict, List
 DEFAULT_CONFIG: Dict[str, Any] = {
     "rules": [
         {
+            "name": "微信音量规则",
             "trigger": {
                 "type": "process_state",
                 "params": {
-                    "process_name": "WeChat",
+                    "process_name": "WeChat.exe",
                     "state": "running"
                 }
             },
@@ -25,10 +26,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             ]
         },
         {
+            "name": "PPT音量规则",
             "trigger": {
                 "type": "process_state",
                 "params": {
-                    "process_name": "POWERPNT",
+                    "process_name": "POWERPNT.EXE",
                     "state": "running"
                 }
             },
@@ -44,20 +46,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             ]
         },
         {
+            "name": "媒体播放器规则",
             "trigger": {
                 "type": "process_state",
                 "params": {
-                    "process_name": "wmplayer",
+                    "process_name": "wmplayer.exe",
                     "state": "running"
                 }
             },
             "actions": [
-                {"type": "set_volume", "params": {"action": "max"}},
+                {"type": "set_volume", "params": {"action": "half"}},
                 {
                     "type": "notify",
                     "params": {
-                        "title": "Windows Media Player运行中",
-                        "message": "音量已设置为100%"
+                        "title": "媒体播放器检测",
+                        "message": "音量已调整为50%"
                     }
                 }
             ]
@@ -68,29 +71,40 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 CONFIG_FILE = os.path.join(os.getenv("APPDATA", ""), "NotmyFault", "config.json")
 
 
-def _migrate_legacy_config(config: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    if isinstance(config, dict) and isinstance(config.get("rules"), list):
+        return config
+
     processes = config.get("processes")
     if not isinstance(processes, list):
         return config
 
     rules: List[Dict[str, Any]] = []
     for process in processes:
-        notification = process.get("notification", {})
+        if not isinstance(process, dict):
+            continue
+
+        process_name = process.get("process_name", "")
+        software_name = process.get("software_name", process_name)
+        volume_action = process.get("volume_action", "max")
+        notification = process.get("notification", {}) or {}
+
         rules.append(
             {
+                "name": f"{software_name} 音量规则",
                 "trigger": {
                     "type": "process_state",
                     "params": {
-                        "process_name": process.get("process_name", ""),
+                        "process_name": process_name,
                         "state": "running"
                     }
                 },
                 "actions": [
-                    {"type": "set_volume", "params": {"action": process.get("volume_action", "max")}},
+                    {"type": "set_volume", "params": {"action": volume_action}},
                     {
                         "type": "notify",
                         "params": {
-                            "title": notification.get("title", process.get("process_name", "")),
+                            "title": notification.get("title", f"{software_name} 正在运行"),
                             "message": notification.get("message", "")
                         }
                     }
@@ -98,7 +112,7 @@ def _migrate_legacy_config(config: Dict[str, Any]) -> Dict[str, Any]:
             }
         )
 
-    return {"rules": rules}
+    return {"rules": rules} if rules else config
 
 
 def get_config() -> Dict[str, Any]:
@@ -115,7 +129,7 @@ def get_config() -> Dict[str, Any]:
     with open(CONFIG_FILE, "r", encoding="utf-8") as config_file:
         config = json.load(config_file)
 
-    normalized = _migrate_legacy_config(config)
+    normalized = _normalize_config(config)
     if normalized != config:
         with open(CONFIG_FILE, "w", encoding="utf-8") as config_file:
             json.dump(normalized, config_file, ensure_ascii=False, indent=4)

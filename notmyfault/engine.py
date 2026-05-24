@@ -4,9 +4,6 @@ import os
 import threading
 from typing import Any, Dict, List
 
-from .volume import set_volume
-from Win_toaster.show_notification import show_notification
-
 
 class AutomationEngine:
     def __init__(self, config: Dict[str, Any]) -> None:
@@ -14,32 +11,65 @@ class AutomationEngine:
         self.rules: List[Dict[str, Any]] = config.get("rules", [])
         self.triggers_meta: Dict[str, Dict[str, Any]] = {}
         self.triggers_funcs: Dict[str, Any] = {}
+        self.actions_meta: Dict[str, Dict[str, Any]] = {}
+        self.actions_funcs: Dict[str, Any] = {}
 
     def auto_load(self, base_dir: str) -> None:
-        triggers_dir = os.path.join(base_dir, "triggers")
-        if not os.path.isdir(triggers_dir):
+        self._load_plugins(
+            base_dir=base_dir,
+            plugins_dir="triggers",
+            json_filename="trigger.json",
+            py_filename="trigger.py",
+            module_prefix="notmyfault.trigger_",
+            meta_store=self.triggers_meta,
+            func_store=self.triggers_funcs,
+            store_name="触发器",
+        )
+        self._load_plugins(
+            base_dir=base_dir,
+            plugins_dir="actions",
+            json_filename="action.json",
+            py_filename="action.py",
+            module_prefix="notmyfault.action_",
+            meta_store=self.actions_meta,
+            func_store=self.actions_funcs,
+            store_name="执行器",
+        )
+
+    def _load_plugins(
+        self,
+        base_dir: str,
+        plugins_dir: str,
+        json_filename: str,
+        py_filename: str,
+        module_prefix: str,
+        meta_store: Dict[str, Dict[str, Any]],
+        func_store: Dict[str, Any],
+        store_name: str,
+    ) -> None:
+        root_dir = os.path.join(base_dir, plugins_dir)
+        if not os.path.isdir(root_dir):
             return
 
-        for folder_name in os.listdir(triggers_dir):
-            folder_path = os.path.join(triggers_dir, folder_name)
+        for folder_name in os.listdir(root_dir):
+            folder_path = os.path.join(root_dir, folder_name)
             if not os.path.isdir(folder_path):
                 continue
 
-            json_file = os.path.join(folder_path, "trigger.json")
-            py_file = os.path.join(folder_path, "trigger.py")
+            json_file = os.path.join(folder_path, json_filename)
+            py_file = os.path.join(folder_path, py_filename)
             if not os.path.exists(json_file) or not os.path.exists(py_file):
                 continue
 
             with open(json_file, "r", encoding="utf-8") as fp:
                 meta = json.load(fp)
 
-            trigger_id = meta.get("id")
-            if not trigger_id:
+            plugin_id = meta.get("id")
+            if not plugin_id:
                 continue
 
-            self.triggers_meta[trigger_id] = meta
-
-            module_name = f"notmyfault.trigger_{trigger_id}"
+            meta_store[plugin_id] = meta
+            module_name = f"{module_prefix}{plugin_id}"
             spec = importlib.util.spec_from_file_location(module_name, py_file)
             if spec is None or spec.loader is None:
                 continue
@@ -48,8 +78,8 @@ class AutomationEngine:
             spec.loader.exec_module(module)
 
             if hasattr(module, "run"):
-                self.triggers_funcs[trigger_id] = getattr(module, "run")
-                print(f"[Engine] 装载触发器: {meta.get('name', trigger_id)}")
+                func_store[plugin_id] = getattr(module, "run")
+                print(f"[Engine] 装载{store_name}: {meta.get('name', plugin_id)}")
 
     def call_notmyfault(self, event_data: Dict[str, Any]) -> None:
         trigger_id = event_data.get("trigger_id")
@@ -74,12 +104,12 @@ class AutomationEngine:
         action_type = action.get("type")
         params = action.get("params", {})
 
-        if action_type == "set_volume":
-            set_volume(params.get("action", "max"))
-        elif action_type == "notify":
-            show_notification(params.get("title", "NotmyFault"), params.get("message", ""))
+        if action_type in self.actions_funcs:
+            action_meta = self.actions_meta.get(action_type, {})
+            action_func = self.actions_funcs[action_type]
+            action_func(action_meta, params)
         else:
-            print(f"[Engine] 未知 action 类型: {action_type}")
+            print(f"[Engine] 未知 action 类型或未装载模块: {action_type}")
 
     def start(self) -> None:
         thread_count = 0
