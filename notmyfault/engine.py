@@ -74,31 +74,51 @@ class AutomationEngine:
             if spec is None or spec.loader is None:
                 continue
 
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+            try:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            except Exception as e:
+                print(f"[Engine] 装载{store_name} 插件 {plugin_id} 失败: {e}")
+                continue
 
-            if hasattr(module, "run"):
-                func_store[plugin_id] = getattr(module, "run")
-                print(f"[Engine] 装载{store_name}: {meta.get('name', plugin_id)}")
+            try:
+                if hasattr(module, "run"):
+                    func_store[plugin_id] = getattr(module, "run")
+                    print(f"[Engine] 装载{store_name}: {meta.get('name', plugin_id)}")
+            except Exception as e:
+                print(f"[Engine] 装载{store_name} 插件 {plugin_id} 失败: {e}")
 
-    def call_notmyfault(self, event_data: Dict[str, Any]) -> None:
-        trigger_id = event_data.get("trigger_id")
-        triggered_params = event_data.get("triggered_params", {})
-        print(f"[Engine] 收到触发器事件: {trigger_id} -> {triggered_params}")
+    def emit_event(self, event_type: str, event_payload: Dict[str, Any]) -> None:
+        print(f"[EventBus] 收到广播事件: [{event_type}] -> {event_payload}")
 
         for rule in self.rules:
-            rule_trigger = rule.get("trigger", {})
-            if rule_trigger.get("type") != trigger_id:
+            rule_event = rule.get("event", {}) or rule.get("trigger", {})
+            if rule_event.get("type") != event_type:
                 continue
 
-            expected_params = rule_trigger.get("params", {})
-            is_match = all(triggered_params.get(key) == value for key, value in expected_params.items())
-            if not is_match:
+            expected_params = rule_event.get("params", {})
+            if not self._match_event(expected_params, event_payload):
                 continue
 
-            print(f"[Engine] 规则匹配成功: {rule_trigger}")
+            print(f"[EventBus] 规则匹配成功: {rule_event}")
             for action in rule.get("actions", []):
                 self.execute_action(action)
+
+    def _match_event(self, expected: Dict[str, Any], payload: Dict[str, Any]) -> bool:
+        for key, expected_value in expected.items():
+            actual_value = payload.get(key)
+            if key == "process_name" and isinstance(expected_value, str) and isinstance(actual_value, str):
+                if expected_value.lower() != actual_value.lower():
+                    return False
+            else:
+                if expected_value != actual_value:
+                    return False
+        return True
+
+    def call_notmyfault(self, event_data: Dict[str, Any]) -> None:
+        event_type = event_data.get("trigger_id")
+        event_payload = event_data.get("triggered_params", {})
+        self.emit_event(event_type, event_payload)
 
     def execute_action(self, action: Dict[str, Any]) -> None:
         action_type = action.get("type")
@@ -107,34 +127,45 @@ class AutomationEngine:
         if action_type in self.actions_funcs:
             action_meta = self.actions_meta.get(action_type, {})
             action_func = self.actions_funcs[action_type]
-            action_func(action_meta, params)
+            try:
+                action_func(action_meta, params)
+            except Exception as e:
+                print(f"[Engine] 执行 action {action_type} 失败: {e}")
         else:
             print(f"[Engine] 未知 action 类型或未装载模块: {action_type}")
 
     def start(self) -> None:
-        thread_count = 0
+        aggregated_event_configs: Dict[str, List[Dict[str, Any]]] = {}
         for rule in self.rules:
-            trigger_type = rule.get("trigger", {}).get("type")
-            params = rule.get("trigger", {}).get("params", {})
-            if trigger_type not in self.triggers_funcs:
+            event = rule.get("event", {}) or rule.get("trigger", {})
+            event_type = event.get("type")
+            event_params = event.get("params", {})
+            if not event_type:
                 continue
 
-            trigger_meta = self.triggers_meta.get(trigger_type, {})
-            trigger_func = self.triggers_funcs[trigger_type]
+            aggregated_event_configs.setdefault(event_type, []).append(event_params)
+
+        thread_count = 0
+        for event_type, config_list in aggregated_event_configs.items():
+            if event_type not in self.triggers_funcs:
+                continue
+
+            trigger_meta = self.triggers_meta.get(event_type, {})
+            trigger_func = self.triggers_funcs[event_type]
             mode = trigger_meta.get("mode", "continuous")
 
             if mode == "continuous":
                 thread_count += 1
                 thread = threading.Thread(
                     target=trigger_func,
-                    args=(trigger_meta, params, self.call_notmyfault),
+                    args=(trigger_meta, config_list, self.emit_event),
                     daemon=True,
                 )
                 thread.start()
-                print(f"[Engine] 已启动触发器线程: {trigger_type}")
+                print(f"[Engine] 已启动触发器线程: {event_type} (共监听 {len(config_list)} 条规则)")
             elif mode == "single":
-                trigger_func(trigger_meta, params, self.call_notmyfault)
-                print(f"[Engine] 已执行单次触发器: {trigger_type}")
+                trigger_func(trigger_meta, config_list, self.emit_event)
+                print(f"[Engine] 已执行单次触发器: {event_type}")
 
         if thread_count == 0:
             print("[Engine] 没有找到可用触发器，程序将退出。")

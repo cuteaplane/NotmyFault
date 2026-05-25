@@ -7,7 +7,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "rules": [
         {
             "name": "微信音量规则",
-            "trigger": {
+            "event": {
                 "type": "process_state",
                 "params": {
                     "process_name": "WeChat.exe",
@@ -27,7 +27,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         },
         {
             "name": "PPT音量规则",
-            "trigger": {
+            "event": {
                 "type": "process_state",
                 "params": {
                     "process_name": "POWERPNT.EXE",
@@ -47,7 +47,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         },
         {
             "name": "媒体播放器规则",
-            "trigger": {
+            "event": {
                 "type": "process_state",
                 "params": {
                     "process_name": "wmplayer.exe",
@@ -72,8 +72,23 @@ CONFIG_FILE = os.path.join(os.getenv("APPDATA", ""), "NotmyFault", "config.json"
 
 
 def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
-    if isinstance(config, dict) and isinstance(config.get("rules"), list):
+    if not isinstance(config, dict):
         return config
+
+    if isinstance(config.get("rules"), list):
+        normalized_rules = []
+        for rule in config.get("rules", []):
+            if not isinstance(rule, dict):
+                continue
+
+            if "trigger" in rule and "event" not in rule:
+                copied = dict(rule)
+                copied["event"] = copied.pop("trigger")
+                normalized_rules.append(copied)
+            else:
+                normalized_rules.append(rule)
+
+        return {"rules": normalized_rules}
 
     processes = config.get("processes")
     if not isinstance(processes, list):
@@ -92,7 +107,7 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         rules.append(
             {
                 "name": f"{software_name} 音量规则",
-                "trigger": {
+                "event": {
                     "type": "process_state",
                     "params": {
                         "process_name": process_name,
