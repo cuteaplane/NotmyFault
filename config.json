@@ -1,31 +1,79 @@
 {
-    "processes": [
+    "rules": [
         {
-            "process_name": "WeChat.exe",
-            "software_name": "微信",
-            "volume_action": "max",
-            "notification": {
-                "title": "微信正在运行",
-                "message": "音量已设置为100%"
-            }
+            "name": "微信音量规则",
+            "event": {
+                "type": "process_state",
+                "params": {
+                    "process_name": "WeChat.exe",
+                    "state": "running"
+                }
+            },
+            "actions": [
+                {
+                    "type": "set_volume",
+                    "params": {
+                        "action": "max"
+                    }
+                },
+                {
+                    "type": "notify",
+                    "params": {
+                        "title": "微信正在运行",
+                        "message": "音量已设置为100%"
+                    }
+                }
+            ]
         },
         {
-            "process_name": "POWERPNT.EXE",
-            "software_name": "PowerPoint",
-            "volume_action": "max",
-            "notification": {
-                "title": "PowerPoint正在运行",
-                "message": "音量已设置为100%"
-            }
+            "name": "PPT音量规则",
+            "event": {
+                "type": "process_state",
+                "params": {
+                    "process_name": "POWERPNT.EXE",
+                    "state": "running"
+                }
+            },
+            "actions": [
+                {
+                    "type": "set_volume",
+                    "params": {
+                        "action": "max"
+                    }
+                },
+                {
+                    "type": "notify",
+                    "params": {
+                        "title": "PowerPoint正在运行",
+                        "message": "音量已设置为100%"
+                    }
+                }
+            ]
         },
         {
-            "process_name": "wmplayer.exe",
-            "software_name": "Windows Media Player",
-            "volume_action": "half",
-            "notification": {
-                "title": "媒体播放器检测",
-                "message": "音量已调整为50%"
-            }
+            "name": "媒体播放器规则",
+            "event": {
+                "type": "process_state",
+                "params": {
+                    "process_name": "wmplayer.exe",
+                    "state": "running"
+                }
+            },
+            "actions": [
+                {
+                    "type": "set_volume",
+                    "params": {
+                        "action": "half"
+                    }
+                },
+                {
+                    "type": "notify",
+                    "params": {
+                        "title": "媒体播放器检测",
+                        "message": "音量已调整为50%"
+                    }
+                }
+            ]
         }
     ]
 }

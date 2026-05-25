@@ -1,0 +1,7 @@
+{
+    "id": "process_state",
+    "name": "进程状态扫描器",
+    "mode": "continuous",
+    "description": "持续扫描进程状态并在目标状态到达时通知主程序",
+    "required_params": ["process_name", "state"]
+}
