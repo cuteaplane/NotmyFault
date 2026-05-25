@@ -2,39 +2,55 @@ import time
 import psutil
 
 
-def run(trigger_info, params, call_notmyfault):
-    process_name = params.get("process_name", "").strip()
-    target_state = params.get("state", "running")
-    poll_interval = float(params.get("poll_interval", 2))
+def run(trigger_info, config_list, emit_event):
+    trigger_id = trigger_info.get("id")
+    poll_interval = 2.0
 
-    if not process_name:
-        print(f"[Trigger:{trigger_info.get('id')}] 缺少 process_name，触发器退出")
+    target_processes = set()
+    for cfg in config_list:
+        process_name = cfg.get("process_name", "").strip()
+        if not process_name:
+            continue
+
+        if not process_name.lower().endswith(".exe"):
+            process_name += ".exe"
+
+        target_processes.add(process_name.lower())
+
+    if not target_processes:
+        print(f"[Trigger:{trigger_id}] 没有需要监听的进程，触发器退出")
         return
 
-    if not process_name.lower().endswith(".exe"):
-        process_name += ".exe"
+    print(f"[Trigger:{trigger_id}] 开始监听进程: {sorted(target_processes)}")
 
-    last_state = None
-    print(f"[Trigger:{trigger_info.get('id')}] 开始监听 {process_name}，期望状态 {target_state}")
+    last_states = {process_name: "stopped" for process_name in target_processes}
+
+    for proc in psutil.process_iter(["name"]):
+        try:
+            name = proc.info["name"]
+            if name and name.lower() in target_processes:
+                last_states[name.lower()] = "running"
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
 
     while True:
-        is_running = False
+        currently_running = set()
         for proc in psutil.process_iter(["name"]):
             try:
-                if proc.info["name"] and proc.info["name"].lower() == process_name.lower():
-                    is_running = True
-                    break
+                name = proc.info["name"]
+                if name and name.lower() in target_processes:
+                    currently_running.add(name.lower())
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
-        current_state = "running" if is_running else "stopped"
-        if current_state != last_state:
-            last_state = current_state
-            print(f"[Trigger:{trigger_info.get('id')}] 状态变化: {current_state}")
-            if current_state == target_state:
-                call_notmyfault({
-                    "trigger_id": trigger_info.get("id"),
-                    "triggered_params": params,
+        for process_name in target_processes:
+            current_state = "running" if process_name in currently_running else "stopped"
+            if current_state != last_states[process_name]:
+                last_states[process_name] = current_state
+                print(f"[Trigger:{trigger_id}] {process_name} 状态变化: {current_state}")
+                emit_event(trigger_id, {
+                    "process_name": process_name,
+                    "state": current_state,
                 })
 
         time.sleep(poll_interval)
