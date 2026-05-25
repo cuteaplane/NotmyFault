@@ -89,20 +89,49 @@ class AutomationEngine:
                 print(f"[Engine] 装载{store_name} 插件 {plugin_id} 失败: {e}")
 
     def emit_event(self, event_type: str, event_payload: Dict[str, Any]) -> None:
+        """
+        ✨ 核心事件路由总线 (搭载智能宽容匹配引擎) ✨
+        """
         print(f"[EventBus] 收到广播事件: [{event_type}] -> {event_payload}")
 
         for rule in self.rules:
-            rule_event = rule.get("event", {}) or rule.get("trigger", {})
+            rule_event = rule.get("event", {})
             if rule_event.get("type") != event_type:
                 continue
 
             expected_params = rule_event.get("params", {})
-            if not self._match_event(expected_params, event_payload):
-                continue
+            is_match = True
 
-            print(f"[EventBus] 规则匹配成功: {rule_event}")
-            for action in rule.get("actions", []):
-                self.execute_action(action)
+            # 开始逐个核对参数啦！
+            for key, expected_val in expected_params.items():
+                actual_val = event_payload.get(key)
+
+                # 💡 智能宽容匹配：如果是字符串，我们要忽略大小写和两端多余的空格哦！
+                if isinstance(expected_val, str) and isinstance(actual_val, str):
+                    exp_str = expected_val.strip().lower()
+                    act_str = actual_val.strip().lower()
+
+                    # 🌟 针对进程名字的终极保护：哪怕 JSON 里忘了写 .exe，也自动补全再比对！
+                    if key == "process_name":
+                        if not exp_str.endswith(".exe"):
+                            exp_str += ".exe"
+                        if not act_str.endswith(".exe"):
+                            act_str += ".exe"
+
+                    # 如果变成小写、补齐后缀后还是不一样，那就是真不一样啦
+                    if exp_str != act_str:
+                        is_match = False
+                        break
+                # 对于非字符串 (比如数字或布尔值)，直接严格对比
+                else:
+                    if expected_val != actual_val:
+                        is_match = False
+                        break
+
+            if is_match:
+                print(f"[EventBus] ✨ 匹配到规则: <{rule.get('name', '未命名规则')}>, 准备分发动作！")
+                for action in rule.get("actions", []):
+                    self.execute_action(action)
 
     def _match_event(self, expected: Dict[str, Any], payload: Dict[str, Any]) -> bool:
         for key, expected_value in expected.items():
