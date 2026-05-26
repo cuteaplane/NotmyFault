@@ -20,7 +20,7 @@ def run(trigger_info, config_list, emit_event):
 
         normalized_key = normalized_name.lower()
         target_processes.add(normalized_key)
-        original_names[normalized_key] = normalized_name
+        original_names[normalized_key] = raw_name
 
     if not target_processes:
         print(f"[Trigger:{trigger_id}] 没有需要监听的进程，触发器退出")
