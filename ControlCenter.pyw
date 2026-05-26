@@ -53,7 +53,6 @@ class ControlCenterApi:
             return f"ERROR: {e}"
 
     def start_engine(self):
-        """不改动架构的前提下，一键启动你的无敌引擎！"""
         if self.is_running:
             return "ALREADY_RUNNING"
             
@@ -78,7 +77,7 @@ def run_control_center():
     api = ControlCenterApi(base_dir)
     
     window = webview.create_window(
-        title="NotmyFault - 控制中心",
+        title="NotmyFault",
         url=html_path,
         js_api=api,
         width=1000,

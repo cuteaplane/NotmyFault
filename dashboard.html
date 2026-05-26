@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NotmyFault 控制中心</title>
+    <title>NotmyFault</title>
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet" />
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
     <style>
@@ -46,7 +46,7 @@
 <body>
 
     <header>
-        <h1><span class="material-symbols-outlined">manufacturing</span> 控制中心</h1>
+        <h1><span class="material-symbols-outlined">manufacturing</span> NotmyFault</h1>
         <div style="display: flex; gap: 12px;">
             <button class="btn btn-primary" onclick="saveConfig()">
                 <span class="material-symbols-outlined">save</span> 保存配置
@@ -63,11 +63,11 @@
                 <h2 style="margin: 0 0 12px 0; font-size: 18px;">NotmyFault 引擎状态</h2>
                 <div class="status-badge">
                     <div class="status-dot" id="statusDot"></div>
-                    <span id="statusText">已停止 (修改配置后点击右侧启动)</span>
+                    <span id="statusText">🤔已停止</span>
                 </div>
             </div>
             <button class="btn btn-tonal" id="startBtn" onclick="startEngine()">
-                <span class="material-symbols-outlined">play_arrow</span> 启动 / 应用最新配置
+                <span class="material-symbols-outlined">play_arrow</span> 启动 NotmyFault
             </button>
         </div>
         <div id="app"></div>
@@ -222,7 +222,7 @@
                 window.pywebview.api.start_engine().then(res => {
                     if(res === "STARTED" || res === "ALREADY_RUNNING") {
                         document.getElementById('statusDot').classList.add('active');
-                        document.getElementById('statusText').innerText = "引擎正在后台平稳运行中 ฅ'ω'ฅ";
+                        document.getElementById('statusText').innerText = "😋运行中";
                         btn.innerHTML = '<span class="material-symbols-outlined">check_circle</span> 运行中';
                     } else {
                         alert("启动失败: " + res);
