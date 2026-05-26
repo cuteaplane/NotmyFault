@@ -4,14 +4,14 @@ import webview
 import threading
 import sys
 
-from notmyfault.config import get_config
+from notmyfault.config import get_config, CONFIG_FILE
 from notmyfault.engine import AutomationEngine
 from Win_toaster.AUMID_Register import register_toaster
 
 class ControlCenterApi:
     def __init__(self, base_dir):
         self.base_dir = base_dir
-        self.config_path = os.path.join(base_dir, "config.json")
+        self.config_path = CONFIG_FILE
         self.engine_thread = None
         self.is_running = False
 
@@ -36,18 +36,22 @@ class ControlCenterApi:
         return json.dumps(schema, ensure_ascii=False)
 
     def load_config(self):
-        if os.path.exists(self.config_path):
-            try:
-                with open(self.config_path, "r", encoding="utf-8") as f:
-                    return json.dumps(json.load(f), ensure_ascii=False)
-            except Exception:
-                pass
-        return json.dumps({"rules": []})
+        try:
+            config = get_config()
+            return json.dumps(config, ensure_ascii=False)
+        except Exception as e:
+            print(f"读取配置失败: {e}")
+            return json.dumps({"rules": []})
 
     def save_config(self, json_data):
         try:
+            data = json.loads(json_data)
+            config_dir = os.path.dirname(self.config_path)
+            if config_dir and not os.path.exists(config_dir):
+                os.makedirs(config_dir, exist_ok=True)
+
             with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(json.loads(json_data), f, ensure_ascii=False, indent=4)
+                json.dump(data, f, ensure_ascii=False, indent=4)
             return "SUCCESS"
         except Exception as e:
             return f"ERROR: {e}"
