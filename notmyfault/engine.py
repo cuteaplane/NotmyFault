@@ -23,7 +23,7 @@ class AutomationEngine:
             module_prefix="notmyfault.trigger_",
             meta_store=self.triggers_meta,
             func_store=self.triggers_funcs,
-            store_name="触发器",
+            store_name="Trigger",
         )
         self._load_plugins(
             base_dir=base_dir,
@@ -33,7 +33,7 @@ class AutomationEngine:
             module_prefix="notmyfault.action_",
             meta_store=self.actions_meta,
             func_store=self.actions_funcs,
-            store_name="执行器",
+            store_name="Actioner",
         )
 
     def _load_plugins(
@@ -90,7 +90,7 @@ class AutomationEngine:
 
     def emit_event(self, event_type: str, event_payload: Dict[str, Any]) -> None:
         """
-        ✨ 核心事件路由总线 (搭载智能宽容匹配引擎) ✨
+        这个函数会被触发器线程调用，或者直接被插件调用（比如说手动触发某个事件），它的职责就是把事件分发给所有规则，看看有没有哪个规则的触发条件
         """
         print(f"[EventBus] 收到广播事件: [{event_type}] -> {event_payload}")
 
@@ -102,47 +102,16 @@ class AutomationEngine:
             expected_params = rule_event.get("params", {})
             is_match = True
 
-            # 开始逐个核对参数啦！
             for key, expected_val in expected_params.items():
                 actual_val = event_payload.get(key)
-
-                # 💡 智能宽容匹配：如果是字符串，我们要忽略大小写和两端多余的空格哦！
-                if isinstance(expected_val, str) and isinstance(actual_val, str):
-                    exp_str = expected_val.strip().lower()
-                    act_str = actual_val.strip().lower()
-
-                    # 🌟 针对进程名字的终极保护：哪怕 JSON 里忘了写 .exe，也自动补全再比对！
-                    if key == "process_name":
-                        if not exp_str.endswith(".exe"):
-                            exp_str += ".exe"
-                        if not act_str.endswith(".exe"):
-                            act_str += ".exe"
-
-                    # 如果变成小写、补齐后缀后还是不一样，那就是真不一样啦
-                    if exp_str != act_str:
-                        is_match = False
-                        break
-                # 对于非字符串 (比如数字或布尔值)，直接严格对比
-                else:
-                    if expected_val != actual_val:
-                        is_match = False
-                        break
+                if expected_val != actual_val:
+                    is_match = False
+                    break
 
             if is_match:
-                print(f"[EventBus] ✨ 匹配到规则: <{rule.get('name', '未命名规则')}>, 准备分发动作！")
+                print(f"[EventBus] 😋 匹配到规则: <{rule.get('name', '未命名规则')}>, 准备分发动作！")
                 for action in rule.get("actions", []):
                     self.execute_action(action)
-
-    def _match_event(self, expected: Dict[str, Any], payload: Dict[str, Any]) -> bool:
-        for key, expected_value in expected.items():
-            actual_value = payload.get(key)
-            if key == "process_name" and isinstance(expected_value, str) and isinstance(actual_value, str):
-                if expected_value.lower() != actual_value.lower():
-                    return False
-            else:
-                if expected_value != actual_value:
-                    return False
-        return True
 
     def call_notmyfault(self, event_data: Dict[str, Any]) -> None:
         event_type = event_data.get("trigger_id")
@@ -159,9 +128,9 @@ class AutomationEngine:
             try:
                 action_func(action_meta, params)
             except Exception as e:
-                print(f"[Engine] 执行 action {action_type} 失败: {e}")
+                print(f"[Engine] 😥 执行 action {action_type} 失败: {e}")
         else:
-            print(f"[Engine] 未知 action 类型或未装载模块: {action_type}")
+            print(f"[Engine] 😕 未知 action 类型或未装载模块: {action_type}")
 
     def start(self) -> None:
         aggregated_event_configs: Dict[str, List[Dict[str, Any]]] = {}

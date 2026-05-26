@@ -1,0 +1,9 @@
+{
+    "id": "usb_insert",
+    "name": "U盘插入监控",
+    "mode": "continuous",
+    "description": "持续监控可移动磁盘(U盘)的插入事件",
+    "required_params": [
+        "drive_letter"
+    ]
+}
