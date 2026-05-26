@@ -2,6 +2,8 @@
 
 # NotmyFault
 
+> 本项目正在重构，这个README已经完全过时，请参阅 `develop` 或 `develop-alpha` 分支。
+
 **NotmyFault** 是一款用于监控特定进程并自动调整系统音量的 Windows 工具，同时通过 Windows Toast 通知实时反馈进程状态。 
 
 其初衷为解决某些尴尬的英语听力问题。。。。。。
