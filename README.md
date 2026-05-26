@@ -1,81 +1,165 @@
-
-
 # NotmyFault
 
-> 本项目正在重构，这个README已经完全过时，请参阅 `develop` 或 `develop-alpha` 分支。
+**NotmyFault** 是一款面向 Windows 的草台班子自动化工具。
 
-**NotmyFault** 是一款用于监控特定进程并自动调整系统音量的 Windows 工具，同时通过 Windows Toast 通知实时反馈进程状态。 
+本项目的特色是：
 
-其初衷为解决某些尴尬的英语听力问题。。。。。。
+- 支持插件化的触发器与执行器！只要会 Python ，你可以以极高的自由度轻松自己写你所需要的触发器和执行器！
 
-开源，采用 GPL-3 许可协议
+---
 
-**本项目的图标直接使用了WindowsToast的图标用来占位，侵权请联系删除**
+## 特性
 
-## 功能简介
+- **规则驱动**：以 `rules` 方式定义触发条件和动作。规则可包含多个动作。
+- **进程检测触发器**：当前内置 `process_state` 触发器，可监听进程启动/停止。
+- **动作执行器**：内置 `set_volume` 和 `notify`，可扩展更多动作插件。
+- **图形化配置**：通过 `ControlCenter.pyw` 提供桌面配置编辑与启动界面。
+- **统一配置路径**：默认配置存储在 `%APPDATA%\NotmyFault\config.json`。
 
-- **进程监控**：自动扫描指定进程（如微信、PowerPoint、Windows Media Player）的运行状态。
-- **音量控制**：当指定进程启动时，根据配置自动设置系统音量（最大、最小或中等）。
-- **通知提示**：进程状态变化时，弹出 Windows Toast 通知提示用户。
-- **配置管理**：提供图形化配置编辑器，可自定义监控的进程和相关操作。
-- **检测脚本状态显示**：在主界面实时显示检测主脚本（NOTMYFAULT.pyw）的运行状态，并可通过按钮启动/重启或关闭检测。
+---
 
 ## 目录结构
 
-```
+```text
 NotmyFault/
-├── NOTMYFAULT.pyw         # 进程检测主脚本（无窗口运行）
-├── main.py                # 欢迎界面和配置编辑器入口（带 GUI 界面）
-├── app_icon.ico           # 应用图标（欢迎界面左侧大图标）
-├── README.md              # 项目说明文档
-└── (其他依赖文件)
+├── ControlCenter.pyw           # GUI 控制中心入口
+├── dashboard.html              # GUI 界面模板
+├── NOTMYFAULT.pyw              # 后台检测引擎入口
+├── README.md                   # 项目说明文档
+├── notmyfault/                 # 核心引擎代码
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── app.py
+│   ├── config.py
+│   ├── engine.py
+│   ├── monitor.py
+│   ├── volume.py
+│   ├── actions/
+│   │   ├── notify/
+│   │   │   ├── action.json
+│   │   │   └── action.py
+│   │   └── set_volume/
+│   │       ├── action.json
+│   │       └── action.py
+│   └── triggers/
+│       └── process_state/
+│           ├── trigger.json
+│           └── trigger.py
+├── Win_toaster/                # Windows 通知相关支持库
+└── config.json                 # 项目默认模板配置（仅用于项目初始化）
 ```
+
+---
 
 ## 安装依赖
 
-本项目基于 Python 开发，需要以下依赖库：
-
-- [psutil](https://pypi.org/project/psutil/)
-- [PyQt5](https://pypi.org/project/PyQt5/)
-- [pywin32](https://pypi.org/project/pywin32/)
-- [windows_toasts](https://pypi.org/project/windows-toasts/)
-
-你可以使用 pip 安装：
+推荐使用 Python 3.11+。
 
 ```bash
-pip install psutil PyQt5 pywin32 windows-toasts
+pip install psutil pywebview pywin32
 ```
 
-## 使用方法
+> 需要确保 `pywebview` 能正常运行来使用 Web UI ；如果只运行命令行引擎，则 `pywebview` 不是必须依赖。
 
-1. **配置文件存储**  
-   默认配置文件存储在当前用户的 AppData/Roaming 目录下：  
-   `%APPDATA%\NotmyFault\config.json`  
-   如果配置文件不存在，程序会自动创建并写入默认设置。
+> 内置的触发器和执行器需要其他依赖:
 
-2. **启动程序**  
-   - **GUI 界面**：运行 `main.py`（或者编译为可执行文件）启动欢迎页面。  
-     在欢迎页面中，你可以：
-   - 查看检测主脚本的运行状态（例如 “检测运行中 (pythonw.exe running)”）。
-   - 通过 “启动检测” 按钮启动或重启检测主脚本。
-   - 通过 “关闭检测” 按钮终止检测主脚本。
-   - 点击 “打开编辑器” 进入配置编辑器，对监控进程及相关操作进行修改。
+```bash
+pip install windows-toasts pycaw 
+# 可能需要更多依赖。
+```
 
-3. **检测主脚本**  
-   进程检测主脚本位于同一目录下的 `NOTMYFAULT.pyw`，用于后台无窗口运行检测目标进程并执行音量调节与通知提示。  
-   欢迎界面提供了实时监控该脚本状态的功能，并支持启动/重启及关闭操作。
 
-## 系统要求
+---
 
-- Windows 10 22H2及以上（由于依赖 win32 API 和 Windows Toast 通知）。
-- 安装 OPPO Sans 字体
+## 运行方式
 
-## 开发与贡献
+### 1. 启动控制中心（推荐）
 
-如果你有任何问题、建议或希望贡献代码，欢迎提交 Issue 或 Pull Request。
+```bash
+python ControlCenter.pyw
+```
+
+点击界面上的“启动 NotmyFault”按钮即可启动后台引擎；也可以在界面中编辑规则并保存。
+
+### 2. 直接运行后台引擎
+
+```bash
+python NOTMYFAULT.pyw
+```
+
+### 3. 通过包入口运行
+
+```bash
+python -m notmyfault
+```
+
+---
+
+## 配置说明
+
+配置文件位于：
+
+```text
+%APPDATA%\NotmyFault\config.json
+```
+
+如果该文件不存在，程序会自动创建默认配置。
+
+### 配置格式
+
+配置文件为 JSON 格式，主要由 `rules` 列表组成：
+
+```json(example)
+{
+  "rules": [
+    {
+      "name": "微信音量规则",
+      "event": {
+        "type": "process_state",
+        "params": {
+          "process_name": "WeChat.exe",
+          "state": "running"
+        }
+      },
+      "actions": [
+        {"type": "set_volume", "params": {"action": "max"}},
+        {"type": "notify", "params": {"title": "微信正在运行", "message": "音量已设置为100%"}}
+      ]
+    }
+  ]
+}
+```
+
+
+## 插件结构
+
+### 触发器
+
+每个触发器位于 `notmyfault/triggers/<id>/`，包含：
+
+- `trigger.json`：插件元数据
+- `trigger.py`：实际运行逻辑
+
+### 执行器
+
+每个执行器位于 `notmyfault/actions/<id>/`，包含：
+
+- `action.json`：插件元数据
+- `action.py`：执行实现
+
+这使得你可以按同样格式扩展更多触发器和动作。
+
+---
+
+## 开发提示
+
+- 入口函数在 `notmyfault/app.py`
+- 配置读取与自动迁移在 `notmyfault/config.py`
+- 事件广播与规则匹配在 `notmyfault/engine.py`
+
+---
 
 ## 许可证
 
-本项目采用 **GPL-3** 开源许可协议。在完善后，完整的许可证文本将包含在项目中
+本项目采用 **GPL-3** 许可协议。欢迎阅读并遵守 GPL 的相关条款。
 
-* 祝你有美好的一天~ 

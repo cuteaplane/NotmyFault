@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NotmyFault</title>
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --md-primary: #0061a4; --md-on-primary: #ffffff;
+            --md-surface: #fdfcff; --md-on-surface: #1a1c1e;
+            --md-surface-container: #f3f3f7; --md-outline: #73777f;
+            --md-success: #146c2e; --md-error: #ba1a1a;
+        }
+        body { font-family: 'Roboto', sans-serif; background-color: var(--md-surface); color: var(--md-on-surface); margin: 0; padding: 0; }
+        header { background-color: var(--md-surface); padding: 16px 32px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #dfe2eb; position: sticky; top: 0; z-index: 10; }
+        h1 { margin: 0; font-size: 22px; font-weight: 500; display: flex; align-items: center; gap: 12px; }
+        .container { padding: 24px 32px; max-width: 900px; margin: 0 auto; }
+        
+        .dashboard-card { background-color: #e8def8; border-radius: 24px; padding: 24px; margin-bottom: 32px; display: flex; justify-content: space-between; align-items: center; }
+        .status-badge { display: inline-flex; align-items: center; gap: 8px; padding: 8px 16px; border-radius: 16px; background-color: var(--md-surface); font-weight: 500; }
+        .status-dot { width: 10px; height: 10px; border-radius: 50%; background-color: var(--md-outline); }
+        .status-dot.active { background-color: var(--md-success); box-shadow: 0 0 8px var(--md-success); }
+        
+        .rule-card { background-color: var(--md-surface-container); border-radius: 16px; padding: 24px; margin-bottom: 24px; border: 1px solid transparent; transition: all 0.2s; }
+        .rule-card:hover { border-color: var(--md-outline); }
+        .section-title { font-size: 14px; font-weight: 700; color: var(--md-primary); margin: 16px 0 12px 0; display: flex; align-items: center; gap: 8px; }
+        
+        .input-row { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 16px; align-items: flex-end; }
+        .input-group { display: flex; flex-direction: column; flex: 1; min-width: 150px; }
+        .input-group label { font-size: 12px; color: var(--md-outline); margin-bottom: 4px; font-weight: 500; }
+        input, select { padding: 12px 16px; border-radius: 8px; border: 1px solid var(--md-outline); background-color: var(--md-surface); color: var(--md-on-surface); font-size: 14px; outline: none; }
+        input:focus, select:focus { border: 2px solid var(--md-primary); padding: 11px 15px; }
+
+        .btn { display: inline-flex; align-items: center; gap: 8px; padding: 10px 24px; border-radius: 24px; font-size: 14px; font-weight: 500; border: none; cursor: pointer; transition: opacity 0.2s; }
+        .btn-primary { background-color: var(--md-primary); color: var(--md-on-primary); }
+        .btn-tonal { background-color: #ceadd4; color: #3a004b; }
+        .btn-small { padding: 6px 12px; font-size: 12px; border-radius: 12px; background-color: #e0e2ec; color: #44474e; }
+        .btn:hover { opacity: 0.8; }
+        
+        .icon-btn { background: none; border: none; color: var(--md-outline); cursor: pointer; display: flex; align-items: center; padding: 6px; border-radius: 50%; }
+        .icon-btn:hover { background-color: #ffdad6; color: var(--md-error); }
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1><span class="material-symbols-outlined">manufacturing</span> NotmyFault</h1>
+        <div style="display: flex; gap: 12px;">
+            <button class="btn btn-primary" onclick="saveConfig()">
+                <span class="material-symbols-outlined">save</span> 保存配置
+            </button>
+            <button class="btn btn-primary" onclick="addRule()" style="background-color: #146c2e;">
+                <span class="material-symbols-outlined">add</span> 新建规则
+            </button>
+        </div>
+    </header>
+
+    <div class="container">
+        <div class="dashboard-card">
+            <div>
+                <h2 style="margin: 0 0 12px 0; font-size: 18px;">NotmyFault 引擎状态</h2>
+                <div class="status-badge">
+                    <div class="status-dot" id="statusDot"></div>
+                    <span id="statusText">🤔已停止</span>
+                </div>
+            </div>
+            <button class="btn btn-tonal" id="startBtn" onclick="startEngine()">
+                <span class="material-symbols-outlined">play_arrow</span> 启动 NotmyFault
+            </button>
+        </div>
+        <div id="app"></div>
+    </div>
+
+    <script>
+        let schema = { triggers: {}, actions: {} };
+        let configData = { rules: [] };
+
+        function renderUI() {
+            const app = document.getElementById('app');
+            app.innerHTML = '';
+            
+            if (configData.rules.length === 0) {
+                app.innerHTML = '<div style="text-align:center; padding: 40px; color: var(--md-outline);">还没有配置任何规则哦，快去新建吧~</div>';
+                return;
+            }
+
+            configData.rules.forEach((rule, rIdx) => {
+                const card = document.createElement('div');
+                card.className = 'rule-card';
+                
+                // 1. 规则名称
+                let html = `
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                        <div class="input-group" style="flex: 1; margin-right: 20px;">
+                            <label>规则名称</label>
+                            <input type="text" value="${rule.name || ''}" onchange="updateData(${rIdx}, 'name', this.value)">
+                        </div>
+                        <button class="icon-btn" onclick="deleteRule(${rIdx})" title="删除规则">
+                            <span class="material-symbols-outlined">delete</span>
+                        </button>
+                    </div>
+                `;
+
+                // 2. 动态触发器选择 & 参数渲染
+                const currentTrigger = rule.event?.type;
+                html += `<div class="section-title"><span class="material-symbols-outlined">memory</span> 触发事件</div><div class="input-row">`;
+                
+                // 触发器下拉框
+                html += `<div class="input-group" style="flex: 0.5;"><label>选择触发器</label><select onchange="changeTrigger(${rIdx}, this.value)">`;
+                Object.keys(schema.triggers).forEach(tKey => {
+                    const tName = schema.triggers[tKey].name || tKey;
+                    html += `<option value="${tKey}" ${currentTrigger === tKey ? 'selected' : ''}>${tName}</option>`;
+                });
+                html += `</select></div>`;
+                
+                // 触发器参数
+                const eventSchema = schema.triggers[currentTrigger];
+                if (eventSchema && eventSchema.required_params) {
+                    eventSchema.required_params.forEach(paramKey => {
+                        const val = rule.event.params[paramKey] || '';
+                        html += `
+                            <div class="input-group">
+                                <label>${paramKey}</label>
+                                <input type="text" value="${val}" onchange="updateEventParam(${rIdx}, '${paramKey}', this.value)">
+                            </div>
+                        `;
+                    });
+                }
+                html += `</div>`;
+
+                // 3. 动态动作器选择 & 参数渲染
+                html += `<div class="section-title" style="justify-content: space-between;">
+                            <span><span class="material-symbols-outlined">bolt</span> 执行动作</span>
+                            <button class="btn btn-small" onclick="addAction(${rIdx})">+ 添加动作</button>
+                         </div>`;
+                         
+                (rule.actions || []).forEach((action, aIdx) => {
+                    html += `<div class="input-row" style="background: var(--md-surface); padding: 12px; border-radius: 8px; margin-bottom: 8px;">`;
+                    
+                    // 动作下拉框
+                    html += `<div class="input-group" style="flex: 0.5;"><label>动作类型</label><select onchange="changeAction(${rIdx}, ${aIdx}, this.value)">`;
+                    Object.keys(schema.actions).forEach(aKey => {
+                        const aName = schema.actions[aKey].name || aKey;
+                        html += `<option value="${aKey}" ${action.type === aKey ? 'selected' : ''}>${aName}</option>`;
+                    });
+                    html += `</select></div>`;
+
+                    // 动作参数 (根据你最新的 JSON 设计，这里自动遍历现有的 keys)
+                    Object.keys(action.params || {}).forEach(paramKey => {
+                        html += `
+                            <div class="input-group">
+                                <label>${paramKey}</label>
+                                <input type="text" value="${action.params[paramKey]}" onchange="updateActionParam(${rIdx}, ${aIdx}, '${paramKey}', this.value)">
+                            </div>
+                        `;
+                    });
+
+                    html += `<button class="icon-btn" onclick="removeAction(${rIdx}, ${aIdx})" title="移除动作"><span class="material-symbols-outlined">close</span></button></div>`;
+                });
+
+                card.innerHTML = html;
+                app.appendChild(card);
+            });
+        }
+
+        // --- 数据更新魔法 ---
+        function updateData(rIdx, key, val) { configData.rules[rIdx][key] = val; }
+        function updateEventParam(rIdx, key, val) { configData.rules[rIdx].event.params[key] = val; }
+        function updateActionParam(rIdx, aIdx, key, val) { configData.rules[rIdx].actions[aIdx].params[key] = val; }
+        
+        // 🌟 核心：切换触发器时，自动重置参数格式！
+        function changeTrigger(rIdx, newType) {
+            let newParams = {};
+            if (schema.triggers[newType]?.required_params) {
+                schema.triggers[newType].required_params.forEach(p => newParams[p] = "");
+            }
+            configData.rules[rIdx].event = { type: newType, params: newParams };
+            renderUI();
+        }
+
+        // 🌟 核心：切换动作时，自动重置参数格式！
+        function changeAction(rIdx, aIdx, newType) {
+            let newParams = {};
+            if (schema.actions[newType]?.required_params) {
+                schema.actions[newType].required_params.forEach(p => newParams[p] = "");
+            } else if (newType === "set_volume") { newParams = {"action": "max"}; }
+              else if (newType === "notify") { newParams = {"title": "", "message": ""}; }
+            
+            configData.rules[rIdx].actions[aIdx] = { type: newType, params: newParams };
+            renderUI();
+        }
+
+        function deleteRule(rIdx) { configData.rules.splice(rIdx, 1); renderUI(); }
+        function addAction(rIdx) { 
+            const defaultAction = Object.keys(schema.actions)[0] || "unknown";
+            configData.rules[rIdx].actions.push({ type: defaultAction, params: {} }); 
+            changeAction(rIdx, configData.rules[rIdx].actions.length - 1, defaultAction);
+        }
+        
+        function addRule() {
+            const defaultTrigger = Object.keys(schema.triggers)[0] || "unknown";
+            configData.rules.unshift({ name: "新规则", event: { type: defaultTrigger, params: {} }, actions: [] });
+            changeTrigger(0, defaultTrigger); // 自动生成新触发器对应的参数框
+        }
+
+        // --- 后端通讯 ---
+        function saveConfig() {
+            if (window.pywebview) {
+                window.pywebview.api.save_config(JSON.stringify(configData)).then(res => {
+                    if(res === "SUCCESS") alert("保存成功啦！(๑•̀ㅂ•́)و✧");
+                });
+            }
+        }
+        function startEngine() {
+            if (window.pywebview) {
+                const btn = document.getElementById('startBtn');
+                btn.disabled = true;
+                btn.innerHTML = '<span class="material-symbols-outlined">hourglass_empty</span> 启动中...';
+                
+                window.pywebview.api.start_engine().then(res => {
+                    if(res === "STARTED" || res === "ALREADY_RUNNING") {
+                        document.getElementById('statusDot').classList.add('active');
+                        document.getElementById('statusText').innerText = "😋运行中";
+                        btn.innerHTML = '<span class="material-symbols-outlined">check_circle</span> 运行中';
+                    } else {
+                        alert("启动失败: " + res);
+                        btn.disabled = false;
+                    }
+                });
+            }
+        }
+
+        window.addEventListener('pywebviewready', function() {
+            window.pywebview.api.get_plugins_schema().then(schemaStr => {
+                schema = JSON.parse(schemaStr);
+                return window.pywebview.api.load_config();
+            }).then(configStr => {
+                configData = JSON.parse(configStr);
+                if (!configData.rules) configData.rules = [];
+                renderUI();
+            });
+        });
+    </script>
+</body>
+</html>
