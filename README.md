@@ -14,6 +14,7 @@
 - **进程检测触发器**：当前内置 `process_state` 触发器，可监听进程启动/停止。
 - **动作执行器**：内置 `set_volume` 和 `notify`，可扩展更多动作插件。
 - **图形化配置**：通过 `ControlCenter.pyw` 提供桌面配置编辑与启动界面。
+
 - **统一配置路径**：默认配置存储在 `%APPDATA%\NotmyFault\config.json`。
 
 ---
