@@ -2,13 +2,23 @@ import importlib.util
 import json
 import os
 import threading
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
+
+
+def _normalize_process_name(name: str) -> str:
+    """标准化进程名：转小写，补全 .exe 后缀"""
+    n = (name or "").strip().lower()
+    if n and not n.endswith(".exe"):
+        n += ".exe"
+    return n
 
 
 class AutomationEngine:
-    def __init__(self, config: Dict[str, Any]) -> None:
+    def __init__(self, config: Dict[str, Any],
+                 on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None) -> None:
         self.config = config
         self.rules: List[Dict[str, Any]] = config.get("rules", [])
+        self.on_event = on_event  # 事件回调: (event_type, data_dict)
         self.triggers_meta: Dict[str, Dict[str, Any]] = {}
         self.triggers_funcs: Dict[str, Any] = {}
         self.actions_meta: Dict[str, Dict[str, Any]] = {}
@@ -95,7 +105,7 @@ class AutomationEngine:
         print(f"[EventBus] 收到广播事件: [{event_type}] -> {event_payload}")
 
         for rule in self.rules:
-            rule_event = rule.get("event", {})
+            rule_event = rule.get("event", {}) or rule.get("trigger", {})
             if rule_event.get("type") != event_type:
                 continue
 
@@ -104,21 +114,32 @@ class AutomationEngine:
 
             for key, expected_val in expected_params.items():
                 actual_val = event_payload.get(key)
+                # 进程名标准化比较：大小写不敏感，统一补全 .exe
+                if key == "process_name":
+                    expected_val = _normalize_process_name(expected_val)
+                    actual_val = _normalize_process_name(actual_val or "")
                 if expected_val != actual_val:
                     is_match = False
                     break
 
             if is_match:
-                print(f"[EventBus] 😋 匹配到规则: <{rule.get('name', '未命名规则')}>, 准备分发动作！")
+                rule_name = rule.get('name', '未命名规则')
+                print(f"[EventBus] [OK] 匹配到规则: <{rule_name}>, 准备分发动作！")
+                if self.on_event:
+                    self.on_event("rule_triggered", {
+                        "rule_name": rule_name,
+                        "event_type": event_type,
+                        "event_payload": event_payload,
+                    })
                 for action in rule.get("actions", []):
-                    self.execute_action(action)
+                    self.execute_action(action, rule_name=rule_name)
 
     def call_notmyfault(self, event_data: Dict[str, Any]) -> None:
         event_type = event_data.get("trigger_id")
         event_payload = event_data.get("triggered_params", {})
         self.emit_event(event_type, event_payload)
 
-    def execute_action(self, action: Dict[str, Any]) -> None:
+    def execute_action(self, action: Dict[str, Any], rule_name: str = "") -> None:
         action_type = action.get("type")
         params = action.get("params", {})
 
@@ -127,13 +148,30 @@ class AutomationEngine:
             action_func = self.actions_funcs[action_type]
             try:
                 action_func(action_meta, params)
+                if self.on_event:
+                    self.on_event("action_executed", {
+                        "action_type": action_type,
+                        "params": params,
+                        "rule_name": rule_name,
+                        "status": "ok",
+                    })
             except Exception as e:
-                print(f"[Engine] 😥 执行 action {action_type} 失败: {e}")
+                print(f"[Engine] [ERR] 执行 action {action_type} 失败: {e}")
+                if self.on_event:
+                    self.on_event("error", {
+                        "action_type": action_type,
+                        "rule_name": rule_name,
+                        "error": str(e),
+                    })
         else:
-            print(f"[Engine] 😕 未知 action 类型或未装载模块: {action_type}")
+            print(f"[Engine] [?] 未知 action 类型或未装载模块: {action_type}")
 
-    def start(self) -> None:
+    def start(self, shutdown_event: "threading.Event | None" = None) -> None:
         aggregated_event_configs: Dict[str, List[Dict[str, Any]]] = {}
+        from Win_toaster.show_notification import show_notification
+        from Win_toaster.AUMID_Register import register_toaster
+        register_toaster()
+        show_notification("NotmyFault 已加载", "")
         for rule in self.rules:
             event = rule.get("event", {}) or rule.get("trigger", {})
             event_type = event.get("type")
@@ -169,8 +207,13 @@ class AutomationEngine:
             print("[Engine] 没有找到可用触发器，程序将退出。")
             return
 
+        # 使用 shutdown_event 实现优雅关闭
+        if shutdown_event is None:
+            shutdown_event = threading.Event()
+
         try:
-            while True:
-                threading.Event().wait(1)
+            while not shutdown_event.is_set():
+                shutdown_event.wait(1)
         except KeyboardInterrupt:
             print("[Engine] 主程序收到中断，退出中...")
+

@@ -3,5 +3,20 @@
     "name": "进程状态扫描器",
     "mode": "continuous",
     "description": "持续扫描进程状态并在目标状态到达时通知主程序",
-    "required_params": ["process_name", "state"]
+    "params": [
+        {
+            "name": "process_name",
+            "label": "进程名",
+            "type": "string",
+            "default": "WeChat.exe",
+            "placeholder": "如 WeChat.exe、notepad.exe"
+        },
+        {
+            "name": "state",
+            "label": "触发状态",
+            "type": "select",
+            "default": "running",
+            "options": ["running", "stopped"]
+        }
+    ]
 }

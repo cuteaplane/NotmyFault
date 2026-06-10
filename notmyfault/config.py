@@ -64,6 +64,66 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                     }
                 }
             ]
+        },
+        {
+            "name": "微信退出-恢复音量",
+            "event": {
+                "type": "process_state",
+                "params": {
+                    "process_name": "WeChat.exe",
+                    "state": "stopped"
+                }
+            },
+            "actions": [
+                {"type": "set_volume", "params": {"action": "half"}},
+                {
+                    "type": "notify",
+                    "params": {
+                        "title": "微信已退出",
+                        "message": "音量已恢复至50%"
+                    }
+                }
+            ]
+        },
+        {
+            "name": "PPT退出-恢复音量",
+            "event": {
+                "type": "process_state",
+                "params": {
+                    "process_name": "POWERPNT.EXE",
+                    "state": "stopped"
+                }
+            },
+            "actions": [
+                {"type": "set_volume", "params": {"action": "half"}},
+                {
+                    "type": "notify",
+                    "params": {
+                        "title": "PowerPoint已退出",
+                        "message": "音量已恢复至50%"
+                    }
+                }
+            ]
+        },
+        {
+            "name": "媒体播放器退出-恢复音量",
+            "event": {
+                "type": "process_state",
+                "params": {
+                    "process_name": "wmplayer.exe",
+                    "state": "stopped"
+                }
+            },
+            "actions": [
+                {"type": "set_volume", "params": {"action": "half"}},
+                {
+                    "type": "notify",
+                    "params": {
+                        "title": "媒体播放器已退出",
+                        "message": "音量已恢复至50%"
+                    }
+                }
+            ]
         }
     ]
 }
@@ -88,7 +148,10 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
             else:
                 normalized_rules.append(rule)
 
-        return {"rules": normalized_rules}
+        # 保留 rules 之外的其他顶层键
+        result = dict(config)
+        result["rules"] = normalized_rules
+        return result
 
     processes = config.get("processes")
     if not isinstance(processes, list):
@@ -127,7 +190,10 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
             }
         )
 
-    return {"rules": rules} if rules else config
+    # 保留 processes 之外的其他顶层键，删除 processes 并替换为 rules
+    result = {k: v for k, v in config.items() if k != "processes"}
+    result["rules"] = rules
+    return result if rules else config
 
 
 def get_config() -> Dict[str, Any]:
