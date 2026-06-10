@@ -72,6 +72,8 @@ class UIRemoteController:
 
         # 回调函数存储
         self.callbacks: Dict[str, List[Callable]] = {}  # 频道 -> 回调列表
+        self._pending_requests: Dict[str, threading.Event] = {}  # request_id → 响应事件
+        self._pending_responses: Dict[str, dict] = {}  # request_id → 响应数据
 
         # 连接状态
         self.connected = False
@@ -181,7 +183,14 @@ class UIRemoteController:
                     # 解析消息
                     try:
                         msg = Message.from_dict(msg_dict)
-                        
+
+                        # 处理响应消息
+                        if msg.type == MessageType.RESPONSE.value:
+                            if msg.request_id and msg.request_id in self._pending_requests:
+                                self._pending_responses[msg.request_id] = msg.data
+                                self._pending_requests[msg.request_id].set()
+                            continue
+
                         # 查找对应的回调
                         if msg.channel in self.callbacks:
                             for callback in self.callbacks[msg.channel]:
@@ -247,6 +256,50 @@ class UIRemoteController:
             if callback in self.callbacks[channel]:
                 self.callbacks[channel].remove(callback)
     
+    def request(self, channel: str, data: Optional[Dict] = None, timeout: float = 10.0) -> Optional[dict]:
+        """
+        发送请求并等待响应（同步 RPC）
+
+        Args:
+            channel: 目标频道
+            data: 请求数据
+            timeout: 等待超时（秒）
+
+        Returns:
+            响应数据字典，超时或失败返回 None
+        """
+        if not self.connected or not self.conn:
+            print(f"[IPC Client] 未连接，无法发送请求: {channel}")
+            return None
+
+        try:
+            msg = Message(
+                type=MessageType.REQUEST.value,
+                channel=channel,
+                data=data or {}
+            )
+            rid = msg.request_id
+            event = threading.Event()
+            self._pending_responses[rid] = None
+            self._pending_requests[rid] = event
+            self.conn.send(msg.to_dict())
+            print(f"[IPC Client] 已发送请求: {channel} (id={rid[:6]})")
+
+            if event.wait(timeout=timeout):
+                result = self._pending_responses.pop(rid, None)
+                self._pending_requests.pop(rid, None)
+                print(f"[IPC Client] 收到响应: {channel}")
+                return result
+            else:
+                self._pending_requests.pop(rid, None)
+                self._pending_responses.pop(rid, None)
+                print(f"[IPC Client] 请求超时: {channel}")
+                return None
+        except Exception as e:
+            print(f"[IPC Client] 请求失败 ({channel}): {e}")
+            self.connected = False
+            return None
+
     def send_request(self, channel: str, data: Optional[Dict] = None) -> bool:
         """
         向后台发送控制请求

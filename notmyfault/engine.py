@@ -146,6 +146,10 @@ class AutomationEngine:
 
     def start(self, shutdown_event: "threading.Event | None" = None) -> None:
         aggregated_event_configs: Dict[str, List[Dict[str, Any]]] = {}
+        from Win_toaster.show_notification import show_notification
+        from Win_toaster.AUMID_Register import register_toaster
+        register_toaster()
+        show_notification("NotmyFault 已加载", "")
         for rule in self.rules:
             event = rule.get("event", {}) or rule.get("trigger", {})
             event_type = event.get("type")

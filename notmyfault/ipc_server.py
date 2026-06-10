@@ -1,14 +1,3 @@
-"""
-IPC 服务器 - 运行在后台引擎进程中
-用于与 UI 进程进行跨进程通信
-
-特性：
-- 监听 UI 连接请求
-- 转发引擎内部事件给所有连接的 UI
-- 接收 UI 指令并投递到引擎
-- 自动清理掉线的客户端
-"""
-
 import threading
 import time
 from multiprocessing.connection import Listener
@@ -115,7 +104,7 @@ class EngineIPCServer:
 
                     while self.running:
                         conn = listener.accept()
-                        print("[IPC Server] [OK] 捕捉到一个可爱的 UI 遥控器连接！")
+                        print("[IPC Server] [OK] 捕捉到连接请求！")
 
                         with self.lock:
                             self.clients.append(conn)
@@ -147,15 +136,13 @@ class EngineIPCServer:
     def _handle_client(self, conn):
         """处理单个 UI 客户端的连接"""
         client_id = None
-        conn.settimeout(5.0)  # 防止 recv 永久阻塞
 
         try:
             while self.running:
-                try:
-                    msg_dict = conn.recv()  # 接收 UI 发来的字典
-                except TimeoutError:
-                    # 超时后检查 self.running 再继续
-                    continue
+                # 用 poll 实现可中断的 recv（Connection 不支持 settimeout）
+                if not conn.poll(timeout=5.0):
+                    continue  # 超时，检查 self.running 后继续
+                msg_dict = conn.recv()  # 接收 UI 发来的字典
 
                 # 第一条消息应该是客户端标识
                 if msg_dict.get("type") == "client_hello":
