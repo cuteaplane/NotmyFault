@@ -254,42 +254,128 @@
             changeTrigger(0, defaultTrigger);
         }
 
+        // --- API 基础地址 ---
+        const API = 'http://127.0.0.1:19198';
+
         // --- 后端通讯 ---
-        function saveConfig() {
-            if (window.pywebview) {
-                window.pywebview.api.save_config(JSON.stringify(configData)).then(res => {
-                    if (res === "SUCCESS") alert("保存成功啦！");
+        async function saveConfig() {
+            try {
+                const res = await fetch(API + '/api/rules', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ rules: configData.rules })
                 });
+                const data = await res.json();
+                if (data.ok) alert("保存成功啦！");
+                else alert("保存失败: " + (data.error || "未知错误"));
+            } catch (e) {
+                alert("无法连接到引擎: " + e.message);
             }
         }
-        function startEngine() {
-            if (window.pywebview) {
-                const btn = document.getElementById('startBtn');
+
+        async function startEngine() {
+            const btn = document.getElementById('startBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="material-symbols-outlined">hourglass_empty</span> 启动中...';
+
+            try {
+                const res = await fetch(API + '/api/engine/start', { method: 'POST' });
+                const data = await res.json();
+                if (data.ok) {
+                    document.getElementById('statusDot').classList.add('active');
+                    document.getElementById('statusText').innerText = "运行中";
+                    btn.innerHTML = '<span class="material-symbols-outlined">check_circle</span> 运行中';
+                } else {
+                    alert("启动失败: " + JSON.stringify(data));
+                    btn.disabled = false;
+                }
+            } catch (e) {
+                alert("无法连接到引擎: " + e.message);
+                btn.disabled = false;
+            }
+        }
+
+        function updateStatusUI(status) {
+            const dot = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+            const btn = document.getElementById('startBtn');
+            if (status.running) {
+                dot.classList.add('active');
+                text.innerText = "运行中";
+                btn.innerHTML = '<span class="material-symbols-outlined">check_circle</span> 运行中';
                 btn.disabled = true;
-                btn.innerHTML = '<span class="material-symbols-outlined">hourglass_empty</span> 启动中...';
-
-                window.pywebview.api.start_engine().then(res => {
-                    if (res === "STARTED" || res === "ALREADY_RUNNING") {
-                        document.getElementById('statusDot').classList.add('active');
-                        document.getElementById('statusText').innerText = "运行中";
-                        btn.innerHTML = '<span class="material-symbols-outlined">check_circle</span> 运行中';
-                    } else {
-                        alert("启动失败: " + res);
-                        btn.disabled = false;
-                    }
-                });
+            } else {
+                dot.classList.remove('active');
+                text.innerText = "已停止";
+                btn.innerHTML = '<span class="material-symbols-outlined">play_arrow</span> 启动 NotmyFault';
+                btn.disabled = false;
             }
         }
 
-        window.addEventListener('pywebviewready', function() {
-            window.pywebview.api.get_plugins_schema().then(schemaStr => {
-                schema = JSON.parse(schemaStr);
-                return window.pywebview.api.load_config();
-            }).then(configStr => {
-                configData = JSON.parse(configStr);
-                if (!configData.rules) configData.rules = [];
-                renderUI();
+        function connectSSE() {
+            const es = new EventSource(API + '/api/events');
+
+            es.addEventListener('rule_triggered', function(e) {
+                const data = JSON.parse(e.data);
+                console.log('[SSE] 规则触发:', data.rule_name);
             });
+
+            es.addEventListener('action_executed', function(e) {
+                const data = JSON.parse(e.data);
+                console.log('[SSE] 动作执行:', data.action_type, data.status);
+            });
+
+            es.addEventListener('engine_state_changed', function(e) {
+                const data = JSON.parse(e.data);
+                console.log('[SSE] 引擎状态:', data.state);
+                updateStatusUI({ running: data.state === 'running' });
+            });
+
+            es.addEventListener('error', function(e) {
+                console.log('[SSE] 引擎错误:', e.data);
+            });
+
+            es.onerror = function(e) {
+                console.log('[SSE] 连接断开，5 秒后重连...');
+                es.close();
+                setTimeout(connectSSE, 5000);
+            };
+
+            console.log('[SSE] 已连接事件流');
+        }
+
+        window.addEventListener('load', async function() {
+            try {
+                // 1. 获取插件 schema
+                const schemaRes = await fetch(API + '/api/plugins');
+                schema = await schemaRes.json();
+
+                // 2. 获取当前规则
+                const rulesRes = await fetch(API + '/api/rules');
+                const rulesData = await rulesRes.json();
+                configData = rulesData;
+                if (!configData.rules) configData.rules = [];
+
+                // 3. 获取引擎状态
+                const statusRes = await fetch(API + '/api/engine/status');
+                const status = await statusRes.json();
+                updateStatusUI(status);
+
+                // 4. 连接 SSE 事件流
+                connectSSE();
+
+                // 5. 渲染 UI
+                renderUI();
+                console.log('[Init] NotmyFault Dashboard 已就绪');
+            } catch (e) {
+                console.error('[Init] 无法连接到引擎:', e.message);
+                document.getElementById('app').innerHTML =
+                    '<div style="text-align:center; padding: 40px; color: var(--md-error);">' +
+                    '<h2>无法连接到引擎</h2>' +
+                    '<p>请先启动 NOTMYFAULT.pyw，然后刷新本页面。</p>' +
+                    '<p style="font-size:12px; color: var(--md-outline);">' + e.message + '</p>' +
+                    '</div>';
+            }
         });
     </script>
 </body>

@@ -2,7 +2,7 @@ import importlib.util
 import json
 import os
 import threading
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 
 def _normalize_process_name(name: str) -> str:
@@ -14,9 +14,11 @@ def _normalize_process_name(name: str) -> str:
 
 
 class AutomationEngine:
-    def __init__(self, config: Dict[str, Any]) -> None:
+    def __init__(self, config: Dict[str, Any],
+                 on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None) -> None:
         self.config = config
         self.rules: List[Dict[str, Any]] = config.get("rules", [])
+        self.on_event = on_event  # 事件回调: (event_type, data_dict)
         self.triggers_meta: Dict[str, Dict[str, Any]] = {}
         self.triggers_funcs: Dict[str, Any] = {}
         self.actions_meta: Dict[str, Dict[str, Any]] = {}
@@ -121,16 +123,23 @@ class AutomationEngine:
                     break
 
             if is_match:
-                print(f"[EventBus] [OK] 匹配到规则: <{rule.get('name', '未命名规则')}>, 准备分发动作！")
+                rule_name = rule.get('name', '未命名规则')
+                print(f"[EventBus] [OK] 匹配到规则: <{rule_name}>, 准备分发动作！")
+                if self.on_event:
+                    self.on_event("rule_triggered", {
+                        "rule_name": rule_name,
+                        "event_type": event_type,
+                        "event_payload": event_payload,
+                    })
                 for action in rule.get("actions", []):
-                    self.execute_action(action)
+                    self.execute_action(action, rule_name=rule_name)
 
     def call_notmyfault(self, event_data: Dict[str, Any]) -> None:
         event_type = event_data.get("trigger_id")
         event_payload = event_data.get("triggered_params", {})
         self.emit_event(event_type, event_payload)
 
-    def execute_action(self, action: Dict[str, Any]) -> None:
+    def execute_action(self, action: Dict[str, Any], rule_name: str = "") -> None:
         action_type = action.get("type")
         params = action.get("params", {})
 
@@ -139,8 +148,21 @@ class AutomationEngine:
             action_func = self.actions_funcs[action_type]
             try:
                 action_func(action_meta, params)
+                if self.on_event:
+                    self.on_event("action_executed", {
+                        "action_type": action_type,
+                        "params": params,
+                        "rule_name": rule_name,
+                        "status": "ok",
+                    })
             except Exception as e:
                 print(f"[Engine] [ERR] 执行 action {action_type} 失败: {e}")
+                if self.on_event:
+                    self.on_event("error", {
+                        "action_type": action_type,
+                        "rule_name": rule_name,
+                        "error": str(e),
+                    })
         else:
             print(f"[Engine] [?] 未知 action 类型或未装载模块: {action_type}")
 
