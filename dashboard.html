@@ -77,6 +77,13 @@
         let schema = { triggers: {}, actions: {} };
         let configData = { rules: [] };
 
+        // HTML 转义，防止 XSS
+        function esc(s) {
+            const div = document.createElement('div');
+            div.textContent = s;
+            return div.innerHTML;
+        }
+
         function renderUI() {
             const app = document.getElementById('app');
             app.innerHTML = '';
@@ -95,7 +102,7 @@
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
                         <div class="input-group" style="flex: 1; margin-right: 20px;">
                             <label>规则名称</label>
-                            <input type="text" value="${rule.name || ''}" onchange="updateData(${rIdx}, 'name', this.value)">
+                            <input type="text" value="${esc(rule.name || '')}" onchange="updateData(${rIdx}, 'name', this.value)">
                         </div>
                         <button class="icon-btn" onclick="deleteRule(${rIdx})" title="删除规则">
                             <span class="material-symbols-outlined">delete</span>
@@ -122,8 +129,8 @@
                         const val = rule.event.params[paramKey] || '';
                         html += `
                             <div class="input-group">
-                                <label>${paramKey}</label>
-                                <input type="text" value="${val}" onchange="updateEventParam(${rIdx}, '${paramKey}', this.value)">
+                                <label>${esc(paramKey)}</label>
+                                <input type="text" value="${esc(val)}" onchange="updateEventParam(${rIdx}, '${esc(paramKey)}', this.value)">
                             </div>
                         `;
                     });
@@ -151,8 +158,8 @@
                     Object.keys(action.params || {}).forEach(paramKey => {
                         html += `
                             <div class="input-group">
-                                <label>${paramKey}</label>
-                                <input type="text" value="${action.params[paramKey]}" onchange="updateActionParam(${rIdx}, ${aIdx}, '${paramKey}', this.value)">
+                                <label>${esc(paramKey)}</label>
+                                <input type="text" value="${esc(String(action.params[paramKey]))}" onchange="updateActionParam(${rIdx}, ${aIdx}, '${esc(paramKey)}', this.value)">
                             </div>
                         `;
                     });
@@ -185,9 +192,11 @@
             let newParams = {};
             if (schema.actions[newType]?.required_params) {
                 schema.actions[newType].required_params.forEach(p => newParams[p] = "");
-            } else if (newType === "set_volume") { newParams = {"action": "max"}; }
-              else if (newType === "notify") { newParams = {"title": "", "message": ""}; }
-            
+            } else {
+                // 回退：根据 action type 推断默认参数
+                newParams = {"action": "max"};  // 通用默认值
+            }
+
             configData.rules[rIdx].actions[aIdx] = { type: newType, params: newParams };
             renderUI();
         }

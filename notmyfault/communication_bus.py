@@ -4,6 +4,7 @@
 支持消息传递、事件系统和RPC-like的请求-响应模式
 """
 
+import fnmatch
 import threading
 import queue
 import json
@@ -132,19 +133,19 @@ class CommunicationBus:
     def subscribe(self, channel: str, callback: Callable):
         """
         订阅频道，支持通配符
-        
+
         Args:
-            channel: 频道名称或通配符（如 ".*" 匹配所有频道，"rule.*" 匹配 rule 开头的频道）
+            channel: 频道名称或通配符（如 "*" 匹配所有频道，"rule.*" 匹配 rule 开头的频道）
             callback: 回调函数，接收Message对象
         """
         with self.lock:
             if channel not in self.subscribers:
                 self.subscribers[channel] = []
-            self.subscribers[channel].append(callback)
+            if callback not in self.subscribers[channel]:
+                self.subscribers[channel].append(callback)
     
     def _match_channel(self, pattern: str, channel: str) -> bool:
         """判断频道是否匹配模式（支持简单的通配符）"""
-        import fnmatch
         return fnmatch.fnmatch(channel, pattern)
     
     def unsubscribe(self, channel: str, callback: Callable):
@@ -257,14 +258,18 @@ class CommunicationBus:
 
 # 全局通信总线实例
 _global_bus = None
+_global_bus_lock = threading.Lock()
 
 
 def get_communication_bus() -> CommunicationBus:
     """获取全局通信总线实例"""
     global _global_bus
     if _global_bus is None:
-        _global_bus = CommunicationBus()
-        _global_bus.start()
+        with _global_bus_lock:
+            # 双重检查锁定
+            if _global_bus is None:
+                _global_bus = CommunicationBus()
+                _global_bus.start()
     return _global_bus
 
 

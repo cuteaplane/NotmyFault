@@ -56,64 +56,105 @@ class UIRemoteController:
         
         print(f"[IPC Client] 初始化完成，客户端 ID: {self.client_id}")
     
+    def __init__(self, host: str = 'localhost', port: int = 19198, authkey: bytes = b'notmyfault_ipc_key'):
+        """
+        初始化 UI 远程控制器
+
+        Args:
+            host: 服务器地址
+            port: 服务器端口
+            authkey: 认证密钥
+        """
+        self.address = (host, port)
+        self.authkey = authkey
+        self.client_id = str(uuid.uuid4())[:8]
+        self.conn: Optional[object] = None
+
+        # 回调函数存储
+        self.callbacks: Dict[str, List[Callable]] = {}  # 频道 -> 回调列表
+
+        # 连接状态
+        self.connected = False
+        self._connecting = False  # 防止并发连接
+        self._connect_lock = threading.Lock()
+        self.receiver_thread = None
+        self.reconnect_enabled = True
+        self.reconnect_interval = 2.0  # 秒
+
+        print(f"[IPC Client] 初始化完成，客户端 ID: {self.client_id}")
+
     def connect(self, timeout: float = 5.0) -> bool:
         """
         连接到后台引擎
-        
+
         Args:
             timeout: 连接超时时间（秒）
-        
+
         Returns:
             是否连接成功
         """
         if self.connected:
             return True
-        
+
+        # 防止并发连接
+        with self._connect_lock:
+            if self._connecting:
+                return False
+            if self.connected:
+                return True
+            self._connecting = True
+
         try:
             print(f"[IPC Client] 正在连接后台引擎 {self.address[0]}:{self.address[1]}...")
             self.conn = Client(self.address, authkey=self.authkey)
-            
+
             # 发送 hello 消息
             self.conn.send({
                 "type": "client_hello",
                 "client_id": self.client_id,
                 "timestamp": time.time()
             })
-            
+
             # 等待 hello 回复
             try:
                 self.conn.settimeout(timeout)
                 response = self.conn.recv()
                 if response.get("type") == "server_hello":
-                    print(f"[IPC Client] ✨ 成功连上后台守护引擎！( •̀ ω •́ )✧")
+                    print(f"[IPC Client] [OK] 成功连上后台守护引擎！")
+
+                    # 先停止旧的接收线程（如果有）
+                    old_connected = self.connected
                     self.connected = True
-                    
-                    # 启动接收线程
-                    self.receiver_thread = threading.Thread(
-                        target=self._receive_loop,
-                        name="IPC-Receiver",
-                        daemon=True
-                    )
-                    self.receiver_thread.start()
-                    
-                    # 启动自动重连监控线程
-                    threading.Thread(
-                        target=self._reconnect_monitor,
-                        name="IPC-Reconnect",
-                        daemon=True
-                    ).start()
-                    
+                    if old_connected is False:
+                        # 仅首次连接时启动接收线程
+                        self.receiver_thread = threading.Thread(
+                            target=self._receive_loop,
+                            name="IPC-Receiver",
+                            daemon=True
+                        )
+                        self.receiver_thread.start()
+
+                        # 启动自动重连监控线程
+                        threading.Thread(
+                            target=self._reconnect_monitor,
+                            name="IPC-Reconnect",
+                            daemon=True
+                        ).start()
+
                     return True
             except (TimeoutError, EOFError):
                 print("[IPC Client] 服务器未响应")
                 self.conn = None
                 return False
-        
+
         except (ConnectionRefusedError, OSError) as e:
             print(f"[IPC Client] 连接失败: {e}")
             print("[IPC Client] 引擎似乎还在睡懒觉，没连上哦。")
             self.conn = None
             return False
+        finally:
+            # 总是重置 connecting 标志
+            self._connecting = False
     
     def disconnect(self):
         """断开连接"""
@@ -166,7 +207,7 @@ class UIRemoteController:
     def _reconnect_monitor(self):
         """自动重连监控线程"""
         while self.reconnect_enabled:
-            if not self.connected:
+            if not self.connected and not self._connecting:
                 time.sleep(self.reconnect_interval)
                 if self.reconnect_enabled:
                     print("[IPC Client] 尝试重新连接...")

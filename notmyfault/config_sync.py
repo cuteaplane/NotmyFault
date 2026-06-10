@@ -97,81 +97,67 @@ class ConfigSyncManager:
         with self.lock:
             return dict(self.config)
     
+    def _apply_config_update(self, new_config: Dict[str, Any], source: str, extra_publish_fields: Optional[Dict] = None):
+        """
+        应用配置更新的核心逻辑
+
+        Args:
+            new_config: 新的配置字典
+            source: 更新来源 ("ui" 或 "backend" 或 "file")
+            extra_publish_fields: 发布到总线时额外附加的字段
+        """
+        # 检测是否真的有变化
+        old_hash = self.current_version.content_hash if self.current_version else ""
+        new_hash = self._get_content_hash(new_config)
+
+        if old_hash == new_hash:
+            print(f"[ConfigSync] 配置未变化，跳过")
+            return
+
+        with self.lock:
+            self.config = new_config
+
+        self._update_version(source)
+        self._save_config_to_file()
+
+        # 广播配置更新
+        publish_data = {
+            "config": new_config,
+            "source": source,
+            "timestamp": self.current_version.timestamp
+        }
+        if extra_publish_fields:
+            publish_data.update(extra_publish_fields)
+
+        self.bus.publish(
+            "config.updated",
+            publish_data,
+            msg_type=MessageType.STATUS.value
+        )
+
+        # 执行本地回调
+        self._notify_changes(source, new_config)
+
     def update_from_ui(self, new_config: Dict[str, Any], ui_id: str = "unknown"):
         """
         UI 更新配置
-        
+
         Args:
             new_config: 新的配置字典
             ui_id: UI 的标识
         """
         print(f"[ConfigSync] 接收到来自 UI {ui_id} 的配置更新")
-        
-        # 检测是否真的有变化
-        old_hash = self.current_version.content_hash if self.current_version else ""
-        new_hash = self._get_content_hash(new_config)
-        
-        if old_hash == new_hash:
-            print(f"[ConfigSync] 配置未变化，跳过")
-            return
-        
-        with self.lock:
-            self.config = new_config
-        
-        self._update_version("ui")
-        self._save_config_to_file()
-        
-        # 向后台广播配置更新
-        self.bus.publish(
-            "config.updated",
-            {
-                "config": new_config,
-                "source": "ui",
-                "ui_id": ui_id,
-                "timestamp": self.current_version.timestamp
-            },
-            msg_type=MessageType.STATUS.value
-        )
-        
-        # 执行本地回调
-        self._notify_changes("ui", new_config)
-    
+        self._apply_config_update(new_config, "ui", extra_publish_fields={"ui_id": ui_id})
+
     def update_from_backend(self, new_config: Dict[str, Any]):
         """
         后台更新配置
-        
+
         Args:
             new_config: 新的配置字典
         """
         print(f"[ConfigSync] 接收到来自后台的配置更新")
-        
-        # 检测是否真的有变化
-        old_hash = self.current_version.content_hash if self.current_version else ""
-        new_hash = self._get_content_hash(new_config)
-        
-        if old_hash == new_hash:
-            print(f"[ConfigSync] 配置未变化，跳过")
-            return
-        
-        with self.lock:
-            self.config = new_config
-        
-        self._update_version("backend")
-        self._save_config_to_file()
-        
-        # 向所有 UI 广播配置更新
-        self.bus.publish(
-            "config.updated",
-            {
-                "config": new_config,
-                "source": "backend",
-                "timestamp": self.current_version.timestamp
-            },
-            msg_type=MessageType.STATUS.value
-        )
-        
-        # 执行本地回调
-        self._notify_changes("backend", new_config)
+        self._apply_config_update(new_config, "backend")
     
     def watch_file_changes(self, poll_interval: float = 2.0):
         """
@@ -288,14 +274,18 @@ class ConfigSyncBridge:
     def _on_config_query(self, message: Message):
         """处理配置查询请求"""
         config = self.config_mgr.get_config()
-        
-        self.bus.respond(message, {
-            "config": config,
-            "version": {
+
+        version_info = {}
+        if self.config_mgr.current_version is not None:
+            version_info = {
                 "hash": self.config_mgr.current_version.content_hash,
                 "timestamp": self.config_mgr.current_version.timestamp,
                 "source": self.config_mgr.current_version.source
             }
+
+        self.bus.respond(message, {
+            "config": config,
+            "version": version_info
         })
     
     def broadcast_config(self):

@@ -4,7 +4,7 @@ import psutil
 
 def run(meta, config_list, emit_event):
     trigger_id = meta.get("id", "usb_insert")
-    print(f"[Trigger:{trigger_id}] U盘监视雷达已启动！(๑•̀ㅂ•́)و✧")
+    print(f"[Trigger:{trigger_id}] U盘监视雷达已启动！")
 
     # 帮助函数：获取当前所有的可移动磁盘盘符 (比如 {'E:', 'F:'})
     def get_removable_drives():
@@ -33,14 +33,15 @@ def run(meta, config_list, emit_event):
                     # 遍历用户的规则进行模糊匹配
                     for config in config_list:
                         expected_drive = config.get("drive_letter", "").strip().upper()
-                        
+
                         # 如果用户填了 "ANY" 或者精确匹配到了盘符 (比如 "E:")
                         if expected_drive == "ANY" or expected_drive == drive:
-                            # 发射标准化事件给引擎！
+                            # 发射标准化事件给引擎！发送实际盘符用于匹配规则
                             emit_event(
                                 trigger_id,
                                 {
-                                    "drive_letter": expected_drive
+                                    "drive_letter": expected_drive,
+                                    "actual_drive": drive
                                 }
                             )
 

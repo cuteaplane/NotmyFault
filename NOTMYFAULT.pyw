@@ -42,7 +42,7 @@ class EngineRunner:
             enable_config_sync: 是否启用配置同步
         """
         print("=" * 60)
-        print("🚀 NotmyFault 后台守护引擎正在启动...")
+        print(">>> NotmyFault 后台守护引擎正在启动...")
         print("=" * 60)
         
         try:
@@ -74,6 +74,7 @@ class EngineRunner:
             print("[启动序列] 启动主引擎核心...")
             engine_thread = threading.Thread(
                 target=self._run_engine,
+                args=(self.shutdown_event,),
                 name="Engine-Core",
                 daemon=False
             )
@@ -92,8 +93,8 @@ class EngineRunner:
             print("\n" + "=" * 60)
             print("✅ NotmyFault 后台引擎已启动！")
             print("=" * 60)
-            print("\n📡 IPC 服务器监听地址: localhost:19198")
-            print("🎮 现在可以启动 UI 进行远程控制")
+            print("\n[IPC] 服务器监听地址: localhost:19198")
+            print("[UI] 现在可以启动 UI 进行远程控制")
             print("\n按 Ctrl+C 或关闭此窗口以停止引擎")
             print("=" * 60 + "\n")
             
@@ -107,11 +108,11 @@ class EngineRunner:
         finally:
             self._cleanup()
     
-    def _run_engine(self):
+    def _run_engine(self, shutdown_event=None):
         """运行引擎核心"""
         try:
             self.engine_running = True
-            start_engine()
+            start_engine(shutdown_event=shutdown_event)
         except KeyboardInterrupt:
             pass
         except Exception as e:
@@ -165,7 +166,7 @@ class EngineRunner:
         
         print("[清理] 引擎已完全关闭")
         print("\n" + "=" * 60)
-        print("👋 NotmyFault 后台引擎已停止")
+        print(">>> NotmyFault 后台引擎已停止")
         print("=" * 60)
 
 

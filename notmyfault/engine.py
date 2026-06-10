@@ -95,7 +95,7 @@ class AutomationEngine:
         print(f"[EventBus] 收到广播事件: [{event_type}] -> {event_payload}")
 
         for rule in self.rules:
-            rule_event = rule.get("event", {})
+            rule_event = rule.get("event", {}) or rule.get("trigger", {})
             if rule_event.get("type") != event_type:
                 continue
 
@@ -109,7 +109,7 @@ class AutomationEngine:
                     break
 
             if is_match:
-                print(f"[EventBus] 😋 匹配到规则: <{rule.get('name', '未命名规则')}>, 准备分发动作！")
+                print(f"[EventBus] [OK] 匹配到规则: <{rule.get('name', '未命名规则')}>, 准备分发动作！")
                 for action in rule.get("actions", []):
                     self.execute_action(action)
 
@@ -128,11 +128,11 @@ class AutomationEngine:
             try:
                 action_func(action_meta, params)
             except Exception as e:
-                print(f"[Engine] 😥 执行 action {action_type} 失败: {e}")
+                print(f"[Engine] [ERR] 执行 action {action_type} 失败: {e}")
         else:
-            print(f"[Engine] 😕 未知 action 类型或未装载模块: {action_type}")
+            print(f"[Engine] [?] 未知 action 类型或未装载模块: {action_type}")
 
-    def start(self) -> None:
+    def start(self, shutdown_event: "threading.Event | None" = None) -> None:
         aggregated_event_configs: Dict[str, List[Dict[str, Any]]] = {}
         for rule in self.rules:
             event = rule.get("event", {}) or rule.get("trigger", {})
@@ -169,8 +169,13 @@ class AutomationEngine:
             print("[Engine] 没有找到可用触发器，程序将退出。")
             return
 
+        # 使用 shutdown_event 实现优雅关闭
+        if shutdown_event is None:
+            shutdown_event = threading.Event()
+
         try:
-            while True:
-                threading.Event().wait(1)
+            while not shutdown_event.is_set():
+                shutdown_event.wait(1)
         except KeyboardInterrupt:
             print("[Engine] 主程序收到中断，退出中...")
+

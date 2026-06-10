@@ -24,17 +24,17 @@ from notmyfault.communication_bus import (
 class EngineIPCServer:
     """
     后台引擎的 IPC 服务器
-    
+
     负责：
     1. 监听 UI 的连接请求
     2. 将引擎内部事件广播给所有连接的 UI
     3. 接收并转发 UI 的控制指令到引擎
     """
-    
+
     def __init__(self, host: str = 'localhost', port: int = 19198, authkey: bytes = b'notmyfault_ipc_key'):
         """
         初始化 IPC 服务器
-        
+
         Args:
             host: 监听地址
             port: 监听端口
@@ -48,17 +48,19 @@ class EngineIPCServer:
         self.running = False
         self.listener_thread = None
         self.event_forwarder_thread = None
-        
+        self._listener = None  # 保存 listener 引用，用于从 stop() 中断 accept()
+        self._listener_lock = threading.Lock()
+
         print(f"[IPC Server] 初始化完成，准备在 {host}:{port} 启动")
-    
+
     def start(self):
         """启动 IPC 服务器"""
         if self.running:
             print("[IPC Server] 服务器已在运行")
             return
-        
+
         self.running = True
-        
+
         # 启动监听线程
         self.listener_thread = threading.Thread(
             target=self._listen_for_connections,
@@ -66,7 +68,7 @@ class EngineIPCServer:
             daemon=True
         )
         self.listener_thread.start()
-        
+
         # 启动事件转发线程
         self.event_forwarder_thread = threading.Thread(
             target=self._setup_event_forwarding,
@@ -74,13 +76,22 @@ class EngineIPCServer:
             daemon=True
         )
         self.event_forwarder_thread.start()
-        
-        print(f"[IPC Server] 引擎后台天线已升起，监听 {self.address[0]}:{self.address[1]} 📡")
-    
+
+        print(f"[IPC Server] 引擎后台天线已升起，监听 {self.address[0]}:{self.address[1]} [READY]")
+
     def stop(self):
         """停止 IPC 服务器"""
         self.running = False
-        
+
+        # 关闭 listener 以中断阻塞的 accept()
+        with self._listener_lock:
+            if self._listener is not None:
+                try:
+                    self._listener.close()
+                except Exception:
+                    pass
+                self._listener = None
+
         # 关闭所有客户端连接
         with self.lock:
             for conn in self.clients:
@@ -89,52 +100,63 @@ class EngineIPCServer:
                 except:
                     pass
             self.clients.clear()
-        
+
         print("[IPC Server] 服务器已关闭")
-    
+
     def _listen_for_connections(self):
         """监听来自 UI 的连接请求"""
-        try:
-            with Listener(self.address, authkey=self.authkey) as listener:
-                print(f"[IPC Server] 监听器已就绪，等待 UI 连接...")
-                
-                while self.running:
-                    try:
-                        # 设置超时以便定期检查 self.running 标志
-                        listener.close()  # 关闭旧的监听器
-                        
-                        # 重新创建以支持超时
-                        with Listener(self.address, authkey=self.authkey) as new_listener:
-                            conn = new_listener.accept()
-                            print("[IPC Server] ✨ 捕捉到一个可爱的 UI 遥控器连接！")
-                            
-                            with self.lock:
-                                self.clients.append(conn)
-                            
-                            # 为每个 UI 开个小线程听它说话
-                            client_thread = threading.Thread(
-                                target=self._handle_client,
-                                args=(conn,),
-                                name=f"IPC-Client-{len(self.clients)}",
-                                daemon=True
-                            )
-                            client_thread.start()
-                    except OSError:
-                        # 端口被占用或其他错误，重试
-                        if self.running:
-                            time.sleep(1)
-                        break
-        except Exception as e:
-            print(f"[IPC Server] 监听器错误: {e}")
-    
+        while self.running:
+            try:
+                with Listener(self.address, authkey=self.authkey) as listener:
+                    with self._listener_lock:
+                        self._listener = listener
+
+                    print(f"[IPC Server] 监听器已就绪，等待 UI 连接...")
+
+                    while self.running:
+                        conn = listener.accept()
+                        print("[IPC Server] [OK] 捕捉到一个可爱的 UI 遥控器连接！")
+
+                        with self.lock:
+                            self.clients.append(conn)
+
+                        # 为每个 UI 开个小线程听它说话
+                        client_thread = threading.Thread(
+                            target=self._handle_client,
+                            args=(conn,),
+                            name=f"IPC-Client-{len(self.clients)}",
+                            daemon=True
+                        )
+                        client_thread.start()
+            except OSError as e:
+                # listener.close() 被 stop() 调用时会触发 OSError，这是正常的退出
+                if not self.running:
+                    print(f"[IPC Server] 监听器正常关闭")
+                else:
+                    print(f"[IPC Server] 监听器异常: {e}，将在 1 秒后重试...")
+                    time.sleep(1)
+                    # 不 break，继续重试
+            except Exception as e:
+                print(f"[IPC Server] 监听器错误: {e}")
+                if self.running:
+                    time.sleep(1)
+            finally:
+                with self._listener_lock:
+                    self._listener = None
+
     def _handle_client(self, conn):
         """处理单个 UI 客户端的连接"""
         client_id = None
-        
+        conn.settimeout(5.0)  # 防止 recv 永久阻塞
+
         try:
             while self.running:
-                msg_dict = conn.recv()  # 接收 UI 发来的字典
-                
+                try:
+                    msg_dict = conn.recv()  # 接收 UI 发来的字典
+                except TimeoutError:
+                    # 超时后检查 self.running 再继续
+                    continue
+
                 # 第一条消息应该是客户端标识
                 if msg_dict.get("type") == "client_hello":
                     client_id = msg_dict.get("client_id", "unknown")
@@ -142,19 +164,21 @@ class EngineIPCServer:
                     # 回复 hello
                     conn.send({"type": "server_hello", "status": "connected"})
                     continue
-                
+
                 # 处理正常的消息
                 try:
                     msg = Message.from_dict(msg_dict)
                     print(f"[IPC Server] 收到 UI 指令 ({client_id}): {msg.channel}")
-                    
+
                     # 将消息直接投递到通信总线处理
                     self.bus.message_queue.put_nowait(msg)
                 except Exception as e:
                     print(f"[IPC Server] 消息反序列化失败: {e}")
-        
+
         except EOFError:
             print(f"[IPC Server] UI 客户端 {client_id} 断开连接了~")
+        except (ConnectionResetError, OSError):
+            print(f"[IPC Server] UI 客户端 {client_id} 连接异常断开")
         except Exception as e:
             print(f"[IPC Server] 客户端处理错误 ({client_id}): {e}")
         finally:
@@ -162,7 +186,7 @@ class EngineIPCServer:
                 conn.close()
             except:
                 pass
-            
+
             with self.lock:
                 if conn in self.clients:
                     self.clients.remove(conn)
