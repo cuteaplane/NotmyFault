@@ -64,6 +64,66 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                     }
                 }
             ]
+        },
+        {
+            "name": "微信退出-恢复音量",
+            "event": {
+                "type": "process_state",
+                "params": {
+                    "process_name": "WeChat.exe",
+                    "state": "stopped"
+                }
+            },
+            "actions": [
+                {"type": "set_volume", "params": {"action": "half"}},
+                {
+                    "type": "notify",
+                    "params": {
+                        "title": "微信已退出",
+                        "message": "音量已恢复至50%"
+                    }
+                }
+            ]
+        },
+        {
+            "name": "PPT退出-恢复音量",
+            "event": {
+                "type": "process_state",
+                "params": {
+                    "process_name": "POWERPNT.EXE",
+                    "state": "stopped"
+                }
+            },
+            "actions": [
+                {"type": "set_volume", "params": {"action": "half"}},
+                {
+                    "type": "notify",
+                    "params": {
+                        "title": "PowerPoint已退出",
+                        "message": "音量已恢复至50%"
+                    }
+                }
+            ]
+        },
+        {
+            "name": "媒体播放器退出-恢复音量",
+            "event": {
+                "type": "process_state",
+                "params": {
+                    "process_name": "wmplayer.exe",
+                    "state": "stopped"
+                }
+            },
+            "actions": [
+                {"type": "set_volume", "params": {"action": "half"}},
+                {
+                    "type": "notify",
+                    "params": {
+                        "title": "媒体播放器已退出",
+                        "message": "音量已恢复至50%"
+                    }
+                }
+            ]
         }
     ]
 }

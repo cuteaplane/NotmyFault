@@ -1,0 +1,21 @@
+{
+    "id": "launch_program",
+    "name": "启动程序",
+    "description": "启动指定程序或打开文件",
+    "params": [
+        {
+            "name": "path",
+            "label": "程序路径",
+            "type": "string",
+            "default": "",
+            "placeholder": "exe 路径、系统命令或文件路径"
+        },
+        {
+            "name": "args",
+            "label": "启动参数",
+            "type": "string",
+            "default": "",
+            "placeholder": "可选，命令行参数"
+        }
+    ]
+}

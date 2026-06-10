@@ -1,0 +1,14 @@
+{
+    "id": "kill_process",
+    "name": "终止进程",
+    "description": "按进程名终止运行中的进程",
+    "params": [
+        {
+            "name": "process_name",
+            "label": "进程名",
+            "type": "string",
+            "default": "",
+            "placeholder": "如 Notepad.exe、WeChat.exe"
+        }
+    ]
+}

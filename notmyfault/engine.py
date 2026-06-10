@@ -5,6 +5,14 @@ import threading
 from typing import Any, Dict, List
 
 
+def _normalize_process_name(name: str) -> str:
+    """标准化进程名：转小写，补全 .exe 后缀"""
+    n = (name or "").strip().lower()
+    if n and not n.endswith(".exe"):
+        n += ".exe"
+    return n
+
+
 class AutomationEngine:
     def __init__(self, config: Dict[str, Any]) -> None:
         self.config = config
@@ -104,6 +112,10 @@ class AutomationEngine:
 
             for key, expected_val in expected_params.items():
                 actual_val = event_payload.get(key)
+                # 进程名标准化比较：大小写不敏感，统一补全 .exe
+                if key == "process_name":
+                    expected_val = _normalize_process_name(expected_val)
+                    actual_val = _normalize_process_name(actual_val or "")
                 if expected_val != actual_val:
                     is_match = False
                     break

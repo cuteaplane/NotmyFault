@@ -1,0 +1,14 @@
+{
+    "id": "run_powershell",
+    "name": "执行 PowerShell",
+    "description": "执行一段 PowerShell 命令",
+    "params": [
+        {
+            "name": "command",
+            "label": "PowerShell 命令",
+            "type": "string",
+            "default": "",
+            "placeholder": "要执行的 PowerShell 命令"
+        }
+    ]
+}

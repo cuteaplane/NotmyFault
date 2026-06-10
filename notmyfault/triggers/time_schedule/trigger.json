@@ -1,0 +1,15 @@
+{
+    "id": "time_schedule",
+    "name": "定时触发",
+    "mode": "continuous",
+    "description": "在指定时间（HH:MM 格式）每日触发一次",
+    "params": [
+        {
+            "name": "time",
+            "label": "触发时间",
+            "type": "string",
+            "default": "22:00",
+            "placeholder": "HH:MM 格式，如 08:30、22:00"
+        }
+    ]
+}
