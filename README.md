@@ -2,20 +2,93 @@
 
 **NotmyFault** 是一款面向 Windows 的草台班子自动化工具。
 
-本项目的特色是：
-
-- 支持插件化的触发器与执行器！只要会 Python ，你可以以极高的自由度轻松自己写你所需要的触发器和执行器！
-
 ---
 
 ## 特性
 
-- **规则驱动**：以 `rules` 方式定义触发条件和动作。规则可包含多个动作。
-- **进程检测触发器**：当前内置 `process_state` 触发器，可监听进程启动/停止。
-- **动作执行器**：内置 `set_volume` 和 `notify`，可扩展更多动作插件。
-- **图形化配置**：通过 `ControlCenter.pyw` 提供桌面配置编辑与启动界面。
+- **规则驱动**：每条规则 = 一个触发条件 + 多个动作，简单直白
+- **插件化**：触发器和动作各自独立，会 Python 就能自己写
+- **HTTP API**：后台暴露 REST 接口，SSE 实时推送事件，任意浏览器打开 Dashboard 就能管理
+- **双进程架构**：引擎后台常驻，UI 只是管理面板，关了也不影响规则运行
+- **日志写盘**：所有输出自动写入 `engine.log`，出问题好排查
 
-- **统一配置路径**：默认配置存储在 `%APPDATA%\NotmyFault\config.json`。
+---
+
+## 快速开始
+
+### 1. 安装依赖
+
+Python 3.11+ 推荐。
+
+```bash
+pip install fastapi uvicorn psutil pywin32
+```
+
+部分插件需要额外依赖：
+
+```bash
+pip install windows-toasts pycaw
+```
+
+### 2. 启动后台引擎
+
+```bash
+python NOTMYFAULT.pyw
+```
+
+引擎启动后会在 `http://127.0.0.1:19198` 监听 HTTP 请求，日志写入 `%APPDATA%\NotmyFault\engine.log`。
+
+### 3. 打开管理面板
+
+浏览器打开 `dashboard.html` 即可配置规则、启停引擎、查看实时事件。
+
+或者直接调 API：
+
+```bash
+curl http://127.0.0.1:19198/api/engine/status
+curl http://127.0.0.1:19198/api/rules
+# 在线 API 文档：http://127.0.0.1:19198/docs
+```
+
+---
+
+## API 一览
+
+| Method | Path | 说明 |
+|---|---|---|
+| `POST` | `/api/engine/start` | 启动引擎 |
+| `POST` | `/api/engine/stop` | 停止引擎 |
+| `GET` | `/api/engine/status` | 引擎状态 |
+| `GET` | `/api/rules` | 获取所有规则 |
+| `PUT` | `/api/rules` | 保存规则 |
+| `GET` | `/api/plugins` | 插件列表（含参数定义） |
+| `GET` | `/api/events` | SSE 事件流（实时推送） |
+
+启动引擎后访问 `http://127.0.0.1:19198/docs` 可查看 Swagger 交互式文档。
+
+---
+
+## 配置格式
+
+配置文件位于 `%APPDATA%\NotmyFault\config.json`，首次运行自动生成默认配置。
+
+```json
+{
+  "rules": [
+    {
+      "name": "微信音量规则",
+      "event": {
+        "type": "process_state",
+        "params": { "process_name": "WeChat.exe", "state": "running" }
+      },
+      "actions": [
+        { "type": "set_volume", "params": { "action": "max" } },
+        { "type": "notify", "params": { "title": "微信正在运行", "message": "音量已设为100%" } }
+      ]
+    }
+  ]
+}
+```
 
 ---
 
@@ -23,144 +96,92 @@
 
 ```text
 NotmyFault/
-├── ControlCenter.pyw           # GUI 控制中心入口
-├── dashboard.html              # GUI 界面模板
-├── NOTMYFAULT.pyw              # 后台检测引擎入口
-├── README.md                   # 项目说明文档
-├── notmyfault/                 # 核心引擎代码
-│   ├── __init__.py
-│   ├── __main__.py
-│   ├── app.py
-│   ├── config.py
-│   ├── engine.py
-│   ├── monitor.py
-│   ├── volume.py
-│   ├── actions/
-│   │   ├── notify/
-│   │   │   ├── action.json
-│   │   │   └── action.py
-│   │   └── set_volume/
-│   │       ├── action.json
-│   │       └── action.py
-│   └── triggers/
-│       └── process_state/
-│           ├── trigger.json
-│           └── trigger.py
-├── Win_toaster/                # Windows 通知相关支持库
-└── config.json                 # 项目默认模板配置（仅用于项目初始化）
+├── NOTMYFAULT.pyw              # 后台引擎入口
+├── dashboard.html              # Web 管理面板
+├── README.md
+├── notmyfault/                 # 核心代码
+│   ├── api_server.py           # HTTP API + SSE 事件流
+│   ├── app.py                  # 引擎工厂入口
+│   ├── engine.py               # 规则匹配与动作分发
+│   ├── config.py               # 配置读写与迁移
+│   ├── volume.py               # 系统音量控制
+│   ├── monitor.py              # 进程监控工具
+│   ├── triggers/               # 触发器插件
+│   │   ├── process_state/      #   进程状态检测
+│   │   ├── idle_detect/        #   系统空闲检测
+│   │   ├── time_schedule/      #   定时触发
+│   │   ├── usb_insert/         #   U盘插入检测
+│   │   └── window_title/       #   窗口标题检测
+│   └── actions/                # 动作插件
+│       ├── set_volume/         #   设置系统音量
+│       ├── notify/             #   显示 Windows 通知
+│       ├── launch_program/     #   启动程序
+│       ├── kill_process/       #   终止进程
+│       ├── run_powershell/     #   执行 PowerShell
+│       └── lock_screen/        #   锁定屏幕
+├── Win_toaster/                # Windows 通知 AUMID 注册
+└── tests/                      # 测试
 ```
 
 ---
 
-## 安装依赖
+## 插件开发
 
-推荐使用 Python 3.11+。
+### 触发器
 
-```bash
-pip install psutil pywebview pywin32
-```
+在 `notmyfault/triggers/<id>/` 下放两个文件：
 
-> 需要确保 `pywebview` 能正常运行来使用 Web UI ；如果只运行命令行引擎，则 `pywebview` 不是必须依赖。
+- `trigger.json` — 元数据
+- `trigger.py` — 必须导出 `run(meta, config_list, emit_event)` 函数
 
-> 内置的触发器和执行器需要其他依赖:
-
-```bash
-pip install windows-toasts pycaw 
-# 可能需要更多依赖。
-```
-
-
----
-
-## 运行方式
-
-### 1. 启动控制中心（推荐）
-
-```bash
-python ControlCenter.pyw
-```
-
-点击界面上的“启动 NotmyFault”按钮即可启动后台引擎；也可以在界面中编辑规则并保存。
-
-### 2. 直接运行后台引擎
-
-```bash
-python NOTMYFAULT.pyw
-```
-
-### 3. 通过包入口运行
-
-```bash
-python -m notmyfault
-```
-
----
-
-## 配置说明
-
-配置文件位于：
-
-```text
-%APPDATA%\NotmyFault\config.json
-```
-
-如果该文件不存在，程序会自动创建默认配置。
-
-### 配置格式
-
-配置文件为 JSON 格式，主要由 `rules` 列表组成：
-
-```json(example)
+```json
 {
-  "rules": [
-    {
-      "name": "微信音量规则",
-      "event": {
-        "type": "process_state",
-        "params": {
-          "process_name": "WeChat.exe",
-          "state": "running"
-        }
-      },
-      "actions": [
-        {"type": "set_volume", "params": {"action": "max"}},
-        {"type": "notify", "params": {"title": "微信正在运行", "message": "音量已设置为100%"}}
-      ]
-    }
+  "id": "my_trigger",
+  "name": "我的触发器",
+  "mode": "continuous",
+  "params": [
+    { "name": "keyword", "label": "关键词", "type": "string", "default": "" }
   ]
 }
 ```
 
+`mode` 为 `continuous` 时引擎会为它开一个常驻线程；`single` 则只执行一次。
 
-## 插件结构
+### 动作
 
-### 触发器
+在 `notmyfault/actions/<id>/` 下放两个文件：
 
-每个触发器位于 `notmyfault/triggers/<id>/`，包含：
+- `action.json` — 元数据
+- `action.py` — 必须导出 `run(meta, params)` 函数
 
-- `trigger.json`：插件元数据
-- `trigger.py`：实际运行逻辑
-
-### 执行器
-
-每个执行器位于 `notmyfault/actions/<id>/`，包含：
-
-- `action.json`：插件元数据
-- `action.py`：执行实现
-
-这使得你可以按同样格式扩展更多触发器和动作。
+```json
+{
+  "id": "my_action",
+  "name": "我的动作",
+  "params": [
+    { "name": "message", "label": "消息", "type": "string", "default": "" }
+  ]
+}
+```
 
 ---
 
-## 开发提示
+## 架构
 
-- 入口函数在 `notmyfault/app.py`
-- 配置读取与自动迁移在 `notmyfault/config.py`
-- 事件广播与规则匹配在 `notmyfault/engine.py`
+```
+浏览器 / pywebview  ←──fetch()──→  http://127.0.0.1:19198/api/*
+                    ←──SSE──────  http://127.0.0.1:19198/api/events
+
+引擎进程 (NOTMYFAULT.pyw)
+  ├── FastAPI + uvicorn (HTTP 服务)
+  ├── EngineAPI (路由 + SSE 事件队列)
+  └── AutomationEngine (规则引擎线程)
+```
+
+双进程：引擎独立运行，UI 随时开关。通信全程 HTTP，`curl` 直接调试。
 
 ---
 
 ## 许可证
 
-本项目采用 **GPL-3** 许可协议。欢迎阅读并遵守 GPL 的相关条款。
-
+GPL-3
