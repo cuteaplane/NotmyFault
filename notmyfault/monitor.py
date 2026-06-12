@@ -2,7 +2,7 @@ import time
 import psutil
 from typing import Dict, Any
 
-from .volume import set_volume
+from .actions.set_volume.volume import set_volume
 import Win_toaster.show_notification as show_notification
 
 

@@ -77,10 +77,59 @@
         let schema = { triggers: {}, actions: {} };
         let configData = { rules: [] };
 
+        // HTML 转义，防止 XSS
+        function esc(s) {
+            if (s == null) return '';
+            const div = document.createElement('div');
+            div.textContent = String(s);
+            return div.innerHTML;
+        }
+
+        // 获取插件的 params 定义（兼容新旧格式）
+        function getParamDefs(pluginMeta) {
+            if (!pluginMeta) return [];
+            // 新格式: params = [{name, label, type, default, ...}]
+            if (Array.isArray(pluginMeta.params)) return pluginMeta.params;
+            // 旧格式: required_params = ["name1", "name2"]
+            if (Array.isArray(pluginMeta.required_params)) {
+                return pluginMeta.required_params.map(p => ({ name: p, label: p, type: 'string', default: '' }));
+            }
+            return [];
+        }
+
+        // 根据 param 定义渲染输入控件
+        function renderParamInput(paramDef, currentValue, onChangeHandler) {
+            const name = paramDef.name;
+            const label = paramDef.label || name;
+            const type = paramDef.type || 'string';
+            const placeholder = paramDef.placeholder || '';
+            const val = currentValue != null ? currentValue : (paramDef.default || '');
+
+            let inputHtml = '';
+            if (type === 'select' && Array.isArray(paramDef.options)) {
+                inputHtml = `<select onchange="${onChangeHandler}">`;
+                paramDef.options.forEach(opt => {
+                    inputHtml += `<option value="${esc(opt)}" ${String(val) === opt ? 'selected' : ''}>${esc(opt)}</option>`;
+                });
+                inputHtml += `</select>`;
+            } else if (type === 'number') {
+                inputHtml = `<input type="number" value="${esc(val)}" placeholder="${esc(placeholder)}" onchange="${onChangeHandler}">`;
+            } else {
+                inputHtml = `<input type="text" value="${esc(val)}" placeholder="${esc(placeholder)}" onchange="${onChangeHandler}">`;
+            }
+
+            return `
+                <div class="input-group">
+                    <label>${esc(label)}</label>
+                    ${inputHtml}
+                </div>
+            `;
+        }
+
         function renderUI() {
             const app = document.getElementById('app');
             app.innerHTML = '';
-            
+
             if (configData.rules.length === 0) {
                 app.innerHTML = '<div style="text-align:center; padding: 40px; color: var(--md-outline);">还没有配置任何规则哦，快去新建吧~</div>';
                 return;
@@ -89,13 +138,13 @@
             configData.rules.forEach((rule, rIdx) => {
                 const card = document.createElement('div');
                 card.className = 'rule-card';
-                
+
                 // 1. 规则名称
                 let html = `
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
                         <div class="input-group" style="flex: 1; margin-right: 20px;">
                             <label>规则名称</label>
-                            <input type="text" value="${rule.name || ''}" onchange="updateData(${rIdx}, 'name', this.value)">
+                            <input type="text" value="${esc(rule.name || '')}" onchange="updateData(${rIdx}, 'name', this.value)">
                         </div>
                         <button class="icon-btn" onclick="deleteRule(${rIdx})" title="删除规则">
                             <span class="material-symbols-outlined">delete</span>
@@ -103,58 +152,50 @@
                     </div>
                 `;
 
-                // 2. 动态触发器选择 & 参数渲染
+                // 2. 触发器选择 & 参数
                 const currentTrigger = rule.event?.type;
                 html += `<div class="section-title"><span class="material-symbols-outlined">memory</span> 触发事件</div><div class="input-row">`;
-                
+
                 // 触发器下拉框
                 html += `<div class="input-group" style="flex: 0.5;"><label>选择触发器</label><select onchange="changeTrigger(${rIdx}, this.value)">`;
                 Object.keys(schema.triggers).forEach(tKey => {
                     const tName = schema.triggers[tKey].name || tKey;
-                    html += `<option value="${tKey}" ${currentTrigger === tKey ? 'selected' : ''}>${tName}</option>`;
+                    html += `<option value="${esc(tKey)}" ${currentTrigger === tKey ? 'selected' : ''}>${esc(tName)}</option>`;
                 });
                 html += `</select></div>`;
-                
-                // 触发器参数
-                const eventSchema = schema.triggers[currentTrigger];
-                if (eventSchema && eventSchema.required_params) {
-                    eventSchema.required_params.forEach(paramKey => {
-                        const val = rule.event.params[paramKey] || '';
-                        html += `
-                            <div class="input-group">
-                                <label>${paramKey}</label>
-                                <input type="text" value="${val}" onchange="updateEventParam(${rIdx}, '${paramKey}', this.value)">
-                            </div>
-                        `;
-                    });
-                }
+
+                // 触发器参数 — 使用 schema 中的 params 定义渲染
+                const triggerDefs = getParamDefs(schema.triggers[currentTrigger]);
+                triggerDefs.forEach(pDef => {
+                    const curVal = (rule.event && rule.event.params) ? rule.event.params[pDef.name] : null;
+                    html += renderParamInput(pDef, curVal,
+                        `updateEventParam(${rIdx}, '${esc(pDef.name)}', this${pDef.type === 'select' ? '.value' : '.value'})`);
+                });
                 html += `</div>`;
 
-                // 3. 动态动作器选择 & 参数渲染
+                // 3. 动作选择 & 参数
                 html += `<div class="section-title" style="justify-content: space-between;">
                             <span><span class="material-symbols-outlined">bolt</span> 执行动作</span>
                             <button class="btn btn-small" onclick="addAction(${rIdx})">+ 添加动作</button>
                          </div>`;
-                         
+
                 (rule.actions || []).forEach((action, aIdx) => {
                     html += `<div class="input-row" style="background: var(--md-surface); padding: 12px; border-radius: 8px; margin-bottom: 8px;">`;
-                    
+
                     // 动作下拉框
                     html += `<div class="input-group" style="flex: 0.5;"><label>动作类型</label><select onchange="changeAction(${rIdx}, ${aIdx}, this.value)">`;
                     Object.keys(schema.actions).forEach(aKey => {
                         const aName = schema.actions[aKey].name || aKey;
-                        html += `<option value="${aKey}" ${action.type === aKey ? 'selected' : ''}>${aName}</option>`;
+                        html += `<option value="${esc(aKey)}" ${action.type === aKey ? 'selected' : ''}>${esc(aName)}</option>`;
                     });
                     html += `</select></div>`;
 
-                    // 动作参数 (根据你最新的 JSON 设计，这里自动遍历现有的 keys)
-                    Object.keys(action.params || {}).forEach(paramKey => {
-                        html += `
-                            <div class="input-group">
-                                <label>${paramKey}</label>
-                                <input type="text" value="${action.params[paramKey]}" onchange="updateActionParam(${rIdx}, ${aIdx}, '${paramKey}', this.value)">
-                            </div>
-                        `;
+                    // 动作参数 — 使用 schema 中的 params 定义渲染
+                    const actionDefs = getParamDefs(schema.actions[action.type]);
+                    actionDefs.forEach(pDef => {
+                        const curVal = (action.params) ? action.params[pDef.name] : null;
+                        html += renderParamInput(pDef, curVal,
+                            `updateActionParam(${rIdx}, ${aIdx}, '${esc(pDef.name)}', this${pDef.type === 'select' ? '.value' : '.value'})`);
                     });
 
                     html += `<button class="icon-btn" onclick="removeAction(${rIdx}, ${aIdx})" title="移除动作"><span class="material-symbols-outlined">close</span></button></div>`;
@@ -165,82 +206,176 @@
             });
         }
 
-        // --- 数据更新魔法 ---
+        // --- 数据更新 ---
         function updateData(rIdx, key, val) { configData.rules[rIdx][key] = val; }
-        function updateEventParam(rIdx, key, val) { configData.rules[rIdx].event.params[key] = val; }
-        function updateActionParam(rIdx, aIdx, key, val) { configData.rules[rIdx].actions[aIdx].params[key] = val; }
-        
-        // 🌟 核心：切换触发器时，自动重置参数格式！
+        function updateEventParam(rIdx, key, val) {
+            if (!configData.rules[rIdx].event) configData.rules[rIdx].event = { type: '', params: {} };
+            if (!configData.rules[rIdx].event.params) configData.rules[rIdx].event.params = {};
+            configData.rules[rIdx].event.params[key] = val;
+        }
+        function updateActionParam(rIdx, aIdx, key, val) {
+            if (!configData.rules[rIdx].actions[aIdx].params) configData.rules[rIdx].actions[aIdx].params = {};
+            configData.rules[rIdx].actions[aIdx].params[key] = val;
+        }
+
+        // 从 schema 的 params 定义生成默认值对象
+        function buildDefaultParams(pluginMeta) {
+            const defs = getParamDefs(pluginMeta);
+            const params = {};
+            defs.forEach(p => { params[p.name] = p.default || ''; });
+            return params;
+        }
+
+        // 切换触发器
         function changeTrigger(rIdx, newType) {
-            let newParams = {};
-            if (schema.triggers[newType]?.required_params) {
-                schema.triggers[newType].required_params.forEach(p => newParams[p] = "");
-            }
+            const newParams = buildDefaultParams(schema.triggers[newType]);
             configData.rules[rIdx].event = { type: newType, params: newParams };
             renderUI();
         }
 
-        // 🌟 核心：切换动作时，自动重置参数格式！
+        // 切换动作
         function changeAction(rIdx, aIdx, newType) {
-            let newParams = {};
-            if (schema.actions[newType]?.required_params) {
-                schema.actions[newType].required_params.forEach(p => newParams[p] = "");
-            } else if (newType === "set_volume") { newParams = {"action": "max"}; }
-              else if (newType === "notify") { newParams = {"title": "", "message": ""}; }
-            
+            const newParams = buildDefaultParams(schema.actions[newType]);
             configData.rules[rIdx].actions[aIdx] = { type: newType, params: newParams };
             renderUI();
         }
 
         function deleteRule(rIdx) { configData.rules.splice(rIdx, 1); renderUI(); }
-        function addAction(rIdx) { 
+
+        function addAction(rIdx) {
             const defaultAction = Object.keys(schema.actions)[0] || "unknown";
-            configData.rules[rIdx].actions.push({ type: defaultAction, params: {} }); 
+            configData.rules[rIdx].actions.push({ type: defaultAction, params: {} });
             changeAction(rIdx, configData.rules[rIdx].actions.length - 1, defaultAction);
         }
-        
+
         function addRule() {
             const defaultTrigger = Object.keys(schema.triggers)[0] || "unknown";
             configData.rules.unshift({ name: "新规则", event: { type: defaultTrigger, params: {} }, actions: [] });
-            changeTrigger(0, defaultTrigger); // 自动生成新触发器对应的参数框
+            changeTrigger(0, defaultTrigger);
         }
+
+        // --- API 基础地址 ---
+        const API = 'http://127.0.0.1:19198';
 
         // --- 后端通讯 ---
-        function saveConfig() {
-            if (window.pywebview) {
-                window.pywebview.api.save_config(JSON.stringify(configData)).then(res => {
-                    if(res === "SUCCESS") alert("保存成功啦！(๑•̀ㅂ•́)و✧");
+        async function saveConfig() {
+            try {
+                const res = await fetch(API + '/api/rules', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ rules: configData.rules })
                 });
-            }
-        }
-        function startEngine() {
-            if (window.pywebview) {
-                const btn = document.getElementById('startBtn');
-                btn.disabled = true;
-                btn.innerHTML = '<span class="material-symbols-outlined">hourglass_empty</span> 启动中...';
-                
-                window.pywebview.api.start_engine().then(res => {
-                    if(res === "STARTED" || res === "ALREADY_RUNNING") {
-                        document.getElementById('statusDot').classList.add('active');
-                        document.getElementById('statusText').innerText = "😋运行中";
-                        btn.innerHTML = '<span class="material-symbols-outlined">check_circle</span> 运行中';
-                    } else {
-                        alert("启动失败: " + res);
-                        btn.disabled = false;
-                    }
-                });
+                const data = await res.json();
+                if (data.ok) alert("保存成功啦！");
+                else alert("保存失败: " + (data.error || "未知错误"));
+            } catch (e) {
+                alert("无法连接到引擎: " + e.message);
             }
         }
 
-        window.addEventListener('pywebviewready', function() {
-            window.pywebview.api.get_plugins_schema().then(schemaStr => {
-                schema = JSON.parse(schemaStr);
-                return window.pywebview.api.load_config();
-            }).then(configStr => {
-                configData = JSON.parse(configStr);
-                if (!configData.rules) configData.rules = [];
-                renderUI();
+        async function startEngine() {
+            const btn = document.getElementById('startBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="material-symbols-outlined">hourglass_empty</span> 启动中...';
+
+            try {
+                const res = await fetch(API + '/api/engine/start', { method: 'POST' });
+                const data = await res.json();
+                if (data.ok) {
+                    document.getElementById('statusDot').classList.add('active');
+                    document.getElementById('statusText').innerText = "运行中";
+                    btn.innerHTML = '<span class="material-symbols-outlined">check_circle</span> 运行中';
+                } else {
+                    alert("启动失败: " + JSON.stringify(data));
+                    btn.disabled = false;
+                }
+            } catch (e) {
+                alert("无法连接到引擎: " + e.message);
+                btn.disabled = false;
+            }
+        }
+
+        function updateStatusUI(status) {
+            const dot = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+            const btn = document.getElementById('startBtn');
+            if (status.running) {
+                dot.classList.add('active');
+                text.innerText = "运行中";
+                btn.innerHTML = '<span class="material-symbols-outlined">check_circle</span> 运行中';
+                btn.disabled = true;
+            } else {
+                dot.classList.remove('active');
+                text.innerText = "已停止";
+                btn.innerHTML = '<span class="material-symbols-outlined">play_arrow</span> 启动 NotmyFault';
+                btn.disabled = false;
+            }
+        }
+
+        function connectSSE() {
+            const es = new EventSource(API + '/api/events');
+
+            es.addEventListener('rule_triggered', function(e) {
+                const data = JSON.parse(e.data);
+                console.log('[SSE] 规则触发:', data.rule_name);
             });
+
+            es.addEventListener('action_executed', function(e) {
+                const data = JSON.parse(e.data);
+                console.log('[SSE] 动作执行:', data.action_type, data.status);
+            });
+
+            es.addEventListener('engine_state_changed', function(e) {
+                const data = JSON.parse(e.data);
+                console.log('[SSE] 引擎状态:', data.state);
+                updateStatusUI({ running: data.state === 'running' });
+            });
+
+            es.addEventListener('error', function(e) {
+                console.log('[SSE] 引擎错误:', e.data);
+            });
+
+            es.onerror = function(e) {
+                console.log('[SSE] 连接断开，5 秒后重连...');
+                es.close();
+                setTimeout(connectSSE, 5000);
+            };
+
+            console.log('[SSE] 已连接事件流');
+        }
+
+        window.addEventListener('load', async function() {
+            try {
+                // 1. 获取插件 schema
+                const schemaRes = await fetch(API + '/api/plugins');
+                schema = await schemaRes.json();
+
+                // 2. 获取当前规则
+                const rulesRes = await fetch(API + '/api/rules');
+                const rulesData = await rulesRes.json();
+                configData = rulesData;
+                if (!configData.rules) configData.rules = [];
+
+                // 3. 获取引擎状态
+                const statusRes = await fetch(API + '/api/engine/status');
+                const status = await statusRes.json();
+                updateStatusUI(status);
+
+                // 4. 连接 SSE 事件流
+                connectSSE();
+
+                // 5. 渲染 UI
+                renderUI();
+                console.log('[Init] NotmyFault Dashboard 已就绪');
+            } catch (e) {
+                console.error('[Init] 无法连接到引擎:', e.message);
+                document.getElementById('app').innerHTML =
+                    '<div style="text-align:center; padding: 40px; color: var(--md-error);">' +
+                    '<h2>无法连接到引擎</h2>' +
+                    '<p>请先启动 NOTMYFAULT.pyw，然后刷新本页面。</p>' +
+                    '<p style="font-size:12px; color: var(--md-outline);">' + e.message + '</p>' +
+                    '</div>';
+            }
         });
     </script>
 </body>

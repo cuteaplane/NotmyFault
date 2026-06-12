@@ -1,0 +1,15 @@
+{
+    "id": "idle_detect",
+    "name": "系统空闲检测",
+    "semantic": "state",
+    "description": "检测系统无键盘鼠标操作的闲置时间，在进入/退出空闲状态时触发",
+    "params": [
+        {
+            "name": "idle_seconds",
+            "label": "空闲秒数",
+            "type": "number",
+            "default": "300",
+            "placeholder": "空闲多少秒后触发（默认300秒=5分钟）"
+        }
+    ]
+}

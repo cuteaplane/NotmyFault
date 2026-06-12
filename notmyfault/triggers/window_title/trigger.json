@@ -1,0 +1,22 @@
+{
+    "id": "window_title",
+    "name": "窗口标题检测",
+    "semantic": "state",
+    "description": "检测包含特定关键词的窗口出现或关闭",
+    "params": [
+        {
+            "name": "title_pattern",
+            "label": "标题关键词",
+            "type": "string",
+            "default": "",
+            "placeholder": "匹配窗口标题包含的关键词"
+        },
+        {
+            "name": "state",
+            "label": "触发状态",
+            "type": "select",
+            "default": "opened",
+            "options": ["opened", "closed"]
+        }
+    ]
+}

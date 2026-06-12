@@ -49,8 +49,16 @@ class IPropertyStore(IUnknown):
     ]
 
 
-def create_shortcut(lnk_path, target, args="", icon=None, aumid="cuteaplane.notmyfault.app"):
+def create_shortcut():
     comtypes.CoInitialize()
+    start_menu = Path(os.getenv("APPDATA")) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+    start_menu.mkdir(parents=True, exist_ok=True)
+    lnk_path = start_menu / "NotmyFault.lnk"
+    root = Path(__file__).resolve().parents[1]
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    target = pythonw if pythonw.exists() else Path(sys.executable)
+    args = f'"{root / "NOTMYFAULT.pyw"}"'
+    icon = root / "logo.ico"
     try:
         # 创建 .lnk
         shell_link = comtypes.client.CreateObject(ShellLink, interface=IShellLinkW)
@@ -70,7 +78,7 @@ def create_shortcut(lnk_path, target, args="", icon=None, aumid="cuteaplane.notm
             fmtid=GUID("{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}"),
             pid=5,
         )
-        buf = create_unicode_buffer(aumid)
+        buf = create_unicode_buffer("cuteaplane.notmyfault.app")
         propvar = PROPVARIANT()
         propvar.vt = VT_LPWSTR
         propvar.union.pwszVal = cast(buf, c_wchar_p)
@@ -81,22 +89,5 @@ def create_shortcut(lnk_path, target, args="", icon=None, aumid="cuteaplane.notm
         persist_file.Save(str(lnk_path), 1)
     finally:
         comtypes.CoUninitialize()
-
-if __name__ == "__main__":
-    start_menu = Path(os.getenv("APPDATA")) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
-    start_menu.mkdir(parents=True, exist_ok=True)
-    lnk = start_menu / "NotmyFault.lnk"
-    root = Path(__file__).resolve().parents[1]
-    pythonw = Path(sys.executable).with_name("pythonw.exe")
-    exe = pythonw if pythonw.exists() else Path(sys.executable)
-    script = root / "NOTMYFAULT.pyw"
-    icon = root / "logo.ico"
-    create_shortcut(
-        lnk,
-        exe,
-        args=f'"{script}"',
-        icon=icon,
-        aumid="cuteaplane.notmyfault.app",
-    )
-    print(f"Shortcut created: {lnk}")
-    print(f"Exists: {lnk.exists()}")
+        print(f"Shortcut created: {lnk_path}")
+        print(f"Exists: {lnk_path.exists()}")

@@ -1,0 +1,21 @@
+{
+    "id": "notify",
+    "name": "显示通知",
+    "description": "显示 Windows 通知消息",
+    "params": [
+        {
+            "name": "title",
+            "label": "通知标题",
+            "type": "string",
+            "default": "NotmyFault",
+            "placeholder": "通知的标题"
+        },
+        {
+            "name": "message",
+            "label": "通知内容",
+            "type": "string",
+            "default": "",
+            "placeholder": "通知的正文内容"
+        }
+    ]
+}
