@@ -1,7 +1,7 @@
 {
     "id": "window_title",
     "name": "窗口标题检测",
-    "mode": "continuous",
+    "semantic": "state",
     "description": "检测包含特定关键词的窗口出现或关闭",
     "params": [
         {
