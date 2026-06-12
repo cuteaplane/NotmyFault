@@ -138,14 +138,16 @@ NotmyFault/
 {
   "id": "my_trigger",
   "name": "我的触发器",
-  "mode": "continuous",
+  "semantic": "state",
   "params": [
     { "name": "keyword", "label": "关键词", "type": "string", "default": "" }
   ]
 }
 ```
 
-`mode` 为 `continuous` 时引擎会为它开一个常驻线程；`single` 则只执行一次。
+`semantic` 描述事件的语义类型：
+- `"state"` — 持续状态上报（如进程运行/停止、窗口开关），事件携带状态值
+- `"oneshot"` — 单次触发（如定时到时、USB插入），事件只表示"发生了"
 
 ### 动作
 

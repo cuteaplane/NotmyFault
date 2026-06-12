@@ -100,9 +100,13 @@ class AutomationEngine:
 
     def emit_event(self, event_type: str, event_payload: Dict[str, Any]) -> None:
         """
-        这个函数会被触发器线程调用，或者直接被插件调用（比如说手动触发某个事件），它的职责就是把事件分发给所有规则，看看有没有哪个规则的触发条件
+        分发事件给所有规则。
+        event_type: 事件类型ID（触发器 ID）
+        event_payload: 事件参数
+        semantic 由触发器元数据定义（state=持续状态上报, oneshot=单次触发）
         """
-        print(f"[EventBus] 收到广播事件: [{event_type}] -> {event_payload}")
+        semantic = self.triggers_meta.get(event_type, {}).get("semantic", "oneshot")
+        print(f"[EventBus] 收到广播事件: [{event_type}] ({semantic}) -> {event_payload}")
 
         for rule in self.rules:
             rule_event = rule.get("event", {}) or rule.get("trigger", {})
@@ -188,20 +192,15 @@ class AutomationEngine:
 
             trigger_meta = self.triggers_meta.get(event_type, {})
             trigger_func = self.triggers_funcs[event_type]
-            mode = trigger_meta.get("mode", "continuous")
 
-            if mode == "continuous":
-                thread_count += 1
-                thread = threading.Thread(
-                    target=trigger_func,
-                    args=(trigger_meta, config_list, self.emit_event),
-                    daemon=True,
-                )
-                thread.start()
-                print(f"[Engine] 已启动触发器线程: {event_type} (共监听 {len(config_list)} 条规则)")
-            elif mode == "single":
-                trigger_func(trigger_meta, config_list, self.emit_event)
-                print(f"[Engine] 已执行单次触发器: {event_type}")
+            thread_count += 1
+            thread = threading.Thread(
+                target=trigger_func,
+                args=(trigger_meta, config_list, self.emit_event),
+                daemon=True,
+            )
+            thread.start()
+            print(f"[Engine] 已启动触发器线程: {event_type} (共监听 {len(config_list)} 条规则)")
 
         if thread_count == 0:
             print("[Engine] 没有找到可用触发器，程序将退出。")
