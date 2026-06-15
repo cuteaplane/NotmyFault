@@ -40,7 +40,22 @@ class DashboardAPI:
             return {"_error": str(e), "rules": []}
 
     def save_config(self, rules: list) -> dict:
-        """写入 %APPDATA%/NotmyFault/config.json"""
+        """写入配置 — 引擎运行时走 API（单写者），引擎离线时直接写文件"""
+        # 优先走 API（引擎在运行），避免跨进程文件冲突
+        try:
+            req = urllib.request.Request(
+                f"{API}/api/rules",
+                method="PUT",
+                data=json.dumps({"rules": rules}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            result = json.loads(urllib.request.urlopen(req, timeout=5).read())
+            if result.get("ok"):
+                return {"ok": True}
+        except Exception:
+            pass  # API 不可达（引擎未启动），回退到直接写文件
+
+        # Fallback: 引擎未运行，无冲突风险，直接写
         try:
             os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:

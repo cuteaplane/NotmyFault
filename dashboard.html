@@ -549,6 +549,16 @@ input:focus, select:focus {
 ::-webkit-scrollbar-thumb { background: var(--md-outline-variant); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--md-outline); }
 
+/* MD 旋转圆圈 */
+@keyframes md-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.md-spinner {
+  animation: md-spin 1.2s cubic-bezier(0.4, 0.0, 0.2, 1) infinite;
+  font-variation-settings: 'FILL' 0;
+}
+
 /* Responsive */
 @media (max-width: 700px) {
   .sidebar { width: 72px; min-width: 72px; }
@@ -614,7 +624,7 @@ input:focus, select:focus {
           <span class="material-symbols-outlined">play_arrow</span> 启动引擎
         </button>
         <button class="btn btn-filled btn-error" id="stopBtn" onclick="stopEngine()" style="display:none;min-width:140px;">
-          <span class="material-symbols-outlined">stop</span> 停止引擎
+          <span class="material-symbols-outlined">power_settings_new</span> 关闭引擎
         </button>
       </div>
     </div>
@@ -667,20 +677,12 @@ input:focus, select:focus {
     <div class="page-header"><h2>关于</h2></div>
     <div class="about-card">
       <p style="font:var(--md-typescale-title);margin-bottom:4px;">NotmyFault</p>
-      <p style="color:var(--md-on-surface-variant);">Windows 系统自动化引擎 — 基于触发器/动作规则的本地后台服务。</p>
-      <div class="tech-tags">
-        <span class="tech-tag"><span class="material-symbols-outlined" style="font-size:16px;">code</span> Python 3</span>
-        <span class="tech-tag"><span class="material-symbols-outlined" style="font-size:16px;">web</span> FastAPI</span>
-        <span class="tech-tag"><span class="material-symbols-outlined" style="font-size:16px;">desktop_windows</span> pywebview</span>
-        <span class="tech-tag"><span class="material-symbols-outlined" style="font-size:16px;">design_services</span> Material 3</span>
-      </div>
+      <p style="color:var(--md-on-surface-variant);">轻量级 Windows 系统自动化工具 — 设置规则，当条件满足时自动执行动作。</p>
       <p style="font:var(--md-typescale-label-sm);color:var(--md-on-surface-variant);margin-top:24px;">
-        进程分离架构：引擎 (NOTMYFAULT.pyw) 作为 Windows 后台服务独立运行，
-        Dashboard (dashboard.pyw) 作为管理界面独立运行，通过 HTTP API 通信。
-        关闭 Dashboard 不影响引擎运行。
+        引擎在后台独立运行，关闭管理界面不影响引擎工作。
       </p>
       <p style="font:var(--md-typescale-label-sm);color:var(--md-outline);margin-top:16px;">
-        © 2025 NotmyFault Project &nbsp;|&nbsp; 配置路径: %APPDATA%/NotmyFault/
+        © 2025 NotmyFault Project &nbsp;|&nbsp; %APPDATA%/NotmyFault/
       </p>
     </div>
   </section>
@@ -700,6 +702,8 @@ let _engineStatus = { running: false, pid: null };
 let _eventLog = [];  // max 50 recent events
 let _timers = [];      // 跟踪所有 interval/timeout，便于清理
 let _sseSource = null; // SSE EventSource 引用
+let _sseRetryCount = 0;
+const _sseMaxRetries = 10;
 let _starting = false; // startEngine 防重入
 const API = 'http://127.0.0.1:19198';
 
@@ -922,25 +926,32 @@ async function loadConfig() {
 }
 
 async function saveConfig() {
-  let ok = false;
   if (hasBridge()) {
     const r = await window.pywebview.api.save_config(configData.rules);
-    ok = r.ok;
-    if (!ok) alert("保存失败: " + (r.error || "未知错误"));
+    if (r.ok) {
+      snackbar("配置已保存");
+      return;
+    }
+    alert("保存失败: " + (r.error || "未知错误"));
+    return;
   }
-  if (!ok) {
-    try {
-      const res = await fetch(API + '/api/rules', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rules: configData.rules }),
-      });
-      const data = await res.json();
-      ok = data.ok;
-      if (!ok) alert("保存失败: " + (data.error || "未知错误"));
-    } catch (e) { alert("无法连接到引擎: " + e.message); }
+
+  // 无桥接（浏览器模式），直接走 API
+  try {
+    const res = await fetch(API + '/api/rules', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rules: configData.rules }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      snackbar("配置已保存");
+    } else {
+      alert("保存失败: " + (data.error || "未知错误"));
+    }
+  } catch (e) {
+    alert("无法连接到引擎: " + e.message);
   }
-  if (ok) snackbar("配置已保存");
 }
 
 // ---- Home: Status UI ----
@@ -961,7 +972,7 @@ function updateStatusUI(status) {
     startBtn.style.display = 'none';
     stopBtn.style.display = '';
     stopBtn.disabled = false;
-    stopBtn.innerHTML = '<span class="material-symbols-outlined">stop</span> 停止引擎';
+    stopBtn.innerHTML = '<span class="material-symbols-outlined">power_settings_new</span> 关闭引擎';
   } else {
     icon.textContent = 'stop_circle';
     icon.classList.add('stopped');
@@ -976,6 +987,13 @@ function updateStatusUI(status) {
   loadHomeStats();
 }
 
+// ---- 最小耗时等待（假加载让用户体验更平滑） ----
+function _minDelay(ms, startTime) {
+  const elapsed = Date.now() - startTime;
+  if (elapsed >= ms) return;
+  return new Promise(r => _setTimeout(r, ms - elapsed));
+}
+
 // ---- Home: Start / Stop ----
 async function startEngine() {
   // 防重入保护
@@ -984,7 +1002,8 @@ async function startEngine() {
 
   const startBtn = document.getElementById('startBtn');
   startBtn.disabled = true;
-  startBtn.innerHTML = '<span class="material-symbols-outlined">hourglass_empty</span> 启动中...';
+  startBtn.innerHTML = '<span class="material-symbols-outlined md-spinner">progress_activity</span> 启动中...';
+  const startTime = Date.now();
 
   if (hasBridge()) {
     const result = await window.pywebview.api.launch_engine();
@@ -1005,6 +1024,7 @@ async function startEngine() {
       const status = await res.json();
       if (status.running) {
         clearInterval(pollId);
+        await _minDelay(3000, startTime);
         _starting = false;
         // 直接更新 UI 状态，不刷新整个页面
         updateStatusUI(status);
@@ -1014,6 +1034,7 @@ async function startEngine() {
     } catch (e) {}
     if (attempts >= 15) {
       clearInterval(pollId);
+      await _minDelay(3000, startTime);
       _starting = false;
       startBtn.disabled = false;
       startBtn.innerHTML = '<span class="material-symbols-outlined">play_arrow</span> 启动引擎';
@@ -1026,7 +1047,10 @@ async function stopEngine() {
   const stopBtn = document.getElementById('stopBtn');
   if (stopBtn.disabled) return;  // 防重入
   stopBtn.disabled = true;
-  stopBtn.innerHTML = '<span class="material-symbols-outlined">hourglass_empty</span> 停止中...';
+  stopBtn.innerHTML = '<span class="material-symbols-outlined md-spinner">progress_activity</span> 关闭中...';
+  // 强制浏览器重绘后再执行后续操作，确保旋转动画可见
+  await new Promise(r => setTimeout(r, 50));
+  const startTime = Date.now();
 
   // 优先走 bridge（避免 pywebview 中 file:// 对 POST 的 CORS 拦截）
   if (hasBridge()) {
@@ -1034,36 +1058,29 @@ async function stopEngine() {
   } else {
     try {
       await fetch(API + '/api/engine/shutdown', { method: 'POST' });
-    } catch (e) {}
+    } catch (e) {
+      // 引擎进程优雅退出，fetch 可能触发连接重置 — 正常现象
+    }
   }
 
-  // 轮询确认引擎已停止，确保 UI 正确更新
+  // 引擎优雅关闭后 HTTP 服务会自行退出，连接断开即确认停止
   let pollAttempts = 0;
   const pollId = _setInterval(async () => {
     pollAttempts++;
     try {
-      const res = await fetch(API + '/api/engine/status');
-      const s = await res.json();
-      if (!s.running) {
+      await fetch(API + '/api/engine/status');
+      // 服务还在，继续等
+      if (pollAttempts >= 8) {
         clearInterval(pollId);
-        updateStatusUI(s);
-        return;
-      }
-    } catch (e) {
-      // 无法连接 = 引擎已停止
-      clearInterval(pollId);
-      updateStatusUI({ running: false });
-      return;
-    }
-    if (pollAttempts >= 8) {
-      // 8 秒超时，强制检查
-      clearInterval(pollId);
-      try {
-        const res = await fetch(API + '/api/engine/status');
-        updateStatusUI(await res.json());
-      } catch (e) {
+        await _minDelay(3000, startTime);
         updateStatusUI({ running: false });
       }
+    } catch (e) {
+      // 连接拒绝 = HTTP 服务已退出 = 引擎已关闭
+      clearInterval(pollId);
+      await _minDelay(3000, startTime);
+      updateStatusUI({ running: false });
+      return;
     }
   }, 1000);
 }
@@ -1130,6 +1147,11 @@ function connectSSE() {
   const es = new EventSource(API + '/api/events');
   _sseSource = es;
 
+  es.addEventListener('open', function() {
+    _sseRetryCount = 0;
+    console.log('[SSE] 已连接事件流');
+  });
+
   es.addEventListener('rule_triggered', function(e) {
     const data = JSON.parse(e.data);
     console.log('[SSE] 规则触发:', data.rule_name);
@@ -1154,6 +1176,12 @@ function connectSSE() {
     console.log('[SSE] 连接断开，5 秒后重连...');
     es.close();
     _sseSource = null;
+    _sseRetryCount++;
+    if (_sseRetryCount > _sseMaxRetries) {
+      console.log('[SSE] 超过最大重试次数（' + _sseMaxRetries + '），停止重连');
+      updateStatusUI({ running: false });
+      return;
+    }
     _setTimeout(connectSSE, 5000);
   };
   console.log('[SSE] 已连接事件流');

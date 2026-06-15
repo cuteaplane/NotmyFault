@@ -86,8 +86,9 @@ class EngineAPI:
 
     def __init__(self, engine_runner: EngineRunnerLike):
         self._engine = engine_runner
-        self._event_queue: queue.Queue = queue.Queue()
+        self._event_queue: queue.Queue = queue.Queue(maxsize=100)
         self._event_signal = threading.Event()
+        self._server = None
 
         self.app = FastAPI(title="NotmyFault Engine API", version="1.0")
         self._setup_middleware()
@@ -169,23 +170,21 @@ class EngineAPI:
             return {"ok": True, "running": self._engine.engine_running}
 
         @app.post("/api/engine/stop")
-        async def engine_stop():
+        def engine_stop():
             print("[API] POST /api/engine/stop")
             self._engine._stop_engine()
             return {"ok": True}
 
         @app.post("/api/engine/shutdown")
-        async def engine_shutdown():
-            """彻底退出引擎进程（先停引擎，再关 HTTP 服务）"""
+        def engine_shutdown():
+            """彻底退出引擎进程（先停引擎，再优雅关闭 HTTP 服务）"""
             print("[API] POST /api/engine/shutdown")
             self._engine._stop_engine()
 
-            # 在后台线程延迟退出，确保 HTTP 响应先返回给客户端
-            def _delayed_exit():
-                time.sleep(0.5)
-                os._exit(0)  # os._exit 强杀整个进程，sys.exit 只能退出当前线程
+            # 触发 uvicorn 优雅关闭 — 替代 os._exit(0)
+            if self._server:
+                self._server.should_exit = True
 
-            threading.Thread(target=_delayed_exit, daemon=True).start()
             return {"ok": True, "message": "shutting_down"}
 
         @app.get("/api/engine/status")
@@ -315,13 +314,16 @@ class EngineAPI:
         print(f"  API 文档: http://{host}:{port}/docs")
         print(f"{'=' * 50}\n")
 
+        config = uvicorn.Config(
+            self.app,
+            host=host,
+            port=port,
+            log_level="info",
+        )
+        self._server = uvicorn.Server(config)
+
         try:
-            uvicorn.run(
-                self.app,
-                host=host,
-                port=port,
-                log_level="info",
-            )
+            self._server.run()
         except (OSError, SystemExit) as e:
             code = getattr(e, 'winerror', None) or getattr(e, 'code', None)
             if str(code) == "10048" or "10048" in str(e) or "bind" in str(e).lower():
