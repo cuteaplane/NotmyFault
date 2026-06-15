@@ -1,6 +1,7 @@
 import sys
 import os
 import signal
+import socket
 import threading
 from datetime import datetime
 
@@ -60,8 +61,9 @@ def setup_logging(log_path: str):
             self.file.flush()
             self.orig.flush()
 
-    sys.stdout = _TimestampWriter(log_fp, sys.__stdout__)  # type: ignore
-    sys.stderr = _TimestampWriter(log_fp, sys.__stderr__)  # type: ignore
+    _devnull = open(os.devnull, "w")
+    sys.stdout = _TimestampWriter(log_fp, sys.__stdout__ or _devnull)  # type: ignore
+    sys.stderr = _TimestampWriter(log_fp, sys.__stderr__ or _devnull)  # type: ignore
     print(f"--- NotmyFault 引擎启动 {datetime.now().isoformat()} ---")
 
 
@@ -91,7 +93,14 @@ class EngineRunner:
             print("[Engine] 引擎已在运行")
             return
 
-        self.shutdown_event.clear()
+        # 确保旧引擎线程彻底退出后再启动新的
+        if self.engine_thread and self.engine_thread.is_alive():
+            print("[Engine] 等待旧引擎线程退出...")
+            self.engine_thread.join(timeout=10)
+
+        # 每个引擎实例使用独立的 shutdown_event，避免旧 daemon
+        # 触发器线程在新引擎 clear() 后死灰复燃造成重复处理
+        self.shutdown_event = threading.Event()
         self.engine_thread = threading.Thread(
             target=self._run_engine,
             name="Engine-Core",
@@ -125,7 +134,25 @@ class EngineRunner:
         self.shutdown_event.set()
         if self.engine_thread and self.engine_thread.is_alive():
             self.engine_thread.join(timeout=5)
+            if self.engine_thread.is_alive():
+                print("[Engine] 警告：引擎线程 5 秒内未退出，强制标记为停止")
         self.engine_running = False
+
+    # ================================================================
+    # 单实例检查
+    # ================================================================
+
+    @staticmethod
+    def _check_already_running(port: int = 19198) -> bool:
+        """尝试连接本地端口，连上说明已有实例在运行"""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            s.connect(("127.0.0.1", port))
+            s.close()
+            return True
+        except (socket.error, OSError):
+            return False
 
     # ================================================================
     # 主启动流程
@@ -138,6 +165,11 @@ class EngineRunner:
         print("  NotmyFault Engine ")
         print("=" * 50)
         print(f"  日志文件: {LOG_FILE}")
+
+        # 0. 单实例检查
+        if self._check_already_running():
+            print("[Engine] 引擎已在运行，无需重复启动")
+            return
 
         # 1. 创建 HTTP API 服务
         self._api = EngineAPI(self)

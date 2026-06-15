@@ -23,6 +23,11 @@ class AutomationEngine:
         self.triggers_funcs: Dict[str, Any] = {}
         self.actions_meta: Dict[str, Dict[str, Any]] = {}
         self.actions_funcs: Dict[str, Any] = {}
+        # 优雅关闭
+        self._active_actions = 0
+        self._action_lock = threading.Lock()
+        self._action_done = threading.Condition()
+        self._shutdown_flag: "threading.Event | None" = None
 
     def auto_load(self, base_dir: str) -> None:
         self._load_plugins(
@@ -105,6 +110,11 @@ class AutomationEngine:
         event_payload: 事件参数
         semantic 由触发器元数据定义（state=持续状态上报, oneshot=单次触发）
         """
+        # 关闭期间拒绝新事件，但允许完成已在队列中的事件
+        if self._shutdown_flag and self._shutdown_flag.is_set():
+            print(f"[EventBus] 引擎正在关闭，忽略事件: [{event_type}]")
+            return
+
         semantic = self.triggers_meta.get(event_type, {}).get("semantic", "oneshot")
         print(f"[EventBus] 收到广播事件: [{event_type}] ({semantic}) -> {event_payload}")
 
@@ -144,33 +154,47 @@ class AutomationEngine:
         self.emit_event(event_type, event_payload)
 
     def execute_action(self, action: Dict[str, Any], rule_name: str = "") -> None:
+        # 关闭期间拒绝新动作
+        if self._shutdown_flag and self._shutdown_flag.is_set():
+            print(f"[Engine] 正在关闭，跳过动作: {action.get('type', '?')}")
+            return
+
         action_type = action.get("type")
         params = action.get("params", {})
 
-        if action_type in self.actions_funcs:
+        if action_type not in self.actions_funcs:
+            print(f"[Engine] [?] 未知 action 类型或未装载模块: {action_type}")
+            return
+
+        with self._action_lock:
+            self._active_actions += 1
+        try:
             action_meta = self.actions_meta.get(action_type, {})
             action_func = self.actions_funcs[action_type]
-            try:
-                action_func(action_meta, params)
-                if self.on_event:
-                    self.on_event("action_executed", {
-                        "action_type": action_type,
-                        "params": params,
-                        "rule_name": rule_name,
-                        "status": "ok",
-                    })
-            except Exception as e:
-                print(f"[Engine] [ERR] 执行 action {action_type} 失败: {e}")
-                if self.on_event:
-                    self.on_event("error", {
-                        "action_type": action_type,
-                        "rule_name": rule_name,
-                        "error": str(e),
-                    })
-        else:
-            print(f"[Engine] [?] 未知 action 类型或未装载模块: {action_type}")
+            action_func(action_meta, params)
+            if self.on_event:
+                self.on_event("action_executed", {
+                    "action_type": action_type,
+                    "params": params,
+                    "rule_name": rule_name,
+                    "status": "ok",
+                })
+        except Exception as e:
+            print(f"[Engine] [ERR] 执行 action {action_type} 失败: {e}")
+            if self.on_event:
+                self.on_event("error", {
+                    "action_type": action_type,
+                    "rule_name": rule_name,
+                    "error": str(e),
+                })
+        finally:
+            with self._action_lock:
+                self._active_actions -= 1
+            with self._action_done:
+                self._action_done.notify_all()
 
     def start(self, shutdown_event: "threading.Event | None" = None) -> None:
+        self._shutdown_flag = shutdown_event or threading.Event()
         aggregated_event_configs: Dict[str, List[Dict[str, Any]]] = {}
         from Win_toaster.show_notification import show_notification
         from Win_toaster.AUMID_Register import register_toaster
@@ -207,12 +231,24 @@ class AutomationEngine:
             return
 
         # 使用 shutdown_event 实现优雅关闭
-        if shutdown_event is None:
-            shutdown_event = threading.Event()
+        se = self._shutdown_flag
 
         try:
-            while not shutdown_event.is_set():
-                shutdown_event.wait(1)
+            while not se.is_set():
+                se.wait(1)
         except KeyboardInterrupt:
             print("[Engine] 主程序收到中断，退出中...")
+
+        # 等待在手活跃动作完成
+        print("[Engine] 正在关闭，等待活跃动作完成...")
+        while True:
+            with self._action_lock:
+                remaining = self._active_actions
+            if remaining == 0:
+                break
+            print(f"[Engine] 等待 {remaining} 个活跃动作完成...")
+            with self._action_done:
+                self._action_done.wait(timeout=3)
+
+        print("[Engine] 所有动作已完成，引擎安全关闭")
 
