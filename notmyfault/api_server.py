@@ -174,6 +174,20 @@ class EngineAPI:
             self._engine._stop_engine()
             return {"ok": True}
 
+        @app.post("/api/engine/shutdown")
+        async def engine_shutdown():
+            """彻底退出引擎进程（先停引擎，再关 HTTP 服务）"""
+            print("[API] POST /api/engine/shutdown")
+            self._engine._stop_engine()
+
+            # 在后台线程延迟退出，确保 HTTP 响应先返回给客户端
+            def _delayed_exit():
+                time.sleep(0.5)
+                os._exit(0)  # os._exit 强杀整个进程，sys.exit 只能退出当前线程
+
+            threading.Thread(target=_delayed_exit, daemon=True).start()
+            return {"ok": True, "message": "shutting_down"}
+
         @app.get("/api/engine/status")
         async def engine_status():
             config = self._load_config()
@@ -294,7 +308,7 @@ class EngineAPI:
     # ---- 启动 HTTP 服务 --------------------------------------------------
 
     def serve(self, host: str = "127.0.0.1", port: int = 19198):
-        """启动 HTTP 服务（阻塞当前线程）"""
+        """启动 HTTP 服务（阻塞当前线程，端口冲突时优雅退出不崩溃）"""
         print(f"\n{'=' * 50}")
         print(f"  NotmyFault API Server")
         print(f"  监听 http://{host}:{port}")
@@ -308,11 +322,12 @@ class EngineAPI:
                 port=port,
                 log_level="info",
             )
-        except OSError as e:
-            if "10048" in str(e) or "bind" in str(e).lower():
-                print(f"\n[错误] 端口 {port} 已被占用！")
-                print(f"  可能之前的引擎进程还没关。")
-                print(f"  在 PowerShell 中运行以下命令找到并关闭它：")
-                print(f"    netstat -ano | findstr {port}")
-                print(f"    taskkill /F /PID <PID>")
-            raise
+        except (OSError, SystemExit) as e:
+            code = getattr(e, 'winerror', None) or getattr(e, 'code', None)
+            if str(code) == "10048" or "10048" in str(e) or "bind" in str(e).lower():
+                print(f"\n[提示] 端口 {port} 已被占用 — 引擎可能已在运行")
+            elif isinstance(e, SystemExit):
+                print(f"\n[API] HTTP 服务已退出")
+            else:
+                raise
+            # 不 raise — 让主线程自然进入 cleanup

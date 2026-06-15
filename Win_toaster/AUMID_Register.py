@@ -32,12 +32,15 @@ def register_toaster():
         elif not icon_path.lower().endswith('.ico'):
             print(f"[AUMID_Register] 图标文件不是 .ico：{icon_path}，将跳过 IconUri 注册。")
 
-    # 1. 检查是否已注册
-    check_command = f'powershell -Command "Get-StartApps | Where-Object {{$_.AppUserModelId -eq \'{aumid}\'}}"'
-    result_check = subprocess.run(check_command, capture_output=True, text=True, shell=True)
-    if aumid in result_check.stdout:
-        print(f"[AUMID_Register] AUMID '{aumid}' 已注册，跳过。")
+    # 1. 检查是否已注册（直接查注册表，因为 Get-StartApps 查不到仅通过注册表注册的 AUMID）
+    key_path = f"SOFTWARE\\Classes\\AppUserModelId\\{aumid}"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as check_key:
+            winreg.QueryValueEx(check_key, "DisplayName")
+        print(f"[AUMID_Register] AUMID '{aumid}' 已注册（注册表检测），跳过。")
         return
+    except OSError:
+        pass  # 注册表键不存在，需要注册
 
     # 2. 首选直接写注册表
 
