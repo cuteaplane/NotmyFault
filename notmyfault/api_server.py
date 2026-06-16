@@ -102,6 +102,7 @@ class EngineAPI:
         self._event_queue: queue.Queue = queue.Queue(maxsize=100)
         self._event_signal = threading.Event()
         self._server = None
+        self._engine_ref = None  # AutomationEngine 实例，由 NOTMYFAULT.pyw 注入
 
         self.app = FastAPI(title="NotmyFault Engine API", version="1.0")
         self._setup_middleware()
@@ -259,6 +260,35 @@ class EngineAPI:
         @app.get("/api/plugins")
         async def plugins_schema():
             return self._get_plugins_schema()
+
+        # ================================================================
+        # 诊断 & 日志
+        # ================================================================
+
+        @app.get("/api/engine/diagnostics")
+        async def engine_diagnostics():
+            engine = getattr(self, "_engine_ref", None)
+            if engine is not None:
+                return engine.get_diagnostics()
+            return {"uptime_seconds": 0, "plugins": {}, "rules": {}, "actions": {}}
+
+        @app.get("/api/engine/logs")
+        async def engine_logs(lines: int = 200):
+            from notmyfault.logging import get_latest_log
+            log_path = get_latest_log(
+                os.path.join(os.path.dirname(CONFIG_FILE), "logs")
+            )
+            if not log_path:
+                return {"lines": [], "total": 0}
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    all_lines = f.readlines()
+                return {
+                    "lines": [l.rstrip("\n") for l in all_lines[-lines:]],
+                    "total": len(all_lines),
+                }
+            except FileNotFoundError:
+                return {"lines": [], "total": 0}
 
         # ================================================================
         # SSE 事件流

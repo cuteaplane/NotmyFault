@@ -4,10 +4,12 @@ import json
 import os
 import sys
 import threading
+import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from notmyfault.config import CONFIG_FILE
+from notmyfault.logging import engine_info, engine_warn, engine_error
 
 
 # ---------------------------------------------------------------------------
@@ -31,8 +33,6 @@ def _validate_plugin_meta(
 
     if not isinstance(meta, dict):
         return False, ["插件元数据不是有效的 JSON 对象"]
-
-    plugin_id = meta.get("id", "?")
 
     # --- 必填字段 ---
     for field in sorted(_REQUIRED_META_FIELDS):
@@ -159,13 +159,66 @@ class AutomationEngine:
         # 规则热重载线程安全
         self._rules_lock = threading.RLock()
 
+        # 诊断数据 (供 Dashboard 展示)
+        self._start_time: float = 0.0
+        self._diag: Dict[str, Any] = {
+            "plugin_errors": [],      # [(plugin_id, reason), ...]
+            "rule_issues": [],        # [(rule_name, issue), ...]
+            "action_ok": 0,
+            "action_fail": 0,
+            "hot_reload_errors": 0,
+        }
+
+    # ------------------------------------------------------------------
+    # 告警辅助
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _alert_user(title: str, message: str, open_dashboard: bool = False) -> None:
+        """向用户发送告警（包装 alert_user，静默忽略导入/发送失败）。"""
+        try:
+            from notmyfault.alert import alert_user
+            alert_user(title, message, open_dashboard=open_dashboard)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # 诊断
+    # ------------------------------------------------------------------
+
+    def get_diagnostics(self) -> Dict[str, Any]:
+        """返回引擎当前诊断快照（供 Dashboard 展示）。"""
+        uptime = time.time() - self._start_time if self._start_time > 0 else 0
+        total_actions = self._diag["action_ok"] + self._diag["action_fail"]
+        return {
+            "uptime_seconds": round(uptime, 1),
+            "plugins": {
+                "actions_loaded": len(self.actions_funcs),
+                "triggers_loaded": len(self.triggers_funcs),
+                "errors": self._diag["plugin_errors"][-20:],  # 最近 20 条
+                "error_count": len(self._diag["plugin_errors"]),
+            },
+            "rules": {
+                "total": len(self.rules),
+                "issues": self._diag["rule_issues"],
+                "issue_count": len(self._diag["rule_issues"]),
+            },
+            "actions": {
+                "ok": self._diag["action_ok"],
+                "fail": self._diag["action_fail"],
+                "total": total_actions,
+            },
+            "hot_reload_errors": self._diag["hot_reload_errors"],
+        }
+
     # ------------------------------------------------------------------
     # 插件加载
     # ------------------------------------------------------------------
 
     def auto_load(self, base_dir: str) -> None:
         """扫描并加载所有动作插件和触发器插件。"""
-        self._load_plugins(
+        engine_info("=== SESSION_START ===")
+        t_loaded, t_failed = self._load_plugins(
             base_dir=base_dir,
             plugins_dir="triggers",
             json_filename="trigger.json",
@@ -175,7 +228,7 @@ class AutomationEngine:
             func_store=self.triggers_funcs,
             store_name="Trigger",
         )
-        self._load_plugins(
+        a_loaded, a_failed = self._load_plugins(
             base_dir=base_dir,
             plugins_dir="actions",
             json_filename="action.json",
@@ -187,15 +240,28 @@ class AutomationEngine:
         )
 
         # 启动摘要
+        print(
+            f"\n[Engine] 已加载 {a_loaded} 个动作插件, {t_loaded} 个触发器插件"
+        )
+
+        # 插件加载失败 → 告警
+        total_failed = t_failed + a_failed
+        if total_failed > 0:
+            parts = []
+            if t_failed > 0:
+                parts.append(f"{t_failed} 个触发器")
+            if a_failed > 0:
+                parts.append(f"{a_failed} 个动作")
+            fail_msg = "、".join(parts) + " 插件加载失败，请检查引擎日志"
+            print(f"[Engine] [!!] {fail_msg}", file=sys.stderr)
+            self._alert_user("插件加载异常", fail_msg)
+
+        # admin 权限提示
         admin_plugins = [
             pid
             for pid, meta in {**self.triggers_meta, **self.actions_meta}.items()
             if "admin" in (meta.get("permissions") or [])
         ]
-        print(
-            f"\n[Engine] 已加载 {len(self.actions_funcs)} 个动作插件, "
-            f"{len(self.triggers_funcs)} 个触发器插件"
-        )
         if admin_plugins:
             print(
                 f"[Engine] [!!] 以下插件声明了 admin 权限: {', '.join(admin_plugins)}"
@@ -212,14 +278,21 @@ class AutomationEngine:
         meta_store: Dict[str, Dict[str, Any]],
         func_store: Dict[str, Any],
         store_name: str,
-    ) -> None:
-        """通用插件加载器（触发器和动作共用）。"""
+    ) -> Tuple[int, int]:
+        """通用插件加载器（触发器和动作共用）。
+
+        Returns:
+            (loaded_count, failed_count) — loaded 是成功加载数，failed 是出错数。
+            故意跳过的（如 disabled、缺少文件）不计入 failed。
+        """
         plugin_type = "trigger" if store_name == "Trigger" else "action"
         root_dir = os.path.join(base_dir, plugins_dir)
+        loaded_count = 0
+        failed_count = 0
 
         if not os.path.isdir(root_dir):
             print(f"[Engine] 插件目录不存在，跳过: {root_dir}", file=sys.stderr)
-            return
+            return 0, 0
 
         for folder_name in sorted(os.listdir(root_dir)):
             folder_path = os.path.join(root_dir, folder_name)
@@ -229,7 +302,7 @@ class AutomationEngine:
             json_file = os.path.join(folder_path, json_filename)
             py_file = os.path.join(folder_path, py_filename)
 
-            # --- 文件存在检查 ---
+            # --- 文件存在检查（非错误：可能不是插件目录）---
             if not os.path.exists(json_file):
                 print(
                     f"[Engine] 插件目录缺少 {json_filename}，跳过: {folder_path}",
@@ -252,12 +325,22 @@ class AutomationEngine:
                     f"[Engine] 插件 JSON 解析失败 ({json_file}): {e}",
                     file=sys.stderr,
                 )
+                failed_count += 1
+                self._diag["plugin_errors"].append(
+                    (store_name, folder_name, f"JSON 解析失败: {e}")
+                )
+                engine_error("plugin_load_failed", plugin=folder_name, type=store_name, reason=f"JSON 解析失败: {e}")
                 continue
             except OSError as e:
                 print(
                     f"[Engine] 无法读取插件元数据 ({json_file}): {e}",
                     file=sys.stderr,
                 )
+                failed_count += 1
+                self._diag["plugin_errors"].append(
+                    (store_name, folder_name, f"读取文件失败: {e}")
+                )
+                engine_error("plugin_load_failed", plugin=folder_name, type=store_name, reason=f"读取文件失败: {e}")
                 continue
 
             # --- Schema 校验 ---
@@ -270,9 +353,12 @@ class AutomationEngine:
                 )
                 for err in errors:
                     print(f"         - {err}", file=sys.stderr)
+                failed_count += 1
+                self._diag["plugin_errors"].append(
+                    (store_name, plugin_id, f"schema 校验失败: {'; '.join(errors[:3])}")
+                )
+                engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason=f"schema 校验失败: {'; '.join(errors[:3])}")
                 continue
-
-            # --- 启用/禁用 ---
             if not meta["enabled"]:
                 print(
                     f"[Engine] 插件 \"{plugin_id}\" ({meta['name']}) 已禁用，跳过"
@@ -287,6 +373,11 @@ class AutomationEngine:
                     f"[Engine] 无法创建模块规格，跳过: {py_file}",
                     file=sys.stderr,
                 )
+                failed_count += 1
+                self._diag["plugin_errors"].append(
+                    (store_name, plugin_id, "无法创建模块规格")
+                )
+                engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason="无法创建模块规格")
                 continue
 
             try:
@@ -298,6 +389,11 @@ class AutomationEngine:
                     file=sys.stderr,
                 )
                 traceback.print_exc(file=sys.stderr)
+                failed_count += 1
+                self._diag["plugin_errors"].append(
+                    (store_name, plugin_id, f"Python 加载异常: {traceback.format_exc()[-200:]}")
+                )
+                engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason="Python 加载异常")
                 continue
 
             # --- 权限一致性检查 ---
@@ -316,11 +412,17 @@ class AutomationEngine:
                     f"[Engine] 插件 \"{plugin_id}\" ({meta['name']}) 缺少 run() 函数，跳过",
                     file=sys.stderr,
                 )
+                failed_count += 1
+                self._diag["plugin_errors"].append(
+                    (store_name, plugin_id, "缺少 run() 函数")
+                )
+                engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason="缺少 run() 函数")
                 continue
 
             func_store[plugin_id] = getattr(module, "run")
             meta_store[plugin_id] = meta
             self._plugin_modules[plugin_id] = module
+            loaded_count += 1
 
             # --- 生命周期: setup (触发器) ---
             if plugin_type == "trigger" and hasattr(module, "setup"):
@@ -335,6 +437,12 @@ class AutomationEngine:
                         del func_store[plugin_id]
                         del meta_store[plugin_id]
                         self._plugin_modules.pop(plugin_id, None)
+                        loaded_count -= 1
+                        failed_count += 1
+                        self._diag["plugin_errors"].append(
+                            (store_name, plugin_id, "setup() 返回 False")
+                        )
+                        engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason="setup() 返回 False")
                         continue
                 except Exception:
                     print(
@@ -343,7 +451,11 @@ class AutomationEngine:
                     )
                     traceback.print_exc(file=sys.stderr)
 
-            version_info = f" v{meta['version_code']}" if meta.get("version_code") is not None else ""
+            version_info = (
+                f" v{meta['version_code']}"
+                if meta.get("version_code") is not None
+                else ""
+            )
             perm_info = ""
             if meta.get("permissions"):
                 perm_info = f" [权限: {', '.join(meta['permissions'])}]"
@@ -352,17 +464,23 @@ class AutomationEngine:
                 f"[Engine] 装载{store_name}: {meta['name']} ({plugin_id}){version_info}{perm_info}"
             )
 
+        return loaded_count, failed_count
+
     # ------------------------------------------------------------------
     # 规则 & 参数校验
     # ------------------------------------------------------------------
 
-    def _validate_all_rules(self) -> None:
+    def _validate_all_rules(self) -> Tuple[int, int]:
         """校验所有规则的 event/action 引用和参数是否与已加载插件匹配。
 
-        非致命：只打印警告，不拒绝任何规则。"""
+        非致命：只打印警告，不拒绝任何规则。
+        Returns:
+            (valid_count, total_count)
+        """
         with self._rules_lock:
             rules = list(self.rules)
 
+        self._diag["rule_issues"] = []
         valid_count = 0
         for i, rule in enumerate(rules):
             rule_name = rule.get("name", f"规则 #{i+1}")
@@ -371,29 +489,38 @@ class AutomationEngine:
 
             # 检查 event 引用的触发器是否存在
             if event_type and event_type not in self.triggers_meta:
+                issue = f"引用了未加载的触发器: {event_type}"
                 print(
-                    f"[Engine] [!!] 规则 \"{rule_name}\" 引用了未加载的触发器: {event_type}",
+                    f"[Engine] [!!] 规则 \"{rule_name}\" {issue}",
                     file=sys.stderr,
                 )
+                self._diag["rule_issues"].append((rule_name, issue))
+                engine_error("rule_issue", rule=rule_name, issue=issue)
                 continue
 
             rule_ok = True
             for j, action in enumerate(rule.get("actions", [])):
                 action_type = action.get("type", "")
                 if not action_type:
+                    issue = f"actions[{j}] 缺少 type"
                     print(
-                        f"[Engine] [!!] 规则 \"{rule_name}\" actions[{j}] 缺少 type",
+                        f"[Engine] [!!] 规则 \"{rule_name}\" {issue}",
                         file=sys.stderr,
                     )
+                    self._diag["rule_issues"].append((rule_name, issue))
+                    engine_error("rule_issue", rule=rule_name, issue=issue)
                     rule_ok = False
                     continue
 
                 # 检查 action 引用的插件是否存在
                 if action_type not in self.actions_meta:
+                    issue = f"引用了未加载的 action: {action_type}"
                     print(
-                        f"[Engine] [!!] 规则 \"{rule_name}\" 引用了未加载的 action: {action_type}",
+                        f"[Engine] [!!] 规则 \"{rule_name}\" {issue}",
                         file=sys.stderr,
                     )
+                    self._diag["rule_issues"].append((rule_name, issue))
+                    engine_error("rule_issue", rule=rule_name, issue=issue)
                     rule_ok = False
                     continue
 
@@ -418,7 +545,6 @@ class AutomationEngine:
                     schema = schema_param_names[param_name]
                     expected_type = schema.get("type", "string")
 
-                    # 类型检查
                     if expected_type == "number":
                         if not isinstance(param_value, (int, float)):
                             print(
@@ -442,7 +568,7 @@ class AutomationEngine:
                                 f"({', '.join(map(str, options))})",
                                 file=sys.stderr,
                             )
-                    # string 类型不做严格检查，因为 JSON 的字符串就是 str
+                    # string 类型不做严格检查
 
             if rule_ok:
                 valid_count += 1
@@ -450,6 +576,16 @@ class AutomationEngine:
         print(
             f"[Engine] 规则校验完成: {valid_count}/{len(rules)} 条有效规则"
         )
+
+        # 规则校验有问题 → 告警（仅通知，不自动弹 UI）
+        if valid_count < len(rules):
+            problem_count = len(rules) - valid_count
+            self._alert_user(
+                "规则配置异常",
+                f"{problem_count} 条规则引用了未加载的插件或参数不匹配，请检查引擎日志",
+            )
+
+        return valid_count, len(rules)
 
     # ------------------------------------------------------------------
     # 事件分发
@@ -551,6 +687,7 @@ class AutomationEngine:
             action_meta = self.actions_meta.get(action_type, {})
             action_func = self.actions_funcs[action_type]
             action_func(action_meta, params)
+            self._diag["action_ok"] += 1
             if self.on_event:
                 self.on_event(
                     "action_executed",
@@ -562,11 +699,14 @@ class AutomationEngine:
                     },
                 )
         except Exception:
+            self._diag["action_fail"] += 1
+            err_msg = traceback.format_exc()
             print(
                 f"[Engine] [ERR] 执行 action \"{action_type}\" 失败:",
                 file=sys.stderr,
             )
             traceback.print_exc(file=sys.stderr)
+            engine_error("action_failed", action_type=action_type, rule_name=rule_name, error=str(err_msg[-500:]))
             if self.on_event:
                 self.on_event(
                     "error",
@@ -590,6 +730,7 @@ class AutomationEngine:
         self, shutdown_event: "threading.Event | None" = None
     ) -> None:
         """启动引擎：加载规则、启动触发器线程、进入主循环。"""
+        self._start_time = time.time()
         self._shutdown_flag = shutdown_event or threading.Event()
 
         # 校验规则（初始加载）
@@ -615,6 +756,21 @@ class AutomationEngine:
                 continue
             aggregated_event_configs.setdefault(event_type, []).append(event_params)
 
+        # 检查规则引用了但未加载的触发器（在启动线程之前告警）
+        missing_triggers = [
+            et for et in aggregated_event_configs
+            if et not in self.triggers_funcs
+        ]
+        if missing_triggers:
+            print(
+                f"[Engine] [!!] 规则引用了未加载的触发器: {', '.join(missing_triggers)}",
+                file=sys.stderr,
+            )
+            self._alert_user(
+                "触发器缺失",
+                f"以下触发器未装载，相关规则不会生效: {', '.join(missing_triggers)}",
+            )
+
         # 启动触发器线程
         thread_count = 0
         for event_type, config_list in aggregated_event_configs.items():
@@ -623,9 +779,6 @@ class AutomationEngine:
 
             trigger_meta = self.triggers_meta.get(event_type, {})
             trigger_func = self.triggers_funcs[event_type]
-
-            # 调用 setup（如果在 _load_plugins 之后还有需要延迟初始化的）
-            # setup 已在 _load_plugins 中调用，此处不再重复
 
             thread_count += 1
             thread = threading.Thread(
@@ -641,15 +794,11 @@ class AutomationEngine:
 
         if thread_count == 0:
             print("[Engine] 没有找到可用触发器，程序将退出。")
-            try:
-                from notmyfault.alert import alert_user
-                alert_user(
-                    "NoMyFault 启动失败",
-                    "没有可用的触发器，请检查规则配置",
-                    open_dashboard=True,
-                )
-            except Exception:
-                pass
+            self._alert_user(
+                "NotmyFault 启动失败",
+                "没有可用的触发器，请检查规则配置",
+                open_dashboard=True,
+            )
             return
 
         # 主循环：等待关闭信号 + 配置热重载
@@ -657,6 +806,7 @@ class AutomationEngine:
         config_mtime = (
             os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else 0
         )
+        _hot_reload_error_reported = False  # 避免重复告警
 
         try:
             while not se.is_set():
@@ -678,11 +828,25 @@ class AutomationEngine:
                         print(
                             f"[Engine] 配置已热加载（{len(self.rules)} 条规则）"
                         )
+                        _hot_reload_error_reported = False
                         # 重新校验规则
                         self._validate_all_rules()
                 except json.JSONDecodeError as e:
+                    self._diag["hot_reload_errors"] += 1
+                    engine_error("hot_reload_error", error=str(e))
                     print(
                         f"[Engine] 热加载配置 JSON 解析失败: {e}",
+                        file=sys.stderr,
+                    )
+                    if not _hot_reload_error_reported:
+                        _hot_reload_error_reported = True
+                        self._alert_user(
+                            "配置格式错误",
+                            f"config.json 存在 JSON 语法错误，热加载失败，请修正后保存",
+                        )
+                except OSError as e:
+                    print(
+                        f"[Engine] 读取配置文件失败: {e}",
                         file=sys.stderr,
                     )
                 except Exception:

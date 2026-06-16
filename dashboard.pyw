@@ -80,8 +80,69 @@ class DashboardAPI:
         except Exception as e:
             return {"_error": str(e)}
 
+    # ---- 日志读取 (bridge 直读文件，不依赖 API) ----
+
+    _LOG_DIR = os.path.join(os.path.dirname(CONFIG_FILE), "logs")
+
+    def _get_latest_log(self):
+        """返回最新日志文件路径，没有则返回 None。"""
+        from notmyfault.logging import get_latest_log
+        return get_latest_log(self._LOG_DIR)
+
+    def read_log_entries(self, lines: int = 500) -> list:
+        """读取最新日志末尾 N 行，返回解析后的结构化条目列表。"""
+        try:
+            from notmyfault.logging import read_log_entries as _read
+            log_path = self._get_latest_log()
+            if not log_path:
+                return [{"ts": "", "level": "INFO", "text": "还没有日志文件，请启动引擎", "data": None}]
+            return _read(log_path, lines=lines)
+        except Exception as e:
+            return [{"ts": "", "level": "ERROR", "text": f"读取日志失败: {e}", "data": None}]
+
+    def read_diagnostics(self) -> dict:
+        """从最新日志文件构建诊断摘要。"""
+        try:
+            from notmyfault.logging import read_log_entries as _read, build_diagnostics
+            log_path = self._get_latest_log()
+            if not log_path:
+                return {"error_count": 0, "warn_count": 0, "last_errors": ["还没有日志文件，请启动引擎"]}
+            entries = _read(log_path, lines=500)
+            return build_diagnostics(entries)
+        except Exception as e:
+            return {"error_count": 1, "last_errors": [str(e)]}
+
+    def read_log_raw(self, lines: int = 300) -> str:
+        """读取最新日志文件原始文本（供日志查看器使用）。"""
+        try:
+            log_path = self._get_latest_log()
+            if not log_path:
+                return "(还没有日志文件)\n\n请先启动引擎。"
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                all_lines = f.readlines()
+            if not all_lines:
+                return f"(日志为空)\n{log_path}"
+            return "".join(all_lines[-lines:])
+        except Exception as e:
+            return f"读取日志失败: {e}"
+
+    def list_log_files(self) -> list:
+        """列出所有日志文件信息。"""
+        try:
+            from notmyfault.logging import list_logs
+            return list_logs(self._LOG_DIR)
+        except Exception as e:
+            return []
+
 
 def main():
+    # 注册协议（幂等，每次启动都确保存在）
+    try:
+        from Win_toaster.AUMID_Register import register_protocol
+        register_protocol()
+    except Exception:
+        pass
+
     dashboard_path = os.path.join(PROJECT_ROOT, "dashboard.html")
     icon_path = os.path.join(PROJECT_ROOT, "logo.ico")
 
@@ -122,4 +183,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # 处理协议调用: notmyfault://dashboard
+    if "--protocol" in sys.argv:
+        print("[Dashboard] 通过协议启动")
     main()

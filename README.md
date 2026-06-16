@@ -36,7 +36,7 @@ pip install windows-toasts pycaw
 python NOTMYFAULT.pyw
 ```
 
-引擎启动后会在 `http://127.0.0.1:19198` 监听 HTTP 请求，日志写入 `%APPDATA%\NotmyFault\engine.log`。
+引擎启动后会在 `http://127.0.0.1:19198` 监听 HTTP 请求，日志按 session 写入 `%APPDATA%\NotmyFault\logs\engine-YYYYMMDD-HHMMSS.log`，自动保留最近 7 个。
 
 ### 3. 打开管理面板
 
