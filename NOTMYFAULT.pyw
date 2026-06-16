@@ -121,6 +121,12 @@ class EngineRunner:
             print(f"[Engine] 引擎错误: {e}")
             import traceback
             traceback.print_exc()
+            # 拉起 Dashboard 通知用户
+            try:
+                from notmyfault.alert import alert_user
+                alert_user("引擎异常退出", f"引擎线程崩溃: {e}", open_dashboard=True)
+            except Exception:
+                pass
             if self._api:
                 self._api.push_event("error", {"error": str(e)})
         finally:

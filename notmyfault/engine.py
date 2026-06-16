@@ -641,6 +641,15 @@ class AutomationEngine:
 
         if thread_count == 0:
             print("[Engine] 没有找到可用触发器，程序将退出。")
+            try:
+                from notmyfault.alert import alert_user
+                alert_user(
+                    "NoMyFault 启动失败",
+                    "没有可用的触发器，请检查规则配置",
+                    open_dashboard=True,
+                )
+            except Exception:
+                pass
             return
 
         # 主循环：等待关闭信号 + 配置热重载
