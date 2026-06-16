@@ -104,15 +104,16 @@ NotmyFault/
 │   ├── app.py                  # 引擎工厂入口
 │   ├── engine.py               # 规则匹配与动作分发
 │   ├── config.py               # 配置读写与迁移
-│   ├── volume.py               # 系统音量控制
-│   ├── monitor.py              # 进程监控工具
+│   ├── sudo.py                 # 管理员权限辅助模块
 │   ├── triggers/               # 触发器插件
+│   │   ├── bluetooth_device/   #   蓝牙设备检测
 │   │   ├── process_state/      #   进程状态检测
 │   │   ├── idle_detect/        #   系统空闲检测
 │   │   ├── time_schedule/      #   定时触发
 │   │   ├── usb_insert/         #   U盘插入检测
 │   │   └── window_title/       #   窗口标题检测
 │   └── actions/                # 动作插件
+│       ├── bluetooth_toggle/   #   开关蓝牙
 │       ├── set_volume/         #   设置系统音量
 │       ├── notify/             #   显示 Windows 通知
 │       ├── launch_program/     #   启动程序
@@ -127,23 +128,80 @@ NotmyFault/
 
 ## 插件开发
 
-### 触发器
+每个插件 = 一个目录，放在 `notmyfault/triggers/<id>/` 或 `notmyfault/actions/<id>/` 下，包含：
 
-在 `notmyfault/triggers/<id>/` 下放两个文件：
+- `<type>.json` — 元数据（触发器和动作都适用以下 schema）
+- `<type>.py` — 必须导出 `run()` 函数
 
-- `trigger.json` — 元数据
-- `trigger.py` — 必须导出 `run(meta, config_list, emit_event)` 函数
+### 元数据 schema
 
 ```json
 {
-  "id": "my_trigger",
-  "name": "我的触发器",
+  "id": "my_plugin",
+  "name": "我的插件",
+  "description": "插件功能描述",
+  "version_code": 1,
+  "enabled": true,
   "semantic": "state",
+  "permissions": [],
   "params": [
     { "name": "keyword", "label": "关键词", "type": "string", "default": "" }
   ]
 }
 ```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `id` | string | ✅ | 唯一标识符，规则通过它引用插件 |
+| `name` | string | ✅ | 显示名称 |
+| `description` | string | ✅ | 功能描述 |
+| `enabled` | bool | ✅ | 是否启用，`false` 则跳过加载 |
+| `version_code` | int | ✅ | 版本号（递增整数），供后续插件管理使用 |
+| `semantic` | string | — | 仅触发器：`"state"`（持续状态）或 `"oneshot"`（单次触发） |
+| `permissions` | list | — | 权限声明，目前支持 `"admin"` |
+| `params` | list | — | 参数定义，见下表 |
+
+**params 条目字段**：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `name` | string | ✅ | 参数名 |
+| `type` | string | ✅ | 类型：`string` / `number` / `select` / `bool` |
+| `label` | string | ✅ | 参数显示名称 |
+| `default` | any | — | 默认值 |
+| `options` | list | — | 当 type=`select` 时的可选值列表 |
+| `placeholder` | string | — | 输入框占位文本 |
+
+### 生命周期钩子（可选）
+
+插件模块可以导出以下函数：
+
+| 函数 | 签名 | 调用时机 |
+|------|------|----------|
+| `setup(meta)` | 返回 `None` 或 `False`（`False` 中止加载） | 插件加载后 |
+| `teardown()` | 无参数 | 引擎关闭时 |
+| `validate_params(meta, params)` | 返回 `list[str]` 错误列表 | 动作执行前 |
+
+### 权限声明
+
+如果插件需要管理员权限（如操作蓝牙适配器、修改系统设置），应在元数据中声明：
+
+```json
+{ "permissions": ["admin"] }
+```
+
+并在代码中使用引擎提供的提权辅助模块，而不是自己拼 PowerShell：
+
+```python
+from notmyfault.sudo import run_as_admin
+result = run_as_admin(["net", "start", "MyService"])
+```
+
+引擎加载时会检查：如果插件 import 了 `notmyfault.sudo` 但未声明 `admin` 权限，会打印警告。
+
+### 触发器
+
+必须导出 `run(meta, config_list, emit_event)` 函数。
 
 `semantic` 描述事件的语义类型：
 - `"state"` — 持续状态上报（如进程运行/停止、窗口开关），事件携带状态值
@@ -151,20 +209,7 @@ NotmyFault/
 
 ### 动作
 
-在 `notmyfault/actions/<id>/` 下放两个文件：
-
-- `action.json` — 元数据
-- `action.py` — 必须导出 `run(meta, params)` 函数
-
-```json
-{
-  "id": "my_action",
-  "name": "我的动作",
-  "params": [
-    { "name": "message", "label": "消息", "type": "string", "default": "" }
-  ]
-}
-```
+必须导出 `run(meta, params)` 函数。
 
 ---
 

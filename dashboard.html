@@ -830,8 +830,11 @@ function renderUI() {
       <div class="input-row">`;
     html += `<div class="input-group" style="flex:0.5;min-width:160px;"><label>选择触发器</label><select onchange="changeTrigger(${rIdx}, this.value)">`;
     Object.keys(schema.triggers).forEach(tKey => {
-      const tName = schema.triggers[tKey].name || tKey;
-      html += `<option value="${esc(tKey)}" ${currentTrigger === tKey ? 'selected' : ''}>${esc(tName)}</option>`;
+      const tMeta = schema.triggers[tKey];
+      const tName = tMeta.name || tKey;
+      const perms = tMeta.permissions || [];
+      const adminTag = perms.includes('admin') ? ' [管理员]' : '';
+      html += `<option value="${esc(tKey)}" ${currentTrigger === tKey ? 'selected' : ''}>${esc(tName)}${adminTag}</option>`;
     });
     html += `</select></div>`;
     const triggerDefs = getParamDefs(schema.triggers[currentTrigger]);
@@ -855,10 +858,20 @@ function renderUI() {
       html += `<div class="action-row">
         <div class="input-group" style="flex:0.5;min-width:140px;"><label>动作类型</label><select onchange="changeAction(${rIdx}, ${aIdx}, this.value)">`;
       Object.keys(schema.actions).forEach(aKey => {
-        const aName = schema.actions[aKey].name || aKey;
-        html += `<option value="${esc(aKey)}" ${action.type === aKey ? 'selected' : ''}>${esc(aName)}</option>`;
+        const aMeta = schema.actions[aKey];
+        const aName = aMeta.name || aKey;
+        const perms = aMeta.permissions || [];
+        const adminTag = perms.includes('admin') ? ' [管理员]' : '';
+        html += `<option value="${esc(aKey)}" ${action.type === aKey ? 'selected' : ''}>${esc(aName)}${adminTag}</option>`;
       });
       html += `</select></div>`;
+      // 管理员权限提示
+      const curActionMeta = schema.actions[action.type];
+      if (curActionMeta && (curActionMeta.permissions || []).includes('admin')) {
+        html += `<div style="display:flex;align-items:center;gap:4px;color:var(--md-error);font:var(--md-typescale-label-sm);margin-left:4px;">
+          <span class="material-symbols-outlined" style="font-size:16px;">admin_panel_settings</span> 需要管理员权限
+        </div>`;
+      }
       const actionDefs = getParamDefs(schema.actions[action.type]);
       actionDefs.forEach(pDef => {
         const curVal = (action.params) ? action.params[pDef.name] : null;

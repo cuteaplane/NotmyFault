@@ -3,6 +3,8 @@
     "name": "蓝牙设备检测",
     "semantic": "state",
     "description": "监控蓝牙设备的连接和断开事件",
+    "version_code": 1,
+    "enabled": true,
     "params": [
         {
             "name": "device_name",

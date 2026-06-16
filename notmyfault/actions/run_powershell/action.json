@@ -2,6 +2,8 @@
     "id": "run_powershell",
     "name": "执行 PowerShell",
     "description": "执行一段 PowerShell 命令",
+    "version_code": 1,
+    "enabled": true,
     "params": [
         {
             "name": "command",

@@ -3,6 +3,8 @@
     "name": "定时触发",
     "semantic": "oneshot",
     "description": "在指定时间（HH:MM 格式）每日触发一次",
+    "version_code": 1,
+    "enabled": true,
     "params": [
         {
             "name": "time",

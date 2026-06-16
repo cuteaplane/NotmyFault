@@ -42,13 +42,16 @@ class EngineRunnerLike(Protocol):
 # ---------------------------------------------------------------------------
 
 def _scan_plugins(base_dir: str, plugins_dir: str, json_filename: str) -> Dict[str, Dict]:
-    """扫描插件目录，返回 {plugin_id: metadata} 的字典"""
+    """扫描插件目录，返回 {plugin_id: metadata} 的字典。
+
+    跳过禁用、缺少必填字段、或 JSON 损坏的插件。
+    """
     result: Dict[str, Dict] = {}
     root = os.path.join(base_dir, plugins_dir)
     if not os.path.isdir(root):
         return result
 
-    for folder_name in os.listdir(root):
+    for folder_name in sorted(os.listdir(root)):
         folder_path = os.path.join(root, folder_name)
         if not os.path.isdir(folder_path):
             continue
@@ -64,8 +67,18 @@ def _scan_plugins(base_dir: str, plugins_dir: str, json_filename: str) -> Dict[s
             continue
 
         plugin_id = meta.get("id")
-        if plugin_id:
-            result[plugin_id] = meta
+        if not plugin_id:
+            continue
+
+        # 跳过缺少必填字段的插件（与 engine.py schema 对齐）
+        if not all(k in meta for k in ("name", "description", "enabled", "version_code")):
+            continue
+
+        # 跳过已禁用的插件
+        if meta.get("enabled") is False:
+            continue
+
+        result[plugin_id] = meta
 
     return result
 
