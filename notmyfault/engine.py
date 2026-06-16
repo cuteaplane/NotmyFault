@@ -4,13 +4,8 @@ import os
 import threading
 from typing import Any, Callable, Dict, List, Optional
 
+from notmyfault.config import CONFIG_FILE
 
-def _normalize_process_name(name: str) -> str:
-    """标准化进程名：转小写，补全 .exe 后缀"""
-    n = (name or "").strip().lower()
-    if n and not n.endswith(".exe"):
-        n += ".exe"
-    return n
 
 
 class AutomationEngine:
@@ -128,10 +123,6 @@ class AutomationEngine:
 
             for key, expected_val in expected_params.items():
                 actual_val = event_payload.get(key)
-                # 进程名标准化比较：大小写不敏感，统一补全 .exe
-                if key == "process_name":
-                    expected_val = _normalize_process_name(expected_val)
-                    actual_val = _normalize_process_name(actual_val or "")
                 if expected_val != actual_val:
                     is_match = False
                     break
@@ -232,10 +223,23 @@ class AutomationEngine:
 
         # 使用 shutdown_event 实现优雅关闭
         se = self._shutdown_flag
+        config_mtime = os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else 0
 
         try:
             while not se.is_set():
                 se.wait(1)
+
+                # 配置热加载：检测 CONFIG_FILE 变化后自动更新规则
+                try:
+                    new_mtime = os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else 0
+                    if new_mtime > config_mtime:
+                        config_mtime = new_mtime
+                        with open(CONFIG_FILE, "r", encoding="utf-8") as _f:
+                            _new = json.load(_f)
+                        self.rules = _new.get("rules", [])
+                        print(f"[Engine] 配置已热加载（{len(self.rules)} 条规则）")
+                except Exception:
+                    pass
         except KeyboardInterrupt:
             print("[Engine] 主程序收到中断，退出中...")
 

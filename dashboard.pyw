@@ -13,9 +13,9 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import webview
-from notmyfault.config import get_config, CONFIG_FILE
 
 API = "http://127.0.0.1:19198"
+CONFIG_FILE = os.path.join(os.environ.get("APPDATA", ""), "NotmyFault", "config.json")
 
 
 class DashboardAPI:
@@ -33,29 +33,17 @@ class DashboardAPI:
             return {"ok": False, "error": str(e)}
 
     def get_config(self) -> dict:
-        """读取配置（与引擎使用相同的加载逻辑，首次自动创建默认配置）"""
+        """直接读取 JSON 配置文件，文件不存在则返回默认规则"""
         try:
-            return get_config()
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
         except Exception as e:
             return {"_error": str(e), "rules": []}
+        return {"rules": []}
 
     def save_config(self, rules: list) -> dict:
-        """写入配置 — 引擎运行时走 API（单写者），引擎离线时直接写文件"""
-        # 优先走 API（引擎在运行），避免跨进程文件冲突
-        try:
-            req = urllib.request.Request(
-                f"{API}/api/rules",
-                method="PUT",
-                data=json.dumps({"rules": rules}).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-            )
-            result = json.loads(urllib.request.urlopen(req, timeout=5).read())
-            if result.get("ok"):
-                return {"ok": True}
-        except Exception:
-            pass  # API 不可达（引擎未启动），回退到直接写文件
-
-        # Fallback: 引擎未运行，无冲突风险，直接写
+        """直接写入 JSON 配置文件"""
         try:
             os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
