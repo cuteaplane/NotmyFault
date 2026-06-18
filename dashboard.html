@@ -730,6 +730,7 @@ let _sseSource = null; // SSE EventSource 引用
 let _sseRetryCount = 0;
 const _sseMaxRetries = 10;
 let _starting = false; // startEngine 防重入
+let _stopping = false; // stopEngine 防重入
 const API = 'http://127.0.0.1:19198';
 
 // ---- Timer 管理 ----
@@ -1022,7 +1023,7 @@ function updateStatusUI(status) {
     startBtn.innerHTML = '<span class="material-symbols-outlined">play_arrow</span> 启动引擎';
     stopBtn.style.display = 'none';
   }
-  loadHomeStats();
+  loadHomeStats().catch(() => {});
 }
 
 // ---- 最小耗时等待（假加载让用户体验更平滑） ----
@@ -1044,9 +1045,13 @@ async function startEngine() {
   const startTime = Date.now();
 
   if (hasBridge()) {
-    const result = await window.pywebview.api.launch_engine();
-    if (!result.ok) {
-      alert("启动失败: " + (result.error || "未知错误"));
+    try {
+      const result = await window.pywebview.api.launch_engine();
+      if (!result.ok) {
+        throw new Error(result.error || "未知错误");
+      }
+    } catch (e) {
+      alert("启动失败: " + e.message);
       startBtn.disabled = false;
       startBtn.innerHTML = '<span class="material-symbols-outlined">play_arrow</span> 启动引擎';
       _starting = false;
@@ -1082,8 +1087,10 @@ async function startEngine() {
 }
 
 async function stopEngine() {
+  if (_stopping) return;  // 防重入
+  _stopping = true;
   const stopBtn = document.getElementById('stopBtn');
-  if (stopBtn.disabled) return;  // 防重入
+  if (stopBtn.disabled) { _stopping = false; return; }
   stopBtn.disabled = true;
   stopBtn.innerHTML = '<span class="material-symbols-outlined md-spinner">progress_activity</span> 关闭中...';
   // 强制浏览器重绘后再执行后续操作，确保旋转动画可见
@@ -1112,12 +1119,14 @@ async function stopEngine() {
         clearInterval(pollId);
         await _minDelay(3000, startTime);
         updateStatusUI({ running: false });
+        _stopping = false;
       }
     } catch (e) {
       // 连接拒绝 = HTTP 服务已退出 = 引擎已关闭
       clearInterval(pollId);
       await _minDelay(3000, startTime);
       updateStatusUI({ running: false });
+      _stopping = false;
       return;
     }
   }, 1000);
@@ -1224,7 +1233,7 @@ async function refreshLog() {
 function toggleLogAutoRefresh() {
   const checked = document.getElementById('logAutoRefresh').checked;
   if (checked) {
-    if (!_logTimer) _logTimer = setInterval(refreshLog, 3000);
+    if (!_logTimer) _logTimer = _setInterval(refreshLog, 3000);
   } else {
     clearInterval(_logTimer);
     _logTimer = null;

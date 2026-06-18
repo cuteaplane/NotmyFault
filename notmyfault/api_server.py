@@ -367,12 +367,12 @@ class EngineAPI:
 
         try:
             self._server.run()
-        except (OSError, SystemExit) as e:
-            code = getattr(e, 'winerror', None) or getattr(e, 'code', None)
+        except OSError as e:
+            code = getattr(e, 'winerror', None)
             if str(code) == "10048" or "10048" in str(e) or "bind" in str(e).lower():
                 print(f"\n[提示] 端口 {port} 已被占用 — 引擎可能已在运行")
-            elif isinstance(e, SystemExit):
-                print(f"\n[API] HTTP 服务已退出")
             else:
                 raise
-            # 不 raise — 让主线程自然进入 cleanup
+        except SystemExit:
+            # uvicorn 内部通过 sys.exit() 完成干净关闭，这是预期行为
+            print(f"\n[API] HTTP 服务已退出")

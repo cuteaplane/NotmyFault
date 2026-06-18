@@ -122,6 +122,10 @@ def _check_sudo_import(py_file_path: str) -> bool:
             elif isinstance(node, ast.ImportFrom):
                 if node.module == "notmyfault.sudo":
                     return True
+                if node.module == "notmyfault":
+                    for alias in node.names:
+                        if alias.name == "sudo":
+                            return True
         return False
     except Exception:
         return False
@@ -450,6 +454,16 @@ class AutomationEngine:
                         file=sys.stderr,
                     )
                     traceback.print_exc(file=sys.stderr)
+                    del func_store[plugin_id]
+                    del meta_store[plugin_id]
+                    self._plugin_modules.pop(plugin_id, None)
+                    loaded_count -= 1
+                    failed_count += 1
+                    self._diag["plugin_errors"].append(
+                        (store_name, plugin_id, "setup() 执行异常")
+                    )
+                    engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason="setup() 执行异常")
+                    continue
 
             version_info = (
                 f" v{meta['version_code']}"

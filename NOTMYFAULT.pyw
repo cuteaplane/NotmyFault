@@ -73,6 +73,8 @@ def setup_logging(log_dir: str) -> str:
             self.file.flush()
             self.orig.flush()
 
+    # pythonw.exe 无控制台，sys.__stdout__/__stderr__ 为 None，_devnull 兜底
+    # 这玩意不能删！！！
     _devnull = open(os.devnull, "w")
     sys.stdout = _TimestampWriter(log_fp, sys.__stdout__ or _devnull)  # type: ignore
     sys.stderr = _TimestampWriter(log_fp, sys.__stderr__ or _devnull)  # type: ignore
@@ -167,10 +169,9 @@ class EngineRunner:
     def _check_already_running(port: int = 19198) -> bool:
         """尝试连接本地端口，连上说明已有实例在运行"""
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.5)
-            s.connect(("127.0.0.1", port))
-            s.close()
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                s.connect(("127.0.0.1", port))
             return True
         except (socket.error, OSError):
             return False

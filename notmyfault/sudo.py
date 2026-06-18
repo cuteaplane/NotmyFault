@@ -39,20 +39,16 @@ def run_as_admin(
     if not command:
         raise ValueError("command 不能为空")
 
-    # 构建 PowerShell 命令：Start-Process 以 RunAs 启动
-    cmd_parts = " ".join(f"'{arg}'" if " " in arg else arg for arg in command)
-    ps_script = (
-        f"Start-Process -FilePath '{command[0]}' "
-        f"-ArgumentList '{', '.join(command[1:])}' "
-        f"-Verb RunAs "
-        f"{'-Wait' if wait else ''}"
-    ).strip()
+    # 安全转义：单引号内 '' 表示一个字面单引号
+    def _ps_quote(s: str) -> str:
+        return "'" + s.replace("'", "''") + "'"
 
-    # 简化版：直接用 PowerShell
+    exe = _ps_quote(command[0])
+    args = ", ".join(_ps_quote(a) for a in command[1:])
     ps_script = (
-        f'Start-Process -FilePath "{command[0]}" '
-        f'-ArgumentList "{chr(44).join(command[1:])}" '
-        f"-Verb RunAs"
+        f"Start-Process -FilePath {exe}"
+        + (f" -ArgumentList {args}" if args else "")
+        + " -Verb RunAs"
         + (" -Wait" if wait else "")
     )
 
