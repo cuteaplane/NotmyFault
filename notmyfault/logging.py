@@ -159,8 +159,19 @@ def parse_log_line(line: str) -> Dict[str, Any] | None:
         bracket_end = rest.find("] ")
         candidate_level = rest[1:bracket_end]
         if candidate_level in ("INFO", "WARN", "ERROR"):
-            level = candidate_level
-            payload = rest[bracket_end + 2:]
+            # 防御：旧格式 payload 不应以 [LEVEL] 开头后又紧跟另一个 [LEVEL]
+            # 若提取 level 后的剩余部分仍以已知 level 标记开头，则判定为旧格式
+            after_level = rest[bracket_end + 2:]
+            if after_level.startswith("[") and "] " in after_level:
+                nested_candidate = after_level[1:after_level.find("] ")]
+                if nested_candidate in ("INFO", "WARN", "ERROR"):
+                    pass  # 嵌套 [LEVEL] → 保持旧格式
+                else:
+                    level = candidate_level
+                    payload = after_level
+            else:
+                level = candidate_level
+                payload = after_level
 
     data = None
     text = payload

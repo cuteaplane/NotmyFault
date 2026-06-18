@@ -10,6 +10,7 @@ NotmyFault HTTP API 服务器
 import json
 import os
 import queue
+import sys
 import threading
 import time
 from pathlib import Path
@@ -151,8 +152,10 @@ class EngineAPI:
             if os.path.exists(CONFIG_FILE):
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     return json.load(f)
-        except Exception:
-            pass
+        except json.JSONDecodeError:
+            print(f"[API] 配置文件 JSON 格式错误，返回空规则列表", file=sys.stderr)
+        except OSError as e:
+            print(f"[API] 读取配置文件失败: {e}，返回空规则列表", file=sys.stderr)
         return {"rules": []}
 
     def _save_config(self, config: Dict[str, Any]) -> bool:

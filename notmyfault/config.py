@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import sys
 from typing import Any, Dict, List
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -207,8 +208,17 @@ def get_config() -> Dict[str, Any]:
         print("[DEBUG] Default config created.")
         return copy.deepcopy(DEFAULT_CONFIG)
 
-    with open(CONFIG_FILE, "r", encoding="utf-8") as config_file:
-        config = json.load(config_file)
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as config_file:
+            config = json.load(config_file)
+    except (json.JSONDecodeError, OSError):
+        print(
+            "[ERROR] 配置文件损坏，使用默认配置覆盖",
+            file=sys.stderr,
+        )
+        with open(CONFIG_FILE, "w", encoding="utf-8") as config_file:
+            json.dump(DEFAULT_CONFIG, config_file, ensure_ascii=False, indent=4)
+        return copy.deepcopy(DEFAULT_CONFIG)
 
     normalized = _normalize_config(config)
     if normalized != config:

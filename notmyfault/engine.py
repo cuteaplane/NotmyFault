@@ -820,7 +820,7 @@ class AutomationEngine:
         config_mtime = (
             os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else 0
         )
-        _hot_reload_error_reported = False  # 避免重复告警
+        self._hot_reload_error_reported = False  # 避免重复告警
 
         try:
             while not se.is_set():
@@ -842,7 +842,7 @@ class AutomationEngine:
                         print(
                             f"[Engine] 配置已热加载（{len(self.rules)} 条规则）"
                         )
-                        _hot_reload_error_reported = False
+                        self._hot_reload_error_reported = False
                         # 重新校验规则
                         self._validate_all_rules()
                 except json.JSONDecodeError as e:
@@ -852,8 +852,8 @@ class AutomationEngine:
                         f"[Engine] 热加载配置 JSON 解析失败: {e}",
                         file=sys.stderr,
                     )
-                    if not _hot_reload_error_reported:
-                        _hot_reload_error_reported = True
+                    if not self._hot_reload_error_reported:
+                        self._hot_reload_error_reported = True
                         self._alert_user(
                             "配置格式错误",
                             f"config.json 存在 JSON 语法错误，热加载失败，请修正后保存",
