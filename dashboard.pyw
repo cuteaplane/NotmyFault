@@ -16,6 +16,7 @@ import webview
 
 API = "http://127.0.0.1:19198"
 CONFIG_FILE = os.path.join(os.environ.get("APPDATA", ""), "NotmyFault", "config.json")
+API_TOKEN_FILE = os.path.join(os.environ.get("TEMP", ""), "notmyfault_api_token")
 
 
 class DashboardAPI:
@@ -43,6 +44,13 @@ class DashboardAPI:
         return {"rules": []}
 
     def save_config(self, rules: list) -> dict:
+        """写入 JSON 配置文件（自动签名）"""
+        try:
+            from notmyfault.config import save_config as _save
+            ok = _save({"rules": rules})
+            return {"ok": ok}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
         """直接写入 JSON 配置文件"""
         try:
             os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
@@ -52,7 +60,40 @@ class DashboardAPI:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def _get_api_token(self) -> str:
+        """读取 API 认证令牌"""
+        try:
+            with open(API_TOKEN_FILE, "r") as f:
+                return f.read().strip()
+        except (OSError, IOError):
+            return ""
+
+    def _auth_request(self, path: str, method: str = "POST", data: dict = None) -> dict:
+        """发送带认证的 HTTP 请求"""
+        try:
+            token = self._get_api_token()
+            req = urllib.request.Request(
+                f"{API}{path}",
+                method=method,
+            )
+            if token:
+                req.add_header("Authorization", f"Bearer {token}")
+            if data is not None:
+                import json as _j
+                req.data = _j.dumps(data).encode("utf-8")
+                req.add_header("Content-Type", "application/json")
+            return json.loads(urllib.request.urlopen(req, timeout=5).read())
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def get_api_token(self) -> str:
+        """暴露给 JS bridge 的 API Token 读取方法"""
+        return self._get_api_token()
+
     def stop_engine(self) -> dict:
+        """停止引擎"""
+        return self._auth_request("/api/engine/stop")
+
         """停止引擎（通过 bridge 代理 POST，避免 pywebview 的 CORS 限制）"""
         try:
             req = urllib.request.Request(
@@ -64,14 +105,7 @@ class DashboardAPI:
 
     def shutdown_engine(self) -> dict:
         """彻底退出引擎进程"""
-        try:
-            req = urllib.request.Request(
-                f"{API}/api/engine/shutdown", method="POST"
-            )
-            return json.loads(urllib.request.urlopen(req, timeout=5).read())
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-
+        return self._auth_request("/api/engine/shutdown")
     def fetch_api(self, path: str) -> dict:
         """代理 API 请求"""
         try:

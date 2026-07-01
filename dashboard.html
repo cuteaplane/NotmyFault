@@ -989,7 +989,7 @@ async function saveConfig() {
       alert("保存失败: " + (data.error || "未知错误"));
     }
   } catch (e) {
-    alert("无法连接到引擎: " + e.message);
+      alert("保存失败: " + (data.error || "未知错误") + (data.error?.includes("Forbidden") ? " — 浏览器模式不支持写入操作，请使用桌面端 Dashboard" : ""));
   }
 }
 
@@ -1081,7 +1081,7 @@ async function startEngine() {
       _starting = false;
       startBtn.disabled = false;
       startBtn.innerHTML = '<span class="material-symbols-outlined">play_arrow</span> 启动引擎';
-      alert("启动超时，请手动双击 NOTMYFAULT.pyw");
+      alert("启动超时，请手动双击 NOTMYFAULT.pyw，或先通过桌面端 Dashboard 启动");
     }
   }, 1000);
 }

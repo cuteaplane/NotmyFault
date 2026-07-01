@@ -8,6 +8,7 @@ NotmyFault HTTP API 服务器
 """
 
 import json
+import secrets
 import os
 import queue
 import sys
@@ -17,11 +18,16 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Callable, Protocol
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from notmyfault.config import CONFIG_FILE
+from notmyfault.config import CONFIG_FILE, save_config as config_save, save_config as config_save
+
+# API 认证令牌（每次进程启动时随机生成）
+API_TOKEN: str = secrets.token_hex(32)
+API_TOKEN_FILE: str = os.path.join(os.environ.get("TEMP", ""), "notmyfault_api_token")
+
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +114,17 @@ class EngineAPI:
         self.app = FastAPI(title="NotmyFault Engine API", version="1.0")
         self._setup_middleware()
         self._setup_routes()
+        global API_TOKEN
+        API_TOKEN = secrets.token_hex(32)
+        try:
+            os.makedirs(os.path.dirname(API_TOKEN_FILE), exist_ok=True)
+        except OSError:
+            pass
+        try:
+            with open(API_TOKEN_FILE, "w") as f:
+                f.write(API_TOKEN)
+        except OSError:
+            pass
 
     # ---- CORS -----------------------------------------------------------
 
@@ -151,7 +168,9 @@ class EngineAPI:
         try:
             if os.path.exists(CONFIG_FILE):
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    cfg = json.load(f)
+                    cfg.pop("_signature", None)
+                    return cfg
         except json.JSONDecodeError:
             print(f"[API] 配置文件 JSON 格式错误，返回空规则列表", file=sys.stderr)
         except OSError as e:
@@ -159,16 +178,17 @@ class EngineAPI:
         return {"rules": []}
 
     def _save_config(self, config: Dict[str, Any]) -> bool:
-        try:
-            os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(config, f, ensure_ascii=False, indent=4)
-            return True
-        except Exception as e:
-            print(f"[API] 保存配置失败: {e}")
-            return False
+        return config_save(config)
 
     # ---- 路由注册 --------------------------------------------------------
+
+    async def _verify_auth(self, request: Request) -> None:
+        if request.method == "GET":
+            return
+        auth = request.headers.get("Authorization", "")
+        token = auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""
+        if not token or not secrets.compare_digest(token, API_TOKEN):
+            raise HTTPException(status_code=403, detail="Forbidden: invalid API Token")
 
     def _setup_routes(self):
         app = self.app
@@ -178,7 +198,8 @@ class EngineAPI:
         # ================================================================
 
         @app.post("/api/engine/start")
-        async def engine_start():
+        async def engine_start(request: Request):
+            await self._verify_auth(request)
             print("[API] POST /api/engine/start")
             if self._engine.engine_running:
                 return {"ok": True, "running": True, "message": "already_running"}
@@ -187,13 +208,15 @@ class EngineAPI:
             return {"ok": True, "running": self._engine.engine_running}
 
         @app.post("/api/engine/stop")
-        def engine_stop():
+        async def engine_stop(request: Request):
+            await self._verify_auth(request)
             print("[API] POST /api/engine/stop")
             self._engine._stop_engine()
             return {"ok": True}
 
         @app.post("/api/engine/shutdown")
-        def engine_shutdown():
+        async def engine_shutdown(request: Request):
+            await self._verify_auth(request)
             """彻底退出引擎进程（先停引擎，再优雅关闭 HTTP 服务）"""
             print("[API] POST /api/engine/shutdown")
             self._engine._stop_engine()
@@ -234,6 +257,7 @@ class EngineAPI:
 
         @app.put("/api/rules")
         async def rules_save(request: Request):
+            await self._verify_auth(request)
             try:
                 body = await request.json()
             except Exception:

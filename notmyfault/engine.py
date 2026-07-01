@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import time
+import secrets
 import traceback
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -23,6 +24,8 @@ _ALLOWED_SEMANTICS = {"state", "oneshot"}
 _ALLOWED_PARAM_TYPES = {"string", "number", "select", "bool"}
 _REQUIRED_PARAM_FIELDS = {"name", "type", "label"}
 _ALLOWED_PERMISSIONS = {"admin"}
+_DANGEROUS_IMPORTS = {"os.system", "subprocess", "ctypes.windll", "eval", "exec", "__import__", "compile"}
+_PLUGIN_MANIFEST_FILE = os.path.join(os.path.dirname(CONFIG_FILE), "plugin_manifest.json")
 
 
 def _validate_plugin_meta(
@@ -131,6 +134,92 @@ def _check_sudo_import(py_file_path: str) -> bool:
         return False
 
 
+def _scan_dangerous_code(py_file_path: str) -> list[str]:
+    """AST 级别扫描插件源码，检测危险模式。
+    Returns: 危险模式列表，空列表表示安全。
+    """
+    dangers: list[str] = []
+    try:
+        with open(py_file_path, "r", encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    n = alias.name
+                    if n == "subprocess":
+                        dangers.append("import subprocess（可执行系统命令）")
+                    elif n == "ctypes":
+                        dangers.append("import ctypes（可操作 Windows API 提权）")
+            elif isinstance(node, ast.ImportFrom):
+                if node.module == "subprocess":
+                    dangers.append("from subprocess import（可执行系统命令）")
+                if node.module and node.module.startswith("ctypes"):
+                    dangers.append("from " + node.module + " import（可操作 Windows API 提权）")
+                if node.module == "os":
+                    for alias in node.names:
+                        if alias.name in ("system", "popen", "posix_spawn"):
+                            dangers.append("from os import " + alias.name + "（可执行系统命令）")
+            elif isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id in ("eval", "exec", "compile", "__import__"):
+                    dangers.append("使用 " + node.func.id + "()（动态执行代码）")
+        return dangers
+    except SyntaxError:
+        return ["源码语法错误"]
+    except Exception:
+        return []
+
+def _compute_file_hash(file_path: str) -> str | None:
+    import hashlib
+    try:
+        with open(file_path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+def _load_plugin_manifest() -> dict[str, dict[str, str]]:
+    try:
+        if os.path.exists(_PLUGIN_MANIFEST_FILE):
+            with open(_PLUGIN_MANIFEST_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+def _save_plugin_manifest(manifest: dict[str, dict[str, str]]) -> None:
+    try:
+        os.makedirs(os.path.dirname(_PLUGIN_MANIFEST_FILE), exist_ok=True)
+        with open(_PLUGIN_MANIFEST_FILE, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, sort_keys=True)
+    except OSError:
+        pass
+
+def _verify_plugin_integrity(plugin_id: str, files: list[tuple[str, str]]) -> tuple[bool, str]:
+    manifest = _load_plugin_manifest()
+    existing = manifest.get(plugin_id, {})
+    all_match = True
+    messages: list[str] = []
+    for file_type, file_path in files:
+        current_hash = _compute_file_hash(file_path)
+        if current_hash is None:
+            messages.append("无法读取 " + file_type)
+            all_match = False
+            continue
+        if plugin_id in manifest:
+            expected_hash = existing.get(file_type)
+            if expected_hash is not None and current_hash != expected_hash:
+                messages.append(file_type + " 文件已被修改！（期望 " + expected_hash[:12] + "...）")
+                all_match = False
+        if plugin_id not in manifest:
+            manifest[plugin_id] = {}
+        manifest[plugin_id][file_type] = current_hash
+    _save_plugin_manifest(manifest)
+    if not all_match:
+        return False, "；".join(messages)
+    return True, "完整性校验通过"
+
+
+
 # ---------------------------------------------------------------------------
 # AutomationEngine
 # ---------------------------------------------------------------------------
@@ -153,6 +242,13 @@ class AutomationEngine:
         self.actions_meta: Dict[str, Dict[str, Any]] = {}
         self.actions_funcs: Dict[str, Any] = {}
         self._plugin_modules: Dict[str, Any] = {}  # plugin_id → module (用于 teardown)
+
+        # 安全系统
+        self._engine_token: str = secrets.token_hex(32)
+        from notmyfault import sudo as _sudo
+        _sudo.set_engine_token(self._engine_token)
+        self._sudo = _sudo
+        self._plugin_integrity_errors: list[str] = []
 
         # 优雅关闭
         self._active_actions = 0
@@ -201,6 +297,8 @@ class AutomationEngine:
                 "triggers_loaded": len(self.triggers_funcs),
                 "errors": self._diag["plugin_errors"][-20:],  # 最近 20 条
                 "error_count": len(self._diag["plugin_errors"]),
+                "admin_plugins": self._sudo.get_authorized_plugins(),
+                "integrity_errors": self._plugin_integrity_errors[-10:],
             },
             "rules": {
                 "total": len(self.rules),
@@ -410,6 +508,25 @@ class AutomationEngine:
                         file=sys.stderr,
                     )
 
+            # --- 插件完整性校验 ---
+            integrity_files = [
+                (json_filename, json_file),
+                (py_filename, py_file),
+            ]
+            integrity_ok, integrity_msg = _verify_plugin_integrity(plugin_id, integrity_files)
+            if not integrity_ok:
+                warning = (f"[Engine] [安全] 插件 \"{plugin_id}\" 完整性校验失败：" + integrity_msg)
+                print(warning, file=sys.stderr)
+                engine_error("integrity_check_failed", plugin=plugin_id, detail=integrity_msg)
+                self._plugin_integrity_errors.append(warning)
+
+            # --- 危险代码扫描 ---
+            dangers = _scan_dangerous_code(py_file)
+            if dangers:
+                for d in dangers:
+                    print(f"[Engine] [安全] 插件 \"{plugin_id}\" 包含危险模式: {d}", file=sys.stderr)
+                engine_error("dangerous_code_detected", plugin=plugin_id, dangers=dangers)
+
             # --- 提取 run 入口 ---
             if not hasattr(module, "run"):
                 print(
@@ -426,6 +543,16 @@ class AutomationEngine:
             func_store[plugin_id] = getattr(module, "run")
             meta_store[plugin_id] = meta
             self._plugin_modules[plugin_id] = module
+
+            # --- Admin 权限注册 ---
+            if "admin" in (meta.get("permissions") or []):
+                try:
+                    self._sudo.authorize_plugin(plugin_id, self._engine_token)
+                    print(f"[Engine] [安全] 插件 \"{plugin_id}\" 已注册管理员权限")
+                except PermissionError as e:
+                    print(f"[Engine] [!!] 插件 \"{plugin_id}\" 管理员权限注册失败: {e}", file=sys.stderr)
+                    engine_error("admin_registration_failed", plugin=plugin_id, error=str(e))
+
             loaded_count += 1
 
             # --- 生命周期: setup (触发器) ---
