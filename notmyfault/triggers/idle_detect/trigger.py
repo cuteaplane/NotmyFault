@@ -16,7 +16,7 @@ def _get_idle_seconds() -> float:
     return (tick - lii.dwTime) / 1000.0
 
 
-def run(meta, config_list, emit_event):
+def run(meta, config_list, emit_event, shutdown_event):
     trigger_id = meta.get("id", "idle_detect")
 
     # 取第一条规则的空闲阈值（多条规则用同一触发器时取最小值）
@@ -37,7 +37,7 @@ def run(meta, config_list, emit_event):
 
     was_idle = False
 
-    while True:
+    while not shutdown_event.is_set():
         try:
             idle = _get_idle_seconds() >= threshold
             if idle and not was_idle:

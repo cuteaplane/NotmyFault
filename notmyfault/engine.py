@@ -1,114 +1,26 @@
 import ast
 import importlib.util
+import inspect
 import json
 import os
 import sys
 import threading
 import time
+import datetime
+from enum import Enum
 import secrets
+import subprocess
 import traceback
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from notmyfault.config import CONFIG_FILE
 from notmyfault.logging import engine_info, engine_warn, engine_error
+from notmyfault.plugin_schema import validate_plugin_meta
+
+_validate_plugin_meta = validate_plugin_meta  # 向后兼容旧导入
 
 
-# ---------------------------------------------------------------------------
-# Plugin metadata schema
-# ---------------------------------------------------------------------------
-
-_REQUIRED_META_FIELDS = {"id", "name", "description", "enabled", "version_code"}
-_TRIGGER_OPTIONAL_FIELDS = {"semantic", "params", "permissions"}
-_ACTION_OPTIONAL_FIELDS = {"params", "permissions"}
-_ALLOWED_SEMANTICS = {"state", "oneshot"}
-_ALLOWED_PARAM_TYPES = {"string", "number", "select", "bool"}
-_REQUIRED_PARAM_FIELDS = {"name", "type", "label"}
-_ALLOWED_PERMISSIONS = {"admin"}
-_DANGEROUS_IMPORTS = {"os.system", "subprocess", "ctypes.windll", "eval", "exec", "__import__", "compile"}
 _PLUGIN_MANIFEST_FILE = os.path.join(os.path.dirname(CONFIG_FILE), "plugin_manifest.json")
-
-
-def _validate_plugin_meta(
-    meta: Dict[str, Any], plugin_type: str
-) -> Tuple[bool, List[str]]:
-    """校验插件元数据 schema，返回 (is_valid, 错误列表)。"""
-    errors: List[str] = []
-
-    if not isinstance(meta, dict):
-        return False, ["插件元数据不是有效的 JSON 对象"]
-
-    # --- 必填字段 ---
-    for field in sorted(_REQUIRED_META_FIELDS):
-        if field not in meta:
-            errors.append(f"缺少必填字段: {field}")
-
-    # --- 字段类型校验 ---
-    if "id" in meta and not isinstance(meta["id"], str):
-        errors.append(f"字段 'id' 必须是字符串，实际: {type(meta['id']).__name__}")
-    if "name" in meta and not isinstance(meta["name"], str):
-        errors.append(f"字段 'name' 必须是字符串")
-    if "description" in meta and not isinstance(meta["description"], str):
-        errors.append(f"字段 'description' 必须是字符串")
-    if "enabled" in meta and not isinstance(meta["enabled"], bool):
-        errors.append(f"字段 'enabled' 必须为布尔值 (true/false)，实际: {type(meta['enabled']).__name__}")
-    if "version_code" in meta and not isinstance(meta["version_code"], int):
-        errors.append(f"字段 'version_code' 必须为整数，实际: {type(meta['version_code']).__name__}")
-
-    # --- semantic (仅触发器) ---
-    if "semantic" in meta:
-        if meta["semantic"] not in _ALLOWED_SEMANTICS:
-            errors.append(
-                f"字段 'semantic' 无效: '{meta['semantic']}'"
-                f"（允许: {', '.join(sorted(_ALLOWED_SEMANTICS))}）"
-            )
-
-    # --- permissions ---
-    if "permissions" in meta:
-        perms = meta["permissions"]
-        if not isinstance(perms, list):
-            errors.append(f"字段 'permissions' 必须是数组")
-        else:
-            for perm in perms:
-                if not isinstance(perm, str):
-                    errors.append(f"permissions 中的值必须是字符串，实际: {type(perm).__name__}")
-                elif perm not in _ALLOWED_PERMISSIONS:
-                    errors.append(
-                        f"未知权限类型: '{perm}'（目前仅支持: {', '.join(sorted(_ALLOWED_PERMISSIONS))}）"
-                    )
-
-    # --- params ---
-    if "params" in meta:
-        params = meta["params"]
-        if not isinstance(params, list):
-            errors.append(f"字段 'params' 必须是数组")
-        else:
-            for i, param in enumerate(params):
-                if not isinstance(param, dict):
-                    errors.append(f"params[{i}] 必须是对象")
-                    continue
-                for field in sorted(_REQUIRED_PARAM_FIELDS):
-                    if field not in param:
-                        errors.append(f"params[{i}] 缺少必填字段: {field}")
-                ptype = param.get("type", "")
-                if ptype and ptype not in _ALLOWED_PARAM_TYPES:
-                    errors.append(
-                        f"params[{i}].type 无效: '{ptype}'"
-                        f"（允许: {', '.join(sorted(_ALLOWED_PARAM_TYPES))}）"
-                    )
-                if ptype == "select" and "options" not in param:
-                    errors.append(f"params[{i}] (type=select) 必须提供 'options' 字段")
-
-    # --- 未知字段 ---
-    allowed_fields = (
-        _REQUIRED_META_FIELDS | _TRIGGER_OPTIONAL_FIELDS
-        if plugin_type == "trigger"
-        else _REQUIRED_META_FIELDS | _ACTION_OPTIONAL_FIELDS
-    )
-    for key in meta:
-        if key not in allowed_fields:
-            errors.append(f"包含未知字段: '{key}'")
-
-    return len(errors) == 0, errors
 
 
 def _check_sudo_import(py_file_path: str) -> bool:
@@ -133,41 +45,6 @@ def _check_sudo_import(py_file_path: str) -> bool:
     except Exception:
         return False
 
-
-def _scan_dangerous_code(py_file_path: str) -> list[str]:
-    """AST 级别扫描插件源码，检测危险模式。
-    Returns: 危险模式列表，空列表表示安全。
-    """
-    dangers: list[str] = []
-    try:
-        with open(py_file_path, "r", encoding="utf-8") as f:
-            source = f.read()
-        tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    n = alias.name
-                    if n == "subprocess":
-                        dangers.append("import subprocess（可执行系统命令）")
-                    elif n == "ctypes":
-                        dangers.append("import ctypes（可操作 Windows API 提权）")
-            elif isinstance(node, ast.ImportFrom):
-                if node.module == "subprocess":
-                    dangers.append("from subprocess import（可执行系统命令）")
-                if node.module and node.module.startswith("ctypes"):
-                    dangers.append("from " + node.module + " import（可操作 Windows API 提权）")
-                if node.module == "os":
-                    for alias in node.names:
-                        if alias.name in ("system", "popen", "posix_spawn"):
-                            dangers.append("from os import " + alias.name + "（可执行系统命令）")
-            elif isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name) and node.func.id in ("eval", "exec", "compile", "__import__"):
-                    dangers.append("使用 " + node.func.id + "()（动态执行代码）")
-        return dangers
-    except SyntaxError:
-        return ["源码语法错误"]
-    except Exception:
-        return []
 
 def _compute_file_hash(file_path: str) -> str | None:
     import hashlib
@@ -221,9 +98,100 @@ def _verify_plugin_integrity(plugin_id: str, files: list[tuple[str, str]]) -> tu
 
 
 # ---------------------------------------------------------------------------
+# 插件签名校验
+# ---------------------------------------------------------------------------
+
+def _verify_plugin_sig(plugin_dir, origin="builtin"):
+    if origin != "builtin":
+        return True
+    try:
+        from notmyfault.signing_keys import get_public_keys
+        pub_keys = get_public_keys()
+        if not pub_keys:
+            return False
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        pubs = [Ed25519PublicKey.from_public_bytes(k) for k in pub_keys]
+    except ImportError:
+        return False
+    import hashlib
+    sig_file = os.path.join(plugin_dir, "signature.sig")
+    if not os.path.exists(sig_file):
+        return False
+    with open(sig_file, "rb") as f:
+        sig = f.read()
+    files = sorted(os.listdir(plugin_dir))
+    payload = b""
+    for name in files:
+        if name == "signature.sig" or name.startswith("."):
+            continue
+        fp = os.path.join(plugin_dir, name)
+        if os.path.isfile(fp):
+            with open(fp, "rb") as f:
+                payload += f.read()
+    digest = hashlib.sha256(payload).digest()
+    for pub in pubs:
+        try:
+            pub.verify(sig, digest)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+# ---------------------------------------------------------------------------
 # AutomationEngine
 # ---------------------------------------------------------------------------
 
+
+class SecurityMode(Enum):
+    STRICT = "strict"
+    NORMAL = "normal"
+    PERMISSIVE = "permissive"
+
+
+def _detect_security_mode() -> SecurityMode:
+    env_mode = os.environ.get("NOTMYFAULT_MODE", "").lower().strip()
+    if env_mode == "alpha":
+        return SecurityMode.PERMISSIVE
+    elif env_mode in ("develop", "dev"):
+        return SecurityMode.NORMAL
+    elif env_mode in ("stable", "master"):
+        return SecurityMode.STRICT
+
+    import json as _j
+    _paths = []
+    if getattr(sys, "frozen", False):
+        _paths.append(os.path.join(sys._MEIPASS, "build.json"))
+    _paths += [
+        os.path.join(os.path.dirname(__file__), "..", "build.json"),
+        os.path.join(os.getcwd(), "build.json"),
+    ]
+    for _bp in _paths:
+        try:
+            _bj = _j.load(open(_bp, encoding="utf-8"))
+            _m = _bj.get("security_mode", "").lower().strip()
+            if _m == "permissive":
+                return SecurityMode.PERMISSIVE
+            elif _m == "normal":
+                return SecurityMode.NORMAL
+            elif _m == "strict":
+                return SecurityMode.STRICT
+        except Exception:
+            continue
+
+    try:
+        import subprocess as _sp
+        r = _sp.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, timeout=3)
+        branch = r.stdout.strip()
+        if branch in ("master",):
+            return SecurityMode.STRICT
+        elif branch in ("develop",):
+            return SecurityMode.NORMAL
+        elif branch in ("develop-alpha",):
+            return SecurityMode.PERMISSIVE
+    except Exception:
+        pass
+    return SecurityMode.STRICT
 
 class AutomationEngine:
     """规则引擎：加载插件 → 匹配规则 → 执行动作。"""
@@ -248,6 +216,8 @@ class AutomationEngine:
         from notmyfault import sudo as _sudo
         _sudo.set_engine_token(self._engine_token)
         self._sudo = _sudo
+        self._security_mode = _detect_security_mode()
+        engine_info(f"Security mode: {self._security_mode.value}")
         self._plugin_integrity_errors: list[str] = []
 
         # 优雅关闭
@@ -258,6 +228,10 @@ class AutomationEngine:
 
         # 规则热重载线程安全
         self._rules_lock = threading.RLock()
+
+        # 触发器线程管理
+        self._trigger_threads: Dict[str, threading.Thread] = {}
+        self._trigger_events: Dict[str, threading.Event] = {}
 
         # 诊断数据 (供 Dashboard 展示)
         self._start_time: float = 0.0
@@ -317,29 +291,37 @@ class AutomationEngine:
     # 插件加载
     # ------------------------------------------------------------------
 
-    def auto_load(self, base_dir: str) -> None:
-        """扫描并加载所有动作插件和触发器插件。"""
+    def auto_load(self, load_paths) -> None:
+        """扫描并加载所有插件。支持 [(base_dir, origin), ...] 或兼容单字符串。"""
+        if isinstance(load_paths, str):
+            load_paths = [(load_paths, "builtin")]
         engine_info("=== SESSION_START ===")
-        t_loaded, t_failed = self._load_plugins(
-            base_dir=base_dir,
-            plugins_dir="triggers",
-            json_filename="trigger.json",
-            py_filename="trigger.py",
-            module_prefix="notmyfault.trigger_",
-            meta_store=self.triggers_meta,
-            func_store=self.triggers_funcs,
-            store_name="Trigger",
-        )
-        a_loaded, a_failed = self._load_plugins(
-            base_dir=base_dir,
-            plugins_dir="actions",
-            json_filename="action.json",
-            py_filename="action.py",
-            module_prefix="notmyfault.action_",
-            meta_store=self.actions_meta,
-            func_store=self.actions_funcs,
-            store_name="Actioner",
-        )
+        t_loaded = t_failed = a_loaded = a_failed = 0
+        for base_dir, origin in load_paths:
+            _t, _tf = self._load_plugins(
+                base_dir=base_dir,
+                plugins_dir="triggers",
+                json_filename="trigger.json",
+                py_filename="trigger.py",
+                module_prefix="notmyfault.trigger_",
+                meta_store=self.triggers_meta,
+                func_store=self.triggers_funcs,
+                store_name="Trigger",
+                origin=origin,
+            )
+            _a, _af = self._load_plugins(
+                base_dir=base_dir,
+                plugins_dir="actions",
+                json_filename="action.json",
+                py_filename="action.py",
+                module_prefix="notmyfault.action_",
+                meta_store=self.actions_meta,
+                func_store=self.actions_funcs,
+                store_name="Actioner",
+                origin=origin,
+            )
+            t_loaded += _t; t_failed += _tf
+            a_loaded += _a; a_failed += _af
 
         # 启动摘要
         print(
@@ -380,6 +362,7 @@ class AutomationEngine:
         meta_store: Dict[str, Dict[str, Any]],
         func_store: Dict[str, Any],
         store_name: str,
+        origin: str = "builtin",
     ) -> Tuple[int, int]:
         """通用插件加载器（触发器和动作共用）。
 
@@ -446,7 +429,7 @@ class AutomationEngine:
                 continue
 
             # --- Schema 校验 ---
-            is_valid, errors = _validate_plugin_meta(meta, plugin_type)
+            is_valid, errors = validate_plugin_meta(meta, plugin_type)
             plugin_id = meta.get("id", folder_name)
             if not is_valid:
                 print(
@@ -517,15 +500,8 @@ class AutomationEngine:
             if not integrity_ok:
                 warning = (f"[Engine] [安全] 插件 \"{plugin_id}\" 完整性校验失败：" + integrity_msg)
                 print(warning, file=sys.stderr)
-                engine_error("integrity_check_failed", plugin=plugin_id, detail=integrity_msg)
+                engine_warn(f"integrity_check: {integrity_msg}")
                 self._plugin_integrity_errors.append(warning)
-
-            # --- 危险代码扫描 ---
-            dangers = _scan_dangerous_code(py_file)
-            if dangers:
-                for d in dangers:
-                    print(f"[Engine] [安全] 插件 \"{plugin_id}\" 包含危险模式: {d}", file=sys.stderr)
-                engine_error("dangerous_code_detected", plugin=plugin_id, dangers=dangers)
 
             # --- 提取 run 入口 ---
             if not hasattr(module, "run"):
@@ -540,8 +516,25 @@ class AutomationEngine:
                 engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason="缺少 run() 函数")
                 continue
 
+            # --- 签名校验（仅 builtin） ---
+            if origin == "builtin" and not _verify_plugin_sig(folder_path, origin):
+                if self._security_mode == SecurityMode.STRICT:
+                    print(f"[Engine] [!!] {store_name} \"{plugin_id}\" 签名无效，不加载", file=sys.stderr)
+                    continue
+                elif self._security_mode == SecurityMode.NORMAL:
+                    print(f"[Engine] [!!] {store_name} \"{plugin_id}\" 签名无效，降级加载", file=sys.stderr)
+            # --- 同名覆盖 ---
+            if plugin_id in self._plugin_modules:
+                old_origin = meta_store.get(plugin_id, {}).get("origin", "builtin")
+                engine_info(f"{store_name} \"{plugin_id}\": {old_origin} -> {origin} override")
+                old_module = self._plugin_modules[plugin_id]
+                if hasattr(old_module, "teardown"):
+                    old_module.teardown()
+                self._plugin_modules.pop(plugin_id, None)
+                func_store.pop(plugin_id, None)
+                meta_store.pop(plugin_id, None)
             func_store[plugin_id] = getattr(module, "run")
-            meta_store[plugin_id] = meta
+            meta_store[plugin_id] = {**meta, "origin": origin}
             self._plugin_modules[plugin_id] = module
 
             # --- Admin 权限注册 ---
@@ -864,74 +857,99 @@ class AutomationEngine:
                 self._action_done.notify_all()
 
     # ------------------------------------------------------------------
+    # 触发器线程管理
+    # ------------------------------------------------------------------
+
+    def _start_trigger_threads(self, rules: List[Dict[str, Any]] | None = None) -> int:
+        if rules is None:
+            with self._rules_lock:
+                rules = list(self.rules)
+
+        aggregated: Dict[str, List[Dict[str, Any]]] = {}
+        for rule in rules:
+            event = rule.get("event", {}) or rule.get("trigger", {})
+            event_type = event.get("type")
+            if not event_type:
+                continue
+            aggregated.setdefault(event_type, []).append(event.get("params", {}))
+
+        missing = [et for et in aggregated if et not in self.triggers_funcs]
+        if missing:
+            print(
+                f"[Engine] [!!] 规则引用了未加载的触发器: {', '.join(missing)}",
+                file=sys.stderr,
+            )
+            self._alert_user(
+                "触发器缺失",
+                f"以下触发器未装载，相关规则不会生效: {', '.join(missing)}",
+            )
+
+        count = 0
+        for event_type, config_list in aggregated.items():
+            if event_type not in self.triggers_funcs:
+                continue
+
+            trigger_meta = self.triggers_meta.get(event_type, {})
+            trigger_func = self.triggers_funcs[event_type]
+            trigger_event = threading.Event()
+            self._trigger_events[event_type] = trigger_event
+
+            thread = threading.Thread(
+                target=trigger_func,
+                args=(trigger_meta, config_list, self.emit_event, trigger_event),
+                daemon=True,
+            )
+            thread.start()
+            self._trigger_threads[event_type] = thread
+            count += 1
+            print(
+                f"[Engine] 已启动触发器线程: {event_type}"
+                f"（共监听 {len(config_list)} 条规则）"
+            )
+
+        return count
+
+    def _stop_trigger_threads(self, timeout: float = 30.0) -> None:
+        """设置所有触发器关闭事件，等待线程退出（最多 timeout 秒）。"""
+        if not self._trigger_threads:
+            return
+
+        for evt in self._trigger_events.values():
+            evt.set()
+
+        deadline = time.time() + timeout
+        for event_type, thread in list(self._trigger_threads.items()):
+            remaining = deadline - time.time()
+            if remaining > 0:
+                thread.join(timeout=remaining)
+            if thread.is_alive():
+                print(
+                    f"[Engine] [!!] 触发器线程 {event_type} 未在 {timeout}s 内退出，强制终止",
+                    file=sys.stderr,
+                )
+
+        self._trigger_threads.clear()
+        self._trigger_events.clear()
+
+    # ------------------------------------------------------------------
     # 引擎生命周期
     # ------------------------------------------------------------------
 
     def start(
         self, shutdown_event: "threading.Event | None" = None
     ) -> None:
-        """启动引擎：加载规则、启动触发器线程、进入主循环。"""
         self._start_time = time.time()
         self._shutdown_flag = shutdown_event or threading.Event()
 
-        # 校验规则（初始加载）
         self._validate_all_rules()
 
-        # 通知系统就绪
         from Win_toaster.show_notification import show_notification
         from Win_toaster.AUMID_Register import register_toaster
 
         register_toaster()
         show_notification("NotmyFault 已加载", "")
 
-        # 聚合规则中的触发器配置
-        aggregated_event_configs: Dict[str, List[Dict[str, Any]]] = {}
-        with self._rules_lock:
-            rules_snapshot = list(self.rules)
-
-        for rule in rules_snapshot:
-            event = rule.get("event", {}) or rule.get("trigger", {})
-            event_type = event.get("type")
-            event_params = event.get("params", {})
-            if not event_type:
-                continue
-            aggregated_event_configs.setdefault(event_type, []).append(event_params)
-
-        # 检查规则引用了但未加载的触发器（在启动线程之前告警）
-        missing_triggers = [
-            et for et in aggregated_event_configs
-            if et not in self.triggers_funcs
-        ]
-        if missing_triggers:
-            print(
-                f"[Engine] [!!] 规则引用了未加载的触发器: {', '.join(missing_triggers)}",
-                file=sys.stderr,
-            )
-            self._alert_user(
-                "触发器缺失",
-                f"以下触发器未装载，相关规则不会生效: {', '.join(missing_triggers)}",
-            )
-
-        # 启动触发器线程
-        thread_count = 0
-        for event_type, config_list in aggregated_event_configs.items():
-            if event_type not in self.triggers_funcs:
-                continue
-
-            trigger_meta = self.triggers_meta.get(event_type, {})
-            trigger_func = self.triggers_funcs[event_type]
-
-            thread_count += 1
-            thread = threading.Thread(
-                target=trigger_func,
-                args=(trigger_meta, config_list, self.emit_event),
-                daemon=True,
-            )
-            thread.start()
-            print(
-                f"[Engine] 已启动触发器线程: {event_type}"
-                f"（共监听 {len(config_list)} 条规则）"
-            )
+        thread_count = self._start_trigger_threads()
 
         if thread_count == 0:
             print("[Engine] 没有找到可用触发器，程序将退出。")
@@ -942,18 +960,16 @@ class AutomationEngine:
             )
             return
 
-        # 主循环：等待关闭信号 + 配置热重载
         se = self._shutdown_flag
         config_mtime = (
             os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else 0
         )
-        self._hot_reload_error_reported = False  # 避免重复告警
+        self._hot_reload_error_reported = False
 
         try:
             while not se.is_set():
                 se.wait(1)
 
-                # 配置热重载
                 try:
                     new_mtime = (
                         os.path.getmtime(CONFIG_FILE)
@@ -964,14 +980,22 @@ class AutomationEngine:
                         config_mtime = new_mtime
                         with open(CONFIG_FILE, "r", encoding="utf-8") as _f:
                             _new = json.load(_f)
+                        new_rules = _new.get("rules", [])
+
                         with self._rules_lock:
-                            self.rules = _new.get("rules", [])
+                            old_rule_count = len(self.rules)
+                            self.rules = new_rules
+
                         print(
-                            f"[Engine] 配置已热加载（{len(self.rules)} 条规则）"
+                            f"[Engine] 配置已热加载（{old_rule_count} → {len(new_rules)} 条规则）"
                         )
                         self._hot_reload_error_reported = False
-                        # 重新校验规则
                         self._validate_all_rules()
+
+                        self._stop_trigger_threads(timeout=30)
+                        started = self._start_trigger_threads(new_rules)
+                        if started == 0:
+                            print("[Engine] 热加载后无可用触发器，保持引擎运行")
                 except json.JSONDecodeError as e:
                     self._diag["hot_reload_errors"] += 1
                     engine_error("hot_reload_error", error=str(e))
@@ -999,12 +1023,11 @@ class AutomationEngine:
         except KeyboardInterrupt:
             print("[Engine] 主程序收到中断，退出中...")
 
-        # 优雅关闭
+        self._stop_trigger_threads(timeout=30)
         self._shutdown_plugins()
         self._wait_active_actions()
 
     def _shutdown_plugins(self) -> None:
-        """调用所有已加载插件的 teardown() 钩子。"""
         for plugin_id, module in self._plugin_modules.items():
             if hasattr(module, "teardown"):
                 try:
@@ -1018,7 +1041,6 @@ class AutomationEngine:
                     traceback.print_exc(file=sys.stderr)
 
     def _wait_active_actions(self) -> None:
-        """等待所有活跃动作完成。"""
         print("[Engine] 正在关闭，等待活跃动作完成...")
         while True:
             with self._action_lock:
@@ -1031,8 +1053,10 @@ class AutomationEngine:
         print("[Engine] 所有动作已完成，引擎安全关闭")
 
     def shutdown(self) -> None:
-        """外部关闭入口（供 API 层调用）。"""
         if self._shutdown_flag:
             self._shutdown_flag.set()
+        for evt in self._trigger_events.values():
+            evt.set()
+        self._stop_trigger_threads(timeout=30)
         self._shutdown_plugins()
         self._wait_active_actions()

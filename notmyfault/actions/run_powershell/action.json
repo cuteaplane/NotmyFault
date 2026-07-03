@@ -12,5 +12,6 @@
             "default": "",
             "placeholder": "要执行的 PowerShell 命令"
         }
-    ]
+    ],
+    "origin": "builtin"
 }

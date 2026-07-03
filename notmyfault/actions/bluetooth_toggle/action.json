@@ -4,14 +4,21 @@
     "description": "打开或关闭蓝牙适配器",
     "version_code": 1,
     "enabled": true,
-    "permissions": ["admin"],
+    "permissions": [
+        "admin"
+    ],
     "params": [
         {
             "name": "action",
             "label": "操作",
             "type": "select",
             "default": "toggle",
-            "options": ["toggle", "on", "off"]
+            "options": [
+                "toggle",
+                "on",
+                "off"
+            ]
         }
-    ]
+    ],
+    "origin": "builtin"
 }

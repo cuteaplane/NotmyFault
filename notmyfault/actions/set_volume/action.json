@@ -10,7 +10,13 @@
             "label": "音量级别",
             "type": "select",
             "default": "max",
-            "options": ["max", "half", "min", "mute"]
+            "options": [
+                "max",
+                "half",
+                "min",
+                "mute"
+            ]
         }
-    ]
+    ],
+    "origin": "builtin"
 }

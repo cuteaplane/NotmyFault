@@ -2,7 +2,7 @@ import time
 import psutil
 
 
-def run(meta, config_list, emit_event):
+def run(meta, config_list, emit_event, shutdown_event):
     trigger_id = meta.get("id", "usb_insert")
     print(f"[Trigger:{trigger_id}] U盘监视雷达已启动！")
 
@@ -19,7 +19,7 @@ def run(meta, config_list, emit_event):
     last_drives = get_removable_drives()
 
     # 2. 开始持续监听
-    while True:
+    while not shutdown_event.is_set():
         try:
             current_drives = get_removable_drives()
             

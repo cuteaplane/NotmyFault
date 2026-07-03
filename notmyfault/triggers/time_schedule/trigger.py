@@ -2,7 +2,7 @@ import time
 from datetime import datetime
 
 
-def run(meta, config_list, emit_event):
+def run(meta, config_list, emit_event, shutdown_event):
     trigger_id = meta.get("id", "time_schedule")
 
     target_times = set()
@@ -20,7 +20,7 @@ def run(meta, config_list, emit_event):
     # 记录每个时间点今天是否已触发过（key: "HH:MM" → date string）
     fired_on_date = {t: None for t in target_times}
 
-    while True:
+    while not shutdown_event.is_set():
         try:
             now = datetime.now()
             current_time = now.strftime("%H:%M")

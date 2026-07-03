@@ -30,13 +30,18 @@ def _dashboard_pyw_path() -> str:
 
 
 def _launch_dashboard() -> None:
-    """启动 dashboard.pyw（独立进程）。"""
+    """启动 Dashboard。开发模式用 startfile，exe 模式启动自身 --dashboard。"""
+    if getattr(sys, "frozen", False):
+        try:
+            import subprocess
+            subprocess.Popen([sys.executable, "--dashboard"], creationflags=subprocess.CREATE_NO_WINDOW)
+            print("[Alert] 已拉起 Dashboard (exe mode)")
+        except Exception as e:
+            print(f"[Alert] 拉起 Dashboard 失败: {e}", file=sys.stderr)
+        return
     dashboard_pyw = _dashboard_pyw_path()
     if not os.path.exists(dashboard_pyw):
-        print(
-            f"[Alert] 找不到 dashboard 入口: {dashboard_pyw}",
-            file=sys.stderr,
-        )
+        print(f"[Alert] 找不到 dashboard 入口: {dashboard_pyw}", file=sys.stderr)
         return
     try:
         os.startfile(dashboard_pyw)

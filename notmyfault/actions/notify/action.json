@@ -19,5 +19,6 @@
             "default": "",
             "placeholder": "通知的正文内容"
         }
-    ]
+    ],
+    "origin": "builtin"
 }

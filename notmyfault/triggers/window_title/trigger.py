@@ -25,7 +25,7 @@ def _get_window_titles() -> dict:
     return titles
 
 
-def run(meta, config_list, emit_event):
+def run(meta, config_list, emit_event, shutdown_event):
     trigger_id = meta.get("id", "window_title")
 
     patterns = {}
@@ -44,7 +44,7 @@ def run(meta, config_list, emit_event):
     # 记录每个模式当前是否已匹配到
     was_matched = {p: False for p in patterns}
 
-    while True:
+    while not shutdown_event.is_set():
         try:
             titles = _get_window_titles()
             all_text = " ".join(titles.values()).lower()

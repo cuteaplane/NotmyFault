@@ -19,5 +19,6 @@
             "default": "",
             "placeholder": "可选，命令行参数"
         }
-    ]
+    ],
+    "origin": "builtin"
 }

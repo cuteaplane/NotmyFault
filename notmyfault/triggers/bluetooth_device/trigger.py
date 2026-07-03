@@ -119,7 +119,7 @@ def _device_set_hash(devices: set) -> int:
     return hash(tuple(sorted(devices)))
 
 
-def run(meta, config_list, emit_event):
+def run(meta, config_list, emit_event, shutdown_event):
     trigger_id = meta.get("id", "bluetooth_device")
     print(f"[Trigger:{trigger_id}] 蓝牙设备监控已启动（共 {len(config_list)} 条规则）")
 
@@ -135,7 +135,7 @@ def run(meta, config_list, emit_event):
     last_hash = _device_set_hash(last_devices)
     scan_count = 0
 
-    while True:
+    while not shutdown_event.is_set():
         try:
             time.sleep(3)
             scan_count += 1

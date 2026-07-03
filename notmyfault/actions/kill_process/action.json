@@ -12,5 +12,6 @@
             "default": "",
             "placeholder": "如 Notepad.exe、WeChat.exe"
         }
-    ]
+    ],
+    "origin": "builtin"
 }

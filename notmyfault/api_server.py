@@ -23,6 +23,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from notmyfault.config import CONFIG_FILE, save_config as config_save, save_config as config_save
+from notmyfault.plugin_schema import scan_plugins
+
+_scan_plugins = scan_plugins  # 向后兼容
 
 # API 认证令牌（每次进程启动时随机生成）
 API_TOKEN: str = secrets.token_hex(32)
@@ -45,52 +48,6 @@ class EngineRunnerLike(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# 插件 schema 扫描 (复刻 engine.py 的 auto_load 扫描逻辑)
-# ---------------------------------------------------------------------------
-
-def _scan_plugins(base_dir: str, plugins_dir: str, json_filename: str) -> Dict[str, Dict]:
-    """扫描插件目录，返回 {plugin_id: metadata} 的字典。
-
-    跳过禁用、缺少必填字段、或 JSON 损坏的插件。
-    """
-    result: Dict[str, Dict] = {}
-    root = os.path.join(base_dir, plugins_dir)
-    if not os.path.isdir(root):
-        return result
-
-    for folder_name in sorted(os.listdir(root)):
-        folder_path = os.path.join(root, folder_name)
-        if not os.path.isdir(folder_path):
-            continue
-
-        json_file = os.path.join(folder_path, json_filename)
-        if not os.path.exists(json_file):
-            continue
-
-        try:
-            with open(json_file, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-        except Exception:
-            continue
-
-        plugin_id = meta.get("id")
-        if not plugin_id:
-            continue
-
-        # 跳过缺少必填字段的插件（与 engine.py schema 对齐）
-        if not all(k in meta for k in ("name", "description", "enabled", "version_code")):
-            continue
-
-        # 跳过已禁用的插件
-        if meta.get("enabled") is False:
-            continue
-
-        result[plugin_id] = meta
-
-    return result
-
-
-# ---------------------------------------------------------------------------
 # EngineAPI
 # ---------------------------------------------------------------------------
 
@@ -106,10 +63,10 @@ class EngineAPI:
 
     def __init__(self, engine_runner: EngineRunnerLike):
         self._engine = engine_runner
-        self._event_queue: queue.Queue = queue.Queue(maxsize=100)
-        self._event_signal = threading.Event()
+        self._subscribers: list[queue.Queue] = []
+        self._sub_lock = threading.Lock()
         self._server = None
-        self._engine_ref = None  # AutomationEngine 实例，由 NOTMYFAULT.pyw 注入
+        self._engine_ref = None
 
         self.app = FastAPI(title="NotmyFault Engine API", version="1.0")
         self._setup_middleware()
@@ -139,28 +96,99 @@ class EngineAPI:
     # ---- 事件推送 (引擎线程 → SSE) ---------------------------------------
 
     def push_event(self, event_type: str, data: Dict[str, Any]):
-        """
-        引擎线程调用此方法推送事件。
-        线程安全 — 使用 queue + event 唤醒 SSE 生成器。
-        """
-        try:
-            self._event_queue.put_nowait({
-                "type": event_type,
-                "data": data,
-                "ts": time.time(),
-            })
-            self._event_signal.set()  # 立即唤醒 SSE 轮询
-        except queue.Full:
-            pass  # 队列满了就丢弃，不阻塞引擎
+        packet = {"type": event_type, "data": data, "ts": time.time()}
+        with self._sub_lock:
+            dead = []
+            for q in self._subscribers:
+                try:
+                    q.put_nowait(packet)
+                except queue.Full:
+                    dead.append(q)
+            for q in dead:
+                self._subscribers.remove(q)
 
     # ---- 插件扫描 (供 /api/plugins 使用) --------------------------------
 
     def _get_plugins_schema(self) -> Dict[str, Any]:
         base = os.path.dirname(__file__)
         return {
-            "triggers": _scan_plugins(base, "triggers", "trigger.json"),
-            "actions": _scan_plugins(base, "actions", "action.json"),
+            "triggers": scan_plugins(base, "triggers", "trigger.json"),
+            "actions": scan_plugins(base, "actions", "action.json"),
         }
+
+    def _get_user_plugins_dir(self) -> str:
+        return os.path.join(os.environ.get("APPDATA", ""), "NotmyFault", "plugins")
+
+    def _list_all_plugins(self) -> Dict[str, Any]:
+        base = os.path.dirname(__file__)
+        user_dir = self._get_user_plugins_dir()
+
+        result: Dict[str, Dict] = {"triggers": {}, "actions": {}}
+        for ptype in ("triggers", "actions"):
+            json_name = "trigger.json" if ptype == "triggers" else "action.json"
+            # builtin
+            for pid, meta in scan_plugins(base, ptype, json_name).items():
+                meta["origin"] = meta.get("origin", "builtin")
+                result[ptype][pid] = meta
+            # user
+            if os.path.isdir(user_dir):
+                for pid, meta in scan_plugins(user_dir, ptype, json_name).items():
+                    meta["origin"] = meta.get("origin", "user")
+                    result[ptype][pid] = meta
+
+        # merge diagnostics (loaded status / errors)
+        engine = getattr(self, "_engine_ref", None)
+        if engine is not None:
+            diag = engine.get_diagnostics()
+            for err in diag.get("plugins", {}).get("errors", []):
+                # errors: ["Trigger", plugin_id, reason]
+                if len(err) >= 3:
+                    etype, epid, ereason = err[0], err[1], err[2]
+                    cat = "triggers" if etype == "Trigger" else "actions"
+                    if epid in result.get(cat, {}):
+                        result[cat][epid]["_error"] = ereason
+
+        return result
+
+    def _toggle_plugin(self, ptype: str, pid: str) -> dict:
+        base = os.path.dirname(__file__)
+        user_dir = self._get_user_plugins_dir()
+        json_name = "trigger.json" if ptype == "triggers" else "action.json"
+
+        for root in (base, user_dir):
+            json_path = os.path.join(root, ptype, pid, json_name)
+            if os.path.exists(json_path):
+                try:
+                    with open(json_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    meta["enabled"] = not meta.get("enabled", True)
+                    os.makedirs(os.path.dirname(json_path), exist_ok=True)
+                    with open(json_path, "w", encoding="utf-8") as f:
+                        json.dump(meta, f, ensure_ascii=False, indent=2)
+                    return {"ok": True, "enabled": meta["enabled"],
+                            "origin": "builtin" if root == base else "user",
+                            "restart_required": True}
+                except (json.JSONDecodeError, OSError) as e:
+                    return {"ok": False, "error": str(e)}
+
+        return {"ok": False, "error": "插件不存在"}
+
+    def _uninstall_plugin(self, ptype: str, pid: str) -> dict:
+        user_dir = self._get_user_plugins_dir()
+        json_name = "trigger.json" if ptype == "triggers" else "action.json"
+        plugin_dir = os.path.join(user_dir, ptype, pid)
+        json_path = os.path.join(plugin_dir, json_name)
+
+        if not os.path.exists(json_path):
+            return {"ok": False, "error": "只能卸载用户插件，或插件不存在"}
+
+        try:
+            import shutil
+            shutil.rmtree(plugin_dir)
+            return {"ok": True, "restart_required": True}
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
+
 
     # ---- 配置读写辅助 ----------------------------------------------------
 
@@ -232,7 +260,8 @@ class EngineAPI:
             config = self._load_config()
             rules = config.get("rules", [])
             return {
-                "running": self._engine.engine_running,
+                "running": True,
+                "engine_running": self._engine.engine_running,
                 "pid": os.getpid(),
                 "rules_count": len(rules),
                 "triggers_count": len(set(
@@ -281,12 +310,107 @@ class EngineAPI:
                 )
 
         # ================================================================
-        # 插件 schema
+        # 插件管理
         # ================================================================
 
         @app.get("/api/plugins")
         async def plugins_schema():
             return self._get_plugins_schema()
+
+        @app.get("/api/plugins/list")
+        async def plugins_list():
+            return self._list_all_plugins()
+
+        @app.post("/api/plugins/toggle")
+        async def plugin_toggle(request: Request):
+            await self._verify_auth(request)
+            try:
+                body = await request.json()
+                ptype = body.get("type", "")
+                pid = body.get("id", "")
+                if ptype not in ("triggers", "actions") or not pid:
+                    return JSONResponse(
+                        {"ok": False, "error": "需要 type (triggers/actions) 和 id"},
+                        status_code=400)
+                return self._toggle_plugin(ptype, pid)
+            except Exception as e:
+                return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+        @app.post("/api/plugins/install")
+        async def plugin_install(request: Request):
+            await self._verify_auth(request)
+            import tempfile, zipfile, shutil
+            form = await request.form()
+            file = form.get("file")
+            if not file:
+                return JSONResponse({"ok": False, "error": "缺少上传文件"}, status_code=400)
+
+            data = await file.read()
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+            try:
+                tmp.write(data)
+                tmp.close()
+                with zipfile.ZipFile(tmp.name, "r") as zf:
+                    names = zf.namelist()
+                    # 找根目录名
+                    roots = set(n.split("/")[0] for n in names if "/" in n)
+                    if len(roots) != 1:
+                        return JSONResponse({"ok": False, "error": "zip 根目录应恰好有一个插件文件夹"}, status_code=400)
+                    root_name = roots.pop()
+
+                    # 确定是 trigger 还是 action
+                    has_trigger = f"{root_name}/trigger.json" in names
+                    has_action = f"{root_name}/action.json" in names
+                    if has_trigger:
+                        ptype, json_name = "triggers", "trigger.json"
+                    elif has_action:
+                        ptype, json_name = "actions", "action.json"
+                    else:
+                        return JSONResponse({"ok": False, "error": "zip 中未找到 trigger.json 或 action.json"}, status_code=400)
+
+                    # 校验 metadata
+                    try:
+                        meta = json.loads(zf.read(f"{root_name}/{json_name}"))
+                    except (json.JSONDecodeError, KeyError):
+                        return JSONResponse({"ok": False, "error": "插件元数据 JSON 损坏或缺失"}, status_code=400)
+
+                    from notmyfault.plugin_schema import validate_plugin_meta
+                    ok, errors = validate_plugin_meta(meta, ptype)
+                    if not ok:
+                        return JSONResponse({"ok": False, "error": "schema 校验失败: " + "; ".join(errors[:3])}, status_code=400)
+
+                    pid = meta.get("id", root_name)
+                    user_dir = self._get_user_plugins_dir()
+                    dest = os.path.join(user_dir, ptype, pid)
+                    if os.path.exists(dest):
+                        return JSONResponse({"ok": False, "error": f"插件 '{pid}' 已存在"}, status_code=400)
+
+                    os.makedirs(dest, exist_ok=True)
+                    for member in zf.namelist():
+                        rel = os.path.relpath(member, root_name)
+                        if rel == "." or rel.startswith(".."):
+                            continue
+                        target = os.path.join(dest, rel)
+                        if member.endswith("/"):
+                            os.makedirs(target, exist_ok=True)
+                        else:
+                            os.makedirs(os.path.dirname(target), exist_ok=True)
+                            with zf.open(member) as src, open(target, "wb") as dst:
+                                dst.write(src.read())
+
+                    return {"ok": True, "id": pid, "type": ptype, "restart_required": True}
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+
+        @app.delete("/api/plugins/{ptype}/{pid}")
+        async def plugin_uninstall(ptype: str, pid: str, request: Request):
+            await self._verify_auth(request)
+            if ptype not in ("triggers", "actions"):
+                return JSONResponse({"ok": False, "error": "type 必须为 triggers 或 actions"}, status_code=400)
+            return self._uninstall_plugin(ptype, pid)
 
         # ================================================================
         # 诊断 & 日志
@@ -323,46 +447,37 @@ class EngineAPI:
 
         @app.get("/api/events")
         async def event_stream(request: Request):
-            """
-            Server-Sent Events 流。
-            引擎事件通过 queue + event 机制从引擎线程传递到这里。
-            客户端断开时自动清理。
-            """
-
             async def generate():
-                # 为每个客户端创建独立的本地引用
-                q = self._event_queue
-                ev = self._event_signal
+                client_queue: queue.Queue = queue.Queue(maxsize=200)
+                with self._sub_lock:
+                    self._subscribers.append(client_queue)
 
-                while True:
-                    # 检查客户端是否断开
-                    if await request.is_disconnected():
-                        break
-
-                    # 非阻塞排空队列
-                    drained = False
-                    while True:
-                        try:
-                            event = q.get_nowait()
-                            drained = True
-                            yield f"event: {event['type']}\n"
-                            yield f"data: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
-                        except queue.Empty:
-                            break
-
-                    if drained:
-                        continue  # 立即再检查一次，不 sleep
-
-                    # 等待新事件或超时（用短 sleep 替代 threading.Event 的跨线程等待）
-                    # 在 asyncio 中不能直接 block，所以用 run_in_executor
+                try:
                     import asyncio
                     loop = asyncio.get_event_loop()
 
-                    def wait_signal():
-                        ev.wait(1.0)
-                        ev.clear()
+                    while True:
+                        if await request.is_disconnected():
+                            break
 
-                    await loop.run_in_executor(None, wait_signal)
+                        drained = False
+                        while True:
+                            try:
+                                event = client_queue.get_nowait()
+                                drained = True
+                                yield f"event: {event['type']}\n"
+                                yield f"data: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
+                            except queue.Empty:
+                                break
+
+                        if drained:
+                            continue
+
+                        await asyncio.sleep(0.5)
+                finally:
+                    with self._sub_lock:
+                        if client_queue in self._subscribers:
+                            self._subscribers.remove(client_queue)
 
             return StreamingResponse(
                 generate(),

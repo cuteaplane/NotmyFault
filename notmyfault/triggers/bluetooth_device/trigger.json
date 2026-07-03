@@ -18,7 +18,11 @@
             "label": "触发状态",
             "type": "select",
             "default": "connected",
-            "options": ["connected", "disconnected"]
+            "options": [
+                "connected",
+                "disconnected"
+            ]
         }
-    ]
+    ],
+    "origin": "builtin"
 }

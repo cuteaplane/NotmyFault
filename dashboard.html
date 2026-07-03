@@ -521,7 +521,86 @@ input:focus, select:focus {
 }
 
 /* ============================================================
+   Plugin Cards
+   ============================================================ */
+.plugin-card {
+  background: var(--md-surface-container-lowest);
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--md-shape-md);
+  padding: 20px;
+  box-shadow: var(--md-elevation-1);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  transition: border-color .2s, box-shadow .2s;
+}
+.plugin-card:hover { border-color: var(--md-outline); box-shadow: var(--md-elevation-2); }
+.plugin-card.disabled { opacity: .6; }
+.plugin-card-top {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.plugin-card-icon { font-size: 32px; color: var(--md-primary); flex-shrink: 0; }
+.plugin-card-info { flex: 1; min-width: 0; }
+.plugin-card-name {
+  font: var(--md-typescale-title);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.plugin-card-id {
+  font: var(--md-typescale-label-sm);
+  color: var(--md-on-surface-variant);
+}
+.plugin-card-desc {
+  font: var(--md-typescale-body);
+  font-size: 13px;
+  color: var(--md-on-surface-variant);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.plugin-card-meta { display: flex; flex-wrap: wrap; gap: 6px; }
+.plugin-card-footer {
+  border-top: 1px solid var(--md-outline-variant);
+  padding-top: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.switch-label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.switch-text { font: var(--md-typescale-label-sm); color: var(--md-on-surface-variant); }
+.switch-input {
+  width: 40px; height: 24px;
+  appearance: none;
+  border-radius: 12px;
+  background: var(--md-outline-variant);
+  position: relative;
+  cursor: pointer;
+  transition: background .2s;
+  border: none;
+  min-height: unset;
+  padding: 0;
+}
+.switch-input:checked { background: var(--md-primary); }
+.switch-input::after {
+  content: '';
+  position: absolute;
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  top: 3px; left: 3px;
+  transition: transform .2s;
+}
+.switch-input:checked::after { transform: translateX(16px); }
+.switch-input:focus { border: none; padding: 0; }
+#installDialog::backdrop { background: rgba(0,0,0,.4); }
+
+/* ============================================================
    Utility
+   ============================================================ */
    ============================================================ */
 .spacer { flex: 1; }
 .snackbar {
@@ -582,6 +661,10 @@ input:focus, select:focus {
     <button class="nav-item active" data-page="home">
       <span class="material-symbols-outlined nav-icon">dashboard</span>
       <span>首页</span>
+    </button>
+    <button class="nav-item" data-page="plugins">
+      <span class="material-symbols-outlined nav-icon">extension</span>
+      <span>插件</span>
     </button>
     <button class="nav-item" data-page="rules">
       <span class="material-symbols-outlined nav-icon">rule</span>
@@ -664,6 +747,71 @@ input:focus, select:focus {
       <div class="stat-card"><div class="stat-value" id="diagErrors">—</div><div class="stat-label">错误 / 警告</div></div>
     </div>
     <div id="diagDetail" style="font:var(--md-typescale-label-sm);color:var(--md-on-surface-variant);margin-top:12px;max-height:120px;overflow-y:auto;"></div>
+  </section>
+
+  <!-- PLUGINS -->
+  <section class="page" id="page-plugins">
+    <div class="page-header">
+      <h2>插件管理</h2>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;">
+        <button class="btn btn-tonal" onclick="showInstallDialog()">
+          <span class="material-symbols-outlined">upload</span> 安装插件
+        </button>
+        <button class="btn btn-outlined" onclick="loadPlugins()">
+          <span class="material-symbols-outlined">refresh</span> 刷新
+        </button>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:20px;">
+      <button class="btn btn-text" id="plugTabTriggers" onclick="switchPluginTab('triggers')" style="font-weight:600;">触发器</button>
+      <button class="btn btn-text" id="plugTabActions" onclick="switchPluginTab('actions')">动作</button>
+    </div>
+    <div id="pluginsGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;"></div>
+
+    <template id="pluginCardTpl">
+      <div class="plugin-card" data-plugin-card>
+        <div class="plugin-card-top">
+          <span class="material-symbols-outlined plugin-card-icon">extension</span>
+          <div class="plugin-card-info">
+            <div class="plugin-card-name"></div>
+            <div class="plugin-card-id"></div>
+          </div>
+          <div class="plugin-card-actions">
+            <button class="icon-btn danger" data-delete-btn title="卸载" style="display:none;">
+              <span class="material-symbols-outlined">delete</span>
+            </button>
+          </div>
+        </div>
+        <div class="plugin-card-body">
+          <div class="plugin-card-desc"></div>
+          <div class="plugin-card-meta">
+            <span class="tech-tag" data-version></span>
+            <span class="tech-tag" data-origin></span>
+            <span class="tech-tag" data-admin style="display:none;background:var(--md-error-container);color:var(--md-error);">admin</span>
+            <span class="tech-tag" data-error style="display:none;background:var(--md-error-container);color:var(--md-error);"></span>
+          </div>
+        </div>
+        <div class="plugin-card-footer">
+          <label class="switch-label">
+            <span class="switch-text" data-enable-text>已启用</span>
+            <input type="checkbox" class="switch-input" data-enable-check onchange="togglePlugin(this)" checked>
+          </label>
+        </div>
+      </div>
+    </template>
+
+    <dialog id="installDialog" style="border:1px solid var(--md-outline-variant);border-radius:var(--md-shape-lg);padding:32px;max-width:440px;width:90%;background:var(--md-surface-container-lowest);color:var(--md-on-surface);">
+      <h3 style="font:var(--md-typescale-title);margin-bottom:8px;">安装插件</h3>
+      <p style="font:var(--md-typescale-body);color:var(--md-on-surface-variant);margin-bottom:20px;">选择一个 .zip 文件，包含插件文件夹。</p>
+      <div style="border:2px dashed var(--md-outline-variant);border-radius:var(--md-shape-sm);padding:28px;text-align:center;margin-bottom:16px;cursor:pointer;" id="dropZone">
+        <span class="material-symbols-outlined" style="font-size:48px;color:var(--md-outline);margin-bottom:8px;display:block;">upload_file</span>
+        <span style="font:var(--md-typescale-label-sm);color:var(--md-on-surface-variant);">拖拽 .zip 到此处或点击选择</span>
+        <input type="file" id="installFileInput" accept=".zip" style="display:none;" onchange="installPlugin(this.files[0])">
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;">
+        <button class="btn btn-text" onclick="document.getElementById('installDialog').close()">取消</button>
+      </div>
+    </dialog>
   </section>
 
   <!-- RULES -->
@@ -957,6 +1105,20 @@ function addRule() {
 // ---- pywebview bridge ----
 function hasBridge() { return !!(window.pywebview && window.pywebview.api); }
 
+async function _apiWrite(path, method, body, isForm) {
+  const headers = {};
+  if (!isForm) headers['Content-Type'] = 'application/json';
+  if (hasBridge()) {
+    try {
+      const token = await window.pywebview.api.get_api_token();
+      if (token) headers['Authorization'] = 'Bearer ' + token;
+    } catch(e) {}
+  }
+  const opts = { method, headers };
+  if (body) opts.body = isForm ? body : JSON.stringify(body);
+  return fetch(API + path, opts);
+}
+
 // ---- Config I/O ----
 async function loadConfig() {
   if (hasBridge()) return await window.pywebview.api.get_config();
@@ -993,6 +1155,167 @@ async function saveConfig() {
   }
 }
 
+// ---- Plugins page ----
+
+let _pluginsData = { triggers: {}, actions: {} };
+let _pluginTab = 'triggers';
+
+async function loadPlugins() {
+  try {
+    const res = await fetch(API + '/api/plugins/list');
+    _pluginsData = await res.json();
+  } catch (e) {
+    _pluginsData = { triggers: {}, actions: {} };
+  }
+  renderPlugins();
+}
+
+function switchPluginTab(tab) {
+  _pluginTab = tab;
+  document.getElementById('plugTabTriggers').style.fontWeight = tab === 'triggers' ? '600' : '400';
+  document.getElementById('plugTabActions').style.fontWeight = tab === 'actions' ? '600' : '400';
+  renderPlugins();
+}
+
+function renderPlugins() {
+  const grid = document.getElementById('pluginsGrid');
+  const tpl = document.getElementById('pluginCardTpl');
+  const plugins = _pluginsData[_pluginTab] || {};
+  grid.innerHTML = '';
+
+  if (Object.keys(plugins).length === 0) {
+    grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1;">
+      <div class="material-symbols-outlined empty-icon">extension_off</div>
+      <h3>暂无插件</h3><p>安装插件或启动引擎后刷新</p></div>`;
+    return;
+  }
+
+  Object.entries(plugins).forEach(([pid, meta]) => {
+    const clone = tpl.content.cloneNode(true);
+    const card = clone.querySelector('.plugin-card');
+    const icon = card.querySelector('.plugin-card-icon');
+    const nameEl = card.querySelector('.plugin-card-name');
+    const idEl = card.querySelector('.plugin-card-id');
+    const descEl = card.querySelector('.plugin-card-desc');
+    const versionEl = card.querySelector('[data-version]');
+    const originEl = card.querySelector('[data-origin]');
+    const adminEl = card.querySelector('[data-admin]');
+    const errorEl = card.querySelector('[data-error]');
+    const checkEl = card.querySelector('[data-enable-check]');
+    const enableText = card.querySelector('[data-enable-text]');
+    const deleteBtn = card.querySelector('[data-delete-btn]');
+
+    const isAction = _pluginTab === 'actions';
+    icon.textContent = isAction ? 'bolt' : 'memory';
+    nameEl.textContent = meta.name || pid;
+    idEl.textContent = pid;
+    descEl.textContent = meta.description || '';
+
+    versionEl.textContent = 'v' + (meta.version_code || 0);
+    const originLabel = { builtin: '内置', user: '用户', third_party: '第三方' };
+    originEl.textContent = originLabel[meta.origin] || meta.origin || '未知';
+    originEl.style.background = meta.origin === 'builtin' ? 'var(--md-primary-container)' : 'var(--md-tertiary-container)';
+    originEl.style.color = meta.origin === 'builtin' ? 'var(--md-on-primary-container)' : 'var(--md-on-tertiary-container)';
+
+    if (meta.permissions && meta.permissions.includes('admin')) {
+      adminEl.style.display = '';
+    }
+
+    if (meta._error) {
+      errorEl.style.display = '';
+      errorEl.textContent = meta._error.substring(0, 40);
+    }
+
+    checkEl.checked = meta.enabled !== false;
+    enableText.textContent = meta.enabled !== false ? '已启用' : '已禁用';
+    if (meta.enabled === false) card.classList.add('disabled');
+
+    checkEl.dataset.pluginType = _pluginTab;
+    checkEl.dataset.pluginId = pid;
+
+    // 只有用户插件可以卸载
+    if (meta.origin === 'user' || meta.origin === 'third_party') {
+      deleteBtn.style.display = '';
+      deleteBtn.onclick = function() { uninstallPlugin(_pluginTab, pid); };
+    }
+
+    grid.appendChild(card);
+  });
+}
+
+async function togglePlugin(checkbox) {
+  const ptype = checkbox.dataset.pluginType;
+  const pid = checkbox.dataset.pluginId;
+  try {
+    const res = await _apiWrite('/api/plugins/toggle', 'POST', { type: ptype, id: pid });
+    const data = await res.json();
+    if (data.ok) {
+      snackbar(data.restart_required ? '状态已更新，需重启引擎生效' : '状态已更新');
+      loadPlugins();
+    } else {
+      checkbox.checked = !checkbox.checked;
+      alert('操作失败: ' + (data.error || '未知错误'));
+    }
+  } catch (e) {
+    checkbox.checked = !checkbox.checked;
+    alert('请求失败: ' + e.message);
+  }
+}
+
+async function uninstallPlugin(ptype, pid) {
+  if (!confirm('确定要卸载插件 "' + pid + '" 吗？此操作不可撤销。')) return;
+  try {
+    const res = await _apiWrite('/api/plugins/' + ptype + '/' + pid, 'DELETE');
+    const data = await res.json();
+    if (data.ok) {
+      snackbar('已卸载，需重启引擎生效');
+      loadPlugins();
+    } else {
+      alert('卸载失败: ' + (data.error || '未知错误'));
+    }
+  } catch (e) {
+    alert('请求失败: ' + e.message);
+  }
+}
+
+function showInstallDialog() {
+  document.getElementById('installDialog').showModal();
+}
+
+async function installPlugin(file) {
+  if (!file) return;
+  const formData = new FormData();
+  formData.append('file', file);
+  try {
+    const res = await _apiWrite('/api/plugins/install', 'POST', formData, true);
+    const data = await res.json();
+    if (data.ok) {
+      snackbar('插件 "' + data.id + '" 安装成功，需重启引擎生效');
+      document.getElementById('installDialog').close();
+      loadPlugins();
+    } else {
+      alert('安装失败: ' + (data.error || '未知错误'));
+    }
+  } catch (e) {
+    alert('请求失败: ' + e.message);
+  }
+}
+
+// drag & drop
+(function() {
+  const zone = document.getElementById('dropZone');
+  const input = document.getElementById('installFileInput');
+  if (!zone || !input) return;
+  zone.addEventListener('click', function() { input.click(); });
+  zone.addEventListener('dragover', function(e) { e.preventDefault(); zone.style.borderColor = 'var(--md-primary)'; });
+  zone.addEventListener('dragleave', function() { zone.style.borderColor = 'var(--md-outline-variant)'; });
+  zone.addEventListener('drop', function(e) {
+    e.preventDefault();
+    zone.style.borderColor = 'var(--md-outline-variant)';
+    if (e.dataTransfer.files.length) installPlugin(e.dataTransfer.files[0]);
+  });
+})();
+
 // ---- Home: Status UI ----
 function updateStatusUI(status) {
   _engineStatus = status;
@@ -1002,7 +1325,9 @@ function updateStatusUI(status) {
   const startBtn = document.getElementById('startBtn');
   const stopBtn = document.getElementById('stopBtn');
 
-  if (status.running) {
+  const engineOn = status.engine_running === true;
+
+  if (engineOn) {
     icon.textContent = 'play_circle';
     icon.classList.add('running');
     icon.classList.remove('stopped');
@@ -1118,14 +1443,14 @@ async function stopEngine() {
       if (pollAttempts >= 8) {
         clearInterval(pollId);
         await _minDelay(3000, startTime);
-        updateStatusUI({ running: false });
+        updateStatusUI({ engine_running: false });
         _stopping = false;
       }
     } catch (e) {
       // 连接拒绝 = HTTP 服务已退出 = 引擎已关闭
       clearInterval(pollId);
       await _minDelay(3000, startTime);
-      updateStatusUI({ running: false });
+      updateStatusUI({ engine_running: false });
       _stopping = false;
       return;
     }
@@ -1139,8 +1464,7 @@ async function refreshHome() {
     updateStatusUI(await res.json());
     snackbar("已刷新");
   } catch (e) {
-    // 引擎离线
-    updateStatusUI({ running: false });
+    updateStatusUI({ engine_running: false });
     snackbar("无法连接引擎");
   }
 }
@@ -1268,7 +1592,7 @@ function connectSSE() {
   es.addEventListener('engine_state_changed', function(e) {
     const data = JSON.parse(e.data);
     console.log('[SSE] 引擎状态:', data.state);
-    updateStatusUI({ running: data.state === 'running' });
+    updateStatusUI({ engine_running: data.state === 'running' });
     if (data.state === 'running') loadDiagnostics();
   });
   es.addEventListener('error', function(e) {
@@ -1282,7 +1606,7 @@ function connectSSE() {
     _sseRetryCount++;
     if (_sseRetryCount > _sseMaxRetries) {
       console.log('[SSE] 超过最大重试次数（' + _sseMaxRetries + '），停止重连');
-      updateStatusUI({ running: false });
+      updateStatusUI({ engine_running: false });
       return;
     }
     _setTimeout(connectSSE, 5000);
@@ -1303,32 +1627,34 @@ window.addEventListener('load', async function() {
 
   // 2. Connect to engine
   try {
-    const schemaRes = await fetch(API + '/api/plugins');
+    const [schemaRes, statusRes, pluginsRes] = await Promise.all([
+      fetch(API + '/api/plugins'),
+      fetch(API + '/api/engine/status'),
+      fetch(API + '/api/plugins/list'),
+    ]);
     schema = await schemaRes.json();
-    const statusRes = await fetch(API + '/api/engine/status');
     updateStatusUI(await statusRes.json());
+    _pluginsData = await pluginsRes.json();
     connectSSE();
     console.log('[Init] NotmyFault Dashboard 已就绪');
   } catch (e) {
     console.warn('[Init] 引擎离线');
-    updateStatusUI({ running: false });
-    // Background reconnect
+    updateStatusUI({ engine_running: false });
     let retries = 0;
     const tryReconnect = _setInterval(async () => {
       try {
         const res = await fetch(API + '/api/plugins');
         schema = await res.json();
         clearInterval(tryReconnect);
-        // 引擎上线后重新加载配置和状态
-        const [configRes, statusRes] = await Promise.all([
+        const [configRes, statusRes, pluginsRes] = await Promise.all([
           fetch(API + '/api/rules'),
           fetch(API + '/api/engine/status'),
+          fetch(API + '/api/plugins/list'),
         ]);
         const freshConfig = await configRes.json();
-        if (freshConfig.rules) {
-          configData = freshConfig;
-        }
+        if (freshConfig.rules) configData = freshConfig;
         updateStatusUI(await statusRes.json());
+        _pluginsData = await pluginsRes.json();
         connectSSE();
         renderUI();
       } catch {}
@@ -1340,18 +1666,19 @@ window.addEventListener('load', async function() {
   renderUI();
   if (hasBridge()) {
     loadDiagnostics();
-    // 定期刷新诊断（30s）
     _setInterval(loadDiagnostics, 30000);
   }
 
-  // 4. Logs page: auto-load on first visit
-  const origNavClick = document.querySelector('.nav-item[data-page="logs"]');
-  if (origNavClick) {
-    origNavClick.addEventListener('click', function() {
-      refreshLog();
-      toggleLogAutoRefresh();
-    }, { once: true });
-  }
+  // 4. Logs & Plugins: first-visit load
+  const logsNav = document.querySelector('.nav-item[data-page="logs"]');
+  if (logsNav) logsNav.addEventListener('click', function() {
+    refreshLog();
+    toggleLogAutoRefresh();
+  }, { once: true });
+  const pluginsNav = document.querySelector('.nav-item[data-page="plugins"]');
+  if (pluginsNav) pluginsNav.addEventListener('click', function() {
+    renderPlugins();
+  }, { once: true });
 });
 
 // ---- 页面关闭清理 ----

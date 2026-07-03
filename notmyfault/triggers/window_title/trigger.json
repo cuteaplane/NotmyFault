@@ -18,7 +18,11 @@
             "label": "触发状态",
             "type": "select",
             "default": "opened",
-            "options": ["opened", "closed"]
+            "options": [
+                "opened",
+                "closed"
+            ]
         }
-    ]
+    ],
+    "origin": "builtin"
 }

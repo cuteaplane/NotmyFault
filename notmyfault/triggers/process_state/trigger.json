@@ -18,7 +18,11 @@
             "label": "触发状态",
             "type": "select",
             "default": "running",
-            "options": ["running", "stopped"]
+            "options": [
+                "running",
+                "stopped"
+            ]
         }
-    ]
+    ],
+    "origin": "builtin"
 }

@@ -2,7 +2,7 @@ import time
 import psutil
 
 
-def run(trigger_info, config_list, emit_event):
+def run(trigger_info, config_list, emit_event, shutdown_event):
     trigger_id = trigger_info.get("id")
     poll_interval = 2.0
 
@@ -39,7 +39,7 @@ def run(trigger_info, config_list, emit_event):
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
 
-    while True:
+    while not shutdown_event.is_set():
         currently_running = set()
         for proc in psutil.process_iter(["name"]):
             try:
