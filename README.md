@@ -6,11 +6,13 @@
 
 ## 特性
 
-- **规则驱动**：每条规则 = 一个触发条件 + 多个动作，简单直白
-- **插件化**：触发器和动作各自独立，会 Python 就能自己写
-- **HTTP API**：后台暴露 REST 接口，SSE 实时推送事件，任意浏览器打开 Dashboard 就能管理
-- **双进程架构**：引擎后台常驻，UI 只是管理面板，关了也不影响规则运行
-- **日志写盘**：所有输出自动写入 `engine.log`，出问题好排查
+ - **规则驱动**：每条规则 = 一个触发条件 + 多个动作，简单直白
+ - **插件化**：触发器和动作各自独立，会 Python 就能自己写
+ - **HTTP API**：后台暴露 REST 接口，SSE 实时推送事件，任意浏览器打开 Dashboard 就能管理
+ - **双进程架构**：引擎后台常驻，UI 只是管理面板，关了也不影响规则运行
+ - **日志写盘**：session 级日志自动轮转，每行带时间戳，保留最近 7 个文件
+ - **安全加固**：插件签名校验、权限声明 + 防越权、防重入、防注入
+ - **规则条件**：支持 AND / OR 组合，匹配更灵活
 
 ---
 
@@ -42,12 +44,13 @@ python NOTMYFAULT.pyw
 
 浏览器打开 `dashboard.html` 即可配置规则、启停引擎、查看实时事件。
 
-或者直接调 API：
-
-```bash
-curl http://127.0.0.1:19198/api/engine/status
-curl http://127.0.0.1:19198/api/rules
-# 在线 API 文档：http://127.0.0.1:19198/docs
+ 或者直接调 API：
+ 
+ ```bash
+ # 开发辅助：python build.py dev  启动监听模式，python build.py init-keys  生成签名密钥
+ curl http://127.0.0.1:19198/api/engine/status
+ curl http://127.0.0.1:19198/api/rules
+ # 在线 API 文档：http://127.0.0.1:19198/docs
 ```
 
 ---
@@ -56,13 +59,15 @@ curl http://127.0.0.1:19198/api/rules
 
 | Method | Path | 说明 |
 |---|---|---|
-| `POST` | `/api/engine/start` | 启动引擎 |
-| `POST` | `/api/engine/stop` | 停止引擎 |
-| `GET` | `/api/engine/status` | 引擎状态 |
-| `GET` | `/api/rules` | 获取所有规则 |
-| `PUT` | `/api/rules` | 保存规则 |
-| `GET` | `/api/plugins` | 插件列表（含参数定义） |
-| `GET` | `/api/events` | SSE 事件流（实时推送） |
+ | `POST` | `/api/engine/start` | 启动引擎 |
+ | `POST` | `/api/engine/stop` | 停止引擎 |
+ | `GET` | `/api/engine/status` | 引擎状态 |
+ | `GET` | `/api/rules` | 获取所有规则 |
+ | `PUT` | `/api/rules` | 保存规则 |
+ | `GET` | `/api/plugins` | 插件列表（含参数定义） |
+ | `POST` | `/api/plugins/{id}` | 添加 / 更新单个插件 |
+ | `DELETE` | `/api/plugins/{id}` | 删除单个插件 |
+ | `GET` | `/api/events` | SSE 事件流（实时推送） |
 
 启动引擎后访问 `http://127.0.0.1:19198/docs` 可查看 Swagger 交互式文档。
 
@@ -70,10 +75,11 @@ curl http://127.0.0.1:19198/api/rules
 
 ## 配置格式
 
-配置文件位于 `%APPDATA%\NotmyFault\config.json`，首次运行自动生成默认配置。
-
-```json
-{
+ 配置文件位于 `%APPDATA%\NotmyFault\config.json`，首次运行自动生成默认配置。
+ 条件支持 `"condition_mode": "or"`（默认 `"and"`），可组合多个触发条件。
+ 
+ ```json
+ {
   "rules": [
     {
       "name": "微信音量规则",
@@ -97,16 +103,26 @@ curl http://127.0.0.1:19198/api/rules
 ```text
 NotmyFault/
 ├── NOTMYFAULT.pyw              # 后台引擎入口
-├── dashboard.html              # Web 管理面板
-├── README.md
-├── notmyfault/                 # 核心代码
-│   ├── api_server.py           # HTTP API + SSE 事件流
-│   ├── app.py                  # 引擎工厂入口
-│   ├── engine.py               # 规则匹配与动作分发
-│   ├── config.py               # 配置读写与迁移
-│   ├── sudo.py                 # 管理员权限辅助模块
-│   ├── triggers/               # 触发器插件
-│   │   ├── bluetooth_device/   #   蓝牙设备检测
+ ├── build.py                   # 构建 / 签名 / 打包脚本
+ ├── dashboard.html              # Web 管理面板
+ ├── README.md
+ ├── notmyfault/                 # 核心代码
+ │   ├── api_server.py           # HTTP API + SSE 事件流
+ │   ├── app.py                  # 引擎工厂入口
+ │   ├── engine.py               # 规则匹配与动作分发
+ │   ├── config.py               # 配置读写与迁移
+ │   ├── logging.py              # session 日志系统
+ │   ├── alert.py                # 引擎异常弹窗告警
+ │   ├── plugin_schema.py        # 插件元数据 schema 校验
+ │   ├── signing.py              # 插件签名校验
+ │   ├── signing_keys.py         # 签名密钥生成
+ │   ├── sudo.py                 # 管理员权限辅助模块
+ │   ├── simulator/              # 触发器模拟测试环境
+ │   │   ├── __init__.py
+ │   │   ├── environment.py      #   模拟环境配置
+ │   │   └── runner.py           #   模拟运行器
+ │   ├── triggers/               # 触发器插件
+ │   │   ├── bluetooth_device/   #   蓝牙设备检测
 │   │   ├── process_state/      #   进程状态检测
 │   │   ├── idle_detect/        #   系统空闲检测
 │   │   ├── time_schedule/      #   定时触发
