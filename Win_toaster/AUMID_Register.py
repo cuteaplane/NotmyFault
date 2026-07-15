@@ -6,6 +6,42 @@ import ctypes
 import winreg
 
 
+def register_protocol() -> bool:
+    """注册 notmyfault:// 协议 → 启动 dashboard.pyw（HKCU，无需管理员）。"""
+    protocol = "notmyfault"
+    key_path = f"SOFTWARE\\Classes\\{protocol}"
+
+    # 找到 dashboard.pyw
+    dashboard_pyw = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "dashboard.pyw")
+    )
+    if not os.path.exists(dashboard_pyw):
+        print(f"[Protocol] 找不到 dashboard.pyw: {dashboard_pyw}")
+        return False
+
+    pythonw = sys.executable.replace("python.exe", "pythonw.exe")
+    if not os.path.exists(pythonw):
+        pythonw = sys.executable  # 回退
+
+    command = f'"{pythonw}" "{dashboard_pyw}" --protocol "%1"'
+
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            winreg.SetValue(key, "", winreg.REG_SZ, "URL:NotmyFault Protocol")
+            winreg.SetValueEx(key, "URL Protocol", 0, winreg.REG_SZ, "")
+
+        with winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER, f"{key_path}\\shell\\open\\command"
+        ) as key:
+            winreg.SetValue(key, "", winreg.REG_SZ, command)
+
+        print(f"[Protocol] 已注册协议: {protocol}:// → dashboard.pyw")
+        return True
+    except OSError as e:
+        print(f"[Protocol] 注册协议失败: {e}")
+        return False
+
+
 def register_aumid_registry(aumid: str, display_name: str, icon_path: str | None) -> bool:
     key_path = f"SOFTWARE\\Classes\\AppUserModelId\\{aumid}"
     try:
@@ -20,6 +56,9 @@ def register_aumid_registry(aumid: str, display_name: str, icon_path: str | None
 
 
 def register_toaster():
+    # 注册协议处理器（每次启动都检查，幂等）
+    register_protocol()
+
     aumid = 'cuteaplane.notmyfault.app'
     display_name = 'NotmyFault'   # 可自定义
     icon_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'logo.ico'))

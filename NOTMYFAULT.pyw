@@ -8,18 +8,30 @@ from datetime import datetime
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
-from notmyfault import run as start_engine
+from notmyfault.app import create_engine
 from notmyfault.api_server import EngineAPI
 from notmyfault.config import CONFIG_FILE
+from notmyfault.logging import init_session_log
 
-LOG_FILE = os.path.join(os.path.dirname(CONFIG_FILE), "engine.log")
+LOG_DIR = os.path.join(os.path.dirname(CONFIG_FILE), "logs")
 
 
-def setup_logging(log_path: str):
-    """将 stdout / stderr 重定向到日志文件，每行带时间戳"""
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+def setup_logging(log_dir: str) -> str:
+    """初始化 session 日志文件，重定向 stdout/stderr。
 
-    log_fp = open(log_path, "a", encoding="utf-8", buffering=1)  # 行缓冲
+    每次调用创建新文件 engine-YYYYMMDD-HHMMSS.log，自动清理旧文件保留 7 个。
+    同时删除旧版单体 engine.log（迁移用，仅首次执行一次）。
+    """
+    # 删除旧版单体日志文件
+    old_log = os.path.join(os.path.dirname(log_dir), "engine.log")
+    if os.path.exists(old_log):
+        try:
+            os.remove(old_log)
+        except OSError:
+            pass
+
+    log_path = init_session_log(log_dir)
+    log_fp = open(log_path, "a", encoding="utf-8", buffering=1)
 
     class _TimestampWriter:
         """在每行前面插入时间戳，同时写到文件和原始 stdout"""
@@ -61,6 +73,8 @@ def setup_logging(log_path: str):
             self.file.flush()
             self.orig.flush()
 
+    # pythonw.exe 无控制台，sys.__stdout__/__stderr__ 为 None，_devnull 兜底
+    # 这玩意不能删！！！
     _devnull = open(os.devnull, "w")
     sys.stdout = _TimestampWriter(log_fp, sys.__stdout__ or _devnull)  # type: ignore
     sys.stderr = _TimestampWriter(log_fp, sys.__stderr__ or _devnull)  # type: ignore
@@ -111,16 +125,25 @@ class EngineRunner:
     def _run_engine(self):
         try:
             self.engine_running = True
-            start_engine(
-                shutdown_event=self.shutdown_event,
+            engine = create_engine(
                 on_event=self._api.push_event if self._api else None,
             )
+            # 注入引擎引用，供 API 诊断端点使用
+            if self._api:
+                self._api._engine_ref = engine
+            engine.start(shutdown_event=self.shutdown_event)
         except KeyboardInterrupt:
             pass
         except Exception as e:
             print(f"[Engine] 引擎错误: {e}")
             import traceback
             traceback.print_exc()
+            # 拉起 Dashboard 通知用户
+            try:
+                from notmyfault.alert import alert_user
+                alert_user("引擎异常退出", f"引擎线程崩溃: {e}", open_dashboard=True)
+            except Exception:
+                pass
             if self._api:
                 self._api.push_event("error", {"error": str(e)})
         finally:
@@ -146,10 +169,9 @@ class EngineRunner:
     def _check_already_running(port: int = 19198) -> bool:
         """尝试连接本地端口，连上说明已有实例在运行"""
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.5)
-            s.connect(("127.0.0.1", port))
-            s.close()
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                s.connect(("127.0.0.1", port))
             return True
         except (socket.error, OSError):
             return False
@@ -159,12 +181,13 @@ class EngineRunner:
     # ================================================================
 
     def run(self):
-        setup_logging(LOG_FILE)
+        log_path = setup_logging(LOG_DIR)
 
         print("=" * 50)
         print("  NotmyFault Engine ")
         print("=" * 50)
-        print(f"  日志文件: {LOG_FILE}")
+        print(f"  日志目录: {LOG_DIR}")
+        print(f"  当前日志: {log_path}")
 
         # 0. 单实例检查
         if self._check_already_running():

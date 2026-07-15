@@ -13,62 +13,90 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import webview
-from notmyfault.config import get_config, CONFIG_FILE
 
 API = "http://127.0.0.1:19198"
+CONFIG_FILE = os.path.join(os.environ.get("APPDATA", ""), "NotmyFault", "config.json")
+API_TOKEN_FILE = os.path.join(os.environ.get("TEMP", ""), "notmyfault_api_token")
 
 
 class DashboardAPI:
     """暴露给前端 JS 的 Python 接口"""
 
     def launch_engine(self) -> dict:
-        """启动 NOTMYFAULT.pyw — os.startfile 完全独立，父进程退出后不受影响"""
+        """启动引擎。开发模式启动 NOTMYFAULT.pyw，exe 模式启动自身 --engine。"""
+        if getattr(sys, "frozen", False):
+            try:
+                import subprocess
+                subprocess.Popen([sys.executable])
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
         pyw = os.path.join(PROJECT_ROOT, "NOTMYFAULT.pyw")
         if not os.path.exists(pyw):
             return {"ok": False, "error": f"找不到 {pyw}"}
         try:
-            os.startfile(pyw)  # Windows 原生"双击打开"，与父进程彻底无关
+            os.startfile(pyw)
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
     def get_config(self) -> dict:
-        """读取配置（与引擎使用相同的加载逻辑，首次自动创建默认配置）"""
+        """直接读取 JSON 配置文件，文件不存在则返回默认规则"""
         try:
-            return get_config()
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
         except Exception as e:
             return {"_error": str(e), "rules": []}
+        return {"rules": []}
 
     def save_config(self, rules: list) -> dict:
-        """写入 %APPDATA%/NotmyFault/config.json"""
         try:
-            os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump({"rules": rules}, f, ensure_ascii=False, indent=4)
-            return {"ok": True}
+            from notmyfault.config import save_config as _save
+            ok = _save({"rules": rules})
+            return {"ok": ok}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    def stop_engine(self) -> dict:
-        """停止引擎（通过 bridge 代理 POST，避免 pywebview 的 CORS 限制）"""
+    def _get_api_token(self) -> str:
+        """读取 API 认证令牌"""
         try:
+            with open(API_TOKEN_FILE, "r") as f:
+                return f.read().strip()
+        except (OSError, IOError):
+            return ""
+
+    def _auth_request(self, path: str, method: str = "POST", data: dict = None) -> dict:
+        """发送带认证的 HTTP 请求"""
+        try:
+            token = self._get_api_token()
+            body = None
+            if data is not None:
+                import json as _j
+                body = _j.dumps(data).encode("utf-8")
             req = urllib.request.Request(
-                f"{API}/api/engine/stop", method="POST"
+                f"{API}{path}",
+                data=body,
+                method=method,
             )
+            if token:
+                req.add_header("Authorization", f"Bearer {token}")
+            if data is not None:
+                req.add_header("Content-Type", "application/json")
             return json.loads(urllib.request.urlopen(req, timeout=5).read())
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    def get_api_token(self) -> str:
+        """暴露给 JS bridge 的 API Token 读取方法"""
+        return self._get_api_token()
+
+    def stop_engine(self) -> dict:
+        return self._auth_request("/api/engine/stop")
 
     def shutdown_engine(self) -> dict:
         """彻底退出引擎进程"""
-        try:
-            req = urllib.request.Request(
-                f"{API}/api/engine/shutdown", method="POST"
-            )
-            return json.loads(urllib.request.urlopen(req, timeout=5).read())
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-
+        return self._auth_request("/api/engine/shutdown")
     def fetch_api(self, path: str) -> dict:
         """代理 API 请求"""
         try:
@@ -77,8 +105,69 @@ class DashboardAPI:
         except Exception as e:
             return {"_error": str(e)}
 
+    # ---- 日志读取 (bridge 直读文件，不依赖 API) ----
+
+    _LOG_DIR = os.path.join(os.path.dirname(CONFIG_FILE), "logs")
+
+    def _get_latest_log(self):
+        """返回最新日志文件路径，没有则返回 None。"""
+        from notmyfault.logging import get_latest_log
+        return get_latest_log(self._LOG_DIR)
+
+    def read_log_entries(self, lines: int = 500) -> list:
+        """读取最新日志末尾 N 行，返回解析后的结构化条目列表。"""
+        try:
+            from notmyfault.logging import read_log_entries as _read
+            log_path = self._get_latest_log()
+            if not log_path:
+                return [{"ts": "", "level": "INFO", "text": "还没有日志文件，请启动引擎", "data": None}]
+            return _read(log_path, lines=lines)
+        except Exception as e:
+            return [{"ts": "", "level": "ERROR", "text": f"读取日志失败: {e}", "data": None}]
+
+    def read_diagnostics(self) -> dict:
+        """从最新日志文件构建诊断摘要。"""
+        try:
+            from notmyfault.logging import read_log_entries as _read, build_diagnostics
+            log_path = self._get_latest_log()
+            if not log_path:
+                return {"error_count": 0, "warn_count": 0, "last_errors": ["还没有日志文件，请启动引擎"]}
+            entries = _read(log_path, lines=500)
+            return build_diagnostics(entries)
+        except Exception as e:
+            return {"error_count": 1, "last_errors": [str(e)]}
+
+    def read_log_raw(self, lines: int = 300) -> str:
+        """读取最新日志文件原始文本（供日志查看器使用）。"""
+        try:
+            log_path = self._get_latest_log()
+            if not log_path:
+                return "(还没有日志文件)\n\n请先启动引擎。"
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                all_lines = f.readlines()
+            if not all_lines:
+                return f"(日志为空)\n{log_path}"
+            return "".join(all_lines[-lines:])
+        except Exception as e:
+            return f"读取日志失败: {e}"
+
+    def list_log_files(self) -> list:
+        """列出所有日志文件信息。"""
+        try:
+            from notmyfault.logging import list_logs
+            return list_logs(self._LOG_DIR)
+        except Exception as e:
+            return []
+
 
 def main():
+    # 注册协议（幂等，每次启动都确保存在）
+    try:
+        from Win_toaster.AUMID_Register import register_protocol
+        register_protocol()
+    except Exception:
+        pass
+
     dashboard_path = os.path.join(PROJECT_ROOT, "dashboard.html")
     icon_path = os.path.join(PROJECT_ROOT, "logo.ico")
 
@@ -119,4 +208,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # 处理协议调用: notmyfault://dashboard
+    if "--protocol" in sys.argv:
+        print("[Dashboard] 通过协议启动")
     main()

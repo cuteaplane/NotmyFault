@@ -2,5 +2,7 @@
     "id": "lock_screen",
     "name": "锁定屏幕",
     "description": "立即锁定 Windows 工作站",
+    "version_code": 1,
+    "enabled": true,
     "params": []
 }

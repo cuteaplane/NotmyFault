@@ -3,6 +3,8 @@
     "name": "系统空闲检测",
     "semantic": "state",
     "description": "检测系统无键盘鼠标操作的闲置时间，在进入/退出空闲状态时触发",
+    "version_code": 1,
+    "enabled": true,
     "params": [
         {
             "name": "idle_seconds",

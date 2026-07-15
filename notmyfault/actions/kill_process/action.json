@@ -2,6 +2,8 @@
     "id": "kill_process",
     "name": "终止进程",
     "description": "按进程名终止运行中的进程",
+    "version_code": 1,
+    "enabled": true,
     "params": [
         {
             "name": "process_name",
