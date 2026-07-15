@@ -12,6 +12,7 @@ import secrets
 import os
 import queue
 import sys
+import asyncio
 import threading
 import time
 from pathlib import Path
@@ -70,7 +71,7 @@ class EngineAPI:
         self._server = None
         self._engine_ref = None
 
-        self.app = FastAPI(title="NotmyFault Engine API", version="1.0")
+        self.app = FastAPI(title="NotmyFault Engine API", version="alpha-0.10")
         self._setup_middleware()
         self._setup_routes()
         global API_TOKEN
