@@ -15,6 +15,9 @@ _ALLOWED_ORIGINS = {"builtin", "user", "third_party"}
 def validate_plugin_meta(
     meta: Dict[str, Any], plugin_type: str
 ) -> Tuple[bool, List[str]]:
+    if plugin_type not in ("trigger", "action", "triggers", "actions"):
+        return False, [f"未知插件类型: '{plugin_type}'（应为 trigger 或 action）"]
+
     errors: List[str] = []
 
     if not isinstance(meta, dict):
@@ -80,9 +83,10 @@ def validate_plugin_meta(
                 if ptype == "select" and "options" not in param:
                     errors.append(f"params[{i}] (type=select) 必须提供 'options' 字段")
 
+    is_trigger = plugin_type in ("trigger", "triggers")
     allowed_fields = (
         _REQUIRED_META_FIELDS | _TRIGGER_OPTIONAL_FIELDS
-        if plugin_type == "trigger"
+        if is_trigger
         else _REQUIRED_META_FIELDS | _ACTION_OPTIONAL_FIELDS
     )
     for key in meta:

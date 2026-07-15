@@ -63,7 +63,9 @@ class EngineAPI:
 
     def __init__(self, engine_runner: EngineRunnerLike):
         self._engine = engine_runner
-        self._subscribers: list[queue.Queue] = []
+        self._subscribers: list["asyncio.Queue"] = []
+
+        self._loop = None
         self._sub_lock = threading.Lock()
         self._server = None
         self._engine_ref = None
@@ -97,15 +99,16 @@ class EngineAPI:
 
     def push_event(self, event_type: str, data: Dict[str, Any]):
         packet = {"type": event_type, "data": data, "ts": time.time()}
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
         with self._sub_lock:
-            dead = []
-            for q in self._subscribers:
-                try:
-                    q.put_nowait(packet)
-                except queue.Full:
-                    dead.append(q)
-            for q in dead:
-                self._subscribers.remove(q)
+            subscribers = list(self._subscribers)
+        for q in subscribers:
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, packet)
+            except Exception:
+                pass
 
     # ---- 插件扫描 (供 /api/plugins 使用) --------------------------------
 
@@ -123,17 +126,44 @@ class EngineAPI:
         base = os.path.dirname(__file__)
         user_dir = self._get_user_plugins_dir()
 
+        config = self._load_config()
+        disabled = config.get("disabled_plugins", {})
+        if not isinstance(disabled, dict):
+            disabled = {"triggers": [], "actions": []}
+
         result: Dict[str, Dict] = {"triggers": {}, "actions": {}}
         for ptype in ("triggers", "actions"):
             json_name = "trigger.json" if ptype == "triggers" else "action.json"
-            # builtin
-            for pid, meta in scan_plugins(base, ptype, json_name).items():
-                meta["origin"] = meta.get("origin", "builtin")
+            disabled_set = set(disabled.get(ptype, []))
+
+            builtin_plugins = scan_plugins(base, ptype, json_name)
+            for pid, meta in builtin_plugins.items():
+                meta["origin"] = "builtin"
                 result[ptype][pid] = meta
-            # user
+
+            builtin_root = os.path.join(base, ptype)
+            if os.path.isdir(builtin_root):
+                for folder_name in sorted(os.listdir(builtin_root)):
+                    json_path = os.path.join(builtin_root, folder_name, json_name)
+                    if not os.path.exists(json_path):
+                        continue
+                    try:
+                        with open(json_path, "r", encoding="utf-8") as f:
+                            meta = json.load(f)
+                        pid = meta.get("id")
+                        if pid and pid not in result[ptype]:
+                            meta["origin"] = "builtin"
+                            result[ptype][pid] = meta
+                    except Exception:
+                        continue
+
+            for pid in disabled_set:
+                if pid in result[ptype]:
+                    result[ptype][pid]["enabled"] = False
+
             if os.path.isdir(user_dir):
                 for pid, meta in scan_plugins(user_dir, ptype, json_name).items():
-                    meta["origin"] = meta.get("origin", "user")
+                    meta["origin"] = "user"
                     result[ptype][pid] = meta
 
         # merge diagnostics (loaded status / errors)
@@ -155,21 +185,45 @@ class EngineAPI:
         user_dir = self._get_user_plugins_dir()
         json_name = "trigger.json" if ptype == "triggers" else "action.json"
 
-        for root in (base, user_dir):
-            json_path = os.path.join(root, ptype, pid, json_name)
-            if os.path.exists(json_path):
-                try:
-                    with open(json_path, "r", encoding="utf-8") as f:
-                        meta = json.load(f)
-                    meta["enabled"] = not meta.get("enabled", True)
-                    os.makedirs(os.path.dirname(json_path), exist_ok=True)
-                    with open(json_path, "w", encoding="utf-8") as f:
-                        json.dump(meta, f, ensure_ascii=False, indent=2)
-                    return {"ok": True, "enabled": meta["enabled"],
-                            "origin": "builtin" if root == base else "user",
-                            "restart_required": True}
-                except (json.JSONDecodeError, OSError) as e:
-                    return {"ok": False, "error": str(e)}
+        user_json = os.path.join(user_dir, ptype, pid, json_name)
+        if os.path.exists(user_json):
+            try:
+                with open(user_json, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                meta["enabled"] = not meta.get("enabled", True)
+                os.makedirs(os.path.dirname(user_json), exist_ok=True)
+                with open(user_json, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, ensure_ascii=False, indent=2)
+                return {"ok": True, "enabled": meta["enabled"],
+                        "origin": "user",
+                        "restart_required": True}
+            except (json.JSONDecodeError, OSError) as e:
+                return {"ok": False, "error": str(e)}
+
+        builtin_json = os.path.join(base, ptype, pid, json_name)
+        if os.path.exists(builtin_json):
+            try:
+                config = self._load_config()
+                disabled = config.get("disabled_plugins", {})
+                if not isinstance(disabled, dict):
+                    disabled = {"triggers": [], "actions": []}
+                disabled_list = disabled.get(ptype, [])
+                if pid in disabled_list:
+                    disabled_list.remove(pid)
+                    new_enabled = True
+                else:
+                    disabled_list.append(pid)
+                    new_enabled = False
+                disabled[ptype] = disabled_list
+                config["disabled_plugins"] = disabled
+                ok = self._save_config(config)
+                if not ok:
+                    return {"ok": False, "error": "无法保存配置"}
+                return {"ok": True, "enabled": new_enabled,
+                        "origin": "builtin",
+                        "restart_required": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
 
         return {"ok": False, "error": "插件不存在"}
 
@@ -230,7 +284,9 @@ class EngineAPI:
             await self._verify_auth(request)
             print("[API] POST /api/engine/start")
             if self._engine.engine_running:
-                return {"ok": True, "running": True, "message": "already_running"}
+                return {"ok": True, "running": self._engine.engine_running,
+
+                "api_alive": True, "message": "already_running"}
 
             self._engine._start_engine_core()
             return {"ok": True, "running": self._engine.engine_running}
@@ -260,7 +316,9 @@ class EngineAPI:
             config = self._load_config()
             rules = config.get("rules", [])
             return {
-                "running": True,
+                "running": self._engine.engine_running,
+
+                "api_alive": True,
                 "engine_running": self._engine.engine_running,
                 "pid": os.getpid(),
                 "rules_count": len(rules),
@@ -295,8 +353,10 @@ class EngineAPI:
                     status_code=400,
                 )
 
+            existing_config = self._load_config()
             new_config = {
                 "rules": body.get("rules", []),
+                "disabled_plugins": existing_config.get("disabled_plugins", {"triggers": [], "actions": []}),
             }
 
             ok = self._save_config(new_config)
@@ -339,71 +399,106 @@ class EngineAPI:
         @app.post("/api/plugins/install")
         async def plugin_install(request: Request):
             await self._verify_auth(request)
-            import tempfile, zipfile, shutil
+            import tempfile, shutil, py7zr
             form = await request.form()
             file = form.get("file")
+            password = form.get("password", "")
             if not file:
                 return JSONResponse({"ok": False, "error": "缺少上传文件"}, status_code=400)
 
             data = await file.read()
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".nmfp")
+            extract_dir = None
             try:
                 tmp.write(data)
                 tmp.close()
-                with zipfile.ZipFile(tmp.name, "r") as zf:
-                    names = zf.namelist()
-                    # 找根目录名
-                    roots = set(n.split("/")[0] for n in names if "/" in n)
-                    if len(roots) != 1:
-                        return JSONResponse({"ok": False, "error": "zip 根目录应恰好有一个插件文件夹"}, status_code=400)
-                    root_name = roots.pop()
 
-                    # 确定是 trigger 还是 action
-                    has_trigger = f"{root_name}/trigger.json" in names
-                    has_action = f"{root_name}/action.json" in names
-                    if has_trigger:
-                        ptype, json_name = "triggers", "trigger.json"
-                    elif has_action:
-                        ptype, json_name = "actions", "action.json"
-                    else:
-                        return JSONResponse({"ok": False, "error": "zip 中未找到 trigger.json 或 action.json"}, status_code=400)
+                extract_dir = tempfile.mkdtemp()
+                with py7zr.SevenZipFile(tmp.name, mode="r", password=password or None) as zf:
+                    zf.extractall(extract_dir)
 
-                    # 校验 metadata
-                    try:
-                        meta = json.loads(zf.read(f"{root_name}/{json_name}"))
-                    except (json.JSONDecodeError, KeyError):
-                        return JSONResponse({"ok": False, "error": "插件元数据 JSON 损坏或缺失"}, status_code=400)
+                # 找插件根目录：优先单文件夹，兼容文件平铺的打包方式
+                entries = os.listdir(extract_dir)
+                dirs = [d for d in entries if os.path.isdir(os.path.join(extract_dir, d))]
+                if len(dirs) == 1:
+                    root_path = os.path.join(extract_dir, dirs[0])
+                elif len(dirs) == 0:
+                    # 文件直接平铺在 archive 根目录
+                    root_path = extract_dir
+                else:
+                    return JSONResponse({"ok": False, "error": "nmfp 根目录应恰好有一个插件文件夹"}, status_code=400)
 
-                    from notmyfault.plugin_schema import validate_plugin_meta
-                    ok, errors = validate_plugin_meta(meta, ptype)
-                    if not ok:
-                        return JSONResponse({"ok": False, "error": "schema 校验失败: " + "; ".join(errors[:3])}, status_code=400)
+                # 确定类型
+                has_trigger = os.path.exists(os.path.join(root_path, "trigger.json"))
+                has_action = os.path.exists(os.path.join(root_path, "action.json"))
+                if has_trigger:
+                    ptype, json_name = "triggers", "trigger.json"
+                elif has_action:
+                    ptype, json_name = "actions", "action.json"
+                else:
+                    return JSONResponse({"ok": False, "error": "未找到 trigger.json 或 action.json"}, status_code=400)
 
-                    pid = meta.get("id", root_name)
-                    user_dir = self._get_user_plugins_dir()
-                    dest = os.path.join(user_dir, ptype, pid)
-                    if os.path.exists(dest):
-                        return JSONResponse({"ok": False, "error": f"插件 '{pid}' 已存在"}, status_code=400)
+                # 校验 metadata
+                try:
+                    with open(os.path.join(root_path, json_name), "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    return JSONResponse({"ok": False, "error": "插件元数据 JSON 损坏或缺失"}, status_code=400)
 
-                    os.makedirs(dest, exist_ok=True)
-                    for member in zf.namelist():
-                        rel = os.path.relpath(member, root_name)
-                        if rel == "." or rel.startswith(".."):
-                            continue
-                        target = os.path.join(dest, rel)
-                        if member.endswith("/"):
-                            os.makedirs(target, exist_ok=True)
-                        else:
-                            os.makedirs(os.path.dirname(target), exist_ok=True)
-                            with zf.open(member) as src, open(target, "wb") as dst:
-                                dst.write(src.read())
+                from notmyfault.plugin_schema import validate_plugin_meta
+                plugin_type = "trigger" if ptype == "triggers" else "action"
+                ok, errors = validate_plugin_meta(meta, plugin_type)
+                if not ok:
+                    return JSONResponse({"ok": False, "error": "schema 校验失败: " + "; ".join(errors[:3])}, status_code=400)
 
-                    return {"ok": True, "id": pid, "type": ptype, "restart_required": True}
+                pid = meta.get("id", os.path.basename(root_path))
+                user_dir = self._get_user_plugins_dir()
+                dest = os.path.join(user_dir, ptype, pid)
+                if os.path.exists(dest):
+                    return JSONResponse({"ok": False, "error": f"插件 '{pid}' 已存在"}, status_code=400)
+
+                # 签名
+                priv_key_path = os.path.join(os.path.dirname(__file__), "..", ".private", "signing_private_key.pem")
+                if not os.path.exists(priv_key_path):
+                    return JSONResponse({"ok": False, "error": "私钥不存在，请先运行 build.py init-keys"}, status_code=400)
+
+                try:
+                    from notmyfault.signing import sign_plugin, load_private_key
+                    from pathlib import Path
+                    pk = load_private_key(Path(priv_key_path), password=password or None)
+                    sign_plugin(Path(root_path), json_name, pk)
+                except Exception as e:
+                    err = str(e)
+                    if "password" in err.lower() or "bad decrypt" in err.lower():
+                        return JSONResponse({"ok": False, "error": "私钥密码错误"}, status_code=400)
+                    return JSONResponse({"ok": False, "error": "签名失败: " + err}, status_code=400)
+
+                # 复制到 user plugins
+                os.makedirs(dest, exist_ok=True)
+                for fname in os.listdir(root_path):
+                    src = os.path.join(root_path, fname)
+                    dst = os.path.join(dest, fname)
+                    if os.path.isfile(src):
+                        shutil.copy2(src, dst)
+
+                return {"ok": True, "id": pid, "type": ptype, "restart_required": True}
             finally:
                 try:
                     os.unlink(tmp.name)
-                except OSError:
+                except Exception:
                     pass
+                if extract_dir:
+                    shutil.rmtree(extract_dir, ignore_errors=True)
+
+        @app.get("/api/plugins/key-status")
+        async def plugin_key_status():
+            priv = os.path.join(os.path.dirname(__file__), "..", ".private", "signing_private_key.pem")
+            if not os.path.exists(priv):
+                return {"exists": False, "encrypted": False}
+            with open(priv, "rb") as f:
+                header = f.read(20)
+            encrypted = header.startswith(b"-----BEGIN ENCRYPTED")
+            return {"exists": True, "encrypted": encrypted}
 
         @app.delete("/api/plugins/{ptype}/{pid}")
         async def plugin_uninstall(ptype: str, pid: str, request: Request):
@@ -448,32 +543,23 @@ class EngineAPI:
         @app.get("/api/events")
         async def event_stream(request: Request):
             async def generate():
-                client_queue: queue.Queue = queue.Queue(maxsize=200)
+                import asyncio
+                client_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+                self._loop = asyncio.get_running_loop()
                 with self._sub_lock:
                     self._subscribers.append(client_queue)
 
                 try:
-                    import asyncio
-                    loop = asyncio.get_event_loop()
-
                     while True:
                         if await request.is_disconnected():
                             break
 
-                        drained = False
-                        while True:
-                            try:
-                                event = client_queue.get_nowait()
-                                drained = True
-                                yield f"event: {event['type']}\n"
-                                yield f"data: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
-                            except queue.Empty:
-                                break
-
-                        if drained:
-                            continue
-
-                        await asyncio.sleep(0.5)
+                        try:
+                            event = await asyncio.wait_for(client_queue.get(), timeout=15)
+                            yield f"event: {event['type']}\n"
+                            yield f"data: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
+                        except asyncio.TimeoutError:
+                            yield ": keepalive\n\n"
                 finally:
                     with self._sub_lock:
                         if client_queue in self._subscribers:

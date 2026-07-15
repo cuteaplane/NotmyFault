@@ -137,7 +137,7 @@ def run(meta, config_list, emit_event, shutdown_event):
 
     while not shutdown_event.is_set():
         try:
-            time.sleep(3)
+            shutdown_event.wait(3)
             scan_count += 1
 
             current_devices, errors = _get_connected_devices()

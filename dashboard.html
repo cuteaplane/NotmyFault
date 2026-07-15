@@ -559,6 +559,7 @@ input:focus, select:focus {
   color: var(--md-on-surface-variant);
   display: -webkit-box;
   -webkit-line-clamp: 2;
+  line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
@@ -600,7 +601,6 @@ input:focus, select:focus {
 
 /* ============================================================
    Utility
-   ============================================================ */
    ============================================================ */
 .spacer { flex: 1; }
 .snackbar {
@@ -802,14 +802,30 @@ input:focus, select:focus {
 
     <dialog id="installDialog" style="border:1px solid var(--md-outline-variant);border-radius:var(--md-shape-lg);padding:32px;max-width:440px;width:90%;background:var(--md-surface-container-lowest);color:var(--md-on-surface);">
       <h3 style="font:var(--md-typescale-title);margin-bottom:8px;">安装插件</h3>
-      <p style="font:var(--md-typescale-body);color:var(--md-on-surface-variant);margin-bottom:20px;">选择一个 .zip 文件，包含插件文件夹。</p>
+      <p style="font:var(--md-typescale-body);color:var(--md-on-surface-variant);margin-bottom:20px;">选择一个 .nmfp 文件（7z 打包的插件文件夹）。</p>
       <div style="border:2px dashed var(--md-outline-variant);border-radius:var(--md-shape-sm);padding:28px;text-align:center;margin-bottom:16px;cursor:pointer;" id="dropZone">
         <span class="material-symbols-outlined" style="font-size:48px;color:var(--md-outline);margin-bottom:8px;display:block;">upload_file</span>
-        <span style="font:var(--md-typescale-label-sm);color:var(--md-on-surface-variant);">拖拽 .zip 到此处或点击选择</span>
-        <input type="file" id="installFileInput" accept=".zip" style="display:none;" onchange="installPlugin(this.files[0])">
+        <span style="font:var(--md-typescale-label-sm);color:var(--md-on-surface-variant);">拖拽 .nmfp 到此处或点击选择</span>
+        <input type="file" id="installFileInput" accept=".nmfp" style="display:none;" onchange="installPlugin(this.files[0])">
       </div>
       <div style="display:flex;gap:8px;justify-content:flex-end;">
         <button class="btn btn-text" onclick="document.getElementById('installDialog').close()">取消</button>
+      </div>
+    </dialog>
+
+    <dialog id="keyDialog" style="border:1px solid var(--md-outline-variant);border-radius:var(--md-shape-lg);padding:32px;max-width:400px;width:90%;background:var(--md-surface-container-lowest);color:var(--md-on-surface);text-align:center;">
+      <span class="material-symbols-outlined" style="font-size:48px;color:var(--md-primary);margin-bottom:12px;display:block;">key</span>
+      <h3 style="font:var(--md-typescale-title);margin-bottom:4px;">NotmyFault 安装密钥</h3>
+      <div style="display:flex;align-items:center;justify-content:center;gap:6px;margin-bottom:20px;color:var(--md-on-surface-variant);">
+        <span class="material-symbols-outlined" style="font-size:14px;">info</span>
+        <span style="font:var(--md-typescale-label-sm);">NotmyFault 安装密钥是您在安装 NotmyFault 时输入的密钥。</span>
+      </div>
+      <form onsubmit="submitKeyDialog();return false" style="text-align:left;margin-bottom:20px;">
+        <input type="password" id="keyDialogPassword" placeholder="输入密钥" style="width:100%;font-size:16px;text-align:center;">
+      </form>
+      <div style="display:flex;gap:8px;justify-content:flex-end;">
+        <button class="btn btn-text" onclick="document.getElementById('keyDialog').close()">取消</button>
+        <button class="btn btn-filled" onclick="submitKeyDialog()">确认</button>
       </div>
     </dialog>
   </section>
@@ -1278,14 +1294,42 @@ async function uninstallPlugin(ptype, pid) {
   }
 }
 
-function showInstallDialog() {
-  document.getElementById('installDialog').showModal();
+let _installPassword = '';
+let _keyResolve = null;
+
+async function showInstallDialog() {
+  const dialog = document.getElementById('installDialog');
+  try {
+    const res = await fetch(API + '/api/plugins/key-status');
+    const ks = await res.json();
+    if (ks.encrypted) {
+      _installPassword = '';
+      // 弹出密钥对话框,等待用户输入后 resolve 再打开安装窗口
+      await new Promise(function(resolve) {
+        _keyResolve = resolve;
+        document.getElementById('keyDialogPassword').value = '';
+        document.getElementById('keyDialog').showModal();
+      });
+    }
+  } catch (e) {
+    _installPassword = '';
+  }
+  dialog.showModal();
+}
+
+function submitKeyDialog() {
+  const pw = document.getElementById('keyDialogPassword').value.trim();
+  if (!pw) return;
+  _installPassword = pw;
+  document.getElementById('keyDialog').close();
+  if (_keyResolve) { _keyResolve(); _keyResolve = null; }
 }
 
 async function installPlugin(file) {
   if (!file) return;
   const formData = new FormData();
   formData.append('file', file);
+  if (_installPassword) formData.append('password', _installPassword);
   try {
     const res = await _apiWrite('/api/plugins/install', 'POST', formData, true);
     const data = await res.json();

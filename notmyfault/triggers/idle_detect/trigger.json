@@ -13,6 +13,5 @@
             "default": "300",
             "placeholder": "空闲多少秒后触发（默认300秒=5分钟）"
         }
-    ],
-    "origin": "builtin"
+    ]
 }

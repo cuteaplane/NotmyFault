@@ -54,12 +54,10 @@ def run(trigger_info, config_list, emit_event, shutdown_event):
             if current_state != last_states[process_name]:
                 last_states[process_name] = current_state
                 raw_name = original_names.get(process_name, process_name)
-                # 始终发出带 .exe 后缀的标准化名称，避免与规则中的 "XXX.exe" 匹配不上
-                emit_name = raw_name if raw_name.lower().endswith('.exe') else raw_name + '.exe'
-                print(f"[Trigger:{trigger_id}] {emit_name} 状态变化: {current_state}")
+                print(f"[Trigger:{trigger_id}] {raw_name} 状态变化: {current_state}")
                 emit_event(trigger_id, {
-                    "process_name": emit_name,
+                    "process_name": raw_name,
                     "state": current_state,
                 })
 
-        time.sleep(poll_interval)
+        shutdown_event.wait(poll_interval)

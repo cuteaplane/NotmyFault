@@ -13,6 +13,5 @@
             "default": "22:00",
             "placeholder": "HH:MM 格式，如 08:30、22:00"
         }
-    ],
-    "origin": "builtin"
+    ]
 }

@@ -70,15 +70,18 @@ class DashboardAPI:
         """发送带认证的 HTTP 请求"""
         try:
             token = self._get_api_token()
+            body = None
+            if data is not None:
+                import json as _j
+                body = _j.dumps(data).encode("utf-8")
             req = urllib.request.Request(
                 f"{API}{path}",
+                data=body,
                 method=method,
             )
             if token:
                 req.add_header("Authorization", f"Bearer {token}")
             if data is not None:
-                import json as _j
-                req.data = _j.dumps(data).encode("utf-8")
                 req.add_header("Content-Type", "application/json")
             return json.loads(urllib.request.urlopen(req, timeout=5).read())
         except Exception as e:

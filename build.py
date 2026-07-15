@@ -45,7 +45,7 @@ def _save_private_key(key, path: Path, encrypt: bool = False) -> None:
             raise SystemExit(1)
         encryption = BestAvailableEncryption(pw.encode())
     else:
-        encryption = NoEncryption
+        encryption = NoEncryption()
     pem = key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, encryption)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as f:
@@ -54,28 +54,11 @@ def _save_private_key(key, path: Path, encrypt: bool = False) -> None:
     print(f"+ 私钥{status}: {path}")
 
 
-def _load_private_key(path: Path):
-    """加载私钥（自动识别加密/明文，兼容旧版 Raw 格式）。"""
-    _, _, _, _, _, _, _, _, _, load_pem_private_key, Ed25519PrivateKey = _get_crypto()
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-    except OSError:
-        print(f"! 无法读取私钥文件: {path}")
-        raise SystemExit(1)
-
-    if data.startswith(b"-----BEGIN "):
-        try:
-            return load_pem_private_key(data, password=None)
-        except Exception:
-            pw = _prompt_passphrase()
-            if pw is None:
-                raise SystemExit(1)
-            return load_pem_private_key(data, password=pw.encode())
-
-    # 旧版 Raw 格式（明文，无加密）
-    print("  检测到旧版明文私钥，将在下次 init-keys --force 时迁移")
-    return Ed25519PrivateKey.from_private_bytes(data)
+try:
+    from notmyfault.signing import load_private_key, sign_plugin
+except ImportError:
+    print("! 无法导入签名模块，请确保项目结构完整", file=sys.stderr)
+    raise SystemExit(1)
 
 def _collect_plugins():
     """返回所有插件目录列表 [(plugin_dir, main_json_name), ...]"""
@@ -151,24 +134,14 @@ def cmd_sign(args):
     if not PRIVATE_KEY_FILE.exists():
         print("! 私钥不存在，请先运行 build.py init-keys")
         return
-    
-    private_key = _load_private_key(PRIVATE_KEY_FILE)
-    public_key = private_key.public_key()
-    
+
+    private_key = load_private_key(PRIVATE_KEY_FILE)
     plugins = _collect_plugins()
     signed = 0
     for plugin_dir, json_name in plugins:
-        files = _plugin_files(plugin_dir, json_name)
-        payload = b""
-        for f in files:
-            payload += f.read_bytes()
-        digest = hashlib.sha256(payload).digest()
-        sig = private_key.sign(digest)
-        sig_file = plugin_dir / "signature.sig"
-        with open(sig_file, "wb") as f:
-            f.write(sig)
+        sign_plugin(plugin_dir, json_name, private_key)
         plugin_id = json.loads((plugin_dir / json_name).read_text(encoding="utf-8")).get("id", plugin_dir.name)
-        print(f"  + {plugin_id:20s} signed ({len(files)} files)")
+        print(f"  + {plugin_id:20s} signed ({len(_plugin_files(plugin_dir, json_name))} files)")
         signed += 1
     print(f"已签名 {signed} 个插件")
 

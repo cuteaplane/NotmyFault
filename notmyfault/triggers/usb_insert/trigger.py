@@ -52,4 +52,4 @@ def run(meta, config_list, emit_event, shutdown_event):
             print(f"[Trigger:{trigger_id}] 哎呀，扫描U盘的时候报错啦: {e}")
 
         # 每3秒扫描一次就足够啦
-        time.sleep(3)
+        shutdown_event.wait(3)

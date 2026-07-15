@@ -8,6 +8,10 @@ import sys
 from typing import Any, Dict, List
 
 DEFAULT_CONFIG: Dict[str, Any] = {
+    "disabled_plugins": {
+        "triggers": [],
+        "actions": []
+    },
     "rules": [
         {
             "name": "微信音量规则",
@@ -322,9 +326,12 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
             if "trigger" in rule and "event" not in rule:
                 copied = dict(rule)
                 copied["event"] = copied.pop("trigger")
+                _inject_condition(copied)
                 normalized_rules.append(copied)
             else:
-                normalized_rules.append(rule)
+                copied = dict(rule)
+                _inject_condition(copied)
+                normalized_rules.append(copied)
 
         result = dict(config)
         result["rules"] = normalized_rules
@@ -344,8 +351,7 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         volume_action = process.get("volume_action", "max")
         notification = process.get("notification", {}) or {}
 
-        rules.append(
-            {
+        _rule = {
                 "name": f"{software_name} 音量规则",
                 "event": {
                     "type": "process_state",
@@ -365,11 +371,26 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
                     }
                 ]
             }
-        )
 
     result = {k: v for k, v in config.items() if k != "processes"}
     result["rules"] = rules
     return result if rules else config
+
+
+
+def _inject_condition(rule: Dict[str, Any]) -> None:
+    """为旧格式 rule 注入 condition 字段。
+    旧: {"event": {...}} -> 新: {"condition": {"type": "or", "events": [{...}]}}
+    """
+    if "condition" in rule:
+        return
+    event = rule.get("event") or rule.get("trigger")
+    if event is None:
+        return
+    rule["condition"] = {
+        "type": "or",
+        "events": [event],
+    }
 
 
 def get_config() -> Dict[str, Any]:

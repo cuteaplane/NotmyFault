@@ -288,6 +288,38 @@ class AutomationEngine:
         }
 
     # ------------------------------------------------------------------
+    # 条件匹配助手
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_rule_events(rule: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """从规则中提取所有事件条件。
+
+        新格式: rule.condition.events → event列表
+        旧格式: rule.event → 单个事件包装为列表
+        """
+        condition = rule.get("condition")
+        if condition is not None and isinstance(condition, dict):
+            events = condition.get("events", [])
+            if isinstance(events, list) and events:
+                return events
+        event = rule.get("event") or rule.get("trigger")
+        if event and isinstance(event, dict):
+            return [event]
+        return []
+
+    @staticmethod
+    def _check_event_params(event_def: Dict[str, Any], event_payload: Dict[str, Any]) -> bool:
+        """检查事件payload是否匹配事件定义的参数。"""
+        expected_params = event_def.get("params", {})
+        for key, expected_val in expected_params.items():
+            if event_payload.get(key) != expected_val:
+                return False
+        return True
+
+
+
+    # ------------------------------------------------------------------
     # 插件加载
     # ------------------------------------------------------------------
 
@@ -449,6 +481,16 @@ class AutomationEngine:
                     f"[Engine] 插件 \"{plugin_id}\" ({meta['name']}) 已禁用，跳过"
                 )
                 continue
+
+            if origin == "builtin":
+                disabled_cfg = self.config.get("disabled_plugins", {})
+                ptype_key = "triggers" if store_name == "Trigger" else "actions"
+                disabled_list = disabled_cfg.get(ptype_key, []) if isinstance(disabled_cfg, dict) else []
+                if plugin_id in disabled_list:
+                    print(
+                        f"[Engine] 插件 \"{plugin_id}\" ({meta["name"]}) 已被用户禁用，跳过"
+                    )
+                    continue
 
             # --- Python 模块加载 ---
             module_name = f"{module_prefix}{plugin_id}"
@@ -618,18 +660,20 @@ class AutomationEngine:
         valid_count = 0
         for i, rule in enumerate(rules):
             rule_name = rule.get("name", f"规则 #{i+1}")
-            event = rule.get("event", {}) or rule.get("trigger", {})
-            event_type = event.get("type", "")
-
-            # 检查 event 引用的触发器是否存在
-            if event_type and event_type not in self.triggers_meta:
-                issue = f"引用了未加载的触发器: {event_type}"
-                print(
-                    f"[Engine] [!!] 规则 \"{rule_name}\" {issue}",
-                    file=sys.stderr,
-                )
-                self._diag["rule_issues"].append((rule_name, issue))
-                engine_error("rule_issue", rule=rule_name, issue=issue)
+            rule_events = self._get_rule_events(rule)
+            all_events_valid = True
+            for event_def in rule_events:
+                event_type = event_def.get("type", "")
+                if event_type and event_type not in self.triggers_meta:
+                    issue = f"引用了未加载的触发器: {event_type}"
+                    print(
+                        f"[Engine] [!!] 规则 \"{rule_name}\" {issue}",
+                        file=sys.stderr,
+                    )
+                    self._diag["rule_issues"].append((rule_name, issue))
+                    engine_error("rule_issue", rule=rule_name, issue=issue)
+                    all_events_valid = False
+            if not all_events_valid:
                 continue
 
             rule_ok = True
@@ -740,19 +784,17 @@ class AutomationEngine:
             rules_snapshot = list(self.rules)
 
         for rule in rules_snapshot:
-            rule_event = rule.get("event", {}) or rule.get("trigger", {})
-            if rule_event.get("type") != event_type:
-                continue
-
-            expected_params = rule_event.get("params", {})
-            is_match = True
-            for key, expected_val in expected_params.items():
-                actual_val = event_payload.get(key)
-                if expected_val != actual_val:
-                    is_match = False
+            events = self._get_rule_events(rule)
+            matched = False
+            for event_def in events:
+                if event_def.get("type") != event_type:
+                    continue
+                if self._check_event_params(event_def, event_payload):
+                    matched = True
                     break
-
-            if is_match:
+            if not matched:
+                continue
+            
                 rule_name = rule.get("name", "未命名规则")
                 print(f"[EventBus] [OK] 匹配到规则: <{rule_name}>, 准备分发动作！")
                 if self.on_event:
@@ -867,11 +909,12 @@ class AutomationEngine:
 
         aggregated: Dict[str, List[Dict[str, Any]]] = {}
         for rule in rules:
-            event = rule.get("event", {}) or rule.get("trigger", {})
-            event_type = event.get("type")
-            if not event_type:
-                continue
-            aggregated.setdefault(event_type, []).append(event.get("params", {}))
+            rule_events = self._get_rule_events(rule)
+            for event_def in rule_events:
+                event_type = event_def.get("type")
+                if not event_type:
+                    continue
+                aggregated.setdefault(event_type, []).append(event_def.get("params", {}))
 
         missing = [et for et in aggregated if et not in self.triggers_funcs]
         if missing:
