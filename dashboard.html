@@ -1015,9 +1015,45 @@ function renderUI() {
 
     // Trigger
     const currentTrigger = rule.event?.type;
-    html += `<div class="rule-section">
-      <div class="rule-section-title"><span class="material-symbols-outlined">memory</span> 触发事件</div>
-      <div class="input-row">`;
+    // Trigger / Condition (OR)
+    if (rule.condition) {
+      html += `<div class="rule-section">
+        <div class="rule-section-title" style="justify-content:space-between;">
+          <span><span class="material-symbols-outlined">alt_route</span> 触发条件 (OR)</span>
+          <button class="btn btn-text" onclick="addEventCondition(${rIdx})" style="font-size:12px;padding:4px 8px;">
+            <span class="material-symbols-outlined" style="font-size:16px;">add</span> 添加条件
+          </button>
+        </div>`;
+      (rule.condition.events || []).forEach((evt, eIdx) => {
+        html += `<div class="input-row" style="border:1px solid var(--md-outline-variant);border-radius:8px;padding:8px;margin:8px 0;">`;
+        html += `<div class="input-group" style="flex:0.5;min-width:160px;"><label>触发器 ${eIdx+1}</label><select onchange="changeConditionTrigger(${rIdx}, ${eIdx}, this.value)">`;
+        Object.keys(schema.triggers).forEach(tKey => {
+          const tMeta = schema.triggers[tKey];
+          const tName = tMeta.name || tKey;
+          html += `<option value="${esc(tKey)}" ${evt.type === tKey ? 'selected' : ''}>${esc(tName)}</option>`;
+        });
+        html += `</select><button class="icon-btn danger" onclick="removeEventCondition(${rIdx}, ${eIdx})" title="移除"><span class="material-symbols-outlined">close</span></button></div>`;
+        const tDefs = getParamDefs(schema.triggers[evt.type]);
+        tDefs.forEach(pDef => {
+          const curVal = (evt.params) ? evt.params[pDef.name] : null;
+          html += renderParamInput(pDef, curVal,
+            `updateConditionEventParam(${rIdx}, ${eIdx}, '${esc(pDef.name)}', this${pDef.type === 'select' ? '.value' : '.value'})`);
+        });
+        html += `</div>`;
+      });
+      html += `<button class="btn btn-text" onclick="toggleEventMode(${rIdx})" style="font-size:12px;margin-top:4px;">
+        <span class="material-symbols-outlined">swap_horiz</span> 切换到单事件模式
+      </button></div>`;
+    } else {
+      html += `<div class="rule-section">
+        <div class="rule-section-title" style="justify-content:space-between;">
+          <span><span class="material-symbols-outlined">memory</span> 触发事件</span>
+          <button class="btn btn-text" onclick="toggleEventMode(${rIdx})" style="font-size:12px;padding:4px 8px;">
+            <span class="material-symbols-outlined">alt_route</span> 改用 OR 条件
+          </button>
+        </div>
+        <div class="input-row">`;
+    const currentTrigger = rule.event?.type;
     html += `<div class="input-group" style="flex:0.5;min-width:160px;"><label>选择触发器</label><select onchange="changeTrigger(${rIdx}, this.value)">`;
     Object.keys(schema.triggers).forEach(tKey => {
       const tMeta = schema.triggers[tKey];
@@ -1034,6 +1070,7 @@ function renderUI() {
         `updateEventParam(${rIdx}, '${esc(pDef.name)}', this${pDef.type === 'select' ? '.value' : '.value'})`);
     });
     html += `</div></div>`;
+    }
 
     // Actions
     html += `<div class="rule-section">
@@ -1111,6 +1148,46 @@ function addAction(rIdx) {
   const defaultAction = Object.keys(schema.actions)[0] || "unknown";
   configData.rules[rIdx].actions.push({ type: defaultAction, params: {} });
   changeAction(rIdx, configData.rules[rIdx].actions.length - 1, defaultAction);
+}
+// ---- OR condition ---- 
+function addEventCondition(rIdx) {
+  const keys = Object.keys(schema.triggers);
+  const first = keys[0] || "";
+  if (!configData.rules[rIdx].condition) configData.rules[rIdx].condition = {type:"or",events:[]};
+  configData.rules[rIdx].condition.events.push({type:first,params:buildDefaultParams(schema.triggers[first])});
+  renderUI();
+}
+function removeEventCondition(rIdx, eIdx) {
+  const cond = configData.rules[rIdx].condition;
+  if (cond) {
+    cond.events.splice(eIdx,1);
+    if (!cond.events.length) delete configData.rules[rIdx].condition;
+  }
+  renderUI();
+}
+function changeConditionTrigger(rIdx,eIdx,newType) {
+  const cond = configData.rules[rIdx].condition;
+  if (cond&&cond.events[eIdx]) cond.events[eIdx] = {type:newType,params:buildDefaultParams(schema.triggers[newType])};
+  renderUI();
+}
+function updateConditionEventParam(rIdx,eIdx,key,val) {
+  const cond = configData.rules[rIdx].condition;
+  if (cond&&cond.events[eIdx]) {
+    if (!cond.events[eIdx].params) cond.events[eIdx].params = {};
+    cond.events[eIdx].params[key] = val;
+  }
+}
+function toggleEventMode(rIdx) {
+  const rule = configData.rules[rIdx];
+  if (rule.condition) {
+    const first = (rule.condition.events||[])[0];
+    rule.event = first ? {type:first.type,params:{...first.params}} : {type:"",params:{}};
+    delete rule.condition;
+  } else if (rule.event) {
+    rule.condition = {type:"or",events:[{type:rule.event.type,params:{...rule.event.params}}]};
+    delete rule.event;
+  }
+  renderUI();
 }
 function addRule() {
   const defaultTrigger = Object.keys(schema.triggers)[0] || "unknown";

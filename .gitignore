@@ -38,3 +38,5 @@ tests/
 .coverage
 .private/
 build.json
+_patch_dash.py
+
