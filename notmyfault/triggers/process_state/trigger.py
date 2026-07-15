@@ -62,4 +62,4 @@ def run(trigger_info, config_list, emit_event, shutdown_event):
                     "state": current_state,
                 })
 
-        time.sleep(poll_interval)
+        shutdown_event.wait(poll_interval)

@@ -39,4 +39,4 @@ def run(meta, config_list, emit_event, shutdown_event):
         except Exception as e:
             print(f"[Trigger:{trigger_id}] 检查出错: {e}")
 
-        time.sleep(30)
+        shutdown_event.wait(30)

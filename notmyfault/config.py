@@ -8,6 +8,10 @@ import sys
 from typing import Any, Dict, List
 
 DEFAULT_CONFIG: Dict[str, Any] = {
+    "disabled_plugins": {
+        "triggers": [],
+        "actions": [],
+    },
     "rules": [
         {
             "name": "微信音量规则",

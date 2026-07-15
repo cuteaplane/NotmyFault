@@ -13,6 +13,5 @@
             "default": "ANY",
             "placeholder": "ANY 匹配任意盘符，或指定如 E:"
         }
-    ],
-    "origin": "builtin"
+    ]
 }

@@ -4,6 +4,5 @@
     "description": "立即锁定 Windows 工作站",
     "version_code": 1,
     "enabled": true,
-    "params": [],
-    "origin": "builtin"
+    "params": []
 }

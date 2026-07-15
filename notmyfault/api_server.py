@@ -10,7 +10,6 @@ NotmyFault HTTP API 服务器
 import json
 import secrets
 import os
-import queue
 import sys
 import threading
 import time
@@ -63,7 +62,7 @@ class EngineAPI:
 
     def __init__(self, engine_runner: EngineRunnerLike):
         self._engine = engine_runner
-        self._subscribers: list[queue.Queue] = []
+        self._subscribers: list[tuple[Any, Any]] = []
         self._sub_lock = threading.Lock()
         self._server = None
         self._engine_ref = None
@@ -98,14 +97,21 @@ class EngineAPI:
     def push_event(self, event_type: str, data: Dict[str, Any]):
         packet = {"type": event_type, "data": data, "ts": time.time()}
         with self._sub_lock:
-            dead = []
-            for q in self._subscribers:
+            subscribers = list(self._subscribers)
+
+        for loop, q in subscribers:
+            def _push(target=q):
                 try:
-                    q.put_nowait(packet)
-                except queue.Full:
-                    dead.append(q)
-            for q in dead:
-                self._subscribers.remove(q)
+                    target.put_nowait(packet)
+                except Exception:
+                    pass
+
+            try:
+                loop.call_soon_threadsafe(_push)
+            except RuntimeError:
+                with self._sub_lock:
+                    if (loop, q) in self._subscribers:
+                        self._subscribers.remove((loop, q))
 
     # ---- 插件扫描 (供 /api/plugins 使用) --------------------------------
 
@@ -122,6 +128,7 @@ class EngineAPI:
     def _list_all_plugins(self) -> Dict[str, Any]:
         base = os.path.dirname(__file__)
         user_dir = self._get_user_plugins_dir()
+        disabled_plugins = self._load_config().get("disabled_plugins", {})
 
         result: Dict[str, Dict] = {"triggers": {}, "actions": {}}
         for ptype in ("triggers", "actions"):
@@ -129,6 +136,8 @@ class EngineAPI:
             # builtin
             for pid, meta in scan_plugins(base, ptype, json_name).items():
                 meta["origin"] = meta.get("origin", "builtin")
+                if pid in disabled_plugins.get(ptype, []):
+                    meta["enabled"] = False
                 result[ptype][pid] = meta
             # user
             if os.path.isdir(user_dir):
@@ -155,7 +164,7 @@ class EngineAPI:
         user_dir = self._get_user_plugins_dir()
         json_name = "trigger.json" if ptype == "triggers" else "action.json"
 
-        for root in (base, user_dir):
+        for root in (user_dir,):
             json_path = os.path.join(root, ptype, pid, json_name)
             if os.path.exists(json_path):
                 try:
@@ -166,12 +175,29 @@ class EngineAPI:
                     with open(json_path, "w", encoding="utf-8") as f:
                         json.dump(meta, f, ensure_ascii=False, indent=2)
                     return {"ok": True, "enabled": meta["enabled"],
-                            "origin": "builtin" if root == base else "user",
+                            "origin": "user",
                             "restart_required": True}
                 except (json.JSONDecodeError, OSError) as e:
                     return {"ok": False, "error": str(e)}
 
-        return {"ok": False, "error": "插件不存在"}
+        builtin_json = os.path.join(base, ptype, pid, json_name)
+        if not os.path.exists(builtin_json):
+            return {"ok": False, "error": "插件不存在"}
+
+        config = self._load_config()
+        disabled_plugins = config.setdefault("disabled_plugins", {})
+        disabled = set(disabled_plugins.get(ptype, []))
+        if pid in disabled:
+            disabled.remove(pid)
+            enabled = True
+        else:
+            disabled.add(pid)
+            enabled = False
+        disabled_plugins[ptype] = sorted(disabled)
+
+        if not self._save_config(config):
+            return {"ok": False, "error": "写入配置文件失败"}
+        return {"ok": True, "enabled": enabled, "origin": "builtin", "restart_required": True}
 
     def _uninstall_plugin(self, ptype: str, pid: str) -> dict:
         user_dir = self._get_user_plugins_dir()
@@ -260,8 +286,9 @@ class EngineAPI:
             config = self._load_config()
             rules = config.get("rules", [])
             return {
-                "running": True,
+                "running": self._engine.engine_running,
                 "engine_running": self._engine.engine_running,
+                "api_alive": True,
                 "pid": os.getpid(),
                 "rules_count": len(rules),
                 "triggers_count": len(set(
@@ -298,6 +325,9 @@ class EngineAPI:
             new_config = {
                 "rules": body.get("rules", []),
             }
+            current_config = self._load_config()
+            if "disabled_plugins" in current_config:
+                new_config["disabled_plugins"] = current_config["disabled_plugins"]
 
             ok = self._save_config(new_config)
             if ok:
@@ -375,7 +405,8 @@ class EngineAPI:
                         return JSONResponse({"ok": False, "error": "插件元数据 JSON 损坏或缺失"}, status_code=400)
 
                     from notmyfault.plugin_schema import validate_plugin_meta
-                    ok, errors = validate_plugin_meta(meta, ptype)
+                    plugin_type = "trigger" if ptype == "triggers" else "action"
+                    ok, errors = validate_plugin_meta(meta, plugin_type)
                     if not ok:
                         return JSONResponse({"ok": False, "error": "schema 校验失败: " + "; ".join(errors[:3])}, status_code=400)
 
@@ -448,36 +479,31 @@ class EngineAPI:
         @app.get("/api/events")
         async def event_stream(request: Request):
             async def generate():
-                client_queue: queue.Queue = queue.Queue(maxsize=200)
+                import asyncio
+
+                loop = asyncio.get_running_loop()
+                client_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+                subscriber = (loop, client_queue)
                 with self._sub_lock:
-                    self._subscribers.append(client_queue)
+                    self._subscribers.append(subscriber)
 
                 try:
-                    import asyncio
-                    loop = asyncio.get_event_loop()
-
                     while True:
                         if await request.is_disconnected():
                             break
 
-                        drained = False
-                        while True:
-                            try:
-                                event = client_queue.get_nowait()
-                                drained = True
-                                yield f"event: {event['type']}\n"
-                                yield f"data: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
-                            except queue.Empty:
-                                break
-
-                        if drained:
+                        try:
+                            event = await asyncio.wait_for(client_queue.get(), timeout=15)
+                        except asyncio.TimeoutError:
+                            yield ": keep-alive\n\n"
                             continue
 
-                        await asyncio.sleep(0.5)
+                        yield f"event: {event['type']}\n"
+                        yield f"data: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
                 finally:
                     with self._sub_lock:
-                        if client_queue in self._subscribers:
-                            self._subscribers.remove(client_queue)
+                        if subscriber in self._subscribers:
+                            self._subscribers.remove(subscriber)
 
             return StreamingResponse(
                 generate(),

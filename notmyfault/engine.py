@@ -450,6 +450,13 @@ class AutomationEngine:
                 )
                 continue
 
+            disabled_plugins = self.config.get("disabled_plugins", {})
+            if plugin_id in disabled_plugins.get(plugins_dir, []):
+                print(
+                    f"[Engine] 插件 \"{plugin_id}\" ({meta['name']}) 已由用户配置禁用，跳过"
+                )
+                continue
+
             # --- Python 模块加载 ---
             module_name = f"{module_prefix}{plugin_id}"
             spec = importlib.util.spec_from_file_location(module_name, py_file)

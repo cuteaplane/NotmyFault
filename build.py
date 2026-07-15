@@ -8,11 +8,16 @@ SIGNING_MODULE = ROOT / "notmyfault" / "signing_keys.py"
 PLUGIN_DIRS = [("actions", "action.json"), ("triggers", "trigger.json")]
 
 def _get_crypto():
-    from cryptography.hazmat.primitives.asymmetric import ed25519
-    from cryptography.hazmat.primitives.serialization import (
-        load_ssh_private_key, load_ssh_public_key, Encoding, PrivateFormat, PublicFormat, NoEncryption, BestAvailableEncryption, load_pem_private_key
-    )
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    try:
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        from cryptography.hazmat.primitives.serialization import (
+            load_ssh_private_key, load_ssh_public_key, Encoding, PrivateFormat, PublicFormat, NoEncryption, BestAvailableEncryption, load_pem_private_key
+        )
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    except ImportError:
+        print("! 缺少 cryptography 依赖，无法生成或验证插件签名")
+        print("  请先安装依赖后重试: python -m pip install cryptography")
+        raise SystemExit(1)
     return ed25519, load_ssh_private_key, load_ssh_public_key, Encoding, PrivateFormat, PublicFormat, NoEncryption, BestAvailableEncryption, load_pem_private_key, Ed25519PrivateKey
 
 
