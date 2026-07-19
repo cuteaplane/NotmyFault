@@ -3,6 +3,8 @@
     "name": "终止进程",
     "description": "按进程名终止运行中的进程",
     "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.kill_process",
     "enabled": true,
     "params": [
         {

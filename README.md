@@ -32,7 +32,21 @@ pip install fastapi uvicorn psutil pywin32
 pip install windows-toasts pycaw
 ```
 
-### 2. 启动后台引擎
+### 2. 构建签名与配置（首次 / 源码运行必做）
+
+```bash
+python build.py
+```
+
+默认 **strict** 模式：会要求设置签名密码、生成密钥、给内置插件签名并写入 `build.json`。
+源码运行必须先跑这一步——否则引擎在 strict 模式下会因内置插件缺少签名而被拒载、无法启动。
+想用更宽松的模式（免去每次改完代码都要重签）：
+
+```bash
+python build.py --security-mode=permissive
+```
+
+### 3. 启动后台引擎
 
 ```bash
 python NOTMYFAULT.pyw
@@ -40,7 +54,7 @@ python NOTMYFAULT.pyw
 
 引擎启动后会在 `http://127.0.0.1:19198` 监听 HTTP 请求，日志按 session 写入 `%APPDATA%\NotmyFault\logs\engine-YYYYMMDD-HHMMSS.log`，自动保留最近 7 个。
 
-### 3. 打开管理面板
+### 4. 打开管理面板
 
 浏览器打开 `dashboard.html` 即可配置规则、启停引擎、查看实时事件。
 

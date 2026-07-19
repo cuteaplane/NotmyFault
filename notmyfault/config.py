@@ -223,10 +223,39 @@ def save_config(config: Dict[str, Any]) -> bool:
                 pass  # 备份失败不是致命错误
 
         # 计算签名并保存
+        
         to_save = dict(config)
         to_save[_SIGNATURE_KEY] = _sign_config(to_save)
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(to_save, f, ensure_ascii=False, indent=4)
+        tmp_path = CONFIG_FILE + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(to_save, f, ensure_ascii=False, indent=4)
+            os.replace(tmp_path, CONFIG_FILE)
+        except OSError:
+            # os.replace 失败（Windows 下目标被占用）：退回直接写活配置文件。
+            # 但 'w' 会先截断，若写到一半失败（磁盘满等）会把活配置写坏，
+            # 所以先备份当前内容，写失败时还原。
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            backup = None
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as bf:
+                    backup = bf.read()
+            except OSError:
+                pass
+            try:
+                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                    json.dump(to_save, f, ensure_ascii=False, indent=4)
+            except OSError:
+                if backup is not None:
+                    try:
+                        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                            f.write(backup)
+                    except OSError:
+                        pass
+                raise
         return True
     except OSError as e:
         print(f"[Config] 保存配置失败: {e}", file=sys.stderr)
@@ -322,16 +351,10 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         for rule in config.get("rules", []):
             if not isinstance(rule, dict):
                 continue
-
-            if "trigger" in rule and "event" not in rule:
-                copied = dict(rule)
+            copied = dict(rule)
+            if "trigger" in copied and "event" not in copied:
                 copied["event"] = copied.pop("trigger")
-                _inject_condition(copied)
-                normalized_rules.append(copied)
-            else:
-                copied = dict(rule)
-                _inject_condition(copied)
-                normalized_rules.append(copied)
+            normalized_rules.append(copied)
 
         result = dict(config)
         result["rules"] = normalized_rules
@@ -371,26 +394,11 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
                     }
                 ]
             }
+        rules.append(_rule)
 
     result = {k: v for k, v in config.items() if k != "processes"}
     result["rules"] = rules
     return result if rules else config
-
-
-
-def _inject_condition(rule: Dict[str, Any]) -> None:
-    """为旧格式 rule 注入 condition 字段。
-    旧: {"event": {...}} -> 新: {"condition": {"type": "or", "events": [{...}]}}
-    """
-    if "condition" in rule:
-        return
-    event = rule.get("event") or rule.get("trigger")
-    if event is None:
-        return
-    rule["condition"] = {
-        "type": "or",
-        "events": [event],
-    }
 
 
 def get_config() -> Dict[str, Any]:

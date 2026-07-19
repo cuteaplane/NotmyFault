@@ -3,6 +3,8 @@
     "name": "设置系统音量",
     "description": "根据参数将系统主音量调整到指定级别",
     "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.set_volume",
     "enabled": true,
     "params": [
         {

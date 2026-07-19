@@ -4,6 +4,8 @@
     "semantic": "oneshot",
     "description": "监控可移动磁盘(U盘)的插入事件",
     "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.usb_insert",
     "enabled": true,
     "params": [
         {

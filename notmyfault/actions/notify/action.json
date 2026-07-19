@@ -3,6 +3,8 @@
     "name": "显示通知",
     "description": "显示 Windows 通知消息",
     "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.notify",
     "enabled": true,
     "params": [
         {

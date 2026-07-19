@@ -10,21 +10,21 @@ NotmyFault HTTP API 服务器
 import json
 import secrets
 import os
-import queue
 import sys
 import asyncio
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Callable, Protocol
+from typing import Any, Dict, Protocol
 
 import uvicorn
-from fastapi import FastAPI, Request, HTTPException, HTTPException
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from notmyfault.config import CONFIG_FILE, save_config as config_save, save_config as config_save
+from notmyfault.config import CONFIG_FILE, save_config as config_save
 from notmyfault.plugin_schema import scan_plugins
+from notmyfault.security import detect_security_mode
 
 _scan_plugins = scan_plugins  # 向后兼容
 
@@ -106,8 +106,15 @@ class EngineAPI:
         with self._sub_lock:
             subscribers = list(self._subscribers)
         for q in subscribers:
+            def _deliver(q=q, packet=packet):
+                try:
+                    q.put_nowait(packet)
+                except Exception:
+                    with self._sub_lock:
+                        if q in self._subscribers:
+                            self._subscribers.remove(q)
             try:
-                loop.call_soon_threadsafe(q.put_nowait, packet)
+                loop.call_soon_threadsafe(_deliver)
             except Exception:
                 pass
 
@@ -115,13 +122,38 @@ class EngineAPI:
 
     def _get_plugins_schema(self) -> Dict[str, Any]:
         base = os.path.dirname(__file__)
-        return {
+        result: Dict[str, Dict] = {
             "triggers": scan_plugins(base, "triggers", "trigger.json"),
             "actions": scan_plugins(base, "actions", "action.json"),
         }
+        user_dir = self._get_user_plugins_dir()
+        if os.path.isdir(user_dir):
+            for ptype in ("triggers", "actions"):
+                json_name = "trigger.json" if ptype == "triggers" else "action.json"
+                for pid, meta in scan_plugins(user_dir, ptype, json_name).items():
+                    if pid not in result[ptype]:
+                        result[ptype][pid] = meta
+        return result
 
     def _get_user_plugins_dir(self) -> str:
         return os.path.join(os.environ.get("APPDATA", ""), "NotmyFault", "plugins")
+
+    def _find_plugin_by_package(self, package_name: str):
+        """在用户插件目录中按 package_name 查找已安装插件。
+
+        返回 (ptype, pid, meta) 或 None。
+        """
+        if not package_name:
+            return None
+        user_dir = self._get_user_plugins_dir()
+        if not os.path.isdir(user_dir):
+            return None
+        for ptype in ("triggers", "actions"):
+            json_name = "trigger.json" if ptype == "triggers" else "action.json"
+            for pid, meta in scan_plugins(user_dir, ptype, json_name).items():
+                if meta.get("package_name") == package_name:
+                    return ptype, pid, meta
+        return None
 
     def _list_all_plugins(self) -> Dict[str, Any]:
         base = os.path.dirname(__file__)
@@ -271,6 +303,8 @@ class EngineAPI:
         auth = request.headers.get("Authorization", "")
         token = auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""
         if not token or not secrets.compare_digest(token, API_TOKEN):
+            print(f"[Auth] 403 rejected: has_hdr={bool(auth)} req_len={len(token)} srv_len={len(API_TOKEN)}",
+                  file=sys.stderr)
             raise HTTPException(status_code=403, detail="Forbidden: invalid API Token")
 
     def _setup_routes(self):
@@ -318,7 +352,6 @@ class EngineAPI:
             rules = config.get("rules", [])
             return {
                 "running": self._engine.engine_running,
-
                 "api_alive": True,
                 "engine_running": self._engine.engine_running,
                 "pid": os.getpid(),
@@ -332,6 +365,7 @@ class EngineAPI:
                     for r in rules
                     for a in r.get("actions", [])
                 )),
+                "security_mode": detect_security_mode().value,
             }
 
         # ================================================================
@@ -452,11 +486,27 @@ class EngineAPI:
                 if not ok:
                     return JSONResponse({"ok": False, "error": "schema 校验失败: " + "; ".join(errors[:3])}, status_code=400)
 
+                pkg = meta.get("package_name", "")
+                new_vc = meta.get("version_code", 0)
                 pid = meta.get("id", os.path.basename(root_path))
+                force = str(form.get("force", "")).lower() in ("1", "true", "yes")
                 user_dir = self._get_user_plugins_dir()
+
+                # 全局包名唯一性检查 + 版本对比
+                existing = self._find_plugin_by_package(pkg)
+                if existing:
+                    ex_ptype, ex_pid, ex_meta = existing
+                    ex_vc = ex_meta.get("version_code", 0)
+                    if not force and new_vc < ex_vc:
+                        return JSONResponse(
+                            {"ok": False,
+                             "error": f"降级安装被拒绝: 当前 v{ex_vc} >= 新版 v{new_vc}（packageName={pkg}）。强制覆盖请传 force=true"},
+                            status_code=400)
+                    # 删除旧插件（允许跨类型升级/覆盖）
+                    import shutil as _sh
+                    _sh.rmtree(os.path.join(user_dir, ex_ptype, ex_pid), ignore_errors=True)
+
                 dest = os.path.join(user_dir, ptype, pid)
-                if os.path.exists(dest):
-                    return JSONResponse({"ok": False, "error": f"插件 '{pid}' 已存在"}, status_code=400)
 
                 # 签名
                 priv_key_path = os.path.join(os.path.dirname(__file__), "..", ".private", "signing_private_key.pem")
@@ -474,7 +524,9 @@ class EngineAPI:
                         return JSONResponse({"ok": False, "error": "私钥密码错误"}, status_code=400)
                     return JSONResponse({"ok": False, "error": "签名失败: " + err}, status_code=400)
 
-                # 复制到 user plugins
+                # 复制到 user plugins（清空旧目录后写入）
+                if os.path.exists(dest):
+                    shutil.rmtree(dest, ignore_errors=True)
                 os.makedirs(dest, exist_ok=True)
                 for fname in os.listdir(root_path):
                     src = os.path.join(root_path, fname)
@@ -482,7 +534,8 @@ class EngineAPI:
                     if os.path.isfile(src):
                         shutil.copy2(src, dst)
 
-                return {"ok": True, "id": pid, "type": ptype, "restart_required": True}
+                return {"ok": True, "id": pid, "type": ptype, "package_name": pkg,
+                        "version_code": new_vc, "restart_required": True}
             finally:
                 try:
                     os.unlink(tmp.name)

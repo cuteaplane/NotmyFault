@@ -1,15 +1,17 @@
 import json
 import os
+import re
 from typing import Any, Dict, List, Tuple
 
-_REQUIRED_META_FIELDS = {"id", "name", "description", "enabled", "version_code"}
+_REQUIRED_META_FIELDS = {"id", "name", "description", "enabled", "version_code", "version", "package_name"}
 _TRIGGER_OPTIONAL_FIELDS = {"semantic", "params", "permissions", "origin"}
 _ACTION_OPTIONAL_FIELDS = {"params", "permissions", "origin"}
 _ALLOWED_SEMANTICS = {"state", "oneshot"}
 _ALLOWED_PARAM_TYPES = {"string", "number", "select", "bool"}
 _REQUIRED_PARAM_FIELDS = {"name", "type", "label"}
-_ALLOWED_PERMISSIONS = {"admin"}
+_ALLOWED_PERMISSIONS = {"admin", "external_binary", "native_api"}
 _ALLOWED_ORIGINS = {"builtin", "user", "third_party"}
+_PACKAGE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$")
 
 
 def validate_plugin_meta(
@@ -35,8 +37,18 @@ def validate_plugin_meta(
         errors.append(f"字段 'description' 必须是字符串")
     if "enabled" in meta and not isinstance(meta["enabled"], bool):
         errors.append(f"字段 'enabled' 必须为布尔值 (true/false)，实际: {type(meta['enabled']).__name__}")
-    if "version_code" in meta and not isinstance(meta["version_code"], int):
-        errors.append(f"字段 'version_code' 必须为整数，实际: {type(meta['version_code']).__name__}")
+    if "version_code" in meta:
+        if not isinstance(meta["version_code"], int) or isinstance(meta["version_code"], bool):
+            errors.append(f"字段 'version_code' 必须为整数，实际: {type(meta['version_code']).__name__}")
+        elif meta["version_code"] < 1:
+            errors.append(f"字段 'version_code' 必须 >= 1，实际: {meta['version_code']}")
+    if "version" in meta and not isinstance(meta["version"], str):
+        errors.append(f"字段 'version' 必须是字符串，实际: {type(meta['version']).__name__}")
+    if "package_name" in meta:
+        if not isinstance(meta["package_name"], str):
+            errors.append(f"字段 'package_name' 必须是字符串，实际: {type(meta['package_name']).__name__}")
+        elif not _PACKAGE_NAME_RE.match(meta["package_name"]):
+            errors.append(f"字段 'package_name' 格式无效: '{meta['package_name']}'（应类似 com.example.plugin）")
 
     if "semantic" in meta:
         if meta["semantic"] not in _ALLOWED_SEMANTICS:

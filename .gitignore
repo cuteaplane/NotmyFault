@@ -24,6 +24,8 @@ env/
 *.swp
 *.swo
 *~
+.agents/
+.pytest_cache/
 
 # OS
 .DS_Store
@@ -38,5 +40,7 @@ tests/
 .coverage
 .private/
 build.json
+notmyfault/integrity.json
 _patch_dash.py
 
+DECOUPLING.md

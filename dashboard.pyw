@@ -6,6 +6,12 @@ import json
 import os
 import sys
 import urllib.request
+import functools
+import http.server
+import socketserver
+import threading
+
+DASHBOARD_PORT = 19199
 
 # 确保能导入 notmyfault 包
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -68,8 +74,8 @@ class DashboardAPI:
 
     def _auth_request(self, path: str, method: str = "POST", data: dict = None) -> dict:
         """发送带认证的 HTTP 请求"""
+        token = self._get_api_token()
         try:
-            token = self._get_api_token()
             body = None
             if data is not None:
                 import json as _j
@@ -84,8 +90,11 @@ class DashboardAPI:
             if data is not None:
                 req.add_header("Content-Type", "application/json")
             return json.loads(urllib.request.urlopen(req, timeout=5).read())
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")
+            return {"ok": False, "error": f"HTTP {e.code}: {detail}", "token_found": bool(token)}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": str(e), "token_found": bool(token)}
 
     def get_api_token(self) -> str:
         """暴露给 JS bridge 的 API Token 读取方法"""
@@ -160,6 +169,71 @@ class DashboardAPI:
             return []
 
 
+
+def _start_static_server(directory, port=DASHBOARD_PORT):
+    """后台线程托管 Vue 构建产物（多文件 ES 模块）。
+
+    pywebview 从 file:// 加载 ES 模块会被浏览器 CORS 拦截，故改用本地 HTTP。
+    端口被占用时自动 +1 重试。
+    """
+    Handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=directory)
+    for p in range(port, port + 20):
+        try:
+            httpd = socketserver.TCPServer(("127.0.0.1", p), Handler)
+            httpd.daemon_threads = True
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            return httpd, f"http://127.0.0.1:{p}/"
+        except OSError:
+            continue
+    return None, None
+
+
+def _ensure_dashboard_build():
+    """如果 dashboard/dist 不存在，自动 npm run build。"""
+    dist = os.path.join(PROJECT_ROOT, "dashboard", "dist")
+    if os.path.isdir(dist) and os.path.exists(os.path.join(dist, "index.html")):
+        return True
+    npm = os.path.join(PROJECT_ROOT, "dashboard")
+    if not os.path.exists(os.path.join(npm, "package.json")):
+        return False
+    print("[Dashboard] 构建产物不存在，自动 npm run build...")
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["npm", "run", "build"],
+            cwd=npm,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode == 0:
+            print("[Dashboard] npm run build 成功")
+            return True
+        print(f"[Dashboard] npm run build 失败 (code={result.returncode}): {result.stderr.strip()[:200]}")
+    except FileNotFoundError:
+        print("[Dashboard] npm 未安装，无法自动构建")
+    except subprocess.TimeoutExpired:
+        print("[Dashboard] npm run build 超时")
+    except Exception as e:
+        print(f"[Dashboard] npm run build 异常: {e}")
+    return False
+
+
+def _resolve_dashboard_url():
+    """优先使用 dashboard/dist 构建产物，回退旧 dashboard.html。"""
+    dist = os.path.join(PROJECT_ROOT, "dashboard", "dist")
+    if not (os.path.isdir(dist) and os.path.exists(os.path.join(dist, "index.html"))):
+        _ensure_dashboard_build()
+    if os.path.isdir(dist) and os.path.exists(os.path.join(dist, "index.html")):
+        httpd, url = _start_static_server(dist)
+        if url:
+            return url, httpd
+        print("[Dashboard] 静态服务器启动失败，回退到单文件模式", file=sys.stderr)
+    legacy = os.path.join(PROJECT_ROOT, "dashboard.html")
+    if os.path.exists(legacy):
+        return legacy, None
+    return None, None
+
 def main():
     # 注册协议（幂等，每次启动都确保存在）
     try:
@@ -168,14 +242,17 @@ def main():
     except Exception:
         pass
 
-    dashboard_path = os.path.join(PROJECT_ROOT, "dashboard.html")
+    dashboard_url, _static_httpd = _resolve_dashboard_url()
+    if not dashboard_url:
+        print("[Dashboard] 找不到 dashboard/dist 构建产物，也找不到 dashboard.html", file=sys.stderr)
+        return
     icon_path = os.path.join(PROJECT_ROOT, "logo.ico")
 
     api = DashboardAPI()
 
     window = webview.create_window(
         title="NotmyFault",
-        url=dashboard_path,
+        url=dashboard_url,
         js_api=api,
         width=960,
         height=720,
