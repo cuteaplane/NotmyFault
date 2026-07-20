@@ -22,7 +22,10 @@ import webview
 
 API = "http://127.0.0.1:19198"
 CONFIG_FILE = os.path.join(os.environ.get("APPDATA", ""), "NotmyFault", "config.json")
-API_TOKEN_FILE = os.path.join(os.environ.get("TEMP", ""), "notmyfault_api_token")
+# 必须与 notmyfault/api_server.py 的 API_TOKEN_FILE 保持一致：
+# token 写在 config.json 同目录下（%APPDATA%/NotmyFault/.api_token），
+# 不再用 %TEMP%/notmyfault_api_token（旧路径，Authenticated Users 可读，已废弃）。
+API_TOKEN_FILE = os.path.join(os.path.dirname(CONFIG_FILE), ".api_token")
 
 
 class DashboardAPI:
@@ -258,6 +261,10 @@ def main():
         height=720,
         min_size=(640, 480),
         confirm_close=False,
+        # 窗口背景色：HTML 渲染前 pywebview 显示这个颜色而非默认白色。
+        # 用深色（与深色模式 --md-surface-c-low 一致），深色模式零闪烁；
+        # 浅色模式会闪一下深色但不如白色刺眼，且 HTML 加载后立即被正确背景覆盖。
+        background_color='#1b1b21',
     )
 
     # 设置窗口图标（仅 Windows）

@@ -135,12 +135,13 @@ def run_as_admin(
             f"插件 '{caller_id}' 未授权使用 run_as_admin()。"
             f"请在插件元数据的 permissions 字段中添加 \"admin\" 并重启引擎。"
         )
-    # 如果无法检测调用者（例如直接从 shell 调用），允许但不安全
+    # 如果无法检测调用者，拒绝执行（PoC-6 修复）：
+    # 非插件命名空间的调用（恶意脚本/第三方包/exec 绕过后间接调用）
+    # caller_id=None，之前放行，现在拒绝以防绕过提权。
     if caller_id is None:
-        print(
-            "[sudo] 警告: 无法确定 run_as_admin() 的调用者身份，"
-            "允许执行但存在安全风险",
-            file=sys.stderr,
+        raise PermissionError(
+            "无法确定 run_as_admin() 的调用者身份，拒绝执行。"
+            "请在被引擎授权的插件模块中调用。"
         )
 
     # 安全转义：单引号内 '' 表示一个字面单引号

@@ -10,6 +10,7 @@ const list = computed(() => store.pluginsData[tab.value] || {})
 const showInstall = ref(false)
 const showKey = ref(false)
 const keyPw = ref('')
+const forceInstall = ref(false)
 const fileInput = ref(null)
 let keyResolve = null
 
@@ -75,10 +76,11 @@ async function onFilePicked(e) {
   const fd = new FormData()
   fd.append('file', file)
   if (keyPw.value) fd.append('password', keyPw.value)
+  if (forceInstall.value) fd.append('force', 'true')
   try {
     const r = await apiWrite('/api/plugins/install', 'POST', fd, true)
     const d = await r.json()
-    if (d.ok) { snackbar('插件 "' + d.id + '" 安装成功，需重启引擎生效'); showInstall.value = false; await refresh() }
+    if (d.ok) { snackbar('插件 "' + d.id + '" 安装成功，需重启引擎生效'); showInstall.value = false; forceInstall.value = false; await refresh() }
     else alert('安装失败: ' + (d.error || '未知错误'))
   } catch (e) { alert('请求失败: ' + e.message) }
 }
@@ -112,6 +114,9 @@ onMounted(refresh)
           <span class="material-symbols-outlined">cloud_upload</span>点击选择 .nmfp 文件
         </div>
         <input ref="fileInput" type="file" accept=".nmfp" class="hidden" @change="onFilePicked">
+        <label class="check-row" style="margin-top:8px">
+          <input type="checkbox" v-model="forceInstall">强制覆盖已安装的同包名插件
+        </label>
         <div class="dialog-actions">
           <button class="btn btn-text" @click="showInstall = false">取消</button>
         </div>

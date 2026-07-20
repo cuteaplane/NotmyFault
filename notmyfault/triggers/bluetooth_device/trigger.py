@@ -177,8 +177,14 @@ def run(meta, config_list, emit_event, shutdown_event):
                                     f"[Trigger:{trigger_id}] [OK] "
                                     f"设备已连接: {device}"
                                 )
+                                # device_name 用用户配置值（供规则匹配），
+                                # actual_device 保留实际设备名（供日志/调试）。
+                                # 之前 emit 实际设备名导致 rules.check_event_params
+                                # 严格相等比较永远不匹配（用户配 "JBL"，
+                                # 实际 "JBL Flip 5"）。与 usb_insert 设计对齐。
                                 emit_event(trigger_id, {
-                                    "device_name": device,
+                                    "device_name": target,
+                                    "actual_device": device,
                                     "state": "connected",
                                 })
 
@@ -190,7 +196,8 @@ def run(meta, config_list, emit_event, shutdown_event):
                                     f"设备已断开: {device}"
                                 )
                                 emit_event(trigger_id, {
-                                    "device_name": device,
+                                    "device_name": target,
+                                    "actual_device": device,
                                     "state": "disconnected",
                                 })
 

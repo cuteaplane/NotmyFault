@@ -9,6 +9,7 @@ const stopping = ref(false)
 const stats = ref({ rules: '-', triggers: '-', actions: '-', pid: '-' })
 const diag = ref(null)
 let diagTimer = null
+const appVersion = __APP_VERSION__
 
 const isRunning = computed(() => store.engineStatus.engine_running === true)
 const modeLabel = computed(() => {
@@ -29,11 +30,16 @@ async function loadStats() {
   try {
     const s = await getEngineStatus()
     await syncStatus(s)
-    stats.value = {
-      rules: s.rules_count != null ? s.rules_count : '-',
-      triggers: s.triggers_count != null ? s.triggers_count : '-',
-      actions: s.actions_count != null ? s.actions_count : '-',
-      pid: s.pid || '-',
+    if (s.engine_running === true) {
+      stats.value = {
+        rules: s.rules_count != null ? s.rules_count : '-',
+        triggers: s.triggers_count != null ? s.triggers_count : '-',
+        actions: s.actions_count != null ? s.actions_count : '-',
+        pid: s.pid || '-',
+      }
+    } else {
+      // 引擎未运行：清空数据，避免把配置文件的 rules_count 误报为运行态数据
+      stats.value = { rules: '-', triggers: '-', actions: '-', pid: '-' }
     }
   } catch (e) {
     stats.value = { rules: '-', triggers: '-', actions: '-', pid: '-' }
@@ -41,7 +47,11 @@ async function loadStats() {
   loadDiag()
 }
 
-async function loadDiag() { diag.value = await readDiagnostics() }
+async function loadDiag() {
+  // 引擎未运行时不请求诊断，避免误报
+  if (!isRunning.value) { diag.value = null; return }
+  diag.value = await readDiagnostics()
+}
 
 const diagPlugins = computed(() => {
   const d = diag.value
@@ -181,6 +191,15 @@ onMounted(() => {
 onUnmounted(() => { if (diagTimer) clearInterval(diagTimer) })
 // SSE 事件到达时统一刷新统计 + 诊断
 watch(() => store.refreshSignal, () => loadStats())
+// 引擎状态切换：关闭时清空数据，启动时立即刷新
+watch(isRunning, (running) => {
+  if (!running) {
+    stats.value = { rules: '-', triggers: '-', actions: '-', pid: '-' }
+    diag.value = null
+  } else {
+    loadStats()
+  }
+})
 </script>
 
 <template>
@@ -188,36 +207,85 @@ watch(() => store.refreshSignal, () => loadStats())
     <div class="page-head"><h2>引擎状态</h2><div class="actions">
       <button class="btn btn-outlined" @click="refreshHome"><span class="material-symbols-outlined">refresh</span>刷新</button>
     </div></div>
-    <div class="status-hero">
-      <div class="left">
-        <div class="status-dot" :class="{ running: isRunning }"><span class="material-symbols-outlined">{{ isRunning ? 'play_circle' : 'stop_circle' }}</span></div>
-        <div><h3>{{ isRunning ? '运行中' : '已停止' }}</h3>
-          <p v-if="isRunning">PID: {{ stats.pid }} · 安全模式: {{ modeLabel }} · 监听 127.0.0.1:19198</p>
-          <p v-else>引擎未运行</p></div>
+
+    <!-- APatch 风格状态卡片 -->
+    <div class="apatch-hero" :class="starting ? 'starting' : stopping ? 'stopping' : isRunning ? 'running' : 'stopped'">
+      <div class="hero-left">
+        <div class="hero-icon">
+          <span v-if="starting" class="spinner"></span>
+          <span v-else-if="stopping" class="spinner"></span>
+          <span v-else class="material-symbols-outlined">{{ isRunning ? 'task_alt' : 'cancel' }}</span>
+        </div>
+        <div>
+          <h3>{{ starting ? '启动中...' : stopping ? '关闭中...' : isRunning ? '运行中 😋' : '已停止' }}</h3>
+          <p v-if="starting">正在启动引擎进程...</p>
+          <p v-else-if="stopping">正在关闭引擎...</p>
+          <p v-else-if="isRunning">PID {{ stats.pid }} · {{ modeLabel }} · 127.0.0.1:19198</p>
+          <p v-else>引擎未运行</p>
+        </div>
       </div>
+      <!-- 填充按钮 + 假加载 spinner，4 态互斥 -->
       <div class="actions">
-        <button v-if="!isRunning" class="btn btn-tonal" @click="startEngine" :disabled="starting" style="min-width:148px">
-          <span v-if="starting" class="spinner"></span><span v-else class="material-symbols-outlined">play_arrow</span>{{ starting ? '启动中...' : '启动引擎' }}</button>
-        <button v-if="isRunning" class="btn btn-error" @click="stopEngine" :disabled="stopping" style="min-width:148px">
-          <span v-if="stopping" class="spinner"></span><span v-else class="material-symbols-outlined">power_settings_new</span>{{ stopping ? '关闭中...' : '关闭引擎' }}</button>
+        <button v-if="!isRunning && !starting && !stopping" class="btn" @click="startEngine" style="min-width:148px">
+          <span class="material-symbols-outlined">play_arrow</span>启动引擎</button>
+        <button v-if="starting" class="btn" disabled style="min-width:148px">
+          <span class="spinner"></span>启动中...</button>
+        <button v-if="isRunning && !stopping" class="btn" @click="stopEngine" style="min-width:148px">
+          <span class="material-symbols-outlined">power_settings_new</span>关闭引擎</button>
+        <button v-if="stopping" class="btn" disabled style="min-width:148px">
+          <span class="spinner"></span>关闭中...</button>
       </div>
     </div>
-    <div class="stat-grid">
-      <div class="stat-card"><div class="material-symbols-outlined stat-ico">rule</div><div class="stat-val">{{ stats.rules }}</div><div class="stat-lbl">规则数量</div></div>
-      <div class="stat-card"><div class="material-symbols-outlined stat-ico">memory</div><div class="stat-val">{{ stats.triggers }}</div><div class="stat-lbl">活跃触发器</div></div>
-      <div class="stat-card"><div class="material-symbols-outlined stat-ico">bolt</div><div class="stat-val">{{ stats.actions }}</div><div class="stat-lbl">动作类型</div></div>
-      <div class="stat-card"><div class="material-symbols-outlined stat-ico">tag</div><div class="stat-val">{{ stats.pid }}</div><div class="stat-lbl">进程 PID</div></div>
+
+    <!-- 引擎运行中：显示概览 + 诊断 -->
+    <template v-if="isRunning">
+    <div class="card" style="margin-bottom:16px">
+      <h4 class="card-section-title">引擎概览</h4>
+      <div class="kv-list">
+        <div class="kv-item"><span class="kv-key">规则数量</span><span class="kv-val">{{ stats.rules }}</span></div>
+        <div class="kv-item"><span class="kv-key">活跃触发器</span><span class="kv-val">{{ stats.triggers }}</span></div>
+        <div class="kv-item"><span class="kv-key">动作类型</span><span class="kv-val">{{ stats.actions }}</span></div>
+        <div class="kv-item"><span class="kv-key">进程 PID</span><span class="kv-val">{{ stats.pid }}</span></div>
+      </div>
     </div>
-    <h4 class="sec-h">引擎诊断</h4>
-    <div class="stat-grid">
-      <div class="stat-card"><div class="stat-val" :class="diagPlugins.cls"><span v-if="diagPlugins.icon" class="material-symbols-outlined">{{ diagPlugins.icon }}</span>{{ diagPlugins.txt }}</div><div class="stat-lbl">插件状态</div></div>
-      <div class="stat-card"><div class="stat-val" :class="diagRules.cls"><span v-if="diagRules.icon" class="material-symbols-outlined">{{ diagRules.icon }}</span>{{ diagRules.txt }}</div><div class="stat-lbl">规则状态</div></div>
-      <div class="stat-card"><div class="stat-val" :class="diagActions.cls"><span v-if="diagActions.icon" class="material-symbols-outlined">{{ diagActions.icon }}</span>{{ diagActions.txt }}</div><div class="stat-lbl">动作执行</div></div>
-      <div class="stat-card"><div class="stat-val"><span class="material-symbols-outlined">{{ diagErrors.ec > 0 ? 'error' : 'check_circle' }}</span>{{ diagErrors.txt }}</div><div class="stat-lbl">错误 / 警告</div></div>
+
+    <div class="card" style="margin-bottom:16px">
+      <h4 class="card-section-title">引擎诊断</h4>
+      <div class="kv-list">
+        <div class="kv-item"><span class="kv-key">插件状态</span><span class="kv-val" :class="diagPlugins.cls"><span v-if="diagPlugins.icon" class="material-symbols-outlined">{{ diagPlugins.icon }}</span>{{ diagPlugins.txt }}</span></div>
+        <div class="kv-item"><span class="kv-key">规则状态</span><span class="kv-val" :class="diagRules.cls"><span v-if="diagRules.icon" class="material-symbols-outlined">{{ diagRules.icon }}</span>{{ diagRules.txt }}</span></div>
+        <div class="kv-item"><span class="kv-key">动作执行</span><span class="kv-val" :class="diagActions.cls"><span v-if="diagActions.icon" class="material-symbols-outlined">{{ diagActions.icon }}</span>{{ diagActions.txt }}</span></div>
+        <div class="kv-item"><span class="kv-key">错误 / 警告</span><span class="kv-val"><span class="material-symbols-outlined">{{ diagErrors.ec > 0 ? 'error' : 'check_circle' }}</span>{{ diagErrors.txt }}</span></div>
+        <!-- 诊断详情整合到卡片内，kv-item 风格统一 -->
+        <template v-if="diagLines.length">
+          <div class="kv-item" v-for="(l, i) in diagLines" :key="i">
+            <span class="kv-key" :class="l.cls"><span class="material-symbols-outlined">{{ l.icon }}</span>{{ l.text }}</span>
+          </div>
+        </template>
+        <div v-else class="kv-item">
+          <span class="kv-key">异常详情</span>
+          <span class="kv-val diag-ok"><span class="material-symbols-outlined">check_circle</span>无异常</span>
+        </div>
+      </div>
     </div>
-    <div class="diag-detail">
-      <div v-for="(l, i) in diagLines" :key="i" :class="l.cls"><span class="material-symbols-outlined">{{ l.icon }}</span>{{ l.text }}</div>
-      <div v-if="!diagLines.length">无异常</div>
+    </template>
+
+    <!-- 引擎未运行：显示系统信息 -->
+    <template v-else>
+    <div class="card" style="margin-bottom:16px">
+      <h4 class="card-section-title">系统信息</h4>
+      <div class="kv-list">
+        <div class="kv-item"><span class="kv-key">版本</span><span class="kv-val">NotmyFault v{{ appVersion }}</span></div>
+        <div class="kv-item"><span class="kv-key">安全模式</span><span class="kv-val">{{ modeLabel }}</span></div>
+        <div class="kv-item"><span class="kv-key">配置目录</span><span class="kv-val">%APPDATA%/NotmyFault/</span></div>
+        <div class="kv-item"><span class="kv-key">已配置规则</span><span class="kv-val">{{ store.configData?.rules?.length || 0 }} 条</span></div>
+      </div>
     </div>
+    <div class="empty-state" style="padding:32px 20px">
+      <div class="material-symbols-outlined">power_off</div>
+      <h3>引擎未启动</h3>
+      <p>点击上方"启动引擎"按钮开始使用</p>
+    </div>
+    </template>
   </section>
 </template>

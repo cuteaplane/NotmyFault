@@ -9,6 +9,6 @@ export function getParamDefs(m) {
 
 export function buildDefaultParams(m) {
   const o = {}
-  getParamDefs(m).forEach(p => { o[p.name] = p.default || '' })
+  getParamDefs(m).forEach(p => { o[p.name] = p.default ?? '' })
   return o
 }

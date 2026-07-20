@@ -1,3 +1,15 @@
+/* 本地字体（从 Google Fonts 下载，避免 CDN 延迟和 node 依赖） */
+@font-face{
+  font-family:'Material Symbols Outlined';font-style:normal;font-weight:400;
+  font-display:block;
+  src:url('./assets/fonts/material-symbols-outlined.woff2') format('woff2')
+}
+@font-face{
+  font-family:'Roboto';font-style:normal;font-weight:400 700;
+  font-display:swap;
+  src:url('./assets/fonts/roboto-latin.woff2') format('woff2');
+  unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD
+}
 
 :root{
   --md-primary:#0061a4;--md-on-primary:#fff;--md-primary-container:#d1e4ff;--md-on-primary-container:#001d36;
@@ -26,7 +38,7 @@ html{color-scheme:light}:root[data-theme="dark"]{color-scheme:dark}
 #app{display:contents}
 body{font:var(--ts-body);background:var(--md-surface-c-low);color:var(--md-on-surface);display:flex;height:100vh;overflow:hidden;-webkit-font-smoothing:antialiased}
 .hidden{display:none!important}
-.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;line-height:1;display:inline-block;white-space:nowrap;font-variation-settings:'FILL' 0,'wght' 400,'GRAD' 0,'opsz' 24}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-size:24px;line-height:1;letter-spacing:normal;text-transform:none;display:inline-block;white-space:nowrap;word-wrap:normal;direction:ltr;-webkit-font-feature-settings:'liga';-webkit-font-smoothing:antialiased;font-variation-settings:'FILL' 0,'wght' 400,'GRAD' 0,'opsz' 24}
 .nav-rail{width:var(--nav-w);min-width:var(--nav-w);height:100vh;background:var(--md-surface-c-low);display:flex;flex-direction:column;padding:12px;user-select:none;border-right:1px solid var(--md-outline-variant)}
 .nav-brand{display:flex;align-items:center;gap:12px;padding:12px 8px 20px;font:var(--ts-title)}
 .nav-brand .brand-icon{color:var(--md-primary);font-size:26px;font-variation-settings:'FILL' 1}
@@ -189,9 +201,9 @@ body:not(.engine-online) .nav-item.needs-engine{display:none}
   border:1px solid color-mix(in srgb,var(--md-surface-c-highest) 50%,transparent)
 }
 
-/* 空状态图标缓缓浮动 */
-.empty-state .material-symbols-outlined{animation:nmf-float 3s ease-in-out infinite}
-@keyframes nmf-float{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
+/* 空状态图标（去掉浮动动画，用户反馈"飘来飘去"不好看） */
+/* .empty-state .material-symbols-outlined{animation:nmf-float 3s ease-in-out infinite} */
+/* @keyframes nmf-float{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}} */
 
 /* 对话框入场（缩放 + 淡入） */
 dialog{animation:nmf-dlg .25s cubic-bezier(.2,0,0,1)}
@@ -210,3 +222,88 @@ select.select{transition:background-image .18s ease,border-color .18s ease}
 
 /* 诊断详情区域 */
 .diag-detail{transition:border-color .3s ease}
+
+/* ================================================================
+   APatch 风格组件
+   ================================================================ */
+
+/* 状态英雄卡片 -- 运行时天蓝高对比，停止时暖色调 */
+.apatch-hero{
+  display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap;
+  border-radius:var(--r-md);padding:24px 28px;margin-bottom:20px;
+  transition:background .3s ease;
+}
+.apatch-hero.running{background:#66CCFF;color:#003D5C}
+:root[data-theme="dark"] .apatch-hero.running{background:#3A9DD5;color:#E8F7FF}
+.apatch-hero.stopped{background:color-mix(in srgb,var(--md-error) 12%,var(--md-surface-c-low));color:var(--md-on-surface)}
+.apatch-hero.starting{background:color-mix(in srgb,var(--md-primary) 15%,var(--md-surface-c-low));color:var(--md-on-surface)}
+.apatch-hero.stopping{background:color-mix(in srgb,var(--md-warn) 15%,var(--md-surface-c-low));color:var(--md-on-surface)}
+.apatch-hero .hero-left{display:flex;align-items:center;gap:16px;min-width:0}
+.apatch-hero .hero-icon{
+  width:44px;height:44px;border-radius:50%;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;
+}
+.apatch-hero.running .hero-icon{background:rgba(0,0,0,.1);color:#003D5C}
+:root[data-theme="dark"] .apatch-hero.running .hero-icon{background:rgba(255,255,255,.12);color:#B3E0FF}
+.apatch-hero.stopped .hero-icon{background:var(--md-error-container);color:var(--md-error)}
+.apatch-hero .hero-icon .material-symbols-outlined{font-size:26px}
+.apatch-hero h3{font:var(--ts-head);font-size:20px;margin-bottom:4px}
+.apatch-hero p{font-size:13px;opacity:.7}
+.apatch-hero .hero-btn{
+  background:transparent;border:none;font:var(--ts-label);font-size:14px;cursor:pointer;
+  padding:10px 20px;border-radius:var(--r-full);white-space:nowrap;
+  opacity:.65;transition:opacity .18s,background .18s;
+}
+.apatch-hero .hero-btn:hover{opacity:1}
+.apatch-hero.running .hero-btn:hover{background:rgba(0,0,0,.08)}
+.apatch-hero.stopped .hero-btn:hover{background:var(--md-surface-c-high)}
+.apatch-hero .hero-btn:disabled{opacity:.4;cursor:default}
+.apatch-hero .actions{display:flex;align-items:center;gap:10px;flex-shrink:0}
+/* hero 内按钮：运行时用半透明深色，停止时用 primary 填充，确保对比度 */
+.apatch-hero.running .btn{background:rgba(0,0,0,.18);color:#003D5C}
+:root[data-theme="dark"] .apatch-hero.running .btn{background:rgba(255,255,255,.15);color:#E8F7FF}
+.apatch-hero.running .btn:hover{background:rgba(0,0,0,.28)}
+:root[data-theme="dark"] .apatch-hero.running .btn:hover{background:rgba(255,255,255,.25)}
+.apatch-hero.stopped .btn,.apatch-hero.starting .btn,.apatch-hero.stopping .btn{
+  background:var(--md-primary);color:var(--md-on-primary)
+}
+.apatch-hero.stopped .btn:hover,.apatch-hero.starting .btn:hover,.apatch-hero.stopping .btn:hover{
+  background:color-mix(in srgb,var(--md-primary) 88%,#000)
+}
+
+/* 键值对列表 -- 包在卡片内，无分割线，靠 padding 区分 */
+.kv-list{display:flex;flex-direction:column}
+.kv-item{
+  display:flex;align-items:center;justify-content:space-between;gap:16px;
+  padding:14px 0;
+}
+.kv-item:first-child{padding-top:0}
+.kv-item:last-child{padding-bottom:0}
+.kv-item .kv-key{font:var(--ts-body);color:var(--md-on-surface-variant)}
+.kv-item .kv-val{font:var(--ts-body);font-weight:500;color:var(--md-on-surface);text-align:right}
+.kv-item .kv-val .material-symbols-outlined{font-size:18px;vertical-align:-3px;margin-right:4px}
+
+/* 区块卡片标题 */
+.card-section-title{font:var(--ts-title);font-size:16px;margin-bottom:14px;color:var(--md-on-surface)}
+
+/* 规则编辑器 - 折叠/展开 */
+.rule-collapsed{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  cursor:pointer;margin-bottom:10px;padding:16px 20px;
+  transition:box-shadow .2s ease;
+}
+.rule-collapsed:hover{box-shadow:var(--md-elev2)}
+.rule-summary-left{display:flex;align-items:center;gap:12px;min-width:0}
+.toggle-ico{font-size:24px;color:var(--md-on-surface-variant);flex-shrink:0;transition:transform .2s}
+.rule-summary-name{font:var(--ts-title);font-size:15px;color:var(--md-on-surface);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rule-summary-meta{display:flex;gap:8px;margin-top:4px;flex-wrap:wrap}
+.rule-tag{display:inline-flex;align-items:center;gap:3px;font:var(--ts-lbl-sm);color:var(--md-on-surface-variant)}
+.rule-tag .material-symbols-outlined{font-size:14px}
+.rule-head{display:flex;align-items:center;gap:8px}
+.rule-item{
+  background:var(--md-surface-c-lowest);border-radius:var(--r-sm);padding:14px 16px;
+  margin-bottom:10px;display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap;
+}
+.rule-item:last-child{margin-bottom:0}
+.rule-actions-bar{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
+.rule-empty-hint{font:var(--ts-lbl-sm);color:var(--md-outline);padding:8px 0;text-align:center}

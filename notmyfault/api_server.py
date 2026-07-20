@@ -23,14 +23,56 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from notmyfault.config import CONFIG_FILE, save_config as config_save
-from notmyfault.plugin_schema import scan_plugins
+from notmyfault.plugin_schema import scan_plugins, validate_plugin_meta
 from notmyfault.security import detect_security_mode
 
 _scan_plugins = scan_plugins  # 向后兼容
 
 # API 认证令牌（每次进程启动时随机生成）
 API_TOKEN: str = secrets.token_hex(32)
-API_TOKEN_FILE: str = os.path.join(os.environ.get("TEMP", ""), "notmyfault_api_token")
+# token 文件存放在 %APPDATA%/NotmyFault/ 下（与 config.json 同目录），
+# 不再使用 %TEMP%——TEMP 目录默认 Authenticated Users 可读，权限过宽。
+API_TOKEN_FILE: str = os.path.join(os.path.dirname(CONFIG_FILE), ".api_token")
+
+
+def _secure_write_token(path: str, token: str) -> None:
+    """安全写入 token 文件，限制权限仅当前用户可访问。
+
+    - 用 os.open 创建文件并设置 0o600（Unix 生效；Windows 上部分生效）
+    - Windows 上额外用 icacls 移除继承权限，仅保留当前用户 Full control
+      （os.getlogin() 在某些环境下返回的用户名不被 icacls 识别，改用 %USERNAME%）
+    """
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError:
+        pass
+    try:
+        # 先写到临时文件再原子替换，避免半写状态
+        tmp_path = path + ".tmp"
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(token)
+        os.replace(tmp_path, path)
+        # Windows 上用 icacls 限制 DACL：移除继承，仅当前用户 Full control
+        if os.name == "nt":
+            try:
+                import subprocess as _sp
+                userdomain = os.environ.get("USERDOMAIN", "")
+                username = os.environ.get("USERNAME") or os.getlogin()
+                full_user = f"{userdomain}\\{username}" if userdomain else username
+                r1 = _sp.run(
+                    ["icacls", path, "/grant:r", f"{full_user}:F"],
+                    capture_output=True, timeout=5,
+                )
+                if r1.returncode == 0:
+                    _sp.run(
+                        ["icacls", path, "/inheritance:r"],
+                        capture_output=True, timeout=5,
+                    )
+            except Exception:
+                pass
+    except OSError:
+        pass
 
 
 
@@ -76,15 +118,7 @@ class EngineAPI:
         self._setup_routes()
         global API_TOKEN
         API_TOKEN = secrets.token_hex(32)
-        try:
-            os.makedirs(os.path.dirname(API_TOKEN_FILE), exist_ok=True)
-        except OSError:
-            pass
-        try:
-            with open(API_TOKEN_FILE, "w") as f:
-                f.write(API_TOKEN)
-        except OSError:
-            pass
+        _secure_write_token(API_TOKEN_FILE, API_TOKEN)
 
     # ---- CORS -----------------------------------------------------------
 
@@ -137,6 +171,20 @@ class EngineAPI:
 
     def _get_user_plugins_dir(self) -> str:
         return os.path.join(os.environ.get("APPDATA", ""), "NotmyFault", "plugins")
+
+    @staticmethod
+    def _is_safe_plugin_id(pid: str) -> bool:
+        """校验插件 id 不含路径穿越字符（防 ../ 越界）。
+
+        与 plugin_install 端点校验保持一致：禁止路径分隔符和 ..。
+        toggle/uninstall 端点之前缺少这层校验，可构造
+        `DELETE /api/plugins/triggers/..%2F..%2F..%2Fdir` 删除任意目录。
+        """
+        if not pid:
+            return False
+        if "/" in pid or "\\" in pid or ".." in pid:
+            return False
+        return True
 
     def _find_plugin_by_package(self, package_name: str):
         """在用户插件目录中按 package_name 查找已安装插件。
@@ -195,9 +243,35 @@ class EngineAPI:
                     result[ptype][pid]["enabled"] = False
 
             if os.path.isdir(user_dir):
+                user_root = os.path.join(user_dir, ptype)
+                # scan_plugins 会跳过 disabled 和 schema 校验失败的插件，
+                # 导致这些插件不显示在 dashboard 上，用户无法禁用/卸载。
+                # 先用 scan_plugins 获取有效插件，再兜底扫描所有目录，
+                # 把被跳过的加回来（与 builtin 插件逻辑一致）。
                 for pid, meta in scan_plugins(user_dir, ptype, json_name).items():
                     meta["origin"] = "user"
                     result[ptype][pid] = meta
+
+                if os.path.isdir(user_root):
+                    plugin_type = "trigger" if ptype == "triggers" else "action"
+                    for folder_name in sorted(os.listdir(user_root)):
+                        json_path = os.path.join(user_root, folder_name, json_name)
+                        if not os.path.exists(json_path):
+                            continue
+                        try:
+                            with open(json_path, "r", encoding="utf-8") as f:
+                                meta = json.load(f)
+                        except (json.JSONDecodeError, OSError):
+                            continue
+                        pid = meta.get("id", folder_name)
+                        if pid in result[ptype]:
+                            continue
+                        meta["origin"] = "user"
+                        # schema 校验失败的插件标注 _error，让用户知道为什么加载失败
+                        is_valid, errors = validate_plugin_meta(meta, plugin_type)
+                        if not is_valid:
+                            meta["_error"] = "schema: " + "; ".join(errors[:2])
+                        result[ptype][pid] = meta
 
         # merge diagnostics (loaded status / errors)
         engine = getattr(self, "_engine_ref", None)
@@ -214,6 +288,8 @@ class EngineAPI:
         return result
 
     def _toggle_plugin(self, ptype: str, pid: str) -> dict:
+        if not self._is_safe_plugin_id(pid):
+            return {"ok": False, "error": "插件 id 含非法字符（禁止路径分隔符）"}
         base = os.path.dirname(__file__)
         user_dir = self._get_user_plugins_dir()
         json_name = "trigger.json" if ptype == "triggers" else "action.json"
@@ -261,6 +337,8 @@ class EngineAPI:
         return {"ok": False, "error": "插件不存在"}
 
     def _uninstall_plugin(self, ptype: str, pid: str) -> dict:
+        if not self._is_safe_plugin_id(pid):
+            return {"ok": False, "error": "插件 id 含非法字符（禁止路径分隔符）"}
         user_dir = self._get_user_plugins_dir()
         json_name = "trigger.json" if ptype == "triggers" else "action.json"
         plugin_dir = os.path.join(user_dir, ptype, pid)
@@ -388,6 +466,15 @@ class EngineAPI:
                     status_code=400,
                 )
 
+            # 安全校验：命中危险模式（危险命令/危险路径）则拒绝写入
+            from notmyfault.config import _validate_rules_safety
+            _warnings, errors = _validate_rules_safety(body.get("rules", []))
+            if errors:
+                return JSONResponse(
+                    {"ok": False, "error": "规则安全校验失败", "details": errors[:10]},
+                    status_code=400,
+                )
+
             existing_config = self._load_config()
             new_config = {
                 "rules": body.get("rules", []),
@@ -435,11 +522,14 @@ class EngineAPI:
         async def plugin_install(request: Request):
             await self._verify_auth(request)
             import tempfile, shutil, py7zr
+            from starlette.datastructures import UploadFile
             form = await request.form()
             file = form.get("file")
-            password = form.get("password", "")
-            if not file:
+            if not isinstance(file, UploadFile):
                 return JSONResponse({"ok": False, "error": "缺少上传文件"}, status_code=400)
+            password = form.get("password", "")
+            if not isinstance(password, str):
+                password = ""
 
             data = await file.read()
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".nmfp")
@@ -492,15 +582,34 @@ class EngineAPI:
                 force = str(form.get("force", "")).lower() in ("1", "true", "yes")
                 user_dir = self._get_user_plugins_dir()
 
+                # 路径穿越防御：pid 不可含路径分隔符或 ..
+                if not self._is_safe_plugin_id(pid):
+                    return JSONResponse(
+                        {"ok": False, "error": "插件 id 含非法字符（禁止路径分隔符）"},
+                        status_code=400,
+                    )
+                dest = os.path.join(user_dir, ptype, pid)
+                # 二次校验：normpath 后 dest 必须仍在 user_dir/ptype 下
+                ptype_dir = os.path.join(user_dir, ptype)
+                if not os.path.normpath(dest).startswith(
+                    os.path.normpath(ptype_dir) + os.sep
+                ):
+                    return JSONResponse(
+                        {"ok": False, "error": "插件路径越界"},
+                        status_code=400,
+                    )
+
                 # 全局包名唯一性检查 + 版本对比
                 existing = self._find_plugin_by_package(pkg)
                 if existing:
                     ex_ptype, ex_pid, ex_meta = existing
                     ex_vc = ex_meta.get("version_code", 0)
-                    if not force and new_vc < ex_vc:
+                    # 相同版本号也要求 force（之前只拦截降级 new_vc < ex_vc，
+                    # 导致 new_vc == ex_vc 时静默覆盖用户已修改的插件配置）。
+                    if not force and new_vc <= ex_vc:
                         return JSONResponse(
                             {"ok": False,
-                             "error": f"降级安装被拒绝: 当前 v{ex_vc} >= 新版 v{new_vc}（packageName={pkg}）。强制覆盖请传 force=true"},
+                             "error": f"版本不高于当前 v{ex_vc}（packageName={pkg}）。强制覆盖请传 force=true"},
                             status_code=400)
                     # 删除旧插件（允许跨类型升级/覆盖）
                     import shutil as _sh
@@ -525,14 +634,16 @@ class EngineAPI:
                     return JSONResponse({"ok": False, "error": "签名失败: " + err}, status_code=400)
 
                 # 复制到 user plugins（清空旧目录后写入）
+                # 之前只复制文件（os.path.isfile），跳过子目录，
+                # 导致含 assets/、lib/ 等子目录的插件资源丢失。
+                # 改用 shutil.copytree 递归复制，ignore 跳过 __pycache__ 缓存。
                 if os.path.exists(dest):
                     shutil.rmtree(dest, ignore_errors=True)
-                os.makedirs(dest, exist_ok=True)
-                for fname in os.listdir(root_path):
-                    src = os.path.join(root_path, fname)
-                    dst = os.path.join(dest, fname)
-                    if os.path.isfile(src):
-                        shutil.copy2(src, dst)
+                shutil.copytree(
+                    root_path, dest,
+                    dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc'),
+                )
 
                 return {"ok": True, "id": pid, "type": ptype, "package_name": pkg,
                         "version_code": new_vc, "restart_required": True}

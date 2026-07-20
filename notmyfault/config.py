@@ -152,11 +152,50 @@ _ALLOWED_ACTION_TYPES = {"set_volume", "notify", "run_powershell", "launch_progr
 # 配置签名与完整性校验
 # ---------------------------------------------------------------------------
 
+def _secure_write_secret(path: str, data: bytes) -> None:
+    """安全写入密钥文件，限制权限仅当前用户可访问。
+
+    - 用 os.open 创建文件并设置 0o600（Unix 生效；Windows 部分生效）
+    - Windows 上额外用 icacls 移除继承权限，仅保留当前用户 Full control
+      （需要 F 权限而非 R，因为 _get_or_create_secret 可能需要重新写入 secret；
+      os.getlogin() 在某些环境下返回的用户名不被 icacls 识别，改用 %USERNAME%）
+    """
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        if os.name == "nt":
+            try:
+                import subprocess as _sp
+                # os.getlogin()/USERNAME 只返回用户名，icacls 会把计算机名
+                # 当成域名解析失败（如 CUTEAPLANE\:(R) 无人有权限）。
+                # 必须用 domain\user 完整格式。优先 %USERDOMAIN%\%USERNAME%。
+                userdomain = os.environ.get("USERDOMAIN", "")
+                username = os.environ.get("USERNAME") or os.getlogin()
+                full_user = f"{userdomain}\\{username}" if userdomain else username
+                # 先 grant 再 inheritance：如果 grant 失败（用户名解析问题），
+                # 不移除继承权限，至少保留默认权限让文件可读写。
+                r1 = _sp.run(
+                    ["icacls", path, "/grant:r", f"{full_user}:F"],
+                    capture_output=True, timeout=5,
+                )
+                if r1.returncode == 0:
+                    _sp.run(
+                        ["icacls", path, "/inheritance:r"],
+                        capture_output=True, timeout=5,
+                    )
+            except Exception:
+                pass
+    except OSError:
+        pass
+
+
 def _get_or_create_secret() -> bytes:
     """获取或创建配置签名密钥。
 
     密钥存储在 %APPDATA%/NotmyFault/.config_secret 中。
     每个安装实例有自己的唯一密钥。
+    文件权限限制为仅当前用户可读（PoC-8 修复）。
     """
     config_dir = os.path.dirname(CONFIG_FILE)
     if config_dir:
@@ -170,11 +209,7 @@ def _get_or_create_secret() -> bytes:
             pass
 
     secret = secrets.token_bytes(32)
-    try:
-        with open(_secret_path(), "wb") as f:
-            f.write(secret)
-    except OSError:
-        pass
+    _secure_write_secret(_secret_path(), secret)
     return secret
 
 
@@ -281,6 +316,20 @@ _DANGEROUS_PATTERNS = [
     "Set-MpPreference", "Add-MpPreference", "New-Service",
     "Set-ItemProperty", "New-ItemProperty",
     "reg add", "sc config", "bcdedit",
+    # 高危：脚本块/间接调用绕过（PoC-3 修复）
+    "[scriptblock]::create", "[scriptblock]::",
+    "get-command", "get-alias",
+    ".invoke()",
+    "icm",  # Invoke-Command 别名
+    "iex ",  # Invoke-Expression 别名（带空格避免误匹配子串）
+]
+
+# launch_program 危险路径黑名单（命中归入 errors 拒绝）
+_DANGEROUS_LAUNCH_PATHS = [
+    "\\\\", "temp\\", "%tmp%\\", "%temp%\\",
+    "powershell.exe", "cmd.exe", "wscript.exe", "cscript.exe",
+    "powers~",   # 8.3 短名绕过
+    "rundll32", "regsvr32", "wmic", "mshta", "certutil", "bitsadmin",
 ]
 
 def _has_dangerous_command(command: str) -> str | None:
@@ -295,47 +344,50 @@ def _has_dangerous_command(command: str) -> str | None:
     return None
 
 
-def _validate_rules_safety(rules: list) -> list[str]:
-    """校验规则中的动作参数是否安全。返回警告列表。"""
+def _validate_rules_safety(rules: list) -> tuple[list[str], list[str]]:
+    """校验规则中的动作参数是否安全。
+
+    Returns:
+        (warnings, errors):
+        - warnings: 提醒类问题（非标准 action 类型等），不阻止写入
+        - errors: 危险模式命中（危险命令/危险路径），应拒绝写入
+    """
     warnings: list[str] = []
+    errors: list[str] = []
     for i, rule in enumerate(rules):
         rule_name = rule.get("name", f"规则 #{i+1}")
         for j, action in enumerate(rule.get("actions", [])):
             action_type = action.get("type", "")
 
-            # action 类型白名单检查
+            # action 类型白名单检查（warning）
             if action_type and action_type not in _ALLOWED_ACTION_TYPES:
                 warnings.append(
                     f"规则 \"{rule_name}\" 使用了非标准的 action 类型: '{action_type}'"
                 )
 
-            # 危险命令检测
+            # 危险命令检测（error - 命中拒绝）
             if action_type in ("run_powershell",):
                 cmd = action.get("params", {}).get("command", "")
                 if cmd:
                     danger = _has_dangerous_command(cmd)
                     if danger:
-                        warnings.append(
+                        errors.append(
                             f"规则 \"{rule_name}\" 的 PowerShell 命令包含危险模式: '{danger}'"
                         )
 
-            # launch_program 路径检查
+            # launch_program 路径检查（error - 命中拒绝）
             if action_type == "launch_program":
                 path = action.get("params", {}).get("path", "")
                 if path:
-                    dangerous_locations = [
-                        "\\\\", "temp\\", "%tmp%\\", "%temp%\\",
-                        "powershell.exe", "cmd.exe", "wscript.exe", "cscript.exe",
-                    ]
                     path_lower = path.lower()
-                    for dl in dangerous_locations:
+                    for dl in _DANGEROUS_LAUNCH_PATHS:
                         if dl in path_lower:
-                            warnings.append(
+                            errors.append(
                                 f"规则 \"{rule_name}\" 的启动路径包含危险位置: '{path}'"
                             )
                             break
 
-    return warnings
+    return warnings, errors
 
 
 # ---------------------------------------------------------------------------
@@ -460,10 +512,13 @@ def get_config() -> Dict[str, Any]:
 
     # --- 运行时安全校验 ---
     rules = config.get("rules", [])
-    safety_warnings = _validate_rules_safety(rules)
+    safety_warnings, safety_errors = _validate_rules_safety(rules)
     if safety_warnings:
         for w in safety_warnings:
             print(f"[Config] [安全] {w}", file=sys.stderr)
+    if safety_errors:
+        for e in safety_errors:
+            print(f"[Config] [安全-严重] {e}", file=sys.stderr)
 
     print("[DEBUG] Config loaded:", config)
     return config

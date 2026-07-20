@@ -44,3 +44,6 @@ notmyfault/integrity.json
 _patch_dash.py
 
 DECOUPLING.md
+
+# 测试沙箱残留（含敏感凭据）
+sandbox_appdata/

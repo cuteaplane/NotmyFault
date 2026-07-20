@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import pkg from './package.json' with { type: 'json' }
 
 // Dashboard 构建配置
 // dev: localhost:5173（HMR），proxy /api -> 引擎 API
@@ -7,6 +8,9 @@ import vue from '@vitejs/plugin-vue'
 export default defineConfig({
   plugins: [vue()],
   base: './',
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version)
+  },
   server: {
     port: 5173,
     proxy: { '/api': 'http://127.0.0.1:19198' }

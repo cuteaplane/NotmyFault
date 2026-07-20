@@ -284,9 +284,20 @@ class PluginLoader:
                 engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason=f"禁止能力: {cap_msg}")
                 continue
 
+            # dynamic_exec（exec/eval/compile/__import__/importlib.import_module）一律禁止：
+            # 可绕过所有 AST 能力检测，声明了也不安全。不分安全模式--硬规则。
+            if "dynamic_exec" in caps:
+                cap_msg = "dynamic_exec（exec/eval/compile/__import__ 动态执行：可绕过所有能力检测）"
+                print(f'[Engine] [安全] 插件 "{plugin_id}" 触发禁止能力: {cap_msg}', file=sys.stderr)
+                engine_warn(f"forbidden_capability: {plugin_id} {cap_msg}")
+                failed_count += 1
+                self._diagnostics.record_plugin_error(store_name, plugin_id, f"禁止能力: {cap_msg}")
+                engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason=f"禁止能力: {cap_msg}")
+                continue
+
             declared_perms = set(meta.get("permissions") or [])
-            # self_elevation 不可声明，从“未声明”判定里剔除，避免误导性提示。
-            undeclared = (caps - {"self_elevation"}) - declared_perms
+            # self_elevation / dynamic_exec 不可声明，从“未声明”判定里剔除。
+            undeclared = (caps - {"self_elevation", "dynamic_exec"}) - declared_perms
             if undeclared:
                 cap_msg = ", ".join(sorted(undeclared))
                 print(f'[Engine] [安全] 插件 "{plugin_id}" 使用了未在清单声明的能力: {cap_msg}', file=sys.stderr)
@@ -364,13 +375,16 @@ class PluginLoader:
                 engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason="缺少 run() 函数")
                 continue
 
-            # --- 签名校验（仅 builtin） ---
-            if origin == "builtin" and not verify_plugin_sig(folder_path, origin):
+            # --- 签名校验（builtin + user 均需签名）---
+            # 用户插件通过 /api/plugins/install 安装时会用项目私钥签名；
+            # 直接放入用户插件目录的插件（无签名）在 strict 模式下拒载。
+            if not verify_plugin_sig(folder_path, origin):
                 if self._security_mode == SecurityMode.STRICT:
                     print(f"[Engine] [!!] {store_name} \"{plugin_id}\" 签名无效，不加载", file=sys.stderr)
                     continue
                 elif self._security_mode == SecurityMode.NORMAL:
                     print(f"[Engine] [!!] {store_name} \"{plugin_id}\" 签名无效，降级加载", file=sys.stderr)
+                # PERMISSIVE: 放行，允许直接放入文件夹安装（开发/测试用）
             # --- 同名覆盖 ---
             # 用户插件覆盖内置插件时，先拍下旧插件状态再卸下，但 teardown 推迟到
             # 新插件 setup 成功之后：万一新 setup 失败，能把旧插件原样装回去，

@@ -3,7 +3,7 @@ import { computed } from 'vue'
 const props = defineProps({ def: Object, modelValue: [String, Number, Boolean] })
 const emit = defineEmits(['update:modelValue'])
 const value = computed({
-  get: () => props.modelValue != null ? props.modelValue : (props.def.default || ''),
+  get: () => props.modelValue != null ? props.modelValue : (props.def.default ?? ''),
   set: (v) => emit('update:modelValue', v)
 })
 const type = computed(() => props.def.type || 'string')

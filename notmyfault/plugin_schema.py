@@ -12,6 +12,8 @@ _REQUIRED_PARAM_FIELDS = {"name", "type", "label"}
 _ALLOWED_PERMISSIONS = {"admin", "external_binary", "native_api"}
 _ALLOWED_ORIGINS = {"builtin", "user", "third_party"}
 _PACKAGE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$")
+# id 仅允许字母/数字/下划线/连字符，禁止路径分隔符（防 ../ 路径穿越）
+_PLUGIN_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 
 
 def validate_plugin_meta(
@@ -31,6 +33,11 @@ def validate_plugin_meta(
 
     if "id" in meta and not isinstance(meta["id"], str):
         errors.append(f"字段 'id' 必须是字符串，实际: {type(meta['id']).__name__}")
+    elif "id" in meta and not _PLUGIN_ID_RE.match(meta["id"]):
+        errors.append(
+            f"字段 'id' 含非法字符: '{meta['id']}'"
+            f"（仅允许字母/数字/下划线/连字符，禁止路径分隔符）"
+        )
     if "name" in meta and not isinstance(meta["name"], str):
         errors.append(f"字段 'name' 必须是字符串")
     if "description" in meta and not isinstance(meta["description"], str):

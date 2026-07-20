@@ -65,6 +65,10 @@ _CTYPES_DANGEROUS = {"windll", "CDLL", "WinDLL", "OleDLL", "WINFUNCTYPE", "CFUNC
 # 插件必须走 notmyfault.sudo.run_as_admin（声明 admin 权限），禁止自己直接提权。
 _ELEVATION_FUNCS = {"shellexecute", "shellexecutew", "shellexecuteex", "shellexecutea"}
 _ELEVATION_VERB = "runas"
+# 动态执行函数：exec/eval/compile 可绕过所有 AST 能力检测，
+# __import__ 和 importlib.import_module 可动态导入任意模块。
+# 这些一律禁止（PoC-5 修复），声明了也不允许。
+_DYNAMIC_EXEC_FUNCS = {"exec", "eval", "compile"}
 
 
 def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
@@ -134,8 +138,18 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
             # 直接 ShellExecuteW(...)（from xx import ShellExecuteW 之后）。
             if isinstance(func, ast.Name) and func.id.lower() in _ELEVATION_FUNCS:
                 caps.add("self_elevation")
-            # __import__("subprocess") / importlib.import_module("ctypes") 动态导入。
-            # 只能识别常量模块名；动态拼名字符串仍可绕过（见 docstring）。
+            # exec/eval/compile 动态执行（PoC-5 修复）- 一律禁止
+            if isinstance(func, ast.Name) and func.id in _DYNAMIC_EXEC_FUNCS:
+                caps.add("dynamic_exec")
+            # __import__ 调用本身（无论参数是否常量）都视为动态执行
+            if isinstance(func, ast.Name) and func.id == "__import__":
+                caps.add("dynamic_exec")
+            # importlib.import_module 调用本身（无论参数是否常量）
+            if (isinstance(func, ast.Attribute) and func.attr == "import_module"
+                  and isinstance(func.value, ast.Name) and func.value.id == "importlib"):
+                caps.add("dynamic_exec")
+            # __import__("subprocess") / importlib.import_module("ctypes") 常量模块名检测
+            # （保留：进一步标注 native_api/external_binary，方便诊断）
             mod_arg = None
             if isinstance(func, ast.Name) and func.id == "__import__":
                 mod_arg = node.args[0] if node.args else None
@@ -149,6 +163,7 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
                 if top in _EXTERNAL_MODULES:
                     caps.add("external_binary")
             # getattr(os, "system") / getattr(subprocess, "Popen") 动态属性取用。
+            # getattr(__builtins__, "__import__") 也视为动态执行。
             if (isinstance(func, ast.Name) and func.id == "getattr"
                     and len(node.args) >= 2):
                 target, name_arg = node.args[0], node.args[1]
@@ -161,6 +176,8 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
                         caps.add("external_binary")
                     elif target.id == "ctypes" and attr in _CTYPES_DANGEROUS:
                         caps.add("native_api")
+                    elif target.id in ("__builtins__", "builtins") and attr == "__import__":
+                        caps.add("dynamic_exec")
         elif isinstance(node, ast.keyword):
             # shell=True / shell=1 / shell="x" 等真值都视为启用 shell（之前只认 is True，
             # 会漏掉 shell=1 这类真值）。shell=False/0 不触发。
@@ -175,16 +192,16 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
 
 
 # ============================================================================
-# Ed25519 签名校验（仅 builtin 插件）
+# Ed25519 签名校验（builtin + user 插件均需校验）
 # ============================================================================
 
 def verify_plugin_sig(plugin_dir: str, origin: str = "builtin") -> bool:
-    """校验 builtin 插件目录的 signature.sig。
+    """校验插件目录的 signature.sig。
 
-    用户插件（origin != "builtin"）直接放行，不查签名。
+    所有插件（builtin 和 user）都需要签名校验。
+    用户插件通过 /api/plugins/install 安装时会用项目私钥签名，
+    直接放入用户插件目录的插件（无签名）将被拒载。
     """
-    if origin != "builtin":
-        return True
     try:
         from notmyfault.signing_keys import get_public_keys
         pub_keys = get_public_keys()
