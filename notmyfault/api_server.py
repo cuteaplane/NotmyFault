@@ -23,8 +23,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from notmyfault.config import CONFIG_FILE, save_config as config_save
-from notmyfault.plugin_schema import scan_plugins, validate_plugin_meta
-from notmyfault.security import detect_security_mode
+from notmyfault.plugin_schema import (
+    scan_plugins,
+    validate_plugin_meta,
+    scan_plugin_security,
+    check_permissions_conform,
+    get_permission_info,
+    is_known_permission,
+    PERMISSION_REGISTRY,
+)
+from notmyfault.security import detect_security_mode, SecurityMode
 
 _scan_plugins = scan_plugins  # 向后兼容
 
@@ -112,6 +120,9 @@ class EngineAPI:
         self._sub_lock = threading.Lock()
         self._server = None
         self._engine_ref = None
+
+        # 插件预览暂存：{token: {"extract_dir", "root_path", "meta", "ptype", "created_at"}}
+        self._pending_previews: Dict[str, Any] = {}
 
         self.app = FastAPI(title="NotmyFault Engine API", version="alpha-0.10")
         self._setup_middleware()
@@ -518,10 +529,20 @@ class EngineAPI:
             except Exception as e:
                 return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
-        @app.post("/api/plugins/install")
-        async def plugin_install(request: Request):
+        @app.post("/api/plugins/preview")
+        async def plugin_preview(request: Request):
             await self._verify_auth(request)
-            import tempfile, shutil, py7zr
+            # 清理超过 30 分钟未安装的预览（避免临时目录+内存泄漏）
+            _now = time.time()
+            for _t in [t for t, v in self._pending_previews.items()
+                       if _now - v.get("created_at", 0) > 1800]:
+                _p = self._pending_previews.pop(_t, None)
+                if _p:
+                    import shutil as _sh
+                    _ed = _p.get("extract_dir")
+                    if _ed and os.path.isdir(_ed):
+                        _sh.rmtree(_ed, ignore_errors=True)
+            import tempfile, py7zr
             from starlette.datastructures import UploadFile
             form = await request.form()
             file = form.get("file")
@@ -542,18 +563,15 @@ class EngineAPI:
                 with py7zr.SevenZipFile(tmp.name, mode="r", password=password or None) as zf:
                     zf.extractall(extract_dir)
 
-                # 找插件根目录：优先单文件夹，兼容文件平铺的打包方式
                 entries = os.listdir(extract_dir)
                 dirs = [d for d in entries if os.path.isdir(os.path.join(extract_dir, d))]
                 if len(dirs) == 1:
                     root_path = os.path.join(extract_dir, dirs[0])
                 elif len(dirs) == 0:
-                    # 文件直接平铺在 archive 根目录
                     root_path = extract_dir
                 else:
                     return JSONResponse({"ok": False, "error": "nmfp 根目录应恰好有一个插件文件夹"}, status_code=400)
 
-                # 确定类型
                 has_trigger = os.path.exists(os.path.join(root_path, "trigger.json"))
                 has_action = os.path.exists(os.path.join(root_path, "action.json"))
                 if has_trigger:
@@ -563,34 +581,182 @@ class EngineAPI:
                 else:
                     return JSONResponse({"ok": False, "error": "未找到 trigger.json 或 action.json"}, status_code=400)
 
-                # 校验 metadata
                 try:
                     with open(os.path.join(root_path, json_name), "r", encoding="utf-8") as f:
                         meta = json.load(f)
                 except (json.JSONDecodeError, OSError):
                     return JSONResponse({"ok": False, "error": "插件元数据 JSON 损坏或缺失"}, status_code=400)
 
-                from notmyfault.plugin_schema import validate_plugin_meta
                 plugin_type = "trigger" if ptype == "triggers" else "action"
                 ok, errors = validate_plugin_meta(meta, plugin_type)
-                if not ok:
-                    return JSONResponse({"ok": False, "error": "schema 校验失败: " + "; ".join(errors[:3])}, status_code=400)
+                schema_valid = ok
+                schema_errors = errors[:5] if errors else []
 
+                # 安全扫描
+                risks = scan_plugin_security(root_path)
+
+                # 权限分析
+                perms = meta.get("permissions", [])
+                perm_analysis = []
+                for p in perms:
+                    info = get_permission_info(p)
+                    if info:
+                        perm_analysis.append({
+                            "permission": p,
+                            "label": info["label"],
+                            "risk": info["risk"],
+                            "description": info["description"],
+                            "known": True,
+                        })
+                    else:
+                        perm_analysis.append({
+                            "permission": p,
+                            "label": p,
+                            "risk": "unknown",
+                            "description": "未知权限，不在安全规范中",
+                            "known": False,
+                        })
+
+                # 权限合规检查
+                perm_conform, perm_errors = check_permissions_conform(perms)
+
+                # 生成预览 token
+                preview_token = secrets.token_hex(16)
+                self._pending_previews[preview_token] = {
+                    "extract_dir": extract_dir,
+                    "root_path": root_path,
+                    "meta": meta,
+                    "ptype": ptype,
+                    "json_name": json_name,
+                    "created_at": time.time(),
+                }
+                extract_dir = None  # 防止 finally 清空
+
+                return {
+                    "ok": True,
+                    "preview_token": preview_token,
+                    "plugin": {
+                        "id": meta.get("id", ""),
+                        "name": meta.get("name", ""),
+                        "description": meta.get("description", ""),
+                        "version": meta.get("version", ""),
+                        "version_code": meta.get("version_code", 0),
+                        "author": meta.get("author", ""),
+                        "package_name": meta.get("package_name", ""),
+                        "type": ptype,
+                        "semantic": meta.get("semantic", ""),
+                    },
+                    "permissions": perm_analysis,
+                    "permission_conform": perm_conform,
+                    "permission_errors": perm_errors,
+                    "risks": risks,
+                    "schema_valid": schema_valid,
+                    "schema_errors": schema_errors,
+                }
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
+                if extract_dir:
+                    import shutil
+                    shutil.rmtree(extract_dir, ignore_errors=True)
+
+        @app.post("/api/plugins/install")
+        async def plugin_install(request: Request):
+            await self._verify_auth(request)
+            import shutil, py7zr
+            from starlette.datastructures import UploadFile
+            form = await request.form()
+
+            preview_token = str(form.get("preview_token", "") or "")
+            password = str(form.get("password", "") or "")
+            if not isinstance(password, str):
+                password = ""
+            force = str(form.get("force", "")).lower() in ("1", "true", "yes")
+
+            tmp = None
+
+            # 优先从 preview_token 恢复
+            if preview_token and preview_token in self._pending_previews:
+                preview = self._pending_previews.pop(preview_token)
+                root_path = preview["root_path"]
+                meta = preview["meta"]
+                ptype = preview["ptype"]
+                json_name = preview["json_name"]
+                extract_dir = preview.get("extract_dir")
+                # 清理会在 finally 中完成
+            else:
+                # 回退：直接上传安装（无预览）
+                file = form.get("file")
+                if not isinstance(file, UploadFile):
+                    return JSONResponse({"ok": False, "error": "缺少上传文件或 preview_token 无效"}, status_code=400)
+
+                data = await file.read()
+                import tempfile as _tf
+                tmp = _tf.NamedTemporaryFile(delete=False, suffix=".nmfp")
+                extract_dir = None
+                try:
+                    tmp.write(data)
+                    tmp.close()
+
+                    extract_dir = _tf.mkdtemp()
+                    with py7zr.SevenZipFile(tmp.name, mode="r", password=password or None) as zf:
+                        zf.extractall(extract_dir)
+
+                    entries = os.listdir(extract_dir)
+                    dirs = [d for d in entries if os.path.isdir(os.path.join(extract_dir, d))]
+                    if len(dirs) == 1:
+                        root_path = os.path.join(extract_dir, dirs[0])
+                    elif len(dirs) == 0:
+                        root_path = extract_dir
+                    else:
+                        return JSONResponse({"ok": False, "error": "nmfp 根目录应恰好有一个插件文件夹"}, status_code=400)
+
+                    has_trigger = os.path.exists(os.path.join(root_path, "trigger.json"))
+                    has_action = os.path.exists(os.path.join(root_path, "action.json"))
+                    if has_trigger:
+                        ptype, json_name = "triggers", "trigger.json"
+                    elif has_action:
+                        ptype, json_name = "actions", "action.json"
+                    else:
+                        return JSONResponse({"ok": False, "error": "未找到 trigger.json 或 action.json"}, status_code=400)
+
+                    try:
+                        with open(os.path.join(root_path, json_name), "r", encoding="utf-8") as f:
+                            meta = json.load(f)
+                    except (json.JSONDecodeError, OSError):
+                        return JSONResponse({"ok": False, "error": "插件元数据 JSON 损坏或缺失"}, status_code=400)
+
+                    plugin_type = "trigger" if ptype == "triggers" else "action"
+                    ok, errors = validate_plugin_meta(meta, plugin_type)
+                    if not ok:
+                        return JSONResponse({"ok": False, "error": "schema 校验失败: " + "; ".join(errors[:3])}, status_code=400)
+                except Exception:
+                    try:
+                        os.unlink(tmp.name)
+                    except Exception:
+                        pass
+                    if extract_dir:
+                        shutil.rmtree(extract_dir, ignore_errors=True)
+                    raise
+
+            # ---- 共享安装逻辑 ----
+            try:
                 pkg = meta.get("package_name", "")
                 new_vc = meta.get("version_code", 0)
-                pid = meta.get("id", os.path.basename(root_path))
-                force = str(form.get("force", "")).lower() in ("1", "true", "yes")
+                pid = meta.get("id", os.path.basename(root_path) if root_path else "")
                 user_dir = self._get_user_plugins_dir()
 
-                # 路径穿越防御：pid 不可含路径分隔符或 ..
+                # 路径穿越防御
                 if not self._is_safe_plugin_id(pid):
                     return JSONResponse(
                         {"ok": False, "error": "插件 id 含非法字符（禁止路径分隔符）"},
                         status_code=400,
                     )
-                dest = os.path.join(user_dir, ptype, pid)
-                # 二次校验：normpath 后 dest 必须仍在 user_dir/ptype 下
+
                 ptype_dir = os.path.join(user_dir, ptype)
+                dest = os.path.join(user_dir, ptype, pid)
                 if not os.path.normpath(dest).startswith(
                     os.path.normpath(ptype_dir) + os.sep
                 ):
@@ -599,21 +765,28 @@ class EngineAPI:
                         status_code=400,
                     )
 
+                # 许可权限校验 vs security_mode
+                perms = meta.get("permissions", [])
+                perm_conform, _ = check_permissions_conform(perms)
+                sec_mode = detect_security_mode()
+                if sec_mode == SecurityMode.STRICT and not perm_conform:
+                    unknown = [p for p in perms if not is_known_permission(p)]
+                    return JSONResponse(
+                        {"ok": False, "error": f"严格模式下拒绝安装：插件请求了未知权限: {', '.join(unknown)}"},
+                        status_code=400,
+                    )
+
                 # 全局包名唯一性检查 + 版本对比
                 existing = self._find_plugin_by_package(pkg)
                 if existing:
                     ex_ptype, ex_pid, ex_meta = existing
                     ex_vc = ex_meta.get("version_code", 0)
-                    # 相同版本号也要求 force（之前只拦截降级 new_vc < ex_vc，
-                    # 导致 new_vc == ex_vc 时静默覆盖用户已修改的插件配置）。
-                    if not force and new_vc <= ex_vc:
+                    if not force and new_vc < ex_vc:
                         return JSONResponse(
                             {"ok": False,
-                             "error": f"版本不高于当前 v{ex_vc}（packageName={pkg}）。强制覆盖请传 force=true"},
+                             "error": f"已安装更高版本 v{ex_vc}，如需降级请勾选「强制覆盖」后重试"},
                             status_code=400)
-                    # 删除旧插件（允许跨类型升级/覆盖）
-                    import shutil as _sh
-                    _sh.rmtree(os.path.join(user_dir, ex_ptype, ex_pid), ignore_errors=True)
+                    shutil.rmtree(os.path.join(user_dir, ex_ptype, ex_pid), ignore_errors=True)
 
                 dest = os.path.join(user_dir, ptype, pid)
 
@@ -633,10 +806,6 @@ class EngineAPI:
                         return JSONResponse({"ok": False, "error": "私钥密码错误"}, status_code=400)
                     return JSONResponse({"ok": False, "error": "签名失败: " + err}, status_code=400)
 
-                # 复制到 user plugins（清空旧目录后写入）
-                # 之前只复制文件（os.path.isfile），跳过子目录，
-                # 导致含 assets/、lib/ 等子目录的插件资源丢失。
-                # 改用 shutil.copytree 递归复制，ignore 跳过 __pycache__ 缓存。
                 if os.path.exists(dest):
                     shutil.rmtree(dest, ignore_errors=True)
                 shutil.copytree(
@@ -648,12 +817,20 @@ class EngineAPI:
                 return {"ok": True, "id": pid, "type": ptype, "package_name": pkg,
                         "version_code": new_vc, "restart_required": True}
             finally:
-                try:
-                    os.unlink(tmp.name)
-                except Exception:
-                    pass
-                if extract_dir:
+                if not preview_token and extract_dir:
+                    if tmp is not None:
+                        try:
+                            os.unlink(tmp.name)
+                        except Exception:
+                            pass
                     shutil.rmtree(extract_dir, ignore_errors=True)
+                elif preview_token:
+                    # extract_dir 始终是预览时 mkdtemp 的临时解压目录；
+                    # 无论 root_path 是 extract_dir 本身（平铺打包）还是其子目录（单文件夹打包），
+                    # 删 extract_dir 即可。不可用 dirname(root_path)，否则平铺打包会误删 Temp 父目录。
+                    if extract_dir:
+                        import shutil as _sh_clean
+                        _sh_clean.rmtree(extract_dir, ignore_errors=True)
 
         @app.get("/api/plugins/key-status")
         async def plugin_key_status():

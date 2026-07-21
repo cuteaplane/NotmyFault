@@ -162,13 +162,18 @@ def validate_rules(
                             f'应为布尔值，实际: {type(param_value).__name__}',
                         ))
                 elif expected_type == "select":
-                    options = schema.get("options", [])
-                    if options and param_value not in options:
+                    raw_options = schema.get("options", [])
+                    # 兼容新格式 {"value","label"} 和旧格式字符串
+                    opt_values = [
+                        o["value"] if isinstance(o, dict) else o
+                        for o in raw_options
+                    ]
+                    if opt_values and param_value not in opt_values:
                         warnings.append((
                             rule_name,
                             f'action "{action_type}" 参数 \'{param_name}\' '
                             f'值 \'{param_value}\' 不在可选项中 '
-                            f"({', '.join(map(str, options))})",
+                            f"({', '.join(map(str, opt_values))})",
                         ))
                 # string 类型不做严格检查——用户爱填什么填什么
 

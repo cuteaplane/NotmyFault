@@ -15,6 +15,13 @@ from notmyfault.logging import init_session_log
 
 LOG_DIR = os.path.join(os.path.dirname(CONFIG_FILE), "logs")
 
+# 系统托盘（导入失败不阻塞，无托盘也能运行）
+try:
+    from notmyfault.tray import TrayIcon
+    _HAS_TRAY = True
+except ImportError:
+    _HAS_TRAY = False
+
 
 def setup_logging(log_dir: str) -> str:
     """初始化 session 日志文件，重定向 stdout/stderr。
@@ -81,6 +88,16 @@ def setup_logging(log_dir: str) -> str:
     print(f"--- NotmyFault 引擎启动 {datetime.now().isoformat()} ---")
 
 
+def _open_dashboard():
+    """在后台打开 Dashboard。"""
+    dashboard_pyw = os.path.join(PROJECT_ROOT, "dashboard.pyw")
+    if os.path.exists(dashboard_pyw):
+        try:
+            os.startfile(dashboard_pyw)
+        except Exception:
+            pass
+
+
 class EngineRunner:
     """后台引擎运行器 — 管理引擎生命周期"""
 
@@ -89,6 +106,7 @@ class EngineRunner:
         self.shutdown_event = threading.Event()
         self.engine_thread = None
         self._api = None
+        self._tray = None
 
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -125,6 +143,8 @@ class EngineRunner:
     def _run_engine(self):
         try:
             self.engine_running = True
+            if self._tray:
+                self._tray.set_engine_running(True)
             engine = create_engine(
                 on_event=self._api.push_event if self._api else None,
             )
@@ -138,6 +158,8 @@ class EngineRunner:
             print(f"[Engine] 引擎错误: {e}")
             import traceback
             traceback.print_exc()
+            if self._tray:
+                self._tray.show_balloon("引擎异常", f"引擎线程崩溃: {e}", 3)
             # 拉起 Dashboard 通知用户
             try:
                 from notmyfault.alert import alert_user
@@ -148,6 +170,8 @@ class EngineRunner:
                 self._api.push_event("error", {"error": str(e)})
         finally:
             self.engine_running = False
+            if self._tray:
+                self._tray.set_engine_running(False)
             if self._api:
                 self._api.push_event("engine_state_changed", {"state": "stopped"})
 
@@ -160,6 +184,34 @@ class EngineRunner:
             if self.engine_thread.is_alive():
                 print("[Engine] 警告：引擎线程 5 秒内未退出，强制标记为停止")
         self.engine_running = False
+
+    def _toggle_engine(self):
+        """托盘切换引擎启停"""
+        if self.engine_running:
+            self._stop_engine()
+            if self._tray:
+                self._tray.set_engine_running(False)
+        else:
+            # 启动是异步的，乐观更新托盘状态；
+            # _run_engine 线程启动后会再次同步，避免读取尚未置位的 engine_running
+            self._start_engine_core()
+            if self._tray:
+                self._tray.set_engine_running(True)
+
+    def _tray_exit(self):
+        """托盘退出—关闭引擎、HTTP 服务、退出进程"""
+        print("[Tray] 用户请求退出")
+        self.shutdown_event.set()
+        if self._api and self._api._server:
+            self._api._server.should_exit = True
+        if self._tray:
+            self._tray.stop()
+        # 强制退出（5 秒内干净的 shutdown 没完成就硬杀）
+        def _force():
+            import time
+            time.sleep(5)
+            os._exit(0)
+        threading.Thread(target=_force, daemon=True).start()
 
     # ================================================================
     # 单实例检查
@@ -202,7 +254,19 @@ class EngineRunner:
         self._start_engine_core()
         self._api.push_event("engine_state_changed", {"state": "running"})
 
-        # 3. 启动 HTTP 服务（阻塞，直到 uvicorn 退出）
+        # 3. 系统托盘
+        if _HAS_TRAY:
+            self._tray = TrayIcon(
+                on_open_dashboard=_open_dashboard,
+                on_toggle_engine=self._toggle_engine,
+                on_exit=self._tray_exit,
+            )
+            self._tray.start()
+            self._tray.set_engine_running(True)
+            self._tray.show_balloon("NotmyFault", "引擎已启动")
+            print("[Tray] 系统托盘图标已启动")
+
+        # 4. 启动 HTTP 服务（阻塞，直到 uvicorn 退出）
         try:
             self._api.serve(host="127.0.0.1", port=19198)
         except KeyboardInterrupt:
@@ -217,8 +281,12 @@ class EngineRunner:
     def _cleanup(self):
         print("\n[Cleanup] 正在关闭...")
         self.shutdown_event.set()
+        if self._tray:
+            self._tray.stop()
         if self.engine_thread and self.engine_thread.is_alive():
             self.engine_thread.join(timeout=5)
+        if self._tray:
+            self._tray.show_balloon("NotmyFault", "引擎已停止", 1)
         print("[Cleanup] Done! ")
         print(f"--- 引擎关闭 {datetime.now().isoformat()} ---")
 

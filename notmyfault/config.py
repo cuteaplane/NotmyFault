@@ -144,8 +144,6 @@ def _backup_path() -> str:
 def _secret_path() -> str:
     return os.path.join(os.path.dirname(CONFIG_FILE), ".config_secret")
 _SIGNATURE_KEY = "_signature"
-# 允许的 action 类型白名单（防恶意插件注入）
-_ALLOWED_ACTION_TYPES = {"set_volume", "notify", "run_powershell", "launch_program", "kill_process", "lock_screen"}
 
 
 # ---------------------------------------------------------------------------
@@ -358,12 +356,6 @@ def _validate_rules_safety(rules: list) -> tuple[list[str], list[str]]:
         rule_name = rule.get("name", f"规则 #{i+1}")
         for j, action in enumerate(rule.get("actions", [])):
             action_type = action.get("type", "")
-
-            # action 类型白名单检查（warning）
-            if action_type and action_type not in _ALLOWED_ACTION_TYPES:
-                warnings.append(
-                    f"规则 \"{rule_name}\" 使用了非标准的 action 类型: '{action_type}'"
-                )
 
             # 危险命令检测（error - 命中拒绝）
             if action_type in ("run_powershell",):

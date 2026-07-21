@@ -1,0 +1,20 @@
+{
+    "id": "hotkey",
+    "name": "全局热键",
+    "semantic": "oneshot",
+    "description": "按下指定全局热键时触发动作",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.hotkey",
+    "enabled": true,
+    "permissions": ["native_api"],
+    "params": [
+        {
+            "name": "hotkey",
+            "label": "快捷键",
+            "type": "string",
+            "default": "Ctrl+Alt+Shift+X",
+            "placeholder": "如 Ctrl+Shift+A、Alt+F1"
+        }
+    ]
+}

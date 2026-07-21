@@ -1,0 +1,34 @@
+{
+    "id": "system_resource",
+    "name": "系统资源阈值",
+    "semantic": "state",
+    "description": "当 CPU/内存/磁盘/网络 达到指定阈值时触发",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.system_resource",
+    "enabled": true,
+    "permissions": ["native_api"],
+    "params": [
+        {
+            "name": "resource",
+            "label": "资源类型",
+            "type": "select",
+            "default": "cpu",
+            "options": ["cpu", "memory", "disk", "network"]
+        },
+        {
+            "name": "threshold",
+            "label": "阈值 (%)",
+            "type": "number",
+            "default": 90,
+            "placeholder": "0-100"
+        },
+        {
+            "name": "direction",
+            "label": "触发方向",
+            "type": "select",
+            "default": "above",
+            "options": ["above", "below"]
+        }
+    ]
+}

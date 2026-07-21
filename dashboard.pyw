@@ -223,7 +223,7 @@ def _ensure_dashboard_build():
 
 
 def _resolve_dashboard_url():
-    """优先使用 dashboard/dist 构建产物，回退旧 dashboard.html。"""
+    """使用 dashboard/dist 构建产物。"""
     dist = os.path.join(PROJECT_ROOT, "dashboard", "dist")
     if not (os.path.isdir(dist) and os.path.exists(os.path.join(dist, "index.html"))):
         _ensure_dashboard_build()
@@ -231,10 +231,6 @@ def _resolve_dashboard_url():
         httpd, url = _start_static_server(dist)
         if url:
             return url, httpd
-        print("[Dashboard] 静态服务器启动失败，回退到单文件模式", file=sys.stderr)
-    legacy = os.path.join(PROJECT_ROOT, "dashboard.html")
-    if os.path.exists(legacy):
-        return legacy, None
     return None, None
 
 def main():
@@ -247,7 +243,7 @@ def main():
 
     dashboard_url, _static_httpd = _resolve_dashboard_url()
     if not dashboard_url:
-        print("[Dashboard] 找不到 dashboard/dist 构建产物，也找不到 dashboard.html", file=sys.stderr)
+        print("[Dashboard] 找不到 dashboard/dist 构建产物", file=sys.stderr)
         return
     icon_path = os.path.join(PROJECT_ROOT, "logo.ico")
 

@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed } from 'vue'
 import { store } from '../lib/store'
-import { getParamDefs, buildDefaultParams } from '../lib/utils'
+import { getVisibleParamDefs, buildDefaultParams } from '../lib/utils'
 import ParamInput from './ParamInput.vue'
 
 const props = defineProps({ rule: Object })
@@ -29,8 +29,8 @@ const actionSummary = computed(() => {
 })
 
 function isAdmin(m) { return !!(m && (m.permissions || []).includes('admin')) }
-function evParams(ev) { return getParamDefs(store.schema.triggers[ev.type]) }
-function actParams(a) { return getParamDefs(store.schema.actions[a.type]) }
+function evParams(ev) { return getVisibleParamDefs(store.schema.triggers[ev.type], ev.params) }
+function actParams(a) { return getVisibleParamDefs(store.schema.actions[a.type], a.params) }
 
 function changeTrigger(t) {
   props.rule.event = { type: t, params: buildDefaultParams(store.schema.triggers[t]) }

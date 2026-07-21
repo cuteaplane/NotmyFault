@@ -1,0 +1,40 @@
+{
+    "id": "http_request",
+    "name": "HTTP 请求",
+    "description": "发送 HTTP GET/POST/PUT/DELETE 请求",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.http_request",
+    "enabled": true,
+    "permissions": ["network"],
+    "params": [
+        {
+            "name": "method",
+            "label": "请求方法",
+            "type": "select",
+            "default": "GET",
+            "options": ["GET", "POST", "PUT", "DELETE"]
+        },
+        {
+            "name": "url",
+            "label": "URL",
+            "type": "string",
+            "default": "",
+            "placeholder": "https://example.com/api"
+        },
+        {
+            "name": "body",
+            "label": "请求体 (POST/PUT)",
+            "type": "string",
+            "default": "",
+            "placeholder": "JSON 字符串"
+        },
+        {
+            "name": "headers",
+            "label": "自定义请求头",
+            "type": "string",
+            "default": "",
+            "placeholder": "每行一条，如 Content-Type: application/json"
+        }
+    ]
+}

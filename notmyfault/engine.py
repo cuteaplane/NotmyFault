@@ -27,7 +27,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from notmyfault.config import CONFIG_FILE
 from notmyfault.logging import engine_error, engine_info, engine_warn
-from notmyfault.plugin_schema import validate_plugin_meta
+from notmyfault.plugin_schema import validate_plugin_meta, check_permissions_conform, is_known_permission
 
 # --- 协作者（原 core/ 和 plugins/ 包已平铺为单文件）---
 from notmyfault.diagnostics import Diagnostics
@@ -385,6 +385,21 @@ class PluginLoader:
                 elif self._security_mode == SecurityMode.NORMAL:
                     print(f"[Engine] [!!] {store_name} \"{plugin_id}\" 签名无效，降级加载", file=sys.stderr)
                 # PERMISSIVE: 放行，允许直接放入文件夹安装（开发/测试用）
+
+            # --- 权限合规校验（strict 模式）---
+            # 允许安装时未做权限合规检查的插件（permissive 安装的），
+            # 切换到 strict 后拒载。
+            if self._security_mode == SecurityMode.STRICT:
+                perms = meta.get("permissions") or []
+                perm_conform, _ = check_permissions_conform(perms)
+                if not perm_conform:
+                    unknown = [p for p in perms if not is_known_permission(p)]
+                    print(
+                        f"[Engine] [!!] {store_name} \"{plugin_id}\" "
+                        f"包含未知权限: {', '.join(unknown)}，strict 模式不加载",
+                        file=sys.stderr,
+                    )
+                    continue
             # --- 同名覆盖 ---
             # 用户插件覆盖内置插件时，先拍下旧插件状态再卸下，但 teardown 推迟到
             # 新插件 setup 成功之后：万一新 setup 失败，能把旧插件原样装回去，
