@@ -233,7 +233,7 @@ def _is_secret_installed() -> bool:
 
 
 def save_config(config: Dict[str, Any]) -> bool:
-    """统一保存配置接口，自动签名并备份。
+    """统一保存配置接口，规范化、自动签名并备份。
 
     Args:
         config: 配置字典
@@ -255,9 +255,11 @@ def save_config(config: Dict[str, Any]) -> bool:
             except OSError:
                 pass  # 备份失败不是致命错误
 
-        # 计算签名并保存
-        
-        to_save = dict(config)
+        # 先清理界面已废弃字段，再对实际落盘内容签名。
+        to_save = _normalize_config(config)
+        if not isinstance(to_save, dict):
+            raise ValueError("配置根节点必须是对象")
+        to_save = dict(to_save)
         to_save[_SIGNATURE_KEY] = _sign_config(to_save)
         tmp_path = CONFIG_FILE + ".tmp"
         try:
@@ -386,6 +388,106 @@ def _validate_rules_safety(rules: list) -> tuple[list[str], list[str]]:
 # 配置加载
 # ---------------------------------------------------------------------------
 
+class ConfigValidationError(ValueError):
+    """运行时配置未通过完整性或安全校验。"""
+
+
+def load_verified_config() -> Dict[str, Any]:
+    """读取一份可安全应用到运行中引擎的配置快照。
+
+    与 :func:`get_config` 的启动恢复策略不同，这个入口绝不回退默认配置、
+    也不写回磁盘。热重载必须保持当前已验证的运行快照，直到新文件同时
+    通过签名、结构和规则安全校验。
+    """
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as config_file:
+            raw = json.load(config_file)
+    except (json.JSONDecodeError, OSError) as e:
+        raise ConfigValidationError(f"配置文件无法解析: {e}") from e
+
+    if not isinstance(raw, dict):
+        raise ConfigValidationError("配置根节点必须是对象")
+
+    signature = raw.pop(_SIGNATURE_KEY, "")
+    if not _is_secret_installed():
+        raise ConfigValidationError("配置签名密钥缺失")
+    if not signature:
+        raise ConfigValidationError("配置缺少签名")
+    if not _verify_config(raw, signature):
+        raise ConfigValidationError("配置签名校验失败")
+
+    normalized = _normalize_config(raw)
+    if not isinstance(normalized, dict):
+        raise ConfigValidationError("规范化后的配置必须是对象")
+    rules = normalized.get("rules", [])
+    if not isinstance(rules, list):
+        raise ConfigValidationError("rules 必须是列表")
+
+    _warnings, errors = _validate_rules_safety(rules)
+    if errors:
+        raise ConfigValidationError("规则安全校验失败: " + "; ".join(errors[:3]))
+    return normalized
+
+def _normalize_condition(condition: Any) -> Any:
+    """清理条件树中已不适用的字段，同时保留原有嵌套结构。"""
+    if not isinstance(condition, dict):
+        return condition
+
+    copied = dict(condition)
+    op = copied.get("op", copied.get("type"))
+    if op in ("any", "or"):
+        # within_seconds 只有 all 条件组才有意义；旧版界面曾只隐藏它而没有删除。
+        copied.pop("within_seconds", None)
+    for key in ("children", "events"):
+        children = copied.get(key)
+        if isinstance(children, list):
+            copied[key] = [_normalize_condition(child) for child in children]
+    return copied
+
+
+def _replace_step_references(value: Any, replacements: Dict[str, str]) -> Any:
+    if isinstance(value, str):
+        for old, new in replacements.items():
+            value = value.replace(f"steps.{old}.", f"steps.{new}.")
+        return value
+    if isinstance(value, list):
+        return [_replace_step_references(item, replacements) for item in value]
+    if isinstance(value, dict):
+        return {key: _replace_step_references(item, replacements) for key, item in value.items()}
+    return value
+
+
+def _normalize_rule_actions(actions: Any) -> Any:
+    """移除旧步骤 ID，并把能确定的旧引用改为自动步骤名。"""
+    if not isinstance(actions, list):
+        return actions
+
+    ids: Dict[str, str] = {}
+    duplicate_ids = set()
+    for index, action in enumerate(actions):
+        if not isinstance(action, dict):
+            continue
+        old_id = action.get("id")
+        if not isinstance(old_id, str) or not old_id:
+            continue
+        generated = f"{action.get('type', 'action')}_{index + 1}"
+        if old_id in ids:
+            duplicate_ids.add(old_id)
+        else:
+            ids[old_id] = generated
+    replacements = {old: new for old, new in ids.items() if old not in duplicate_ids}
+
+    normalized = []
+    for action in actions:
+        if not isinstance(action, dict):
+            normalized.append(action)
+            continue
+        copied = dict(action)
+        copied.pop("id", None)
+        normalized.append(_replace_step_references(copied, replacements))
+    return normalized
+
+
 def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(config, dict):
         return config
@@ -398,6 +500,10 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
             copied = dict(rule)
             if "trigger" in copied and "event" not in copied:
                 copied["event"] = copied.pop("trigger")
+            if "condition" in copied:
+                copied["condition"] = _normalize_condition(copied["condition"])
+            if "actions" in copied:
+                copied["actions"] = _normalize_rule_actions(copied["actions"])
             normalized_rules.append(copied)
 
         result = dict(config)

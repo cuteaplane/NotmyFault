@@ -102,6 +102,20 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
     except Exception:
         return caps
 
+    # 先收集常见 import 别名。只比较 AST 中的裸名字会漏掉
+    # ``import os as system``、``importlib as il`` 等最普通的绕过。
+    module_aliases: dict[str, str] = {}
+    imported_symbols: dict[str, tuple[str, str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                module_aliases[alias.asname or top] = top
+        elif isinstance(node, ast.ImportFrom):
+            top = (node.module or "").split(".")[0]
+            for alias in node.names:
+                imported_symbols[alias.asname or alias.name] = (top, alias.name)
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -127,11 +141,12 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
             if attr.lower() in _ELEVATION_FUNCS:
                 caps.add("self_elevation")
             if isinstance(base, ast.Name):
-                if base.id == "os" and attr in _OS_DANGEROUS:
+                owner = module_aliases.get(base.id, base.id)
+                if owner == "os" and attr in _OS_DANGEROUS:
                     caps.add("external_binary")
-                if base.id == "subprocess" and attr in _SUBPROCESS_CALLS:
+                if owner == "subprocess" and attr in _SUBPROCESS_CALLS:
                     caps.add("external_binary")
-                if base.id == "ctypes" and attr in _CTYPES_DANGEROUS:
+                if owner == "ctypes" and attr in _CTYPES_DANGEROUS:
                     caps.add("native_api")
         elif isinstance(node, ast.Call):
             func = node.func
@@ -141,12 +156,27 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
             # exec/eval/compile 动态执行（PoC-5 修复）- 一律禁止
             if isinstance(func, ast.Name) and func.id in _DYNAMIC_EXEC_FUNCS:
                 caps.add("dynamic_exec")
+            if isinstance(func, ast.Name):
+                imported = imported_symbols.get(func.id)
+                if imported:
+                    owner, attr = imported
+                    if owner == "os" and attr in _OS_DANGEROUS:
+                        caps.add("external_binary")
+                    elif owner == "subprocess" and attr in _SUBPROCESS_CALLS:
+                        caps.add("external_binary")
+                    elif owner == "ctypes" and attr in _CTYPES_DANGEROUS:
+                        caps.add("native_api")
+                    elif owner in ("builtins", "__builtins__") and attr == "__import__":
+                        caps.add("dynamic_exec")
+                    elif owner == "importlib" and attr == "import_module":
+                        caps.add("dynamic_exec")
             # __import__ 调用本身（无论参数是否常量）都视为动态执行
             if isinstance(func, ast.Name) and func.id == "__import__":
                 caps.add("dynamic_exec")
             # importlib.import_module 调用本身（无论参数是否常量）
             if (isinstance(func, ast.Attribute) and func.attr == "import_module"
-                  and isinstance(func.value, ast.Name) and func.value.id == "importlib"):
+                  and isinstance(func.value, ast.Name)
+                  and module_aliases.get(func.value.id, func.value.id) == "importlib"):
                 caps.add("dynamic_exec")
             # __import__("subprocess") / importlib.import_module("ctypes") 常量模块名检测
             # （保留：进一步标注 native_api/external_binary，方便诊断）
@@ -154,7 +184,8 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
             if isinstance(func, ast.Name) and func.id == "__import__":
                 mod_arg = node.args[0] if node.args else None
             elif (isinstance(func, ast.Attribute) and func.attr == "import_module"
-                  and isinstance(func.value, ast.Name) and func.value.id == "importlib"):
+                  and isinstance(func.value, ast.Name)
+                  and module_aliases.get(func.value.id, func.value.id) == "importlib"):
                 mod_arg = node.args[0] if node.args else None
             if isinstance(mod_arg, ast.Constant) and isinstance(mod_arg.value, str):
                 top = mod_arg.value.split(".")[0]
@@ -170,13 +201,14 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
                 if isinstance(target, ast.Name) and isinstance(name_arg, ast.Constant) \
                         and isinstance(name_arg.value, str):
                     attr = name_arg.value
-                    if target.id == "os" and attr in _OS_DANGEROUS:
+                    owner = module_aliases.get(target.id, target.id)
+                    if owner == "os" and attr in _OS_DANGEROUS:
                         caps.add("external_binary")
-                    elif target.id == "subprocess" and attr in _SUBPROCESS_CALLS:
+                    elif owner == "subprocess" and attr in _SUBPROCESS_CALLS:
                         caps.add("external_binary")
-                    elif target.id == "ctypes" and attr in _CTYPES_DANGEROUS:
+                    elif owner == "ctypes" and attr in _CTYPES_DANGEROUS:
                         caps.add("native_api")
-                    elif target.id in ("__builtins__", "builtins") and attr == "__import__":
+                    elif owner in ("__builtins__", "builtins") and attr == "__import__":
                         caps.add("dynamic_exec")
         elif isinstance(node, ast.keyword):
             # shell=True / shell=1 / shell="x" 等真值都视为启用 shell（之前只认 is True，

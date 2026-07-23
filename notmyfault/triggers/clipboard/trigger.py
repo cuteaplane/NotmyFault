@@ -1,25 +1,30 @@
-import time
 import ctypes
 
-CF_TEXT = 1
-GMEM_MOVEABLE = 0x0002
+CF_UNICODETEXT = 13
+
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+# 64 位兼容：返回类型和参数类型都要显式声明，否则 ctypes 默认 c_int (32位)
+# 会截断指针高位或报 OverflowError
+user32.GetClipboardData.restype = ctypes.c_void_p
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
 
 
 def _get_clipboard_text():
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
     if not user32.OpenClipboard(None):
         return None
     try:
-        handle = user32.GetClipboardData(CF_TEXT)
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
         if not handle:
             return None
         ptr = kernel32.GlobalLock(handle)
         if not ptr:
             return None
         try:
-            text = ctypes.c_char_p(ptr).value
-            return text.decode("utf-8", errors="replace") if text else None
+            # CF_UNICODETEXT 保证以 NUL 结尾；传入 GlobalSize 会把终止符也读入。
+            return ctypes.wstring_at(ptr)
         finally:
             kernel32.GlobalUnlock(handle)
     finally:
@@ -47,12 +52,17 @@ def run(meta, config_list, emit_event, shutdown_event):
             if current is not None and current != last_content:
                 if any_match:
                     print(f"[Trigger:{trigger_id}] 剪贴板内容变化")
-                    emit_event(trigger_id, {"text": current[:200]})
+                    emit_event(trigger_id, {"text": current[:200], "match_text": ""})
                 else:
+                    current_lower = current.lower()
                     for mt in match_texts:
-                        if mt in current:
+                        if mt.lower() in current_lower:
                             print(f"[Trigger:{trigger_id}] 剪贴板匹配: {mt}")
-                            emit_event(trigger_id, {"text": current[:200], "matched": mt})
+                            emit_event(trigger_id, {
+                                "text": current[:200],
+                                "match_text": mt,
+                                "matched": mt,
+                            })
                             break
                 last_content = current
         except Exception as e:

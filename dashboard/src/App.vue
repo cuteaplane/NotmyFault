@@ -39,9 +39,12 @@ async function refreshAll() {
   } catch (e) { /* 引擎离线，静默 */ }
 }
 
-function connectSSE() {
+async function connectSSE() {
   if (sseSource) { sseSource.close(); sseSource = null }
-  const es = new EventSource('http://127.0.0.1:19198/api/events')
+  let token = ''
+  try { token = await window.pywebview?.api?.get_api_token() || '' } catch (e) { /* offline */ }
+  if (!token) { updateStatus({ engine_running: false }); return }
+  const es = new EventSource('http://127.0.0.1:19198/api/events?token=' + encodeURIComponent(token))
   sseSource = es
   es.addEventListener('open', () => { sseRetry = 0 })
   es.addEventListener('engine_state_changed', (e) => {

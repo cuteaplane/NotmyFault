@@ -2,6 +2,7 @@
     "id": "clipboard",
     "name": "剪贴板监控",
     "semantic": "oneshot",
+    "trigger_api": "event-v1",
     "description": "剪贴板内容发生变化时触发",
     "version_code": 1,
     "version": "1.0",

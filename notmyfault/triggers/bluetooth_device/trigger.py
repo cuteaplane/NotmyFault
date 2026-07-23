@@ -51,6 +51,7 @@ foreach ($dev in $all) {{
             ["powershell", "-NoProfile", "-Command", ps],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=15,
         )
     except subprocess.TimeoutExpired:

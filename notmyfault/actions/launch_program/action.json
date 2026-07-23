@@ -23,6 +23,13 @@
             "type": "string",
             "default": "",
             "placeholder": "可选，命令行参数"
+        },
+        {
+            "name": "working_directory",
+            "label": "工作目录",
+            "type": "path",
+            "default": "",
+            "placeholder": "留空使用当前目录"
         }
     ]
 }

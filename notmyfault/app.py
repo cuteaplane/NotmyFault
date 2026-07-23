@@ -9,6 +9,24 @@ import glob
 import subprocess as _sp
 
 
+def _run_build_command(cmd: list[str], build_dir: str):
+    """以 UTF-8 运行 build.py，避免 Windows 控制台代码页污染首次启动日志。"""
+    env = os.environ.copy()
+    # build.py 会输出中文。capture_output 时没有控制台代码页可借，必须明确
+    # 规定子进程和父进程都按 UTF-8 处理，不能再让 subprocess 猜 GBK。
+    env["PYTHONUTF8"] = "1"
+    return _sp.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=build_dir,
+        env=env,
+        timeout=60,
+    )
+
+
 def _ensure_first_run_build() -> None:
     if getattr(sys, "frozen", False):
         return
@@ -24,14 +42,15 @@ def _ensure_first_run_build() -> None:
     if not needs_build:
         return
     print("[FirstRun] Detected missing signatures or build file, running first-time build...")
+    # 第一次从 GUI 启动没有可用终端来输入私钥口令。一次完成 permissive 构建：
+    # 生成本机开发签名键、签内置插件并写 build.json；正式发布仍由开发者显式
+    # 执行 strict 构建，不能把交互式口令提示藏进后台子进程。
     commands = [
-        ([sys.executable, build_py, "init-keys", "--builtin"], "init-keys"),
-        ([sys.executable, build_py, "sign"], "sign"),
-        ([sys.executable, build_py, "build"], "build"),
+        ([sys.executable, build_py, "build", "--security-mode=permissive"], "build"),
     ]
     for cmd, name in commands:
         try:
-            result = _sp.run(cmd, capture_output=True, text=True, cwd=os.path.dirname(build_py), timeout=60)
+            result = _run_build_command(cmd, os.path.dirname(build_py))
             if result.returncode != 0:
                 print(f"[FirstRun] build {name} failed (code={result.returncode}): {result.stderr.strip()[:500]}")
                 _degrade_security_mode()

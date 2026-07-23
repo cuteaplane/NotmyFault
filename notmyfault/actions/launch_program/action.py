@@ -10,6 +10,7 @@ def run(action_info, params):
         return
 
     raw_args = params.get("args", "").strip()
+    working_directory = params.get("working_directory", "").strip() or None
     print(f"[Action:launch_program] 启动: {path} {raw_args}")
 
     try:
@@ -23,11 +24,12 @@ def run(action_info, params):
         if sys.platform == "win32":
             subprocess.Popen(
                 args,
+                cwd=working_directory,
                 creationflags=subprocess.CREATE_NO_WINDOW,
                 shell=False
             )
         else:
-            subprocess.Popen(args)
+            subprocess.Popen(args, cwd=working_directory)
         print(f"[Action:launch_program] 已启动: {path}")
     except FileNotFoundError:
         # 回退：用 os.startfile（Windows）；非 Windows 用列表形式（不经 shell）

@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { store } from '../../lib/store'
-import { getEngineStatus, readDiagnostics, hasBridge, API } from '../../lib/api'
+import { getEngineStatus, readDiagnostics, hasBridge } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
 
 const starting = ref(false)
@@ -57,8 +57,15 @@ const diagPlugins = computed(() => {
   const d = diag.value
   if (!d) return { txt: '引擎未启动', cls: 'diag-warn', icon: 'remove' }
   const n = (d.plugin_errors || []).length
-  return n ? { txt: n + ' 个插件加载失败', cls: 'diag-err', icon: 'error' }
-           : { txt: '正常', cls: 'diag-ok', icon: 'check_circle' }
+  const crashes = d.trigger_crash_details || []
+  const parts = []
+  if (n) parts.push(n + ' 个加载失败')
+  if (crashes.length) {
+    const names = [...new Set(crashes.map(c => c.trigger_id))].join('、')
+    parts.push('触发器 ' + names + ' 崩溃')
+  }
+  return parts.length ? { txt: parts.join(' · '), cls: 'diag-err', icon: 'error' }
+                      : { txt: '正常', cls: 'diag-ok', icon: 'check_circle' }
 })
 const diagRules = computed(() => {
   const d = diag.value
@@ -105,8 +112,7 @@ async function startEngine() {
   const id = setInterval(async () => {
     attempts++
     try {
-      const r = await fetch(API + '/api/engine/status')
-      const s = await r.json()
+      const s = await getEngineStatus()
       if (s.engine_running) {
         clearInterval(id)
         starting.value = false

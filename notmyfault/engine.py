@@ -16,6 +16,7 @@
   单点异常不击穿主循环、不静默杀死线程。
 """
 import importlib.util
+import inspect
 import json
 import os
 import secrets
@@ -25,7 +26,7 @@ import time
 import traceback
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
-from notmyfault.config import CONFIG_FILE
+from notmyfault.config import CONFIG_FILE, ConfigValidationError, load_verified_config
 from notmyfault.logging import engine_error, engine_info, engine_warn
 from notmyfault.plugin_schema import validate_plugin_meta, check_permissions_conform, is_known_permission
 
@@ -38,6 +39,7 @@ from notmyfault.plugins import (
     verify_plugin_sig,
 )
 from notmyfault.rules import (
+    ConditionRuntime,
     aggregate_trigger_params,
     check_event_params,
     get_rule_events,
@@ -45,6 +47,7 @@ from notmyfault.rules import (
     validate_rules,
 )
 from notmyfault.security import SecurityMode, detect_security_mode as _detect_security_mode, verify_core_integrity
+from notmyfault.workflow import build_context, invoke_action, resolve_templates
 
 # 向后兼容旧导入
 _validate_plugin_meta = validate_plugin_meta
@@ -351,16 +354,20 @@ class PluginLoader:
                     )
 
             # --- 插件完整性校验 ---
-            integrity_files = [
-                (json_filename, json_file),
-                (py_filename, py_file),
-            ]
-            integrity_ok, integrity_msg = verify_plugin_integrity(plugin_id, integrity_files)
-            if not integrity_ok:
-                warning = (f"[Engine] [安全] 插件 \"{plugin_id}\" 完整性校验失败：" + integrity_msg)
-                print(warning, file=sys.stderr)
-                engine_warn(f"integrity_check: {integrity_msg}")
-                self._integrity_errors.append(warning)
+            # 内置插件由构建时 Ed25519 签名覆盖；再拿用户目录里的可变 hash
+            # 缓存比对只会在源码升级后制造“被修改”假警报。用户/第三方插件
+            # 才使用本地清单记录首次见到的文件内容。
+            if origin != "builtin":
+                integrity_files = [
+                    (json_filename, json_file),
+                    (py_filename, py_file),
+                ]
+                integrity_ok, integrity_msg = verify_plugin_integrity(plugin_id, integrity_files)
+                if not integrity_ok:
+                    warning = (f"[Engine] [安全] 插件 \"{plugin_id}\" 完整性校验失败：" + integrity_msg)
+                    print(warning, file=sys.stderr)
+                    engine_warn(f"integrity_check: {integrity_msg}")
+                    self._integrity_errors.append(warning)
 
             # --- 提取 run 入口 ---
             if not hasattr(module, "run"):
@@ -374,6 +381,20 @@ class PluginLoader:
                 )
                 engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason="缺少 run() 函数")
                 continue
+
+            # 内置触发器统一采用 event-v1：run(meta, config_list, emit_event,
+            # shutdown_event)。在启动线程前做签名绑定检查，接口写错时直接标出
+            # 插件问题，而不是让后台线程启动后才留下一段 traceback。
+            if plugin_type == "trigger" and meta.get("trigger_api") == "event-v1":
+                try:
+                    inspect.signature(module.run).bind({}, [], lambda *_args: None, threading.Event())
+                except (TypeError, ValueError) as exc:
+                    message = f"event-v1 入口不兼容: {exc}"
+                    print(f'[Engine] 触发器 "{plugin_id}" {message}', file=sys.stderr)
+                    failed_count += 1
+                    self._diagnostics.record_plugin_error(store_name, plugin_id, message)
+                    engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason=message)
+                    continue
 
             # --- 签名校验（builtin + user 均需签名）---
             # 用户插件通过 /api/plugins/install 安装时会用项目私钥签名；
@@ -551,9 +572,14 @@ class AutomationEngine:
         self._action_lock = threading.Lock()
         self._action_done = threading.Condition()
         self._shutdown_flag: "threading.Event | None" = None
+        # 前置条件未满足时的延后重试任务；以规则为粒度去重，避免定时器堆积。
+        self._deferred_workflows: Dict[str, threading.Timer] = {}
+        self._deferred_workflows_lock = threading.RLock()
 
         # 规则热重载线程安全
         self._rules_lock = threading.RLock()
+        # 条件树需要保存 AND 分支最近一次命中；规则热重载时整体换代。
+        self._condition_runtime = ConditionRuntime()
 
         # 触发器线程管理（单一所有权 + 锁，避免热加载与 shutdown 竞态）
         self._trigger_threads: Dict[str, threading.Thread] = {}
@@ -626,6 +652,15 @@ class AutomationEngine:
                 "trigger_crashed",
                 {"trigger_id": trigger_id, "error": err[-500:]},
             )
+            try:
+                from notmyfault.alert import alert_user
+                alert_user(
+                    f"触发器 {trigger_id} 崩溃",
+                    err[-200:],
+                    open_dashboard=False,
+                )
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # 诊断
@@ -658,6 +693,7 @@ class AutomationEngine:
             },
             "hot_reload_errors": snap["hot_reload_errors"],
             "trigger_crashes": snap["trigger_crashes"],
+            "trigger_crash_details": snap["trigger_crash_details"],
             "errors": snap["errors"][-20:],
         }
 
@@ -828,8 +864,9 @@ class AutomationEngine:
             # 事件分发沿用同步语义；这里刻意不持锁执行 action，慢动作不能卡住热重载。
             rules_snapshot = list(self.rules)
 
-        for rule in rules_snapshot:
-            if not match_rule(rule, event_type, event_payload):
+        for rule_index, rule in enumerate(rules_snapshot):
+            rule_key = f"{rule_index}:{rule.get('name', '')}"
+            if not self._condition_runtime.match(rule_key, rule, event_type, event_payload):
                 continue
 
             rule_name = rule.get("name", "未命名规则")
@@ -842,8 +879,13 @@ class AutomationEngine:
                     "event_payload": event_payload,
                 },
             )
-            for action in rule.get("actions", []):
-                self.execute_action(action, rule_name=rule_name)
+            context = build_context(
+                rule_name,
+                event_type,
+                event_payload,
+                self._condition_runtime.last_match(rule_key),
+            )
+            self.execute_workflow(rule_key, rule, rule_name, context)
 
     def call_notmyfault(self, event_data: Dict[str, Any]) -> None:
         """接收外部事件（触发器线程通过此方法推送事件）。"""
@@ -851,25 +893,208 @@ class AutomationEngine:
         event_payload = event_data.get("triggered_params", {})
         self.emit_event(event_type, event_payload)
 
+    def run_manual_rule(self, rule_index: int) -> tuple[bool, str]:
+        """从 Dashboard 手动执行一条显式配置了 ``manual`` 触发器的规则。
+
+        手动执行不能成为绕过条件的万能后门：只有规则条件树中声明了
+        manual 触发器，才允许从列表直接启动。动作放入独立线程，HTTP 请求
+        只负责受理，不会被长动作卡住。
+        """
+        with self._rules_lock:
+            if rule_index < 0 or rule_index >= len(self.rules):
+                return False, "规则不存在或已被重新加载"
+            rule = self.rules[rule_index]
+
+        if not any(event.get("type") == "manual" for event in get_rule_events(rule)):
+            return False, "该规则未配置手动触发器"
+
+        rule_name = rule.get("name", f"规则 #{rule_index + 1}")
+        context = build_context(
+            rule_name,
+            "manual",
+            {"source": "dashboard", "rule_index": rule_index},
+            [],
+        )
+        self._safe_on_event("rule_triggered", {
+            "rule_name": rule_name,
+            "event_type": "manual",
+            "event_payload": {"source": "dashboard"},
+        })
+        threading.Thread(
+            target=self.execute_workflow,
+            args=(f"manual:{rule_index}", rule, rule_name, context),
+            name=f"ManualRule-{rule_index}",
+            daemon=True,
+        ).start()
+        return True, "已开始执行"
+
     # ------------------------------------------------------------------
     # 动作执行
     # ------------------------------------------------------------------
 
-    def execute_action(self, action: Dict[str, Any], rule_name: str = "") -> None:
-        """执行单个动作。"""
+    def execute_workflow(
+        self,
+        workflow_key: str,
+        rule: Dict[str, Any],
+        rule_name: str,
+        context: Dict[str, Any],
+    ) -> None:
+        """执行规则工作流；前置条件不安全时延后，而不是冒险运行动作。"""
+        ready, reason, retry_after = self._check_preconditions(
+            rule.get("preconditions", []), context,
+        )
+        if not ready:
+            delay = min(max(retry_after or 60, 5), 3600)
+            self._safe_on_event(
+                "workflow_deferred",
+                {
+                    "rule_name": rule_name,
+                    "reason": reason,
+                    "retry_after_seconds": delay,
+                },
+            )
+            print(
+                f"[Engine] 工作流 <{rule_name}> 前置条件未满足，{delay}s 后重试: {reason}",
+                file=sys.stderr,
+            )
+            self._defer_workflow(workflow_key, rule, rule_name, context, delay)
+            return
+        self.execute_actions(rule.get("actions", []), rule_name, context)
+
+    def _check_preconditions(
+        self, preconditions: Any, context: Dict[str, Any],
+    ) -> Tuple[bool, str, float | None]:
+        """调用动作插件声明的 check_precondition()；未知/异常一律不放行。"""
+        if not preconditions:
+            return True, "", None
+        if not isinstance(preconditions, list):
+            return False, "preconditions 必须是数组", None
+        for index, spec in enumerate(preconditions):
+            if not isinstance(spec, dict):
+                return False, f"preconditions[{index}] 必须是对象", None
+            action_type = spec.get("type")
+            module = self._plugin_modules.get(action_type)
+            action_meta = self.actions_meta.get(action_type, {})
+            check = getattr(module, "check_precondition", None)
+            if action_type not in self.actions_funcs or not callable(check) \
+                    or action_meta.get("precondition_api") != "context-v1":
+                return False, f"前置条件插件不可用或未声明 context-v1: {action_type}", None
+            try:
+                params = resolve_templates(spec.get("params", {}), context)
+                if not isinstance(params, dict):
+                    return False, f"前置条件 {action_type} 的 params 必须是对象", None
+                verdict = check(action_meta, params, context)
+            except Exception:
+                return False, f"前置条件 {action_type} 检查异常: {traceback.format_exc()[-200:]}", None
+            if verdict is True:
+                continue
+            if isinstance(verdict, dict):
+                if verdict.get("ok") is True:
+                    continue
+                return (
+                    False,
+                    str(verdict.get("reason") or f"前置条件 {action_type} 未满足"),
+                    verdict.get("retry_after_seconds"),
+                )
+            return False, f"前置条件 {action_type} 未满足", None
+        return True, "", None
+
+    def _defer_workflow(
+        self,
+        workflow_key: str,
+        rule: Dict[str, Any],
+        rule_name: str,
+        context: Dict[str, Any],
+        delay: float,
+    ) -> None:
+        with self._deferred_workflows_lock:
+            existing = self._deferred_workflows.get(workflow_key)
+            if existing is not None and existing.is_alive():
+                return
+            timer = threading.Timer(
+                delay,
+                self._resume_workflow,
+                args=(workflow_key, rule, rule_name, context),
+            )
+            timer.daemon = True
+            self._deferred_workflows[workflow_key] = timer
+            timer.start()
+
+    def _resume_workflow(
+        self,
+        workflow_key: str,
+        rule: Dict[str, Any],
+        rule_name: str,
+        context: Dict[str, Any],
+    ) -> None:
+        with self._deferred_workflows_lock:
+            self._deferred_workflows.pop(workflow_key, None)
+        if self._shutdown_flag and self._shutdown_flag.is_set():
+            return
+        self.execute_workflow(workflow_key, rule, rule_name, context)
+
+    def _cancel_deferred_workflows(self) -> None:
+        with self._deferred_workflows_lock:
+            timers = list(self._deferred_workflows.values())
+            self._deferred_workflows.clear()
+        for timer in timers:
+            timer.cancel()
+
+    def execute_actions(
+        self,
+        actions: List[Dict[str, Any]],
+        rule_name: str,
+        context: Dict[str, Any],
+    ) -> None:
+        """顺序执行一条规则的动作流水线，并把每一步产物写入 context。"""
+        for index, action in enumerate(actions):
+            # 步骤名由动作类型和位置自动生成，配置文件不保存也不接受用户自定义 ID。
+            step_id = f"{action.get('type', 'action')}_{index + 1}"
+            ok, result = self._run_action(action, rule_name, context)
+            context["steps"][step_id] = {
+                "status": "ok" if ok else "failed",
+                "result": result if ok else None,
+                "error": None if ok else str(result),
+            }
+            if not ok and action.get("on_error", "stop") != "continue":
+                print(f"[Engine] 动作流水线在步骤 {step_id} 停止", file=sys.stderr)
+                break
+
+    def execute_action(
+        self,
+        action: Dict[str, Any],
+        rule_name: str = "",
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """兼容入口：执行一个动作并返回插件的结构化结果（旧调用可忽略返回值）。"""
+        if context is None:
+            context = build_context(rule_name, "", {}, [])
+        _ok, result = self._run_action(action, rule_name, context)
+        return result if _ok else None
+
+    def _run_action(
+        self,
+        action: Dict[str, Any],
+        rule_name: str,
+        context: Dict[str, Any],
+    ) -> Tuple[bool, Any]:
+        """执行单一步骤；新插件可拿上下文并返回结果，旧插件保持两参数 API。"""
         if self._shutdown_flag and self._shutdown_flag.is_set():
             print(f"[Engine] 正在关闭，跳过动作: {action.get('type', '?')}")
-            return
+            return False, "引擎正在关闭"
 
         action_type = action.get("type")
-        params = action.get("params", {})
+        raw_params = action.get("params", {})
+        params = resolve_templates(raw_params, context)
+        if not isinstance(params, dict):
+            return False, "action.params 必须是对象"
 
         if action_type not in self.actions_funcs:
             print(
                 f"[Engine] [?] 未知 action 类型或未装载模块: {action_type}",
                 file=sys.stderr,
             )
-            return
+            return False, f"未知 action 类型: {action_type}"
 
         # --- 插件自定义参数校验 ---
         module = self._plugin_modules.get(action_type)
@@ -899,17 +1124,34 @@ class AutomationEngine:
         try:
             action_meta = self.actions_meta.get(action_type, {})
             action_func = self.actions_funcs[action_type]
-            action_func(action_meta, params)
-            self._diag_obj.inc_action_ok()
-            self._safe_on_event(
-                "action_executed",
-                {
-                    "action_type": action_type,
-                    "params": params,
-                    "rule_name": rule_name,
-                    "status": "ok",
-                },
-            )
+            retries = min(max(int(action.get("retry", 0) or 0), 0), 3)
+            delay = max(float(action.get("retry_delay_seconds", 0) or 0), 0)
+            for attempt in range(retries + 1):
+                try:
+                    result = invoke_action(action_func, module, action_meta, params, context)
+                    self._diag_obj.inc_action_ok()
+                    self._safe_on_event(
+                        "action_executed",
+                        {
+                            "action_type": action_type,
+                            "params": params,
+                            "rule_name": rule_name,
+                            "status": "ok",
+                            "result": result,
+                            "attempt": attempt + 1,
+                        },
+                    )
+                    return True, result
+                except Exception:
+                    if attempt < retries:
+                        print(
+                            f"[Engine] action \"{action_type}\" 第 {attempt + 1} 次失败，准备重试",
+                            file=sys.stderr,
+                        )
+                        if delay:
+                            time.sleep(delay)
+                        continue
+                    raise
         except Exception:
             self._diag_obj.inc_action_fail()
             err_msg = traceback.format_exc()
@@ -924,9 +1166,10 @@ class AutomationEngine:
                 {
                     "action_type": action_type,
                     "rule_name": rule_name,
-                    "error": traceback.format_exc(),
+                    "error": err_msg,
                 },
             )
+            return False, err_msg[-500:]
         finally:
             with self._action_lock:
                 self._active_actions -= 1
@@ -982,11 +1225,15 @@ class AutomationEngine:
 
         return count
 
-    def _stop_trigger_threads(self, timeout: float = 30.0) -> None:
-        """设置所有触发器关闭事件，等待线程退出（最多 timeout 秒）。"""
+    def _stop_trigger_threads(self, timeout: float = 30.0) -> bool:
+        """请求停止所有触发器，并报告它们是否全部退出。
+
+        Python 线程不能被安全地强制终止；仍在运行的插件必须保留登记，
+        这样热重载不会在同一触发器上再启动一代线程而造成重复执行。
+        """
         with self._trigger_lock:
             if not self._trigger_threads:
-                return
+                return True
             events = list(self._trigger_events.values())
             threads = list(self._trigger_threads.items())
 
@@ -1005,9 +1252,13 @@ class AutomationEngine:
                     file=sys.stderr,
                 )
 
+        alive = {event_type for event_type, thread in threads if thread.is_alive()}
         with self._trigger_lock:
-            self._trigger_threads.clear()
-            self._trigger_events.clear()
+            for event_type, _thread in threads:
+                if event_type not in alive:
+                    self._trigger_threads.pop(event_type, None)
+                    self._trigger_events.pop(event_type, None)
+        return not alive
 
     # ------------------------------------------------------------------
     # 引擎生命周期
@@ -1081,14 +1332,25 @@ class AutomationEngine:
                     )
                     if new_mtime > config_mtime:
                         # 文件保存可能正好写到一半，JSON 失败走下面的兜底，下个 tick 再来。
-                        config_mtime = new_mtime
-                        with open(CONFIG_FILE, "r", encoding="utf-8") as _f:
-                            _new = json.load(_f)
-                        new_rules = _new.get("rules", [])
+                        new_config = load_verified_config()
+                        new_rules = new_config["rules"]
+
+                        # 旧触发器还活着时绝不启动新一代，否则同一事件会被处理两次。
+                        if not self._stop_trigger_threads(timeout=30):
+                            message = "旧触发器未能在 30 秒内退出，已拒绝应用新配置"
+                            if not self._hot_reload_error_reported:
+                                self._diag_obj.inc_hot_reload_error()
+                                engine_error("hot_reload_error", error=message)
+                                print(f"[Engine] [!!] {message}", file=sys.stderr)
+                                self._alert_user("热重载被拒绝", message)
+                                self._hot_reload_error_reported = True
+                            continue
 
                         with self._rules_lock:
                             old_rule_count = len(self.rules)
                             self.rules = new_rules
+                            self._condition_runtime.reset()
+                        self._cancel_deferred_workflows()
 
                         print(
                             f"[Engine] 配置已热加载（{old_rule_count} -> {len(new_rules)} 条规则）"
@@ -1096,23 +1358,25 @@ class AutomationEngine:
                         self._hot_reload_error_reported = False
                         self._validate_all_rules()
 
-                        self._stop_trigger_threads(timeout=30)
                         started = self._start_trigger_threads(new_rules)
                         if started == 0:
                             print("[Engine] 热加载后无可用触发器，保持引擎运行")
-                except json.JSONDecodeError as e:
+                        config_mtime = new_mtime
+                except ConfigValidationError as e:
                     self._diag_obj.inc_hot_reload_error()
                     engine_error("hot_reload_error", error=str(e))
                     print(
-                        f"[Engine] 热加载配置 JSON 解析失败: {e}",
+                        f"[Engine] 热加载配置校验失败: {e}",
                         file=sys.stderr,
                     )
                     if not self._hot_reload_error_reported:
                         self._hot_reload_error_reported = True
                         self._alert_user(
-                            "配置格式错误",
-                            f"config.json 存在 JSON 语法错误，热加载失败，请修正后保存",
+                            "配置校验失败",
+                            "config.json 未通过格式、签名或安全校验，热加载已拒绝；请修正后重新保存",
                         )
+                    # 配置校验失败需要用户重新保存，避免每秒重复报同一个错误。
+                    config_mtime = new_mtime
                 except OSError as e:
                     print(
                         f"[Engine] 读取配置文件失败: {e}",
@@ -1127,6 +1391,7 @@ class AutomationEngine:
         except KeyboardInterrupt:
             print("[Engine] 主程序收到中断，退出中...")
 
+        self._cancel_deferred_workflows()
         self._stop_trigger_threads(timeout=30)
         self._shutdown_plugins()
         self._wait_active_actions()
@@ -1179,6 +1444,7 @@ class AutomationEngine:
             events = list(self._trigger_events.values())
         for evt in events:
             evt.set()
+        self._cancel_deferred_workflows()
         self._stop_trigger_threads(timeout=30)
         self._shutdown_plugins()
         self._wait_active_actions()

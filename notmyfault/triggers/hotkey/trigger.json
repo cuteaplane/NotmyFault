@@ -2,6 +2,7 @@
     "id": "hotkey",
     "name": "全局热键",
     "semantic": "oneshot",
+    "trigger_api": "event-v1",
     "description": "按下指定全局热键时触发动作",
     "version_code": 1,
     "version": "1.0",
@@ -12,7 +13,7 @@
         {
             "name": "hotkey",
             "label": "快捷键",
-            "type": "string",
+            "type": "hotkey",
             "default": "Ctrl+Alt+Shift+X",
             "placeholder": "如 Ctrl+Shift+A、Alt+F1"
         }

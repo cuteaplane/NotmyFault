@@ -31,6 +31,11 @@ API_TOKEN_FILE = os.path.join(os.path.dirname(CONFIG_FILE), ".api_token")
 class DashboardAPI:
     """暴露给前端 JS 的 Python 接口"""
 
+    def __init__(self):
+        # pywebview 会检查 bridge API 的公开属性；不能把原生 Window 放在
+        # self.window 上，否则它会递归枚举 AccessibilityObject 并卡死。
+        self._window = None
+
     def launch_engine(self) -> dict:
         """启动引擎。开发模式启动 NOTMYFAULT.pyw，exe 模式启动自身 --engine。"""
         if getattr(sys, "frozen", False):
@@ -102,6 +107,19 @@ class DashboardAPI:
     def get_api_token(self) -> str:
         """暴露给 JS bridge 的 API Token 读取方法"""
         return self._get_api_token()
+
+    def select_folder(self, initial_path: str = "") -> str:
+        """让 Dashboard 选择本地目录；仅通过桌面 bridge 暴露。"""
+        if self._window is None:
+            return ""
+        try:
+            result = self._window.create_file_dialog(
+                webview.FOLDER_DIALOG,
+                directory=initial_path if os.path.isdir(initial_path) else "",
+            )
+            return result[0] if result else ""
+        except Exception:
+            return ""
 
     def stop_engine(self) -> dict:
         return self._auth_request("/api/engine/stop")
@@ -207,6 +225,8 @@ def _ensure_dashboard_build():
             cwd=npm,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=120,
         )
         if result.returncode == 0:
@@ -262,6 +282,7 @@ def main():
         # 浅色模式会闪一下深色但不如白色刺眼，且 HTML 加载后立即被正确背景覆盖。
         background_color='#1b1b21',
     )
+    api._window = window
 
     # 设置窗口图标（仅 Windows）
     if os.name == "nt" and os.path.exists(icon_path):

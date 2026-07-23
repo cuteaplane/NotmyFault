@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
 import { store } from '../../lib/store'
-import { apiWrite, loadPlugins, getSchema, API } from '../../lib/api'
+import { apiRead, apiWrite, loadPlugins, getSchema } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
 import PluginCard from '../PluginCard.vue'
 
@@ -98,7 +98,7 @@ async function doInstall() {
 
   if (!keyPw.value) {
     try {
-      const r = await fetch(API + '/api/plugins/key-status')
+      const r = await apiRead('/api/plugins/key-status')
       if (r.ok) {
         const ks = await r.json()
         if (ks.encrypted) {

@@ -1,155 +1,268 @@
 <script setup>
-import { ref, computed } from 'vue'
+import { computed, ref, watchEffect } from 'vue'
 import { store } from '../lib/store'
-import { getVisibleParamDefs, buildDefaultParams } from '../lib/utils'
+import { getVisibleParamDefs, buildDefaultParams, groupTriggerKeys } from '../lib/utils'
 import ParamInput from './ParamInput.vue'
+import ConditionEditor from './ConditionEditor.vue'
 
 const props = defineProps({ rule: Object })
-const emit = defineEmits(['delete'])
+const emit = defineEmits(['back', 'delete', 'save'])
 
-const expanded = ref(false)
+const activePanel = ref('trigger')
+const selectedEvent = ref(null)
+const selectedAction = ref(0)
+const selectedPrecondition = ref(0)
+
 const triggerKeys = computed(() => Object.keys(store.schema.triggers))
+const triggerGroups = computed(() => groupTriggerKeys(triggerKeys.value))
 const actionKeys = computed(() => Object.keys(store.schema.actions))
+const preconditionKeys = computed(() => actionKeys.value.filter(
+  key => store.schema.actions[key]?.precondition_api === 'context-v1'
+))
 const isCondition = computed(() => !!props.rule.condition)
 
-// 折叠状态摘要
-const triggerSummary = computed(() => {
-  if (isCondition.value) {
-    const events = props.rule.condition?.events || []
-    if (!events.length) return '未配置'
-    const names = events.map(e => store.schema.triggers[e.type]?.name || e.type)
-    return names.join(' / ') + ' (OR)'
+function normalizeCondition(condition) {
+  if (Array.isArray(condition.children)) return condition
+  const legacyEvents = Array.isArray(condition.events) ? condition.events : []
+  condition.op = condition.op || (condition.type === 'and' ? 'all' : 'any')
+  condition.children = legacyEvents
+  delete condition.events
+  delete condition.type
+  return condition
+}
+const conditionNode = computed(() => props.rule.condition ? normalizeCondition(props.rule.condition) : null)
+
+function flattenEvents(node, depth = 0, parentOp = null, result = []) {
+  for (const child of node?.children || []) {
+    if (child?.type && !child.children && !child.events) {
+      result.push({ event: child, depth, parentOp })
+    } else {
+      flattenEvents(child, depth + 1, child.op, result)
+    }
   }
-  const t = props.rule.event?.type
-  return t ? (store.schema.triggers[t]?.name || t) : '未配置'
+  return result
+}
+const conditionEvents = computed(() => flattenEvents(conditionNode.value))
+const visibleEvents = computed(() => isCondition.value
+  ? conditionEvents.value
+  : (props.rule.event ? [{ event: props.rule.event, depth: 0, parentOp: null }] : []))
+const currentEvent = computed(() => {
+  if (!isCondition.value) return props.rule.event
+  return selectedEvent.value || conditionEvents.value[0]?.event || null
 })
-const actionSummary = computed(() => {
-  const n = props.rule.actions?.length || 0
-  return n + ' 个动作'
+const currentAction = computed(() => props.rule.actions?.[selectedAction.value] || null)
+const currentPrecondition = computed(() => props.rule.preconditions?.[selectedPrecondition.value] || null)
+const rootLogicLabel = computed(() => conditionNode.value?.op === 'all' ? 'AND · 全部满足' : 'OR · 任一满足')
+
+watchEffect(() => {
+  if (isCondition.value && !conditionEvents.value.some(item => item.event === selectedEvent.value)) {
+    selectedEvent.value = conditionEvents.value[0]?.event || null
+  }
+  if (selectedAction.value >= (props.rule.actions?.length || 0)) selectedAction.value = Math.max(0, (props.rule.actions?.length || 1) - 1)
+  if (selectedPrecondition.value >= (props.rule.preconditions?.length || 0)) selectedPrecondition.value = Math.max(0, (props.rule.preconditions?.length || 1) - 1)
 })
 
-function isAdmin(m) { return !!(m && (m.permissions || []).includes('admin')) }
-function evParams(ev) { return getVisibleParamDefs(store.schema.triggers[ev.type], ev.params) }
-function actParams(a) { return getVisibleParamDefs(store.schema.actions[a.type], a.params) }
+function isAdmin(meta) { return !!(meta?.permissions || []).includes('admin') }
+function eventParams(event) { return getVisibleParamDefs(store.schema.triggers[event.type], event.params) }
+function actionParams(action) { return getVisibleParamDefs(store.schema.actions[action.type], action.params) }
+function preconditionParams(item) { return getVisibleParamDefs(store.schema.actions[item.type], item.params) }
+function eventName(event) { return store.schema.triggers[event?.type]?.name || event?.type || '未配置触发器' }
+function actionName(action) { return store.schema.actions[action?.type]?.name || action?.type || '未配置动作' }
+function defaultEvent() {
+  const type = triggerKeys.value[0] || 'unknown'
+  return { type, params: buildDefaultParams(store.schema.triggers[type]) }
+}
 
-function changeTrigger(t) {
-  props.rule.event = { type: t, params: buildDefaultParams(store.schema.triggers[t]) }
+function selectEvent(event) {
+  selectedEvent.value = event
+  activePanel.value = 'trigger'
 }
-function changeAction(a, t) {
-  props.rule.actions[a] = { type: t, params: buildDefaultParams(store.schema.actions[t]) }
+function changeCurrentEvent(type) {
+  if (!currentEvent.value) return
+  currentEvent.value.type = type
+  currentEvent.value.params = buildDefaultParams(store.schema.triggers[type])
 }
-function addAction() {
-  const d = actionKeys.value[0] || 'unknown'
-  props.rule.actions.push({ type: d, params: buildDefaultParams(store.schema.actions[d]) })
+function changeAction(type) {
+  if (!currentAction.value) return
+  currentAction.value.type = type
+  currentAction.value.params = buildDefaultParams(store.schema.actions[type])
 }
-function removeAction(a) { props.rule.actions.splice(a, 1) }
-
-function changeCondTrigger(e, t) {
-  props.rule.condition.events[e] = { type: t, params: buildDefaultParams(store.schema.triggers[t]) }
+function changePrecondition(type) {
+  if (!currentPrecondition.value) return
+  currentPrecondition.value.type = type
+  currentPrecondition.value.params = buildDefaultParams(store.schema.actions[type])
+}
+function upgradeToConditions() {
+  const initial = props.rule.event || defaultEvent()
+  props.rule.condition = { op: 'any', children: [{ type: initial.type, params: { ...initial.params } }] }
+  delete props.rule.event
+  selectedEvent.value = props.rule.condition.children[0]
+  activePanel.value = 'trigger'
+}
+function useSingleEvent() {
+  const first = conditionEvents.value[0]?.event || defaultEvent()
+  props.rule.event = { type: first.type, params: { ...first.params } }
+  delete props.rule.condition
+  selectedEvent.value = null
+  activePanel.value = 'trigger'
 }
 function addCondition() {
-  const k = triggerKeys.value[0] || ''
-  if (!props.rule.condition) props.rule.condition = { type: 'or', events: [] }
-  props.rule.condition.events.push({ type: k, params: buildDefaultParams(store.schema.triggers[k]) })
+  if (!isCondition.value) { upgradeToConditions(); return }
+  const event = defaultEvent()
+  conditionNode.value.children.push(event)
+  selectEvent(event)
 }
-function removeCondition(e) {
-  const c = props.rule.condition
-  if (c) { c.events.splice(e, 1); if (!c.events.length) delete props.rule.condition }
-}
-
-function toggleMode() {
-  const r = props.rule
-  if (r.condition) {
-    const f = (r.condition.events || [])[0]
-    r.event = f ? { type: f.type, params: { ...f.params } } : { type: '', params: {} }
-    delete r.condition
-  } else if (r.event) {
-    r.condition = { type: 'or', events: [{ type: r.event.type, params: { ...r.event.params } }] }
-    delete r.event
+function removeEvent(target) {
+  function removeFrom(node) {
+    const index = (node.children || []).indexOf(target)
+    if (index >= 0) { node.children.splice(index, 1); return true }
+    return (node.children || []).some(child => child.children && removeFrom(child))
   }
+  removeFrom(conditionNode.value)
+  selectedEvent.value = conditionEvents.value[0]?.event || null
+}
+function addAction() {
+  const type = actionKeys.value[0] || 'unknown'
+  props.rule.actions.push({ type, params: buildDefaultParams(store.schema.actions[type]) })
+  selectedAction.value = props.rule.actions.length - 1
+  activePanel.value = 'action'
+}
+function removeAction() {
+  props.rule.actions.splice(selectedAction.value, 1)
+}
+function addPrecondition() {
+  const type = preconditionKeys.value[0]
+  if (!type) return
+  if (!Array.isArray(props.rule.preconditions)) props.rule.preconditions = []
+  props.rule.preconditions.push({ type, params: buildDefaultParams(store.schema.actions[type]) })
+  selectedPrecondition.value = props.rule.preconditions.length - 1
+  activePanel.value = 'precondition'
+}
+function removePrecondition() { props.rule.preconditions.splice(selectedPrecondition.value, 1) }
+function actionOutputHint(action, index) {
+  const outputs = store.schema.actions[action.type]?.outputs || []
+  if (!outputs.length) return ''
+  const step = `${action.type}_${index + 1}`
+  return outputs.map(key => `{{ steps.${step}.result.${key} }}`).join('　')
 }
 </script>
 
 <template>
-  <!-- 折叠状态：摘要行，点击展开 -->
-  <div v-if="!expanded" class="card rule-collapsed" @click="expanded = true">
-    <div class="rule-summary-left">
-      <span class="material-symbols-outlined toggle-ico">expand_more</span>
-      <div>
-        <div class="rule-summary-name">{{ rule.name || '未命名规则' }}</div>
-        <div class="rule-summary-meta">
-          <span class="rule-tag"><span class="material-symbols-outlined">bolt</span>{{ triggerSummary }}</span>
-          <span class="rule-tag"><span class="material-symbols-outlined">play_circle</span>{{ actionSummary }}</span>
+  <section class="rule-editor-page">
+    <header class="rule-editor-head">
+      <button class="btn btn-text" @click="emit('back')"><span class="material-symbols-outlined">arrow_back</span>全部规则</button>
+      <div class="rule-editor-title">
+        <input v-model="rule.name" class="rule-editor-name" placeholder="未命名规则">
+        <label class="rule-folder-field"><span class="material-symbols-outlined">folder</span><input v-model="rule.folder" placeholder="未分类"></label>
+      </div>
+      <div class="rule-editor-actions">
+        <button class="btn btn-text danger-text" @click="emit('delete')"><span class="material-symbols-outlined">delete</span>删除</button>
+        <button class="btn btn-filled" @click="emit('save')"><span class="material-symbols-outlined">save</span>保存配置</button>
+      </div>
+    </header>
+
+    <div class="rule-editor-layout">
+      <aside class="rule-editor-nav">
+        <div class="rule-nav-label">触发条件</div>
+        <button class="rule-nav-item logic-nav" :class="{ active: activePanel === 'logic' }" @click="activePanel = 'logic'">
+          <span class="logic-orb" :class="conditionNode?.op || 'single'">{{ isCondition ? (conditionNode.op === 'all' ? 'AND' : 'OR') : 'ONE' }}</span>
+          <span><b>{{ isCondition ? rootLogicLabel : '单个触发器' }}</b><small>条件关系</small></span>
+        </button>
+        <div class="rule-nav-tree">
+          <button v-for="(item, index) in visibleEvents" :key="item.event" class="rule-nav-item trigger-nav"
+            :class="{ active: activePanel === 'trigger' && currentEvent === item.event }"
+            :style="{ '--tree-depth': item.depth }" @click="selectEvent(item.event)">
+            <span class="trigger-index">{{ String(index + 1).padStart(2, '0') }}</span>
+            <span><b>{{ eventName(item.event) }}</b><small>{{ item.parentOp === 'all' ? '需同时满足' : item.parentOp === 'any' ? '任一即可' : '唯一入口' }}</small></span>
+          </button>
         </div>
-      </div>
+        <button class="rule-nav-add" @click="addCondition"><span class="material-symbols-outlined">add</span>{{ isCondition ? '添加触发条件' : '改为多条件' }}</button>
+
+        <div v-if="preconditionKeys.length" class="rule-nav-label separated">执行前检查</div>
+        <button v-for="(item, index) in (rule.preconditions || [])" :key="item" class="rule-nav-item compact-nav"
+          :class="{ active: activePanel === 'precondition' && selectedPrecondition === index }" @click="selectedPrecondition = index; activePanel = 'precondition'">
+          <span class="material-symbols-outlined">verified_user</span><span>{{ actionName(item) }}</span>
+        </button>
+        <button v-if="preconditionKeys.length" class="rule-nav-add" @click="addPrecondition"><span class="material-symbols-outlined">add</span>添加检查</button>
+
+        <div class="rule-nav-label separated">执行动作</div>
+        <button v-for="(item, index) in rule.actions" :key="item" class="rule-nav-item compact-nav"
+          :class="{ active: activePanel === 'action' && selectedAction === index }" @click="selectedAction = index; activePanel = 'action'">
+          <span class="step-dot">{{ index + 1 }}</span><span>{{ actionName(item) }}</span>
+        </button>
+        <button class="rule-nav-add" @click="addAction"><span class="material-symbols-outlined">add</span>添加动作</button>
+      </aside>
+
+      <main class="rule-editor-content">
+        <template v-if="activePanel === 'trigger' && currentEvent">
+          <div class="inspector-topline"><span class="section-caption">触发条件</span><span class="status-pill">条件 {{ visibleEvents.findIndex(item => item.event === currentEvent) + 1 }}</span></div>
+          <h2>配置这个触发器</h2>
+          <p class="inspector-lead">选择触发器类型并填写参数。</p>
+          <section class="inspector-card trigger-detail-card">
+            <label class="field field-wide"><span class="field-label">触发器类型</span>
+              <select class="select" :value="currentEvent.type" @change="changeCurrentEvent($event.target.value)">
+                <optgroup v-for="([group, keys]) in triggerGroups" :key="group" :label="group">
+                  <option v-for="key in keys" :key="key" :value="key">{{ store.schema.triggers[key].name || key }}{{ isAdmin(store.schema.triggers[key]) ? ' [管理员]' : '' }}</option>
+                </optgroup>
+              </select>
+            </label>
+            <div class="param-grid">
+              <ParamInput v-for="param in eventParams(currentEvent)" :key="param.name" :def="param" v-model="currentEvent.params[param.name]" />
+            </div>
+            <div v-if="isAdmin(store.schema.triggers[currentEvent.type])" class="perm-hint"><span class="material-symbols-outlined">admin_panel_settings</span>此触发器需要管理员权限</div>
+          </section>
+          <div class="inspector-footer">
+            <button v-if="isCondition" class="btn btn-text danger-text" @click="removeEvent(currentEvent)"><span class="material-symbols-outlined">delete</span>移除此条件</button>
+            <button v-else class="btn btn-tonal" @click="upgradeToConditions"><span class="material-symbols-outlined">alt_route</span>升级为 AND / OR 条件</button>
+          </div>
+        </template>
+
+        <template v-else-if="activePanel === 'logic'">
+          <div class="inspector-topline"><span class="section-caption">触发条件</span><span class="status-pill logic-status">{{ isCondition ? rootLogicLabel : '单个触发器' }}</span></div>
+          <h2>条件关系</h2>
+          <p class="inspector-lead">设置条件之间的 AND / OR 关系；具体参数在左侧选择对应触发器后编辑。</p>
+          <section v-if="isCondition" class="logic-editor-card"><ConditionEditor :node="conditionNode" /></section>
+          <section v-else class="logic-empty-card">
+            <span class="material-symbols-outlined">alt_route</span><div><b>当前只有一个触发器</b><p>增加条件后，可自由选择 OR（任一）或 AND（全部）关系。</p></div>
+            <button class="btn btn-filled" @click="upgradeToConditions">开始组合</button>
+          </section>
+          <div v-if="isCondition" class="inspector-footer"><button class="btn btn-tonal" @click="useSingleEvent"><span class="material-symbols-outlined">filter_1</span>改回单个触发器</button></div>
+        </template>
+
+        <template v-else-if="activePanel === 'action' && currentAction">
+          <div class="inspector-topline"><span class="section-caption">执行动作</span><span class="status-pill">步骤 {{ selectedAction + 1 }}</span></div>
+          <h2>{{ actionName(currentAction) }}</h2>
+          <p class="inspector-lead">动作将按左侧顺序执行。</p>
+          <section class="inspector-card">
+            <label class="field field-wide"><span class="field-label">动作类型</span>
+              <select class="select" :value="currentAction.type" @change="changeAction($event.target.value)">
+                <option v-for="key in actionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}{{ isAdmin(store.schema.actions[key]) ? ' [管理员]' : '' }}</option>
+              </select>
+            </label>
+            <div class="param-grid"><ParamInput v-for="param in actionParams(currentAction)" :key="param.name" :def="param" v-model="currentAction.params[param.name]" /></div>
+            <div v-if="isAdmin(store.schema.actions[currentAction.type])" class="perm-hint"><span class="material-symbols-outlined">admin_panel_settings</span>此动作需要管理员权限</div>
+            <div v-if="actionOutputHint(currentAction, selectedAction)" class="workflow-hint workflow-output-hint">后续步骤可引用：<code>{{ actionOutputHint(currentAction, selectedAction) }}</code></div>
+          </section>
+          <div class="inspector-footer"><button class="btn btn-text danger-text" @click="removeAction"><span class="material-symbols-outlined">delete</span>移除此动作</button></div>
+        </template>
+
+        <template v-else-if="activePanel === 'precondition' && currentPrecondition">
+          <div class="inspector-topline"><span class="section-caption">执行前检查</span><span class="status-pill">检查</span></div>
+          <h2>{{ actionName(currentPrecondition) }}</h2>
+          <p class="inspector-lead">所有检查通过后才启动动作；不通过时引擎会安全地延后重试。</p>
+          <section class="inspector-card">
+            <label class="field field-wide"><span class="field-label">检查类型</span>
+              <select class="select" :value="currentPrecondition.type" @change="changePrecondition($event.target.value)">
+                <option v-for="key in preconditionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option>
+              </select>
+            </label>
+            <div class="param-grid"><ParamInput v-for="param in preconditionParams(currentPrecondition)" :key="param.name" :def="param" v-model="currentPrecondition.params[param.name]" /></div>
+          </section>
+          <div class="inspector-footer"><button class="btn btn-text danger-text" @click="removePrecondition"><span class="material-symbols-outlined">delete</span>移除此检查</button></div>
+        </template>
+
+        <section v-else class="empty-state rule-editor-empty"><span class="material-symbols-outlined">account_tree</span><h3>请选择一项</h3><p>从左侧选择触发条件、检查或动作进行编辑。</p></section>
+      </main>
     </div>
-    <button class="icon-btn icon-btn-danger" @click.stop="emit('delete')" title="删除规则">
-      <span class="material-symbols-outlined">delete</span></button>
-  </div>
-
-  <!-- 展开状态：完整编辑 -->
-  <div v-else class="card" style="margin-bottom:16px">
-    <div class="rule-head" @click="expanded = false" style="cursor:pointer">
-      <span class="material-symbols-outlined toggle-ico">expand_less</span>
-      <input class="text-field" type="text" v-model="rule.name" placeholder="规则名称" @click.stop style="flex:1">
-      <button class="icon-btn icon-btn-danger" @click.stop="emit('delete')" title="删除规则">
-        <span class="material-symbols-outlined">delete</span></button>
-    </div>
-
-    <h4 class="card-section-title" style="margin-top:16px">
-      <span class="material-symbols-outlined" style="font-size:18px;vertical-align:-3px;margin-right:4px;color:var(--md-primary)">
-        {{ isCondition ? 'alt_route' : 'bolt' }}</span>
-      {{ isCondition ? '触发条件 (OR)' : '触发事件' }}
-    </h4>
-
-    <template v-if="isCondition">
-      <div v-for="(ev, eIdx) in rule.condition.events" :key="eIdx" class="rule-item">
-        <label class="field field-narrow"><span class="field-label">触发器 {{ eIdx + 1 }}</span>
-          <select class="select" :value="ev.type" @change="changeCondTrigger(eIdx, $event.target.value)">
-            <option v-for="k in triggerKeys" :key="k" :value="k">{{ store.schema.triggers[k].name || k }}</option>
-          </select></label>
-        <ParamInput v-for="p in evParams(ev)" :key="p.name" :def="p" v-model="ev.params[p.name]" />
-        <button class="icon-btn icon-btn-danger" @click="removeCondition(eIdx)" title="移除">
-          <span class="material-symbols-outlined">close</span></button>
-      </div>
-      <div class="rule-actions-bar">
-        <button class="btn btn-text btn-sm" @click="addCondition"><span class="material-symbols-outlined">add</span>添加条件</button>
-        <button class="btn btn-text btn-sm" @click="toggleMode"><span class="material-symbols-outlined">swap_horiz</span>切换单事件</button>
-      </div>
-    </template>
-
-    <template v-else>
-      <div class="rule-item">
-        <label class="field field-narrow"><span class="field-label">选择触发器</span>
-          <select class="select" :value="rule.event.type" @change="changeTrigger($event.target.value)">
-            <option v-for="k in triggerKeys" :key="k" :value="k">{{ store.schema.triggers[k].name || k }}{{ isAdmin(store.schema.triggers[k]) ? ' [管理员]' : '' }}</option>
-          </select></label>
-        <ParamInput v-for="p in evParams(rule.event)" :key="p.name" :def="p" v-model="rule.event.params[p.name]" />
-      </div>
-      <div class="rule-actions-bar">
-        <button class="btn btn-text btn-sm" @click="toggleMode"><span class="material-symbols-outlined">alt_route</span>改用 OR 条件</button>
-      </div>
-    </template>
-
-    <h4 class="card-section-title" style="margin-top:20px">
-      <span class="material-symbols-outlined" style="font-size:18px;vertical-align:-3px;margin-right:4px;color:var(--md-primary)">play_circle</span>
-      执行动作
-    </h4>
-
-    <div v-for="(a, aIdx) in rule.actions" :key="aIdx" class="rule-item">
-      <label class="field field-narrow"><span class="field-label">动作 {{ aIdx + 1 }}</span>
-        <select class="select" :value="a.type" @change="changeAction(aIdx, $event.target.value)">
-          <option v-for="k in actionKeys" :key="k" :value="k">{{ store.schema.actions[k].name || k }}{{ isAdmin(store.schema.actions[k]) ? ' [管理员]' : '' }}</option>
-        </select></label>
-      <ParamInput v-for="p in actParams(a)" :key="p.name" :def="p" v-model="a.params[p.name]" />
-      <button class="icon-btn icon-btn-danger" @click="removeAction(aIdx)" title="移除动作">
-        <span class="material-symbols-outlined">close</span></button>
-      <div v-if="isAdmin(store.schema.actions[a.type])" class="perm-hint" style="width:100%">
-        <span class="material-symbols-outlined">admin_panel_settings</span>需要管理员权限</div>
-    </div>
-    <div v-if="!rule.actions.length" class="rule-empty-hint">暂无动作，点击下方添加</div>
-    <div class="rule-actions-bar">
-      <button class="btn btn-text btn-sm" @click="addAction"><span class="material-symbols-outlined">add</span>添加动作</button>
-    </div>
-  </div>
+  </section>
 </template>

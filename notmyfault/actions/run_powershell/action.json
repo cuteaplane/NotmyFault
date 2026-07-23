@@ -13,9 +13,10 @@
         {
             "name": "command",
             "label": "PowerShell 命令",
-            "type": "string",
+            "type": "textarea",
             "default": "",
-            "placeholder": "要执行的 PowerShell 命令"
+            "placeholder": "要执行的 PowerShell 命令",
+            "rows": 8
         }
     ]
 }

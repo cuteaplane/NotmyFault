@@ -17,9 +17,10 @@
         {
             "name": "message",
             "label": "通知内容",
-            "type": "string",
+            "type": "textarea",
             "default": "",
-            "placeholder": "通知的正文内容"
+            "placeholder": "通知的正文内容",
+            "rows": 5
         }
     ]
 }

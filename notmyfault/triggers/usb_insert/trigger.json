@@ -2,6 +2,7 @@
     "id": "usb_insert",
     "name": "U盘插入监控",
     "semantic": "oneshot",
+    "trigger_api": "event-v1",
     "description": "监控可移动磁盘(U盘)的插入事件",
     "version_code": 1,
     "version": "1.0",

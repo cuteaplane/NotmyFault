@@ -5,10 +5,10 @@ import re
 from typing import Any, Dict, List, Tuple
 
 _REQUIRED_META_FIELDS = {"id", "name", "description", "enabled", "version_code", "version", "package_name"}
-_TRIGGER_OPTIONAL_FIELDS = {"semantic", "params", "permissions", "origin"}
-_ACTION_OPTIONAL_FIELDS = {"params", "permissions", "origin"}
+_TRIGGER_OPTIONAL_FIELDS = {"semantic", "params", "permissions", "origin", "trigger_api"}
+_ACTION_OPTIONAL_FIELDS = {"params", "permissions", "origin", "execution_api", "precondition_api", "outputs"}
 _ALLOWED_SEMANTICS = {"state", "oneshot"}
-_ALLOWED_PARAM_TYPES = {"string", "number", "select", "bool"}
+_ALLOWED_PARAM_TYPES = {"string", "number", "select", "bool", "time", "hotkey", "path", "textarea"}
 _REQUIRED_PARAM_FIELDS = {"name", "type", "label"}
 _ALLOWED_ORIGINS = {"builtin", "user", "third_party"}
 _PACKAGE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$")
@@ -199,6 +199,9 @@ def validate_plugin_meta(
                 f"（允许: {', '.join(sorted(_ALLOWED_SEMANTICS))}）"
             )
 
+    if "trigger_api" in meta and meta["trigger_api"] not in ("legacy", "event-v1"):
+        errors.append("trigger_api 必须为 legacy 或 event-v1")
+
     if "permissions" in meta:
         perms = meta["permissions"]
         if not isinstance(perms, list):
@@ -215,6 +218,15 @@ def validate_plugin_meta(
     if "origin" in meta:
         if meta["origin"] not in _ALLOWED_ORIGINS:
             errors.append("origin invalid: " + meta["origin"])
+
+    if "execution_api" in meta and meta["execution_api"] not in ("legacy", "context-v1"):
+        errors.append("execution_api 必须为 legacy 或 context-v1")
+    if "precondition_api" in meta and meta["precondition_api"] != "context-v1":
+        errors.append("precondition_api 目前仅支持 context-v1")
+    if "outputs" in meta:
+        outputs = meta["outputs"]
+        if not isinstance(outputs, list) or not all(isinstance(item, str) and item for item in outputs):
+            errors.append("outputs 必须是非空字符串数组")
 
     if "params" in meta:
         params = meta["params"]

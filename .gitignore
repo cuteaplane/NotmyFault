@@ -6,6 +6,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.pyc
+.pytest-review-tmp/
 
 # Distribution / packaging
 dist/

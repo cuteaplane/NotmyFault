@@ -41,3 +41,17 @@ export function isVisible(paramDef, currentParams) {
 export function getVisibleParamDefs(meta, currentParams) {
   return getParamDefs(meta).filter(p => isVisible(p, currentParams))
 }
+
+const triggerCategoryMap = {
+  manual: '手动', hotkey: '手动', time_schedule: '时间', idle_detect: '时间',
+  window_title: '程序', process_state: '程序',
+  folder_monitor: '文件与内容', clipboard: '文件与内容', usb_insert: '设备', bluetooth_device: '设备',
+  network_status: '网络', power_state: '系统', system_resource: '系统',
+}
+const triggerCategoryOrder = ['手动', '时间', '程序', '文件与内容', '设备', '网络', '系统', '其他']
+
+export function groupTriggerKeys(keys) {
+  const groups = new Map(triggerCategoryOrder.map(name => [name, []]))
+  keys.forEach(key => groups.get(triggerCategoryMap[key] || '其他').push(key))
+  return [...groups].filter(([, items]) => items.length)
+}

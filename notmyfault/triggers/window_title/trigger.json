@@ -2,6 +2,7 @@
     "id": "window_title",
     "name": "窗口标题检测",
     "semantic": "state",
+    "trigger_api": "event-v1",
     "description": "检测包含特定关键词的窗口出现或关闭",
     "version_code": 1,
     "version": "1.0",

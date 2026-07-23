@@ -1,0 +1,13 @@
+{
+  "id": "manual",
+  "name": "手动触发",
+  "semantic": "oneshot",
+  "trigger_api": "event-v1",
+  "description": "在规则列表中点击运行按钮时执行",
+  "version_code": 1,
+  "version": "1.0",
+  "package_name": "io.github.notmyfault.manual",
+  "enabled": true,
+  "permissions": [],
+  "params": []
+}

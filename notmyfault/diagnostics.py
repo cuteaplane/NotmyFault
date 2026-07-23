@@ -24,6 +24,7 @@ class Diagnostics:
             "action_fail": 0,
             "hot_reload_errors": 0,
             "trigger_crashes": 0,     # 触发器线程未捕获异常计数
+            "trigger_crash_details": [],  # [{trigger_id, error}] 最近 20 条
             "errors": [],             # [(category, detail), ...] 最近 _MAX_ERRORS 条
         }
         self._lock = threading.RLock()
@@ -74,16 +75,22 @@ class Diagnostics:
                 del self._data["errors"][: len(self._data["errors"]) - self._MAX_ERRORS]
 
     def record_trigger_crash(self, trigger_id: str, error: str) -> None:
-        """触发器线程崩溃：计数 + 记入错误日志。
+        """触发器线程崩溃：计数 + 记入错误日志 + 结构化详情。
 
         计数与错误记录在同一把锁内完成，避免 snapshot() 在两次加锁之间观察到
-        “崩了计数已加但错误日志还没写”的不一致快照。
+        "崩了计数已加但错误日志还没写"的不一致快照。
         """
         with self._lock:
             self._data["trigger_crashes"] += 1
             self._data["errors"].append(("trigger_crash", f"{trigger_id}: {error}"))
             if len(self._data["errors"]) > self._MAX_ERRORS:
                 del self._data["errors"][: len(self._data["errors"]) - self._MAX_ERRORS]
+            self._data["trigger_crash_details"].append({
+                "trigger_id": trigger_id,
+                "error": error[:300],
+            })
+            if len(self._data["trigger_crash_details"]) > 20:
+                del self._data["trigger_crash_details"][:-20]
 
     # -- 读取：返回不可变快照 --
     def snapshot(self) -> Dict[str, Any]:

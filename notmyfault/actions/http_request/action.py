@@ -8,6 +8,10 @@ def run(action_info, params):
     url = params.get("url", "").strip()
     body = params.get("body", "")
     headers_raw = params.get("headers", "")
+    try:
+        timeout = max(1, min(float(params.get("timeout_seconds", 30)), 300))
+    except (TypeError, ValueError):
+        timeout = 30
 
     if not url:
         print("[Action:http_request] 未指定 URL")
@@ -31,7 +35,7 @@ def run(action_info, params):
             if not any(k.lower() == "content-type" for k in req.headers):
                 req.add_header("Content-Type", "application/json")
 
-        with urllib.request.urlopen(req, data=data, timeout=30) as resp:
+        with urllib.request.urlopen(req, data=data, timeout=timeout) as resp:
             status = resp.status
             resp_body = resp.read().decode("utf-8", errors="replace")[:500]
             print(f"[Action:http_request] {method} {url} -> {status}")

@@ -5,16 +5,28 @@ export function hasBridge() {
   return !!(window.pywebview && window.pywebview.api)
 }
 
+async function authHeaders() {
+  if (!hasBridge()) return {}
+  try {
+    const t = await window.pywebview.api.get_api_token()
+    return t ? { Authorization: 'Bearer ' + t } : {}
+  } catch (e) {
+    return {}
+  }
+}
+
+export async function apiRead(path) {
+  const res = await fetch(API + path, { headers: await authHeaders() })
+  if (res.status === 403) {
+    throw new Error('认证失败：请使用桌面端 Dashboard')
+  }
+  return res
+}
+
 // 带认证的写入请求（bridge 模式从 pywebview 取 token）
 export async function apiWrite(path, method, body, isForm) {
-  const headers = {}
+  const headers = await authHeaders()
   if (!isForm) headers['Content-Type'] = 'application/json'
-  if (hasBridge()) {
-    try {
-      const t = await window.pywebview.api.get_api_token()
-      if (t) headers['Authorization'] = 'Bearer ' + t
-    } catch (e) { /* ignore */ }
-  }
   const opts = { method, headers }
   if (body) opts.body = isForm ? body : JSON.stringify(body)
   const res = await fetch(API + path, opts)
@@ -27,23 +39,24 @@ export async function apiWrite(path, method, body, isForm) {
 
 export async function loadConfig() {
   if (hasBridge()) return await window.pywebview.api.get_config()
-  const res = await fetch(API + '/api/rules')
+  const res = await apiRead('/api/rules')
   return await res.json()
 }
 
 export async function saveConfig(rules) {
   if (hasBridge()) return await window.pywebview.api.save_config(rules)
-  const res = await fetch(API + '/api/rules', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ rules })
-  })
+  const res = await apiWrite('/api/rules', 'PUT', { rules })
+  return await res.json()
+}
+
+export async function runRule(ruleIndex) {
+  const res = await apiWrite(`/api/rules/${ruleIndex}/run`, 'POST')
   return await res.json()
 }
 
 export async function loadPlugins() {
   try {
-    const r = await fetch(API + '/api/plugins/list')
+    const r = await apiRead('/api/plugins/list')
     return await r.json()
   } catch (e) {
     return { triggers: {}, actions: {} }
@@ -51,12 +64,12 @@ export async function loadPlugins() {
 }
 
 export async function getSchema() {
-  const r = await fetch(API + '/api/plugins')
+  const r = await apiRead('/api/plugins')
   return await r.json()
 }
 
 export async function getEngineStatus() {
-  const r = await fetch(API + '/api/engine/status')
+  const r = await apiRead('/api/engine/status')
   return await r.json()
 }
 
@@ -68,12 +81,12 @@ export async function readLogRaw(lines = 300) {
   return '日志查看仅在 Dashboard 桌面应用中可用'
 }
 
-// 诊断：优先 HTTP 直读引擎实时诊断（含 action_ok；GET 无需认证），
+// 诊断：优先经认证 HTTP 直读引擎实时诊断（含 action_ok），
 // 引擎离线时回退 bridge 直读日志。日志里只有 action_failed 没有“成功”条目，
 // bridge 的 build_diagnostics 凑不出 action_ok，桌面端会永远显示“正常”而非执行次数。
 export async function readDiagnostics() {
   try {
-    const r = await fetch(API + '/api/engine/diagnostics')
+    const r = await apiRead('/api/engine/diagnostics')
     if (!r.ok) return null
     const d = await r.json()
     // get_diagnostics 返回嵌套结构，展平成 build_diagnostics 格式
@@ -86,6 +99,8 @@ export async function readDiagnostics() {
       action_ok: d.actions?.ok || 0,
       action_fails: d.actions?.fail || 0,
       hot_reload_errors: d.hot_reload_errors || 0,
+      trigger_crashes: d.trigger_crashes || 0,
+      trigger_crash_details: d.trigger_crash_details || [],
       last_errors: errs.map(e => typeof e === 'string' ? e : (e[1] || JSON.stringify(e))),
       last_warns: [],
     }

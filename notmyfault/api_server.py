@@ -41,6 +41,10 @@ API_TOKEN: str = secrets.token_hex(32)
 # token 文件存放在 %APPDATA%/NotmyFault/ 下（与 config.json 同目录），
 # 不再使用 %TEMP%——TEMP 目录默认 Authenticated Users 可读，权限过宽。
 API_TOKEN_FILE: str = os.path.join(os.path.dirname(CONFIG_FILE), ".api_token")
+_DASHBOARD_ORIGINS = [
+    "http://127.0.0.1:19199",
+    "http://localhost:19199",
+]
 
 
 def _secure_write_token(path: str, token: str) -> None:
@@ -94,8 +98,8 @@ class EngineRunnerLike(Protocol):
     shutdown_event: Any  # threading.Event
     engine_thread: Any   # threading.Thread | None
 
-    def _start_engine_core(self) -> None: ...
-    def _stop_engine(self) -> None: ...
+    def _start_engine_core(self) -> bool: ...
+    def _stop_engine(self) -> bool: ...
 
 
 # ---------------------------------------------------------------------------
@@ -136,10 +140,22 @@ class EngineAPI:
     def _setup_middleware(self):
         self.app.add_middleware(
             CORSMiddleware,
-            allow_origins=["*"],
+            # Dashboard 是本机静态站点；不能让任意网页跨域读取本地自动化数据。
+            allow_origins=_DASHBOARD_ORIGINS,
             allow_methods=["*"],
             allow_headers=["*"],
         )
+        self.app.middleware("http")(self._auth_middleware)
+
+    async def _auth_middleware(self, request: Request, call_next):
+        """为全部 API 路由统一认证，避免新 GET 端点漏掉校验。"""
+        if request.url.path.startswith("/api/"):
+            try:
+                await self._verify_auth(request)
+            except HTTPException as exc:
+                # BaseHTTPMiddleware 之外抛出的 HTTPException 不会自动转成响应。
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+        return await call_next(request)
 
     # ---- 事件推送 (引擎线程 → SSE) ---------------------------------------
 
@@ -387,10 +403,14 @@ class EngineAPI:
     # ---- 路由注册 --------------------------------------------------------
 
     async def _verify_auth(self, request: Request) -> None:
-        if request.method == "GET":
+        # CORS 预检没有凭据，必须交给 CORSMiddleware 正常响应。
+        if request.method == "OPTIONS":
             return
         auth = request.headers.get("Authorization", "")
         token = auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""
+        # 原生 EventSource 不能设置 Authorization；仅 SSE 接口接受 query token。
+        if not token and request.url.path == "/api/events":
+            token = request.query_params.get("token", "")
         if not token or not secrets.compare_digest(token, API_TOKEN):
             print(f"[Auth] 403 rejected: has_hdr={bool(auth)} req_len={len(token)} srv_len={len(API_TOKEN)}",
                   file=sys.stderr)
@@ -412,15 +432,21 @@ class EngineAPI:
 
                 "api_alive": True, "message": "already_running"}
 
-            self._engine._start_engine_core()
+            started = self._engine._start_engine_core()
+            if started is False:
+                return JSONResponse(
+                    {"ok": False, "running": self._engine.engine_running,
+                     "message": "engine_stopping"},
+                    status_code=409,
+                )
             return {"ok": True, "running": self._engine.engine_running}
 
         @app.post("/api/engine/stop")
         async def engine_stop(request: Request):
             await self._verify_auth(request)
             print("[API] POST /api/engine/stop")
-            self._engine._stop_engine()
-            return {"ok": True}
+            stopped = self._engine._stop_engine()
+            return {"ok": True, "stopped": stopped, "stopping": not stopped}
 
         @app.post("/api/engine/shutdown")
         async def engine_shutdown(request: Request):
@@ -501,6 +527,18 @@ class EngineAPI:
                     {"ok": False, "error": "写入配置文件失败"},
                     status_code=500,
                 )
+
+        @app.post("/api/rules/{rule_index}/run")
+        async def rules_run(rule_index: int):
+            engine = self._engine_ref
+            if engine is None:
+                return JSONResponse(
+                    {"ok": False, "error": "引擎尚未就绪"}, status_code=409,
+                )
+            ok, message = engine.run_manual_rule(rule_index)
+            if not ok:
+                return JSONResponse({"ok": False, "error": message}, status_code=400)
+            return {"ok": True, "message": message}
 
         # ================================================================
         # 插件管理
@@ -781,6 +819,7 @@ class EngineAPI:
                 if existing:
                     ex_ptype, ex_pid, ex_meta = existing
                     ex_vc = ex_meta.get("version_code", 0)
+                    # 同版本重装是幂等覆盖：方便修复包和重复安装；只阻止降级。
                     if not force and new_vc < ex_vc:
                         return JSONResponse(
                             {"ok": False,

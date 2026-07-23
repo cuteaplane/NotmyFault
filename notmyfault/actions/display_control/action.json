@@ -6,7 +6,7 @@
     "version": "1.0",
     "package_name": "io.github.notmyfault.display_control",
     "enabled": true,
-    "permissions": ["native_api"],
+    "permissions": ["native_api", "external_binary"],
     "params": [
         {
             "name": "action",

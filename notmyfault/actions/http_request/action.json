@@ -25,16 +25,27 @@
         {
             "name": "body",
             "label": "请求体 (POST/PUT)",
-            "type": "string",
+            "type": "textarea",
             "default": "",
-            "placeholder": "JSON 字符串"
+            "placeholder": "JSON 字符串",
+            "rows": 7
         },
         {
             "name": "headers",
             "label": "自定义请求头",
-            "type": "string",
+            "type": "textarea",
             "default": "",
-            "placeholder": "每行一条，如 Content-Type: application/json"
+            "placeholder": "每行一条，如 Content-Type: application/json",
+            "rows": 5
+        },
+        {
+            "name": "timeout_seconds",
+            "label": "超时（秒）",
+            "type": "number",
+            "default": 30,
+            "min": 1,
+            "max": 300,
+            "step": 1
         }
     ]
 }

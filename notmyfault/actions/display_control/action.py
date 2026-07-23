@@ -13,7 +13,7 @@ def _set_brightness(level: int):
         subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              f"(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1,{level})"],
-            capture_output=True, timeout=5,
+            capture_output=True, errors="replace", timeout=5,
         )
     except Exception:
         pass

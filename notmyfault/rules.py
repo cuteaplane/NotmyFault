@@ -1,31 +1,92 @@
-"""规则引擎的核心纯函数：事件提取、参数匹配、规则校验、触发器参数聚合。
+"""规则引擎的核心纯函数：条件树、事件匹配、规则校验、触发器参数聚合。
 
 全都是无 I/O、无状态的纯函数，随你怎么單测，不用起引擎、不用读文件、不用 mock。
 engine.py 只管拿这些函数的返回值去打印和记诊断，逻辑和副作用分得干干净净。
 """
-import sys
-from typing import Any, Dict, List, Tuple
+import json
+import threading
+import time
+from typing import Any, Dict, Iterable, List, Tuple
 
 
 # ---------------------------------------------------------------------------
 # 事件提取
 # ---------------------------------------------------------------------------
 
-def get_rule_events(rule: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """从规则中提取所有事件条件。
+def get_rule_condition(rule: Dict[str, Any]) -> Dict[str, Any] | None:
+    """返回规则的条件树，并兼容两代扁平规则格式。
 
-    新格式: rule.condition.events -> event 列表
-    旧格式: rule.event -> 单个事件包装为列表
+    新格式使用 ``op``/``children``（``any``/``all`` 可嵌套）；旧 Dashboard
+    写出的 ``{type: "or", events: [...]}`` 与 ``event`` 仍在这里归一化，
+    所以升级不会让已有自动化失效。
     """
     condition = rule.get("condition")
-    if condition is not None and isinstance(condition, dict):
-        events = condition.get("events", [])
-        if isinstance(events, list) and events:
-            return events
+    if isinstance(condition, dict):
+        return condition
     event = rule.get("event") or rule.get("trigger")
-    if event and isinstance(event, dict):
-        return [event]
-    return []
+    return event if isinstance(event, dict) else None
+
+
+def _is_event_leaf(node: Any) -> bool:
+    return isinstance(node, dict) and isinstance(node.get("type"), str) and \
+        "children" not in node and "events" not in node
+
+
+def _condition_children(node: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """取条件节点子项，兼容旧的 events 字段。"""
+    children = node.get("children")
+    if not isinstance(children, list):
+        children = node.get("events", [])
+    return [child for child in children if isinstance(child, dict)]
+
+
+def iter_condition_events(node: Dict[str, Any] | None) -> Iterable[Dict[str, Any]]:
+    """深度优先枚举条件树中的事件叶子。"""
+    if not isinstance(node, dict):
+        return
+    if _is_event_leaf(node):
+        yield node
+        return
+    for child in _condition_children(node):
+        yield from iter_condition_events(child)
+
+
+def get_rule_events(rule: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """从规则的任意条件树中提取所有事件条件。"""
+    return list(iter_condition_events(get_rule_condition(rule)))
+
+
+def validate_condition_tree(node: Dict[str, Any] | None) -> List[str]:
+    """校验可序列化的条件树结构，拒绝引擎无法解释的运算符。"""
+    errors: List[str] = []
+
+    def visit(current: Any, path: str) -> None:
+        if not isinstance(current, dict):
+            errors.append(f"{path} 必须是对象")
+            return
+        if _is_event_leaf(current):
+            if not current.get("type"):
+                errors.append(f"{path}.type 不能为空")
+            if "params" in current and not isinstance(current["params"], dict):
+                errors.append(f"{path}.params 必须是对象")
+            return
+        op = _condition_op(current)
+        if op not in ("any", "all"):
+            errors.append(f"{path} 的 op 必须为 any 或 all")
+        children = _condition_children(current)
+        if not children:
+            errors.append(f"{path} 至少需要一个子条件")
+        for index, child in enumerate(children):
+            visit(child, f"{path}.children[{index}]")
+        if "within_seconds" in current:
+            try:
+                if float(current["within_seconds"]) <= 0:
+                    errors.append(f"{path}.within_seconds 必须大于 0")
+            except (TypeError, ValueError):
+                errors.append(f"{path}.within_seconds 必须是数字")
+
+    visit(node, "condition")
+    return errors
 
 
 # ---------------------------------------------------------------------------
@@ -33,10 +94,11 @@ def get_rule_events(rule: Dict[str, Any]) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def check_event_params(event_def: Dict[str, Any], event_payload: Dict[str, Any]) -> bool:
-    """检查事件 payload 是否匹配事件定义的参数（事件可含额外参数）。"""
+    """检查事件 payload 是否匹配事件定义的参数（允许 payload 有额外字段）。"""
     expected_params = event_def.get("params", {})
     for key, expected_val in expected_params.items():
-        if event_payload.get(key) != expected_val:
+        # 缺字段不能等同于满足条件，否则多个规则会互相误触发。
+        if key not in event_payload or event_payload[key] != expected_val:
             return False
     return True
 
@@ -52,6 +114,137 @@ def match_rule(rule: Dict[str, Any], event_type: str, event_payload: Dict[str, A
         if check_event_params(event_def, event_payload):
             return True
     return False
+
+
+def _condition_op(node: Dict[str, Any]) -> str:
+    """读取条件运算符，兼容 ``type: and/or`` 的早期格式。"""
+    op = node.get("op", node.get("type", "any"))
+    return {"or": "any", "and": "all"}.get(str(op).lower(), str(op).lower())
+
+
+def _event_key(event_def: Dict[str, Any]) -> str:
+    """事件叶子的稳定键；用于保存最近一次命中，而不是依赖对象 id。"""
+    return json.dumps(
+        {"type": event_def.get("type", ""), "params": event_def.get("params", {})},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+class ConditionRuntime:
+    """有状态地评估嵌套条件树。
+
+    单一事件与 OR 立即触发。AND 则保存每个事件叶子的最近一次命中，并可在
+    节点上声明 ``within_seconds``，例如 ``{op: "all", within_seconds: 300}``
+    表示所有子条件必须在五分钟内发生。每一组命中只触发一次，直到其中任一
+    事件再次发生并形成新的组合。
+    """
+
+    def __init__(self) -> None:
+        self._seen: Dict[str, Dict[str, tuple[float, Dict[str, Any]]]] = {}
+        self._fired: Dict[str, tuple[tuple[str, float], ...]] = {}
+        self._last_matches: Dict[str, List[Dict[str, Any]]] = {}
+        self._lock = threading.RLock()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._seen.clear()
+            self._fired.clear()
+            self._last_matches.clear()
+
+    def last_match(self, rule_key: str) -> List[Dict[str, Any]]:
+        """返回最近一次成功条件组合的全部事件，供执行流水线消费。"""
+        with self._lock:
+            return [
+                {**item, "payload": dict(item["payload"])}
+                for item in self._last_matches.get(rule_key, [])
+            ]
+
+    def match(
+        self,
+        rule_key: str,
+        rule: Dict[str, Any],
+        event_type: str,
+        event_payload: Dict[str, Any],
+        now: float | None = None,
+    ) -> bool:
+        """记录入站事件后，判断规则条件是否形成一组新的有效命中。"""
+        node = get_rule_condition(rule)
+        if node is None:
+            return False
+        timestamp = time.monotonic() if now is None else now
+        matching_leaves = [
+            leaf for leaf in iter_condition_events(node)
+            if leaf.get("type") == event_type and check_event_params(leaf, event_payload)
+        ]
+        if not matching_leaves:
+            return False
+
+        with self._lock:
+            seen = self._seen.setdefault(rule_key, {})
+            for leaf in matching_leaves:
+                seen[_event_key(leaf)] = (timestamp, dict(event_payload))
+
+            matched, signature = self._evaluate(node, seen)
+            if not matched:
+                return False
+            # 同一批 AND 命中不能被后续无关事件或重复轮询反复执行。
+            if self._fired.get(rule_key) == signature:
+                return False
+            self._fired[rule_key] = signature
+            self._last_matches[rule_key] = [
+                {
+                    "event": json.loads(key),
+                    "timestamp": fired_at,
+                    "payload": dict(seen[key][1]),
+                }
+                for key, fired_at in signature
+                if key in seen
+            ]
+            return True
+
+    def _evaluate(
+        self,
+        node: Dict[str, Any],
+        seen: Dict[str, tuple[float, Dict[str, Any]]],
+    ) -> tuple[bool, tuple[tuple[str, float], ...]]:
+        if _is_event_leaf(node):
+            key = _event_key(node)
+            entry = seen.get(key)
+            return (entry is not None, ((key, entry[0]),) if entry else ())
+
+        children = _condition_children(node)
+        if not children:
+            return False, ()
+        states = [self._evaluate(child, seen) for child in children]
+        op = _condition_op(node)
+        if op == "all":
+            if not all(ok for ok, _signature in states):
+                return False, ()
+            signature = tuple(item for _ok, part in states for item in part)
+            window = node.get("within_seconds")
+            if window not in (None, ""):
+                try:
+                    limit = float(window)
+                except (TypeError, ValueError):
+                    return False, ()
+                timestamps = [item[1] for item in signature]
+                if limit < 0 or (timestamps and max(timestamps) - min(timestamps) > limit):
+                    return False, ()
+            return True, tuple(sorted(signature))
+
+        # 默认 any，且保留旧 condition.type == "or" 的行为。选择最近一次
+        # 命中的分支，不能总拿第一个缓存分支，否则 OR 的第二个事件会被误判
+        # 成与上一次相同的组合。
+        matches = [signature for ok, signature in states if ok]
+        if matches:
+            latest = max(
+                matches,
+                key=lambda signature: max((item[1] for item in signature), default=float("-inf")),
+            )
+            return True, latest
+        return False, ()
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +295,10 @@ def validate_rules(
         rule_name = rule.get("name", f"规则 #{i+1}")
 
         # --- event 引用检查 ---
+        condition_errors = validate_condition_tree(get_rule_condition(rule))
+        if condition_errors:
+            issues.extend((rule_name, error) for error in condition_errors)
+            continue
         rule_events = get_rule_events(rule)
         all_events_valid = True
         for event_def in rule_events:

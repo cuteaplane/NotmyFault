@@ -2,6 +2,7 @@
     "id": "power_state",
     "name": "电源状态监测",
     "semantic": "state",
+    "trigger_api": "event-v1",
     "description": "电源接入/电池/低电量/休眠恢复时触发",
     "version_code": 1,
     "version": "1.0",

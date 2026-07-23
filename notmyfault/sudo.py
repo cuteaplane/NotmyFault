@@ -162,6 +162,7 @@ def run_as_admin(
             ["powershell", "-NoProfile", "-Command", ps_script],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout,
         )
         if result.returncode != 0 and result.stderr:

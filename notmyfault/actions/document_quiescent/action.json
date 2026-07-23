@@ -1,0 +1,38 @@
+{
+  "id": "document_quiescent",
+  "name": "文档可安全归档检查",
+  "description": "确认目录文件已稳定、未被占用，且 Office/WPS/Adobe 未显示正在编辑的文档；不确定时延后工作流。",
+  "version_code": 1,
+  "version": "1.0",
+  "package_name": "io.github.notmyfault.document_quiescent",
+  "enabled": true,
+  "permissions": ["filesystem", "native_api"],
+  "precondition_api": "context-v1",
+  "params": [
+    {
+      "name": "source_folder",
+      "label": "待归档目录",
+      "type": "path",
+      "default": "",
+      "placeholder": "如 D:\\工作文件"
+    },
+    {
+      "name": "quiet_seconds",
+      "label": "文件静默时长（秒）",
+      "type": "number",
+      "default": 120
+    },
+    {
+      "name": "check_file_locks",
+      "label": "检查文件占用",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "name": "check_document_windows",
+      "label": "检查可见编辑窗口",
+      "type": "bool",
+      "default": true
+    }
+  ]
+}

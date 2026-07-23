@@ -105,6 +105,9 @@ class EngineRunner:
         self.engine_running = False
         self.shutdown_event = threading.Event()
         self.engine_thread = None
+        # 启停可能同时来自托盘和 HTTP API。更关键的是，旧引擎线程尚未退出时
+        # 绝不能替换 shutdown_event 后再启动一代新线程，否则两个引擎会同时监听。
+        self._lifecycle_lock = threading.RLock()
         self._api = None
         self._tray = None
 
@@ -120,25 +123,30 @@ class EngineRunner:
     # ================================================================
 
     def _start_engine_core(self):
-        """启动引擎线程"""
-        if self.engine_running:
-            print("[Engine] 引擎已在运行")
-            return
+        """启动引擎线程。
 
-        # 确保旧引擎线程彻底退出后再启动新的
-        if self.engine_thread and self.engine_thread.is_alive():
-            print("[Engine] 等待旧引擎线程退出...")
-            self.engine_thread.join(timeout=10)
+        返回 ``True`` 只表示本次成功创建了新线程。旧线程还在收尾时返回
+        ``False``：停机中的引擎不允许被覆盖，必须等它自己的 finally 清理完。
+        """
+        with self._lifecycle_lock:
+            if self.engine_running:
+                print("[Engine] 引擎已在运行")
+                return False
 
-        # 每个引擎实例使用独立的 shutdown_event，避免旧 daemon
-        # 触发器线程在新引擎 clear() 后死灰复燃造成重复处理
-        self.shutdown_event = threading.Event()
-        self.engine_thread = threading.Thread(
-            target=self._run_engine,
-            name="Engine-Core",
-            daemon=False,
-        )
-        self.engine_thread.start()
+            if self.engine_thread and self.engine_thread.is_alive():
+                print("[Engine] 旧引擎仍在停止中，拒绝启动新线程")
+                return False
+
+            # 每个已完全结束的引擎实例使用独立 shutdown_event，避免旧触发器
+            # 读取到新 Event 后死灰复燃。
+            self.shutdown_event = threading.Event()
+            self.engine_thread = threading.Thread(
+                target=self._run_engine,
+                name="Engine-Core",
+                daemon=False,
+            )
+            self.engine_thread.start()
+            return True
 
     def _run_engine(self):
         try:
@@ -169,21 +177,25 @@ class EngineRunner:
             if self._api:
                 self._api.push_event("error", {"error": str(e)})
         finally:
-            self.engine_running = False
+            with self._lifecycle_lock:
+                self.engine_running = False
             if self._tray:
                 self._tray.set_engine_running(False)
             if self._api:
                 self._api.push_event("engine_state_changed", {"state": "stopped"})
 
     def _stop_engine(self):
-        """停止引擎"""
+        """请求停止引擎；返回线程是否已经完全退出。"""
         print("[Engine] 收到停止指令")
         self.shutdown_event.set()
         if self.engine_thread and self.engine_thread.is_alive():
             self.engine_thread.join(timeout=5)
             if self.engine_thread.is_alive():
-                print("[Engine] 警告：引擎线程 5 秒内未退出，强制标记为停止")
-        self.engine_running = False
+                print("[Engine] 警告：引擎线程 5 秒内未退出，继续停止中")
+                return False
+        with self._lifecycle_lock:
+            self.engine_running = False
+        return True
 
     def _toggle_engine(self):
         """托盘切换引擎启停"""

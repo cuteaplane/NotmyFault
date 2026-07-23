@@ -2,6 +2,7 @@
     "id": "network_status",
     "name": "网络状态变化",
     "semantic": "state",
+    "trigger_api": "event-v1",
     "description": "网络连接/断开时触发",
     "version_code": 1,
     "version": "1.0",
