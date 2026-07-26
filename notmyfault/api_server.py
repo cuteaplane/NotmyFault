@@ -118,12 +118,14 @@ def _load_or_create_api_token(path: str) -> str:
 class EngineRunnerLike(Protocol):
     """api_server 期望的引擎运行器接口"""
     engine_running: bool
+    engine_state: str
     shutdown_event: Any  # threading.Event
     engine_thread: Any   # threading.Thread | None
+    current_engine: Any
 
-    def _start_engine_core(self) -> bool: ...
-    def _stop_engine(self) -> bool: ...
-    def _request_process_shutdown(self, force_after: float = 10) -> None: ...
+    def start_engine(self) -> bool: ...
+    def stop_engine(self) -> bool: ...
+    def request_process_shutdown(self, force_after: float = 10) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +149,8 @@ class EngineAPI:
         self._loop = None
         self._sub_lock = threading.Lock()
         self._server = None
+        # 仅供旧测试宿主和第三方嵌入代码过渡；正式运行时从
+        # EngineRunner.current_engine 读取，不再由 API 持有第二份实例状态。
         self._engine_ref = None
 
         # 插件预览暂存：{token: {"extract_dir", "root_path", "meta", "ptype", "created_at"}}
@@ -324,7 +328,7 @@ class EngineAPI:
                         result[ptype][pid] = meta
 
         # merge diagnostics (loaded status / errors)
-        engine = getattr(self, "_engine_ref", None)
+        engine = self._resolve_current_engine()
         if engine is not None:
             diag = engine.get_diagnostics()
             for err in diag.get("plugins", {}).get("errors", []):
@@ -336,6 +340,36 @@ class EngineAPI:
                         result[cat][epid]["_error"] = ereason
 
         return result
+
+    def _resolve_current_engine(self):
+        """从运行时控制器读取当前实例，兼容旧嵌入宿主的临时注入。"""
+        engine = getattr(self._engine, "current_engine", None)
+        if engine is not None:
+            return engine
+        return self._engine_ref
+
+    def _start_runtime(self) -> bool:
+        start = getattr(self._engine, "start_engine", None)
+        if callable(start):
+            return start()
+        return self._engine._start_engine_core()
+
+    def _stop_runtime(self) -> bool:
+        stop = getattr(self._engine, "stop_engine", None)
+        if callable(stop):
+            return stop()
+        return self._engine._stop_engine()
+
+    def _shutdown_runtime(self) -> None:
+        shutdown = getattr(self._engine, "request_process_shutdown", None)
+        if not callable(shutdown):
+            shutdown = getattr(self._engine, "_request_process_shutdown", None)
+        if callable(shutdown):
+            shutdown()
+            return
+        self._stop_runtime()
+        if self._server:
+            self._server.should_exit = True
 
     def _toggle_plugin(self, ptype: str, pid: str) -> dict:
         if not self._is_safe_plugin_id(pid):
@@ -477,7 +511,7 @@ class EngineAPI:
                         "api_alive": True,
                         "message": "already_running" if current_state == "running" else "already_starting"}
 
-            started = self._engine._start_engine_core()
+            started = self._start_runtime()
             if started is False:
                 return JSONResponse(
                     {"ok": False, "running": self._engine.engine_running,
@@ -496,7 +530,7 @@ class EngineAPI:
         async def engine_stop(request: Request):
             await self._verify_auth(request)
             print("[API] POST /api/engine/stop")
-            stopped = self._engine._stop_engine()
+            stopped = self._stop_runtime()
             return {
                 "ok": True,
                 "stopped": stopped,
@@ -510,17 +544,7 @@ class EngineAPI:
             await self._verify_auth(request)
             """彻底退出引擎进程（先停引擎，再优雅关闭 HTTP 服务）"""
             print("[API] POST /api/engine/shutdown")
-            request_shutdown = getattr(
-                self._engine,
-                "_request_process_shutdown",
-                None,
-            )
-            if callable(request_shutdown):
-                request_shutdown()
-            else:
-                self._engine._stop_engine()
-                if self._server:
-                    self._server.should_exit = True
+            self._shutdown_runtime()
 
             return {"ok": True, "message": "shutting_down"}
 
@@ -631,7 +655,7 @@ class EngineAPI:
 
         @app.post("/api/rules/{rule_index}/run")
         async def rules_run(rule_index: int, request: Request):
-            engine = self._engine_ref
+            engine = self._resolve_current_engine()
             if engine is None:
                 return JSONResponse(
                     {"ok": False, "error": "引擎尚未就绪"}, status_code=409,
@@ -1039,7 +1063,7 @@ class EngineAPI:
 
         @app.get("/api/engine/diagnostics")
         async def engine_diagnostics():
-            engine = getattr(self, "_engine_ref", None)
+            engine = self._resolve_current_engine()
             if engine is not None:
                 return engine.get_diagnostics()
             return {"uptime_seconds": 0, "plugins": {}, "rules": {}, "actions": {}}
