@@ -20,6 +20,7 @@ import inspect
 import json
 import os
 import secrets
+import copy
 import sys
 import threading
 import time
@@ -894,19 +895,26 @@ class AutomationEngine:
         self.emit_event(event_type, event_payload)
 
     def run_manual_rule(self, rule_index: int) -> tuple[bool, str]:
-        """从 Dashboard 手动执行一条显式配置了 ``manual`` 触发器的规则。
+        """从 Dashboard 立即执行一条规则，不依赖其自动触发条件。
 
-        手动执行不能成为绕过条件的万能后门：只有规则条件树中声明了
-        manual 触发器，才允许从列表直接启动。动作放入独立线程，HTTP 请求
-        只负责受理，不会被长动作卡住。
+        列表上的运行箭头是“立即运行一次”，因此必须常驻；``manual``
+        触发器仍可用于只由用户点击触发的规则建模。动作放入独立线程，HTTP
+        请求只负责受理，不会被长动作卡住。
         """
         with self._rules_lock:
             if rule_index < 0 or rule_index >= len(self.rules):
                 return False, "规则不存在或已被重新加载"
-            rule = self.rules[rule_index]
+            rule = copy.deepcopy(self.rules[rule_index])
 
-        if not any(event.get("type") == "manual" for event in get_rule_events(rule)):
-            return False, "该规则未配置手动触发器"
+        return self.run_manual_rule_snapshot(rule, rule_index)
+
+    def run_manual_rule_snapshot(
+        self,
+        rule: Dict[str, Any],
+        rule_index: int = -1,
+    ) -> tuple[bool, str]:
+        """执行调用方已核对过的规则快照，不依赖热重载时序。"""
+        rule = copy.deepcopy(rule)
 
         rule_name = rule.get("name", f"规则 #{rule_index + 1}")
         context = build_context(

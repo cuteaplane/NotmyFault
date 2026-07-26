@@ -5,7 +5,8 @@ export const store = reactive({
   schema: { triggers: {}, actions: {} },
   configData: { rules: [] },
   pluginsData: { triggers: {}, actions: {} },
-  engineStatus: { running: false, pid: null },
+  engineStatus: { api_alive: false, engine_running: false, engine_state: 'offline', pid: null },
+  controllerOnline: false,
   engineOnline: false,
   refreshSignal: 0,   // SSE 事件触发时自增，视图 watch 后刷新
 })

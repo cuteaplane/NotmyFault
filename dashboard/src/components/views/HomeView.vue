@@ -12,6 +12,10 @@ let diagTimer = null
 const appVersion = __APP_VERSION__
 
 const isRunning = computed(() => store.engineStatus.engine_running === true)
+const isControllerOnline = computed(() => store.engineStatus.api_alive === true)
+const engineState = computed(() => store.engineStatus.engine_state || (isRunning.value ? 'running' : 'offline'))
+const isStarting = computed(() => starting.value || engineState.value === 'starting')
+const isStopping = computed(() => stopping.value || engineState.value === 'stopping')
 const modeLabel = computed(() => {
   const m = store.engineStatus.security_mode
   return ({ strict: '严格', normal: '标准', permissive: '宽松' })[m] || '-'
@@ -22,7 +26,9 @@ async function syncStatus(s) {
   // 整体替换会把 security_mode / pid / rules_count 等字段一起冲掉，导致停引擎后
   // 安全模式标签变 '-'、SecurityView 显示“未知”。与 App.vue.updateStatus 对齐。
   store.engineStatus = { ...store.engineStatus, ...s }
-  store.engineOnline = s.engine_running === true
+  if ('api_alive' in s) store.controllerOnline = s.api_alive === true
+  if ('engine_running' in s) store.engineOnline = s.engine_running === true
+  document.body.classList.toggle('controller-online', store.controllerOnline)
   document.body.classList.toggle('engine-online', store.engineOnline)
 }
 
@@ -30,7 +36,7 @@ async function loadStats() {
   try {
     const s = await getEngineStatus()
     await syncStatus(s)
-    if (s.engine_running === true) {
+    if (s.api_alive === true) {
       stats.value = {
         rules: s.rules_count != null ? s.rules_count : '-',
         triggers: s.triggers_count != null ? s.triggers_count : '-',
@@ -102,87 +108,36 @@ const diagLines = computed(() => {
 async function startEngine() {
   if (starting.value) return
   starting.value = true
-  if (hasBridge()) {
-    try {
-      const r = await window.pywebview.api.launch_engine()
-      if (!r.ok) throw new Error(r.error || '未知错误')
-    } catch (e) { alert('启动失败: ' + e.message); starting.value = false; return }
+  try {
+    if (!hasBridge()) throw new Error('Dashboard 桌面桥接尚未就绪')
+    const r = await window.pywebview.api.launch_engine()
+    if (!r.ok) throw new Error(r.error || '未知错误')
+    await syncStatus(r)
+    if (window.__nmf) await window.__nmf.refreshAll()
+    await loadStats()
+    snackbar(r.engine_running ? '自动化已启动' : '后台服务正在启动自动化')
+  } catch (e) {
+    alert('启动失败: ' + e.message)
+  } finally {
+    starting.value = false
   }
-  let attempts = 0
-  const id = setInterval(async () => {
-    attempts++
-    try {
-      const s = await getEngineStatus()
-      if (s.engine_running) {
-        clearInterval(id)
-        starting.value = false
-        await syncStatus(s)
-        if (window.__nmf) window.__nmf.refreshAll()
-        loadStats()
-      }
-    } catch (e) { /* retry */ }
-    if (attempts >= 15) {
-      clearInterval(id)
-      starting.value = false
-      alert('启动超时，请手动双击 NOTMYFAULT.pyw，或先通过桌面端 Dashboard 启动')
-    }
-  }, 1000)
 }
 
 async function stopEngine() {
   if (stopping.value) return
   stopping.value = true
-
-  // bridge 是唯一安全的停引擎途径（dashboard.pyw 的 _auth_request 带了 token）
-  // 非 bridge 模式下裸 fetch 没 token 会 403，直接拦住不走那条路
-  if (!hasBridge()) {
-    // bridge 可能还在注入，等一拍再检查
-    await new Promise(r => setTimeout(r, 300))
-  }
-  if (!hasBridge()) {
-    alert('Dashboard 尚未就绪，请稍后再试')
-    stopping.value = false
-    return
-  }
-
-  let stopOk = false
   try {
-    const r = await window.pywebview.api.shutdown_engine()
-    stopOk = r && r.ok
-    if (!stopOk) {
-      alert('关闭失败: ' + (r?.error || '引擎未响应'))
-      stopping.value = false
-      return
-    }
+    if (!hasBridge()) throw new Error('Dashboard 桌面桥接尚未就绪')
+    const r = await window.pywebview.api.stop_engine()
+    if (!r?.ok) throw new Error(r?.error || '后台服务未响应')
+    const status = await getEngineStatus()
+    await syncStatus(status)
+    snackbar(r.stopping ? '正在暂停自动化' : '自动化已暂停，后台服务仍在线')
   } catch (e) {
-    // bridge 调用异常--引擎可能已经退了，走轮询确认
+    alert('暂停失败: ' + e.message)
+  } finally {
+    stopping.value = false
   }
-
-  // 轮询等待引擎退出
-  let pa = 0
-  const id = setInterval(async () => {
-    pa++
-    try {
-      const s = await getEngineStatus()
-      if (!s.engine_running) {
-        clearInterval(id)
-        stopping.value = false
-        await syncStatus({ engine_running: false })
-        snackbar('引擎已关闭')
-      }
-      if (pa >= 8) {
-        clearInterval(id)
-        stopping.value = false
-        await syncStatus({ engine_running: false })
-      }
-    } catch (e) {
-      // API 也挂了--引擎确实退了
-      clearInterval(id)
-      stopping.value = false
-      await syncStatus({ engine_running: false })
-      snackbar('引擎已关闭')
-    }
-  }, 1000)
 }
 
 function refreshHome() {
@@ -200,7 +155,6 @@ watch(() => store.refreshSignal, () => loadStats())
 // 引擎状态切换：关闭时清空数据，启动时立即刷新
 watch(isRunning, (running) => {
   if (!running) {
-    stats.value = { rules: '-', triggers: '-', actions: '-', pid: '-' }
     diag.value = null
   } else {
     loadStats()
@@ -215,37 +169,37 @@ watch(isRunning, (running) => {
     </div></div>
 
     <!-- APatch 风格状态卡片 -->
-    <div class="apatch-hero" :class="starting ? 'starting' : stopping ? 'stopping' : isRunning ? 'running' : 'stopped'">
+    <div class="apatch-hero" :class="isStarting ? 'starting' : isStopping ? 'stopping' : isRunning ? 'running' : isControllerOnline ? 'stopped' : 'offline'">
       <div class="hero-left">
         <div class="hero-icon">
-          <span v-if="starting" class="spinner"></span>
-          <span v-else-if="stopping" class="spinner"></span>
-          <span v-else class="material-symbols-outlined">{{ isRunning ? 'task_alt' : 'cancel' }}</span>
+          <span v-if="isStarting || isStopping" class="spinner"></span>
+          <span v-else class="material-symbols-outlined">{{ isRunning ? 'task_alt' : isControllerOnline ? 'pause_circle' : 'cloud_off' }}</span>
         </div>
         <div>
-          <h3>{{ starting ? '启动中...' : stopping ? '关闭中...' : isRunning ? '运行中 😋' : '已停止' }}</h3>
-          <p v-if="starting">正在启动引擎进程...</p>
-          <p v-else-if="stopping">正在关闭引擎...</p>
+          <h3>{{ isStarting ? '启动中…' : isStopping ? '暂停中…' : isRunning ? '自动化运行中' : isControllerOnline ? '自动化已暂停' : '后台服务未启动' }}</h3>
+          <p v-if="isStarting">正在连接后台服务并加载规则…</p>
+          <p v-else-if="isStopping">触发器正在安全退出，托盘与配置服务会保持在线。</p>
           <p v-else-if="isRunning">PID {{ stats.pid }} · {{ modeLabel }} · 127.0.0.1:19198</p>
-          <p v-else>引擎未运行</p>
+          <p v-else-if="isControllerOnline">PID {{ stats.pid }} · 可继续编辑规则或重新启动自动化</p>
+          <p v-else>Dashboard 会为你启动后台服务、托盘与自动化核心</p>
         </div>
       </div>
       <!-- 填充按钮 + 假加载 spinner，4 态互斥 -->
       <div class="actions">
-        <button v-if="!isRunning && !starting && !stopping" class="btn" @click="startEngine" style="min-width:148px">
-          <span class="material-symbols-outlined">play_arrow</span>启动引擎</button>
-        <button v-if="starting" class="btn" disabled style="min-width:148px">
+        <button v-if="!isRunning && !isStarting && !isStopping" class="btn" @click="startEngine" style="min-width:148px">
+          <span class="material-symbols-outlined">play_arrow</span>{{ isControllerOnline ? '启动自动化' : '启动后台服务' }}</button>
+        <button v-if="isStarting" class="btn" disabled style="min-width:148px">
           <span class="spinner"></span>启动中...</button>
-        <button v-if="isRunning && !stopping" class="btn" @click="stopEngine" style="min-width:148px">
-          <span class="material-symbols-outlined">power_settings_new</span>关闭引擎</button>
-        <button v-if="stopping" class="btn" disabled style="min-width:148px">
-          <span class="spinner"></span>关闭中...</button>
+        <button v-if="isRunning && !isStopping" class="btn" @click="stopEngine" style="min-width:148px">
+          <span class="material-symbols-outlined">pause</span>暂停自动化</button>
+        <button v-if="isStopping" class="btn" disabled style="min-width:148px">
+          <span class="spinner"></span>暂停中...</button>
       </div>
     </div>
 
     <!-- 引擎运行中：显示概览 + 诊断 -->
-    <template v-if="isRunning">
-    <div class="card" style="margin-bottom:16px">
+    <template v-if="isControllerOnline">
+    <div v-if="isRunning" class="card" style="margin-bottom:16px">
       <h4 class="card-section-title">引擎概览</h4>
       <div class="kv-list">
         <div class="kv-item"><span class="kv-key">规则数量</span><span class="kv-val">{{ stats.rules }}</span></div>
@@ -289,8 +243,8 @@ watch(isRunning, (running) => {
     </div>
     <div class="empty-state" style="padding:32px 20px">
       <div class="material-symbols-outlined">power_off</div>
-      <h3>引擎未启动</h3>
-      <p>点击上方"启动引擎"按钮开始使用</p>
+      <h3>后台服务未启动</h3>
+      <p>点击上方按钮，同时启动托盘、配置服务和自动化核心</p>
     </div>
     </template>
   </section>

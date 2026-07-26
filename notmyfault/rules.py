@@ -89,6 +89,68 @@ def validate_condition_tree(node: Dict[str, Any] | None) -> List[str]:
     return errors
 
 
+def validate_rule_structure(rule: Any) -> List[str]:
+    """校验一条可由 Dashboard 保存并交给引擎执行的规则。"""
+    errors: List[str] = []
+    if not isinstance(rule, dict):
+        return ["规则必须是对象"]
+
+    if not str(rule.get("name", "")).strip():
+        errors.append("name 不能为空")
+
+    has_event = "event" in rule or "trigger" in rule
+    has_condition = "condition" in rule
+    if has_event and has_condition:
+        errors.append("event/trigger 与 condition 不能同时存在")
+    elif not has_event and not has_condition:
+        errors.append("必须配置 event 或 condition")
+    else:
+        errors.extend(validate_condition_tree(get_rule_condition(rule)))
+
+    actions = rule.get("actions")
+    if not isinstance(actions, list) or not actions:
+        errors.append("actions 至少需要一个动作")
+    else:
+        for index, action in enumerate(actions):
+            if not isinstance(action, dict):
+                errors.append(f"actions[{index}] 必须是对象")
+                continue
+            if not str(action.get("type", "")).strip():
+                errors.append(f"actions[{index}].type 不能为空")
+            if "params" in action and not isinstance(action["params"], dict):
+                errors.append(f"actions[{index}].params 必须是对象")
+
+    preconditions = rule.get("preconditions", [])
+    if not isinstance(preconditions, list):
+        errors.append("preconditions 必须是列表")
+    else:
+        for index, item in enumerate(preconditions):
+            if not isinstance(item, dict):
+                errors.append(f"preconditions[{index}] 必须是对象")
+                continue
+            if not str(item.get("type", "")).strip():
+                errors.append(f"preconditions[{index}].type 不能为空")
+            if "params" in item and not isinstance(item["params"], dict):
+                errors.append(f"preconditions[{index}].params 必须是对象")
+
+    return errors
+
+
+def validate_rules_structure(rules: Any) -> List[str]:
+    """校验规则列表并返回带索引的错误，供所有写入入口复用。"""
+    if not isinstance(rules, list):
+        return ["rules 必须是列表"]
+    errors: List[str] = []
+    for index, rule in enumerate(rules):
+        name = rule.get("name") if isinstance(rule, dict) else None
+        label = str(name).strip() if name else f"#{index + 1}"
+        errors.extend(
+            f"规则 {label}: {error}"
+            for error in validate_rule_structure(rule)
+        )
+    return errors
+
+
 # ---------------------------------------------------------------------------
 # 参数匹配
 # ---------------------------------------------------------------------------

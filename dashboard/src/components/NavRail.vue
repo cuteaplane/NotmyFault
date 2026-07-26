@@ -3,6 +3,7 @@ import { useTheme } from '../composables/useTheme'
 defineProps({ current: String })
 const emit = defineEmits(['switch'])
 const { isDark, toggle } = useTheme()
+const appVersion = __APP_VERSION__
 const items = [
   { page: 'home', icon: 'dashboard', label: '首页', needs: false },
   { page: 'plugins', icon: 'extension', label: '插件', needs: true },
@@ -29,7 +30,7 @@ const items = [
         <span class="material-symbols-outlined nav-icon">{{ isDark ? 'light_mode' : 'dark_mode' }}</span>
         <span>{{ isDark ? '浅色模式' : '深色模式' }}</span>
       </button>
-      <div class="nav-ver">NotmyFault v1.0</div>
+      <div class="nav-ver">NotmyFault {{ appVersion }}</div>
     </div>
   </aside>
 </template>

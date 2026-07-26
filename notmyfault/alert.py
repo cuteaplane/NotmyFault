@@ -30,11 +30,29 @@ def _dashboard_pyw_path() -> str:
 
 
 def _launch_dashboard() -> None:
-    """启动 Dashboard。开发模式用 startfile，exe 模式启动自身 --dashboard。"""
+    """启动 Dashboard；冻结态优先使用同目录 UI，可回退统一入口参数。"""
     if getattr(sys, "frozen", False):
         try:
             import subprocess
-            subprocess.Popen([sys.executable, "--dashboard"], creationflags=subprocess.CREATE_NO_WINDOW)
+            executable_dir = os.path.dirname(sys.executable)
+            current = os.path.normcase(os.path.abspath(sys.executable))
+            sibling = next(
+                (
+                    candidate
+                    for candidate in (
+                        os.path.join(executable_dir, "NotmyFaultDashboard.exe"),
+                        os.path.join(executable_dir, "dashboard.exe"),
+                    )
+                    if os.path.isfile(candidate)
+                    and os.path.normcase(os.path.abspath(candidate)) != current
+                ),
+                None,
+            )
+            command = [sibling] if sibling else [sys.executable, "--dashboard"]
+            subprocess.Popen(
+                command,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
             print("[Alert] 已拉起 Dashboard (exe mode)")
         except Exception as e:
             print(f"[Alert] 拉起 Dashboard 失败: {e}", file=sys.stderr)

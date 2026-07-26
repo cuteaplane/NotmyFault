@@ -86,16 +86,34 @@ def setup_logging(log_dir: str) -> str:
     sys.stdout = _TimestampWriter(log_fp, sys.__stdout__ or _devnull)  # type: ignore
     sys.stderr = _TimestampWriter(log_fp, sys.__stderr__ or _devnull)  # type: ignore
     print(f"--- NotmyFault 引擎启动 {datetime.now().isoformat()} ---")
+    return log_path
 
 
 def _open_dashboard():
     """在后台打开 Dashboard。"""
+    if getattr(sys, "frozen", False):
+        import subprocess
+        executable_dir = os.path.dirname(sys.executable)
+        current = os.path.normcase(os.path.abspath(sys.executable))
+        for filename in ("NotmyFaultDashboard.exe", "dashboard.exe"):
+            candidate = os.path.join(executable_dir, filename)
+            if (
+                os.path.isfile(candidate)
+                and os.path.normcase(os.path.abspath(candidate)) != current
+            ):
+                subprocess.Popen(
+                    [candidate],
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                return
     dashboard_pyw = os.path.join(PROJECT_ROOT, "dashboard.pyw")
     if os.path.exists(dashboard_pyw):
         try:
             os.startfile(dashboard_pyw)
+            return
         except Exception:
             pass
+    print("[Dashboard] 找不到可启动的 Dashboard 入口", file=sys.stderr)
 
 
 class EngineRunner:
@@ -103,6 +121,7 @@ class EngineRunner:
 
     def __init__(self):
         self.engine_running = False
+        self.engine_state = "stopped"
         self.shutdown_event = threading.Event()
         self.engine_thread = None
         # 启停可能同时来自托盘和 HTTP API。更关键的是，旧引擎线程尚未退出时
@@ -110,6 +129,8 @@ class EngineRunner:
         self._lifecycle_lock = threading.RLock()
         self._api = None
         self._tray = None
+        self._api_socket = None
+        self._force_exit_armed = threading.Event()
 
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -117,6 +138,16 @@ class EngineRunner:
     def _signal_handler(self, signum, frame):
         print(f"\n[Engine] 收到关闭信号 ({signum})，正在关闭...")
         self.shutdown_event.set()
+
+    def _set_engine_state(self, state: str) -> None:
+        """以一个状态源同步核心、托盘和 Dashboard。"""
+        with self._lifecycle_lock:
+            self.engine_state = state
+            self.engine_running = state == "running"
+        if self._tray:
+            self._tray.set_engine_state(state)
+        if self._api:
+            self._api.push_event("engine_state_changed", {"state": state})
 
     # ================================================================
     # 引擎生命周期
@@ -134,7 +165,7 @@ class EngineRunner:
                 return False
 
             if self.engine_thread and self.engine_thread.is_alive():
-                print("[Engine] 旧引擎仍在停止中，拒绝启动新线程")
+                print(f"[Engine] 引擎当前处于 {self.engine_state}，拒绝重复启动")
                 return False
 
             # 每个已完全结束的引擎实例使用独立 shutdown_event，避免旧触发器
@@ -145,20 +176,19 @@ class EngineRunner:
                 name="Engine-Core",
                 daemon=False,
             )
+            self._set_engine_state("starting")
             self.engine_thread.start()
             return True
 
     def _run_engine(self):
         try:
-            self.engine_running = True
-            if self._tray:
-                self._tray.set_engine_running(True)
             engine = create_engine(
                 on_event=self._api.push_event if self._api else None,
             )
             # 注入引擎引用，供 API 诊断端点使用
             if self._api:
                 self._api._engine_ref = engine
+            self._set_engine_state("running")
             engine.start(shutdown_event=self.shutdown_event)
         except KeyboardInterrupt:
             pass
@@ -177,51 +207,57 @@ class EngineRunner:
             if self._api:
                 self._api.push_event("error", {"error": str(e)})
         finally:
-            with self._lifecycle_lock:
-                self.engine_running = False
-            if self._tray:
-                self._tray.set_engine_running(False)
             if self._api:
-                self._api.push_event("engine_state_changed", {"state": "stopped"})
+                self._api._engine_ref = None
+            self._set_engine_state("stopped")
 
     def _stop_engine(self):
         """请求停止引擎；返回线程是否已经完全退出。"""
         print("[Engine] 收到停止指令")
+        if not self.engine_thread or not self.engine_thread.is_alive():
+            self._set_engine_state("stopped")
+            return True
+        self._set_engine_state("stopping")
         self.shutdown_event.set()
         if self.engine_thread and self.engine_thread.is_alive():
             self.engine_thread.join(timeout=5)
             if self.engine_thread.is_alive():
                 print("[Engine] 警告：引擎线程 5 秒内未退出，继续停止中")
                 return False
-        with self._lifecycle_lock:
-            self.engine_running = False
+        self._set_engine_state("stopped")
         return True
 
     def _toggle_engine(self):
         """托盘切换引擎启停"""
-        if self.engine_running:
+        if self.engine_state == "running":
             self._stop_engine()
-            if self._tray:
-                self._tray.set_engine_running(False)
-        else:
-            # 启动是异步的，乐观更新托盘状态；
-            # _run_engine 线程启动后会再次同步，避免读取尚未置位的 engine_running
+        elif self.engine_state == "stopped":
             self._start_engine_core()
-            if self._tray:
-                self._tray.set_engine_running(True)
+        else:
+            print(f"[Tray] 引擎正处于 {self.engine_state}，忽略重复切换")
 
     def _tray_exit(self):
         """托盘退出—关闭引擎、HTTP 服务、退出进程"""
         print("[Tray] 用户请求退出")
+        self._stop_engine()
+        self._request_process_shutdown(force_after=5)
+
+    def _request_process_shutdown(self, force_after: float = 10) -> None:
+        """关闭托盘和 API；超时后兜底终止，避免残留无控制面的僵尸进程。"""
+        if self.engine_thread and self.engine_thread.is_alive():
+            self._set_engine_state("stopping")
         self.shutdown_event.set()
         if self._api and self._api._server:
             self._api._server.should_exit = True
         if self._tray:
             self._tray.stop()
-        # 强制退出（5 秒内干净的 shutdown 没完成就硬杀）
+        if self._force_exit_armed.is_set():
+            return
+        self._force_exit_armed.set()
+
         def _force():
             import time
-            time.sleep(5)
+            time.sleep(force_after)
             os._exit(0)
         threading.Thread(target=_force, daemon=True).start()
 
@@ -240,6 +276,24 @@ class EngineRunner:
         except (socket.error, OSError):
             return False
 
+    @staticmethod
+    def _claim_api_socket(port: int = 19198):
+        """在启动任何触发器之前独占 API 端口，消除并发启动竞态。"""
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                listener.setsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_EXCLUSIVEADDRUSE,
+                    1,
+                )
+            listener.bind(("127.0.0.1", port))
+            listener.listen(128)
+            return listener
+        except OSError:
+            listener.close()
+            return None
+
     # ================================================================
     # 主启动流程
     # ================================================================
@@ -253,38 +307,46 @@ class EngineRunner:
         print(f"  日志目录: {LOG_DIR}")
         print(f"  当前日志: {log_path}")
 
-        # 0. 单实例检查
-        if self._check_already_running():
-            print("[Engine] 引擎已在运行，无需重复启动")
+        # 0. 在启动核心前先独占监听端口。单纯“先 connect 再 bind”存在
+        # TOCTOU 窗口，两个并发实例可能都启动触发器。
+        self._api_socket = self._claim_api_socket()
+        if self._api_socket is None:
+            if self._check_already_running():
+                print("[Engine] 已有实例或其他服务占用 127.0.0.1:19198，拒绝重复启动")
+            else:
+                print("[Engine] 无法独占 127.0.0.1:19198，拒绝启动", file=sys.stderr)
             return
 
-        # 1. 创建 HTTP API 服务
-        self._api = EngineAPI(self)
-
-        # 2. 启动引擎
-        print("[启动] 启动主引擎...")
-        self._start_engine_core()
-        self._api.push_event("engine_state_changed", {"state": "running"})
-
-        # 3. 系统托盘
-        if _HAS_TRAY:
-            self._tray = TrayIcon(
-                on_open_dashboard=_open_dashboard,
-                on_toggle_engine=self._toggle_engine,
-                on_exit=self._tray_exit,
-            )
-            self._tray.start()
-            self._tray.set_engine_running(True)
-            self._tray.show_balloon("NotmyFault", "引擎已启动")
-            print("[Tray] 系统托盘图标已启动")
-
-        # 4. 启动 HTTP 服务（阻塞，直到 uvicorn 退出）
         try:
-            self._api.serve(host="127.0.0.1", port=19198)
+            # 1. 创建 HTTP API 服务
+            self._api = EngineAPI(self)
+
+            # 2. 启动引擎
+            print("[启动] 启动主引擎...")
+            self._start_engine_core()
+
+            # 3. 系统托盘
+            if _HAS_TRAY:
+                self._tray = TrayIcon(
+                    on_open_dashboard=_open_dashboard,
+                    on_toggle_engine=self._toggle_engine,
+                    on_exit=self._tray_exit,
+                )
+                self._tray.start()
+                self._tray.set_engine_state(self.engine_state)
+                self._tray.show_balloon("NotmyFault", "引擎已启动")
+                print("[Tray] 系统托盘图标已启动")
+
+            # 4. 启动 HTTP 服务（阻塞，直到 uvicorn 退出）
+            self._api.serve(
+                host="127.0.0.1",
+                port=19198,
+                sockets=[self._api_socket],
+            )
         except KeyboardInterrupt:
             print("\n[Engine] 手动中断")
         except Exception as e:
-            print(f"\n[Engine] HTTP 服务异常: {e}")
+            print(f"\n[Engine] 启动或 HTTP 服务异常: {e}")
             import traceback
             traceback.print_exc()
         finally:
@@ -297,8 +359,17 @@ class EngineRunner:
             self._tray.stop()
         if self.engine_thread and self.engine_thread.is_alive():
             self.engine_thread.join(timeout=5)
+            if self.engine_thread.is_alive():
+                print("[Cleanup] 引擎线程仍未退出，已安排强制终止", file=sys.stderr)
+                self._request_process_shutdown(force_after=5)
         if self._tray:
             self._tray.show_balloon("NotmyFault", "引擎已停止", 1)
+        if self._api_socket is not None:
+            try:
+                self._api_socket.close()
+            except OSError:
+                pass
+            self._api_socket = None
         print("[Cleanup] Done! ")
         print(f"--- 引擎关闭 {datetime.now().isoformat()} ---")
 
@@ -309,4 +380,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--dashboard" in sys.argv:
+        _open_dashboard()
+    else:
+        main()

@@ -3,12 +3,15 @@ import { computed, onMounted, ref } from 'vue'
 import { store } from '../../lib/store'
 import { runRule, saveConfig } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
-import { buildDefaultParams } from '../../lib/utils'
 import RuleEditor from '../RuleEditor.vue'
 
 const activeRuleIndex = ref(null)
+const draftRule = ref(null)
+const baseline = ref('')
 const runningRuleIndex = ref(null)
-const activeRule = computed(() => activeRuleIndex.value === null ? null : store.configData.rules[activeRuleIndex.value])
+const activeRule = computed(() => draftRule.value)
+const isDirty = computed(() => !!draftRule.value && JSON.stringify(draftRule.value) !== baseline.value)
+
 const ruleFolders = computed(() => {
   const folders = new Map()
   store.configData.rules.forEach((rule, index) => {
@@ -19,6 +22,39 @@ const ruleFolders = computed(() => {
   return [...folders]
 })
 
+function clone(value) { return JSON.parse(JSON.stringify(value)) }
+function normalizeCondition(node) {
+  if (!node || typeof node !== 'object') return node
+  if (!Array.isArray(node.children)) {
+    node.op = node.op || (node.type === 'and' ? 'all' : 'any')
+    node.children = Array.isArray(node.events) ? node.events : []
+    delete node.events
+    delete node.type
+  }
+  node.children.forEach(normalizeCondition)
+  return node
+}
+function normalizeRuleDraft(rule) {
+  if (rule?.condition) normalizeCondition(rule.condition)
+  return rule
+}
+function openRule(index) {
+  activeRuleIndex.value = index
+  draftRule.value = normalizeRuleDraft(clone(store.configData.rules[index]))
+  baseline.value = JSON.stringify(draftRule.value)
+}
+function addRule() {
+  activeRuleIndex.value = -1
+  draftRule.value = { name: '新规则', folder: '未分类', event: null, actions: [] }
+  baseline.value = JSON.stringify(draftRule.value)
+}
+function leaveEditor() {
+  if (isDirty.value && !confirm('这条规则还有未保存的修改。要放弃这些修改吗？')) return
+  activeRuleIndex.value = null
+  draftRule.value = null
+  baseline.value = ''
+}
+
 function triggerCount(rule) {
   function count(node) {
     if (!node) return 0
@@ -28,73 +64,103 @@ function triggerCount(rule) {
   return rule.condition ? count(rule.condition) : (rule.event ? 1 : 0)
 }
 function triggerSummary(rule) {
-  if (!rule.condition) return store.schema.triggers[rule.event?.type]?.name || rule.event?.type || '未配置触发器'
+  if (!rule.condition) return store.schema.triggers[rule.event?.type]?.name || rule.event?.type || '未配置触发条件'
   const op = rule.condition.op || (rule.condition.type === 'and' ? 'all' : 'any')
-  return `${op === 'all' ? 'AND · 全部满足' : 'OR · 任一满足'} · ${triggerCount(rule)} 项`
+  return `${op === 'all' ? '全部满足' : '满足任一'} · ${triggerCount(rule)} 个条件`
 }
-function hasManualTrigger(rule) {
-  function includesManual(node) {
-    if (!node) return false
-    if (node.type && !node.children && !node.events) return node.type === 'manual'
-    return (node.children || node.events || []).some(includesManual)
+
+async function persistRules(nextRules, successMessage) {
+  const result = await saveConfig(nextRules)
+  if (!result?.ok) {
+    const details = Array.isArray(result?.details) ? result.details.join(' · ') : ''
+    throw new Error([result?.error || '未知错误', details].filter(Boolean).join('：'))
   }
-  return rule.condition ? includesManual(rule.condition) : rule.event?.type === 'manual'
+  const savedRules = Array.isArray(result.rules) ? result.rules : nextRules
+  store.configData = { ...store.configData, rules: savedRules }
+  snackbar(successMessage)
+  return savedRules
 }
-function addRule() {
-  const type = Object.keys(store.schema.triggers)[0] || 'unknown'
-  store.configData.rules.unshift({
-    name: '新规则',
-    folder: '未分类',
-    event: { type, params: buildDefaultParams(store.schema.triggers[type]) },
-    actions: [],
-  })
-  activeRuleIndex.value = 0
-}
-function deleteRule(index) {
-  store.configData.rules.splice(index, 1)
-  activeRuleIndex.value = null
-}
-async function doSave() {
+async function doSave(runAfter = false) {
   try {
-    const result = await saveConfig(store.configData.rules)
-    if (result.ok) { snackbar('配置已保存'); return }
-    let message = '保存失败: ' + (result.error || '未知错误')
-    if (result.error?.includes('Forbidden')) message += ' - 浏览器模式不支持写入，请使用桌面端 Dashboard'
-    alert(message)
-  } catch (error) { alert('保存失败: ' + error.message) }
+    const nextRules = clone(store.configData.rules)
+    let savedIndex = activeRuleIndex.value
+    if (savedIndex === -1) {
+      nextRules.unshift(clone(draftRule.value))
+      savedIndex = 0
+    } else {
+      nextRules[savedIndex] = clone(draftRule.value)
+    }
+    const savedRules = await persistRules(
+      nextRules,
+      runAfter ? '规则已保存，准备运行' : '规则已保存',
+    )
+    activeRuleIndex.value = savedIndex
+    draftRule.value = clone(savedRules[savedIndex])
+    baseline.value = JSON.stringify(draftRule.value)
+    if (runAfter) {
+      await runManualRule(savedIndex, savedRules[savedIndex])
+    }
+  } catch (error) {
+    alert('保存失败: ' + error.message)
+  }
 }
-async function runManualRule(index) {
+async function deleteRule(index) {
+  if (!confirm('确定删除这条规则吗？此操作将在保存后立即生效。')) return
+  try {
+    const nextRules = clone(store.configData.rules)
+    nextRules.splice(index, 1)
+    await persistRules(nextRules, '规则已删除')
+    if (activeRuleIndex.value === index) leaveEditorAfterDelete()
+  } catch (error) {
+    alert('删除失败: ' + error.message)
+  }
+}
+async function deleteActiveRule() {
+  if (activeRuleIndex.value === -1) { leaveEditorAfterDelete(); return }
+  await deleteRule(activeRuleIndex.value)
+}
+function leaveEditorAfterDelete() {
+  activeRuleIndex.value = null
+  draftRule.value = null
+  baseline.value = ''
+}
+async function runManualRule(index, ruleSnapshot = null) {
   runningRuleIndex.value = index
   try {
-    const result = await runRule(index)
+    const snapshot = ruleSnapshot ? clone(ruleSnapshot) : null
+    const result = await runRule(index, snapshot)
     if (result.ok) snackbar(result.message || '规则已开始执行')
     else alert('无法执行规则: ' + (result.error || '未知错误'))
-  } catch (error) { alert('无法执行规则: ' + error.message) }
-  finally { runningRuleIndex.value = null }
+  } catch (error) {
+    alert('无法执行规则: ' + error.message)
+  } finally {
+    runningRuleIndex.value = null
+  }
 }
 
 onMounted(() => { if (!store.configData.rules) store.configData.rules = [] })
 </script>
 
 <template>
-  <RuleEditor v-if="activeRule" :rule="activeRule" @back="activeRuleIndex = null" @delete="deleteRule(activeRuleIndex)" @save="doSave" />
+  <RuleEditor v-if="activeRule" :rule="activeRule" :dirty="isDirty"
+    @back="leaveEditor" @delete="deleteActiveRule" @save="doSave(false)" @save-run="doSave(true)" />
 
   <section v-else class="page active rules-library">
     <div class="page-head">
-      <h2>规则配置</h2>
+      <div><h2>规则</h2><p class="page-subtitle">用“当 → 然后”描述每一条自动化。</p></div>
       <div class="actions"><button class="btn btn-filled" @click="addRule"><span class="material-symbols-outlined">add</span>新建规则</button></div>
     </div>
     <div v-if="!store.configData.rules.length" class="empty-state">
-      <div class="material-symbols-outlined">rule_folder</div><h3>还没有规则</h3><p>新建一条，给自动化立个规矩。</p>
+      <div class="material-symbols-outlined">rule_folder</div><h3>还没有规则</h3><p>从一个触发条件和一个动作开始。</p>
       <button class="btn btn-tonal" style="margin-top:14px" @click="addRule"><span class="material-symbols-outlined">add</span>新建规则</button>
     </div>
     <div v-else class="rules-folders">
       <section v-for="([folder, entries]) in ruleFolders" :key="folder" class="rules-folder">
         <header><span class="material-symbols-outlined">folder_open</span><b>{{ folder }}</b><small>{{ entries.length }} 条规则</small></header>
-        <article v-for="({ rule, index }) in entries" :key="rule" class="rule-library-row" @click="activeRuleIndex = index">
-          <div class="rule-library-row-main"><h3>{{ rule.name || '未命名规则' }}</h3><div class="rule-library-meta"><span><span class="material-symbols-outlined">bolt</span>{{ triggerSummary(rule) }}</span><span><span class="material-symbols-outlined">play_circle</span>{{ rule.actions?.length || 0 }} 个动作</span></div></div>
+        <article v-for="({ rule, index }) in entries" :key="rule" class="rule-library-row" @click="openRule(index)">
+          <div class="rule-library-row-main"><h3>{{ rule.name || '未命名规则' }}</h3><div class="rule-library-meta"><span><span class="material-symbols-outlined">bolt</span>当：{{ triggerSummary(rule) }}</span><span><span class="material-symbols-outlined">play_circle</span>然后：{{ rule.actions?.length || 0 }} 个动作</span></div></div>
           <div class="rule-library-actions">
-            <button v-if="hasManualTrigger(rule)" class="icon-btn rule-run-btn" :class="{ spin: runningRuleIndex === index }" :disabled="runningRuleIndex === index" title="运行规则" @click.stop="runManualRule(index)"><span class="material-symbols-outlined">play_arrow</span></button>
+            <button class="icon-btn rule-run-btn" :class="{ spin: runningRuleIndex === index }" :disabled="runningRuleIndex === index" title="立即运行一次" @click.stop="runManualRule(index, rule)"><span class="material-symbols-outlined">play_arrow</span></button>
             <button class="icon-btn icon-btn-danger" title="删除规则" @click.stop="deleteRule(index)"><span class="material-symbols-outlined">delete</span></button>
           </div>
         </article>

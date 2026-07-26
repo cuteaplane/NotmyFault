@@ -4,7 +4,7 @@ NotmyFault HTTP API 服务器
 本地 REST API + SSE 事件流，替代w***d的 IPC 层。
 
 引擎启动后，UI 通过 HTTP 请求控制引擎，通过 SSE 接收实时事件。
-可以用任何浏览器打开 dashboard.html 直接管理。
+Dashboard 仅通过 pywebview 桌面桥接访问；不提供浏览器管理模式。
 """
 
 import json
@@ -33,17 +33,25 @@ from notmyfault.plugin_schema import (
     PERMISSION_REGISTRY,
 )
 from notmyfault.security import detect_security_mode, SecurityMode
+from notmyfault.rules import get_rule_events, validate_rules_structure
+from notmyfault.version import __version__
 
 _scan_plugins = scan_plugins  # 向后兼容
 
-# API 认证令牌（每次进程启动时随机生成）
-API_TOKEN: str = secrets.token_hex(32)
+# API 认证令牌。令牌文件是 Dashboard 与后台服务之间的本机凭据，
+# 在权限仍安全的前提下跨后台服务重启复用，避免两进程生命周期不同步时失联。
+API_TOKEN: str = ""
 # token 文件存放在 %APPDATA%/NotmyFault/ 下（与 config.json 同目录），
 # 不再使用 %TEMP%——TEMP 目录默认 Authenticated Users 可读，权限过宽。
 API_TOKEN_FILE: str = os.path.join(os.path.dirname(CONFIG_FILE), ".api_token")
+# dashboard.pyw 在端口被占用时会从 19199 起顺延；所有候选地址都只绑定
+# loopback，仍然是本机 pywebview 的受信任来源。若只允许 19199，第二次唤醒
+# 或旧 WebView 残留占端口时，CORSMiddleware 会让 OPTIONS 直接返回 400，
+# 前端便会把仍在运行的引擎误判为离线。
 _DASHBOARD_ORIGINS = [
-    "http://127.0.0.1:19199",
-    "http://localhost:19199",
+    f"http://{host}:{port}"
+    for host in ("127.0.0.1", "localhost")
+    for port in range(19199, 19219)
 ]
 
 
@@ -87,6 +95,21 @@ def _secure_write_token(path: str, token: str) -> None:
         pass
 
 
+def _load_or_create_api_token(path: str) -> str:
+    """读取现有安全 token；文件缺失或内容损坏时才生成新 token。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            token = f.read().strip()
+        if len(token) == 64:
+            int(token, 16)
+            return token
+    except (OSError, ValueError):
+        pass
+    token = secrets.token_hex(32)
+    _secure_write_token(path, token)
+    return token
+
+
 
 # ---------------------------------------------------------------------------
 # 引擎运行器接口 (由 NOTMYFAULT.pyw 的 EngineRunner 实现)
@@ -100,6 +123,7 @@ class EngineRunnerLike(Protocol):
 
     def _start_engine_core(self) -> bool: ...
     def _stop_engine(self) -> bool: ...
+    def _request_process_shutdown(self, force_after: float = 10) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -128,12 +152,11 @@ class EngineAPI:
         # 插件预览暂存：{token: {"extract_dir", "root_path", "meta", "ptype", "created_at"}}
         self._pending_previews: Dict[str, Any] = {}
 
-        self.app = FastAPI(title="NotmyFault Engine API", version="alpha-0.10")
+        self.app = FastAPI(title="NotmyFault Engine API", version=__version__)
         self._setup_middleware()
         self._setup_routes()
         global API_TOKEN
-        API_TOKEN = secrets.token_hex(32)
-        _secure_write_token(API_TOKEN_FILE, API_TOKEN)
+        API_TOKEN = _load_or_create_api_token(API_TOKEN_FILE)
 
     # ---- CORS -----------------------------------------------------------
 
@@ -412,9 +435,25 @@ class EngineAPI:
         if not token and request.url.path == "/api/events":
             token = request.query_params.get("token", "")
         if not token or not secrets.compare_digest(token, API_TOKEN):
+            # Dashboard 从磁盘读取 token，而服务端校验内存中的 token。若 token
+            # 文件被清理、截断或意外覆盖，两边会永久失联。认证失败时由仍在监听
+            # 端口的实例重新发布自己的 token；客户端重读后即可恢复。当前请求仍
+            # 返回 403，避免把错误 token 当成已认证。
+            self._repair_token_file()
             print(f"[Auth] 403 rejected: has_hdr={bool(auth)} req_len={len(token)} srv_len={len(API_TOKEN)}",
                   file=sys.stderr)
             raise HTTPException(status_code=403, detail="Forbidden: invalid API Token")
+
+    @staticmethod
+    def _repair_token_file() -> None:
+        """确保磁盘 token 与当前正在提供服务的实例一致。"""
+        try:
+            with open(API_TOKEN_FILE, "r", encoding="utf-8") as f:
+                if secrets.compare_digest(f.read().strip(), API_TOKEN):
+                    return
+        except OSError:
+            pass
+        _secure_write_token(API_TOKEN_FILE, API_TOKEN)
 
     def _setup_routes(self):
         app = self.app
@@ -427,37 +466,61 @@ class EngineAPI:
         async def engine_start(request: Request):
             await self._verify_auth(request)
             print("[API] POST /api/engine/start")
-            if self._engine.engine_running:
+            current_state = getattr(
+                self._engine,
+                "engine_state",
+                "running" if self._engine.engine_running else "stopped",
+            )
+            if current_state in ("running", "starting"):
                 return {"ok": True, "running": self._engine.engine_running,
-
-                "api_alive": True, "message": "already_running"}
+                        "engine_state": current_state,
+                        "api_alive": True,
+                        "message": "already_running" if current_state == "running" else "already_starting"}
 
             started = self._engine._start_engine_core()
             if started is False:
                 return JSONResponse(
                     {"ok": False, "running": self._engine.engine_running,
+                     "engine_state": getattr(self._engine, "engine_state", "stopping"),
                      "message": "engine_stopping"},
                     status_code=409,
                 )
-            return {"ok": True, "running": self._engine.engine_running}
+            return {
+                "ok": True,
+                "running": self._engine.engine_running,
+                "engine_state": getattr(self._engine, "engine_state", "starting"),
+                "api_alive": True,
+            }
 
         @app.post("/api/engine/stop")
         async def engine_stop(request: Request):
             await self._verify_auth(request)
             print("[API] POST /api/engine/stop")
             stopped = self._engine._stop_engine()
-            return {"ok": True, "stopped": stopped, "stopping": not stopped}
+            return {
+                "ok": True,
+                "stopped": stopped,
+                "stopping": not stopped,
+                "engine_state": getattr(self._engine, "engine_state", "stopped"),
+                "api_alive": True,
+            }
 
         @app.post("/api/engine/shutdown")
         async def engine_shutdown(request: Request):
             await self._verify_auth(request)
             """彻底退出引擎进程（先停引擎，再优雅关闭 HTTP 服务）"""
             print("[API] POST /api/engine/shutdown")
-            self._engine._stop_engine()
-
-            # 触发 uvicorn 优雅关闭 — 替代 os._exit(0)
-            if self._server:
-                self._server.should_exit = True
+            request_shutdown = getattr(
+                self._engine,
+                "_request_process_shutdown",
+                None,
+            )
+            if callable(request_shutdown):
+                request_shutdown()
+            else:
+                self._engine._stop_engine()
+                if self._server:
+                    self._server.should_exit = True
 
             return {"ok": True, "message": "shutting_down"}
 
@@ -465,21 +528,40 @@ class EngineAPI:
         async def engine_status():
             config = self._load_config()
             rules = config.get("rules", [])
+            if not isinstance(rules, list):
+                rules = []
+            trigger_types = {
+                event.get("type")
+                for rule in rules
+                if isinstance(rule, dict)
+                for event in get_rule_events(rule)
+                if event.get("type")
+            }
+            action_types = set()
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    continue
+                actions = rule.get("actions", [])
+                if not isinstance(actions, list):
+                    continue
+                action_types.update(
+                    action.get("type")
+                    for action in actions
+                    if isinstance(action, dict) and action.get("type")
+                )
             return {
                 "running": self._engine.engine_running,
                 "api_alive": True,
                 "engine_running": self._engine.engine_running,
+                "engine_state": getattr(
+                    self._engine,
+                    "engine_state",
+                    "running" if self._engine.engine_running else "stopped",
+                ),
                 "pid": os.getpid(),
                 "rules_count": len(rules),
-                "triggers_count": len(set(
-                    r.get("event", {}).get("type", "")
-                    for r in rules
-                )),
-                "actions_count": len(set(
-                    a.get("type", "")
-                    for r in rules
-                    for a in r.get("actions", [])
-                )),
+                "triggers_count": len(trigger_types),
+                "actions_count": len(action_types),
                 "security_mode": detect_security_mode().value,
             }
 
@@ -490,7 +572,8 @@ class EngineAPI:
         @app.get("/api/rules")
         async def rules_list():
             config = self._load_config()
-            return {"rules": config.get("rules", [])}
+            rules = config.get("rules", [])
+            return {"rules": rules if isinstance(rules, list) else []}
 
         @app.put("/api/rules")
         async def rules_save(request: Request):
@@ -503,9 +586,24 @@ class EngineAPI:
                     status_code=400,
                 )
 
+            if not isinstance(body, dict):
+                return JSONResponse(
+                    {"ok": False, "error": "请求体必须是 JSON 对象"},
+                    status_code=400,
+                )
+
+            rules = body.get("rules")
+            structure_errors = validate_rules_structure(rules)
+            if structure_errors:
+                return JSONResponse(
+                    {"ok": False, "error": "规则结构校验失败",
+                     "details": structure_errors[:10]},
+                    status_code=400,
+                )
+
             # 安全校验：命中危险模式（危险命令/危险路径）则拒绝写入
             from notmyfault.config import _validate_rules_safety
-            _warnings, errors = _validate_rules_safety(body.get("rules", []))
+            _warnings, errors = _validate_rules_safety(rules)
             if errors:
                 return JSONResponse(
                     {"ok": False, "error": "规则安全校验失败", "details": errors[:10]},
@@ -513,10 +611,13 @@ class EngineAPI:
                 )
 
             existing_config = self._load_config()
-            new_config = {
-                "rules": body.get("rules", []),
-                "disabled_plugins": existing_config.get("disabled_plugins", {"triggers": [], "actions": []}),
-            }
+            new_config = dict(existing_config) if isinstance(existing_config, dict) else {}
+            new_config.pop("_signature", None)
+            new_config["rules"] = rules
+            new_config.setdefault(
+                "disabled_plugins",
+                {"triggers": [], "actions": []},
+            )
 
             ok = self._save_config(new_config)
             if ok:
@@ -529,13 +630,57 @@ class EngineAPI:
                 )
 
         @app.post("/api/rules/{rule_index}/run")
-        async def rules_run(rule_index: int):
+        async def rules_run(rule_index: int, request: Request):
             engine = self._engine_ref
             if engine is None:
                 return JSONResponse(
                     {"ok": False, "error": "引擎尚未就绪"}, status_code=409,
                 )
-            ok, message = engine.run_manual_rule(rule_index)
+            rule_snapshot = None
+            has_snapshot = False
+            raw_body = await request.body()
+            if raw_body:
+                try:
+                    body = json.loads(raw_body)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    return JSONResponse(
+                        {"ok": False, "error": "无效的 JSON 请求体"},
+                        status_code=400,
+                    )
+                if not isinstance(body, dict):
+                    return JSONResponse(
+                        {"ok": False, "error": "请求体必须是 JSON 对象"},
+                        status_code=400,
+                    )
+                if "rule" in body:
+                    has_snapshot = True
+                    rule_snapshot = body["rule"]
+
+            if has_snapshot:
+                structure_errors = validate_rules_structure([rule_snapshot])
+                if structure_errors:
+                    return JSONResponse(
+                        {"ok": False, "error": "规则结构校验失败",
+                         "details": structure_errors[:10]},
+                        status_code=400,
+                    )
+                disk_rules = self._load_config().get("rules", [])
+                if (
+                    not isinstance(disk_rules, list)
+                    or rule_index < 0
+                    or rule_index >= len(disk_rules)
+                    or disk_rules[rule_index] != rule_snapshot
+                ):
+                    return JSONResponse(
+                        {"ok": False, "error": "规则保存版本已变化，请刷新后重试"},
+                        status_code=409,
+                    )
+                ok, message = engine.run_manual_rule_snapshot(
+                    rule_snapshot,
+                    rule_index,
+                )
+            else:
+                ok, message = engine.run_manual_rule(rule_index)
             if not ok:
                 return JSONResponse({"ok": False, "error": message}, status_code=400)
             return {"ok": True, "message": message}
@@ -958,7 +1103,12 @@ class EngineAPI:
 
     # ---- 启动 HTTP 服务 --------------------------------------------------
 
-    def serve(self, host: str = "127.0.0.1", port: int = 19198):
+    def serve(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 19198,
+        sockets: list | None = None,
+    ):
         """启动 HTTP 服务（阻塞当前线程，端口冲突时优雅退出不崩溃）"""
         print(f"\n{'=' * 50}")
         print(f"  NotmyFault API Server")
@@ -975,7 +1125,7 @@ class EngineAPI:
         self._server = uvicorn.Server(config)
 
         try:
-            self._server.run()
+            self._server.run(sockets=sockets)
         except OSError as e:
             code = getattr(e, 'winerror', None)
             if str(code) == "10048" or "10048" in str(e) or "bind" in str(e).lower():

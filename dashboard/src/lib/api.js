@@ -1,4 +1,5 @@
-// API 客户端 + pywebview bridge 检测
+// pywebview 桌面客户端。普通 JSON 请求统一经 Python bridge 代理；
+// 只有包含 File 的 FormData 上传需要由 WebView 直接发送。
 export const API = 'http://127.0.0.1:19198'
 
 export function hasBridge() {
@@ -15,42 +16,62 @@ async function authHeaders() {
   }
 }
 
-export async function apiRead(path) {
-  const res = await fetch(API + path, { headers: await authHeaders() })
-  if (res.status === 403) {
-    throw new Error('认证失败：请使用桌面端 Dashboard')
+async function fetchAuthenticated(path, options = {}) {
+  const request = async () => {
+    const headers = { ...(options.headers || {}), ...await authHeaders() }
+    return await fetch(API + path, { ...options, headers })
   }
+  let res = await request()
+  // 运行中的 engine 会在认证失败时重新发布其内存 token。重新从 bridge
+  // 读取并重试一次，可从 token 文件被清理/覆盖的状态中立即自愈。
+  if (res.status === 403 && hasBridge()) res = await request()
   return res
 }
 
-// 带认证的写入请求（bridge 模式从 pywebview 取 token）
-export async function apiWrite(path, method, body, isForm) {
-  const headers = await authHeaders()
-  if (!isForm) headers['Content-Type'] = 'application/json'
-  const opts = { method, headers }
-  if (body) opts.body = isForm ? body : JSON.stringify(body)
-  const res = await fetch(API + path, opts)
-  if (res.status === 403) {
-    const d = await res.json().catch(() => ({}))
-    throw new Error((d.detail || d.error || '认证失败') + (hasBridge() ? '' : ' — 浏览器模式不支持写入，请使用桌面端 Dashboard'))
+function bridgeResponse(data) {
+  const status = Number(data?.status || (data?.ok === false ? 400 : 200))
+  return {
+    ok: status >= 200 && status < 300 && data?.ok !== false,
+    status,
+    json: async () => data,
   }
+}
+
+async function bridgeRequest(path, method = 'GET', data = null) {
+  if (!hasBridge()) throw new Error('Dashboard 桌面桥接尚未就绪')
+  const result = await window.pywebview.api.request_api(path, method, data)
+  if (result?.status === 403) throw new Error('Dashboard 与后台服务认证不同步')
+  return bridgeResponse(result)
+}
+
+export async function apiRead(path) {
+  return await bridgeRequest(path, 'GET')
+}
+
+// 带文件的上传无法穿过 pywebview JSON bridge，保留唯一一条直连路径。
+export async function apiWrite(path, method, body, isForm) {
+  if (!isForm) return await bridgeRequest(path, method, body || null)
+  const res = await fetchAuthenticated(path, { method, body })
+  if (res.status === 403) throw new Error('Dashboard 与后台服务认证不同步')
   return res
 }
 
 export async function loadConfig() {
-  if (hasBridge()) return await window.pywebview.api.get_config()
-  const res = await apiRead('/api/rules')
-  return await res.json()
+  if (!hasBridge()) throw new Error('Dashboard 桌面桥接尚未就绪')
+  return await window.pywebview.api.get_config()
 }
 
 export async function saveConfig(rules) {
-  if (hasBridge()) return await window.pywebview.api.save_config(rules)
-  const res = await apiWrite('/api/rules', 'PUT', { rules })
-  return await res.json()
+  if (!hasBridge()) throw new Error('Dashboard 桌面桥接尚未就绪')
+  return await window.pywebview.api.save_config(rules)
 }
 
-export async function runRule(ruleIndex) {
-  const res = await apiWrite(`/api/rules/${ruleIndex}/run`, 'POST')
+export async function runRule(ruleIndex, rule = null) {
+  const res = await apiWrite(
+    `/api/rules/${ruleIndex}/run`,
+    'POST',
+    rule ? { rule } : null,
+  )
   return await res.json()
 }
 
@@ -69,16 +90,15 @@ export async function getSchema() {
 }
 
 export async function getEngineStatus() {
-  const r = await apiRead('/api/engine/status')
-  return await r.json()
+  if (!hasBridge()) {
+    return { api_alive: false, engine_running: false, engine_state: 'offline' }
+  }
+  return await window.pywebview.api.get_engine_status()
 }
 
 export async function readLogRaw(lines = 300) {
-  if (hasBridge()) {
-    try { return await window.pywebview.api.read_log_raw(lines) }
-    catch (e) { return '读取日志失败: ' + e.message }
-  }
-  return '日志查看仅在 Dashboard 桌面应用中可用'
+  try { return await window.pywebview.api.read_log_raw(lines) }
+  catch (e) { return '读取日志失败: ' + e.message }
 }
 
 // 诊断：优先经认证 HTTP 直读引擎实时诊断（含 action_ok），

@@ -52,6 +52,7 @@ class TrayIcon:
         self._thread: Optional[threading.Thread] = None
         self._shutdown_event = threading.Event()
         self._engine_running = False
+        self._engine_state = "stopped"
         self._auto_start_enabled = _is_auto_start_enabled()
 
     def start(self):
@@ -78,8 +79,13 @@ class TrayIcon:
                 self._thread.join(timeout=3)
 
     def set_engine_running(self, running: bool):
-        """更新引擎状态同步到托盘。"""
-        self._engine_running = running
+        """兼容旧调用方；新代码统一使用 set_engine_state。"""
+        self.set_engine_state("running" if running else "stopped")
+
+    def set_engine_state(self, state: str):
+        """更新后台核心状态并同步托盘提示。"""
+        self._engine_state = state
+        self._engine_running = state == "running"
         self._update_tray_tip()
 
     def show_balloon(self, title: str, message: str, icon_type: int = NIIF_INFO):
@@ -201,7 +207,13 @@ class TrayIcon:
     def _update_tray_tip(self):
         if not self._hwnd:
             return
-        tip = "NotmyFault 引擎 - 运行中" if self._engine_running else "NotmyFault 引擎 - 已停止"
+        labels = {
+            "starting": "NotmyFault - 正在启动自动化",
+            "running": "NotmyFault - 自动化运行中",
+            "stopping": "NotmyFault - 正在暂停自动化",
+            "stopped": "NotmyFault - 后台在线，自动化已暂停",
+        }
+        tip = labels.get(self._engine_state, "NotmyFault")
         try:
             win32gui.Shell_NotifyIcon(
                 win32gui.NIM_MODIFY,
@@ -215,9 +227,22 @@ class TrayIcon:
 
         win32gui.AppendMenu(menu, win32con.MF_STRING,
                             MID_OPEN_DASHBOARD, "打开控制面板")
-        win32gui.AppendMenu(menu, win32con.MF_STRING,
-                            MID_TOGGLE_ENGINE,
-                            "停止引擎" if self._engine_running else "启动引擎")
+        transient = self._engine_state in ("starting", "stopping")
+        toggle_flags = win32con.MF_STRING
+        if transient:
+            toggle_flags |= win32con.MF_GRAYED
+        toggle_label = {
+            "starting": "正在启动自动化…",
+            "running": "暂停自动化",
+            "stopping": "正在暂停自动化…",
+            "stopped": "启动自动化",
+        }.get(self._engine_state, "启动自动化")
+        win32gui.AppendMenu(
+            menu,
+            toggle_flags,
+            MID_TOGGLE_ENGINE,
+            toggle_label,
+        )
         win32gui.AppendMenu(menu, win32con.MF_SEPARATOR,
                             MID_SEPARATOR_1, "")
 

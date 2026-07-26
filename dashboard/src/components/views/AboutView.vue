@@ -1,9 +1,11 @@
-<script setup></script>
+<script setup>
+const appVersion = __APP_VERSION__
+</script>
 <template>
   <section class="page active">
     <div class="page-head"><h2>关于</h2></div>
     <div class="about-hero"><span class="material-symbols-outlined about-logo">manufacturing</span>
-      <div><h3>NotmyFault</h3><p class="about-ver">Alpha 0.10 · 2026</p></div></div>
+      <div><h3>NotmyFault</h3><p class="about-ver">{{ appVersion }} · 2026</p></div></div>
     <div class="about-card">
       <p class="about-desc">轻量级 Windows 系统自动化工具。设置触发条件与动作，让电脑在你需要时自动响应。</p>
       <div class="about-features">
