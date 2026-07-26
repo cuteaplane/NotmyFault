@@ -35,6 +35,11 @@ Desktop.ini
 
 # Project specific
 *.log
+# OpenCode 无头任务的临时描述与输出；任务结束后仍会主动清理，
+# 忽略规则用于避免运行期间污染 VS Code Source Control。
+.opencode-*.job.json
+.opencode-*.stdout.log
+.opencode-*.stderr.log
 *.sig
 tests/
 .claude/
