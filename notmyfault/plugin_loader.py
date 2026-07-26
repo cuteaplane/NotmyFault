@@ -244,6 +244,55 @@ class PluginLoader:
                     )
                     continue
 
+            # --- 签名校验（必须在 exec_module 前）---
+            # strict 模式不能先执行模块级代码再决定是否信任插件；normal /
+            # permissive 仍保持原有的降级加载语义。
+            signature_ok = verify_plugin_sig(folder_path, origin)
+            if not signature_ok:
+                if self._security_mode == SecurityMode.STRICT:
+                    reason = "签名无效"
+                    print(
+                        f"[Engine] [!!] {store_name} \"{plugin_id}\" {reason}，不加载",
+                        file=sys.stderr,
+                    )
+                    failed_count += 1
+                    self._diagnostics.record_plugin_error(store_name, plugin_id, reason)
+                    engine_error(
+                        "plugin_load_failed",
+                        plugin=plugin_id,
+                        type=store_name,
+                        reason=reason,
+                    )
+                    continue
+                if self._security_mode == SecurityMode.NORMAL:
+                    print(
+                        f"[Engine] [!!] {store_name} \"{plugin_id}\" 签名无效，降级加载",
+                        file=sys.stderr,
+                    )
+
+            # --- 权限合规校验（必须在 exec_module 前）---
+            # permissive/normal 继续兼容未知权限；strict 在执行任何插件代码前拒载。
+            if self._security_mode == SecurityMode.STRICT:
+                perms = meta.get("permissions") or []
+                perm_conform, _ = check_permissions_conform(perms)
+                if not perm_conform:
+                    unknown = [p for p in perms if not is_known_permission(p)]
+                    reason = f"包含未知权限: {', '.join(unknown)}"
+                    print(
+                        f"[Engine] [!!] {store_name} \"{plugin_id}\" {reason}，"
+                        "strict 模式不加载",
+                        file=sys.stderr,
+                    )
+                    failed_count += 1
+                    self._diagnostics.record_plugin_error(store_name, plugin_id, reason)
+                    engine_error(
+                        "plugin_load_failed",
+                        plugin=plugin_id,
+                        type=store_name,
+                        reason=reason,
+                    )
+                    continue
+
             # --- 安全能力扫描（exec 前，AST 级，避免执行未声明危险代码）---
             # 先看源码再 import，不能让“我只是看看”顺手把危险代码跑起来。
             caps = scan_plugin_capabilities(py_file)
@@ -284,6 +333,37 @@ class PluginLoader:
                     engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason=f"未声明能力: {cap_msg}")
                     continue
 
+            # --- 权限声明与源码引用一致性（exec 前）---
+            if check_sudo_import(py_file):
+                declared_perms = meta.get("permissions") or []
+                if "admin" not in declared_perms:
+                    print(
+                        f"[Engine] [!!] 插件 \"{plugin_id}\" import 了 notmyfault.sudo "
+                        f"但未在元数据中声明 'admin' 权限",
+                        file=sys.stderr,
+                    )
+
+            # --- 用户插件完整性校验（exec 前）---
+            # 内置插件由构建时 Ed25519 签名覆盖；用户/第三方插件使用本地清单
+            # 记录首次见到的文件内容。现有策略仅告警，不改变 normal/permissive
+            # 模式的加载行为。
+            if origin != "builtin":
+                integrity_files = [
+                    (json_filename, json_file),
+                    (py_filename, py_file),
+                ]
+                integrity_ok, integrity_msg = verify_plugin_integrity(
+                    plugin_id, integrity_files
+                )
+                if not integrity_ok:
+                    warning = (
+                        f"[Engine] [安全] 插件 \"{plugin_id}\" 完整性校验失败："
+                        + integrity_msg
+                    )
+                    print(warning, file=sys.stderr)
+                    engine_warn(f"integrity_check: {integrity_msg}")
+                    self._integrity_errors.append(warning)
+
             # --- Python 模块加载 ---
             # 这里是真正执行插件 import 的临界点，前面的检查都是在给它铺软垫。
             module_name = f"{module_prefix}{plugin_id}"
@@ -316,32 +396,6 @@ class PluginLoader:
                 engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason="Python 加载异常")
                 continue
 
-            # --- 权限一致性检查 ---
-            if check_sudo_import(py_file):
-                declared_perms = meta.get("permissions") or []
-                if "admin" not in declared_perms:
-                    print(
-                        f"[Engine] [!!] 插件 \"{plugin_id}\" import 了 notmyfault.sudo "
-                        f"但未在元数据中声明 'admin' 权限",
-                        file=sys.stderr,
-                    )
-
-            # --- 插件完整性校验 ---
-            # 内置插件由构建时 Ed25519 签名覆盖；再拿用户目录里的可变 hash
-            # 缓存比对只会在源码升级后制造“被修改”假警报。用户/第三方插件
-            # 才使用本地清单记录首次见到的文件内容。
-            if origin != "builtin":
-                integrity_files = [
-                    (json_filename, json_file),
-                    (py_filename, py_file),
-                ]
-                integrity_ok, integrity_msg = verify_plugin_integrity(plugin_id, integrity_files)
-                if not integrity_ok:
-                    warning = (f"[Engine] [安全] 插件 \"{plugin_id}\" 完整性校验失败：" + integrity_msg)
-                    print(warning, file=sys.stderr)
-                    engine_warn(f"integrity_check: {integrity_msg}")
-                    self._integrity_errors.append(warning)
-
             # --- 提取 run 入口 ---
             if not hasattr(module, "run"):
                 print(
@@ -369,31 +423,6 @@ class PluginLoader:
                     engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason=message)
                     continue
 
-            # --- 签名校验（builtin + user 均需签名）---
-            # 用户插件通过 /api/plugins/install 安装时会用项目私钥签名；
-            # 直接放入用户插件目录的插件（无签名）在 strict 模式下拒载。
-            if not verify_plugin_sig(folder_path, origin):
-                if self._security_mode == SecurityMode.STRICT:
-                    print(f"[Engine] [!!] {store_name} \"{plugin_id}\" 签名无效，不加载", file=sys.stderr)
-                    continue
-                elif self._security_mode == SecurityMode.NORMAL:
-                    print(f"[Engine] [!!] {store_name} \"{plugin_id}\" 签名无效，降级加载", file=sys.stderr)
-                # PERMISSIVE: 放行，允许直接放入文件夹安装（开发/测试用）
-
-            # --- 权限合规校验（strict 模式）---
-            # 允许安装时未做权限合规检查的插件（permissive 安装的），
-            # 切换到 strict 后拒载。
-            if self._security_mode == SecurityMode.STRICT:
-                perms = meta.get("permissions") or []
-                perm_conform, _ = check_permissions_conform(perms)
-                if not perm_conform:
-                    unknown = [p for p in perms if not is_known_permission(p)]
-                    print(
-                        f"[Engine] [!!] {store_name} \"{plugin_id}\" "
-                        f"包含未知权限: {', '.join(unknown)}，strict 模式不加载",
-                        file=sys.stderr,
-                    )
-                    continue
             # --- 同名覆盖 ---
             # 用户插件覆盖内置插件时，先拍下旧插件状态再卸下，但 teardown 推迟到
             # 新插件 setup 成功之后：万一新 setup 失败，能把旧插件原样装回去，
@@ -494,4 +523,3 @@ class PluginLoader:
             )
 
         return loaded_count, failed_count
-
