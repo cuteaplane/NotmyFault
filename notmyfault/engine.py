@@ -78,6 +78,8 @@ class AutomationEngine:
         self.actions_meta = self._plugin_registry.actions_meta
         self.actions_funcs = self._plugin_registry.actions_funcs
         self._plugin_modules = self._plugin_registry.modules
+        self._plugin_shutdown_lock = threading.RLock()
+        self._plugins_shutdown = False
 
         # 安全系统
         from notmyfault import sudo as _sudo
@@ -763,7 +765,15 @@ class AutomationEngine:
         self._wait_active_actions()
 
     def _shutdown_plugins(self) -> None:
-        for plugin_id, module in self._plugin_modules.items():
+        # shutdown() 与运行线程 finally 可能并发抵达。先在锁内认领清理权，
+        # 再到锁外调用第三方 teardown，避免同一插件被执行两次或锁住回调。
+        with self._plugin_shutdown_lock:
+            if self._plugins_shutdown:
+                return
+            self._plugins_shutdown = True
+            modules = list(self._plugin_modules.items())
+
+        for plugin_id, module in modules:
             if hasattr(module, "teardown"):
                 try:
                     print(f"[Engine] 调用 teardown: {plugin_id}")
