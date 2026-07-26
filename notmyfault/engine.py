@@ -45,6 +45,7 @@ from notmyfault.security import (
     detect_security_mode as _detect_security_mode,
     verify_core_integrity,
 )
+from notmyfault.trigger_supervisor import TriggerSupervisor
 from notmyfault.workflow import build_context
 from notmyfault.workflow_executor import WorkflowExecutor
 
@@ -101,10 +102,12 @@ class AutomationEngine:
         # 条件树需要保存 AND 分支最近一次命中；规则热重载时整体换代。
         self._condition_runtime = ConditionRuntime()
 
-        # 触发器线程管理（单一所有权 + 锁，避免热加载与 shutdown 竞态）
-        self._trigger_threads: Dict[str, threading.Thread] = {}
-        self._trigger_events: Dict[str, threading.Event] = {}
-        self._trigger_lock = threading.RLock()
+        # 触发器线程管理：TriggerSupervisor 独占 threads/events/lock，
+        # engine._trigger_threads 等属性通过 property 代理指向同一对象。
+        self._trigger_supervisor = TriggerSupervisor(
+            # 延迟查找，保持构造后替换 _alert_user 的模拟器/测试契约。
+            alert_cb=lambda title, message: self._alert_user(title, message),
+        )
 
         # 诊断时间
         self._start_time: float = 0.0
@@ -143,6 +146,31 @@ class AutomationEngine:
     @property
     def _active_actions(self) -> int:
         return self._workflow_executor.active_actions
+
+    # -- 兼容马甲：_trigger_threads / _events / _lock 代理到 supervisor --
+    @property
+    def _trigger_threads(self) -> Dict[str, threading.Thread]:
+        return self._trigger_supervisor.threads
+
+    @_trigger_threads.setter
+    def _trigger_threads(self, value: Dict[str, threading.Thread]) -> None:
+        self._trigger_supervisor.threads = value
+
+    @property
+    def _trigger_events(self) -> Dict[str, threading.Event]:
+        return self._trigger_supervisor.events
+
+    @_trigger_events.setter
+    def _trigger_events(self, value: Dict[str, threading.Event]) -> None:
+        self._trigger_supervisor.events = value
+
+    @property
+    def _trigger_lock(self) -> threading.RLock:
+        return self._trigger_supervisor.lock
+
+    @_trigger_lock.setter
+    def _trigger_lock(self, value: threading.RLock) -> None:
+        self._trigger_supervisor.lock = value
 
     # ------------------------------------------------------------------
     # 告警与安全回调
@@ -192,6 +220,7 @@ class AutomationEngine:
             traceback.print_exc(file=sys.stderr)
             engine_error("trigger_crashed", trigger=trigger_id, error=err[-500:])
             self._diag_obj.record_trigger_crash(trigger_id, err[-300:])
+            self._trigger_supervisor.mark_crashed(trigger_id, err[-300:])
             self._safe_on_event(
                 "trigger_crashed",
                 {"trigger_id": trigger_id, "error": err[-500:]},
@@ -238,6 +267,9 @@ class AutomationEngine:
             "hot_reload_errors": snap["hot_reload_errors"],
             "trigger_crashes": snap["trigger_crashes"],
             "trigger_crash_details": snap["trigger_crash_details"],
+            "triggers": {
+                "health": self._trigger_supervisor.health(),
+            },
             "errors": snap["errors"][-20:],
         }
 
@@ -561,42 +593,12 @@ class AutomationEngine:
         # 同一个 trigger 只开一条线程，把所有规则参数打包给它，省得大家重复蹲点。
         aggregated = aggregate_trigger_params(rules)
 
-        missing = [et for et in aggregated if et not in self.triggers_funcs]
-        if missing:
-            print(
-                f"[Engine] [!!] 规则引用了未加载的触发器: {', '.join(missing)}",
-                file=sys.stderr,
-            )
-            self._alert_user(
-                "触发器缺失",
-                f"以下触发器未装载，相关规则不会生效: {', '.join(missing)}",
-            )
-
-        count = 0
-        for event_type, config_list in aggregated.items():
-            if event_type not in self.triggers_funcs:
-                continue
-
-            trigger_meta = self.triggers_meta.get(event_type, {})
-            trigger_func = self.triggers_funcs[event_type]
-            trigger_event = threading.Event()
-            thread = threading.Thread(
-                target=self._run_trigger,
-                args=(event_type, trigger_func, trigger_meta, config_list, trigger_event),
-                daemon=True,
-            )
-            # 先登记再启动：避免 shutdown 与启动竞态漏掉事件信号
-            with self._trigger_lock:
-                self._trigger_events[event_type] = trigger_event
-                self._trigger_threads[event_type] = thread
-            thread.start()
-            count += 1
-            print(
-                f"[Engine] 已启动触发器线程: {event_type}"
-                f"（共监听 {len(config_list)} 条规则）"
-            )
-
-        return count
+        return self._trigger_supervisor.start(
+            aggregated=aggregated,
+            triggers_funcs=self.triggers_funcs,
+            triggers_meta=self.triggers_meta,
+            run_trigger_cb=self._run_trigger,
+        )
 
     def _stop_trigger_threads(self, timeout: float = 30.0) -> bool:
         """请求停止所有触发器，并报告它们是否全部退出。
@@ -604,34 +606,7 @@ class AutomationEngine:
         Python 线程不能被安全地强制终止；仍在运行的插件必须保留登记，
         这样热重载不会在同一触发器上再启动一代线程而造成重复执行。
         """
-        with self._trigger_lock:
-            if not self._trigger_threads:
-                return True
-            events = list(self._trigger_events.values())
-            threads = list(self._trigger_threads.items())
-
-        # 先广播“收工”，再 join；反过来等会儿基本就是和自己较劲。
-        for evt in events:
-            evt.set()
-
-        deadline = time.time() + timeout
-        for event_type, thread in threads:
-            remaining = deadline - time.time()
-            if remaining > 0:
-                thread.join(timeout=remaining)
-            if thread.is_alive():
-                print(
-                    f"[Engine] [!!] 触发器线程 {event_type} 未在 {timeout}s 内退出，强制终止",
-                    file=sys.stderr,
-                )
-
-        alive = {event_type for event_type, thread in threads if thread.is_alive()}
-        with self._trigger_lock:
-            for event_type, _thread in threads:
-                if event_type not in alive:
-                    self._trigger_threads.pop(event_type, None)
-                    self._trigger_events.pop(event_type, None)
-        return not alive
+        return self._trigger_supervisor.stop(timeout)
 
     # ------------------------------------------------------------------
     # 引擎生命周期
@@ -814,10 +789,7 @@ class AutomationEngine:
         # shutdown 可能被 API、信号和 finally 同时喊到；每一步都尽量可重复。
         if self._shutdown_flag:
             self._shutdown_flag.set()
-        with self._trigger_lock:
-            events = list(self._trigger_events.values())
-        for evt in events:
-            evt.set()
+        self._trigger_supervisor.request_stop_all()
         self._cancel_deferred_workflows()
         self._stop_trigger_threads(timeout=30)
         self._shutdown_plugins()
