@@ -9,7 +9,6 @@
 """
 import copy
 import os
-import secrets
 import sys
 import threading
 import time
@@ -79,10 +78,10 @@ class AutomationEngine:
         self._plugin_modules = self._plugin_registry.modules
 
         # 安全系统
-        self._engine_token: str = secrets.token_hex(32)
         from notmyfault import sudo as _sudo
-        _sudo.set_engine_token(self._engine_token)
         self._sudo = _sudo
+        self._engine_token: str = _sudo.begin_engine_session()
+        self._privilege_session_closed = False
         self._security_mode = _detect_security_mode()
         engine_info(f"Security mode: {self._security_mode.value}")
         self._plugin_integrity_errors: list[str] = []
@@ -798,6 +797,24 @@ class AutomationEngine:
     # ------------------------------------------------------------------
 
     def start(
+        self, shutdown_event: "threading.Event | None" = None
+    ) -> None:
+        """运行引擎，并保证本代引擎的提权授权最终被撤销。"""
+        if self._privilege_session_closed:
+            raise RuntimeError("引擎实例已经关闭，不能再次启动")
+        try:
+            self._run(shutdown_event=shutdown_event)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        """撤销本代引擎权限会话；可安全重复调用。"""
+        if self._privilege_session_closed:
+            return
+        self._sudo.end_engine_session(self._engine_token)
+        self._privilege_session_closed = True
+
+    def _run(
         self, shutdown_event: "threading.Event | None" = None
     ) -> None:
         self._start_time = time.time()
