@@ -429,20 +429,40 @@ def load_verified_config() -> Dict[str, Any]:
     return normalized
 
 def _normalize_condition(condition: Any) -> Any:
-    """清理条件树中已不适用的字段，同时保留原有嵌套结构。"""
+    """把旧条件树转换成统一的 ``op + children`` 格式。"""
     if not isinstance(condition, dict):
         return condition
 
     copied = dict(condition)
-    op = copied.get("op", copied.get("type"))
-    if op in ("any", "or"):
+    children = copied.get("children", copied.get("events"))
+    # 有 children/events 的节点是条件组；没有二者且带 type 的节点是事件叶子，
+    # 叶子的 type 绝不能被当作组操作符删除。
+    if not isinstance(children, list):
+        return copied
+
+    op = copied.get("op", copied.get("type", "any"))
+    copied["op"] = "all" if op in ("all", "and") else "any"
+    copied["children"] = [_normalize_condition(child) for child in children]
+    copied.pop("events", None)
+    copied.pop("type", None)
+    if copied["op"] == "any":
         # within_seconds 只有 all 条件组才有意义；旧版界面曾只隐藏它而没有删除。
         copied.pop("within_seconds", None)
-    for key in ("children", "events"):
-        children = copied.get(key)
-        if isinstance(children, list):
-            copied[key] = [_normalize_condition(child) for child in children]
     return copied
+
+
+def _unwrap_single_condition(condition: Any) -> Dict[str, Any] | None:
+    """从只有一个分支的条件组中取出事件，用于消除旧版重复字段。"""
+    current = condition
+    while isinstance(current, dict):
+        children = current.get("children")
+        if isinstance(children, list):
+            if len(children) != 1:
+                return None
+            current = children[0]
+            continue
+        return current if isinstance(current.get("type"), str) else None
+    return None
 
 
 def _replace_step_references(value: Any, replacements: Dict[str, str]) -> Any:
@@ -498,10 +518,19 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(rule, dict):
                 continue
             copied = dict(rule)
-            if "trigger" in copied and "event" not in copied:
-                copied["event"] = copied.pop("trigger")
+            if "trigger" in copied:
+                if "event" not in copied:
+                    copied["event"] = copied["trigger"]
+                copied.pop("trigger", None)
             if "condition" in copied:
                 copied["condition"] = _normalize_condition(copied["condition"])
+                if "event" not in copied and isinstance(copied["condition"], dict):
+                    if not isinstance(copied["condition"].get("children"), list):
+                        copied["event"] = copied.pop("condition")
+                elif isinstance(copied.get("event"), dict):
+                    condition_event = _unwrap_single_condition(copied["condition"])
+                    if condition_event == copied["event"]:
+                        copied.pop("condition", None)
             if "actions" in copied:
                 copied["actions"] = _normalize_rule_actions(copied["actions"])
             normalized_rules.append(copied)
@@ -594,7 +623,11 @@ def get_config() -> Dict[str, Any]:
             save_config(DEFAULT_CONFIG)
             return copy.deepcopy(DEFAULT_CONFIG)
 
-    # 签名验证通过，重新签名保存（修复签名老化问题）
+    normalized = _normalize_config(config)
+    migrated = normalized != config
+    config = normalized
+
+    # 签名验证通过后，以规范化结果重新签名并原子写回。
     if has_secret:
         save_config(config)
     else:
@@ -602,11 +635,8 @@ def get_config() -> Dict[str, Any]:
         _get_or_create_secret()
         save_config(config)
 
-    normalized = _normalize_config(config)
-    if normalized != config:
-        save_config(normalized)
+    if migrated:
         print("[DEBUG] Legacy config migrated to new rule format.")
-        config = normalized
 
     # --- 运行时安全校验 ---
     rules = config.get("rules", [])
@@ -633,12 +663,14 @@ def _try_recover_from_backup() -> Dict[str, Any] | None:
         signature = config.pop(_SIGNATURE_KEY, "")
         if _is_secret_installed() and signature and _verify_config(config, signature):
             print("[INFO] 从备份成功恢复配置", file=sys.stderr)
-            save_config(config)
-            return config
+            normalized = _normalize_config(config)
+            save_config(normalized)
+            return normalized
         # 备份没有签名或签名无效 — 可能是旧版配置直接使用
         print("[WARN] 备份文件无有效签名，但尝试使用", file=sys.stderr)
-        save_config(config)
-        return config
+        normalized = _normalize_config(config)
+        save_config(normalized)
+        return normalized
     except Exception as e:
         print(f"[ERROR] 备份恢复失败: {e}", file=sys.stderr)
         return None
