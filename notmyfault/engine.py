@@ -45,7 +45,8 @@ from notmyfault.security import (
     detect_security_mode as _detect_security_mode,
     verify_core_integrity,
 )
-from notmyfault.workflow import build_context, invoke_action, resolve_templates
+from notmyfault.workflow import build_context
+from notmyfault.workflow_executor import WorkflowExecutor
 
 
 # ============================================================================
@@ -93,13 +94,7 @@ class AutomationEngine:
         self._diag_lock = self._diag_obj.lock                 # 兼容：旧加锁路径
 
         # 关闭
-        self._active_actions = 0
-        self._action_lock = threading.Lock()
-        self._action_done = threading.Condition()
         self._shutdown_flag: "threading.Event | None" = None
-        # 前置条件未满足时的延后重试任务；以规则为粒度去重，避免定时器堆积。
-        self._deferred_workflows: Dict[str, threading.Timer] = {}
-        self._deferred_workflows_lock = threading.RLock()
 
         # 规则热重载线程安全
         self._rules_lock = threading.RLock()
@@ -124,6 +119,30 @@ class AutomationEngine:
             engine_token=self._engine_token,
             integrity_errors=self._plugin_integrity_errors,
         )
+        self._workflow_executor = WorkflowExecutor(
+            actions_meta=lambda: self.actions_meta,
+            actions_funcs=lambda: self.actions_funcs,
+            plugin_modules=lambda: self._plugin_modules,
+            diagnostics=self._diag_obj,
+            shutdown_event=lambda: self._shutdown_flag,
+            on_event=self._safe_on_event,
+            defer_workflow=lambda *args: self._defer_workflow(*args),
+            resume_workflow=lambda *args: self._resume_workflow(*args),
+            execute_workflow=lambda *args: self.execute_workflow(*args),
+            execute_actions=lambda *args: self.execute_actions(*args),
+            run_action=lambda *args: self._run_action(*args),
+        )
+        # 兼容旧扩展和测试读取这些同步对象。
+        self._action_lock = self._workflow_executor.action_lock
+        self._action_done = self._workflow_executor.action_done
+        self._deferred_workflows = self._workflow_executor.deferred_workflows
+        self._deferred_workflows_lock = (
+            self._workflow_executor.deferred_workflows_lock
+        )
+
+    @property
+    def _active_actions(self) -> int:
+        return self._workflow_executor.active_actions
 
     # ------------------------------------------------------------------
     # 告警与安全回调
@@ -471,65 +490,14 @@ class AutomationEngine:
         rule_name: str,
         context: Dict[str, Any],
     ) -> None:
-        """执行规则工作流；前置条件不安全时延后，而不是冒险运行动作。"""
-        ready, reason, retry_after = self._check_preconditions(
-            rule.get("preconditions", []), context,
+        return self._workflow_executor.execute_workflow(
+            workflow_key, rule, rule_name, context
         )
-        if not ready:
-            delay = min(max(retry_after or 60, 5), 3600)
-            self._safe_on_event(
-                "workflow_deferred",
-                {
-                    "rule_name": rule_name,
-                    "reason": reason,
-                    "retry_after_seconds": delay,
-                },
-            )
-            print(
-                f"[Engine] 工作流 <{rule_name}> 前置条件未满足，{delay}s 后重试: {reason}",
-                file=sys.stderr,
-            )
-            self._defer_workflow(workflow_key, rule, rule_name, context, delay)
-            return
-        self.execute_actions(rule.get("actions", []), rule_name, context)
 
     def _check_preconditions(
         self, preconditions: Any, context: Dict[str, Any],
     ) -> Tuple[bool, str, float | None]:
-        """调用动作插件声明的 check_precondition()；未知/异常一律不放行。"""
-        if not preconditions:
-            return True, "", None
-        if not isinstance(preconditions, list):
-            return False, "preconditions 必须是数组", None
-        for index, spec in enumerate(preconditions):
-            if not isinstance(spec, dict):
-                return False, f"preconditions[{index}] 必须是对象", None
-            action_type = spec.get("type")
-            module = self._plugin_modules.get(action_type)
-            action_meta = self.actions_meta.get(action_type, {})
-            check = getattr(module, "check_precondition", None)
-            if action_type not in self.actions_funcs or not callable(check) \
-                    or action_meta.get("precondition_api") != "context-v1":
-                return False, f"前置条件插件不可用或未声明 context-v1: {action_type}", None
-            try:
-                params = resolve_templates(spec.get("params", {}), context)
-                if not isinstance(params, dict):
-                    return False, f"前置条件 {action_type} 的 params 必须是对象", None
-                verdict = check(action_meta, params, context)
-            except Exception:
-                return False, f"前置条件 {action_type} 检查异常: {traceback.format_exc()[-200:]}", None
-            if verdict is True:
-                continue
-            if isinstance(verdict, dict):
-                if verdict.get("ok") is True:
-                    continue
-                return (
-                    False,
-                    str(verdict.get("reason") or f"前置条件 {action_type} 未满足"),
-                    verdict.get("retry_after_seconds"),
-                )
-            return False, f"前置条件 {action_type} 未满足", None
-        return True, "", None
+        return self._workflow_executor.check_preconditions(preconditions, context)
 
     def _defer_workflow(
         self,
@@ -539,18 +507,9 @@ class AutomationEngine:
         context: Dict[str, Any],
         delay: float,
     ) -> None:
-        with self._deferred_workflows_lock:
-            existing = self._deferred_workflows.get(workflow_key)
-            if existing is not None and existing.is_alive():
-                return
-            timer = threading.Timer(
-                delay,
-                self._resume_workflow,
-                args=(workflow_key, rule, rule_name, context),
-            )
-            timer.daemon = True
-            self._deferred_workflows[workflow_key] = timer
-            timer.start()
+        self._workflow_executor.defer_workflow(
+            workflow_key, rule, rule_name, context, delay
+        )
 
     def _resume_workflow(
         self,
@@ -559,18 +518,12 @@ class AutomationEngine:
         rule_name: str,
         context: Dict[str, Any],
     ) -> None:
-        with self._deferred_workflows_lock:
-            self._deferred_workflows.pop(workflow_key, None)
-        if self._shutdown_flag and self._shutdown_flag.is_set():
-            return
-        self.execute_workflow(workflow_key, rule, rule_name, context)
+        self._workflow_executor.resume_workflow(
+            workflow_key, rule, rule_name, context
+        )
 
     def _cancel_deferred_workflows(self) -> None:
-        with self._deferred_workflows_lock:
-            timers = list(self._deferred_workflows.values())
-            self._deferred_workflows.clear()
-        for timer in timers:
-            timer.cancel()
+        self._workflow_executor.cancel_deferred_workflows()
 
     def execute_actions(
         self,
@@ -578,19 +531,7 @@ class AutomationEngine:
         rule_name: str,
         context: Dict[str, Any],
     ) -> None:
-        """顺序执行一条规则的动作流水线，并把每一步产物写入 context。"""
-        for index, action in enumerate(actions):
-            # 步骤名由动作类型和位置自动生成，配置文件不保存也不接受用户自定义 ID。
-            step_id = f"{action.get('type', 'action')}_{index + 1}"
-            ok, result = self._run_action(action, rule_name, context)
-            context["steps"][step_id] = {
-                "status": "ok" if ok else "failed",
-                "result": result if ok else None,
-                "error": None if ok else str(result),
-            }
-            if not ok and action.get("on_error", "stop") != "continue":
-                print(f"[Engine] 动作流水线在步骤 {step_id} 停止", file=sys.stderr)
-                break
+        self._workflow_executor.execute_actions(actions, rule_name, context)
 
     def execute_action(
         self,
@@ -598,11 +539,7 @@ class AutomationEngine:
         rule_name: str = "",
         context: Optional[Dict[str, Any]] = None,
     ) -> Any:
-        """兼容入口：执行一个动作并返回插件的结构化结果（旧调用可忽略返回值）。"""
-        if context is None:
-            context = build_context(rule_name, "", {}, [])
-        _ok, result = self._run_action(action, rule_name, context)
-        return result if _ok else None
+        return self._workflow_executor.execute_action(action, rule_name, context)
 
     def _run_action(
         self,
@@ -610,103 +547,7 @@ class AutomationEngine:
         rule_name: str,
         context: Dict[str, Any],
     ) -> Tuple[bool, Any]:
-        """执行单一步骤；新插件可拿上下文并返回结果，旧插件保持两参数 API。"""
-        if self._shutdown_flag and self._shutdown_flag.is_set():
-            print(f"[Engine] 正在关闭，跳过动作: {action.get('type', '?')}")
-            return False, "引擎正在关闭"
-
-        action_type = action.get("type")
-        raw_params = action.get("params", {})
-        params = resolve_templates(raw_params, context)
-        if not isinstance(params, dict):
-            return False, "action.params 必须是对象"
-
-        if action_type not in self.actions_funcs:
-            print(
-                f"[Engine] [?] 未知 action 类型或未装载模块: {action_type}",
-                file=sys.stderr,
-            )
-            return False, f"未知 action 类型: {action_type}"
-
-        # --- 插件自定义参数校验 ---
-        module = self._plugin_modules.get(action_type)
-        if module is not None and hasattr(module, "validate_params"):
-            try:
-                validation_errors = module.validate_params(
-                    self.actions_meta.get(action_type, {}), params
-                )
-                if validation_errors:
-                    print(
-                        f"[Engine] [!!] action \"{action_type}\" validate_params 警告:",
-                        file=sys.stderr,
-                    )
-                    for ve in validation_errors:
-                        print(f"         - {ve}", file=sys.stderr)
-            except Exception:
-                print(
-                    f"[Engine] action \"{action_type}\" validate_params() 执行异常:",
-                    file=sys.stderr,
-                )
-                traceback.print_exc(file=sys.stderr)
-
-        # 计数只管“正在跑几个”，真正的插件调用放在锁外，不然一个慢动作全员罚站。
-        with self._action_lock:
-            self._active_actions += 1
-
-        try:
-            action_meta = self.actions_meta.get(action_type, {})
-            action_func = self.actions_funcs[action_type]
-            retries = min(max(int(action.get("retry", 0) or 0), 0), 3)
-            delay = max(float(action.get("retry_delay_seconds", 0) or 0), 0)
-            for attempt in range(retries + 1):
-                try:
-                    result = invoke_action(action_func, module, action_meta, params, context)
-                    self._diag_obj.inc_action_ok()
-                    self._safe_on_event(
-                        "action_executed",
-                        {
-                            "action_type": action_type,
-                            "params": params,
-                            "rule_name": rule_name,
-                            "status": "ok",
-                            "result": result,
-                            "attempt": attempt + 1,
-                        },
-                    )
-                    return True, result
-                except Exception:
-                    if attempt < retries:
-                        print(
-                            f"[Engine] action \"{action_type}\" 第 {attempt + 1} 次失败，准备重试",
-                            file=sys.stderr,
-                        )
-                        if delay:
-                            time.sleep(delay)
-                        continue
-                    raise
-        except Exception:
-            self._diag_obj.inc_action_fail()
-            err_msg = traceback.format_exc()
-            print(
-                f"[Engine] [ERR] 执行 action \"{action_type}\" 失败:",
-                file=sys.stderr,
-            )
-            traceback.print_exc(file=sys.stderr)
-            engine_error("action_failed", action_type=action_type, rule_name=rule_name, error=str(err_msg[-500:]))
-            self._safe_on_event(
-                "error",
-                {
-                    "action_type": action_type,
-                    "rule_name": rule_name,
-                    "error": err_msg,
-                },
-            )
-            return False, err_msg[-500:]
-        finally:
-            with self._action_lock:
-                self._active_actions -= 1
-            with self._action_done:
-                self._action_done.notify_all()
+        return self._workflow_executor.run_action(action, rule_name, context)
 
     # ------------------------------------------------------------------
     # 触发器线程管理
@@ -966,24 +807,7 @@ class AutomationEngine:
                     )
 
     def _wait_active_actions(self, timeout: float = 60.0) -> None:
-        print("[Engine] 正在关闭，等待活跃动作完成...")
-        deadline = time.time() + timeout
-        while True:
-            with self._action_lock:
-                remaining = self._active_actions
-            if remaining == 0:
-                break
-            if time.time() >= deadline:
-                print(
-                    f"[Engine] [!!] shutdown: {remaining} active action(s) still "
-                    f"running after {timeout}s, forcing exit",
-                    file=sys.stderr,
-                )
-                break
-            print(f"[Engine] 等待 {remaining} 个活跃动作完成...")
-            with self._action_done:
-                self._action_done.wait(timeout=3)
-        print("[Engine] 所有动作已完成，引擎安全关闭")
+        self._workflow_executor.wait_active_actions(timeout=timeout)
 
     def shutdown(self) -> None:
         
