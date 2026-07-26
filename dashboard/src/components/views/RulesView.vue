@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { store } from '../../lib/store'
 import { runRule, saveConfig } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
+import { normalizeRuleDraft } from '../../lib/utils'
 import RuleEditor from '../RuleEditor.vue'
 
 const activeRuleIndex = ref(null)
@@ -23,21 +24,6 @@ const ruleFolders = computed(() => {
 })
 
 function clone(value) { return JSON.parse(JSON.stringify(value)) }
-function normalizeCondition(node) {
-  if (!node || typeof node !== 'object') return node
-  if (!Array.isArray(node.children)) {
-    node.op = node.op || (node.type === 'and' ? 'all' : 'any')
-    node.children = Array.isArray(node.events) ? node.events : []
-    delete node.events
-    delete node.type
-  }
-  node.children.forEach(normalizeCondition)
-  return node
-}
-function normalizeRuleDraft(rule) {
-  if (rule?.condition) normalizeCondition(rule.condition)
-  return rule
-}
 function openRule(index) {
   activeRuleIndex.value = index
   draftRule.value = normalizeRuleDraft(clone(store.configData.rules[index]))

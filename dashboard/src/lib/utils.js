@@ -55,3 +55,69 @@ export function groupTriggerKeys(keys) {
   keys.forEach(key => groups.get(triggerCategoryMap[key] || '其他').push(key))
   return [...groups].filter(([, items]) => items.length)
 }
+
+function isObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function valuesEqual(left, right) {
+  if (left === right) return true
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left)
+      && Array.isArray(right)
+      && left.length === right.length
+      && left.every((value, index) => valuesEqual(value, right[index]))
+  }
+  if (!isObject(left) || !isObject(right)) return false
+  const leftKeys = Object.keys(left)
+  const rightKeys = Object.keys(right)
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every(key => Object.prototype.hasOwnProperty.call(right, key)
+      && valuesEqual(left[key], right[key]))
+}
+
+export function isConditionLeaf(node) {
+  return isObject(node)
+    && typeof node.type === 'string'
+    && node.type.length > 0
+    && !Array.isArray(node.children)
+    && !Array.isArray(node.events)
+}
+
+export function normalizeConditionTree(node) {
+  if (!isObject(node)) return node
+  if (isConditionLeaf(node)) return node
+
+  node.children = Array.isArray(node.children)
+    ? node.children
+    : (Array.isArray(node.events) ? node.events : [])
+  node.op = node.op || (node.type === 'and' ? 'all' : 'any')
+  delete node.events
+  delete node.type
+  node.children.forEach(normalizeConditionTree)
+  return node
+}
+
+function unwrapSingleCondition(node) {
+  if (isConditionLeaf(node)) return node
+  if (!isObject(node) || !Array.isArray(node.children) || node.children.length !== 1) return null
+  return unwrapSingleCondition(node.children[0])
+}
+
+export function normalizeRuleDraft(rule) {
+  if (!isObject(rule)) return rule
+  if (!rule.event && isObject(rule.trigger)) rule.event = rule.trigger
+  delete rule.trigger
+
+  if (isObject(rule.condition)) {
+    normalizeConditionTree(rule.condition)
+    if (isConditionLeaf(rule.condition) && !rule.event) {
+      rule.event = rule.condition
+      delete rule.condition
+    } else if (isObject(rule.event)) {
+      const conditionEvent = unwrapSingleCondition(rule.condition)
+      if (conditionEvent && valuesEqual(conditionEvent, rule.event)) delete rule.condition
+    }
+  }
+  return rule
+}

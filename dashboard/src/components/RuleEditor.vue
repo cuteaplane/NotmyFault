@@ -1,7 +1,13 @@
 <script setup>
 import { computed, ref } from 'vue'
 import { store } from '../lib/store'
-import { getVisibleParamDefs, buildDefaultParams, groupTriggerKeys } from '../lib/utils'
+import {
+  getVisibleParamDefs,
+  buildDefaultParams,
+  groupTriggerKeys,
+  normalizeConditionTree,
+  normalizeRuleDraft,
+} from '../lib/utils'
 import ParamInput from './ParamInput.vue'
 import ConditionEditor from './ConditionEditor.vue'
 
@@ -23,20 +29,8 @@ const isCondition = computed(() => (
   && !Array.isArray(props.rule.condition)
 ))
 
-function normalizeCondition(condition) {
-  if (!condition || typeof condition !== 'object' || Array.isArray(condition)) return condition
-  if (!Array.isArray(condition.children)) {
-    condition.op = condition.op || (condition.type === 'and' ? 'all' : 'any')
-    condition.children = Array.isArray(condition.events) ? condition.events : []
-    delete condition.events
-    delete condition.type
-  }
-  condition.children.forEach(child => {
-    if (child && typeof child === 'object' && (child.children || child.events)) normalizeCondition(child)
-  })
-  return condition
-}
-const conditionNode = computed(() => props.rule.condition ? normalizeCondition(props.rule.condition) : null)
+normalizeRuleDraft(props.rule)
+const conditionNode = computed(() => props.rule.condition ? normalizeConditionTree(props.rule.condition) : null)
 const isAdmin = (meta) => !!(meta?.permissions || []).includes('admin')
 const eventParams = (event) => getVisibleParamDefs(store.schema.triggers[event.type], event.params)
 const actionParams = (action) => getVisibleParamDefs(store.schema.actions[action.type], action.params)
