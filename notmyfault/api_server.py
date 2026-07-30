@@ -8,19 +8,30 @@ NotmyFault HTTP API 服务器
 """
 
 import json
+import secrets
 import os
 import queue
+import sys
+import asyncio
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Callable, Protocol
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from notmyfault.config import CONFIG_FILE
+from notmyfault.config import CONFIG_FILE, save_config as config_save, save_config as config_save
+from notmyfault.plugin_schema import scan_plugins
+
+_scan_plugins = scan_plugins  # 向后兼容
+
+# API 认证令牌（每次进程启动时随机生成）
+API_TOKEN: str = secrets.token_hex(32)
+API_TOKEN_FILE: str = os.path.join(os.environ.get("TEMP", ""), "notmyfault_api_token")
+
 
 
 # ---------------------------------------------------------------------------
@@ -35,39 +46,6 @@ class EngineRunnerLike(Protocol):
 
     def _start_engine_core(self) -> None: ...
     def _stop_engine(self) -> None: ...
-
-
-# ---------------------------------------------------------------------------
-# 插件 schema 扫描 (复刻 engine.py 的 auto_load 扫描逻辑)
-# ---------------------------------------------------------------------------
-
-def _scan_plugins(base_dir: str, plugins_dir: str, json_filename: str) -> Dict[str, Dict]:
-    """扫描插件目录，返回 {plugin_id: metadata} 的字典"""
-    result: Dict[str, Dict] = {}
-    root = os.path.join(base_dir, plugins_dir)
-    if not os.path.isdir(root):
-        return result
-
-    for folder_name in os.listdir(root):
-        folder_path = os.path.join(root, folder_name)
-        if not os.path.isdir(folder_path):
-            continue
-
-        json_file = os.path.join(folder_path, json_filename)
-        if not os.path.exists(json_file):
-            continue
-
-        try:
-            with open(json_file, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-        except Exception:
-            continue
-
-        plugin_id = meta.get("id")
-        if plugin_id:
-            result[plugin_id] = meta
-
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -86,12 +64,27 @@ class EngineAPI:
 
     def __init__(self, engine_runner: EngineRunnerLike):
         self._engine = engine_runner
-        self._event_queue: queue.Queue = queue.Queue()
-        self._event_signal = threading.Event()
+        self._subscribers: list["asyncio.Queue"] = []
 
-        self.app = FastAPI(title="NotmyFault Engine API", version="1.0")
+        self._loop = None
+        self._sub_lock = threading.Lock()
+        self._server = None
+        self._engine_ref = None
+
+        self.app = FastAPI(title="NotmyFault Engine API", version="alpha-0.10")
         self._setup_middleware()
         self._setup_routes()
+        global API_TOKEN
+        API_TOKEN = secrets.token_hex(32)
+        try:
+            os.makedirs(os.path.dirname(API_TOKEN_FILE), exist_ok=True)
+        except OSError:
+            pass
+        try:
+            with open(API_TOKEN_FILE, "w") as f:
+                f.write(API_TOKEN)
+        except OSError:
+            pass
 
     # ---- CORS -----------------------------------------------------------
 
@@ -106,28 +99,151 @@ class EngineAPI:
     # ---- 事件推送 (引擎线程 → SSE) ---------------------------------------
 
     def push_event(self, event_type: str, data: Dict[str, Any]):
-        """
-        引擎线程调用此方法推送事件。
-        线程安全 — 使用 queue + event 唤醒 SSE 生成器。
-        """
-        try:
-            self._event_queue.put_nowait({
-                "type": event_type,
-                "data": data,
-                "ts": time.time(),
-            })
-            self._event_signal.set()  # 立即唤醒 SSE 轮询
-        except queue.Full:
-            pass  # 队列满了就丢弃，不阻塞引擎
+        packet = {"type": event_type, "data": data, "ts": time.time()}
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        with self._sub_lock:
+            subscribers = list(self._subscribers)
+        for q in subscribers:
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, packet)
+            except Exception:
+                pass
 
     # ---- 插件扫描 (供 /api/plugins 使用) --------------------------------
 
     def _get_plugins_schema(self) -> Dict[str, Any]:
         base = os.path.dirname(__file__)
         return {
-            "triggers": _scan_plugins(base, "triggers", "trigger.json"),
-            "actions": _scan_plugins(base, "actions", "action.json"),
+            "triggers": scan_plugins(base, "triggers", "trigger.json"),
+            "actions": scan_plugins(base, "actions", "action.json"),
         }
+
+    def _get_user_plugins_dir(self) -> str:
+        return os.path.join(os.environ.get("APPDATA", ""), "NotmyFault", "plugins")
+
+    def _list_all_plugins(self) -> Dict[str, Any]:
+        base = os.path.dirname(__file__)
+        user_dir = self._get_user_plugins_dir()
+
+        config = self._load_config()
+        disabled = config.get("disabled_plugins", {})
+        if not isinstance(disabled, dict):
+            disabled = {"triggers": [], "actions": []}
+
+        result: Dict[str, Dict] = {"triggers": {}, "actions": {}}
+        for ptype in ("triggers", "actions"):
+            json_name = "trigger.json" if ptype == "triggers" else "action.json"
+            disabled_set = set(disabled.get(ptype, []))
+
+            builtin_plugins = scan_plugins(base, ptype, json_name)
+            for pid, meta in builtin_plugins.items():
+                meta["origin"] = "builtin"
+                result[ptype][pid] = meta
+
+            builtin_root = os.path.join(base, ptype)
+            if os.path.isdir(builtin_root):
+                for folder_name in sorted(os.listdir(builtin_root)):
+                    json_path = os.path.join(builtin_root, folder_name, json_name)
+                    if not os.path.exists(json_path):
+                        continue
+                    try:
+                        with open(json_path, "r", encoding="utf-8") as f:
+                            meta = json.load(f)
+                        pid = meta.get("id")
+                        if pid and pid not in result[ptype]:
+                            meta["origin"] = "builtin"
+                            result[ptype][pid] = meta
+                    except Exception:
+                        continue
+
+            for pid in disabled_set:
+                if pid in result[ptype]:
+                    result[ptype][pid]["enabled"] = False
+
+            if os.path.isdir(user_dir):
+                for pid, meta in scan_plugins(user_dir, ptype, json_name).items():
+                    meta["origin"] = "user"
+                    result[ptype][pid] = meta
+
+        # merge diagnostics (loaded status / errors)
+        engine = getattr(self, "_engine_ref", None)
+        if engine is not None:
+            diag = engine.get_diagnostics()
+            for err in diag.get("plugins", {}).get("errors", []):
+                # errors: ["Trigger", plugin_id, reason]
+                if len(err) >= 3:
+                    etype, epid, ereason = err[0], err[1], err[2]
+                    cat = "triggers" if etype == "Trigger" else "actions"
+                    if epid in result.get(cat, {}):
+                        result[cat][epid]["_error"] = ereason
+
+        return result
+
+    def _toggle_plugin(self, ptype: str, pid: str) -> dict:
+        base = os.path.dirname(__file__)
+        user_dir = self._get_user_plugins_dir()
+        json_name = "trigger.json" if ptype == "triggers" else "action.json"
+
+        user_json = os.path.join(user_dir, ptype, pid, json_name)
+        if os.path.exists(user_json):
+            try:
+                with open(user_json, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                meta["enabled"] = not meta.get("enabled", True)
+                os.makedirs(os.path.dirname(user_json), exist_ok=True)
+                with open(user_json, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, ensure_ascii=False, indent=2)
+                return {"ok": True, "enabled": meta["enabled"],
+                        "origin": "user",
+                        "restart_required": True}
+            except (json.JSONDecodeError, OSError) as e:
+                return {"ok": False, "error": str(e)}
+
+        builtin_json = os.path.join(base, ptype, pid, json_name)
+        if os.path.exists(builtin_json):
+            try:
+                config = self._load_config()
+                disabled = config.get("disabled_plugins", {})
+                if not isinstance(disabled, dict):
+                    disabled = {"triggers": [], "actions": []}
+                disabled_list = disabled.get(ptype, [])
+                if pid in disabled_list:
+                    disabled_list.remove(pid)
+                    new_enabled = True
+                else:
+                    disabled_list.append(pid)
+                    new_enabled = False
+                disabled[ptype] = disabled_list
+                config["disabled_plugins"] = disabled
+                ok = self._save_config(config)
+                if not ok:
+                    return {"ok": False, "error": "无法保存配置"}
+                return {"ok": True, "enabled": new_enabled,
+                        "origin": "builtin",
+                        "restart_required": True}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+
+        return {"ok": False, "error": "插件不存在"}
+
+    def _uninstall_plugin(self, ptype: str, pid: str) -> dict:
+        user_dir = self._get_user_plugins_dir()
+        json_name = "trigger.json" if ptype == "triggers" else "action.json"
+        plugin_dir = os.path.join(user_dir, ptype, pid)
+        json_path = os.path.join(plugin_dir, json_name)
+
+        if not os.path.exists(json_path):
+            return {"ok": False, "error": "只能卸载用户插件，或插件不存在"}
+
+        try:
+            import shutil
+            shutil.rmtree(plugin_dir)
+            return {"ok": True, "restart_required": True}
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
+
 
     # ---- 配置读写辅助 ----------------------------------------------------
 
@@ -135,22 +251,27 @@ class EngineAPI:
         try:
             if os.path.exists(CONFIG_FILE):
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception:
-            pass
+                    cfg = json.load(f)
+                    cfg.pop("_signature", None)
+                    return cfg
+        except json.JSONDecodeError:
+            print(f"[API] 配置文件 JSON 格式错误，返回空规则列表", file=sys.stderr)
+        except OSError as e:
+            print(f"[API] 读取配置文件失败: {e}，返回空规则列表", file=sys.stderr)
         return {"rules": []}
 
     def _save_config(self, config: Dict[str, Any]) -> bool:
-        try:
-            os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(config, f, ensure_ascii=False, indent=4)
-            return True
-        except Exception as e:
-            print(f"[API] 保存配置失败: {e}")
-            return False
+        return config_save(config)
 
     # ---- 路由注册 --------------------------------------------------------
+
+    async def _verify_auth(self, request: Request) -> None:
+        if request.method == "GET":
+            return
+        auth = request.headers.get("Authorization", "")
+        token = auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""
+        if not token or not secrets.compare_digest(token, API_TOKEN):
+            raise HTTPException(status_code=403, detail="Forbidden: invalid API Token")
 
     def _setup_routes(self):
         app = self.app
@@ -160,19 +281,36 @@ class EngineAPI:
         # ================================================================
 
         @app.post("/api/engine/start")
-        async def engine_start():
+        async def engine_start(request: Request):
+            await self._verify_auth(request)
             print("[API] POST /api/engine/start")
             if self._engine.engine_running:
-                return {"ok": True, "running": True, "message": "already_running"}
+                return {"ok": True, "running": self._engine.engine_running,
+
+                "api_alive": True, "message": "already_running"}
 
             self._engine._start_engine_core()
             return {"ok": True, "running": self._engine.engine_running}
 
         @app.post("/api/engine/stop")
-        async def engine_stop():
+        async def engine_stop(request: Request):
+            await self._verify_auth(request)
             print("[API] POST /api/engine/stop")
             self._engine._stop_engine()
             return {"ok": True}
+
+        @app.post("/api/engine/shutdown")
+        async def engine_shutdown(request: Request):
+            await self._verify_auth(request)
+            """彻底退出引擎进程（先停引擎，再优雅关闭 HTTP 服务）"""
+            print("[API] POST /api/engine/shutdown")
+            self._engine._stop_engine()
+
+            # 触发 uvicorn 优雅关闭 — 替代 os._exit(0)
+            if self._server:
+                self._server.should_exit = True
+
+            return {"ok": True, "message": "shutting_down"}
 
         @app.get("/api/engine/status")
         async def engine_status():
@@ -180,6 +318,9 @@ class EngineAPI:
             rules = config.get("rules", [])
             return {
                 "running": self._engine.engine_running,
+
+                "api_alive": True,
+                "engine_running": self._engine.engine_running,
                 "pid": os.getpid(),
                 "rules_count": len(rules),
                 "triggers_count": len(set(
@@ -204,6 +345,7 @@ class EngineAPI:
 
         @app.put("/api/rules")
         async def rules_save(request: Request):
+            await self._verify_auth(request)
             try:
                 body = await request.json()
             except Exception:
@@ -212,8 +354,10 @@ class EngineAPI:
                     status_code=400,
                 )
 
+            existing_config = self._load_config()
             new_config = {
                 "rules": body.get("rules", []),
+                "disabled_plugins": existing_config.get("disabled_plugins", {"triggers": [], "actions": []}),
             }
 
             ok = self._save_config(new_config)
@@ -227,12 +371,171 @@ class EngineAPI:
                 )
 
         # ================================================================
-        # 插件 schema
+        # 插件管理
         # ================================================================
 
         @app.get("/api/plugins")
         async def plugins_schema():
             return self._get_plugins_schema()
+
+        @app.get("/api/plugins/list")
+        async def plugins_list():
+            return self._list_all_plugins()
+
+        @app.post("/api/plugins/toggle")
+        async def plugin_toggle(request: Request):
+            await self._verify_auth(request)
+            try:
+                body = await request.json()
+                ptype = body.get("type", "")
+                pid = body.get("id", "")
+                if ptype not in ("triggers", "actions") or not pid:
+                    return JSONResponse(
+                        {"ok": False, "error": "需要 type (triggers/actions) 和 id"},
+                        status_code=400)
+                return self._toggle_plugin(ptype, pid)
+            except Exception as e:
+                return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+        @app.post("/api/plugins/install")
+        async def plugin_install(request: Request):
+            await self._verify_auth(request)
+            import tempfile, shutil, py7zr
+            form = await request.form()
+            file = form.get("file")
+            password = form.get("password", "")
+            if not file:
+                return JSONResponse({"ok": False, "error": "缺少上传文件"}, status_code=400)
+
+            data = await file.read()
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".nmfp")
+            extract_dir = None
+            try:
+                tmp.write(data)
+                tmp.close()
+
+                extract_dir = tempfile.mkdtemp()
+                with py7zr.SevenZipFile(tmp.name, mode="r", password=password or None) as zf:
+                    zf.extractall(extract_dir)
+
+                # 找插件根目录：优先单文件夹，兼容文件平铺的打包方式
+                entries = os.listdir(extract_dir)
+                dirs = [d for d in entries if os.path.isdir(os.path.join(extract_dir, d))]
+                if len(dirs) == 1:
+                    root_path = os.path.join(extract_dir, dirs[0])
+                elif len(dirs) == 0:
+                    # 文件直接平铺在 archive 根目录
+                    root_path = extract_dir
+                else:
+                    return JSONResponse({"ok": False, "error": "nmfp 根目录应恰好有一个插件文件夹"}, status_code=400)
+
+                # 确定类型
+                has_trigger = os.path.exists(os.path.join(root_path, "trigger.json"))
+                has_action = os.path.exists(os.path.join(root_path, "action.json"))
+                if has_trigger:
+                    ptype, json_name = "triggers", "trigger.json"
+                elif has_action:
+                    ptype, json_name = "actions", "action.json"
+                else:
+                    return JSONResponse({"ok": False, "error": "未找到 trigger.json 或 action.json"}, status_code=400)
+
+                # 校验 metadata
+                try:
+                    with open(os.path.join(root_path, json_name), "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    return JSONResponse({"ok": False, "error": "插件元数据 JSON 损坏或缺失"}, status_code=400)
+
+                from notmyfault.plugin_schema import validate_plugin_meta
+                plugin_type = "trigger" if ptype == "triggers" else "action"
+                ok, errors = validate_plugin_meta(meta, plugin_type)
+                if not ok:
+                    return JSONResponse({"ok": False, "error": "schema 校验失败: " + "; ".join(errors[:3])}, status_code=400)
+
+                pid = meta.get("id", os.path.basename(root_path))
+                user_dir = self._get_user_plugins_dir()
+                dest = os.path.join(user_dir, ptype, pid)
+                if os.path.exists(dest):
+                    return JSONResponse({"ok": False, "error": f"插件 '{pid}' 已存在"}, status_code=400)
+
+                # 签名
+                priv_key_path = os.path.join(os.path.dirname(__file__), "..", ".private", "signing_private_key.pem")
+                if not os.path.exists(priv_key_path):
+                    return JSONResponse({"ok": False, "error": "私钥不存在，请先运行 build.py init-keys"}, status_code=400)
+
+                try:
+                    from notmyfault.signing import sign_plugin, load_private_key
+                    from pathlib import Path
+                    pk = load_private_key(Path(priv_key_path), password=password or None)
+                    sign_plugin(Path(root_path), json_name, pk)
+                except Exception as e:
+                    err = str(e)
+                    if "password" in err.lower() or "bad decrypt" in err.lower():
+                        return JSONResponse({"ok": False, "error": "私钥密码错误"}, status_code=400)
+                    return JSONResponse({"ok": False, "error": "签名失败: " + err}, status_code=400)
+
+                # 复制到 user plugins
+                os.makedirs(dest, exist_ok=True)
+                for fname in os.listdir(root_path):
+                    src = os.path.join(root_path, fname)
+                    dst = os.path.join(dest, fname)
+                    if os.path.isfile(src):
+                        shutil.copy2(src, dst)
+
+                return {"ok": True, "id": pid, "type": ptype, "restart_required": True}
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
+                if extract_dir:
+                    shutil.rmtree(extract_dir, ignore_errors=True)
+
+        @app.get("/api/plugins/key-status")
+        async def plugin_key_status():
+            priv = os.path.join(os.path.dirname(__file__), "..", ".private", "signing_private_key.pem")
+            if not os.path.exists(priv):
+                return {"exists": False, "encrypted": False}
+            with open(priv, "rb") as f:
+                header = f.read(20)
+            encrypted = header.startswith(b"-----BEGIN ENCRYPTED")
+            return {"exists": True, "encrypted": encrypted}
+
+        @app.delete("/api/plugins/{ptype}/{pid}")
+        async def plugin_uninstall(ptype: str, pid: str, request: Request):
+            await self._verify_auth(request)
+            if ptype not in ("triggers", "actions"):
+                return JSONResponse({"ok": False, "error": "type 必须为 triggers 或 actions"}, status_code=400)
+            return self._uninstall_plugin(ptype, pid)
+
+        # ================================================================
+        # 诊断 & 日志
+        # ================================================================
+
+        @app.get("/api/engine/diagnostics")
+        async def engine_diagnostics():
+            engine = getattr(self, "_engine_ref", None)
+            if engine is not None:
+                return engine.get_diagnostics()
+            return {"uptime_seconds": 0, "plugins": {}, "rules": {}, "actions": {}}
+
+        @app.get("/api/engine/logs")
+        async def engine_logs(lines: int = 200):
+            from notmyfault.logging import get_latest_log
+            log_path = get_latest_log(
+                os.path.join(os.path.dirname(CONFIG_FILE), "logs")
+            )
+            if not log_path:
+                return {"lines": [], "total": 0}
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    all_lines = f.readlines()
+                return {
+                    "lines": [l.rstrip("\n") for l in all_lines[-lines:]],
+                    "total": len(all_lines),
+                }
+            except FileNotFoundError:
+                return {"lines": [], "total": 0}
 
         # ================================================================
         # SSE 事件流
@@ -240,46 +543,28 @@ class EngineAPI:
 
         @app.get("/api/events")
         async def event_stream(request: Request):
-            """
-            Server-Sent Events 流。
-            引擎事件通过 queue + event 机制从引擎线程传递到这里。
-            客户端断开时自动清理。
-            """
-
             async def generate():
-                # 为每个客户端创建独立的本地引用
-                q = self._event_queue
-                ev = self._event_signal
+                import asyncio
+                client_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+                self._loop = asyncio.get_running_loop()
+                with self._sub_lock:
+                    self._subscribers.append(client_queue)
 
-                while True:
-                    # 检查客户端是否断开
-                    if await request.is_disconnected():
-                        break
-
-                    # 非阻塞排空队列
-                    drained = False
+                try:
                     while True:
-                        try:
-                            event = q.get_nowait()
-                            drained = True
-                            yield f"event: {event['type']}\n"
-                            yield f"data: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
-                        except queue.Empty:
+                        if await request.is_disconnected():
                             break
 
-                    if drained:
-                        continue  # 立即再检查一次，不 sleep
-
-                    # 等待新事件或超时（用短 sleep 替代 threading.Event 的跨线程等待）
-                    # 在 asyncio 中不能直接 block，所以用 run_in_executor
-                    import asyncio
-                    loop = asyncio.get_event_loop()
-
-                    def wait_signal():
-                        ev.wait(1.0)
-                        ev.clear()
-
-                    await loop.run_in_executor(None, wait_signal)
+                        try:
+                            event = await asyncio.wait_for(client_queue.get(), timeout=15)
+                            yield f"event: {event['type']}\n"
+                            yield f"data: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
+                        except asyncio.TimeoutError:
+                            yield ": keepalive\n\n"
+                finally:
+                    with self._sub_lock:
+                        if client_queue in self._subscribers:
+                            self._subscribers.remove(client_queue)
 
             return StreamingResponse(
                 generate(),
@@ -294,25 +579,29 @@ class EngineAPI:
     # ---- 启动 HTTP 服务 --------------------------------------------------
 
     def serve(self, host: str = "127.0.0.1", port: int = 19198):
-        """启动 HTTP 服务（阻塞当前线程）"""
+        """启动 HTTP 服务（阻塞当前线程，端口冲突时优雅退出不崩溃）"""
         print(f"\n{'=' * 50}")
         print(f"  NotmyFault API Server")
         print(f"  监听 http://{host}:{port}")
         print(f"  API 文档: http://{host}:{port}/docs")
         print(f"{'=' * 50}\n")
 
+        config = uvicorn.Config(
+            self.app,
+            host=host,
+            port=port,
+            log_level="info",
+        )
+        self._server = uvicorn.Server(config)
+
         try:
-            uvicorn.run(
-                self.app,
-                host=host,
-                port=port,
-                log_level="info",
-            )
+            self._server.run()
         except OSError as e:
-            if "10048" in str(e) or "bind" in str(e).lower():
-                print(f"\n[错误] 端口 {port} 已被占用！")
-                print(f"  可能之前的引擎进程还没关。")
-                print(f"  在 PowerShell 中运行以下命令找到并关闭它：")
-                print(f"    netstat -ano | findstr {port}")
-                print(f"    taskkill /F /PID <PID>")
-            raise
+            code = getattr(e, 'winerror', None)
+            if str(code) == "10048" or "10048" in str(e) or "bind" in str(e).lower():
+                print(f"\n[提示] 端口 {port} 已被占用 — 引擎可能已在运行")
+            else:
+                raise
+        except SystemExit:
+            # uvicorn 内部通过 sys.exit() 完成干净关闭，这是预期行为
+            print(f"\n[API] HTTP 服务已退出")

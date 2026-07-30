@@ -2,6 +2,8 @@
     "id": "launch_program",
     "name": "启动程序",
     "description": "启动指定程序或打开文件",
+    "version_code": 1,
+    "enabled": true,
     "params": [
         {
             "name": "path",

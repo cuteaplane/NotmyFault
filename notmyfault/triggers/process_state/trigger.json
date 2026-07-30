@@ -3,6 +3,8 @@
     "name": "进程状态扫描器",
     "semantic": "state",
     "description": "持续扫描进程状态并在目标状态到达时通知主程序",
+    "version_code": 1,
+    "enabled": true,
     "params": [
         {
             "name": "process_name",
@@ -16,7 +18,10 @@
             "label": "触发状态",
             "type": "select",
             "default": "running",
-            "options": ["running", "stopped"]
+            "options": [
+                "running",
+                "stopped"
+            ]
         }
     ]
 }

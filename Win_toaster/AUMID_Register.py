@@ -6,6 +6,42 @@ import ctypes
 import winreg
 
 
+def register_protocol() -> bool:
+    """注册 notmyfault:// 协议 → 启动 dashboard.pyw（HKCU，无需管理员）。"""
+    protocol = "notmyfault"
+    key_path = f"SOFTWARE\\Classes\\{protocol}"
+
+    # 找到 dashboard.pyw
+    dashboard_pyw = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "dashboard.pyw")
+    )
+    if not os.path.exists(dashboard_pyw):
+        print(f"[Protocol] 找不到 dashboard.pyw: {dashboard_pyw}")
+        return False
+
+    pythonw = sys.executable.replace("python.exe", "pythonw.exe")
+    if not os.path.exists(pythonw):
+        pythonw = sys.executable  # 回退
+
+    command = f'"{pythonw}" "{dashboard_pyw}" --protocol "%1"'
+
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            winreg.SetValue(key, "", winreg.REG_SZ, "URL:NotmyFault Protocol")
+            winreg.SetValueEx(key, "URL Protocol", 0, winreg.REG_SZ, "")
+
+        with winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER, f"{key_path}\\shell\\open\\command"
+        ) as key:
+            winreg.SetValue(key, "", winreg.REG_SZ, command)
+
+        print(f"[Protocol] 已注册协议: {protocol}:// → dashboard.pyw")
+        return True
+    except OSError as e:
+        print(f"[Protocol] 注册协议失败: {e}")
+        return False
+
+
 def register_aumid_registry(aumid: str, display_name: str, icon_path: str | None) -> bool:
     key_path = f"SOFTWARE\\Classes\\AppUserModelId\\{aumid}"
     try:
@@ -20,6 +56,9 @@ def register_aumid_registry(aumid: str, display_name: str, icon_path: str | None
 
 
 def register_toaster():
+    # 注册协议处理器（每次启动都检查，幂等）
+    register_protocol()
+
     aumid = 'cuteaplane.notmyfault.app'
     display_name = 'NotmyFault'   # 可自定义
     icon_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'logo.ico'))
@@ -32,12 +71,15 @@ def register_toaster():
         elif not icon_path.lower().endswith('.ico'):
             print(f"[AUMID_Register] 图标文件不是 .ico：{icon_path}，将跳过 IconUri 注册。")
 
-    # 1. 检查是否已注册
-    check_command = f'powershell -Command "Get-StartApps | Where-Object {{$_.AppUserModelId -eq \'{aumid}\'}}"'
-    result_check = subprocess.run(check_command, capture_output=True, text=True, shell=True)
-    if aumid in result_check.stdout:
-        print(f"[AUMID_Register] AUMID '{aumid}' 已注册，跳过。")
+    # 1. 检查是否已注册（直接查注册表，因为 Get-StartApps 查不到仅通过注册表注册的 AUMID）
+    key_path = f"SOFTWARE\\Classes\\AppUserModelId\\{aumid}"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as check_key:
+            winreg.QueryValueEx(check_key, "DisplayName")
+        print(f"[AUMID_Register] AUMID '{aumid}' 已注册（注册表检测），跳过。")
         return
+    except OSError:
+        pass  # 注册表键不存在，需要注册
 
     # 2. 首选直接写注册表
 

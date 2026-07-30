@@ -1,0 +1,23 @@
+{
+    "id": "bluetooth_toggle",
+    "name": "开关蓝牙",
+    "description": "打开或关闭蓝牙适配器",
+    "version_code": 1,
+    "enabled": true,
+    "permissions": [
+        "admin"
+    ],
+    "params": [
+        {
+            "name": "action",
+            "label": "操作",
+            "type": "select",
+            "default": "toggle",
+            "options": [
+                "toggle",
+                "on",
+                "off"
+            ]
+        }
+    ]
+}

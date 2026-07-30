@@ -1,382 +1,1817 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NotmyFault</title>
-    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet" />
-    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --md-primary: #0061a4; --md-on-primary: #ffffff;
-            --md-surface: #fdfcff; --md-on-surface: #1a1c1e;
-            --md-surface-container: #f3f3f7; --md-outline: #73777f;
-            --md-success: #146c2e; --md-error: #ba1a1a;
-        }
-        body { font-family: 'Roboto', sans-serif; background-color: var(--md-surface); color: var(--md-on-surface); margin: 0; padding: 0; }
-        header { background-color: var(--md-surface); padding: 16px 32px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #dfe2eb; position: sticky; top: 0; z-index: 10; }
-        h1 { margin: 0; font-size: 22px; font-weight: 500; display: flex; align-items: center; gap: 12px; }
-        .container { padding: 24px 32px; max-width: 900px; margin: 0 auto; }
-        
-        .dashboard-card { background-color: #e8def8; border-radius: 24px; padding: 24px; margin-bottom: 32px; display: flex; justify-content: space-between; align-items: center; }
-        .status-badge { display: inline-flex; align-items: center; gap: 8px; padding: 8px 16px; border-radius: 16px; background-color: var(--md-surface); font-weight: 500; }
-        .status-dot { width: 10px; height: 10px; border-radius: 50%; background-color: var(--md-outline); }
-        .status-dot.active { background-color: var(--md-success); box-shadow: 0 0 8px var(--md-success); }
-        
-        .rule-card { background-color: var(--md-surface-container); border-radius: 16px; padding: 24px; margin-bottom: 24px; border: 1px solid transparent; transition: all 0.2s; }
-        .rule-card:hover { border-color: var(--md-outline); }
-        .section-title { font-size: 14px; font-weight: 700; color: var(--md-primary); margin: 16px 0 12px 0; display: flex; align-items: center; gap: 8px; }
-        
-        .input-row { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 16px; align-items: flex-end; }
-        .input-group { display: flex; flex-direction: column; flex: 1; min-width: 150px; }
-        .input-group label { font-size: 12px; color: var(--md-outline); margin-bottom: 4px; font-weight: 500; }
-        input, select { padding: 12px 16px; border-radius: 8px; border: 1px solid var(--md-outline); background-color: var(--md-surface); color: var(--md-on-surface); font-size: 14px; outline: none; }
-        input:focus, select:focus { border: 2px solid var(--md-primary); padding: 11px 15px; }
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NotmyFault</title>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   Material Design 3 Token System
+   ============================================================ */
+:root {
+  --md-primary: #0061a4;
+  --md-on-primary: #ffffff;
+  --md-primary-container: #d1e4ff;
+  --md-on-primary-container: #001d36;
+  --md-secondary: #6d4d7b;
+  --md-secondary-container: #ceadd4;
+  --md-on-secondary-container: #28053d;
+  --md-tertiary: #006a67;
+  --md-tertiary-container: #5fbebb;
+  --md-on-tertiary-container: #002020;
+  --md-surface: #fdfcff;
+  --md-surface-dim: #dddbdf;
+  --md-surface-container-lowest: #ffffff;
+  --md-surface-container-low: #f8f7fb;
+  --md-surface-container: #f3f3f7;
+  --md-surface-container-high: #ededf1;
+  --md-surface-container-highest: #e7e7eb;
+  --md-on-surface: #1a1c1e;
+  --md-on-surface-variant: #43474e;
+  --md-outline: #73777f;
+  --md-outline-variant: #c3c6cf;
+  --md-success: #146c2e;
+  --md-on-success: #ffffff;
+  --md-success-container: #8ef5a1;
+  --md-error: #ba1a1a;
+  --md-on-error: #ffffff;
+  --md-error-container: #ffdad6;
 
-        .btn { display: inline-flex; align-items: center; gap: 8px; padding: 10px 24px; border-radius: 24px; font-size: 14px; font-weight: 500; border: none; cursor: pointer; transition: opacity 0.2s; }
-        .btn-primary { background-color: var(--md-primary); color: var(--md-on-primary); }
-        .btn-tonal { background-color: #ceadd4; color: #3a004b; }
-        .btn-small { padding: 6px 12px; font-size: 12px; border-radius: 12px; background-color: #e0e2ec; color: #44474e; }
-        .btn:hover { opacity: 0.8; }
-        
-        .icon-btn { background: none; border: none; color: var(--md-outline); cursor: pointer; display: flex; align-items: center; padding: 6px; border-radius: 50%; }
-        .icon-btn:hover { background-color: #ffdad6; color: var(--md-error); }
-    </style>
+  /* Elevation */
+  --md-elevation-1: 0 1px 2px rgba(0,0,0,.08), 0 1px 3px 1px rgba(0,0,0,.06);
+  --md-elevation-2: 0 1px 2px rgba(0,0,0,.08), 0 2px 6px 2px rgba(0,0,0,.06);
+  --md-elevation-3: 0 4px 8px 3px rgba(0,0,0,.06), 0 1px 3px rgba(0,0,0,.08);
+
+  /* Shape */
+  --md-shape-xs: 8px;
+  --md-shape-sm: 12px;
+  --md-shape-md: 16px;
+  --md-shape-lg: 24px;
+  --md-shape-xl: 28px;
+
+  /* Typography */
+  --md-typescale-display: 500 32px/40px 'Roboto', sans-serif;
+  --md-typescale-headline: 400 24px/32px 'Roboto', sans-serif;
+  --md-typescale-title: 500 16px/24px 'Roboto', sans-serif;
+  --md-typescale-body: 400 14px/20px 'Roboto', sans-serif;
+  --md-typescale-label: 500 12px/16px 'Roboto', sans-serif;
+  --md-typescale-label-sm: 500 11px/16px 'Roboto', sans-serif;
+
+  /* Sidebar */
+  --sidebar-width: 240px;
+}
+
+/* Reset */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font: var(--md-typescale-body);
+  background: var(--md-surface-container-lowest);
+  color: var(--md-on-surface);
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ============================================================
+   Sidebar
+   ============================================================ */
+.sidebar {
+  width: var(--sidebar-width);
+  min-width: var(--sidebar-width);
+  height: 100vh;
+  background: var(--md-surface-container-low);
+  border-right: 1px solid var(--md-outline-variant);
+  display: flex;
+  flex-direction: column;
+  user-select: none;
+  z-index: 10;
+}
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 20px 20px 28px;
+  font: var(--md-typescale-title);
+  color: var(--md-on-surface);
+}
+.sidebar-brand .brand-icon {
+  color: var(--md-primary);
+  font-size: 28px;
+  font-variation-settings: 'FILL' 1;
+}
+.sidebar-nav {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 12px;
+}
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: 28px;
+  font: var(--md-typescale-label);
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--md-on-surface-variant);
+  cursor: pointer;
+  transition: background .15s, color .15s;
+  position: relative;
+  text-decoration: none;
+  border: none;
+  background: none;
+  width: 100%;
+  text-align: left;
+}
+.nav-item:hover { background: var(--md-surface-container-highest); color: var(--md-on-surface); }
+.nav-item.active {
+  background: var(--md-secondary-container);
+  color: var(--md-on-secondary-container);
+  font-weight: 600;
+}
+.nav-item .nav-icon {
+  font-size: 22px;
+  font-variation-settings: 'FILL' 0;
+}
+.nav-item.active .nav-icon { font-variation-settings: 'FILL' 1; }
+.sidebar-footer {
+  padding: 16px 24px;
+  font: var(--md-typescale-label-sm);
+  color: var(--md-outline);
+  border-top: 1px solid var(--md-outline-variant);
+}
+
+/* ============================================================
+   Content
+   ============================================================ */
+.content {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--md-surface);
+}
+.page { display: none; padding: 32px 40px; height: 100%; }
+.page.active { display: block; }
+
+.page-header {
+  margin-bottom: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+.page-header h2 {
+  font: var(--md-typescale-headline);
+  color: var(--md-on-surface);
+}
+
+/* ============================================================
+   Home — Status Card
+   ============================================================ */
+.status-card {
+  background: var(--md-primary-container);
+  border-radius: var(--md-shape-lg);
+  padding: 32px;
+  box-shadow: var(--md-elevation-1);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 24px;
+  margin-bottom: 24px;
+}
+.status-card-left {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+.status-indicator {
+  width: 56px; height: 56px;
+  border-radius: 50%;
+  background: var(--md-surface);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.status-icon {
+  font-size: 40px;
+  transition: color .3s, font-variation-settings .3s;
+  font-variation-settings: 'FILL' 0;
+}
+.status-icon.running {
+  color: var(--md-success);
+  font-variation-settings: 'FILL' 1;
+  animation: status-pulse 2s ease-in-out infinite;
+}
+.status-icon.stopped {
+  color: var(--md-outline);
+}
+@keyframes status-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .75; transform: scale(.92); }
+}
+.status-info h3 {
+  font: var(--md-typescale-title);
+  margin-bottom: 2px;
+}
+.status-info p {
+  font: var(--md-typescale-label-sm);
+  color: var(--md-on-surface-variant);
+}
+.status-card-right {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ============================================================
+   Home — Stats Row
+   ============================================================ */
+.stats-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 16px;
+  margin-bottom: 24px;
+}
+.stat-card {
+  background: var(--md-surface-container-low);
+  border-radius: var(--md-shape-sm);
+  padding: 20px;
+  box-shadow: var(--md-elevation-1);
+}
+.stat-card .stat-icon {
+  font-size: 24px;
+  color: var(--md-primary);
+  margin-bottom: 8px;
+}
+.stat-card .stat-value {
+  font: var(--md-typescale-headline);
+  color: var(--md-on-surface);
+}
+.stat-card .stat-label {
+  font: var(--md-typescale-label-sm);
+  color: var(--md-on-surface-variant);
+  margin-top: 2px;
+}
+
+/* ============================================================
+   Home — Event Log (mini)
+   ============================================================ */
+.event-log {
+  background: var(--md-surface-container-lowest);
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--md-shape-sm);
+  padding: 16px 20px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.event-log h4 {
+  font: var(--md-typescale-label);
+  color: var(--md-on-surface-variant);
+  margin-bottom: 12px;
+  letter-spacing: .5px;
+}
+.event-log .log-entry {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 0;
+  font: var(--md-typescale-label-sm);
+  font-size: 12px;
+  border-bottom: 1px solid var(--md-outline-variant);
+}
+.event-log .log-entry:last-child { border: none; }
+.event-log .log-dot { width: 8px; height: 8px; border-radius: 50%; margin-top: 3px; flex-shrink: 0; }
+.event-log .log-dot.trigger { background: var(--md-tertiary); }
+.event-log .log-dot.action { background: var(--md-secondary); }
+.event-log .log-dot.error { background: var(--md-error); }
+.event-log:empty::after {
+  content: '暂无事件';
+  display: block;
+  text-align: center;
+  color: var(--md-outline);
+  font: var(--md-typescale-label-sm);
+  padding: 20px 0;
+}
+
+/* ============================================================
+   Buttons (MD3)
+   ============================================================ */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 24px;
+  border-radius: var(--md-shape-xl);
+  font: var(--md-typescale-label);
+  font-size: 14px;
+  font-weight: 500;
+  border: none;
+  cursor: pointer;
+  transition: box-shadow .15s, opacity .15s, background .15s;
+  white-space: nowrap;
+  letter-spacing: .1px;
+}
+.btn:hover { box-shadow: var(--md-elevation-1); }
+.btn:active { box-shadow: none; opacity: .85; }
+.btn:disabled { opacity: .38; pointer-events: none; box-shadow: none; }
+
+.btn-filled {
+  background: var(--md-primary);
+  color: var(--md-on-primary);
+}
+.btn-filled.btn-error {
+  background: var(--md-error);
+  color: var(--md-on-error);
+}
+
+.btn-tonal {
+  background: var(--md-secondary-container);
+  color: var(--md-on-secondary-container);
+}
+
+.btn-outlined {
+  background: transparent;
+  color: var(--md-primary);
+  border: 1px solid var(--md-outline);
+}
+.btn-outlined.btn-error {
+  color: var(--md-error);
+  border-color: var(--md-error);
+}
+
+.btn-text {
+  background: transparent;
+  color: var(--md-primary);
+  padding: 10px 12px;
+}
+.btn-text.btn-error { color: var(--md-error); }
+
+/* Icon only */
+.icon-btn {
+  background: none;
+  border: none;
+  color: var(--md-on-surface-variant);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px; height: 40px;
+  border-radius: 50%;
+  transition: background .15s, color .15s;
+  flex-shrink: 0;
+}
+.icon-btn:hover { background: var(--md-surface-container-highest); }
+.icon-btn.danger:hover { background: var(--md-error-container); color: var(--md-error); }
+.icon-btn .material-symbols-outlined { font-size: 20px; }
+
+/* ============================================================
+   Rule Cards
+   ============================================================ */
+.rules-toolbar {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+}
+.rule-card {
+  background: var(--md-surface-container-lowest);
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--md-shape-md);
+  padding: 24px;
+  margin-bottom: 20px;
+  transition: border-color .2s, box-shadow .2s;
+  box-shadow: var(--md-elevation-1);
+}
+.rule-card:hover {
+  border-color: var(--md-outline);
+  box-shadow: var(--md-elevation-2);
+}
+.rule-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+.rule-card-header .input-group { flex: 1; max-width: 400px; }
+
+.rule-section {
+  margin-bottom: 20px;
+}
+.rule-section-title {
+  font: var(--md-typescale-label);
+  font-size: 13px;
+  color: var(--md-primary);
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  letter-spacing: .5px;
+}
+
+/* ============================================================
+   Forms
+   ============================================================ */
+.input-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: flex-end;
+}
+.input-row + .input-row { margin-top: 12px; }
+.input-group {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 140px;
+}
+.input-group label {
+  font: var(--md-typescale-label-sm);
+  color: var(--md-on-surface-variant);
+  margin-bottom: 6px;
+}
+input, select {
+  padding: 10px 14px;
+  border-radius: var(--md-shape-xs);
+  border: 1px solid var(--md-outline-variant);
+  background: var(--md-surface-container-lowest);
+  color: var(--md-on-surface);
+  font: var(--md-typescale-body);
+  font-size: 14px;
+  outline: none;
+  transition: border-color .15s;
+  min-height: 42px;
+}
+input:focus, select:focus {
+  border: 2px solid var(--md-primary);
+  padding: 9px 13px;
+}
+.action-row {
+  background: var(--md-surface-container-low);
+  padding: 12px 16px;
+  border-radius: var(--md-shape-xs);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: flex-end;
+}
+.action-row + .action-row { margin-top: 8px; }
+
+/* ============================================================
+   About Page
+   ============================================================ */
+.about-card {
+  background: var(--md-surface-container-lowest);
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--md-shape-md);
+  padding: 32px;
+  box-shadow: var(--md-elevation-1);
+  max-width: 560px;
+}
+.about-card p { margin-bottom: 12px; line-height: 1.7; }
+.about-card .tech-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 16px 0;
+}
+.tech-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: var(--md-shape-xs);
+  background: var(--md-secondary-container);
+  color: var(--md-on-secondary-container);
+  font: var(--md-typescale-label-sm);
+  font-weight: 500;
+}
+
+/* ============================================================
+   Empty State
+   ============================================================ */
+.empty-state {
+  text-align: center;
+  padding: 60px 20px;
+  color: var(--md-on-surface-variant);
+}
+.empty-state .empty-icon {
+  font-size: 64px;
+  color: var(--md-outline-variant);
+  margin-bottom: 16px;
+  font-variation-settings: 'FILL' 0;
+}
+.empty-state h3 {
+  font: var(--md-typescale-title);
+  margin-bottom: 8px;
+  color: var(--md-on-surface);
+}
+.empty-state p {
+  font: var(--md-typescale-body);
+  margin-bottom: 20px;
+}
+
+/* ============================================================
+   Plugin Cards
+   ============================================================ */
+.plugin-card {
+  background: var(--md-surface-container-lowest);
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--md-shape-md);
+  padding: 20px;
+  box-shadow: var(--md-elevation-1);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  transition: border-color .2s, box-shadow .2s;
+}
+.plugin-card:hover { border-color: var(--md-outline); box-shadow: var(--md-elevation-2); }
+.plugin-card.disabled { opacity: .6; }
+.plugin-card-top {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.plugin-card-icon { font-size: 32px; color: var(--md-primary); flex-shrink: 0; }
+.plugin-card-info { flex: 1; min-width: 0; }
+.plugin-card-name {
+  font: var(--md-typescale-title);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.plugin-card-id {
+  font: var(--md-typescale-label-sm);
+  color: var(--md-on-surface-variant);
+}
+.plugin-card-desc {
+  font: var(--md-typescale-body);
+  font-size: 13px;
+  color: var(--md-on-surface-variant);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.plugin-card-meta { display: flex; flex-wrap: wrap; gap: 6px; }
+.plugin-card-footer {
+  border-top: 1px solid var(--md-outline-variant);
+  padding-top: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.switch-label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.switch-text { font: var(--md-typescale-label-sm); color: var(--md-on-surface-variant); }
+.switch-input {
+  width: 40px; height: 24px;
+  appearance: none;
+  border-radius: 12px;
+  background: var(--md-outline-variant);
+  position: relative;
+  cursor: pointer;
+  transition: background .2s;
+  border: none;
+  min-height: unset;
+  padding: 0;
+}
+.switch-input:checked { background: var(--md-primary); }
+.switch-input::after {
+  content: '';
+  position: absolute;
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  top: 3px; left: 3px;
+  transition: transform .2s;
+}
+.switch-input:checked::after { transform: translateX(16px); }
+.switch-input:focus { border: none; padding: 0; }
+#installDialog::backdrop { background: rgba(0,0,0,.4); }
+
+/* ============================================================
+   Utility
+   ============================================================ */
+.spacer { flex: 1; }
+.snackbar {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--md-on-surface-variant);
+  color: var(--md-surface-container-lowest);
+  padding: 12px 24px;
+  border-radius: var(--md-shape-xs);
+  font: var(--md-typescale-label);
+  font-size: 13px;
+  z-index: 100;
+  opacity: 0;
+  transition: opacity .3s;
+  pointer-events: none;
+  box-shadow: var(--md-elevation-2);
+}
+.snackbar.show { opacity: 1; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--md-outline-variant); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--md-outline); }
+
+/* MD 旋转圆圈 */
+@keyframes md-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.md-spinner {
+  animation: md-spin 1.2s cubic-bezier(0.4, 0.0, 0.2, 1) infinite;
+  font-variation-settings: 'FILL' 0;
+}
+
+/* Responsive */
+@media (max-width: 700px) {
+  .sidebar { width: 72px; min-width: 72px; }
+  .sidebar-brand span, .nav-item span:not(.material-symbols-outlined), .sidebar-footer { display: none; }
+  .nav-item { justify-content: center; padding: 12px; }
+  .page { padding: 24px 16px; }
+}
+</style>
 </head>
 <body>
 
-    <header>
-        <h1><span class="material-symbols-outlined">manufacturing</span> NotmyFault</h1>
-        <div style="display: flex; gap: 12px;">
-            <button class="btn btn-primary" onclick="saveConfig()">
-                <span class="material-symbols-outlined">save</span> 保存配置
-            </button>
-            <button class="btn btn-primary" onclick="addRule()" style="background-color: #146c2e;">
-                <span class="material-symbols-outlined">add</span> 新建规则
-            </button>
-        </div>
-    </header>
+<!-- ============================================================
+     Sidebar
+     ============================================================ -->
+<nav class="sidebar">
+  <div class="sidebar-brand">
+    <span class="material-symbols-outlined brand-icon">manufacturing</span>
+    <span>NotmyFault</span>
+  </div>
+  <div class="sidebar-nav">
+    <button class="nav-item active" data-page="home">
+      <span class="material-symbols-outlined nav-icon">dashboard</span>
+      <span>首页</span>
+    </button>
+    <button class="nav-item" data-page="plugins">
+      <span class="material-symbols-outlined nav-icon">extension</span>
+      <span>插件</span>
+    </button>
+    <button class="nav-item" data-page="rules">
+      <span class="material-symbols-outlined nav-icon">rule</span>
+      <span>规则</span>
+    </button>
+    <button class="nav-item" data-page="logs">
+      <span class="material-symbols-outlined nav-icon">article</span>
+      <span>日志</span>
+    </button>
+    <button class="nav-item" data-page="about">
+      <span class="material-symbols-outlined nav-icon">info</span>
+      <span>关于</span>
+    </button>
+  </div>
+  <div class="sidebar-footer">NotmyFault v1.0</div>
+</nav>
 
-    <div class="container">
-        <div class="dashboard-card">
-            <div>
-                <h2 style="margin: 0 0 12px 0; font-size: 18px;">NotmyFault 引擎状态</h2>
-                <div class="status-badge">
-                    <div class="status-dot" id="statusDot"></div>
-                    <span id="statusText">🤔已停止</span>
-                </div>
-            </div>
-            <button class="btn btn-tonal" id="startBtn" onclick="startEngine()">
-                <span class="material-symbols-outlined">play_arrow</span> 启动 NotmyFault
-            </button>
-        </div>
-        <div id="app"></div>
+<!-- ============================================================
+     Content
+     ============================================================ -->
+<main class="content">
+
+  <!-- HOME -->
+  <section class="page active" id="page-home">
+    <div class="page-header">
+      <h2>引擎状态</h2>
+      <button class="btn btn-outlined" onclick="refreshHome()">
+        <span class="material-symbols-outlined">refresh</span> 刷新
+      </button>
     </div>
 
-    <script>
-        let schema = { triggers: {}, actions: {} };
-        let configData = { rules: [] };
+    <div class="status-card">
+      <div class="status-card-left">
+        <div class="status-indicator" id="statusIndicator">
+          <span class="material-symbols-outlined status-icon stopped" id="statusIcon">stop_circle</span>
+        </div>
+        <div class="status-info">
+          <h3 id="statusText">已停止</h3>
+          <p id="statusDetail">引擎未运行</p>
+        </div>
+      </div>
+      <div class="status-card-right">
+        <button class="btn btn-tonal" id="startBtn" onclick="startEngine()" style="min-width:140px;">
+          <span class="material-symbols-outlined">play_arrow</span> 启动引擎
+        </button>
+        <button class="btn btn-filled btn-error" id="stopBtn" onclick="stopEngine()" style="display:none;min-width:140px;">
+          <span class="material-symbols-outlined">power_settings_new</span> 关闭引擎
+        </button>
+      </div>
+    </div>
 
-        // HTML 转义，防止 XSS
-        function esc(s) {
-            if (s == null) return '';
-            const div = document.createElement('div');
-            div.textContent = String(s);
-            return div.innerHTML;
-        }
+    <div class="stats-row" id="statsRow">
+      <div class="stat-card">
+        <div class="stat-icon material-symbols-outlined">rule</div>
+        <div class="stat-value" id="statRules">—</div>
+        <div class="stat-label">规则数量</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon material-symbols-outlined">memory</div>
+        <div class="stat-value" id="statTriggers">—</div>
+        <div class="stat-label">活跃触发器</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon material-symbols-outlined">bolt</div>
+        <div class="stat-value" id="statActions">—</div>
+        <div class="stat-label">动作类型</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon material-symbols-outlined">tag</div>
+        <div class="stat-value" id="statPid">—</div>
+        <div class="stat-label">进程 PID</div>
+      </div>
+    </div>
 
-        // 获取插件的 params 定义（兼容新旧格式）
-        function getParamDefs(pluginMeta) {
-            if (!pluginMeta) return [];
-            // 新格式: params = [{name, label, type, default, ...}]
-            if (Array.isArray(pluginMeta.params)) return pluginMeta.params;
-            // 旧格式: required_params = ["name1", "name2"]
-            if (Array.isArray(pluginMeta.required_params)) {
-                return pluginMeta.required_params.map(p => ({ name: p, label: p, type: 'string', default: '' }));
-            }
-            return [];
-        }
+    <h4 style="font:var(--md-typescale-label);color:var(--md-on-surface-variant);margin-bottom:12px;letter-spacing:.5px;">引擎诊断</h4>
+    <div id="diagPanel" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;">
+      <div class="stat-card"><div class="stat-value" id="diagPlugins">—</div><div class="stat-label">插件状态</div></div>
+      <div class="stat-card"><div class="stat-value" id="diagRules">—</div><div class="stat-label">规则状态</div></div>
+      <div class="stat-card"><div class="stat-value" id="diagActions">—</div><div class="stat-label">动作执行</div></div>
+      <div class="stat-card"><div class="stat-value" id="diagErrors">—</div><div class="stat-label">错误 / 警告</div></div>
+    </div>
+    <div id="diagDetail" style="font:var(--md-typescale-label-sm);color:var(--md-on-surface-variant);margin-top:12px;max-height:120px;overflow-y:auto;"></div>
+  </section>
 
-        // 根据 param 定义渲染输入控件
-        function renderParamInput(paramDef, currentValue, onChangeHandler) {
-            const name = paramDef.name;
-            const label = paramDef.label || name;
-            const type = paramDef.type || 'string';
-            const placeholder = paramDef.placeholder || '';
-            const val = currentValue != null ? currentValue : (paramDef.default || '');
+  <!-- PLUGINS -->
+  <section class="page" id="page-plugins">
+    <div class="page-header">
+      <h2>插件管理</h2>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;">
+        <button class="btn btn-tonal" onclick="showInstallDialog()">
+          <span class="material-symbols-outlined">upload</span> 安装插件
+        </button>
+        <button class="btn btn-outlined" onclick="loadPlugins()">
+          <span class="material-symbols-outlined">refresh</span> 刷新
+        </button>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:20px;">
+      <button class="btn btn-text" id="plugTabTriggers" onclick="switchPluginTab('triggers')" style="font-weight:600;">触发器</button>
+      <button class="btn btn-text" id="plugTabActions" onclick="switchPluginTab('actions')">动作</button>
+    </div>
+    <div id="pluginsGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;"></div>
 
-            let inputHtml = '';
-            if (type === 'select' && Array.isArray(paramDef.options)) {
-                inputHtml = `<select onchange="${onChangeHandler}">`;
-                paramDef.options.forEach(opt => {
-                    inputHtml += `<option value="${esc(opt)}" ${String(val) === opt ? 'selected' : ''}>${esc(opt)}</option>`;
-                });
-                inputHtml += `</select>`;
-            } else if (type === 'number') {
-                inputHtml = `<input type="number" value="${esc(val)}" placeholder="${esc(placeholder)}" onchange="${onChangeHandler}">`;
-            } else {
-                inputHtml = `<input type="text" value="${esc(val)}" placeholder="${esc(placeholder)}" onchange="${onChangeHandler}">`;
-            }
+    <template id="pluginCardTpl">
+      <div class="plugin-card" data-plugin-card>
+        <div class="plugin-card-top">
+          <span class="material-symbols-outlined plugin-card-icon">extension</span>
+          <div class="plugin-card-info">
+            <div class="plugin-card-name"></div>
+            <div class="plugin-card-id"></div>
+          </div>
+          <div class="plugin-card-actions">
+            <button class="icon-btn danger" data-delete-btn title="卸载" style="display:none;">
+              <span class="material-symbols-outlined">delete</span>
+            </button>
+          </div>
+        </div>
+        <div class="plugin-card-body">
+          <div class="plugin-card-desc"></div>
+          <div class="plugin-card-meta">
+            <span class="tech-tag" data-version></span>
+            <span class="tech-tag" data-origin></span>
+            <span class="tech-tag" data-admin style="display:none;background:var(--md-error-container);color:var(--md-error);">admin</span>
+            <span class="tech-tag" data-error style="display:none;background:var(--md-error-container);color:var(--md-error);"></span>
+          </div>
+        </div>
+        <div class="plugin-card-footer">
+          <label class="switch-label">
+            <span class="switch-text" data-enable-text>已启用</span>
+            <input type="checkbox" class="switch-input" data-enable-check onchange="togglePlugin(this)" checked>
+          </label>
+        </div>
+      </div>
+    </template>
 
-            return `
-                <div class="input-group">
-                    <label>${esc(label)}</label>
-                    ${inputHtml}
-                </div>
-            `;
-        }
+    <dialog id="installDialog" style="border:1px solid var(--md-outline-variant);border-radius:var(--md-shape-lg);padding:32px;max-width:440px;width:90%;background:var(--md-surface-container-lowest);color:var(--md-on-surface);">
+      <h3 style="font:var(--md-typescale-title);margin-bottom:8px;">安装插件</h3>
+      <p style="font:var(--md-typescale-body);color:var(--md-on-surface-variant);margin-bottom:20px;">选择一个 .nmfp 文件（7z 打包的插件文件夹）。</p>
+      <div style="border:2px dashed var(--md-outline-variant);border-radius:var(--md-shape-sm);padding:28px;text-align:center;margin-bottom:16px;cursor:pointer;" id="dropZone">
+        <span class="material-symbols-outlined" style="font-size:48px;color:var(--md-outline);margin-bottom:8px;display:block;">upload_file</span>
+        <span style="font:var(--md-typescale-label-sm);color:var(--md-on-surface-variant);">拖拽 .nmfp 到此处或点击选择</span>
+        <input type="file" id="installFileInput" accept=".nmfp" style="display:none;" onchange="installPlugin(this.files[0])">
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;">
+        <button class="btn btn-text" onclick="document.getElementById('installDialog').close()">取消</button>
+      </div>
+    </dialog>
 
-        function renderUI() {
-            const app = document.getElementById('app');
-            app.innerHTML = '';
+    <dialog id="keyDialog" style="border:1px solid var(--md-outline-variant);border-radius:var(--md-shape-lg);padding:32px;max-width:400px;width:90%;background:var(--md-surface-container-lowest);color:var(--md-on-surface);text-align:center;">
+      <span class="material-symbols-outlined" style="font-size:48px;color:var(--md-primary);margin-bottom:12px;display:block;">key</span>
+      <h3 style="font:var(--md-typescale-title);margin-bottom:4px;">NotmyFault 安装密钥</h3>
+      <div style="display:flex;align-items:center;justify-content:center;gap:6px;margin-bottom:20px;color:var(--md-on-surface-variant);">
+        <span class="material-symbols-outlined" style="font-size:14px;">info</span>
+        <span style="font:var(--md-typescale-label-sm);">NotmyFault 安装密钥是您在安装 NotmyFault 时输入的密钥。</span>
+      </div>
+      <form onsubmit="submitKeyDialog();return false" style="text-align:left;margin-bottom:20px;">
+        <input type="password" id="keyDialogPassword" placeholder="输入密钥" style="width:100%;font-size:16px;text-align:center;">
+      </form>
+      <div style="display:flex;gap:8px;justify-content:flex-end;">
+        <button class="btn btn-text" onclick="document.getElementById('keyDialog').close()">取消</button>
+        <button class="btn btn-filled" onclick="submitKeyDialog()">确认</button>
+      </div>
+    </dialog>
+  </section>
 
-            if (configData.rules.length === 0) {
-                app.innerHTML = '<div style="text-align:center; padding: 40px; color: var(--md-outline);">还没有配置任何规则哦，快去新建吧~</div>';
-                return;
-            }
+  <!-- RULES -->
+  <section class="page" id="page-rules">
+    <div class="page-header">
+      <h2>规则配置</h2>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;">
+        <button class="btn btn-tonal" onclick="addRule()">
+          <span class="material-symbols-outlined">add</span> 新建规则
+        </button>
+        <button class="btn btn-filled" onclick="saveConfig()">
+          <span class="material-symbols-outlined">save</span> 保存配置
+        </button>
+      </div>
+    </div>
+    <div id="app"></div>
+  </section>
 
-            configData.rules.forEach((rule, rIdx) => {
-                const card = document.createElement('div');
-                card.className = 'rule-card';
+  <!-- LOGS -->
+  <section class="page" id="page-logs">
+    <div class="page-header">
+      <h2>引擎日志</h2>
+      <div style="display:flex;gap:12px;align-items:center;">
+        <label style="font:var(--md-typescale-label-sm);display:flex;align-items:center;gap:6px;cursor:pointer;">
+          <input type="checkbox" id="logAutoRefresh" checked onchange="toggleLogAutoRefresh()"> 自动刷新
+        </label>
+        <button class="btn btn-outlined" onclick="refreshLog()">
+          <span class="material-symbols-outlined">refresh</span> 刷新
+        </button>
+      </div>
+    </div>
+    <pre id="logViewer" style="background:var(--md-surface-container-lowest);border:1px solid var(--md-outline-variant);border-radius:var(--md-shape-sm);padding:16px;font:11px/1.5 'Cascadia Code','Consolas',monospace;max-height:calc(100vh - 200px);overflow:auto;white-space:pre-wrap;word-break:break-all;">加载中...</pre>
+  </section>
 
-                // 1. 规则名称
-                let html = `
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                        <div class="input-group" style="flex: 1; margin-right: 20px;">
-                            <label>规则名称</label>
-                            <input type="text" value="${esc(rule.name || '')}" onchange="updateData(${rIdx}, 'name', this.value)">
-                        </div>
-                        <button class="icon-btn" onclick="deleteRule(${rIdx})" title="删除规则">
-                            <span class="material-symbols-outlined">delete</span>
-                        </button>
-                    </div>
-                `;
+  <!-- ABOUT -->
+  <section class="page" id="page-about">
+    <div class="page-header"><h2>关于</h2></div>
+    <div class="about-card">
+      <p style="font:var(--md-typescale-title);margin-bottom:4px;">NotmyFault</p>
+      <p style="color:var(--md-on-surface-variant);">轻量级 Windows 系统自动化工具 — 设置规则，当条件满足时自动执行动作。</p>
+      <p style="font:var(--md-typescale-label-sm);color:var(--md-on-surface-variant);margin-top:24px;">
+        引擎在后台独立运行，关闭管理界面不影响引擎工作。
+      </p>
+      <p style="font:var(--md-typescale-label-sm);color:var(--md-outline);margin-top:16px;">
+        © 2025 NotmyFault Project &nbsp;|&nbsp; %APPDATA%/NotmyFault/
+      </p>
+    </div>
+  </section>
 
-                // 2. 触发器选择 & 参数
-                const currentTrigger = rule.event?.type;
-                html += `<div class="section-title"><span class="material-symbols-outlined">memory</span> 触发事件</div><div class="input-row">`;
+</main>
 
-                // 触发器下拉框
-                html += `<div class="input-group" style="flex: 0.5;"><label>选择触发器</label><select onchange="changeTrigger(${rIdx}, this.value)">`;
-                Object.keys(schema.triggers).forEach(tKey => {
-                    const tName = schema.triggers[tKey].name || tKey;
-                    html += `<option value="${esc(tKey)}" ${currentTrigger === tKey ? 'selected' : ''}>${esc(tName)}</option>`;
-                });
-                html += `</select></div>`;
+<div class="snackbar" id="snackbar"></div>
 
-                // 触发器参数 — 使用 schema 中的 params 定义渲染
-                const triggerDefs = getParamDefs(schema.triggers[currentTrigger]);
-                triggerDefs.forEach(pDef => {
-                    const curVal = (rule.event && rule.event.params) ? rule.event.params[pDef.name] : null;
-                    html += renderParamInput(pDef, curVal,
-                        `updateEventParam(${rIdx}, '${esc(pDef.name)}', this${pDef.type === 'select' ? '.value' : '.value'})`);
-                });
-                html += `</div>`;
+<!-- ============================================================
+     JavaScript — Core Logic (preserved & extended)
+     ============================================================ -->
+<script>
+// ---- State ----
+let schema = { triggers: {}, actions: {} };
+let configData = { rules: [] };
+let _engineStatus = { running: false, pid: null };
+let _timers = [];      // 跟踪所有 interval/timeout，便于清理
+let _sseSource = null; // SSE EventSource 引用
+let _sseRetryCount = 0;
+const _sseMaxRetries = 10;
+let _starting = false; // startEngine 防重入
+let _stopping = false; // stopEngine 防重入
+const API = 'http://127.0.0.1:19198';
 
-                // 3. 动作选择 & 参数
-                html += `<div class="section-title" style="justify-content: space-between;">
-                            <span><span class="material-symbols-outlined">bolt</span> 执行动作</span>
-                            <button class="btn btn-small" onclick="addAction(${rIdx})">+ 添加动作</button>
-                         </div>`;
+// ---- Timer 管理 ----
+function _setInterval(fn, ms) {
+  const id = setInterval(fn, ms);
+  _timers.push(id);
+  return id;
+}
+function _setTimeout(fn, ms) {
+  const id = setTimeout(fn, ms);
+  _timers.push(id);
+  return id;
+}
+function _clearAllTimers() {
+  _timers.forEach(id => { try { clearInterval(id); } catch(e) {} try { clearTimeout(id); } catch(e) {} });
+  _timers = [];
+}
 
-                (rule.actions || []).forEach((action, aIdx) => {
-                    html += `<div class="input-row" style="background: var(--md-surface); padding: 12px; border-radius: 8px; margin-bottom: 8px;">`;
+// ---- Sidebar Navigation ----
+(function() {
+  const navItems = document.querySelectorAll('.nav-item');
+  const pages = document.querySelectorAll('.page');
+  navItems.forEach(item => {
+    item.addEventListener('click', () => {
+      const target = item.dataset.page;
+      navItems.forEach(n => n.classList.remove('active'));
+      item.classList.add('active');
+      pages.forEach(p => p.classList.remove('active'));
+      const pageEl = document.getElementById('page-' + target);
+      if (pageEl) pageEl.classList.add('active');
+    });
+  });
+})();
 
-                    // 动作下拉框
-                    html += `<div class="input-group" style="flex: 0.5;"><label>动作类型</label><select onchange="changeAction(${rIdx}, ${aIdx}, this.value)">`;
-                    Object.keys(schema.actions).forEach(aKey => {
-                        const aName = schema.actions[aKey].name || aKey;
-                        html += `<option value="${esc(aKey)}" ${action.type === aKey ? 'selected' : ''}>${esc(aName)}</option>`;
-                    });
-                    html += `</select></div>`;
+// ---- Snackbar ----
+let _snackTimer;
+function snackbar(msg) {
+  const el = document.getElementById('snackbar');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(_snackTimer);
+  _snackTimer = setTimeout(() => el.classList.remove('show'), 2000);
+}
 
-                    // 动作参数 — 使用 schema 中的 params 定义渲染
-                    const actionDefs = getParamDefs(schema.actions[action.type]);
-                    actionDefs.forEach(pDef => {
-                        const curVal = (action.params) ? action.params[pDef.name] : null;
-                        html += renderParamInput(pDef, curVal,
-                            `updateActionParam(${rIdx}, ${aIdx}, '${esc(pDef.name)}', this${pDef.type === 'select' ? '.value' : '.value'})`);
-                    });
+// ---- HTML escape ----
+function esc(s) {
+  if (s == null) return '';
+  const div = document.createElement('div');
+  div.textContent = String(s);
+  return div.innerHTML;
+}
 
-                    html += `<button class="icon-btn" onclick="removeAction(${rIdx}, ${aIdx})" title="移除动作"><span class="material-symbols-outlined">close</span></button></div>`;
-                });
+// ---- Plugin param definitions ----
+function getParamDefs(pluginMeta) {
+  if (!pluginMeta) return [];
+  if (Array.isArray(pluginMeta.params)) return pluginMeta.params;
+  if (Array.isArray(pluginMeta.required_params)) {
+    return pluginMeta.required_params.map(p => ({ name: p, label: p, type: 'string', default: '' }));
+  }
+  return [];
+}
 
-                card.innerHTML = html;
-                app.appendChild(card);
-            });
-        }
+// ---- Render a param input ----
+function renderParamInput(paramDef, currentValue, onChangeHandler) {
+  const name = paramDef.name;
+  const label = paramDef.label || name;
+  const type = paramDef.type || 'string';
+  const placeholder = paramDef.placeholder || '';
+  const val = currentValue != null ? currentValue : (paramDef.default || '');
 
-        // --- 数据更新 ---
-        function updateData(rIdx, key, val) { configData.rules[rIdx][key] = val; }
-        function updateEventParam(rIdx, key, val) {
-            if (!configData.rules[rIdx].event) configData.rules[rIdx].event = { type: '', params: {} };
-            if (!configData.rules[rIdx].event.params) configData.rules[rIdx].event.params = {};
-            configData.rules[rIdx].event.params[key] = val;
-        }
-        function updateActionParam(rIdx, aIdx, key, val) {
-            if (!configData.rules[rIdx].actions[aIdx].params) configData.rules[rIdx].actions[aIdx].params = {};
-            configData.rules[rIdx].actions[aIdx].params[key] = val;
-        }
+  let inputHtml = '';
+  if (type === 'select' && Array.isArray(paramDef.options)) {
+    inputHtml = `<select onchange="${onChangeHandler}">`;
+    paramDef.options.forEach(opt => {
+      inputHtml += `<option value="${esc(opt)}" ${String(val) === opt ? 'selected' : ''}>${esc(opt)}</option>`;
+    });
+    inputHtml += `</select>`;
+  } else if (type === 'number') {
+    inputHtml = `<input type="number" value="${esc(val)}" placeholder="${esc(placeholder)}" onchange="${onChangeHandler}">`;
+  } else {
+    inputHtml = `<input type="text" value="${esc(val)}" placeholder="${esc(placeholder)}" onchange="${onChangeHandler}">`;
+  }
+  return `<div class="input-group"><label>${esc(label)}</label>${inputHtml}</div>`;
+}
 
-        // 从 schema 的 params 定义生成默认值对象
-        function buildDefaultParams(pluginMeta) {
-            const defs = getParamDefs(pluginMeta);
-            const params = {};
-            defs.forEach(p => { params[p.name] = p.default || ''; });
-            return params;
-        }
+// ---- Render all rules ----
+function renderUI() {
+  const app = document.getElementById('app');
+  app.innerHTML = '';
 
-        // 切换触发器
-        function changeTrigger(rIdx, newType) {
-            const newParams = buildDefaultParams(schema.triggers[newType]);
-            configData.rules[rIdx].event = { type: newType, params: newParams };
-            renderUI();
-        }
+  if (configData.rules.length === 0) {
+    app.innerHTML = `
+      <div class="empty-state">
+        <div class="material-symbols-outlined empty-icon">rule_folder</div>
+        <h3>还没有规则</h3>
+        <p>创建你的第一条自动化规则，让 NotmyFault 开始工作</p>
+        <button class="btn btn-tonal" onclick="addRule()">
+          <span class="material-symbols-outlined">add</span> 新建规则
+        </button>
+      </div>`;
+    return;
+  }
 
-        // 切换动作
-        function changeAction(rIdx, aIdx, newType) {
-            const newParams = buildDefaultParams(schema.actions[newType]);
-            configData.rules[rIdx].actions[aIdx] = { type: newType, params: newParams };
-            renderUI();
-        }
+  configData.rules.forEach((rule, rIdx) => {
+    const card = document.createElement('div');
+    card.className = 'rule-card';
 
-        function deleteRule(rIdx) { configData.rules.splice(rIdx, 1); renderUI(); }
+    // Header: name + delete
+    let html = `<div class="rule-card-header">
+      <div class="input-group">
+        <label>规则名称</label>
+        <input type="text" value="${esc(rule.name || '')}" onchange="updateData(${rIdx}, 'name', this.value)" placeholder="输入规则名称">
+      </div>
+      <button class="icon-btn danger" onclick="deleteRule(${rIdx})" title="删除规则">
+        <span class="material-symbols-outlined">delete</span>
+      </button>
+    </div>`;
 
-        function addAction(rIdx) {
-            const defaultAction = Object.keys(schema.actions)[0] || "unknown";
-            configData.rules[rIdx].actions.push({ type: defaultAction, params: {} });
-            changeAction(rIdx, configData.rules[rIdx].actions.length - 1, defaultAction);
-        }
-
-        function addRule() {
-            const defaultTrigger = Object.keys(schema.triggers)[0] || "unknown";
-            configData.rules.unshift({ name: "新规则", event: { type: defaultTrigger, params: {} }, actions: [] });
-            changeTrigger(0, defaultTrigger);
-        }
-
-        // --- API 基础地址 ---
-        const API = 'http://127.0.0.1:19198';
-
-        // --- 后端通讯 ---
-        async function saveConfig() {
-            try {
-                const res = await fetch(API + '/api/rules', {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ rules: configData.rules })
-                });
-                const data = await res.json();
-                if (data.ok) alert("保存成功啦！");
-                else alert("保存失败: " + (data.error || "未知错误"));
-            } catch (e) {
-                alert("无法连接到引擎: " + e.message);
-            }
-        }
-
-        async function startEngine() {
-            const btn = document.getElementById('startBtn');
-            btn.disabled = true;
-            btn.innerHTML = '<span class="material-symbols-outlined">hourglass_empty</span> 启动中...';
-
-            try {
-                const res = await fetch(API + '/api/engine/start', { method: 'POST' });
-                const data = await res.json();
-                if (data.ok) {
-                    document.getElementById('statusDot').classList.add('active');
-                    document.getElementById('statusText').innerText = "运行中";
-                    btn.innerHTML = '<span class="material-symbols-outlined">check_circle</span> 运行中';
-                } else {
-                    alert("启动失败: " + JSON.stringify(data));
-                    btn.disabled = false;
-                }
-            } catch (e) {
-                alert("无法连接到引擎: " + e.message);
-                btn.disabled = false;
-            }
-        }
-
-        function updateStatusUI(status) {
-            const dot = document.getElementById('statusDot');
-            const text = document.getElementById('statusText');
-            const btn = document.getElementById('startBtn');
-            if (status.running) {
-                dot.classList.add('active');
-                text.innerText = "运行中";
-                btn.innerHTML = '<span class="material-symbols-outlined">check_circle</span> 运行中';
-                btn.disabled = true;
-            } else {
-                dot.classList.remove('active');
-                text.innerText = "已停止";
-                btn.innerHTML = '<span class="material-symbols-outlined">play_arrow</span> 启动 NotmyFault';
-                btn.disabled = false;
-            }
-        }
-
-        function connectSSE() {
-            const es = new EventSource(API + '/api/events');
-
-            es.addEventListener('rule_triggered', function(e) {
-                const data = JSON.parse(e.data);
-                console.log('[SSE] 规则触发:', data.rule_name);
-            });
-
-            es.addEventListener('action_executed', function(e) {
-                const data = JSON.parse(e.data);
-                console.log('[SSE] 动作执行:', data.action_type, data.status);
-            });
-
-            es.addEventListener('engine_state_changed', function(e) {
-                const data = JSON.parse(e.data);
-                console.log('[SSE] 引擎状态:', data.state);
-                updateStatusUI({ running: data.state === 'running' });
-            });
-
-            es.addEventListener('error', function(e) {
-                console.log('[SSE] 引擎错误:', e.data);
-            });
-
-            es.onerror = function(e) {
-                console.log('[SSE] 连接断开，5 秒后重连...');
-                es.close();
-                setTimeout(connectSSE, 5000);
-            };
-
-            console.log('[SSE] 已连接事件流');
-        }
-
-        window.addEventListener('load', async function() {
-            try {
-                // 1. 获取插件 schema
-                const schemaRes = await fetch(API + '/api/plugins');
-                schema = await schemaRes.json();
-
-                // 2. 获取当前规则
-                const rulesRes = await fetch(API + '/api/rules');
-                const rulesData = await rulesRes.json();
-                configData = rulesData;
-                if (!configData.rules) configData.rules = [];
-
-                // 3. 获取引擎状态
-                const statusRes = await fetch(API + '/api/engine/status');
-                const status = await statusRes.json();
-                updateStatusUI(status);
-
-                // 4. 连接 SSE 事件流
-                connectSSE();
-
-                // 5. 渲染 UI
-                renderUI();
-                console.log('[Init] NotmyFault Dashboard 已就绪');
-            } catch (e) {
-                console.error('[Init] 无法连接到引擎:', e.message);
-                document.getElementById('app').innerHTML =
-                    '<div style="text-align:center; padding: 40px; color: var(--md-error);">' +
-                    '<h2>无法连接到引擎</h2>' +
-                    '<p>请先启动 NOTMYFAULT.pyw，然后刷新本页面。</p>' +
-                    '<p style="font-size:12px; color: var(--md-outline);">' + e.message + '</p>' +
-                    '</div>';
-            }
+    // Trigger
+    const currentTrigger = rule.event?.type;
+    // Trigger / Condition (OR)
+    if (rule.condition) {
+      html += `<div class="rule-section">
+        <div class="rule-section-title" style="justify-content:space-between;">
+          <span><span class="material-symbols-outlined">alt_route</span> 触发条件 (OR)</span>
+          <button class="btn btn-text" onclick="addEventCondition(${rIdx})" style="font-size:12px;padding:4px 8px;">
+            <span class="material-symbols-outlined" style="font-size:16px;">add</span> 添加条件
+          </button>
+        </div>`;
+      (rule.condition.events || []).forEach((evt, eIdx) => {
+        html += `<div class="input-row" style="border:1px solid var(--md-outline-variant);border-radius:8px;padding:8px;margin:8px 0;">`;
+        html += `<div class="input-group" style="flex:0.5;min-width:160px;"><label>触发器 ${eIdx+1}</label><select onchange="changeConditionTrigger(${rIdx}, ${eIdx}, this.value)">`;
+        Object.keys(schema.triggers).forEach(tKey => {
+          const tMeta = schema.triggers[tKey];
+          const tName = tMeta.name || tKey;
+          html += `<option value="${esc(tKey)}" ${evt.type === tKey ? 'selected' : ''}>${esc(tName)}</option>`;
         });
-    </script>
+        html += `</select><button class="icon-btn danger" onclick="removeEventCondition(${rIdx}, ${eIdx})" title="移除"><span class="material-symbols-outlined">close</span></button></div>`;
+        const tDefs = getParamDefs(schema.triggers[evt.type]);
+        tDefs.forEach(pDef => {
+          const curVal = (evt.params) ? evt.params[pDef.name] : null;
+          html += renderParamInput(pDef, curVal,
+            `updateConditionEventParam(${rIdx}, ${eIdx}, '${esc(pDef.name)}', this${pDef.type === 'select' ? '.value' : '.value'})`);
+        });
+        html += `</div>`;
+      });
+      html += `<button class="btn btn-text" onclick="toggleEventMode(${rIdx})" style="font-size:12px;margin-top:4px;">
+        <span class="material-symbols-outlined">swap_horiz</span> 切换到单事件模式
+      </button></div>`;
+    } else {
+      html += `<div class="rule-section">
+        <div class="rule-section-title" style="justify-content:space-between;">
+          <span><span class="material-symbols-outlined">memory</span> 触发事件</span>
+          <button class="btn btn-text" onclick="toggleEventMode(${rIdx})" style="font-size:12px;padding:4px 8px;">
+            <span class="material-symbols-outlined">alt_route</span> 改用 OR 条件
+          </button>
+        </div>
+        <div class="input-row">`;
+    const currentTrigger = rule.event?.type;
+    html += `<div class="input-group" style="flex:0.5;min-width:160px;"><label>选择触发器</label><select onchange="changeTrigger(${rIdx}, this.value)">`;
+    Object.keys(schema.triggers).forEach(tKey => {
+      const tMeta = schema.triggers[tKey];
+      const tName = tMeta.name || tKey;
+      const perms = tMeta.permissions || [];
+      const adminTag = perms.includes('admin') ? ' [管理员]' : '';
+      html += `<option value="${esc(tKey)}" ${currentTrigger === tKey ? 'selected' : ''}>${esc(tName)}${adminTag}</option>`;
+    });
+    html += `</select></div>`;
+    const triggerDefs = getParamDefs(schema.triggers[currentTrigger]);
+    triggerDefs.forEach(pDef => {
+      const curVal = (rule.event && rule.event.params) ? rule.event.params[pDef.name] : null;
+      html += renderParamInput(pDef, curVal,
+        `updateEventParam(${rIdx}, '${esc(pDef.name)}', this${pDef.type === 'select' ? '.value' : '.value'})`);
+    });
+    html += `</div></div>`;
+    }
+
+    // Actions
+    html += `<div class="rule-section">
+      <div class="rule-section-title" style="justify-content:space-between;">
+        <span><span class="material-symbols-outlined">bolt</span> 执行动作</span>
+        <button class="btn btn-text" onclick="addAction(${rIdx})" style="font-size:12px;padding:4px 8px;">
+          <span class="material-symbols-outlined" style="font-size:16px;">add</span> 添加动作
+        </button>
+      </div>`;
+
+    (rule.actions || []).forEach((action, aIdx) => {
+      html += `<div class="action-row">
+        <div class="input-group" style="flex:0.5;min-width:140px;"><label>动作类型</label><select onchange="changeAction(${rIdx}, ${aIdx}, this.value)">`;
+      Object.keys(schema.actions).forEach(aKey => {
+        const aMeta = schema.actions[aKey];
+        const aName = aMeta.name || aKey;
+        const perms = aMeta.permissions || [];
+        const adminTag = perms.includes('admin') ? ' [管理员]' : '';
+        html += `<option value="${esc(aKey)}" ${action.type === aKey ? 'selected' : ''}>${esc(aName)}${adminTag}</option>`;
+      });
+      html += `</select></div>`;
+      // 管理员权限提示
+      const curActionMeta = schema.actions[action.type];
+      if (curActionMeta && (curActionMeta.permissions || []).includes('admin')) {
+        html += `<div style="display:flex;align-items:center;gap:4px;color:var(--md-error);font:var(--md-typescale-label-sm);margin-left:4px;">
+          <span class="material-symbols-outlined" style="font-size:16px;">admin_panel_settings</span> 需要管理员权限
+        </div>`;
+      }
+      const actionDefs = getParamDefs(schema.actions[action.type]);
+      actionDefs.forEach(pDef => {
+        const curVal = (action.params) ? action.params[pDef.name] : null;
+        html += renderParamInput(pDef, curVal,
+          `updateActionParam(${rIdx}, ${aIdx}, '${esc(pDef.name)}', this${pDef.type === 'select' ? '.value' : '.value'})`);
+      });
+      html += `<button class="icon-btn danger" onclick="removeAction(${rIdx}, ${aIdx})" title="移除动作" style="margin-bottom:2px;">
+        <span class="material-symbols-outlined">close</span></button></div>`;
+    });
+    html += `</div>`;
+
+    card.innerHTML = html;
+    app.appendChild(card);
+  });
+}
+
+// ---- Data mutations ----
+function updateData(rIdx, key, val) { configData.rules[rIdx][key] = val; }
+function updateEventParam(rIdx, key, val) {
+  if (!configData.rules[rIdx].event) configData.rules[rIdx].event = { type: '', params: {} };
+  if (!configData.rules[rIdx].event.params) configData.rules[rIdx].event.params = {};
+  configData.rules[rIdx].event.params[key] = val;
+}
+function updateActionParam(rIdx, aIdx, key, val) {
+  if (!configData.rules[rIdx].actions[aIdx].params) configData.rules[rIdx].actions[aIdx].params = {};
+  configData.rules[rIdx].actions[aIdx].params[key] = val;
+}
+function buildDefaultParams(pluginMeta) {
+  const defs = getParamDefs(pluginMeta);
+  const params = {};
+  defs.forEach(p => { params[p.name] = p.default || ''; });
+  return params;
+}
+function changeTrigger(rIdx, newType) {
+  const newParams = buildDefaultParams(schema.triggers[newType]);
+  configData.rules[rIdx].event = { type: newType, params: newParams };
+  renderUI();
+}
+function changeAction(rIdx, aIdx, newType) {
+  const newParams = buildDefaultParams(schema.actions[newType]);
+  configData.rules[rIdx].actions[aIdx] = { type: newType, params: newParams };
+  renderUI();
+}
+function deleteRule(rIdx) { configData.rules.splice(rIdx, 1); renderUI(); }
+function removeAction(rIdx, aIdx) { configData.rules[rIdx].actions.splice(aIdx, 1); renderUI(); }
+function addAction(rIdx) {
+  const defaultAction = Object.keys(schema.actions)[0] || "unknown";
+  configData.rules[rIdx].actions.push({ type: defaultAction, params: {} });
+  changeAction(rIdx, configData.rules[rIdx].actions.length - 1, defaultAction);
+}
+// ---- OR condition ---- 
+function addEventCondition(rIdx) {
+  const keys = Object.keys(schema.triggers);
+  const first = keys[0] || "";
+  if (!configData.rules[rIdx].condition) configData.rules[rIdx].condition = {type:"or",events:[]};
+  configData.rules[rIdx].condition.events.push({type:first,params:buildDefaultParams(schema.triggers[first])});
+  renderUI();
+}
+function removeEventCondition(rIdx, eIdx) {
+  const cond = configData.rules[rIdx].condition;
+  if (cond) {
+    cond.events.splice(eIdx,1);
+    if (!cond.events.length) delete configData.rules[rIdx].condition;
+  }
+  renderUI();
+}
+function changeConditionTrigger(rIdx,eIdx,newType) {
+  const cond = configData.rules[rIdx].condition;
+  if (cond&&cond.events[eIdx]) cond.events[eIdx] = {type:newType,params:buildDefaultParams(schema.triggers[newType])};
+  renderUI();
+}
+function updateConditionEventParam(rIdx,eIdx,key,val) {
+  const cond = configData.rules[rIdx].condition;
+  if (cond&&cond.events[eIdx]) {
+    if (!cond.events[eIdx].params) cond.events[eIdx].params = {};
+    cond.events[eIdx].params[key] = val;
+  }
+}
+function toggleEventMode(rIdx) {
+  const rule = configData.rules[rIdx];
+  if (rule.condition) {
+    const first = (rule.condition.events||[])[0];
+    rule.event = first ? {type:first.type,params:{...first.params}} : {type:"",params:{}};
+    delete rule.condition;
+  } else if (rule.event) {
+    rule.condition = {type:"or",events:[{type:rule.event.type,params:{...rule.event.params}}]};
+    delete rule.event;
+  }
+  renderUI();
+}
+function addRule() {
+  const defaultTrigger = Object.keys(schema.triggers)[0] || "unknown";
+  configData.rules.unshift({ name: "新规则", event: { type: defaultTrigger, params: {} }, actions: [] });
+  changeTrigger(0, defaultTrigger);
+}
+
+// ---- pywebview bridge ----
+function hasBridge() { return !!(window.pywebview && window.pywebview.api); }
+
+async function _apiWrite(path, method, body, isForm) {
+  const headers = {};
+  if (!isForm) headers['Content-Type'] = 'application/json';
+  if (hasBridge()) {
+    try {
+      const token = await window.pywebview.api.get_api_token();
+      if (token) headers['Authorization'] = 'Bearer ' + token;
+    } catch(e) {}
+  }
+  const opts = { method, headers };
+  if (body) opts.body = isForm ? body : JSON.stringify(body);
+  return fetch(API + path, opts);
+}
+
+// ---- Config I/O ----
+async function loadConfig() {
+  if (hasBridge()) return await window.pywebview.api.get_config();
+  const res = await fetch(API + '/api/rules');
+  return await res.json();
+}
+
+async function saveConfig() {
+  if (hasBridge()) {
+    const r = await window.pywebview.api.save_config(configData.rules);
+    if (r.ok) {
+      snackbar("配置已保存");
+      return;
+    }
+    alert("保存失败: " + (r.error || "未知错误"));
+    return;
+  }
+
+  // 无桥接（浏览器模式），直接走 API
+  try {
+    const res = await fetch(API + '/api/rules', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rules: configData.rules }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      snackbar("配置已保存");
+    } else {
+      alert("保存失败: " + (data.error || "未知错误"));
+    }
+  } catch (e) {
+      alert("保存失败: " + (data.error || "未知错误") + (data.error?.includes("Forbidden") ? " — 浏览器模式不支持写入操作，请使用桌面端 Dashboard" : ""));
+  }
+}
+
+// ---- Plugins page ----
+
+let _pluginsData = { triggers: {}, actions: {} };
+let _pluginTab = 'triggers';
+
+async function loadPlugins() {
+  try {
+    const res = await fetch(API + '/api/plugins/list');
+    _pluginsData = await res.json();
+  } catch (e) {
+    _pluginsData = { triggers: {}, actions: {} };
+  }
+  renderPlugins();
+}
+
+function switchPluginTab(tab) {
+  _pluginTab = tab;
+  document.getElementById('plugTabTriggers').style.fontWeight = tab === 'triggers' ? '600' : '400';
+  document.getElementById('plugTabActions').style.fontWeight = tab === 'actions' ? '600' : '400';
+  renderPlugins();
+}
+
+function renderPlugins() {
+  const grid = document.getElementById('pluginsGrid');
+  const tpl = document.getElementById('pluginCardTpl');
+  const plugins = _pluginsData[_pluginTab] || {};
+  grid.innerHTML = '';
+
+  if (Object.keys(plugins).length === 0) {
+    grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1;">
+      <div class="material-symbols-outlined empty-icon">extension_off</div>
+      <h3>暂无插件</h3><p>安装插件或启动引擎后刷新</p></div>`;
+    return;
+  }
+
+  Object.entries(plugins).forEach(([pid, meta]) => {
+    const clone = tpl.content.cloneNode(true);
+    const card = clone.querySelector('.plugin-card');
+    const icon = card.querySelector('.plugin-card-icon');
+    const nameEl = card.querySelector('.plugin-card-name');
+    const idEl = card.querySelector('.plugin-card-id');
+    const descEl = card.querySelector('.plugin-card-desc');
+    const versionEl = card.querySelector('[data-version]');
+    const originEl = card.querySelector('[data-origin]');
+    const adminEl = card.querySelector('[data-admin]');
+    const errorEl = card.querySelector('[data-error]');
+    const checkEl = card.querySelector('[data-enable-check]');
+    const enableText = card.querySelector('[data-enable-text]');
+    const deleteBtn = card.querySelector('[data-delete-btn]');
+
+    const isAction = _pluginTab === 'actions';
+    icon.textContent = isAction ? 'bolt' : 'memory';
+    nameEl.textContent = meta.name || pid;
+    idEl.textContent = pid;
+    descEl.textContent = meta.description || '';
+
+    versionEl.textContent = 'v' + (meta.version_code || 0);
+    const originLabel = { builtin: '内置', user: '用户', third_party: '第三方' };
+    originEl.textContent = originLabel[meta.origin] || meta.origin || '未知';
+    originEl.style.background = meta.origin === 'builtin' ? 'var(--md-primary-container)' : 'var(--md-tertiary-container)';
+    originEl.style.color = meta.origin === 'builtin' ? 'var(--md-on-primary-container)' : 'var(--md-on-tertiary-container)';
+
+    if (meta.permissions && meta.permissions.includes('admin')) {
+      adminEl.style.display = '';
+    }
+
+    if (meta._error) {
+      errorEl.style.display = '';
+      errorEl.textContent = meta._error.substring(0, 40);
+    }
+
+    checkEl.checked = meta.enabled !== false;
+    enableText.textContent = meta.enabled !== false ? '已启用' : '已禁用';
+    if (meta.enabled === false) card.classList.add('disabled');
+
+    checkEl.dataset.pluginType = _pluginTab;
+    checkEl.dataset.pluginId = pid;
+
+    // 只有用户插件可以卸载
+    if (meta.origin === 'user' || meta.origin === 'third_party') {
+      deleteBtn.style.display = '';
+      deleteBtn.onclick = function() { uninstallPlugin(_pluginTab, pid); };
+    }
+
+    grid.appendChild(card);
+  });
+}
+
+async function togglePlugin(checkbox) {
+  const ptype = checkbox.dataset.pluginType;
+  const pid = checkbox.dataset.pluginId;
+  try {
+    const res = await _apiWrite('/api/plugins/toggle', 'POST', { type: ptype, id: pid });
+    const data = await res.json();
+    if (data.ok) {
+      snackbar(data.restart_required ? '状态已更新，需重启引擎生效' : '状态已更新');
+      loadPlugins();
+    } else {
+      checkbox.checked = !checkbox.checked;
+      alert('操作失败: ' + (data.error || '未知错误'));
+    }
+  } catch (e) {
+    checkbox.checked = !checkbox.checked;
+    alert('请求失败: ' + e.message);
+  }
+}
+
+async function uninstallPlugin(ptype, pid) {
+  if (!confirm('确定要卸载插件 "' + pid + '" 吗？此操作不可撤销。')) return;
+  try {
+    const res = await _apiWrite('/api/plugins/' + ptype + '/' + pid, 'DELETE');
+    const data = await res.json();
+    if (data.ok) {
+      snackbar('已卸载，需重启引擎生效');
+      loadPlugins();
+    } else {
+      alert('卸载失败: ' + (data.error || '未知错误'));
+    }
+  } catch (e) {
+    alert('请求失败: ' + e.message);
+  }
+}
+
+let _installPassword = '';
+let _keyResolve = null;
+
+async function showInstallDialog() {
+  const dialog = document.getElementById('installDialog');
+  try {
+    const res = await fetch(API + '/api/plugins/key-status');
+    const ks = await res.json();
+    if (ks.encrypted) {
+      _installPassword = '';
+      // 弹出密钥对话框,等待用户输入后 resolve 再打开安装窗口
+      await new Promise(function(resolve) {
+        _keyResolve = resolve;
+        document.getElementById('keyDialogPassword').value = '';
+        document.getElementById('keyDialog').showModal();
+      });
+    }
+  } catch (e) {
+    _installPassword = '';
+  }
+  dialog.showModal();
+}
+
+function submitKeyDialog() {
+  const pw = document.getElementById('keyDialogPassword').value.trim();
+  if (!pw) return;
+  _installPassword = pw;
+  document.getElementById('keyDialog').close();
+  if (_keyResolve) { _keyResolve(); _keyResolve = null; }
+}
+
+async function installPlugin(file) {
+  if (!file) return;
+  const formData = new FormData();
+  formData.append('file', file);
+  if (_installPassword) formData.append('password', _installPassword);
+  try {
+    const res = await _apiWrite('/api/plugins/install', 'POST', formData, true);
+    const data = await res.json();
+    if (data.ok) {
+      snackbar('插件 "' + data.id + '" 安装成功，需重启引擎生效');
+      document.getElementById('installDialog').close();
+      loadPlugins();
+    } else {
+      alert('安装失败: ' + (data.error || '未知错误'));
+    }
+  } catch (e) {
+    alert('请求失败: ' + e.message);
+  }
+}
+
+// drag & drop
+(function() {
+  const zone = document.getElementById('dropZone');
+  const input = document.getElementById('installFileInput');
+  if (!zone || !input) return;
+  zone.addEventListener('click', function() { input.click(); });
+  zone.addEventListener('dragover', function(e) { e.preventDefault(); zone.style.borderColor = 'var(--md-primary)'; });
+  zone.addEventListener('dragleave', function() { zone.style.borderColor = 'var(--md-outline-variant)'; });
+  zone.addEventListener('drop', function(e) {
+    e.preventDefault();
+    zone.style.borderColor = 'var(--md-outline-variant)';
+    if (e.dataTransfer.files.length) installPlugin(e.dataTransfer.files[0]);
+  });
+})();
+
+// ---- Home: Status UI ----
+function updateStatusUI(status) {
+  _engineStatus = status;
+  const icon = document.getElementById('statusIcon');
+  const text = document.getElementById('statusText');
+  const detail = document.getElementById('statusDetail');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+
+  const engineOn = status.engine_running === true;
+
+  if (engineOn) {
+    icon.textContent = 'play_circle';
+    icon.classList.add('running');
+    icon.classList.remove('stopped');
+    text.innerText = '运行中';
+    if (detail) detail.innerText = 'PID: ' + (status.pid || '—') + ' · 监听 127.0.0.1:19198';
+    startBtn.style.display = 'none';
+    stopBtn.style.display = '';
+    stopBtn.disabled = false;
+    stopBtn.innerHTML = '<span class="material-symbols-outlined">power_settings_new</span> 关闭引擎';
+  } else {
+    icon.textContent = 'stop_circle';
+    icon.classList.add('stopped');
+    icon.classList.remove('running');
+    text.innerText = '已停止';
+    if (detail) detail.innerText = '引擎未运行';
+    startBtn.style.display = '';
+    startBtn.disabled = false;
+    startBtn.innerHTML = '<span class="material-symbols-outlined">play_arrow</span> 启动引擎';
+    stopBtn.style.display = 'none';
+  }
+  loadHomeStats().catch(() => {});
+}
+
+// ---- 最小耗时等待（假加载让用户体验更平滑） ----
+function _minDelay(ms, startTime) {
+  const elapsed = Date.now() - startTime;
+  if (elapsed >= ms) return;
+  return new Promise(r => _setTimeout(r, ms - elapsed));
+}
+
+// ---- Home: Start / Stop ----
+async function startEngine() {
+  // 防重入保护
+  if (_starting) return;
+  _starting = true;
+
+  const startBtn = document.getElementById('startBtn');
+  startBtn.disabled = true;
+  startBtn.innerHTML = '<span class="material-symbols-outlined md-spinner">progress_activity</span> 启动中...';
+  const startTime = Date.now();
+
+  if (hasBridge()) {
+    try {
+      const result = await window.pywebview.api.launch_engine();
+      if (!result.ok) {
+        throw new Error(result.error || "未知错误");
+      }
+    } catch (e) {
+      alert("启动失败: " + e.message);
+      startBtn.disabled = false;
+      startBtn.innerHTML = '<span class="material-symbols-outlined">play_arrow</span> 启动引擎';
+      _starting = false;
+      return;
+    }
+  }
+
+  let attempts = 0;
+  const pollId = _setInterval(async () => {
+    attempts++;
+    try {
+      const res = await fetch(API + '/api/engine/status');
+      const status = await res.json();
+      if (status.running) {
+        clearInterval(pollId);
+        await _minDelay(3000, startTime);
+        _starting = false;
+        // 直接更新 UI 状态，不刷新整个页面
+        updateStatusUI(status);
+        connectSSE();
+        return;
+      }
+    } catch (e) {}
+    if (attempts >= 15) {
+      clearInterval(pollId);
+      await _minDelay(3000, startTime);
+      _starting = false;
+      startBtn.disabled = false;
+      startBtn.innerHTML = '<span class="material-symbols-outlined">play_arrow</span> 启动引擎';
+      alert("启动超时，请手动双击 NOTMYFAULT.pyw，或先通过桌面端 Dashboard 启动");
+    }
+  }, 1000);
+}
+
+async function stopEngine() {
+  if (_stopping) return;  // 防重入
+  _stopping = true;
+  const stopBtn = document.getElementById('stopBtn');
+  if (stopBtn.disabled) { _stopping = false; return; }
+  stopBtn.disabled = true;
+  stopBtn.innerHTML = '<span class="material-symbols-outlined md-spinner">progress_activity</span> 关闭中...';
+  // 强制浏览器重绘后再执行后续操作，确保旋转动画可见
+  await new Promise(r => setTimeout(r, 50));
+  const startTime = Date.now();
+
+  // 优先走 bridge（避免 pywebview 中 file:// 对 POST 的 CORS 拦截）
+  if (hasBridge()) {
+    await window.pywebview.api.shutdown_engine();
+  } else {
+    try {
+      await fetch(API + '/api/engine/shutdown', { method: 'POST' });
+    } catch (e) {
+      // 引擎进程优雅退出，fetch 可能触发连接重置 — 正常现象
+    }
+  }
+
+  // 引擎优雅关闭后 HTTP 服务会自行退出，连接断开即确认停止
+  let pollAttempts = 0;
+  const pollId = _setInterval(async () => {
+    pollAttempts++;
+    try {
+      await fetch(API + '/api/engine/status');
+      // 服务还在，继续等
+      if (pollAttempts >= 8) {
+        clearInterval(pollId);
+        await _minDelay(3000, startTime);
+        updateStatusUI({ engine_running: false });
+        _stopping = false;
+      }
+    } catch (e) {
+      // 连接拒绝 = HTTP 服务已退出 = 引擎已关闭
+      clearInterval(pollId);
+      await _minDelay(3000, startTime);
+      updateStatusUI({ engine_running: false });
+      _stopping = false;
+      return;
+    }
+  }, 1000);
+}
+
+// ---- Home: Refresh stats ----
+async function refreshHome() {
+  try {
+    const res = await fetch(API + '/api/engine/status');
+    updateStatusUI(await res.json());
+    snackbar("已刷新");
+  } catch (e) {
+    updateStatusUI({ engine_running: false });
+    snackbar("无法连接引擎");
+  }
+}
+
+async function loadHomeStats() {
+  try {
+    const res = await fetch(API + '/api/engine/status');
+    const s = await res.json();
+    _engineStatus = s;
+    document.getElementById('statRules').textContent = (s.rules_count != null) ? s.rules_count : '—';
+    document.getElementById('statTriggers').textContent = (s.triggers_count != null) ? s.triggers_count : '—';
+    document.getElementById('statActions').textContent = (s.actions_count != null) ? s.actions_count : '—';
+    document.getElementById('statPid').textContent = s.pid || '—';
+  } catch (e) {
+    document.getElementById('statRules').textContent = '—';
+    document.getElementById('statTriggers').textContent = '—';
+    document.getElementById('statActions').textContent = '—';
+    document.getElementById('statPid').textContent = '—';
+  }
+  // 同时刷新诊断面板
+  loadDiagnostics();
+}
+
+// ---- Home: Diagnostics (from bridge → log file) ----
+
+async function loadDiagnostics() {
+  let diag = null;
+  if (hasBridge()) {
+    try { diag = await window.pywebview.api.read_diagnostics(); } catch(e) {}
+  }
+  if (!diag) {
+    document.getElementById('diagPlugins').innerHTML = '<span style=\"color:var(--md-outline)\">引擎未启动</span>';
+    document.getElementById('diagRules').innerHTML = '<span style=\"color:var(--md-outline)\">—</span>';
+    document.getElementById('diagActions').innerHTML = '<span style=\"color:var(--md-outline)\">—</span>';
+    document.getElementById('diagErrors').innerHTML = '<span style=\"color:var(--md-outline)\">—</span>';
+    return;
+  }
+
+  const pluginOK = !diag.plugin_errors || diag.plugin_errors.length === 0;
+  const ruleOK = !diag.rule_issues || diag.rule_issues.length === 0;
+  const actionOK = (diag.action_fails || 0) === 0;
+
+  const iconOK = '<span class=\"material-symbols-outlined\" style=\"font-size:16px;vertical-align:middle\">check_circle</span>';
+  const iconERR = '<span class=\"material-symbols-outlined\" style=\"font-size:16px;vertical-align:middle\">error</span>';
+  const iconWARN = '<span class=\"material-symbols-outlined\" style=\"font-size:16px;vertical-align:middle\">warning</span>';
+
+  document.getElementById('diagPlugins').innerHTML = pluginOK
+    ? `<span style=\"color:var(--md-success)\">${iconOK} 正常</span>`
+    : `<span style="color:var(--md-error)\">${iconERR} ${diag.plugin_errors.length} 个插件加载失败</span>`;
+  document.getElementById('diagRules').innerHTML = ruleOK
+    ? `<span style=\"color:var(--md-success)\">${iconOK} 正常</span>`
+    : `<span style="color:var(--md-error)\">${iconWARN} ${diag.rule_issues.length} 条规则有问题</span>`;
+  document.getElementById('diagActions').innerHTML = actionOK
+    ? `<span style="color:var(--md-success)\">${iconOK} ${diag.action_fails !== undefined ? '已执行 '+(diag.action_fails+diag.action_ok||0)+' 次' : '正常'}</span>`
+    : `<span style="color:var(--md-error)\">${iconERR} ${diag.action_fails} 次失败</span>`;
+  document.getElementById('diagErrors').innerHTML =
+    `<span style="color:${(diag.error_count||0) > 0 ? 'var(--md-error)' : 'var(--md-success)'}">${(diag.error_count||0) > 0 ? iconERR : iconOK} ${diag.error_count||0} 错误</span> / <span style="color:${(diag.warn_count||0) > 0 ? '#c66a00' : 'var(--md-outline)'}">${(diag.warn_count||0) > 0 ? iconWARN : ''} ${diag.warn_count||0} 警告</span>`;
+
+  // 错误详情
+  const detail = document.getElementById('diagDetail');
+  const lines = [];
+  if (diag.last_errors && diag.last_errors.length > 0) {
+    lines.push(...diag.last_errors.map(e => `<div style="color:var(--md-error);padding:2px 0;">${iconERR} ${esc(e)}</div>`));
+  }
+  if (diag.last_warns && diag.last_warns.length > 0) {
+    lines.push(...diag.last_warns.map(w => `<div style="color:#c66a00;padding:2px 0;">${iconWARN} ${esc(w)}</div>`));
+  }
+  detail.innerHTML = lines.length > 0 ? lines.join('') : '无异常';
+}
+
+// ---- Logs page ----
+
+let _logTimer = null;
+
+async function refreshLog() {
+  const el = document.getElementById('logViewer');
+  if (!el) return;
+  let text = '';
+  if (hasBridge()) {
+    try { text = await window.pywebview.api.read_log_raw(300); } catch(e) {
+      text = '读取日志失败: ' + e.message;
+    }
+  } else {
+    text = '日志查看仅在 Dashboard 桌面应用中可用';
+  }
+  el.textContent = text || '(日志为空)';
+  el.scrollTop = el.scrollHeight;
+}
+
+function toggleLogAutoRefresh() {
+  const checked = document.getElementById('logAutoRefresh').checked;
+  if (checked) {
+    if (!_logTimer) _logTimer = _setInterval(refreshLog, 3000);
+  } else {
+    clearInterval(_logTimer);
+    _logTimer = null;
+  }
+}
+
+// ---- SSE ----
+function connectSSE() {
+  // 关闭已有连接，避免重复连接
+  if (_sseSource) {
+    _sseSource.close();
+    _sseSource = null;
+  }
+
+  const es = new EventSource(API + '/api/events');
+  _sseSource = es;
+
+  es.addEventListener('open', function() {
+    _sseRetryCount = 0;
+    console.log('[SSE] 已连接事件流');
+  });
+
+  es.addEventListener('rule_triggered', function(e) {
+    const data = JSON.parse(e.data);
+    console.log('[SSE] 规则触发:', data.rule_name);
+  });
+  es.addEventListener('action_executed', function(e) {
+    const data = JSON.parse(e.data);
+    console.log('[SSE] 动作执行:', data.action_type, data.status);
+    if (data.status !== 'ok') loadDiagnostics();  // 失败时刷新诊断
+  });
+  es.addEventListener('engine_state_changed', function(e) {
+    const data = JSON.parse(e.data);
+    console.log('[SSE] 引擎状态:', data.state);
+    updateStatusUI({ engine_running: data.state === 'running' });
+    if (data.state === 'running') loadDiagnostics();
+  });
+  es.addEventListener('error', function(e) {
+    console.log('[SSE] 引擎错误:', e.data);
+    loadDiagnostics();  // 错误时刷新诊断面板
+  });
+  es.onerror = function(e) {
+    console.log('[SSE] 连接断开，5 秒后重连...');
+    es.close();
+    _sseSource = null;
+    _sseRetryCount++;
+    if (_sseRetryCount > _sseMaxRetries) {
+      console.log('[SSE] 超过最大重试次数（' + _sseMaxRetries + '），停止重连');
+      updateStatusUI({ engine_running: false });
+      return;
+    }
+    _setTimeout(connectSSE, 5000);
+  };
+  console.log('[SSE] 已连接事件流');
+}
+
+// ---- Init ----
+window.addEventListener('load', async function() {
+  // 1. Load config (bridge or API)
+  try {
+    configData = await loadConfig();
+    if (!configData.rules) configData.rules = [];
+  } catch (e) {
+    console.warn('[Init] 配置读取失败:', e.message);
+    configData = { rules: [] };
+  }
+
+  // 2. Connect to engine
+  try {
+    const [schemaRes, statusRes, pluginsRes] = await Promise.all([
+      fetch(API + '/api/plugins'),
+      fetch(API + '/api/engine/status'),
+      fetch(API + '/api/plugins/list'),
+    ]);
+    schema = await schemaRes.json();
+    updateStatusUI(await statusRes.json());
+    _pluginsData = await pluginsRes.json();
+    connectSSE();
+    console.log('[Init] NotmyFault Dashboard 已就绪');
+  } catch (e) {
+    console.warn('[Init] 引擎离线');
+    updateStatusUI({ engine_running: false });
+    let retries = 0;
+    const tryReconnect = _setInterval(async () => {
+      try {
+        const res = await fetch(API + '/api/plugins');
+        schema = await res.json();
+        clearInterval(tryReconnect);
+        const [configRes, statusRes, pluginsRes] = await Promise.all([
+          fetch(API + '/api/rules'),
+          fetch(API + '/api/engine/status'),
+          fetch(API + '/api/plugins/list'),
+        ]);
+        const freshConfig = await configRes.json();
+        if (freshConfig.rules) configData = freshConfig;
+        updateStatusUI(await statusRes.json());
+        _pluginsData = await pluginsRes.json();
+        connectSSE();
+        renderUI();
+      } catch {}
+      if (++retries > 30) clearInterval(tryReconnect);
+    }, 2000);
+  }
+
+  // 3. Render rules & load diagnostics
+  renderUI();
+  if (hasBridge()) {
+    loadDiagnostics();
+    _setInterval(loadDiagnostics, 30000);
+  }
+
+  // 4. Logs & Plugins: first-visit load
+  const logsNav = document.querySelector('.nav-item[data-page="logs"]');
+  if (logsNav) logsNav.addEventListener('click', function() {
+    refreshLog();
+    toggleLogAutoRefresh();
+  }, { once: true });
+  const pluginsNav = document.querySelector('.nav-item[data-page="plugins"]');
+  if (pluginsNav) pluginsNav.addEventListener('click', function() {
+    renderPlugins();
+  }, { once: true });
+});
+
+// ---- 页面关闭清理 ----
+window.addEventListener('beforeunload', function() {
+  // 清理所有定时器
+  _clearAllTimers();
+  // 关闭 SSE 连接
+  if (_sseSource) {
+    _sseSource.close();
+    _sseSource = null;
+  }
+});
+</script>
 </body>
 </html>
