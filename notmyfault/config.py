@@ -7,6 +7,8 @@ import secrets
 import sys
 from typing import Any, Dict, List
 
+from .platform_support import get_config_dir
+
 DEFAULT_CONFIG: Dict[str, Any] = {
     "disabled_plugins": {
         "triggers": [],
@@ -136,7 +138,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     ]
 }
 
-CONFIG_FILE = os.path.join(os.getenv("APPDATA", ""), "NotmyFault", "config.json")
+CONFIG_FILE = os.path.join(get_config_dir(), "config.json")
 def _backup_path() -> str:
     return CONFIG_FILE + ".bak"
 
@@ -144,19 +146,56 @@ def _backup_path() -> str:
 def _secret_path() -> str:
     return os.path.join(os.path.dirname(CONFIG_FILE), ".config_secret")
 _SIGNATURE_KEY = "_signature"
-# 允许的 action 类型白名单（防恶意插件注入）
-_ALLOWED_ACTION_TYPES = {"set_volume", "notify", "run_powershell", "launch_program", "kill_process", "lock_screen"}
 
 
 # ---------------------------------------------------------------------------
 # 配置签名与完整性校验
 # ---------------------------------------------------------------------------
 
+def _secure_write_secret(path: str, data: bytes) -> None:
+    """安全写入密钥文件，限制权限仅当前用户可访问。
+
+    - 用 os.open 创建文件并设置 0o600（Unix 生效；Windows 部分生效）
+    - Windows 上额外用 icacls 移除继承权限，仅保留当前用户 Full control
+      （需要 F 权限而非 R，因为 _get_or_create_secret 可能需要重新写入 secret；
+      os.getlogin() 在某些环境下返回的用户名不被 icacls 识别，改用 %USERNAME%）
+    """
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        if os.name == "nt":
+            try:
+                import subprocess as _sp
+                # os.getlogin()/USERNAME 只返回用户名，icacls 会把计算机名
+                # 当成域名解析失败（如 CUTEAPLANE\:(R) 无人有权限）。
+                # 必须用 domain\user 完整格式。优先 %USERDOMAIN%\%USERNAME%。
+                userdomain = os.environ.get("USERDOMAIN", "")
+                username = os.environ.get("USERNAME") or os.getlogin()
+                full_user = f"{userdomain}\\{username}" if userdomain else username
+                # 先 grant 再 inheritance：如果 grant 失败（用户名解析问题），
+                # 不移除继承权限，至少保留默认权限让文件可读写。
+                r1 = _sp.run(
+                    ["icacls", path, "/grant:r", f"{full_user}:F"],
+                    capture_output=True, timeout=5,
+                )
+                if r1.returncode == 0:
+                    _sp.run(
+                        ["icacls", path, "/inheritance:r"],
+                        capture_output=True, timeout=5,
+                    )
+            except Exception:
+                pass
+    except OSError:
+        pass
+
+
 def _get_or_create_secret() -> bytes:
     """获取或创建配置签名密钥。
 
     密钥存储在 %APPDATA%/NotmyFault/.config_secret 中。
     每个安装实例有自己的唯一密钥。
+    文件权限限制为仅当前用户可读（PoC-8 修复）。
     """
     config_dir = os.path.dirname(CONFIG_FILE)
     if config_dir:
@@ -170,11 +209,7 @@ def _get_or_create_secret() -> bytes:
             pass
 
     secret = secrets.token_bytes(32)
-    try:
-        with open(_secret_path(), "wb") as f:
-            f.write(secret)
-    except OSError:
-        pass
+    _secure_write_secret(_secret_path(), secret)
     return secret
 
 
@@ -200,7 +235,7 @@ def _is_secret_installed() -> bool:
 
 
 def save_config(config: Dict[str, Any]) -> bool:
-    """统一保存配置接口，自动签名并备份。
+    """统一保存配置接口，规范化、自动签名并备份。
 
     Args:
         config: 配置字典
@@ -222,11 +257,42 @@ def save_config(config: Dict[str, Any]) -> bool:
             except OSError:
                 pass  # 备份失败不是致命错误
 
-        # 计算签名并保存
-        to_save = dict(config)
+        # 先清理界面已废弃字段，再对实际落盘内容签名。
+        to_save = _normalize_config(config)
+        if not isinstance(to_save, dict):
+            raise ValueError("配置根节点必须是对象")
+        to_save = dict(to_save)
         to_save[_SIGNATURE_KEY] = _sign_config(to_save)
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(to_save, f, ensure_ascii=False, indent=4)
+        tmp_path = CONFIG_FILE + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(to_save, f, ensure_ascii=False, indent=4)
+            os.replace(tmp_path, CONFIG_FILE)
+        except OSError:
+            # os.replace 失败（Windows 下目标被占用）：退回直接写活配置文件。
+            # 但 'w' 会先截断，若写到一半失败（磁盘满等）会把活配置写坏，
+            # 所以先备份当前内容，写失败时还原。
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            backup = None
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as bf:
+                    backup = bf.read()
+            except OSError:
+                pass
+            try:
+                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                    json.dump(to_save, f, ensure_ascii=False, indent=4)
+            except OSError:
+                if backup is not None:
+                    try:
+                        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                            f.write(backup)
+                    except OSError:
+                        pass
+                raise
         return True
     except OSError as e:
         print(f"[Config] 保存配置失败: {e}", file=sys.stderr)
@@ -252,6 +318,20 @@ _DANGEROUS_PATTERNS = [
     "Set-MpPreference", "Add-MpPreference", "New-Service",
     "Set-ItemProperty", "New-ItemProperty",
     "reg add", "sc config", "bcdedit",
+    # 高危：脚本块/间接调用绕过（PoC-3 修复）
+    "[scriptblock]::create", "[scriptblock]::",
+    "get-command", "get-alias",
+    ".invoke()",
+    "icm",  # Invoke-Command 别名
+    "iex ",  # Invoke-Expression 别名（带空格避免误匹配子串）
+]
+
+# launch_program 危险路径黑名单（命中归入 errors 拒绝）
+_DANGEROUS_LAUNCH_PATHS = [
+    "\\\\", "temp\\", "%tmp%\\", "%temp%\\",
+    "powershell.exe", "cmd.exe", "wscript.exe", "cscript.exe",
+    "powers~",   # 8.3 短名绕过
+    "rundll32", "regsvr32", "wmic", "mshta", "certutil", "bitsadmin",
 ]
 
 def _has_dangerous_command(command: str) -> str | None:
@@ -266,52 +346,182 @@ def _has_dangerous_command(command: str) -> str | None:
     return None
 
 
-def _validate_rules_safety(rules: list) -> list[str]:
-    """校验规则中的动作参数是否安全。返回警告列表。"""
+def _validate_rules_safety(rules: list) -> tuple[list[str], list[str]]:
+    """校验规则中的动作参数是否安全。
+
+    Returns:
+        (warnings, errors):
+        - warnings: 提醒类问题（非标准 action 类型等），不阻止写入
+        - errors: 危险模式命中（危险命令/危险路径），应拒绝写入
+    """
     warnings: list[str] = []
+    errors: list[str] = []
     for i, rule in enumerate(rules):
         rule_name = rule.get("name", f"规则 #{i+1}")
         for j, action in enumerate(rule.get("actions", [])):
             action_type = action.get("type", "")
 
-            # action 类型白名单检查
-            if action_type and action_type not in _ALLOWED_ACTION_TYPES:
-                warnings.append(
-                    f"规则 \"{rule_name}\" 使用了非标准的 action 类型: '{action_type}'"
-                )
-
-            # 危险命令检测
+            # 危险命令检测（error - 命中拒绝）
             if action_type in ("run_powershell",):
                 cmd = action.get("params", {}).get("command", "")
                 if cmd:
                     danger = _has_dangerous_command(cmd)
                     if danger:
-                        warnings.append(
+                        errors.append(
                             f"规则 \"{rule_name}\" 的 PowerShell 命令包含危险模式: '{danger}'"
                         )
 
-            # launch_program 路径检查
+            # launch_program 路径检查（error - 命中拒绝）
             if action_type == "launch_program":
                 path = action.get("params", {}).get("path", "")
                 if path:
-                    dangerous_locations = [
-                        "\\\\", "temp\\", "%tmp%\\", "%temp%\\",
-                        "powershell.exe", "cmd.exe", "wscript.exe", "cscript.exe",
-                    ]
                     path_lower = path.lower()
-                    for dl in dangerous_locations:
+                    for dl in _DANGEROUS_LAUNCH_PATHS:
                         if dl in path_lower:
-                            warnings.append(
+                            errors.append(
                                 f"规则 \"{rule_name}\" 的启动路径包含危险位置: '{path}'"
                             )
                             break
 
-    return warnings
+    return warnings, errors
 
 
 # ---------------------------------------------------------------------------
 # 配置加载
 # ---------------------------------------------------------------------------
+
+class ConfigValidationError(ValueError):
+    """运行时配置未通过完整性或安全校验。"""
+
+
+def load_verified_config() -> Dict[str, Any]:
+    """读取一份可安全应用到运行中引擎的配置快照。
+
+    与 :func:`get_config` 的启动恢复策略不同，这个入口绝不回退默认配置、
+    也不写回磁盘。热重载必须保持当前已验证的运行快照，直到新文件同时
+    通过签名、结构和规则安全校验。
+    """
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as config_file:
+            raw = json.load(config_file)
+    except (json.JSONDecodeError, OSError) as e:
+        raise ConfigValidationError(f"配置文件无法解析: {e}") from e
+
+    if not isinstance(raw, dict):
+        raise ConfigValidationError("配置根节点必须是对象")
+
+    signature = raw.pop(_SIGNATURE_KEY, "")
+    if not _is_secret_installed():
+        raise ConfigValidationError("配置签名密钥缺失")
+    if not signature:
+        raise ConfigValidationError("配置缺少签名")
+    if not _verify_config(raw, signature):
+        raise ConfigValidationError("配置签名校验失败")
+
+    normalized = _normalize_config(raw)
+    if not isinstance(normalized, dict):
+        raise ConfigValidationError("规范化后的配置必须是对象")
+    rules = normalized.get("rules", [])
+    if not isinstance(rules, list):
+        raise ConfigValidationError("rules 必须是列表")
+
+    _warnings, errors = _validate_rules_safety(rules)
+    if errors:
+        raise ConfigValidationError("规则安全校验失败: " + "; ".join(errors[:3]))
+    return normalized
+
+def _normalize_condition(condition: Any) -> Any:
+    """把旧条件树转换成统一的 ``op + children`` 格式。"""
+    if not isinstance(condition, dict):
+        return condition
+
+    copied = dict(condition)
+    children = copied.get("children", copied.get("events"))
+    # 有 children/events 的节点是条件组；没有二者且带 type 的节点是事件叶子，
+    # 叶子的 type 绝不能被当作组操作符删除。
+    if not isinstance(children, list):
+        return copied
+
+    op = copied.get("op", copied.get("type", "any"))
+    copied["op"] = "all" if op in ("all", "and") else "any"
+    copied["children"] = [_normalize_condition(child) for child in children]
+    copied.pop("events", None)
+    copied.pop("type", None)
+    if copied["op"] == "any":
+        # within_seconds 只有 all 条件组才有意义；旧版界面曾只隐藏它而没有删除。
+        copied.pop("within_seconds", None)
+    return copied
+
+
+def _unwrap_single_condition(condition: Any) -> Dict[str, Any] | None:
+    """从只有一个分支的条件组中取出事件，用于消除旧版重复字段。"""
+    current = condition
+    while isinstance(current, dict):
+        children = current.get("children")
+        if isinstance(children, list):
+            if len(children) != 1:
+                return None
+            current = children[0]
+            continue
+        return current if isinstance(current.get("type"), str) else None
+    return None
+
+
+def _replace_step_references(value: Any, replacements: Dict[str, str]) -> Any:
+    if isinstance(value, str):
+        for old, new in replacements.items():
+            value = value.replace(f"steps.{old}.", f"steps.{new}.")
+        return value
+    if isinstance(value, list):
+        return [_replace_step_references(item, replacements) for item in value]
+    if isinstance(value, dict):
+        return {key: _replace_step_references(item, replacements) for key, item in value.items()}
+    return value
+
+
+def _normalize_rule_actions(actions: Any) -> Any:
+    """移除旧步骤 ID，并把能确定的旧引用改为自动步骤名。"""
+    if not isinstance(actions, list):
+        return actions
+
+    ids: Dict[str, str] = {}
+    duplicate_ids = set()
+    for index, action in enumerate(actions):
+        if not isinstance(action, dict):
+            continue
+        old_id = action.get("id")
+        if not isinstance(old_id, str) or not old_id:
+            continue
+        generated = f"{action.get('type', 'action')}_{index + 1}"
+        if old_id in ids:
+            duplicate_ids.add(old_id)
+        else:
+            ids[old_id] = generated
+    replacements = {old: new for old, new in ids.items() if old not in duplicate_ids}
+
+    normalized = []
+    for action in actions:
+        if not isinstance(action, dict):
+            normalized.append(action)
+            continue
+        copied = dict(action)
+        copied.pop("id", None)
+        # display_control 1.2 起统一使用可配置亮度。旧规则继续可执行，
+        # 并在加载时无损迁移，避免编辑器出现已移除的下拉选项。
+        if copied.get("type") == "display_control":
+            params = copied.get("params")
+            if isinstance(params, dict):
+                legacy_action = params.get("action")
+                if legacy_action in ("low_brightness", "high_brightness"):
+                    copied_params = dict(params)
+                    copied_params["action"] = "set_brightness"
+                    copied_params["brightness"] = (
+                        10 if legacy_action == "low_brightness" else 90
+                    )
+                    copied["params"] = copied_params
+        normalized.append(_replace_step_references(copied, replacements))
+    return normalized
+
 
 def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(config, dict):
@@ -322,16 +532,23 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         for rule in config.get("rules", []):
             if not isinstance(rule, dict):
                 continue
-
-            if "trigger" in rule and "event" not in rule:
-                copied = dict(rule)
-                copied["event"] = copied.pop("trigger")
-                _inject_condition(copied)
-                normalized_rules.append(copied)
-            else:
-                copied = dict(rule)
-                _inject_condition(copied)
-                normalized_rules.append(copied)
+            copied = dict(rule)
+            if "trigger" in copied:
+                if "event" not in copied:
+                    copied["event"] = copied["trigger"]
+                copied.pop("trigger", None)
+            if "condition" in copied:
+                copied["condition"] = _normalize_condition(copied["condition"])
+                if "event" not in copied and isinstance(copied["condition"], dict):
+                    if not isinstance(copied["condition"].get("children"), list):
+                        copied["event"] = copied.pop("condition")
+                elif isinstance(copied.get("event"), dict):
+                    condition_event = _unwrap_single_condition(copied["condition"])
+                    if condition_event == copied["event"]:
+                        copied.pop("condition", None)
+            if "actions" in copied:
+                copied["actions"] = _normalize_rule_actions(copied["actions"])
+            normalized_rules.append(copied)
 
         result = dict(config)
         result["rules"] = normalized_rules
@@ -371,26 +588,11 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
                     }
                 ]
             }
+        rules.append(_rule)
 
     result = {k: v for k, v in config.items() if k != "processes"}
     result["rules"] = rules
     return result if rules else config
-
-
-
-def _inject_condition(rule: Dict[str, Any]) -> None:
-    """为旧格式 rule 注入 condition 字段。
-    旧: {"event": {...}} -> 新: {"condition": {"type": "or", "events": [{...}]}}
-    """
-    if "condition" in rule:
-        return
-    event = rule.get("event") or rule.get("trigger")
-    if event is None:
-        return
-    rule["condition"] = {
-        "type": "or",
-        "events": [event],
-    }
 
 
 def get_config() -> Dict[str, Any]:
@@ -436,7 +638,11 @@ def get_config() -> Dict[str, Any]:
             save_config(DEFAULT_CONFIG)
             return copy.deepcopy(DEFAULT_CONFIG)
 
-    # 签名验证通过，重新签名保存（修复签名老化问题）
+    normalized = _normalize_config(config)
+    migrated = normalized != config
+    config = normalized
+
+    # 签名验证通过后，以规范化结果重新签名并原子写回。
     if has_secret:
         save_config(config)
     else:
@@ -444,18 +650,18 @@ def get_config() -> Dict[str, Any]:
         _get_or_create_secret()
         save_config(config)
 
-    normalized = _normalize_config(config)
-    if normalized != config:
-        save_config(normalized)
+    if migrated:
         print("[DEBUG] Legacy config migrated to new rule format.")
-        config = normalized
 
     # --- 运行时安全校验 ---
     rules = config.get("rules", [])
-    safety_warnings = _validate_rules_safety(rules)
+    safety_warnings, safety_errors = _validate_rules_safety(rules)
     if safety_warnings:
         for w in safety_warnings:
             print(f"[Config] [安全] {w}", file=sys.stderr)
+    if safety_errors:
+        for e in safety_errors:
+            print(f"[Config] [安全-严重] {e}", file=sys.stderr)
 
     print("[DEBUG] Config loaded:", config)
     return config
@@ -472,12 +678,14 @@ def _try_recover_from_backup() -> Dict[str, Any] | None:
         signature = config.pop(_SIGNATURE_KEY, "")
         if _is_secret_installed() and signature and _verify_config(config, signature):
             print("[INFO] 从备份成功恢复配置", file=sys.stderr)
-            save_config(config)
-            return config
+            normalized = _normalize_config(config)
+            save_config(normalized)
+            return normalized
         # 备份没有签名或签名无效 — 可能是旧版配置直接使用
         print("[WARN] 备份文件无有效签名，但尝试使用", file=sys.stderr)
-        save_config(config)
-        return config
+        normalized = _normalize_config(config)
+        save_config(normalized)
+        return normalized
     except Exception as e:
         print(f"[ERROR] 备份恢复失败: {e}", file=sys.stderr)
         return None

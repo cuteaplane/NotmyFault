@@ -2,9 +2,16 @@
     "id": "window_title",
     "name": "窗口标题检测",
     "semantic": "state",
+    "trigger_api": "event-v1",
     "description": "检测包含特定关键词的窗口出现或关闭",
-    "version_code": 1,
+    "version_code": 2,
+    "version": "1.1",
+    "package_name": "io.github.notmyfault.window_title",
+    "platforms": ["windows"],
     "enabled": true,
+    "permissions": [
+        "native_api"
+    ],
     "params": [
         {
             "name": "title_pattern",
@@ -19,8 +26,8 @@
             "type": "select",
             "default": "opened",
             "options": [
-                "opened",
-                "closed"
+                {"value": "opened", "label": "窗口已打开"},
+                {"value": "closed", "label": "窗口已关闭"}
             ]
         }
     ]

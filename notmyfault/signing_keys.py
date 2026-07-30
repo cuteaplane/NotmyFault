@@ -10,7 +10,7 @@ from typing import Optional
 CURDIR = os.path.dirname(os.path.abspath(__file__))
 _PRIVATE_DIR = os.path.normpath(os.path.join(CURDIR, "..", ".private"))
 
-BUILTIN_PUBLIC_KEY: bytes = b'11\xda\xd4\xf3[\x9c\xd5\xf3e\xadF\xb16\xa4\xfe\xd1#q\xca\\\x0fsy8%PbVg\xf3H'
+BUILTIN_PUBLIC_KEY: bytes = b'\xc1\xad\xe1\xdds\xf1\xe8\xb2\x7fV\xb0\xda\xfe_\xb2\x12\x86\xb0Bg.=m\xdc\xa1p\\\xca\xda\xe9+\x87'
 
 _USER_PUBLIC_KEY_PATH = os.path.join(_PRIVATE_DIR, "signing_public.pem")
 

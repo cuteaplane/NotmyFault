@@ -16,6 +16,7 @@ def run(action_info, params):
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=60
             )
         else:
@@ -23,6 +24,7 @@ def run(action_info, params):
                 ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=60
             )
 

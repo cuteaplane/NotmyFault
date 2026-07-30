@@ -1,0 +1,58 @@
+{
+  "id": "tianyi_drive_sync",
+  "name": "天翼云盘增量上传",
+  "description": "把指定文件夹中已静默的新文件上传到天翼云盘。上传清单作为工作流输出，可交给通用 Excel 动作记录。仅使用环境变量引用授权信息。",
+  "version_code": 1,
+  "version": "0.1.0-alpha",
+  "package_name": "io.github.notmyfault.tianyi_drive_sync",
+  "enabled": true,
+  "permissions": ["filesystem", "network"],
+  "origin": "user",
+  "execution_api": "context-v1",
+  "outputs": ["uploaded_files", "skipped", "failed_files"],
+  "params": [
+    {
+      "name": "source_folder",
+      "label": "归档文件夹",
+      "type": "path",
+      "default": "",
+      "placeholder": "选择需要归档的文件夹"
+    },
+    {
+      "name": "remote_parent_folder_id",
+      "label": "天翼目标文件夹 ID",
+      "type": "string",
+      "default": "",
+      "placeholder": "天翼开放平台中的父文件夹 ID"
+    },
+    {
+      "name": "access_token_env",
+      "label": "AccessToken 环境变量名",
+      "type": "string",
+      "default": "NMF_TY_ACCESS_TOKEN",
+      "placeholder": "例如 NMF_TY_ACCESS_TOKEN"
+    },
+    {
+      "name": "app_secret_env",
+      "label": "AppSecret 环境变量名",
+      "type": "string",
+      "default": "NMF_TY_APP_SECRET",
+      "placeholder": "例如 NMF_TY_APP_SECRET"
+    },
+    {
+      "name": "recursive",
+      "label": "包含子文件夹",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "name": "max_file_size_mb",
+      "label": "单文件上限（MB）",
+      "type": "number",
+      "default": 100,
+      "min": 1,
+      "max": 1024,
+      "placeholder": "一次性上传模式不支持断点续传"
+    }
+  ]
+}

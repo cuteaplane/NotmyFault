@@ -1,0 +1,39 @@
+{
+    "id": "screenshot",
+    "name": "截图",
+    "description": "截取屏幕并保存为图片文件",
+    "version_code": 2,
+    "version": "1.1",
+    "package_name": "io.github.notmyfault.screenshot",
+    "enabled": true,
+    "permissions": ["screen_reader", "filesystem", "native_api", "external_binary"],
+    "params": [
+        {
+            "name": "mode",
+            "label": "截取范围",
+            "type": "select",
+            "default": "fullscreen",
+            "options": [
+                {"value": "fullscreen", "label": "整个屏幕"},
+                {"value": "active_window", "label": "当前活动窗口"}
+            ]
+        },
+        {
+            "name": "output_path",
+            "label": "保存路径",
+            "type": "string",
+            "default": "",
+            "placeholder": "留空=桌面带时间戳文件名"
+        },
+        {
+            "name": "format",
+            "label": "图片格式",
+            "type": "select",
+            "default": "png",
+            "options": [
+                {"value": "png", "label": "PNG（无损）"},
+                {"value": "jpg", "label": "JPEG（较小文件）"}
+            ]
+        }
+    ]
+}

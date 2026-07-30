@@ -1,4 +1,5 @@
-from pycaw.pycaw import AudioUtilities
+import os
+import subprocess
 
 _VOLUME_LEVELS = {
     "max": 1.0,
@@ -16,6 +17,25 @@ def set_volume(action):
         scalar = 0.5
 
     try:
+        if os.name != "nt":
+            percent = round(scalar * 100)
+            result = subprocess.run(
+                ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{percent}%"],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=5,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "wpctl 设置音量失败")
+            subprocess.run(
+                ["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "1" if action_lower == "mute" else "0"],
+                capture_output=True,
+                timeout=5,
+            )
+            return
+
+        from pycaw.pycaw import AudioUtilities
         device = AudioUtilities.GetSpeakers()
 
         device.EndpointVolume.SetMasterVolumeLevelScalar(

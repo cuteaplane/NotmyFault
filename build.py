@@ -55,7 +55,7 @@ def _save_private_key(key, path: Path, encrypt: bool = False) -> None:
 
 
 try:
-    from notmyfault.signing import load_private_key, sign_plugin
+    from notmyfault.signing import load_private_key, sign_plugin, plugin_files, sign_file
 except ImportError:
     print("! 无法导入签名模块，请确保项目结构完整", file=sys.stderr)
     raise SystemExit(1)
@@ -73,14 +73,9 @@ def _collect_plugins():
                         plugins.append((p, json_name))
     return plugins
 
-def _plugin_files(plugin_dir, json_name):
-    """返回插件目录中需要签名的文件列表（按文件名排序）"""
-    allowed = {json_name, json_name.replace("action", "action").replace("trigger", "trigger")}
-    files = []
-    for f in sorted(plugin_dir.iterdir()):
-        if f.is_file() and f.suffix in (".py", ".json") and f.name != "signature.sig":
-            files.append(f)
-    return files
+# 复用 signing.plugin_files：签名 (sign_plugin)、校验 (cmd_verify)、内置校验
+# (plugins.verify_plugin_sig) 必须用同一份文件清单，否则 payload 不一致会让合法
+# 签名被当成篡改。这里不再各自维护一份 _plugin_files。
 
 def cmd_init_keys(args):
     """生成 Ed25519 密钥对"""
@@ -130,10 +125,10 @@ def cmd_init_keys(args):
         print(f"+ 内置公钥: {SIGNING_MODULE}（检入 git）")
 
 def cmd_sign(args):
-    """签名所有插件"""
+    """签名所有插件。返回加载到的私钥（供 cmd_build 复用签 build.json），缺失则返回 None。"""
     if not PRIVATE_KEY_FILE.exists():
         print("! 私钥不存在，请先运行 build.py init-keys")
-        return
+        return None
 
     private_key = load_private_key(PRIVATE_KEY_FILE)
     plugins = _collect_plugins()
@@ -141,9 +136,10 @@ def cmd_sign(args):
     for plugin_dir, json_name in plugins:
         sign_plugin(plugin_dir, json_name, private_key)
         plugin_id = json.loads((plugin_dir / json_name).read_text(encoding="utf-8")).get("id", plugin_dir.name)
-        print(f"  + {plugin_id:20s} signed ({len(_plugin_files(plugin_dir, json_name))} files)")
+        print(f"  + {plugin_id:20s} signed ({len(plugin_files(plugin_dir))} files)")
         signed += 1
     print(f"已签名 {signed} 个插件")
+    return private_key
 
 def cmd_verify(args):
     """验证所有插件签名"""
@@ -172,7 +168,7 @@ def cmd_verify(args):
             print(f"  - {plugin_dir.parent.name:10s}/{plugin_dir.name:20s} 未签名")
             unsigned += 1
             continue
-        files = _plugin_files(plugin_dir, json_name)
+        files = plugin_files(plugin_dir)
         payload = b""
         for f in files:
             payload += f.read_bytes()
@@ -195,11 +191,73 @@ def cmd_verify(args):
             failed += 1
     print(f"验证完成: {passed} 有效, {failed} 无效, {unsigned} 未签名")
 
+def _key_is_encrypted() -> bool:
+    """私钥是否已用密码加密。"""
+    if not PRIVATE_KEY_FILE.exists():
+        return False
+    return b"ENCRYPTED" in PRIVATE_KEY_FILE.read_bytes()[:40]
+
+
+def _ensure_strict_encrypted_key() -> None:
+    """strict 模式强制使用密码加密的私钥。
+
+    - 没有私钥：生成加密密钥对（提示设置密码）并写入公钥。
+    - 私钥未加密：提示设置密码，把现有私钥重新加密保存（不重新生成，保留已签发身份）。
+    - 私钥已加密：直接放行（后续 cmd_sign 会提示密码解锁）。
+    """
+    if PRIVATE_KEY_FILE.exists() and _key_is_encrypted():
+        return
+    if not PRIVATE_KEY_FILE.exists():
+        print("[strict] 未找到私钥；strict 模式需要密码加密的私钥，现在生成。")
+        cmd_init_keys({"force": False, "builtin": True, "encrypt": True})
+    else:
+        print("[strict] 当前私钥未加密；strict 模式要求加密，现在为它设置密码。")
+        key = load_private_key(PRIVATE_KEY_FILE)  # 未加密，无需密码即可加载
+        _save_private_key(key, PRIVATE_KEY_FILE, encrypt=True)
+
+
+def _ensure_key_for_build(security_mode: str, force: bool = False) -> None:
+    """任何构建都需要私钥来签 build.json（防止 security_mode 被篡改降级）。
+
+    - strict：强制密码加密的私钥（_ensure_strict_encrypted_key）。
+    - normal/permissive：需要私钥即可，不强制加密（dev 免密码）；没有就生成一个不加密的。
+    - force=True：按当前模式重新生成私钥--permissive/normal 生成不加密的（免密码），
+      strict 生成加密的。注意会覆盖现有私钥（已签发的身份会失效，需重新签全部插件）。
+    """
+    if security_mode == "strict":
+        if force:
+            print("[strict] --force：重新生成加密私钥（会要求设置密码）。")
+            cmd_init_keys({"force": True, "builtin": True, "encrypt": True})
+            return
+        _ensure_strict_encrypted_key()
+        return
+    # normal/permissive：不加密私钥即可（dev 免密码）。
+    if force or not PRIVATE_KEY_FILE.exists():
+        if force and PRIVATE_KEY_FILE.exists():
+            print(f"[{security_mode}] --force：重新生成不加密私钥（覆盖现有私钥）。")
+        else:
+            print(f"[{security_mode}] 未找到私钥，生成一个（不加密）用于签名 build.json。")
+        cmd_init_keys({"force": bool(force), "builtin": True, "encrypt": False})
+
+
 def cmd_build(args):
-    """完整构建：签名 + build.json"""
-    cmd_sign(args)
-    
-    # 检测分支
+    """完整构建：签名 + build.json（含 build.json 签名）。默认 strict，可用 --security-mode 覆盖。
+
+    fresh clone 直接 `python build.py` 走 strict，会要求设置签名密码。build.json 会被
+    签名（build.json.sig），引擎加载时校验，防止有人改 security_mode 降级。
+    """
+    security_mode = args.get("security_mode") or "strict"
+    if security_mode not in ("strict", "normal", "permissive"):
+        print(f"! 未知 security_mode: {security_mode}（应为 strict / normal / permissive）")
+        raise SystemExit(1)
+
+    # 任何模式都需要私钥来签 build.json；strict 额外要求加密。--force 按模式重新生成私钥。
+    _ensure_key_for_build(security_mode, force=args.get("force"))
+
+    # cmd_sign 签插件并返回私钥，复用它签 build.json（避免重复解锁提示）。
+    private_key = cmd_sign(args)
+
+    # 检测分支（仅记录到 build.build，不再用它推断 security_mode）
     branch = "unknown"
     try:
         import subprocess
@@ -207,10 +265,7 @@ def cmd_build(args):
         branch = r.stdout.strip()
     except Exception:
         pass
-    
-    mode_map = {"master": "strict", "develop": "normal", "develop-alpha": "permissive"}
-    security_mode = mode_map.get(branch, "strict")
-    
+
     build_info = {
         "security_mode": security_mode,
         "build": branch,
@@ -219,7 +274,35 @@ def cmd_build(args):
     build_path = ROOT / "build.json"
     with open(build_path, "w", encoding="utf-8") as f:
         json.dump(build_info, f, indent=2)
+
+    # 签 build.json：未签的 build.json 引擎不信任（回退 STRICT）。
+    if private_key is not None:
+        sign_file(build_path, private_key)
+        print(f"+ build.json 签名: {build_path}.sig")
+        # 生成核心源码哈希清单并签名（integrity.json + .sig），防篡改 engine.py/config.py 等。
+        _build_integrity_manifest(private_key)
+    else:
+        print("! 缺少私钥，build.json 未签名 -- 引擎将不信任它（回退 strict）。", file=sys.stderr)
     print(f"+ build.json 写入: {build_path} (mode={security_mode}, branch={branch})")
+
+
+def _build_integrity_manifest(private_key) -> None:
+    """生成 notmyfault/*.py 的签名哈希清单（integrity.json + .sig）。
+
+    引擎在 strict 模式启动时重新哈希这些核心文件并与清单比对：任何文件被改过
+    （比如有人删掉 engine.py 里的签名校验调用）就拒绝启动。清单本身用 Ed25519
+    签名，没有私钥伪造不出匹配篡改文件的合法清单。
+    """
+    pkg_dir = ROOT / "notmyfault"
+    files = {}
+    for p in sorted(pkg_dir.glob("*.py")):
+        files[p.name] = hashlib.sha256(p.read_bytes()).hexdigest()
+    manifest_path = pkg_dir / "integrity.json"
+    manifest_path.write_text(
+        json.dumps({"files": files}, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    sign_file(manifest_path, private_key)
+    print(f"+ 完整性清单: {manifest_path} + .sig ({len(files)} 个核心文件)")
 
 def cmd_version(args):
     """显示当前密钥状态"""
@@ -229,14 +312,29 @@ def cmd_version(args):
         pub_ok = bool(BUILTIN_PUBLIC_KEY)
     except ImportError:
         pub_ok = False
-    print(f"私钥: {'✓' if priv_ok else '✗'} {PRIVATE_KEY_FILE}")
-    print(f"公钥: {'✓' if pub_ok else '✗'} {SIGNING_MODULE}")
+    # Windows 控制台仍可能使用 GBK；避免仅用于状态展示的 Unicode
+    # 符号让发布工具在真正执行签名之前就崩溃。
+    print(f"私钥: {'OK' if priv_ok else 'MISSING'} {PRIVATE_KEY_FILE}")
+    print(f"公钥: {'OK' if pub_ok else 'MISSING'} {SIGNING_MODULE}")
     if pub_ok:
         fp = hashlib.sha256(BUILTIN_PUBLIC_KEY).hexdigest()[:16]
         print(f"公钥指纹: {fp}...")
     plugins = _collect_plugins()
     sig_count = sum(1 for d, _ in plugins if (d / "signature.sig").exists())
     print(f"插件: {len(plugins)} 个, 已签名: {sig_count} 个")
+
+def _print_usage(cmds):
+    print("用法: python build.py <command> [options]")
+    print(f"命令: {', '.join(sorted(cmds))}")
+    print("选项: --force                  强制覆盖已有密钥（build 里：按当前模式重新生成私钥）")
+    print("      --builtin                同时写入内置公钥到 signing_keys.py")
+    print("      --encrypt                用密码加密私钥（init-keys 用）")
+    print("      --security-mode=MODE     指定安全模式: strict / normal / permissive")
+    print("                               （仅 build 命令；默认 strict）")
+    print("说明: 直接 `python build.py`（不带子命令）= build。")
+    print("      permissive/normal 用不加密私钥免密码；若现有私钥是加密的，加 --force 重新生成不加密私钥（覆盖现有）。")
+    print("      fresh clone 必须先跑一次以生成插件签名与 build.json。")
+
 
 def main():
     cmds = {
@@ -245,23 +343,36 @@ def main():
         "verify": cmd_verify,
         "build": cmd_build,
         "version": cmd_version,
+        "help": lambda args: _print_usage(cmds),
     }
-    args = {"force": "--force" in sys.argv, "builtin": "--builtin" in sys.argv, "encrypt": "--encrypt" in sys.argv}
+    # --security-mode=MODE 显式指定安全模式（覆盖默认 strict）
+    security_mode = None
+    for a in sys.argv:
+        if a.startswith("--security-mode="):
+            security_mode = a.split("=", 1)[1].strip().lower()
+    args = {
+        "force": "--force" in sys.argv,
+        "builtin": "--builtin" in sys.argv,
+        "encrypt": "--encrypt" in sys.argv,
+        "security_mode": security_mode,
+    }
     cmds_list = [a for a in sys.argv[1:] if not a.startswith("--")]
-    
+
     if not cmds_list:
-        print("用法: python build.py <command> [options]")
-        print(f"命令: {', '.join(sorted(cmds))}")
-        print("选项: --force    强制覆盖已有密钥")
-        print("      --builtin  同时写入内置公钥到 signing_keys.py")
-        print("      --encrypt  用密码加密私钥")
-        return
-    
+        # `python build.py` 直接跑 -> 默认 build。模式由 --security-mode 决定（默认 strict）。
+        # fresh source clone 必须先跑 build.py 生成签名与 build.json。
+        mode = security_mode or "strict"
+        extra = "，会要求设置签名密码" if mode == "strict" else "（permissive/normal 用不加密私钥，免密码；加 --force 可重新生成不加密私钥）"
+        print(f"[build] 未指定子命令，默认执行 build（{mode}{extra}）。")
+        print("[build] 查看完整用法: python build.py help")
+        cmds_list = ["build"]
+
     for cmd_name in cmds_list:
         if cmd_name in cmds:
             cmds[cmd_name](args)
         else:
             print(f"未知命令: {cmd_name}")
+            _print_usage(cmds)
 
 if __name__ == "__main__":
     main()

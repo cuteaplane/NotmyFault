@@ -2,8 +2,11 @@
     "id": "process_state",
     "name": "进程状态扫描器",
     "semantic": "state",
+    "trigger_api": "event-v1",
     "description": "持续扫描进程状态并在目标状态到达时通知主程序",
-    "version_code": 1,
+    "version_code": 2,
+    "version": "1.1",
+    "package_name": "io.github.notmyfault.process_state",
     "enabled": true,
     "params": [
         {
@@ -19,8 +22,8 @@
             "type": "select",
             "default": "running",
             "options": [
-                "running",
-                "stopped"
+                {"value": "running", "label": "进程正在运行"},
+                {"value": "stopped", "label": "进程已经停止"}
             ]
         }
     ]

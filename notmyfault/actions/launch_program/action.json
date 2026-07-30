@@ -3,7 +3,12 @@
     "name": "启动程序",
     "description": "启动指定程序或打开文件",
     "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.launch_program",
     "enabled": true,
+    "permissions": [
+        "external_binary"
+    ],
     "params": [
         {
             "name": "path",
@@ -18,6 +23,13 @@
             "type": "string",
             "default": "",
             "placeholder": "可选，命令行参数"
+        },
+        {
+            "name": "working_directory",
+            "label": "工作目录",
+            "type": "path",
+            "default": "",
+            "placeholder": "留空使用当前目录"
         }
     ]
 }

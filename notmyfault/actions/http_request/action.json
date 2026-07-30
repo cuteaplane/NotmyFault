@@ -1,0 +1,56 @@
+{
+    "id": "http_request",
+    "name": "HTTP 请求",
+    "description": "发送 HTTP GET/POST/PUT/DELETE 请求",
+    "version_code": 2,
+    "version": "1.1",
+    "package_name": "io.github.notmyfault.http_request",
+    "enabled": true,
+    "permissions": ["network"],
+    "params": [
+        {
+            "name": "method",
+            "label": "请求方法",
+            "type": "select",
+            "default": "GET",
+            "options": [
+                {"value": "GET", "label": "GET（读取）"},
+                {"value": "POST", "label": "POST（创建/提交）"},
+                {"value": "PUT", "label": "PUT（更新）"},
+                {"value": "DELETE", "label": "DELETE（删除）"}
+            ]
+        },
+        {
+            "name": "url",
+            "label": "URL",
+            "type": "string",
+            "default": "",
+            "placeholder": "https://example.com/api"
+        },
+        {
+            "name": "body",
+            "label": "请求体 (POST/PUT)",
+            "type": "textarea",
+            "default": "",
+            "placeholder": "JSON 字符串",
+            "rows": 7
+        },
+        {
+            "name": "headers",
+            "label": "自定义请求头",
+            "type": "textarea",
+            "default": "",
+            "placeholder": "每行一条，如 Content-Type: application/json",
+            "rows": 5
+        },
+        {
+            "name": "timeout_seconds",
+            "label": "超时（秒）",
+            "type": "number",
+            "default": 30,
+            "min": 1,
+            "max": 300,
+            "step": 1
+        }
+    ]
+}

@@ -3,6 +3,8 @@
     "name": "显示通知",
     "description": "显示 Windows 通知消息",
     "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.notify",
     "enabled": true,
     "params": [
         {
@@ -15,9 +17,10 @@
         {
             "name": "message",
             "label": "通知内容",
-            "type": "string",
+            "type": "textarea",
             "default": "",
-            "placeholder": "通知的正文内容"
+            "placeholder": "通知的正文内容",
+            "rows": 5
         }
     ]
 }
