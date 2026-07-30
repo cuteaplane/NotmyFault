@@ -2,8 +2,8 @@
     "id": "file_operation",
     "name": "文件操作",
     "description": "复制、移动、删除、压缩、解压文件或文件夹",
-    "version_code": 1,
-    "version": "1.0",
+    "version_code": 2,
+    "version": "1.1",
     "package_name": "io.github.notmyfault.file_operation",
     "enabled": true,
     "permissions": ["filesystem"],
@@ -13,7 +13,13 @@
             "label": "操作类型",
             "type": "select",
             "default": "copy",
-            "options": ["copy", "move", "delete", "compress", "extract"]
+            "options": [
+                {"value": "copy", "label": "复制"},
+                {"value": "move", "label": "移动"},
+                {"value": "delete", "label": "删除"},
+                {"value": "compress", "label": "压缩"},
+                {"value": "extract", "label": "解压"}
+            ]
         },
         {
             "name": "source",

@@ -2,10 +2,11 @@
     "id": "set_volume",
     "name": "设置系统音量",
     "description": "根据参数将系统主音量调整到指定级别",
-    "version_code": 1,
-    "version": "1.0",
+    "version_code": 2,
+    "version": "1.1",
     "package_name": "io.github.notmyfault.set_volume",
     "enabled": true,
+    "permissions": ["audio", "external_binary"],
     "params": [
         {
             "name": "action",
@@ -13,10 +14,10 @@
             "type": "select",
             "default": "max",
             "options": [
-                "max",
-                "half",
-                "min",
-                "mute"
+                {"value": "max", "label": "最大音量"},
+                {"value": "half", "label": "一半音量"},
+                {"value": "min", "label": "最小音量"},
+                {"value": "mute", "label": "静音"}
             ]
         }
     ]

@@ -186,6 +186,9 @@ def run(_action_info, params):
     if action not in {"toggle", "on", "off", "query"}:
         raise ValueError(f"Unsupported Bluetooth action: {action}")
 
+    if os.name != "nt":
+        return _run_linux_bluetooth(action)
+
     radio_error = ""
     try:
         radio = _run_radio("query")
@@ -206,3 +209,35 @@ def run(_action_info, params):
     result = _run_pnp(action)
     result.update({"ok": True, "winrt_error": radio_error})
     return result
+
+
+def _run_linux_bluetooth(action: str) -> dict[str, Any]:
+    def query_state() -> str:
+        result = subprocess.run(
+            ["bluetoothctl", "show"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=10,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "bluetoothctl show 失败")
+        return "on" if "Powered: yes" in result.stdout else "off"
+
+    current = query_state()
+    target = ("off" if current == "on" else "on") if action == "toggle" else action
+    if target != "query":
+        result = subprocess.run(
+            ["bluetoothctl", "power", target],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=15,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or f"蓝牙切换到 {target} 失败")
+    actual = query_state()
+    expected = current if target == "query" else target
+    if actual != expected:
+        raise RuntimeError(f"请求蓝牙 {expected}，实际状态为 {actual}")
+    return {"ok": True, "method": "bluetoothctl", "state": actual}

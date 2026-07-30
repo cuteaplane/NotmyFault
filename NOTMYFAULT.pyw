@@ -18,9 +18,13 @@ LOG_DIR = os.path.join(os.path.dirname(CONFIG_FILE), "logs")
 
 # 系统托盘（导入失败不阻塞，无托盘也能运行）
 try:
-    from notmyfault.tray import TrayIcon
-    _HAS_TRAY = True
-except ImportError:
+    if os.name == "nt":
+        from notmyfault.tray import TrayIcon
+        _HAS_TRAY = True
+    else:
+        from notmyfault.tray_linux import TrayIcon, is_tray_supported
+        _HAS_TRAY = is_tray_supported()
+except Exception:
     _HAS_TRAY = False
 
 
@@ -96,7 +100,12 @@ def _open_dashboard():
         import subprocess
         executable_dir = os.path.dirname(sys.executable)
         current = os.path.normcase(os.path.abspath(sys.executable))
-        for filename in ("NotmyFaultDashboard.exe", "dashboard.exe"):
+        filenames = (
+            ("NotmyFaultDashboard.exe", "dashboard.exe")
+            if os.name == "nt"
+            else ("NotmyFaultDashboard", "dashboard", "notmyfault-dashboard")
+        )
+        for filename in filenames:
             candidate = os.path.join(executable_dir, filename)
             if (
                 os.path.isfile(candidate)
@@ -110,7 +119,8 @@ def _open_dashboard():
     dashboard_pyw = os.path.join(PROJECT_ROOT, "dashboard.pyw")
     if os.path.exists(dashboard_pyw):
         try:
-            os.startfile(dashboard_pyw)
+            from notmyfault.platform_support import launch_python_entry
+            launch_python_entry(dashboard_pyw)
             return
         except Exception:
             pass
@@ -357,7 +367,14 @@ def main():
 
 
 if __name__ == "__main__":
-    if "--dashboard" in sys.argv:
+    if "--enable-autostart" in sys.argv or "--disable-autostart" in sys.argv:
+        if os.name == "nt":
+            raise SystemExit("请通过 Windows 托盘菜单管理开机自启")
+        from notmyfault.platform_support import set_linux_autostart
+        enabled = "--enable-autostart" in sys.argv
+        set_linux_autostart(enabled, PROJECT_ROOT)
+        print("已启用开机自启" if enabled else "已关闭开机自启")
+    elif "--dashboard" in sys.argv:
         _open_dashboard()
     else:
         main()

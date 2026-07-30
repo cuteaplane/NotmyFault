@@ -6,7 +6,7 @@
 
 ### 环境
 
-- Windows
+- Windows / Linux
 - Python 3.11+（当前开发环境可用 Python 3.14）
 - Node.js 18+
 
@@ -17,6 +17,35 @@ pip install fastapi uvicorn psutil pywin32 py7zr openpyxl
 cd dashboard
 npm install
 ```
+
+Linux 不需要 `pywin32`，Dashboard 可使用 `pywebview[qt]`。
+推荐统一使用 `pip install -r requirements-dev.txt`，平台专属依赖由环境标记自动选择。
+
+### 插件平台兼容性
+
+默认的 `action.py` / `trigger.py` 入口视为跨平台。若插件只支持部分系统，
+在清单中声明：
+
+```json
+{
+  "platforms": ["windows"]
+}
+```
+
+只有当不同系统的实现差异很大时才拆分入口：
+
+```json
+{
+  "platforms": ["windows", "linux"],
+  "entrypoints": {
+    "windows": "windows/action.py",
+    "linux": "linux/action.py"
+  }
+}
+```
+
+入口必须是插件目录内的相对 `.py` 路径。内置插件和用户插件使用同一套
+平台选择、签名、权限扫描和完整性校验；当前平台没有入口时会在执行代码前跳过。
 
 启动引擎：
 

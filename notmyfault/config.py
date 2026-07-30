@@ -7,6 +7,8 @@ import secrets
 import sys
 from typing import Any, Dict, List
 
+from .platform_support import get_config_dir
+
 DEFAULT_CONFIG: Dict[str, Any] = {
     "disabled_plugins": {
         "triggers": [],
@@ -136,7 +138,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     ]
 }
 
-CONFIG_FILE = os.path.join(os.getenv("APPDATA", ""), "NotmyFault", "config.json")
+CONFIG_FILE = os.path.join(get_config_dir(), "config.json")
 def _backup_path() -> str:
     return CONFIG_FILE + ".bak"
 
@@ -504,6 +506,19 @@ def _normalize_rule_actions(actions: Any) -> Any:
             continue
         copied = dict(action)
         copied.pop("id", None)
+        # display_control 1.2 起统一使用可配置亮度。旧规则继续可执行，
+        # 并在加载时无损迁移，避免编辑器出现已移除的下拉选项。
+        if copied.get("type") == "display_control":
+            params = copied.get("params")
+            if isinstance(params, dict):
+                legacy_action = params.get("action")
+                if legacy_action in ("low_brightness", "high_brightness"):
+                    copied_params = dict(params)
+                    copied_params["action"] = "set_brightness"
+                    copied_params["brightness"] = (
+                        10 if legacy_action == "low_brightness" else 90
+                    )
+                    copied["params"] = copied_params
         normalized.append(_replace_step_references(copied, replacements))
     return normalized
 

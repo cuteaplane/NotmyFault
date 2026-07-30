@@ -1,19 +1,20 @@
 import ctypes
+import os
 
 GMEM_MOVEABLE = 0x0002
 CF_UNICODETEXT = 13
 
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
-# 64 位兼容：返回类型和参数类型都要显式声明
-kernel32.GlobalAlloc.restype = ctypes.c_void_p
-kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
-kernel32.GlobalLock.restype = ctypes.c_void_p
-kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
-kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
-kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
-user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
-user32.SetClipboardData.restype = ctypes.c_void_p
+if os.name == "nt":
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
 
 
 def run(action_info, params):
@@ -24,6 +25,15 @@ def run(action_info, params):
         return
 
     print(f"[Action:clipboard_set] 写入剪贴板: {text[:50]}...")
+
+    if os.name != "nt":
+        try:
+            from notmyfault.linux_support import set_clipboard_text
+            set_clipboard_text(str(text))
+            print(f"[Action:clipboard_set] 剪贴板写入成功 ({len(text)} 字符)")
+        except Exception as error:
+            print(f"[Action:clipboard_set] 写入失败: {error}")
+        return
 
     clipboard_open = False
     handle = None

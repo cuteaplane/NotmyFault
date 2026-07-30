@@ -6,7 +6,7 @@
     "version": "1.0",
     "package_name": "io.github.notmyfault.text_to_speech",
     "enabled": true,
-    "permissions": ["audio", "native_api"],
+    "permissions": ["audio", "native_api", "external_binary"],
     "params": [
         {
             "name": "text",

@@ -2,18 +2,37 @@ import ast
 import json
 import os
 import re
+import sys
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 _REQUIRED_META_FIELDS = {"id", "name", "description", "enabled", "version_code", "version", "package_name"}
-_TRIGGER_OPTIONAL_FIELDS = {"semantic", "params", "permissions", "origin", "trigger_api"}
-_ACTION_OPTIONAL_FIELDS = {"params", "permissions", "origin", "execution_api", "precondition_api", "outputs"}
+_TRIGGER_OPTIONAL_FIELDS = {
+    "semantic", "params", "permissions", "origin", "trigger_api", "platforms",
+    "entrypoints",
+}
+_ACTION_OPTIONAL_FIELDS = {
+    "params", "permissions", "origin", "execution_api", "precondition_api",
+    "outputs", "platforms", "entrypoints",
+}
 _ALLOWED_SEMANTICS = {"state", "oneshot"}
 _ALLOWED_PARAM_TYPES = {"string", "number", "select", "bool", "time", "hotkey", "path", "textarea"}
 _REQUIRED_PARAM_FIELDS = {"name", "type", "label"}
 _ALLOWED_ORIGINS = {"builtin", "user", "third_party"}
+_ALLOWED_PLATFORMS = {"windows", "linux", "macos"}
 _PACKAGE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$")
 # id 仅允许字母/数字/下划线/连字符，禁止路径分隔符（防 ../ 路径穿越）
 _PLUGIN_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
+
+
+def current_platform_name() -> str:
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    if sys.platform == "darwin":
+        return "macos"
+    return sys.platform
 
 # =========================================================================
 # 权限注册表
@@ -117,10 +136,11 @@ def scan_plugin_security(plugin_dir: str) -> List[Dict[str, Any]]:
     if not os.path.isdir(plugin_dir):
         return risks
 
-    for fname in sorted(os.listdir(plugin_dir)):
-        if not fname.endswith(".py"):
+    for fpath_obj in sorted(Path(plugin_dir).rglob("*.py")):
+        if not fpath_obj.is_file():
             continue
-        fpath = os.path.join(plugin_dir, fname)
+        fpath = str(fpath_obj)
+        fname = fpath_obj.relative_to(plugin_dir).as_posix()
         try:
             with open(fpath, "r", encoding="utf-8", errors="replace") as f:
                 source = f.read()
@@ -219,6 +239,45 @@ def validate_plugin_meta(
         if meta["origin"] not in _ALLOWED_ORIGINS:
             errors.append("origin invalid: " + meta["origin"])
 
+    if "platforms" in meta:
+        platforms = meta["platforms"]
+        if not isinstance(platforms, list) or not platforms:
+            errors.append("字段 'platforms' 必须是非空数组")
+        else:
+            for platform in platforms:
+                if platform not in _ALLOWED_PLATFORMS:
+                    errors.append(
+                        f"platforms 包含无效平台: {platform!r}"
+                        f"（允许: {', '.join(sorted(_ALLOWED_PLATFORMS))}）"
+                    )
+
+    if "entrypoints" in meta:
+        entrypoints = meta["entrypoints"]
+        if not isinstance(entrypoints, dict) or not entrypoints:
+            errors.append("字段 'entrypoints' 必须是非空对象")
+        else:
+            for platform, entrypoint in entrypoints.items():
+                if platform not in _ALLOWED_PLATFORMS:
+                    errors.append(f"entrypoints 包含无效平台: {platform!r}")
+                    continue
+                if not isinstance(entrypoint, str) or not entrypoint.endswith(".py"):
+                    errors.append(
+                        f"entrypoints.{platform} 必须是相对 .py 文件路径"
+                    )
+                    continue
+                normalized = entrypoint.replace("\\", "/")
+                if (
+                    normalized.startswith("/")
+                    or "\\" in entrypoint
+                    or any(part in ("", ".", "..") for part in normalized.split("/"))
+                ):
+                    errors.append(
+                        f"entrypoints.{platform} 必须位于插件目录内: {entrypoint!r}"
+                    )
+            platforms = meta.get("platforms")
+            if isinstance(platforms, list) and set(entrypoints) != set(platforms):
+                errors.append("platforms 与 entrypoints 的平台集合必须一致")
+
     if "execution_api" in meta and meta["execution_api"] not in ("legacy", "context-v1"):
         errors.append("execution_api 必须为 legacy 或 context-v1")
     if "precondition_api" in meta and meta["precondition_api"] != "context-v1":
@@ -306,6 +365,19 @@ def scan_plugins(base_dir: str, plugins_dir: str, json_filename: str) -> Dict[st
         if not is_valid:
             continue
 
-        result[plugin_id] = meta
+        current_platform = current_platform_name()
+        entrypoints = meta.get("entrypoints") or {}
+        platforms = meta.get("platforms") or list(entrypoints)
+        compatible = (
+            current_platform in entrypoints
+            if entrypoints
+            else not platforms or current_platform in platforms
+        )
+        result[plugin_id] = {
+            **meta,
+            "platform_compatible": compatible,
+            "current_platform": current_platform,
+            "selected_entrypoint": entrypoints.get(current_platform),
+        }
 
     return result

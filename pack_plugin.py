@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import py7zr
+from notmyfault.plugin_schema import validate_plugin_meta
 
 ROOT = Path(__file__).parent.resolve()
 USER_PLUGINS_DIR = ROOT / "user_plugins"
@@ -58,6 +59,13 @@ def pack_plugin(plugin_dir: Path, output_dir: Path = DIST_DIR) -> Path | None:
     meta = json.loads((plugin_dir / json_name).read_text(encoding="utf-8"))
     plugin_id = meta.get("id", plugin_dir.name)
     ptype = "action" if json_name == "action.json" else "trigger"
+    valid, errors = validate_plugin_meta(meta, ptype)
+    if not valid:
+        print(
+            "! 插件清单校验失败: " + "; ".join(errors[:5]),
+            file=sys.stderr,
+        )
+        return None
 
     output_dir.mkdir(parents=True, exist_ok=True)
     nmfp_path = output_dir / f"{plugin_id}.nmfp"

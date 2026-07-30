@@ -4,7 +4,7 @@
   "description": "确认目录文件已稳定、未被占用，且 Office/WPS/Adobe 未显示正在编辑的文档；不确定时延后工作流。",
   "version_code": 1,
   "version": "1.0",
-  "package_name": "io.github.notmyfault.document_quiescent",
+    "package_name": "io.github.notmyfault.document_quiescent",
   "enabled": true,
   "permissions": ["filesystem", "native_api"],
   "precondition_api": "context-v1",

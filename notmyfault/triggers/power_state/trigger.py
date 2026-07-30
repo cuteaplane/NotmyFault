@@ -1,16 +1,20 @@
 import time
 import ctypes
 import threading
+import os
+import psutil
 
 WM_POWERBROADCAST = 0x0218
 PBT_APMRESUMEAUTOMATIC = 0x0012
 PBT_APMRESUMESUSPEND = 0x0007
 PBT_APMSUSPEND = 0x0004
 
-kernel32 = ctypes.windll.kernel32
-
-
 def _is_on_battery():
+    if os.name != "nt":
+        battery = psutil.sensors_battery()
+        if battery is None:
+            return False, 100
+        return not battery.power_plugged, round(battery.percent)
     try:
         SYSTEM_POWER_STATUS = ctypes.c_uint8 * 12
         sps = SYSTEM_POWER_STATUS()

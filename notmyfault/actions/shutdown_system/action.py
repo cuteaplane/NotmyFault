@@ -1,6 +1,8 @@
 import ctypes
 import time
 import threading
+import os
+import subprocess
 
 EWX_LOGOFF = 0
 EWX_SHUTDOWN = 0x00000001
@@ -64,6 +66,31 @@ def run(action_info, params):
         if delay > 0:
             time.sleep(delay)
         print(f"[Action:shutdown_system] 执行: {action}")
+        if os.name != "nt":
+            commands = {
+                "shutdown": ["systemctl", "poweroff"],
+                "restart": ["systemctl", "reboot"],
+                "logoff": ["loginctl", "terminate-user", str(os.getuid())],
+                "hibernate": ["systemctl", "hibernate"],
+                "sleep": ["systemctl", "suspend"],
+            }
+            command = commands.get(action)
+            if not command:
+                print(f"[Action:shutdown_system] 不支持的操作: {action}")
+                return
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=15,
+            )
+            if result.returncode != 0:
+                print(
+                    "[Action:shutdown_system] 操作失败: "
+                    + (result.stderr.strip() or f"退出码 {result.returncode}")
+                )
+            return
         if action == "hibernate":
             ctypes.windll.powrprof.SetSuspendState(True, True, False)
         elif action == "sleep":

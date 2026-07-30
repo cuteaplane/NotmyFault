@@ -2,11 +2,11 @@
     "id": "wallpaper",
     "name": "更换壁纸",
     "description": "设置桌面壁纸（支持图片路径和样式）",
-    "version_code": 1,
-    "version": "1.0",
+    "version_code": 2,
+    "version": "1.1",
     "package_name": "io.github.notmyfault.wallpaper",
     "enabled": true,
-    "permissions": ["native_api", "filesystem"],
+    "permissions": ["native_api", "filesystem", "external_binary"],
     "params": [
         {
             "name": "image_path",
@@ -20,7 +20,13 @@
             "label": "填充样式",
             "type": "select",
             "default": "fill",
-            "options": ["fill", "fit", "stretch", "tile", "center"]
+            "options": [
+                {"value": "fill", "label": "填充"},
+                {"value": "fit", "label": "适应"},
+                {"value": "stretch", "label": "拉伸"},
+                {"value": "tile", "label": "平铺"},
+                {"value": "center", "label": "居中"}
+            ]
         }
     ]
 }

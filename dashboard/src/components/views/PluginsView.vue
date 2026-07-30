@@ -205,6 +205,9 @@ onMounted(refresh)
                     {{ preview.plugin.type === 'triggers' ? '触发器' : '动作' }}
                   </span>
                   <span class="chip">v{{ preview.plugin.version }}</span>
+                  <span v-if="preview.plugin.platform_compatible === false" class="chip chip-error">
+                    当前系统不兼容
+                  </span>
                   <span v-if="preview.plugin.author" class="chip">{{ preview.plugin.author }}</span>
                 </div>
                 <p class="preview-desc" v-if="preview.plugin.description">{{ preview.plugin.description }}</p>

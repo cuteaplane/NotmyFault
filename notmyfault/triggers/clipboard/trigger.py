@@ -1,18 +1,21 @@
 import ctypes
+import os
 
 CF_UNICODETEXT = 13
 
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
-# 64 位兼容：返回类型和参数类型都要显式声明，否则 ctypes 默认 c_int (32位)
-# 会截断指针高位或报 OverflowError
-user32.GetClipboardData.restype = ctypes.c_void_p
-kernel32.GlobalLock.restype = ctypes.c_void_p
-kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
-kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+if os.name == "nt":
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
 
 
 def _get_clipboard_text():
+    if os.name != "nt":
+        from notmyfault.linux_support import get_clipboard_text
+        return get_clipboard_text()
     if not user32.OpenClipboard(None):
         return None
     try:

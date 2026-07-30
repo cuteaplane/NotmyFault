@@ -25,9 +25,10 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import webview
+from notmyfault.config import CONFIG_FILE
+from notmyfault.platform_support import launch_python_entry
 
 API = "http://127.0.0.1:19198"
-CONFIG_FILE = os.path.join(os.environ.get("APPDATA", ""), "NotmyFault", "config.json")
 # 必须与 notmyfault/api_server.py 的 API_TOKEN_FILE 保持一致：
 # token 写在 config.json 同目录下（%APPDATA%/NotmyFault/.api_token），
 # 不再用 %TEMP%/notmyfault_api_token（旧路径，Authenticated Users 可读，已废弃）。
@@ -117,12 +118,17 @@ class DashboardAPI:
                 import subprocess
                 executable_dir = os.path.dirname(sys.executable)
                 current = os.path.normcase(os.path.abspath(sys.executable))
+                sibling_names = (
+                    ("NotmyFault.exe", "engine.exe")
+                    if os.name == "nt"
+                    else ("NotmyFault", "engine", "notmyfault-engine")
+                )
                 sibling = next(
                     (
                         candidate
                         for candidate in (
-                            os.path.join(executable_dir, "NotmyFault.exe"),
-                            os.path.join(executable_dir, "engine.exe"),
+                            os.path.join(executable_dir, name)
+                            for name in sibling_names
                         )
                         if os.path.isfile(candidate)
                         and os.path.normcase(os.path.abspath(candidate)) != current
@@ -136,7 +142,7 @@ class DashboardAPI:
                 else:
                     return {
                         "ok": False,
-                        "error": "打包目录中缺少 NotmyFault.exe 引擎入口",
+                        "error": "打包目录中缺少 NotmyFault 引擎入口",
                     }
                 subprocess.Popen(
                     command,
@@ -149,7 +155,7 @@ class DashboardAPI:
             if not os.path.exists(pyw):
                 return {"ok": False, "error": f"找不到 {pyw}"}
             try:
-                os.startfile(pyw)
+                launch_python_entry(pyw)
             except Exception as e:
                 return {"ok": False, "error": str(e)}
 
@@ -501,7 +507,10 @@ def main():
     window.events.closed += lambda: print("[Dashboard] 窗口已关闭")
 
     try:
-        webview.start()
+        if sys.platform.startswith("linux"):
+            webview.start(gui="qt")
+        else:
+            webview.start()
     except KeyboardInterrupt:
         pass
     control_server.shutdown()

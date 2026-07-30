@@ -1,3 +1,4 @@
+import os
 import psutil
 
 
@@ -11,7 +12,7 @@ def run(action_info, params):
 
     killed = 0
     target = process_name.lower()
-    if not target.endswith(".exe"):
+    if os.name == "nt" and not target.endswith(".exe"):
         target += ".exe"
 
     try:

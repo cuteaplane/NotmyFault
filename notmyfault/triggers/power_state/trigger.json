@@ -4,8 +4,8 @@
     "semantic": "state",
     "trigger_api": "event-v1",
     "description": "电源接入/电池/低电量/休眠恢复时触发",
-    "version_code": 1,
-    "version": "1.0",
+    "version_code": 2,
+    "version": "1.1",
     "package_name": "io.github.notmyfault.power_state",
     "enabled": true,
     "permissions": ["native_api"],
@@ -15,7 +15,12 @@
             "label": "状态",
             "type": "select",
             "default": "ac",
-            "options": ["ac", "battery", "low_battery", "resume"]
+            "options": [
+                {"value": "ac", "label": "已接通电源"},
+                {"value": "battery", "label": "正在使用电池"},
+                {"value": "low_battery", "label": "电池电量低"},
+                {"value": "resume", "label": "从睡眠中恢复"}
+            ]
         }
     ]
 }

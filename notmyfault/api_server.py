@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from notmyfault.config import CONFIG_FILE, save_config as config_save
+from notmyfault.platform_support import get_config_dir
 from notmyfault.plugin_schema import (
     scan_plugins,
     validate_plugin_meta,
@@ -30,6 +31,7 @@ from notmyfault.plugin_schema import (
     check_permissions_conform,
     get_permission_info,
     is_known_permission,
+    current_platform_name,
     PERMISSION_REGISTRY,
 )
 from notmyfault.security import detect_security_mode, SecurityMode
@@ -224,7 +226,7 @@ class EngineAPI:
         return result
 
     def _get_user_plugins_dir(self) -> str:
-        return os.path.join(os.environ.get("APPDATA", ""), "NotmyFault", "plugins")
+        return os.path.join(get_config_dir(), "plugins")
 
     @staticmethod
     def _is_safe_plugin_id(pid: str) -> bool:
@@ -589,6 +591,19 @@ class EngineAPI:
                 "security_mode": detect_security_mode().value,
             }
 
+        @app.get("/api/platform")
+        async def platform_status():
+            if sys.platform.startswith("linux"):
+                from notmyfault.linux_support import capability_report
+                return capability_report()
+            return {
+                "platform": "windows" if sys.platform == "win32" else sys.platform,
+                "desktop": None,
+                "session_type": None,
+                "capabilities": {},
+                "limitations": {},
+            }
+
         # ================================================================
         # 规则 CRUD
         # ================================================================
@@ -852,6 +867,16 @@ class EngineAPI:
                         "package_name": meta.get("package_name", ""),
                         "type": ptype,
                         "semantic": meta.get("semantic", ""),
+                        "platforms": meta.get("platforms", []),
+                        "entrypoints": meta.get("entrypoints", {}),
+                        "platform_compatible": (
+                            current_platform_name() in meta.get("entrypoints", {})
+                            if meta.get("entrypoints")
+                            else (
+                                not meta.get("platforms")
+                                or current_platform_name() in meta.get("platforms", [])
+                            )
+                        ),
                     },
                     "permissions": perm_analysis,
                     "permission_conform": perm_conform,

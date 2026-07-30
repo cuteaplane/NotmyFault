@@ -13,6 +13,7 @@ r"""
 
 import subprocess
 import time
+import os
 
 # 设备容器属性：指示蓝牙设备是否真正已连接（True/False）
 _DEVPKEY_CONNECTION_STATE = "{83DA6326-97A6-4088-9453-A1923F573B29} 15"
@@ -26,6 +27,9 @@ def _get_connected_devices():
 
     返回 (devices: set[str], errors: list[str])
     """
+    if os.name != "nt":
+        return _get_linux_connected_devices()
+
     ps = f"""
 $all = Get-PnpDevice -Class Bluetooth | Where-Object {{ $_.Present }}
 foreach ($dev in $all) {{
@@ -95,6 +99,27 @@ foreach ($dev in $all) {{
         devices.add(base_name)
 
     return devices, errors
+
+
+def _get_linux_connected_devices():
+    try:
+        result = subprocess.run(
+            ["bluetoothctl", "devices", "Connected"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=10,
+        )
+    except Exception as error:
+        return set(), [f"bluetoothctl 启动失败: {error}"]
+    if result.returncode != 0:
+        return set(), [result.stderr.strip() or "bluetoothctl 查询失败"]
+    devices = set()
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(maxsplit=2)
+        if len(parts) == 3 and parts[0] == "Device":
+            devices.add(_strip_bluetooth_suffix(parts[2]))
+    return devices, []
 
 
 def _strip_bluetooth_suffix(name: str) -> str:

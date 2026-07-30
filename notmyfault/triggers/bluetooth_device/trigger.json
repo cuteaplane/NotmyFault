@@ -4,8 +4,8 @@
     "semantic": "state",
     "trigger_api": "event-v1",
     "description": "监控蓝牙设备的连接和断开事件",
-    "version_code": 1,
-    "version": "1.0",
+    "version_code": 2,
+    "version": "1.1",
     "package_name": "io.github.notmyfault.bluetooth_device",
     "enabled": false,
     "permissions": [
@@ -25,8 +25,8 @@
             "type": "select",
             "default": "connected",
             "options": [
-                "connected",
-                "disconnected"
+                {"value": "connected", "label": "设备已连接"},
+                {"value": "disconnected", "label": "设备已断开"}
             ]
         }
     ]

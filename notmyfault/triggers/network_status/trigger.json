@@ -4,8 +4,8 @@
     "semantic": "state",
     "trigger_api": "event-v1",
     "description": "网络连接/断开时触发",
-    "version_code": 1,
-    "version": "1.0",
+    "version_code": 2,
+    "version": "1.1",
     "package_name": "io.github.notmyfault.network_status",
     "enabled": true,
     "permissions": ["network"],
@@ -15,7 +15,10 @@
             "label": "目标状态",
             "type": "select",
             "default": "disconnected",
-            "options": ["connected", "disconnected"]
+            "options": [
+                {"value": "connected", "label": "网络已连接"},
+                {"value": "disconnected", "label": "网络已断开"}
+            ]
         }
     ]
 }

@@ -24,7 +24,10 @@ def plugin_files(plugin_dir) -> list[Path]:
     签名只哈希 .py/.json，校验却哈希了目录下所有文件，多放一个 README/icon 就校验失败。
     """
     files = []
-    for f in sorted(Path(plugin_dir).iterdir()):
+    for f in sorted(
+        Path(plugin_dir).rglob("*"),
+        key=lambda path: path.relative_to(plugin_dir).as_posix(),
+    ):
         if f.is_file() and f.suffix in (".py", ".json") and f.name != "signature.sig":
             files.append(f)
     return files

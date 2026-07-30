@@ -20,12 +20,15 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
+from notmyfault.platform_support import get_config_dir
+
 
 _UPLOAD_URL = "https://upload.cloud.189.cn/uploadFile.action"
 _REQUEST_URI = "/uploadFile.action"
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _STATE_LOCK = threading.Lock()
-_STATE_ROOT = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "NotmyFault" / "plugin-data" / "tianyi_drive_sync"
+
+_STATE_ROOT = Path(get_config_dir()) / "plugin-data" / "tianyi_drive_sync"
 
 
 class SyncError(RuntimeError):

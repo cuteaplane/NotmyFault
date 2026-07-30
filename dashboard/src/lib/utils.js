@@ -21,8 +21,23 @@ export function optValue(o) {
 
 // options 统一提取 label（兼容字符串和 {value,label} 对象）
 export function optLabel(o) {
-  if (typeof o === 'object' && o !== null) return o.label || o.value || ''
-  return o
+  if (typeof o === 'object' && o !== null) return o.label || friendlyOptionLabel(o.value)
+  return friendlyOptionLabel(o)
+}
+
+const commonOptionLabels = {
+  opened: '已打开', closed: '已关闭',
+  connected: '已连接', disconnected: '已断开',
+  running: '运行中', stopped: '已停止',
+  on: '开启', off: '关闭', toggle: '切换', query: '查询状态',
+  created: '新建', modified: '修改', deleted: '删除', all: '全部',
+  above: '高于阈值', below: '低于阈值',
+  low_brightness: '低亮度', high_brightness: '高亮度',
+}
+
+function friendlyOptionLabel(value) {
+  const text = String(value ?? '')
+  return commonOptionLabels[text] || text.replace(/[_-]+/g, ' ')
 }
 
 // 判断参数是否应该显示（基于 visible_when 条件）

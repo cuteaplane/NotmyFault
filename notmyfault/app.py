@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict, Optional
 
 from .config import get_config
 from .engine import AutomationEngine
+from .platform_support import get_config_dir
 import glob
 import subprocess as _sp
 
@@ -77,7 +78,7 @@ def _get_plugin_paths():
         paths.append((os.path.join(sys._MEIPASS, "notmyfault"), "builtin"))
     else:
         paths.append((os.path.dirname(__file__), "builtin"))
-    user_dir = os.path.join(os.environ.get("APPDATA", ""), "NotmyFault", "plugins")
+    user_dir = os.path.join(get_config_dir(), "plugins")
     if os.path.isdir(user_dir):
         paths.append((user_dir, "user"))
     return paths

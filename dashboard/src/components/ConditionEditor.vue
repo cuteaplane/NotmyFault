@@ -12,7 +12,9 @@ const emit = defineEmits(['remove'])
 // 允许用户在界面中修复旧配置或手写配置里的缺失 children 字段。
 if (!Array.isArray(props.node.children)) props.node.children = []
 
-const triggerKeys = computed(() => Object.keys(store.schema.triggers))
+const triggerKeys = computed(() => Object.keys(store.schema.triggers).filter(
+  key => store.schema.triggers[key]?.platform_compatible !== false
+))
 const triggerGroups = computed(() => groupTriggerKeys(triggerKeys.value))
 const isLeaf = (node) => !!node?.type && !node.children && !node.events
 const isObjectNode = (node) => !!node && typeof node === 'object' && !Array.isArray(node)

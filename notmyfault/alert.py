@@ -14,11 +14,12 @@ import sys
 import threading
 import time
 
-from windows_toasts import Toast, ToastButton
+from notmyfault.platform_support import launch_python_entry, show_notification
 
-# 持有活跃 toast 引用，防止 GC 回收
-_active_toasts: list[Toast] = []
-_toasts_lock = threading.Lock()
+if os.name == "nt":
+    from windows_toasts import Toast, ToastButton
+    _active_toasts: list[Toast] = []
+    _toasts_lock = threading.Lock()
 
 
 def _dashboard_pyw_path() -> str:
@@ -62,7 +63,7 @@ def _launch_dashboard() -> None:
         print(f"[Alert] 找不到 dashboard 入口: {dashboard_pyw}", file=sys.stderr)
         return
     try:
-        os.startfile(dashboard_pyw)
+        launch_python_entry(dashboard_pyw)
         print("[Alert] 已拉起 Dashboard")
     except Exception as e:
         print(f"[Alert] 拉起 Dashboard 失败: {e}", file=sys.stderr)
@@ -85,48 +86,51 @@ def alert_user(
         open_dashboard: 是否同时立即打开 Dashboard（默认 True）
         display_seconds: 通知显示秒数（到达后自动消失）
     """
-    try:
-        from Win_toaster.show_notification import toaster
-
-        toast = Toast([f"[!] {title}", message])
-
-        # 协议按钮 — launch 字段 = 协议 URL，库自动设 activationType="protocol"
-        btn = ToastButton("打开控制面板")
-        btn.launch = "notmyfault://dashboard"
-        toast.AddAction(btn)
-
-        # 点击通知本体也尝试拉起（作为备用，不依赖 COM）
-        def _on_activated(args):
-            _launch_dashboard()
-
-        toast.on_activated = _on_activated
-
-        # 持有引用防止 GC
-        with _toasts_lock:
-            _active_toasts.append(toast)
-
-        toaster.show_toast(toast)
-
-        # 保活线程 — 确保进程在通知显示期间存活
-        def _keepalive_and_cleanup():
-            deadline = time.time() + display_seconds + 2
-            while time.time() < deadline:
-                time.sleep(0.5)
-            try:
-                toaster.remove_toast(toast)
-            except Exception:
-                pass
-            try:
-                with _toasts_lock:
-                    _active_toasts.remove(toast)
-            except ValueError:
-                pass
-
-        threading.Thread(target=_keepalive_and_cleanup, daemon=True).start()
-
-    except Exception as e:
-        print(f"[Alert] 通知发送失败: {e}", file=sys.stderr)
+    if os.name == "nt":
+        try:
+            _show_windows_alert(title, message, display_seconds)
+        except Exception as e:
+            print(f"[Alert] 通知发送失败: {e}", file=sys.stderr)
+    else:
+        show_notification(f"[!] {title}", message)
 
     # 立即拉起 Dashboard
     if open_dashboard:
         threading.Thread(target=_launch_dashboard, daemon=True).start()
+
+
+def _show_windows_alert(title: str, message: str, display_seconds: int) -> None:
+    """发送带 Dashboard 操作按钮的 Windows Toast。"""
+    from Win_toaster.show_notification import toaster
+
+    toast = Toast([f"[!] {title}", message])
+
+    btn = ToastButton("打开控制面板")
+    btn.launch = "notmyfault://dashboard"
+    toast.AddAction(btn)
+
+    def _on_activated(args):
+        _launch_dashboard()
+
+    toast.on_activated = _on_activated
+
+    with _toasts_lock:
+        _active_toasts.append(toast)
+
+    toaster.show_toast(toast)
+
+    def _keepalive_and_cleanup():
+        deadline = time.time() + display_seconds + 2
+        while time.time() < deadline:
+            time.sleep(0.5)
+        try:
+            toaster.remove_toast(toast)
+        except Exception:
+            pass
+        try:
+            with _toasts_lock:
+                _active_toasts.remove(toast)
+        except ValueError:
+            pass
+
+    threading.Thread(target=_keepalive_and_cleanup, daemon=True).start()

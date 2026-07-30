@@ -3,9 +3,10 @@ import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { store } from '../../lib/store'
 import { getEngineStatus, readDiagnostics, hasBridge } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
+import { useEngineControl } from '../../composables/useEngineControl'
 
-const starting = ref(false)
-const stopping = ref(false)
+// 引擎启动/暂停/重启逻辑与 NavRail 快捷按钮共享（含 busy 状态）
+const { starting, stopping, syncStatus, startEngine, stopEngine } = useEngineControl()
 const stats = ref({ rules: '-', triggers: '-', actions: '-', pid: '-' })
 const diag = ref(null)
 let diagTimer = null
@@ -20,17 +21,6 @@ const modeLabel = computed(() => {
   const m = store.engineStatus.security_mode
   return ({ strict: '严格', normal: '标准', permissive: '宽松' })[m] || '-'
 })
-
-async function syncStatus(s) {
-  // 合并而非整体替换：stopEngine 会传 {engine_running:false} 这样的部分对象，
-  // 整体替换会把 security_mode / pid / rules_count 等字段一起冲掉，导致停引擎后
-  // 安全模式标签变 '-'、SecurityView 显示“未知”。与 App.vue.updateStatus 对齐。
-  store.engineStatus = { ...store.engineStatus, ...s }
-  if ('api_alive' in s) store.controllerOnline = s.api_alive === true
-  if ('engine_running' in s) store.engineOnline = s.engine_running === true
-  document.body.classList.toggle('controller-online', store.controllerOnline)
-  document.body.classList.toggle('engine-online', store.engineOnline)
-}
 
 async function loadStats() {
   try {
@@ -104,41 +94,6 @@ const diagLines = computed(() => {
   ;(d.last_warns || []).forEach(w => lines.push({ cls: 'diag-warn', icon: 'warning', text: w }))
   return lines
 })
-
-async function startEngine() {
-  if (starting.value) return
-  starting.value = true
-  try {
-    if (!hasBridge()) throw new Error('Dashboard 桌面桥接尚未就绪')
-    const r = await window.pywebview.api.launch_engine()
-    if (!r.ok) throw new Error(r.error || '未知错误')
-    await syncStatus(r)
-    if (window.__nmf) await window.__nmf.refreshAll()
-    await loadStats()
-    snackbar(r.engine_running ? '自动化已启动' : '后台服务正在启动自动化')
-  } catch (e) {
-    alert('启动失败: ' + e.message)
-  } finally {
-    starting.value = false
-  }
-}
-
-async function stopEngine() {
-  if (stopping.value) return
-  stopping.value = true
-  try {
-    if (!hasBridge()) throw new Error('Dashboard 桌面桥接尚未就绪')
-    const r = await window.pywebview.api.stop_engine()
-    if (!r?.ok) throw new Error(r?.error || '后台服务未响应')
-    const status = await getEngineStatus()
-    await syncStatus(status)
-    snackbar(r.stopping ? '正在暂停自动化' : '自动化已暂停，后台服务仍在线')
-  } catch (e) {
-    alert('暂停失败: ' + e.message)
-  } finally {
-    stopping.value = false
-  }
-}
 
 function refreshHome() {
   loadStats()

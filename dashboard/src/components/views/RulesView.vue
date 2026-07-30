@@ -12,6 +12,10 @@ const baseline = ref('')
 const runningRuleIndex = ref(null)
 const activeRule = computed(() => draftRule.value)
 const isDirty = computed(() => !!draftRule.value && JSON.stringify(draftRule.value) !== baseline.value)
+const isTestingActiveRule = computed(() => (
+  activeRuleIndex.value !== null
+  && runningRuleIndex.value === activeRuleIndex.value
+))
 
 const ruleFolders = computed(() => {
   const folders = new Map()
@@ -78,7 +82,7 @@ async function doSave(runAfter = false) {
     }
     const savedRules = await persistRules(
       nextRules,
-      runAfter ? '规则已保存，准备运行' : '规则已保存',
+      runAfter ? '规则已保存，正在启动测试' : '规则已保存',
     )
     activeRuleIndex.value = savedIndex
     draftRule.value = clone(savedRules[savedIndex])
@@ -111,14 +115,15 @@ function leaveEditorAfterDelete() {
   baseline.value = ''
 }
 async function runManualRule(index, ruleSnapshot = null) {
+  if (runningRuleIndex.value !== null) return
   runningRuleIndex.value = index
   try {
     const snapshot = ruleSnapshot ? clone(ruleSnapshot) : null
     const result = await runRule(index, snapshot)
-    if (result.ok) snackbar(result.message || '规则已开始执行')
-    else alert('无法执行规则: ' + (result.error || '未知错误'))
+    if (result.ok) snackbar(result.message ? `测试已启动：${result.message}` : '规则测试已启动')
+    else alert('规则测试失败: ' + (result.error || '未知错误'))
   } catch (error) {
-    alert('无法执行规则: ' + error.message)
+    alert('规则测试失败: ' + error.message)
   } finally {
     runningRuleIndex.value = null
   }
@@ -129,6 +134,7 @@ onMounted(() => { if (!store.configData.rules) store.configData.rules = [] })
 
 <template>
   <RuleEditor v-if="activeRule" :rule="activeRule" :dirty="isDirty"
+    :testing="isTestingActiveRule"
     @back="leaveEditor" @delete="deleteActiveRule" @save="doSave(false)" @save-run="doSave(true)" />
 
   <section v-else class="page active rules-library">
@@ -146,7 +152,12 @@ onMounted(() => { if (!store.configData.rules) store.configData.rules = [] })
         <article v-for="({ rule, index }) in entries" :key="rule" class="rule-library-row" @click="openRule(index)">
           <div class="rule-library-row-main"><h3>{{ rule.name || '未命名规则' }}</h3><div class="rule-library-meta"><span><span class="material-symbols-outlined">bolt</span>当：{{ triggerSummary(rule) }}</span><span><span class="material-symbols-outlined">play_circle</span>然后：{{ rule.actions?.length || 0 }} 个动作</span></div></div>
           <div class="rule-library-actions">
-            <button class="icon-btn rule-run-btn" :class="{ spin: runningRuleIndex === index }" :disabled="runningRuleIndex === index" title="立即运行一次" @click.stop="runManualRule(index, rule)"><span class="material-symbols-outlined">play_arrow</span></button>
+            <button class="btn btn-text btn-sm rule-run-btn" :disabled="runningRuleIndex !== null"
+              title="真实执行一次这条规则中的动作" @click.stop="runManualRule(index, rule)">
+              <span v-if="runningRuleIndex === index" class="spinner"></span>
+              <span v-else class="material-symbols-outlined">experiment</span>
+              {{ runningRuleIndex === index ? '测试中…' : '测试' }}
+            </button>
             <button class="icon-btn icon-btn-danger" title="删除规则" @click.stop="deleteRule(index)"><span class="material-symbols-outlined">delete</span></button>
           </div>
         </article>

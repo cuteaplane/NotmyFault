@@ -1,264 +1,207 @@
 # NotmyFault
 
-**NotmyFault** 是一款面向 Windows 的草台班子自动化工具。
+一个仍在抢救中草台班本地桌面自动化工具。
 
----
+NotmyFault 让你用“条件 → 检查 → 动作”的方式告诉电脑以后该怎么做。例如：
 
-## 特性
-
- - **规则驱动**：每条规则 = 一个触发条件 + 多个动作，简单直白
- - **插件化**：触发器和动作各自独立，会 Python 就能自己写
- - **HTTP API**：后台暴露 REST 接口，SSE 实时推送事件，任意浏览器打开 Dashboard 就能管理
- - **双进程架构**：引擎后台常驻，UI 只是管理面板，关了也不影响规则运行
- - **日志写盘**：session 级日志自动轮转，每行带时间戳，保留最近 7 个文件
- - **安全加固**：插件签名校验、权限声明 + 防越权、防重入、防注入
- - **规则条件**：支持 AND / OR 组合，匹配更灵活
-
----
-
-## 快速开始
-
-### 1. 安装依赖
-
-Python 3.11+ 推荐。
-
-```bash
-pip install fastapi uvicorn psutil pywin32
+```text
+每天 20:00
+  并且已接通电源
+    → 将显示器亮度设置为 70%
+    → 显示一条通知
 ```
 
-部分插件需要额外依赖：
+不稳定，目前最适合愿意测试、提交日志和接受配置变化的 Alpha 用户。
 
-```bash
-pip install windows-toasts pycaw
+## 当前状态
+
+当前版本：`alpha-0.11.0`
+
+| 平台 | 状态 | 说明 |
+| --- | --- | --- |
+| Windows | 主要开发平台 | 核心引擎、Dashboard 和大多数内置插件可用 |
+| Linux | 实验性支持 | 不同桌面环境差异较大，Wayland 会限制全局热键和窗口检测 |
+| macOS | 暂不支持 | 插件协议预留了平台字段，但尚未完成适配 |
+
+## 已经能做什么
+
+- 用定时、热键、进程、剪贴板、文件夹、设备、电源和网络状态触发规则。
+- 使用可嵌套的 `AND` / `OR` 条件树组合多个条件。
+- 按顺序执行多个动作，并在后续步骤中引用上一步的结果。
+- 在动作开始前检查文件是否仍在写入、文档是否还在编辑。
+- 调整音量和亮度、启动或结束程序、操作文件、截图、通知、HTTP 请求等。
+- 将触发器和动作作为插件独立加载，并检查权限、签名和平台兼容性。
+- 后台引擎与 Dashboard 分离；关闭管理窗口不会自动停止已经运行的引擎。
+- 记录执行日志、动作成功/失败和触发器崩溃信息。
+
+内置插件目前包括 13 个触发器和 16 个动作。部分功能依赖操作系统或硬件支持：例如 Windows 全局热键、窗口标题检测，以及外接显示器的亮度控制。
+
+## 从源码运行
+
+### 环境要求
+
+- Python 3.11+
+- Node.js 18+
+- Windows 10/11，或较新的 Linux 桌面环境
+
+### Windows
+
+```powershell
+git clone https://github.com/cuteaplane/notmyfault.git
+cd notmyfault
+
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements-dev.txt
+
+cd dashboard
+npm install
+npm run build
+cd ..
+
+.\.venv\Scripts\python build.py --security-mode=permissive
+.\.venv\Scripts\python dashboard.pyw
 ```
 
-### 2. 构建签名与配置（首次 / 源码运行必做）
+Dashboard 打开后可以启动、暂停和重启后台引擎。只想运行后台服务时：
 
-```bash
-python build.py
+```powershell
+.\.venv\Scripts\python NOTMYFAULT.pyw
 ```
 
-默认 **strict** 模式：会要求设置签名密码、生成密钥、给内置插件签名并写入 `build.json`。
-源码运行必须先跑这一步——否则引擎在 strict 模式下会因内置插件缺少签名而被拒载、无法启动。
-想用更宽松的模式（免去每次改完代码都要重签）：
+### Linux
+
+Linux 支持仍处于实验阶段。以 Ubuntu 系桌面为例：
+
+```bash
+git clone https://github.com/cuteaplane/notmyfault.git
+cd notmyfault
+
+python3 -m venv .venv
+./.venv/bin/python -m pip install -r requirements-dev.txt
+
+cd dashboard
+npm install
+npm run build
+cd ..
+
+./.venv/bin/python build.py --security-mode=permissive
+./.venv/bin/python dashboard.pyw
+```
+
+根据桌面环境，剪贴板、截图、空闲检测和亮度功能还可能需要：
+
+```bash
+sudo apt install wl-clipboard gnome-screenshot brightnessctl xprintidle
+```
+
+Wayland 默认禁止普通应用监听全局按键或枚举其他应用的窗口标题。NotmyFault 会跳过明确不兼容的平台插件，但不能绕过桌面系统自身的安全限制。
+
+## 为什么首次运行需要 `build.py`
+
+NotmyFault 会验证插件签名和核心文件完整性。直接从源码运行前，需要生成本地构建信息并为当前源码签名：
 
 ```bash
 python build.py --security-mode=permissive
 ```
 
-### 3. 启动后台引擎
+修改内置插件或核心源码后需要重新执行该命令，否则旧签名会失效。
+
+`permissive` 适合本地开发和 Alpha 测试。默认的 `strict` 模式会要求加密签名密钥，面向正式构建：
 
 ```bash
-python NOTMYFAULT.pyw
+python build.py
 ```
 
-引擎启动后会在 `http://127.0.0.1:19198` 监听 HTTP 请求，日志按 session 写入 `%APPDATA%\NotmyFault\logs\engine-YYYYMMDD-HHMMSS.log`，自动保留最近 7 个。
+## 规则模型
 
-### 4. 打开管理面板
+一条规则由三部分组成：
 
-浏览器打开 `dashboard.html` 即可配置规则、启停引擎、查看实时事件。
-
- 或者直接调 API：
- 
- ```bash
- # 开发辅助：python build.py dev  启动监听模式，python build.py init-keys  生成签名密钥
- curl http://127.0.0.1:19198/api/engine/status
- curl http://127.0.0.1:19198/api/rules
- # 在线 API 文档：http://127.0.0.1:19198/docs
+```text
+触发条件 → 可选的执行前检查 → 动作流水线
 ```
 
----
+单一触发条件使用 `event`；复杂条件使用可嵌套的 `condition`：
 
-## API 一览
-
-| Method | Path | 说明 |
-|---|---|---|
- | `POST` | `/api/engine/start` | 启动引擎 |
- | `POST` | `/api/engine/stop` | 停止引擎 |
- | `GET` | `/api/engine/status` | 引擎状态 |
- | `GET` | `/api/rules` | 获取所有规则 |
- | `PUT` | `/api/rules` | 保存规则 |
- | `GET` | `/api/plugins` | 插件列表（含参数定义） |
- | `POST` | `/api/plugins/{id}` | 添加 / 更新单个插件 |
- | `DELETE` | `/api/plugins/{id}` | 删除单个插件 |
- | `GET` | `/api/events` | SSE 事件流（实时推送） |
-
-启动引擎后访问 `http://127.0.0.1:19198/docs` 可查看 Swagger 交互式文档。
-
----
-
-## 配置格式
-
- 配置文件位于 `%APPDATA%\NotmyFault\config.json`，首次运行自动生成默认配置。
- 条件支持 `"condition_mode": "or"`（默认 `"and"`），可组合多个触发条件。
- 
- ```json
- {
-  "rules": [
-    {
-      "name": "微信音量规则",
-      "event": {
-        "type": "process_state",
-        "params": { "process_name": "WeChat.exe", "state": "running" }
+```json
+{
+  "name": "晚间亮度",
+  "condition": {
+    "op": "all",
+    "children": [
+      {
+        "type": "time_schedule",
+        "params": {"time": "20:00"}
       },
-      "actions": [
-        { "type": "set_volume", "params": { "action": "max" } },
-        { "type": "notify", "params": { "title": "微信正在运行", "message": "音量已设为100%" } }
-      ]
+      {
+        "type": "power_state",
+        "params": {"state": "ac"}
+      }
+    ]
+  },
+  "actions": [
+    {
+      "type": "display_control",
+      "params": {
+        "action": "set_brightness",
+        "brightness": 70
+      }
+    },
+    {
+      "type": "notify",
+      "params": {
+        "title": "NotmyFault",
+        "message": "晚间亮度已调整"
+      }
     }
   ]
 }
 ```
 
----
+一般不需要手写 JSON，Dashboard 会负责编辑和校验规则。
 
-## 目录结构
+## 数据位置
 
-```text
-NotmyFault/
-├── NOTMYFAULT.pyw              # 后台引擎入口
- ├── build.py                   # 构建 / 签名 / 打包脚本
- ├── dashboard.html              # Web 管理面板
- ├── README.md
- ├── notmyfault/                 # 核心代码
- │   ├── api_server.py           # HTTP API + SSE 事件流
- │   ├── app.py                  # 引擎工厂入口
- │   ├── engine.py               # 规则匹配与动作分发
- │   ├── config.py               # 配置读写与迁移
- │   ├── logging.py              # session 日志系统
- │   ├── alert.py                # 引擎异常弹窗告警
- │   ├── plugin_schema.py        # 插件元数据 schema 校验
- │   ├── signing.py              # 插件签名校验
- │   ├── signing_keys.py         # 签名密钥生成
- │   ├── sudo.py                 # 管理员权限辅助模块
- │   ├── simulator/              # 触发器模拟测试环境
- │   │   ├── __init__.py
- │   │   ├── environment.py      #   模拟环境配置
- │   │   └── runner.py           #   模拟运行器
- │   ├── triggers/               # 触发器插件
- │   │   ├── bluetooth_device/   #   蓝牙设备检测
-│   │   ├── process_state/      #   进程状态检测
-│   │   ├── idle_detect/        #   系统空闲检测
-│   │   ├── time_schedule/      #   定时触发
-│   │   ├── usb_insert/         #   U盘插入检测
-│   │   └── window_title/       #   窗口标题检测
-│   └── actions/                # 动作插件
-│       ├── bluetooth_toggle/   #   开关蓝牙
-│       ├── set_volume/         #   设置系统音量
-│       ├── notify/             #   显示 Windows 通知
-│       ├── launch_program/     #   启动程序
-│       ├── kill_process/       #   终止进程
-│       ├── run_powershell/     #   执行 PowerShell
-│       └── lock_screen/        #   锁定屏幕
-├── Win_toaster/                # Windows 通知 AUMID 注册
-└── tests/                      # 测试
+| 平台 | 配置与日志目录 |
+| --- | --- |
+| Windows | `%APPDATA%\NotmyFault\` |
+| Linux | `$XDG_CONFIG_HOME/notmyfault/`，未设置时为 `~/.config/notmyfault/` |
+
+本地 API 监听 `127.0.0.1:19198`，但它使用 Dashboard 管理的本机认证令牌。项目目前不提供“随便打开浏览器或直接 curl 就能管理”的模式。
+
+## 开发与验证
+
+后端测试：
+
+```bash
+python -m pytest notmyfault/tests -q
 ```
 
----
+Dashboard 构建与挂载测试：
 
-## 插件开发
-
-每个插件 = 一个目录，放在 `notmyfault/triggers/<id>/` 或 `notmyfault/actions/<id>/` 下，包含：
-
-- `<type>.json` — 元数据（触发器和动作都适用以下 schema）
-- `<type>.py` — 必须导出 `run()` 函数
-
-### 元数据 schema
-
-```json
-{
-  "id": "my_plugin",
-  "name": "我的插件",
-  "description": "插件功能描述",
-  "version_code": 1,
-  "enabled": true,
-  "semantic": "state",
-  "permissions": [],
-  "params": [
-    { "name": "keyword", "label": "关键词", "type": "string", "default": "" }
-  ]
-}
+```bash
+cd dashboard
+npm test
 ```
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `id` | string | ✅ | 唯一标识符，规则通过它引用插件 |
-| `name` | string | ✅ | 显示名称 |
-| `description` | string | ✅ | 功能描述 |
-| `enabled` | bool | ✅ | 是否启用，`false` 则跳过加载 |
-| `version_code` | int | ✅ | 版本号（递增整数），供后续插件管理使用 |
-| `semantic` | string | — | 仅触发器：`"state"`（持续状态）或 `"oneshot"`（单次触发） |
-| `permissions` | list | — | 权限声明，目前支持 `"admin"` |
-| `params` | list | — | 参数定义，见下表 |
+验证插件签名：
 
-**params 条目字段**：
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `name` | string | ✅ | 参数名 |
-| `type` | string | ✅ | 类型：`string` / `number` / `select` / `bool` |
-| `label` | string | ✅ | 参数显示名称 |
-| `default` | any | — | 默认值 |
-| `options` | list | — | 当 type=`select` 时的可选值列表 |
-| `placeholder` | string | — | 输入框占位文本 |
-
-### 生命周期钩子（可选）
-
-插件模块可以导出以下函数：
-
-| 函数 | 签名 | 调用时机 |
-|------|------|----------|
-| `setup(meta)` | 返回 `None` 或 `False`（`False` 中止加载） | 插件加载后 |
-| `teardown()` | 无参数 | 引擎关闭时 |
-| `validate_params(meta, params)` | 返回 `list[str]` 错误列表 | 动作执行前 |
-
-### 权限声明
-
-如果插件需要管理员权限（如操作蓝牙适配器、修改系统设置），应在元数据中声明：
-
-```json
-{ "permissions": ["admin"] }
+```bash
+python build.py verify
 ```
 
-并在代码中使用引擎提供的提权辅助模块，而不是自己拼 PowerShell：
+插件格式、条件树、动作上下文和目录说明见 [开发文档](docs/DEVELOPMENT.md)。
 
-```python
-from notmyfault.sudo import run_as_admin
-result = run_as_admin(["net", "start", "MyService"])
-```
+## 已知限制
 
-引擎加载时会检查：如果插件 import 了 `notmyfault.sudo` 但未声明 `admin` 权限，会打印警告。
+- 这是 Alpha；界面、插件描述协议和配置格式仍可能调整。
+- Linux 尚未覆盖足够多的桌面环境和发行版。
+- 部分插件名称和参数仍然偏开发者视角，易用性正在收敛。
+- 显示器亮度、蓝牙、睡眠等系统功能会受到驱动、权限和硬件能力限制。
+- Dashboard 是桌面客户端，不是远程管理后台。
+- 目前没有稳定版安装包承诺；从源码运行仍需要 Python 和 Node.js。
 
-### 触发器
+遇到问题时，请附上操作系统、复现步骤以及最新的日志文件
 
-必须导出 `run(meta, config_list, emit_event)` 函数。
+## License
 
-`semantic` 描述事件的语义类型：
-- `"state"` — 持续状态上报（如进程运行/停止、窗口开关），事件携带状态值
-- `"oneshot"` — 单次触发（如定时到时、USB插入），事件只表示"发生了"
-
-### 动作
-
-必须导出 `run(meta, params)` 函数。
-
----
-
-## 架构
-
-```
-浏览器 / pywebview  ←──fetch()──→  http://127.0.0.1:19198/api/*
-                    ←──SSE──────  http://127.0.0.1:19198/api/events
-
-引擎进程 (NOTMYFAULT.pyw)
-  ├── FastAPI + uvicorn (HTTP 服务)
-  ├── EngineAPI (路由 + SSE 事件队列)
-  └── AutomationEngine (规则引擎线程)
-```
-
-双进程：引擎独立运行，UI 随时开关。通信全程 HTTP，`curl` 直接调试。
-
----
-
-## 许可证
-
-GPL-3
+[GNU General Public License v3.0](LICENSE)

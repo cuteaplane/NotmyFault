@@ -312,8 +312,10 @@ def cmd_version(args):
         pub_ok = bool(BUILTIN_PUBLIC_KEY)
     except ImportError:
         pub_ok = False
-    print(f"私钥: {'✓' if priv_ok else '✗'} {PRIVATE_KEY_FILE}")
-    print(f"公钥: {'✓' if pub_ok else '✗'} {SIGNING_MODULE}")
+    # Windows 控制台仍可能使用 GBK；避免仅用于状态展示的 Unicode
+    # 符号让发布工具在真正执行签名之前就崩溃。
+    print(f"私钥: {'OK' if priv_ok else 'MISSING'} {PRIVATE_KEY_FILE}")
+    print(f"公钥: {'OK' if pub_ok else 'MISSING'} {SIGNING_MODULE}")
     if pub_ok:
         fp = hashlib.sha256(BUILTIN_PUBLIC_KEY).hexdigest()[:16]
         print(f"公钥指纹: {fp}...")

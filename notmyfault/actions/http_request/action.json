@@ -2,8 +2,8 @@
     "id": "http_request",
     "name": "HTTP 请求",
     "description": "发送 HTTP GET/POST/PUT/DELETE 请求",
-    "version_code": 1,
-    "version": "1.0",
+    "version_code": 2,
+    "version": "1.1",
     "package_name": "io.github.notmyfault.http_request",
     "enabled": true,
     "permissions": ["network"],
@@ -13,7 +13,12 @@
             "label": "请求方法",
             "type": "select",
             "default": "GET",
-            "options": ["GET", "POST", "PUT", "DELETE"]
+            "options": [
+                {"value": "GET", "label": "GET（读取）"},
+                {"value": "POST", "label": "POST（创建/提交）"},
+                {"value": "PUT", "label": "PUT（更新）"},
+                {"value": "DELETE", "label": "DELETE（删除）"}
+            ]
         },
         {
             "name": "url",

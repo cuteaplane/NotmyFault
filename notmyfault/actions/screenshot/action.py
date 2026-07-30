@@ -1,9 +1,12 @@
 import os
 import ctypes
+import subprocess
+from pathlib import Path
 from datetime import datetime
 
-user32 = ctypes.windll.user32
-gdi32 = ctypes.windll.gdi32
+if os.name == "nt":
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
 
 
 def run(action_info, params):
@@ -12,11 +15,76 @@ def run(action_info, params):
     fmt = params.get("format", "png")
 
     if not output_path:
-        desktop = os.path.join(os.environ["USERPROFILE"], "Desktop")
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = os.path.join(desktop, f"screenshot_{ts}.{fmt}")
+        if os.name == "nt":
+            desktop = os.path.join(os.environ["USERPROFILE"], "Desktop")
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(desktop, f"screenshot_{ts}.{fmt}")
+        else:
+            from notmyfault.linux_support import default_output_path
+            output_path = str(default_output_path("screenshot", fmt))
 
     print(f"[Action:screenshot] 截取{mode} -> {output_path}")
+
+    if os.name != "nt":
+        try:
+            from notmyfault.linux_support import command_path, session_type
+
+            destination = Path(output_path).expanduser()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            capture_path = destination
+            if fmt.lower() in ("jpg", "jpeg"):
+                capture_path = destination.with_suffix(".capture.png")
+
+            if session_type() == "wayland":
+                from notmyfault.portal_screenshot import take_screenshot
+
+                take_screenshot(
+                    str(capture_path),
+                    interactive=mode == "active_window",
+                )
+                command = None
+            elif executable := command_path("gnome-screenshot"):
+                command = [executable, "-f", str(capture_path)]
+                if mode == "active_window":
+                    command.insert(1, "-w")
+            elif session_type() == "wayland" and (executable := command_path("grim")):
+                if mode == "active_window":
+                    raise RuntimeError("grim 无法安全识别 GNOME 当前窗口，请安装 gnome-screenshot")
+                command = [executable, str(capture_path)]
+            elif executable := command_path("spectacle"):
+                command = [
+                    executable,
+                    "-b",
+                    "-n",
+                    "-a" if mode == "active_window" else "-f",
+                    "-o",
+                    str(capture_path),
+                ]
+            elif executable := command_path("import"):
+                command = [executable, "-window", "root", str(capture_path)]
+            else:
+                raise RuntimeError("缺少截图后端，请安装 gnome-screenshot")
+
+            if command:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=30,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.strip() or "截图命令失败")
+
+            if capture_path != destination:
+                from PIL import Image
+                with Image.open(capture_path) as image:
+                    image.convert("RGB").save(destination, "JPEG", quality=92)
+                capture_path.unlink(missing_ok=True)
+            print(f"[Action:screenshot] 截图已保存: {destination}")
+        except Exception as error:
+            print(f"[Action:screenshot] 截图失败: {error}")
+        return
 
     hdc_screen = None
     hdc_mem = None

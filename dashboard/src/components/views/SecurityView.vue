@@ -44,7 +44,7 @@ const modeInfo = computed(() => modeMap[mode.value] || modeMap.unknown)
 async function load() {
   try {
     const s = await getEngineStatus()
-    // 合并而非整体覆盖：与 App.vue.updateStatus / HomeView.syncStatus 对齐。
+    // 合并而非整体覆盖：与 App.vue.updateStatus / useEngineControl.syncStatus 对齐。
     // 整体替换会把 engine_running 等部分状态字段冲掉，导致引擎状态不一致。
     store.engineStatus = { ...store.engineStatus, ...s }
     store.engineOnline = s.engine_running === true

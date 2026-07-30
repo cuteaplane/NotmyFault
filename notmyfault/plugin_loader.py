@@ -26,12 +26,47 @@ from notmyfault.plugins import (
     verify_plugin_sig,
 )
 from notmyfault.security import SecurityMode
+from notmyfault.signing import plugin_files
 
 # 向后兼容早期内部导入。
 _validate_plugin_meta = validate_plugin_meta
 _check_sudo_import = check_sudo_import
 
 PluginKind = Literal["trigger", "action"]
+
+
+def _current_platform_name() -> str:
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    if sys.platform == "darwin":
+        return "macos"
+    return sys.platform
+
+
+def is_plugin_platform_compatible(meta: Dict[str, Any]) -> bool:
+    """清单未声明 platforms 时保持向后兼容，视为支持所有平台。"""
+    platforms = meta.get("platforms")
+    entrypoints = meta.get("entrypoints")
+    if entrypoints:
+        return _current_platform_name() in entrypoints
+    return not platforms or _current_platform_name() in platforms
+
+
+def resolve_plugin_entrypoint(
+    folder_path: str,
+    meta: Dict[str, Any],
+    default_filename: str,
+) -> str:
+    """解析当前平台入口，并再次防御目录逃逸。"""
+    entrypoints = meta.get("entrypoints") or {}
+    relative_path = entrypoints.get(_current_platform_name(), default_filename)
+    plugin_root = os.path.realpath(folder_path)
+    entrypoint = os.path.realpath(os.path.join(plugin_root, relative_path))
+    if os.path.commonpath((plugin_root, entrypoint)) != plugin_root:
+        raise ValueError(f"插件入口逃逸插件目录: {relative_path}")
+    return entrypoint
 
 
 class PluginRegistry:
@@ -178,13 +213,6 @@ class PluginLoader:
                     file=sys.stderr,
                 )
                 continue
-            if not os.path.exists(py_file):
-                print(
-                    f"[Engine] 插件目录缺少 {py_filename}，跳过: {folder_path}",
-                    file=sys.stderr,
-                )
-                continue
-
             # --- JSON 解析 ---
             try:
                 with open(json_file, "r", encoding="utf-8") as fp:
@@ -231,6 +259,63 @@ class PluginLoader:
             if not meta["enabled"]:
                 print(
                     f"[Engine] 插件 \"{plugin_id}\" ({meta['name']}) 已禁用，跳过"
+                )
+                continue
+
+            if not is_plugin_platform_compatible(meta):
+                supported = ", ".join(
+                    meta.get("platforms") or (meta.get("entrypoints") or {}).keys()
+                )
+                print(
+                    f'[Engine] 插件 "{plugin_id}" ({meta["name"]}) 不支持当前平台 '
+                    f'{_current_platform_name()}（支持: {supported}），跳过'
+                )
+                engine_info(
+                    f"plugin_platform_skipped: {plugin_id} "
+                    f"current={_current_platform_name()} supported={supported}"
+                )
+                continue
+
+            try:
+                py_file = resolve_plugin_entrypoint(
+                    folder_path,
+                    meta,
+                    py_filename,
+                )
+            except ValueError as error:
+                failed_count += 1
+                self._diagnostics.record_plugin_error(
+                    store_name, plugin_id, str(error)
+                )
+                engine_error(
+                    "plugin_load_failed",
+                    plugin=plugin_id,
+                    type=store_name,
+                    reason=str(error),
+                )
+                continue
+            if not os.path.isfile(py_file):
+                relative_entry = os.path.relpath(py_file, folder_path)
+                if not meta.get("entrypoints"):
+                    print(
+                        f"[Engine] 插件目录缺少 {py_filename}，跳过: {folder_path}",
+                        file=sys.stderr,
+                    )
+                    continue
+                reason = f"当前平台入口不存在: {relative_entry}"
+                print(
+                    f'[Engine] 插件 "{plugin_id}" {reason}，跳过',
+                    file=sys.stderr,
+                )
+                failed_count += 1
+                self._diagnostics.record_plugin_error(
+                    store_name, plugin_id, reason
+                )
+                engine_error(
+                    "plugin_load_failed",
+                    plugin=plugin_id,
+                    type=store_name,
+                    reason=reason,
                 )
                 continue
 
@@ -295,7 +380,14 @@ class PluginLoader:
 
             # --- 安全能力扫描（exec 前，AST 级，避免执行未声明危险代码）---
             # 先看源码再 import，不能让“我只是看看”顺手把危险代码跑起来。
-            caps = scan_plugin_capabilities(py_file)
+            python_files = [
+                str(path)
+                for path in plugin_files(folder_path)
+                if path.suffix == ".py"
+            ]
+            caps = set().union(
+                *(scan_plugin_capabilities(path) for path in python_files)
+            )
 
             # self_elevation（自行提权）一律禁止：插件要提权必须走
             # notmyfault.sudo.run_as_admin 并声明 admin，禁止自己 ShellExecute("runas") 等。
@@ -334,7 +426,7 @@ class PluginLoader:
                     continue
 
             # --- 权限声明与源码引用一致性（exec 前）---
-            if check_sudo_import(py_file):
+            if any(check_sudo_import(path) for path in python_files):
                 declared_perms = meta.get("permissions") or []
                 if "admin" not in declared_perms:
                     print(
@@ -350,7 +442,7 @@ class PluginLoader:
             if origin != "builtin":
                 integrity_files = [
                     (json_filename, json_file),
-                    (py_filename, py_file),
+                    (os.path.relpath(py_file, folder_path), py_file),
                 ]
                 integrity_ok, integrity_msg = verify_plugin_integrity(
                     plugin_id, integrity_files

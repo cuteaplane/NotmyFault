@@ -22,7 +22,9 @@ NotmyFault 提权辅助模块
 """
 
 import inspect
+import os
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -165,22 +167,42 @@ def run_as_admin(
             "请在被引擎授权的插件模块中调用。"
         )
 
-    # 安全转义：单引号内 '' 表示一个字面单引号
-    def _ps_quote(s: str) -> str:
-        return "'" + s.replace("'", "''") + "'"
+    if os.name == "nt":
+        # 安全转义：单引号内 '' 表示一个字面单引号
+        def _ps_quote(value: str) -> str:
+            return "'" + value.replace("'", "''") + "'"
 
-    exe = _ps_quote(command[0])
-    args = ", ".join(_ps_quote(a) for a in command[1:])
-    ps_script = (
-        f"Start-Process -FilePath {exe}"
-        + (f" -ArgumentList {args}" if args else "")
-        + " -Verb RunAs"
-        + (" -Wait" if wait else "")
-    )
+        executable = _ps_quote(command[0])
+        arguments = ", ".join(_ps_quote(argument) for argument in command[1:])
+        ps_script = (
+            f"Start-Process -FilePath {executable}"
+            + (f" -ArgumentList {arguments}" if arguments else "")
+            + " -Verb RunAs"
+            + (" -Wait" if wait else "")
+        )
+        elevated_command = ["powershell", "-NoProfile", "-Command", ps_script]
+    else:
+        pkexec = shutil.which("pkexec")
+        if not pkexec:
+            raise RuntimeError(
+                "当前 Linux 系统缺少 pkexec，无法弹出桌面管理员认证窗口。"
+                "请安装 polkit/policykit-1。"
+            )
+        elevated_command = [pkexec, "--", *command]
 
     try:
+        if not wait:
+            subprocess.Popen(
+                elevated_command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=os.name != "nt",
+            )
+            return subprocess.CompletedProcess(elevated_command, 0)
+
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_script],
+            elevated_command,
             capture_output=True,
             text=True,
             errors="replace",

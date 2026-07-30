@@ -658,10 +658,11 @@ class AutomationEngine:
         # 启动前先体检：问题规则会被诊断出来，但不因为一条坏规则饿死整台引擎。
         self._validate_all_rules()
 
-        from Win_toaster.show_notification import show_notification
-        from Win_toaster.AUMID_Register import register_toaster
+        from notmyfault.platform_support import show_notification
 
-        register_toaster()
+        if os.name == "nt":
+            from Win_toaster.AUMID_Register import register_toaster
+            register_toaster()
         show_notification("NotmyFault 已加载", "")
 
         thread_count = self._start_trigger_threads()

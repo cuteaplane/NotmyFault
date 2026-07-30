@@ -16,6 +16,11 @@ _GENERIC_TITLES = {
 _EDITING_PROCESS_NAMES = {
     "winword.exe", "excel.exe", "powerpnt.exe", "wps.exe", "et.exe", "wpp.exe",
     "acrobat.exe", "acrord32.exe",
+    "libreoffice", "soffice.bin", "onlyoffice-desktopeditors", "wps", "et", "wpp",
+}
+_DOCUMENT_EXTENSIONS = {
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp",
+    ".pdf",
 }
 
 
@@ -70,7 +75,28 @@ def _can_open_exclusively(path: str) -> bool:
 def _visible_editing_windows() -> Iterable[str]:
     """返回疑似正在编辑文档的可见窗口标题；后台常驻但无文档窗口不会误拦。"""
     if os.name != "nt":
-        raise RuntimeError("当前平台无法检查 Windows 文档窗口")
+        try:
+            import psutil
+        except ImportError as exc:
+            raise RuntimeError("缺少 psutil，无法检查文档进程") from exc
+        editing: List[str] = []
+        for process in psutil.process_iter(["pid", "name", "open_files"]):
+            try:
+                process_name = (process.info["name"] or "").lower()
+                if process_name not in _EDITING_PROCESS_NAMES:
+                    continue
+                document_paths = [
+                    item.path
+                    for item in (process.info["open_files"] or [])
+                    if Path(item.path).suffix.lower() in _DOCUMENT_EXTENSIONS
+                ]
+                if document_paths:
+                    editing.append(
+                        f"{process_name}: {Path(document_paths[0]).name}"
+                    )
+            except (psutil.Error, OSError):
+                continue
+        return editing
     try:
         import psutil
     except ImportError as exc:

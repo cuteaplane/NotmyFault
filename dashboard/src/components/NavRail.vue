@@ -15,22 +15,25 @@ const items = [
 </script>
 
 <template>
+  <!-- M3 Navigation Rail（collapsed）：icon 在上 label 在下，active 时 56×32 pill indicator + 填充图标 -->
   <aside class="nav-rail">
-    <div class="nav-brand"><span class="material-symbols-outlined brand-icon">manufacturing</span><span>NotmyFault</span></div>
+    <div class="nav-brand">
+      <span class="material-symbols-outlined brand-icon">manufacturing</span>
+      <span class="brand-name">NotmyFault</span>
+    </div>
     <nav class="nav-items">
       <button v-for="it in items" :key="it.page"
         class="nav-item" :class="{ active: current === it.page, 'needs-engine': it.needs }"
         @click="emit('switch', it.page)">
-        <span class="material-symbols-outlined nav-icon">{{ it.icon }}</span>
-        <span>{{ it.label }}</span>
+        <span class="nav-ind"><span class="material-symbols-outlined nav-icon">{{ it.icon }}</span></span>
+        <span class="nav-label">{{ it.label }}</span>
       </button>
     </nav>
     <div class="nav-foot">
-      <button class="nav-item" @click="toggle">
-        <span class="material-symbols-outlined nav-icon">{{ isDark ? 'light_mode' : 'dark_mode' }}</span>
-        <span>{{ isDark ? '浅色模式' : '深色模式' }}</span>
+      <button class="icon-btn" :title="isDark ? '切换到浅色模式' : '切换到深色模式'" @click="toggle">
+        <span class="material-symbols-outlined">{{ isDark ? 'light_mode' : 'dark_mode' }}</span>
       </button>
-      <div class="nav-ver">NotmyFault {{ appVersion }}</div>
+      <div class="nav-ver" :title="'NotmyFault ' + appVersion">{{ appVersion }}</div>
     </div>
   </aside>
 </template>
