@@ -1,0 +1,37 @@
+{
+    "id": "shutdown_system",
+    "name": "系统控制",
+    "description": "关机、重启、注销、休眠、睡眠",
+    "version_code": 2,
+    "version": "1.1",
+    "package_name": "io.github.notmyfault.shutdown_system",
+    "enabled": true,
+    "permissions": ["admin", "native_api", "external_binary"],
+    "params": [
+        {
+            "name": "action",
+            "label": "操作",
+            "type": "select",
+            "default": "shutdown",
+            "options": [
+                {"value": "shutdown", "label": "关机"},
+                {"value": "restart", "label": "重新启动"},
+                {"value": "logoff", "label": "注销当前用户"},
+                {"value": "hibernate", "label": "休眠"},
+                {"value": "sleep", "label": "睡眠"}
+            ]
+        },
+        {
+            "name": "force",
+            "label": "强制（不等待应用响应）",
+            "type": "bool",
+            "default": true
+        },
+        {
+            "name": "delay_seconds",
+            "label": "延迟秒数",
+            "type": "number",
+            "default": 0
+        }
+    ]
+}

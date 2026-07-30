@@ -1,5 +1,4 @@
 from .app import run
+from .version import __version__
 
-__version__ = "alpha-0.10"
-
-__all__ = ["run"]
+__all__ = ["run", "__version__"]

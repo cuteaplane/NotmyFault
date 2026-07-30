@@ -13,6 +13,7 @@ r"""
 
 import subprocess
 import time
+import os
 
 # 设备容器属性：指示蓝牙设备是否真正已连接（True/False）
 _DEVPKEY_CONNECTION_STATE = "{83DA6326-97A6-4088-9453-A1923F573B29} 15"
@@ -26,6 +27,9 @@ def _get_connected_devices():
 
     返回 (devices: set[str], errors: list[str])
     """
+    if os.name != "nt":
+        return _get_linux_connected_devices()
+
     ps = f"""
 $all = Get-PnpDevice -Class Bluetooth | Where-Object {{ $_.Present }}
 foreach ($dev in $all) {{
@@ -51,6 +55,7 @@ foreach ($dev in $all) {{
             ["powershell", "-NoProfile", "-Command", ps],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=15,
         )
     except subprocess.TimeoutExpired:
@@ -94,6 +99,27 @@ foreach ($dev in $all) {{
         devices.add(base_name)
 
     return devices, errors
+
+
+def _get_linux_connected_devices():
+    try:
+        result = subprocess.run(
+            ["bluetoothctl", "devices", "Connected"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=10,
+        )
+    except Exception as error:
+        return set(), [f"bluetoothctl 启动失败: {error}"]
+    if result.returncode != 0:
+        return set(), [result.stderr.strip() or "bluetoothctl 查询失败"]
+    devices = set()
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(maxsplit=2)
+        if len(parts) == 3 and parts[0] == "Device":
+            devices.add(_strip_bluetooth_suffix(parts[2]))
+    return devices, []
 
 
 def _strip_bluetooth_suffix(name: str) -> str:
@@ -177,8 +203,14 @@ def run(meta, config_list, emit_event, shutdown_event):
                                     f"[Trigger:{trigger_id}] [OK] "
                                     f"设备已连接: {device}"
                                 )
+                                # device_name 用用户配置值（供规则匹配），
+                                # actual_device 保留实际设备名（供日志/调试）。
+                                # 之前 emit 实际设备名导致 rules.check_event_params
+                                # 严格相等比较永远不匹配（用户配 "JBL"，
+                                # 实际 "JBL Flip 5"）。与 usb_insert 设计对齐。
                                 emit_event(trigger_id, {
-                                    "device_name": device,
+                                    "device_name": target,
+                                    "actual_device": device,
                                     "state": "connected",
                                 })
 
@@ -190,7 +222,8 @@ def run(meta, config_list, emit_event, shutdown_event):
                                     f"设备已断开: {device}"
                                 )
                                 emit_event(trigger_id, {
-                                    "device_name": device,
+                                    "device_name": target,
+                                    "actual_device": device,
                                     "state": "disconnected",
                                 })
 

@@ -22,9 +22,12 @@ NotmyFault 提权辅助模块
 """
 
 import inspect
+import os
 import secrets
+import shutil
 import subprocess
 import sys
+import threading
 
 # ---------------------------------------------------------------------------
 # 进程级令牌系统
@@ -34,19 +37,37 @@ import sys
 
 _engine_token: str | None = None
 _admin_plugins: set[str] = set()
+_session_lock = threading.RLock()
+
+
+def begin_engine_session(token: str | None = None) -> str:
+    """开始一代引擎权限会话，并撤销上一代遗留的插件授权。
+
+    RuntimeController 保证同一时刻只有一代引擎运行；这里仍以原子轮换兜底，
+    避免后台进程内停止后重启时沿用旧令牌和旧授权集合。
+    """
+    global _engine_token, _admin_plugins
+    session_token = token or secrets.token_hex(32)
+    with _session_lock:
+        _engine_token = session_token
+        _admin_plugins.clear()
+    return session_token
+
+
+def end_engine_session(token: str) -> bool:
+    """结束匹配的权限会话；旧引擎不能撤销新一代会话。"""
+    global _engine_token, _admin_plugins
+    with _session_lock:
+        if _engine_token is None or not secrets.compare_digest(token, _engine_token):
+            return False
+        _engine_token = None
+        _admin_plugins.clear()
+        return True
 
 
 def set_engine_token(token: str) -> None:
-    """设置引擎令牌。只能设置一次，后续调用被忽略。
-
-    由 AutomationEngine.__init__() 在引擎启动时调用。
-    令牌用于验证 authorize_plugin() 调用方的身份。
-    """
-    global _engine_token
-    if _engine_token is not None:
-        # 令牌已设置，忽略后续调用（防止被恶意覆盖）
-        return
-    _engine_token = token
+    """兼容旧调用：以指定令牌开始一代新权限会话。"""
+    begin_engine_session(token)
 
 
 def authorize_plugin(plugin_id: str, token: str) -> None:
@@ -55,12 +76,12 @@ def authorize_plugin(plugin_id: str, token: str) -> None:
     只能在引擎设置令牌后调用，且 token 必须匹配引擎令牌。
     由引擎在加载声明了 'admin' 权限的插件时调用。
     """
-    global _admin_plugins
-    if _engine_token is None:
-        raise RuntimeError("引擎令牌尚未设置，无法授权插件")
-    if not secrets.compare_digest(token, _engine_token):
-        raise PermissionError("令牌不匹配，拒绝授权")
-    _admin_plugins.add(plugin_id)
+    with _session_lock:
+        if _engine_token is None:
+            raise RuntimeError("引擎令牌尚未设置，无法授权插件")
+        if not secrets.compare_digest(token, _engine_token):
+            raise PermissionError("令牌不匹配，拒绝授权")
+        _admin_plugins.add(plugin_id)
 
 
 def _get_caller_plugin_id() -> str | None:
@@ -82,12 +103,14 @@ def _get_caller_plugin_id() -> str | None:
 
 def is_authorized(plugin_id: str) -> bool:
     """检查插件是否已被授权管理员权限。"""
-    return plugin_id in _admin_plugins
+    with _session_lock:
+        return plugin_id in _admin_plugins
 
 
 def get_authorized_plugins() -> list[str]:
     """返回当前已授权的插件 ID 列表（仅供诊断使用）。"""
-    return sorted(_admin_plugins)
+    with _session_lock:
+        return sorted(_admin_plugins)
 
 
 def _warn_no_admin_permission(plugin_id: str) -> None:
@@ -129,38 +152,60 @@ def run_as_admin(
 
     # --- 权限校验 ---
     caller_id = _get_caller_plugin_id()
-    if caller_id is not None and caller_id not in _admin_plugins:
+    if caller_id is not None and not is_authorized(caller_id):
         _warn_no_admin_permission(caller_id)
         raise PermissionError(
             f"插件 '{caller_id}' 未授权使用 run_as_admin()。"
             f"请在插件元数据的 permissions 字段中添加 \"admin\" 并重启引擎。"
         )
-    # 如果无法检测调用者（例如直接从 shell 调用），允许但不安全
+    # 如果无法检测调用者，拒绝执行（PoC-6 修复）：
+    # 非插件命名空间的调用（恶意脚本/第三方包/exec 绕过后间接调用）
+    # caller_id=None，之前放行，现在拒绝以防绕过提权。
     if caller_id is None:
-        print(
-            "[sudo] 警告: 无法确定 run_as_admin() 的调用者身份，"
-            "允许执行但存在安全风险",
-            file=sys.stderr,
+        raise PermissionError(
+            "无法确定 run_as_admin() 的调用者身份，拒绝执行。"
+            "请在被引擎授权的插件模块中调用。"
         )
 
-    # 安全转义：单引号内 '' 表示一个字面单引号
-    def _ps_quote(s: str) -> str:
-        return "'" + s.replace("'", "''") + "'"
+    if os.name == "nt":
+        # 安全转义：单引号内 '' 表示一个字面单引号
+        def _ps_quote(value: str) -> str:
+            return "'" + value.replace("'", "''") + "'"
 
-    exe = _ps_quote(command[0])
-    args = ", ".join(_ps_quote(a) for a in command[1:])
-    ps_script = (
-        f"Start-Process -FilePath {exe}"
-        + (f" -ArgumentList {args}" if args else "")
-        + " -Verb RunAs"
-        + (" -Wait" if wait else "")
-    )
+        executable = _ps_quote(command[0])
+        arguments = ", ".join(_ps_quote(argument) for argument in command[1:])
+        ps_script = (
+            f"Start-Process -FilePath {executable}"
+            + (f" -ArgumentList {arguments}" if arguments else "")
+            + " -Verb RunAs"
+            + (" -Wait" if wait else "")
+        )
+        elevated_command = ["powershell", "-NoProfile", "-Command", ps_script]
+    else:
+        pkexec = shutil.which("pkexec")
+        if not pkexec:
+            raise RuntimeError(
+                "当前 Linux 系统缺少 pkexec，无法弹出桌面管理员认证窗口。"
+                "请安装 polkit/policykit-1。"
+            )
+        elevated_command = [pkexec, "--", *command]
 
     try:
+        if not wait:
+            subprocess.Popen(
+                elevated_command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=os.name != "nt",
+            )
+            return subprocess.CompletedProcess(elevated_command, 0)
+
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_script],
+            elevated_command,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout,
         )
         if result.returncode != 0 and result.stderr:

@@ -1,4 +1,5 @@
 import time
+import os
 import psutil
 
 
@@ -13,7 +14,7 @@ def run(trigger_info, config_list, emit_event, shutdown_event):
         if not raw_name:
             continue
 
-        if not raw_name.lower().endswith(".exe"):
+        if os.name == "nt" and not raw_name.lower().endswith(".exe"):
             normalized_name = raw_name + ".exe"
         else:
             normalized_name = raw_name

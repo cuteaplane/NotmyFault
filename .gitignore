@@ -6,6 +6,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.pyc
+.pytest-review-tmp/
 
 # Distribution / packaging
 dist/
@@ -24,6 +25,8 @@ env/
 *.swp
 *.swo
 *~
+.agents/
+.pytest_cache/
 
 # OS
 .DS_Store
@@ -32,11 +35,23 @@ Desktop.ini
 
 # Project specific
 *.log
+# OpenCode 无头任务的临时描述与输出；任务结束后仍会主动清理，
+# 忽略规则用于避免运行期间污染 VS Code Source Control。
+.opencode-*.job.json
+.opencode-*.stdout.log
+.opencode-*.stderr.log
 *.sig
 tests/
 .claude/
 .coverage
 .private/
 build.json
+notmyfault/integrity.json
 _patch_dash.py
 
+DECOUPLING.md
+
+# 测试沙箱残留（含敏感凭据）
+sandbox_appdata/
+
+.git_commit_msg.txt

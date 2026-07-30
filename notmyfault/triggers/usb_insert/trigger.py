@@ -1,5 +1,6 @@
 import time
 import psutil
+import os
 
 
 def run(meta, config_list, emit_event, shutdown_event):
@@ -10,9 +11,14 @@ def run(meta, config_list, emit_event, shutdown_event):
     def get_removable_drives():
         drives = set()
         for p in psutil.disk_partitions(all=False):
-            if 'removable' in p.opts:
+            if "removable" in p.opts or (
+                os.name != "nt"
+                and p.mountpoint.startswith(("/media/", "/run/media/"))
+            ):
                 # p.device 通常长这样: 'E:\\'，我们截取前两个字符 'E:'
-                drives.add(p.device[:2].upper())
+                drives.add(
+                    p.device[:2].upper() if os.name == "nt" else p.mountpoint
+                )
         return drives
 
     # 1. 启动时先摸底，把已经插在电脑上的 U盘记录下来，防止刚开机就误报！
@@ -35,7 +41,7 @@ def run(meta, config_list, emit_event, shutdown_event):
                         expected_drive = config.get("drive_letter", "").strip().upper()
 
                         # 如果用户填了 "ANY" 或者精确匹配到了盘符 (比如 "E:")
-                        if expected_drive == "ANY" or expected_drive == drive:
+                        if expected_drive == "ANY" or expected_drive == drive.upper():
                             # 发射标准化事件给引擎！发送实际盘符用于匹配规则
                             emit_event(
                                 trigger_id,

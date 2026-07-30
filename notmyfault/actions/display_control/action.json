@@ -1,0 +1,33 @@
+{
+    "id": "display_control",
+    "name": "显示器控制",
+    "description": "关闭显示器、调节亮度",
+    "version_code": 3,
+    "version": "1.2",
+    "package_name": "io.github.notmyfault.display_control",
+    "enabled": true,
+    "permissions": ["native_api", "external_binary"],
+    "params": [
+        {
+            "name": "action",
+            "label": "操作",
+            "type": "select",
+            "default": "off",
+            "options": [
+                {"value": "off", "label": "关闭显示器"},
+                {"value": "on", "label": "开启显示器"},
+                {"value": "set_brightness", "label": "设置亮度"}
+            ]
+        },
+        {
+            "name": "brightness",
+            "label": "亮度（0–100）",
+            "type": "number",
+            "default": 50,
+            "min": 0,
+            "max": 100,
+            "step": 1,
+            "visible_when": {"action": ["set_brightness"]}
+        }
+    ]
+}

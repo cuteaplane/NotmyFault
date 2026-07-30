@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+psutil
+cryptography
+py7zr
+openpyxl
+python-multipart
+pillow
+dbus-next
+
+pywebview[qt]; sys_platform == "linux"
+pystray; sys_platform == "linux"
+
+pywebview; sys_platform == "win32"
+pywin32; sys_platform == "win32"
+windows-toasts; sys_platform == "win32"
+pycaw; sys_platform == "win32"

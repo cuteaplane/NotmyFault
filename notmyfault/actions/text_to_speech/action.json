@@ -1,0 +1,45 @@
+{
+    "id": "text_to_speech",
+    "name": "语音播报",
+    "description": "将文字转为语音朗读（TTS，使用 Windows SAPI）",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.text_to_speech",
+    "enabled": true,
+    "permissions": ["audio", "native_api", "external_binary"],
+    "params": [
+        {
+            "name": "text",
+            "label": "播报文本",
+            "type": "textarea",
+            "default": "",
+            "placeholder": "要朗读的内容",
+            "rows": 6
+        },
+        {
+            "name": "rate",
+            "label": "语速 (-10 ~ 10)",
+            "type": "number",
+            "default": 0,
+            "min": -10,
+            "max": 10,
+            "step": 1
+        },
+        {
+            "name": "volume",
+            "label": "音量 (0-100)",
+            "type": "number",
+            "default": 100,
+            "min": 0,
+            "max": 100,
+            "step": 1
+        },
+        {
+            "name": "voice",
+            "label": "声音名称",
+            "type": "string",
+            "default": "",
+            "placeholder": "留空使用系统默认；可填写 Microsoft Xiaoxiao"
+        }
+    ]
+}

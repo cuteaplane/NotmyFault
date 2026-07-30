@@ -7,7 +7,7 @@ def run(meta, config_list, emit_event, shutdown_event):
 
     target_times = set()
     for cfg in config_list:
-        t = cfg.get("time", "").strip()
+        t = cfg.get("time", "").strip().replace("：", ":")
         if t and len(t) == 5 and t[2] == ":":
             target_times.add(t)
 
