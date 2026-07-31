@@ -17,6 +17,10 @@ def _is_connected(host="8.8.8.8", port=53, timeout=2):
 def run(meta, config, emit_event, shutdown_event):
     trigger_id = meta.get("id", "network_status")
     target_state = config.get("state", "disconnected")
+    if target_state not in ("connected", "disconnected"):
+        raise ValueError(
+            f"无效的网络状态: {target_state!r}（可选: connected/disconnected）"
+        )
     print(f"[Trigger:{trigger_id}] 开始监控网络状态，目标: {target_state}")
 
     last_connected = _is_connected()

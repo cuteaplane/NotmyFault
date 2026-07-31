@@ -31,10 +31,16 @@ def _dir_snapshot(folder: str):
 
 def run(meta, config, emit_event, shutdown_event):
     trigger_id = meta.get("id", "folder_monitor")
+    # 配置校验优先于环境检查：event_type 非法属于配置错误，先于目录问题暴露
+    event_type = config.get("event_type", "all")
+    if event_type not in ("created", "modified", "deleted", "all"):
+        raise ValueError(
+            f"无效的事件类型: {event_type!r}"
+            "（可选: created/modified/deleted/all）"
+        )
     folder = config.get("folder_path", "").strip()
     if not folder or not os.path.isdir(folder):
         raise FileNotFoundError(f"监控目录不存在或不可读: {folder}")
-    event_type = config.get("event_type", "all")
     pattern = config.get("file_pattern", "*")
     snapshot = _dir_snapshot(folder)
     print(f"[Trigger:{trigger_id}] 开始监控: {folder} (事件={event_type}, 过滤={pattern})")

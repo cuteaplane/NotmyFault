@@ -150,6 +150,10 @@ def run(meta, config, emit_event, shutdown_event):
     trigger_id = meta.get("id", "bluetooth_device")
     target = config.get("device_name", "").strip()
     target_state = config.get("state", "connected")
+    if target_state not in ("connected", "disconnected"):
+        raise ValueError(
+            f"无效的蓝牙设备状态: {target_state!r}（可选: connected/disconnected）"
+        )
     print(f"[Trigger:{trigger_id}] 蓝牙设备监控已启动")
 
     last_devices, errors = _get_connected_devices()

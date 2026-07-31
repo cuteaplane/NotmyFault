@@ -19,14 +19,20 @@ def run(meta, config, emit_event, shutdown_event):
     trigger_id = meta.get("id", "system_resource")
     resource = config.get("resource", "cpu")
     direction = config.get("direction", "above")
+    if resource not in ("cpu", "memory", "disk", "network"):
+        raise ValueError(
+            f"无效的资源类型: {resource!r}（可选: cpu/memory/disk/network）"
+        )
+    if direction not in ("above", "below"):
+        raise ValueError(
+            f"无效的阈值方向: {direction!r}（可选: above/below）"
+        )
     try:
         threshold = float(config.get("threshold", 90))
     except (TypeError, ValueError):
-        print(
-            f"[Trigger:{trigger_id}] threshold 必须是数字，实际: "
-            f"{config.get('threshold')!r}，使用默认值 90"
-        )
-        threshold = 90.0
+        raise ValueError(
+            f"threshold 必须是数字，实际: {config.get('threshold')!r}"
+        ) from None
     print(f"[Trigger:{trigger_id}] 开始监控系统资源: {resource} {direction}")
     last_triggered = False
     # network 采样基线，用于计算速率而非累计字节

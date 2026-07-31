@@ -32,6 +32,10 @@ def run(meta, config, emit_event, shutdown_event):
 
     print(f"[Trigger:{trigger_id}] 开始监视窗口标题: {pattern}")
     target_state = config.get("state", "opened")
+    if target_state not in ("opened", "closed"):
+        raise ValueError(
+            f"无效的窗口状态: {target_state!r}（可选: opened/closed）"
+        )
     was_matched = False
 
     while not shutdown_event.is_set():

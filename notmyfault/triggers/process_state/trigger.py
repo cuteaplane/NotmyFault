@@ -14,6 +14,10 @@ def run(meta, config, emit_event, shutdown_event):
 
     print(f"[Trigger:{trigger_id}] 开始监听进程: {raw_name}")
     target_state = config.get("state", "running")
+    if target_state not in ("running", "stopped"):
+        raise ValueError(
+            f"无效的进程状态: {target_state!r}（可选: running/stopped）"
+        )
     last_state = "stopped"
 
     for proc in psutil.process_iter(["name"]):

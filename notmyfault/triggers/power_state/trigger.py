@@ -102,6 +102,7 @@ def _create_power_event_window():
             "user32": user32,
             "msg_cls": MSG,
             "class_name": class_name,
+            "wnd_proc": wnd_proc,
         }
     except Exception:
         return None
@@ -133,6 +134,9 @@ def _destroy_power_event_window(window) -> None:
     try:
         hwnd = window.get("hwnd")
         class_name = window.get("class_name")
+        wnd_proc = window.get("wnd_proc")
+        if wnd_proc in _WND_PROC_HOLD:
+            _WND_PROC_HOLD.remove(wnd_proc)
         if hwnd:
             ctypes.windll.user32.DestroyWindow(hwnd)
         if class_name:
@@ -145,6 +149,11 @@ def _destroy_power_event_window(window) -> None:
 def run(meta, config, emit_event, shutdown_event):
     trigger_id = meta.get("id", "power_state")
     target_state = config.get("state", "ac")
+    if target_state not in ("ac", "battery", "low_battery", "resume"):
+        raise ValueError(
+            f"无效的电源状态: {target_state!r}"
+            "（可选: ac/battery/low_battery/resume）"
+        )
     print(f"[Trigger:{trigger_id}] 开始监控电源状态，目标: {target_state}")
 
     # resume 只在 Windows 上通过电源广播消息实现。
