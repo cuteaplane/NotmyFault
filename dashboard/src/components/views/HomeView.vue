@@ -236,7 +236,7 @@ watch(isRunning, (running) => {
       </header>
       <div class="dashboard-system-grid">
         <div v-for="info in [
-            { icon: 'info', key: '版本', val: 'NotmyFault v' + appVersion },
+            { icon: 'info', key: '版本', val: 'NotmyFault ' + appVersion },
             { icon: 'shield', key: '安全模式', val: modeLabel },
             { icon: 'folder', key: '配置目录', val: '%APPDATA%/NotmyFault/' },
             { icon: 'rule', key: '已配置规则', val: (store.configData?.rules?.length || 0) + ' 条' },
