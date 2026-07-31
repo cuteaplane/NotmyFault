@@ -3,12 +3,10 @@
 这里刻意不认识任何云盘、Excel 或具体插件。核心只负责把事件、条件组合和
 前序步骤结果交给插件；第三方服务的协议与凭据留在用户插件里。
 """
-import re
+import copy
 from typing import Any, Callable, Dict
 
-
-_TEMPLATE = re.compile(r"{{\s*([a-zA-Z_][\w.]*)\s*}}")
-_MISSING = object()
+from notmyfault.bindings import resolve_value
 
 
 def build_context(
@@ -18,46 +16,32 @@ def build_context(
     condition_events: list[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """创建一次规则运行独享的上下文。"""
+    triggers: Dict[str, Dict[str, Any]] = {}
+    for item in condition_events:
+        binding_id = item.get("binding_id")
+        event = item.get("event", {})
+        if not isinstance(binding_id, str) or not binding_id:
+            continue
+        triggers[binding_id] = {
+            "type": event.get("type", ""),
+            "payload": copy.deepcopy(item.get("payload", {})),
+        }
     return {
+        "context_version": 2,
         "rule": {"name": rule_name},
-        "event": {"type": event_type, "payload": dict(event_payload)},
-        "condition_events": condition_events,
+        "event": {
+            "type": event_type,
+            "payload": copy.deepcopy(event_payload),
+        },
+        "triggers": triggers,
+        "condition_events": copy.deepcopy(condition_events),
         "steps": {},
     }
 
 
-def _lookup(context: Dict[str, Any], dotted_path: str) -> Any:
-    current: Any = context
-    for segment in dotted_path.split("."):
-        if not isinstance(current, dict) or segment not in current:
-            return _MISSING
-        current = current[segment]
-    return current
-
-
 def resolve_templates(value: Any, context: Dict[str, Any]) -> Any:
-    """递归解析 ``{{ event.payload.path }}`` / ``{{ steps.sync.result }}``。
-
-    完整占位符保留原始类型（列表、数字都能直接传给下一步）；嵌在文本中的
-    占位符按字符串替换。找不到变量保持原文，避免静默把路径替成空字符串。
-    """
-    if isinstance(value, dict):
-        return {key: resolve_templates(item, context) for key, item in value.items()}
-    if isinstance(value, list):
-        return [resolve_templates(item, context) for item in value]
-    if not isinstance(value, str):
-        return value
-
-    full = _TEMPLATE.fullmatch(value)
-    if full:
-        resolved = _lookup(context, full.group(1))
-        return value if resolved is _MISSING else resolved
-
-    def replace(match: re.Match[str]) -> str:
-        resolved = _lookup(context, match.group(1))
-        return match.group(0) if resolved is _MISSING else str(resolved)
-
-    return _TEMPLATE.sub(replace, value)
+    """兼容旧调用点；新规则使用结构化 ``$ref``。"""
+    return resolve_value(value, context)
 
 
 def invoke_action(

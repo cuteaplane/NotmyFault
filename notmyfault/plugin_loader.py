@@ -8,6 +8,7 @@ import importlib.util
 import inspect
 import json
 import os
+import posixpath
 import sys
 import threading
 import traceback
@@ -62,9 +63,10 @@ def resolve_plugin_entrypoint(
     """解析当前平台入口，并再次防御目录逃逸。"""
     entrypoints = meta.get("entrypoints") or {}
     relative_path = entrypoints.get(_current_platform_name(), default_filename)
-    plugin_root = os.path.realpath(folder_path)
-    entrypoint = os.path.realpath(os.path.join(plugin_root, relative_path))
-    if os.path.commonpath((plugin_root, entrypoint)) != plugin_root:
+    path_api = posixpath if sys.platform.startswith("linux") else os.path
+    plugin_root = path_api.realpath(folder_path)
+    entrypoint = path_api.realpath(path_api.join(plugin_root, relative_path))
+    if path_api.commonpath((plugin_root, entrypoint)) != plugin_root:
         raise ValueError(f"插件入口逃逸插件目录: {relative_path}")
     return entrypoint
 

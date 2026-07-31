@@ -489,21 +489,41 @@ class AutomationEngine:
         self,
         rule: Dict[str, Any],
         rule_index: int = -1,
+        trigger_payloads: Optional[Dict[str, Dict[str, Any]]] = None,
+        event_payload: Optional[Dict[str, Any]] = None,
     ) -> tuple[bool, str]:
         """执行调用方已核对过的规则快照，不依赖热重载时序。"""
         rule = copy.deepcopy(rule)
 
         rule_name = rule.get("name", f"规则 #{rule_index + 1}")
+        manual_payload = (
+            dict(event_payload)
+            if isinstance(event_payload, dict)
+            else {"source": "dashboard", "rule_index": rule_index}
+        )
         context = build_context(
             rule_name,
             "manual",
-            {"source": "dashboard", "rule_index": rule_index},
+            manual_payload,
             [],
         )
+        if isinstance(trigger_payloads, dict):
+            event_types = {
+                event.get("binding_id"): event.get("type", "")
+                for event in get_rule_events(rule)
+            }
+            context["triggers"] = {
+                binding_id: {
+                    "type": event_types.get(binding_id, ""),
+                    "payload": copy.deepcopy(payload),
+                }
+                for binding_id, payload in trigger_payloads.items()
+                if isinstance(binding_id, str) and isinstance(payload, dict)
+            }
         self._safe_on_event("rule_triggered", {
             "rule_name": rule_name,
             "event_type": "manual",
-            "event_payload": {"source": "dashboard"},
+            "event_payload": manual_payload,
         })
         threading.Thread(
             target=self.execute_workflow,

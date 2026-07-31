@@ -11,6 +11,11 @@
     "permissions": [
         "external_binary"
     ],
+    "outputs": [
+        {"name": "device_name", "label": "匹配设备", "type": "string"},
+        {"name": "actual_device", "label": "实际设备", "type": "string"},
+        {"name": "state", "label": "连接状态", "type": "string"}
+    ],
     "params": [
         {
             "name": "device_name",

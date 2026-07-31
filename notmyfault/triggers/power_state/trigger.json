@@ -9,6 +9,10 @@
     "package_name": "io.github.notmyfault.power_state",
     "enabled": true,
     "permissions": ["native_api"],
+    "outputs": [
+        {"name": "state", "label": "电源状态", "type": "string"},
+        {"name": "battery_percent", "label": "电池电量", "type": "number"}
+    ],
     "params": [
         {
             "name": "state",

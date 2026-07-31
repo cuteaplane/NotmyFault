@@ -22,7 +22,12 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from notmyfault.config import CONFIG_FILE, save_config as config_save
+from notmyfault.bindings import iter_legacy_event_payload_paths, iter_references
+from notmyfault.config import (
+    CONFIG_FILE,
+    ensure_rule_binding_ids,
+    save_config as config_save,
+)
 from notmyfault.platform_support import get_config_dir
 from notmyfault.plugin_schema import (
     scan_plugins,
@@ -35,7 +40,11 @@ from notmyfault.plugin_schema import (
     PERMISSION_REGISTRY,
 )
 from notmyfault.security import detect_security_mode, SecurityMode
-from notmyfault.rules import get_rule_events, validate_rules_structure
+from notmyfault.rules import (
+    get_rule_events,
+    validate_rule_bindings,
+    validate_rules_structure,
+)
 from notmyfault.version import __version__
 
 _scan_plugins = scan_plugins  # 向后兼容
@@ -639,10 +648,46 @@ class EngineAPI:
                      "details": structure_errors[:10]},
                     status_code=400,
                 )
+            if not isinstance(rules, list):
+                return JSONResponse(
+                    {"ok": False, "error": "rules 必须是列表"},
+                    status_code=400,
+                )
+            normalized_rules = [
+                ensure_rule_binding_ids(rule) for rule in rules
+            ]
+            structure_errors = validate_rules_structure(normalized_rules)
+            if structure_errors:
+                return JSONResponse(
+                    {"ok": False, "error": "规则节点标识无效",
+                     "details": structure_errors[:10]},
+                    status_code=400,
+                )
+            schema = self._get_plugins_schema()
+            binding_issues = []
+            for index, rule in enumerate(normalized_rules):
+                for issue in validate_rule_bindings(
+                    rule,
+                    schema["triggers"],
+                    schema["actions"],
+                ):
+                    binding_issues.append({
+                        "rule": rule.get("name", f"规则 #{index + 1}"),
+                        **issue,
+                    })
+            if binding_issues:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "error": "规则数据绑定无效",
+                        "details": binding_issues[:20],
+                    },
+                    status_code=400,
+                )
 
             # 安全校验：命中危险模式（危险命令/危险路径）则拒绝写入
             from notmyfault.config import _validate_rules_safety
-            _warnings, errors = _validate_rules_safety(rules)
+            _warnings, errors = _validate_rules_safety(normalized_rules)
             if errors:
                 return JSONResponse(
                     {"ok": False, "error": "规则安全校验失败", "details": errors[:10]},
@@ -652,7 +697,7 @@ class EngineAPI:
             existing_config = self._load_config()
             new_config = dict(existing_config) if isinstance(existing_config, dict) else {}
             new_config.pop("_signature", None)
-            new_config["rules"] = rules
+            new_config["rules"] = normalized_rules
             new_config.setdefault(
                 "disabled_plugins",
                 {"triggers": [], "actions": []},
@@ -661,7 +706,7 @@ class EngineAPI:
             ok = self._save_config(new_config)
             if ok:
                 print(f"[API] 规则已保存 ({len(new_config['rules'])} 条)")
-                return {"ok": True}
+                return {"ok": True, "rules": normalized_rules}
             else:
                 return JSONResponse(
                     {"ok": False, "error": "写入配置文件失败"},
@@ -677,6 +722,8 @@ class EngineAPI:
                 )
             rule_snapshot = None
             has_snapshot = False
+            trigger_payloads: Dict[str, Dict[str, Any]] = {}
+            event_payload = None
             raw_body = await request.body()
             if raw_body:
                 try:
@@ -694,7 +741,12 @@ class EngineAPI:
                 if "rule" in body:
                     has_snapshot = True
                     rule_snapshot = body["rule"]
+                if isinstance(body.get("trigger_payloads"), dict):
+                    trigger_payloads = body["trigger_payloads"]
+                if isinstance(body.get("event_payload"), dict):
+                    event_payload = body["event_payload"]
 
+            candidate_rule = None
             if has_snapshot:
                 structure_errors = validate_rules_structure([rule_snapshot])
                 if structure_errors:
@@ -714,12 +766,62 @@ class EngineAPI:
                         {"ok": False, "error": "规则保存版本已变化，请刷新后重试"},
                         status_code=409,
                     )
+                candidate_rule = rule_snapshot
+            else:
+                disk_rules = self._load_config().get("rules", [])
+                if (
+                    not isinstance(disk_rules, list)
+                    or rule_index < 0
+                    or rule_index >= len(disk_rules)
+                ):
+                    return JSONResponse(
+                        {"ok": False, "error": "规则不存在"},
+                        status_code=404,
+                    )
+                candidate_rule = disk_rules[rule_index]
+
+            references = list(iter_references(candidate_rule))
+            legacy_event_paths = list(iter_legacy_event_payload_paths(candidate_rule))
+            required_trigger_ids = sorted({
+                binding_id
+                for usage in references
+                if usage.reference.get("scope") == "trigger"
+                and isinstance(
+                    binding_id := usage.reference.get("node"), str
+                )
+            })
+            missing_trigger_ids = [
+                binding_id for binding_id in required_trigger_ids
+                if not isinstance(trigger_payloads.get(binding_id), dict)
+            ]
+            needs_event = any(
+                usage.reference.get("scope") == "event"
+                for usage in references
+            ) or bool(legacy_event_paths)
+            if missing_trigger_ids or (needs_event and event_payload is None):
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "code": "missing_test_context",
+                        "error": "测试规则需要提供触发时产生的数据",
+                        "required_trigger_ids": missing_trigger_ids,
+                        "event_payload_required": needs_event and event_payload is None,
+                    },
+                    status_code=400,
+                )
+
+            if trigger_payloads or event_payload is not None:
                 ok, message = engine.run_manual_rule_snapshot(
-                    rule_snapshot,
+                    candidate_rule,
                     rule_index,
+                    trigger_payloads=trigger_payloads,
+                    event_payload=event_payload,
                 )
             else:
-                ok, message = engine.run_manual_rule(rule_index)
+                ok, message = engine.run_manual_rule_snapshot(
+                    candidate_rule,
+                    rule_index,
+                )
             if not ok:
                 return JSONResponse({"ok": False, "error": message}, status_code=400)
             return {"ok": True, "message": message}

@@ -9,6 +9,11 @@
     "package_name": "io.github.notmyfault.clipboard",
     "enabled": true,
     "permissions": ["clipboard", "native_api"],
+    "outputs": [
+        {"name": "text", "label": "剪贴板内容", "type": "string", "sensitive": true},
+        {"name": "match_text", "label": "匹配配置", "type": "string"},
+        {"name": "matched", "label": "实际匹配文本", "type": "string", "required": false}
+    ],
     "params": [
         {
             "name": "match_text",

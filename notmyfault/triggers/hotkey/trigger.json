@@ -10,6 +10,9 @@
     "platforms": ["windows"],
     "enabled": true,
     "permissions": ["native_api"],
+    "outputs": [
+        {"name": "hotkey", "label": "触发热键", "type": "string"}
+    ],
     "params": [
         {
             "name": "hotkey",

@@ -8,6 +8,9 @@
     "version": "1.0",
     "package_name": "io.github.notmyfault.time_schedule",
     "enabled": true,
+    "outputs": [
+        {"name": "triggered_time", "label": "触发时间", "type": "string"}
+    ],
     "params": [
         {
             "name": "time",

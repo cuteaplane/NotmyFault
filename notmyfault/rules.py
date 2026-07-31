@@ -6,8 +6,13 @@ engine.py 只管拿这些函数的返回值去打印和记诊断，逻辑和副�
 import json
 import threading
 import time
+import re
 from typing import Any, Dict, Iterable, List, Tuple
 
+from notmyfault.bindings import is_reference, iter_references
+
+
+_BINDING_ID_RE = re.compile(r"^[tap]_[a-z0-9_]{6,64}$")
 
 # ---------------------------------------------------------------------------
 # 事件提取
@@ -136,6 +141,53 @@ def validate_rule_structure(rule: Any) -> List[str]:
     return errors
 
 
+def _validate_node_binding_id(
+    node: Dict[str, Any],
+    prefix: str,
+    path: str,
+    seen: set[str],
+    errors: List[str],
+) -> None:
+    binding_id = node.get("binding_id")
+    if not isinstance(binding_id, str) or not _BINDING_ID_RE.fullmatch(binding_id):
+        errors.append(f"{path}.binding_id 无效")
+        return
+    if not binding_id.startswith(f"{prefix}_"):
+        errors.append(f"{path}.binding_id 必须以 {prefix}_ 开头")
+    if binding_id in seen:
+        errors.append(f"{path}.binding_id 与其他节点重复")
+    seen.add(binding_id)
+
+
+def validate_rule_binding_ids(rule: Dict[str, Any]) -> List[str]:
+    """校验 v2 节点身份；配置迁移器负责给 v1 规则补齐。"""
+    errors: List[str] = []
+    seen: set[str] = set()
+
+    def visit(node: Any, path: str) -> None:
+        if not isinstance(node, dict):
+            return
+        if _is_event_leaf(node):
+            _validate_node_binding_id(node, "t", path, seen, errors)
+            return
+        for index, child in enumerate(_condition_children(node)):
+            visit(child, f"{path}.children[{index}]")
+
+    condition = get_rule_condition(rule)
+    if condition is not None:
+        visit(condition, "condition" if "condition" in rule else "event")
+    for field, prefix in (("preconditions", "p"), ("actions", "a")):
+        items = rule.get(field, [])
+        if not isinstance(items, list):
+            continue
+        for index, item in enumerate(items):
+            if isinstance(item, dict):
+                _validate_node_binding_id(
+                    item, prefix, f"{field}[{index}]", seen, errors
+                )
+    return errors
+
+
 def validate_rules_structure(rules: Any) -> List[str]:
     """校验规则列表并返回带索引的错误，供所有写入入口复用。"""
     if not isinstance(rules, list):
@@ -146,7 +198,25 @@ def validate_rules_structure(rules: Any) -> List[str]:
         label = str(name).strip() if name else f"#{index + 1}"
         errors.extend(
             f"规则 {label}: {error}"
-            for error in validate_rule_structure(rule)
+            for error in (
+                validate_rule_structure(rule)
+                + (
+                    validate_rule_binding_ids(rule)
+                    if isinstance(rule, dict)
+                    and any(
+                        "binding_id" in node
+                        for node in (
+                            get_rule_events(rule)
+                            + [
+                                item for field in ("preconditions", "actions")
+                                for item in rule.get(field, [])
+                                if isinstance(item, dict)
+                            ]
+                        )
+                    )
+                    else []
+                )
+            )
         )
     return errors
 
@@ -186,6 +256,9 @@ def _condition_op(node: Dict[str, Any]) -> str:
 
 def _event_key(event_def: Dict[str, Any]) -> str:
     """事件叶子的稳定键；用于保存最近一次命中，而不是依赖对象 id。"""
+    binding_id = event_def.get("binding_id")
+    if isinstance(binding_id, str) and binding_id:
+        return f"id:{binding_id}"
     return json.dumps(
         {"type": event_def.get("type", ""), "params": event_def.get("params", {})},
         ensure_ascii=False,
@@ -204,7 +277,7 @@ class ConditionRuntime:
     """
 
     def __init__(self) -> None:
-        self._seen: Dict[str, Dict[str, tuple[float, Dict[str, Any]]]] = {}
+        self._seen: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._fired: Dict[str, tuple[tuple[str, float], ...]] = {}
         self._last_matches: Dict[str, List[Dict[str, Any]]] = {}
         self._lock = threading.RLock()
@@ -219,7 +292,11 @@ class ConditionRuntime:
         """返回最近一次成功条件组合的全部事件，供执行流水线消费。"""
         with self._lock:
             return [
-                {**item, "payload": dict(item["payload"])}
+                {
+                    **item,
+                    "event": dict(item["event"]),
+                    "payload": dict(item["payload"]),
+                }
                 for item in self._last_matches.get(rule_key, [])
             ]
 
@@ -246,7 +323,15 @@ class ConditionRuntime:
         with self._lock:
             seen = self._seen.setdefault(rule_key, {})
             for leaf in matching_leaves:
-                seen[_event_key(leaf)] = (timestamp, dict(event_payload))
+                seen[_event_key(leaf)] = {
+                    "binding_id": leaf.get("binding_id"),
+                    "event": {
+                        "type": leaf.get("type", ""),
+                        "params": dict(leaf.get("params", {})),
+                    },
+                    "timestamp": timestamp,
+                    "payload": dict(event_payload),
+                }
 
             matched, signature = self._evaluate(node, seen)
             if not matched:
@@ -256,11 +341,7 @@ class ConditionRuntime:
                 return False
             self._fired[rule_key] = signature
             self._last_matches[rule_key] = [
-                {
-                    "event": json.loads(key),
-                    "timestamp": fired_at,
-                    "payload": dict(seen[key][1]),
-                }
+                dict(seen[key])
                 for key, fired_at in signature
                 if key in seen
             ]
@@ -269,12 +350,15 @@ class ConditionRuntime:
     def _evaluate(
         self,
         node: Dict[str, Any],
-        seen: Dict[str, tuple[float, Dict[str, Any]]],
+        seen: Dict[str, Dict[str, Any]],
     ) -> tuple[bool, tuple[tuple[str, float], ...]]:
         if _is_event_leaf(node):
             key = _event_key(node)
             entry = seen.get(key)
-            return (entry is not None, ((key, entry[0]),) if entry else ())
+            return (
+                entry is not None,
+                ((key, float(entry["timestamp"])),) if entry else (),
+            )
 
         children = _condition_children(node)
         if not children:
@@ -327,6 +411,241 @@ def aggregate_trigger_params(rules: List[Dict[str, Any]]) -> Dict[str, List[Dict
                 continue
             aggregated.setdefault(event_type, []).append(event_def.get("params", {}))
     return aggregated
+
+
+# ---------------------------------------------------------------------------
+# 运行数据绑定静态校验
+# ---------------------------------------------------------------------------
+
+def _normalized_outputs(meta: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    for item in meta.get("outputs", []):
+        if isinstance(item, str) and item:
+            result[item] = {
+                "name": item,
+                "label": item,
+                "type": "any",
+                "required": True,
+            }
+        elif isinstance(item, dict) and isinstance(item.get("name"), str):
+            result[item["name"]] = {
+                "required": True,
+                "sensitive": False,
+                **item,
+            }
+    return result
+
+
+def guaranteed_trigger_ids(node: Dict[str, Any] | None) -> set[str]:
+    """返回条件树每次成立时都必然出现的触发器节点。"""
+    if not isinstance(node, dict):
+        return set()
+    if _is_event_leaf(node):
+        binding_id = node.get("binding_id")
+        return {binding_id} if isinstance(binding_id, str) else set()
+    children = _condition_children(node)
+    if not children:
+        return set()
+    child_sets = [guaranteed_trigger_ids(child) for child in children]
+    if _condition_op(node) == "all":
+        return set().union(*child_sets)
+    result = set(child_sets[0])
+    for child_set in child_sets[1:]:
+        result.intersection_update(child_set)
+    return result
+
+
+def _source_type(
+    output: Dict[str, Any] | None,
+) -> str:
+    return str(output.get("type", "any")) if output else "any"
+
+
+def _target_type(param: Dict[str, Any] | None) -> str:
+    if not param:
+        return "any"
+    raw = param.get("type", "string")
+    if raw in ("string", "textarea", "path", "time", "hotkey", "select"):
+        return "string"
+    return str(raw)
+
+
+def _types_compatible(source: str, target: str) -> bool:
+    return source == "any" or target == "any" or source == target
+
+
+def validate_rule_bindings(
+    rule: Dict[str, Any],
+    triggers_meta: Dict[str, Dict[str, Any]],
+    actions_meta: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """静态验证结构化 ``$ref`` 的来源、顺序、可用性和类型。"""
+    issues: List[Dict[str, Any]] = []
+    leaves = get_rule_events(rule)
+    leaves_by_id = {
+        item.get("binding_id"): item
+        for item in leaves
+        if isinstance(item.get("binding_id"), str)
+    }
+    guaranteed = guaranteed_trigger_ids(get_rule_condition(rule))
+    actions = [
+        item for item in rule.get("actions", []) if isinstance(item, dict)
+    ]
+    actions_by_id = {
+        item.get("binding_id"): (index, item)
+        for index, item in enumerate(actions)
+        if isinstance(item.get("binding_id"), str)
+    }
+
+    def add(code: str, usage: Any, message: str) -> None:
+        issues.append({
+            "code": code,
+            "location": usage.location,
+            "reference": usage.reference,
+            "message": message,
+        })
+
+    def output_for(
+        meta: Dict[str, Any],
+        reference: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        path = reference.get("path", [])
+        if not isinstance(path, list) or not path:
+            return None
+        return _normalized_outputs(meta).get(path[0])
+
+    def validate_item(
+        item: Dict[str, Any],
+        *,
+        item_index: int,
+        field: str,
+        allow_steps: bool,
+    ) -> None:
+        action_meta = actions_meta.get(item.get("type", ""), {})
+        target_params = {
+            param.get("name"): param
+            for param in action_meta.get("params", [])
+            if isinstance(param, dict)
+        }
+        params = item.get("params", {})
+        if not isinstance(params, dict):
+            return
+        for param_name, value in params.items():
+            for usage in iter_references(
+                value,
+                location=f"{field}[{item_index}].params.{param_name}",
+            ):
+                if item.get("type") == "run_powershell" and param_name == "command":
+                    add(
+                        "unsafe_dynamic_parameter",
+                        usage,
+                        "PowerShell 命令不允许来自运行时数据",
+                    )
+                    continue
+                reference = usage.reference
+                scope = reference.get("scope")
+                path = reference.get("path")
+                if (
+                    not isinstance(path, list)
+                    or any(not isinstance(segment, str) for segment in path)
+                ):
+                    add("invalid_reference", usage, "$ref.path 必须是字符串数组")
+                    continue
+
+                source_output: Dict[str, Any] | None = None
+                if scope == "trigger":
+                    node_id = reference.get("node")
+                    leaf = leaves_by_id.get(node_id)
+                    if leaf is None:
+                        add("unknown_source", usage, "引用的触发条件不存在")
+                        continue
+                    if node_id not in guaranteed:
+                        add(
+                            "conditional_source",
+                            usage,
+                            "该触发条件并非每次规则运行都会命中",
+                        )
+                        continue
+                    source_output = output_for(
+                        triggers_meta.get(leaf.get("type", ""), {}),
+                        reference,
+                    )
+                elif scope == "event":
+                    candidates = []
+                    for leaf in leaves:
+                        output = output_for(
+                            triggers_meta.get(leaf.get("type", ""), {}),
+                            reference,
+                        )
+                        candidates.append(output)
+                    if not candidates or any(output is None for output in candidates):
+                        add(
+                            "unknown_output",
+                            usage,
+                            "并非所有可能触发本规则的事件都提供该字段",
+                        )
+                        continue
+                    source_types = {_source_type(output) for output in candidates}
+                    if len(source_types) != 1:
+                        add(
+                            "binding_type_mismatch",
+                            usage,
+                            "不同触发分支对该字段声明了不同类型",
+                        )
+                        continue
+                    source_output = candidates[0]
+                elif scope == "step":
+                    if not allow_steps:
+                        add("step_not_available", usage, "开始前确认不能引用动作结果")
+                        continue
+                    node_id = reference.get("node")
+                    source = actions_by_id.get(node_id)
+                    if source is None:
+                        add("unknown_source", usage, "引用的动作步骤不存在")
+                        continue
+                    source_index, source_action = source
+                    if source_index >= item_index:
+                        add("forward_reference", usage, "只能引用当前动作之前的步骤")
+                        continue
+                    source_output = output_for(
+                        actions_meta.get(source_action.get("type", ""), {}),
+                        reference,
+                    )
+                else:
+                    add("invalid_reference", usage, f"未知的数据源 scope: {scope!r}")
+                    continue
+
+                if path and source_output is None:
+                    add("unknown_output", usage, f"数据源未声明输出字段 {path[0]!r}")
+                    continue
+                if source_output and source_output.get("required") is False:
+                    add("optional_output", usage, "该输出字段可能不存在")
+                    continue
+                source_type = _source_type(source_output)
+                target_type = _target_type(target_params.get(param_name))
+                if not _types_compatible(source_type, target_type):
+                    add(
+                        "binding_type_mismatch",
+                        usage,
+                        f"{source_type} 数据不能绑定到 {target_type} 参数",
+                    )
+
+    for index, item in enumerate(rule.get("preconditions", [])):
+        if isinstance(item, dict):
+            validate_item(
+                item,
+                item_index=index,
+                field="preconditions",
+                allow_steps=False,
+            )
+    for index, action in enumerate(actions):
+        validate_item(
+            action,
+            item_index=index,
+            field="actions",
+            allow_steps=True,
+        )
+    return issues
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +724,9 @@ def validate_rules(
 
                 schema = schema_param_names[param_name]
                 expected_type = schema.get("type", "string")
+                if is_reference(param_value):
+                    # 结构化绑定由 validate_rule_bindings 按来源输出类型检查。
+                    continue
 
                 if expected_type == "number":
                     if not isinstance(param_value, (int, float)):

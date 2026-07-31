@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Tuple
 _REQUIRED_META_FIELDS = {"id", "name", "description", "enabled", "version_code", "version", "package_name"}
 _TRIGGER_OPTIONAL_FIELDS = {
     "semantic", "params", "permissions", "origin", "trigger_api", "platforms",
-    "entrypoints",
+    "entrypoints", "outputs",
 }
 _ACTION_OPTIONAL_FIELDS = {
     "params", "permissions", "origin", "execution_api", "precondition_api",
@@ -17,7 +17,9 @@ _ACTION_OPTIONAL_FIELDS = {
 }
 _ALLOWED_SEMANTICS = {"state", "oneshot"}
 _ALLOWED_PARAM_TYPES = {"string", "number", "select", "bool", "time", "hotkey", "path", "textarea"}
+_ALLOWED_OUTPUT_TYPES = {"string", "number", "bool", "array", "object", "any"}
 _REQUIRED_PARAM_FIELDS = {"name", "type", "label"}
+_REQUIRED_OUTPUT_FIELDS = {"name", "type", "label"}
 _ALLOWED_ORIGINS = {"builtin", "user", "third_party"}
 _ALLOWED_PLATFORMS = {"windows", "linux", "macos"}
 _PACKAGE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$")
@@ -284,8 +286,49 @@ def validate_plugin_meta(
         errors.append("precondition_api 目前仅支持 context-v1")
     if "outputs" in meta:
         outputs = meta["outputs"]
-        if not isinstance(outputs, list) or not all(isinstance(item, str) and item for item in outputs):
-            errors.append("outputs 必须是非空字符串数组")
+        if not isinstance(outputs, list):
+            errors.append("outputs 必须是数组")
+        else:
+            output_names: set[str] = set()
+            for i, output in enumerate(outputs):
+                # 兼容早期 action 插件使用的 ["files", "count"] 简写。
+                if isinstance(output, str):
+                    if not output:
+                        errors.append(f"outputs[{i}] 不能为空")
+                        continue
+                    output_name = output
+                elif isinstance(output, dict):
+                    for field in sorted(_REQUIRED_OUTPUT_FIELDS):
+                        if field not in output:
+                            errors.append(f"outputs[{i}] 缺少必填字段: {field}")
+                    output_name = output.get("name")
+                    output_type = output.get("type")
+                    if output_type and output_type not in _ALLOWED_OUTPUT_TYPES:
+                        errors.append(
+                            f"outputs[{i}].type 无效: '{output_type}'"
+                            f"（允许: {', '.join(sorted(_ALLOWED_OUTPUT_TYPES))}）"
+                        )
+                    for flag in ("required", "sensitive"):
+                        if flag in output and not isinstance(output[flag], bool):
+                            errors.append(f"outputs[{i}].{flag} 必须为布尔值")
+                    if (
+                        output_type == "array"
+                        and "item_type" in output
+                        and output["item_type"] not in _ALLOWED_OUTPUT_TYPES - {"array"}
+                    ):
+                        errors.append(f"outputs[{i}].item_type 无效")
+                else:
+                    errors.append(f"outputs[{i}] 必须是字符串或对象")
+                    continue
+
+                if not isinstance(output_name, str) or not output_name:
+                    errors.append(f"outputs[{i}].name 必须是非空字符串")
+                    continue
+                if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", output_name):
+                    errors.append(f"outputs[{i}].name 含非法字符: {output_name!r}")
+                if output_name in output_names:
+                    errors.append(f"outputs 包含重复名称: {output_name}")
+                output_names.add(output_name)
 
     if "params" in meta:
         params = meta["params"]

@@ -3,11 +3,83 @@ import hmac
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 from typing import Any, Dict, List
 
 from .platform_support import get_config_dir
+
+
+_BINDING_ID_RE = re.compile(r"^[tap]_[a-z0-9_]{6,64}$")
+
+
+def _new_binding_id(prefix: str) -> str:
+    return f"{prefix}_{secrets.token_hex(6)}"
+
+
+def _ensure_condition_binding_ids(
+    condition: Any,
+    seen: set[str],
+) -> Any:
+    """给条件树叶子补充持久、可被动作引用的运行时身份。"""
+    if not isinstance(condition, dict):
+        return condition
+    copied = dict(condition)
+    children = copied.get("children")
+    if isinstance(children, list):
+        copied["children"] = [
+            _ensure_condition_binding_ids(child, seen) for child in children
+        ]
+        return copied
+
+    binding_id = copied.get("binding_id")
+    if (
+        not isinstance(binding_id, str)
+        or not _BINDING_ID_RE.fullmatch(binding_id)
+        or not binding_id.startswith("t_")
+        or binding_id in seen
+    ):
+        binding_id = _new_binding_id("t")
+    copied["binding_id"] = binding_id
+    seen.add(binding_id)
+    return copied
+
+
+def ensure_rule_binding_ids(rule: Dict[str, Any]) -> Dict[str, Any]:
+    """规范化一条规则中可产生/消费运行数据的节点身份。"""
+    copied = dict(rule)
+    seen: set[str] = set()
+    if isinstance(copied.get("event"), dict):
+        copied["event"] = _ensure_condition_binding_ids(copied["event"], seen)
+    if isinstance(copied.get("condition"), dict):
+        copied["condition"] = _ensure_condition_binding_ids(
+            copied["condition"], seen
+        )
+
+    for field, prefix in (("preconditions", "p"), ("actions", "a")):
+        items = copied.get(field)
+        if not isinstance(items, list):
+            continue
+        normalized = []
+        for item in items:
+            if not isinstance(item, dict):
+                normalized.append(item)
+                continue
+            item_copy = dict(item)
+            binding_id = item_copy.get("binding_id")
+            if (
+                not isinstance(binding_id, str)
+                or not _BINDING_ID_RE.fullmatch(binding_id)
+                or not binding_id.startswith(f"{prefix}_")
+                or binding_id in seen
+            ):
+                binding_id = _new_binding_id(prefix)
+            item_copy["binding_id"] = binding_id
+            seen.add(binding_id)
+            normalized.append(item_copy)
+        copied[field] = normalized
+    return copied
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "disabled_plugins": {
@@ -364,7 +436,7 @@ def _validate_rules_safety(rules: list) -> tuple[list[str], list[str]]:
             # 危险命令检测（error - 命中拒绝）
             if action_type in ("run_powershell",):
                 cmd = action.get("params", {}).get("command", "")
-                if cmd:
+                if isinstance(cmd, str) and cmd:
                     danger = _has_dangerous_command(cmd)
                     if danger:
                         errors.append(
@@ -374,7 +446,7 @@ def _validate_rules_safety(rules: list) -> tuple[list[str], list[str]]:
             # launch_program 路径检查（error - 命中拒绝）
             if action_type == "launch_program":
                 path = action.get("params", {}).get("path", "")
-                if path:
+                if isinstance(path, str) and path:
                     path_lower = path.lower()
                     for dl in _DANGEROUS_LAUNCH_PATHS:
                         if dl in path_lower:
@@ -548,9 +620,10 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
                         copied.pop("condition", None)
             if "actions" in copied:
                 copied["actions"] = _normalize_rule_actions(copied["actions"])
-            normalized_rules.append(copied)
+            normalized_rules.append(ensure_rule_binding_ids(copied))
 
         result = dict(config)
+        result["schema_version"] = 2
         result["rules"] = normalized_rules
         return result
 
@@ -592,7 +665,13 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
     result = {k: v for k, v in config.items() if k != "processes"}
     result["rules"] = rules
-    return result if rules else config
+    return _normalize_config(result) if rules else config
+
+
+def _default_v2_config() -> Dict[str, Any]:
+    normalized = _normalize_config(copy.deepcopy(DEFAULT_CONFIG))
+    assert isinstance(normalized, dict)
+    return normalized
 
 
 def get_config() -> Dict[str, Any]:
@@ -602,9 +681,10 @@ def get_config() -> Dict[str, Any]:
         os.makedirs(config_dir, exist_ok=True)
 
     if not os.path.exists(CONFIG_FILE):
-        save_config(DEFAULT_CONFIG)
+        default_config = _default_v2_config()
+        save_config(default_config)
         print("[DEBUG] Default config created.")
-        return copy.deepcopy(DEFAULT_CONFIG)
+        return default_config
 
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as config_file:
@@ -616,8 +696,9 @@ def get_config() -> Dict[str, Any]:
         if recovered is not None:
             return recovered
         print("[ERROR] 备份也无效，使用默认配置覆盖", file=sys.stderr)
-        save_config(DEFAULT_CONFIG)
-        return copy.deepcopy(DEFAULT_CONFIG)
+        default_config = _default_v2_config()
+        save_config(default_config)
+        return default_config
 
     # --- 签名校验 ---
     signature = config.pop(_SIGNATURE_KEY, "")
@@ -627,7 +708,7 @@ def get_config() -> Dict[str, Any]:
         if not signature:
             print("[WARN] 配置文件缺少签名，可能被篡改！已回退默认配置并告警", file=sys.stderr)
             _try_recover_from_backup()
-            return copy.deepcopy(DEFAULT_CONFIG)
+            return _default_v2_config()
 
         if not _verify_config(config, signature):
             print("[!!] 配置文件签名校验失败！文件可能被篡改，尝试从备份恢复", file=sys.stderr)
@@ -635,8 +716,9 @@ def get_config() -> Dict[str, Any]:
             if recovered is not None:
                 return recovered
             print("[!!] 备份也无效，加载默认安全配置", file=sys.stderr)
-            save_config(DEFAULT_CONFIG)
-            return copy.deepcopy(DEFAULT_CONFIG)
+            default_config = _default_v2_config()
+            save_config(default_config)
+            return default_config
 
     normalized = _normalize_config(config)
     migrated = normalized != config

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import posixpath
 import shutil
 import subprocess
 import sys
@@ -18,8 +19,9 @@ def get_config_dir() -> str:
         return str(Path.home() / "AppData" / "Roaming" / "NotmyFault")
 
     xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
-    base_dir = Path(xdg_config_home).expanduser() if xdg_config_home else Path.home() / ".config"
-    return str(base_dir / "notmyfault")
+    if xdg_config_home:
+        return posixpath.join(xdg_config_home, "notmyfault")
+    return posixpath.join(str(Path.home()).replace("\\", "/"), ".config", "notmyfault")
 
 
 def launch_python_entry(entry_path: str) -> None:
@@ -78,13 +80,13 @@ def set_linux_autostart(enabled: bool, project_root: str) -> bool:
     def quote_exec(value: str) -> str:
         return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
-    entry_path = Path(project_root) / "NOTMYFAULT.pyw"
+    entry_path = posixpath.join(project_root.replace("\\", "/"), "NOTMYFAULT.pyw")
     desktop_file.parent.mkdir(parents=True, exist_ok=True)
     desktop_file.write_text(
         "[Desktop Entry]\n"
         "Type=Application\n"
         "Name=NotmyFault Engine\n"
-        f"Exec={quote_exec(sys.executable)} {quote_exec(str(entry_path))}\n"
+        f"Exec={quote_exec(sys.executable)} {quote_exec(entry_path)}\n"
         "Terminal=false\n"
         "X-GNOME-Autostart-enabled=true\n"
         "X-KDE-autostart-after=panel\n",

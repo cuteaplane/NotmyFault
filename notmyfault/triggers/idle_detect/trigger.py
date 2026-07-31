@@ -48,21 +48,16 @@ def run(meta, config_list, emit_event, shutdown_event):
                 idle = idle_secs >= threshold
                 if idle and not was_idle:
                     print(f"[Trigger:{trigger_id}] 用户进入空闲状态 ({int(idle_secs)}s >= {threshold}s)")
-                    # idle_seconds 用字符串与用户配置类型一致
-                    # （rules.check_event_params 严格相等比较，
-                    #   schema default 是 "300" 字符串，input v-model 也是字符串）
-                    idle_str = str(int(threshold)) if threshold == int(threshold) else str(threshold)
                     emit_event(trigger_id, {
                         "state": "idle",
-                        "idle_seconds": idle_str,
+                        "idle_seconds": threshold,
                     })
                     threshold_states[threshold] = True
                 elif not idle and was_idle:
                     print(f"[Trigger:{trigger_id}] 用户恢复活动 (阈值 {threshold}s)")
-                    idle_str = str(int(threshold)) if threshold == int(threshold) else str(threshold)
                     emit_event(trigger_id, {
                         "state": "active",
-                        "idle_seconds": idle_str,
+                        "idle_seconds": threshold,
                     })
                     threshold_states[threshold] = False
         except Exception as e:

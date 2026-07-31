@@ -9,6 +9,11 @@
     "package_name": "io.github.notmyfault.folder_monitor",
     "enabled": true,
     "permissions": ["filesystem"],
+    "outputs": [
+        {"name": "event", "label": "变化类型", "type": "string"},
+        {"name": "path", "label": "变化文件", "type": "string", "format": "path"},
+        {"name": "folder", "label": "监控目录", "type": "string", "format": "path"}
+    ],
     "params": [
         {
             "name": "folder_path",

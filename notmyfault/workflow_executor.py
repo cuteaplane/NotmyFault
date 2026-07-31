@@ -8,9 +8,10 @@ import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from notmyfault.bindings import BindingResolutionError, resolve_value
 from notmyfault.diagnostics import Diagnostics
 from notmyfault.logging import engine_error
-from notmyfault.workflow import build_context, invoke_action, resolve_templates
+from notmyfault.workflow import build_context, invoke_action
 
 
 MappingProvider = Callable[[], Dict[str, Any]]
@@ -68,9 +69,23 @@ class WorkflowExecutor:
         context: Dict[str, Any],
     ) -> None:
         """执行规则工作流；前置条件不安全时延后，而不是冒险运行动作。"""
-        ready, reason, retry_after = self.check_preconditions(
-            rule.get("preconditions", []), context,
-        )
+        try:
+            ready, reason, retry_after = self.check_preconditions(
+                rule.get("preconditions", []), context,
+            )
+        except BindingResolutionError as exc:
+            self._on_event(
+                "workflow_failed",
+                {
+                    "rule_name": rule_name,
+                    "error": exc.as_dict(),
+                },
+            )
+            print(
+                f"[Engine] 工作流 <{rule_name}> 数据绑定失败: {exc}",
+                file=sys.stderr,
+            )
+            return
         if not ready:
             delay = min(max(retry_after or 60, 5), 3600)
             self._on_event(
@@ -121,10 +136,16 @@ class WorkflowExecutor:
                     None,
                 )
             try:
-                params = resolve_templates(spec.get("params", {}), context)
+                params = resolve_value(
+                    spec.get("params", {}),
+                    context,
+                    location=f"preconditions[{index}].params",
+                )
                 if not isinstance(params, dict):
                     return False, f"前置条件 {action_type} 的 params 必须是对象", None
                 verdict = check(action_meta, params, context)
+            except BindingResolutionError:
+                raise
             except Exception:
                 return (
                     False,
@@ -195,13 +216,18 @@ class WorkflowExecutor:
     ) -> None:
         """顺序执行动作流水线，并把每一步产物写入 context。"""
         for index, action in enumerate(actions):
-            step_id = f"{action.get('type', 'action')}_{index + 1}"
+            legacy_step_id = f"{action.get('type', 'action')}_{index + 1}"
+            step_id = action.get("binding_id") or legacy_step_id
             ok, result = self._run_action(action, rule_name, context)
-            context["steps"][step_id] = {
+            record = {
+                "type": action.get("type", "action"),
                 "status": "ok" if ok else "failed",
                 "result": result if ok else None,
                 "error": None if ok else str(result),
             }
+            context["steps"][step_id] = record
+            if legacy_step_id != step_id:
+                context["steps"][legacy_step_id] = record
             if not ok and action.get("on_error", "stop") != "continue":
                 print(f"[Engine] 动作流水线在步骤 {step_id} 停止", file=sys.stderr)
                 break
@@ -231,7 +257,27 @@ class WorkflowExecutor:
             return False, "引擎正在关闭"
 
         action_type = action.get("type")
-        params = resolve_templates(action.get("params", {}), context)
+        try:
+            params = resolve_value(
+                action.get("params", {}),
+                context,
+                location=f"actions.{action.get('binding_id') or action_type}.params",
+            )
+        except BindingResolutionError as exc:
+            self._diagnostics.inc_action_fail()
+            self._on_event(
+                "workflow_failed",
+                {
+                    "action_type": action_type,
+                    "rule_name": rule_name,
+                    "error": exc.as_dict(),
+                },
+            )
+            print(
+                f"[Engine] action \"{action_type}\" 数据绑定失败: {exc}",
+                file=sys.stderr,
+            )
+            return False, str(exc)
         if not isinstance(params, dict):
             return False, "action.params 必须是对象"
 

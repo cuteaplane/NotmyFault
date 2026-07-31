@@ -9,6 +9,9 @@
     "package_name": "io.github.notmyfault.network_status",
     "enabled": true,
     "permissions": ["network"],
+    "outputs": [
+        {"name": "state", "label": "网络状态", "type": "string"}
+    ],
     "params": [
         {
             "name": "state",

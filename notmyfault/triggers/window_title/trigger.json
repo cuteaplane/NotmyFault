@@ -12,6 +12,11 @@
     "permissions": [
         "native_api"
     ],
+    "outputs": [
+        {"name": "title_pattern", "label": "匹配规则", "type": "string"},
+        {"name": "state", "label": "窗口状态", "type": "string"},
+        {"name": "matched_title", "label": "匹配标题", "type": "string"}
+    ],
     "params": [
         {
             "name": "title_pattern",

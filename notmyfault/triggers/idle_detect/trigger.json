@@ -11,12 +11,16 @@
     "permissions": [
         "native_api"
     ],
+    "outputs": [
+        {"name": "state", "label": "活动状态", "type": "string"},
+        {"name": "idle_seconds", "label": "空闲秒数", "type": "number"}
+    ],
     "params": [
         {
             "name": "idle_seconds",
             "label": "空闲秒数",
             "type": "number",
-            "default": "300",
+            "default": 300,
             "placeholder": "空闲多少秒后触发（默认300秒=5分钟）"
         }
     ]
