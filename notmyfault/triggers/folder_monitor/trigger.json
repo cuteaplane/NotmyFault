@@ -2,7 +2,7 @@
     "id": "folder_monitor",
     "name": "文件夹监控",
     "semantic": "oneshot",
-    "trigger_api": "event-v1",
+    "trigger_api": "event-v2",
     "description": "监控文件夹内文件的新增、修改、删除",
     "version_code": 2,
     "version": "1.1",

@@ -34,18 +34,11 @@ def _get_clipboard_text():
         user32.CloseClipboard()
 
 
-def run(meta, config_list, emit_event, shutdown_event):
+def run(meta, config, emit_event, shutdown_event):
     trigger_id = meta.get("id", "clipboard")
     print(f"[Trigger:{trigger_id}] 剪贴板监控启动")
 
-    match_texts = set()
-    any_match = False
-    for cfg in config_list:
-        t = cfg.get("match_text", "").strip()
-        if t:
-            match_texts.add(t)
-        else:
-            any_match = True
+    match_text = config.get("match_text", "").strip()
 
     last_content = _get_clipboard_text()
 
@@ -53,20 +46,18 @@ def run(meta, config_list, emit_event, shutdown_event):
         try:
             current = _get_clipboard_text()
             if current is not None and current != last_content:
-                if any_match:
+                if not match_text:
                     print(f"[Trigger:{trigger_id}] 剪贴板内容变化")
-                    emit_event(trigger_id, {"text": current[:200], "match_text": ""})
+                    emit_event({"text": current[:200], "match_text": ""})
                 else:
                     current_lower = current.lower()
-                    for mt in match_texts:
-                        if mt.lower() in current_lower:
-                            print(f"[Trigger:{trigger_id}] 剪贴板匹配: {mt}")
-                            emit_event(trigger_id, {
-                                "text": current[:200],
-                                "match_text": mt,
-                                "matched": mt,
-                            })
-                            break
+                    if match_text.lower() in current_lower:
+                        print(f"[Trigger:{trigger_id}] 剪贴板匹配: {match_text}")
+                        emit_event({
+                            "text": current[:200],
+                            "match_text": match_text,
+                            "matched": match_text,
+                        })
                 last_content = current
         except Exception as e:
             print(f"[Trigger:{trigger_id}] 检查剪贴板出错: {e}")

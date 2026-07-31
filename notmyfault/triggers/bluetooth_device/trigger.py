@@ -57,6 +57,7 @@ foreach ($dev in $all) {{
             text=True,
             errors="replace",
             timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except subprocess.TimeoutExpired:
         return set(), ["PowerShell 超时"]
@@ -145,9 +146,11 @@ def _device_set_hash(devices: set) -> int:
     return hash(tuple(sorted(devices)))
 
 
-def run(meta, config_list, emit_event, shutdown_event):
+def run(meta, config, emit_event, shutdown_event):
     trigger_id = meta.get("id", "bluetooth_device")
-    print(f"[Trigger:{trigger_id}] 蓝牙设备监控已启动（共 {len(config_list)} 条规则）")
+    target = config.get("device_name", "").strip()
+    target_state = config.get("state", "connected")
+    print(f"[Trigger:{trigger_id}] 蓝牙设备监控已启动")
 
     last_devices, errors = _get_connected_devices()
     if errors:
@@ -192,40 +195,16 @@ def run(meta, config_list, emit_event, shutdown_event):
                 if lost_devices:
                     print(f"  - 已断开: {lost_devices}")
 
-                for config in config_list:
-                    target = config.get("device_name", "").strip()
-                    target_state = config.get("state", "connected")
-
-                    if target_state == "connected":
-                        for device in new_devices:
-                            if not target or target.lower() in device.lower():
-                                print(
-                                    f"[Trigger:{trigger_id}] [OK] "
-                                    f"设备已连接: {device}"
-                                )
-                                # device_name 用用户配置值（供规则匹配），
-                                # actual_device 保留实际设备名（供日志/调试）。
-                                # 之前 emit 实际设备名导致 rules.check_event_params
-                                # 严格相等比较永远不匹配（用户配 "JBL"，
-                                # 实际 "JBL Flip 5"）。与 usb_insert 设计对齐。
-                                emit_event(trigger_id, {
-                                    "device_name": target,
-                                    "actual_device": device,
-                                    "state": "connected",
-                                })
-
-                    if target_state == "disconnected":
-                        for device in lost_devices:
-                            if not target or target.lower() in device.lower():
-                                print(
-                                    f"[Trigger:{trigger_id}] [OK] "
-                                    f"设备已断开: {device}"
-                                )
-                                emit_event(trigger_id, {
-                                    "device_name": target,
-                                    "actual_device": device,
-                                    "state": "disconnected",
-                                })
+                devices = new_devices if target_state == "connected" else lost_devices
+                for device in devices:
+                    if not target or target.lower() in device.lower():
+                        print(f"[Trigger:{trigger_id}] [OK] 设备状态变化: {device}")
+                        # device_name 用用户配置值供规则匹配，actual_device 保留实际名称。
+                        emit_event({
+                            "device_name": target,
+                            "actual_device": device,
+                            "state": target_state,
+                        })
 
             last_devices = current_devices
             last_hash = current_hash

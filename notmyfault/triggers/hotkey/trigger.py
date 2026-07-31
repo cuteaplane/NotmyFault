@@ -61,29 +61,22 @@ def _parse_hotkey(hotkey_str: str):
     return mod, key
 
 
-def run(meta, config_list, emit_event, shutdown_event):
+def run(meta, config, emit_event, shutdown_event):
     trigger_id = meta.get("id", "hotkey")
     print(f"[Trigger:{trigger_id}] 全局热键监听启动")
-
-    registered = {}
-    for cfg in config_list:
-        raw = cfg.get("hotkey", "").strip()
-        if not raw:
-            continue
-        mod, vk = _parse_hotkey(raw)
-        if vk == 0:
-            print(f"[Trigger:{trigger_id}] 无法解析热键: {raw}")
-            continue
-        hkid = len(registered) + 1
-        if user32.RegisterHotKey(None, hkid, mod, vk):
-            registered[hkid] = {"raw": raw, "mod": mod, "vk": vk}
-            print(f"[Trigger:{trigger_id}] 已注册热键: {raw}")
-        else:
-            print(f"[Trigger:{trigger_id}] 注册热键失败（可能冲突）: {raw}")
-
-    if not registered:
-        print(f"[Trigger:{trigger_id}] 没有可注册的热键，退出")
+    raw = config.get("hotkey", "").strip()
+    if not raw:
+        print(f"[Trigger:{trigger_id}] 未配置热键，退出")
         return
+    mod, vk = _parse_hotkey(raw)
+    if vk == 0:
+        print(f"[Trigger:{trigger_id}] 无法解析热键: {raw}")
+        return
+    hkid = 1
+    if not user32.RegisterHotKey(None, hkid, mod, vk):
+        print(f"[Trigger:{trigger_id}] 注册热键失败（可能冲突）: {raw}")
+        return
+    print(f"[Trigger:{trigger_id}] 已注册热键: {raw}")
 
     msg = wintypes.MSG()
     while not shutdown_event.is_set():
@@ -91,16 +84,13 @@ def run(meta, config_list, emit_event, shutdown_event):
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
             if msg.message == WM_HOTKEY:
-                hkid = msg.wParam
-                info = registered.get(hkid)
-                if info:
-                    print(f"[Trigger:{trigger_id}] 热键触发: {info['raw']}")
-                    emit_event(trigger_id, {"hotkey": info["raw"]})
+                if msg.wParam == hkid:
+                    print(f"[Trigger:{trigger_id}] 热键触发: {raw}")
+                    emit_event({"hotkey": raw})
         shutdown_event.wait(0.05)
 
-    for hkid in registered:
-        try:
-            user32.UnregisterHotKey(None, hkid)
-        except Exception:
-            pass
+    try:
+        user32.UnregisterHotKey(None, hkid)
+    except Exception:
+        pass
     print(f"[Trigger:{trigger_id}] 热键监听已停止")

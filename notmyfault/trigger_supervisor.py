@@ -7,6 +7,7 @@ _trigger_threads / _trigger_events / _trigger_lock 的所有权移至独立组�
 import sys
 import threading
 import time
+from notmyfault.rules import config_fingerprint
 from typing import Any, Callable, Dict, List, Optional
 
 
@@ -73,7 +74,8 @@ class TriggerSupervisor:
     ) -> int:
         """接收聚合订阅并启动触发器线程，保持先登记后启动语义。
 
-        缺失触发器时通过 alert_cb 告警，原日志语义不变。
+        ``event-v1`` 每类触发器共用一个配置列表；``event-v2`` 为每个配置
+        启动一个隔离实例，实例 ID 使用 ``trigger_id:index``。
         """
         missing = [et for et in aggregated if et not in triggers_funcs]
         if missing:
@@ -95,44 +97,65 @@ class TriggerSupervisor:
 
                 trigger_meta = triggers_meta.get(event_type, {})
                 trigger_func = triggers_funcs[event_type]
-                trigger_event = threading.Event()
-                thread = threading.Thread(
-                    target=run_trigger_cb,
-                    args=(
-                        event_type,
-                        trigger_func,
-                        trigger_meta,
-                        config_list,
-                        trigger_event,
-                    ),
-                    daemon=True,
+                # event-v2 按配置指纹去重：多条规则使用相同配置（如同一热键、
+                # 同一监控文件夹）时只启动一个实例，事件仍按指纹匹配所有
+                # 叶子；否则相同配置会启动 N 个实例，每次真实事件被放大 N 倍。
+                instances = (
+                    config_list
+                    if trigger_meta.get("trigger_api") == "event-v2"
+                    else [config_list]
                 )
-                # 登记和 start 在同一临界区内。stop 只能观察到“尚未登记”或
-                # “已经启动”的线程，不会 join 一个未启动的 Thread。
-                with self._lock:
-                    existing = self._threads.get(event_type)
-                    if existing is not None and existing.is_alive():
-                        print(
-                            f"[Engine] [!!] 触发器线程 {event_type} 已在运行，"
-                            "拒绝重复启动",
-                            file=sys.stderr,
-                        )
-                        continue
-                    self._events[event_type] = trigger_event
-                    self._threads[event_type] = thread
-                    self._crash_errors.pop(event_type, None)
-                    try:
-                        thread.start()
-                    except Exception:
-                        if self._threads.get(event_type) is thread:
-                            self._threads.pop(event_type, None)
-                            self._events.pop(event_type, None)
-                        raise
-                count += 1
-                print(
-                    f"[Engine] 已启动触发器线程: {event_type}"
-                    f"（共监听 {len(config_list)} 条规则）"
-                )
+                if trigger_meta.get("trigger_api") == "event-v2":
+                    seen_fingerprints = set()
+                    unique_instances = []
+                    for cfg in instances:
+                        fp = config_fingerprint(cfg)
+                        if fp in seen_fingerprints:
+                            continue
+                        seen_fingerprints.add(fp)
+                        unique_instances.append(cfg)
+                    instances = unique_instances
+                for index, config in enumerate(instances):
+                    instance_id = f"{event_type}:{index + 1}" if len(instances) > 1 else event_type
+                    trigger_event = threading.Event()
+                    thread = threading.Thread(
+                        target=run_trigger_cb,
+                        args=(
+                            instance_id,
+                            event_type,
+                            trigger_func,
+                            trigger_meta,
+                            config,
+                            trigger_event,
+                        ),
+                        daemon=True,
+                    )
+                    # 登记和 start 在同一临界区内。stop 只能观察到“尚未登记”或
+                    # “已经启动”的线程，不会 join 一个未启动的 Thread。
+                    with self._lock:
+                        existing = self._threads.get(instance_id)
+                        if existing is not None and existing.is_alive():
+                            print(
+                                f"[Engine] [!!] 触发器线程 {instance_id} 已在运行，"
+                                "拒绝重复启动",
+                                file=sys.stderr,
+                            )
+                            continue
+                        self._events[instance_id] = trigger_event
+                        self._threads[instance_id] = thread
+                        self._crash_errors.pop(instance_id, None)
+                        try:
+                            thread.start()
+                        except Exception:
+                            if self._threads.get(instance_id) is thread:
+                                self._threads.pop(instance_id, None)
+                                self._events.pop(instance_id, None)
+                            raise
+                    count += 1
+                    print(
+                        f"[Engine] 已启动触发器线程: {instance_id}"
+                        f"（监听 {event_type} 的第 {index + 1} 项配置）"
+                    )
 
         return count
 

@@ -2,7 +2,7 @@
     "id": "system_resource",
     "name": "系统资源阈值",
     "semantic": "state",
-    "trigger_api": "event-v1",
+    "trigger_api": "event-v2",
     "description": "当 CPU/内存/磁盘/网络 达到指定阈值时触发",
     "version_code": 2,
     "version": "1.1",

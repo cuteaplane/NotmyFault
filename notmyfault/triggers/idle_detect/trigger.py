@@ -20,46 +20,28 @@ def _get_idle_seconds() -> float:
     return (tick - lii.dwTime) / 1000.0
 
 
-def run(meta, config_list, emit_event, shutdown_event):
+def run(meta, config, emit_event, shutdown_event):
     trigger_id = meta.get("id", "idle_detect")
-
-    # 每个阈值独立跟踪 was_idle 状态，之前只取 min(thresholds) 导致：
-    # 1. 300s 和 600s 的规则都会在 300s 时触发（600s 规则失效）
-    # 2. emit 事件不携带阈值，规则无法区分
-    threshold_states = {}
-    for cfg in config_list:
-        try:
-            t = float(cfg.get("idle_seconds", 300))
-            threshold_states[t] = False
-        except (ValueError, TypeError):
-            pass
-
-    if not threshold_states:
+    try:
+        threshold = float(config.get("idle_seconds", 300))
+    except (ValueError, TypeError):
         print(f"[Trigger:{trigger_id}] 无有效空闲阈值配置，退出")
         return
-
-    print(f"[Trigger:{trigger_id}] 开始监视空闲状态，阈值: {sorted(threshold_states.keys())} 秒")
+    print(f"[Trigger:{trigger_id}] 开始监视空闲状态，阈值: {threshold} 秒")
+    was_idle = False
 
     while not shutdown_event.is_set():
         try:
             idle_secs = _get_idle_seconds()
-            # 遍历快照避免迭代时修改
-            for threshold, was_idle in list(threshold_states.items()):
-                idle = idle_secs >= threshold
-                if idle and not was_idle:
-                    print(f"[Trigger:{trigger_id}] 用户进入空闲状态 ({int(idle_secs)}s >= {threshold}s)")
-                    emit_event(trigger_id, {
-                        "state": "idle",
-                        "idle_seconds": threshold,
-                    })
-                    threshold_states[threshold] = True
-                elif not idle and was_idle:
-                    print(f"[Trigger:{trigger_id}] 用户恢复活动 (阈值 {threshold}s)")
-                    emit_event(trigger_id, {
-                        "state": "active",
-                        "idle_seconds": threshold,
-                    })
-                    threshold_states[threshold] = False
+            idle = idle_secs >= threshold
+            if idle and not was_idle:
+                print(f"[Trigger:{trigger_id}] 用户进入空闲状态 ({int(idle_secs)}s >= {threshold}s)")
+                emit_event({"state": "idle", "idle_seconds": threshold})
+                was_idle = True
+            elif not idle and was_idle:
+                print(f"[Trigger:{trigger_id}] 用户恢复活动 (阈值 {threshold}s)")
+                emit_event({"state": "active", "idle_seconds": threshold})
+                was_idle = False
         except Exception as e:
             print(f"[Trigger:{trigger_id}] 扫描出错: {e}")
 

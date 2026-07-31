@@ -220,12 +220,12 @@ python pack_plugin.py user_plugins/my_action
 
 ## 5. 写触发器
 
-内置触发器统一使用 `event-v1`。入口固定为：
+内置触发器使用 `event-v2`。每条规则配置独立运行，入口固定为：
 
 ```python
-def run(meta, config_list, emit_event, shutdown_event):
-    # config_list：所有使用这个触发器的规则参数
-    # emit_event("my_trigger", {"key": "value"})：发出事件
+def run(meta, config, emit_event, shutdown_event):
+    # config：当前规则配置的参数对象
+    # emit_event({"key": "value"})：发出事件，Engine 已绑定 trigger ID
     # shutdown_event.is_set()：循环中及时退出
     ...
 ```
@@ -233,10 +233,23 @@ def run(meta, config_list, emit_event, shutdown_event):
 内置触发器的 `trigger.json` 必须声明：
 
 ```json
-{"trigger_api": "event-v1"}
+{"trigger_api": "event-v2"}
 ```
 
-加载时会检查这四个参数是否齐全；不合格的触发器不会启动后台线程。旧用户触发器没有声明 `trigger_api` 时仍按旧方式兼容。
+加载时会检查这四个参数是否齐全；不合格的触发器不会启动后台线程。已有
+`event-v1` 和未声明 `trigger_api` 的用户触发器仍按旧方式兼容。
+
+## 5.1 导入安全限制
+
+`notmyfault` 包在 **strict** 安全模式下拒绝外部代码直接 `import notmyfault`
+（pytest 与项目根目录下的官方脚本除外），防止第三方进程把引擎组件当库随意
+加载。需要以库方式使用引擎时，请将安全模式设为 `normal`/`permissive`，或从
+`NOTMYFAULT.pyw` 启动。
+
+`notmyfault.sudo` 的导入守卫更严：只允许插件命名空间（`notmyfault.action_*` /
+`notmyfault.trigger_*`）与引擎核心（`engine.py`）导入，strict 模式下其他一切
+导入都会触发 `ImportError`。插件需要管理员权限时，请在元数据声明
+`"permissions": ["admin"]` 并通过 `notmyfault.sudo.run_as_admin` 走受控通道。
 
 ## 6. 当前的归档示例
 

@@ -2,7 +2,7 @@
     "id": "idle_detect",
     "name": "系统空闲检测",
     "semantic": "state",
-    "trigger_api": "event-v1",
+    "trigger_api": "event-v2",
     "description": "检测系统无键盘鼠标操作的闲置时间，在进入/退出空闲状态时触发",
     "version_code": 1,
     "version": "1.0",

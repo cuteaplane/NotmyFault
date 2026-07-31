@@ -2,7 +2,7 @@
     "id": "bluetooth_device",
     "name": "蓝牙设备检测",
     "semantic": "state",
-    "trigger_api": "event-v1",
+    "trigger_api": "event-v2",
     "description": "监控蓝牙设备的连接和断开事件",
     "version_code": 2,
     "version": "1.1",

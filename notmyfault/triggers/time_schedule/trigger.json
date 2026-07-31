@@ -2,7 +2,7 @@
     "id": "time_schedule",
     "name": "定时触发",
     "semantic": "oneshot",
-    "trigger_api": "event-v1",
+    "trigger_api": "event-v2",
     "description": "在指定时间（HH:MM 格式）每日触发一次",
     "version_code": 1,
     "version": "1.0",

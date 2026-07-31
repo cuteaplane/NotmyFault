@@ -35,11 +35,10 @@ from notmyfault.plugin_loader import (
 from notmyfault.rules import (
     ConditionRuntime,
     aggregate_trigger_params,
-    check_event_params,
     get_rule_events,
-    match_rule,
     validate_rules,
 )
+from notmyfault.plugin_schema import check_payload_contract
 from notmyfault.security import (
     SecurityMode,
     detect_security_mode as _detect_security_mode,
@@ -206,31 +205,70 @@ class AutomationEngine:
 
     def _run_trigger(
         self,
+        instance_id: str,
         trigger_id: str,
         trigger_func: Callable[..., Any],
         trigger_meta: Dict[str, Any],
-        config_list: List[Dict[str, Any]],
+        config: Any,
         stop_event: threading.Event,
     ) -> None:
         """触发器线程入口：隔离插件异常，崩溃即上报而非静默退出。"""
         # 触发器是插件代码，包一层安全气囊：炸了也不能把整台引擎带走。
         try:
-            trigger_func(trigger_meta, config_list, self.emit_event, stop_event)
+            if trigger_meta.get("trigger_api") == "event-v2":
+
+                def emit_event(payload: Dict[str, Any]) -> None:
+                    if not isinstance(payload, dict):
+                        raise TypeError("event-v2 emit_event(payload) 的 payload 必须是对象")
+                    problems = check_payload_contract(
+                        trigger_meta.get("outputs"), payload
+                    )
+                    if problems:
+                        print(
+                            f"[Engine] [!!] 触发器 {instance_id} 事件 payload "
+                            "违反输出契约，已拦截:",
+                            file=sys.stderr,
+                        )
+                        for problem in problems:
+                            print(f"         - {problem}", file=sys.stderr)
+                        engine_error(
+                            "trigger_payload_invalid",
+                            trigger=instance_id,
+                            error="; ".join(problems),
+                        )
+                        self._safe_on_event(
+                            "trigger_payload_invalid",
+                            {
+                                "trigger_id": trigger_id,
+                                "instance_id": instance_id,
+                                "problems": problems,
+                            },
+                        )
+                        return
+                    self.emit_event(
+                        trigger_id,
+                        payload,
+                        instance={"config": config},
+                    )
+
+                trigger_func(trigger_meta, config, emit_event, stop_event)
+            else:
+                trigger_func(trigger_meta, config, self.emit_event, stop_event)
         except Exception:
             err = traceback.format_exc()
-            print(f"[Engine] [!!] 触发器线程 {trigger_id} 崩溃:", file=sys.stderr)
+            print(f"[Engine] [!!] 触发器线程 {instance_id} 崩溃:", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
-            engine_error("trigger_crashed", trigger=trigger_id, error=err[-500:])
-            self._diag_obj.record_trigger_crash(trigger_id, err[-300:])
-            self._trigger_supervisor.mark_crashed(trigger_id, err[-300:])
+            engine_error("trigger_crashed", trigger=instance_id, error=err[-500:])
+            self._diag_obj.record_trigger_crash(instance_id, err[-300:])
+            self._trigger_supervisor.mark_crashed(instance_id, err[-300:])
             self._safe_on_event(
                 "trigger_crashed",
-                {"trigger_id": trigger_id, "error": err[-500:]},
+                {"trigger_id": trigger_id, "instance_id": instance_id, "error": err[-500:]},
             )
             try:
                 from notmyfault.alert import alert_user
                 alert_user(
-                    f"触发器 {trigger_id} 崩溃",
+                    f"触发器 {instance_id} 崩溃",
                     err[-200:],
                     open_dashboard=False,
                 )
@@ -283,11 +321,6 @@ class AutomationEngine:
     def _get_rule_events(rule: Dict[str, Any]) -> List[Dict[str, Any]]:
         """从规则中提取所有事件条件。"""
         return get_rule_events(rule)
-
-    @staticmethod
-    def _check_event_params(event_def: Dict[str, Any], event_payload: Dict[str, Any]) -> bool:
-        """检查事件payload是否匹配事件定义的参数。"""
-        return check_event_params(event_def, event_payload)
 
     # ------------------------------------------------------------------
     # 插件加载
@@ -427,8 +460,17 @@ class AutomationEngine:
     # 事件分发
     # ------------------------------------------------------------------
 
-    def emit_event(self, event_type: str, event_payload: Dict[str, Any]) -> None:
-        """分发事件给匹配的规则。"""
+    def emit_event(
+        self,
+        event_type: str,
+        event_payload: Dict[str, Any],
+        instance: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """分发事件给匹配的规则。
+
+        ``instance`` 由 event-v2 触发器传入（携带 config 指纹），条件运行时
+        按配置匹配语义判定；v1/legacy 事件不传，保持 payload 过滤。
+        """
         if self._shutdown_flag and self._shutdown_flag.is_set():
             print(f"[EventBus] 引擎正在关闭，忽略事件: [{event_type}]")
             return
@@ -444,7 +486,13 @@ class AutomationEngine:
 
         for rule_index, rule in enumerate(rules_snapshot):
             rule_key = f"{rule_index}:{rule.get('name', '')}"
-            if not self._condition_runtime.match(rule_key, rule, event_type, event_payload):
+            if not self._condition_runtime.match(
+                rule_key,
+                rule,
+                event_type,
+                event_payload,
+                instance=instance,
+            ):
                 continue
 
             rule_name = rule.get("name", "未命名规则")
@@ -469,6 +517,9 @@ class AutomationEngine:
         """接收外部事件（触发器线程通过此方法推送事件）。"""
         event_type = event_data.get("trigger_id")
         event_payload = event_data.get("triggered_params", {})
+        if not isinstance(event_type, str) or not isinstance(event_payload, dict):
+            engine_warn("忽略格式无效的外部事件")
+            return
         self.emit_event(event_type, event_payload)
 
     def run_manual_rule(self, rule_index: int) -> tuple[bool, str]:
@@ -512,10 +563,15 @@ class AutomationEngine:
                 event.get("binding_id"): event.get("type", "")
                 for event in get_rule_events(rule)
             }
+            leaf_configs = {
+                event.get("binding_id"): event.get("params", {})
+                for event in get_rule_events(rule)
+            }
             context["triggers"] = {
                 binding_id: {
                     "type": event_types.get(binding_id, ""),
                     "payload": copy.deepcopy(payload),
+                    "config": copy.deepcopy(leaf_configs.get(binding_id, {})),
                 }
                 for binding_id, payload in trigger_payloads.items()
                 if isinstance(binding_id, str) and isinstance(payload, dict)
@@ -612,7 +668,8 @@ class AutomationEngine:
             with self._rules_lock:
                 rules = list(self.rules)
 
-        # 同一个 trigger 只开一条线程，把所有规则参数打包给它，省得大家重复蹲点。
+        # event-v1 同一个 trigger 只开一条线程并打包全部参数；event-v2 每个唯一
+        # 配置一个隔离实例（相同配置去重，见 TriggerSupervisor.start）。
         aggregated = aggregate_trigger_params(rules)
 
         return self._trigger_supervisor.start(
@@ -712,6 +769,7 @@ class AutomationEngine:
         try:
             while not se.is_set():
                 se.wait(1)
+                new_mtime = config_mtime
 
                 try:
                     new_mtime = (

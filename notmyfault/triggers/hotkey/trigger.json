@@ -2,7 +2,7 @@
     "id": "hotkey",
     "name": "全局热键",
     "semantic": "oneshot",
-    "trigger_api": "event-v1",
+    "trigger_api": "event-v2",
     "description": "按下指定全局热键时触发动作",
     "version_code": 1,
     "version": "1.0",

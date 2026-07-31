@@ -3,9 +3,10 @@ import psutil
 import os
 
 
-def run(meta, config_list, emit_event, shutdown_event):
+def run(meta, config, emit_event, shutdown_event):
     trigger_id = meta.get("id", "usb_insert")
     print(f"[Trigger:{trigger_id}] U盘监视雷达已启动！")
+    expected_drive = config.get("drive_letter", "").strip().upper()
 
     # 帮助函数：获取当前所有的可移动磁盘盘符 (比如 {'E:', 'F:'})
     def get_removable_drives():
@@ -36,20 +37,9 @@ def run(meta, config_list, emit_event, shutdown_event):
                 for drive in new_drives:
                     print(f"[Trigger:{trigger_id}] 捕捉到新U盘插入: {drive}")
                     
-                    # 遍历用户的规则进行模糊匹配
-                    for config in config_list:
-                        expected_drive = config.get("drive_letter", "").strip().upper()
-
-                        # 如果用户填了 "ANY" 或者精确匹配到了盘符 (比如 "E:")
-                        if expected_drive == "ANY" or expected_drive == drive.upper():
-                            # 发射标准化事件给引擎！发送实际盘符用于匹配规则
-                            emit_event(
-                                trigger_id,
-                                {
-                                    "drive_letter": expected_drive,
-                                    "actual_drive": drive
-                                }
-                            )
+                    # 留空与 "ANY" 等价：匹配任意 U 盘插入。
+                    if expected_drive in ("ANY", "") or expected_drive == drive.upper():
+                        emit_event({"drive_letter": expected_drive, "actual_drive": drive})
 
             # 更新历史小本本
             last_drives = current_drives

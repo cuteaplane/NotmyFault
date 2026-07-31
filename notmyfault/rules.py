@@ -4,6 +4,7 @@
 engine.py 只管拿这些函数的返回值去打印和记诊断，逻辑和副作用分得干干净净。
 """
 import json
+import copy
 import threading
 import time
 import re
@@ -226,7 +227,11 @@ def validate_rules_structure(rules: Any) -> List[str]:
 # ---------------------------------------------------------------------------
 
 def check_event_params(event_def: Dict[str, Any], event_payload: Dict[str, Any]) -> bool:
-    """检查事件 payload 是否匹配事件定义的参数（允许 payload 有额外字段）。"""
+    """检查事件 payload 是否匹配事件定义的参数（允许 payload 有额外字段）。
+
+    v1/legacy 触发器语义：事件叶子的 params 是过滤条件，payload 必须包含
+    相同键值才命中。event-v2 触发器不走本函数，改用配置匹配。
+    """
     expected_params = event_def.get("params", {})
     for key, expected_val in expected_params.items():
         # 缺字段不能等同于满足条件，否则多个规则会互相误触发。
@@ -235,17 +240,15 @@ def check_event_params(event_def: Dict[str, Any], event_payload: Dict[str, Any])
     return True
 
 
-def match_rule(rule: Dict[str, Any], event_type: str, event_payload: Dict[str, Any]) -> bool:
-    """判断单条规则是否匹配给定事件。
+def config_fingerprint(params: Any) -> str:
+    """event-v2 触发器实例配置的稳定指纹。
 
-    只要规则里有一个 event_def 的 type 对上、参数也对上，就算匹配。
+    v2 语义下事件叶子的 params 就是该实例的配置；配置匹配 = 事件携带的
+    实例指纹与叶子配置指纹相等，payload 不再参与命中判断。
     """
-    for event_def in get_rule_events(rule):
-        if event_def.get("type") != event_type:
-            continue
-        if check_event_params(event_def, event_payload):
-            return True
-    return False
+    if not isinstance(params, dict):
+        params = {}
+    return json.dumps(params, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _condition_op(node: Dict[str, Any]) -> str:
@@ -307,16 +310,30 @@ class ConditionRuntime:
         event_type: str,
         event_payload: Dict[str, Any],
         now: float | None = None,
+        instance: Dict[str, Any] | None = None,
     ) -> bool:
-        """记录入站事件后，判断规则条件是否形成一组新的有效命中。"""
+        """记录入站事件后，判断规则条件是否形成一组新的有效命中。
+
+        ``instance`` 由 event-v2 触发器传入（携带 config 指纹）：命中判定
+        改用配置匹配——叶子 params（即该实例的配置）与指纹相等即命中，
+        payload 不再参与；v1/legacy 触发器保持 payload 过滤语义。
+        """
         node = get_rule_condition(rule)
         if node is None:
             return False
         timestamp = time.monotonic() if now is None else now
-        matching_leaves = [
-            leaf for leaf in iter_condition_events(node)
-            if leaf.get("type") == event_type and check_event_params(leaf, event_payload)
-        ]
+        if instance is not None:
+            fingerprint = config_fingerprint(instance.get("config"))
+            matching_leaves = [
+                leaf for leaf in iter_condition_events(node)
+                if leaf.get("type") == event_type
+                and config_fingerprint(leaf.get("params")) == fingerprint
+            ]
+        else:
+            matching_leaves = [
+                leaf for leaf in iter_condition_events(node)
+                if leaf.get("type") == event_type and check_event_params(leaf, event_payload)
+            ]
         if not matching_leaves:
             return False
 
@@ -400,8 +417,9 @@ class ConditionRuntime:
 def aggregate_trigger_params(rules: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     """把所有规则里同一个 trigger 的参数打包成列表。
 
-    同一个 trigger 只需要开一条线程，所有规则参数一次性塞给它，
-    省得大家各蹲各的点。
+    event-v1 同一个 trigger 只开一条线程；event-v2 每配置一个隔离实例
+    （相同配置由 TriggerSupervisor 按指纹去重）。深拷贝避免线程共享可变字典。
+    省得各规则各蹲各的点。
     """
     aggregated: Dict[str, List[Dict[str, Any]]] = {}
     for rule in rules:
@@ -409,7 +427,7 @@ def aggregate_trigger_params(rules: List[Dict[str, Any]]) -> Dict[str, List[Dict
             event_type = event_def.get("type")
             if not event_type:
                 continue
-            aggregated.setdefault(event_type, []).append(event_def.get("params", {}))
+            aggregated.setdefault(event_type, []).append(copy.deepcopy(event_def.get("params", {})))
     return aggregated
 
 
@@ -464,7 +482,7 @@ def _source_type(
 def _target_type(param: Dict[str, Any] | None) -> str:
     if not param:
         return "any"
-    raw = param.get("type", "string")
+    raw = param.get("value_type", param.get("type", "string"))
     if raw in ("string", "textarea", "path", "time", "hotkey", "select"):
         return "string"
     return str(raw)
@@ -520,6 +538,7 @@ def validate_rule_bindings(
         item_index: int,
         field: str,
         allow_steps: bool,
+        allow_conditional_sources: bool,
     ) -> None:
         action_meta = actions_meta.get(item.get("type", ""), {})
         target_params = {
@@ -559,7 +578,7 @@ def validate_rule_bindings(
                     if leaf is None:
                         add("unknown_source", usage, "引用的触发条件不存在")
                         continue
-                    if node_id not in guaranteed:
+                    if node_id not in guaranteed and not allow_conditional_sources:
                         add(
                             "conditional_source",
                             usage,
@@ -570,6 +589,34 @@ def validate_rule_bindings(
                         triggers_meta.get(leaf.get("type", ""), {}),
                         reference,
                     )
+                elif scope == "trigger_config":
+                    node_id = reference.get("node")
+                    leaf = leaves_by_id.get(node_id)
+                    if leaf is None:
+                        add("unknown_source", usage, "引用的触发条件不存在")
+                        continue
+                    if node_id not in guaranteed and not allow_conditional_sources:
+                        add(
+                            "conditional_source",
+                            usage,
+                            "该触发条件并非每次规则运行都会命中",
+                        )
+                        continue
+                    param_defs = {
+                        param.get("name"): param
+                        for param in triggers_meta
+                        .get(leaf.get("type", ""), {})
+                        .get("params", [])
+                        if isinstance(param, dict)
+                    }
+                    if not path or path[0] not in param_defs:
+                        source_output = None
+                    else:
+                        param_def = param_defs[path[0]]
+                        source_output = {
+                            "name": path[0],
+                            "type": _target_type(param_def),
+                        }
                 elif scope == "event":
                     candidates = []
                     for leaf in leaves:
@@ -637,6 +684,7 @@ def validate_rule_bindings(
                 item_index=index,
                 field="preconditions",
                 allow_steps=False,
+                allow_conditional_sources=False,
             )
     for index, action in enumerate(actions):
         validate_item(
@@ -644,6 +692,7 @@ def validate_rule_bindings(
             item_index=index,
             field="actions",
             allow_steps=True,
+            allow_conditional_sources=True,
         )
     return issues
 
