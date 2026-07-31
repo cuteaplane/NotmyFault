@@ -26,7 +26,11 @@ const fileForUpload = ref(null)
 const installError = ref('')
 
 async function refresh() {
-  const [plugins, sch] = await Promise.all([loadPlugins(), getSchema()])
+  // 引擎离线时接口会失败：插件页不因离线而崩溃，保留上次数据。
+  const [plugins, sch] = await Promise.all([
+    loadPlugins().catch(() => store.pluginsData),
+    getSchema().catch(() => store.schema),
+  ])
   store.pluginsData = plugins
   store.schema = sch
 }

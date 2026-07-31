@@ -42,108 +42,114 @@ const runtimeInfo = computed(() => [
 </script>
 
 <template>
-  <section class="page active">
+  <section class="page active about-page">
     <div class="page-head"><h2>关于</h2></div>
 
-    <div class="flex flex-col gap-4">
-      <!-- Hero：品牌 + 版本徽章 + 一句话简介 -->
-      <div class="rounded-lg bg-surface-c-low p-6 shadow-elev1">
-        <div class="flex items-center gap-4">
-          <span class="material-symbols-outlined text-[56px] leading-none text-primary" style="font-variation-settings:'FILL' 1">manufacturing</span>
-          <div class="min-w-0">
-            <h3 class="text-headline-s text-on-surface">NotmyFault</h3>
-            <div class="mt-2 flex flex-wrap items-center gap-2">
-              <span class="chip chip-origin-builtin">{{ appVersion }}</span>
-              <span class="chip">Alpha 测试版</span>
-              <span class="chip">GPL-3.0</span>
-            </div>
+    <div class="about-shell">
+      <header class="about-intro">
+        <div class="about-brand">
+          <span class="material-symbols-outlined about-brand-mark">manufacturing</span>
+          <div>
+            <p class="about-kicker">LOCAL AUTOMATION ENGINE</p>
+            <h3>NotmyFault</h3>
           </div>
         </div>
-        <p class="mt-4 max-w-2xl text-body-m text-on-surface-variant">
+        <div class="about-badges">
+          <span>{{ appVersion }}</span>
+          <span>Alpha</span>
+          <span>GPL-3.0</span>
+        </div>
+        <p>
           本地桌面自动化工具：用「条件 → 检查 → 动作」的方式告诉电脑以后该怎么做。
           引擎在后台独立运行，关闭管理界面不影响已经启动的自动化。
         </p>
-      </div>
+      </header>
 
-      <!-- 核心特性：2×2 网格 -->
-      <div class="rounded-lg bg-surface-c-low p-6 shadow-elev1">
-        <h4 class="mb-4 text-title-m text-on-surface">核心特性</h4>
-        <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <div v-for="f in features" :key="f.title"
-            class="flex items-start gap-3 rounded-sm border border-outline-variant bg-surface-c-lowest p-4 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-elev1">
-            <span class="material-symbols-outlined mt-0.5 text-[22px] text-primary">{{ f.icon }}</span>
-            <div class="min-w-0">
-              <b class="block text-title-s text-on-surface">{{ f.title }}</b>
-              <p class="mt-1 text-body-s text-on-surface-variant">{{ f.desc }}</p>
+      <main class="about-content">
+        <div class="about-main-column">
+          <section class="about-section">
+            <header class="about-section-head">
+              <p>能力</p>
+              <h4>核心特性</h4>
+            </header>
+            <div class="about-feature-list">
+              <article v-for="f in features" :key="f.title" class="about-feature">
+                <span class="material-symbols-outlined">{{ f.icon }}</span>
+                <div>
+                  <b>{{ f.title }}</b>
+                  <p>{{ f.desc }}</p>
+                </div>
+              </article>
             </div>
-          </div>
-        </div>
-      </div>
+          </section>
 
-      <!-- 规则模型：三步流程 -->
-      <div class="rounded-lg bg-surface-c-low p-6 shadow-elev1">
-        <h4 class="mb-1 text-title-m text-on-surface">规则模型</h4>
-        <p class="mb-5 text-body-s text-on-surface-variant">一条规则由三部分组成，一般不需要手写 JSON，规则页面会负责编辑和校验。</p>
-        <div class="grid grid-cols-1 gap-3 md:grid-cols-3">
-          <template v-for="(s, i) in ruleFlow" :key="s.step">
-            <div class="relative flex flex-col gap-2 rounded-sm border border-outline-variant bg-surface-c-lowest p-4">
-              <div class="flex items-center gap-2.5">
-                <span class="flex h-9 w-9 items-center justify-center rounded-full bg-primary-container text-on-primary-container">
-                  <span class="material-symbols-outlined text-[20px]">{{ s.icon }}</span>
-                </span>
-                <span class="text-title-s text-on-surface">{{ s.step }}</span>
+          <section class="about-section">
+            <header class="about-section-head">
+              <p>规则模型</p>
+              <h4>从触发到执行</h4>
+            </header>
+            <p class="about-section-lead">一条规则由三个连续阶段组成，规则页面负责编辑与校验，无需手写 JSON。</p>
+            <div class="about-flow">
+              <article v-for="(s, i) in ruleFlow" :key="s.step">
+                <span class="about-flow-index">{{ String(i + 1).padStart(2, '0') }}</span>
+                <span class="material-symbols-outlined">{{ s.icon }}</span>
+                <div>
+                  <b>{{ s.step }}</b>
+                  <p>{{ s.desc }}</p>
+                </div>
+              </article>
+            </div>
+          </section>
+        </div>
+
+        <aside class="about-side-column">
+          <section class="about-section about-runtime">
+            <header class="about-section-head">
+              <p>当前环境</p>
+              <h4>运行信息</h4>
+            </header>
+            <dl>
+              <div v-for="r in runtimeInfo" :key="r.key">
+                <dt><span class="material-symbols-outlined">{{ r.icon }}</span>{{ r.key }}</dt>
+                <dd>{{ r.val }}</dd>
               </div>
-              <p class="text-body-s text-on-surface-variant">{{ s.desc }}</p>
-              <span v-if="i < ruleFlow.length - 1"
-                class="material-symbols-outlined absolute top-1/2 -right-[15px] z-10 hidden -translate-y-1/2 text-[20px] text-outline md:block">arrow_forward</span>
+            </dl>
+          </section>
+
+          <section class="about-section">
+            <header class="about-section-head">
+              <p>兼容性</p>
+              <h4>平台支持</h4>
+            </header>
+            <div class="about-platforms">
+              <div v-for="p in platforms" :key="p.name">
+                <span class="material-symbols-outlined">{{ p.icon }}</span>
+                <b>{{ p.name }}</b>
+                <span :class="p.cls">{{ p.state }}</span>
+              </div>
             </div>
-          </template>
-        </div>
-      </div>
+            <p class="about-platform-note">
+              配置与日志位于 <code>%APPDATA%\NotmyFault\</code>，Linux 为 <code>~/.config/notmyfault/</code>。
+            </p>
+          </section>
 
-      <!-- 运行信息：动态读取引擎与配置 -->
-      <div class="rounded-lg bg-surface-c-low p-6 shadow-elev1">
-        <h4 class="mb-4 text-title-m text-on-surface">运行信息</h4>
-        <div class="grid grid-cols-1 gap-x-8 gap-y-3 sm:grid-cols-2">
-          <div v-for="r in runtimeInfo" :key="r.key" class="flex items-center justify-between gap-4 border-b border-outline-variant pb-3">
-            <span class="flex items-center gap-2 text-body-m text-on-surface-variant">
-              <span class="material-symbols-outlined text-[18px] text-primary">{{ r.icon }}</span>{{ r.key }}
-            </span>
-            <span class="text-right text-body-m font-medium text-on-surface">{{ r.val }}</span>
-          </div>
-        </div>
-      </div>
-
-      <!-- 平台支持 -->
-      <div class="rounded-lg bg-surface-c-low p-6 shadow-elev1">
-        <h4 class="mb-4 text-title-m text-on-surface">平台支持</h4>
-        <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
-          <div v-for="p in platforms" :key="p.name"
-            class="flex items-center gap-3 rounded-sm border border-outline-variant bg-surface-c-lowest px-4 py-3">
-            <span class="material-symbols-outlined text-[24px] text-on-surface-variant">{{ p.icon }}</span>
-            <div class="min-w-0">
-              <b class="block text-label-l text-on-surface">{{ p.name }}</b>
-              <span class="text-label-m" :class="p.cls">{{ p.state }}</span>
+          <section class="about-section about-stack">
+            <header class="about-section-head">
+              <p>构成</p>
+              <h4>技术栈</h4>
+            </header>
+            <div>
+              <span v-for="t in ['Python 3.11+', 'Vue 3', 'Material 3', 'FastAPI', 'SSE']" :key="t">{{ t }}</span>
             </div>
-          </div>
-        </div>
-        <p class="mt-4 text-body-s text-on-surface-variant">
-          部分功能依赖操作系统或硬件支持，例如 Windows 全局热键、窗口标题检测与外接显示器亮度控制。
-          配置与日志位于 <code class="rounded-xs bg-surface-c-high px-1.5 py-0.5 text-label-m text-on-surface">%APPDATA%\NotmyFault\</code>（Linux 为 <code class="rounded-xs bg-surface-c-high px-1.5 py-0.5 text-label-m text-on-surface">~/.config/notmyfault/</code>）。
-        </p>
-      </div>
+          </section>
+        </aside>
+      </main>
 
-      <!-- 技术栈与版权 -->
-      <div class="rounded-lg bg-surface-c-low p-6 shadow-elev1">
-        <h4 class="mb-4 text-title-m text-on-surface">技术栈</h4>
-        <div class="flex flex-wrap gap-2">
-          <span v-for="t in ['Python 3.11+ 引擎', 'Vue 3 Dashboard', 'Material Design 3', 'FastAPI 本地服务', 'SSE 实时事件']" :key="t" class="chip">{{ t }}</span>
-        </div>
-        <p class="mt-5 text-body-s text-outline">
-          &copy; 2026 NotmyFault Project · 基于 GNU General Public License v3.0 开源 ·
-          遇到问题时请附上操作系统、复现步骤与最新日志文件
-        </p>
-      </div>
+      <footer class="about-footer">
+        <span>&copy; 2026 NotmyFault Project</span>
+        <span>GNU General Public License v3.0</span>
+        <span>问题反馈请附系统版本、复现步骤与最新日志</span>
+      </footer>
     </div>
   </section>
 </template>

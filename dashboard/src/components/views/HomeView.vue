@@ -21,6 +21,12 @@ const modeLabel = computed(() => {
   const m = store.engineStatus.security_mode
   return ({ strict: '严格', normal: '标准', permissive: '宽松' })[m] || '-'
 })
+// 引擎启动失败/被拒绝的原因（如配置签名密钥缺失），暂停态展示警告
+const pausedError = computed(() => store.engineStatus.last_error || '')
+
+function goSecurity() {
+  if (window.__nmf && window.__nmf.switchPage) window.__nmf.switchPage('security')
+}
 
 async function loadStats() {
   try {
@@ -118,7 +124,7 @@ watch(isRunning, (running) => {
 </script>
 
 <template>
-  <section class="page active">
+  <section class="page active dashboard-home">
     <div class="page-head"><h2>引擎状态</h2><div class="actions">
       <button class="btn btn-outlined" @click="refreshHome"><span class="material-symbols-outlined">refresh</span>刷新</button>
     </div></div>
@@ -152,72 +158,100 @@ watch(isRunning, (running) => {
       </div>
     </div>
 
-    <!-- 引擎运行中：显示概览 + 诊断 -->
-    <template v-if="isControllerOnline">
-    <!-- 概览：M3 大数字 stat 网格，数字层级优先于标签 -->
-    <div v-if="isRunning" class="mb-4 grid grid-cols-2 gap-3.5 lg:grid-cols-4">
-      <div v-for="s in [
-          { icon: 'rule', val: stats.rules, lbl: '规则数量' },
-          { icon: 'memory', val: stats.triggers, lbl: '活跃触发器' },
-          { icon: 'bolt', val: stats.actions, lbl: '动作类型' },
-          { icon: 'dns', val: stats.pid, lbl: '进程 PID' },
-        ]" :key="s.lbl"
-        class="flex flex-col gap-1 rounded-md bg-surface-c-low p-4 shadow-elev1 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-elev2">
-        <span class="material-symbols-outlined text-[22px] text-primary">{{ s.icon }}</span>
-        <span class="mt-1 text-headline-s text-on-surface">{{ s.val }}</span>
-        <span class="text-label-m text-on-surface-variant">{{ s.lbl }}</span>
+    <!-- 引擎被拒绝启动：配置可能被篡改（暂停横幅下追加红色警告条） -->
+    <div v-if="isControllerOnline && !isRunning && !isStarting && pausedError" class="mt-3 flex items-start gap-3 rounded-lg border border-error/40 bg-error/10 p-4">
+      <span class="material-symbols-outlined text-error">shield_person</span>
+      <div class="min-w-0 flex-1">
+        <b class="text-error">引擎启动被拒绝</b>
+        <p class="mt-0.5 break-all text-body-s text-on-surface-variant">{{ pausedError }}</p>
+        <button class="btn btn-outlined mt-2" @click="goSecurity">
+          <span class="material-symbols-outlined">security</span>前往安全页查看配置并处理
+        </button>
       </div>
     </div>
 
-    <!-- 诊断：状态徽章网格 + 异常详情独立区块 -->
-    <div class="mb-4 rounded-md bg-surface-c-low p-5 shadow-elev1">
-      <h4 class="mb-4 text-title-m text-on-surface">引擎诊断</h4>
-      <div class="grid grid-cols-1 gap-x-8 gap-y-3.5 sm:grid-cols-2">
-        <div v-for="row in [
-            { key: '插件状态', d: diagPlugins },
-            { key: '规则状态', d: diagRules },
-            { key: '动作执行', d: diagActions },
-            { key: '错误 / 警告', d: { txt: diagErrors.txt, cls: diagErrors.ec > 0 ? 'diag-err' : 'diag-ok', icon: diagErrors.ec > 0 ? 'error' : 'check_circle' } },
-          ]" :key="row.key" class="flex items-center justify-between gap-4">
-          <span class="text-body-m text-on-surface-variant">{{ row.key }}</span>
-          <span class="text-label-l" :class="row.d.cls">
-            <span v-if="row.d.icon" class="material-symbols-outlined align-[-3px] text-[16px]">{{ row.d.icon }}</span>{{ row.d.txt }}
-          </span>
+    <!-- 引擎运行中：整块信息架构，避免碎片化小卡片 -->
+    <template v-if="isControllerOnline">
+      <section v-if="isRunning" class="dashboard-card dashboard-overview">
+        <header class="dashboard-card-head">
+          <div>
+            <p class="dashboard-card-eyebrow">实时概览</p>
+            <h3>自动化核心</h3>
+          </div>
+          <span class="dashboard-live"><i></i>运行中</span>
+        </header>
+        <div class="dashboard-metrics">
+          <div v-for="s in [
+              { icon: 'rule', val: stats.rules, lbl: '规则数量' },
+              { icon: 'memory', val: stats.triggers, lbl: '活跃触发器' },
+              { icon: 'bolt', val: stats.actions, lbl: '动作类型' },
+              { icon: 'dns', val: stats.pid, lbl: '进程 PID' },
+            ]" :key="s.lbl" class="dashboard-metric">
+            <span class="material-symbols-outlined dashboard-metric-icon">{{ s.icon }}</span>
+            <div>
+              <strong>{{ s.val }}</strong>
+              <span>{{ s.lbl }}</span>
+            </div>
+          </div>
         </div>
-      </div>
-      <!-- 异常详情：仅在有异常时展示，surface-c-lowest 凹陷层级 -->
-      <div v-if="diagLines.length" class="mt-4 flex flex-col gap-1.5 rounded-sm border border-outline-variant bg-surface-c-lowest p-3.5">
-        <div v-for="(l, i) in diagLines" :key="i" class="flex items-start gap-1.5 text-label-m" :class="l.cls">
-          <span class="material-symbols-outlined text-[15px] leading-5">{{ l.icon }}</span>
-          <span class="min-w-0 break-all">{{ l.text }}</span>
+      </section>
+
+      <section class="dashboard-card dashboard-diagnostics">
+        <header class="dashboard-card-head">
+          <div>
+            <p class="dashboard-card-eyebrow">健康检查</p>
+            <h3>引擎诊断</h3>
+          </div>
+        </header>
+        <div class="dashboard-diagnostic-grid">
+          <div v-for="row in [
+              { key: '插件状态', d: diagPlugins },
+              { key: '规则状态', d: diagRules },
+              { key: '动作执行', d: diagActions },
+              { key: '错误 / 警告', d: { txt: diagErrors.txt, cls: diagErrors.ec > 0 ? 'diag-err' : 'diag-ok', icon: diagErrors.ec > 0 ? 'error' : 'check_circle' } },
+            ]" :key="row.key" class="dashboard-diagnostic-row">
+            <span>{{ row.key }}</span>
+            <span class="dashboard-diagnostic-value" :class="row.d.cls">
+              <span v-if="row.d.icon" class="material-symbols-outlined">{{ row.d.icon }}</span>{{ row.d.txt }}
+            </span>
+          </div>
         </div>
-      </div>
-      <div v-else class="mt-4 flex items-center gap-1.5 rounded-sm border border-outline-variant bg-surface-c-lowest p-3.5 text-label-m diag-ok">
-        <span class="material-symbols-outlined text-[15px]">check_circle</span>暂无异常记录
-      </div>
-    </div>
+        <div v-if="diagLines.length" class="dashboard-diagnostic-detail">
+          <div v-for="(l, i) in diagLines" :key="i" :class="l.cls">
+            <span class="material-symbols-outlined">{{ l.icon }}</span>
+            <span>{{ l.text }}</span>
+          </div>
+        </div>
+        <div v-else class="dashboard-diagnostic-empty diag-ok">
+          <span class="material-symbols-outlined">check_circle</span>暂无异常记录
+        </div>
+      </section>
     </template>
 
     <!-- 引擎未运行：显示系统信息 -->
     <template v-else>
-    <div class="mb-4 rounded-md bg-surface-c-low p-5 shadow-elev1">
-      <h4 class="mb-4 text-title-m text-on-surface">系统信息</h4>
-      <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+    <section class="dashboard-card dashboard-system">
+      <header class="dashboard-card-head">
+        <div>
+          <p class="dashboard-card-eyebrow">本机配置</p>
+          <h3>系统信息</h3>
+        </div>
+      </header>
+      <div class="dashboard-system-grid">
         <div v-for="info in [
             { icon: 'info', key: '版本', val: 'NotmyFault v' + appVersion },
             { icon: 'shield', key: '安全模式', val: modeLabel },
             { icon: 'folder', key: '配置目录', val: '%APPDATA%/NotmyFault/' },
             { icon: 'rule', key: '已配置规则', val: (store.configData?.rules?.length || 0) + ' 条' },
-          ]" :key="info.key"
-          class="flex items-center gap-3 rounded-sm border border-outline-variant bg-surface-c-lowest px-3.5 py-3">
-          <span class="material-symbols-outlined text-[22px] text-primary">{{ info.icon }}</span>
-          <div class="flex min-w-0 flex-col">
-            <span class="text-label-m text-on-surface-variant">{{ info.key }}</span>
-            <span class="truncate text-body-m font-medium text-on-surface">{{ info.val }}</span>
+          ]" :key="info.key" class="dashboard-system-row">
+          <span class="material-symbols-outlined">{{ info.icon }}</span>
+          <div>
+            <span>{{ info.key }}</span>
+            <strong>{{ info.val }}</strong>
           </div>
         </div>
       </div>
-    </div>
+    </section>
     <div class="empty-state" style="padding:32px 20px">
       <div class="material-symbols-outlined">power_off</div>
       <h3>后台服务未启动</h3>

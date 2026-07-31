@@ -65,6 +65,16 @@ export function useEngineControl() {
       if (status.api_alive && status.engine_running) {
         const r = await window.pywebview.api.stop_engine()
         if (!r?.ok) throw new Error(r?.error || '停止失败')
+        // 引擎停机是异步的；RuntimeController 在旧线程退出前拒绝新启动，
+        // 这里等待 state 真正回到 stopped 再拉起，避免 409 竞态。
+        const deadline = Date.now() + 15000
+        let current = { ...status }
+        while (Date.now() < deadline) {
+          current = await getEngineStatus()
+          if (!current.engine_running || !current.api_alive) break
+          await new Promise(resolve => setTimeout(resolve, 500))
+        }
+        if (current.engine_running) throw new Error('引擎停止超时，请稍后重试')
       }
       const r2 = await window.pywebview.api.launch_engine()
       if (!r2.ok) throw new Error(r2.error || '启动失败')

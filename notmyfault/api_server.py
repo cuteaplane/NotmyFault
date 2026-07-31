@@ -10,12 +10,13 @@ Dashboard 仅通过 pywebview 桌面桥接访问；不提供浏览器管理模�
 import json
 import secrets
 import os
+import re
 import sys
 import asyncio
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Protocol
+from typing import Any, Dict, List, Protocol
 
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException
@@ -37,8 +38,10 @@ from notmyfault.plugin_schema import (
     get_permission_info,
     is_known_permission,
     current_platform_name,
+    check_payload_contract,
     PERMISSION_REGISTRY,
 )
+from notmyfault.plugins import scan_borrowed_privilege
 from notmyfault.security import detect_security_mode, SecurityMode
 from notmyfault.rules import (
     get_rule_events,
@@ -64,6 +67,44 @@ _DASHBOARD_ORIGINS = [
     for host in ("127.0.0.1", "localhost")
     for port in range(19199, 19219)
 ]
+
+# nmfp 插件包解压防护：py7zr 1.1.x 只拦绝对路径/盘符，不拦 ../ 相对穿越；
+# 且对解压炸弹（海量条目/巨量解压体积）无默认限制。这里在解压前统一校验。
+_NMFP_MAX_ENTRIES = 2000
+_NMFP_MAX_UNCOMPRESSED = 500 * 1024 * 1024  # 500 MiB
+_NMFP_MAX_UPLOAD_BYTES = 64 * 1024 * 1024   # 64 MiB
+
+
+def _extract_nmfp_safely(archive_path: str, extract_dir: str, password: str | None) -> None:
+    """解压 nmfp 插件包，拦截路径穿越与解压炸弹。
+
+    Raises:
+        ValueError: 归档含非法路径（../ 穿越/绝对路径）或超过条目/体积限制。
+    """
+    import py7zr as _py7zr
+    with _py7zr.SevenZipFile(archive_path, mode="r", password=password or None) as zf:
+        entries = 0
+        total_uncompressed = 0
+        for info in zf.list():
+            entries += 1
+            if entries > _NMFP_MAX_ENTRIES:
+                raise ValueError(
+                    f"插件包条目过多（>{_NMFP_MAX_ENTRIES}），疑似解压炸弹"
+                )
+            total_uncompressed += int(getattr(info, "uncompressed", 0) or 0)
+            if total_uncompressed > _NMFP_MAX_UNCOMPRESSED:
+                raise ValueError(
+                    "插件包解压后体积过大，疑似解压炸弹"
+                )
+            name = str(getattr(info, "filename", ""))
+            normalized = os.path.normpath(name)
+            if (
+                normalized.startswith("..")
+                or os.path.isabs(normalized)
+                or re.match(r"^[a-zA-Z]:", normalized)
+            ):
+                raise ValueError(f"插件包包含非法路径: {name}")
+        zf.extractall(extract_dir)
 
 
 def _secure_write_token(path: str, token: str) -> None:
@@ -475,7 +516,7 @@ class EngineAPI:
         if request.method == "OPTIONS":
             return
         auth = request.headers.get("Authorization", "")
-        token = auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""
+        token = auth.removeprefix("Bearer ") if auth.startswith("Bearer ") else ""
         # 原生 EventSource 不能设置 Authorization；仅 SSE 接口接受 query token。
         if not token and request.url.path == "/api/events":
             token = request.query_params.get("token", "")
@@ -598,6 +639,7 @@ class EngineAPI:
                 "triggers_count": len(trigger_types),
                 "actions_count": len(action_types),
                 "security_mode": detect_security_mode().value,
+                "last_error": getattr(self._engine, "last_error", None),
             }
 
         @app.get("/api/platform")
@@ -810,6 +852,45 @@ class EngineAPI:
                     status_code=400,
                 )
 
+            # 已提供的触发 payload 按插件 outputs 契约做字段级校验，
+            # 缺必填输出/未知字段/类型不符直接提示，而不是等绑定失败。
+            trigger_field_issues: List[str] = []
+            assert isinstance(candidate_rule, dict)
+            engine_triggers_meta = getattr(engine, "triggers_meta", {}) or {}
+            leaves_by_id = {
+                leaf.get("binding_id"): leaf
+                for leaf in get_rule_events(candidate_rule)
+                if isinstance(leaf.get("binding_id"), str)
+            }
+            for usage in references:
+                reference = usage.reference
+                if reference.get("scope") != "trigger":
+                    continue
+                binding_id = reference.get("node")
+                if not isinstance(binding_id, str):
+                    continue
+                payload = trigger_payloads.get(binding_id)
+                if not isinstance(payload, dict):
+                    continue
+                leaf = leaves_by_id.get(binding_id)
+                if leaf is None:
+                    continue
+                trigger_meta = engine_triggers_meta.get(leaf.get("type", ""), {})
+                for problem in check_payload_contract(
+                    trigger_meta.get("outputs"), payload
+                ):
+                    trigger_field_issues.append(f"{binding_id}: {problem}")
+            if trigger_field_issues:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "code": "invalid_test_payload",
+                        "error": "测试数据不符合触发器输出契约",
+                        "details": trigger_field_issues[:10],
+                    },
+                    status_code=400,
+                )
+
             if trigger_payloads or event_payload is not None:
                 ok, message = engine.run_manual_rule_snapshot(
                     candidate_rule,
@@ -877,6 +958,11 @@ class EngineAPI:
                 password = ""
 
             data = await file.read()
+            if len(data) > _NMFP_MAX_UPLOAD_BYTES:
+                return JSONResponse(
+                    {"ok": False, "error": f"插件包过大（>{_NMFP_MAX_UPLOAD_BYTES // (1024 * 1024)}MB）"},
+                    status_code=400,
+                )
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".nmfp")
             extract_dir = None
             try:
@@ -884,8 +970,7 @@ class EngineAPI:
                 tmp.close()
 
                 extract_dir = tempfile.mkdtemp()
-                with py7zr.SevenZipFile(tmp.name, mode="r", password=password or None) as zf:
-                    zf.extractall(extract_dir)
+                _extract_nmfp_safely(tmp.name, extract_dir, password)
 
                 entries = os.listdir(extract_dir)
                 dirs = [d for d in entries if os.path.isdir(os.path.join(extract_dir, d))]
@@ -918,6 +1003,25 @@ class EngineAPI:
 
                 # 安全扫描
                 risks = scan_plugin_security(root_path)
+
+                # 借壳提权嫌疑扫描：导入/调用引擎插件模块、绕过动态执行检测等。
+                # 命中即向用户告警，帮助识别伪装成普通工具的恶意插件。
+                borrowed_findings = []
+                for py_file in sorted(Path(root_path).rglob("*.py")):
+                    if not py_file.is_file():
+                        continue
+                    borrowed_findings.extend(
+                        scan_borrowed_privilege(str(py_file))
+                    )
+                if borrowed_findings:
+                    risks.append({
+                        "id": "borrowed_privilege",
+                        "label": "借壳提权嫌疑",
+                        "level": "high",
+                        "detail": "插件代码可能借其他已授权插件的身份请求管理员权限: "
+                        + "；".join(sorted(set(borrowed_findings))[:3]),
+                        "file": "*.py",
+                    })
 
                 # 权限分析
                 perms = meta.get("permissions", [])
@@ -987,6 +1091,9 @@ class EngineAPI:
                     "schema_valid": schema_valid,
                     "schema_errors": schema_errors,
                 }
+            except ValueError as ve:
+                # 解压防护命中：路径穿越/解压炸弹/大小超限
+                return JSONResponse({"ok": False, "error": str(ve)}, status_code=400)
             finally:
                 try:
                     os.unlink(tmp.name)
@@ -1027,6 +1134,11 @@ class EngineAPI:
                     return JSONResponse({"ok": False, "error": "缺少上传文件或 preview_token 无效"}, status_code=400)
 
                 data = await file.read()
+                if len(data) > _NMFP_MAX_UPLOAD_BYTES:
+                    return JSONResponse(
+                        {"ok": False, "error": f"插件包过大（>{_NMFP_MAX_UPLOAD_BYTES // (1024 * 1024)}MB）"},
+                        status_code=400,
+                    )
                 import tempfile as _tf
                 tmp = _tf.NamedTemporaryFile(delete=False, suffix=".nmfp")
                 extract_dir = None
@@ -1035,8 +1147,7 @@ class EngineAPI:
                     tmp.close()
 
                     extract_dir = _tf.mkdtemp()
-                    with py7zr.SevenZipFile(tmp.name, mode="r", password=password or None) as zf:
-                        zf.extractall(extract_dir)
+                    _extract_nmfp_safely(tmp.name, extract_dir, password)
 
                     entries = os.listdir(extract_dir)
                     dirs = [d for d in entries if os.path.isdir(os.path.join(extract_dir, d))]
@@ -1066,6 +1177,15 @@ class EngineAPI:
                     ok, errors = validate_plugin_meta(meta, plugin_type)
                     if not ok:
                         return JSONResponse({"ok": False, "error": "schema 校验失败: " + "; ".join(errors[:3])}, status_code=400)
+                except ValueError as ve:
+                    # 解压防护命中：路径穿越/解压炸弹/大小超限
+                    try:
+                        os.unlink(tmp.name)
+                    except Exception:
+                        pass
+                    if extract_dir:
+                        shutil.rmtree(extract_dir, ignore_errors=True)
+                    return JSONResponse({"ok": False, "error": str(ve)}, status_code=400)
                 except Exception:
                     try:
                         os.unlink(tmp.name)
@@ -1185,6 +1305,115 @@ class EngineAPI:
             return self._uninstall_plugin(ptype, pid)
 
         # ================================================================
+        # 配置安全审查（密钥缺失/签名失败时的恢复入口）
+        # ================================================================
+
+        # 高风险动作类型：摘要展示时标记，提醒用户核对
+        _HIGH_RISK_ACTIONS = ("run_powershell", "shutdown_system", "kill_process")
+
+        def _config_security_snapshot() -> Dict[str, Any]:
+            """读取磁盘配置，判定完整性并生成供用户核对的摘要。"""
+            import notmyfault.config as cfg_mod
+            status: Dict[str, Any] = {"status": "ok", "reason": "", "summary": None}
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                return {"status": "unreadable",
+                        "reason": f"配置文件无法读取: {e}", "summary": None}
+            if not isinstance(raw, dict):
+                return {"status": "unreadable",
+                        "reason": "配置根节点不是对象", "summary": None}
+
+            signature = raw.pop("_signature", "")
+            has_secret = cfg_mod._is_secret_installed()
+            if not has_secret:
+                status["status"] = "tampered"
+                status["reason"] = (
+                    "配置签名密钥缺失，无法验证配置是否被篡改。"
+                    "引擎已暂停，请核对下方配置摘要后选择处理方式。"
+                )
+            elif not signature or not cfg_mod._verify_config(raw, signature):
+                status["status"] = "tampered"
+                status["reason"] = (
+                    "配置签名校验失败，文件可能被篡改。"
+                    "引擎已暂停，请核对下方配置摘要后选择处理方式。"
+                )
+
+            rules = raw.get("rules", [])
+            if not isinstance(rules, list):
+                rules = []
+            status["summary"] = {
+                "rule_count": len(rules),
+                "rules": [
+                    {
+                        "name": rule.get("name", f"规则 #{i + 1}") if isinstance(rule, dict) else f"规则 #{i + 1}",
+                        "actions": [
+                            {
+                                "type": action.get("type", "?") if isinstance(action, dict) else "?",
+                                "high_risk": isinstance(action, dict)
+                                and action.get("type") in _HIGH_RISK_ACTIONS,
+                            }
+                            for action in rule.get("actions", [])
+                            if isinstance(rule, dict)
+                        ],
+                    }
+                    for i, rule in enumerate(rules)
+                ],
+            }
+            return status
+
+        @app.get("/api/config/security-status")
+        async def config_security_status():
+            return _config_security_snapshot()
+
+        @app.post("/api/config/security-approve")
+        async def config_security_approve(request: Request):
+            """用户核对确认配置无误后重新签名（重建密钥），解除引擎暂停。
+
+            不丢弃用户配置：当前配置原样保留，仅重建签名密钥并重新签名。
+            """
+            await self._verify_auth(request)
+            import notmyfault.config as cfg_mod
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if not isinstance(raw, dict):
+                    return JSONResponse({"ok": False, "error": "配置根节点不是对象"},
+                                        status_code=400)
+                raw.pop("_signature", None)
+                normalized = cfg_mod._normalize_config(raw)
+                # 重新签名前仍执行危险命令黑名单校验，防止确认操作放行危险规则。
+                rules = normalized.get("rules", [])
+                if not isinstance(rules, list):
+                    rules = []
+                _warnings, errors = cfg_mod._validate_rules_safety(rules)
+                if errors:
+                    return JSONResponse(
+                        {"ok": False,
+                         "error": "配置包含危险规则，拒绝重新签名: " + "; ".join(errors[:3])},
+                        status_code=400,
+                    )
+
+                # 结构校验同样前置：被篡改的配置即使不触发危险命令黑名单，
+                # 也可能携带畸形规则（缺字段/类型错误），确认放行前必须拦截。
+                structure_errors = validate_rules_structure(rules)
+                if structure_errors:
+                    return JSONResponse(
+                        {"ok": False,
+                         "error": "配置包含结构无效的规则，拒绝重新签名: "
+                         + "; ".join(structure_errors[:3])},
+                        status_code=400,
+                    )
+                ok = cfg_mod.save_config(normalized)
+                if not ok:
+                    return JSONResponse({"ok": False, "error": "重新签名失败"},
+                                        status_code=500)
+                return {"ok": True, "message": "配置已重新签名，引擎可正常启动"}
+            except Exception as e:
+                return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+        # ================================================================
         # 诊断 & 日志
         # ================================================================
 
@@ -1271,7 +1500,11 @@ class EngineAPI:
             self.app,
             host=host,
             port=port,
-            log_level="info",
+            # 关闭 access log：SSE 认证 token 曾以 query 形式出现在 URL 中，
+            # uvicorn 默认 access log 会把完整请求行（含 query）写进引擎日志。
+            # 引擎有自己的结构化日志，access log 冗余且是 token 泄露面。
+            access_log=False,
+            log_level="warning",
         )
         self._server = uvicorn.Server(config)
 

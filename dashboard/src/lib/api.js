@@ -100,6 +100,22 @@ export async function getEngineStatus() {
   return await window.pywebview.api.get_engine_status()
 }
 
+// ---- 配置安全审查（密钥缺失/签名失败时的恢复入口）----
+
+export async function getConfigSecurityStatus() {
+  try {
+    const r = await apiRead('/api/config/security-status')
+    return await r.json()
+  } catch (e) {
+    return { status: 'unavailable', reason: '无法获取配置安全状态', summary: null }
+  }
+}
+
+export async function approveConfigSecurity() {
+  const r = await apiWrite('/api/config/security-approve', 'POST')
+  return await r.json()
+}
+
 export async function readLogRaw(lines = 300) {
   try { return await window.pywebview.api.read_log_raw(lines) }
   catch (e) { return '读取日志失败: ' + e.message }

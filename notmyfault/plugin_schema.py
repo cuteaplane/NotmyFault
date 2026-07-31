@@ -221,8 +221,8 @@ def validate_plugin_meta(
                 f"（允许: {', '.join(sorted(_ALLOWED_SEMANTICS))}）"
             )
 
-    if "trigger_api" in meta and meta["trigger_api"] not in ("legacy", "event-v1"):
-        errors.append("trigger_api 必须为 legacy 或 event-v1")
+    if "trigger_api" in meta and meta["trigger_api"] not in ("legacy", "event-v1", "event-v2"):
+        errors.append("trigger_api 必须为 legacy、event-v1 或 event-v2")
 
     if "permissions" in meta:
         perms = meta["permissions"]
@@ -348,6 +348,12 @@ def validate_plugin_meta(
                         f"params[{i}].type 无效: '{ptype}'"
                         f"（允许: {', '.join(sorted(_ALLOWED_PARAM_TYPES))}）"
                     )
+                value_type = param.get("value_type")
+                if value_type is not None and value_type not in _ALLOWED_OUTPUT_TYPES:
+                    errors.append(
+                        f"params[{i}].value_type 无效: '{value_type}'"
+                        f"（允许: {', '.join(sorted(_ALLOWED_OUTPUT_TYPES))}）"
+                    )
                 if ptype == "select":
                     if "options" not in param:
                         errors.append(f"params[{i}] (type=select) 必须提供 'options' 字段")
@@ -373,6 +379,52 @@ def validate_plugin_meta(
             errors.append(f"包含未知字段: '{key}'")
 
     return len(errors) == 0, errors
+
+
+def check_payload_contract(
+    outputs: Any,
+    payload: Dict[str, Any],
+) -> List[str]:
+    """按插件 outputs 声明校验 event-v2 事件 payload，返回问题列表（空=通过）。
+
+    契约：payload 必须包含全部 required 输出字段、不能含未声明字段，
+    且 string/number/bool 声明与运行时类型一致。array/object/any 只查存在性。
+    插件未声明 outputs（无契约）时不做任何拦截，兼容未升级的旧插件。
+    """
+    declared: Dict[str, Dict[str, Any]] = {}
+    if isinstance(outputs, list):
+        for output in outputs:
+            if isinstance(output, str):
+                declared[output] = {"type": "any", "required": True}
+            elif isinstance(output, dict) and isinstance(output.get("name"), str):
+                declared[output["name"]] = {"required": True, **output}
+    if not declared:
+        return []
+
+    problems: List[str] = []
+    for name, spec in declared.items():
+        if spec.get("required") is not False and name not in payload:
+            problems.append(f"缺少必填输出字段: {name}")
+        elif name in payload:
+            value = payload[name]
+            output_type = spec.get("type", "any")
+            if output_type == "string" and not isinstance(value, str):
+                problems.append(
+                    f"输出字段 {name} 应为 string，实际为 {type(value).__name__}"
+                )
+            elif output_type == "number":
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    problems.append(
+                        f"输出字段 {name} 应为 number，实际为 {type(value).__name__}"
+                    )
+            elif output_type == "bool" and not isinstance(value, bool):
+                problems.append(
+                    f"输出字段 {name} 应为 bool，实际为 {type(value).__name__}"
+                )
+    for key in payload:
+        if key not in declared:
+            problems.append(f"未声明的输出字段: {key}")
+    return problems
 
 
 def scan_plugins(base_dir: str, plugins_dir: str, json_filename: str) -> Dict[str, Dict]:

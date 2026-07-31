@@ -18,7 +18,7 @@ const views = { home: HomeView, plugins: PluginsView, security: SecurityView, ru
 
 function switchPage(p) { currentPage.value = p }
 
-let sseSource = null
+let sseAbort = null
 let sseRetry = 0
 const SSE_MAX = 10
 let sseReconnectTimer = null
@@ -60,34 +60,102 @@ async function refreshStatus() {
 
 async function connectSSE() {
   sseReconnectTimer = null
-  if (sseSource) { sseSource.close(); sseSource = null }
+  if (sseAbort) { sseAbort.abort(); sseAbort = null }
   let token = ''
   try { token = await window.pywebview?.api?.get_api_token() || '' } catch (e) { /* offline */ }
-  if (!token) { updateStatus({ engine_running: false }); return }
-  const es = new EventSource('http://127.0.0.1:19198/api/events?token=' + encodeURIComponent(token))
-  sseSource = es
-  es.addEventListener('open', () => { sseRetry = 0 })
-  es.addEventListener('engine_state_changed', (e) => {
-    const d = JSON.parse(e.data)
+  if (!token) {
+    // 后台服务可能刚重启、token 文件尚未发布；不能放弃，按退避延迟重连，
+    // 否则事件流永久断开直到整页刷新。
+    updateStatus({ engine_running: false })
+    sseRetry++
+    const delay = Math.min(1000 * 2 ** Math.min(sseRetry - 1, 4), 15000)
+    sseReconnectTimer = setTimeout(connectSSE, delay)
+    return
+  }
+  // 用 fetch 流代替 EventSource：token 走 Authorization header，
+  // 不再以 ?token= 形式出现在 URL（防止进入任何访问日志）。
+  const abort = new AbortController()
+  sseAbort = abort
+  try {
+    const res = await fetch('http://127.0.0.1:19198/api/events', {
+      headers: { Authorization: 'Bearer ' + token },
+      signal: abort.signal,
+    })
+    if (!res.ok || !res.body) throw new Error('SSE HTTP ' + res.status)
+    sseRetry = 0
+    consumeSSE(res, abort)
+  } catch (e) {
+    if (abort.signal.aborted) return
+    scheduleSSEReconnect()
+  }
+}
+
+function scheduleSSEReconnect() {
+  sseRetry++
+  if (sseRetry > SSE_MAX) updateStatus({ engine_running: false })
+  // 长时间休眠、WebView 网络栈重置或 token 自愈期间都可能连续失败。
+  // 达到阈值只改变显示状态，不永久放弃重连。
+  const delay = Math.min(1000 * 2 ** Math.min(sseRetry - 1, 4), 15000)
+  if (sseReconnectTimer) clearTimeout(sseReconnectTimer)
+  sseReconnectTimer = setTimeout(connectSSE, delay)
+}
+
+function dispatchSSEEvent(eventName, dataText) {
+  if (eventName === 'engine_state_changed') {
+    let d = {}
+    try { d = JSON.parse(dataText) } catch (err) { return }
     updateStatus({
       api_alive: true,
       engine_state: d.state,
       engine_running: d.state === 'running',
     })
     if (d.state === 'running') refreshAll()
-  })
-  es.addEventListener('action_executed', () => { store.refreshSignal++ })
-  es.onerror = () => {
-    if (sseSource !== es) return
-    es.close(); sseSource = null
-    sseRetry++
-    if (sseRetry > SSE_MAX) updateStatus({ engine_running: false })
-    // 长时间休眠、WebView 网络栈重置或 token 自愈期间都可能连续失败。
-    // 达到阈值只改变显示状态，不永久放弃重连。
-    const delay = Math.min(1000 * 2 ** Math.min(sseRetry - 1, 4), 15000)
-    if (sseReconnectTimer) clearTimeout(sseReconnectTimer)
-    sseReconnectTimer = setTimeout(connectSSE, delay)
+  } else if (eventName === 'action_executed') {
+    store.refreshSignal++
   }
+}
+
+async function consumeSSE(res, abort) {
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let eventName = ''
+  let dataLines = []
+  let lastActivity = Date.now()
+  // 服务端 15s 发一次 keepalive；超过 45s 无任何数据视为假死连接，主动重建。
+  const watchdog = setInterval(() => {
+    if (Date.now() - lastActivity > 45000) abort.abort()
+  }, 15000)
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      lastActivity = Date.now()
+      buffer += decoder.decode(value, { stream: true })
+      let idx
+      while ((idx = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, idx).replace(/\r$/, '')
+        buffer = buffer.slice(idx + 1)
+        if (line === '') {
+          if (dataLines.length) {
+            dispatchSSEEvent(eventName, dataLines.join('\n'))
+            eventName = ''
+            dataLines = []
+          }
+          continue
+        }
+        if (line.startsWith(':')) continue // keepalive 注释行
+        if (line.startsWith('event:')) eventName = line.slice(6).trim()
+        else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
+      }
+    }
+  } catch (e) {
+    /* 流中断/abort */
+  } finally {
+    clearInterval(watchdog)
+    if (sseAbort === abort) sseAbort = null
+  }
+  scheduleSSEReconnect()
 }
 
 // 只有后台控制服务真正离线时才离开管理页面；自动化暂停期间仍可编辑。
@@ -98,7 +166,7 @@ watch(() => store.controllerOnline, (on) => {
 })
 
 // 暴露刷新入口给子视图（启动/停止引擎后调用）
-window.__nmf = { refreshAll, updateStatus }
+window.__nmf = { refreshAll, updateStatus, switchPage }
 
 onMounted(async () => {
   initTheme()
@@ -114,7 +182,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
-  if (sseSource) sseSource.close()
+  if (sseAbort) sseAbort.abort()
   if (sseReconnectTimer) clearTimeout(sseReconnectTimer)
   timers.forEach(id => clearInterval(id))
 })

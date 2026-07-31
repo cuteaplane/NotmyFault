@@ -1,7 +1,12 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
 import { store } from '../../lib/store'
-import { getEngineStatus } from '../../lib/api'
+import {
+  getEngineStatus,
+  getConfigSecurityStatus,
+  approveConfigSecurity,
+} from '../../lib/api'
+import { snack } from '../../lib/notify'
 
 const mode = ref('unknown')
 const modeMap = {
@@ -14,6 +19,35 @@ const pL = { admin: '管理员', native_api: '原生API', external_binary: '外�
 const pC = { admin: 'chip-admin', native_api: 'chip-native', external_binary: 'chip-external' }
 const pI = { admin: 'admin_panel_settings', native_api: 'code', external_binary: 'terminal' }
 const oL = { builtin: '内置', user: '用户', third_party: '第三方' }
+
+// ---- 配置安全审查（密钥缺失/签名失败时的恢复入口）----
+const configSec = ref({ status: 'loading', reason: '', summary: null })
+const approving = ref(false)
+const HIGH_RISK = ['run_powershell', 'shutdown_system', 'kill_process']
+
+async function loadConfigSecurity() {
+  const data = await getConfigSecurityStatus()
+  configSec.value = data
+}
+
+async function approveConfig() {
+  if (!confirm('请再次确认上方摘要中的规则均为你本人配置。确认无误后，当前配置将被原样重新签名，引擎恢复运行。')) return
+  approving.value = true
+  try {
+    const r = await approveConfigSecurity()
+    if (r.ok) {
+      snack(r.message || '配置已重新签名')
+      await loadConfigSecurity()
+      await load()
+    } else {
+      alert('重新签名失败: ' + (r.error || '未知错误'))
+    }
+  } catch (e) {
+    alert('重新签名失败: ' + e.message)
+  } finally {
+    approving.value = false
+  }
+}
 
 const all = computed(() => {
   const arr = []
@@ -52,14 +86,55 @@ async function load() {
     mode.value = s.security_mode || 'unknown'
   } catch (e) { mode.value = 'unknown' }
 }
-onMounted(load)
+onMounted(() => { load(); loadConfigSecurity() })
 </script>
 
 <template>
   <section class="page active">
     <div class="page-head"><h2>安全与权限</h2><div class="actions">
-      <button class="btn btn-outlined" @click="load"><span class="material-symbols-outlined">refresh</span>刷新</button>
+      <button class="btn btn-outlined" @click="load(); loadConfigSecurity()"><span class="material-symbols-outlined">refresh</span>刷新</button>
     </div></div>
+
+    <!-- 配置完整性审查卡片 -->
+    <div v-if="configSec.status === 'tampered'" class="mb-5 rounded-lg border border-error/40 bg-error/10 p-4">
+      <div class="flex items-center gap-2">
+        <span class="material-symbols-outlined text-error">shield_person</span>
+        <h3 class="font-bold text-error">配置可能被篡改，引擎已暂停</h3>
+      </div>
+      <p class="mt-1 text-body-s text-on-surface-variant">{{ configSec.reason }}</p>
+      <div v-if="configSec.summary" class="mt-3">
+        <p class="text-body-s font-semibold">当前配置摘要（共 {{ configSec.summary.rule_count }} 条规则）：</p>
+        <div class="mt-2 max-h-48 overflow-y-auto rounded-md bg-surface-c-low p-3">
+          <div v-for="(rule, i) in configSec.summary.rules" :key="i" class="border-b border-on-surface/10 py-1 last:border-0">
+            <span class="text-body-s font-medium">{{ i + 1 }}. {{ rule.name }}</span>
+            <span class="ml-2 flex flex-wrap gap-1">
+              <span v-for="(a, j) in rule.actions" :key="j" class="chip"
+                    :class="a.high_risk ? 'chip-admin' : 'chip-clean'">{{ a.type }}</span>
+            </span>
+          </div>
+        </div>
+        <p class="mt-2 text-body-s text-warn">
+          红色标记为高风险动作（PowerShell 执行 / 系统控制 / 进程终止），请仔细核对是否为你本人配置。
+        </p>
+      </div>
+      <div class="mt-3 flex flex-wrap gap-2">
+        <button class="btn btn-primary" :disabled="approving" @click="approveConfig">
+          <span class="material-symbols-outlined">verified</span>{{ approving ? '重新签名中…' : '我已确认无误，重新签名' }}
+        </button>
+        <button class="btn btn-outlined btn-danger" :disabled="resetting" @click="resetConfig">
+          <span class="material-symbols-outlined">restart_alt</span>{{ resetting ? '恢复中…' : '恢复默认配置' }}
+        </button>
+      </div>
+      <p class="mt-2 text-body-s text-on-surface-variant">当前内容已自动备份到 config.json.bak，可随时手动恢复。</p>
+    </div>
+    <div v-else-if="configSec.status === 'ok'" class="mb-5 flex items-center gap-2 rounded-lg border border-success/40 bg-success/10 p-3">
+      <span class="material-symbols-outlined text-success">verified</span>
+      <span class="text-body-s">配置签名有效，完整性正常。</span>
+    </div>
+    <div v-else-if="configSec.status === 'unreadable'" class="mb-5 rounded-lg border border-warn/40 bg-warn/10 p-3">
+      <span class="text-body-s text-warn">配置无法读取：{{ configSec.reason }}</span>
+    </div>
+
     <div class="sec-banner" :class="modeInfo.c"><span class="material-symbols-outlined sec-banner-ico">shield</span>
       <div><div class="sec-banner-title">安全模式：{{ modeInfo.l }}</div><p class="sec-banner-desc">{{ modeInfo.d }}</p></div></div>
     <div class="stat-grid">

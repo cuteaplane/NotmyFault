@@ -9,9 +9,11 @@ import sys
 from typing import Any, Dict, List
 
 from .platform_support import get_config_dir
+from .bindings import is_reference
 
 
 _BINDING_ID_RE = re.compile(r"^[tap]_[a-z0-9_]{6,64}$")
+_LEGACY_TEMPLATE_RE = re.compile(r"{{\s*([a-zA-Z_][\w.]*)\s*}}")
 
 
 def _new_binding_id(prefix: str) -> str:
@@ -406,15 +408,34 @@ _DANGEROUS_LAUNCH_PATHS = [
     "rundll32", "regsvr32", "wmic", "mshta", "certutil", "bitsadmin",
 ]
 
-def _has_dangerous_command(command: str) -> str | None:
-    """检测命令中是否包含危险模式。
+# 子串黑名单无法覆盖的正则模式（堵住常见绕过）：
+# - 嵌套 powershell：powershell -nop -c whoami（原黑名单无 powershell 本体）
+# - 无空格 iex：IEX(...) / iex$c / iex(Get-Content ...)（原黑名单要求 "iex " 带空格）
+# - 动态获取命令：Get-Command $a$b（命令名拆变量后间接调用）
+# - 调用运算符 & 接变量/表达式：& $a$b / & ($PSHOME + ...)（拼接执行器）
+# - $PSHOME / $env: 变量拼接出可执行文件
+# 静态分析无法覆盖任意字符串拼接（$a='Invoke-'; ...），此类检测为"防君子"，
+# 真正边界是 config 签名（规则只能由用户经 Dashboard 写入）。
+_DANGEROUS_RE_PATTERNS = [
+    (r"\bpowershell(\.exe)?\b", "嵌套 PowerShell"),
+    (r"\bpwsh\b", "嵌套 PowerShell"),
+    (r"\biex\b", "Invoke-Expression 别名"),
+    (r"\bGet-Command\b", "动态获取命令"),
+    (r"&\s*[\$\(]", "间接调用运算符 &"),
+    (r"\$PSHOME", "路径变量拼接"),
+    (r"\$env:\w+\s*[+)]", "环境变量拼接"),
+    (r"\.\s*invoke\s*\(", "脚本块 Invoke"),
+]
 
-    只对 run_powershell 和 launch_program 的参数做检查。
-    """
+def _has_dangerous_command(command: str) -> str | None:
+    """检测命令中是否包含危险模式（子串 + 正则双层）。"""
     cmd_lower = command.lower()
     for pattern in _DANGEROUS_PATTERNS:
         if pattern.lower() in cmd_lower:
             return pattern
+    for regex, label in _DANGEROUS_RE_PATTERNS:
+        if re.search(regex, command, re.IGNORECASE):
+            return label
     return None
 
 
@@ -595,6 +616,81 @@ def _normalize_rule_actions(actions: Any) -> Any:
     return normalized
 
 
+def _legacy_template_ref(
+    dotted_path: str,
+    step_refs: Dict[str, str],
+) -> Dict[str, Any] | None:
+    """把旧 ``{{ dotted.path }}`` 模板解析为结构化 $ref；无法确定来源返回 None。"""
+    parts = dotted_path.split(".")
+    if len(parts) >= 3 and parts[:2] == ["event", "payload"]:
+        return {"scope": "event", "path": parts[2:]}
+    if len(parts) >= 4 and parts[0] == "steps" and parts[2] == "result":
+        new_id = step_refs.get(parts[1])
+        if new_id is None:
+            return None
+        return {"scope": "step", "node": new_id, "path": parts[3:]}
+    return None
+
+
+def _upgrade_legacy_templates(
+    value: Any,
+    step_refs: Dict[str, str],
+) -> Any:
+    """把纯模板字符串升级为结构化 $ref；混合模板保留，由绑定解析兜底。"""
+    if isinstance(value, str):
+        full = _LEGACY_TEMPLATE_RE.fullmatch(value)
+        if full:
+            reference = _legacy_template_ref(full.group(1), step_refs)
+            if reference is not None:
+                return {"$ref": reference}
+        return value
+    if isinstance(value, list):
+        return [_upgrade_legacy_templates(item, step_refs) for item in value]
+    if isinstance(value, dict):
+        if is_reference(value):
+            return value
+        return {
+            key: _upgrade_legacy_templates(item, step_refs)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _upgrade_rule_templates(rule: Dict[str, Any]) -> Dict[str, Any]:
+    """升级规则动作/确认参数里的旧模板引用。
+
+    步骤引用需要 legacy 名（``steps.{type}_{i}``）到新 binding_id 的映射，
+    因此必须在 ``ensure_rule_binding_ids`` 之后执行。
+    """
+    step_refs: Dict[str, str] = {}
+    actions = rule.get("actions")
+    if isinstance(actions, list):
+        for index, action in enumerate(actions):
+            if not isinstance(action, dict):
+                continue
+            legacy_key = f"{action.get('type', 'action')}_{index + 1}"
+            step_refs[legacy_key] = action.get("binding_id", legacy_key)
+
+    copied = dict(rule)
+    for field in ("preconditions", "actions"):
+        items = copied.get(field)
+        if not isinstance(items, list):
+            continue
+        normalized = []
+        for item in items:
+            if not isinstance(item, dict):
+                normalized.append(item)
+                continue
+            item_copy = dict(item)
+            if isinstance(item_copy.get("params"), dict):
+                item_copy["params"] = _upgrade_legacy_templates(
+                    item_copy["params"], step_refs
+                )
+            normalized.append(item_copy)
+        copied[field] = normalized
+    return copied
+
+
 def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(config, dict):
         return config
@@ -620,7 +716,8 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
                         copied.pop("condition", None)
             if "actions" in copied:
                 copied["actions"] = _normalize_rule_actions(copied["actions"])
-            normalized_rules.append(ensure_rule_binding_ids(copied))
+            normalized = ensure_rule_binding_ids(copied)
+            normalized_rules.append(_upgrade_rule_templates(normalized))
 
         result = dict(config)
         result["schema_version"] = 2
@@ -704,33 +801,36 @@ def get_config() -> Dict[str, Any]:
     signature = config.pop(_SIGNATURE_KEY, "")
     has_secret = _is_secret_installed()
 
-    if has_secret:
-        if not signature:
-            print("[WARN] 配置文件缺少签名，可能被篡改！已回退默认配置并告警", file=sys.stderr)
-            _try_recover_from_backup()
-            return _default_v2_config()
+    if not has_secret:
+        # 密钥缺失 = 无法验证任何现有配置。攻击者删除密钥文件后即可伪造
+        # 任意配置（PoC 实证）。暂停引擎并告警：不静默回退、不冒险接受。
+        raise ConfigValidationError(
+            "配置签名密钥缺失，无法验证配置完整性，文件可能被篡改。"
+            f"引擎已暂停。请在 Dashboard「安全与权限」页核对配置摘要后重新签名；"
+            f"确认无异常后可删除 {CONFIG_FILE} 让引擎重新生成默认配置。"
+        )
 
-        if not _verify_config(config, signature):
-            print("[!!] 配置文件签名校验失败！文件可能被篡改，尝试从备份恢复", file=sys.stderr)
-            recovered = _try_recover_from_backup()
-            if recovered is not None:
-                return recovered
-            print("[!!] 备份也无效，加载默认安全配置", file=sys.stderr)
-            default_config = _default_v2_config()
-            save_config(default_config)
-            return default_config
+    if not signature:
+        # 配置无签名（被删签名或从未签名）：无法验证，暂停引擎等待用户确认。
+        raise ConfigValidationError(
+            "配置文件缺少签名，可能被篡改。引擎已暂停。"
+            "请在 Dashboard「安全与权限」页核对配置摘要后重新签名。"
+        )
+
+    if not _verify_config(config, signature):
+        # 签名校验失败：文件被修改过。暂停引擎，不静默回退丢弃用户配置。
+        raise ConfigValidationError(
+            "配置文件签名校验失败，文件可能被篡改。引擎已暂停。"
+            "请在 Dashboard「安全与权限」页核对配置摘要后重新签名；"
+            "如需找回旧版本，可检查 config.json.bak。"
+        )
 
     normalized = _normalize_config(config)
     migrated = normalized != config
     config = normalized
 
     # 签名验证通过后，以规范化结果重新签名并原子写回。
-    if has_secret:
-        save_config(config)
-    else:
-        # 首次安装，创建密钥并签名
-        _get_or_create_secret()
-        save_config(config)
+    save_config(config)
 
     if migrated:
         print("[DEBUG] Legacy config migrated to new rule format.")
@@ -758,16 +858,18 @@ def _try_recover_from_backup() -> Dict[str, Any] | None:
             raw = f.read()
         config = json.loads(raw)
         signature = config.pop(_SIGNATURE_KEY, "")
-        if _is_secret_installed() and signature and _verify_config(config, signature):
+        if not _is_secret_installed():
+            # 密钥缺失时备份同样无法验证（攻击者可一并伪造），拒绝恢复。
+            print("[WARN] 签名密钥缺失，无法验证备份，拒绝恢复", file=sys.stderr)
+            return None
+        if signature and _verify_config(config, signature):
             print("[INFO] 从备份成功恢复配置", file=sys.stderr)
             normalized = _normalize_config(config)
             save_config(normalized)
             return normalized
-        # 备份没有签名或签名无效 — 可能是旧版配置直接使用
-        print("[WARN] 备份文件无有效签名，但尝试使用", file=sys.stderr)
-        normalized = _normalize_config(config)
-        save_config(normalized)
-        return normalized
+        # 备份没有签名或签名无效
+        print("[WARN] 备份文件无有效签名，拒绝恢复", file=sys.stderr)
+        return None
     except Exception as e:
         print(f"[ERROR] 备份恢复失败: {e}", file=sys.stderr)
         return None
