@@ -72,8 +72,10 @@ def run(action_info, params):
     if volume != 100:
         speaker.Volume = max(0, min(100, volume))
 
-    # SpeakAsync + 轮询：避免长文本/卡死的 TTS 永久阻塞工作流。
-    speaker.SpeakAsync(text)
+    # SAPI 的 ISpeechVoice 没有 SpeakAsync 方法：异步播报用 Speak 的
+    # SVSFlagsAsync（=1）标志。轮询 RunningState，避免长文本/卡死的
+    # TTS 永久阻塞工作流。
+    speaker.Speak(text, 1)
     deadline = time.time() + _SPEAK_TIMEOUT
     while time.time() < deadline:
         try:
