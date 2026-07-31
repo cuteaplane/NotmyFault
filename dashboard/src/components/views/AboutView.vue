@@ -13,16 +13,16 @@ const modeLabel = computed(() => {
 })
 
 const features = [
-  { icon: 'extension', title: '插件化架构', desc: '触发器与动作作为插件独立加载，支持签名校验、权限声明与平台兼容性检查' },
-  { icon: 'account_tree', title: '规则引擎', desc: 'AND / OR 可嵌套条件树，多动作顺序执行，后续步骤可引用上一步结果' },
-  { icon: 'shield', title: '安全隔离', desc: 'Ed25519 插件签名、管理员权限分级、危险能力声明扫描' },
-  { icon: 'monitor_heart', title: '可观测性', desc: '结构化执行日志、动作成败统计、触发器崩溃记录与 SSE 实时事件' },
+  { icon: 'extension', title: '插件化', desc: '触发器与动作都是独立插件，自带签名校验、权限声明和平台兼容检查' },
+  { icon: 'account_tree', title: '规则', desc: '条件支持 AND / OR 嵌套，动作按顺序执行，后面的动作可以用前面步骤的结果' },
+  { icon: 'shield', title: '安全', desc: '插件需要 Ed25519 签名，管理员权限单独授权，危险能力会被扫描提示' },
+  { icon: 'monitor_heart', title: '日志与诊断', desc: '动作执行记录、触发器运行状态都能在页面上直接看到' },
 ]
 
 const ruleFlow = [
-  { icon: 'sensors', step: '触发条件', desc: '定时、热键、进程、剪贴板、文件夹、设备、电源与网络状态' },
-  { icon: 'fact_check', step: '执行前检查', desc: '可选：确认文件仍在写入、文档还在编辑时再决定是否继续' },
-  { icon: 'play_circle', step: '动作流水线', desc: '亮度 / 音量、启动或结束程序、文件操作、截图、通知、HTTP 请求' },
+  { icon: 'sensors', step: '触发', desc: '定时、热键、剪贴板、进程、文件夹、设备、电源、网络等' },
+  { icon: 'fact_check', step: '检查（可选）', desc: '比如确认文件不再写入、文档没在编辑，再决定是否继续' },
+  { icon: 'play_circle', step: '执行', desc: '音量/亮度、启动或结束程序、文件操作、截图、通知、HTTP 请求等' },
 ]
 
 const platforms = [
@@ -50,7 +50,6 @@ const runtimeInfo = computed(() => [
         <div class="about-brand">
           <span class="material-symbols-outlined about-brand-mark">manufacturing</span>
           <div>
-            <p class="about-kicker">LOCAL AUTOMATION ENGINE</p>
             <h3>NotmyFault</h3>
           </div>
         </div>
@@ -60,8 +59,8 @@ const runtimeInfo = computed(() => [
           <span>GPL-3.0</span>
         </div>
         <p>
-          本地桌面自动化工具：用「条件 → 检查 → 动作」的方式告诉电脑以后该怎么做。
-          引擎在后台独立运行，关闭管理界面不影响已经启动的自动化。
+          运行在本机的自动化工具。规则按「条件 → 检查 → 动作」组织，由引擎在后台执行；
+          关闭管理窗口不影响已经启动的自动化。
         </p>
       </header>
 
@@ -69,8 +68,7 @@ const runtimeInfo = computed(() => [
         <div class="about-main-column">
           <section class="about-section">
             <header class="about-section-head">
-              <p>能力</p>
-              <h4>核心特性</h4>
+              <h4>功能</h4>
             </header>
             <div class="about-feature-list">
               <article v-for="f in features" :key="f.title" class="about-feature">
@@ -85,10 +83,9 @@ const runtimeInfo = computed(() => [
 
           <section class="about-section">
             <header class="about-section-head">
-              <p>规则模型</p>
-              <h4>从触发到执行</h4>
+              <h4>规则</h4>
             </header>
-            <p class="about-section-lead">一条规则由三个连续阶段组成，规则页面负责编辑与校验，无需手写 JSON。</p>
+            <p class="about-section-lead">一条规则由三步组成，规则页负责编辑和校验，不用手写 JSON。</p>
             <div class="about-flow">
               <article v-for="(s, i) in ruleFlow" :key="s.step">
                 <span class="about-flow-index">{{ String(i + 1).padStart(2, '0') }}</span>
@@ -105,7 +102,6 @@ const runtimeInfo = computed(() => [
         <aside class="about-side-column">
           <section class="about-section about-runtime">
             <header class="about-section-head">
-              <p>当前环境</p>
               <h4>运行信息</h4>
             </header>
             <dl>
@@ -118,7 +114,6 @@ const runtimeInfo = computed(() => [
 
           <section class="about-section">
             <header class="about-section-head">
-              <p>兼容性</p>
               <h4>平台支持</h4>
             </header>
             <div class="about-platforms">
@@ -135,11 +130,10 @@ const runtimeInfo = computed(() => [
 
           <section class="about-section about-stack">
             <header class="about-section-head">
-              <p>构成</p>
               <h4>技术栈</h4>
             </header>
             <div>
-              <span v-for="t in ['Python 3.11+', 'Vue 3', 'Material 3', 'FastAPI', 'SSE']" :key="t">{{ t }}</span>
+              <span v-for="t in ['Python 引擎', 'Vue 3', 'FastAPI 本地服务', 'SSE 事件推送']" :key="t">{{ t }}</span>
             </div>
           </section>
         </aside>

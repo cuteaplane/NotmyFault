@@ -142,7 +142,7 @@ watch(isRunning, (running) => {
           <p v-else-if="isStopping">触发器正在安全退出，托盘与配置服务会保持在线。</p>
           <p v-else-if="isRunning">PID {{ stats.pid }} · {{ modeLabel }} · 127.0.0.1:19198</p>
           <p v-else-if="isControllerOnline">PID {{ stats.pid }} · 可继续编辑规则或重新启动自动化</p>
-          <p v-else>Dashboard 会为你启动后台服务、托盘与自动化核心</p>
+          <p v-else>Dashboard 会为你启动后台服务、托盘与自动化引擎</p>
         </div>
       </div>
       <!-- 填充按钮 + 假加载 spinner，4 态互斥 -->
@@ -175,8 +175,7 @@ watch(isRunning, (running) => {
       <section v-if="isRunning" class="dashboard-card dashboard-overview">
         <header class="dashboard-card-head">
           <div>
-            <p class="dashboard-card-eyebrow">实时概览</p>
-            <h3>自动化核心</h3>
+            <h3>运行概览</h3>
           </div>
           <span class="dashboard-live"><i></i>运行中</span>
         </header>
@@ -199,7 +198,6 @@ watch(isRunning, (running) => {
       <section class="dashboard-card dashboard-diagnostics">
         <header class="dashboard-card-head">
           <div>
-            <p class="dashboard-card-eyebrow">健康检查</p>
             <h3>引擎诊断</h3>
           </div>
         </header>
@@ -233,7 +231,6 @@ watch(isRunning, (running) => {
     <section class="dashboard-card dashboard-system">
       <header class="dashboard-card-head">
         <div>
-          <p class="dashboard-card-eyebrow">本机配置</p>
           <h3>系统信息</h3>
         </div>
       </header>
@@ -255,7 +252,7 @@ watch(isRunning, (running) => {
     <div class="empty-state" style="padding:32px 20px">
       <div class="material-symbols-outlined">power_off</div>
       <h3>后台服务未启动</h3>
-      <p>点击上方按钮，同时启动托盘、配置服务和自动化核心</p>
+      <p>点击上方按钮，同时启动托盘、配置服务和自动化引擎</p>
     </div>
     </template>
   </section>
