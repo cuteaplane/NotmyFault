@@ -140,7 +140,7 @@ export function buildFlowGraph({
 
   const preconditions = Array.isArray(rule.preconditions) ? rule.preconditions : []
   preconditions.forEach((item, index) => {
-    const id = `precondition-${index}`
+    const id = `precondition-${item.binding_id || index}`
     nodes.push({
       id,
       kind: 'precondition',
@@ -169,7 +169,7 @@ export function buildFlowGraph({
 
   const actions = Array.isArray(rule.actions) ? rule.actions : []
   actions.forEach((item, index) => {
-    const id = `action-${index}`
+    const id = `action-${item.binding_id || index}`
     nodes.push({
       id,
       kind: 'action',

@@ -63,20 +63,26 @@ onMounted(load)
     <div class="sec-banner" :class="modeInfo.c"><span class="material-symbols-outlined sec-banner-ico">shield</span>
       <div><div class="sec-banner-title">安全模式：{{ modeInfo.l }}</div><p class="sec-banner-desc">{{ modeInfo.d }}</p></div></div>
     <div class="stat-grid">
-      <div class="stat-card"><div class="material-symbols-outlined stat-ico" style="color:var(--md-error)">admin_panel_settings</div><div class="stat-val">{{ counts.admin }}</div><div class="stat-lbl">管理员权限</div></div>
-      <div class="stat-card"><div class="material-symbols-outlined stat-ico" style="color:var(--md-warn)">code</div><div class="stat-val">{{ counts.native }}</div><div class="stat-lbl">原生 API</div></div>
-      <div class="stat-card"><div class="material-symbols-outlined stat-ico" style="color:var(--md-tertiary)">terminal</div><div class="stat-val">{{ counts.external }}</div><div class="stat-lbl">外部程序</div></div>
-      <div class="stat-card"><div class="material-symbols-outlined stat-ico" style="color:var(--md-success)">verified</div><div class="stat-val">{{ counts.clean }}</div><div class="stat-lbl">无特殊权限</div></div>
+      <div class="stat-card"><div class="material-symbols-outlined stat-ico text-error">admin_panel_settings</div><div class="stat-val">{{ counts.admin }}</div><div class="stat-lbl">管理员权限</div></div>
+      <div class="stat-card"><div class="material-symbols-outlined stat-ico text-warn">code</div><div class="stat-val">{{ counts.native }}</div><div class="stat-lbl">原生 API</div></div>
+      <div class="stat-card"><div class="material-symbols-outlined stat-ico text-tertiary">terminal</div><div class="stat-val">{{ counts.external }}</div><div class="stat-lbl">外部程序</div></div>
+      <div class="stat-card"><div class="material-symbols-outlined stat-ico text-success">verified</div><div class="stat-val">{{ counts.clean }}</div><div class="stat-lbl">无特殊权限</div></div>
     </div>
     <h4 class="sec-h">权限说明</h4>
-    <div class="sec-legend">
-      <div class="sec-legend-item"><span class="chip chip-admin">管理员</span><span>导入 notmyfault.sudo 模块，可请求管理员提权执行</span></div>
-      <div class="sec-legend-item"><span class="chip chip-native">原生 API</span><span>直接调用 ctypes / win32api 等系统底层接口，可绕过内置工具</span></div>
-      <div class="sec-legend-item"><span class="chip chip-external">外部程序</span><span>通过 subprocess / os.system 执行外部命令或进程</span></div>
+    <div class="mb-5 grid grid-cols-1 gap-3 md:grid-cols-3">
+      <div v-for="leg in [
+          { chip: 'chip-admin', label: '管理员', icon: 'admin_panel_settings', desc: '导入 notmyfault.sudo 模块，可请求管理员提权执行' },
+          { chip: 'chip-native', label: '原生 API', icon: 'code', desc: '直接调用 ctypes / win32api 等系统底层接口，可绕过内置工具' },
+          { chip: 'chip-external', label: '外部程序', icon: 'terminal', desc: '通过 subprocess / os.system 执行外部命令或进程' },
+        ]" :key="leg.label"
+        class="flex items-start gap-3 rounded-md bg-surface-c-low p-4 shadow-elev1">
+        <span class="chip shrink-0" :class="leg.chip">{{ leg.label }}</span>
+        <p class="text-body-s text-on-surface-variant">{{ leg.desc }}</p>
+      </div>
     </div>
     <h4 class="sec-h">插件权限清单</h4>
     <div v-if="!all.length" class="empty-state"><div class="material-symbols-outlined">extension_off</div><h3>暂无插件</h3><p>启动引擎或安装插件后查看</p></div>
-    <div v-else class="perm-table">
+    <div v-else class="overflow-x-auto"><div class="perm-table min-w-[680px]">
       <div class="perm-row perm-row-head"><span class="perm-name">插件</span><span class="perm-type">类型</span><span class="perm-origin">来源</span><span class="perm-chips">声明权限</span></div>
       <div v-for="p in all" :key="p.pid" class="perm-row" :class="{ disabled: !p.enabled }">
         <span class="perm-name"><b>{{ p.name }}</b><small>{{ p.pid }}</small></span>
@@ -89,6 +95,6 @@ onMounted(load)
           </span>
         </span>
       </div>
-    </div>
+    </div></div>
   </section>
 </template>

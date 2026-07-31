@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
 import { store } from '../lib/store'
 import {
   getVisibleParamDefs,
@@ -15,6 +15,15 @@ import {
   buildFlowGraph,
   routeFlowEdge,
 } from '../lib/flowGraph'
+import {
+  buildBindingSources,
+  createBindingId,
+  ensureRuleBindingIds,
+  isReference,
+  outputDefs,
+  regenerateBindingIds,
+  typesCompatible,
+} from '../lib/bindings'
 import ParamInput from './ParamInput.vue'
 import ConditionEditor from './ConditionEditor.vue'
 
@@ -44,6 +53,7 @@ const isCondition = computed(() => (
   && !Array.isArray(props.rule.condition)
 ))
 normalizeRuleDraft(props.rule)
+ensureRuleBindingIds(props.rule)
 if (props.rule.condition) selectedNodeId.value = 'condition-root'
 const conditionNode = computed(() => props.rule.condition ? normalizeConditionTree(props.rule.condition) : null)
 const isAdmin = (meta) => !!(meta?.permissions || []).includes('admin')
@@ -52,6 +62,7 @@ const actionParams = (action) => getVisibleParamDefs(store.schema.actions[action
 const eventName = (event) => store.schema.triggers[event?.type]?.name || event?.type || '未选择触发器'
 const actionName = (action) => store.schema.actions[action?.type]?.name || action?.type || '未选择动作'
 function formatParamValue(value, def) {
+  if (isReference(value)) return '运行数据'
   if (def?.type === 'password' || def?.type === 'secret') return value ? '已设置' : ''
   if (def?.type === 'select') {
     const option = (def.options || []).find(item => String(optValue(item)) === String(value))
@@ -92,10 +103,6 @@ const graphEdges = computed(() => {
   const nodesById = new Map(layoutNodes.value.map(node => [node.id, node]))
   return graph.value.edges.map(edge => routeFlowEdge(edge, nodesById)).filter(Boolean)
 })
-const canvasSize = computed(() => ({
-  width: Math.max(920, ...layoutNodes.value.map(node => node.x + FLOW_NODE_WIDTH + 90)),
-  height: Math.max(560, ...layoutNodes.value.map(node => node.y + 220)),
-}))
 const selectedGraphNode = computed(() => layoutNodes.value.find(node => node.id === selectedNodeId.value) || null)
 const selectedKind = computed(() => {
   if (selectedNodeId.value === 'add-precondition') return 'add-precondition'
@@ -156,6 +163,16 @@ const validationIssues = computed(() => {
       || store.schema.actions[action?.type]?.platform_compatible === false
     ) issues.push(`动作 ${index + 1} 引用了当前系统不可用的插件`)
     if (action?.params != null && (typeof action.params !== 'object' || Array.isArray(action.params))) issues.push(`动作 ${index + 1} 参数格式无效`)
+    const sources = actionBindingSources(index)
+    for (const def of actionParams(action)) {
+      const value = action?.params?.[def.name]
+      if (!isReference(value)) continue
+      const source = sources.find(item => JSON.stringify(item.value) === JSON.stringify(value))
+      if (!source) issues.push(`动作 ${index + 1} 的“${def.label || def.name}”引用了不可用数据`)
+      else if (!typesCompatible(source.type, def.type)) {
+        issues.push(`动作 ${index + 1} 的“${def.label || def.name}”数据类型不兼容`)
+      }
+    }
   })
   const preconditions = props.rule.preconditions == null
     ? []
@@ -170,7 +187,11 @@ const validationIssues = computed(() => {
 
 function setSingleTrigger(type) {
   if (!type) return
-  props.rule.event = { type, params: buildDefaultParams(store.schema.triggers[type]) }
+  props.rule.event = {
+    binding_id: createBindingId('trigger'),
+    type,
+    params: buildDefaultParams(store.schema.triggers[type]),
+  }
   delete props.rule.condition
   newTriggerType.value = ''
   selectedNodeId.value = 'trigger'
@@ -178,9 +199,14 @@ function setSingleTrigger(type) {
 function changeSingleTrigger(type) { setSingleTrigger(type) }
 function upgradeToConditions() {
   const initial = props.rule.event
+  // 保留原 binding_id：动作参数里的 $ref.scope === 'trigger' 仍指向这个节点
   props.rule.condition = {
     op: 'any',
-    children: initial ? [{ type: initial.type, params: { ...initial.params } }] : [],
+    children: initial ? [{
+      binding_id: initial.binding_id || createBindingId('trigger'),
+      type: initial.type,
+      params: { ...initial.params },
+    }] : [],
   }
   delete props.rule.event
   selectedNodeId.value = 'condition-root'
@@ -196,7 +222,14 @@ function useSingleEvent() {
     return null
   }
   const first = firstEvent(conditionNode.value)
-  if (first) props.rule.event = { type: first.type, params: { ...first.params } }
+  // 保留选中叶节点的 binding_id，下游 $ref 引用不随结构切换失效
+  if (first) {
+    props.rule.event = {
+      binding_id: first.binding_id || createBindingId('trigger'),
+      type: first.type,
+      params: { ...first.params },
+    }
+  }
   else delete props.rule.event
   delete props.rule.condition
   selectedNodeId.value = 'trigger'
@@ -221,7 +254,11 @@ function addConditionChild(kind) {
   if (!node || selectedKind.value !== 'condition' || !triggerKeys.value.length) return
   if (!Array.isArray(node.children)) node.children = []
   const type = triggerKeys.value[0]
-  const event = { type, params: buildDefaultParams(store.schema.triggers[type]) }
+  const event = {
+    binding_id: createBindingId('trigger'),
+    type,
+    params: buildDefaultParams(store.schema.triggers[type]),
+  }
   node.children.push(kind === 'group' ? { op: 'any', children: [event] } : event)
   const path = [...selectedConditionPath.value, node.children.length - 1]
   selectedNodeId.value = conditionId(path)
@@ -253,6 +290,7 @@ function duplicateSelectedCondition() {
   if (!parent || !path.length) return
   const index = path[path.length - 1]
   const copy = JSON.parse(JSON.stringify(parent.children[index]))
+  regenerateBindingIds(copy, 'trigger')
   parent.children.splice(index + 1, 0, copy)
   selectedNodeId.value = conditionId([...path.slice(0, -1), index + 1])
   nodePositions.value = {}
@@ -261,8 +299,12 @@ function addAction() {
   const type = newActionType.value || actionKeys.value[0]
   if (!type) return
   if (!Array.isArray(props.rule.actions)) props.rule.actions = []
-  props.rule.actions.push({ type, params: buildDefaultParams(store.schema.actions[type]) })
-  selectedNodeId.value = `action-${props.rule.actions.length - 1}`
+  props.rule.actions.push({
+    binding_id: createBindingId('action'),
+    type,
+    params: buildDefaultParams(store.schema.actions[type]),
+  })
+  selectedNodeId.value = `action-${props.rule.actions.at(-1).binding_id}`
   nodePositions.value = {}
   newActionType.value = ''
 }
@@ -273,15 +315,17 @@ function changeAction(action, type) {
 function removeAction(index) {
   props.rule.actions.splice(index, 1)
   selectedNodeId.value = props.rule.actions.length
-    ? `action-${Math.min(index, props.rule.actions.length - 1)}`
+    ? `action-${props.rule.actions[Math.min(index, props.rule.actions.length - 1)].binding_id}`
     : 'add-action'
   nodePositions.value = {}
 }
 function duplicateAction(index) {
   const source = props.rule.actions?.[index]
   if (!source) return
-  props.rule.actions.splice(index + 1, 0, JSON.parse(JSON.stringify(source)))
-  selectedNodeId.value = `action-${index + 1}`
+  const copy = JSON.parse(JSON.stringify(source))
+  regenerateBindingIds(copy, 'action')
+  props.rule.actions.splice(index + 1, 0, copy)
+  selectedNodeId.value = `action-${copy.binding_id}`
   nodePositions.value = {}
 }
 function moveAction(index, offset) {
@@ -289,15 +333,19 @@ function moveAction(index, offset) {
   if (target < 0 || target >= props.rule.actions.length) return
   const [action] = props.rule.actions.splice(index, 1)
   props.rule.actions.splice(target, 0, action)
-  selectedNodeId.value = `action-${target}`
+  selectedNodeId.value = `action-${action.binding_id}`
   nodePositions.value = {}
 }
 function addPrecondition() {
   const type = newPreconditionType.value || preconditionKeys.value[0]
   if (!type) return
   if (!Array.isArray(props.rule.preconditions)) props.rule.preconditions = []
-  props.rule.preconditions.push({ type, params: buildDefaultParams(store.schema.actions[type]) })
-  selectedNodeId.value = `precondition-${props.rule.preconditions.length - 1}`
+  props.rule.preconditions.push({
+    binding_id: createBindingId('precondition'),
+    type,
+    params: buildDefaultParams(store.schema.actions[type]),
+  })
+  selectedNodeId.value = `precondition-${props.rule.preconditions.at(-1).binding_id}`
   nodePositions.value = {}
   newPreconditionType.value = ''
 }
@@ -306,22 +354,248 @@ function changePrecondition(item, type) {
   item.params = buildDefaultParams(store.schema.actions[type])
 }
 function actionOutputHint(action, index) {
-  const outputs = store.schema.actions[action.type]?.outputs || []
-  const step = `${action.type}_${index + 1}`
-  return outputs.map(key => `{{ steps.${step}.result.${key} }}`).join('　')
+  const outputs = outputDefs(store.schema.actions[action.type])
+  return outputs.map(output => `${action.binding_id} · ${output.label || output.name}`).join('　')
+}
+function actionBindingSources(index) {
+  return buildBindingSources(props.rule, index, store.schema)
+}
+function preconditionBindingSources() {
+  return buildBindingSources(props.rule, 0, store.schema, { allowSteps: false })
 }
 function removePrecondition(index) {
   props.rule.preconditions.splice(index, 1)
   selectedNodeId.value = props.rule.preconditions.length
-    ? `precondition-${Math.min(index, props.rule.preconditions.length - 1)}`
+    ? `precondition-${props.rule.preconditions[Math.min(index, props.rule.preconditions.length - 1)].binding_id}`
     : 'trigger'
   nodePositions.value = {}
 }
 function selectNode(id) {
   selectedNodeId.value = id
 }
+
+// ================================================================
+// 画布相机：pan / zoom / fit / 小地图。
+// 视口内是一个 0×0 的 transform 容器，节点始终使用逻辑坐标定位，
+// 相机只改 translate + scale；连线 SVG 与节点同层，天然随动。
+// ================================================================
+const viewportRef = ref(null)
+const viewportSize = ref({ w: 0, h: 0 })
+const zoom = ref(1)
+const pan = ref({ x: 0, y: 0 })
+const isPanning = ref(false)
+const camAnim = ref(false)
+const hoverNodeId = ref(null)
+const ZOOM_MIN = 0.25
+const ZOOM_MAX = 2
+let panState = null
+let minimapDragging = false
+let resizeObserver = null
+let fittedOnce = false
+let camAnimTimer = null
+let formConditionLayoutKey = null
+
+function clampZoom(value) { return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, value)) }
+function animateCamera() {
+  camAnim.value = true
+  if (camAnimTimer) clearTimeout(camAnimTimer)
+  camAnimTimer = setTimeout(() => { camAnim.value = false }, 300)
+}
+
+// 以视口内 (cx, cy) 为锚点缩放：锚点下的内容保持不动
+function zoomAt(nextZoom, cx, cy) {
+  const z = clampZoom(nextZoom)
+  const scale = z / zoom.value
+  pan.value = {
+    x: cx - (cx - pan.value.x) * scale,
+    y: cy - (cy - pan.value.y) * scale,
+  }
+  zoom.value = z
+}
+function onCanvasWheel(event) {
+  if (!viewportRef.value) return
+  event.preventDefault()
+  const rect = viewportRef.value.getBoundingClientRect()
+  const factor = event.deltaY < 0 ? 1.12 : 1 / 1.12
+  zoomAt(zoom.value * factor, event.clientX - rect.left, event.clientY - rect.top)
+}
+function zoomStep(factor) {
+  animateCamera()
+  zoomAt(zoom.value * factor, viewportSize.value.w / 2, viewportSize.value.h / 2)
+}
+function resetZoom() {
+  animateCamera()
+  zoomAt(1, viewportSize.value.w / 2, viewportSize.value.h / 2)
+}
+
+// 空白处拖拽平移（节点与按钮上不触发）
+function startPan(event) {
+  if (event.button !== 0) return
+  if (event.target.closest('.graph-node') || event.target.closest('button')) return
+  panState = { startX: event.clientX, startY: event.clientY, x: pan.value.x, y: pan.value.y }
+  isPanning.value = true
+  event.currentTarget.setPointerCapture?.(event.pointerId)
+}
+function movePan(event) {
+  if (!panState) return
+  pan.value = {
+    x: panState.x + event.clientX - panState.startX,
+    y: panState.y + event.clientY - panState.startY,
+  }
+}
+function endPan() {
+  panState = null
+  isPanning.value = false
+}
+
+// 内容包围盒（节点 228×~120）
+const contentBounds = computed(() => {
+  const nodes = layoutNodes.value
+  if (!nodes.length) return { minX: 0, minY: 0, w: 900, h: 560 }
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+  for (const node of nodes) {
+    minX = Math.min(minX, node.x)
+    minY = Math.min(minY, node.y)
+    maxX = Math.max(maxX, node.x + FLOW_NODE_WIDTH)
+    maxY = Math.max(maxY, node.y + 120)
+  }
+  return { minX, minY, maxX, maxY, w: maxX - minX, h: maxY - minY }
+})
+
+function fitView() {
+  const { w, h } = viewportSize.value
+  if (!w || !h) return
+  const bounds = contentBounds.value
+  const padding = 72
+  const z = clampZoom(Math.min((w - padding * 2) / bounds.w, (h - padding * 2) / bounds.h, 1.2))
+  animateCamera()
+  zoom.value = z
+  pan.value = {
+    x: (w - bounds.w * z) / 2 - bounds.minX * z,
+    y: (h - bounds.h * z) / 2 - bounds.minY * z,
+  }
+}
+
+// 把节点平移到视口中心（已经在可视范围内则不动）
+function centerOnNode(node) {
+  const { w, h } = viewportSize.value
+  if (!w || !h || !node) return
+  const cx = node.x + FLOW_NODE_WIDTH / 2
+  const cy = node.y + 60
+  const viewX = -pan.value.x / zoom.value
+  const viewY = -pan.value.y / zoom.value
+  const margin = 90
+  if (
+    cx > viewX + margin && cx < viewX + w / zoom.value - margin
+    && cy > viewY + margin && cy < viewY + h / zoom.value - margin
+  ) return
+  animateCamera()
+  pan.value = { x: w / 2 - cx * zoom.value, y: h / 2 - cy * zoom.value }
+}
+// 程序化选中（工具栏、添加节点）时把目标带入视野；用户手动点击的节点本就可见
+watch(selectedGraphNode, (node, previous) => {
+  if (node && node.id !== previous?.id && editorMode.value === 'canvas') centerOnNode(node)
+})
+
+// 小地图：内容坐标系视图 + 当前视口框，点击/拖动跳转
+const minimapFrame = computed(() => {
+  const bounds = contentBounds.value
+  const padding = 90
+  return {
+    x: (bounds.minX ?? 0) - padding,
+    y: (bounds.minY ?? 0) - padding,
+    w: bounds.w + padding * 2,
+    h: bounds.h + padding * 2,
+  }
+})
+const minimapViewport = computed(() => ({
+  x: -pan.value.x / zoom.value,
+  y: -pan.value.y / zoom.value,
+  w: viewportSize.value.w / zoom.value,
+  h: viewportSize.value.h / zoom.value,
+}))
+function jumpMinimap(event) {
+  const rect = event.currentTarget.getBoundingClientRect()
+  if (!rect.width || !rect.height) return
+  const frame = minimapFrame.value
+  // preserveAspectRatio="meet" 会给比例不一致的小地图留白；点击坐标必须
+  // 先映射到实际绘制区域，不能直接按整个容器换算。
+  const scale = Math.min(rect.width / frame.w, rect.height / frame.h)
+  const drawnWidth = frame.w * scale
+  const drawnHeight = frame.h * scale
+  const offsetX = (rect.width - drawnWidth) / 2
+  const offsetY = (rect.height - drawnHeight) / 2
+  const relativeX = Math.min(1, Math.max(0, (event.clientX - rect.left - offsetX) / drawnWidth))
+  const relativeY = Math.min(1, Math.max(0, (event.clientY - rect.top - offsetY) / drawnHeight))
+  const contentX = frame.x + relativeX * frame.w
+  const contentY = frame.y + relativeY * frame.h
+  pan.value = {
+    x: viewportSize.value.w / 2 - contentX * zoom.value,
+    y: viewportSize.value.h / 2 - contentY * zoom.value,
+  }
+}
+function startMinimapDrag(event) {
+  minimapDragging = true
+  jumpMinimap(event)
+  event.currentTarget.setPointerCapture?.(event.pointerId)
+}
+function moveMinimapDrag(event) { if (minimapDragging) jumpMinimap(event) }
+function endMinimapDrag() { minimapDragging = false }
+
+// 点阵背景随相机移动与缩放（画在视口上，逻辑上无限延伸）
+const gridStyle = computed(() => ({
+  backgroundImage: 'radial-gradient(circle, var(--md-outline-variant) 1px, transparent 1.2px)',
+  backgroundSize: `${20 * zoom.value}px ${20 * zoom.value}px`,
+  backgroundPosition: `${pan.value.x}px ${pan.value.y}px`,
+}))
+const cameraStyle = computed(() => ({
+  transform: `translate(${pan.value.x}px, ${pan.value.y}px) scale(${zoom.value})`,
+}))
+
+// Hover 节点时沿有向连线收集全部上游和下游节点，追踪完整执行链路。
+const highlightedIds = computed(() => {
+  const nodeId = hoverNodeId.value
+  if (!layoutNodes.value.some(node => node.id === nodeId)) return null
+  const ids = new Set([nodeId])
+  const follow = (currentId, direction) => {
+    for (const edge of graph.value.edges) {
+      const nextId = direction === 'upstream'
+        ? (edge.to === currentId ? edge.from : null)
+        : (edge.from === currentId ? edge.to : null)
+      if (nextId && !ids.has(nextId)) {
+        ids.add(nextId)
+        follow(nextId, direction)
+      }
+    }
+  }
+  follow(nodeId, 'upstream')
+  follow(nodeId, 'downstream')
+  return ids
+})
+function nodeDimmed(id) { return highlightedIds.value ? !highlightedIds.value.has(id) : false }
+function edgeDimmed(edge) { return highlightedIds.value ? !highlightedIds.value.has(edge.from) || !highlightedIds.value.has(edge.to) : false }
+
+function conditionStructureKey(node) {
+  if (!node || typeof node !== 'object') return ''
+  if (node.type && !node.children && !node.events) return `leaf:${node.binding_id || node.type}`
+  const children = node.children || node.events || []
+  return `group:${node.op || node.type || 'any'}(${children.map(conditionStructureKey).join(',')})`
+}
+
+watch(editorMode, (mode, previousMode) => {
+  if (mode === 'form') {
+    formConditionLayoutKey = conditionStructureKey(conditionNode.value)
+    return
+  }
+  if (mode === 'canvas' && previousMode === 'form') {
+    if (formConditionLayoutKey !== conditionStructureKey(conditionNode.value)) nodePositions.value = {}
+    formConditionLayoutKey = null
+  }
+})
+
 function resetLayout() {
   nodePositions.value = {}
+  fitView()
 }
 function startNodeDrag(event, node) {
   if (event.button !== 0) return
@@ -338,17 +612,37 @@ function startNodeDrag(event, node) {
 }
 function dragNode(event) {
   if (!dragState) return
+  // 屏幕像素换算回逻辑坐标：除以当前缩放
   nodePositions.value = {
     ...nodePositions.value,
     [dragState.id]: {
-      x: Math.max(24, dragState.x + event.clientX - dragState.startX),
-      y: Math.max(72, dragState.y + event.clientY - dragState.startY),
+      x: Math.max(24, dragState.x + (event.clientX - dragState.startX) / zoom.value),
+      y: Math.max(24, dragState.y + (event.clientY - dragState.startY) / zoom.value),
     },
   }
 }
 function endNodeDrag() {
   dragState = null
 }
+
+onMounted(() => {
+  if (typeof ResizeObserver !== 'undefined' && viewportRef.value) {
+    resizeObserver = new ResizeObserver(entries => {
+      const rect = entries[0].contentRect
+      viewportSize.value = { w: rect.width, h: rect.height }
+      // 首次拿到真实尺寸时自动适应全部节点（编辑器打开 / 切到画布标签）
+      if (!fittedOnce && rect.width) {
+        fittedOnce = true
+        fitView()
+      }
+    })
+    resizeObserver.observe(viewportRef.value)
+  }
+})
+onUnmounted(() => {
+  resizeObserver?.disconnect()
+  if (camAnimTimer) clearTimeout(camAnimTimer)
+})
 </script>
 
 <template>
@@ -392,17 +686,27 @@ function endNodeDrag() {
             <button v-if="preconditionKeys.length" class="btn btn-text btn-sm" @click="selectNode('add-precondition')"><span class="material-symbols-outlined">verified_user</span>添加确认</button>
             <button class="btn btn-text btn-sm" @click="selectNode('add-action')"><span class="material-symbols-outlined">add</span>添加动作</button>
           </div>
-          <div class="node-canvas-status">
-            <span>{{ layoutNodes.length }} 个节点 · {{ graphEdges.length }} 条连接</span>
-            <button class="icon-btn" title="恢复自动布局" @click="resetLayout"><span class="material-symbols-outlined">auto_fix_high</span></button>
+          <div class="node-canvas-toolbar-side">
+            <div class="node-canvas-zoom">
+              <button class="icon-btn" title="缩小" @click="zoomStep(1 / 1.25)"><span class="material-symbols-outlined">remove</span></button>
+              <button class="zoom-label" title="重置为 100%" @click="resetZoom">{{ Math.round(zoom * 100) }}%</button>
+              <button class="icon-btn" title="放大" @click="zoomStep(1.25)"><span class="material-symbols-outlined">add</span></button>
+              <button class="icon-btn" title="适应全部节点" @click="fitView"><span class="material-symbols-outlined">fit_screen</span></button>
+            </div>
+            <div class="node-canvas-status">
+              <span>{{ layoutNodes.length }} 个节点 · {{ graphEdges.length }} 条连接</span>
+              <button class="icon-btn" title="恢复自动布局" @click="resetLayout"><span class="material-symbols-outlined">auto_fix_high</span></button>
+            </div>
           </div>
         </div>
-        <div class="node-canvas-viewport">
-          <div class="node-canvas" :style="{ width: `${canvasSize.width}px`, height: `${canvasSize.height}px` }">
+        <div ref="viewportRef" class="node-canvas-viewport" :class="{ panning: isPanning }" :style="gridStyle"
+          @pointerdown="startPan" @pointermove="movePan" @pointerup="endPan" @pointercancel="endPan"
+          @wheel="onCanvasWheel">
+          <div class="node-canvas" :class="{ 'cam-anim': camAnim }" :style="cameraStyle">
             <!--
-              路径坐标和节点位置都以画布 CSS 像素为单位。不要在这里设置
-              viewBox：画布可能被 min-width/min-height 撑大，固定 viewBox
-              会让 SVG 单独缩放并居中，导致连线与节点端口错位。
+              画布是 0×0 的 transform 容器，路径坐标和节点位置都使用逻辑像素，
+              与节点保持同一坐标系。不要在这里设置 viewBox：SVG 靠
+              overflow:visible 画出容器外内容，viewBox 会让连线与节点端口错位。
             -->
             <svg class="node-links" aria-hidden="true">
               <defs>
@@ -410,16 +714,17 @@ function endNodeDrag() {
                   <path d="M 0 0 L 8 4 L 0 8 z" />
                 </marker>
               </defs>
-              <g v-for="edge in graphEdges" :key="edge.id" class="node-edge">
+              <g v-for="edge in graphEdges" :key="edge.id" class="node-edge" :class="{ dimmed: edgeDimmed(edge) }">
                 <path class="node-link" :class="[`node-link-${edge.kind}`, { reversed: edge.reversed }]" :d="edge.d" />
                 <text v-if="edge.label" class="node-link-label" :x="edge.labelX" :y="edge.labelY" text-anchor="middle">{{ edge.label }}</text>
               </g>
             </svg>
 
             <article v-for="node in layoutNodes" :key="node.id"
-              class="graph-node" :class="[`graph-node-${node.kind}`, { selected: selectedNodeId === node.id }]"
+              class="graph-node" :class="[`graph-node-${node.kind}`, { selected: selectedNodeId === node.id, dimmed: nodeDimmed(node.id) }]"
               :style="{ left: `${node.x}px`, top: `${node.y}px` }"
-              role="button" tabindex="0" @click="selectNode(node.id)" @keydown.enter="selectNode(node.id)">
+              role="button" tabindex="0" @click="selectNode(node.id)" @keydown.enter="selectNode(node.id)"
+              @pointerenter="hoverNodeId = node.id" @pointerleave="hoverNodeId = null">
               <span v-if="node.hasInput" class="node-port node-port-in"></span>
               <header class="graph-node-head" @pointerdown.stop="startNodeDrag($event, node)"
                 @pointermove.stop="dragNode" @pointerup.stop="endNodeDrag" @pointercancel.stop="endNodeDrag">
@@ -444,8 +749,20 @@ function endNodeDrag() {
               <span v-if="node.hasOutput" class="node-port node-port-out"></span>
             </article>
           </div>
+
+          <!-- 小地图：整图缩略 + 视口框，点击/拖动跳转 -->
+          <div v-if="layoutNodes.length" class="node-minimap" title="小地图：点击或拖动跳转"
+            @pointerdown.stop="startMinimapDrag" @pointermove="moveMinimapDrag"
+            @pointerup="endMinimapDrag" @pointercancel="endMinimapDrag">
+            <svg :viewBox="`${minimapFrame.x} ${minimapFrame.y} ${minimapFrame.w} ${minimapFrame.h}`" preserveAspectRatio="xMidYMid meet">
+              <rect v-for="node in layoutNodes" :key="node.id" class="mm-node" :class="`mm-${node.kind}`"
+                :x="node.x" :y="node.y" :width="FLOW_NODE_WIDTH" height="116" rx="24" />
+              <rect class="mm-view" :x="minimapViewport.x" :y="minimapViewport.y"
+                :width="minimapViewport.w" :height="minimapViewport.h" rx="60" />
+            </svg>
+          </div>
         </div>
-        <div class="canvas-help"><span class="material-symbols-outlined">pan_tool</span>拖动整理 · 点击节点直接编辑 · 分支汇入 AND / OR 后再执行</div>
+        <div class="canvas-help"><span class="material-symbols-outlined">pan_tool</span>拖空白处平移 · 滚轮缩放 · 悬停节点可追踪上下游链路</div>
       </section>
 
       <aside class="node-inspector">
@@ -537,7 +854,7 @@ function endNodeDrag() {
                 <option v-for="key in preconditionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option>
               </select>
             </label>
-            <div class="param-grid"><ParamInput v-for="param in actionParams(selectedPrecondition)" :key="param.name" :def="param" v-model="selectedPrecondition.params[param.name]" /></div>
+            <div class="param-grid"><ParamInput v-for="param in actionParams(selectedPrecondition)" :key="param.name" :def="param" v-model="selectedPrecondition.params[param.name]" allow-binding :binding-sources="preconditionBindingSources()" /></div>
             <button class="btn btn-text btn-sm danger-text inspector-switch" @click="removePrecondition(selectedIndex)"><span class="material-symbols-outlined">delete</span>删除确认</button>
           </template>
 
@@ -547,7 +864,7 @@ function endNodeDrag() {
                 <option v-for="key in actionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option>
               </select>
             </label>
-            <div class="param-grid"><ParamInput v-for="param in actionParams(selectedAction)" :key="param.name" :def="param" v-model="selectedAction.params[param.name]" /></div>
+            <div class="param-grid"><ParamInput v-for="param in actionParams(selectedAction)" :key="param.name" :def="param" v-model="selectedAction.params[param.name]" allow-binding :binding-sources="actionBindingSources(selectedIndex)" /></div>
             <div v-if="actionOutputHint(selectedAction, selectedIndex)" class="workflow-output-hint">后续步骤可引用：<code>{{ actionOutputHint(selectedAction, selectedIndex) }}</code></div>
             <div class="inspector-action-row">
               <button class="btn btn-text btn-sm" :disabled="selectedIndex === 0" @click="moveAction(selectedIndex, -1)"><span class="material-symbols-outlined">arrow_back</span>提前</button>
@@ -627,7 +944,7 @@ function endNodeDrag() {
             <summary><span class="material-symbols-outlined flow-kind-icon">verified</span><span class="flow-card-copy"><b>{{ actionName(item) }}</b><small>开始前确认</small></span><button class="icon-btn icon-btn-danger" title="移除确认" @click.prevent.stop="removePrecondition(index)"><span class="material-symbols-outlined">delete</span></button><span class="material-symbols-outlined flow-expand">expand_more</span></summary>
             <div class="flow-card-body">
               <label class="field field-wide"><span class="field-label">确认方式</span><select class="select" :value="item.type" @change="changePrecondition(item, $event.target.value)"><option v-for="key in preconditionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option></select></label>
-              <div class="param-grid"><ParamInput v-for="param in actionParams(item)" :key="param.name" :def="param" v-model="item.params[param.name]" /></div>
+              <div class="param-grid"><ParamInput v-for="param in actionParams(item)" :key="param.name" :def="param" v-model="item.params[param.name]" allow-binding :binding-sources="preconditionBindingSources()" /></div>
             </div>
           </details>
           <div class="flow-add-control"><select v-model="newPreconditionType" class="select"><option value="" disabled>选择确认方式…</option><option v-for="key in preconditionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option></select><button class="btn btn-tonal" @click="addPrecondition"><span class="material-symbols-outlined">add</span>添加确认</button></div>
@@ -647,7 +964,7 @@ function endNodeDrag() {
             </summary>
             <div class="flow-card-body">
               <label class="field field-wide"><span class="field-label">动作类型</span><select class="select" :value="action.type" @change="changeAction(action, $event.target.value)"><option v-for="key in actionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option></select></label>
-              <div class="param-grid"><ParamInput v-for="param in actionParams(action)" :key="param.name" :def="param" v-model="action.params[param.name]" /></div>
+              <div class="param-grid"><ParamInput v-for="param in actionParams(action)" :key="param.name" :def="param" v-model="action.params[param.name]" allow-binding :binding-sources="actionBindingSources(index)" /></div>
               <div v-if="actionOutputHint(action, index)" class="workflow-output-hint">后续步骤可引用：<code>{{ actionOutputHint(action, index) }}</code></div>
             </div>
           </details>

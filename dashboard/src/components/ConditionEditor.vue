@@ -2,6 +2,7 @@
 import { computed } from 'vue'
 import { store } from '../lib/store'
 import { buildDefaultParams, getVisibleParamDefs, groupTriggerKeys } from '../lib/utils'
+import { createBindingId } from '../lib/bindings'
 import ParamInput from './ParamInput.vue'
 
 defineOptions({ name: 'ConditionEditor' })
@@ -23,10 +24,17 @@ const eventParams = (event) => getVisibleParamDefs(store.schema.triggers[event.t
 
 function defaultEvent() {
   const type = triggerKeys.value[0] || ''
-  return { type, params: buildDefaultParams(store.schema.triggers[type]) }
+  // 新条件必须带 binding_id，否则无法作为运行数据来源出现在绑定选择器中
+  return { binding_id: createBindingId('trigger'), type, params: buildDefaultParams(store.schema.triggers[type]) }
 }
 function changeEvent(index, type) {
-  props.node.children[index] = { type, params: buildDefaultParams(store.schema.triggers[type]) }
+  const previous = props.node.children[index]
+  // 更换触发器类型时保留 binding_id，避免下游 $ref 引用失效
+  props.node.children[index] = {
+    binding_id: previous?.binding_id || createBindingId('trigger'),
+    type,
+    params: buildDefaultParams(store.schema.triggers[type]),
+  }
 }
 function changeOp() {
   if (props.node.op !== 'all') delete props.node.within_seconds

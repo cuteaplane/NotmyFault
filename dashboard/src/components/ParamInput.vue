@@ -2,8 +2,15 @@
 import { computed, ref } from 'vue'
 import { optValue, optLabel } from '../lib/utils'
 import { hasBridge } from '../lib/api'
+import { isReference, referenceLabel, typesCompatible } from '../lib/bindings'
+import BindingPicker from './BindingPicker.vue'
 
-const props = defineProps({ def: Object, modelValue: [String, Number, Boolean] })
+const props = defineProps({
+  def: Object,
+  modelValue: [String, Number, Boolean, Object, Array],
+  bindingSources: { type: Array, default: () => [] },
+  allowBinding: { type: Boolean, default: false },
+})
 const emit = defineEmits(['update:modelValue'])
 const value = computed({
   get: () => props.modelValue != null ? props.modelValue : (props.def.default ?? ''),
@@ -11,6 +18,21 @@ const value = computed({
 })
 const type = computed(() => props.def.type || 'string')
 const recording = ref(false)
+const bindingOpen = ref(false)
+const bound = computed(() => isReference(props.modelValue))
+const boundLabel = computed(() => referenceLabel(props.modelValue, props.bindingSources))
+const compatibleSources = computed(() => props.bindingSources.filter(
+  source => typesCompatible(source.type, type.value),
+))
+
+function useBinding(binding) {
+  emit('update:modelValue', binding)
+  bindingOpen.value = false
+}
+
+function useFixedValue() {
+  emit('update:modelValue', props.def.default ?? (type.value === 'bool' ? false : ''))
+}
 
 function captureHotkey(event) {
   const ignored = ['Control', 'Shift', 'Alt', 'Meta']
@@ -36,13 +58,27 @@ async function pickFolder() {
 </script>
 
 <template>
-  <label class="field">
-    <span class="field-label">{{ def.label || def.name }}</span>
-    <select v-if="type === 'select'" v-model="value" class="select">
+  <div class="field">
+    <span class="field-label">
+      {{ def.label || def.name }}
+      <button v-if="allowBinding && !bound" type="button" class="field-binding-button"
+        :disabled="!compatibleSources.length" @click="bindingOpen = !bindingOpen">
+        <span class="material-symbols-outlined">data_object</span>使用运行数据
+      </button>
+    </span>
+    <div v-if="bound" class="binding-value">
+      <span class="material-symbols-outlined">link</span>
+      <span>{{ boundLabel }}</span>
+      <button type="button" class="btn btn-text btn-sm" @click="bindingOpen = !bindingOpen">更换</button>
+      <button type="button" class="btn btn-text btn-sm" @click="useFixedValue">改为固定值</button>
+    </div>
+    <BindingPicker v-if="bindingOpen" :sources="bindingSources" :target-type="type"
+      @select="useBinding" @cancel="bindingOpen = false" />
+    <select v-else-if="!bound && type === 'select'" v-model="value" class="select">
       <option v-for="o in (def.options || [])" :key="optValue(o)" :value="optValue(o)">{{ optLabel(o) }}</option>
     </select>
-    <input v-else-if="type === 'time'" v-model="value" type="time" class="text-field">
-    <div v-else-if="type === 'hotkey'" class="hotkey-input">
+    <input v-else-if="!bound && type === 'time'" v-model="value" type="time" class="text-field">
+    <div v-else-if="!bound && type === 'hotkey'" class="hotkey-input">
       <input :value="value" class="text-field" readonly
         :placeholder="recording ? '请按下组合键…' : (def.placeholder || '点击后按下组合键')"
         @focus="recording = true" @keydown.prevent.stop="captureHotkey">
@@ -50,15 +86,15 @@ async function pickFolder() {
         <span class="material-symbols-outlined">keyboard</span>{{ recording ? '正在录制' : '录制' }}
       </button>
     </div>
-    <div v-else-if="type === 'path'" class="path-input">
+    <div v-else-if="!bound && type === 'path'" class="path-input">
       <input v-model="value" type="text" class="text-field" :placeholder="def.placeholder || '选择或输入文件夹路径'">
       <button v-if="hasBridge()" type="button" class="btn btn-tonal btn-sm" @click="pickFolder">
         <span class="material-symbols-outlined">folder_open</span>选择
       </button>
     </div>
-    <textarea v-else-if="type === 'textarea'" v-model="value" class="text-field textarea-field" :placeholder="def.placeholder" :rows="def.rows || 5" />
-    <input v-else-if="type === 'number'" v-model.number="value" type="number" class="text-field" :placeholder="def.placeholder" :min="def.min" :max="def.max" :step="def.step">
-    <input v-else-if="type === 'bool'" type="checkbox" v-model="value">
-    <input v-else v-model="value" type="text" class="text-field" :placeholder="def.placeholder">
-  </label>
+    <textarea v-else-if="!bound && type === 'textarea'" v-model="value" class="text-field textarea-field" :placeholder="def.placeholder" :rows="def.rows || 5" />
+    <input v-else-if="!bound && type === 'number'" v-model.number="value" type="number" class="text-field" :placeholder="def.placeholder" :min="def.min" :max="def.max" :step="def.step">
+    <input v-else-if="!bound && type === 'bool'" type="checkbox" v-model="value">
+    <input v-else-if="!bound" v-model="value" type="text" class="text-field" :placeholder="def.placeholder">
+  </div>
 </template>

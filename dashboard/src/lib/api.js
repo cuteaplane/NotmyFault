@@ -66,11 +66,15 @@ export async function saveConfig(rules) {
   return await window.pywebview.api.save_config(rules)
 }
 
-export async function runRule(ruleIndex, rule = null) {
+export async function runRule(ruleIndex, rule = null, testContext = null) {
+  const body = {
+    ...(rule ? { rule } : {}),
+    ...(testContext || {}),
+  }
   const res = await apiWrite(
     `/api/rules/${ruleIndex}/run`,
     'POST',
-    rule ? { rule } : null,
+    Object.keys(body).length ? body : null,
   )
   return await res.json()
 }

@@ -7,6 +7,10 @@ import PluginCard from '../PluginCard.vue'
 
 const tab = ref('triggers')
 const list = computed(() => store.pluginsData[tab.value] || {})
+const tabCounts = computed(() => ({
+  triggers: Object.keys(store.pluginsData.triggers || {}).length,
+  actions: Object.keys(store.pluginsData.actions || {}).length,
+}))
 const showInstall = ref(false)
 const showKey = ref(false)
 const keyPw = ref('')
@@ -148,8 +152,12 @@ onMounted(refresh)
       <button class="btn btn-filled" @click="openInstall"><span class="material-symbols-outlined">install_desktop</span>安装插件</button>
     </div></div>
     <div class="tabs">
-      <button class="tab" :class="{ active: tab === 'triggers' }" @click="tab = 'triggers'">触发器</button>
-      <button class="tab" :class="{ active: tab === 'actions' }" @click="tab = 'actions'">动作</button>
+      <button class="tab" :class="{ active: tab === 'triggers' }" @click="tab = 'triggers'">
+        触发器<span class="ml-1.5 inline-flex min-w-5 items-center justify-center rounded-full bg-on-surface/10 px-1.5 py-0.5 text-label-s">{{ tabCounts.triggers }}</span>
+      </button>
+      <button class="tab" :class="{ active: tab === 'actions' }" @click="tab = 'actions'">
+        动作<span class="ml-1.5 inline-flex min-w-5 items-center justify-center rounded-full bg-on-surface/10 px-1.5 py-0.5 text-label-s">{{ tabCounts.actions }}</span>
+      </button>
     </div>
     <div v-if="!Object.keys(list).length" class="empty-state">
       <div class="material-symbols-outlined">extension_off</div><h3>暂无插件</h3><p>安装插件或启动引擎后刷新</p>

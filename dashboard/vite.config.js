@@ -1,12 +1,13 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import tailwindcss from '@tailwindcss/vite'
 import pkg from './package.json' with { type: 'json' }
 
 // Dashboard 构建配置
 // dev: localhost:5173（HMR），proxy /api -> 引擎 API
 // build: 输出多文件到 dist/，由 dashboard.pyw 的本地静态服务器托管
 export default defineConfig({
-  plugins: [vue()],
+  plugins: [vue(), tailwindcss()],
   base: './',
   define: {
     __APP_VERSION__: JSON.stringify(pkg.version)

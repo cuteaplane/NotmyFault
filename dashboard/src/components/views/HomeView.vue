@@ -154,46 +154,68 @@ watch(isRunning, (running) => {
 
     <!-- 引擎运行中：显示概览 + 诊断 -->
     <template v-if="isControllerOnline">
-    <div v-if="isRunning" class="card" style="margin-bottom:16px">
-      <h4 class="card-section-title">引擎概览</h4>
-      <div class="kv-list">
-        <div class="kv-item"><span class="kv-key">规则数量</span><span class="kv-val">{{ stats.rules }}</span></div>
-        <div class="kv-item"><span class="kv-key">活跃触发器</span><span class="kv-val">{{ stats.triggers }}</span></div>
-        <div class="kv-item"><span class="kv-key">动作类型</span><span class="kv-val">{{ stats.actions }}</span></div>
-        <div class="kv-item"><span class="kv-key">进程 PID</span><span class="kv-val">{{ stats.pid }}</span></div>
+    <!-- 概览：M3 大数字 stat 网格，数字层级优先于标签 -->
+    <div v-if="isRunning" class="mb-4 grid grid-cols-2 gap-3.5 lg:grid-cols-4">
+      <div v-for="s in [
+          { icon: 'rule', val: stats.rules, lbl: '规则数量' },
+          { icon: 'memory', val: stats.triggers, lbl: '活跃触发器' },
+          { icon: 'bolt', val: stats.actions, lbl: '动作类型' },
+          { icon: 'dns', val: stats.pid, lbl: '进程 PID' },
+        ]" :key="s.lbl"
+        class="flex flex-col gap-1 rounded-md bg-surface-c-low p-4 shadow-elev1 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-elev2">
+        <span class="material-symbols-outlined text-[22px] text-primary">{{ s.icon }}</span>
+        <span class="mt-1 text-headline-s text-on-surface">{{ s.val }}</span>
+        <span class="text-label-m text-on-surface-variant">{{ s.lbl }}</span>
       </div>
     </div>
 
-    <div class="card" style="margin-bottom:16px">
-      <h4 class="card-section-title">引擎诊断</h4>
-      <div class="kv-list">
-        <div class="kv-item"><span class="kv-key">插件状态</span><span class="kv-val" :class="diagPlugins.cls"><span v-if="diagPlugins.icon" class="material-symbols-outlined">{{ diagPlugins.icon }}</span>{{ diagPlugins.txt }}</span></div>
-        <div class="kv-item"><span class="kv-key">规则状态</span><span class="kv-val" :class="diagRules.cls"><span v-if="diagRules.icon" class="material-symbols-outlined">{{ diagRules.icon }}</span>{{ diagRules.txt }}</span></div>
-        <div class="kv-item"><span class="kv-key">动作执行</span><span class="kv-val" :class="diagActions.cls"><span v-if="diagActions.icon" class="material-symbols-outlined">{{ diagActions.icon }}</span>{{ diagActions.txt }}</span></div>
-        <div class="kv-item"><span class="kv-key">错误 / 警告</span><span class="kv-val"><span class="material-symbols-outlined">{{ diagErrors.ec > 0 ? 'error' : 'check_circle' }}</span>{{ diagErrors.txt }}</span></div>
-        <!-- 诊断详情整合到卡片内，kv-item 风格统一 -->
-        <template v-if="diagLines.length">
-          <div class="kv-item" v-for="(l, i) in diagLines" :key="i">
-            <span class="kv-key" :class="l.cls"><span class="material-symbols-outlined">{{ l.icon }}</span>{{ l.text }}</span>
-          </div>
-        </template>
-        <div v-else class="kv-item">
-          <span class="kv-key">异常详情</span>
-          <span class="kv-val diag-ok"><span class="material-symbols-outlined">check_circle</span>无异常</span>
+    <!-- 诊断：状态徽章网格 + 异常详情独立区块 -->
+    <div class="mb-4 rounded-md bg-surface-c-low p-5 shadow-elev1">
+      <h4 class="mb-4 text-title-m text-on-surface">引擎诊断</h4>
+      <div class="grid grid-cols-1 gap-x-8 gap-y-3.5 sm:grid-cols-2">
+        <div v-for="row in [
+            { key: '插件状态', d: diagPlugins },
+            { key: '规则状态', d: diagRules },
+            { key: '动作执行', d: diagActions },
+            { key: '错误 / 警告', d: { txt: diagErrors.txt, cls: diagErrors.ec > 0 ? 'diag-err' : 'diag-ok', icon: diagErrors.ec > 0 ? 'error' : 'check_circle' } },
+          ]" :key="row.key" class="flex items-center justify-between gap-4">
+          <span class="text-body-m text-on-surface-variant">{{ row.key }}</span>
+          <span class="text-label-l" :class="row.d.cls">
+            <span v-if="row.d.icon" class="material-symbols-outlined align-[-3px] text-[16px]">{{ row.d.icon }}</span>{{ row.d.txt }}
+          </span>
         </div>
+      </div>
+      <!-- 异常详情：仅在有异常时展示，surface-c-lowest 凹陷层级 -->
+      <div v-if="diagLines.length" class="mt-4 flex flex-col gap-1.5 rounded-sm border border-outline-variant bg-surface-c-lowest p-3.5">
+        <div v-for="(l, i) in diagLines" :key="i" class="flex items-start gap-1.5 text-label-m" :class="l.cls">
+          <span class="material-symbols-outlined text-[15px] leading-5">{{ l.icon }}</span>
+          <span class="min-w-0 break-all">{{ l.text }}</span>
+        </div>
+      </div>
+      <div v-else class="mt-4 flex items-center gap-1.5 rounded-sm border border-outline-variant bg-surface-c-lowest p-3.5 text-label-m diag-ok">
+        <span class="material-symbols-outlined text-[15px]">check_circle</span>暂无异常记录
       </div>
     </div>
     </template>
 
     <!-- 引擎未运行：显示系统信息 -->
     <template v-else>
-    <div class="card" style="margin-bottom:16px">
-      <h4 class="card-section-title">系统信息</h4>
-      <div class="kv-list">
-        <div class="kv-item"><span class="kv-key">版本</span><span class="kv-val">NotmyFault v{{ appVersion }}</span></div>
-        <div class="kv-item"><span class="kv-key">安全模式</span><span class="kv-val">{{ modeLabel }}</span></div>
-        <div class="kv-item"><span class="kv-key">配置目录</span><span class="kv-val">%APPDATA%/NotmyFault/</span></div>
-        <div class="kv-item"><span class="kv-key">已配置规则</span><span class="kv-val">{{ store.configData?.rules?.length || 0 }} 条</span></div>
+    <div class="mb-4 rounded-md bg-surface-c-low p-5 shadow-elev1">
+      <h4 class="mb-4 text-title-m text-on-surface">系统信息</h4>
+      <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div v-for="info in [
+            { icon: 'info', key: '版本', val: 'NotmyFault v' + appVersion },
+            { icon: 'shield', key: '安全模式', val: modeLabel },
+            { icon: 'folder', key: '配置目录', val: '%APPDATA%/NotmyFault/' },
+            { icon: 'rule', key: '已配置规则', val: (store.configData?.rules?.length || 0) + ' 条' },
+          ]" :key="info.key"
+          class="flex items-center gap-3 rounded-sm border border-outline-variant bg-surface-c-lowest px-3.5 py-3">
+          <span class="material-symbols-outlined text-[22px] text-primary">{{ info.icon }}</span>
+          <div class="flex min-w-0 flex-col">
+            <span class="text-label-m text-on-surface-variant">{{ info.key }}</span>
+            <span class="truncate text-body-m font-medium text-on-surface">{{ info.val }}</span>
+          </div>
+        </div>
       </div>
     </div>
     <div class="empty-state" style="padding:32px 20px">

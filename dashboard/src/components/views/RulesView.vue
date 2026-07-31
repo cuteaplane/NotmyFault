@@ -4,6 +4,7 @@ import { store } from '../../lib/store'
 import { runRule, saveConfig } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
 import { normalizeRuleDraft } from '../../lib/utils'
+import { ensureRuleBindingIds, requestTestContext } from '../../lib/bindings'
 import RuleEditor from '../RuleEditor.vue'
 
 const activeRuleIndex = ref(null)
@@ -30,12 +31,19 @@ const ruleFolders = computed(() => {
 function clone(value) { return JSON.parse(JSON.stringify(value)) }
 function openRule(index) {
   activeRuleIndex.value = index
-  draftRule.value = normalizeRuleDraft(clone(store.configData.rules[index]))
+  draftRule.value = ensureRuleBindingIds(
+    normalizeRuleDraft(clone(store.configData.rules[index])),
+  )
   baseline.value = JSON.stringify(draftRule.value)
 }
 function addRule() {
   activeRuleIndex.value = -1
-  draftRule.value = { name: '新规则', folder: '未分类', event: null, actions: [] }
+  draftRule.value = ensureRuleBindingIds({
+    name: '新规则',
+    folder: '未分类',
+    event: null,
+    actions: [],
+  })
   baseline.value = JSON.stringify(draftRule.value)
 }
 function leaveEditor() {
@@ -119,7 +127,12 @@ async function runManualRule(index, ruleSnapshot = null) {
   runningRuleIndex.value = index
   try {
     const snapshot = ruleSnapshot ? clone(ruleSnapshot) : null
-    const result = await runRule(index, snapshot)
+    let result = await runRule(index, snapshot)
+    if (result?.code === 'missing_test_context') {
+      const testContext = requestTestContext(snapshot || store.configData.rules[index], store.schema)
+      if (testContext === null) return
+      result = await runRule(index, snapshot, testContext)
+    }
     if (result.ok) snackbar(result.message ? `测试已启动：${result.message}` : '规则测试已启动')
     else alert('规则测试失败: ' + (result.error || '未知错误'))
   } catch (error) {

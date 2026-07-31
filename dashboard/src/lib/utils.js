@@ -46,7 +46,10 @@ export function isVisible(paramDef, currentParams) {
   const vw = paramDef.visible_when
   if (!vw) return true
   for (const [key, vals] of Object.entries(vw)) {
-    const cur = String(currentParams?.[key] ?? '')
+    const raw = currentParams?.[key]
+    // 控制参数来自运行数据时，编辑期无法判断 visible_when；全部显示以免丢配置。
+    if (raw && typeof raw === 'object' && raw.$ref) continue
+    const cur = String(raw ?? '')
     if (!vals.map(String).includes(cur)) return false
   }
   return true
