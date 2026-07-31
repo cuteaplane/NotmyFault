@@ -66,16 +66,13 @@ def run(meta, config, emit_event, shutdown_event):
     print(f"[Trigger:{trigger_id}] 全局热键监听启动")
     raw = config.get("hotkey", "").strip()
     if not raw:
-        print(f"[Trigger:{trigger_id}] 未配置热键，退出")
-        return
+        raise ValueError("未配置热键（hotkey 参数为空）")
     mod, vk = _parse_hotkey(raw)
     if vk == 0:
-        print(f"[Trigger:{trigger_id}] 无法解析热键: {raw}")
-        return
+        raise ValueError(f"无法解析热键: {raw}")
     hkid = 1
     if not user32.RegisterHotKey(None, hkid, mod, vk):
-        print(f"[Trigger:{trigger_id}] 注册热键失败（可能冲突）: {raw}")
-        return
+        raise RuntimeError(f"热键注册失败（可能与其他程序冲突）: {raw}")
     print(f"[Trigger:{trigger_id}] 已注册热键: {raw}")
 
     msg = wintypes.MSG()

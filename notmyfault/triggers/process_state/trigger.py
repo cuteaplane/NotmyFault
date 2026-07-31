@@ -8,8 +8,7 @@ def run(meta, config, emit_event, shutdown_event):
     poll_interval = 2.0
     raw_name = config.get("process_name", "").strip()
     if not raw_name:
-        print(f"[Trigger:{trigger_id}] 没有需要监听的进程，触发器退出")
-        return
+        raise ValueError("未配置监听的进程名（process_name 为空）")
     normalized_name = raw_name + ".exe" if os.name == "nt" and not raw_name.lower().endswith(".exe") else raw_name
     target_process = normalized_name.lower()
 

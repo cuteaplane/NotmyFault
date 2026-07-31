@@ -25,8 +25,9 @@ def run(meta, config, emit_event, shutdown_event):
     try:
         threshold = float(config.get("idle_seconds", 300))
     except (ValueError, TypeError):
-        print(f"[Trigger:{trigger_id}] 无有效空闲阈值配置，退出")
-        return
+        raise ValueError(
+            f"无效的空闲阈值配置: {config.get('idle_seconds')!r}"
+        ) from None
     print(f"[Trigger:{trigger_id}] 开始监视空闲状态，阈值: {threshold} 秒")
     was_idle = False
 

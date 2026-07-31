@@ -240,15 +240,41 @@ def check_event_params(event_def: Dict[str, Any], event_payload: Dict[str, Any])
     return True
 
 
+def _canonical_config_value(value: Any) -> Any:
+    """递归规范化配置值，消除"写法不同但语义相同"的指纹差异。
+
+    整数值 90 与 90.0 归一为 90（否则同一配置因写法不同会去重失败或
+    热重载后不命中）；bool 保持独立，避免与 0/1 混为一谈。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        try:
+            return int(value) if float(value).is_integer() else value
+        except (OverflowError, ValueError):
+            return value
+    if isinstance(value, dict):
+        return {str(key): _canonical_config_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_config_value(item) for item in value]
+    return value
+
+
 def config_fingerprint(params: Any) -> str:
     """event-v2 触发器实例配置的稳定指纹。
 
     v2 语义下事件叶子的 params 就是该实例的配置；配置匹配 = 事件携带的
-    实例指纹与叶子配置指纹相等，payload 不再参与命中判断。
+    实例指纹与叶子配置指纹相等，payload 不再参与命中判断。指纹前先做
+    规范化，让 90/90.0 等写法差异不影响匹配与去重。
     """
     if not isinstance(params, dict):
         params = {}
-    return json.dumps(params, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        _canonical_config_value(params),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _condition_op(node: Dict[str, Any]) -> str:

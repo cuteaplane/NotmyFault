@@ -26,6 +26,7 @@ class TriggerSupervisor:
         self._threads: Dict[str, threading.Thread] = {}
         self._events: Dict[str, threading.Event] = {}
         self._crash_errors: Dict[str, str] = {}
+        self._configs: Dict[str, Dict[str, Any]] = {}  # 实例 ID -> 配置快照（健康状态展示）
         self._lock = threading.RLock()
         # start/stop 不能交叉。登记锁只保护字典，生命周期锁覆盖 thread.start
         # 到 stop/join 的完整操作，封死“已登记但尚未 start 就被 join”的窗口。
@@ -106,15 +107,23 @@ class TriggerSupervisor:
                     else [config_list]
                 )
                 if trigger_meta.get("trigger_api") == "event-v2":
+                    skipped = 0
                     seen_fingerprints = set()
                     unique_instances = []
                     for cfg in instances:
                         fp = config_fingerprint(cfg)
                         if fp in seen_fingerprints:
+                            skipped += 1
                             continue
                         seen_fingerprints.add(fp)
                         unique_instances.append(cfg)
                     instances = unique_instances
+                    if skipped:
+                        print(
+                            f"[Engine] 触发器 {event_type} 有 {skipped} 个重复配置"
+                            "（相同指纹）已合并，只启动一个实例",
+                            file=sys.stderr,
+                        )
                 for index, config in enumerate(instances):
                     instance_id = f"{event_type}:{index + 1}" if len(instances) > 1 else event_type
                     trigger_event = threading.Event()
@@ -142,12 +151,14 @@ class TriggerSupervisor:
                             )
                             continue
                         self._events[instance_id] = trigger_event
+                        self._configs[instance_id] = config
                         self._threads[instance_id] = thread
                         self._crash_errors.pop(instance_id, None)
                         try:
                             thread.start()
                         except Exception:
                             if self._threads.get(instance_id) is thread:
+                                self._configs.pop(instance_id, None)
                                 self._threads.pop(instance_id, None)
                                 self._events.pop(instance_id, None)
                             raise
@@ -201,6 +212,7 @@ class TriggerSupervisor:
                     ):
                         self._threads.pop(event_type, None)
                         self._events.pop(event_type, None)
+                        self._configs.pop(event_type, None)
                         self._crash_errors.pop(event_type, None)
             return not alive
 
@@ -236,6 +248,7 @@ class TriggerSupervisor:
                 alive = thread.is_alive()
                 last_error = self._crash_errors.get(trigger_id)
                 result[trigger_id] = {
+                    "config": self._configs.get(trigger_id),
                     "alive": alive,
                     "crashed": (not alive) and last_error is not None,
                     "last_error": last_error if not alive else None,

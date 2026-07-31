@@ -28,8 +28,7 @@ def run(meta, config, emit_event, shutdown_event):
     trigger_id = meta.get("id", "window_title")
     pattern = config.get("title_pattern", "").strip().lower()
     if not pattern:
-        print(f"[Trigger:{trigger_id}] 未配置标题关键词，退出")
-        return
+        raise ValueError("未配置标题关键词（title_pattern 为空）")
 
     print(f"[Trigger:{trigger_id}] 开始监视窗口标题: {pattern}")
     target_state = config.get("state", "opened")

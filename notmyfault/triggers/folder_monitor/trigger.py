@@ -33,8 +33,7 @@ def run(meta, config, emit_event, shutdown_event):
     trigger_id = meta.get("id", "folder_monitor")
     folder = config.get("folder_path", "").strip()
     if not folder or not os.path.isdir(folder):
-        print(f"[Trigger:{trigger_id}] 目录不存在或不可读: {folder}")
-        return
+        raise FileNotFoundError(f"监控目录不存在或不可读: {folder}")
     event_type = config.get("event_type", "all")
     pattern = config.get("file_pattern", "*")
     snapshot = _dir_snapshot(folder)
