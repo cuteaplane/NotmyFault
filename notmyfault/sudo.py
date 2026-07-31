@@ -30,6 +30,92 @@ import sys
 import threading
 
 # ---------------------------------------------------------------------------
+# 导入守卫：notmyfault.sudo 只允许插件命名空间与引擎核心导入
+# ---------------------------------------------------------------------------
+# sudo 是提权通道，比包级守卫更严：notmyfault 的其他组件也不许导入它，
+# 只有插件（通过元数据声明 admin + run_as_admin 的正道）和引擎核心
+# （engine.py，负责会话令牌与授权管理）能碰。strict 模式下其他一切导入
+# 都被拒绝，normal / permissive 打印日志后放行。
+
+# 引擎核心中唯一允许导入 sudo 的模块：它是 sudo 会话的授权管理者
+# （begin/end_engine_session、authorize_plugin），与提权调用无关。
+_ENGINE_CORE_MODULES = {"notmyfault.engine"}
+
+
+def _guard_sudo_import() -> None:
+    """校验 sudo 模块的导入者身份，在模块加载时执行一次。"""
+    # 冻结构建由打包者控制运行环境，与包级守卫保持一致跳过。
+    if getattr(sys, "frozen", False):
+        return
+    try:
+        caller_name = None
+        for frame_info in inspect.stack():
+            name = frame_info.frame.f_globals.get("__name__", "")
+            if (
+                name == "notmyfault.sudo"
+                or name.startswith("importlib")
+                or name.startswith("_frozen_importlib")
+            ):
+                continue
+            caller_name = name
+            break
+    except Exception:
+        return
+    if caller_name is None:
+        return
+    # 插件命名空间（含用户插件，加载时模块名同为 notmyfault.action_*）与
+    # 引擎核心是合法导入者；其他 notmyfault 组件一律拒绝（strict）/日志
+    # （宽松）；外部导入者仅 pytest 与项目根官方脚本放行。
+    if (
+        caller_name.startswith("notmyfault.action_")
+        or caller_name.startswith("notmyfault.trigger_")
+        or caller_name in _ENGINE_CORE_MODULES
+    ):
+        return
+    if caller_name.startswith("notmyfault"):
+        caller_kind = f"notmyfault 组件 {caller_name}"
+    elif (
+        "pytest" in sys.modules
+        or "_pytest" in sys.modules
+        or _is_project_script()
+    ):
+        return
+    else:
+        caller_kind = f"外部代码 {caller_name}"
+    from notmyfault.security import detect_security_mode
+    mode = detect_security_mode()
+    if mode is not None and mode.value != "strict":
+        print(
+            f"[sudo] 宽松模式（{mode.value}）：{caller_kind} 导入 notmyfault.sudo，放行",
+            file=sys.stderr,
+        )
+        return
+    raise ImportError(
+        f"notmyfault.sudo 安全限制（strict）：仅插件（notmyfault.action_*/trigger_*）"
+        f"与引擎核心可导入，{caller_kind} 被拒绝。"
+        f"插件请声明 'admin' 权限后通过 run_as_admin 提权。"
+    )
+
+
+def _is_project_script() -> bool:
+    """调用者文件位于项目根目录内（官方入口/测试脚本）即视为可信。"""
+    try:
+        for frame_info in inspect.stack():
+            file_path = frame_info.frame.f_globals.get("__file__") or ""
+            if not file_path:
+                continue
+            real = os.path.realpath(file_path)
+            root = os.path.realpath(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            )
+            if os.path.commonpath([real, root]) == root:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+# ---------------------------------------------------------------------------
 # 进程级令牌系统
 # ---------------------------------------------------------------------------
 # _engine_token: 引擎在 __init__ 时设置，外部代码无法知晓
@@ -227,3 +313,7 @@ def run_as_admin(
             file=sys.stderr,
         )
         raise
+
+
+# 模块加载即执行导入守卫（放在所有定义之后，调用链完整）。
+_guard_sudo_import()

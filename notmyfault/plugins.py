@@ -198,18 +198,49 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
             if (isinstance(func, ast.Name) and func.id == "getattr"
                     and len(node.args) >= 2):
                 target, name_arg = node.args[0], node.args[1]
-                if isinstance(target, ast.Name) and isinstance(name_arg, ast.Constant) \
+                if isinstance(name_arg, ast.Constant) \
                         and isinstance(name_arg.value, str):
                     attr = name_arg.value
-                    owner = module_aliases.get(target.id, target.id)
-                    if owner == "os" and attr in _OS_DANGEROUS:
-                        caps.add("external_binary")
-                    elif owner == "subprocess" and attr in _SUBPROCESS_CALLS:
-                        caps.add("external_binary")
-                    elif owner == "ctypes" and attr in _CTYPES_DANGEROUS:
-                        caps.add("native_api")
-                    elif owner in ("__builtins__", "builtins") and attr == "__import__":
-                        caps.add("dynamic_exec")
+                    if isinstance(target, ast.Name):
+                        owner = module_aliases.get(target.id, target.id)
+                        if owner == "os" and attr in _OS_DANGEROUS:
+                            caps.add("external_binary")
+                        elif owner == "subprocess" and attr in _SUBPROCESS_CALLS:
+                            caps.add("external_binary")
+                        elif owner == "ctypes" and attr in _CTYPES_DANGEROUS:
+                            caps.add("native_api")
+                        elif owner in ("__builtins__", "builtins") and attr == "__import__":
+                            caps.add("dynamic_exec")
+                    elif isinstance(target, ast.Subscript):
+                        # getattr(sys.modules['os'], 'system') 绕过：
+                        # 通过 sys.modules 下标取模块后动态取属性。
+                        tv = target.value
+                        if (
+                            isinstance(tv, ast.Attribute)
+                            and tv.attr == "modules"
+                            and isinstance(tv.value, ast.Name)
+                            and tv.value.id == "sys"
+                            and isinstance(target.slice, ast.Constant)
+                            and isinstance(target.slice.value, str)
+                        ):
+                            mod = target.slice.value.split(".")[0]
+                            if mod == "os" and attr in _OS_DANGEROUS:
+                                caps.add("external_binary")
+                            elif mod == "subprocess" and attr in _SUBPROCESS_CALLS:
+                                caps.add("external_binary")
+                            elif mod in _NATIVE_MODULES and attr in _CTYPES_DANGEROUS:
+                                caps.add("native_api")
+        elif isinstance(node, ast.Subscript):
+            # __builtins__['exec'] / __builtins__['__import__'] 下标取内置函数。
+            tv = node.value
+            if (
+                isinstance(tv, ast.Name)
+                and tv.id in ("__builtins__", "builtins")
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, str)
+                and node.slice.value in _DYNAMIC_EXEC_FUNCS
+            ):
+                caps.add("dynamic_exec")
         elif isinstance(node, ast.keyword):
             # shell=True / shell=1 / shell="x" 等真值都视为启用 shell（之前只认 is True，
             # 会漏掉 shell=1 这类真值）。shell=False/0 不触发。
@@ -221,6 +252,158 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
             if isinstance(node.value, str) and _ELEVATION_VERB in node.value.lower():
                 caps.add("self_elevation")
     return caps
+
+
+# ============================================================================
+# AST: 借壳提权模式扫描（安装预览 / 加载时告警）
+# ============================================================================
+
+_PLUGIN_MODULE_PREFIXES = ("notmyfault.action_", "notmyfault.trigger_")
+_DYNAMIC_EXEC_BYPASS = {"exec", "eval", "compile", "__import__"}
+
+
+def scan_borrowed_privilege(py_file_path: str) -> list[str]:
+    """扫描插件源码中可能"借壳"其他已授权插件身份的访问模式。
+
+    借壳攻击：未授权插件导入/访问引擎已加载的插件模块
+    （notmyfault.action_* / notmyfault.trigger_*），调用其内部函数，
+    使 sudo.run_as_admin 的调用栈检测命中已授权插件。
+
+    命中以下模式不代表一定提权，但属于高风险信号：
+    - 直接 import / from-import 引擎插件模块
+    - 通过 sys.modules 取引擎插件模块
+    - 通过 getattr(__builtins__, ...) 获取 exec/eval/compile/__import__
+      （绕过 AST 动态执行检测）
+    - 调用已导入插件模块的内部函数
+
+    安装预览（api_server.plugin_preview）与插件加载（plugin_loader）时
+    应据此向用户告警。
+    """
+    findings: list[str] = []
+    try:
+        with open(py_file_path, "r", encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source)
+    except Exception:
+        return findings
+
+    # 别名 -> 完整模块名（import notmyfault.action_x as bt -> bt 指向完整名；
+    # from notmyfault.action_x import f -> f 指向 "notmyfault.action_x.f"）
+    module_aliases: dict[str, str] = {}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                # 只记录带 asname 的点分模块（bt = notmyfault.action_x）；
+                # 裸 `import notmyfault.action_x` 不映射顶级包名，否则之后
+                # 任何 notmyfault.xxx 用法都会被误判成引用该插件模块。
+                if alias.asname:
+                    module_aliases[alias.asname] = alias.name
+                elif "." not in alias.name:
+                    module_aliases[alias.name] = alias.name
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            top = mod.split(".")[0] if mod else ""
+            for alias in node.names:
+                target = f"{mod}.{alias.name}" if mod else alias.name
+                module_aliases[alias.asname or alias.name] = (
+                    target if top.startswith("notmyfault") else top or alias.name
+                )
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            # 污点跟踪：bt = sys.modules['notmyfault.action_x'] 之后 bt 指向插件模块
+            val = node.value
+            if (
+                isinstance(val, ast.Subscript)
+                and isinstance(val.value, ast.Attribute)
+                and val.value.attr == "modules"
+                and isinstance(val.value.value, ast.Name)
+                and val.value.value.id == "sys"
+                and isinstance(val.slice, ast.Constant)
+                and isinstance(val.slice.value, str)
+                and val.slice.value.startswith(_PLUGIN_MODULE_PREFIXES)
+            ):
+                module_aliases[node.targets[0].id] = val.slice.value
+
+    for node in ast.walk(tree):
+        # 1) import notmyfault.action_xxx / from notmyfault.action_xxx import ...
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith(_PLUGIN_MODULE_PREFIXES):
+                    findings.append(
+                        f"直接导入引擎插件模块 {alias.name}：可借壳其管理员授权"
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if mod.startswith(_PLUGIN_MODULE_PREFIXES):
+                names = ", ".join(alias.name for alias in node.names)
+                findings.append(
+                    f"from-import 引擎插件模块 {mod} 的 {names}：可借壳其管理员授权"
+                )
+
+        # 2) sys.modules['notmyfault.action_xxx'] 动态取模块
+        if isinstance(node, ast.Subscript):
+            value = node.value
+            if (
+                isinstance(value, ast.Attribute)
+                and value.attr == "modules"
+                and isinstance(value.value, ast.Name)
+                and value.value.id == "sys"
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, str)
+                and node.slice.value.startswith(_PLUGIN_MODULE_PREFIXES)
+            ):
+                findings.append(
+                    f"通过 sys.modules 获取引擎插件模块 {node.slice.value}"
+                )
+
+        # 3) getattr(__builtins__, 'exec'/'eval'/...) 绕过动态执行检测
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in ("__builtins__", "builtins")
+            and isinstance(node.args[1], ast.Constant)
+            and isinstance(node.args[1].value, str)
+            and node.args[1].value in _DYNAMIC_EXEC_BYPASS
+        ):
+            findings.append(
+                f"通过 getattr 获取内置动态执行函数 {node.args[1].value}："
+                "可绕过动态执行检测并在任意命名空间执行代码"
+            )
+
+        # 4) 调用已导入插件模块的内部函数：alias.func(...) / 完整链 / from-import 后 func(...)
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                chain_parts = []
+                chain_node = func
+                while isinstance(chain_node, ast.Attribute):
+                    chain_parts.append(chain_node.attr)
+                    chain_node = chain_node.value
+                if isinstance(chain_node, ast.Name):
+                    chain_parts.append(chain_node.id)
+                chain = ".".join(reversed(chain_parts))
+                first, dot, rest = chain.partition(".")
+                resolved = module_aliases.get(first, first) + ("." + rest if dot else "")
+                if resolved.startswith(_PLUGIN_MODULE_PREFIXES):
+                    findings.append(
+                        f"调用引擎插件模块内部函数 {resolved}()"
+                    )
+            elif isinstance(func, ast.Name):
+                target = module_aliases.get(func.id)
+                if (
+                    target is not None
+                    and target.startswith(_PLUGIN_MODULE_PREFIXES)
+                    and "." in target
+                ):
+                    findings.append(
+                        f"调用引擎插件模块内部函数 {target}()"
+                    )
+
+    # 去重并保持稳定顺序
+    return sorted(set(findings))
 
 
 # ============================================================================

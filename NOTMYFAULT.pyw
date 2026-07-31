@@ -164,6 +164,11 @@ class EngineRunner:
     def current_engine(self):
         return self._runtime.current_engine
 
+    @property
+    def last_error(self):
+        """上次引擎启动/运行失败的原因（配置校验失败等），供 Dashboard 展示。"""
+        return self._runtime.status().last_error
+
     def _signal_handler(self, signum, frame):
         print(f"\n[Engine] 收到关闭信号 ({signum})，正在关闭...")
         self._runtime.request_stop()
@@ -362,6 +367,16 @@ class EngineRunner:
 
 
 def main():
+    # 拒绝以管理员身份启动：插件提权必须走 notmyfault.sudo 的 UAC 授权，
+    # 以提升令牌运行会让整个引擎绕过这道受控通道（最小权限原则）。
+    from notmyfault.security import is_admin_process
+    if is_admin_process():
+        print(
+            "[Engine] [!!] NotmyFault 拒绝以管理员身份启动：请用普通用户权限运行。"
+            "插件需要提权时请通过 notmyfault.sudo.run_as_admin 弹出 UAC 授权。",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     runner = EngineRunner()
     runner.run()
 

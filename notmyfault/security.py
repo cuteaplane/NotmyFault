@@ -11,6 +11,49 @@ from enum import Enum
 from typing import List, Tuple
 
 
+def is_admin_process() -> bool:
+    """当前进程是否以管理员（Windows 提权令牌 / POSIX root）运行。
+
+    Windows 用 TokenElevation 判断而非 IsUserAnAdmin()（后者在部分受控
+    环境会误报），POSIX 看有效 UID。探测失败一律按非管理员处理：
+    引擎以普通权限启动（插件提权仍走 notmyfault.sudo 的受控通道），
+    不会因探测异常误拒绝正常用户。
+    """
+
+    if os.name != "nt":
+        return os.geteuid() == 0  # type: ignore[attr-defined]
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _TOKEN_ELEVATION(ctypes.Structure):
+            _fields_ = [("TokenIsElevated", wintypes.DWORD)]
+
+        TOKEN_QUERY = 0x0008
+        TokenElevation = 20
+        handle = wintypes.HANDLE()
+        if not ctypes.windll.advapi32.OpenProcessToken(
+            ctypes.windll.kernel32.GetCurrentProcess(),
+            TOKEN_QUERY,
+            ctypes.byref(handle),
+        ):
+            return False
+        try:
+            elevation = _TOKEN_ELEVATION()
+            ok = ctypes.windll.advapi32.GetTokenInformation(
+                handle,
+                TokenElevation,
+                ctypes.byref(elevation),
+                ctypes.sizeof(elevation),
+                ctypes.byref(wintypes.DWORD()),
+            )
+            return bool(ok and elevation.TokenIsElevated)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        return False
+
+
 class SecurityMode(Enum):
     STRICT = "strict"
     NORMAL = "normal"

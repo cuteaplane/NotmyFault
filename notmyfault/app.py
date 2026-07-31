@@ -98,5 +98,15 @@ def run(
     shutdown_event: "threading.Event | None" = None,
     on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> None:
+    # 与 NOTMYFAULT.pyw 入口一致：拒绝以管理员身份启动，插件提权必须走
+    # notmyfault.sudo 的 UAC 受控通道，而不是整个引擎带着提升令牌运行。
+    from .security import is_admin_process
+    if is_admin_process():
+        print(
+            "[Engine] [!!] NotmyFault 拒绝以管理员身份启动：请用普通用户权限运行。"
+            "插件需要提权时请通过 notmyfault.sudo.run_as_admin 弹出 UAC 授权。",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     engine = create_engine(on_event=on_event)
     engine.start(shutdown_event=shutdown_event)

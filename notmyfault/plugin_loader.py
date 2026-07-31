@@ -22,6 +22,7 @@ from notmyfault.plugin_schema import (
 )
 from notmyfault.plugins import (
     check_sudo_import,
+    scan_borrowed_privilege,
     scan_plugin_capabilities,
     verify_plugin_integrity,
     verify_plugin_sig,
@@ -152,7 +153,7 @@ class PluginLoader:
 
     def _restore_override(
         self,
-        plugin_type: str,
+        plugin_type: PluginKind,
         plugin_id: str,
         prev: Optional[Tuple[Any, Any, Any]],
         func_store: Dict[str, Any],
@@ -190,7 +191,7 @@ class PluginLoader:
             (loaded_count, failed_count) - loaded 是成功加载数，failed 是出错数。
             故意跳过的（如 disabled、缺少文件）不计入 failed。
         """
-        plugin_type = "trigger" if store_name == "Trigger" else "action"
+        plugin_type: PluginKind = "trigger" if store_name == "Trigger" else "action"
         root_dir = os.path.join(base_dir, plugins_dir)
         loaded_count = 0
         failed_count = 0
@@ -427,15 +428,35 @@ class PluginLoader:
                     engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason=f"未声明能力: {cap_msg}")
                     continue
 
-            # --- 权限声明与源码引用一致性（exec 前）---
-            if any(check_sudo_import(path) for path in python_files):
-                declared_perms = meta.get("permissions") or []
-                if "admin" not in declared_perms:
-                    print(
-                        f"[Engine] [!!] 插件 \"{plugin_id}\" import 了 notmyfault.sudo "
-                        f"但未在元数据中声明 'admin' 权限",
-                        file=sys.stderr,
-                    )
+            # --- 提权通道一致性（exec 前）---
+            # 具有越权可能的插件（import notmyfault.sudo 或声明 admin 权限）
+            # 在 strict 模式必须走受控的 sudo 通道：既 import 了
+            # notmyfault.sudo，又声明了 "admin" 权限。只声明不引用（可能
+            # 自行越权）、只引用不声明（偷用提权）都一律拒载。
+            uses_sudo = any(check_sudo_import(path) for path in python_files)
+            has_admin = "admin" in (meta.get("permissions") or [])
+            if uses_sudo and not has_admin:
+                reason = "import 了 notmyfault.sudo 但未在元数据中声明 'admin' 权限"
+                print(
+                    f'[Engine] [!!] 插件 "{plugin_id}" {reason}',
+                    file=sys.stderr,
+                )
+                if self._security_mode == SecurityMode.STRICT:
+                    failed_count += 1
+                    self._diagnostics.record_plugin_error(store_name, plugin_id, reason)
+                    engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason=reason)
+                    continue
+            elif has_admin and not uses_sudo:
+                reason = "声明了 'admin' 权限但未通过 notmyfault.sudo 使用提权通道"
+                print(
+                    f'[Engine] [!!] 插件 "{plugin_id}" {reason}',
+                    file=sys.stderr,
+                )
+                if self._security_mode == SecurityMode.STRICT:
+                    failed_count += 1
+                    self._diagnostics.record_plugin_error(store_name, plugin_id, reason)
+                    engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason=reason)
+                    continue
 
             # --- 用户插件完整性校验（exec 前）---
             # 内置插件由构建时 Ed25519 签名覆盖；用户/第三方插件使用本地清单
@@ -456,6 +477,23 @@ class PluginLoader:
                     )
                     print(warning, file=sys.stderr)
                     engine_warn(f"integrity_check: {integrity_msg}")
+                    self._integrity_errors.append(warning)
+
+                # --- 借壳提权嫌疑（exec 前，AST 级）---
+                # 导入/调用其他引擎插件模块、绕过动态执行检测的插件可能
+                # 借已授权插件的身份提权。命中仅告警，不改变加载行为。
+                borrowed_findings = []
+                for path in python_files:
+                    borrowed_findings.extend(
+                        scan_borrowed_privilege(path)
+                    )
+                if borrowed_findings:
+                    warning = (
+                        f"[Engine] [安全] 插件 \"{plugin_id}\" 存在借壳提权嫌疑: "
+                        + "；".join(sorted(set(borrowed_findings))[:3])
+                    )
+                    print(warning, file=sys.stderr)
+                    engine_warn(f"borrowed_privilege: {plugin_id} {'; '.join(borrowed_findings)}")
                     self._integrity_errors.append(warning)
 
             # --- Python 模块加载 ---
@@ -503,14 +541,15 @@ class PluginLoader:
                 engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason="缺少 run() 函数")
                 continue
 
-            # 内置触发器统一采用 event-v1：run(meta, config_list, emit_event,
-            # shutdown_event)。在启动线程前做签名绑定检查，接口写错时直接标出
-            # 插件问题，而不是让后台线程启动后才留下一段 traceback。
-            if plugin_type == "trigger" and meta.get("trigger_api") == "event-v1":
+            # event-v1 接收同一触发器的配置列表；event-v2 每条规则配置各自运行，
+            # emit_event 仅接收 payload。启动线程前先验证入口，避免后台才报错。
+            if plugin_type == "trigger" and meta.get("trigger_api") in ("event-v1", "event-v2"):
                 try:
-                    inspect.signature(module.run).bind({}, [], lambda *_args: None, threading.Event())
+                    config = [] if meta.get("trigger_api") == "event-v1" else {}
+                    emit = lambda *_args: None
+                    inspect.signature(module.run).bind({}, config, emit, threading.Event())
                 except (TypeError, ValueError) as exc:
-                    message = f"event-v1 入口不兼容: {exc}"
+                    message = f"{meta['trigger_api']} 入口不兼容: {exc}"
                     print(f'[Engine] 触发器 "{plugin_id}" {message}', file=sys.stderr)
                     failed_count += 1
                     self._diagnostics.record_plugin_error(store_name, plugin_id, message)

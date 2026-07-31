@@ -190,6 +190,9 @@ def cmd_verify(args):
             print(f"  ! {plugin_dir.parent.name}/{plugin_dir.name:20s} 签名无效！")
             failed += 1
     print(f"验证完成: {passed} 有效, {failed} 无效, {unsigned} 未签名")
+    # 签名无效/未签名必须以非零退出码结束，否则 CI 与发布脚本无法感知篡改。
+    if failed > 0 or unsigned > 0:
+        raise SystemExit(1)
 
 def _key_is_encrypted() -> bool:
     """私钥是否已用密码加密。"""
