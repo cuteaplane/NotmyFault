@@ -6,16 +6,31 @@ CF_UNICODETEXT = 13
 if os.name == "nt":
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
+    # 多线程并发调用 ctypes 时，无 argtypes 的函数会在共享 _objects 上产生
+    # 竞态，曾与 window_title 并发导致堆损坏（0xc0000374）。全部显式声明。
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_bool
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = ctypes.c_bool
+    user32.GetClipboardData.argtypes = [ctypes.c_uint]
     user32.GetClipboardData.restype = ctypes.c_void_p
-    kernel32.GlobalLock.restype = ctypes.c_void_p
     kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
     kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = ctypes.c_bool
 
 
 def _get_clipboard_text():
     if os.name != "nt":
         from notmyfault.linux_support import get_clipboard_text
         return get_clipboard_text()
+    # 原生段互斥：多线程并发 ctypes 曾与 window_title 组合触发堆损坏
+    from notmyfault._native_guard import NATIVE_LOCK
+    with NATIVE_LOCK:
+        return _get_clipboard_text_locked()
+
+
+def _get_clipboard_text_locked():
     if not user32.OpenClipboard(None):
         return None
     try:
