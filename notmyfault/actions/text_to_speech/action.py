@@ -1,10 +1,68 @@
+import json
 import os
 import subprocess
-import time
+import sys
 
-# SAPI SpeechRunState: SRSEDone = 1, SRSEIsSpeaking = 2
-_SAPI_DONE = 1
 _SPEAK_TIMEOUT = 60
+
+
+# SAPI + 音频驱动属于不可信的原生代码：曾出现播报完成后引擎进程整体
+# 堆损坏静默崩溃（0xc0000374）。把 Windows TTS 放进独立子进程，SAPI 的
+# 任何原生崩溃只影响该子进程，不会带走引擎/API/托盘。
+_TTS_HELPER = r"""
+import json
+import sys
+import pythoncom
+import win32com.client
+
+payload = json.loads(sys.stdin.read())
+pythoncom.CoInitialize()
+try:
+    speaker = win32com.client.Dispatch("SAPI.SpVoice")
+    voice_name = payload.get("voice") or ""
+    if voice_name:
+        for voice in speaker.GetVoices():
+            try:
+                name = str(voice.GetAttribute("Name"))
+            except Exception:
+                name = ""
+            if voice_name.casefold() in name.casefold():
+                speaker.Voice = voice
+                break
+    rate = int(payload.get("rate", 0) or 0)
+    volume = int(payload.get("volume", 100) or 100)
+    if rate != 0:
+        speaker.Rate = max(-10, min(10, rate))
+    if volume != 100:
+        speaker.Volume = max(0, min(100, volume))
+    # 子进程专职本次播报：同步 Speak 即可，卡死由父进程超时兜底
+    speaker.Speak(payload.get("text", ""))
+    speaker = None
+finally:
+    pythoncom.CoUninitialize()
+"""
+
+
+def _speak_windows(text: str, rate, volume, voice_name: str) -> None:
+    payload = json.dumps({
+        "text": text,
+        "rate": rate,
+        "volume": volume,
+        "voice": voice_name,
+    }, ensure_ascii=False).encode("utf-8")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _TTS_HELPER],
+            input=payload,
+            capture_output=True,
+            timeout=_SPEAK_TIMEOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"语音播报超时（{_SPEAK_TIMEOUT}s）") from None
+    if result.returncode != 0:
+        stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"语音播报失败: {stderr[:200] or 'SAPI 错误'}")
 
 
 def run(action_info, params):
@@ -42,48 +100,11 @@ def run(action_info, params):
         print("[Action:text_to_speech] 播报完成")
         return
 
-    import win32com.client
-
     try:
         rate = int(rate)
         volume = int(volume)
     except (TypeError, ValueError):
         raise ValueError(f"rate/volume 必须是数字，实际: rate={rate!r} volume={volume!r}") from None
 
-    speaker = win32com.client.Dispatch("SAPI.SpVoice")
-
-    if voice_name:
-        matched_voice = None
-        for voice in speaker.GetVoices():
-            try:
-                name = str(voice.GetAttribute("Name"))
-            except Exception:
-                name = ""
-            if voice_name.casefold() in name.casefold():
-                matched_voice = voice
-                break
-        if matched_voice is None:
-            print(f"[Action:text_to_speech] 未找到声音: {voice_name}，使用系统默认声音")
-        else:
-            speaker.Voice = matched_voice
-
-    if rate != 0:
-        speaker.Rate = max(-10, min(10, rate))
-    if volume != 100:
-        speaker.Volume = max(0, min(100, volume))
-
-    # SAPI 的 ISpeechVoice 没有 SpeakAsync 方法：异步播报用 Speak 的
-    # SVSFlagsAsync（=1）标志。轮询 RunningState，避免长文本/卡死的
-    # TTS 永久阻塞工作流。
-    speaker.Speak(text, 1)
-    deadline = time.time() + _SPEAK_TIMEOUT
-    while time.time() < deadline:
-        try:
-            if int(speaker.Status.RunningState) == _SAPI_DONE:
-                break
-        except Exception:
-            break  # COM 状态读取失败时按完成处理，不阻塞工作流
-        time.sleep(0.2)
-    else:
-        raise RuntimeError(f"语音播报超时（{_SPEAK_TIMEOUT}s）")
+    _speak_windows(text, rate, volume, voice_name)
     print("[Action:text_to_speech] 播报完成")
