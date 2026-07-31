@@ -15,7 +15,10 @@ import sys
 import pythoncom
 import win32com.client
 
-payload = json.loads(sys.stdin.read())
+# 关键：必须用二进制读 stdin 再按 UTF-8 解码。Windows 中文环境文本模式
+# stdin 是 GBK，直接 sys.stdin.read() 会把 UTF-8 中文读成乱码，SAPI 就会
+# 念出"ting-shen"这类音。
+payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
 pythoncom.CoInitialize()
 try:
     speaker = win32com.client.Dispatch("SAPI.SpVoice")
