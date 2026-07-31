@@ -6,7 +6,7 @@
     "version": "1.1",
     "package_name": "io.github.notmyfault.wallpaper",
     "enabled": true,
-    "permissions": ["native_api", "filesystem", "external_binary"],
+    "permissions": ["registry", "native_api", "filesystem", "external_binary"],
     "params": [
         {
             "name": "image_path",

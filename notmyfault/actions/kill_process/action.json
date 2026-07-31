@@ -6,6 +6,7 @@
     "version": "1.0",
     "package_name": "io.github.notmyfault.kill_process",
     "enabled": true,
+    "permissions": ["process"],
     "params": [
         {
             "name": "process_name",

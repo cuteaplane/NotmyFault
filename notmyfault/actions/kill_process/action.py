@@ -1,33 +1,60 @@
 import os
+import time
 import psutil
+
+
+def _target_name(process_name: str) -> str:
+    target = process_name.lower()
+    if os.name == "nt" and not target.endswith(".exe"):
+        target += ".exe"
+    return target
 
 
 def run(action_info, params):
     process_name = params.get("process_name", "").strip()
     if not process_name:
-        print("[Action:kill_process] 未指定进程名，跳过")
-        return
+        raise ValueError("未指定进程名")
 
     print(f"[Action:kill_process] 正在终止进程: {process_name}")
 
+    self_pid = os.getpid()
+    target = _target_name(process_name)
     killed = 0
-    target = process_name.lower()
-    if os.name == "nt" and not target.endswith(".exe"):
-        target += ".exe"
+    denied = 0
 
-    try:
-        for proc in psutil.process_iter(["pid", "name"]):
-            try:
-                if proc.info["name"] and proc.info["name"].lower() == target:
-                    proc.terminate()
-                    killed += 1
-                    print(f"[Action:kill_process] 已终止 PID={proc.info['pid']}")
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            if proc.info["name"] and proc.info["name"].lower() == target:
+                if proc.info["pid"] == self_pid:
+                    print("[Action:kill_process] 跳过引擎自身进程")
+                    continue
+                proc.terminate()
+                try:
+                    # terminate 是异步的，等待并验证进程确实退出。
+                    proc.wait(timeout=5)
+                except psutil.TimeoutExpired:
+                    print(
+                        f"[Action:kill_process] PID={proc.info['pid']} "
+                        "5 秒内未退出，发送强杀信号"
+                    )
+                    proc.kill()
+                    proc.wait(timeout=5)
+                killed += 1
+                print(f"[Action:kill_process] 已终止 PID={proc.info['pid']}")
+        except psutil.AccessDenied:
+            denied += 1
+            print(
+                f"[Action:kill_process] PID={proc.info['pid']} 权限不足，"
+                "未终止（可能需管理员权限）"
+            )
+        except psutil.NoSuchProcess:
+            continue
 
-        if killed == 0:
-            print(f"[Action:kill_process] 未找到运行中的进程: {process_name}")
-        else:
-            print(f"[Action:kill_process] 共终止了 {killed} 个进程")
-    except Exception as e:
-        print(f"[Action:kill_process] 失败: {e}")
+    if denied:
+        raise RuntimeError(f"{denied} 个进程因权限不足未能终止（可能需管理员权限）")
+    if killed == 0:
+        # 进程本来就不存在：目标已达成，视为幂等成功。
+        print(f"[Action:kill_process] 未找到运行中的进程: {process_name}")
+        return {"killed": 0}
+    print(f"[Action:kill_process] 共终止了 {killed} 个进程")
+    return {"killed": killed}

@@ -1,8 +1,13 @@
+"""系统关机/重启/注销/休眠/睡眠动作。
+
+安全设计：默认不强制、需要显式 confirm=true 才执行，防止规则误触发关机。
+失败（权限不足、被系统阻止）会抛异常让引擎标记失败，不再静默成功。
+"""
+
 import ctypes
-import time
-import threading
 import os
 import subprocess
+import time
 
 EWX_LOGOFF = 0
 EWX_SHUTDOWN = 0x00000001
@@ -11,6 +16,16 @@ EWX_FORCE = 0x00000004
 EWX_POWEROFF = 0x00000008
 
 SE_SHUTDOWN_NAME = "SeShutdownPrivilege"
+
+_ALLOWED_ACTIONS = ("shutdown", "restart", "logoff", "hibernate", "sleep")
+
+_LINUX_COMMANDS = {
+    "shutdown": ["systemctl", "poweroff"],
+    "restart": ["systemctl", "reboot"],
+    "logoff": ["loginctl", "terminate-user"],
+    "hibernate": ["systemctl", "hibernate"],
+    "sleep": ["systemctl", "suspend"],
+}
 
 
 def _enable_shutdown_privilege():
@@ -45,57 +60,69 @@ def _enable_shutdown_privilege():
 
 def run(action_info, params):
     action = params.get("action", "shutdown")
-    force = params.get("force", True)
+    force = params.get("force", False)
+    confirm = params.get("confirm", False)
     delay = params.get("delay_seconds", 0)
 
-    flags_map = {
-        "shutdown": EWX_SHUTDOWN | EWX_POWEROFF,
-        "restart": EWX_REBOOT,
-        "logoff": EWX_LOGOFF,
-        "hibernate": 0,
-        "sleep": 0,
-    }
+    try:
+        delay = max(0.0, float(delay))
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"delay_seconds 必须是数字，实际: {delay!r}"
+        ) from None
 
-    flags = flags_map.get(action, EWX_SHUTDOWN | EWX_POWEROFF)
-    if force and action in ("shutdown", "restart", "logoff"):
-        flags |= EWX_FORCE
+    if action not in _ALLOWED_ACTIONS:
+        raise ValueError(
+            f"不支持的操作: {action}（可选: {', '.join(_ALLOWED_ACTIONS)}）"
+        )
+    if confirm is not True:
+        raise PermissionError(
+            "shutdown_system 需要显式设置 confirm=true 才会执行，防止误触发关机"
+        )
+    if not isinstance(force, bool):
+        force = bool(force)
+
+    if delay > 0:
+        print(f"[Action:shutdown_system] 等待 {delay}s 后执行: {action}")
+        time.sleep(delay)
+
+    print(f"[Action:shutdown_system] 执行: {action} (force={force})")
+
+    if os.name != "nt":
+        command = _LINUX_COMMANDS[action]
+        if action == "logoff":
+            getuid = getattr(os, "getuid", None)
+            if getuid is None:
+                raise RuntimeError("当前系统无法获取用户 ID，不能注销")
+            command = command + [str(getuid())]
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=15,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"操作失败: {result.stderr.strip() or f'退出码 {result.returncode}'}"
+            )
+        return
 
     _enable_shutdown_privilege()
-
-    def _do_action():
-        if delay > 0:
-            time.sleep(delay)
-        print(f"[Action:shutdown_system] 执行: {action}")
-        if os.name != "nt":
-            commands = {
-                "shutdown": ["systemctl", "poweroff"],
-                "restart": ["systemctl", "reboot"],
-                "logoff": ["loginctl", "terminate-user", str(os.getuid())],
-                "hibernate": ["systemctl", "hibernate"],
-                "sleep": ["systemctl", "suspend"],
-            }
-            command = commands.get(action)
-            if not command:
-                print(f"[Action:shutdown_system] 不支持的操作: {action}")
-                return
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=15,
-            )
-            if result.returncode != 0:
-                print(
-                    "[Action:shutdown_system] 操作失败: "
-                    + (result.stderr.strip() or f"退出码 {result.returncode}")
-                )
-            return
-        if action == "hibernate":
-            ctypes.windll.powrprof.SetSuspendState(True, True, False)
-        elif action == "sleep":
-            ctypes.windll.powrprof.SetSuspendState(False, True, False)
-        else:
-            ctypes.windll.user32.ExitWindowsEx(flags, 0)
-
-    threading.Thread(target=_do_action, daemon=True).start()
+    if action == "hibernate":
+        ok = ctypes.windll.powrprof.SetSuspendState(True, True, False)
+    elif action == "sleep":
+        ok = ctypes.windll.powrprof.SetSuspendState(False, True, False)
+    else:
+        flags = {
+            "shutdown": EWX_SHUTDOWN | EWX_POWEROFF,
+            "restart": EWX_REBOOT,
+            "logoff": EWX_LOGOFF,
+        }[action]
+        if force:
+            flags |= EWX_FORCE
+        ok = ctypes.windll.user32.ExitWindowsEx(flags, 0)
+    if not ok:
+        raise RuntimeError(
+            f"系统未能执行 {action}（可能被其他程序阻止或权限不足）"
+        )
