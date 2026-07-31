@@ -1,5 +1,8 @@
 export const FLOW_NODE_WIDTH = 228
 export const FLOW_NODE_PORT_Y = 58
+// 1px node border + 38px header + 76px body + 1px data divider + 12px row centre.
+export const FLOW_DATA_PORT_Y = 128
+export const FLOW_DATA_PORT_STEP = 24
 
 const LEFT = 52
 const TOP = 118
@@ -107,6 +110,7 @@ export function buildFlowGraph({
         from: child.id,
         to: id,
         kind: 'condition',
+        channel: 'control',
         label: children.length > 1 ? (op === 'all' ? '并且' : '或者') : '',
         branch: index + 1,
       }))
@@ -161,6 +165,7 @@ export function buildFlowGraph({
       from: previousId,
       to: id,
       kind: 'pipeline',
+      channel: 'control',
       label: index ? '再确认' : '开始前',
     })
     previousId = id
@@ -190,6 +195,7 @@ export function buildFlowGraph({
       from: previousId,
       to: id,
       kind: 'pipeline',
+      channel: 'control',
       label: index || preconditions.length ? '然后' : '执行',
     })
     previousId = id
@@ -213,6 +219,7 @@ export function buildFlowGraph({
     from: previousId,
     to: 'add-action',
     kind: 'add',
+    channel: 'control',
     label: '',
   })
 
@@ -225,9 +232,17 @@ export function routeFlowEdge(edge, nodesById) {
   if (!source || !target) return null
 
   const x1 = source.x + FLOW_NODE_WIDTH
-  const y1 = source.y + FLOW_NODE_PORT_Y
+  const y1 = source.y + (
+    edge.channel === 'data'
+      ? FLOW_DATA_PORT_Y + edge.sourcePortIndex * FLOW_DATA_PORT_STEP
+      : FLOW_NODE_PORT_Y
+  )
   const x2 = target.x
-  const y2 = target.y + FLOW_NODE_PORT_Y
+  const y2 = target.y + (
+    edge.channel === 'data'
+      ? FLOW_DATA_PORT_Y + edge.targetPortIndex * FLOW_DATA_PORT_STEP
+      : FLOW_NODE_PORT_Y
+  )
 
   if (x2 - x1 >= 24) {
     const middle = (x1 + x2) / 2

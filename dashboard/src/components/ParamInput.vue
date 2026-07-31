@@ -17,12 +17,13 @@ const value = computed({
   set: (v) => emit('update:modelValue', v)
 })
 const type = computed(() => props.def.type || 'string')
+const bindingType = computed(() => props.def.value_type || type.value)
 const recording = ref(false)
 const bindingOpen = ref(false)
 const bound = computed(() => isReference(props.modelValue))
 const boundLabel = computed(() => referenceLabel(props.modelValue, props.bindingSources))
 const compatibleSources = computed(() => props.bindingSources.filter(
-  source => typesCompatible(source.type, type.value),
+  source => typesCompatible(source.type, bindingType.value),
 ))
 
 function useBinding(binding) {
@@ -72,7 +73,7 @@ async function pickFolder() {
       <button type="button" class="btn btn-text btn-sm" @click="bindingOpen = !bindingOpen">更换</button>
       <button type="button" class="btn btn-text btn-sm" @click="useFixedValue">改为固定值</button>
     </div>
-    <BindingPicker v-if="bindingOpen" :sources="bindingSources" :target-type="type"
+    <BindingPicker v-if="bindingOpen" :sources="bindingSources" :target-type="bindingType"
       @select="useBinding" @cancel="bindingOpen = false" />
     <select v-else-if="!bound && type === 'select'" v-model="value" class="select">
       <option v-for="o in (def.options || [])" :key="optValue(o)" :value="optValue(o)">{{ optLabel(o) }}</option>

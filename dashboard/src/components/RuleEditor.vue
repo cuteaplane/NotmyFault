@@ -11,14 +11,19 @@ import {
   optValue,
 } from '../lib/utils'
 import {
+  FLOW_DATA_PORT_STEP,
+  FLOW_DATA_PORT_Y,
   FLOW_NODE_WIDTH,
   buildFlowGraph,
   routeFlowEdge,
 } from '../lib/flowGraph'
 import {
   buildBindingSources,
+  buildNodeDataPorts,
   createBindingId,
+  deriveDataEdges,
   ensureRuleBindingIds,
+  guaranteedTriggerIds,
   isReference,
   outputDefs,
   regenerateBindingIds,
@@ -85,16 +90,23 @@ function describeItem(item, kind) {
   const text = details.join(' · ') || '无额外参数'
   return text.length > 54 ? `${text.slice(0, 52)}…` : text
 }
-const graph = computed(() => buildFlowGraph({
-  rule: props.rule,
-  condition: isCondition.value ? conditionNode.value : null,
-  eventName,
-  actionName,
-  describeItem,
-  isAdmin: (item, kind) => isAdmin(
-    kind === 'trigger' ? store.schema.triggers[item?.type] : store.schema.actions[item?.type],
-  ),
-}))
+const graph = computed(() => {
+  const controlGraph = buildFlowGraph({
+    rule: props.rule,
+    condition: isCondition.value ? conditionNode.value : null,
+    eventName,
+    actionName,
+    describeItem,
+    isAdmin: (item, kind) => isAdmin(
+      kind === 'trigger' ? store.schema.triggers[item?.type] : store.schema.actions[item?.type],
+    ),
+  })
+  const nodes = controlGraph.nodes.map(node => buildNodeDataPorts(node, store.schema))
+  return {
+    nodes,
+    edges: [...controlGraph.edges, ...deriveDataEdges(props.rule, nodes)],
+  }
+})
 const layoutNodes = computed(() => graph.value.nodes.map(node => ({
   ...node,
   ...(nodePositions.value[node.id] || {}),
@@ -169,7 +181,7 @@ const validationIssues = computed(() => {
       if (!isReference(value)) continue
       const source = sources.find(item => JSON.stringify(item.value) === JSON.stringify(value))
       if (!source) issues.push(`动作 ${index + 1} 的“${def.label || def.name}”引用了不可用数据`)
-      else if (!typesCompatible(source.type, def.type)) {
+      else if (!typesCompatible(source.type, def.value_type || def.type)) {
         issues.push(`动作 ${index + 1} 的“${def.label || def.name}”数据类型不兼容`)
       }
     }
@@ -181,6 +193,16 @@ const validationIssues = computed(() => {
   ;(preconditions || []).forEach((item, index) => {
     if (!preconditionKeys.value.includes(item?.type)) issues.push(`开始前确认 ${index + 1} 不可用`)
     if (item?.params != null && (typeof item.params !== 'object' || Array.isArray(item.params))) issues.push(`开始前确认 ${index + 1} 参数格式无效`)
+    const sources = preconditionBindingSources()
+    for (const def of actionParams(item)) {
+      const value = item?.params?.[def.name]
+      if (!isReference(value)) continue
+      const source = sources.find(candidate => JSON.stringify(candidate.value) === JSON.stringify(value))
+      if (!source) issues.push(`开始前确认 ${index + 1} 的“${def.label || def.name}”引用了不可用数据`)
+      else if (!typesCompatible(source.type, def.value_type || def.type)) {
+        issues.push(`开始前确认 ${index + 1} 的“${def.label || def.name}”数据类型不兼容`)
+      }
+    }
   })
   return issues
 })
@@ -361,7 +383,10 @@ function actionBindingSources(index) {
   return buildBindingSources(props.rule, index, store.schema)
 }
 function preconditionBindingSources() {
-  return buildBindingSources(props.rule, 0, store.schema, { allowSteps: false })
+  return buildBindingSources(props.rule, 0, store.schema, {
+    allowSteps: false,
+    allowConditionalTriggers: false,
+  })
 }
 function removePrecondition(index) {
   props.rule.preconditions.splice(index, 1)
@@ -394,6 +419,8 @@ let resizeObserver = null
 let fittedOnce = false
 let camAnimTimer = null
 let formConditionLayoutKey = null
+const dataDrag = ref(null)
+const dataDropTarget = ref(null)
 
 function clampZoom(value) { return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, value)) }
 function animateCamera() {
@@ -448,6 +475,97 @@ function endPan() {
   isPanning.value = false
 }
 
+function dataReference(node, port) {
+  return {
+    $ref: {
+      scope: node.kind === 'trigger' ? 'trigger' : 'step',
+      node: node.source.binding_id,
+      path: [port.name],
+    },
+  }
+}
+function canConnectDataPorts(sourceNode, sourcePort, targetNode, targetPort) {
+  if (!sourcePort.required || !typesCompatible(sourcePort.type, targetPort.type)) return false
+  if (sourceNode.kind === 'action') {
+    return targetNode.kind === 'action' && sourceNode.index < targetNode.index
+  }
+  if (sourceNode.kind !== 'trigger') return false
+  if (targetNode.kind === 'precondition') {
+    const guaranteed = guaranteedTriggerIds(props.rule.condition || props.rule.event)
+    return guaranteed.has(sourceNode.source.binding_id)
+  }
+  return targetNode.kind === 'action'
+}
+function inputPortAt(event) {
+  const target = event.target?.closest?.('[data-input-node][data-input-port]')
+    || document.elementFromPoint?.(event.clientX, event.clientY)?.closest?.('[data-input-node][data-input-port]')
+  if (!target) return null
+  const node = layoutNodes.value.find(item => item.id === target.dataset.inputNode)
+  const port = node?.dataInputs.find(item => item.name === target.dataset.inputPort)
+  return node && port ? { node, port } : null
+}
+function updateDataDropTarget(event) {
+  if (!dataDrag.value) return
+  dataDrag.value = { ...dataDrag.value, clientX: event.clientX, clientY: event.clientY }
+  const target = inputPortAt(event)
+  const source = layoutNodes.value.find(node => node.id === dataDrag.value.sourceNodeId)
+  const sourcePort = source?.dataOutputs.find(port => port.name === dataDrag.value.sourcePortName)
+  dataDropTarget.value = target && source && sourcePort && canConnectDataPorts(source, sourcePort, target.node, target.port)
+    ? target
+    : null
+}
+function startDataDrag(event, node, port) {
+  if (event.button !== 0 || !port.required) return
+  event.stopPropagation()
+  selectedNodeId.value = node.id
+  dataDrag.value = {
+    sourceNodeId: node.id,
+    sourcePortName: port.name,
+    clientX: event.clientX,
+    clientY: event.clientY,
+  }
+  dataDropTarget.value = null
+  event.currentTarget.setPointerCapture?.(event.pointerId)
+}
+function endDataDrag(event) {
+  if (!dataDrag.value) return
+  updateDataDropTarget(event)
+  const source = layoutNodes.value.find(node => node.id === dataDrag.value.sourceNodeId)
+  const sourcePort = source?.dataOutputs.find(port => port.name === dataDrag.value.sourcePortName)
+  const target = dataDropTarget.value
+  if (source && sourcePort && target && canConnectDataPorts(source, sourcePort, target.node, target.port)) {
+    target.node.source.params ||= {}
+    target.node.source.params[target.port.name] = dataReference(source, sourcePort)
+    selectedNodeId.value = target.node.id
+  }
+  dataDrag.value = null
+  dataDropTarget.value = null
+}
+function cancelDataDrag() {
+  dataDrag.value = null
+  dataDropTarget.value = null
+}
+function dataInputDropState(node, port) {
+  if (!dataDrag.value) return ''
+  const source = layoutNodes.value.find(item => item.id === dataDrag.value.sourceNodeId)
+  const sourcePort = source?.dataOutputs.find(item => item.name === dataDrag.value.sourcePortName)
+  if (!source || !sourcePort) return 'invalid'
+  return canConnectDataPorts(source, sourcePort, node, port) ? 'valid' : 'invalid'
+}
+const pendingDataEdge = computed(() => {
+  if (!dataDrag.value || !viewportRef.value) return null
+  const source = layoutNodes.value.find(node => node.id === dataDrag.value.sourceNodeId)
+  const sourcePort = source?.dataOutputs.find(port => port.name === dataDrag.value.sourcePortName)
+  if (!source || !sourcePort) return null
+  const rect = viewportRef.value.getBoundingClientRect()
+  const x1 = source.x + FLOW_NODE_WIDTH
+  const y1 = source.y + FLOW_DATA_PORT_Y + sourcePort.index * FLOW_DATA_PORT_STEP
+  const x2 = (dataDrag.value.clientX - rect.left - pan.value.x) / zoom.value
+  const y2 = (dataDrag.value.clientY - rect.top - pan.value.y) / zoom.value
+  const middle = Math.max(x1 + 40, (x1 + x2) / 2)
+  return { d: `M ${x1} ${y1} C ${middle} ${y1}, ${middle} ${y2}, ${x2} ${y2}` }
+})
+
 // 内容包围盒（节点 228×~120）
 const contentBounds = computed(() => {
   const nodes = layoutNodes.value
@@ -457,7 +575,7 @@ const contentBounds = computed(() => {
     minX = Math.min(minX, node.x)
     minY = Math.min(minY, node.y)
     maxX = Math.max(maxX, node.x + FLOW_NODE_WIDTH)
-    maxY = Math.max(maxY, node.y + 120)
+    maxY = Math.max(maxY, node.y + 120 + node.dataPortRows * 24)
   }
   return { minX, minY, maxX, maxY, w: maxX - minX, h: maxY - minY }
 })
@@ -700,7 +818,8 @@ onUnmounted(() => {
           </div>
         </div>
         <div ref="viewportRef" class="node-canvas-viewport" :class="{ panning: isPanning }" :style="gridStyle"
-          @pointerdown="startPan" @pointermove="movePan" @pointerup="endPan" @pointercancel="endPan"
+          @pointerdown="startPan" @pointermove="dataDrag ? updateDataDropTarget($event) : movePan($event)"
+          @pointerup="dataDrag ? endDataDrag($event) : endPan()" @pointercancel="dataDrag ? cancelDataDrag() : endPan()"
           @wheel="onCanvasWheel">
           <div class="node-canvas" :class="{ 'cam-anim': camAnim }" :style="cameraStyle">
             <!--
@@ -713,11 +832,15 @@ onUnmounted(() => {
                 <marker id="node-link-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
                   <path d="M 0 0 L 8 4 L 0 8 z" />
                 </marker>
+                <marker id="node-data-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                  <path d="M 0 0 L 8 4 L 0 8 z" />
+                </marker>
               </defs>
-              <g v-for="edge in graphEdges" :key="edge.id" class="node-edge" :class="{ dimmed: edgeDimmed(edge) }">
+               <g v-for="edge in graphEdges" :key="edge.id" class="node-edge" :class="{ dimmed: edgeDimmed(edge) }">
                 <path class="node-link" :class="[`node-link-${edge.kind}`, { reversed: edge.reversed }]" :d="edge.d" />
                 <text v-if="edge.label" class="node-link-label" :x="edge.labelX" :y="edge.labelY" text-anchor="middle">{{ edge.label }}</text>
-              </g>
+               </g>
+               <path v-if="pendingDataEdge" class="node-link node-link-data node-link-pending" :d="pendingDataEdge.d" />
             </svg>
 
             <article v-for="node in layoutNodes" :key="node.id"
@@ -736,6 +859,21 @@ onUnmounted(() => {
                 <b>{{ node.label }}</b>
                 <small :title="node.meta">{{ node.meta }}</small>
                 <span v-if="node.admin" class="node-admin">管理员权限</span>
+              </div>
+              <div v-if="node.dataPortRows" class="graph-node-data">
+                 <div class="data-port-column data-port-column-input">
+                   <span v-for="port in node.dataInputs" :key="port.id" class="data-port-row"
+                     :class="dataInputDropState(node, port)" :data-input-node="node.id" :data-input-port="port.name"
+                     :title="`${port.label} · ${port.type}`">
+                     <i class="data-port-dot"></i><small>{{ port.label }}</small><code>{{ port.type }}</code>
+                   </span>
+                 </div>
+                 <div class="data-port-column data-port-column-output">
+                   <span v-for="port in node.dataOutputs" :key="port.id" class="data-port-row" :class="{ optional: !port.required }" :title="`${port.label} · ${port.type}`">
+                     <small>{{ port.label }}</small><code>{{ port.type }}</code><i class="data-port-dot"
+                       :class="{ draggable: port.required }" @pointerdown="startDataDrag($event, node, port)"></i>
+                   </span>
+                </div>
               </div>
               <footer v-if="node.kind === 'action'" class="graph-node-actions">
                 <button class="icon-btn" :disabled="node.index === 0" title="提前执行" @click.stop="moveAction(node.index, -1)"><span class="material-symbols-outlined">arrow_back</span></button>
@@ -762,7 +900,7 @@ onUnmounted(() => {
             </svg>
           </div>
         </div>
-        <div class="canvas-help"><span class="material-symbols-outlined">pan_tool</span>拖空白处平移 · 滚轮缩放 · 悬停节点可追踪上下游链路</div>
+        <div class="canvas-help"><span class="material-symbols-outlined">pan_tool</span>拖空白处平移 · 从输出端口拖至输入端口绑定数据 · 实线为控制流，虚线为数据流</div>
       </section>
 
       <aside class="node-inspector">

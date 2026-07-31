@@ -26,13 +26,31 @@ if PROJECT_ROOT not in sys.path:
 
 import webview
 from notmyfault.config import CONFIG_FILE
-from notmyfault.platform_support import launch_python_entry
+from notmyfault.platform_support import get_config_dir, launch_python_entry
+from notmyfault.plugin_schema import scan_plugins
 
 API = "http://127.0.0.1:19198"
 # 必须与 notmyfault/api_server.py 的 API_TOKEN_FILE 保持一致：
 # token 写在 config.json 同目录下（%APPDATA%/NotmyFault/.api_token），
 # 不再用 %TEMP%/notmyfault_api_token（旧路径，Authenticated Users 可读，已废弃）。
 API_TOKEN_FILE = os.path.join(os.path.dirname(CONFIG_FILE), ".api_token")
+
+
+def _get_plugins_schema() -> dict:
+    base = os.path.join(PROJECT_ROOT, "notmyfault")
+    result = {
+        "triggers": scan_plugins(base, "triggers", "trigger.json"),
+        "actions": scan_plugins(base, "actions", "action.json"),
+    }
+    user_dir = os.path.join(get_config_dir(), "plugins")
+    if os.path.isdir(user_dir):
+        for plugin_type in ("triggers", "actions"):
+            filename = "trigger.json" if plugin_type == "triggers" else "action.json"
+            for plugin_id, meta in scan_plugins(
+                user_dir, plugin_type, filename,
+            ).items():
+                result[plugin_type].setdefault(plugin_id, meta)
+    return result
 
 
 def _claim_dashboard_instance(port: int = DASHBOARD_CONTROL_PORT):
@@ -188,7 +206,10 @@ class DashboardAPI:
                 _normalize_config,
                 _validate_rules_safety,
             )
-            from notmyfault.rules import validate_rules_structure
+            from notmyfault.rules import (
+                validate_rule_bindings,
+                validate_rules_structure,
+            )
             config = self.get_config()
             if not isinstance(config, dict) or config.get("_error"):
                 config = {}
@@ -202,6 +223,22 @@ class DashboardAPI:
                     "ok": False,
                     "error": "规则结构校验失败",
                     "details": structure_errors[:10],
+                }
+            schema = _get_plugins_schema()
+            binding_issues = []
+            for index, rule in enumerate(normalized_rules):
+                for issue in validate_rule_bindings(
+                    rule, schema["triggers"], schema["actions"],
+                ):
+                    binding_issues.append({
+                        "rule": rule.get("name", f"规则 #{index + 1}"),
+                        **issue,
+                    })
+            if binding_issues:
+                return {
+                    "ok": False,
+                    "error": "规则数据绑定无效",
+                    "details": binding_issues[:20],
                 }
             _warnings, errors = _validate_rules_safety(normalized_rules)
             if errors:
@@ -301,13 +338,6 @@ class DashboardAPI:
     def shutdown_engine(self) -> dict:
         """彻底退出引擎进程"""
         return self._auth_request("/api/engine/shutdown")
-    def fetch_api(self, path: str) -> dict:
-        """代理 API 请求"""
-        try:
-            req = urllib.request.urlopen(f"{API}{path}", timeout=5)
-            return json.loads(req.read())
-        except Exception as e:
-            return {"_error": str(e)}
 
     # ---- 日志读取 (bridge 直读文件，不依赖 API) ----
 

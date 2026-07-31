@@ -8,7 +8,11 @@ import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from notmyfault.bindings import BindingResolutionError, resolve_value
+from notmyfault.bindings import (
+    BindingResolutionError,
+    references_available,
+    resolve_value,
+)
 from notmyfault.diagnostics import Diagnostics
 from notmyfault.logging import engine_error
 from notmyfault.workflow import build_context, invoke_action
@@ -218,13 +222,31 @@ class WorkflowExecutor:
         for index, action in enumerate(actions):
             legacy_step_id = f"{action.get('type', 'action')}_{index + 1}"
             step_id = action.get("binding_id") or legacy_step_id
-            ok, result = self._run_action(action, rule_name, context)
-            record = {
-                "type": action.get("type", "action"),
-                "status": "ok" if ok else "failed",
-                "result": result if ok else None,
-                "error": None if ok else str(result),
-            }
+            if not references_available(action.get("params", {}), context):
+                record = {
+                    "type": action.get("type", "action"),
+                    "status": "skipped",
+                    "result": None,
+                    "error": None,
+                }
+                self._on_event(
+                    "action_skipped",
+                    {
+                        "action_type": action.get("type"),
+                        "rule_name": rule_name,
+                        "step_id": step_id,
+                        "reason": "数据来源未参与本次运行",
+                    },
+                )
+                ok = True
+            else:
+                ok, result = self._run_action(action, rule_name, context)
+                record = {
+                    "type": action.get("type", "action"),
+                    "status": "ok" if ok else "failed",
+                    "result": result if ok else None,
+                    "error": None if ok else str(result),
+                }
             context["steps"][step_id] = record
             if legacy_step_id != step_id:
                 context["steps"][legacy_step_id] = record

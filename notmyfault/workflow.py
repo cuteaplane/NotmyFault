@@ -6,8 +6,6 @@
 import copy
 from typing import Any, Callable, Dict
 
-from notmyfault.bindings import resolve_value
-
 
 def build_context(
     rule_name: str,
@@ -25,6 +23,9 @@ def build_context(
         triggers[binding_id] = {
             "type": event.get("type", ""),
             "payload": copy.deepcopy(item.get("payload", {})),
+            # v2 语义下事件叶子 params 即该触发器的配置快照，
+            # 供 $ref scope=trigger_config 引用。
+            "config": copy.deepcopy(event.get("params", {})),
         }
     return {
         "context_version": 2,
@@ -37,11 +38,6 @@ def build_context(
         "condition_events": copy.deepcopy(condition_events),
         "steps": {},
     }
-
-
-def resolve_templates(value: Any, context: Dict[str, Any]) -> Any:
-    """兼容旧调用点；新规则使用结构化 ``$ref``。"""
-    return resolve_value(value, context)
 
 
 def invoke_action(

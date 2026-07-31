@@ -59,6 +59,7 @@ export function ensureRuleBindingIds(rule) {
     if (!node || typeof node !== 'object') return
     if (node.type && !Array.isArray(node.children) && !Array.isArray(node.events)) {
       if (!node.binding_id || seen.has(node.binding_id)) node.binding_id = createBindingId('trigger')
+      if (!node.params || typeof node.params !== 'object') node.params = {}
       seen.add(node.binding_id)
       return
     }
@@ -69,6 +70,7 @@ export function ensureRuleBindingIds(rule) {
   for (const [field, kind] of [['preconditions', 'precondition'], ['actions', 'action']]) {
     for (const item of rule[field] || []) {
       if (!item.binding_id || seen.has(item.binding_id)) item.binding_id = createBindingId(kind)
+      if (!item.params || typeof item.params !== 'object') item.params = {}
       seen.add(item.binding_id)
     }
   }
@@ -89,7 +91,7 @@ export function regenerateBindingIds(node, kind = 'trigger') {
   return node
 }
 
-function normalizedType(type) {
+export function normalizedType(type) {
   if (['string', 'textarea', 'path', 'time', 'hotkey', 'select'].includes(type)) return 'string'
   return type || 'any'
 }
@@ -100,25 +102,48 @@ export function typesCompatible(source, target) {
   return source === 'any' || target === 'any' || source === target
 }
 
-function sourceItem(group, label, type, ref, sensitive = false) {
-  return { group, label, type: type || 'any', value: { $ref: ref }, sensitive }
+function sourceItem(group, label, output, ref, conditional = false) {
+  return {
+    group,
+    label,
+    type: output.type || 'any',
+    format: output.format,
+    value: { $ref: ref },
+    sensitive: output.sensitive,
+    conditional,
+  }
 }
 
-export function buildBindingSources(rule, actionIndex, schema, { allowSteps = true } = {}) {
+export function buildBindingSources(
+  rule,
+  actionIndex,
+  schema,
+  { allowSteps = true, allowConditionalTriggers = true } = {},
+) {
   const result = []
   const leaves = collectTriggerLeaves(rule)
   const guaranteed = guaranteedTriggerIds(rule.condition || rule.event)
 
   for (const leaf of leaves) {
-    if (!guaranteed.has(leaf.binding_id)) continue
+    const conditional = !guaranteed.has(leaf.binding_id)
+    if (conditional && !allowConditionalTriggers) continue
     const meta = schema.triggers[leaf.type]
     for (const output of outputDefs(meta).filter(item => item.required !== false)) {
       result.push(sourceItem(
-        '触发条件',
+        conditional ? '条件分支（仅命中时执行）' : '触发条件',
         `${meta?.name || leaf.type} · ${output.label || output.name}`,
-        output.type,
+        output,
         { scope: 'trigger', node: leaf.binding_id, path: [output.name] },
-        output.sensitive,
+        conditional,
+      ))
+    }
+    for (const param of meta?.params || []) {
+      result.push(sourceItem(
+        conditional ? '条件分支配置（仅命中时执行）' : '触发条件配置',
+        `${meta?.name || leaf.type} · 配置·${param.label || param.name}`,
+        { type: normalizedType(param.value_type || param.type), format: param.format },
+        { scope: 'trigger_config', node: leaf.binding_id, path: [param.name] },
+        conditional,
       ))
     }
   }
@@ -130,14 +155,91 @@ export function buildBindingSources(rule, actionIndex, schema, { allowSteps = tr
         result.push(sourceItem(
           '之前的动作',
           `动作 ${index + 1}：${meta?.name || action.type} · ${output.label || output.name}`,
-          output.type,
+          output,
           { scope: 'step', node: action.binding_id, path: [output.name] },
-          output.sensitive,
         ))
       }
     })
   }
   return result
+}
+
+export function buildNodeDataPorts(node, schema) {
+  const meta = node.kind === 'trigger'
+    ? schema.triggers[node.source?.type]
+    : schema.actions[node.source?.type]
+  const dataInputs = ['action', 'precondition'].includes(node.kind)
+    ? (meta?.params || []).map((param, index) => ({
+        id: `input:${param.name}`,
+        index,
+        name: param.name,
+        label: param.label || param.name,
+        type: normalizedType(param.value_type || param.type),
+        format: param.format,
+      }))
+    : []
+  const dataOutputs = ['trigger', 'action'].includes(node.kind)
+    ? outputDefs(meta).map((output, index) => ({
+        id: `output:${output.name}`,
+        index,
+        name: output.name,
+        label: output.label || output.name,
+        type: normalizedType(output.type),
+        format: output.format,
+        required: output.required !== false,
+        sensitive: output.sensitive,
+      }))
+    : []
+  return {
+    ...node,
+    dataInputs,
+    dataOutputs,
+    dataPortRows: Math.max(dataInputs.length, dataOutputs.length),
+  }
+}
+
+export function deriveDataEdges(rule, nodes) {
+  const guaranteed = guaranteedTriggerIds(rule.condition || rule.event)
+  const nodesByBindingId = new Map(
+    nodes
+      .filter(node => node.source?.binding_id)
+      .map(node => [node.source.binding_id, node]),
+  )
+  const edges = []
+  for (const target of nodes.filter(node => ['action', 'precondition'].includes(node.kind))) {
+    const params = target.source?.params || {}
+    for (const [paramName, value] of Object.entries(params)) {
+      const targetPort = target.dataInputs.find(port => port.name === paramName)
+      for (const [referenceIndex, reference] of collectReferences(value).entries()) {
+        if (!['trigger', 'step'].includes(reference.scope)) continue
+        const source = nodesByBindingId.get(reference.node)
+        const outputName = Array.isArray(reference.path) ? reference.path[0] : null
+        const sourcePort = source?.dataOutputs.find(port => port.name === outputName)
+        if (!source || !sourcePort || !targetPort) continue
+        const validOrder = source.kind !== 'action'
+          || (target.kind === 'action' && source.index < target.index)
+        const validCondition = target.kind !== 'precondition'
+          || source.kind !== 'trigger'
+          || guaranteed.has(source.source.binding_id)
+        const valid = sourcePort.required
+          && typesCompatible(sourcePort.type, targetPort.type)
+          && validOrder
+          && validCondition
+        edges.push({
+          id: `data:${reference.node}:${outputName}:${target.source.binding_id}:${paramName}:${referenceIndex}`,
+          channel: 'data',
+          kind: valid ? 'data' : 'data-invalid',
+          from: source.id,
+          to: target.id,
+          sourcePortIndex: sourcePort.index,
+          targetPortIndex: targetPort.index,
+          label: `${sourcePort.type} → ${targetPort.label}`,
+          valid,
+        })
+      }
+    }
+  }
+  return edges
 }
 
 export function referenceLabel(value, sources) {

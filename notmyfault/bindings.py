@@ -95,6 +95,11 @@ def _reference_root(
         if trigger is _MISSING:
             return _MISSING, path
         return trigger.get("payload", _MISSING), path
+    if scope == "trigger_config":
+        trigger = context.get("triggers", {}).get(node, _MISSING)
+        if trigger is _MISSING:
+            return _MISSING, path
+        return trigger.get("config", _MISSING), path
     if scope == "step":
         step = context.get("steps", {}).get(node, _MISSING)
         if step is _MISSING:
@@ -202,6 +207,21 @@ def iter_references(value: Any, *, location: str = "$") -> Iterable[BindingUsage
     elif isinstance(value, list):
         for index, item in enumerate(value):
             yield from iter_references(item, location=f"{location}[{index}]")
+
+
+def references_available(value: Any, context: Dict[str, Any]) -> bool:
+    """返回结构化绑定的来源是否参与了本次工作流运行。"""
+    for usage in iter_references(value):
+        reference = usage.reference
+        scope = reference.get("scope")
+        if scope in ("trigger", "trigger_config"):
+            if reference.get("node") not in context.get("triggers", {}):
+                return False
+        elif scope == "step":
+            step = context.get("steps", {}).get(reference.get("node"))
+            if not isinstance(step, dict) or step.get("status") != "ok":
+                return False
+    return True
 
 
 def iter_legacy_event_payload_paths(value: Any) -> Iterable[Tuple[str, ...]]:
