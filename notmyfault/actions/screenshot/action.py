@@ -20,13 +20,13 @@ def run(action_info, params):
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = os.path.join(desktop, f"screenshot_{ts}.{fmt}")
         else:
-            from notmyfault.linux_support import default_output_path
+            from notmyfault.platform.linux_support import default_output_path
             output_path = str(default_output_path("screenshot", fmt))
 
     print(f"[Action:screenshot] 截取{mode} -> {output_path}")
 
     if os.name != "nt":
-        from notmyfault.linux_support import command_path, session_type
+        from notmyfault.platform.linux_support import command_path, session_type
 
         destination = Path(output_path).expanduser()
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -35,7 +35,7 @@ def run(action_info, params):
             capture_path = destination.with_suffix(".capture.png")
 
         if session_type() == "wayland":
-            from notmyfault.portal_screenshot import take_screenshot
+            from notmyfault.platform.portal_screenshot import take_screenshot
 
             take_screenshot(
                 str(capture_path),

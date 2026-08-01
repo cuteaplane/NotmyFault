@@ -10,7 +10,7 @@
     错误:  [TIMESTAMP] [ERROR] {"event": "...", ...JSON...}
 
 用法:
-    from notmyfault.logging import engine_info, engine_warn, engine_error
+    from notmyfault.core.logging import engine_info, engine_warn, engine_error
     engine_info("装载Trigger: 进程状态扫描器 (process_state) v1")
     engine_error("plugin_load_failed", plugin="test", type="Trigger", reason="schema 校验失败")
 """

@@ -32,7 +32,7 @@ def run(action_info, params):
     print(f"[Action:wallpaper] 设置壁纸: {abspath}")
 
     if os.name != "nt":
-        from notmyfault.linux_support import command_path, desktop_environment
+        from notmyfault.platform.linux_support import command_path, desktop_environment
 
         desktop = desktop_environment()
         if desktop == "gnome":

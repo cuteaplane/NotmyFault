@@ -16,9 +16,9 @@ import traceback
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from notmyfault.config import CONFIG_FILE, ConfigValidationError, load_verified_config
-from notmyfault.diagnostics import Diagnostics
-from notmyfault.logging import engine_error, engine_info, engine_warn
-from notmyfault.plugin_loader import (
+from notmyfault.core.diagnostics import Diagnostics
+from notmyfault.core.logging import engine_error, engine_info, engine_warn
+from notmyfault.security.plugin_loader import (
     PluginKind,
     PluginLoader,
     PluginRegistry,
@@ -32,21 +32,21 @@ from notmyfault.plugin_loader import (
     verify_plugin_integrity,
     verify_plugin_sig,
 )
-from notmyfault.rules import (
+from notmyfault.core.rules import (
     ConditionRuntime,
     aggregate_trigger_params,
     get_rule_events,
     validate_rules,
 )
-from notmyfault.plugin_schema import check_payload_contract
-from notmyfault.security import (
+from notmyfault.security.plugin_schema import check_payload_contract
+from notmyfault.security.security import (
     SecurityMode,
     detect_security_mode as _detect_security_mode,
     verify_core_integrity,
 )
-from notmyfault.trigger_supervisor import TriggerSupervisor
-from notmyfault.workflow import build_context
-from notmyfault.workflow_executor import WorkflowExecutor
+from notmyfault.core.trigger_supervisor import TriggerSupervisor
+from notmyfault.core.workflow import build_context
+from notmyfault.core.workflow_executor import WorkflowExecutor
 
 
 # ============================================================================
@@ -81,7 +81,7 @@ class AutomationEngine:
         self._plugins_shutdown = False
 
         # 安全系统
-        from notmyfault import sudo as _sudo
+        from notmyfault.security import sudo as _sudo
         self._sudo = _sudo
         self._engine_token: str = _sudo.begin_engine_session()
         self._privilege_session_closed = False
@@ -181,7 +181,7 @@ class AutomationEngine:
     def _alert_user(title: str, message: str, open_dashboard: bool = False) -> None:
         """向用户发送告警；失败时记录到日志而非静默吞掉。"""
         try:
-            from notmyfault.alert import alert_user
+            from notmyfault.host.alert import alert_user
             alert_user(title, message, open_dashboard=open_dashboard)
         except Exception as e:
             engine_warn(f"alert_user 调用失败 ({title}): {e}")
@@ -266,7 +266,7 @@ class AutomationEngine:
                 {"trigger_id": trigger_id, "instance_id": instance_id, "error": err[-500:]},
             )
             try:
-                from notmyfault.alert import alert_user
+                from notmyfault.host.alert import alert_user
                 alert_user(
                     f"触发器 {instance_id} 崩溃",
                     err[-200:],
@@ -735,7 +735,7 @@ class AutomationEngine:
         # 启动前先体检：问题规则会被诊断出来，但不因为一条坏规则饿死整台引擎。
         self._validate_all_rules()
 
-        from notmyfault.platform_support import show_notification
+        from notmyfault.platform.platform_support import show_notification
 
         if os.name == "nt":
             from Win_toaster.AUMID_Register import register_toaster

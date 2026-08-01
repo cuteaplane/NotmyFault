@@ -7,7 +7,7 @@ _trigger_threads / _trigger_events / _trigger_lock 的所有权移至独立组�
 import sys
 import threading
 import time
-from notmyfault.rules import config_fingerprint
+from notmyfault.core.rules import config_fingerprint
 
 # 触发器只是事件源：连续这么多次 30s 退出失败视为卡死，强制放弃监管，
 # 否则一次原生调用阻塞会让热重载永久瘫痪。

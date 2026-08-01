@@ -7,7 +7,7 @@
 - strict 模式：除上述之外的一切导入行为都会被拒绝，防止外部代码把
   notmyfault 组件当库随意加载；normal / permissive 模式打印日志后放行。
 
-notmyfault.sudo 有更严的专用守卫（见 sudo.py）：只允许插件命名空间
+notmyfault.security.sudo 有更严的专用守卫（见 sudo.py）：只允许插件命名空间
 （notmyfault.action_* / trigger_*）与引擎核心（engine.py）导入。
 """
 
@@ -63,7 +63,7 @@ def _guard_package_import() -> None:
     caller = _find_external_caller()
     if caller is None or _in_pytest() or _is_project_script(caller):
         return
-    from notmyfault.security import detect_security_mode
+    from notmyfault.security.security import detect_security_mode
     mode = detect_security_mode()
     caller_name = caller.f_globals.get("__name__", "")
     caller_file = caller.f_globals.get("__file__") or "<stdin>"
@@ -83,5 +83,5 @@ def _guard_package_import() -> None:
 
 _guard_package_import()
 
-from .app import run
+from .host.app import run
 from .version import __version__

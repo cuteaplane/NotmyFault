@@ -8,14 +8,14 @@ import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from notmyfault.bindings import (
+from notmyfault.core.bindings import (
     BindingResolutionError,
     references_available,
     resolve_value,
 )
-from notmyfault.diagnostics import Diagnostics
-from notmyfault.logging import engine_error
-from notmyfault.workflow import build_context, invoke_action
+from notmyfault.core.diagnostics import Diagnostics
+from notmyfault.core.logging import engine_error
+from notmyfault.core.workflow import build_context, invoke_action
 
 
 MappingProvider = Callable[[], Dict[str, Any]]

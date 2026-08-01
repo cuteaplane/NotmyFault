@@ -22,7 +22,7 @@ from notmyfault.config import CONFIG_FILE
 # ============================================================================
 
 def check_sudo_import(py_file_path: str) -> bool:
-    """扫描 .py 源码是否 import 了 notmyfault.sudo（AST 级别检查）。
+    """扫描 .py 源码是否 import 了 notmyfault.security.sudo（AST 级别检查）。
 
     在插件 exec 之前跑这道安检：如果插件偷偷 import 了 sudo 但没在
     元数据里声明 admin 权限，引擎会知道该盯紧它。
@@ -34,10 +34,10 @@ def check_sudo_import(py_file_path: str) -> bool:
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    if alias.name == "notmyfault.sudo":
+                    if alias.name == "notmyfault.security.sudo":
                         return True
             elif isinstance(node, ast.ImportFrom):
-                if node.module == "notmyfault.sudo":
+                if node.module == "notmyfault.security.sudo":
                     return True
                 if node.module == "notmyfault":
                     for alias in node.names:
@@ -62,7 +62,7 @@ _OS_DANGEROUS = {
 _SUBPROCESS_CALLS = {"run", "Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput"}
 _CTYPES_DANGEROUS = {"windll", "CDLL", "WinDLL", "OleDLL", "WINFUNCTYPE", "CFUNCTYPE", "Structure"}
 # 自提权信号：ShellExecute 系列（UAC runas 提权 API）+ "runas" 动词。
-# 插件必须走 notmyfault.sudo.run_as_admin（声明 admin 权限），禁止自己直接提权。
+# 插件必须走 notmyfault.security.sudo.run_as_admin（声明 admin 权限），禁止自己直接提权。
 _ELEVATION_FUNCS = {"shellexecute", "shellexecutew", "shellexecuteex", "shellexecutea"}
 _ELEVATION_VERB = "runas"
 # 动态执行函数：exec/eval/compile 可绕过所有 AST 能力检测，
@@ -80,12 +80,12 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
     - external_binary: 执行外部二进制/进程（subprocess、os.system、os.popen、
       os.startfile、os.exec*/spawn*、shell=True）。
 
-    admin 能力（import notmyfault.sudo）由上面的 check_sudo_import 负责，
+    admin 能力（import notmyfault.security.sudo）由上面的 check_sudo_import 负责，
     此处不重复。扫描在插件 exec 之前进行，避免执行未声明的危险代码。
 
     另外 self_elevation（自行提权）是一律禁止的能力，不可声明：
     - 检测 ShellExecute/ShellExecuteW/ShellExecuteEx 等调用，或任意字符串里出现
-      "runas" 动词（UAC 提权）。插件要提权必须走 notmyfault.sudo.run_as_admin
+      "runas" 动词（UAC 提权）。插件要提权必须走 notmyfault.security.sudo.run_as_admin
       并在元数据声明 "admin"，禁止自己 ShellExecute("runas")/os.startfile(x,"runas")
       /PowerShell Start-Process -Verb RunAs 之类。
 
@@ -418,7 +418,7 @@ def verify_plugin_sig(plugin_dir: str, origin: str = "builtin") -> bool:
     直接放入用户插件目录的插件（无签名）将被拒载。
     """
     try:
-        from notmyfault.signing_keys import get_public_keys
+        from notmyfault.security.signing_keys import get_public_keys
         pub_keys = get_public_keys()
         if not pub_keys:
             return False
@@ -433,7 +433,7 @@ def verify_plugin_sig(plugin_dir: str, origin: str = "builtin") -> bool:
         sig = f.read()
     # 必须与 signing.sign_plugin 用同一份文件清单（见 signing.plugin_files），
     # 否则两边 payload 不一致会让合法签名校验失败。
-    from notmyfault.signing import plugin_files
+    from notmyfault.security.signing import plugin_files
     payload = b"".join(f.read_bytes() for f in plugin_files(plugin_dir))
     digest = hashlib.sha256(payload).digest()
     for pub in pubs:

@@ -5,7 +5,7 @@
 点击按钮通过协议（notmyfault://）拉起 Dashboard，不依赖进程内 COM 回调。
 
 用法:
-    from notmyfault.alert import alert_user
+    from notmyfault.host.alert import alert_user
     alert_user("触发器崩溃", "process_state 触发器线程异常退出", open_dashboard=True)
 """
 
@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 
-from notmyfault.platform_support import launch_python_entry, show_notification
+from notmyfault.platform.platform_support import launch_python_entry, show_notification
 
 if os.name == "nt":
     from windows_toasts import Toast, ToastButton

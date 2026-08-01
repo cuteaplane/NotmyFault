@@ -14,21 +14,21 @@ import threading
 import traceback
 from typing import Any, Callable, Dict, Literal, Optional, Tuple
 
-from notmyfault.logging import engine_error, engine_info, engine_warn
-from notmyfault.plugin_schema import (
+from notmyfault.core.logging import engine_error, engine_info, engine_warn
+from notmyfault.security.plugin_schema import (
     check_permissions_conform,
     is_known_permission,
     validate_plugin_meta,
 )
-from notmyfault.plugins import (
+from notmyfault.security.plugins import (
     check_sudo_import,
     scan_borrowed_privilege,
     scan_plugin_capabilities,
     verify_plugin_integrity,
     verify_plugin_sig,
 )
-from notmyfault.security import SecurityMode
-from notmyfault.signing import plugin_files
+from notmyfault.security.security import SecurityMode
+from notmyfault.security.signing import plugin_files
 
 # 向后兼容早期内部导入。
 _validate_plugin_meta = validate_plugin_meta
@@ -393,10 +393,10 @@ class PluginLoader:
             )
 
             # self_elevation（自行提权）一律禁止：插件要提权必须走
-            # notmyfault.sudo.run_as_admin 并声明 admin，禁止自己 ShellExecute("runas") 等。
+            # notmyfault.security.sudo.run_as_admin 并声明 admin，禁止自己 ShellExecute("runas") 等。
             # 不分安全模式--这是硬规则，permissive 也拒载。
             if "self_elevation" in caps:
-                cap_msg = "self_elevation（自行提权：必须改走 notmyfault.sudo.run_as_admin 并声明 admin）"
+                cap_msg = "self_elevation（自行提权：必须改走 notmyfault.security.sudo.run_as_admin 并声明 admin）"
                 print(f'[Engine] [安全] 插件 "{plugin_id}" 触发禁止能力: {cap_msg}', file=sys.stderr)
                 engine_warn(f"forbidden_capability: {plugin_id} {cap_msg}")
                 failed_count += 1
@@ -429,14 +429,14 @@ class PluginLoader:
                     continue
 
             # --- 提权通道一致性（exec 前）---
-            # 具有越权可能的插件（import notmyfault.sudo 或声明 admin 权限）
+            # 具有越权可能的插件（import notmyfault.security.sudo 或声明 admin 权限）
             # 在 strict 模式必须走受控的 sudo 通道：既 import 了
-            # notmyfault.sudo，又声明了 "admin" 权限。只声明不引用（可能
+            # notmyfault.security.sudo，又声明了 "admin" 权限。只声明不引用（可能
             # 自行越权）、只引用不声明（偷用提权）都一律拒载。
             uses_sudo = any(check_sudo_import(path) for path in python_files)
             has_admin = "admin" in (meta.get("permissions") or [])
             if uses_sudo and not has_admin:
-                reason = "import 了 notmyfault.sudo 但未在元数据中声明 'admin' 权限"
+                reason = "import 了 notmyfault.security.sudo 但未在元数据中声明 'admin' 权限"
                 print(
                     f'[Engine] [!!] 插件 "{plugin_id}" {reason}',
                     file=sys.stderr,
@@ -447,7 +447,7 @@ class PluginLoader:
                     engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason=reason)
                     continue
             elif has_admin and not uses_sudo:
-                reason = "声明了 'admin' 权限但未通过 notmyfault.sudo 使用提权通道"
+                reason = "声明了 'admin' 权限但未通过 notmyfault.security.sudo 使用提权通道"
                 print(
                     f'[Engine] [!!] 插件 "{plugin_id}" {reason}',
                     file=sys.stderr,

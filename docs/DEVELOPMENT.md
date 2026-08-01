@@ -72,11 +72,13 @@ npm exec vite build -- --emptyOutDir
 
 | 位置 | 用途 |
 | --- | --- |
-| `notmyfault/engine.py` | 引擎生命周期、事件分发、动作流水线、热加载 |
-| `notmyfault/rules.py` | 条件树、规则匹配、规则校验；尽量保持纯函数 |
-| `notmyfault/workflow.py` | 动作上下文、`{{ ... }}` 参数引用、新旧动作 API 兼容 |
+| `notmyfault/core/` | 引擎核心：engine / rules / workflow / workflow_executor / bindings / trigger_supervisor / runtime_controller / diagnostics / logging |
+| `notmyfault/security/` | 安全：security / sudo / signing / signing_keys / plugins / plugin_loader / plugin_schema |
+| `notmyfault/host/` | 宿主/界面：api_server / tray / tray_linux / alert / app |
+| `notmyfault/platform/` | 平台适配：platform_support / linux_support / portal_screenshot |
+| `notmyfault/native/` | 原生调用安全原语（NATIVE_LOCK） |
 | `notmyfault/actions/` | 内置动作插件 |
-| `notmyfault/triggers/` | 内置触发器插件 |
+| `notmyfault/triggers/` | 内置触发器插件（含 `base.py` 轮询基类） |
 | `user_plugins/` | 用户/第三方插件源码；不能把第三方服务塞进内置插件 |
 | `dashboard/src/` | Dashboard 的 Vue 前端 |
 | `notmyfault/tests/` | Python 测试 |
@@ -267,10 +269,12 @@ def run(meta, config, emit_event, shutdown_event):
 加载。需要以库方式使用引擎时，请将安全模式设为 `normal`/`permissive`，或从
 `NOTMYFAULT.pyw` 启动。
 
-`notmyfault.sudo` 的导入守卫更严：只允许插件命名空间（`notmyfault.action_*` /
-`notmyfault.trigger_*`）与引擎核心（`engine.py`）导入，strict 模式下其他一切
-导入都会触发 `ImportError`。插件需要管理员权限时，请在元数据声明
-`"permissions": ["admin"]` 并通过 `notmyfault.sudo.run_as_admin` 走受控通道。
+`notmyfault.security.sudo` 的导入守卫更严：只允许插件命名空间
+（`notmyfault.action_*` / `notmyfault.trigger_*`）与引擎核心
+（`notmyfault.core.engine`）导入，strict 模式下其他一切导入都会触发
+`ImportError`。插件需要管理员权限时，请在元数据声明
+`"permissions": ["admin"]` 并通过 `notmyfault.security.sudo.run_as_admin`
+走受控通道。
 
 ## 6. 当前的归档示例
 

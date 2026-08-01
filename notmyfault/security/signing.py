@@ -86,7 +86,7 @@ def verify_file(path) -> bool:
     if not sig_path.exists():
         return False
     try:
-        from notmyfault.signing_keys import get_public_keys
+        from notmyfault.security.signing_keys import get_public_keys
         pub_keys = get_public_keys()
         if not pub_keys:
             return False

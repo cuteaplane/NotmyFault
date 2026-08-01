@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 from typing import Any
 
-from notmyfault.sudo import run_as_admin
+from notmyfault.security.sudo import run_as_admin
 
 
 _RADIO_SCRIPT = r'''

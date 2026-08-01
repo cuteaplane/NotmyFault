@@ -55,7 +55,7 @@ def _save_private_key(key, path: Path, encrypt: bool = False) -> None:
 
 
 try:
-    from notmyfault.signing import load_private_key, sign_plugin, plugin_files, sign_file
+    from notmyfault.security.signing import load_private_key, sign_plugin, plugin_files, sign_file
 except ImportError:
     print("! 无法导入签名模块，请确保项目结构完整", file=sys.stderr)
     raise SystemExit(1)
@@ -146,7 +146,7 @@ def cmd_verify(args):
     ed25519, *_ = _get_crypto()
     
     try:
-        from notmyfault.signing_keys import get_public_keys
+        from notmyfault.security.signing_keys import get_public_keys
         pub_keys = get_public_keys()
     except ImportError:
         print("! 无法导入公钥模块，请先运行 build.py init-keys")
@@ -298,8 +298,16 @@ def _build_integrity_manifest(private_key) -> None:
     """
     pkg_dir = ROOT / "notmyfault"
     files = {}
-    for p in sorted(pkg_dir.glob("*.py")):
-        files[p.name] = hashlib.sha256(p.read_bytes()).hexdigest()
+    # 递归覆盖根 + core/security/host/platform/native + triggers 框架文件；
+    # 跳过 tests / simulator / actions / 触发器插件（插件另有签名）与 __pycache__。
+    for p in sorted(pkg_dir.rglob("*.py")):
+        rel = p.relative_to(pkg_dir).as_posix()
+        parts = rel.split("/")
+        if parts[0] in ("tests", "simulator", "actions", "__pycache__") or "__pycache__" in parts:
+            continue
+        if parts[0] == "triggers" and rel not in ("triggers/__init__.py", "triggers/base.py"):
+            continue
+        files[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
     manifest_path = pkg_dir / "integrity.json"
     manifest_path.write_text(
         json.dumps({"files": files}, indent=2, sort_keys=True), encoding="utf-8"
@@ -311,7 +319,7 @@ def cmd_version(args):
     """显示当前密钥状态"""
     priv_ok = PRIVATE_KEY_FILE.exists()
     try:
-        from notmyfault.signing_keys import BUILTIN_PUBLIC_KEY
+        from notmyfault.security.signing_keys import BUILTIN_PUBLIC_KEY
         pub_ok = bool(BUILTIN_PUBLIC_KEY)
     except ImportError:
         pub_ok = False

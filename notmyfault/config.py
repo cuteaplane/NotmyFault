@@ -8,8 +8,8 @@ import secrets
 import sys
 from typing import Any, Dict, List
 
-from .platform_support import get_config_dir
-from .bindings import is_reference
+from notmyfault.platform.platform_support import get_config_dir
+from notmyfault.core.bindings import is_reference
 
 
 _BINDING_ID_RE = re.compile(r"^[tap]_[a-z0-9_]{6,64}$")

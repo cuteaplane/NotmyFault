@@ -10,7 +10,7 @@ import time
 import re
 from typing import Any, Dict, Iterable, List, Tuple
 
-from notmyfault.bindings import is_reference, iter_references
+from notmyfault.core.bindings import is_reference, iter_references
 
 
 _BINDING_ID_RE = re.compile(r"^[tap]_[a-z0-9_]{6,64}$")

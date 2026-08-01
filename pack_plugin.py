@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 import py7zr
-from notmyfault.plugin_schema import validate_plugin_meta
+from notmyfault.security.plugin_schema import validate_plugin_meta
 
 ROOT = Path(__file__).parent.resolve()
 USER_PLUGINS_DIR = ROOT / "user_plugins"

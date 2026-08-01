@@ -1,5 +1,5 @@
 def run(action_info, params):
-    from notmyfault.platform_support import show_notification
+    from notmyfault.platform.platform_support import show_notification
 
     title = params.get("title", "NotmyFault")
     message = params.get("message", "")

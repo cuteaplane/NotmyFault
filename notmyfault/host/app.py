@@ -3,9 +3,9 @@ import sys
 import threading
 from typing import Any, Callable, Dict, Optional
 
-from .config import get_config
-from .engine import AutomationEngine
-from .platform_support import get_config_dir
+from notmyfault.config import get_config
+from notmyfault.core.engine import AutomationEngine
+from notmyfault.platform.platform_support import get_config_dir
 import glob
 import subprocess as _sp
 
@@ -28,10 +28,14 @@ def _run_build_command(cmd: list[str], build_dir: str):
     )
 
 
+# 本模块位于 notmyfault/host/ 下，包根（插件目录/构建文件所在）是其上一级。
+_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def _ensure_first_run_build() -> None:
     if getattr(sys, "frozen", False):
         return
-    src_dir = os.path.dirname(__file__)
+    src_dir = _PKG_ROOT
     build_json = os.path.join(src_dir, "..", "build.json")
     build_py = os.path.join(src_dir, "..", "build.py")
     sig_files = glob.glob(os.path.join(src_dir, "actions", "*", "signature.sig"))
@@ -77,7 +81,7 @@ def _get_plugin_paths():
     if getattr(sys, "frozen", False):
         paths.append((os.path.join(sys._MEIPASS, "notmyfault"), "builtin"))
     else:
-        paths.append((os.path.dirname(__file__), "builtin"))
+        paths.append((_PKG_ROOT, "builtin"))
     user_dir = os.path.join(get_config_dir(), "plugins")
     if os.path.isdir(user_dir):
         paths.append((user_dir, "user"))
@@ -99,12 +103,12 @@ def run(
     on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> None:
     # 与 NOTMYFAULT.pyw 入口一致：拒绝以管理员身份启动，插件提权必须走
-    # notmyfault.sudo 的 UAC 受控通道，而不是整个引擎带着提升令牌运行。
-    from .security import is_admin_process
+    # notmyfault.security.sudo 的 UAC 受控通道，而不是整个引擎带着提升令牌运行。
+    from notmyfault.security.security import is_admin_process
     if is_admin_process():
         print(
             "[Engine] [!!] NotmyFault 拒绝以管理员身份启动：请用普通用户权限运行。"
-            "插件需要提权时请通过 notmyfault.sudo.run_as_admin 弹出 UAC 授权。",
+            "插件需要提权时请通过 notmyfault.security.sudo.run_as_admin 弹出 UAC 授权。",
             file=sys.stderr,
         )
         raise SystemExit(1)

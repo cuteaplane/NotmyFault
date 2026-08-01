@@ -23,14 +23,14 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from notmyfault.bindings import iter_legacy_event_payload_paths, iter_references
+from notmyfault.core.bindings import iter_legacy_event_payload_paths, iter_references
 from notmyfault.config import (
     CONFIG_FILE,
     ensure_rule_binding_ids,
     save_config as config_save,
 )
-from notmyfault.platform_support import get_config_dir
-from notmyfault.plugin_schema import (
+from notmyfault.platform.platform_support import get_config_dir
+from notmyfault.security.plugin_schema import (
     scan_plugins,
     validate_plugin_meta,
     scan_plugin_security,
@@ -41,9 +41,9 @@ from notmyfault.plugin_schema import (
     check_payload_contract,
     PERMISSION_REGISTRY,
 )
-from notmyfault.plugins import scan_borrowed_privilege
-from notmyfault.security import detect_security_mode, SecurityMode
-from notmyfault.rules import (
+from notmyfault.security.plugins import scan_borrowed_privilege
+from notmyfault.security.security import detect_security_mode, SecurityMode
+from notmyfault.core.rules import (
     get_rule_events,
     validate_rule_bindings,
     validate_rules_structure,
@@ -645,7 +645,7 @@ class EngineAPI:
         @app.get("/api/platform")
         async def platform_status():
             if sys.platform.startswith("linux"):
-                from notmyfault.linux_support import capability_report
+                from notmyfault.platform.linux_support import capability_report
                 return capability_report()
             return {
                 "platform": "windows" if sys.platform == "win32" else sys.platform,
@@ -1251,7 +1251,7 @@ class EngineAPI:
                     return JSONResponse({"ok": False, "error": "私钥不存在，请先运行 build.py init-keys"}, status_code=400)
 
                 try:
-                    from notmyfault.signing import sign_plugin, load_private_key
+                    from notmyfault.security.signing import sign_plugin, load_private_key
                     from pathlib import Path
                     pk = load_private_key(Path(priv_key_path), password=password or None)
                     sign_plugin(Path(root_path), json_name, pk)
@@ -1426,7 +1426,7 @@ class EngineAPI:
 
         @app.get("/api/engine/logs")
         async def engine_logs(lines: int = 200):
-            from notmyfault.logging import get_latest_log
+            from notmyfault.core.logging import get_latest_log
             log_path = get_latest_log(
                 os.path.join(os.path.dirname(CONFIG_FILE), "logs")
             )

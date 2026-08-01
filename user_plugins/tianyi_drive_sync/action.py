@@ -20,7 +20,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
-from notmyfault.platform_support import get_config_dir
+from notmyfault.platform.platform_support import get_config_dir
 
 
 _UPLOAD_URL = "https://upload.cloud.189.cn/uploadFile.action"

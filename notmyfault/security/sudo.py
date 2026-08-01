@@ -9,7 +9,7 @@ NotmyFault 提权辅助模块
   3. 外部恶意代码即使直接 import sudo.run_as_admin()，也会因未注册而被拒绝。
 
 用法:
-    from notmyfault.sudo import run_as_admin
+    from notmyfault.security.sudo import run_as_admin
 
     result = run_as_admin(["net", "start", "MyService"])
     if result.returncode == 0:
@@ -30,7 +30,7 @@ import sys
 import threading
 
 # ---------------------------------------------------------------------------
-# 导入守卫：notmyfault.sudo 只允许插件命名空间与引擎核心导入
+# 导入守卫：notmyfault.security.sudo 只允许插件命名空间与引擎核心导入
 # ---------------------------------------------------------------------------
 # sudo 是提权通道，比包级守卫更严：notmyfault 的其他组件也不许导入它，
 # 只有插件（通过元数据声明 admin + run_as_admin 的正道）和引擎核心
@@ -39,7 +39,7 @@ import threading
 
 # 引擎核心中唯一允许导入 sudo 的模块：它是 sudo 会话的授权管理者
 # （begin/end_engine_session、authorize_plugin），与提权调用无关。
-_ENGINE_CORE_MODULES = {"notmyfault.engine"}
+_ENGINE_CORE_MODULES = {"notmyfault.core.engine"}
 
 
 def _guard_sudo_import() -> None:
@@ -52,7 +52,7 @@ def _guard_sudo_import() -> None:
         for frame_info in inspect.stack():
             name = frame_info.frame.f_globals.get("__name__", "")
             if (
-                name == "notmyfault.sudo"
+                name == "notmyfault.security.sudo"
                 or name.startswith("importlib")
                 or name.startswith("_frozen_importlib")
             ):
@@ -82,16 +82,16 @@ def _guard_sudo_import() -> None:
         return
     else:
         caller_kind = f"外部代码 {caller_name}"
-    from notmyfault.security import detect_security_mode
+    from notmyfault.security.security import detect_security_mode
     mode = detect_security_mode()
     if mode is not None and mode.value != "strict":
         print(
-            f"[sudo] 宽松模式（{mode.value}）：{caller_kind} 导入 notmyfault.sudo，放行",
+            f"[sudo] 宽松模式（{mode.value}）：{caller_kind} 导入 notmyfault.security.sudo，放行",
             file=sys.stderr,
         )
         return
     raise ImportError(
-        f"notmyfault.sudo 安全限制（strict）：仅插件（notmyfault.action_*/trigger_*）"
+        f"notmyfault.security.sudo 安全限制（strict）：仅插件（notmyfault.action_*/trigger_*）"
         f"与引擎核心可导入，{caller_kind} 被拒绝。"
         f"插件请声明 'admin' 权限后通过 run_as_admin 提权。"
     )

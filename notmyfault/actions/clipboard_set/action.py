@@ -26,7 +26,7 @@ def run(action_info, params):
     print(f"[Action:clipboard_set] 写入剪贴板: {text[:50]}...")
 
     if os.name != "nt":
-        from notmyfault.linux_support import set_clipboard_text
+        from notmyfault.platform.linux_support import set_clipboard_text
 
         set_clipboard_text(str(text))
         print(f"[Action:clipboard_set] 剪贴板写入成功 ({len(text)} 字符)")

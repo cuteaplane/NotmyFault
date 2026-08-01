@@ -9,12 +9,12 @@ from typing import Callable, Optional
 import pystray
 from PIL import Image
 
-from .platform_support import (
+from notmyfault.platform.platform_support import (
     linux_autostart_path,
     set_linux_autostart,
     show_notification,
 )
-from .linux_support import session_type
+from notmyfault.platform.linux_support import session_type
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ICON_PATH = PROJECT_ROOT / "logo.png"

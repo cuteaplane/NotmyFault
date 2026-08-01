@@ -10,7 +10,7 @@ class _LASTINPUTINFO(ctypes.Structure):
 def _get_idle_seconds() -> float:
     """返回系统空闲秒数（自最后输入事件起）"""
     if os.name != "nt":
-        from notmyfault.linux_support import get_idle_seconds
+        from notmyfault.platform.linux_support import get_idle_seconds
         return get_idle_seconds()
     lii = _LASTINPUTINFO()
     lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)

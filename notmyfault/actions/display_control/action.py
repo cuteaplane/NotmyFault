@@ -232,7 +232,7 @@ def run(action_info, params):
 
     try:
         if os.name != "nt":
-            from notmyfault.linux_support import desktop_environment
+            from notmyfault.platform.linux_support import desktop_environment
 
             if action in ("set_brightness", "low_brightness", "high_brightness"):
                 brightness = _brightness_level(params)

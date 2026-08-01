@@ -16,7 +16,7 @@ def is_admin_process() -> bool:
 
     Windows 用 TokenElevation 判断而非 IsUserAnAdmin()（后者在部分受控
     环境会误报），POSIX 看有效 UID。探测失败一律按非管理员处理：
-    引擎以普通权限启动（插件提权仍走 notmyfault.sudo 的受控通道），
+    引擎以普通权限启动（插件提权仍走 notmyfault.security.sudo 的受控通道），
     不会因探测异常误拒绝正常用户。
     """
 
@@ -87,7 +87,7 @@ def detect_security_mode() -> SecurityMode:
         try:
             # build.json 决定安全模式，必须先验签：未签名或签名无效（security_mode
             # 可能被改过）一律不信任，跳过它回退到 STRICT 兜底。
-            from notmyfault.signing import verify_file
+            from notmyfault.security.signing import verify_file
             if not verify_file(_bp):
                 continue
             with open(_bp, encoding="utf-8") as _bf:
@@ -125,7 +125,7 @@ def verify_core_integrity() -> Tuple[bool, List[str]]:
     if not os.path.exists(manifest):
         return False, ["integrity.json (missing; run build.py)"]
     try:
-        from notmyfault.signing import verify_file
+        from notmyfault.security.signing import verify_file
         if not verify_file(manifest):
             return False, ["integrity.json (signature invalid)"]
         with open(manifest, encoding="utf-8") as f:

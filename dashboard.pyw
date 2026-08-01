@@ -27,8 +27,8 @@ if PROJECT_ROOT not in sys.path:
 
 import webview
 from notmyfault.config import CONFIG_FILE
-from notmyfault.platform_support import get_config_dir, launch_python_entry
-from notmyfault.plugin_schema import scan_plugins
+from notmyfault.platform.platform_support import get_config_dir, launch_python_entry
+from notmyfault.security.plugin_schema import scan_plugins
 
 API = "http://127.0.0.1:19198"
 # 必须与 notmyfault/api_server.py 的 API_TOKEN_FILE 保持一致：
@@ -212,7 +212,7 @@ class DashboardAPI:
                 _normalize_config,
                 _validate_rules_safety,
             )
-            from notmyfault.rules import (
+            from notmyfault.core.rules import (
                 validate_rule_bindings,
                 validate_rules_structure,
             )
@@ -351,13 +351,13 @@ class DashboardAPI:
 
     def _get_latest_log(self):
         """返回最新日志文件路径，没有则返回 None。"""
-        from notmyfault.logging import get_latest_log
+        from notmyfault.core.logging import get_latest_log
         return get_latest_log(self._LOG_DIR)
 
     def read_log_entries(self, lines: int = 500) -> list:
         """读取最新日志末尾 N 行，返回解析后的结构化条目列表。"""
         try:
-            from notmyfault.logging import read_log_entries as _read
+            from notmyfault.core.logging import read_log_entries as _read
             log_path = self._get_latest_log()
             if not log_path:
                 return [{"ts": "", "level": "INFO", "text": "还没有日志文件，请启动引擎", "data": None}]
@@ -368,7 +368,7 @@ class DashboardAPI:
     def read_diagnostics(self) -> dict:
         """从最新日志文件构建诊断摘要。"""
         try:
-            from notmyfault.logging import read_log_entries as _read, build_diagnostics
+            from notmyfault.core.logging import read_log_entries as _read, build_diagnostics
             log_path = self._get_latest_log()
             if not log_path:
                 return {"error_count": 0, "warn_count": 0, "last_errors": ["还没有日志文件，请启动引擎"]}
@@ -394,7 +394,7 @@ class DashboardAPI:
     def list_log_files(self) -> list:
         """列出所有日志文件信息。"""
         try:
-            from notmyfault.logging import list_logs
+            from notmyfault.core.logging import list_logs
             return list_logs(self._LOG_DIR)
         except Exception as e:
             return []

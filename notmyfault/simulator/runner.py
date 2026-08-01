@@ -50,7 +50,7 @@ class SimulatedRunner:
         self._originals.clear()
 
     def start(self, config=None):
-        from notmyfault.engine import AutomationEngine
+        from notmyfault.core.engine import AutomationEngine
         if config is None:
             from notmyfault.config import DEFAULT_CONFIG
             config = copy.deepcopy(DEFAULT_CONFIG)

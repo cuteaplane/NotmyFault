@@ -8,11 +8,11 @@ from datetime import datetime
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
-from notmyfault.app import create_engine
-from notmyfault.api_server import EngineAPI
+from notmyfault.host.app import create_engine
+from notmyfault.host.api_server import EngineAPI
 from notmyfault.config import CONFIG_FILE
-from notmyfault.logging import init_session_log
-from notmyfault.runtime_controller import RuntimeController
+from notmyfault.core.logging import init_session_log
+from notmyfault.core.runtime_controller import RuntimeController
 
 LOG_DIR = os.path.join(os.path.dirname(CONFIG_FILE), "logs")
 
@@ -24,10 +24,10 @@ _DASHBOARD_QUIT = b"NMF_DASHBOARD_QUIT_V1"
 # 系统托盘（导入失败不阻塞，无托盘也能运行）
 try:
     if os.name == "nt":
-        from notmyfault.tray import TrayIcon
+        from notmyfault.host.tray import TrayIcon
         _HAS_TRAY = True
     else:
-        from notmyfault.tray_linux import TrayIcon, is_tray_supported
+        from notmyfault.host.tray_linux import TrayIcon, is_tray_supported
         _HAS_TRAY = is_tray_supported()
 except Exception:
     _HAS_TRAY = False
@@ -144,7 +144,7 @@ def _open_dashboard():
     dashboard_pyw = os.path.join(PROJECT_ROOT, "dashboard.pyw")
     if os.path.exists(dashboard_pyw):
         try:
-            from notmyfault.platform_support import launch_python_entry
+            from notmyfault.platform.platform_support import launch_python_entry
             launch_python_entry(dashboard_pyw)
             return
         except Exception:
@@ -209,7 +209,7 @@ class EngineRunner:
         if self._tray:
             self._tray.show_balloon("引擎异常", f"引擎线程崩溃: {error}", 3)
         try:
-            from notmyfault.alert import alert_user
+            from notmyfault.host.alert import alert_user
             alert_user("引擎异常退出", f"引擎线程崩溃: {error}", open_dashboard=True)
         except Exception:
             pass
@@ -393,13 +393,13 @@ class EngineRunner:
 
 
 def main():
-    # 拒绝以管理员身份启动：插件提权必须走 notmyfault.sudo 的 UAC 授权，
+    # 拒绝以管理员身份启动：插件提权必须走 notmyfault.security.sudo 的 UAC 授权，
     # 以提升令牌运行会让整个引擎绕过这道受控通道（最小权限原则）。
-    from notmyfault.security import is_admin_process
+    from notmyfault.security.security import is_admin_process
     if is_admin_process():
         print(
             "[Engine] [!!] NotmyFault 拒绝以管理员身份启动：请用普通用户权限运行。"
-            "插件需要提权时请通过 notmyfault.sudo.run_as_admin 弹出 UAC 授权。",
+            "插件需要提权时请通过 notmyfault.security.sudo.run_as_admin 弹出 UAC 授权。",
             file=sys.stderr,
         )
         raise SystemExit(1)
@@ -411,7 +411,7 @@ if __name__ == "__main__":
     if "--enable-autostart" in sys.argv or "--disable-autostart" in sys.argv:
         if os.name == "nt":
             raise SystemExit("请通过 Windows 托盘菜单管理开机自启")
-        from notmyfault.platform_support import set_linux_autostart
+        from notmyfault.platform.platform_support import set_linux_autostart
         enabled = "--enable-autostart" in sys.argv
         set_linux_autostart(enabled, PROJECT_ROOT)
         print("已启用开机自启" if enabled else "已关闭开机自启")

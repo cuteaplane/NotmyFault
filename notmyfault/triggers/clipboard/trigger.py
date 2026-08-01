@@ -24,7 +24,7 @@ if os.name == "nt":
 
 def _get_clipboard_text():
     if os.name != "nt":
-        from notmyfault.linux_support import get_clipboard_text
+        from notmyfault.platform.linux_support import get_clipboard_text
         return get_clipboard_text()
     # 原生段互斥：多线程并发 ctypes 曾与 window_title 组合触发堆损坏
     from notmyfault.native import NATIVE_LOCK
