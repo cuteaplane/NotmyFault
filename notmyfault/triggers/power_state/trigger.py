@@ -9,6 +9,28 @@ import ctypes
 import os
 import psutil
 
+from notmyfault.trigger_base import PollingTrigger
+
+# 多线程并发调用 ctypes 需显式声明类型（见 docs/native-safety.md）
+from ctypes import wintypes
+_kernel32 = ctypes.windll.kernel32
+_user32 = ctypes.windll.user32
+_kernel32.GetSystemPowerStatus.argtypes = [ctypes.c_void_p]
+_kernel32.GetSystemPowerStatus.restype = ctypes.c_bool
+_kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+_kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+_user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                 wintypes.UINT, wintypes.UINT, wintypes.UINT]
+_user32.PeekMessageW.restype = wintypes.BOOL
+_user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+_user32.TranslateMessage.restype = wintypes.BOOL
+_user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+_user32.DispatchMessageW.restype = ctypes.c_long
+_user32.DestroyWindow.argtypes = [wintypes.HWND]
+_user32.DestroyWindow.restype = wintypes.BOOL
+_user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+_user32.UnregisterClassW.restype = wintypes.BOOL
+
 WM_POWERBROADCAST = 0x0218
 PBT_APMRESUMEAUTOMATIC = 0x0012
 PBT_APMRESUMESUSPEND = 0x0007
@@ -82,6 +104,15 @@ def _create_power_event_window():
 
         _WND_PROC_HOLD.append(wnd_proc)
 
+        user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        user32.RegisterClassW.restype = ctypes.c_ushort
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, ctypes.c_void_p, wintypes.HINSTANCE, ctypes.c_void_p,
+        ]
+        user32.CreateWindowExW.restype = wintypes.HWND
+
         class_name = "NotmyFaultPowerState"
         wc = WNDCLASSW()
         wc.lpfnWndProc = WNDPROC(wnd_proc)
@@ -146,61 +177,63 @@ def _destroy_power_event_window(window) -> None:
     except Exception:
         pass
 
+class PowerStateTrigger(PollingTrigger):
+    """电源状态监测：交流/电池/低电量轮询 + Windows 睡眠恢复事件监听。"""
+
+    interval = 2.0
+    native = True
+
+    def validate(self):
+        state = self.config.get("state", "ac")
+        if state not in ("ac", "battery", "low_battery", "resume"):
+            raise ValueError(
+                f"无效的电源状态: {state!r}"
+                "（可选: ac/battery/low_battery/resume）"
+            )
+
+    def setup(self):
+        self.target_state = self.config.get("state", "ac")
+        self.log(f"开始监控电源状态，目标: {self.target_state}")
+        # resume 只在 Windows 上通过电源广播消息实现。
+        self.power_window = _create_power_event_window() if os.name == "nt" else None
+        if self.target_state == "resume" and self.power_window is None:
+            self.log("当前平台不支持睡眠恢复事件监听，resume 规则不会触发")
+        try:
+            on_battery, _ = _is_on_battery()
+        except Exception as e:
+            self.log(f"初始电源状态读取失败: {e}")
+            on_battery = False
+        self._last_state = "battery" if on_battery else "ac"
+        self._low_battery_active = False
+
+    def poll(self):
+        if _pump_power_messages(self.power_window):
+            if self.target_state == "resume":
+                self.log("系统从睡眠中恢复")
+                _, resume_pct = _is_on_battery()
+                self.emit({"state": "resume", "battery_percent": resume_pct})
+
+        on_battery, battery_pct = _is_on_battery()
+        current = "battery" if on_battery else "ac"
+
+        if current != self._last_state:
+            if current == self.target_state:
+                self.log(f"电源状态变化: {current}")
+                self.emit({"state": current, "battery_percent": battery_pct})
+            self._last_state = current
+
+        # 低电量仅在首次进入时触发一次，恢复后重置，避免每轮重复发事件
+        is_low = on_battery and battery_pct <= 20
+        if is_low and not self._low_battery_active and self.target_state == "low_battery":
+            self.log(f"低电量: {battery_pct}%")
+            self.emit({"state": "low_battery", "battery_percent": battery_pct})
+            self._low_battery_active = True
+        elif not is_low:
+            self._low_battery_active = False
+
+    def teardown(self):
+        _destroy_power_event_window(self.power_window)
+
+
 def run(meta, config, emit_event, shutdown_event):
-    trigger_id = meta.get("id", "power_state")
-    target_state = config.get("state", "ac")
-    if target_state not in ("ac", "battery", "low_battery", "resume"):
-        raise ValueError(
-            f"无效的电源状态: {target_state!r}"
-            "（可选: ac/battery/low_battery/resume）"
-        )
-    print(f"[Trigger:{trigger_id}] 开始监控电源状态，目标: {target_state}")
-
-    # resume 只在 Windows 上通过电源广播消息实现。
-    power_window = _create_power_event_window() if os.name == "nt" else None
-    if target_state == "resume" and power_window is None:
-        print(
-            f"[Trigger:{trigger_id}] 当前平台不支持睡眠恢复事件监听，"
-            "resume 规则不会触发"
-        )
-
-    try:
-        on_battery, _ = _is_on_battery()
-    except Exception as e:
-        print(f"[Trigger:{trigger_id}] 初始电源状态读取失败: {e}")
-        on_battery = False
-    last_state = "battery" if on_battery else "ac"
-    low_battery_active = False
-
-    try:
-        while not shutdown_event.is_set():
-            try:
-                if _pump_power_messages(power_window):
-                    if target_state == "resume":
-                        print(f"[Trigger:{trigger_id}] 系统从睡眠中恢复")
-                        _, resume_pct = _is_on_battery()
-                        emit_event({"state": "resume", "battery_percent": resume_pct})
-
-                on_battery, battery_pct = _is_on_battery()
-                current = "battery" if on_battery else "ac"
-
-                if current != last_state:
-                    if current == target_state:
-                        print(f"[Trigger:{trigger_id}] 电源状态变化: {current}")
-                        emit_event({"state": current, "battery_percent": battery_pct})
-                    last_state = current
-
-                # 低电量仅在首次进入时触发一次，恢复后重置，避免每轮重复发事件
-                is_low = on_battery and battery_pct <= 20
-                if is_low and not low_battery_active and target_state == "low_battery":
-                    print(f"[Trigger:{trigger_id}] 低电量: {battery_pct}%")
-                    emit_event({"state": "low_battery", "battery_percent": battery_pct})
-                    low_battery_active = True
-                elif not is_low:
-                    low_battery_active = False
-            except Exception as e:
-                print(f"[Trigger:{trigger_id}] 检查电源出错: {e}")
-
-            shutdown_event.wait(2)
-    finally:
-        _destroy_power_event_window(power_window)
+    PowerStateTrigger(meta, config, emit_event, shutdown_event).run()

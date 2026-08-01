@@ -1,6 +1,7 @@
-import time
 import ctypes
 from ctypes import wintypes
+
+from notmyfault.trigger_base import PollingTrigger
 
 
 def _get_window_titles() -> dict:
@@ -45,48 +46,53 @@ def _get_window_titles_locked(user32) -> dict:
     return titles
 
 
+class WindowTitleTrigger(PollingTrigger):
+    """窗口标题状态检测：目标窗口出现 / 关闭时触发。"""
+
+    interval = 3.0
+    native = True
+
+    def validate(self):
+        if not str(self.config.get("title_pattern", "")).strip():
+            raise ValueError("未配置标题关键词（title_pattern 为空）")
+        state = self.config.get("state", "opened")
+        if state not in ("opened", "closed"):
+            raise ValueError(
+                f"无效的窗口状态: {state!r}（可选: opened/closed）"
+            )
+
+    def setup(self):
+        self.pattern = str(self.config.get("title_pattern", "")).strip().lower()
+        self.target_state = self.config.get("state", "opened")
+        self._was_matched = False
+        self.log(f"开始监视窗口标题: {self.pattern}")
+
+    def poll(self):
+        titles = _get_window_titles()
+        # 找出实际命中的标题（可能多个窗口同时命中）
+        matched_titles = [t for t in titles.values() if self.pattern in t.lower()]
+        matched = bool(matched_titles)
+
+        if matched and not self._was_matched:
+            if self.target_state == "opened":
+                actual_title = max(matched_titles, key=len)
+                self.log(f"窗口出现: '{self.pattern}'")
+                self.emit({
+                    "title_pattern": self.pattern,
+                    "state": "opened",
+                    "matched_title": actual_title,
+                })
+            self._was_matched = True
+        elif not matched and self._was_matched:
+            if self.target_state == "closed":
+                self.log(f"窗口关闭: '{self.pattern}'")
+                self.emit({
+                    "title_pattern": self.pattern,
+                    "state": "closed",
+                    "matched_title": "",
+                })
+            self._was_matched = False
+
+
 def run(meta, config, emit_event, shutdown_event):
-    trigger_id = meta.get("id", "window_title")
-    pattern = config.get("title_pattern", "").strip().lower()
-    if not pattern:
-        raise ValueError("未配置标题关键词（title_pattern 为空）")
-
-    print(f"[Trigger:{trigger_id}] 开始监视窗口标题: {pattern}")
-    target_state = config.get("state", "opened")
-    if target_state not in ("opened", "closed"):
-        raise ValueError(
-            f"无效的窗口状态: {target_state!r}（可选: opened/closed）"
-        )
-    was_matched = False
-
-    while not shutdown_event.is_set():
-        try:
-            titles = _get_window_titles()
-            # 找出实际命中的标题（可能多个窗口同时命中）
-            matched_titles = [t for t in titles.values() if pattern in t.lower()]
-            matched = bool(matched_titles)
-
-            if matched and not was_matched:
-                if target_state == "opened":
-                    actual_title = max(matched_titles, key=len)
-                    print(f"[Trigger:{trigger_id}] 窗口出现: '{pattern}'")
-                    emit_event({
-                        "title_pattern": pattern,
-                        "state": "opened",
-                        "matched_title": actual_title,
-                    })
-                was_matched = True
-            elif not matched and was_matched:
-                if target_state == "closed":
-                    print(f"[Trigger:{trigger_id}] 窗口关闭: '{pattern}'")
-                    emit_event({
-                        "title_pattern": pattern,
-                        "state": "closed",
-                        "matched_title": "",
-                    })
-                was_matched = False
-
-        except Exception as e:
-            print(f"[Trigger:{trigger_id}] 扫描出错: {e}")
-
-        shutdown_event.wait(3)
+    WindowTitleTrigger(meta, config, emit_event, shutdown_event).run()

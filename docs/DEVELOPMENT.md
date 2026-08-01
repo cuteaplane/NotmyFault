@@ -239,6 +239,27 @@ def run(meta, config, emit_event, shutdown_event):
 加载时会检查这四个参数是否齐全；不合格的触发器不会启动后台线程。已有
 `event-v1` 和未声明 `trigger_api` 的用户触发器仍按旧方式兼容。
 
+### 轮询型触发器用基类
+
+轮询型触发器（clipboard / window_title / hotkey / power_state 等）应继承
+`notmyfault/trigger_base.PollingTrigger`，统一"配置校验 → 原生段自动持锁 →
+间隔轮询 → 退出清理"的骨架，避免手写 while 循环导致原生加锁纪律不一致。
+详见 `docs/native-safety.md`。
+
+### event-v2 实例生命周期
+
+- **每配置一个实例**：同一条触发器被 N 条规则使用时启动 N 个隔离线程，
+  实例 ID 为 `trigger_id:序号`（只有一个配置时就是 `trigger_id`）。
+- **相同配置去重**：多条规则使用完全相同的配置（如同一热键、同一监控目录）
+  时只启动一个实例；事件仍按配置指纹匹配所有规则，避免重复执行。
+- **配置指纹**：JSON 规范化后比较（整数值 90 与 90.0 视为相同）。事件命中
+  = 实例配置指纹与规则叶子 `params` 指纹相等，payload 不参与命中判断。
+- **无效配置抛异常**：缺失字段、非法枚举值（hotkey 为空、state 取值不在
+  清单内、threshold 非数字等）一律抛 `ValueError`，引擎会标记该触发器崩溃
+  并告警，而不是让线程空转、规则永远不触发。
+- 触发器必须用 `shutdown_event` 轮询退出，并在退出时清理原生资源
+  （如 power_state 的隐藏窗口）。
+
 ## 5.1 导入安全限制
 
 `notmyfault` 包在 **strict** 安全模式下拒绝外部代码直接 `import notmyfault`
@@ -292,3 +313,6 @@ def run(meta, config, emit_event, shutdown_event):
 - 热加载和关闭时要取消已延后的工作流。
 - 测试中模拟触发器崩溃时必须 mock 通知，不能真的向 Windows 通知中心刷错误消息。
 - 改动插件元数据、规则格式或 Dashboard 表单时，同时补测试和兼容迁移。
+- 原生调用必须声明 `ctypes argtypes/restype`；跨线程的原生段必须包
+  `notmyfault._native_guard.NATIVE_LOCK`；不可信的 COM/音频等原生代码放
+  子进程隔离。详见 `docs/native-safety.md`。

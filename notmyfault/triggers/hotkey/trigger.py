@@ -2,7 +2,21 @@ import ctypes
 import time
 from ctypes import wintypes
 
+from notmyfault.trigger_base import PollingTrigger
+
 user32 = ctypes.windll.user32
+# 多线程并发调用 ctypes 需显式声明类型，避免共享 _objects 竞态（见 docs/native-safety.md）
+user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+user32.RegisterHotKey.restype = wintypes.BOOL
+user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.UnregisterHotKey.restype = wintypes.BOOL
+user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                wintypes.UINT, wintypes.UINT, wintypes.UINT]
+user32.PeekMessageW.restype = wintypes.BOOL
+user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+user32.TranslateMessage.restype = wintypes.BOOL
+user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+user32.DispatchMessageW.restype = ctypes.c_long
 
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
@@ -61,33 +75,45 @@ def _parse_hotkey(hotkey_str: str):
     return mod, key
 
 
-def run(meta, config, emit_event, shutdown_event):
-    trigger_id = meta.get("id", "hotkey")
-    print(f"[Trigger:{trigger_id}] 全局热键监听启动")
-    raw = config.get("hotkey", "").strip()
-    if not raw:
-        raise ValueError("未配置热键（hotkey 参数为空）")
-    mod, vk = _parse_hotkey(raw)
-    if vk == 0:
-        raise ValueError(f"无法解析热键: {raw}")
-    hkid = 1
-    if not user32.RegisterHotKey(None, hkid, mod, vk):
-        raise RuntimeError(f"热键注册失败（可能与其他程序冲突）: {raw}")
-    print(f"[Trigger:{trigger_id}] 已注册热键: {raw}")
+class HotkeyTrigger(PollingTrigger):
+    """全局热键监听：注册后轮询线程消息队列。"""
 
-    msg = wintypes.MSG()
-    while not shutdown_event.is_set():
+    interval = 0.05
+    native = True
+
+    def validate(self):
+        raw = str(self.config.get("hotkey", "")).strip()
+        if not raw:
+            raise ValueError("未配置热键（hotkey 参数为空）")
+        mod, vk = _parse_hotkey(raw)
+        if vk == 0:
+            raise ValueError(f"无法解析热键: {raw}")
+        self._raw = raw
+        self._mod = mod
+        self._vk = vk
+
+    def setup(self):
+        self._hkid = 1
+        if not user32.RegisterHotKey(None, self._hkid, self._mod, self._vk):
+            raise RuntimeError(f"热键注册失败（可能与其他程序冲突）: {self._raw}")
+        self.log(f"已注册热键: {self._raw}")
+
+    def poll(self):
+        msg = wintypes.MSG()
         while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
-            if msg.message == WM_HOTKEY:
-                if msg.wParam == hkid:
-                    print(f"[Trigger:{trigger_id}] 热键触发: {raw}")
-                    emit_event({"hotkey": raw})
-        shutdown_event.wait(0.05)
+            if msg.message == WM_HOTKEY and msg.wParam == self._hkid:
+                self.log(f"热键触发: {self._raw}")
+                self.emit({"hotkey": self._raw})
 
-    try:
-        user32.UnregisterHotKey(None, hkid)
-    except Exception:
-        pass
-    print(f"[Trigger:{trigger_id}] 热键监听已停止")
+    def teardown(self):
+        try:
+            user32.UnregisterHotKey(None, self._hkid)
+        except Exception:
+            pass
+        self.log("热键监听已停止")
+
+
+def run(meta, config, emit_event, shutdown_event):
+    HotkeyTrigger(meta, config, emit_event, shutdown_event).run()

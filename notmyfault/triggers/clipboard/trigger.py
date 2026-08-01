@@ -1,6 +1,8 @@
 import ctypes
 import os
 
+from notmyfault.trigger_base import PollingTrigger
+
 CF_UNICODETEXT = 13
 
 if os.name == "nt":
@@ -49,32 +51,35 @@ def _get_clipboard_text_locked():
         user32.CloseClipboard()
 
 
+class ClipboardTrigger(PollingTrigger):
+    """剪贴板内容监控。match_text 为空 = 任意内容变化都触发。"""
+
+    interval = 1.0
+    native = True
+
+    def setup(self):
+        self.match_text = str(self.config.get("match_text", "")).strip()
+        self._last_content = _get_clipboard_text()
+        self.log("剪贴板监控启动")
+
+    def poll(self):
+        current = _get_clipboard_text()
+        if current is None or current == self._last_content:
+            return
+        if not self.match_text:
+            self.log("剪贴板内容变化")
+            self.emit({"text": current[:200], "match_text": ""})
+        else:
+            current_lower = current.lower()
+            if self.match_text.lower() in current_lower:
+                self.log(f"剪贴板匹配: {self.match_text}")
+                self.emit({
+                    "text": current[:200],
+                    "match_text": self.match_text,
+                    "matched": self.match_text,
+                })
+        self._last_content = current
+
+
 def run(meta, config, emit_event, shutdown_event):
-    trigger_id = meta.get("id", "clipboard")
-    print(f"[Trigger:{trigger_id}] 剪贴板监控启动")
-
-    match_text = config.get("match_text", "").strip()
-
-    last_content = _get_clipboard_text()
-
-    while not shutdown_event.is_set():
-        try:
-            current = _get_clipboard_text()
-            if current is not None and current != last_content:
-                if not match_text:
-                    print(f"[Trigger:{trigger_id}] 剪贴板内容变化")
-                    emit_event({"text": current[:200], "match_text": ""})
-                else:
-                    current_lower = current.lower()
-                    if match_text.lower() in current_lower:
-                        print(f"[Trigger:{trigger_id}] 剪贴板匹配: {match_text}")
-                        emit_event({
-                            "text": current[:200],
-                            "match_text": match_text,
-                            "matched": match_text,
-                        })
-                last_content = current
-        except Exception as e:
-            print(f"[Trigger:{trigger_id}] 检查剪贴板出错: {e}")
-
-        shutdown_event.wait(1)
+    ClipboardTrigger(meta, config, emit_event, shutdown_event).run()

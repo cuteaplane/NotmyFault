@@ -123,13 +123,23 @@ class TrayIcon:
         self._add_icon()
 
         import ctypes
-        msg = ctypes.wintypes.MSG()
+        user32 = ctypes.windll.user32
+        # 与触发器一致：显式声明类型，避免共享 _objects 竞态（docs/native-safety.md）
+        msg_type = ctypes.wintypes.MSG
+        user32.PeekMessageW.argtypes = [ctypes.POINTER(msg_type), ctypes.wintypes.HWND,
+                                        ctypes.wintypes.UINT, ctypes.wintypes.UINT,
+                                        ctypes.wintypes.UINT]
+        user32.PeekMessageW.restype = ctypes.wintypes.BOOL
+        user32.TranslateMessage.argtypes = [ctypes.POINTER(msg_type)]
+        user32.TranslateMessage.restype = ctypes.wintypes.BOOL
+        user32.DispatchMessageW.argtypes = [ctypes.POINTER(msg_type)]
+        user32.DispatchMessageW.restype = ctypes.c_long
+
+        msg = msg_type()
         while not self._shutdown_event.is_set():
-            while ctypes.windll.user32.PeekMessageW(
-                ctypes.byref(msg), None, 0, 0, 1
-            ):
-                ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
-                ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
+            while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
             self._shutdown_event.wait(0.05)
 
         self._remove_icon()
