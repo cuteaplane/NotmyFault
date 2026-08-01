@@ -22,7 +22,7 @@ import threading
 import traceback
 from typing import Any, Dict
 
-from notmyfault._native_guard import NATIVE_LOCK
+from notmyfault.native import NATIVE_LOCK
 
 
 class PollingTrigger:

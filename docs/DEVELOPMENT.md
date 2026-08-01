@@ -242,7 +242,7 @@ def run(meta, config, emit_event, shutdown_event):
 ### 轮询型触发器用基类
 
 轮询型触发器（clipboard / window_title / hotkey / power_state 等）应继承
-`notmyfault/trigger_base.PollingTrigger`，统一"配置校验 → 原生段自动持锁 →
+`notmyfault/triggers/base.PollingTrigger`，统一"配置校验 → 原生段自动持锁 →
 间隔轮询 → 退出清理"的骨架，避免手写 while 循环导致原生加锁纪律不一致。
 详见 `docs/native-safety.md`。
 

@@ -1,7 +1,7 @@
 import ctypes
 import os
 
-from notmyfault.trigger_base import PollingTrigger
+from notmyfault.triggers.base import PollingTrigger
 
 CF_UNICODETEXT = 13
 
@@ -27,7 +27,7 @@ def _get_clipboard_text():
         from notmyfault.linux_support import get_clipboard_text
         return get_clipboard_text()
     # 原生段互斥：多线程并发 ctypes 曾与 window_title 组合触发堆损坏
-    from notmyfault._native_guard import NATIVE_LOCK
+    from notmyfault.native import NATIVE_LOCK
     with NATIVE_LOCK:
         return _get_clipboard_text_locked()
 

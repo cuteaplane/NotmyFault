@@ -16,6 +16,11 @@ from notmyfault.runtime_controller import RuntimeController
 
 LOG_DIR = os.path.join(os.path.dirname(CONFIG_FILE), "logs")
 
+# Dashboard 控制端口与协议：与 dashboard.pyw 的 DASHBOARD_CONTROL_PORT /
+# _CONTROL_QUIT 保持一致（不 import dashboard.pyw，避免拉起 webview 依赖）。
+_DASHBOARD_CONTROL_PORT = 19197
+_DASHBOARD_QUIT = b"NMF_DASHBOARD_QUIT_V1"
+
 # 系统托盘（导入失败不阻塞，无托盘也能运行）
 try:
     if os.name == "nt":
@@ -45,38 +50,45 @@ def setup_logging(log_dir: str) -> str:
     log_path = init_session_log(log_dir)
     log_fp = open(log_path, "a", encoding="utf-8", buffering=1)
 
+    # stdout / stderr 两个 writer 共享同一把锁：引擎、触发器、动作在多线程里
+    # 同时 print 时，锁保证每一行（含时间戳）原子写入，否则会出现行与行交错
+    # 粘在一起（如 "[Trigger:hotkey] ...启动[2026-07-31 ...]"）。
+    _log_io_lock = threading.Lock()
+
     class _TimestampWriter:
         """在每行前面插入时间戳，同时写到文件和原始 stdout"""
-        def __init__(self, file, orig):
+        def __init__(self, file, orig, lock):
             self.file = file
             self.orig = orig
+            self._lock = lock
             self._pending = True  # 下一行需要写时间戳
 
         def write(self, text: str):
             if not text:
                 return
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            # 按换行符拆分，每行单独加时间戳
-            for i, line in enumerate(text.splitlines(True)):
-                if i == 0 and not self._pending:
-                    # 续上一行
-                    self.file.write(line)
-                    self.orig.write(line)
-                elif line.strip():
-                    prefix = f"[{ts}] "
-                    self.file.write(prefix + line)
-                    self.orig.write(prefix + line)
-                    self._pending = False
-                else:
-                    self.file.write(line)
-                    self.orig.write(line)
-                if line.endswith("\n"):
-                    self._pending = True
-            try:
-                self.file.flush()
-                self.orig.flush()
-            except Exception:
-                pass
+            with self._lock:
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                # 按换行符拆分，每行单独加时间戳
+                for i, line in enumerate(text.splitlines(True)):
+                    if i == 0 and not self._pending:
+                        # 续上一行
+                        self.file.write(line)
+                        self.orig.write(line)
+                    elif line.strip():
+                        prefix = f"[{ts}] "
+                        self.file.write(prefix + line)
+                        self.orig.write(prefix + line)
+                        self._pending = False
+                    else:
+                        self.file.write(line)
+                        self.orig.write(line)
+                    if line.endswith("\n"):
+                        self._pending = True
+                try:
+                    self.file.flush()
+                    self.orig.flush()
+                except Exception:
+                    pass
 
         def isatty(self) -> bool:
             return False  # 日志文件不是终端，uvicorn 不会尝试输出颜色
@@ -88,10 +100,23 @@ def setup_logging(log_dir: str) -> str:
     # pythonw.exe 无控制台，sys.__stdout__/__stderr__ 为 None，_devnull 兜底
     # 这玩意不能删！！！
     _devnull = open(os.devnull, "w")
-    sys.stdout = _TimestampWriter(log_fp, sys.__stdout__ or _devnull)  # type: ignore
-    sys.stderr = _TimestampWriter(log_fp, sys.__stderr__ or _devnull)  # type: ignore
+    sys.stdout = _TimestampWriter(log_fp, sys.__stdout__ or _devnull, _log_io_lock)  # type: ignore
+    sys.stderr = _TimestampWriter(log_fp, sys.__stderr__ or _devnull, _log_io_lock)  # type: ignore
     print(f"--- NotmyFault 引擎启动 {datetime.now().isoformat()} ---")
     return log_path
+
+
+def _notify_dashboard_quit():
+    """通知 Dashboard 控制端口关闭自身（托盘退出时 UI 与引擎一起退出）。"""
+    try:
+        import socket
+        with socket.create_connection(
+            ("127.0.0.1", _DASHBOARD_CONTROL_PORT), timeout=1
+        ) as client:
+            client.sendall(_DASHBOARD_QUIT + b"\n")
+            client.makefile("rb").readline(32)
+    except OSError:
+        pass
 
 
 def _open_dashboard():
@@ -223,8 +248,9 @@ class EngineRunner:
             print(f"[Tray] 引擎正处于 {self.engine_state}，忽略重复切换")
 
     def _tray_exit(self):
-        """托盘退出—关闭引擎、HTTP 服务、退出进程"""
+        """托盘退出—关闭引擎、HTTP 服务、Dashboard 与进程"""
         print("[Tray] 用户请求退出")
+        _notify_dashboard_quit()  # 让 Dashboard UI 一起退出
         self._stop_engine()
         self._request_process_shutdown(force_after=5)
 

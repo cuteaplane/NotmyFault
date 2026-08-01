@@ -6,7 +6,7 @@ import { snackbar } from '../../lib/notify'
 import { useEngineControl } from '../../composables/useEngineControl'
 
 // 引擎启动/暂停/重启逻辑与 NavRail 快捷按钮共享（含 busy 状态）
-const { starting, stopping, syncStatus, startEngine, stopEngine } = useEngineControl()
+const { starting, stopping, shuttingDown, syncStatus, startEngine, stopEngine, shutdownEngine } = useEngineControl()
 const stats = ref({ rules: '-', triggers: '-', actions: '-', pid: '-' })
 const diag = ref(null)
 let diagTimer = null
@@ -155,6 +155,14 @@ watch(isRunning, (running) => {
           <span class="material-symbols-outlined">pause</span>暂停自动化</button>
         <button v-if="isStopping" class="btn" disabled style="min-width:148px">
           <span class="spinner"></span>暂停中...</button>
+      </div>
+      <!-- 彻底退出引擎：暂停只能停自动化线程，卡死的触发器线程会挡住热重载，
+           这里直接结束整个后台进程（含 API/托盘），Dashboard 不受影响 -->
+      <div v-if="isControllerOnline" class="mt-3">
+        <button v-if="!shuttingDown" class="btn btn-outlined btn-danger btn-sm" @click="shutdownEngine">
+          <span class="material-symbols-outlined">power_settings_new</span>彻底退出引擎</button>
+        <button v-else class="btn btn-outlined btn-danger btn-sm" disabled>
+          <span class="spinner"></span>退出中...</button>
       </div>
     </div>
 

@@ -48,7 +48,7 @@ user32.GetClipboardData.restype = ctypes.c_void_p
 
 ## 轮询型触发器的公共基类
 
-所有轮询型触发器应继承 `notmyfault/trigger_base.PollingTrigger`（event-v2）：
+所有轮询型触发器应继承 `notmyfault/triggers/base.PollingTrigger`（event-v2）：
 
 - `interval`：轮询间隔（秒）
 - `native=True`：poll 触达原生 API，基类自动持 `NATIVE_LOCK`
@@ -77,7 +77,7 @@ def _poll():
         ...
 ```
 
-`notmyfault/_native_guard.NATIVE_LOCK` 是全引擎共享的一把锁。原生段都是
+`notmyfault.native.NATIVE_LOCK` 是全引擎共享的一把锁。原生段都是
 微秒级操作，加锁不影响轮询频率，但能杜绝"两个触发器同时写同一函数对象"
 这类竞态。**新增任何轮询型触发器，只要原生段不是一次性调用，就必须套这把锁。**
 

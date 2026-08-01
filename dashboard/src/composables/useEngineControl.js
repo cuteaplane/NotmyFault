@@ -7,6 +7,7 @@ import { snackbar } from '../lib/notify'
 const starting = ref(false)
 const stopping = ref(false)
 const restarting = ref(false)
+const shuttingDown = ref(false)
 
 export function useEngineControl() {
   // 合并式状态同步（与 App.vue.updateStatus 对齐）：
@@ -54,6 +55,26 @@ export function useEngineControl() {
     }
   }
 
+  // 彻底退出引擎进程（后台服务 + 托盘一起退出）。进程退出后 API 会断开，
+  // Dashboard 是独立进程不受影响。
+  async function shutdownEngine() {
+    if (shuttingDown.value) return
+    if (!confirm('彻底退出引擎？将停止全部自动化，并关闭后台服务与托盘。')) return
+    shuttingDown.value = true
+    try {
+      if (!hasBridge()) throw new Error('Dashboard 桌面桥接尚未就绪')
+      await window.pywebview.api.shutdown_engine()
+      snackbar('引擎进程正在退出…')
+    } catch (e) {
+      // 进程可能在响应返回前就断开，按已退出处理
+      snackbar('引擎进程已退出')
+    } finally {
+      syncStatus({ api_alive: false, engine_running: false, engine_state: 'offline' })
+      if (window.__nmf) await window.__nmf.refreshAll()
+      shuttingDown.value = false
+    }
+  }
+
   // 重启 = 暂停自动化后立即拉起。launch_engine 幂等：
   // 服务在线走 /api/engine/start，离线直接拉起引擎进程。
   async function restartEngine() {
@@ -89,5 +110,5 @@ export function useEngineControl() {
     }
   }
 
-  return { starting, stopping, restarting, syncStatus, startEngine, stopEngine, restartEngine }
+  return { starting, stopping, restarting, shuttingDown, syncStatus, startEngine, stopEngine, restartEngine, shutdownEngine }
 }

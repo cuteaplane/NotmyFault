@@ -1,7 +1,7 @@
 import ctypes
 from ctypes import wintypes
 
-from notmyfault.trigger_base import PollingTrigger
+from notmyfault.triggers.base import PollingTrigger
 
 
 def _get_window_titles() -> dict:
@@ -22,7 +22,7 @@ def _get_window_titles() -> dict:
     titles = {}
 
     # 原生段互斥：多线程并发 ctypes 曾与 clipboard 组合触发堆损坏
-    from notmyfault._native_guard import NATIVE_LOCK
+    from notmyfault.native import NATIVE_LOCK
     with NATIVE_LOCK:
         return _get_window_titles_locked(user32)
 

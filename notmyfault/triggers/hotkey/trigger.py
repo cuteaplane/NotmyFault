@@ -2,7 +2,7 @@ import ctypes
 import time
 from ctypes import wintypes
 
-from notmyfault.trigger_base import PollingTrigger
+from notmyfault.triggers.base import PollingTrigger
 
 user32 = ctypes.windll.user32
 # 多线程并发调用 ctypes 需显式声明类型，避免共享 _objects 竞态（见 docs/native-safety.md）

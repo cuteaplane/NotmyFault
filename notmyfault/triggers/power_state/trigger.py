@@ -9,7 +9,7 @@ import ctypes
 import os
 import psutil
 
-from notmyfault.trigger_base import PollingTrigger
+from notmyfault.triggers.base import PollingTrigger
 
 # 多线程并发调用 ctypes 需显式声明类型（见 docs/native-safety.md）
 from ctypes import wintypes

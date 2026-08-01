@@ -8,6 +8,10 @@ import sys
 import threading
 import time
 from notmyfault.rules import config_fingerprint
+
+# 触发器只是事件源：连续这么多次 30s 退出失败视为卡死，强制放弃监管，
+# 否则一次原生调用阻塞会让热重载永久瘫痪。
+_MAX_STOP_FAILURES = 2
 from typing import Any, Callable, Dict, List, Optional
 
 
@@ -26,6 +30,7 @@ class TriggerSupervisor:
         self._threads: Dict[str, threading.Thread] = {}
         self._events: Dict[str, threading.Event] = {}
         self._crash_errors: Dict[str, str] = {}
+        self._stop_failures: Dict[str, int] = {}  # 连续退出失败次数（卡死判定）
         self._configs: Dict[str, Dict[str, Any]] = {}  # 实例 ID -> 配置快照（健康状态展示）
         self._lock = threading.RLock()
         # start/stop 不能交叉。登记锁只保护字典，生命周期锁覆盖 thread.start
@@ -152,6 +157,7 @@ class TriggerSupervisor:
                             continue
                         self._events[instance_id] = trigger_event
                         self._configs[instance_id] = config
+                        self._stop_failures.pop(instance_id, None)
                         self._threads[instance_id] = thread
                         self._crash_errors.pop(instance_id, None)
                         try:
@@ -177,7 +183,9 @@ class TriggerSupervisor:
     def stop(self, timeout: float = 30.0) -> bool:
         """广播停止、共享 deadline join，仅清退已退出线程。
 
-        仍在运行的线程保留登记，避免热重载在同一触发器上再启动一代线程。
+        仍在运行的线程保留登记，避免热重载在同一触发器上再启动一代线程；
+        但触发器只是事件源，连续 _MAX_STOP_FAILURES 次 join 超时的线程
+        视为卡死（原生调用阻塞等），强制放弃监管，让热重载继续应用。
         """
         with self._lifecycle_lock:
             with self._lock:
@@ -196,13 +204,18 @@ class TriggerSupervisor:
                 if remaining > 0:
                     thread.join(timeout=remaining)
                 if thread.is_alive():
+                    failures = self._stop_failures.get(event_type, 0) + 1
+                    self._stop_failures[event_type] = failures
                     print(
                         f"[Engine] [!!] 触发器线程 {event_type}"
-                        f" 未在 {timeout}s 内退出，继续保留监管",
+                        f" 未在 {timeout}s 内退出（连续 {failures} 次）",
                         file=sys.stderr,
                     )
+                else:
+                    self._stop_failures.pop(event_type, None)
 
             alive = {et for et, thread in threads if thread.is_alive()}
+            remaining_alive = set(alive)
             with self._lock:
                 for event_type, thread in threads:
                     # 即使未来允许并发增量替换，也不能让旧 stop 删除新线程。
@@ -214,7 +227,25 @@ class TriggerSupervisor:
                         self._events.pop(event_type, None)
                         self._configs.pop(event_type, None)
                         self._crash_errors.pop(event_type, None)
-            return not alive
+                        self._stop_failures.pop(event_type, None)
+                    elif (
+                        event_type in alive
+                        and self._threads.get(event_type) is thread
+                        and self._stop_failures.get(event_type, 0) >= _MAX_STOP_FAILURES
+                    ):
+                        print(
+                            f"[Engine] [!!] 触发器线程 {event_type} 连续"
+                            f" {_MAX_STOP_FAILURES} 次未退出，强制放弃监管，"
+                            "新配置继续应用",
+                            file=sys.stderr,
+                        )
+                        self._threads.pop(event_type, None)
+                        self._events.pop(event_type, None)
+                        self._configs.pop(event_type, None)
+                        self._crash_errors.pop(event_type, None)
+                        self._stop_failures.pop(event_type, None)
+                        remaining_alive.discard(event_type)
+            return not remaining_alive
 
     def request_stop_all(self) -> None:
         """幂等地广播停止信号给所有已登记触发器。

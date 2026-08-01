@@ -18,6 +18,7 @@ DASHBOARD_PORT = 19199
 DASHBOARD_CONTROL_PORT = 19197
 _CONTROL_SHOW = b"NMF_DASHBOARD_SHOW_V1"
 _CONTROL_OK = b"NMF_DASHBOARD_OK_V1"
+_CONTROL_QUIT = b"NMF_DASHBOARD_QUIT_V1"
 
 # 确保能导入 notmyfault 包
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -56,15 +57,19 @@ def _get_plugins_schema() -> dict:
 def _claim_dashboard_instance(port: int = DASHBOARD_CONTROL_PORT):
     """占用 Dashboard 控制端口；已有窗口时通知它恢复到前台。"""
     show_requested = threading.Event()
+    quit_requested = threading.Event()
 
     class ControlHandler(socketserver.BaseRequestHandler):
         def handle(self):
             try:
                 message = self.request.makefile("rb").readline(64).rstrip(b"\r\n")
-                if message != _CONTROL_SHOW:
-                    return
-                show_requested.set()
-                self.request.sendall(_CONTROL_OK + b"\n")
+                if message == _CONTROL_SHOW:
+                    show_requested.set()
+                    self.request.sendall(_CONTROL_OK + b"\n")
+                elif message == _CONTROL_QUIT:
+                    # 引擎/托盘退出时通知 Dashboard 关闭自身（UI 与引擎一起退出）
+                    quit_requested.set()
+                    self.request.sendall(_CONTROL_OK + b"\n")
             except OSError:
                 pass
 
@@ -101,7 +106,7 @@ def _claim_dashboard_instance(port: int = DASHBOARD_CONTROL_PORT):
                     client.sendall(_CONTROL_SHOW + b"\n")
                     response = client.makefile("rb").readline(64).rstrip(b"\r\n")
                     if response == _CONTROL_OK:
-                        return None, None
+                        return None, None, None
             except OSError:
                 pass
             if attempt < 4:
@@ -112,6 +117,7 @@ def _claim_dashboard_instance(port: int = DASHBOARD_CONTROL_PORT):
         ) from last_error
 
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, show_requested, quit_requested
     return server, show_requested
 
 
@@ -459,7 +465,7 @@ def _resolve_dashboard_url():
 
 def main():
     try:
-        control_server, show_requested = _claim_dashboard_instance()
+        control_server, show_requested, quit_requested = _claim_dashboard_instance()
     except RuntimeError as error:
         print(f"[Dashboard] {error}", file=sys.stderr)
         if os.name == "nt":
@@ -518,6 +524,15 @@ def main():
                 pass
 
     threading.Thread(target=watch_show_requests, daemon=True).start()
+
+    def watch_quit_requests():
+        quit_requested.wait()
+        try:
+            window.destroy()
+        except Exception:
+            pass
+
+    threading.Thread(target=watch_quit_requests, daemon=True).start()
 
     # 设置窗口图标（仅 Windows）
     if os.name == "nt" and os.path.exists(icon_path):
