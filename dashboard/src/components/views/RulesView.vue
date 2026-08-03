@@ -27,6 +27,11 @@ const ruleFolders = computed(() => {
   })
   return [...folders]
 })
+const availableFolders = computed(() => [...new Set(
+  store.configData.rules
+    .map(rule => String(rule.folder || '').trim())
+    .filter(name => name && name !== '未分类'),
+)].sort((a, b) => a.localeCompare(b, 'zh-CN')))
 
 function clone(value) { return JSON.parse(JSON.stringify(value)) }
 function openRule(index) {
@@ -146,11 +151,12 @@ onMounted(() => { if (!store.configData.rules) store.configData.rules = [] })
 </script>
 
 <template>
-  <RuleEditor v-if="activeRule" :rule="activeRule" :dirty="isDirty"
-    :testing="isTestingActiveRule"
+  <Transition name="rule-route" mode="out-in">
+  <RuleEditor v-if="activeRule" key="editor" :rule="activeRule" :dirty="isDirty"
+    :testing="isTestingActiveRule" :folders="availableFolders"
     @back="leaveEditor" @delete="deleteActiveRule" @save="doSave(false)" @save-run="doSave(true)" />
 
-  <section v-else class="page active rules-library">
+  <section v-else key="library" class="page active rules-library">
     <div class="page-head">
       <div><h2>规则</h2><p class="page-subtitle">用“当 → 然后”描述每一条自动化。</p></div>
       <div class="actions"><button class="btn btn-filled" @click="addRule"><span class="material-symbols-outlined">add</span>新建规则</button></div>
@@ -177,4 +183,5 @@ onMounted(() => { if (!store.configData.rules) store.configData.rules = [] })
       </section>
     </div>
   </section>
+  </Transition>
 </template>

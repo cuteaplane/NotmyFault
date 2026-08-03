@@ -1,7 +1,6 @@
 {
   "name": "notmyfault-dashboard",
   "private": true,
-  "version": "alpha-0.11.0",
   "type": "module",
   "scripts": {
     "dev": "vite",

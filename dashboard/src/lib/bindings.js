@@ -231,6 +231,8 @@ export function deriveDataEdges(rule, nodes) {
           kind: valid ? 'data' : 'data-invalid',
           from: source.id,
           to: target.id,
+          sourcePortName: sourcePort.name,
+          targetPortName: targetPort.name,
           sourcePortIndex: sourcePort.index,
           targetPortIndex: targetPort.index,
           label: `${sourcePort.type} → ${targetPort.label}`,
@@ -326,8 +328,7 @@ export function requestTestContext(rule, schema, promptValue = globalThis.prompt
     )
     const raw = promptValue(`${sourceName} · ${label}`, String(defaultValue))
     if (raw === null) return null
-    // 空 path 表示引用完整 payload。后端要求 trigger_payloads[node] 与
-    // event_payload 都是 JSON 对象，空路径无法走 setPath，必须整体写入。
+    // 空 path 代表完整 payload，后端的 trigger_payloads 和 event_payload 都是对象，必须整体写入。
     if (fullPayload) {
       let payloadObject
       try {

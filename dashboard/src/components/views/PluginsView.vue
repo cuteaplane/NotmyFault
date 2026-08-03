@@ -18,7 +18,6 @@ const forceInstall = ref(false)
 const fileInput = ref(null)
 let keyResolve = null
 
-// 预览状态
 const preview = ref(null)
 const previewLoading = ref(false)
 const previewError = ref('')
@@ -26,7 +25,7 @@ const fileForUpload = ref(null)
 const installError = ref('')
 
 async function refresh() {
-  // 引擎离线时接口会失败：插件页不因离线而崩溃，保留上次数据。
+  // 引擎离线时接口会失败，插件页保留上次数据。
   const [plugins, sch] = await Promise.all([
     loadPlugins().catch(() => store.pluginsData),
     getSchema().catch(() => store.schema),
@@ -116,7 +115,7 @@ async function doInstall() {
           if (!ok) return
         }
       }
-    } catch (e) { /* 引擎离线，跳过 */ }
+    } catch (e) { /* 引擎离线时无法读取密钥状态，继续安装请求。 */ }
   }
 
   const fd = new FormData()
@@ -163,19 +162,23 @@ onMounted(refresh)
         动作<span class="ml-1.5 inline-flex min-w-5 items-center justify-center rounded-full bg-on-surface/10 px-1.5 py-0.5 text-label-s">{{ tabCounts.actions }}</span>
       </button>
     </div>
-    <div v-if="!Object.keys(list).length" class="empty-state">
-      <div class="material-symbols-outlined">extension_off</div><h3>暂无插件</h3><p>安装插件或启动引擎后刷新</p>
-    </div>
-    <div v-else class="plugin-grid">
-      <PluginCard v-for="(meta, pid) in list" :key="pid" :pid="pid" :meta="meta" :type="tab"
-        @toggle="togglePlugin" @uninstall="uninstallPlugin" />
-    </div>
+    <Transition name="content-swap" mode="out-in">
+      <div :key="tab" class="plugin-tab-content">
+        <div v-if="!Object.keys(list).length" class="empty-state">
+          <div class="material-symbols-outlined">extension_off</div><h3>暂无插件</h3><p>安装插件或启动引擎后刷新</p>
+        </div>
+        <div v-else class="plugin-grid">
+          <PluginCard v-for="(meta, pid) in list" :key="pid" :pid="pid" :meta="meta" :type="tab"
+            @toggle="togglePlugin" @uninstall="uninstallPlugin" />
+        </div>
+      </div>
+    </Transition>
 
-    <!-- 安装对话框 -->
+    <Transition name="dialog-pop">
     <div v-if="showInstall" class="modal-overlay" @click.self="showInstall = false">
       <div class="preview-dialog">
-        <!-- 步骤 1：选择文件 -->
-        <div v-if="!preview && !previewLoading && !previewError" class="preview-step">
+        <Transition name="dialog-stage" mode="out-in">
+        <div v-if="!preview && !previewLoading && !previewError" key="choose" class="preview-step">
           <span class="material-symbols-outlined dialog-ico">install_desktop</span>
           <h3 class="dialog-title">安装插件</h3>
           <p class="dialog-sub">选择 .nmfp 插件包</p>
@@ -186,14 +189,12 @@ onMounted(refresh)
           <button class="btn btn-text" @click="showInstall = false">取消</button>
         </div>
 
-        <!-- 加载中 -->
-        <div v-else-if="previewLoading" class="preview-loading">
+        <div v-else-if="previewLoading" key="loading" class="preview-loading">
           <div class="spinner" style="margin:24px auto"></div>
           <p>正在解析插件...</p>
         </div>
 
-        <!-- 预览错误 -->
-        <div v-else-if="previewError" class="preview-error">
+        <div v-else-if="previewError" key="error" class="preview-error">
           <span class="material-symbols-outlined dialog-ico" style="color:var(--md-error)">error</span>
           <h3 class="dialog-title">解析失败</h3>
           <p class="dialog-sub">{{ previewError }}</p>
@@ -203,10 +204,8 @@ onMounted(refresh)
           </div>
         </div>
 
-        <!-- 步骤 2：预览详情 -->
-        <template v-else-if="preview">
+        <div v-else-if="preview" key="preview" class="preview-result">
           <div class="preview-scroll">
-            <!-- 插件基本信息 -->
             <div class="preview-hero">
               <span class="material-symbols-outlined preview-hero-ico">extension</span>
               <div>
@@ -227,7 +226,6 @@ onMounted(refresh)
               </div>
             </div>
 
-            <!-- Schema 校验状态 -->
             <div v-if="!preview.schema_valid" class="preview-section warn">
               <div class="preview-section-title">
                 <span class="material-symbols-outlined">warning</span>Schema 校验
@@ -237,7 +235,6 @@ onMounted(refresh)
               </div>
             </div>
 
-            <!-- 权限列表 -->
             <div class="preview-section">
               <div class="preview-section-title">
                 <span class="material-symbols-outlined">security</span>权限申请
@@ -263,7 +260,6 @@ onMounted(refresh)
               </div>
             </div>
 
-            <!-- 安全风险 -->
             <div v-if="preview.risks.length" class="preview-section">
               <div class="preview-section-title">
                 <span class="material-symbols-outlined">bug_report</span>安全扫描
@@ -278,7 +274,6 @@ onMounted(refresh)
               </div>
             </div>
 
-            <!-- 无风险 -->
             <div v-if="!preview.risks.length && preview.permission_conform" class="preview-section">
               <div class="preview-section-title">
                 <span class="material-symbols-outlined">check_circle</span>安全检查
@@ -291,7 +286,6 @@ onMounted(refresh)
             <span class="material-symbols-outlined">warning</span>{{ installError }}
           </div>
 
-          <!-- 底部操作栏 -->
           <div class="preview-foot">
             <label class="check-row" v-if="preview.plugin.package_name">
               <input type="checkbox" v-model="forceInstall">强制覆盖已安装的同包名插件
@@ -304,10 +298,13 @@ onMounted(refresh)
               </button>
             </div>
           </div>
-        </template>
+        </div>
+        </Transition>
       </div>
     </div>
+    </Transition>
 
+    <Transition name="dialog-pop">
     <div v-if="showKey" class="modal-overlay" @click.self="cancelKey">
       <div class="install-dialog">
         <span class="material-symbols-outlined dialog-ico">key</span>
@@ -320,5 +317,6 @@ onMounted(refresh)
         </div>
       </div>
     </div>
+    </Transition>
   </section>
 </template>

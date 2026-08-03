@@ -1,6 +1,7 @@
 <script setup>
 import { computed } from 'vue'
 import { store } from '../../lib/store'
+import { appLogoUrl } from '../../lib/branding'
 
 const appVersion = __APP_VERSION__
 
@@ -48,7 +49,7 @@ const runtimeInfo = computed(() => [
     <div class="about-shell">
       <header class="about-intro">
         <div class="about-brand">
-          <span class="material-symbols-outlined about-brand-mark">manufacturing</span>
+          <img class="about-brand-mark" :src="appLogoUrl" alt="">
           <div>
             <h3>NotmyFault</h3>
           </div>

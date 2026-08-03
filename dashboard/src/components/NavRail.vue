@@ -1,5 +1,6 @@
 <script setup>
 import { useTheme } from '../composables/useTheme'
+import { appLogoUrl } from '../lib/branding'
 defineProps({ current: String })
 const emit = defineEmits(['switch'])
 const { isDark, toggle } = useTheme()
@@ -15,10 +16,9 @@ const items = [
 </script>
 
 <template>
-  <!-- M3 Navigation Rail（collapsed）：icon 在上 label 在下，active 时 56×32 pill indicator + 填充图标 -->
   <aside class="nav-rail">
     <div class="nav-brand">
-      <span class="material-symbols-outlined brand-icon">manufacturing</span>
+      <img class="brand-icon" :src="appLogoUrl" alt="">
       <span class="brand-name">NotmyFault</span>
     </div>
     <nav class="nav-items">

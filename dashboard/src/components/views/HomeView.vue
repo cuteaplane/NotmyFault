@@ -5,7 +5,7 @@ import { getEngineStatus, readDiagnostics, hasBridge } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
 import { useEngineControl } from '../../composables/useEngineControl'
 
-// 引擎启动/暂停/重启逻辑与 NavRail 快捷按钮共享（含 busy 状态）
+// 引擎启停逻辑与 NavRail 快捷按钮共享 starting、stopping 等状态。
 const { starting, stopping, shuttingDown, syncStatus, startEngine, stopEngine, shutdownEngine } = useEngineControl()
 const stats = ref({ rules: '-', triggers: '-', actions: '-', pid: '-' })
 const diag = ref(null)
@@ -21,7 +21,7 @@ const modeLabel = computed(() => {
   const m = store.engineStatus.security_mode
   return ({ strict: '严格', normal: '标准', permissive: '宽松' })[m] || '-'
 })
-// 引擎启动失败/被拒绝的原因（如配置签名密钥缺失），暂停态展示警告
+// 引擎启动失败或被拒绝时，pausedError 保存后台返回的原因。
 const pausedError = computed(() => store.engineStatus.last_error || '')
 
 function goSecurity() {
@@ -40,7 +40,7 @@ async function loadStats() {
         pid: s.pid || '-',
       }
     } else {
-      // 引擎未运行：清空数据，避免把配置文件的 rules_count 误报为运行态数据
+      // 引擎未运行时清空统计，运行态数字只来自当前引擎。
       stats.value = { rules: '-', triggers: '-', actions: '-', pid: '-' }
     }
   } catch (e) {
@@ -50,7 +50,7 @@ async function loadStats() {
 }
 
 async function loadDiag() {
-  // 引擎未运行时不请求诊断，避免误报
+  // 引擎未运行时清空诊断结果，后台请求只在运行状态下进行。
   if (!isRunning.value) { diag.value = null; return }
   diag.value = await readDiagnostics()
 }
@@ -111,9 +111,9 @@ onMounted(() => {
   if (hasBridge()) diagTimer = setInterval(loadDiag, 30000)
 })
 onUnmounted(() => { if (diagTimer) clearInterval(diagTimer) })
-// SSE 事件到达时统一刷新统计 + 诊断
+// SSE 事件到达时重新读取统计，并由 loadStats 更新诊断。
 watch(() => store.refreshSignal, () => loadStats())
-// 引擎状态切换：关闭时清空数据，启动时立即刷新
+// 引擎停止时清空诊断，启动后立即读取统计。
 watch(isRunning, (running) => {
   if (!running) {
     diag.value = null
@@ -129,7 +129,6 @@ watch(isRunning, (running) => {
       <button class="btn btn-outlined" @click="refreshHome"><span class="material-symbols-outlined">refresh</span>刷新</button>
     </div></div>
 
-    <!-- APatch 风格状态卡片 -->
     <div class="apatch-hero" :class="isStarting ? 'starting' : isStopping ? 'stopping' : isRunning ? 'running' : isControllerOnline ? 'stopped' : 'offline'">
       <div class="hero-left">
         <div class="hero-icon">
@@ -145,28 +144,27 @@ watch(isRunning, (running) => {
           <p v-else>Dashboard 会为你启动后台服务、托盘与自动化引擎</p>
         </div>
       </div>
-      <!-- 填充按钮 + 假加载 spinner，4 态互斥 -->
+      <!-- 按钮区域在启动、运行、停止和关闭中只显示一个状态。 -->
       <div class="actions">
-        <button v-if="!isRunning && !isStarting && !isStopping" class="btn" @click="startEngine" style="min-width:148px">
+        <button v-if="!isRunning && !isStarting && !isStopping" class="btn hero-control hero-control-primary" @click="startEngine">
           <span class="material-symbols-outlined">play_arrow</span>{{ isControllerOnline ? '启动自动化' : '启动后台服务' }}</button>
-        <button v-if="isStarting" class="btn" disabled style="min-width:148px">
+        <button v-if="isStarting" class="btn hero-control hero-control-primary" disabled>
           <span class="spinner"></span>启动中...</button>
-        <button v-if="isRunning && !isStopping" class="btn" @click="stopEngine" style="min-width:148px">
+        <button v-if="isRunning && !isStopping" class="btn hero-control hero-control-primary" @click="stopEngine">
           <span class="material-symbols-outlined">pause</span>暂停自动化</button>
-        <button v-if="isStopping" class="btn" disabled style="min-width:148px">
+        <button v-if="isStopping" class="btn hero-control hero-control-primary" disabled>
           <span class="spinner"></span>暂停中...</button>
-      </div>
-      <!-- 彻底退出引擎：暂停只能停自动化线程，卡死的触发器线程会挡住热重载，
-           这里直接结束整个后台进程（含 API/托盘），Dashboard 不受影响 -->
-      <div v-if="isControllerOnline" class="mt-3">
-        <button v-if="!shuttingDown" class="btn btn-outlined btn-danger btn-sm" @click="shutdownEngine">
-          <span class="material-symbols-outlined">power_settings_new</span>彻底退出引擎</button>
-        <button v-else class="btn btn-outlined btn-danger btn-sm" disabled>
-          <span class="spinner"></span>退出中...</button>
+        <!-- 彻底停止按钮只在暂停状态出现，运行时先显示暂停按钮。 -->
+        <button v-if="isControllerOnline && !isRunning && !isStarting && !isStopping && !shuttingDown"
+          class="btn hero-control hero-control-danger" @click="shutdownEngine">
+          <span class="material-symbols-outlined">power_settings_new</span>彻底停止引擎</button>
+        <button v-if="isControllerOnline && !isRunning && !isStarting && !isStopping && shuttingDown"
+          class="btn hero-control hero-control-danger" disabled>
+          <span class="spinner"></span>停止中...</button>
       </div>
     </div>
 
-    <!-- 引擎被拒绝启动：配置可能被篡改（暂停横幅下追加红色警告条） -->
+    <!-- 启动被拒绝时显示后台返回的配置错误。 -->
     <div v-if="isControllerOnline && !isRunning && !isStarting && pausedError" class="mt-3 flex items-start gap-3 rounded-lg border border-error/40 bg-error/10 p-4">
       <span class="material-symbols-outlined text-error">shield_person</span>
       <div class="min-w-0 flex-1">
@@ -178,7 +176,7 @@ watch(isRunning, (running) => {
       </div>
     </div>
 
-    <!-- 引擎运行中：整块信息架构，避免碎片化小卡片 -->
+    <!-- 引擎运行时显示统计、诊断和操作区。 -->
     <template v-if="isControllerOnline">
       <section v-if="isRunning" class="dashboard-card dashboard-overview">
         <header class="dashboard-card-head">
@@ -234,7 +232,6 @@ watch(isRunning, (running) => {
       </section>
     </template>
 
-    <!-- 引擎未运行：显示系统信息 -->
     <template v-else>
     <section class="dashboard-card dashboard-system">
       <header class="dashboard-card-head">

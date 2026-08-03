@@ -1,13 +1,15 @@
 export const FLOW_NODE_WIDTH = 228
 export const FLOW_NODE_PORT_Y = 58
-// 1px node border + 38px header + 76px body + 1px data divider + 12px row centre.
+export const FLOW_NODE_BASE_HEIGHT = 116
+export const FLOW_DATA_SUMMARY_HEIGHT = 30
+// 数据端口的纵坐标由节点边框、标题、正文和分隔线高度相加得到。
 export const FLOW_DATA_PORT_Y = 128
 export const FLOW_DATA_PORT_STEP = 24
+export const FLOW_COLUMN_STEP = 360
+export const FLOW_ROW_STEP = 220
 
 const LEFT = 52
 const TOP = 118
-const COLUMN_STEP = 260
-const ROW_STEP = 164
 
 function isLeaf(node) {
   return !!node
@@ -46,14 +48,14 @@ export function buildFlowGraph({
     function visit(node, path, depth) {
       const id = pathId(path)
       if (!node || typeof node !== 'object' || Array.isArray(node)) {
-        const y = TOP + leafIndex * ROW_STEP
+        const y = TOP + leafIndex * FLOW_ROW_STEP
         leafIndex += 1
         nodes.push({
           id,
           kind: 'invalid',
           path,
           source: node,
-          x: LEFT + (maxDepth - depth) * COLUMN_STEP,
+          x: LEFT + (maxDepth - depth) * FLOW_COLUMN_STEP,
           y,
           icon: 'error',
           kicker: '无效条件',
@@ -65,14 +67,14 @@ export function buildFlowGraph({
         return { id, y }
       }
       if (isLeaf(node)) {
-        const y = TOP + leafIndex * ROW_STEP
+        const y = TOP + leafIndex * FLOW_ROW_STEP
         leafIndex += 1
         nodes.push({
           id,
           kind: 'trigger',
           path,
           source: node,
-          x: LEFT + (maxDepth - depth) * COLUMN_STEP,
+          x: LEFT + (maxDepth - depth) * FLOW_COLUMN_STEP,
           y,
           icon: 'bolt',
           kicker: `触发 ${leafIndex}`,
@@ -96,7 +98,7 @@ export function buildFlowGraph({
         kind: 'condition',
         path,
         source: node,
-        x: LEFT + (maxDepth - depth) * COLUMN_STEP,
+        x: LEFT + (maxDepth - depth) * FLOW_COLUMN_STEP,
         y,
         icon: op === 'all' ? 'done_all' : 'alt_route',
         kicker: '逻辑汇合',
@@ -139,7 +141,7 @@ export function buildFlowGraph({
 
   const conditionExitNode = nodes.find(node => node.id === conditionExit.id)
   let previousId = conditionExit.id
-  let x = conditionExitNode.x + COLUMN_STEP
+  let x = conditionExitNode.x + FLOW_COLUMN_STEP
   const pipelineY = conditionExit.y
 
   const preconditions = Array.isArray(rule.preconditions) ? rule.preconditions : []
@@ -169,7 +171,7 @@ export function buildFlowGraph({
       label: index ? '再确认' : '开始前',
     })
     previousId = id
-    x += COLUMN_STEP
+    x += FLOW_COLUMN_STEP
   })
 
   const actions = Array.isArray(rule.actions) ? rule.actions : []
@@ -197,9 +199,10 @@ export function buildFlowGraph({
       kind: 'pipeline',
       channel: 'control',
       label: index || preconditions.length ? '然后' : '执行',
+      insertActionIndex: index,
     })
     previousId = id
-    x += COLUMN_STEP
+    x += FLOW_COLUMN_STEP
   })
 
   nodes.push({
@@ -221,6 +224,7 @@ export function buildFlowGraph({
     kind: 'add',
     channel: 'control',
     label: '',
+    insertActionIndex: actions.length,
   })
 
   return { nodes, edges }
@@ -232,17 +236,13 @@ export function routeFlowEdge(edge, nodesById) {
   if (!source || !target) return null
 
   const x1 = source.x + FLOW_NODE_WIDTH
-  const y1 = source.y + (
-    edge.channel === 'data'
-      ? FLOW_DATA_PORT_Y + edge.sourcePortIndex * FLOW_DATA_PORT_STEP
-      : FLOW_NODE_PORT_Y
-  )
+  const sourceDataY = source.dataOutputY?.[edge.sourcePortName]
+    ?? FLOW_DATA_PORT_Y + edge.sourcePortIndex * FLOW_DATA_PORT_STEP
+  const targetDataY = target.dataInputY?.[edge.targetPortName]
+    ?? FLOW_DATA_PORT_Y + edge.targetPortIndex * FLOW_DATA_PORT_STEP
+  const y1 = source.y + (edge.channel === 'data' ? sourceDataY : FLOW_NODE_PORT_Y)
   const x2 = target.x
-  const y2 = target.y + (
-    edge.channel === 'data'
-      ? FLOW_DATA_PORT_Y + edge.targetPortIndex * FLOW_DATA_PORT_STEP
-      : FLOW_NODE_PORT_Y
-  )
+  const y2 = target.y + (edge.channel === 'data' ? targetDataY : FLOW_NODE_PORT_Y)
 
   if (x2 - x1 >= 24) {
     const middle = (x1 + x2) / 2
@@ -254,7 +254,7 @@ export function routeFlowEdge(edge, nodesById) {
     }
   }
 
-  // 节点被拖到来源左侧时，从两者右侧回绕，避免贝塞尔曲线反折或穿过节点。
+  // 目标节点在来源左侧时，连线从两节点右侧绕行。
   const routeX = Math.max(x1, target.x + FLOW_NODE_WIDTH) + 58
   return {
     ...edge,

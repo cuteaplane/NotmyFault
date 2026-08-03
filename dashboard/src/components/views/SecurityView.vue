@@ -15,12 +15,25 @@ const modeMap = {
   permissive: { l: '宽松', d: '开发模式：所有插件均可加载，未声明能力仅告警', c: 'sec-mode-permissive' },
   unknown: { l: '未知', d: '无法获取安全模式（引擎可能未运行）', c: 'sec-mode-permissive' },
 }
-const pL = { admin: '管理员', native_api: '原生API', external_binary: '外部程序' }
-const pC = { admin: 'chip-admin', native_api: 'chip-native', external_binary: 'chip-external' }
-const pI = { admin: 'admin_panel_settings', native_api: 'code', external_binary: 'terminal' }
+// pL 按后端 PERMISSION_REGISTRY 列出全部权限，clipboard 等新增项也会显示图标和文字。
+const pL = {
+  notification: '发送通知', audio: '音频', clipboard: '剪贴板', network: '网络访问',
+  external_binary: '外部程序', native_api: '原生 API', filesystem: '文件系统',
+  process: '进程管理', registry: '注册表', screen_reader: '屏幕读取', admin: '管理员权限',
+}
+const pC = {
+  notification: 'chip-clean', audio: 'chip-permission-low', clipboard: 'chip-permission-medium',
+  network: 'chip-permission-medium', external_binary: 'chip-external', native_api: 'chip-native',
+  filesystem: 'chip-permission-high', process: 'chip-permission-high', registry: 'chip-permission-high',
+  screen_reader: 'chip-permission-high', admin: 'chip-admin',
+}
+const pI = {
+  notification: 'notifications', audio: 'volume_up', clipboard: 'content_paste', network: 'language',
+  external_binary: 'terminal', native_api: 'code', filesystem: 'folder_open', process: 'memory',
+  registry: 'account_tree', screen_reader: 'screenshot_monitor', admin: 'admin_panel_settings',
+}
 const oL = { builtin: '内置', user: '用户', third_party: '第三方' }
 
-// ---- 配置安全审查（密钥缺失/签名失败时的恢复入口）----
 const configSec = ref({ status: 'loading', reason: '', summary: null })
 const approving = ref(false)
 const HIGH_RISK = ['run_powershell', 'shutdown_system', 'kill_process']
@@ -78,8 +91,7 @@ const modeInfo = computed(() => modeMap[mode.value] || modeMap.unknown)
 async function load() {
   try {
     const s = await getEngineStatus()
-    // 合并而非整体覆盖：与 App.vue.updateStatus / useEngineControl.syncStatus 对齐。
-    // 整体替换会把 engine_running 等部分状态字段冲掉，导致引擎状态不一致。
+    // 状态更新采用合并，保留已有的 engine_running 等字段。
     store.engineStatus = { ...store.engineStatus, ...s }
     store.engineOnline = s.engine_running === true
     document.body.classList.toggle('engine-online', store.engineOnline)
@@ -95,8 +107,8 @@ onMounted(() => { load(); loadConfigSecurity() })
       <button class="btn btn-outlined" @click="load(); loadConfigSecurity()"><span class="material-symbols-outlined">refresh</span>刷新</button>
     </div></div>
 
-    <!-- 配置完整性审查卡片 -->
-    <div v-if="configSec.status === 'tampered'" class="mb-5 rounded-lg border border-error/40 bg-error/10 p-4">
+    <Transition name="status-strip" mode="out-in">
+    <div v-if="configSec.status === 'tampered'" key="tampered" class="config-security-status rounded-lg border border-error/40 bg-error/10 p-4">
       <div class="flex items-center gap-2">
         <span class="material-symbols-outlined text-error">shield_person</span>
         <h3 class="font-bold text-error">配置可能被篡改，引擎已暂停</h3>
@@ -127,13 +139,14 @@ onMounted(() => { load(); loadConfigSecurity() })
       </div>
       <p class="mt-2 text-body-s text-on-surface-variant">当前内容已自动备份到 config.json.bak，可随时手动恢复。</p>
     </div>
-    <div v-else-if="configSec.status === 'ok'" class="mb-5 flex items-center gap-2 rounded-lg border border-success/40 bg-success/10 p-3">
+    <div v-else-if="configSec.status === 'ok'" key="ok" class="config-security-status flex items-center gap-2 rounded-lg border border-success/40 bg-success/10 p-3">
       <span class="material-symbols-outlined text-success">verified</span>
       <span class="text-body-s">配置签名有效，完整性正常。</span>
     </div>
-    <div v-else-if="configSec.status === 'unreadable'" class="mb-5 rounded-lg border border-warn/40 bg-warn/10 p-3">
+    <div v-else-if="configSec.status === 'unreadable'" key="unreadable" class="config-security-status rounded-lg border border-warn/40 bg-warn/10 p-3">
       <span class="text-body-s text-warn">配置无法读取：{{ configSec.reason }}</span>
     </div>
+    </Transition>
 
     <div class="sec-banner" :class="modeInfo.c"><span class="material-symbols-outlined sec-banner-ico">shield</span>
       <div><div class="sec-banner-title">安全模式：{{ modeInfo.l }}</div><p class="sec-banner-desc">{{ modeInfo.d }}</p></div></div>
@@ -165,8 +178,9 @@ onMounted(() => { load(); loadConfigSecurity() })
         <span class="perm-origin">{{ oL[p.origin] || p.origin || '未知' }}</span>
         <span class="perm-chips">
           <span v-if="!p.perms.length" class="chip chip-clean">无特殊权限</span>
-          <span v-for="perm in p.perms" :key="perm" class="chip" :class="pC[perm]">
-            <span class="material-symbols-outlined" style="font-size:14px">{{ pI[perm] }}</span>{{ pL[perm] }}
+          <span v-for="perm in p.perms" :key="perm" class="chip" :class="pC[perm] || 'chip-unknown'"
+            :title="pL[perm] ? perm : `未识别的权限：${perm || '空值'}`">
+            <span class="material-symbols-outlined" style="font-size:14px">{{ pI[perm] || 'help' }}</span>{{ pL[perm] || perm || '未命名权限' }}
           </span>
         </span>
       </div>

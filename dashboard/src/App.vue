@@ -16,7 +16,10 @@ const { init: initTheme } = useTheme()
 const currentPage = ref('home')
 const views = { home: HomeView, plugins: PluginsView, security: SecurityView, rules: RulesView, logs: LogsView, about: AboutView }
 
-function switchPage(p) { currentPage.value = p }
+function switchPage(p) {
+  if (p === currentPage.value || !views[p]) return
+  currentPage.value = p
+}
 
 let sseAbort = null
 let sseRetry = 0
@@ -43,7 +46,7 @@ async function refreshAll() {
     const [sch, plugins] = await Promise.all([getSchema(), loadPlugins()])
     store.schema = sch
     store.pluginsData = plugins
-  } catch (e) { /* 引擎离线，静默 */ }
+  } catch (e) { /* 引擎离线时刷新配置失败，继续保留旧数据。 */ }
 }
 
 async function refreshStatus() {
@@ -62,18 +65,16 @@ async function connectSSE() {
   sseReconnectTimer = null
   if (sseAbort) { sseAbort.abort(); sseAbort = null }
   let token = ''
-  try { token = await window.pywebview?.api?.get_api_token() || '' } catch (e) { /* offline */ }
+  try { token = await window.pywebview?.api?.get_api_token() || '' } catch (e) { /* bridge 暂时不可用时按无 token 处理。 */ }
   if (!token) {
-    // 后台服务可能刚重启、token 文件尚未发布；不能放弃，按退避延迟重连，
-    // 否则事件流永久断开直到整页刷新。
+    // 后台服务重启时 token 文件可能尚未发布，这里按退避重连直到 token 出现。
     updateStatus({ engine_running: false })
     sseRetry++
     const delay = Math.min(1000 * 2 ** Math.min(sseRetry - 1, 4), 15000)
     sseReconnectTimer = setTimeout(connectSSE, delay)
     return
   }
-  // 用 fetch 流代替 EventSource：token 走 Authorization header，
-  // 不再以 ?token= 形式出现在 URL（防止进入任何访问日志）。
+  // fetch 流把 token 放在 Authorization 请求头中，URL 只带路径，访问日志中的凭据字段为空。
   const abort = new AbortController()
   sseAbort = abort
   try {
@@ -93,8 +94,7 @@ async function connectSSE() {
 function scheduleSSEReconnect() {
   sseRetry++
   if (sseRetry > SSE_MAX) updateStatus({ engine_running: false })
-  // 长时间休眠、WebView 网络栈重置或 token 自愈期间都可能连续失败。
-  // 达到阈值只改变显示状态，不永久放弃重连。
+  // 长时间休眠、WebView 网络栈重置或 token 重新发布期间都可能连续失败，超过阈值仍会继续按退避重连。
   const delay = Math.min(1000 * 2 ** Math.min(sseRetry - 1, 4), 15000)
   if (sseReconnectTimer) clearTimeout(sseReconnectTimer)
   sseReconnectTimer = setTimeout(connectSSE, delay)
@@ -122,7 +122,7 @@ async function consumeSSE(res, abort) {
   let eventName = ''
   let dataLines = []
   let lastActivity = Date.now()
-  // 服务端 15s 发一次 keepalive；超过 45s 无任何数据视为假死连接，主动重建。
+  // 服务端每 15 秒发送心跳，45 秒没有数据时重建连接。
   const watchdog = setInterval(() => {
     if (Date.now() - lastActivity > 45000) abort.abort()
   }, 15000)
@@ -144,13 +144,13 @@ async function consumeSSE(res, abort) {
           }
           continue
         }
-        if (line.startsWith(':')) continue // keepalive 注释行
+        if (line.startsWith(':')) continue // SSE 冒号行只表示心跳，不带事件数据。
         if (line.startsWith('event:')) eventName = line.slice(6).trim()
         else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
       }
     }
   } catch (e) {
-    /* 流中断/abort */
+    /* 流断开或主动终止时结束读取 */
   } finally {
     clearInterval(watchdog)
     if (sseAbort === abort) sseAbort = null
@@ -158,19 +158,19 @@ async function consumeSSE(res, abort) {
   scheduleSSEReconnect()
 }
 
-// 只有后台控制服务真正离线时才离开管理页面；自动化暂停期间仍可编辑。
+// 后台控制服务离线时返回首页，自动化暂停时仍可编辑。
 watch(() => store.controllerOnline, (on) => {
   if (!on && ['plugins', 'rules', 'logs', 'security'].includes(currentPage.value)) {
-    currentPage.value = 'home'
+    switchPage('home')
   }
 })
 
-// 暴露刷新入口给子视图（启动/停止引擎后调用）
+// 子视图在引擎启停后调用这里暴露的刷新入口。
 window.__nmf = { refreshAll, updateStatus, switchPage }
 
 onMounted(async () => {
   initTheme()
-  // main.js 已确保 bridge 就绪才挂载 Vue，这里不用再等
+  // main.js 挂载 Vue 前已检查 pywebview bridge。
   try {
     const cfg = await loadConfig()
     store.configData = cfg && cfg.rules ? cfg : { rules: [] }

@@ -5,36 +5,30 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>NotmyFault</title>
 <script>
-  // 在 CSS 应用前同步设置主题 + 背景色，避免深色模式白屏闪烁（FOUC）。
-  // 两层防御：
-  // 1. data-theme 属性（CSS 变量切换）
-  // 2. <html> 内联 backgroundColor（CSS 文件还没下载完时，浏览器用这个背景色而非默认白色）
+  // CSS 加载前先写入主题属性和背景色，深色主题首屏会直接使用深色背景。
   (function() {
     var t = localStorage.getItem('nmf-theme');
     if (!t && window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) t = 'dark';
     document.documentElement.setAttribute('data-theme', t || 'light');
-    // 与 styles.css 的 --md-surface-c-low 保持一致（body 的背景色）
+    // 背景色与 styles.css 的 --md-surface-c-low 保持一致。
     document.documentElement.style.backgroundColor = t === 'dark' ? '#1b1b21' : '#f6f3fc';
   })();
 </script>
 <style>
-  /* 防止 Material Symbols 字体加载前显示 icon name 文本。
-     字体未加载时 .material-symbols-outlined 元素完全隐藏，
-     加载完成后（fonts-loaded class 由 JS 添加）才显示。
-     比纯 font-display:block 更可靠--block 有 3 秒超时会 fallback。 */
+  /* Material Symbols 加载完成前保持图标隐藏，fonts-loaded 类出现后再显示。 */
   .material-symbols-outlined:not(.fonts-loaded *) { visibility: hidden; }
 </style>
 </head>
 <body>
 <div id="app"></div>
 <script>
-  // 字体加载完成后添加 fonts-loaded class，让图标可见
+  // 字体加载完成后给根元素加 fonts-loaded 类，CSS 据此显示图标。
   if (document.fonts && document.fonts.ready) {
     document.fonts.ready.then(function() {
       document.documentElement.classList.add('fonts-loaded');
     });
   } else {
-    // 不支持 FontFace API 的浏览器直接显示
+    // 不支持 FontFace API 时直接给根元素加 fonts-loaded 类。
     document.documentElement.classList.add('fonts-loaded');
   }
 </script>

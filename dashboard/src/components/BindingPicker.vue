@@ -37,7 +37,7 @@ function apply() {
         </option>
       </optgroup>
     </select>
-    <!-- 敏感输出（如剪贴板内容）：插件已标记 sensitive，绑定前明确告知传播后果 -->
+    <!-- 插件把剪贴板等输出标为 sensitive，绑定后会把内容传给动作。 -->
     <p v-if="selectedSource?.sensitive" class="flex items-start gap-1.5 text-label-m text-warn">
       <span class="material-symbols-outlined text-[16px] leading-5">warning</span>
       <span>此数据被插件标记为敏感，可能包含隐私内容。绑定后，规则每次触发都会把它传给该动作使用。</span>

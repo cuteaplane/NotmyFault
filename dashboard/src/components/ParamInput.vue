@@ -54,7 +54,7 @@ async function pickFolder() {
   try {
     const selected = await window.pywebview.api.select_folder(String(value.value || ''))
     if (selected) value.value = selected
-  } catch (e) { /* bridge 不可用时保留手动输入 */ }
+  } catch (e) { /* bridge 不可用时保持手动输入。 */ }
 }
 </script>
 

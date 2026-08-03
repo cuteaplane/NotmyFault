@@ -1,5 +1,4 @@
-// pywebview 桌面客户端。普通 JSON 请求统一经 Python bridge 代理；
-// 只有包含 File 的 FormData 上传需要由 WebView 直接发送。
+// pywebview 桌面客户端，普通 JSON 请求经 Python bridge 代理，包含 File 的 FormData 上传直接由 WebView 发送。
 export const API = 'http://127.0.0.1:19198'
 
 export function hasBridge() {
@@ -22,8 +21,7 @@ async function fetchAuthenticated(path, options = {}) {
     return await fetch(API + path, { ...options, headers })
   }
   let res = await request()
-  // 运行中的 engine 会在认证失败时重新发布其内存 token。重新从 bridge
-  // 读取并重试一次，可从 token 文件被清理/覆盖的状态中立即自愈。
+  // 认证返回 403 时重新从 bridge 读取内存 token 再重试一次，运行中的 engine 会在这里重新发布 token。
   if (res.status === 403 && hasBridge()) res = await request()
   return res
 }
@@ -48,7 +46,7 @@ export async function apiRead(path) {
   return await bridgeRequest(path, 'GET')
 }
 
-// 带文件的上传无法穿过 pywebview JSON bridge，保留唯一一条直连路径。
+// 含文件的 FormData 无法通过 pywebview JSON bridge，这里直接发 HTTP 请求。
 export async function apiWrite(path, method, body, isForm) {
   if (!isForm) return await bridgeRequest(path, method, body || null)
   const res = await fetchAuthenticated(path, { method, body })
@@ -100,8 +98,6 @@ export async function getEngineStatus() {
   return await window.pywebview.api.get_engine_status()
 }
 
-// ---- 配置安全审查（密钥缺失/签名失败时的恢复入口）----
-
 export async function getConfigSecurityStatus() {
   try {
     const r = await apiRead('/api/config/security-status')
@@ -121,15 +117,13 @@ export async function readLogRaw(lines = 300) {
   catch (e) { return '读取日志失败: ' + e.message }
 }
 
-// 诊断：优先经认证 HTTP 直读引擎实时诊断（含 action_ok），
-// 引擎离线时回退 bridge 直读日志。日志里只有 action_failed 没有“成功”条目，
-// bridge 的 build_diagnostics 凑不出 action_ok，桌面端会永远显示“正常”而非执行次数。
+// 诊断优先从认证 HTTP 读取引擎实时数据，离线时读取 bridge 日志，因为日志只有 action_failed，无法统计成功次数。
 export async function readDiagnostics() {
   try {
     const r = await apiRead('/api/engine/diagnostics')
     if (!r.ok) return null
     const d = await r.json()
-    // get_diagnostics 返回嵌套结构，展平成 build_diagnostics 格式
+    // get_diagnostics 返回嵌套结构，展平成 build_diagnostics 格式。
     const errs = d.errors || []
     return {
       error_count: errs.length,
