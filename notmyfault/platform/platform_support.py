@@ -1,4 +1,4 @@
-"""跨平台桌面集成工具。"""
+"""提供配置目录、独立脚本、桌面通知和 Linux 自启的跨平台函数。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 def get_config_dir() -> str:
-    """返回当前平台的用户配置目录。"""
+    """返回当前平台的用户配置目录"""
     if sys.platform == "win32":
         base_dir = os.environ.get("APPDATA")
         if base_dir:
@@ -25,7 +25,7 @@ def get_config_dir() -> str:
 
 
 def launch_python_entry(entry_path: str) -> None:
-    """使用当前 Python 启动独立入口脚本。"""
+    """使用当前 Python 启动独立入口脚本"""
     popen_options: dict[str, object] = {}
     if sys.platform == "win32":
         popen_options["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -35,7 +35,7 @@ def launch_python_entry(entry_path: str) -> None:
 
 
 def show_notification(title: str, message: str) -> bool:
-    """发送桌面通知；后端不可用时返回 False。"""
+    """发送桌面通知；后端不可用时返回 False"""
     if sys.platform == "win32":
         try:
             from Win_toaster.show_notification import show_notification as show_windows_notification
@@ -69,7 +69,7 @@ def linux_autostart_path() -> Path:
 
 
 def set_linux_autostart(enabled: bool, project_root: str) -> bool:
-    """启用或关闭 XDG 开机自启。"""
+    """启用或关闭 XDG 开机自启"""
     if sys.platform == "win32":
         raise RuntimeError("Linux autostart API cannot be used on Windows")
     desktop_file = linux_autostart_path()

@@ -1,4 +1,4 @@
-"""通过 XDG Desktop Portal 在 Wayland 下截图。"""
+"""通过 XDG Desktop Portal 在 Wayland 下截图"""
 
 from __future__ import annotations
 

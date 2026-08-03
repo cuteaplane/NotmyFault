@@ -11,10 +11,9 @@ import subprocess as _sp
 
 
 def _run_build_command(cmd: list[str], build_dir: str):
-    """以 UTF-8 运行 build.py，避免 Windows 控制台代码页污染首次启动日志。"""
+    """以 UTF-8 运行 build.py，首次启动日志使用统一编码。"""
     env = os.environ.copy()
-    # build.py 会输出中文。capture_output 时没有控制台代码页可借，必须明确
-    # 规定子进程和父进程都按 UTF-8 处理，不能再让 subprocess 猜 GBK。
+    # build.py 输出中文，子进程和父进程都显式使用 UTF-8。
     env["PYTHONUTF8"] = "1"
     return _sp.run(
         cmd,
@@ -28,7 +27,21 @@ def _run_build_command(cmd: list[str], build_dir: str):
     )
 
 
-# 本模块位于 notmyfault/host/ 下，包根（插件目录/构建文件所在）是其上一级。
+def _notify_first_run_mode(mode: str) -> None:
+    """首次构建或降级后通知用户当前安全模式。"""
+    try:
+        from notmyfault.host.alert import alert_user
+        alert_user(
+            "NotmyFault 首次运行",
+            f"检测到缺少签名，已自动完成开发构建并进入 {mode} 安全模式。"
+            "如需更严格的安全模式，请运行 `python build.py build`（strict）"
+            "并在 Dashboard「安全与权限」页确认当前配置。",
+            open_dashboard=False,
+        )
+    except Exception:
+        print("[FirstRun] 无法发送安全模式提示", file=sys.stderr)
+
+
 _PKG_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -47,9 +60,8 @@ def _ensure_first_run_build() -> None:
     if not needs_build:
         return
     print("[FirstRun] Detected missing signatures or build file, running first-time build...")
-    # 第一次从 GUI 启动没有可用终端来输入私钥口令。一次完成 permissive 构建：
-    # 生成本机开发签名键、签内置插件并写 build.json；正式发布仍由开发者显式
-    # 执行 strict 构建，不能把交互式口令提示藏进后台子进程。
+    # GUI 首次启动没有终端输入私钥口令，因此使用 permissive 构建生成本机签名文件。
+    # 正式发布由开发者显式执行 strict 构建。
     commands = [
         ([sys.executable, build_py, "build", "--security-mode=permissive"], "build"),
     ]
@@ -66,6 +78,7 @@ def _ensure_first_run_build() -> None:
             _degrade_security_mode()
             return
     print("[FirstRun] First-time build complete")
+    _notify_first_run_mode("permissive")
 
 
 def _degrade_security_mode() -> None:
@@ -74,6 +87,7 @@ def _degrade_security_mode() -> None:
         return
     os.environ["NOTMYFAULT_MODE"] = "develop"
     print("[FirstRun] Degraded to development mode (NOTMYFAULT_MODE=develop)")
+    _notify_first_run_mode("develop（normal）")
 
 
 def _get_plugin_paths():
@@ -102,8 +116,7 @@ def run(
     shutdown_event: "threading.Event | None" = None,
     on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> None:
-    # 与 NOTMYFAULT.pyw 入口一致：拒绝以管理员身份启动，插件提权必须走
-    # notmyfault.security.sudo 的 UAC 受控通道，而不是整个引擎带着提升令牌运行。
+    # 引擎以普通权限启动，插件提权通过 notmyfault.security.sudo 请求 UAC 授权。
     from notmyfault.security.security import is_admin_process
     if is_admin_process():
         print(

@@ -1,9 +1,6 @@
-"""系统托盘图标 — 用户接触引擎的第一界面。
+"""提供 Windows 系统托盘图标、菜单、通知和开机自启管理。"""
 
-提供托盘图标、右键菜单、气球通知、开机自启管理。
-Windows 实现，跨平台时替换本模块即可。
-"""
-
+import ctypes
 import os
 import sys
 import threading
@@ -13,7 +10,7 @@ import win32api
 import win32con
 import win32gui
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 ICON_PATH = os.path.join(PROJECT_ROOT, "logo.ico")
 
 WM_TASKBARCREATED = win32gui.RegisterWindowMessage("TaskbarCreated")
@@ -32,12 +29,28 @@ NIIF_WARNING = 2
 NIIF_ERROR = 3
 NIN_BALLOONUSERCLICK = 0x0400
 
+# 托盘线程在创建隐藏窗口前设置 Per-Monitor V2，菜单按所在显示器 DPI 绘制。
+_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
+
+
+def _enable_tray_dpi_awareness() -> bool:
+    """托盘窗口和系统菜单按所在显示器的 DPI 原生绘制"""
+    try:
+        # 独立 DLL 句柄使托盘线程单独配置 user32 函数。
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        set_thread_context = user32.SetThreadDpiAwarenessContext
+        set_thread_context.argtypes = [ctypes.c_void_p]
+        set_thread_context.restype = ctypes.c_void_p
+        return bool(
+            set_thread_context(_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+        )
+    except (AttributeError, OSError):
+        # 老系统没有线程级 API，此处保留进程原有 DPI 上下文。
+        return False
+
 
 class TrayIcon:
-    """系统托盘图标（Windows）。
-
-    独立线程 + 隐藏窗口 + 消息泵，不阻塞主线程。
-    """
+    """Windows 系统托盘图标，在线程中使用隐藏窗口和消息泵运行。"""
 
     def __init__(
         self,
@@ -56,7 +69,7 @@ class TrayIcon:
         self._auto_start_enabled = _is_auto_start_enabled()
 
     def start(self):
-        """启动托盘图标（后台线程）。"""
+        """在后台线程启动托盘图标。"""
         if self._thread and self._thread.is_alive():
             return
         self._shutdown_event.clear()
@@ -64,7 +77,7 @@ class TrayIcon:
         self._thread.start()
 
     def stop(self):
-        """停止托盘图标。"""
+        """停止托盘图标"""
         self._shutdown_event.set()
         if self._hwnd:
             try:
@@ -73,23 +86,22 @@ class TrayIcon:
                 pass
             self._hwnd = None
         if self._thread and self._thread.is_alive():
-            # 避免在托盘线程自身调用 join（会抛 RuntimeError/死锁）；
-            # 托盘线程退出循环后会自行清理
+            # 托盘线程不能 join() 自身，退出循环后会自行清理。
             if self._thread is not threading.current_thread():
                 self._thread.join(timeout=3)
 
     def set_engine_running(self, running: bool):
-        """兼容旧调用方；新代码统一使用 set_engine_state。"""
+        """把旧的布尔状态调用转发到 set_engine_state。"""
         self.set_engine_state("running" if running else "stopped")
 
     def set_engine_state(self, state: str):
-        """更新后台核心状态并同步托盘提示。"""
+        """更新托盘标题和菜单中的引擎状态。"""
         self._engine_state = state
         self._engine_running = state == "running"
         self._update_tray_tip()
 
     def show_balloon(self, title: str, message: str, icon_type: int = NIIF_INFO):
-        """显示气球通知。"""
+        """显示气球通知"""
         if not self._hwnd:
             return
         try:
@@ -106,6 +118,8 @@ class TrayIcon:
         (_register_auto_start if enable else _unregister_auto_start)()
 
     def _run(self):
+        # 先设置线程 DPI，再调用 RegisterClass() 和 CreateWindow()。
+        _enable_tray_dpi_awareness()
         hinst = win32api.GetModuleHandle(None)
         wc = win32gui.WNDCLASS()
         wc.hInstance = hinst
@@ -124,7 +138,7 @@ class TrayIcon:
 
         import ctypes
         user32 = ctypes.windll.user32
-        # 与触发器一致：显式声明类型，避免共享 _objects 竞态（docs/native-safety.md）
+        # 显式声明这些函数的参数和返回类型。
         msg_type = ctypes.wintypes.MSG
         user32.PeekMessageW.argtypes = [ctypes.POINTER(msg_type), ctypes.wintypes.HWND,
                                         ctypes.wintypes.UINT, ctypes.wintypes.UINT,
@@ -276,10 +290,6 @@ class TrayIcon:
         win32gui.DestroyMenu(menu)
 
 
-# ================================================================
-# 图标加载
-# ================================================================
-
 _ICON_CACHE = None
 
 
@@ -300,10 +310,6 @@ def _load_icon():
             pass
     return 0
 
-
-# ================================================================
-# 开机自启
-# ================================================================
 
 AUTO_START_NAME = "NotmyFaultEngine"
 

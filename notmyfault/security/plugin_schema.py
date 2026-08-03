@@ -23,7 +23,7 @@ _REQUIRED_OUTPUT_FIELDS = {"name", "type", "label"}
 _ALLOWED_ORIGINS = {"builtin", "user", "third_party"}
 _ALLOWED_PLATFORMS = {"windows", "linux", "macos"}
 _PACKAGE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$")
-# id 仅允许字母/数字/下划线/连字符，禁止路径分隔符（防 ../ 路径穿越）
+# plugin id 只允许字母、数字、下划线和连字符，路径分隔符会把 id 变成路径。
 _PLUGIN_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 
 
@@ -35,10 +35,6 @@ def current_platform_name() -> str:
     if sys.platform == "darwin":
         return "macos"
     return sys.platform
-
-# =========================================================================
-# 权限注册表
-# =========================================================================
 
 PERM_RISK_NONE = "none"
 PERM_RISK_LOW = "low"
@@ -116,11 +112,7 @@ def is_known_permission(perm: str) -> bool:
     return perm in PERMISSION_REGISTRY
 
 
-# =========================================================================
-# 安全扫描器 — 静态分析 .py 中的危险模式
-# =========================================================================
-
-# (pattern_name, risk_label, risk_level, search_terms)
+# 每项依次保存风险 id、标签、等级和搜索词。
 _RISK_PATTERNS: List[Tuple[str, str, str, List[str]]] = [
     ("code_injection", "代码注入", PERM_RISK_HIGH, ["eval(", "exec(", "compile(", "__import__"]),
     ("subprocess", "子进程", PERM_RISK_HIGH, ["subprocess.", "os.system", "os.popen"]),
@@ -133,7 +125,7 @@ _RISK_PATTERNS: List[Tuple[str, str, str, List[str]]] = [
 
 
 def scan_plugin_security(plugin_dir: str) -> List[Dict[str, Any]]:
-    """扫描插件目录下的 .py 文件，返回发现的风险列表。"""
+    """扫描插件目录下的 .py 文件，返回发现的风险列表"""
     risks: List[Dict[str, Any]] = []
     if not os.path.isdir(plugin_dir):
         return risks
@@ -159,14 +151,14 @@ def scan_plugin_security(plugin_dir: str) -> List[Dict[str, Any]]:
                         "detail": f"文件 \"{fname}\" 中发现 \"{term}\"",
                         "file": fname,
                     })
-                    break  # 每种风险只报一次
+                    break
     return risks
 
 
 def check_permissions_conform(
     perms: List[str],
 ) -> Tuple[bool, List[str]]:
-    """检查权限列表是否符合规范（所有权限均在已知注册表中）。"""
+    """检查权限列表中的每项是否都在权限注册表中。"""
     unknown = [p for p in perms if not is_known_permission(p)]
     if unknown:
         return False, [f"未知权限: {p}" for p in unknown]
@@ -291,7 +283,7 @@ def validate_plugin_meta(
         else:
             output_names: set[str] = set()
             for i, output in enumerate(outputs):
-                # 兼容早期 action 插件使用的 ["files", "count"] 简写。
+                # 旧 action 插件可把输出写成字符串列表。
                 if isinstance(output, str):
                     if not output:
                         errors.append(f"outputs[{i}] 不能为空")
@@ -361,7 +353,7 @@ def validate_plugin_meta(
                         errors.append(f"params[{i}] options 必须是数组")
                     else:
                         for opt in param["options"]:
-                            # 支持两种格式：字符串 或 {"value": "...", "label": "..."}
+                            # options 支持字符串，或带 value 字段的对象。
                             if isinstance(opt, str):
                                 continue
                             if isinstance(opt, dict) and isinstance(opt.get("value"), str):
@@ -385,12 +377,7 @@ def check_payload_contract(
     outputs: Any,
     payload: Dict[str, Any],
 ) -> List[str]:
-    """按插件 outputs 声明校验 event-v2 事件 payload，返回问题列表（空=通过）。
-
-    契约：payload 必须包含全部 required 输出字段、不能含未声明字段，
-    且 string/number/bool 声明与运行时类型一致。array/object/any 只查存在性。
-    插件未声明 outputs（无契约）时不做任何拦截，兼容未升级的旧插件。
-    """
+    """按 outputs 声明检查 event-v2 payload，检查必填字段、未声明字段和 string、number、bool 的类型，旧插件未声明 outputs 时跳过检查。"""
     declared: Dict[str, Dict[str, Any]] = {}
     if isinstance(outputs, list):
         for output in outputs:

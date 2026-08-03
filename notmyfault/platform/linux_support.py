@@ -1,4 +1,4 @@
-"""Linux 桌面能力探测与命令后端。"""
+"""Linux 桌面能力探测与命令后端"""
 
 from __future__ import annotations
 
@@ -119,7 +119,7 @@ def default_output_path(prefix: str, extension: str) -> Path:
 
 
 def capability_report() -> dict[str, object]:
-    """返回当前 Linux 桌面可用后端，供诊断页和 API 展示。"""
+    """返回当前 Linux 桌面可用后端，供诊断页和 API 展示"""
     commands = {
         "notification": command_path("notify-send"),
         "clipboard_read": command_path("wl-paste", "xclip", "xsel"),

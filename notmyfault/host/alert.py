@@ -1,13 +1,4 @@
-"""
-引擎告警模块
-------------
-当引擎发生需要用户关注的错误时，弹出 Windows 交互式通知。
-点击按钮通过协议（notmyfault://）拉起 Dashboard，不依赖进程内 COM 回调。
-
-用法:
-    from notmyfault.host.alert import alert_user
-    alert_user("触发器崩溃", "process_state 触发器线程异常退出", open_dashboard=True)
-"""
+"""显示引擎告警通知，并可通过 notmyfault:// 打开 Dashboard。"""
 
 import os
 import sys
@@ -23,41 +14,14 @@ if os.name == "nt":
 
 
 def _dashboard_pyw_path() -> str:
-    """返回 dashboard.pyw 的绝对路径。"""
+    """返回 dashboard.pyw 的绝对路径"""
     project_root = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..")
+        os.path.join(os.path.dirname(__file__), "..", "..")
     )
     return os.path.join(project_root, "dashboard.pyw")
 
 
 def _launch_dashboard() -> None:
-    """启动 Dashboard；冻结态优先使用同目录 UI，可回退统一入口参数。"""
-    if getattr(sys, "frozen", False):
-        try:
-            import subprocess
-            executable_dir = os.path.dirname(sys.executable)
-            current = os.path.normcase(os.path.abspath(sys.executable))
-            sibling = next(
-                (
-                    candidate
-                    for candidate in (
-                        os.path.join(executable_dir, "NotmyFaultDashboard.exe"),
-                        os.path.join(executable_dir, "dashboard.exe"),
-                    )
-                    if os.path.isfile(candidate)
-                    and os.path.normcase(os.path.abspath(candidate)) != current
-                ),
-                None,
-            )
-            command = [sibling] if sibling else [sys.executable, "--dashboard"]
-            subprocess.Popen(
-                command,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            print("[Alert] 已拉起 Dashboard (exe mode)")
-        except Exception as e:
-            print(f"[Alert] 拉起 Dashboard 失败: {e}", file=sys.stderr)
-        return
     dashboard_pyw = _dashboard_pyw_path()
     if not os.path.exists(dashboard_pyw):
         print(f"[Alert] 找不到 dashboard 入口: {dashboard_pyw}", file=sys.stderr)
@@ -75,17 +39,7 @@ def alert_user(
     open_dashboard: bool = True,
     display_seconds: int = 15,
 ) -> None:
-    """向用户发出告警通知。
-
-    通知带有「打开控制面板」按钮，通过 Windows 协议 (notmyfault://)
-    拉起 Dashboard，不依赖进程内 COM 回调。
-
-    Args:
-        title: 通知标题
-        message: 通知正文
-        open_dashboard: 是否同时立即打开 Dashboard（默认 True）
-        display_seconds: 通知显示秒数（到达后自动消失）
-    """
+    """显示告警通知，open_dashboard 控制是否打开 Dashboard，display_seconds 控制显示时长。"""
     if os.name == "nt":
         try:
             _show_windows_alert(title, message, display_seconds)
@@ -94,13 +48,12 @@ def alert_user(
     else:
         show_notification(f"[!] {title}", message)
 
-    # 立即拉起 Dashboard
     if open_dashboard:
         threading.Thread(target=_launch_dashboard, daemon=True).start()
 
 
 def _show_windows_alert(title: str, message: str, display_seconds: int) -> None:
-    """发送带 Dashboard 操作按钮的 Windows Toast。"""
+    """发送带 Dashboard 操作按钮的 Windows Toast"""
     from Win_toaster.show_notification import toaster
 
     toast = Toast([f"[!] {title}", message])

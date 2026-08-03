@@ -1,24 +1,18 @@
-"""安全模式探测：只读环境变量与 build.json，不依赖 git。
-
-以前 engine.py 会在运行时跑 `git rev-parse` 探测分支，但打包/CI 下根本
-没有 .git 目录，探测结果不可靠。现在统一以 NOTMYFAULT_MODE 环境变量
-与 build.json 为权威来源，git 那套全删了。
-"""
+"""读取 NOTMYFAULT_MODE 和签名 build.json，选择引擎安全模式。"""
 import json as _json
 import os
 import sys
 from enum import Enum
+from pathlib import Path
 from typing import List, Tuple
 
 
-def is_admin_process() -> bool:
-    """当前进程是否以管理员（Windows 提权令牌 / POSIX root）运行。
+_PKG_ROOT = Path(__file__).resolve().parents[1]
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-    Windows 用 TokenElevation 判断而非 IsUserAnAdmin()（后者在部分受控
-    环境会误报），POSIX 看有效 UID。探测失败一律按非管理员处理：
-    引擎以普通权限启动（插件提权仍走 notmyfault.security.sudo 的受控通道），
-    不会因探测异常误拒绝正常用户。
-    """
+
+def is_admin_process() -> bool:
+    """检查 Windows 提权令牌或 POSIX 有效 UID，探测异常时返回 False。"""
 
     if os.name != "nt":
         return os.geteuid() == 0  # type: ignore[attr-defined]
@@ -61,13 +55,7 @@ class SecurityMode(Enum):
 
 
 def detect_security_mode() -> SecurityMode:
-    """按 环境变量 > build.json > 默认 STRICT 的优先级决定安全模式。
-
-    fresh source clone 没有 build.json（build.py 生成、被 .gitignore 忽略），
-    默认 STRICT：内置插件因缺少 signature.sig 被拒载，引擎退出并提示先跑
-    `python build.py`（生成签名 + build.json）。打包构建一定带 build.json，
-    由 build.py 决定 strict/normal/permissive。篡改防护不在源码层硬编码，
-    而是由打包者通过 build.py 选择。"""
+    """按环境变量、签名 build.json、默认 STRICT 的顺序选择安全模式。"""
     env_mode = os.environ.get("NOTMYFAULT_MODE", "").lower().strip()
     if env_mode == "alpha":
         return SecurityMode.PERMISSIVE
@@ -80,13 +68,12 @@ def detect_security_mode() -> SecurityMode:
     if getattr(sys, "frozen", False):
         paths.append(os.path.join(sys._MEIPASS, "build.json"))
     paths += [
-        os.path.join(os.path.dirname(__file__), "..", "build.json"),
+        str(_PROJECT_ROOT / "build.json"),
         os.path.join(os.getcwd(), "build.json"),
     ]
     for _bp in paths:
         try:
-            # build.json 决定安全模式，必须先验签：未签名或签名无效（security_mode
-            # 可能被改过）一律不信任，跳过它回退到 STRICT 兜底。
+            # build.json 未通过签名校验时不读取其中的 security_mode。
             from notmyfault.security.signing import verify_file
             if not verify_file(_bp):
                 continue
@@ -102,25 +89,14 @@ def detect_security_mode() -> SecurityMode:
         except Exception:
             continue
 
-    # 没有任何显式配置：默认严格。fresh clone 必须先跑 build.py 生成签名与
-    # build.json，否则内置插件因无签名被拒载。
+    # 没有有效配置时使用 STRICT。
     return SecurityMode.STRICT
 
 
 def verify_core_integrity() -> Tuple[bool, List[str]]:
-    """校验 notmyfault/*.py 核心源码是否与签名清单一致（防篡改 engine.py/config.py 等）。
-
-    build.py 生成 integrity.json（{files: {name: sha256}}）并用 Ed25519 签名。
-    这里先验清单签名，再重新哈希所有核心文件比对。清单缺失/签名无效/哈希不匹配
-    都算不通过。
-
-    局限：本函数本身在 security.py 里，security.py 也在清单中--若有人连本函数
-    一起改掉以绕过校验，这里发现不了。这是自校验的固有弱点（验者不能验自身）；
-    但单文件篡改（只改 engine.py）能被检出，配合插件签名与 build.json 签名构成
-    纵深防御。
-    """
+    """校验核心源码是否匹配签名的 integrity.json 清单，清单缺失、签名无效、哈希不匹配或 security.py 被修改都会失败。"""
     import hashlib
-    pkg_dir = os.path.dirname(__file__)
+    pkg_dir = str(_PKG_ROOT)
     manifest = os.path.join(pkg_dir, "integrity.json")
     if not os.path.exists(manifest):
         return False, ["integrity.json (missing; run build.py)"]

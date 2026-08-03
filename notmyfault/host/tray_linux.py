@@ -1,4 +1,4 @@
-"""Linux 系统托盘实现（可选 pystray 后端）。"""
+"""Linux 系统托盘实现，后端使用可选的 pystray。"""
 
 from __future__ import annotations
 
@@ -16,18 +16,18 @@ from notmyfault.platform.platform_support import (
 )
 from notmyfault.platform.linux_support import session_type
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ICON_PATH = PROJECT_ROOT / "logo.png"
 AUTO_START_FILE = linux_autostart_path()
 
 
 def is_tray_supported() -> bool:
-    """pystray 的 Linux 后端依赖 XEmbed，Wayland 会话不具备该协议。"""
+    """pystray 的 Linux 后端依赖 XEmbed，Wayland 会话不具备该协议"""
     return session_type() == "x11"
 
 
 class TrayIcon:
-    """通过 pystray 提供 Linux 系统托盘。"""
+    """通过 pystray 提供 Linux 系统托盘"""
 
     def __init__(
         self,
