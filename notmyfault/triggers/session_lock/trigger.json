@@ -1,0 +1,30 @@
+{
+    "id": "session_lock",
+    "name": "锁屏状态变化",
+    "semantic": "state",
+    "trigger_api": "event-v2",
+    "description": "系统锁屏/解锁时触发",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.session_lock",
+    "enabled": true,
+    "platforms": ["windows"],
+    "permissions": ["external_binary"],
+    "outputs": [
+        {"name": "state", "label": "锁屏状态", "type": "string"},
+        {"name": "previous_state", "label": "上一个状态", "type": "string"}
+    ],
+    "params": [
+        {
+            "name": "state",
+            "label": "目标状态",
+            "type": "select",
+            "default": "locked",
+            "options": [
+                {"value": "locked", "label": "已锁屏"},
+                {"value": "unlocked", "label": "已解锁"},
+                {"value": "any", "label": "任意变化"}
+            ]
+        }
+    ]
+}

@@ -35,10 +35,10 @@ def run(meta, config, emit_event, shutdown_event):
         ) from None
     print(f"[Trigger:{trigger_id}] 开始监控系统资源: {resource} {direction}")
     last_triggered = False
-    # network 采样基线，用于计算速率而非累计字节
-    net_prev = None  # (timestamp, total_bytes)
+    # network 采样基线，用于计算 MB/s 速率
+    net_prev = None  # 上一次采样的时间戳和总字节数
     net_rate = 0.0
-    first_sample = True  # 首轮只建基线，不做判定，避免误触发
+    first_sample = True  # 首轮只建基线，不做判定
 
     while not shutdown_event.is_set():
         try:
@@ -56,8 +56,7 @@ def run(meta, config, emit_event, shutdown_event):
                 value = _get_usage(resource)
 
             if first_sample:
-                # cpu_percent(interval=0) 首次调用没有基线，返回 0；
-                # network 首轮也没有速率可算。只记录状态，跳过判定。
+                # cpu_percent 首次调用返回 0，network 首轮还没有速率值，首轮只记录状态
                 first_sample = False
                 last_triggered = False
                 continue
@@ -80,7 +79,7 @@ def run(meta, config, emit_event, shutdown_event):
             last_triggered = triggered
         except Exception as e:
             print(f"[Trigger:{trigger_id}] 检查 {resource} 出错: {e}")
-            # 异常时清空触发标志，避免恢复后把同一次越界再触发一遍
+            # 异常时清空触发标志，下一次成功采样重新判断越界
             last_triggered = False
 
         shutdown_event.wait(5)

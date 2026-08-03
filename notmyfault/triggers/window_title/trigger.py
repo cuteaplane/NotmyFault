@@ -7,8 +7,7 @@ from notmyfault.triggers.base import PollingTrigger
 def _get_window_titles() -> dict:
     """枚举所有可见窗口，返回 {hwnd: title} 字典"""
     user32 = ctypes.windll.user32
-    # 显式声明参数/返回类型：无 argtypes 的并发调用曾在与 clipboard 触发器
-    # 同时运行时造成堆损坏（0xc0000374）。
+    # 显式声明参数/返回类型，多线程并发调用 ctypes 的前提
     if not getattr(user32, "_nmf_typed", False):
         user32.IsWindowVisible.argtypes = [wintypes.HWND]
         user32.IsWindowVisible.restype = wintypes.BOOL
@@ -21,7 +20,7 @@ def _get_window_titles() -> dict:
         user32._nmf_typed = True
     titles = {}
 
-    # 原生段互斥：多线程并发 ctypes 曾与 clipboard 组合触发堆损坏
+    # NATIVE_LOCK 保护 ctypes 调用，共享引用表在多线程下存在竞态
     from notmyfault.native import NATIVE_LOCK
     with NATIVE_LOCK:
         return _get_window_titles_locked(user32)
@@ -47,7 +46,7 @@ def _get_window_titles_locked(user32) -> dict:
 
 
 class WindowTitleTrigger(PollingTrigger):
-    """窗口标题状态检测：目标窗口出现 / 关闭时触发。"""
+    """窗口标题状态检测：目标窗口出现 / 关闭时触发"""
 
     interval = 3.0
     native = True
@@ -69,7 +68,7 @@ class WindowTitleTrigger(PollingTrigger):
 
     def poll(self):
         titles = _get_window_titles()
-        # 找出实际命中的标题（可能多个窗口同时命中）
+        # 找出实际命中的标题，可能同时命中多个窗口
         matched_titles = [t for t in titles.values() if self.pattern in t.lower()]
         matched = bool(matched_titles)
 

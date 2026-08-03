@@ -1,0 +1,46 @@
+{
+    "id": "window_pin",
+    "name": "窗口置顶",
+    "description": "把当前窗口或指定窗口设为/取消置顶",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.window_pin",
+    "enabled": true,
+    "platforms": ["windows"],
+    "permissions": ["native_api"],
+    "outputs": [
+        {"name": "state", "label": "置顶状态", "type": "string"},
+        {"name": "hwnd", "label": "窗口句柄", "type": "number"}
+    ],
+    "params": [
+        {
+            "name": "action",
+            "label": "操作",
+            "type": "select",
+            "default": "toggle",
+            "options": [
+                {"value": "toggle", "label": "切换置顶"},
+                {"value": "pin", "label": "置顶"},
+                {"value": "unpin", "label": "取消置顶"}
+            ]
+        },
+        {
+            "name": "target",
+            "label": "目标窗口",
+            "type": "select",
+            "default": "active",
+            "options": [
+                {"value": "active", "label": "当前活动窗口"},
+                {"value": "title", "label": "按标题匹配"}
+            ]
+        },
+        {
+            "name": "title",
+            "label": "窗口标题（模糊匹配）",
+            "type": "string",
+            "default": "",
+            "placeholder": "如 计算器、记事本",
+            "visible_when": {"target": ["title"]}
+        }
+    ]
+}

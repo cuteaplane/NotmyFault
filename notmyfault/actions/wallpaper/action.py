@@ -82,7 +82,7 @@ def run(action_info, params):
             f"SystemParametersInfoW 设置壁纸失败（返回 {result}）"
         )
 
-    # 壁纸已生效后再写样式；样式写失败不致命，不吞掉壁纸本身的成功。
+    # 壁纸已生效后再写样式，样式写入失败时壁纸仍保留
     import winreg
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                         r"Control Panel\Desktop",

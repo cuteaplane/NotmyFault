@@ -1,0 +1,43 @@
+{
+    "id": "send_keys",
+    "name": "发送按键",
+    "description": "向当前活动窗口输入文本或发送组合键",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.send_keys",
+    "enabled": true,
+    "platforms": ["windows"],
+    "permissions": ["native_api"],
+    "outputs": [
+        {"name": "mode", "label": "发送模式", "type": "string"}
+    ],
+    "params": [
+        {
+            "name": "mode",
+            "label": "发送方式",
+            "type": "select",
+            "default": "type_text",
+            "options": [
+                {"value": "type_text", "label": "输入文本"},
+                {"value": "hotkey", "label": "发送组合键"}
+            ]
+        },
+        {
+            "name": "text",
+            "label": "要输入的文本",
+            "type": "textarea",
+            "default": "",
+            "placeholder": "支持中文等任意字符",
+            "rows": 4,
+            "visible_when": {"mode": ["type_text"]}
+        },
+        {
+            "name": "keys",
+            "label": "组合键",
+            "type": "string",
+            "default": "",
+            "placeholder": "如 ctrl+shift+t、win+d、alt+f4、enter",
+            "visible_when": {"mode": ["hotkey"]}
+        }
+    ]
+}

@@ -1,10 +1,4 @@
-"""将插件源码目录打包为 .nmfp 安装包（7z 格式）。
-
-用法:
-  python pack_plugin.py <plugin_dir>
-  python pack_plugin.py user_plugins/window_control
-  python pack_plugin.py --all
-"""
+"""将插件源码目录打包为 .nmfp 安装包，调用方式为 python pack_plugin.py <plugin_dir> 或 python pack_plugin.py --all"""
 import json
 import os
 import sys
@@ -19,7 +13,7 @@ DIST_DIR = ROOT / "dist"
 
 
 def _detect_json_name(plugin_dir: Path) -> str | None:
-    """检测插件类型，返回主 json 文件名。"""
+    """检测插件类型，返回主 json 文件名"""
     for name in ("action.json", "trigger.json"):
         if (plugin_dir / name).exists():
             return name
@@ -31,7 +25,7 @@ _IGNORE_NAMES = {"__pycache__", "signature.sig"}
 
 
 def _collect_files(plugin_dir: Path) -> list[tuple[Path, str]]:
-    """递归收集插件文件，排除 __pycache__/*.pyc/signature.sig。"""
+    """递归收集插件文件，排除 __pycache__/*.pyc/signature.sig"""
     result = []
     for p in sorted(plugin_dir.rglob("*")):
         if not p.is_file():
@@ -45,7 +39,7 @@ def _collect_files(plugin_dir: Path) -> list[tuple[Path, str]]:
 
 
 def pack_plugin(plugin_dir: Path, output_dir: Path = DIST_DIR) -> Path | None:
-    """打包单个插件目录为 .nmfp，返回输出路径。"""
+    """打包单个插件目录为 .nmfp，返回输出路径"""
     plugin_dir = plugin_dir.resolve()
     if not plugin_dir.is_dir():
         print(f"! 目录不存在: {plugin_dir}", file=sys.stderr)

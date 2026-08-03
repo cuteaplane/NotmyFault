@@ -1,0 +1,168 @@
+"""发送按键动作：向当前活动窗口输入文本或发送组合键
+SendInput 使用 KEYEVENTF_UNICODE 输入文本，ctypes 调用声明 argtypes 和 restype 并持有 NATIVE_LOCK
+"""
+
+import ctypes
+import time
+from ctypes import wintypes
+
+from notmyfault.native import NATIVE_LOCK
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+
+_MODIFIERS = {
+    "ctrl": 0x11,
+    "shift": 0x10,
+    "alt": 0x12,
+    "win": 0x5B,
+}
+_SPECIAL_KEYS = {
+    "enter": 0x0D, "return": 0x0D, "tab": 0x09, "space": 0x20,
+    "backspace": 0x08, "delete": 0x2E, "escape": 0x1B, "esc": 0x1B,
+    "home": 0x24, "end": 0x23, "pgup": 0x21, "pgdn": 0x22,
+    "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
+    "capslock": 0x14,
+}
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [
+        ("ki", KEYBDINPUT),
+        ("mi", MOUSEINPUT),
+        ("hi", HARDWAREINPUT),
+    ]
+
+
+class INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("u", _INPUTUNION),
+    ]
+
+
+def _key_input(vk: int, scan: int, flags: int) -> INPUT:
+    inp = INPUT()
+    inp.type = INPUT_KEYBOARD
+    inp.ki.wVk = vk
+    inp.ki.wScan = scan
+    inp.ki.dwFlags = flags
+    return inp
+
+
+def _send(inputs: list[INPUT]) -> None:
+    if not inputs:
+        return
+    array = (INPUT * len(inputs))(*inputs)
+    user32 = ctypes.windll.user32
+    user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+    user32.SendInput.restype = wintypes.UINT
+    sent = user32.SendInput(len(array), array, ctypes.sizeof(INPUT))
+    if sent != len(array):
+        # 常见原因是被 UIPI 拦下或输入被其他程序抢占，重试一次仍失败就报错
+        time.sleep(0.05)
+        sent = user32.SendInput(len(array), array, ctypes.sizeof(INPUT))
+        if sent != len(array):
+            raise RuntimeError(
+                f"SendInput 只发送了 {sent}/{len(array)} 个输入事件"
+            )
+
+
+def _type_unicode(text: str) -> None:
+    inputs = []
+    for ch in text:
+        code = ord(ch)
+        # UNICODE 模式下 wVk 必须为 0，字符放 wScan
+        inputs.append(_key_input(0, code & 0xFFFF, KEYEVENTF_UNICODE))
+        inputs.append(_key_input(0, code & 0xFFFF, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
+    _send(inputs)
+
+
+def _parse_vk(token: str) -> int:
+    token = token.strip().lower()
+    if token in _MODIFIERS:
+        return _MODIFIERS[token]
+    if token in _SPECIAL_KEYS:
+        return _SPECIAL_KEYS[token]
+    if token.startswith("f") and token[1:].isdigit():
+        n = int(token[1:])
+        if 1 <= n <= 24:
+            return 0x70 + (n - 1)
+    if len(token) == 1:
+        ch = token
+        if "a" <= ch <= "z":
+            return ord(ch.upper())
+        return ord(ch)
+    raise ValueError(f"无法识别的按键: {token!r}")
+
+
+def _send_hotkey(keys: str) -> None:
+    parts = [part for part in keys.replace("+", " ").split() if part]
+    if not parts:
+        raise ValueError("热键不能为空")
+    vk_parts = [_parse_vk(part) for part in parts]
+    # 约定：最后一个 token 是主键，其余是修饰键
+    main_vk = vk_parts.pop()
+    modifier_vks = set(_MODIFIERS.values())
+    modifiers = []
+    for vk in vk_parts:
+        if vk not in modifier_vks:
+            raise ValueError(f"组合键中只允许修饰键在前: {keys!r}")
+        modifiers.append(vk)
+
+    inputs = []
+    for vk in modifiers:
+        inputs.append(_key_input(vk, 0, 0))
+    inputs.append(_key_input(main_vk, 0, 0))
+    inputs.append(_key_input(main_vk, 0, KEYEVENTF_KEYUP))
+    for vk in reversed(modifiers):
+        inputs.append(_key_input(vk, 0, KEYEVENTF_KEYUP))
+    _send(inputs)
+
+
+def run(action_info, params):
+    mode = params.get("mode", "type_text")
+    with NATIVE_LOCK:
+        if mode == "type_text":
+            text = str(params.get("text", "") or "")
+            if not text:
+                raise ValueError("没有要输入的文本")
+            _type_unicode(text)
+        elif mode == "hotkey":
+            keys = str(params.get("keys", "") or "")
+            _send_hotkey(keys)
+        else:
+            raise ValueError(f"未知模式: {mode!r}（可选: type_text/hotkey）")
+    print(f"[Action:send_keys] 已发送: mode={mode}")
+    return {"mode": mode}

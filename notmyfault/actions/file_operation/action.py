@@ -1,7 +1,5 @@
-"""文件操作：复制/移动/删除/压缩/解压。
-
-失败（删除失败、路径无效等）一律抛异常让引擎标记失败，
-不再 print 后静默返回成功。
+"""文件操作：复制、移动、删除、压缩和解压
+失败时抛异常，由引擎记录为失败
 """
 
 import os
@@ -11,7 +9,7 @@ import zipfile
 
 
 def _safe_unpack(archive: str, target: str) -> None:
-    """解压并防御 zip-slip：拒绝 .. 路径、绝对路径与符号链接成员。"""
+    """解压时检查成员路径和符号链接，非法成员抛 ValueError"""
     target_real = os.path.realpath(target)
 
     def check_member(name: str, is_link: bool) -> None:
@@ -38,7 +36,7 @@ def _safe_unpack(archive: str, target: str) -> None:
 
 
 def _ensure_copy_safe(source: str, dest: str) -> None:
-    """防止把目标放进源目录内部导致无限递归复制。"""
+    """检查目标路径，目标在源目录内时抛 ValueError"""
     if not source or not dest:
         return
     src_real = os.path.realpath(source)

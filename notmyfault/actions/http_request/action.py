@@ -1,4 +1,4 @@
-"""HTTP 请求动作。仅允许 http/https，防止 file:// 等协议读取本地文件。"""
+"""HTTP 请求动作，仅接受 http 和 https URL"""
 
 import urllib.request
 import urllib.error
@@ -10,7 +10,7 @@ _MAX_RESPONSE_BYTES = 1024 * 1024
 
 
 def _redact_url(url: str) -> str:
-    """日志脱敏：查询参数可能携带 token 等凭据，不打印。"""
+    """查询参数可能包含 token 等凭据，日志只保留 URL 路径"""
     parsed = urlparse(url)
     if not parsed.query:
         return url

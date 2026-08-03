@@ -30,7 +30,7 @@ def run(action_info, params):
                     continue
                 proc.terminate()
                 try:
-                    # terminate 是异步的，等待并验证进程确实退出。
+        # terminate() 是异步的，等待并验证进程确实退出
                     proc.wait(timeout=5)
                 except psutil.TimeoutExpired:
                     print(
@@ -53,7 +53,7 @@ def run(action_info, params):
     if denied:
         raise RuntimeError(f"{denied} 个进程因权限不足未能终止（可能需管理员权限）")
     if killed == 0:
-        # 进程本来就不存在：目标已达成，视为幂等成功。
+        # 进程本来就不存在，视为成功
         print(f"[Action:kill_process] 未找到运行中的进程: {process_name}")
         return {"killed": 0}
     print(f"[Action:kill_process] 共终止了 {killed} 个进程")

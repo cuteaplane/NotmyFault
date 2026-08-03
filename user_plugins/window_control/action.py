@@ -19,7 +19,7 @@ WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
 
 def _find_windows_by_title(keyword):
-    """通过标题模糊匹配查找所有可见窗口句柄。"""
+    """通过标题模糊匹配查找所有可见窗口句柄"""
     found = []
 
     def _callback(hwnd, _lparam):
@@ -39,7 +39,7 @@ def _find_windows_by_title(keyword):
 
 
 def _resolve_hwnd(params):
-    """根据 target/title 参数解析目标窗口句柄。"""
+    """根据 target 和 title 参数解析目标窗口句柄"""
     target = params.get("target", "active")
     title = params.get("title", "").strip()
 

@@ -5,7 +5,7 @@ from ctypes import wintypes
 from notmyfault.triggers.base import PollingTrigger
 
 user32 = ctypes.windll.user32
-# 多线程并发调用 ctypes 需显式声明类型，避免共享 _objects 竞态（见 docs/native-safety.md）
+# ctypes 在多线程下共享 _objects 引用表，函数声明需完整
 user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
 user32.RegisterHotKey.restype = wintypes.BOOL
 user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
@@ -76,7 +76,7 @@ def _parse_hotkey(hotkey_str: str):
 
 
 class HotkeyTrigger(PollingTrigger):
-    """全局热键监听：注册后轮询线程消息队列。"""
+    """全局热键监听，注册后轮询线程消息队列"""
 
     interval = 0.05
     native = True
@@ -112,7 +112,6 @@ class HotkeyTrigger(PollingTrigger):
             user32.UnregisterHotKey(None, self._hkid)
         except Exception:
             pass
-        self.log("热键监听已停止")
 
 
 def run(meta, config, emit_event, shutdown_event):

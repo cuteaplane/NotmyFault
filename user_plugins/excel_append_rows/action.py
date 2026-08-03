@@ -1,4 +1,4 @@
-"""把工作流中的字典记录写入 Excel 的通用用户插件。"""
+"""把工作流中的字典记录追加到 .xlsx 工作表"""
 from __future__ import annotations
 
 from pathlib import Path

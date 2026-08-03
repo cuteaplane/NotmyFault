@@ -1,4 +1,4 @@
-"""工作流前置条件：确认文档目录处于可安全归档的静默状态。"""
+"""工作流前置条件：确认目录在指定时间内未变化，文件未被占用且没有文档编辑窗口"""
 import ctypes
 import os
 import time
@@ -40,7 +40,7 @@ def _snapshot(folder: Path) -> Tuple[Tuple[str, int, int], ...]:
 
 
 def _can_open_exclusively(path: str) -> bool:
-    """Windows 下以零共享模式打开文件；失败即保守视为仍被其它程序使用。"""
+    """Windows 下以零共享模式打开文件，失败时返回 False"""
     if os.name != "nt":
         try:
             with open(path, "rb"):
@@ -57,7 +57,7 @@ def _can_open_exclusively(path: str) -> bool:
     handle = kernel32.CreateFileW(
         path,
         0x80000000,  # GENERIC_READ
-        0,           # 不允许共享：若别的程序仍持有句柄，宁可不放行
+        0,           # 共享参数为 0，其他进程持有句柄时 CreateFileW 会失败
         None,
         3,           # OPEN_EXISTING
         0x80,        # FILE_ATTRIBUTE_NORMAL
@@ -73,7 +73,7 @@ def _can_open_exclusively(path: str) -> bool:
 
 
 def _visible_editing_windows() -> Iterable[str]:
-    """返回疑似正在编辑文档的可见窗口标题；后台常驻但无文档窗口不会误拦。"""
+    """返回疑似正在编辑文档的可见窗口标题，后台进程没有文档窗口时不返回标题"""
     if os.name != "nt":
         try:
             import psutil
@@ -131,7 +131,7 @@ def _visible_editing_windows() -> Iterable[str]:
 
 
 def check_precondition(_meta: Dict[str, Any], params: Dict[str, Any], _context: Dict[str, Any]):
-    """返回 ``{ok, reason, retry_after_seconds}``，任何未知状态都拒绝放行。"""
+    """返回包含 ok、reason 和 retry_after_seconds 的前置检查结果，未知状态返回 ok=False"""
     raw_folder = str(params.get("source_folder", "")).strip()
     if not raw_folder:
         return {"ok": False, "reason": "未配置待归档目录", "retry_after_seconds": 300}
@@ -182,5 +182,5 @@ def check_precondition(_meta: Dict[str, Any], params: Dict[str, Any], _context: 
 
 
 def run(_meta: Dict[str, Any], _params: Dict[str, Any]):
-    """兼容动作插件入口；此插件仅应配置为工作流前置条件。"""
+    """动作插件入口不执行操作，工作流通过 check_precondition 检查目录状态"""
     return None

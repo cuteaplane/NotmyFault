@@ -1,0 +1,49 @@
+{
+    "id": "battery_level",
+    "name": "电量阈值",
+    "semantic": "state",
+    "trigger_api": "event-v2",
+    "description": "电池电量跨过指定阈值（低于/高于）时触发",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.battery_level",
+    "enabled": true,
+    "outputs": [
+        {"name": "battery_percent", "label": "电量百分比", "type": "number"},
+        {"name": "state", "label": "电源状态", "type": "string"},
+        {"name": "threshold", "label": "配置阈值", "type": "number"},
+        {"name": "direction", "label": "触发方向", "type": "string"}
+    ],
+    "params": [
+        {
+            "name": "direction",
+            "label": "触发方向",
+            "type": "select",
+            "default": "below",
+            "options": [
+                {"value": "below", "label": "电量低于阈值"},
+                {"value": "above", "label": "电量高于阈值"}
+            ]
+        },
+        {
+            "name": "threshold",
+            "label": "阈值 (%)",
+            "type": "number",
+            "default": 20,
+            "min": 0,
+            "max": 100,
+            "step": 1
+        },
+        {
+            "name": "charge_state",
+            "label": "电源状态过滤",
+            "type": "select",
+            "default": "any",
+            "options": [
+                {"value": "any", "label": "不限制"},
+                {"value": "charging", "label": "仅充电时"},
+                {"value": "discharging", "label": "仅用电池时"}
+            ]
+        }
+    ]
+}

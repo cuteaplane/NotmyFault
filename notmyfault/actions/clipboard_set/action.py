@@ -43,7 +43,7 @@ def run(action_info, params):
         if not user32.EmptyClipboard():
             raise RuntimeError("清空剪贴板失败")
 
-        # 使用 CF_UNICODETEXT (UTF-16) 以支持中文等非 ASCII 字符
+        # 使用 CF_UNICODETEXT 的 UTF-16 编码以支持中文等非 ASCII 字符
         buf = ctypes.create_unicode_buffer(text)
         byte_len = len(buf) * ctypes.sizeof(ctypes.c_wchar)
 
@@ -59,7 +59,7 @@ def run(action_info, params):
 
         if not user32.SetClipboardData(CF_UNICODETEXT, handle):
             raise RuntimeError("SetClipboardData 失败")
-        transferred = True  # 成功后句柄所有权转交 Windows，不能再 GlobalFree。
+        transferred = True  # 成功后句柄所有权转交 Windows，不能再 GlobalFree
         print(f"[Action:clipboard_set] 剪贴板写入成功 ({len(text)} 字符)")
     finally:
         if handle and not transferred:

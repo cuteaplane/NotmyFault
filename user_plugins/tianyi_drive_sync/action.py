@@ -1,7 +1,5 @@
-"""天翼云盘增量上传用户插件。
-
-它只负责扫描、去重、上传并输出本次成功文件；Excel、通知等后续动作由工作流
-组合。授权信息始终通过环境变量引用，绝不进入 NMF 的规则 JSON。
+"""天翼云盘增量上传用户插件
+扫描本地文件、按状态去重并上传，输出本次成功文件；Excel 和通知由后续工作流动作处理，授权信息从环境变量读取
 """
 from __future__ import annotations
 
@@ -32,7 +30,7 @@ _STATE_ROOT = Path(get_config_dir()) / "plugin-data" / "tianyi_drive_sync"
 
 
 class SyncError(RuntimeError):
-    """可展示给工作流的配置或远端错误。"""
+    """可展示给工作流的配置或远端错误"""
 
 
 def _require_text(params: dict[str, Any], name: str, label: str) -> str:
@@ -108,8 +106,7 @@ def _upload_file(path: Path, parent_id: str, access_token: str, app_secret: str,
         "Content-Type": "application/octet-stream",
     }
     try:
-        # urllib 的 HTTPConnection 支持带 read() 的请求体；保持流式，避免把 1GB
-        # 文件整个读进内存。
+        # urllib 的 HTTPConnection 接受带 read() 方法的请求体，path.open() 返回流对象供上传读取
         with path.open("rb") as body:
             request = Request(_UPLOAD_URL, data=body, headers=headers, method="PUT")
             with urlopen(request, timeout=120) as response:
@@ -130,7 +127,7 @@ def _upload_file(path: Path, parent_id: str, access_token: str, app_secret: str,
             if tag in {"id", "name", "md5", "size"} and child.text:
                 result[tag] = child.text
     except ElementTree.ParseError:
-        # 旧接口偶有非规范 XML；HTTP 2xx 仍作为远端接受成功处理。
+        # 旧接口偶有非规范 XML，HTTP 2xx 作为远端接受成功处理
         pass
     return result
 
@@ -190,7 +187,7 @@ def run_with_context(action_info: dict[str, Any], params: dict[str, Any], contex
                     "uploaded_at": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 entries[relative] = {"size": size, "mtime_ns": mtime_ns, **record}
-                _write_state(state_path, state)  # 重试不会把已成功的文件再传一次。
+                _write_state(state_path, state)  # 写入状态文件，后续重试可跳过已成功文件
                 uploaded_files.append(record)
             except (OSError, SyncError) as exc:
                 failed_files.append({"local_path": str(file_path), "reason": str(exc)})

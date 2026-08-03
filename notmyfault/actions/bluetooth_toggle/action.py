@@ -1,8 +1,8 @@
-"""Windows 蓝牙无线电开关。
+"""Windows 蓝牙无线电开关
 
-Windows 并没有一个在所有硬件、驱动和系统版本上都可靠的“蓝牙总开关”。
+Windows 并没有一个在所有硬件、驱动和系统版本上都可靠的“蓝牙总开关”
 优先使用 WinRT Radio API；它被策略或驱动拒绝时，才使用需要 UAC 的 PnP
-适配器回退方案。两条路径都要返回可验证的结果，不能只打印“成功”。
+适配器回退方案，两条路径都返回可验证的结果
 """
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ if ('__STATE__' -ne 'query') {
 
 
 def _ps_literal(value: str) -> str:
-    """生成 PowerShell 单引号字面量（临时结果路径也不能裸拼）。"""
+    """生成 PowerShell 单引号字面量，路径中的单引号需加倍"""
     return "'" + value.replace("'", "''") + "'"
 
 
@@ -145,11 +145,7 @@ def _run_radio(target: str) -> dict[str, Any]:
 
 
 def _run_pnp(action: str) -> dict[str, Any]:
-    """通过一个已提权 PowerShell 进程完成 PnP 查询、操作和验证。
-
-    部分 Windows 策略连 ``Get-PnpDevice`` 查询也要求管理员权限；不能在 UAC
-    之前先探测。管理员进程把 JSON 写入当前用户创建的临时文件，主进程再读取。
-    """
+    """通过一个已提权 PowerShell 进程完成 PnP 查询、操作和验证，管理员进程把 JSON 写入当前用户的临时文件后由主进程读取。"""
     fd, result_path = tempfile.mkstemp(prefix="notmyfault-bluetooth-", suffix=".json")
     os.close(fd)
     try:
@@ -204,8 +200,8 @@ def run(_action_info, params):
     except Exception as exc:
         radio_error = str(exc)
 
-    # WinRT 在某些 OEM 驱动、远程桌面会话或企业策略下必定拒绝访问。此时用
-    # PnP 适配器回退；它需要 UAC，且只挑物理适配器，绝不误禁用耳机服务条目。
+    # WinRT 查询在 OEM 驱动、远程桌面会话或企业策略下可能被拒绝，回退到需要
+    # UAC 的 PnP 路径并筛选 USB、PCI、BTH 物理适配器
     result = _run_pnp(action)
     result.update({"ok": True, "winrt_error": radio_error})
     return result

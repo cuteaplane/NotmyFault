@@ -1,8 +1,5 @@
-"""电源状态监测：交流/电池/低电量轮询 + Windows 睡眠恢复事件监听。
-
-- ac / battery / low_battery：轮询系统电源状态，状态变化时触发。
-- resume：Windows 下通过隐藏窗口接收 WM_POWERBROADCAST 消息，
-  系统从睡眠恢复时触发一次；非 Windows 平台不支持该选项。
+"""电源状态触发器：轮询交流、电池和低电量状态，并在 Windows 监听睡眠恢复消息
+resume 依赖隐藏窗口接收 WM_POWERBROADCAST，非 Windows 平台没有该事件
 """
 
 import ctypes
@@ -11,7 +8,7 @@ import psutil
 
 from notmyfault.triggers.base import PollingTrigger
 
-# 多线程并发调用 ctypes 需显式声明类型（见 docs/native-safety.md）
+# 多线程并发调用 ctypes 需显式声明类型
 from ctypes import wintypes
 _kernel32 = ctypes.windll.kernel32
 _user32 = ctypes.windll.user32
@@ -36,7 +33,7 @@ PBT_APMRESUMEAUTOMATIC = 0x0012
 PBT_APMRESUMESUSPEND = 0x0007
 PBT_APMSUSPEND = 0x0004
 
-# WNDPROC 回调必须保持引用存活，否则 ctypes 会回收回调导致崩溃。
+# WNDPROC 回调必须保持引用存活，ctypes 才能继续调用它
 _WND_PROC_HOLD: list = []
 
 
@@ -58,7 +55,7 @@ def _is_on_battery():
 
 
 def _create_power_event_window():
-    """创建隐藏窗口接收电源广播；失败返回 None（不阻塞轮询路径）。"""
+    """创建隐藏窗口接收电源广播，失败时返回 None"""
     try:
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
@@ -140,7 +137,7 @@ def _create_power_event_window():
 
 
 def _pump_power_messages(window) -> bool:
-    """处理消息队列中的电源广播；返回本轮是否发生了 resume。"""
+    """处理消息队列中的电源广播；返回本轮是否发生了 resume"""
     if window is None:
         return False
     try:
@@ -159,7 +156,7 @@ def _pump_power_messages(window) -> bool:
 
 
 def _destroy_power_event_window(window) -> None:
-    """销毁隐藏窗口并注销窗口类，避免线程退出后泄漏。"""
+    """销毁隐藏窗口并注销窗口类，在线程退出时调用"""
     if window is None:
         return
     try:
@@ -178,7 +175,7 @@ def _destroy_power_event_window(window) -> None:
         pass
 
 class PowerStateTrigger(PollingTrigger):
-    """电源状态监测：交流/电池/低电量轮询 + Windows 睡眠恢复事件监听。"""
+    """电源状态监测：交流/电池/低电量轮询 + Windows 睡眠恢复事件监听"""
 
     interval = 2.0
     native = True
@@ -194,7 +191,7 @@ class PowerStateTrigger(PollingTrigger):
     def setup(self):
         self.target_state = self.config.get("state", "ac")
         self.log(f"开始监控电源状态，目标: {self.target_state}")
-        # resume 只在 Windows 上通过电源广播消息实现。
+        # resume 只在 Windows 上通过电源广播消息实现
         self.power_window = _create_power_event_window() if os.name == "nt" else None
         if self.target_state == "resume" and self.power_window is None:
             self.log("当前平台不支持睡眠恢复事件监听，resume 规则不会触发")
@@ -222,7 +219,7 @@ class PowerStateTrigger(PollingTrigger):
                 self.emit({"state": current, "battery_percent": battery_pct})
             self._last_state = current
 
-        # 低电量仅在首次进入时触发一次，恢复后重置，避免每轮重复发事件
+        # 低电量首次进入时发送事件，离开阈值后重置标志
         is_low = on_battery and battery_pct <= 20
         if is_low and not self._low_battery_active and self.target_state == "low_battery":
             self.log(f"低电量: {battery_pct}%")

@@ -6,18 +6,15 @@ import sys
 _SPEAK_TIMEOUT = 60
 
 
-# SAPI + 音频驱动属于不可信的原生代码：曾出现播报完成后引擎进程整体
-# 堆损坏静默崩溃（0xc0000374）。把 Windows TTS 放进独立子进程，SAPI 的
-# 任何原生崩溃只影响该子进程，不会带走引擎/API/托盘。
+# SAPI 和音频驱动曾在播报完成后让引擎进程因堆损坏静默崩溃，错误码 0xc0000374，
+# Windows TTS 放进独立子进程，SAPI 崩溃时父进程仍可继续运行
 _TTS_HELPER = r"""
 import json
 import sys
 import pythoncom
 import win32com.client
 
-# 关键：必须用二进制读 stdin 再按 UTF-8 解码。Windows 中文环境文本模式
-# stdin 是 GBK，直接 sys.stdin.read() 会把 UTF-8 中文读成乱码，SAPI 就会
-# 念出"ting-shen"这类音。
+# 父进程以 UTF-8 写入二进制 stdin，Windows 中文环境的文本模式默认使用 GBK
 payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
 pythoncom.CoInitialize()
 try:
@@ -38,7 +35,7 @@ try:
         speaker.Rate = max(-10, min(10, rate))
     if volume != 100:
         speaker.Volume = max(0, min(100, volume))
-    # 子进程专职本次播报：同步 Speak 即可，卡死由父进程超时兜底
+    # 子进程只处理本次播报，父进程超时后终止等待中的子进程
     speaker.Speak(payload.get("text", ""))
     speaker = None
 finally:

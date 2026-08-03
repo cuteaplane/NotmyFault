@@ -12,7 +12,7 @@ MONITOR_OFF = 2
 
 
 def _brightness_level(params) -> int:
-    """Return a validated integer brightness, including legacy action aliases."""
+    """返回经过校验的整数亮度，也处理旧动作别名"""
     action = params.get("action", "off")
     if action == "low_brightness":
         return 10
@@ -48,7 +48,7 @@ def validate_params(_action_info, params):
 
 
 def _set_wmi_brightness(level: int) -> int:
-    """Set and verify brightness for panels exposed through root/WMI."""
+    """设置并回读 root/WMI 提供的显示器亮度"""
     script = (
         "$ErrorActionPreference='Stop';"
         "$methods=@(Get-CimInstance -Namespace root/WMI "
@@ -87,7 +87,7 @@ def _set_wmi_brightness(level: int) -> int:
 
 
 def _set_ddc_brightness(level: int) -> int:
-    """Set and verify brightness for DDC/CI-capable physical monitors."""
+    """设置并回读支持 DDC/CI 的物理显示器亮度"""
     from ctypes import wintypes
 
     class PhysicalMonitor(ctypes.Structure):
@@ -178,9 +178,7 @@ def _set_ddc_brightness(level: int) -> int:
                     errors.append(f"{monitor.description or '显示器'} 拒绝 DDC/CI 亮度设置")
                     continue
 
-                # Some monitors apply DDC commands asynchronously. Read twice before
-                # declaring success so a successful API return cannot become a false
-                # positive in the rule log.
+                # 部分显示器异步应用 DDC 命令，回读确认规则日志中的结果
                 verified = False
                 for delay in (0.08, 0.2):
                     time.sleep(delay)

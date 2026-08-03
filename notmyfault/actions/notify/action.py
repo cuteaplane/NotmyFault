@@ -7,7 +7,7 @@ def run(action_info, params):
         title = str(title)
     if not isinstance(message, str):
         message = str(message)
-    # 系统 Toast 对超长文本处理不可靠，截断到合理长度。
+    # 系统 Toast 处理超长文本不可靠，标题截断为 100 字符，正文截断为 500 字符
     title = title[:100]
     message = message[:500]
     print(f"[Action:notify] 显示通知: {title} / {message}")

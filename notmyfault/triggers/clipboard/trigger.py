@@ -8,8 +8,7 @@ CF_UNICODETEXT = 13
 if os.name == "nt":
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
-    # 多线程并发调用 ctypes 时，无 argtypes 的函数会在共享 _objects 上产生
-    # 竞态，曾与 window_title 并发导致堆损坏（0xc0000374）。全部显式声明。
+    # ctypes 在多线程下共享 _objects 引用表，函数声明需要完整
     user32.OpenClipboard.argtypes = [ctypes.c_void_p]
     user32.OpenClipboard.restype = ctypes.c_bool
     user32.CloseClipboard.argtypes = []
@@ -26,7 +25,7 @@ def _get_clipboard_text():
     if os.name != "nt":
         from notmyfault.platform.linux_support import get_clipboard_text
         return get_clipboard_text()
-    # 原生段互斥：多线程并发 ctypes 曾与 window_title 组合触发堆损坏
+    # NATIVE_LOCK 保护 ctypes 调用，共享引用表在多线程下存在竞态
     from notmyfault.native import NATIVE_LOCK
     with NATIVE_LOCK:
         return _get_clipboard_text_locked()
@@ -43,7 +42,7 @@ def _get_clipboard_text_locked():
         if not ptr:
             return None
         try:
-            # CF_UNICODETEXT 保证以 NUL 结尾；传入 GlobalSize 会把终止符也读入。
+# CF_UNICODETEXT 以 NUL 结尾，传入 GlobalSize 会把终止符也读入
             return ctypes.wstring_at(ptr)
         finally:
             kernel32.GlobalUnlock(handle)
@@ -52,7 +51,7 @@ def _get_clipboard_text_locked():
 
 
 class ClipboardTrigger(PollingTrigger):
-    """剪贴板内容监控。match_text 为空 = 任意内容变化都触发。"""
+    """剪贴板内容监控，match_text 为空时任意内容变化都会触发"""
 
     interval = 1.0
     native = True

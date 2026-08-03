@@ -8,7 +8,7 @@ def _file_matches(pattern: str, name: str) -> bool:
     if not pattern or pattern == "*":
         return True
     if os.name == "nt":
-        # Windows 文件系统大小写不敏感，fnmatch 默认大小写敏感会漏匹配。
+        # Windows 文件系统大小写不敏感，fnmatch 默认大小写敏感会漏匹配
         regex = fnmatch.translate(pattern)
         return re.match(regex, name, re.IGNORECASE) is not None
     return fnmatch.fnmatch(name, pattern)
@@ -31,7 +31,7 @@ def _dir_snapshot(folder: str):
 
 def run(meta, config, emit_event, shutdown_event):
     trigger_id = meta.get("id", "folder_monitor")
-    # 配置校验优先于环境检查：event_type 非法属于配置错误，先于目录问题暴露
+    # 先检查 event_type，目录不存在时再报告目录错误
     event_type = config.get("event_type", "all")
     if event_type not in ("created", "modified", "deleted", "all"):
         raise ValueError(

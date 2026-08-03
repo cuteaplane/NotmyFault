@@ -115,7 +115,7 @@ def run(action_info, params):
         bmp_info = ctypes.create_string_buffer(40)
         ctypes.cast(bmp_info, ctypes.POINTER(ctypes.c_uint32))[0] = 40
         ctypes.cast(bmp_info, ctypes.POINTER(ctypes.c_int32))[4] = width
-        # 正高度 -> GetDIBits 返回 bottom-up 数据，与 BMP 文件正序写入一致
+        # 正高度时 GetDIBits 返回 bottom-up 数据，BMP 文件按同样顺序写入
         ctypes.cast(bmp_info, ctypes.POINTER(ctypes.c_int32))[8] = height
         ctypes.cast(bmp_info, ctypes.POINTER(ctypes.c_uint16))[12] = 1
         ctypes.cast(bmp_info, ctypes.POINTER(ctypes.c_uint16))[14] = 32
@@ -147,8 +147,8 @@ def run(action_info, params):
             f.write(struct.pack("<I", 2835))
             f.write(struct.pack("<I", 0))
             f.write(struct.pack("<I", 0))
-            # 32位 DIB 像素顺序为 BGRA，BMP 24位文件顺序为 BGR。
-            # 用字节切片交错重组（C 级实现），比逐像素循环快一个数量级。
+            # 32位 DIB 像素顺序为 BGRA，BMP 24位文件顺序为 BGR
+        # 用字节切片交错重组，C 级实现比逐像素循环快一个数量级
             for y in range(height):
                 start = y * width * 4
                 src = raw_bytes[start:start + width * 4]
@@ -173,7 +173,7 @@ def run(action_info, params):
         print(f"[Action:screenshot] 截图已保存: {output_path}")
         return output_path
     finally:
-        # 确保 GDI 对象在任何路径下都被释放，避免泄漏
+        # 退出时释放已创建的 GDI 对象
         if hbitmap:
             try:
                 gdi32.DeleteObject(hbitmap)

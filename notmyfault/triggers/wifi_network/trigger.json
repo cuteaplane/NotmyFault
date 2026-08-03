@@ -1,0 +1,39 @@
+{
+    "id": "wifi_network",
+    "name": "WiFi 网络变化",
+    "semantic": "state",
+    "trigger_api": "event-v2",
+    "description": "连上/断开指定 WiFi（SSID）时触发",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.wifi_network",
+    "enabled": true,
+    "platforms": ["windows"],
+    "permissions": ["external_binary"],
+    "outputs": [
+        {"name": "ssid", "label": "当前网络", "type": "string"},
+        {"name": "previous_ssid", "label": "上一个网络", "type": "string"},
+        {"name": "connected", "label": "是否已连接", "type": "bool"},
+        {"name": "target", "label": "目标 SSID", "type": "string"}
+    ],
+    "params": [
+        {
+            "name": "direction",
+            "label": "触发方向",
+            "type": "select",
+            "default": "connected",
+            "options": [
+                {"value": "connected", "label": "连上目标 WiFi"},
+                {"value": "disconnected", "label": "断开目标 WiFi"},
+                {"value": "any", "label": "任意网络变化"}
+            ]
+        },
+        {
+            "name": "ssid",
+            "label": "目标 SSID",
+            "type": "string",
+            "default": "",
+            "placeholder": "如 MyHomeWiFi（方向为 any 时可留空）"
+        }
+    ]
+}

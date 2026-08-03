@@ -1,0 +1,37 @@
+{
+    "id": "power_plan",
+    "name": "切换电源计划",
+    "description": "切换 Windows 平衡/高性能/节能电源计划",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.power_plan",
+    "enabled": true,
+    "platforms": ["windows"],
+    "permissions": ["external_binary"],
+    "outputs": [
+        {"name": "plan", "label": "电源计划", "type": "string"},
+        {"name": "guid", "label": "计划 GUID", "type": "string"}
+    ],
+    "params": [
+        {
+            "name": "plan",
+            "label": "电源计划",
+            "type": "select",
+            "default": "balanced",
+            "options": [
+                {"value": "balanced", "label": "平衡"},
+                {"value": "high_performance", "label": "高性能"},
+                {"value": "power_saver", "label": "节能"},
+                {"value": "custom", "label": "自定义 GUID"}
+            ]
+        },
+        {
+            "name": "custom_guid",
+            "label": "自定义计划 GUID",
+            "type": "string",
+            "default": "",
+            "placeholder": "如 381b4222-f694-41f0-9685-ff5bb260df2e",
+            "visible_when": {"plan": ["custom"]}
+        }
+    ]
+}

@@ -51,15 +51,15 @@ def set_volume(action):
     endpoint = device.EndpointVolume
 
     if action_lower == "mute":
-        # 静音 = 设置 Mute 状态，而不是把音量调到 0（两者不等价）。
+        # 静音通过 Mute 状态控制，音量标尺仍可保留
         endpoint.SetMute(True, None)
     else:
         endpoint.SetMasterVolumeLevelScalar(scalar, None)
-        # 取消静音，避免“设为 50%”时仍处于静音状态。
+        # 设置新音量前解除静音，Windows 可能保留旧 Mute 状态
         if endpoint.GetMute():
             endpoint.SetMute(False, None)
 
-    # 读回验证：Windows 音频端点可能拒绝请求的级别。
+    # 读回验证：Windows 音频端点可能拒绝请求的级别
     final_scalar = endpoint.GetMasterVolumeLevelScalar()
     if action_lower == "mute":
         if not endpoint.GetMute():

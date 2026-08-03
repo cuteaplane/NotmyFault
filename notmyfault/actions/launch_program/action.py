@@ -23,7 +23,7 @@ def run(action_info, params):
 
     args = [path] + _split_args(raw_args) if raw_args else [path]
 
-    # 在 Windows 上使用 CREATE_NO_WINDOW 避免弹出控制台
+    # Windows 使用 CREATE_NO_WINDOW，启动进程不创建控制台窗口
     if sys.platform == "win32":
         popen_kwargs = {
             "creationflags": subprocess.CREATE_NO_WINDOW,
@@ -36,8 +36,7 @@ def run(action_info, params):
         subprocess.Popen(args, cwd=working_directory, **popen_kwargs)
         print(f"[Action:launch_program] 已启动: {path}")
     except FileNotFoundError:
-        # 回退：用 os.startfile（Windows，走文件关联）；非 Windows 用列表形式
-        # （不经 shell，避免命令注入）。两条路径都失败则抛异常让引擎标记失败。
+        # Windows 的 os.startfile() 使用文件关联，其他系统再次调用 subprocess.Popen()，两个启动调用都失败时向引擎抛异常
         try:
             if sys.platform == "win32":
                 os.startfile(path)

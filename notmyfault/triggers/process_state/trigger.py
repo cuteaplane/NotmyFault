@@ -41,7 +41,7 @@ def run(meta, config, emit_event, shutdown_event):
         current_state = "running" if currently_running else "stopped"
         if current_state != last_state:
             last_state = current_state
-            # 按配置方向过滤，避免向规则层发送与目标无关的状态事件。
+            # 仅在 current_state 等于 target_state 时发送事件
             if current_state != target_state:
                 continue
             print(f"[Trigger:{trigger_id}] {raw_name} 状态变化: {current_state}")

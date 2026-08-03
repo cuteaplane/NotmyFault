@@ -1,32 +1,18 @@
-r"""
-蓝牙设备检测触发器
-------------------
-通过 Windows PnP 设备属性检测蓝牙外设的真正连接状态。
-
-原理：
-  配对 ≠ 连接。Get-PnpDevice 的 Status/Present 在设备断开后仍为 OK/True。
-  真正可靠的连接状态由设备容器属性 {83DA6326...} 15 提供 ——
-  这是一个 boolean，表示设备当前是否建立了有效的蓝牙连接。
-
-来源：https://superuser.com/revisions/dabcdfca-44ec-4281-a9b9-9cccd8327f05/view-source
+r"""蓝牙设备检测触发器
+Get-PnpDevice 的 Status/Present 在设备断开后仍可能是 OK/True，连接状态读取设备容器属性 {83DA6326...} 15
+Windows 路径仅处理 BTHENUM 外设，并按 InstanceId 基础段合并同一物理设备
 """
 
 import subprocess
 import time
 import os
 
-# 设备容器属性：指示蓝牙设备是否真正已连接（True/False）
+# 设备容器属性：指示蓝牙设备是否真正已连接，值为 True 或 False
 _DEVPKEY_CONNECTION_STATE = "{83DA6326-97A6-4088-9453-A1923F573B29} 15"
 
 
 def _get_connected_devices():
-    r"""返回当前**真正已连接**的蓝牙外设名集合。
-
-    只返回 InstanceId 前缀为 BTHENUM 的外设（排除适配器、协议栈等系统设备）。
-    每个设备通过 {83DA6326...} 15 属性确认真实连接状态。
-
-    返回 (devices: set[str], errors: list[str])
-    """
+    r"""返回确认已连接的蓝牙外设名集合以及错误列表"""
     if os.name != "nt":
         return _get_linux_connected_devices()
 
@@ -34,18 +20,18 @@ def _get_connected_devices():
 $all = Get-PnpDevice -Class Bluetooth | Where-Object {{ $_.Present }}
 foreach ($dev in $all) {{
     $iid = $dev.InstanceId
-    # 只处理蓝牙外设（BTHENUM 前缀），跳过系统设备（BTH_MS, USB_VID 前缀）
+    # InstanceId 以 BTHENUM 开头的条目进入后续处理
     if ($iid -notlike 'BTHENUM\\*') {{
         continue
     }}
     $name = $dev.FriendlyName
-    # 查询真正的连接状态
+    # 读取设备容器连接状态属性
     $conn = Get-PnpDeviceProperty -InstanceId $iid -KeyName '{_DEVPKEY_CONNECTION_STATE}' -ErrorAction SilentlyContinue
     $connected = 'no'
     if ($conn -and $conn.Data -eq $true) {{
         $connected = 'yes'
     }}
-    # 输出：名称|已连接|InstanceId前缀（去重key）
+    # 输出名称、连接状态和 InstanceId 基础段
     $baseIid = ($iid -split '\\\\')[2]
     Write-Host ("{{0}}|{{1}}|{{2}}" -f $name, $connected, $baseIid)
 }}
@@ -69,8 +55,7 @@ foreach ($dev in $all) {{
         err_msg = result.stderr.strip()[:300] if result.stderr else "无错误输出"
         errors.append(f"PowerShell 返回码={result.returncode}: {err_msg}")
 
-    # 去重用：同一物理设备可能产生多条 BTHENUM 条目
-    # （主设备 + 多个服务 GUID），用 InstanceId 的第二段去重
+    # 同一物理设备会产生主设备和多个服务 GUID 条目，使用 InstanceId 第二段作为去重键
     seen_base_ids = set()
     devices = set()
 
@@ -90,12 +75,12 @@ foreach ($dev in $all) {{
         if connected != "yes":
             continue
 
-        # 去重：同一物理设备只保留一个条目
+        # 基础段已出现时保留首次条目
         if base_iid in seen_base_ids:
             continue
         seen_base_ids.add(base_iid)
 
-        # 基础设备名（去掉协议传输后缀）
+        # 去掉协议传输后缀，得到基础设备名
         base_name = _strip_bluetooth_suffix(name)
         devices.add(base_name)
 
@@ -124,10 +109,7 @@ def _get_linux_connected_devices():
 
 
 def _strip_bluetooth_suffix(name: str) -> str:
-    """剥离蓝牙协议/传输后缀，保留基础设备名。
-
-    "OPPO Enco Free4 Avrcp 传输" → "OPPO Enco Free4"
-    """
+    """去掉蓝牙协议或传输后缀，保留基础设备名"""
     suffixes = [
         " avrcp 传输", " avrcp transport",
         " hands-free ag", " hands-free",
@@ -142,7 +124,7 @@ def _strip_bluetooth_suffix(name: str) -> str:
 
 
 def _device_set_hash(devices: set) -> int:
-    """计算设备集合的稳定哈希。"""
+    """按排序后的设备名计算集合哈希"""
     return hash(tuple(sorted(devices)))
 
 
@@ -178,7 +160,7 @@ def run(meta, config, emit_event, shutdown_event):
             if errors:
                 for e in errors:
                     print(f"[Trigger:{trigger_id}] [!!] 扫描 #{scan_count}: {e}")
-                # 发生错误时不更新 last_devices，防止误报
+                # 查询失败时保留上一次设备集合，等待下一次成功查询
                 continue
 
             current_hash = _device_set_hash(current_devices)
@@ -203,7 +185,7 @@ def run(meta, config, emit_event, shutdown_event):
                 for device in devices:
                     if not target or target.lower() in device.lower():
                         print(f"[Trigger:{trigger_id}] [OK] 设备状态变化: {device}")
-                        # device_name 用用户配置值供规则匹配，actual_device 保留实际名称。
+                        # device_name 用用户配置值供规则匹配，actual_device 保留实际名称
                         emit_event({
                             "device_name": target,
                             "actual_device": device,
@@ -215,4 +197,4 @@ def run(meta, config, emit_event, shutdown_event):
 
         except Exception as e:
             print(f"[Trigger:{trigger_id}] 扫描异常 #{scan_count}: {e}")
-            # 不更新 last_devices，防止瞬时错误产生误报
+            # 异常时保留上一次设备集合，等待下一次成功查询

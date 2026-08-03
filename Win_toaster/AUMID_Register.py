@@ -1,4 +1,3 @@
-# all of import
 import os
 import sys
 import subprocess
@@ -7,11 +6,10 @@ import winreg
 
 
 def register_protocol() -> bool:
-    """注册 notmyfault:// 协议 → 启动 dashboard.pyw（HKCU，无需管理员）。"""
+    """注册 notmyfault:// 协议并启动 dashboard.pyw，注册表写入 HKCU"""
     protocol = "notmyfault"
     key_path = f"SOFTWARE\\Classes\\{protocol}"
 
-    # 找到 dashboard.pyw
     dashboard_pyw = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "dashboard.pyw")
     )
@@ -21,7 +19,7 @@ def register_protocol() -> bool:
 
     pythonw = sys.executable.replace("python.exe", "pythonw.exe")
     if not os.path.exists(pythonw):
-        pythonw = sys.executable  # 回退
+        pythonw = sys.executable  # 当前解释器没有 pythonw.exe 时使用原路径
 
     command = f'"{pythonw}" "{dashboard_pyw}" --protocol "%1"'
 
@@ -56,11 +54,10 @@ def register_aumid_registry(aumid: str, display_name: str, icon_path: str | None
 
 
 def register_toaster():
-    # 注册协议处理器（每次启动都检查，幂等）
     register_protocol()
 
     aumid = 'cuteaplane.notmyfault.app'
-    display_name = 'NotmyFault'   # 可自定义
+    display_name = 'NotmyFault'
     icon_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'logo.ico'))
     icon_uri = None
     if os.path.isfile(icon_path) and icon_path.lower().endswith('.ico'):
@@ -71,7 +68,7 @@ def register_toaster():
         elif not icon_path.lower().endswith('.ico'):
             print(f"[AUMID_Register] 图标文件不是 .ico：{icon_path}，将跳过 IconUri 注册。")
 
-    # 1. 检查是否已注册（直接查注册表，因为 Get-StartApps 查不到仅通过注册表注册的 AUMID）
+    # 直接查询注册表确认 AUMID，Get-StartApps 不列出仅写入注册表的 AUMID
     key_path = f"SOFTWARE\\Classes\\AppUserModelId\\{aumid}"
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as check_key:
@@ -79,9 +76,7 @@ def register_toaster():
         print(f"[AUMID_Register] AUMID '{aumid}' 已注册（注册表检测），跳过。")
         return
     except OSError:
-        pass  # 注册表键不存在，需要注册
-
-    # 2. 首选直接写注册表
+        pass  # 注册表键不存在，继续注册
 
     print("[AUMID_Register] 尝试直接写注册表以注册 AUMID...")
     if register_aumid_registry(aumid, display_name, icon_uri):
@@ -93,17 +88,14 @@ def register_toaster():
 
     print("[AUMID_Register] 直接写注册表失败，回退到注册工具执行逻辑。")
 
-    # 3. 获取当前 Python 解释器所在目录
     python_exe = sys.executable
     python_root = os.path.dirname(python_exe)
     if os.path.basename(python_root).lower() == 'scripts':
         python_root = os.path.dirname(python_root)
 
-    # 4. 定位 Scripts 目录
     scripts_dir = os.path.join(python_root, 'Scripts')
     register_exe = os.path.join(scripts_dir, 'register_hkey_aumid.exe')
 
-    # 5. 优先尝试：执行 register_hkey_aumid.exe
     if not os.path.isfile(register_exe):
         print(f"[AUMID_Register] 未在 {scripts_dir} 中找到 register_hkey_aumid.exe")
         where_reg = subprocess.run('where register_hkey_aumid', capture_output=True, text=True, shell=True)
@@ -134,7 +126,6 @@ def register_toaster():
     else:
         print('未找到 register_hkey_aumid.exe，准备回退到 python -m register_hkey_aumid。')
 
-    # 6. 回退到 python -m register_hkey_aumid
     python_cmd = python_exe
     py_params = f'-m register_hkey_aumid --app_id "{aumid}" --name "{display_name}"'
     if icon_uri:

@@ -1,0 +1,61 @@
+{
+    "id": "create_shortcut",
+    "name": "创建快捷方式",
+    "description": "在桌面或开始菜单创建 .lnk 快捷方式",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.create_shortcut",
+    "enabled": true,
+    "platforms": ["windows"],
+    "permissions": ["external_binary"],
+    "outputs": [
+        {"name": "shortcut_path", "label": "快捷方式路径", "type": "string"}
+    ],
+    "params": [
+        {
+            "name": "name",
+            "label": "快捷方式名称",
+            "type": "string",
+            "default": "",
+            "placeholder": "如 项目归档入口（无需写 .lnk）"
+        },
+        {
+            "name": "target_path",
+            "label": "目标路径",
+            "type": "path",
+            "default": "",
+            "placeholder": "程序、文件夹或文件的完整路径"
+        },
+        {
+            "name": "location",
+            "label": "创建位置",
+            "type": "select",
+            "default": "desktop",
+            "options": [
+                {"value": "desktop", "label": "桌面"},
+                {"value": "start_menu", "label": "开始菜单"}
+            ]
+        },
+        {
+            "name": "arguments",
+            "label": "启动参数",
+            "type": "string",
+            "default": "",
+            "placeholder": "可选，传给目标程序的参数"
+        },
+        {
+            "name": "working_directory",
+            "label": "工作目录",
+            "type": "path",
+            "default": "",
+            "placeholder": "可选，留空使用目标默认目录"
+        },
+        {
+            "name": "icon_path",
+            "label": "图标路径",
+            "type": "string",
+            "default": "",
+            "placeholder": "可选，留空使用目标自带图标"
+        }
+    ]
+}

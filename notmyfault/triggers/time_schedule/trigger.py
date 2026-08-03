@@ -3,10 +3,7 @@ from datetime import datetime
 
 
 def _valid_time_format(value: str) -> bool:
-    """校验 HH:MM 格式且为真实时间：长度 5、中间冒号、时 00-23、分 00-59。
-
-    只查长度/冒号位会放过 "25:99" 这类非法时间，导致触发器空转永不触发。
-    """
+    """校验 HH:MM 格式和真实时间范围，长度 5 且小时 00-23、分钟 00-59"""
     if not isinstance(value, str) or len(value) != 5 or value[2] != ":":
         return False
     try:
