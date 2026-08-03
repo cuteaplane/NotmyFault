@@ -1,12 +1,4 @@
-"""自动化引擎编排：匹配规则、执行动作并管理运行生命周期。
-
-错误处理原则：
-- 不石沉大海：所有异常分支均记录到日志与 Diagnostics（trigger_crashes /
-  errors），Dashboard / API 可观测。
-- 不说崩就崩：触发器线程与外部回调经 _run_trigger / _safe_on_event 隔离，
-  单点异常不击穿主循环、不静默杀死线程。
-插件注册与加载流水线已迁移到 ``plugin_loader.py``，本模块保留兼容导出。
-"""
+"""NotmyFault 规则引擎负责加载插件、匹配规则和执行动作"""
 import copy
 import os
 import sys
@@ -49,29 +41,21 @@ from notmyfault.core.workflow import build_context
 from notmyfault.core.workflow_executor import WorkflowExecutor
 
 
-# ============================================================================
-# 规则引擎
-# ============================================================================
-
 class AutomationEngine:
-    """规则引擎：加载插件 -> 匹配规则 -> 执行动作。
-
-    公共属性与方法签名保持不变，保证插件、Dashboard 与测试零迁移。
-    """
+    """加载插件、匹配规则并执行动作"""
 
     def __init__(
         self,
         config: Dict[str, Any],
         on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> None:
-        # config 是运行期间的“当前快照”；热重载只换 rules，别悄悄改调用方的字典。
+        # 热重载只替换 rules，构造函数传入的 config 保持原对象
         self.config = config
         self.rules: List[Dict[str, Any]] = config.get("rules", [])
         self.on_event = on_event
 
         self._plugin_registry = PluginRegistry()
-        # 兼容旧插件、Dashboard 与测试：这些仍是可直接访问的原字典对象。
-        # 这层马甲先别脱，外面还有人直接往里面塞假插件做测试。
+        # 旧插件、Dashboard 和测试仍直接读取这些注册表对象
         self.triggers_meta = self._plugin_registry.triggers_meta
         self.triggers_funcs = self._plugin_registry.triggers_funcs
         self.actions_meta = self._plugin_registry.actions_meta
@@ -80,7 +64,6 @@ class AutomationEngine:
         self._plugin_shutdown_lock = threading.RLock()
         self._plugins_shutdown = False
 
-        # 安全系统
         from notmyfault.security import sudo as _sudo
         self._sudo = _sudo
         self._engine_token: str = _sudo.begin_engine_session()
@@ -89,31 +72,25 @@ class AutomationEngine:
         engine_info(f"Security mode: {self._security_mode.value}")
         self._plugin_integrity_errors: list[str] = []
 
-        # 诊断（线程安全 + 快照 + 错误上报通道）
         self._diag_obj = Diagnostics()
-        # 旧代码还会摸 _diag / _diag_lock；让它们继续活着，别把兼容性吓跑。
-        self._diag: Dict[str, Any] = self._diag_obj.data      # 兼容：外部仍可读 engine._diag
-        self._diag_lock = self._diag_obj.lock                 # 兼容：旧加锁路径
+        # 旧代码仍读取 _diag 和 _diag_lock，保留这两个兼容属性
+        self._diag: Dict[str, Any] = self._diag_obj.data
+        self._diag_lock = self._diag_obj.lock
 
-        # 关闭
         self._shutdown_flag: "threading.Event | None" = None
 
-        # 规则热重载线程安全
         self._rules_lock = threading.RLock()
-        # 条件树需要保存 AND 分支最近一次命中；规则热重载时整体换代。
+        # 热重载时整体替换条件运行时，保留 AND 分支的最近命中
         self._condition_runtime = ConditionRuntime()
 
-        # 触发器线程管理：TriggerSupervisor 独占 threads/events/lock，
-        # engine._trigger_threads 等属性通过 property 代理指向同一对象。
+        # TriggerSupervisor 管理线程、停止事件和锁，engine 属性通过 property 转发
         self._trigger_supervisor = TriggerSupervisor(
-            # 延迟查找，保持构造后替换 _alert_user 的模拟器/测试契约。
+            # 运行时查找 _alert_user，构造后替换的告警回调仍然生效
             alert_cb=lambda title, message: self._alert_user(title, message),
         )
 
-        # 诊断时间
         self._start_time: float = 0.0
 
-        # 协作者
         self._plugin_loader = PluginLoader(
             registry=self._plugin_registry,
             config=self.config,
@@ -136,7 +113,7 @@ class AutomationEngine:
             execute_actions=lambda *args: self.execute_actions(*args),
             run_action=lambda *args: self._run_action(*args),
         )
-        # 兼容旧扩展和测试读取这些同步对象。
+        # 旧扩展和测试仍直接读取这些同步对象
         self._action_lock = self._workflow_executor.action_lock
         self._action_done = self._workflow_executor.action_done
         self._deferred_workflows = self._workflow_executor.deferred_workflows
@@ -148,7 +125,7 @@ class AutomationEngine:
     def _active_actions(self) -> int:
         return self._workflow_executor.active_actions
 
-    # -- 兼容马甲：_trigger_threads / _events / _lock 代理到 supervisor --
+    # 这些属性转发到 TriggerSupervisor，旧调用方仍可直接访问
     @property
     def _trigger_threads(self) -> Dict[str, threading.Thread]:
         return self._trigger_supervisor.threads
@@ -173,13 +150,9 @@ class AutomationEngine:
     def _trigger_lock(self, value: threading.RLock) -> None:
         self._trigger_supervisor.lock = value
 
-    # ------------------------------------------------------------------
-    # 告警与安全回调
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _alert_user(title: str, message: str, open_dashboard: bool = False) -> None:
-        """向用户发送告警；失败时记录到日志而非静默吞掉。"""
+        """向用户发送告警，失败时记录日志"""
         try:
             from notmyfault.host.alert import alert_user
             alert_user(title, message, open_dashboard=open_dashboard)
@@ -187,13 +160,10 @@ class AutomationEngine:
             engine_warn(f"alert_user 调用失败 ({title}): {e}")
 
     def _safe_on_event(self, event_type: str, payload: Dict[str, Any]) -> None:
-        """调用外部事件回调，异常隔离：不外泄、不中断分发，但记录可观测。
-
-        避免回调（如 API 推送）抛错击穿到触发器线程导致线程静默死亡。
-        """
+        """调用外部事件回调并记录回调异常"""
         if not self.on_event:
             return
-        # UI / SSE 挂了不该连坐规则引擎，事件推送失败就记一笔然后放过主流程。
+        # UI 或 SSE 推送失败时记录错误并继续分发
         try:
             self.on_event(event_type, payload)
         except Exception:
@@ -212,8 +182,8 @@ class AutomationEngine:
         config: Any,
         stop_event: threading.Event,
     ) -> None:
-        """触发器线程入口：隔离插件异常，崩溃即上报而非静默退出。"""
-        # 触发器是插件代码，包一层安全气囊：炸了也不能把整台引擎带走。
+        """触发器线程入口，隔离插件异常并上报崩溃"""
+        # 触发器代码来自插件，异常由这里捕获并上报
         try:
             if trigger_meta.get("trigger_api") == "event-v2":
 
@@ -275,12 +245,8 @@ class AutomationEngine:
             except Exception:
                 pass
 
-    # ------------------------------------------------------------------
-    # 诊断
-    # ------------------------------------------------------------------
-
     def get_diagnostics(self) -> Dict[str, Any]:
-        """返回引擎当前诊断快照（供 Dashboard 展示）。"""
+        """返回当前诊断数据供 Dashboard 展示"""
         uptime = time.time() - self._start_time if self._start_time > 0 else 0
         snap = self._diag_obj.snapshot()
         total_actions = snap["action_ok"] + snap["action_fail"]
@@ -313,23 +279,15 @@ class AutomationEngine:
             "errors": snap["errors"][-20:],
         }
 
-    # ------------------------------------------------------------------
-    # 条件匹配助手（委托纯函数）
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _get_rule_events(rule: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """从规则中提取所有事件条件。"""
+        """从规则中提取所有事件条件"""
         return get_rule_events(rule)
 
-    # ------------------------------------------------------------------
-    # 插件加载
-    # ------------------------------------------------------------------
-
     def auto_load(self, load_paths) -> None:
-        """扫描并加载所有插件。支持 [(base_dir, origin), ...] 或兼容单字符串。"""
+        """扫描并加载插件，支持多个目录或单个目录参数"""
         if isinstance(load_paths, str):
-            # 老调用只给一个目录，给它补上 builtin 标签，别让历史用户白升级。
+            # 旧调用只传一个目录时标记为 builtin
             load_paths = [(load_paths, "builtin")]
         engine_info("=== SESSION_START ===")
         t_loaded = t_failed = a_loaded = a_failed = 0
@@ -359,12 +317,10 @@ class AutomationEngine:
             t_loaded += _t; t_failed += _tf
             a_loaded += _a; a_failed += _af
 
-        # 启动摘要
         print(
             f"\n[Engine] 已加载 {a_loaded} 个动作插件, {t_loaded} 个触发器插件"
         )
 
-        # 插件加载失败 -> 告警
         total_failed = t_failed + a_failed
         if total_failed > 0:
             parts = []
@@ -372,11 +328,10 @@ class AutomationEngine:
                 parts.append(f"{t_failed} 个触发器")
             if a_failed > 0:
                 parts.append(f"{a_failed} 个动作")
-            fail_msg = "、".join(parts) + " 插件加载失败，请检查引擎日志"
+            fail_msg = "、".join(parts) + " 插件加载失败，请检查Engine日志"
             print(f"[Engine] [!!] {fail_msg}", file=sys.stderr)
             self._alert_user("插件加载异常", fail_msg)
 
-        # admin 权限提示
         admin_plugins = [
             pid
             for pid, meta in {**self.triggers_meta, **self.actions_meta}.items()
@@ -400,11 +355,7 @@ class AutomationEngine:
         store_name: str,
         origin: str = "builtin",
     ) -> Tuple[int, int]:
-        """通用插件加载器（转发至 PluginLoader，保持签名与返回值兼容）。
-
-        Returns:
-            (loaded_count, failed_count)
-        """
+        """转发到 PluginLoader 并保留旧加载接口的返回值"""
         return self._plugin_loader.load(
             base_dir=base_dir,
             plugins_dir=plugins_dir,
@@ -417,17 +368,9 @@ class AutomationEngine:
             origin=origin,
         )
 
-    # ------------------------------------------------------------------
-    # 规则 & 参数校验
-    # ------------------------------------------------------------------
-
     def _validate_all_rules(self) -> Tuple[int, int]:
-        """校验所有规则的 event/action 引用和参数是否与已加载插件匹配。
-
-        非致命：只打印警告，不拒绝任何规则。
-        校验逻辑下沉到 rules.validate_rules 纯函数，这里只管打印和记诊断。
-        """
-        # 校验时拿副本：热重载可以在另一边准备下一份规则，别互相抢纸笔。
+        """校验规则引用和参数并记录问题"""
+        # 复制规则列表后再校验，热重载线程可以同时准备下一份配置
         with self._rules_lock:
             rules = list(self.rules)
 
@@ -436,13 +379,13 @@ class AutomationEngine:
             rules, self.triggers_meta, self.actions_meta
         )
 
-        # 引用类问题：进诊断 + 日志，Dashboard 能看到
+        # 引用问题写入诊断和日志，Dashboard 可以查看
         for rule_name, msg in issues:
             print(f"[Engine] [!!] 规则 \"{rule_name}\" {msg}", file=sys.stderr)
             self._diag_obj.add_rule_issue(rule_name, msg)
             engine_error("rule_issue", rule=rule_name, issue=msg)
 
-        # 参数类型不匹配：只打印提醒，不进诊断（保持原行为）
+        # 参数类型不匹配只打印提醒，保持原有行为
         for rule_name, msg in warnings:
             print(f"[Engine] [!!] 规则 \"{rule_name}\" {msg}", file=sys.stderr)
 
@@ -451,14 +394,10 @@ class AutomationEngine:
         if valid < total:
             self._alert_user(
                 "规则配置异常",
-                f"{total - valid} 条规则引用了未加载的插件或参数不匹配，请检查引擎日志",
+                f"{total - valid} 条规则引用了未加载的插件或参数不匹配，请检查Engine日志",
             )
 
         return valid, total
-
-    # ------------------------------------------------------------------
-    # 事件分发
-    # ------------------------------------------------------------------
 
     def emit_event(
         self,
@@ -466,13 +405,9 @@ class AutomationEngine:
         event_payload: Dict[str, Any],
         instance: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """分发事件给匹配的规则。
-
-        ``instance`` 由 event-v2 触发器传入（携带 config 指纹），条件运行时
-        按配置匹配语义判定；v1/legacy 事件不传，保持 payload 过滤。
-        """
+        """按事件版本匹配规则并分发事件"""
         if self._shutdown_flag and self._shutdown_flag.is_set():
-            print(f"[EventBus] 引擎正在关闭，忽略事件: [{event_type}]")
+            print(f"[EventBus] Engine正在关闭，忽略事件: [{event_type}]")
             return
 
         semantic = self.triggers_meta.get(event_type, {}).get("semantic", "oneshot")
@@ -481,7 +416,7 @@ class AutomationEngine:
         )
 
         with self._rules_lock:
-            # 事件分发沿用同步语义；这里刻意不持锁执行 action，慢动作不能卡住热重载。
+            # 规则快照在锁内复制，动作执行在锁外进行
             rules_snapshot = list(self.rules)
 
         for rule_index, rule in enumerate(rules_snapshot):
@@ -514,7 +449,7 @@ class AutomationEngine:
             self.execute_workflow(rule_key, rule, rule_name, context)
 
     def call_notmyfault(self, event_data: Dict[str, Any]) -> None:
-        """接收外部事件（触发器线程通过此方法推送事件）。"""
+        """接收触发器线程推送的外部事件"""
         event_type = event_data.get("trigger_id")
         event_payload = event_data.get("triggered_params", {})
         if not isinstance(event_type, str) or not isinstance(event_payload, dict):
@@ -523,12 +458,7 @@ class AutomationEngine:
         self.emit_event(event_type, event_payload)
 
     def run_manual_rule(self, rule_index: int) -> tuple[bool, str]:
-        """从 Dashboard 立即执行一条规则，不依赖其自动触发条件。
-
-        列表上的运行箭头是“立即运行一次”，因此必须常驻；``manual``
-        触发器仍可用于只由用户点击触发的规则建模。动作放入独立线程，HTTP
-        请求只负责受理，不会被长动作卡住。
-        """
+        """从 Dashboard 立即执行指定规则"""
         with self._rules_lock:
             if rule_index < 0 or rule_index >= len(self.rules):
                 return False, "规则不存在或已被重新加载"
@@ -543,7 +473,7 @@ class AutomationEngine:
         trigger_payloads: Optional[Dict[str, Dict[str, Any]]] = None,
         event_payload: Optional[Dict[str, Any]] = None,
     ) -> tuple[bool, str]:
-        """执行调用方已核对过的规则快照，不依赖热重载时序。"""
+        """执行调用方传入的规则快照"""
         rule = copy.deepcopy(rule)
 
         rule_name = rule.get("name", f"规则 #{rule_index + 1}")
@@ -588,10 +518,6 @@ class AutomationEngine:
             daemon=True,
         ).start()
         return True, "已开始执行"
-
-    # ------------------------------------------------------------------
-    # 动作执行
-    # ------------------------------------------------------------------
 
     def execute_workflow(
         self,
@@ -659,17 +585,12 @@ class AutomationEngine:
     ) -> Tuple[bool, Any]:
         return self._workflow_executor.run_action(action, rule_name, context)
 
-    # ------------------------------------------------------------------
-    # 触发器线程管理
-    # ------------------------------------------------------------------
-
     def _start_trigger_threads(self, rules: List[Dict[str, Any]] | None = None) -> int:
         if rules is None:
             with self._rules_lock:
                 rules = list(self.rules)
 
-        # event-v1 同一个 trigger 只开一条线程并打包全部参数；event-v2 每个唯一
-        # 配置一个隔离实例（相同配置去重，见 TriggerSupervisor.start）。
+        # event-v1 每类触发器共用一条线程，event-v2 每个配置使用独立实例
         aggregated = aggregate_trigger_params(rules)
 
         return self._trigger_supervisor.start(
@@ -680,30 +601,22 @@ class AutomationEngine:
         )
 
     def _stop_trigger_threads(self, timeout: float = 30.0) -> bool:
-        """请求停止所有触发器，并报告它们是否全部退出。
-
-        Python 线程不能被安全地强制终止；仍在运行的插件必须保留登记，
-        这样热重载不会在同一触发器上再启动一代线程而造成重复执行。
-        """
+        """请求停止所有触发器并返回是否全部退出"""
         return self._trigger_supervisor.stop(timeout)
-
-    # ------------------------------------------------------------------
-    # 引擎生命周期
-    # ------------------------------------------------------------------
 
     def start(
         self, shutdown_event: "threading.Event | None" = None
     ) -> None:
-        """运行引擎，并保证本代引擎的提权授权最终被撤销。"""
+        """运行引擎并在结束时撤销本代授权"""
         if self._privilege_session_closed:
-            raise RuntimeError("引擎实例已经关闭，不能再次启动")
+            raise RuntimeError("Engine实例已经关闭，不能再次启动")
         try:
             self._run(shutdown_event=shutdown_event)
         finally:
             self.close()
 
     def close(self) -> None:
-        """撤销本代引擎权限会话；可安全重复调用。"""
+        """撤销本代引擎权限会话并允许重复调用"""
         if self._privilege_session_closed:
             return
         self._sudo.end_engine_session(self._engine_token)
@@ -715,10 +628,8 @@ class AutomationEngine:
         self._start_time = time.time()
         self._shutdown_flag = shutdown_event or threading.Event()
 
-        # strict 模式（源码运行）：校验引擎核心源码完整性（engine.py/config.py 等），
-        # 任何文件被改过就拒绝启动，免得有人改掉签名校验调用让插件签名形同虚设。
-        # 冻结构建（PyInstaller）里没有 .py 源文件，跳过——靠编译产物 + 插件签名 +
-        # build.json 签名防护。
+        # strict 源码运行时校验引擎核心文件完整性
+        # build.json 签名用于保护安全模式
         if self._security_mode == SecurityMode.STRICT and not getattr(sys, "frozen", False):
             ok, bad = verify_core_integrity()
             if not ok:
@@ -727,12 +638,12 @@ class AutomationEngine:
                 engine_error("integrity_check_failed", files=",".join(bad))
                 self._alert_user(
                     "NotmyFault 完整性校验失败",
-                    f"核心文件可能被篡改（{detail}）。请重新运行 python build.py 生成完整性清单。",
+                    f"核心文件可能被篡改（{detail}）请重新运行 python build.py 生成完整性清单",
                     open_dashboard=True,
                 )
                 return
 
-        # 启动前先体检：问题规则会被诊断出来，但不因为一条坏规则饿死整台引擎。
+        # 启动前校验规则并记录问题，坏规则与其他规则分别处理
         self._validate_all_rules()
 
         from notmyfault.platform.platform_support import show_notification
@@ -745,16 +656,16 @@ class AutomationEngine:
         thread_count = self._start_trigger_threads()
 
         if thread_count == 0:
-            print("[Engine] 没有找到可用触发器，程序将退出。")
+            print("[Engine] 没有找到可用触发器，程序将退出")
             hint = "没有可用的触发器，请检查规则配置"
             if self._security_mode == SecurityMode.STRICT:
-                # fresh clone 未跑 build.py：内置插件因无 signature.sig 被拒载。
+                # strict 源码运行需要插件签名文件
                 hint += (
-                    "。当前为 strict 安全模式：若是源码运行，内置插件因缺少签名被拒载，"
-                    "请先运行 `python build.py` 生成插件签名与 build.json。"
+                    "Tips: 当前安全模式为 strict 严格模式：若是源码运行，内置插件因缺少签名被拒载，"
+                    "请先运行 `python build.py` 生成插件签名与 build.json"
                 )
             self._alert_user(
-                "NotmyFault 启动失败",
+                "NotmyFault 启动失败 😥",
                 hint,
                 open_dashboard=True,
             )
@@ -778,11 +689,11 @@ class AutomationEngine:
                         else 0
                     )
                     if new_mtime > config_mtime:
-                        # 文件保存可能正好写到一半，JSON 失败走下面的兜底，下个 tick 再来。
+                        # 文件写入中被读取时可能出现临时 JSON 错误，下一轮继续尝试
                         new_config = load_verified_config()
                         new_rules = new_config["rules"]
 
-                        # 旧触发器还活着时绝不启动新一代，否则同一事件会被处理两次。
+                        # 旧触发器仍在运行时先等待退出，再决定是否加载新配置
                         if not self._stop_trigger_threads(timeout=30):
                             message = "旧触发器未能在 30 秒内退出，已拒绝应用新配置"
                             if not self._hot_reload_error_reported:
@@ -807,7 +718,7 @@ class AutomationEngine:
 
                         started = self._start_trigger_threads(new_rules)
                         if started == 0:
-                            print("[Engine] 热加载后无可用触发器，保持引擎运行")
+                            print("[Engine] 热加载后无可用触发器，保持Engine运行")
                         config_mtime = new_mtime
                 except ConfigValidationError as e:
                     self._diag_obj.inc_hot_reload_error()
@@ -820,9 +731,9 @@ class AutomationEngine:
                         self._hot_reload_error_reported = True
                         self._alert_user(
                             "配置校验失败",
-                            "config.json 未通过格式、签名或安全校验，热加载已拒绝；请修正后重新保存",
+                            "config.json 未通过格式、签名或安全校验，热加载失败；请修改后重新保存",
                         )
-                    # 配置校验失败需要用户重新保存，避免每秒重复报同一个错误。
+                    # 校验失败后记录当前修改时间，等文件再次保存再重试
                     config_mtime = new_mtime
                 except OSError as e:
                     print(
@@ -844,8 +755,7 @@ class AutomationEngine:
         self._wait_active_actions()
 
     def _shutdown_plugins(self) -> None:
-        # shutdown() 与运行线程 finally 可能并发抵达。先在锁内认领清理权，
-        # 再到锁外调用第三方 teardown，避免同一插件被执行两次或锁住回调。
+        # 先在锁内认领清理权，再在锁外调用插件 teardown()
         with self._plugin_shutdown_lock:
             if self._plugins_shutdown:
                 return
@@ -874,8 +784,7 @@ class AutomationEngine:
         self._workflow_executor.wait_active_actions(timeout=timeout)
 
     def shutdown(self) -> None:
-        
-        # shutdown 可能被 API、信号和 finally 同时喊到；每一步都尽量可重复。
+        # API、信号和 finally 可能同时调用 shutdown()，每个清理步骤都支持重复执行
         if self._shutdown_flag:
             self._shutdown_flag.set()
         self._trigger_supervisor.request_stop_all()

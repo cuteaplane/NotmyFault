@@ -1,25 +1,23 @@
-"""触发器线程监管器：独占触发器线程、停止事件与锁的登记和生命周期管理。
-
-作为后续增量订阅和健康状态承载层的前置抽取，本模块将 engine.py 中
-_trigger_threads / _trigger_events / _trigger_lock 的所有权移至独立组件，
-同时通过属性代理保持引擎的兼容马甲（测试可直接读写这些属性）。
+"""触发器管理，用于管线程/停止事件/锁，
+engine.py 里的 _trigger_threads / _trigger_events / _trigger_lock 原本是引擎
+自己的属性，现在收进这个组件统一管理启动、停止、崩溃和健康状态数据；
+对外仍用 property 代理回引擎的老名字用于测试
 """
 import sys
 import threading
 import time
 from notmyfault.core.rules import config_fingerprint
 
-# 触发器只是事件源：连续这么多次 30s 退出失败视为卡死，强制放弃监管，
-# 否则一次原生调用阻塞会让热重载永久瘫痪。
-_MAX_STOP_FAILURES = 2
+# 连续两次 join() 超时后只在 health() 中标记卡住，旧线程仍运行时不能启动新线程
+_STUCK_THRESHOLD = 2
 from typing import Any, Callable, Dict, List, Optional
 
 
 class TriggerSupervisor:
-    """触发器线程的单一所有者：登记、启动、停止与健康观测。
+    """触发器线程管理：启动、停止、记崩溃、报健康
 
     threads / events / lock 通过 property 暴露且支持赋值，
-    使 ``AutomationEngine._trigger_threads`` 等属性仍可被外部直接读写。
+    使 ``AutomationEngine._trigger_threads`` 等属性仍可被外部直接读写
     """
 
     def __init__(
@@ -30,16 +28,13 @@ class TriggerSupervisor:
         self._threads: Dict[str, threading.Thread] = {}
         self._events: Dict[str, threading.Event] = {}
         self._crash_errors: Dict[str, str] = {}
-        self._stop_failures: Dict[str, int] = {}  # 连续退出失败次数（卡死判定）
-        self._configs: Dict[str, Dict[str, Any]] = {}  # 实例 ID -> 配置快照（健康状态展示）
+        self._stop_failures: Dict[str, int] = {}  # 连续退出失败次数，用于判断卡住
+        self._configs: Dict[str, Dict[str, Any]] = {}  # 实例 ID 到配置快照，用于健康状态
         self._lock = threading.RLock()
-        # start/stop 不能交叉。登记锁只保护字典，生命周期锁覆盖 thread.start
-        # 到 stop/join 的完整操作，封死“已登记但尚未 start 就被 join”的窗口。
+        # 启停锁覆盖 thread.start() 到 join() 的完整过程，stop() 只能处理已经挂载的线程
         self._lifecycle_lock = threading.RLock()
 
-    # ------------------------------------------------------------------
-    # 兼容马甲：engine._trigger_threads / _events / _lock 指向同一对象
-    # ------------------------------------------------------------------
+    # engine 仍通过这三个属性访问同一个线程管理对象
 
     @property
     def threads(self) -> Dict[str, threading.Thread]:
@@ -67,10 +62,6 @@ class TriggerSupervisor:
     def lock(self, value: threading.RLock) -> None:
         self._lock = value
 
-    # ------------------------------------------------------------------
-    # 启动
-    # ------------------------------------------------------------------
-
     def start(
         self,
         aggregated: Dict[str, List[Dict[str, Any]]],
@@ -78,11 +69,7 @@ class TriggerSupervisor:
         triggers_meta: Dict[str, Dict[str, Any]],
         run_trigger_cb: Callable[..., Any],
     ) -> int:
-        """接收聚合订阅并启动触发器线程，保持先登记后启动语义。
-
-        ``event-v1`` 每类触发器共用一个配置列表；``event-v2`` 为每个配置
-        启动一个隔离实例，实例 ID 使用 ``trigger_id:index``。
-        """
+        """接收聚合订阅并启动触发器线程，先挂载线程再调用 start"""
         missing = [et for et in aggregated if et not in triggers_funcs]
         if missing:
             print(
@@ -103,9 +90,7 @@ class TriggerSupervisor:
 
                 trigger_meta = triggers_meta.get(event_type, {})
                 trigger_func = triggers_funcs[event_type]
-                # event-v2 按配置指纹去重：多条规则使用相同配置（如同一热键、
-                # 同一监控文件夹）时只启动一个实例，事件仍按指纹匹配所有
-                # 叶子；否则相同配置会启动 N 个实例，每次真实事件被放大 N 倍。
+                # event-v2 按配置指纹合并相同配置，事件仍能匹配所有叶子
                 instances = (
                     config_list
                     if trigger_meta.get("trigger_api") == "event-v2"
@@ -144,8 +129,7 @@ class TriggerSupervisor:
                         ),
                         daemon=True,
                     )
-                    # 登记和 start 在同一临界区内。stop 只能观察到“尚未登记”或
-                    # “已经启动”的线程，不会 join 一个未启动的 Thread。
+                    # 在线程字典中挂载线程后再调用 start()，stop() 才能安全处理它
                     with self._lock:
                         existing = self._threads.get(instance_id)
                         if existing is not None and existing.is_alive():
@@ -176,17 +160,8 @@ class TriggerSupervisor:
 
         return count
 
-    # ------------------------------------------------------------------
-    # 停止
-    # ------------------------------------------------------------------
-
     def stop(self, timeout: float = 30.0) -> bool:
-        """广播停止、共享 deadline join，仅清退已退出线程。
-
-        仍在运行的线程保留登记，避免热重载在同一触发器上再启动一代线程；
-        但触发器只是事件源，连续 _MAX_STOP_FAILURES 次 join 超时的线程
-        视为卡死（原生调用阻塞等），强制放弃监管，让热重载继续应用。
-        """
+        """广播停止信号并等待线程退出，返回是否全部停止"""
         with self._lifecycle_lock:
             with self._lock:
                 if not self._threads:
@@ -194,7 +169,7 @@ class TriggerSupervisor:
                 events = list(self._events.values())
                 threads = list(self._threads.items())
 
-            # 先广播"收工"，再 join；反过来等会儿基本就是和自己较劲。
+            # 先给线程发停止信号，再按同一个截止时间调用 join()
             for evt in events:
                 evt.set()
 
@@ -216,9 +191,10 @@ class TriggerSupervisor:
 
             alive = {et for et, thread in threads if thread.is_alive()}
             remaining_alive = set(alive)
+            stopped_count = len(threads) - len(alive)
             with self._lock:
                 for event_type, thread in threads:
-                    # 即使未来允许并发增量替换，也不能让旧 stop 删除新线程。
+                    # 只删除仍对应当前线程对象的条目
                     if (
                         event_type not in alive
                         and self._threads.get(event_type) is thread
@@ -228,30 +204,12 @@ class TriggerSupervisor:
                         self._configs.pop(event_type, None)
                         self._crash_errors.pop(event_type, None)
                         self._stop_failures.pop(event_type, None)
-                    elif (
-                        event_type in alive
-                        and self._threads.get(event_type) is thread
-                        and self._stop_failures.get(event_type, 0) >= _MAX_STOP_FAILURES
-                    ):
-                        print(
-                            f"[Engine] [!!] 触发器线程 {event_type} 连续"
-                            f" {_MAX_STOP_FAILURES} 次未退出，强制放弃监管，"
-                            "新配置继续应用",
-                            file=sys.stderr,
-                        )
-                        self._threads.pop(event_type, None)
-                        self._events.pop(event_type, None)
-                        self._configs.pop(event_type, None)
-                        self._crash_errors.pop(event_type, None)
-                        self._stop_failures.pop(event_type, None)
-                        remaining_alive.discard(event_type)
+            if stopped_count:
+                print(f"[Engine] 已停止 {stopped_count} 个触发器线程")
             return not remaining_alive
 
     def request_stop_all(self) -> None:
-        """幂等地广播停止信号给所有已登记触发器。
-
-        Event.set() 本身幂等，多次调用安全无副作用。
-        """
+        """向所有已挂载线程发送停止信号"""
         with self._lifecycle_lock:
             with self._lock:
                 events = list(self._events.values())
@@ -259,20 +217,13 @@ class TriggerSupervisor:
                 evt.set()
 
     def mark_crashed(self, trigger_id: str, error: str) -> None:
-        """把崩溃关联到当前登记代，而不是复用 Diagnostics 的历史记录。"""
+        """记录仍在字典中的线程崩溃信息"""
         with self._lock:
             if trigger_id in self._threads:
                 self._crash_errors[trigger_id] = error[:300]
 
-    # ------------------------------------------------------------------
-    # 健康观测
-    # ------------------------------------------------------------------
-
     def health(self) -> Dict[str, Dict[str, Any]]:
-        """返回每个已登记触发器的 alive/crashed/last_error 状态。
-
-        崩溃信息按当前登记代保存；新一代启动时会清除上一代错误。
-        """
+        """返回每个已挂载线程的运行和错误状态"""
         with self._lock:
             result: Dict[str, Dict[str, Any]] = {}
             for trigger_id, thread in list(self._threads.items()):
@@ -281,6 +232,7 @@ class TriggerSupervisor:
                 result[trigger_id] = {
                     "config": self._configs.get(trigger_id),
                     "alive": alive,
+                    "stuck": self._stop_failures.get(trigger_id, 0) >= _STUCK_THRESHOLD,
                     "crashed": (not alive) and last_error is not None,
                     "last_error": last_error if not alive else None,
                 }

@@ -1,4 +1,4 @@
-"""规则运行数据绑定的解析、遍历与错误报告。"""
+"""规则运行数据绑定的解析、遍历与错误报告"""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ class BindingUsage:
 
 
 class BindingResolutionError(ValueError):
-    """绑定无法解析；这是永久配置错误，不应进入动作重试。"""
+    """绑定解析失败说明配置写错，重试也没用"""
 
     def __init__(
         self,
@@ -155,7 +155,7 @@ def resolve_value(
     *,
     location: str = "$",
 ) -> Any:
-    """递归解析 v2 ``$ref`` 与旧 ``{{ dotted.path }}`` 模板。"""
+    """递归解析 v2 ``$ref`` 与旧 ``{{ dotted.path }}`` 模板"""
     if is_reference(value):
         return resolve_reference(value["$ref"], context, location=location)
     if isinstance(value, dict):
@@ -210,7 +210,7 @@ def iter_references(value: Any, *, location: str = "$") -> Iterable[BindingUsage
 
 
 def references_available(value: Any, context: Dict[str, Any]) -> bool:
-    """返回结构化绑定的来源是否参与了本次工作流运行。"""
+    """返回结构化绑定的来源是否参与了本次工作流运行"""
     for usage in iter_references(value):
         reference = usage.reference
         scope = reference.get("scope")
@@ -225,7 +225,7 @@ def references_available(value: Any, context: Dict[str, Any]) -> bool:
 
 
 def iter_legacy_event_payload_paths(value: Any) -> Iterable[Tuple[str, ...]]:
-    """遍历旧模板中需要手动测试输入的 ``event.payload`` 路径。"""
+    """遍历旧模板中需要手动测试输入的 ``event.payload`` 路径"""
     if isinstance(value, str):
         for match in _LEGACY_EVENT_PAYLOAD.finditer(value):
             suffix = match.group("path")

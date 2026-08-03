@@ -1,35 +1,29 @@
-"""引擎诊断数据：线程安全的计数器、问题列表与错误上报通道。
-
-设计目标：
-- 错误不石沉大海：提供 record_error / record_trigger_crash 统一上报，
-  snapshot() 暴露最近错误，供 Dashboard / API 观测。
-- 写入经锁保护，snapshot() 返回深拷贝快照，消除读取与写入竞态。
-"""
+"""引擎诊断数据容器用锁保护计数和错误列表，并向 Dashboard 与 API 提供快照"""
 import copy
 import threading
 from typing import Any, Dict
 
 
 class Diagnostics:
-    """线程安全的诊断数据容器。"""
+    """线程安全的诊断数据容器"""
 
     _MAX_ERRORS = 50
 
     def __init__(self) -> None:
-        # 诊断是黑匣子，不是无限垃圾桶；错误列表下面会自动截断。
+        # 错误列表超过上限时删除最早的记录
         self._data: Dict[str, Any] = {
-            "plugin_errors": [],      # [(store, plugin_id, reason), ...]
-            "rule_issues": [],        # [(rule_name, issue), ...]
+            "plugin_errors": [],      # 保存存储名、插件 ID 和原因
+            "rule_issues": [],        # 保存规则名和问题
             "action_ok": 0,
             "action_fail": 0,
             "hot_reload_errors": 0,
             "trigger_crashes": 0,     # 触发器线程未捕获异常计数
-            "trigger_crash_details": [],  # [{trigger_id, error}] 最近 20 条
-            "errors": [],             # [(category, detail), ...] 最近 _MAX_ERRORS 条
+            "trigger_crash_details": [],  # 保存最近 20 条触发器 ID 和错误
+            "errors": [],             # 保存最近 _MAX_ERRORS 条分类和详情
         }
         self._lock = threading.RLock()
 
-    # -- 兼容入口：engine._diag / engine._diag_lock 仍指向内部对象 --
+    # 旧代码仍通过 engine._diag 和 engine._diag_lock 访问这两个属性
     @property
     def data(self) -> Dict[str, Any]:
         return self._data
@@ -38,7 +32,6 @@ class Diagnostics:
     def lock(self) -> threading.RLock:
         return self._lock
 
-    # -- 写入（均加锁） --
     def record_plugin_error(self, store: str, plugin_id: str, reason: str) -> None:
         with self._lock:
             self._data["plugin_errors"].append((store, plugin_id, reason))
@@ -68,18 +61,14 @@ class Diagnostics:
             self._data["trigger_crashes"] += 1
 
     def record_error(self, category: str, detail: str) -> None:
-        """通用错误上报：写入环形日志（仅保留最近 _MAX_ERRORS 条）。"""
+        """记录错误并保留最近 _MAX_ERRORS 条"""
         with self._lock:
             self._data["errors"].append((category, detail))
             if len(self._data["errors"]) > self._MAX_ERRORS:
                 del self._data["errors"][: len(self._data["errors"]) - self._MAX_ERRORS]
 
     def record_trigger_crash(self, trigger_id: str, error: str) -> None:
-        """触发器线程崩溃：计数 + 记入错误日志 + 结构化详情。
-
-        计数与错误记录在同一把锁内完成，避免 snapshot() 在两次加锁之间观察到
-        "崩了计数已加但错误日志还没写"的不一致快照。
-        """
+        """记录触发器崩溃并在同一把锁内更新计数和详情"""
         with self._lock:
             self._data["trigger_crashes"] += 1
             self._data["errors"].append(("trigger_crash", f"{trigger_id}: {error}"))
@@ -92,8 +81,7 @@ class Diagnostics:
             if len(self._data["trigger_crash_details"]) > 20:
                 del self._data["trigger_crash_details"][:-20]
 
-    # -- 读取：返回不可变快照 --
     def snapshot(self) -> Dict[str, Any]:
-        # 给 Dashboard 的必须是副本，不然它一边看我们一边写，容易看出幻觉。
+        # snapshot() 返回副本，Dashboard 读取与写入线程分开
         with self._lock:
             return copy.deepcopy(self._data)

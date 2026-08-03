@@ -2,7 +2,7 @@
 引擎结构化日志模块
 ------------------
 每个引擎 session 写独立日志文件: logs/engine-YYYYMMDD-HHMMSS.log
-自动保留最近 7 个，旧文件自动删除。
+自动保留最近 7 个，旧文件自动删除
 
 格式约定：
     正常:  [TIMESTAMP] [INFO] 纯文本消息
@@ -24,20 +24,13 @@ from datetime import datetime
 from typing import Any, Dict
 
 
-# 保护多线程写 log
+# 多线程写日志时共用同一把锁
 _log_lock = threading.Lock()
 _current_log_path: str | None = None
 
 
 def init_session_log(log_dir: str) -> str:
-    """创建当前 session 的日志文件，清理旧文件。
-
-    Args:
-        log_dir: 日志目录路径（如 %APPDATA%/NotmyFault/logs）
-
-    Returns:
-        新创建的日志文件路径
-    """
+    """创建当前会话日志并清理旧文件，返回新文件路径"""
     global _current_log_path
 
     os.makedirs(log_dir, exist_ok=True)
@@ -46,14 +39,13 @@ def init_session_log(log_dir: str) -> str:
     filename = f"engine-{timestamp}.log"
     _current_log_path = os.path.join(log_dir, filename)
 
-    # 清理旧日志，只保留最近 7 个
     _rotate_logs(log_dir)
 
     return _current_log_path
 
 
 def _rotate_logs(log_dir: str, keep: int = 7) -> None:
-    """只保留最近 keep 个日志文件。"""
+    """只保留最近 keep 个日志文件"""
     files = sorted(
         glob.glob(os.path.join(log_dir, "engine-*.log")),
         key=os.path.getmtime,
@@ -67,7 +59,7 @@ def _rotate_logs(log_dir: str, keep: int = 7) -> None:
 
 
 def get_latest_log(log_dir: str) -> str | None:
-    """返回最新的日志文件路径，没有则返回 None。"""
+    """返回最新的日志文件路径，没有则返回 None"""
     files = sorted(
         glob.glob(os.path.join(log_dir, "engine-*.log")),
         key=os.path.getmtime,
@@ -77,7 +69,7 @@ def get_latest_log(log_dir: str) -> str | None:
 
 
 def list_logs(log_dir: str) -> list[dict]:
-    """列出所有日志文件（最新在前）。"""
+    """按最新修改时间列出日志文件"""
     files = sorted(
         glob.glob(os.path.join(log_dir, "engine-*.log")),
         key=os.path.getmtime,
@@ -102,43 +94,29 @@ def list_logs(log_dir: str) -> list[dict]:
     return result
 
 
-# ---------------------------------------------------------------------------
-# 写入
-# ---------------------------------------------------------------------------
-
 def _emit(level: str, payload: str) -> None:
-    """线程安全地写入 stdout（被引擎重定向到日志文件）。"""
+    """在引擎重定向的 stdout 上加锁写入日志"""
     with _log_lock:
         print(f"[{level}] {payload}", file=sys.stdout, flush=True)
 
 
 def engine_info(msg: str) -> None:
-    """普通信息日志。"""
     _emit("INFO", msg)
 
 
 def engine_warn(msg: str) -> None:
-    """警告日志 — 需要关注但引擎能继续运行。"""
+    """写入可继续运行的警告日志"""
     _emit("WARN", msg)
 
 
 def engine_error(event: str, **data: Any) -> None:
-    """结构化错误日志 — JSON 格式，供 Dashboard 解析诊断。"""
+    """写入供 Dashboard 解析的 JSON 错误日志"""
     payload = json.dumps({"event": event, **data}, ensure_ascii=False, default=str)
     _emit("ERROR", payload)
 
 
-# ---------------------------------------------------------------------------
-# 日志解析（供 Dashboard bridge 使用）
-# ---------------------------------------------------------------------------
-
 def parse_log_line(line: str) -> Dict[str, Any] | None:
-    """解析一行日志，返回结构化条目或 None。
-
-    兼容两种格式:
-        新: [2026-06-17 12:34:56] [LEVEL] payload...
-        旧: [2026-06-17 12:34:56] payload...          → 视为 INFO
-    """
+    """解析带时间戳的日志行，并兼容没有级别标记的旧格式"""
     line = line.strip()
     if not line:
         return None
@@ -159,8 +137,7 @@ def parse_log_line(line: str) -> Dict[str, Any] | None:
         bracket_end = rest.find("] ")
         candidate_level = rest[1:bracket_end]
         if candidate_level in ("INFO", "WARN", "ERROR"):
-            # 防御：旧格式 payload 不应以 [LEVEL] 开头后又紧跟另一个 [LEVEL]
-            # 若提取 level 后的剩余部分仍以已知 level 标记开头，则判定为旧格式
+            # 旧格式正文可能以 [LEVEL] 开头，遇到嵌套级别时保留 INFO
             after_level = rest[bracket_end + 2:]
             if after_level.startswith("[") and "] " in after_level:
                 nested_candidate = after_level[1:after_level.find("] ")]
@@ -192,7 +169,7 @@ def parse_log_line(line: str) -> Dict[str, Any] | None:
 
 
 def read_log_entries(log_path: str, lines: int = 500) -> list[Dict[str, Any]]:
-    """读取日志文件末尾 N 行，返回解析后的条目列表。"""
+    """读取日志末尾指定行数并返回解析后的条目"""
     entries: list[Dict[str, Any]] = []
     try:
         with open(log_path, "r", encoding="utf-8", errors="replace") as f:
@@ -209,7 +186,7 @@ def read_log_entries(log_path: str, lines: int = 500) -> list[Dict[str, Any]]:
 def build_diagnostics(
     entries: list[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """从解析后的日志条目构建诊断摘要。"""
+    """从解析后的日志条目构建诊断摘要"""
 
     diag: Dict[str, Any] = {
         "error_count": 0,

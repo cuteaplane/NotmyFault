@@ -1,4 +1,4 @@
-"""规则工作流、前置条件与动作流水线执行。"""
+"""执行规则工作流、前置条件和动作"""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ WorkflowCallback = Callable[..., Any]
 
 
 class WorkflowExecutor:
-    """执行工作流并独占延迟任务和活跃动作计数。"""
+    """执行工作流并独占延迟任务和活跃动作计数"""
 
     def __init__(
         self,
@@ -72,7 +72,7 @@ class WorkflowExecutor:
         rule_name: str,
         context: Dict[str, Any],
     ) -> None:
-        """执行规则工作流；前置条件不安全时延后，而不是冒险运行动作。"""
+        """执行规则工作流，前置条件未满足时安排延迟重试"""
         try:
             ready, reason, retry_after = self.check_preconditions(
                 rule.get("preconditions", []), context,
@@ -113,7 +113,7 @@ class WorkflowExecutor:
         preconditions: Any,
         context: Dict[str, Any],
     ) -> Tuple[bool, str, float | None]:
-        """调用动作插件声明的 check_precondition()；未知/异常一律不放行。"""
+        """调用动作插件的前置条件检查并返回结果"""
         if not preconditions:
             return True, "", None
         if not isinstance(preconditions, list):
@@ -218,7 +218,7 @@ class WorkflowExecutor:
         rule_name: str,
         context: Dict[str, Any],
     ) -> None:
-        """顺序执行动作流水线，并把每一步产物写入 context。"""
+        """按顺序执行动作并把每步结果写入 context"""
         for index, action in enumerate(actions):
             legacy_step_id = f"{action.get('type', 'action')}_{index + 1}"
             step_id = action.get("binding_id") or legacy_step_id
@@ -260,7 +260,7 @@ class WorkflowExecutor:
         rule_name: str = "",
         context: Optional[Dict[str, Any]] = None,
     ) -> Any:
-        """兼容入口：执行一个动作并返回插件的结构化结果。"""
+        """执行一个动作并返回插件结果，供旧调用方使用"""
         if context is None:
             context = build_context(rule_name, "", {}, [])
         ok, result = self._run_action(action, rule_name, context)
@@ -272,7 +272,7 @@ class WorkflowExecutor:
         rule_name: str,
         context: Dict[str, Any],
     ) -> Tuple[bool, Any]:
-        """执行单一步骤；新插件可拿上下文并返回结果，旧插件保持两参数 API。"""
+        """执行一个动作并兼容带上下文和旧版两参数插件"""
         shutdown_event = self._shutdown_event()
         if shutdown_event and shutdown_event.is_set():
             print(f"[Engine] 正在关闭，跳过动作: {action.get('type', '?')}")

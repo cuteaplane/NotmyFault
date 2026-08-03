@@ -1,8 +1,4 @@
-"""动作流水线的执行上下文与参数解析。
-
-这里刻意不认识任何云盘、Excel 或具体插件。核心只负责把事件、条件组合和
-前序步骤结果交给插件；第三方服务的协议与凭据留在用户插件里。
-"""
+"""整理事件、条件组合和步骤结果供插件使用"""
 import copy
 from typing import Any, Callable, Dict
 
@@ -13,7 +9,7 @@ def build_context(
     event_payload: Dict[str, Any],
     condition_events: list[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """创建一次规则运行独享的上下文。"""
+    """创建一次规则运行独享的上下文"""
     triggers: Dict[str, Dict[str, Any]] = {}
     for item in condition_events:
         binding_id = item.get("binding_id")
@@ -23,8 +19,7 @@ def build_context(
         triggers[binding_id] = {
             "type": event.get("type", ""),
             "payload": copy.deepcopy(item.get("payload", {})),
-            # v2 语义下事件叶子 params 即该触发器的配置快照，
-            # 供 $ref scope=trigger_config 引用。
+            # v2 事件叶子的 params 是触发器配置，供 $ref scope=trigger_config 使用
             "config": copy.deepcopy(event.get("params", {})),
         }
     return {
@@ -47,14 +42,8 @@ def invoke_action(
     params: Dict[str, Any],
     context: Dict[str, Any],
 ) -> Any:
-    """调用新旧两种动作 API。
-
-    旧插件永远保持 ``run(meta, params)``。需要工作流上下文的新插件显式提供
-    ``run_with_context(meta, params, context)``，避免靠反射猜参数个数而破坏既有
-    插件或 mock。
-    """
-    # 协议由已校验的插件元数据显式声明，而非靠反射猜参数个数。这样第三方
-    # 插件的升级路径明确，旧两参数插件也不会被误调用。
+    """按插件元数据调用新旧动作 API，兼容 run 和 run_with_context"""
+    # 插件元数据声明执行接口，调用方按声明传入参数
     if action_meta.get("execution_api") == "context-v1":
         context_runner = getattr(module, "run_with_context", None)
         if not callable(context_runner):

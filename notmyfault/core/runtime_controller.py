@@ -1,8 +1,4 @@
-"""引擎运行时生命周期控制。
-
-这个模块只管理一代引擎实例的创建、运行与停止，不负责 HTTP、托盘或进程
-退出。外围宿主通过状态监听器和事件回调连接这些界面层。
-"""
+"""管理一代引擎实例的创建、运行和停止，并通过监听器报告状态"""
 
 from __future__ import annotations
 
@@ -20,7 +16,7 @@ FailureListener = Callable[[Exception], None]
 
 @dataclass(frozen=True)
 class RuntimeStatus:
-    """某一时刻的只读运行时快照。"""
+    """某一时刻的只读运行时状态"""
 
     state: str
     running: bool
@@ -30,7 +26,7 @@ class RuntimeStatus:
 
 
 class RuntimeController:
-    """串行化引擎启停，并持有当前可服务的引擎实例。"""
+    """统一管理引擎启停并保存当前实例"""
 
     def __init__(
         self,
@@ -115,7 +111,7 @@ class RuntimeController:
             sink(event_type, data)
 
     def start(self) -> bool:
-        """创建并启动一代新引擎；已有线程尚未退出时拒绝重入。"""
+        """创建并启动新一代引擎，已有线程运行时返回 False"""
         with self._lifecycle_lock:
             thread = self._engine_thread
             if self._state in ("running", "starting"):
@@ -180,7 +176,7 @@ class RuntimeController:
                 self._set_state("stopped")
 
     def request_stop(self) -> bool:
-        """发出停止信号；返回发出信号时是否仍有引擎线程。"""
+        """发出停止信号并返回当前是否存在运行线程"""
         with self._lifecycle_lock:
             thread = self._engine_thread
             alive = bool(thread and thread.is_alive())
@@ -191,7 +187,7 @@ class RuntimeController:
         return alive
 
     def stop(self, timeout: float = 5.0) -> bool:
-        """请求停止并等待线程退出；返回是否已完全停止。"""
+        """请求停止并等待线程退出，返回是否已完全停止"""
         print("[Engine] 收到停止指令")
         self.request_stop()
         with self._lifecycle_lock:
