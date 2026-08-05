@@ -28,6 +28,7 @@ env/
 *~
 .agents/
 .pytest_cache/
+.qoder/
 
 # OS
 .DS_Store
