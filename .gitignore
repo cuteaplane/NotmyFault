@@ -51,7 +51,7 @@ Desktop.ini
 .opencode-*.stdout.log
 .opencode-*.stderr.log
 *.sig
-# 锚定到仓库根，避免误伤 notmyfault/tests 包内测试
+# 带前导斜杠只匹配根目录的 tests，不带斜杠会连 notmyfault/tests 一起忽略
 /tests/
 .coverage
 .private/
