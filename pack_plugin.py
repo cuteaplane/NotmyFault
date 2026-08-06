@@ -6,9 +6,9 @@ from pathlib import Path
 
 import py7zr
 from notmyfault.security.plugin_schema import validate_plugin_meta
+from notmyfault.platform.platform_support import get_config_dir
 
 ROOT = Path(__file__).parent.resolve()
-USER_PLUGINS_DIR = ROOT / "user_plugins"
 DIST_DIR = ROOT / "dist"
 
 
@@ -38,8 +38,8 @@ def _collect_files(plugin_dir: Path) -> list[tuple[Path, str]]:
     return result
 
 
-def pack_plugin(plugin_dir: Path, output_dir: Path = DIST_DIR) -> Path | None:
-    """打包单个插件目录为 .nmfp，返回输出路径"""
+def pack_plugin(plugin_dir: Path, output_dir: Path = DIST_DIR, arc_prefix: str | None = None) -> Path | None:
+    """打包单个插件目录为 .nmfp，arc_prefix 指定归档内路径前缀，返回输出路径"""
     plugin_dir = plugin_dir.resolve()
     if not plugin_dir.is_dir():
         print(f"! 目录不存在: {plugin_dir}", file=sys.stderr)
@@ -67,6 +67,8 @@ def pack_plugin(plugin_dir: Path, output_dir: Path = DIST_DIR) -> Path | None:
     files = _collect_files(plugin_dir)
     with py7zr.SevenZipFile(nmfp_path, mode="w") as archive:
         for fpath, arcname in files:
+            if arc_prefix is not None:
+                arcname = f"{arc_prefix}/{fpath.name}"
             archive.write(fpath, arcname=arcname)
 
     print(f"+ {ptype:8s} {plugin_id:20s} -> {nmfp_path} ({len(files)} files)")
@@ -80,14 +82,21 @@ def main():
         sys.exit(1)
 
     if args[0] == "--all":
-        if not USER_PLUGINS_DIR.is_dir():
-            print(f"! 用户插件目录不存在: {USER_PLUGINS_DIR}", file=sys.stderr)
+        # 用户插件只部署在 %APPDATA% 的配置目录，结构是 plugins/<actions|triggers>/<id>
+        user_root = Path(get_config_dir()) / "plugins"
+        if not user_root.is_dir():
+            print(f"! 用户插件目录不存在: {user_root}", file=sys.stderr)
             sys.exit(1)
         count = 0
-        for p in sorted(USER_PLUGINS_DIR.iterdir()):
-            if p.is_dir() and not p.name.startswith("_"):
-                if pack_plugin(p):
-                    count += 1
+        for ptype in ("actions", "triggers"):
+            ptype_dir = user_root / ptype
+            if not ptype_dir.is_dir():
+                continue
+            for p in sorted(ptype_dir.iterdir()):
+                if p.is_dir() and not p.name.startswith("_"):
+                    # 归档内以插件 id 为顶层目录，安装端才能识别出唯一插件文件夹
+                    if pack_plugin(p, arc_prefix=p.name):
+                        count += 1
         print(f"已打包 {count} 个插件到 {DIST_DIR}")
         return
 

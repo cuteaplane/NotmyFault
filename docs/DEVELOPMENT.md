@@ -79,9 +79,10 @@ npm exec vite build -- --emptyOutDir
 | `notmyfault/native/` | 原生调用安全原语（NATIVE_LOCK） |
 | `notmyfault/actions/` | 内置动作插件 |
 | `notmyfault/triggers/` | 内置触发器插件（含 `base.py` 轮询基类） |
-| `user_plugins/` | 用户/第三方插件源码；不能把第三方服务塞进内置插件 |
 | `dashboard/src/` | Dashboard 的 Vue 前端 |
 | `notmyfault/tests/` | Python 测试 |
+
+用户/第三方插件不存放在仓库内，部署位置是平台配置目录下的 `plugins/`（Windows：`%APPDATA%\NotmyFault\plugins\`）。
 
 ## 3. 规则现在怎么工作
 
@@ -215,12 +216,15 @@ def run_with_context(meta, params, context):
 
 `outputs` 用于让 Dashboard 显示可引用的结果名；真正的返回值必须是 JSON 可表示的数据。
 
-插件声明的权限要与实际能力对应：网络用 `network`，插件目录外读写文件用 `filesystem`，Windows API 用 `native_api`。第三方云盘、邮件、IM 等服务一律做成 `user_plugins/` 下的用户插件。
+插件声明的权限要与实际能力对应：网络用 `network`，插件目录外读写文件用 `filesystem`，Windows API 用 `native_api`。第三方云盘、邮件、IM 等服务一律做成用户插件，安装在平台配置目录的 `plugins/` 下，不进仓库。
 
 打包用户插件：
 
 ```powershell
-python pack_plugin.py user_plugins/my_action
+# 打包配置目录下所有已安装的用户插件
+python pack_plugin.py --all
+# 或指定任意插件目录单独打包
+python pack_plugin.py <插件目录路径>
 ```
 
 ## 5. 写触发器
