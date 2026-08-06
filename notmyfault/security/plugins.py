@@ -52,6 +52,7 @@ _ELEVATION_FUNCS = {"shellexecute", "shellexecutew", "shellexecuteex", "shellexe
 _ELEVATION_VERB = "runas"
 # exec、eval、compile、__import__ 和 importlib.import_module 归为 dynamic_exec
 _DYNAMIC_EXEC_FUNCS = {"exec", "eval", "compile"}
+_BUILTIN_OWNERS = {"builtins", "__builtins__"}
 
 
 def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
@@ -96,6 +97,10 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
                 for alias in node.names:
                     if alias.name in _OS_DANGEROUS:
                         caps.add("external_binary")
+            if top in _BUILTIN_OWNERS:
+                for alias in node.names:
+                    if alias.name in _DYNAMIC_EXEC_BYPASS:
+                        caps.add("dynamic_exec")
         elif isinstance(node, ast.Attribute):
             base, attr = node.value, node.attr
             # ShellExecute 系列调用表示自行提权。
@@ -109,6 +114,9 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
                     caps.add("external_binary")
                 if owner == "ctypes" and attr in _CTYPES_DANGEROUS:
                     caps.add("native_api")
+                # builtins.eval / __builtins__.exec 这类属性访问同样是动态执行。
+                if owner in _BUILTIN_OWNERS and attr in _DYNAMIC_EXEC_FUNCS:
+                    caps.add("dynamic_exec")
         elif isinstance(node, ast.Call):
             func = node.func
             # 直接导入后的 ShellExecuteW 调用也要标记。
@@ -127,7 +135,7 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
                         caps.add("external_binary")
                     elif owner == "ctypes" and attr in _CTYPES_DANGEROUS:
                         caps.add("native_api")
-                    elif owner in ("builtins", "__builtins__") and attr == "__import__":
+                    elif owner in _BUILTIN_OWNERS and attr in _DYNAMIC_EXEC_BYPASS:
                         caps.add("dynamic_exec")
                     elif owner == "importlib" and attr == "import_module":
                         caps.add("dynamic_exec")
@@ -168,7 +176,7 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
                             caps.add("external_binary")
                         elif owner == "ctypes" and attr in _CTYPES_DANGEROUS:
                             caps.add("native_api")
-                        elif owner in ("__builtins__", "builtins") and attr == "__import__":
+                        elif owner in _BUILTIN_OWNERS and attr in _DYNAMIC_EXEC_BYPASS:
                             caps.add("dynamic_exec")
                     elif isinstance(target, ast.Subscript):
                         # 通过 sys.modules 取模块后再动态调用 getattr() 也要标记。
@@ -188,15 +196,17 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
                                 caps.add("external_binary")
                             elif mod in _NATIVE_MODULES and attr in _CTYPES_DANGEROUS:
                                 caps.add("native_api")
+                            elif mod in _BUILTIN_OWNERS and attr in _DYNAMIC_EXEC_BYPASS:
+                                caps.add("dynamic_exec")
         elif isinstance(node, ast.Subscript):
             # 通过 __builtins__ 下标取动态执行函数也要标记。
             tv = node.value
             if (
                 isinstance(tv, ast.Name)
-                and tv.id in ("__builtins__", "builtins")
+                and tv.id in _BUILTIN_OWNERS
                 and isinstance(node.slice, ast.Constant)
                 and isinstance(node.slice.value, str)
-                and node.slice.value in _DYNAMIC_EXEC_FUNCS
+                and node.slice.value in _DYNAMIC_EXEC_BYPASS
             ):
                 caps.add("dynamic_exec")
         elif isinstance(node, ast.keyword):
@@ -204,8 +214,8 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
             if node.arg == "shell" and isinstance(node.value, ast.Constant) and node.value.value:
                 caps.add("external_binary")
         elif isinstance(node, ast.Constant):
-            # 任意字符串中的 runas 都是自行提权信号。
-            if isinstance(node.value, str) and _ELEVATION_VERB in node.value.lower():
+            # 只认恰好等于 runas 的字符串，包含子串的文案不该拒载插件。
+            if isinstance(node.value, str) and node.value.strip().lower() == _ELEVATION_VERB:
                 caps.add("self_elevation")
     return caps
 
@@ -336,7 +346,7 @@ def scan_borrowed_privilege(py_file_path: str) -> list[str]:
 
 
 def verify_plugin_sig(plugin_dir: str, origin: str = "builtin") -> bool:
-    """校验插件签名文件和签名覆盖的源码清单"""
+    """校验插件签名文件和签名覆盖的源码清单，任何异常都按验签失败处理"""
     try:
         from notmyfault.security.signing_keys import get_public_keys
         pub_keys = get_public_keys()
@@ -344,16 +354,19 @@ def verify_plugin_sig(plugin_dir: str, origin: str = "builtin") -> bool:
             return False
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
         pubs = [Ed25519PublicKey.from_public_bytes(k) for k in pub_keys]
-    except ImportError:
+    except Exception:
         return False
     sig_file = os.path.join(plugin_dir, "signature.sig")
     if not os.path.exists(sig_file):
         return False
-    with open(sig_file, "rb") as f:
-        sig = f.read()
-    # 签名和校验使用同一份文件清单，合法签名才能通过校验。
-    from notmyfault.security.signing import plugin_files
-    payload = b"".join(f.read_bytes() for f in plugin_files(plugin_dir))
+    try:
+        with open(sig_file, "rb") as f:
+            sig = f.read()
+        # 签名和校验使用同一份文件清单，合法签名才能通过校验。
+        from notmyfault.security.signing import plugin_files
+        payload = b"".join(f.read_bytes() for f in plugin_files(plugin_dir))
+    except OSError:
+        return False
     digest = hashlib.sha256(payload).digest()
     for pub in pubs:
         try:
@@ -421,14 +434,13 @@ def verify_plugin_integrity(
             messages.append("无法读取 " + file_type)
             all_match = False
             continue
-        if plugin_id in manifest:
-            expected_hash = existing.get(file_type)
-            if expected_hash is not None and current_hash != expected_hash:
-                messages.append(file_type + " 文件已被修改！（期望 " + expected_hash[:12] + "...）")
-                all_match = False
-        if plugin_id not in manifest:
-            manifest[plugin_id] = {}
-        manifest[plugin_id][file_type] = current_hash
+        expected_hash = existing.get(file_type)
+        if expected_hash is not None and current_hash != expected_hash:
+            messages.append(file_type + " 文件已被修改！（期望 " + expected_hash[:12] + "...）")
+            all_match = False
+            # 不匹配时保留旧基线，否则篡改一次后下次就静默了
+            continue
+        manifest.setdefault(plugin_id, {})[file_type] = current_hash
     save_plugin_manifest(manifest)
     if not all_match:
         return False, "；".join(messages)

@@ -1,4 +1,3 @@
-import ast
 import json
 import os
 import re
@@ -421,6 +420,11 @@ def scan_plugins(base_dir: str, plugins_dir: str, json_filename: str) -> Dict[st
         return result
 
     for folder_name in sorted(os.listdir(root)):
+        # 与加载器一致，跳过解释器和开发工具生成的目录。
+        if folder_name.startswith(".") or folder_name in (
+            "__pycache__", "__pypackages__", "node_modules",
+        ):
+            continue
         folder_path = os.path.join(root, folder_name)
         if not os.path.isdir(folder_path):
             continue
@@ -442,7 +446,7 @@ def scan_plugins(base_dir: str, plugins_dir: str, json_filename: str) -> Dict[st
         if meta.get("enabled") is False:
             continue
 
-        plugin_type = "trigger" if plugins_dir == "triggers" else "action"
+        plugin_type = "trigger" if json_filename == "trigger.json" else "action"
         is_valid, _ = validate_plugin_meta(meta, plugin_type)
         if not is_valid:
             continue

@@ -232,7 +232,8 @@ class PluginLoader:
                 continue
 
             is_valid, errors = validate_plugin_meta(meta, plugin_type)
-            plugin_id = meta.get("id", folder_name)
+            # meta 可能是 JSON 数组等非 dict 类型，报错信息里退回目录名
+            plugin_id = meta.get("id", folder_name) if isinstance(meta, dict) else folder_name
             if not is_valid:
                 print(
                     f"[Engine] 插件 \"{plugin_id}\" schema 校验失败 ({json_file}):",
@@ -586,7 +587,14 @@ class PluginLoader:
                     engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason="setup() 执行异常")
                     continue
 
-            # 覆盖插件时先撤销旧模块授权，新模块 setup() 成功后再按声明授权。
+            # 新插件 setup() 成功后才调用旧插件 teardown()。
+            if prev is not None and prev[0] is not None and hasattr(prev[0], "teardown"):
+                try:
+                    prev[0].teardown()
+                except Exception:
+                    engine_warn(f"override teardown \"{plugin_id}\" 异常: {traceback.format_exc()[-200:]}")
+
+            # teardown 走完再撤销旧模块授权，随后按新模块声明授权。
             if prev is not None:
                 self._sudo.deauthorize_plugin(plugin_id, self._engine_token)
             if "admin" in (meta.get("permissions") or []):
@@ -598,13 +606,6 @@ class PluginLoader:
                 except PermissionError as e:
                     print(f"[Engine] [!!] 插件 \"{plugin_id}\" 管理员权限注册失败: {e}", file=sys.stderr)
                     engine_error("admin_registration_failed", plugin=plugin_id, error=str(e))
-
-            # 新插件 setup() 成功后才调用旧插件 teardown()。
-            if prev is not None and prev[0] is not None and hasattr(prev[0], "teardown"):
-                try:
-                    prev[0].teardown()
-                except Exception:
-                    engine_warn(f"override teardown \"{plugin_id}\" 异常: {traceback.format_exc()[-200:]}")
 
             version_info = (
                 f" v{meta['version_code']}"
