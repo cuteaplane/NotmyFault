@@ -2,6 +2,7 @@ import { ref } from 'vue'
 import { store } from '../lib/store'
 import { getEngineStatus, hasBridge } from '../lib/api'
 import { snackbar } from '../lib/notify'
+import { alertDialog, confirmDialog } from '../lib/dialog'
 
 // NavRail 快捷按钮和 HomeView 英雄卡片共用 starting、stopping 等状态。
 const starting = ref(false)
@@ -31,7 +32,7 @@ export function useEngineControl() {
       store.refreshSignal++ // 让各视图重新读取统计。
       snackbar(r.engine_running ? '自动化已启动' : '后台服务正在启动自动化')
     } catch (e) {
-      alert('启动失败: ' + e.message)
+      alertDialog('启动失败', e.message)
     } finally {
       starting.value = false
     }
@@ -48,7 +49,7 @@ export function useEngineControl() {
       syncStatus(status)
       snackbar(r.stopping ? '正在暂停自动化' : '自动化已暂停，后台服务仍在线')
     } catch (e) {
-      alert('暂停失败: ' + e.message)
+      alertDialog('暂停失败', e.message)
     } finally {
       stopping.value = false
     }
@@ -57,7 +58,7 @@ export function useEngineControl() {
   // 引擎进程退出后 API 会断开，独立的 Dashboard 仍可显示当前界面。
   async function shutdownEngine() {
     if (shuttingDown.value) return
-    if (!confirm('彻底退出引擎？将停止全部自动化，并关闭后台服务与托盘。')) return
+    if (!await confirmDialog('彻底退出引擎？', '将停止全部自动化，并关闭后台服务与托盘。', '退出')) return
     shuttingDown.value = true
     try {
       if (!hasBridge()) throw new Error('Dashboard 桌面桥接尚未就绪')
@@ -100,7 +101,7 @@ export function useEngineControl() {
       store.refreshSignal++
       snackbar('引擎已重启')
     } catch (e) {
-      alert('重启失败: ' + e.message)
+      alertDialog('重启失败', e.message)
     } finally {
       restarting.value = false
     }

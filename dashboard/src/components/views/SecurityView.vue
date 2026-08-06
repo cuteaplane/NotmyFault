@@ -6,7 +6,8 @@ import {
   getConfigSecurityStatus,
   approveConfigSecurity,
 } from '../../lib/api'
-import { snack } from '../../lib/notify'
+import { snackbar } from '../../lib/notify'
+import { alertDialog, confirmDialog } from '../../lib/dialog'
 
 const mode = ref('unknown')
 const modeMap = {
@@ -44,19 +45,19 @@ async function loadConfigSecurity() {
 }
 
 async function approveConfig() {
-  if (!confirm('请再次确认上方摘要中的规则均为你本人配置。确认无误后，当前配置将被原样重新签名，引擎恢复运行。')) return
+  if (!await confirmDialog('重新签名配置？', '请再次确认上方摘要中的规则均为你本人配置。确认无误后，当前配置将被原样重新签名，引擎恢复运行。', '重新签名')) return
   approving.value = true
   try {
     const r = await approveConfigSecurity()
     if (r.ok) {
-      snack(r.message || '配置已重新签名')
+      snackbar(r.message || '配置已重新签名')
       await loadConfigSecurity()
       await load()
     } else {
-      alert('重新签名失败: ' + (r.error || '未知错误'))
+      alertDialog('重新签名失败', r.error || '未知错误')
     }
   } catch (e) {
-    alert('重新签名失败: ' + e.message)
+    alertDialog('重新签名失败', e.message)
   } finally {
     approving.value = false
   }
@@ -132,9 +133,6 @@ onMounted(() => { load(); loadConfigSecurity() })
       <div class="mt-3 flex flex-wrap gap-2">
         <button class="btn btn-primary" :disabled="approving" @click="approveConfig">
           <span class="material-symbols-outlined">verified</span>{{ approving ? '重新签名中…' : '我已确认无误，重新签名' }}
-        </button>
-        <button class="btn btn-outlined btn-danger" :disabled="resetting" @click="resetConfig">
-          <span class="material-symbols-outlined">restart_alt</span>{{ resetting ? '恢复中…' : '恢复默认配置' }}
         </button>
       </div>
       <p class="mt-2 text-body-s text-on-surface-variant">当前内容已自动备份到 config.json.bak，可随时手动恢复。</p>

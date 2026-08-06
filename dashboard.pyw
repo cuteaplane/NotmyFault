@@ -1,4 +1,4 @@
-"""NotmyFault 的独立 Dashboard 进程通过 HTTP API 与引擎通信"""
+"""NotmyFault 的独立 Dashboard 进程，通过 HTTP API 与引擎通信"""
 import json
 import os
 import sys

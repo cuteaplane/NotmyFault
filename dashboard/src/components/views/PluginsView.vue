@@ -3,6 +3,7 @@ import { ref, computed, onMounted } from 'vue'
 import { store } from '../../lib/store'
 import { apiRead, apiWrite, loadPlugins, getSchema } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
+import { alertDialog, confirmDialog } from '../../lib/dialog'
 import PluginCard from '../PluginCard.vue'
 
 const tab = ref('triggers')
@@ -39,18 +40,18 @@ async function togglePlugin(pid) {
     const r = await apiWrite('/api/plugins/toggle', 'POST', { type: tab.value, id: pid })
     const d = await r.json()
     if (d.ok) { snackbar(d.restart_required ? '状态已更新，需重启引擎生效' : '状态已更新'); await refresh() }
-    else alert('操作失败: ' + (d.error || '未知错误'))
-  } catch (e) { alert('请求失败: ' + e.message) }
+    else alertDialog('操作失败', d.error || '未知错误')
+  } catch (e) { alertDialog('请求失败', e.message) }
 }
 
 async function uninstallPlugin(pid) {
-  if (!confirm('确定要卸载插件 "' + pid + '" 吗？此操作不可撤销。')) return
+  if (!await confirmDialog('卸载插件 "' + pid + '"？', '此操作不可撤销。', '卸载')) return
   try {
     const r = await apiWrite('/api/plugins/' + tab.value + '/' + pid, 'DELETE')
     const d = await r.json()
     if (d.ok) { snackbar('已卸载，需重启引擎生效'); await refresh() }
-    else alert('卸载失败: ' + (d.error || '未知错误'))
-  } catch (e) { alert('请求失败: ' + e.message) }
+    else alertDialog('卸载失败', d.error || '未知错误')
+  } catch (e) { alertDialog('请求失败', e.message) }
 }
 
 function openInstall() {
@@ -132,7 +133,7 @@ async function doInstall() {
       forceInstall.value = false
       await refresh()
     } else { installError.value = d.error || '安装失败，请重试' }
-  } catch (e) { alert('请求失败: ' + e.message) }
+  } catch (e) { alertDialog('请求失败', e.message) }
 }
 
 function onFilePicked(e) {

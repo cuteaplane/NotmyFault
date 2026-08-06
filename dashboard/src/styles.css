@@ -252,6 +252,12 @@ body:not(.controller-online) .nav-item.needs-engine{display:none}
 .sec-h{font:var(--ts-label);color:var(--md-on-surface-variant);margin:22px 0 4px;letter-spacing:.5px}
 .install-dialog{border:none;border-radius:var(--r-xl);padding:24px;max-width:420px;text-align:center;background:var(--md-surface-c-high);box-shadow:var(--md-elev3)}
 .modal-overlay{position:fixed;inset:0;background:var(--md-scrim);display:flex;align-items:center;justify-content:center;z-index:1000}
+.app-dialog{width:min(420px,calc(100vw - 48px));max-height:calc(100vh - 48px);overflow:auto;border:1px solid var(--md-outline-variant);border-radius:var(--r-lg);padding:24px;text-align:center;background:var(--md-surface-c-low);box-shadow:var(--md-elev3)}
+.app-dialog-ico{display:block;margin-bottom:12px;font-size:28px}
+.app-dialog-ico.tone-error{color:var(--md-error)}
+.app-dialog-ico.tone-warn{color:var(--md-warn)}
+.app-dialog-ico.tone-info{color:var(--md-primary)}
+.app-dialog .dialog-sub{margin-bottom:16px;white-space:pre-line;word-break:break-word}
 
 
 /* 页面切换使用淡入和轻微上移，一级导航仍保持原位。 */

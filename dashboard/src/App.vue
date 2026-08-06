@@ -7,6 +7,7 @@ import SecurityView from './components/views/SecurityView.vue'
 import RulesView from './components/views/RulesView.vue'
 import LogsView from './components/views/LogsView.vue'
 import AboutView from './components/views/AboutView.vue'
+import AppDialog from './components/AppDialog.vue'
 import { store } from './lib/store'
 import { snack } from './lib/notify'
 import { loadConfig, loadPlugins, getSchema, getEngineStatus } from './lib/api'
@@ -196,4 +197,5 @@ onUnmounted(() => {
     </Transition>
   </main>
   <div class="snackbar" :class="{ show: snack.show }">{{ snack.msg }}</div>
+  <AppDialog />
 </template>

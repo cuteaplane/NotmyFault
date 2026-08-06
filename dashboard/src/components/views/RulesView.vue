@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { store } from '../../lib/store'
 import { runRule, saveConfig } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
+import { alertDialog, confirmDialog } from '../../lib/dialog'
 import { normalizeRuleDraft } from '../../lib/utils'
 import { ensureRuleBindingIds, requestTestContext } from '../../lib/bindings'
 import RuleEditor from '../RuleEditor.vue'
@@ -51,8 +52,8 @@ function addRule() {
   })
   baseline.value = JSON.stringify(draftRule.value)
 }
-function leaveEditor() {
-  if (isDirty.value && !confirm('这条规则还有未保存的修改。要放弃这些修改吗？')) return
+async function leaveEditor() {
+  if (isDirty.value && !await confirmDialog('要放弃这些修改吗？', '这条规则还有未保存的修改。', '放弃')) return
   activeRuleIndex.value = null
   draftRule.value = null
   baseline.value = ''
@@ -104,18 +105,18 @@ async function doSave(runAfter = false) {
       await runManualRule(savedIndex, savedRules[savedIndex])
     }
   } catch (error) {
-    alert('保存失败: ' + error.message)
+    alertDialog('保存失败', error.message)
   }
 }
 async function deleteRule(index) {
-  if (!confirm('确定删除这条规则吗？此操作将在保存后立即生效。')) return
+  if (!await confirmDialog('删除这条规则吗？', '此操作将在保存后立即生效。', '删除')) return
   try {
     const nextRules = clone(store.configData.rules)
     nextRules.splice(index, 1)
     await persistRules(nextRules, '规则已删除')
     if (activeRuleIndex.value === index) leaveEditorAfterDelete()
   } catch (error) {
-    alert('删除失败: ' + error.message)
+    alertDialog('删除失败', error.message)
   }
 }
 async function deleteActiveRule() {
@@ -139,9 +140,9 @@ async function runManualRule(index, ruleSnapshot = null) {
       result = await runRule(index, snapshot, testContext)
     }
     if (result.ok) snackbar(result.message ? `测试已启动：${result.message}` : '规则测试已启动')
-    else alert('规则测试失败: ' + (result.error || '未知错误'))
+    else alertDialog('规则测试失败', result.error || '未知错误')
   } catch (error) {
-    alert('规则测试失败: ' + error.message)
+    alertDialog('规则测试失败', error.message)
   } finally {
     runningRuleIndex.value = null
   }
