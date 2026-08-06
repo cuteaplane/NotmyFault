@@ -1,3 +1,3 @@
-"""NotmyFault 产品版本的唯一 Python 侧来源"""
+"""NotmyFault 版本"""
 
-__version__ = "alpha-0.12.3fix"
+__version__ = "alpha-0.12.5"
