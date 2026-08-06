@@ -20,15 +20,23 @@ venv/
 .venv/
 env/
 
+# AI agent 配置与产物（一切与 AI agent 有关的内容）
+.agents/
+.claude/
+.opencode/
+.qoder/
+.cursor/
+agent_docs/
+agent_files/
+AGENTS.md
+
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-.agents/
 .pytest_cache/
-.qoder/
 
 # OS
 .DS_Store
@@ -42,10 +50,9 @@ Desktop.ini
 .opencode-*.job.json
 .opencode-*.stdout.log
 .opencode-*.stderr.log
-.opencode/
 *.sig
-tests/
-.claude/
+# 锚定到仓库根，避免误伤 notmyfault/tests 包内测试
+/tests/
 .coverage
 .private/
 build.json
@@ -58,8 +65,3 @@ DECOUPLING.md
 sandbox_appdata/
 
 .git_commit_msg.txt
-
-# agent 临时规范文档（不提交，不归档）
-agent_docs/
-agent_files/
-AGENTS.md
