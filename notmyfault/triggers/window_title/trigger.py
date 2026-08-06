@@ -1,32 +1,19 @@
 import ctypes
-from ctypes import wintypes
 
 from notmyfault.triggers.base import PollingTrigger
 
 
 def _get_window_titles() -> dict:
     """枚举所有可见窗口，返回 {hwnd: title} 字典"""
-    user32 = ctypes.windll.user32
-    # 显式声明参数/返回类型，多线程并发调用 ctypes 的前提
-    if not getattr(user32, "_nmf_typed", False):
-        user32.IsWindowVisible.argtypes = [wintypes.HWND]
-        user32.IsWindowVisible.restype = wintypes.BOOL
-        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-        user32.GetWindowTextLengthW.restype = ctypes.c_int
-        user32.GetWindowTextW.argtypes = [wintypes.HWND, ctypes.c_wchar_p, ctypes.c_int]
-        user32.GetWindowTextW.restype = ctypes.c_int
-        user32.EnumWindows.argtypes = [ctypes.c_void_p, wintypes.LPARAM]
-        user32.EnumWindows.restype = wintypes.BOOL
-        user32._nmf_typed = True
-    titles = {}
-
-    # NATIVE_LOCK 保护 ctypes 调用，共享引用表在多线程下存在竞态
-    from notmyfault.native import NATIVE_LOCK
+    # argtypes 声明在 notmyfault.native，多线程并发调用 ctypes 时持锁
+    from notmyfault.native import NATIVE_LOCK, typed_user32
+    user32 = typed_user32()
     with NATIVE_LOCK:
         return _get_window_titles_locked(user32)
 
 
 def _get_window_titles_locked(user32) -> dict:
+    from notmyfault.native import WNDENUMPROC
     titles = {}
 
     def enum_callback(hwnd, _):
@@ -40,7 +27,6 @@ def _get_window_titles_locked(user32) -> dict:
                     titles[hwnd] = title
         return True  # 继续枚举
 
-    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     user32.EnumWindows(WNDENUMPROC(enum_callback), 0)
     return titles
 

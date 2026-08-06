@@ -8,7 +8,7 @@
     "version": "1.1",
     "package_name": "io.github.notmyfault.system_resource",
     "enabled": true,
-    "permissions": ["native_api"],
+    "permissions": [],
     "outputs": [
         {"name": "resource", "label": "资源类型", "type": "string"},
         {"name": "value", "label": "当前数值", "type": "number"},

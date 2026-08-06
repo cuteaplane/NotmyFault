@@ -7,6 +7,11 @@ class _LASTINPUTINFO(ctypes.Structure):
     _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
 
 
+if os.name == "nt":
+    # GetTickCount 默认按 c_int 返回，运行 25 天后变负数，用 64 位版本
+    ctypes.windll.kernel32.GetTickCount64.restype = ctypes.c_ulonglong
+
+
 def _get_idle_seconds() -> float:
     """返回自最后输入事件起的系统空闲秒数"""
     if os.name != "nt":
@@ -16,7 +21,7 @@ def _get_idle_seconds() -> float:
     lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)
     if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
         return 0.0
-    tick = ctypes.windll.kernel32.GetTickCount()
+    tick = ctypes.windll.kernel32.GetTickCount64()
     return (tick - lii.dwTime) / 1000.0
 
 

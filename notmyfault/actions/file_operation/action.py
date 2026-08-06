@@ -88,10 +88,13 @@ def run(action_info, params):
     elif operation == "compress":
         if not dest:
             dest = source + ".zip"
+        # make_archive 只会产出 base + ".zip"，目标名不带 .zip 时产物会换名字
+        if not dest.lower().endswith(".zip"):
+            dest += ".zip"
         _ensure_copy_safe(source, dest)
         base = os.path.splitext(dest)[0]
         shutil.make_archive(base, "zip", source)
-        print(f"[Action:file_operation] 压缩完成: {base}.zip")
+        print(f"[Action:file_operation] 压缩完成: {dest}")
 
     elif operation == "extract":
         target = dest or source + "_extracted"

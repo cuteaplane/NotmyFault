@@ -36,6 +36,9 @@ def run(action_info, params):
     target = str(params.get("target_path", "") or "").strip()
     if not name:
         raise ValueError("未指定快捷方式名称")
+    # name 会拼进 Join-Path，带分隔符就能写到桌面和开始菜单之外
+    if any(ch in name for ch in ("\\", "/", ":")) or ".." in name:
+        raise ValueError(f"快捷方式名称不合法: {name!r}")
     if not target:
         raise ValueError("未指定快捷方式目标路径")
     location = str(params.get("location", "desktop") or "desktop")

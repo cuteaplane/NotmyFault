@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 
 _MAX_FILES = 5000
+_MAX_OBSERVATIONS = 64
 _observations: Dict[str, Tuple[Tuple[Tuple[str, int, int], ...], float]] = {}
 
 _GENERIC_TITLES = {
@@ -102,9 +103,10 @@ def _visible_editing_windows() -> Iterable[str]:
     except ImportError as exc:
         raise RuntimeError("缺少 psutil，无法检查文档窗口") from exc
 
-    user32 = ctypes.windll.user32
+    from notmyfault.native import NATIVE_LOCK, WNDENUMPROC, typed_user32
+
+    user32 = typed_user32()
     titles: List[str] = []
-    callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
     def visit(hwnd, _lparam):
         if not user32.IsWindowVisible(hwnd):
@@ -125,8 +127,10 @@ def _visible_editing_windows() -> Iterable[str]:
             titles.append(f"{process_name}: {title}")
         return True
 
-    if not user32.EnumWindows(callback_type(visit), None):
-        raise RuntimeError("EnumWindows 失败")
+    # ctypes 共享函数对象的调用约定要持 NATIVE_LOCK
+    with NATIVE_LOCK:
+        if not user32.EnumWindows(WNDENUMPROC(visit), 0):
+            raise RuntimeError("EnumWindows 失败")
     return titles
 
 
@@ -149,6 +153,9 @@ def check_precondition(_meta: Dict[str, Any], params: Dict[str, Any], _context: 
     previous = _observations.get(key)
     if previous is None or previous[0] != snapshot:
         _observations[key] = (snapshot, now)
+        # 目录多了以后淘汰最早记录的条目，观察中的目录被踢掉只是重新计时
+        if len(_observations) > _MAX_OBSERVATIONS:
+            _observations.pop(next(iter(_observations)), None)
         return {
             "ok": False,
             "reason": f"目录文件刚发生变化，等待静默 {int(quiet_seconds)} 秒",

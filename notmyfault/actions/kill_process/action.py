@@ -50,11 +50,14 @@ def run(action_info, params):
         except psutil.NoSuchProcess:
             continue
 
-    if denied:
+    if killed == 0 and denied:
+        # 一个都没杀掉且全被拒，才算失败；杀了一部分时把 denied 带回结果
         raise RuntimeError(f"{denied} 个进程因权限不足未能终止（可能需管理员权限）")
+    if denied:
+        print(f"[Action:kill_process] 另有 {denied} 个进程因权限不足未能终止")
     if killed == 0:
         # 进程本来就不存在，视为成功
         print(f"[Action:kill_process] 未找到运行中的进程: {process_name}")
-        return {"killed": 0}
+        return {"killed": 0, "denied": denied}
     print(f"[Action:kill_process] 共终止了 {killed} 个进程")
-    return {"killed": killed}
+    return {"killed": killed, "denied": denied}

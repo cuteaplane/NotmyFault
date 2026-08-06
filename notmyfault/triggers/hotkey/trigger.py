@@ -94,7 +94,8 @@ class HotkeyTrigger(PollingTrigger):
 
     def setup(self):
         self._hkid = 1
-        if not user32.RegisterHotKey(None, self._hkid, self._mod, self._vk):
+        # MOD_NOREPEAT：长按时只发一条 WM_HOTKEY，不按键盘重复率连续触发
+        if not user32.RegisterHotKey(None, self._hkid, self._mod | MOD_NOREPEAT, self._vk):
             raise RuntimeError(f"热键注册失败（可能与其他程序冲突）: {self._raw}")
         self.log(f"已注册热键: {self._raw}")
 

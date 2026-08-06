@@ -2,10 +2,7 @@
 SetWindowPos 使用 HWND_TOPMOST 和 HWND_NOTOPMOST，ctypes 调用声明 argtypes 和 restype 并持有 NATIVE_LOCK
 """
 
-import ctypes
-from ctypes import wintypes
-
-from notmyfault.native import NATIVE_LOCK
+from notmyfault.native import NATIVE_LOCK, WNDENUMPROC, typed_user32
 
 HWND_TOPMOST = -1
 HWND_NOTOPMOST = -2
@@ -15,31 +12,13 @@ SWP_NOACTIVATE = 0x0010
 GWL_EXSTYLE = -20
 WS_EX_TOPMOST = 0x00000008
 
-WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-# 模块加载时声明 argtypes 和 restype，调用时直接复用
-user32 = ctypes.windll.user32
-user32.IsWindowVisible.argtypes = [wintypes.HWND]
-user32.IsWindowVisible.restype = wintypes.BOOL
-user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-user32.GetWindowTextLengthW.restype = ctypes.c_int
-user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-user32.GetWindowTextW.restype = ctypes.c_int
-user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
-user32.EnumWindows.restype = wintypes.BOOL
-user32.GetForegroundWindow.argtypes = []
-user32.GetForegroundWindow.restype = wintypes.HWND
-user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
-user32.GetWindowLongW.restype = wintypes.LONG
-user32.SetWindowPos.argtypes = [
-    wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
-    ctypes.c_int, ctypes.c_int, wintypes.UINT,
-]
-user32.SetWindowPos.restype = wintypes.BOOL
+# argtypes 统一在 notmyfault.native 声明，多个插件共用同一套声明
+user32 = typed_user32()
 
 
 def _find_windows_by_title(keyword: str):
     """通过标题模糊匹配查找所有可见窗口句柄"""
+    import ctypes
     found = []
 
     def _callback(hwnd, _lparam):

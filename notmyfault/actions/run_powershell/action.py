@@ -1,6 +1,15 @@
 import subprocess
 import sys
 
+# 命令输出会进规则上下文和日志，全量保留大输出会撑爆内存
+_MAX_OUTPUT = 100 * 1024
+
+
+def _truncate(text: str) -> str:
+    if len(text) <= _MAX_OUTPUT:
+        return text
+    return text[:_MAX_OUTPUT] + f"...（已截断，共 {len(text)} 字符）"
+
 
 def run(action_info, params):
     command = params.get("command", "")
@@ -37,7 +46,11 @@ def run(action_info, params):
 
     if result.returncode != 0:
         raise RuntimeError(
-            f"命令执行失败 (code={result.returncode}): {result.stderr.strip()}"
+            f"命令执行失败 (code={result.returncode}): {_truncate(result.stderr.strip())}"
         )
     print(f"[Action:run_powershell] 执行成功")
-    return {"returncode": 0, "stdout": result.stdout, "stderr": result.stderr}
+    return {
+        "returncode": 0,
+        "stdout": _truncate(result.stdout),
+        "stderr": _truncate(result.stderr),
+    }

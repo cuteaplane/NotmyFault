@@ -20,6 +20,9 @@ def run(action_info, params):
         if not _SCHEME_RE.match(url):
             # 未写协议头时按域名补上 https://
             url = "https://" + url
+        elif not url.lower().startswith(("http://", "https://")):
+            # 自定义协议头会拉起任意注册程序，只放行 http/https
+            raise ValueError(f"只支持 http/https 链接: {url}")
         print(f"[Action:open_url] 打开: {url}")
         if webbrowser.open(url, new=1 if new_window else 0):
             opened.append(url)

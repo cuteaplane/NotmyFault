@@ -158,17 +158,28 @@ def run(action_info, params):
                 row_bgr[2:width * 3:3] = src[2:width * 4:4]      # R
                 f.write(row_bgr)
 
-        if fmt == "jpg":
+        # GDI 截图产出的是 BMP 字节流，png/jpg 目标格式要经 Pillow 转码
+        fmt_lower = fmt.lower()
+        if fmt_lower in ("png", "jpg", "jpeg"):
             try:
                 from PIL import Image
-                img = Image.open(output_path)
-                jpg_path = output_path.replace(".png", ".jpg").replace(".bmp", ".jpg")
-                img.convert("RGB").save(jpg_path, "JPEG", quality=92)
-                if jpg_path != output_path:
+                suffix = ".jpg" if fmt_lower in ("jpg", "jpeg") else ".png"
+                target = os.path.splitext(output_path)[0] + suffix
+                with Image.open(output_path) as img:
+                    if suffix == ".jpg":
+                        img.convert("RGB").save(target, "JPEG", quality=92)
+                    else:
+                        img.save(target, "PNG")
+                if os.path.abspath(target) != os.path.abspath(output_path):
                     os.remove(output_path)
-                    output_path = jpg_path
+                output_path = target
             except ImportError:
-                print("[Action:screenshot] JPG 转换需要 Pillow 库，已保存为 BMP")
+                # 没装 Pillow 时只能保留 BMP，扩展名改成真实的 .bmp
+                bmp_path = os.path.splitext(output_path)[0] + ".bmp"
+                if bmp_path != output_path:
+                    os.replace(output_path, bmp_path)
+                    output_path = bmp_path
+                print("[Action:screenshot] png/jpg 转换需要 Pillow 库，已保存为 BMP")
 
         print(f"[Action:screenshot] 截图已保存: {output_path}")
         return output_path

@@ -7,6 +7,11 @@ def run(meta, config, emit_event, shutdown_event):
     trigger_id = meta.get("id", "usb_insert")
     print(f"[Trigger:{trigger_id}] U盘监视雷达已启动！")
     expected_drive = config.get("drive_letter", "").strip().upper()
+    # 用户填 "e" 或 "E:" 都归一成 E:，和扫描出来的盘符格式对齐
+    if expected_drive and expected_drive != "ANY":
+        letter = expected_drive.rstrip(":")
+        if len(letter) == 1 and letter.isalpha():
+            expected_drive = letter + ":"
 
     def get_removable_drives():
         drives = set()

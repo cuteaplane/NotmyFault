@@ -101,7 +101,7 @@ if ($target -ne 'query' -and $actual -ne $target) {{
 def _run_powershell(script: str) -> tuple[int, str, str]:
     try:
         completed = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
             capture_output=True,
             text=True,
             errors="replace",

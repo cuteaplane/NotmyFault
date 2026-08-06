@@ -191,8 +191,14 @@ class PowerStateTrigger(PollingTrigger):
     def setup(self):
         self.target_state = self.config.get("state", "ac")
         self.log(f"开始监控电源状态，目标: {self.target_state}")
-        # resume 只在 Windows 上通过电源广播消息实现
-        self.power_window = _create_power_event_window() if os.name == "nt" else None
+        # resume 只在 Windows 上通过电源广播消息实现；
+        # 建窗口也要改共享 user32 函数对象，和 poll 一样持 NATIVE_LOCK
+        if os.name == "nt":
+            from notmyfault.native import NATIVE_LOCK
+            with NATIVE_LOCK:
+                self.power_window = _create_power_event_window()
+        else:
+            self.power_window = None
         if self.target_state == "resume" and self.power_window is None:
             self.log("当前平台不支持睡眠恢复事件监听，resume 规则不会触发")
         try:
@@ -229,7 +235,9 @@ class PowerStateTrigger(PollingTrigger):
             self._low_battery_active = False
 
     def teardown(self):
-        _destroy_power_event_window(self.power_window)
+        from notmyfault.native import NATIVE_LOCK
+        with NATIVE_LOCK:
+            _destroy_power_event_window(self.power_window)
 
 
 def run(meta, config, emit_event, shutdown_event):
