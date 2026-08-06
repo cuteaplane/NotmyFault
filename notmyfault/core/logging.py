@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import threading
+from collections import deque
 from datetime import datetime
 from typing import Any, Dict
 
@@ -172,13 +173,14 @@ def read_log_entries(log_path: str, lines: int = 500) -> list[Dict[str, Any]]:
     """读取日志末尾指定行数并返回解析后的条目"""
     entries: list[Dict[str, Any]] = []
     try:
+        # deque 边读边丢尾部，日志再大也不会全部堆进内存
         with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-            raw_lines = f.readlines()
-        for line in raw_lines[-lines:]:
+            raw_lines = deque(f, maxlen=lines)
+        for line in raw_lines:
             entry = parse_log_line(line)
             if entry is not None:
                 entries.append(entry)
-    except FileNotFoundError:
+    except OSError:
         pass
     return entries
 

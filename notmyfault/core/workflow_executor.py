@@ -10,6 +10,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from notmyfault.core.bindings import (
     BindingResolutionError,
+    contains_legacy_template,
+    is_reference,
     references_available,
     resolve_value,
 )
@@ -22,6 +24,21 @@ MappingProvider = Callable[[], Dict[str, Any]]
 ShutdownProvider = Callable[[], "threading.Event | None"]
 EventSink = Callable[[str, Dict[str, Any]], None]
 WorkflowCallback = Callable[..., Any]
+SensitiveProvider = Callable[[Dict[str, Any]], set]
+
+
+def _mask_sensitive(value: Any, sensitive_values: set) -> Any:
+    """把结构里与敏感值相等的字符串换成掩码，只用于事件推送"""
+    if isinstance(value, str):
+        return "***" if value and value in sensitive_values else value
+    if isinstance(value, dict):
+        return {
+            key: _mask_sensitive(item, sensitive_values)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_mask_sensitive(item, sensitive_values) for item in value]
+    return value
 
 
 class WorkflowExecutor:
@@ -41,6 +58,7 @@ class WorkflowExecutor:
         execute_workflow: WorkflowCallback,
         execute_actions: WorkflowCallback,
         run_action: WorkflowCallback,
+        sensitive_values: Optional[SensitiveProvider] = None,
     ) -> None:
         self._actions_meta = actions_meta
         self._actions_funcs = actions_funcs
@@ -53,6 +71,7 @@ class WorkflowExecutor:
         self._execute_workflow = execute_workflow
         self._execute_actions = execute_actions
         self._run_action = run_action
+        self._sensitive_values = sensitive_values
 
         self._active_actions = 0
         self.action_lock = threading.Lock()
@@ -91,7 +110,12 @@ class WorkflowExecutor:
             )
             return
         if not ready:
-            delay = min(max(retry_after or 60, 5), 3600)
+            # 插件可能返回非数字的 retry_after_seconds，转不了就用默认 60s
+            try:
+                delay = float(retry_after)
+            except (TypeError, ValueError):
+                delay = 60.0
+            delay = min(max(delay, 5), 3600)
             self._on_event(
                 "workflow_deferred",
                 {
@@ -279,6 +303,37 @@ class WorkflowExecutor:
             return False, "引擎正在关闭"
 
         action_type = action.get("type")
+        if action_type == "run_powershell":
+            raw_params = action.get("params", {})
+            raw_command = (
+                raw_params.get("command") if isinstance(raw_params, dict) else None
+            )
+            # 写入侧只拦了 $ref，旧模板字符串在这里兜底
+            if is_reference(raw_command) or contains_legacy_template(raw_command):
+                self._diagnostics.inc_action_fail()
+                engine_error(
+                    "unsafe_dynamic_parameter",
+                    action_type=action_type,
+                    rule_name=rule_name,
+                    error="PowerShell 命令不允许来自运行时数据",
+                )
+                self._on_event(
+                    "workflow_failed",
+                    {
+                        "action_type": action_type,
+                        "rule_name": rule_name,
+                        "error": {
+                            "code": "unsafe_dynamic_parameter",
+                            "location": "actions.run_powershell.params.command",
+                            "message": "PowerShell 命令不允许来自运行时数据",
+                        },
+                    },
+                )
+                print(
+                    f"[Engine] [!!] 拦截 run_powershell 动态命令: {rule_name}",
+                    file=sys.stderr,
+                )
+                return False, "PowerShell 命令不允许来自运行时数据"
         try:
             params = resolve_value(
                 action.get("params", {}),
@@ -333,6 +388,10 @@ class WorkflowExecutor:
                 traceback.print_exc(file=sys.stderr)
 
         with self.action_lock:
+            # 在锁内再查一次 shutdown，堵住检查后、计数前被并发关闭的窗口
+            shutdown_event = self._shutdown_event()
+            if shutdown_event and shutdown_event.is_set():
+                return False, "引擎正在关闭"
             self._active_actions += 1
 
         try:
@@ -346,11 +405,18 @@ class WorkflowExecutor:
                         action_func, module, action_meta, params, context
                     )
                     self._diagnostics.inc_action_ok()
+                    if self._sensitive_values is not None:
+                        hidden = self._sensitive_values(context)
+                        event_params = (
+                            _mask_sensitive(params, hidden) if hidden else params
+                        )
+                    else:
+                        event_params = params
                     self._on_event(
                         "action_executed",
                         {
                             "action_type": action_type,
-                            "params": params,
+                            "params": event_params,
                             "rule_name": rule_name,
                             "status": "ok",
                             "result": result,
@@ -398,21 +464,22 @@ class WorkflowExecutor:
             with self.action_done:
                 self.action_done.notify_all()
 
-    def wait_active_actions(self, timeout: float = 60.0) -> None:
+    def wait_active_actions(self, timeout: float = 60.0) -> bool:
+        """等待活跃动作排空，返回是否在超时内全部完成"""
         print("[Engine] 正在关闭，等待活跃动作完成...")
         deadline = time.time() + timeout
         while True:
             remaining = self.active_actions
             if remaining == 0:
-                break
+                print("[Engine] 所有动作已完成，引擎安全关闭")
+                return True
             if time.time() >= deadline:
                 print(
                     f"[Engine] [!!] shutdown: {remaining} active action(s) still "
                     f"running after {timeout}s, forcing exit",
                     file=sys.stderr,
                 )
-                break
+                return False
             print(f"[Engine] 等待 {remaining} 个活跃动作完成...")
             with self.action_done:
                 self.action_done.wait(timeout=3)
-        print("[Engine] 所有动作已完成，引擎安全关闭")

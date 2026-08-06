@@ -179,15 +179,18 @@ class TriggerSupervisor:
                 if remaining > 0:
                     thread.join(timeout=remaining)
                 if thread.is_alive():
-                    failures = self._stop_failures.get(event_type, 0) + 1
-                    self._stop_failures[event_type] = failures
+                    # _stop_failures 的读写统一在 _lock 内，health() 也用它
+                    with self._lock:
+                        failures = self._stop_failures.get(event_type, 0) + 1
+                        self._stop_failures[event_type] = failures
                     print(
                         f"[Engine] [!!] 触发器线程 {event_type}"
                         f" 未在 {timeout}s 内退出（连续 {failures} 次）",
                         file=sys.stderr,
                     )
                 else:
-                    self._stop_failures.pop(event_type, None)
+                    with self._lock:
+                        self._stop_failures.pop(event_type, None)
 
             alive = {et for et, thread in threads if thread.is_alive()}
             remaining_alive = set(alive)

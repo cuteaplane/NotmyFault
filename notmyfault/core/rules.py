@@ -6,7 +6,11 @@ import time
 import re
 from typing import Any, Dict, Iterable, List, Tuple
 
-from notmyfault.core.bindings import is_reference, iter_references
+from notmyfault.core.bindings import (
+    contains_legacy_template,
+    is_reference,
+    iter_references,
+)
 
 
 _BINDING_ID_RE = re.compile(r"^[tap]_[a-z0-9_]{6,64}$")
@@ -520,6 +524,17 @@ def validate_rule_bindings(
         if not isinstance(params, dict):
             return
         for param_name, value in params.items():
+            if (
+                item.get("type") == "run_powershell"
+                and param_name == "command"
+                and contains_legacy_template(value)
+            ):
+                issues.append({
+                    "code": "unsafe_dynamic_parameter",
+                    "location": f"{field}[{item_index}].params.{param_name}",
+                    "reference": None,
+                    "message": "PowerShell 命令不允许来自运行时数据",
+                })
             for usage in iter_references(
                 value,
                 location=f"{field}[{item_index}].params.{param_name}",

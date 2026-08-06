@@ -68,6 +68,11 @@ class AutomationEngine:
         self._sudo = _sudo
         self._engine_token: str = _sudo.begin_engine_session()
         self._privilege_session_closed = False
+        self._close_lock = threading.Lock()
+        # 关闭时若还有线程没退干净，跳过撤销权限，免得截断仍在跑的动作
+        self._shutdown_clean = True
+        self._manual_threads: List[threading.Thread] = []
+        self._manual_threads_lock = threading.Lock()
         self._security_mode = _detect_security_mode()
         engine_info(f"Security mode: {self._security_mode.value}")
         self._plugin_integrity_errors: list[str] = []
@@ -112,6 +117,7 @@ class AutomationEngine:
             execute_workflow=lambda *args: self.execute_workflow(*args),
             execute_actions=lambda *args: self.execute_actions(*args),
             run_action=lambda *args: self._run_action(*args),
+            sensitive_values=self._collect_sensitive_values,
         )
         # 旧扩展和测试仍直接读取这些同步对象
         self._action_lock = self._workflow_executor.action_lock
@@ -235,15 +241,12 @@ class AutomationEngine:
                 "trigger_crashed",
                 {"trigger_id": trigger_id, "instance_id": instance_id, "error": err[-500:]},
             )
-            try:
-                from notmyfault.host.alert import alert_user
-                alert_user(
-                    f"触发器 {instance_id} 崩溃",
-                    err[-200:],
-                    open_dashboard=False,
-                )
-            except Exception:
-                pass
+            # _alert_user 自己会记录告警失败，不再静默吞掉
+            self._alert_user(
+                f"触发器 {instance_id} 崩溃",
+                err[-200:],
+                open_dashboard=False,
+            )
 
     def get_diagnostics(self) -> Dict[str, Any]:
         """返回当前诊断数据供 Dashboard 展示"""
@@ -411,8 +414,10 @@ class AutomationEngine:
             return
 
         semantic = self.triggers_meta.get(event_type, {}).get("semantic", "oneshot")
+        # 声明 sensitive 的输出字段不写明文，日志和事件推送都用掉过掩码的副本
+        masked_payload = self._mask_event_payload(event_type, event_payload)
         print(
-            f"[EventBus] 收到广播事件: [{event_type}] ({semantic}) -> {event_payload}"
+            f"[EventBus] 收到广播事件: [{event_type}] ({semantic}) -> {masked_payload}"
         )
 
         with self._rules_lock:
@@ -437,7 +442,7 @@ class AutomationEngine:
                 {
                     "rule_name": rule_name,
                     "event_type": event_type,
-                    "event_payload": event_payload,
+                    "event_payload": masked_payload,
                 },
             )
             context = build_context(
@@ -456,6 +461,51 @@ class AutomationEngine:
             engine_warn("忽略格式无效的外部事件")
             return
         self.emit_event(event_type, event_payload)
+
+    def _mask_event_payload(
+        self, event_type: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """把触发器 outputs 声明 sensitive 的字段换成掩码再对外输出"""
+        outputs = self.triggers_meta.get(event_type, {}).get("outputs") or []
+        sensitive_names = {
+            output.get("name")
+            for output in outputs
+            if isinstance(output, dict) and output.get("sensitive") is True
+        }
+        if not sensitive_names or not isinstance(payload, dict):
+            return payload
+        masked = dict(payload)
+        for name in sensitive_names:
+            if name in masked:
+                masked[name] = "***"
+        return masked
+
+    def _collect_sensitive_values(self, context: Dict[str, Any]) -> set:
+        """收集上下文里声明 sensitive 的字段当前值，用于掩码动作参数"""
+        values: set = set()
+
+        def collect(meta: Dict[str, Any], payload: Any) -> None:
+            if not isinstance(payload, dict):
+                return
+            for output in meta.get("outputs") or []:
+                if not isinstance(output, dict) or output.get("sensitive") is not True:
+                    continue
+                value = payload.get(output.get("name"))
+                if isinstance(value, str) and value:
+                    values.add(value)
+
+        event = context.get("event") or {}
+        collect(
+            self.triggers_meta.get(event.get("type", ""), {}),
+            event.get("payload"),
+        )
+        for trigger in (context.get("triggers") or {}).values():
+            if isinstance(trigger, dict):
+                collect(
+                    self.triggers_meta.get(trigger.get("type", ""), {}),
+                    trigger.get("payload"),
+                )
+        return values
 
     def run_manual_rule(self, rule_index: int) -> tuple[bool, str]:
         """从 Dashboard 立即执行指定规则"""
@@ -511,12 +561,19 @@ class AutomationEngine:
             "event_type": "manual",
             "event_payload": manual_payload,
         })
-        threading.Thread(
+        thread = threading.Thread(
             target=self.execute_workflow,
             args=(f"manual:{rule_index}", rule, rule_name, context),
             name=f"ManualRule-{rule_index}",
             daemon=True,
-        ).start()
+        )
+        # 登记手工规则线程，shutdown 时要等它们退出再排空动作
+        with self._manual_threads_lock:
+            self._manual_threads = [
+                item for item in self._manual_threads if item.is_alive()
+            ]
+            self._manual_threads.append(thread)
+        thread.start()
         return True, "已开始执行"
 
     def execute_workflow(
@@ -617,10 +674,14 @@ class AutomationEngine:
 
     def close(self) -> None:
         """撤销本代引擎权限会话并允许重复调用"""
-        if self._privilege_session_closed:
+        with self._close_lock:
+            if self._privilege_session_closed:
+                return
+            self._privilege_session_closed = True
+        if not self._shutdown_clean:
+            engine_warn("关闭时仍有线程未完全退出，保留本代权限会话不撤销")
             return
         self._sudo.end_engine_session(self._engine_token)
-        self._privilege_session_closed = True
 
     def _run(
         self, shutdown_event: "threading.Event | None" = None
@@ -750,9 +811,23 @@ class AutomationEngine:
             print("[Engine] 主程序收到中断，退出中...")
 
         self._cancel_deferred_workflows()
-        self._stop_trigger_threads(timeout=30)
+        stopped = self._stop_trigger_threads(timeout=30)
+        manual_stopped = self._join_manual_threads()
         self._shutdown_plugins()
-        self._wait_active_actions()
+        drained = self._wait_active_actions()
+        self._shutdown_clean = bool(stopped and manual_stopped and drained)
+
+    def _join_manual_threads(self, timeout: float = 10.0) -> bool:
+        """等待手工规则线程退出，返回是否全部退出"""
+        with self._manual_threads_lock:
+            threads = list(self._manual_threads)
+            self._manual_threads.clear()
+        deadline = time.time() + timeout
+        for thread in threads:
+            remaining = deadline - time.time()
+            if remaining > 0:
+                thread.join(timeout=remaining)
+        return all(not thread.is_alive() for thread in threads)
 
     def _shutdown_plugins(self) -> None:
         # 先在锁内认领清理权，再在锁外调用插件 teardown()
@@ -780,8 +855,8 @@ class AutomationEngine:
                         "teardown_failed", plugin=plugin_id, error=traceback.format_exc()[-500:]
                     )
 
-    def _wait_active_actions(self, timeout: float = 60.0) -> None:
-        self._workflow_executor.wait_active_actions(timeout=timeout)
+    def _wait_active_actions(self, timeout: float = 60.0) -> bool:
+        return self._workflow_executor.wait_active_actions(timeout=timeout)
 
     def shutdown(self) -> None:
         # API、信号和 finally 可能同时调用 shutdown()，每个清理步骤都支持重复执行
@@ -789,6 +864,8 @@ class AutomationEngine:
             self._shutdown_flag.set()
         self._trigger_supervisor.request_stop_all()
         self._cancel_deferred_workflows()
-        self._stop_trigger_threads(timeout=30)
+        stopped = self._stop_trigger_threads(timeout=30)
+        manual_stopped = self._join_manual_threads()
         self._shutdown_plugins()
-        self._wait_active_actions()
+        drained = self._wait_active_actions()
+        self._shutdown_clean = bool(stopped and manual_stopped and drained)

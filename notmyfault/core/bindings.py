@@ -209,6 +209,17 @@ def iter_references(value: Any, *, location: str = "$") -> Iterable[BindingUsage
             yield from iter_references(item, location=f"{location}[{index}]")
 
 
+def contains_legacy_template(value: Any) -> bool:
+    """递归判断字符串或嵌套结构里是否带旧 ``{{ }}`` 模板"""
+    if isinstance(value, str):
+        return bool(_LEGACY_TEMPLATE.search(value))
+    if isinstance(value, dict):
+        return any(contains_legacy_template(item) for item in value.values())
+    if isinstance(value, list):
+        return any(contains_legacy_template(item) for item in value)
+    return False
+
+
 def references_available(value: Any, context: Dict[str, Any]) -> bool:
     """返回结构化绑定的来源是否参与了本次工作流运行"""
     for usage in iter_references(value):
