@@ -146,6 +146,15 @@ class TestScanPlugins:
 
 
 class TestValidatePluginMetaPermissions:
+    def test_action_idempotent_flag_is_boolean(self):
+        ok, errors = validate_plugin_meta(make_meta(idempotent=True), "action")
+        assert ok is True
+        assert errors == []
+
+        ok, errors = validate_plugin_meta(make_meta(idempotent="yes"), "action")
+        assert ok is False
+        assert "字段 'idempotent' 必须是布尔值" in errors
+
     def test_valid_permissions(self):
         ok, errors = validate_plugin_meta(
             make_meta(permissions=["network", "filesystem"]), "action"

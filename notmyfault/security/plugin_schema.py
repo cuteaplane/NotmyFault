@@ -12,7 +12,7 @@ _TRIGGER_OPTIONAL_FIELDS = {
 }
 _ACTION_OPTIONAL_FIELDS = {
     "params", "permissions", "origin", "execution_api", "precondition_api",
-    "outputs", "platforms", "entrypoints",
+    "outputs", "platforms", "entrypoints", "idempotent",
 }
 _ALLOWED_SEMANTICS = {"state", "oneshot"}
 _ALLOWED_PARAM_TYPES = {"string", "number", "select", "bool", "time", "hotkey", "path", "textarea"}
@@ -358,6 +358,9 @@ def validate_plugin_meta(
                             if isinstance(opt, dict) and isinstance(opt.get("value"), str):
                                 continue
                             errors.append(f"params[{i}] options 元素必须是字符串或含 value 字符串的对象")
+
+    if "idempotent" in meta and not isinstance(meta["idempotent"], bool):
+        errors.append("字段 'idempotent' 必须是布尔值")
 
     is_trigger = plugin_type in ("trigger", "triggers")
     allowed_fields = (
