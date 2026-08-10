@@ -461,6 +461,26 @@ class TestRulesEndpoints:
             for issue in binding_response.json()["issues"]
         )
 
+    def test_validate_rule_draft_warns_when_retry_may_repeat_action(self, api_env):
+        rule = simple_rule()
+        rule["actions"][0]["retry"] = 2
+
+        response = api_env.client.post(
+            "/api/rules/validate",
+            json={"rule": rule},
+            headers=api_env.headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["valid"] is True
+        warning = next(
+            issue
+            for issue in response.json()["issues"]
+            if issue["code"] == "retry_may_repeat"
+        )
+        assert warning["location"] == "actions[0]"
+        assert "重试可能重复产生结果" in warning["message"]
+
     def test_validate_rule_draft_reports_unsafe_command_without_writing(self, api_env):
         rule = simple_rule()
         rule["actions"] = [{

@@ -307,6 +307,17 @@ class EngineAPI:
                             f"{label} {index + 1}“{plugin.get('name') or item.get('type')}”不支持当前系统",
                             location,
                         )
+                    elif (
+                        field == "actions"
+                        and int(item.get("retry", 0) or 0) > 0
+                        and plugin.get("idempotent") is not True
+                    ):
+                        add(
+                            "warning",
+                            "retry_may_repeat",
+                            f"动作 {index + 1}“{plugin.get('name') or item.get('type')}”没有声明可安全重复执行，重试可能重复产生结果",
+                            location,
+                        )
 
             for issue in validate_rule_bindings(
                 normalized,
