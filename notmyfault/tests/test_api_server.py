@@ -420,6 +420,68 @@ class TestRulesEndpoints:
         assert got[0]["name"] == "通知规则"
         assert got[0]["event"]["type"] == "usb_insert"
 
+    def test_validate_rule_draft_reports_valid_rule_with_schema_warning(self, api_env):
+        response = api_env.client.post(
+            "/api/rules/validate",
+            json={"rule": simple_rule()},
+            headers=api_env.headers,
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ok"] is True
+        assert body["valid"] is True
+        assert body["summary"] == {"errors": 0, "warnings": 1}
+        assert body["issues"][0]["code"] == "plugin_parameter"
+
+    def test_validate_rule_draft_reports_plugin_and_binding_errors(self, api_env):
+        missing_plugin = simple_rule()
+        missing_plugin["actions"][0]["type"] = "missing_action"
+        plugin_response = api_env.client.post(
+            "/api/rules/validate",
+            json={"rule": missing_plugin},
+            headers=api_env.headers,
+        )
+        binding_response = api_env.client.post(
+            "/api/rules/validate",
+            json={"rule": typed_binding_rule("force")},
+            headers=api_env.headers,
+        )
+
+        assert plugin_response.status_code == 200
+        assert plugin_response.json()["valid"] is False
+        assert any(
+            issue["code"] == "plugin_reference"
+            for issue in plugin_response.json()["issues"]
+        )
+        assert binding_response.status_code == 200
+        assert binding_response.json()["valid"] is False
+        assert any(
+            issue["code"] == "binding_type_mismatch"
+            for issue in binding_response.json()["issues"]
+        )
+
+    def test_validate_rule_draft_reports_unsafe_command_without_writing(self, api_env):
+        rule = simple_rule()
+        rule["actions"] = [{
+            "type": "run_powershell",
+            "params": {"command": "powershell -EncodedCommand QUFB"},
+        }]
+
+        response = api_env.client.post(
+            "/api/rules/validate",
+            json={"rule": rule},
+            headers=api_env.headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["valid"] is False
+        assert any(
+            issue["code"] == "unsafe_action"
+            for issue in response.json()["issues"]
+        )
+        assert not os.path.exists(api_server.RULES_FILE)
+
     def test_put_rules_invalid_json(self, api_env):
         response = api_env.client.put(
             "/api/rules",

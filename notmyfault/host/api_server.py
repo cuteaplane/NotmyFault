@@ -39,6 +39,7 @@ from notmyfault.security.security import detect_security_mode, SecurityMode
 from notmyfault.core.rules import (
     get_rule_events,
     validate_rule_bindings,
+    validate_rules,
     validate_rules_structure,
 )
 from notmyfault.version import __version__
@@ -235,6 +236,112 @@ class EngineAPI:
                     if pid not in result[ptype]:
                         result[ptype][pid] = meta
         return result
+
+    def _validate_rule_draft(self, rule: Any) -> Dict[str, Any]:
+        issues: List[Dict[str, Any]] = []
+
+        def add(
+            severity: str,
+            code: str,
+            message: str,
+            location: str = "",
+        ) -> None:
+            item = {
+                "severity": severity,
+                "code": code,
+                "message": message,
+            }
+            if location:
+                item["location"] = location
+            issues.append(item)
+
+        structure_errors = validate_rules_structure([rule])
+        if structure_errors:
+            for message in structure_errors[:20]:
+                add("error", "invalid_structure", message)
+        else:
+            normalized = ensure_rule_binding_ids(rule)
+            schema = self._get_plugins_schema()
+            _valid, _total, _plugin_errors, plugin_warnings = validate_rules(
+                [normalized],
+                schema["triggers"],
+                schema["actions"],
+            )
+            for _rule_name, message in plugin_warnings:
+                add("warning", "plugin_parameter", message)
+
+            for event in get_rule_events(normalized):
+                plugin = schema["triggers"].get(event.get("type", ""))
+                if plugin is None:
+                    add(
+                        "error",
+                        "plugin_reference",
+                        f"引用了未加载的触发器: {event.get('type', '')}",
+                        "event",
+                    )
+                elif plugin.get("platform_compatible") is False:
+                    add(
+                        "error",
+                        "platform_incompatible",
+                        f"触发器“{plugin.get('name') or event.get('type')}”不支持当前系统",
+                        "event",
+                    )
+
+            for field in ("preconditions", "actions"):
+                for index, item in enumerate(normalized.get(field, [])):
+                    plugin = schema["actions"].get(item.get("type", ""))
+                    location = f"{field}[{index}]"
+                    if plugin is None:
+                        label = "开始前确认" if field == "preconditions" else "动作"
+                        add(
+                            "error",
+                            "plugin_reference",
+                            f"{label} {index + 1} 引用了未加载的动作: {item.get('type', '')}",
+                            location,
+                        )
+                    elif plugin and plugin.get("platform_compatible") is False:
+                        label = "开始前确认" if field == "preconditions" else "动作"
+                        add(
+                            "error",
+                            "platform_incompatible",
+                            f"{label} {index + 1}“{plugin.get('name') or item.get('type')}”不支持当前系统",
+                            location,
+                        )
+
+            for issue in validate_rule_bindings(
+                normalized,
+                schema["triggers"],
+                schema["actions"],
+            ):
+                add(
+                    "error",
+                    issue.get("code", "invalid_binding"),
+                    issue.get("message", "规则数据绑定无效"),
+                    issue.get("location", ""),
+                )
+
+            from notmyfault.config import _validate_rules_safety
+            safety_warnings, safety_errors = _validate_rules_safety([normalized])
+            for message in safety_warnings:
+                add("warning", "safety_warning", message)
+            for message in safety_errors:
+                add("error", "unsafe_action", message)
+
+        unique_issues = []
+        seen = set()
+        for issue in issues:
+            key = (issue["severity"], issue["message"], issue.get("location", ""))
+            if key not in seen:
+                seen.add(key)
+                unique_issues.append(issue)
+        error_count = sum(item["severity"] == "error" for item in unique_issues)
+        warning_count = sum(item["severity"] == "warning" for item in unique_issues)
+        return {
+            "ok": True,
+            "valid": error_count == 0,
+            "issues": unique_issues,
+            "summary": {"errors": error_count, "warnings": warning_count},
+        }
 
     def _get_user_plugins_dir(self) -> str:
         return os.path.join(get_config_dir(), "plugins")
@@ -599,6 +706,23 @@ class EngineAPI:
             config = self._load_config()
             rules = config.get("rules", [])
             return {"rules": rules if isinstance(rules, list) else []}
+
+        @app.post("/api/rules/validate")
+        async def rules_validate(request: Request):
+            await self._verify_auth(request)
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse(
+                    {"ok": False, "error": "无效的 JSON 请求体"},
+                    status_code=400,
+                )
+            if not isinstance(body, dict) or "rule" not in body:
+                return JSONResponse(
+                    {"ok": False, "error": "请求体必须包含 rule 对象"},
+                    status_code=400,
+                )
+            return self._validate_rule_draft(body["rule"])
 
         @app.put("/api/rules")
         async def rules_save(request: Request):
