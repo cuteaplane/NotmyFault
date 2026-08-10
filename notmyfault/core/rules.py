@@ -1,6 +1,7 @@
 """规则引擎的纯函数负责条件树、事件匹配、规则校验和触发器参数聚合"""
 import json
 import copy
+import math
 import threading
 import time
 import re
@@ -116,6 +117,44 @@ def validate_rule_structure(rule: Any) -> List[str]:
                 errors.append(f"actions[{index}].type 不能为空")
             if "params" in action and not isinstance(action["params"], dict):
                 errors.append(f"actions[{index}].params 必须是对象")
+            path = f"actions[{index}]"
+            on_error = action.get("on_error", "stop")
+            if not isinstance(on_error, str) or on_error not in {"stop", "continue"}:
+                errors.append(f"{path}.on_error 必须是 stop 或 continue")
+            if "retry" in action:
+                retry = action["retry"]
+                valid_integer = (
+                    not isinstance(retry, bool)
+                    and (
+                        isinstance(retry, int)
+                        or isinstance(retry, float) and retry.is_integer()
+                        or isinstance(retry, str) and retry.strip().isdigit()
+                    )
+                )
+                if not valid_integer or not 0 <= int(retry) <= 3:
+                    errors.append(f"{path}.retry 必须是 0 到 3 的整数")
+            if "retry_delay_seconds" in action:
+                delay = action["retry_delay_seconds"]
+                try:
+                    delay_number = float(delay)
+                except (TypeError, ValueError):
+                    delay_number = -1
+                if (
+                    isinstance(delay, bool)
+                    or not math.isfinite(delay_number)
+                    or not 0 <= delay_number <= 3600
+                ):
+                    errors.append(
+                        f"{path}.retry_delay_seconds 必须是 0 到 3600 的数字"
+                    )
+            retry_backoff = action.get("retry_backoff", "fixed")
+            if not isinstance(retry_backoff, str) or retry_backoff not in {
+                "fixed",
+                "exponential",
+            }:
+                errors.append(
+                    f"{path}.retry_backoff 必须是 fixed 或 exponential"
+                )
 
     preconditions = rule.get("preconditions", [])
     if not isinstance(preconditions, list):

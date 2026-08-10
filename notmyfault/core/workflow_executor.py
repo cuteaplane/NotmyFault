@@ -394,11 +394,16 @@ class WorkflowExecutor:
                 return False, "引擎正在关闭"
             self._active_actions += 1
 
+        attempt = 0
         try:
             action_meta = actions_meta.get(action_type, {})
             action_func = actions_funcs[action_type]
             retries = min(max(int(action.get("retry", 0) or 0), 0), 3)
-            delay = max(float(action.get("retry_delay_seconds", 0) or 0), 0)
+            delay = min(
+                max(float(action.get("retry_delay_seconds", 0) or 0), 0),
+                3600,
+            )
+            backoff = action.get("retry_backoff", "fixed")
             for attempt in range(retries + 1):
                 try:
                     result = invoke_action(
@@ -432,7 +437,12 @@ class WorkflowExecutor:
                             file=sys.stderr,
                         )
                         if delay:
-                            time.sleep(delay)
+                            wait_seconds = (
+                                delay * (2 ** attempt)
+                                if backoff == "exponential"
+                                else delay
+                            )
+                            time.sleep(min(wait_seconds, 3600))
                         continue
                     raise
         except Exception:
@@ -455,6 +465,7 @@ class WorkflowExecutor:
                     "action_type": action_type,
                     "rule_name": rule_name,
                     "error": error_message,
+                    "attempt": attempt + 1,
                 },
             )
             return False, error_message[-500:]

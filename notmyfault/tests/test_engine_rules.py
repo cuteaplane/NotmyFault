@@ -341,6 +341,42 @@ class TestRuleStructureValidation:
         }
         assert validate_rule_structure(rule) == []
 
+    @pytest.mark.parametrize(
+        ("field", "value", "expected"),
+        [
+            ("on_error", "skip", "on_error 必须是 stop 或 continue"),
+            ("retry", 4, "retry 必须是 0 到 3 的整数"),
+            ("retry", 1.5, "retry 必须是 0 到 3 的整数"),
+            ("retry_delay_seconds", -1, "retry_delay_seconds 必须是 0 到 3600"),
+            ("retry_delay_seconds", "later", "retry_delay_seconds 必须是 0 到 3600"),
+            ("retry_backoff", "random", "retry_backoff 必须是 fixed 或 exponential"),
+        ],
+    )
+    def test_invalid_action_failure_settings(self, field, value, expected):
+        rule = {
+            "name": "r",
+            "event": {"type": "hotkey", "params": {}},
+            "actions": [{"type": "noop", "params": {}, field: value}],
+        }
+
+        assert any(expected in error for error in validate_rule_structure(rule))
+
+    def test_valid_action_failure_settings(self):
+        rule = {
+            "name": "r",
+            "event": {"type": "hotkey", "params": {}},
+            "actions": [{
+                "type": "noop",
+                "params": {},
+                "on_error": "continue",
+                "retry": 3,
+                "retry_delay_seconds": 1.5,
+                "retry_backoff": "exponential",
+            }],
+        }
+
+        assert validate_rule_structure(rule) == []
+
 
 class TestValidateAllRules:
     def _engine_with_meta(self, rules, action_meta=None):

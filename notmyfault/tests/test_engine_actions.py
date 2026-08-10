@@ -9,6 +9,7 @@ import types
 import pytest
 
 from notmyfault.core.engine import AutomationEngine
+from notmyfault.core import workflow_executor as workflow_executor_module
 from notmyfault.core.workflow import build_context
 
 
@@ -186,6 +187,54 @@ class TestExecuteAction:
         assert len(attempts) == 3
         # 默认 on_error=stop，后续动作不再执行
         assert after == []
+
+    def test_pipeline_continues_after_failure_when_selected(self):
+        engine = make_engine()
+        after = []
+        register_action(engine, "broken", lambda meta, params: 1 / 0)
+        register_action(engine, "after", lambda meta, params: after.append(1))
+
+        engine.execute_workflow(
+            "wf",
+            {"actions": [
+                {"type": "broken", "binding_id": "a_bad001", "params": {}, "on_error": "continue"},
+                {"type": "after", "binding_id": "a_after001", "params": {}},
+            ]},
+            "规则",
+            _context(),
+        )
+
+        assert after == [1]
+
+    def test_exponential_retry_waits_longer_after_each_failure(self, monkeypatch):
+        events = []
+        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        waits = []
+        attempts = []
+
+        def flaky(meta, params):
+            attempts.append(1)
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(workflow_executor_module.time, "sleep", waits.append)
+        register_action(engine, "flaky", flaky)
+
+        engine._run_action(
+            {
+                "type": "flaky",
+                "params": {},
+                "retry": 3,
+                "retry_delay_seconds": 2,
+                "retry_backoff": "exponential",
+            },
+            "规则",
+            _context(),
+        )
+
+        assert len(attempts) == 4
+        assert waits == [2, 4, 8]
+        error = next(data for name, data in events if name == "error")
+        assert error["attempt"] == 4
 
     def test_precondition_allows_ready_workflow(self):
         engine = make_engine()
