@@ -36,6 +36,7 @@ import ParamInput from './ParamInput.vue'
 import ConditionEditor from './ConditionEditor.vue'
 import PluginPicker from './PluginPicker.vue'
 import FolderPicker from './FolderPicker.vue'
+import ActionFailureSettings from './ActionFailureSettings.vue'
 
 const props = defineProps({
   rule: Object,
@@ -106,6 +107,12 @@ const eventParams = (event) => getVisibleParamDefs(store.schema.triggers[event.t
 const actionParams = (action) => getVisibleParamDefs(store.schema.actions[action.type], action.params)
 const eventName = (event) => store.schema.triggers[event?.type]?.name || event?.type || '未选择触发器'
 const actionName = (action) => store.schema.actions[action?.type]?.name || action?.type || '未选择动作'
+function actionFailureSummary(action) {
+  const parts = [action?.on_error === 'continue' ? '失败后继续' : '失败后停止']
+  const retries = Math.min(Math.max(Number(action?.retry || 0), 0), 3)
+  if (retries) parts.push(`最多重试 ${retries} 次`)
+  return parts.join(' · ')
+}
 function formatParamValue(value, def) {
   if (isReference(value)) return '运行数据'
   if (def?.type === 'password' || def?.type === 'secret') return value ? '已设置' : ''
@@ -1278,6 +1285,7 @@ function onEditorKeydown(event) {
             </div>
             <div class="param-grid"><ParamInput v-for="param in actionParams(selectedAction)" :key="param.name" :def="param" v-model="selectedAction.params[param.name]" allow-binding :binding-sources="actionBindingSources(selectedIndex)" /></div>
             <div v-if="actionOutputHint(selectedAction, selectedIndex)" class="workflow-output-hint">后续步骤可引用：<code>{{ actionOutputHint(selectedAction, selectedIndex) }}</code></div>
+            <ActionFailureSettings :action="selectedAction" :meta="store.schema.actions[selectedAction.type]" />
             <div class="inspector-action-row">
               <button class="btn btn-text btn-sm" :disabled="selectedIndex === 0" @click="moveAction(selectedIndex, -1)"><span class="material-symbols-outlined">arrow_back</span>提前</button>
               <button class="btn btn-text btn-sm" :disabled="selectedIndex === rule.actions.length - 1" @click="moveAction(selectedIndex, 1)">稍后<span class="material-symbols-outlined">arrow_forward</span></button>
@@ -1368,7 +1376,7 @@ function onEditorKeydown(event) {
           <header class="stage-head"><div><span class="stage-kicker">然后</span><h2>按顺序执行这些动作</h2></div><span class="stage-required">必填</span></header>
           <details v-for="(action, index) in rule.actions" :key="action" class="flow-card action-flow-card" :open="rule.actions.length === 1">
             <summary>
-              <span class="flow-card-index">{{ index + 1 }}</span><span class="flow-card-copy"><b>{{ actionName(action) }}</b><small>第 {{ index + 1 }} 步</small></span>
+              <span class="flow-card-index">{{ index + 1 }}</span><span class="flow-card-copy"><b>{{ actionName(action) }}</b><small>第 {{ index + 1 }} 步 · {{ actionFailureSummary(action) }}</small></span>
               <span v-if="isAdmin(store.schema.actions[action.type])" class="chip chip-admin">管理员</span>
               <span class="flow-card-tools"><button class="icon-btn" :disabled="index === 0" title="上移" @click.prevent.stop="moveAction(index, -1)"><span class="material-symbols-outlined">arrow_upward</span></button><button class="icon-btn" :disabled="index === rule.actions.length - 1" title="下移" @click.prevent.stop="moveAction(index, 1)"><span class="material-symbols-outlined">arrow_downward</span></button><button class="icon-btn icon-btn-danger" title="移除动作" @click.prevent.stop="removeAction(index)"><span class="material-symbols-outlined">delete</span></button></span>
               <span class="material-symbols-outlined flow-expand">expand_more</span>
@@ -1384,6 +1392,7 @@ function onEditorKeydown(event) {
               </div>
               <div class="param-grid"><ParamInput v-for="param in actionParams(action)" :key="param.name" :def="param" v-model="action.params[param.name]" allow-binding :binding-sources="actionBindingSources(index)" /></div>
               <div v-if="actionOutputHint(action, index)" class="workflow-output-hint">后续步骤可引用：<code>{{ actionOutputHint(action, index) }}</code></div>
+              <ActionFailureSettings :action="action" :meta="store.schema.actions[action.type]" />
             </div>
           </details>
           <div v-if="!rule.actions?.length" class="flow-inline-empty">还没有动作。规则触发后不会执行任何操作。</div>
