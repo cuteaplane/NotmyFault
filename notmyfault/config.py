@@ -13,11 +13,33 @@ from notmyfault.core.bindings import is_reference
 
 
 _BINDING_ID_RE = re.compile(r"^[tap]_[a-z0-9_]{6,64}$")
+_RULE_ID_RE = re.compile(r"^r_[a-z0-9_]{6,64}$")
 _LEGACY_TEMPLATE_RE = re.compile(r"{{\s*([a-zA-Z_][\w.]*)\s*}}")
 
 
 def _new_binding_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(6)}"
+
+
+def ensure_rule_id(
+    rule: Dict[str, Any],
+    seen: set[str] | None = None,
+) -> Dict[str, Any]:
+    """给规则补充跨保存和重排保持不变的身份"""
+    copied = dict(rule)
+    used = seen if seen is not None else set()
+    rule_id = copied.get("rule_id")
+    if (
+        not isinstance(rule_id, str)
+        or not _RULE_ID_RE.fullmatch(rule_id)
+        or rule_id in used
+    ):
+        rule_id = f"r_{secrets.token_hex(6)}"
+        while rule_id in used:
+            rule_id = f"r_{secrets.token_hex(6)}"
+    copied["rule_id"] = rule_id
+    used.add(rule_id)
+    return copied
 
 
 def _ensure_condition_binding_ids(
@@ -59,10 +81,9 @@ def ensure_rule_binding_ids(rule: Dict[str, Any]) -> Dict[str, Any]:
             copied["condition"], seen
         )
 
-    for field, prefix in (("preconditions", "p"), ("actions", "a")):
-        items = copied.get(field)
+    def normalize_items(items: Any, prefix: str, *, include_failures: bool) -> Any:
         if not isinstance(items, list):
-            continue
+            return items
         normalized = []
         for item in items:
             if not isinstance(item, dict):
@@ -79,142 +100,68 @@ def ensure_rule_binding_ids(rule: Dict[str, Any]) -> Dict[str, Any]:
                 binding_id = _new_binding_id(prefix)
             item_copy["binding_id"] = binding_id
             seen.add(binding_id)
+            if include_failures and "failure_actions" in item_copy:
+                item_copy["failure_actions"] = normalize_items(
+                    item_copy["failure_actions"], "a", include_failures=False
+                )
             normalized.append(item_copy)
-        copied[field] = normalized
+        return normalized
+
+    for field, prefix in (("preconditions", "p"), ("actions", "a")):
+        items = copied.get(field)
+        if not isinstance(items, list):
+            continue
+        copied[field] = normalize_items(
+            items, prefix, include_failures=field == "actions"
+        )
     return copied
 
+# 规则单独存放在 rules.json，这里只保留轻量设置。
 DEFAULT_CONFIG: Dict[str, Any] = {
     "disabled_plugins": {
         "triggers": [],
         "actions": []
     },
-    "rules": [
-        {
-            "name": "微信音量规则",
-            "event": {
-                "type": "process_state",
-                "params": {
-                    "process_name": "WeChat.exe",
-                    "state": "running"
-                }
-            },
-            "actions": [
-                {"type": "set_volume", "params": {"action": "max"}},
-                {
-                    "type": "notify",
-                    "params": {
-                        "title": "微信正在运行",
-                        "message": "音量已设置为100%"
-                    }
-                }
-            ]
-        },
-        {
-            "name": "PPT音量规则",
-            "event": {
-                "type": "process_state",
-                "params": {
-                    "process_name": "POWERPNT.EXE",
-                    "state": "running"
-                }
-            },
-            "actions": [
-                {"type": "set_volume", "params": {"action": "max"}},
-                {
-                    "type": "notify",
-                    "params": {
-                        "title": "PowerPoint正在运行",
-                        "message": "音量已设置为100%"
-                    }
-                }
-            ]
-        },
-        {
-            "name": "媒体播放器规则",
-            "event": {
-                "type": "process_state",
-                "params": {
-                    "process_name": "wmplayer.exe",
-                    "state": "running"
-                }
-            },
-            "actions": [
-                {"type": "set_volume", "params": {"action": "half"}},
-                {
-                    "type": "notify",
-                    "params": {
-                        "title": "媒体播放器检测",
-                        "message": "音量已调整为50%"
-                    }
-                }
-            ]
-        },
-        {
-            "name": "微信退出-恢复音量",
-            "event": {
-                "type": "process_state",
-                "params": {
-                    "process_name": "WeChat.exe",
-                    "state": "stopped"
-                }
-            },
-            "actions": [
-                {"type": "set_volume", "params": {"action": "half"}},
-                {
-                    "type": "notify",
-                    "params": {
-                        "title": "微信已退出",
-                        "message": "音量已恢复至50%"
-                    }
-                }
-            ]
-        },
-        {
-            "name": "PPT退出-恢复音量",
-            "event": {
-                "type": "process_state",
-                "params": {
-                    "process_name": "POWERPNT.EXE",
-                    "state": "stopped"
-                }
-            },
-            "actions": [
-                {"type": "set_volume", "params": {"action": "half"}},
-                {
-                    "type": "notify",
-                    "params": {
-                        "title": "PowerPoint已退出",
-                        "message": "音量已恢复至50%"
-                    }
-                }
-            ]
-        },
-        {
-            "name": "媒体播放器退出-恢复音量",
-            "event": {
-                "type": "process_state",
-                "params": {
-                    "process_name": "wmplayer.exe",
-                    "state": "stopped"
-                }
-            },
-            "actions": [
-                {"type": "set_volume", "params": {"action": "half"}},
-                {
-                    "type": "notify",
-                    "params": {
-                        "title": "媒体播放器已退出",
-                        "message": "音量已恢复至50%"
-                    }
-                }
-            ]
-        }
-    ]
+    "settings": {
+        "admin_authorization_mode": "per_execution"
+    }
 }
 
+ADMIN_AUTHORIZATION_MODES = {"per_execution", "engine_start"}
+
+
+def get_admin_authorization_mode(config: Dict[str, Any]) -> str:
+    """读取管理员授权方式，无效或缺失时使用逐次确认。"""
+    settings = config.get("settings") if isinstance(config, dict) else None
+    mode = settings.get("admin_authorization_mode") if isinstance(settings, dict) else None
+    return mode if mode in ADMIN_AUTHORIZATION_MODES else "per_execution"
+
 CONFIG_FILE = os.path.join(get_config_dir(), "config.json")
+RULES_FILE = os.path.join(get_config_dir(), "rules.json")
 def _backup_path() -> str:
     return CONFIG_FILE + ".bak"
+
+
+def _rules_backup_path() -> str:
+    return RULES_FILE + ".bak"
+
+
+def _premigration_backup_path() -> str:
+    return CONFIG_FILE + ".premigration.bak"
+
+
+def _keep_premigration_backup() -> None:
+    """拆分前留一份旧配置全量快照，.bak 只有一代，后面的保存会把它冲掉"""
+    backup = _premigration_backup_path()
+    if os.path.exists(backup):
+        return
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as src:
+            content = src.read()
+        with open(backup, "w", encoding="utf-8") as dst:
+            dst.write(content)
+    except OSError:
+        pass  # 备份失败不是致命错误
 
 
 def _secret_path() -> str:
@@ -285,33 +232,30 @@ def _is_secret_installed() -> bool:
     return os.path.exists(_secret_path())
 
 
-def save_config(config: Dict[str, Any]) -> bool:
-    """规范化配置并写入签名，同时保留上一份备份"""
+def _write_signed_json(path: str, backup_path: str, data: Dict[str, Any]) -> bool:
+    """备份、签名、tmp 原子写入，写入失败时用备份回滚"""
     try:
-        config_dir = os.path.dirname(CONFIG_FILE)
-        if config_dir:
-            os.makedirs(config_dir, exist_ok=True)
+        target_dir = os.path.dirname(path)
+        if target_dir:
+            os.makedirs(target_dir, exist_ok=True)
 
-        # 写入新配置前复制当前文件作为备份
-        if os.path.exists(CONFIG_FILE):
+        # 写入新内容前复制当前文件作为备份
+        if os.path.exists(path):
             try:
-                with open(CONFIG_FILE, "r", encoding="utf-8") as src:
-                    with open(_backup_path(), "w", encoding="utf-8") as dst:
+                with open(path, "r", encoding="utf-8") as src:
+                    with open(backup_path, "w", encoding="utf-8") as dst:
                         dst.write(src.read())
             except OSError:
                 pass  # 备份失败不是致命错误
 
-        # 先删除界面留下的废弃字段，再为实际写入内容计算签名
-        to_save = _normalize_config(config)
-        if not isinstance(to_save, dict):
-            raise ValueError("配置根节点必须是对象")
-        to_save = dict(to_save)
+        # 先为实际写入内容计算签名
+        to_save = dict(data)
         to_save[_SIGNATURE_KEY] = _sign_config(to_save)
-        tmp_path = CONFIG_FILE + ".tmp"
+        tmp_path = path + ".tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(to_save, f, ensure_ascii=False, indent=4)
-            os.replace(tmp_path, CONFIG_FILE)
+            os.replace(tmp_path, path)
         except OSError:
             # Windows 目标文件被占用时直接写入原文件，并在写入失败时用备份恢复
             try:
@@ -320,25 +264,43 @@ def save_config(config: Dict[str, Any]) -> bool:
                 pass
             backup = None
             try:
-                with open(CONFIG_FILE, "r", encoding="utf-8") as bf:
+                with open(path, "r", encoding="utf-8") as bf:
                     backup = bf.read()
             except OSError:
                 pass
             try:
-                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                with open(path, "w", encoding="utf-8") as f:
                     json.dump(to_save, f, ensure_ascii=False, indent=4)
             except OSError:
                 if backup is not None:
                     try:
-                        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                        with open(path, "w", encoding="utf-8") as f:
                             f.write(backup)
                     except OSError:
                         pass
                 raise
         return True
     except OSError as e:
-        print(f"[Config] 保存配置失败: {e}", file=sys.stderr)
+        print(f"[Config] 写入 {os.path.basename(path)} 失败: {e}", file=sys.stderr)
         return False
+
+
+def save_config(config: Dict[str, Any]) -> bool:
+    """规范化设置并写入签名，规则单独存放在 rules.json"""
+    to_save = _normalize_config(config)
+    if not isinstance(to_save, dict):
+        print("[Config] 保存配置失败: 配置根节点必须是对象", file=sys.stderr)
+        return False
+    return _write_signed_json(CONFIG_FILE, _backup_path(), to_save)
+
+
+def save_rules(rules: list) -> bool:
+    """规范化规则列表并签名写入 rules.json"""
+    if not isinstance(rules, list):
+        print("[Config] 保存规则失败: rules 必须是列表", file=sys.stderr)
+        return False
+    data = {"schema_version": 2, "rules": _normalize_rules(rules)}
+    return _write_signed_json(RULES_FILE, _rules_backup_path(), data)
 
 
 _DANGEROUS_PATTERNS = [
@@ -402,7 +364,14 @@ def _validate_rules_safety(rules: list) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     for i, rule in enumerate(rules):
         rule_name = rule.get("name", f"规则 #{i+1}")
-        for j, action in enumerate(rule.get("actions", [])):
+        actions = []
+        for action in rule.get("actions", []):
+            actions.append(action)
+            if isinstance(action, dict) and isinstance(action.get("failure_actions"), list):
+                actions.extend(action["failure_actions"])
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
             action_type = action.get("type", "")
 
             if action_type in ("run_powershell",):
@@ -432,8 +401,21 @@ class ConfigValidationError(ValueError):
     """运行时配置未通过完整性或安全校验"""
 
 
+def _validate_rules_for_runtime(rules: List[Dict[str, Any]]) -> None:
+    """打印安全提醒，并拒绝会在运行时执行的危险规则。"""
+    safety_warnings, safety_errors = _validate_rules_safety(rules)
+    for warning in safety_warnings:
+        print(f"[Config] [安全] {warning}", file=sys.stderr)
+    if safety_errors:
+        for error in safety_errors:
+            print(f"[Config] [安全-严重] {error}", file=sys.stderr)
+        raise ConfigValidationError(
+            "规则安全校验失败: " + "; ".join(safety_errors[:3])
+        )
+
+
 def load_verified_config() -> Dict[str, Any]:
-    """读取通过签名、结构和安全校验的运行时配置快照"""
+    """读取通过签名和结构校验的设置快照，规则校验见 load_verified_rules"""
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as config_file:
             raw = json.load(config_file)
@@ -454,13 +436,34 @@ def load_verified_config() -> Dict[str, Any]:
     normalized = _normalize_config(raw)
     if not isinstance(normalized, dict):
         raise ConfigValidationError("规范化后的配置必须是对象")
-    rules = normalized.get("rules", [])
+    return normalized
+
+
+def load_verified_rules() -> List[Dict[str, Any]]:
+    """读取通过签名、结构和安全校验的规则快照，供热重载使用"""
+    try:
+        with open(RULES_FILE, "r", encoding="utf-8") as rules_file:
+            raw = json.load(rules_file)
+    except (json.JSONDecodeError, OSError) as e:
+        raise ConfigValidationError(f"规则文件无法解析: {e}") from e
+
+    if not isinstance(raw, dict):
+        raise ConfigValidationError("规则文件根节点必须是对象")
+
+    signature = raw.pop(_SIGNATURE_KEY, "")
+    if not _is_secret_installed():
+        raise ConfigValidationError("规则签名密钥缺失")
+    if not signature:
+        raise ConfigValidationError("规则缺少签名")
+    if not _verify_config(raw, signature):
+        raise ConfigValidationError("规则签名校验失败")
+
+    rules = raw.get("rules")
     if not isinstance(rules, list):
         raise ConfigValidationError("rules 必须是列表")
 
-    _warnings, errors = _validate_rules_safety(rules)
-    if errors:
-        raise ConfigValidationError("规则安全校验失败: " + "; ".join(errors[:3]))
+    normalized = _normalize_rules(rules)
+    _validate_rules_for_runtime(normalized)
     return normalized
 
 def _normalize_condition(condition: Any) -> Any:
@@ -625,42 +628,45 @@ def _upgrade_rule_templates(rule: Dict[str, Any]) -> Dict[str, Any]:
     return copied
 
 
-def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(config, dict):
-        return config
+def _normalize_rules(rules: Any) -> List[Dict[str, Any]]:
+    """规范化规则列表并补齐规则和节点身份"""
+    if not isinstance(rules, list):
+        return []
+    normalized_rules = []
+    seen_rule_ids: set[str] = set()
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        copied = dict(rule)
+        if "trigger" in copied:
+            if "event" not in copied:
+                copied["event"] = copied["trigger"]
+            copied.pop("trigger", None)
+        if "condition" in copied:
+            copied["condition"] = _normalize_condition(copied["condition"])
+            if "event" not in copied and isinstance(copied["condition"], dict):
+                if not isinstance(copied["condition"].get("children"), list):
+                    copied["event"] = copied.pop("condition")
+            elif isinstance(copied.get("event"), dict):
+                condition_event = _unwrap_single_condition(copied["condition"])
+                if condition_event == copied["event"]:
+                    copied.pop("condition", None)
+        if "actions" in copied:
+            copied["actions"] = _normalize_rule_actions(copied["actions"])
+        normalized = ensure_rule_id(copied, seen_rule_ids)
+        normalized = ensure_rule_binding_ids(normalized)
+        normalized_rules.append(_upgrade_rule_templates(normalized))
+    return normalized_rules
 
+
+def _extract_legacy_rules(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """从旧 config 提取规则，兼容更早的进程列表格式"""
     if isinstance(config.get("rules"), list):
-        normalized_rules = []
-        for rule in config.get("rules", []):
-            if not isinstance(rule, dict):
-                continue
-            copied = dict(rule)
-            if "trigger" in copied:
-                if "event" not in copied:
-                    copied["event"] = copied["trigger"]
-                copied.pop("trigger", None)
-            if "condition" in copied:
-                copied["condition"] = _normalize_condition(copied["condition"])
-                if "event" not in copied and isinstance(copied["condition"], dict):
-                    if not isinstance(copied["condition"].get("children"), list):
-                        copied["event"] = copied.pop("condition")
-                elif isinstance(copied.get("event"), dict):
-                    condition_event = _unwrap_single_condition(copied["condition"])
-                    if condition_event == copied["event"]:
-                        copied.pop("condition", None)
-            if "actions" in copied:
-                copied["actions"] = _normalize_rule_actions(copied["actions"])
-            normalized = ensure_rule_binding_ids(copied)
-            normalized_rules.append(_upgrade_rule_templates(normalized))
-
-        result = dict(config)
-        result["schema_version"] = 2
-        result["rules"] = normalized_rules
-        return result
+        return _normalize_rules(config["rules"])
 
     processes = config.get("processes")
     if not isinstance(processes, list):
-        return config
+        return []
 
     rules: List[Dict[str, Any]] = []
     for process in processes:
@@ -694,9 +700,26 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
             }
         rules.append(_rule)
 
-    result = {k: v for k, v in config.items() if k != "processes"}
-    result["rules"] = rules
-    return _normalize_config(result) if rules else config
+    return _normalize_rules(rules)
+
+
+def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(config, dict):
+        return config
+
+    # 规则已拆到 rules.json，丢弃旧文件里残留的规则和进程字段
+    result = dict(config)
+    result.pop("rules", None)
+    result.pop("processes", None)
+    result["schema_version"] = 2
+    settings = result.get("settings")
+    if not isinstance(settings, dict):
+        settings = {}
+    else:
+        settings = dict(settings)
+    settings["admin_authorization_mode"] = get_admin_authorization_mode(result)
+    result["settings"] = settings
+    return result
 
 
 def _default_v2_config() -> Dict[str, Any]:
@@ -757,6 +780,9 @@ def get_config() -> Dict[str, Any]:
             "如需找回旧版本，可检查 config.json.bak。"
         )
 
+    # 验签通过后才做拆分，避免把被篡改的规则搬进 rules.json
+    _migrate_rules_file()
+
     normalized = _normalize_config(config)
     migrated = normalized != config
     config = normalized
@@ -767,17 +793,126 @@ def get_config() -> Dict[str, Any]:
     if migrated:
         print("[DEBUG] Legacy config migrated to new rule format.")
 
-    rules = config.get("rules", [])
-    safety_warnings, safety_errors = _validate_rules_safety(rules)
-    if safety_warnings:
-        for w in safety_warnings:
-            print(f"[Config] [安全] {w}", file=sys.stderr)
-    if safety_errors:
-        for e in safety_errors:
-            print(f"[Config] [安全-严重] {e}", file=sys.stderr)
-
     print("[DEBUG] Config loaded:", config)
     return config
+
+
+def _read_rules_content() -> List[Dict[str, Any]]:
+    """读取通过签名和安全校验的现有规则。"""
+    return load_verified_rules()
+
+
+def _merge_rules_into_file(legacy_rules: List[Dict[str, Any]]) -> bool:
+    """把旧配置的规则并进 rules.json，rule_id 已在文件里的跳过，迁移重跑不追加重复条目"""
+    existing = _read_rules_content()
+    existing_ids = {rule.get("rule_id") for rule in existing}
+    new_rules = [
+        rule for rule in legacy_rules if rule.get("rule_id") not in existing_ids
+    ]
+    return save_rules(existing + new_rules)
+
+
+def _migrate_rules_file() -> None:
+    """把旧 config.json 的规则拆进 rules.json，rules.json 已存在时追加旧规则再瘦身"""
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return  # config.json 不可读时由 get_config 的容错链路处理
+    if not isinstance(raw, dict) or ("rules" not in raw and "processes" not in raw):
+        return
+
+    _keep_premigration_backup()
+    legacy = dict(raw)
+    legacy.pop(_SIGNATURE_KEY, None)
+    legacy_rules = _extract_legacy_rules(legacy)
+    if os.path.exists(RULES_FILE):
+        # rules.json 已存在也要合并，跳过直接瘦身会把旧规则静默丢掉
+        if legacy_rules and not _merge_rules_into_file(legacy_rules):
+            raise ConfigValidationError("规则文件写入失败，无法完成规则合并")
+    else:
+        # 先写 rules.json 再瘦身 config.json，任一步失败都中止，避免规则丢失
+        if not save_rules(legacy_rules):
+            raise ConfigValidationError("规则文件写入失败，无法完成规则拆分")
+    stripped = {
+        k: v for k, v in raw.items()
+        if k not in ("rules", "processes", _SIGNATURE_KEY)
+    }
+    if not save_config(stripped):
+        raise ConfigValidationError("配置文件写入失败，无法完成规则拆分")
+    if legacy_rules:
+        print(
+            f"[Config] 已把 {len(legacy_rules)} 条规则从 config.json 拆分到 rules.json"
+        )
+
+
+def get_rules() -> List[Dict[str, Any]]:
+    """加载规则，首次运行时从旧 config.json 迁移"""
+    rules_dir = os.path.dirname(RULES_FILE)
+    if rules_dir and not os.path.exists(rules_dir):
+        os.makedirs(rules_dir, exist_ok=True)
+
+    _migrate_rules_file()
+
+    if not os.path.exists(RULES_FILE):
+        # 全新安装没有可迁移的规则，写入空规则文件
+        save_rules([])
+        print("[DEBUG] Empty rules.json created.")
+        return []
+
+    try:
+        with open(RULES_FILE, "r", encoding="utf-8") as rules_file:
+            data = json.loads(rules_file.read())
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[ERROR] 规则文件损坏 ({e})，尝试从备份恢复...", file=sys.stderr)
+        recovered = _try_recover_rules_from_backup()
+        if recovered is not None:
+            return recovered
+        print("[ERROR] 备份也无效，重置为空规则", file=sys.stderr)
+        save_rules([])
+        return []
+
+    if not isinstance(data, dict):
+        print("[ERROR] 规则文件结构异常，尝试从备份恢复...", file=sys.stderr)
+        recovered = _try_recover_rules_from_backup()
+        if recovered is not None:
+            return recovered
+        save_rules([])
+        return []
+
+    signature = data.pop(_SIGNATURE_KEY, "")
+    if not _is_secret_installed():
+        # 缺少密钥时无法验证规则，暂停引擎并要求用户确认
+        raise ConfigValidationError(
+            "规则签名密钥缺失，无法验证规则完整性，文件可能被篡改。"
+            f"引擎已暂停。请在 Dashboard「安全与权限」页核对规则摘要后重新签名；"
+            f"确认无异常后可删除 {RULES_FILE} 从空规则重新开始。"
+        )
+
+    if not signature:
+        raise ConfigValidationError(
+            "规则文件缺少签名，可能被篡改。引擎已暂停。"
+            "请在 Dashboard「安全与权限」页核对规则摘要后重新签名。"
+        )
+
+    if not _verify_config(data, signature):
+        raise ConfigValidationError(
+            "规则文件签名校验失败，文件可能被篡改。引擎已暂停。"
+            "请在 Dashboard「安全与权限」页核对规则摘要后重新签名；"
+            "如需找回旧版本，可检查 rules.json.bak。"
+        )
+
+    raw_rules = data.get("rules", [])
+    if not isinstance(raw_rules, list):
+        raise ConfigValidationError("rules 必须是列表")
+    rules = _normalize_rules(raw_rules)
+    _validate_rules_for_runtime(rules)
+
+    # 校验通过后用规范化结果重新签名并原子写回
+    save_rules(rules)
+
+    print(f"[DEBUG] Rules loaded: {len(rules)} 条")
+    return rules
 
 
 def _try_recover_from_backup() -> Dict[str, Any] | None:
@@ -794,6 +929,17 @@ def _try_recover_from_backup() -> Dict[str, Any] | None:
             print("[WARN] 签名密钥缺失，无法验证备份，拒绝恢复", file=sys.stderr)
             return None
         if signature and _verify_config(config, signature):
+            # 先确认旧规则写进 rules.json 再瘦身 config.json，写失败时备份原文件不动
+            legacy_rules = _extract_legacy_rules(config)
+            if legacy_rules:
+                merged = (
+                    _merge_rules_into_file(legacy_rules)
+                    if os.path.exists(RULES_FILE)
+                    else save_rules(legacy_rules)
+                )
+                if not merged:
+                    print("[ERROR] 规则文件写入失败，放弃备份恢复", file=sys.stderr)
+                    return None
             print("[INFO] 从备份成功恢复配置", file=sys.stderr)
             normalized = _normalize_config(config)
             save_config(normalized)
@@ -802,4 +948,32 @@ def _try_recover_from_backup() -> Dict[str, Any] | None:
         return None
     except Exception as e:
         print(f"[ERROR] 备份恢复失败: {e}", file=sys.stderr)
+        return None
+
+
+def _try_recover_rules_from_backup() -> List[Dict[str, Any]] | None:
+    """校验 rules.json.bak 签名后恢复规则"""
+    backup = _rules_backup_path()
+    if not os.path.exists(backup):
+        return None
+    try:
+        with open(backup, "r", encoding="utf-8") as f:
+            data = json.loads(f.read())
+        if not isinstance(data, dict):
+            print("[WARN] 规则备份结构异常，拒绝恢复", file=sys.stderr)
+            return None
+        signature = data.pop(_SIGNATURE_KEY, "")
+        if not _is_secret_installed():
+            print("[WARN] 签名密钥缺失，无法验证规则备份，拒绝恢复", file=sys.stderr)
+            return None
+        if signature and _verify_config(data, signature):
+            print("[INFO] 从备份成功恢复规则", file=sys.stderr)
+            rules = _normalize_rules(data.get("rules", []))
+            _validate_rules_for_runtime(rules)
+            save_rules(rules)
+            return rules
+        print("[WARN] 规则备份无有效签名，拒绝恢复", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"[ERROR] 规则备份恢复失败: {e}", file=sys.stderr)
         return None
