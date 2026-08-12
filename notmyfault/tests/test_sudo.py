@@ -1,7 +1,9 @@
 """run_as_admin 提权命令生成与插件授权会话管理"""
 
+import gc
 import subprocess
 import types
+import weakref
 
 import pytest
 
@@ -165,6 +167,55 @@ def test_authorize_binds_to_module_identity(monkeypatch):
     with pytest.raises(PermissionError) as excinfo:
         call_from(impostor, sudo.run_as_admin, ["cmd.exe"])
     assert "未授权使用" in str(excinfo.value)
+
+
+def test_module_mapping_rejects_a_different_module(monkeypatch):
+    sudo.begin_engine_session(TOKEN)
+    authorized = make_plugin_module()
+    impostor = make_plugin_module()
+    sudo.authorize_plugin("testplug", TOKEN, module=authorized)
+    sudo._admin_by_module[id(impostor.__dict__)] = (
+        weakref.ref(authorized),
+        "testplug",
+    )
+    monkeypatch.setattr(
+        sudo.subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0),
+    )
+
+    with pytest.raises(PermissionError):
+        call_from(impostor, sudo.run_as_admin, ["cmd.exe"])
+    assert id(impostor.__dict__) not in sudo._admin_by_module
+
+
+def test_module_mapping_is_removed_after_module_is_collected():
+    sudo.begin_engine_session(TOKEN)
+    module = make_plugin_module()
+    module_key = id(module.__dict__)
+    module_ref = weakref.ref(module)
+    sudo.authorize_plugin("testplug", TOKEN, module=module)
+
+    del module
+    gc.collect()
+
+    assert module_ref() is None
+    assert module_key not in sudo._admin_by_module
+
+
+def test_authorized_plugin_cannot_lend_privilege_to_another_plugin():
+    sudo.begin_engine_session(TOKEN)
+    authorized = make_plugin_module("notmyfault.action_authorized")
+    borrower = make_plugin_module("notmyfault.action_borrower")
+    sudo.authorize_plugin("authorized", TOKEN, module=authorized)
+    authorized.__dict__["run_as_admin"] = sudo.run_as_admin
+    exec(
+        "def helper():\n    return run_as_admin(['cmd.exe'])\n",
+        authorized.__dict__,
+    )
+    borrower.__dict__["helper"] = authorized.__dict__["helper"]
+    with pytest.raises(PermissionError, match="borrower"):
+        exec("result = helper()", borrower.__dict__)
 
 
 def test_deauthorize_plugin_revokes_both_registries(monkeypatch):

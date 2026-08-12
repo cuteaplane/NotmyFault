@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import uuid
+import weakref
 from typing import Any
 
 from notmyfault.security.errors import AdminExecutionBlocked
@@ -91,7 +92,7 @@ def _is_project_script() -> bool:
 
 _engine_token: str | None = None
 _admin_plugins: set[str] = set()
-_admin_by_module: dict[int, str] = {}
+_admin_by_module: dict[int, tuple[weakref.ReferenceType, str]] = {}
 _authorization_mode = "direct"
 _admin_broker = None
 _session_lock = threading.RLock()
@@ -339,7 +340,18 @@ def authorize_plugin(plugin_id: str, token: str, module=None) -> None:
             raise PermissionError("令牌不匹配，拒绝授权")
         _admin_plugins.add(plugin_id)
         if module is not None:
-            _admin_by_module[id(module.__dict__)] = plugin_id
+            module_key = id(module.__dict__)
+
+            def remove_module(reference, key=module_key):
+                with _session_lock:
+                    current = _admin_by_module.get(key)
+                    if current is not None and current[0] is reference:
+                        _admin_by_module.pop(key, None)
+
+            _admin_by_module[module_key] = (
+                weakref.ref(module, remove_module),
+                plugin_id,
+            )
 
 
 def deauthorize_plugin(plugin_id: str, token: str) -> bool:
@@ -350,23 +362,53 @@ def deauthorize_plugin(plugin_id: str, token: str) -> bool:
         removed = plugin_id in _admin_plugins
         _admin_plugins.discard(plugin_id)
         for key in [
-            key for key, pid in _admin_by_module.items() if pid == plugin_id
+            key
+            for key, (_module_ref, pid) in _admin_by_module.items()
+            if pid == plugin_id
         ]:
             del _admin_by_module[key]
         return removed
 
 
+def _plugin_id_for_globals(plugin_globals: Any) -> str | None:
+    """只返回仍指向当前模块全局字典的授权记录"""
+    key = id(plugin_globals)
+    with _session_lock:
+        entry = _admin_by_module.get(key)
+        if entry is None:
+            return None
+        module_ref, plugin_id = entry
+        module = module_ref()
+        if module is None or module.__dict__ is not plugin_globals:
+            if _admin_by_module.get(key) is entry:
+                _admin_by_module.pop(key, None)
+            return None
+        return plugin_id
+
+
 def _find_plugin_caller() -> tuple[str | None, Any | None]:
     """从调用栈中返回第一个插件模块的 ID 和全局字典。"""
+    callers = _find_plugin_callers()
+    return callers[0] if callers else (None, None)
+
+
+def _find_plugin_callers() -> list[tuple[str, Any]]:
+    """返回调用栈中的全部插件模块及其全局字典。"""
+    callers: list[tuple[str, Any]] = []
+    seen_globals: set[int] = set()
     try:
         for frame_info in inspect.stack():
             module_name = frame_info.frame.f_globals.get("__name__", "")
             for prefix in ("notmyfault.action_", "notmyfault.trigger_"):
                 if module_name.startswith(prefix):
-                    return module_name[len(prefix):], frame_info.frame.f_globals
-        return None, None
+                    globals_id = id(frame_info.frame.f_globals)
+                    if globals_id not in seen_globals:
+                        callers.append((module_name[len(prefix):], frame_info.frame.f_globals))
+                        seen_globals.add(globals_id)
+                    break
+        return callers
     except Exception:
-        return None, None
+        return []
 
 
 def _get_caller_plugin_id() -> str | None:
@@ -502,15 +544,37 @@ def run_as_admin(
     if not command:
         raise ValueError("command 不能为空")
 
-    caller_id, caller_globals = _find_plugin_caller()
+    callers = _find_plugin_callers()
+    caller_id = callers[0][0] if callers else None
     with _session_lock:
-        authorized_id = (
-            _admin_by_module.get(id(caller_globals))
-            if caller_globals is not None
-            else None
+        authorized_callers = [
+            (plugin_id, _plugin_id_for_globals(plugin_globals))
+            for plugin_id, plugin_globals in callers
+        ]
+        unauthorized = next(
+            (
+                plugin_id
+                for plugin_id, authorized_id in authorized_callers
+                if authorized_id is None or authorized_id not in _admin_plugins
+            ),
+            None,
+        )
+        authorized_id = next(
+            (
+                authorized_id
+                for _plugin_id, authorized_id in authorized_callers
+                if authorized_id is not None and authorized_id in _admin_plugins
+            ),
+            None,
         )
         mode = _authorization_mode
         broker = _admin_broker
+    if unauthorized is not None:
+        _warn_no_admin_permission(unauthorized)
+        raise PermissionError(
+            f"插件 '{unauthorized}' 未授权使用 run_as_admin()。"
+            f"请在插件元数据的 permissions 字段中添加 \"admin\" 并重启引擎。"
+        )
     if authorized_id is None:
         if caller_id is not None:
             _warn_no_admin_permission(caller_id)
