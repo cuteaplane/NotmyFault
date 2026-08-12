@@ -12,9 +12,11 @@ from notmyfault.core.bindings import (
     is_reference,
     iter_references,
 )
+from notmyfault.extensions.protocol import owned_value_identity
 
 
 _BINDING_ID_RE = re.compile(r"^[tap]_[a-z0-9_]{6,64}$")
+_RULE_ID_RE = re.compile(r"^r_[a-z0-9_]{6,64}$")
 
 def get_rule_condition(rule: Dict[str, Any]) -> Dict[str, Any] | None:
     """返回规则条件树并兼容旧版扁平 event 和 trigger 字段"""
@@ -93,6 +95,12 @@ def validate_rule_structure(rule: Any) -> List[str]:
     if not isinstance(rule, dict):
         return ["规则必须是对象"]
 
+    if "rule_id" in rule and (
+        not isinstance(rule["rule_id"], str)
+        or not _RULE_ID_RE.fullmatch(rule["rule_id"])
+    ):
+        errors.append("rule_id 无效")
+
     if not str(rule.get("name", "")).strip():
         errors.append("name 不能为空")
 
@@ -105,56 +113,86 @@ def validate_rule_structure(rule: Any) -> List[str]:
     else:
         errors.extend(validate_condition_tree(get_rule_condition(rule)))
 
+    def validate_action(action: Any, path: str, *, allow_failure_actions: bool) -> None:
+        if not isinstance(action, dict):
+            errors.append(f"{path} 必须是对象")
+            return
+        if not str(action.get("type", "")).strip():
+            errors.append(f"{path}.type 不能为空")
+        if "params" in action and not isinstance(action["params"], dict):
+            errors.append(f"{path}.params 必须是对象")
+        on_error = action.get("on_error", "stop")
+        if not isinstance(on_error, str) or on_error not in {"stop", "continue"}:
+            errors.append(f"{path}.on_error 必须是 stop 或 continue")
+        if "retry" in action:
+            retry = action["retry"]
+            valid_integer = (
+                not isinstance(retry, bool)
+                and (
+                    isinstance(retry, int)
+                    or isinstance(retry, float) and retry.is_integer()
+                    or isinstance(retry, str) and retry.strip().isdigit()
+                )
+            )
+            if not valid_integer or not 0 <= int(retry) <= 3:
+                errors.append(f"{path}.retry 必须是 0 到 3 的整数")
+        if "retry_delay_seconds" in action:
+            delay = action["retry_delay_seconds"]
+            try:
+                delay_number = float(delay)
+            except (TypeError, ValueError):
+                delay_number = -1
+            if (
+                isinstance(delay, bool)
+                or not math.isfinite(delay_number)
+                or not 0 <= delay_number <= 3600
+            ):
+                errors.append(
+                    f"{path}.retry_delay_seconds 必须是 0 到 3600 的数字"
+                )
+        if "timeout_seconds" in action:
+            timeout = action["timeout_seconds"]
+            try:
+                timeout_number = float(timeout)
+            except (TypeError, ValueError):
+                timeout_number = 0
+            if (
+                isinstance(timeout, bool)
+                or not math.isfinite(timeout_number)
+                or not 1 <= timeout_number <= 86400
+            ):
+                errors.append(
+                    f"{path}.timeout_seconds 必须是 1 到 86400 的数字"
+                )
+        retry_backoff = action.get("retry_backoff", "fixed")
+        if not isinstance(retry_backoff, str) or retry_backoff not in {
+            "fixed",
+            "exponential",
+        }:
+            errors.append(
+                f"{path}.retry_backoff 必须是 fixed 或 exponential"
+            )
+        if "failure_actions" not in action:
+            return
+        failure_actions = action["failure_actions"]
+        if not allow_failure_actions:
+            errors.append(f"{path}.failure_actions 不允许继续嵌套")
+        elif not isinstance(failure_actions, list) or not failure_actions:
+            errors.append(f"{path}.failure_actions 至少需要一个动作")
+        else:
+            for failure_index, failure_action in enumerate(failure_actions):
+                validate_action(
+                    failure_action,
+                    f"{path}.failure_actions[{failure_index}]",
+                    allow_failure_actions=False,
+                )
+
     actions = rule.get("actions")
     if not isinstance(actions, list) or not actions:
         errors.append("actions 至少需要一个动作")
     else:
         for index, action in enumerate(actions):
-            if not isinstance(action, dict):
-                errors.append(f"actions[{index}] 必须是对象")
-                continue
-            if not str(action.get("type", "")).strip():
-                errors.append(f"actions[{index}].type 不能为空")
-            if "params" in action and not isinstance(action["params"], dict):
-                errors.append(f"actions[{index}].params 必须是对象")
-            path = f"actions[{index}]"
-            on_error = action.get("on_error", "stop")
-            if not isinstance(on_error, str) or on_error not in {"stop", "continue"}:
-                errors.append(f"{path}.on_error 必须是 stop 或 continue")
-            if "retry" in action:
-                retry = action["retry"]
-                valid_integer = (
-                    not isinstance(retry, bool)
-                    and (
-                        isinstance(retry, int)
-                        or isinstance(retry, float) and retry.is_integer()
-                        or isinstance(retry, str) and retry.strip().isdigit()
-                    )
-                )
-                if not valid_integer or not 0 <= int(retry) <= 3:
-                    errors.append(f"{path}.retry 必须是 0 到 3 的整数")
-            if "retry_delay_seconds" in action:
-                delay = action["retry_delay_seconds"]
-                try:
-                    delay_number = float(delay)
-                except (TypeError, ValueError):
-                    delay_number = -1
-                if (
-                    isinstance(delay, bool)
-                    or not math.isfinite(delay_number)
-                    or not 0 <= delay_number <= 3600
-                ):
-                    errors.append(
-                        f"{path}.retry_delay_seconds 必须是 0 到 3600 的数字"
-                    )
-            retry_backoff = action.get("retry_backoff", "fixed")
-            if not isinstance(retry_backoff, str) or retry_backoff not in {
-                "fixed",
-                "exponential",
-            }:
-                errors.append(
-                    f"{path}.retry_backoff 必须是 fixed 或 exponential"
-                )
+            validate_action(action, f"actions[{index}]", allow_failure_actions=True)
 
     preconditions = rule.get("preconditions", [])
     if not isinstance(preconditions, list):
@@ -216,6 +254,16 @@ def validate_rule_binding_ids(rule: Dict[str, Any]) -> List[str]:
                 _validate_node_binding_id(
                     item, prefix, f"{field}[{index}]", seen, errors
                 )
+                if field == "actions" and isinstance(item.get("failure_actions"), list):
+                    for failure_index, failure_action in enumerate(item["failure_actions"]):
+                        if isinstance(failure_action, dict):
+                            _validate_node_binding_id(
+                                failure_action,
+                                "a",
+                                f"actions[{index}].failure_actions[{failure_index}]",
+                                seen,
+                                errors,
+                            )
     return errors
 
 
@@ -224,6 +272,7 @@ def validate_rules_structure(rules: Any) -> List[str]:
     if not isinstance(rules, list):
         return ["rules 必须是列表"]
     errors: List[str] = []
+    seen_rule_ids: set[str] = set()
     for index, rule in enumerate(rules):
         name = rule.get("name") if isinstance(rule, dict) else None
         label = str(name).strip() if name else f"#{index + 1}"
@@ -243,12 +292,25 @@ def validate_rules_structure(rules: Any) -> List[str]:
                                 for item in rule.get(field, [])
                                 if isinstance(item, dict)
                             ]
+                            + [
+                                failure_action
+                                for action in rule.get("actions", [])
+                                if isinstance(action, dict)
+                                and isinstance(action.get("failure_actions"), list)
+                                for failure_action in action["failure_actions"]
+                                if isinstance(failure_action, dict)
+                            ]
                         )
                     )
                     else []
                 )
             )
         )
+        if isinstance(rule, dict) and isinstance(rule.get("rule_id"), str):
+            rule_id = rule["rule_id"]
+            if rule_id in seen_rule_ids:
+                errors.append(f"规则 {label}: rule_id 与其他规则重复")
+            seen_rule_ids.add(rule_id)
     return errors
 
 
@@ -501,6 +563,63 @@ def _target_type(param: Dict[str, Any] | None) -> str:
     return str(raw)
 
 
+def _valid_uia_selector(value: Any) -> bool:
+    if not isinstance(value, dict) or value.get("version") != 1:
+        return False
+    window = value.get("window")
+    target = value.get("target")
+    if not isinstance(window, dict) or not isinstance(target, dict):
+        return False
+    control_type = target.get("control_type")
+    return (
+        isinstance(control_type, int)
+        and not isinstance(control_type, bool)
+        and any(
+            isinstance(target.get(key), str) and target.get(key)
+            for key in ("automation_id", "name", "class_name")
+        )
+    )
+
+
+def _valid_plugin_data(
+    value: Any,
+    plugin_meta: Dict[str, Any],
+    param: Dict[str, Any],
+) -> bool:
+    identity = owned_value_identity(value)
+    if identity is None:
+        if isinstance(value, dict) and "$type" in value:
+            return False
+        if not isinstance(value, dict) or not value:
+            return False
+        contributes = plugin_meta.get("contributes")
+        editors = (
+            contributes.get("parameter_editors", [])
+            if isinstance(contributes, dict) else []
+        )
+        return any(
+            isinstance(editor, dict)
+            and editor.get("parameter") == param.get("name")
+            and editor.get("accepts_legacy") is True
+            for editor in editors
+        )
+    package_name, data_type_id, version = identity
+    if package_name != plugin_meta.get("package_name"):
+        return False
+    if data_type_id != param.get("data_type"):
+        return False
+    contributes = plugin_meta.get("contributes")
+    data_types = contributes.get("data_types", []) if isinstance(contributes, dict) else []
+    declared = next(
+        (
+            item for item in data_types
+            if isinstance(item, dict) and item.get("id") == data_type_id
+        ),
+        None,
+    )
+    return isinstance(declared, dict) and declared.get("version") == version
+
+
 def _types_compatible(source: str, target: str) -> bool:
     return source == "any" or target == "any" or source == target
 
@@ -522,11 +641,19 @@ def validate_rule_bindings(
     actions = [
         item for item in rule.get("actions", []) if isinstance(item, dict)
     ]
-    actions_by_id = {
-        item.get("binding_id"): (index, item)
-        for index, item in enumerate(actions)
-        if isinstance(item.get("binding_id"), str)
-    }
+    all_actions_by_id: Dict[str, Dict[str, Any]] = {}
+    for action in actions:
+        if isinstance(action.get("binding_id"), str):
+            all_actions_by_id[action["binding_id"]] = action
+        failure_actions = action.get("failure_actions", [])
+        if not isinstance(failure_actions, list):
+            failure_actions = []
+        for failure_action in failure_actions:
+            if (
+                isinstance(failure_action, dict)
+                and isinstance(failure_action.get("binding_id"), str)
+            ):
+                all_actions_by_id[failure_action["binding_id"]] = failure_action
 
     def add(code: str, usage: Any, message: str) -> None:
         issues.append({
@@ -548,8 +675,8 @@ def validate_rule_bindings(
     def validate_item(
         item: Dict[str, Any],
         *,
-        item_index: int,
-        field: str,
+        location: str,
+        available_actions: Dict[str, Dict[str, Any]],
         allow_steps: bool,
         allow_conditional_sources: bool,
     ) -> None:
@@ -570,13 +697,13 @@ def validate_rule_bindings(
             ):
                 issues.append({
                     "code": "unsafe_dynamic_parameter",
-                    "location": f"{field}[{item_index}].params.{param_name}",
+                    "location": f"{location}.params.{param_name}",
                     "reference": None,
                     "message": "PowerShell 命令不允许来自运行时数据",
                 })
             for usage in iter_references(
                 value,
-                location=f"{field}[{item_index}].params.{param_name}",
+                location=f"{location}.params.{param_name}",
             ):
                 if item.get("type") == "run_powershell" and param_name == "command":
                     add(
@@ -670,13 +797,12 @@ def validate_rule_bindings(
                         add("step_not_available", usage, "开始前确认不能引用动作结果")
                         continue
                     node_id = reference.get("node")
-                    source = actions_by_id.get(node_id)
-                    if source is None:
+                    source_action = available_actions.get(node_id)
+                    if source_action is None and node_id not in all_actions_by_id:
                         add("unknown_source", usage, "引用的动作步骤不存在")
                         continue
-                    source_index, source_action = source
-                    if source_index >= item_index:
-                        add("forward_reference", usage, "只能引用当前动作之前的步骤")
+                    if source_action is None:
+                        add("forward_reference", usage, "只能引用当前路径中已经完成的动作")
                         continue
                     source_output = output_for(
                         actions_meta.get(source_action.get("type", ""), {}),
@@ -693,7 +819,15 @@ def validate_rule_bindings(
                     add("optional_output", usage, "该输出字段可能不存在")
                     continue
                 source_type = _source_type(source_output)
-                target_type = _target_type(target_params.get(param_name))
+                target_param = target_params.get(param_name)
+                if target_param and target_param.get("type") == "plugin_data":
+                    add(
+                        "private_plugin_data",
+                        usage,
+                        "插件自有数据不能绑定运行数据",
+                    )
+                    continue
+                target_type = _target_type(target_param)
                 if not _types_compatible(source_type, target_type):
                     add(
                         "binding_type_mismatch",
@@ -705,19 +839,43 @@ def validate_rule_bindings(
         if isinstance(item, dict):
             validate_item(
                 item,
-                item_index=index,
-                field="preconditions",
+                location=f"preconditions[{index}]",
+                available_actions={},
                 allow_steps=False,
                 allow_conditional_sources=False,
             )
     for index, action in enumerate(actions):
         validate_item(
             action,
-            item_index=index,
-            field="actions",
+            location=f"actions[{index}]",
+            available_actions={
+                item["binding_id"]: item
+                for item in actions[:index]
+                if isinstance(item.get("binding_id"), str)
+            },
             allow_steps=True,
             allow_conditional_sources=True,
         )
+        failure_sources = {
+            item["binding_id"]: item
+            for item in actions[:index]
+            if isinstance(item.get("binding_id"), str)
+        }
+        failure_actions = action.get("failure_actions", [])
+        if not isinstance(failure_actions, list):
+            failure_actions = []
+        for failure_index, failure_action in enumerate(failure_actions):
+            if not isinstance(failure_action, dict):
+                continue
+            validate_item(
+                failure_action,
+                location=f"actions[{index}].failure_actions[{failure_index}]",
+                available_actions=failure_sources,
+                allow_steps=True,
+                allow_conditional_sources=True,
+            )
+            if isinstance(failure_action.get("binding_id"), str):
+                failure_sources[failure_action["binding_id"]] = failure_action
     return issues
 
 
@@ -745,15 +903,57 @@ def validate_rules(
             if event_type and event_type not in triggers_meta:
                 issues.append((rule_name, f"引用了未加载的触发器: {event_type}"))
                 all_events_valid = False
+                continue
+            trigger_meta = triggers_meta.get(event_type, {})
+            event_params = event_def.get("params", {})
+            if not isinstance(event_params, dict):
+                continue
+            for schema in trigger_meta.get("params", []):
+                if not isinstance(schema, dict) or schema.get("type") != "plugin_data":
+                    continue
+                param_name = schema.get("name", "")
+                if schema.get("required") is True and param_name not in event_params:
+                    issues.append((
+                        rule_name,
+                        f'trigger "{event_type}" 缺少必填参数: {param_name}',
+                    ))
+                    all_events_valid = False
+                    continue
+                if param_name not in event_params:
+                    continue
+                if is_reference(event_params[param_name]) or not _valid_plugin_data(
+                    event_params[param_name], trigger_meta, schema
+                ):
+                    issues.append((
+                        rule_name,
+                        f'trigger "{event_type}" 参数 \'{param_name}\' '
+                        "不是该插件声明的数据，请重新编辑",
+                    ))
+                    all_events_valid = False
         if not all_events_valid:
             # 没有有效触发器时跳过 action 校验
             continue
 
         rule_ok = True
+        action_specs = []
         for j, action in enumerate(rule.get("actions", [])):
+            action_specs.append((f"actions[{j}]", action))
+            if isinstance(action, dict):
+                for failure_index, failure_action in enumerate(
+                    action.get("failure_actions", [])
+                ):
+                    action_specs.append((
+                        f"actions[{j}].failure_actions[{failure_index}]",
+                        failure_action,
+                    ))
+        for action_path, action in action_specs:
+            if not isinstance(action, dict):
+                issues.append((rule_name, f"{action_path} 必须是对象"))
+                rule_ok = False
+                continue
             action_type = action.get("type", "")
             if not action_type:
-                issues.append((rule_name, f"actions[{j}] 缺少 type"))
+                issues.append((rule_name, f"{action_path} 缺少 type"))
                 rule_ok = False
                 continue
 
@@ -762,11 +962,30 @@ def validate_rules(
                 rule_ok = False
                 continue
 
+            if (
+                action.get("timeout_seconds") is not None
+                and actions_meta[action_type].get("cancellation_api") != "runtime-v1"
+            ):
+                issues.append((
+                    rule_name,
+                    f'{action_path} 的 action "{action_type}" 不支持安全取消，不能设置运行超时',
+                ))
+                rule_ok = False
+                continue
+
             # 只检查 schema 定义的参数类型
             action_meta = actions_meta[action_type]
             schema_params = action_meta.get("params", [])
             schema_param_names = {p["name"]: p for p in schema_params}
             rule_params = action.get("params", {})
+
+            for schema in schema_params:
+                if schema.get("required") is True and schema["name"] not in rule_params:
+                    issues.append((
+                        rule_name,
+                        f'action "{action_type}" 缺少必填参数: {schema["name"]}',
+                    ))
+                    rule_ok = False
 
             for param_name, param_value in rule_params.items():
                 if param_name not in schema_param_names:
@@ -814,6 +1033,22 @@ def validate_rules(
                             f'值 \'{param_value}\' 不在可选项中 '
                             f"({', '.join(map(str, opt_values))})",
                         ))
+                elif expected_type == "uia_selector":
+                    if not _valid_uia_selector(param_value):
+                        issues.append((
+                            rule_name,
+                            f'action "{action_type}" 参数 \'{param_name}\' '
+                            "没有有效的屏幕控件，请重新选择",
+                        ))
+                        rule_ok = False
+                elif expected_type == "plugin_data":
+                    if not _valid_plugin_data(param_value, action_meta, schema):
+                        issues.append((
+                            rule_name,
+                            f'action "{action_type}" 参数 \'{param_name}\' '
+                            "不是该插件声明的数据，请重新编辑",
+                        ))
+                        rule_ok = False
                 # string 参数保留原值，不做严格类型检查
 
         if rule_ok:

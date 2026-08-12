@@ -10,7 +10,8 @@ import pytest
 
 from notmyfault.core.engine import AutomationEngine
 from notmyfault.core import workflow_executor as workflow_executor_module
-from notmyfault.core.workflow import build_context
+from notmyfault.core.workflow import ActionCancellation, build_context
+from notmyfault.security.errors import AdminExecutionBlocked
 
 
 def make_engine(rules=None, on_event=None):
@@ -102,6 +103,415 @@ class TestExecuteAction:
         assert executed[0]["status"] == "ok"
         assert executed[0]["result"] == "done"
         assert executed[0]["rule_name"] == "规则A"
+
+    def test_action_event_carries_stable_rule_and_step_ids(self):
+        events = []
+        engine = make_engine(on_event=lambda t, p: events.append((t, p)))
+        register_action(engine, "noop", lambda meta, params: "done")
+        context = build_context("规则A", "hotkey", {}, [], "r_rule001")
+
+        engine._run_action(
+            {"type": "noop", "binding_id": "a_step001", "params": {}},
+            "规则A",
+            context,
+        )
+
+        executed = [payload for name, payload in events if name == "action_executed"]
+        assert executed[0]["rule_id"] == "r_rule001"
+        assert executed[0]["step_id"] == "a_step001"
+
+    def test_workflow_events_carry_run_status_and_duration(self):
+        events = []
+        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        register_action(engine, "noop", lambda meta, params: "done")
+        context = build_context(
+            "规则A", "manual", {}, [], "r_rule001", "run_test001"
+        )
+
+        engine.execute_workflow(
+            "r_rule001",
+            {
+                "actions": [
+                    {
+                        "type": "noop",
+                        "binding_id": "a_step001",
+                        "params": {},
+                    }
+                ]
+            },
+            "规则A",
+            context,
+        )
+
+        executed = [data for name, data in events if name == "action_executed"]
+        completed = [data for name, data in events if name == "workflow_completed"]
+        assert executed[0]["run_id"] == "run_test001"
+        assert executed[0]["duration_ms"] >= 0
+        assert len(completed) == 1
+        assert completed[0]["run_id"] == "run_test001"
+        assert completed[0]["rule_id"] == "r_rule001"
+        assert completed[0]["rule_name"] == "规则A"
+        assert completed[0]["status"] == "succeeded"
+
+    def test_manual_run_returns_the_same_run_id_used_by_events(self):
+        events = []
+        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        register_action(engine, "noop", lambda meta, params: "done")
+
+        ok, message, run_id = engine.run_manual_rule_snapshot(
+            {
+                "rule_id": "r_rule001",
+                "name": "规则A",
+                "actions": [
+                    {
+                        "type": "noop",
+                        "binding_id": "a_step001",
+                        "params": {},
+                    }
+                ],
+            },
+            0,
+        )
+        for thread in engine._manual_threads:
+            thread.join(timeout=5)
+
+        assert ok is True
+        assert message == "已开始执行"
+        assert run_id.startswith("run_")
+        run_events = [data for _name, data in events if data.get("run_id") == run_id]
+        assert {data.get("rule_id") for data in run_events} == {"r_rule001"}
+        assert any(name == "workflow_completed" for name, data in events if data.get("run_id") == run_id)
+
+    def test_manual_run_can_continue_from_step_with_supplied_upstream_result(self):
+        events = []
+        received = []
+        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        register_action(engine, "first", lambda meta, params: pytest.fail("skipped action ran"))
+        register_action(
+            engine,
+            "second",
+            lambda meta, params: received.append(params) or {"count": 2},
+        )
+        rule = {
+            "rule_id": "r_partial001",
+            "name": "局部运行",
+            "actions": [
+                {"type": "first", "binding_id": "a_first001", "params": {}},
+                {
+                    "type": "second",
+                    "binding_id": "a_second001",
+                    "params": {
+                        "value": {
+                            "$ref": {
+                                "scope": "step",
+                                "node": "a_first001",
+                                "path": ["value"],
+                            }
+                        }
+                    },
+                },
+            ],
+        }
+
+        ok, _message, run_id = engine.run_manual_rule_snapshot(
+            rule,
+            0,
+            step_outputs={"a_first001": {"value": "provided"}},
+            start_step_id="a_second001",
+            test_assertions=[{
+                "step_id": "a_second001",
+                "path": ["count"],
+                "operator": "gte",
+                "expected": 2,
+            }],
+        )
+        for thread in engine._manual_threads:
+            thread.join(timeout=5)
+
+        assert ok is True
+        assert received == [{"value": "provided"}]
+        triggered = [data for name, data in events if name == "rule_triggered"]
+        assert triggered[0]["action_count"] == 1
+        assertion_event = [data for name, data in events if name == "test_assertions_completed"]
+        assert assertion_event[0]["passed"] == 1
+        completed = [data for name, data in events if name == "workflow_completed"]
+        assert completed[0]["run_id"] == run_id
+        assert completed[0]["status"] == "succeeded"
+
+    def test_manual_run_exposes_trigger_configuration_without_fake_payload(self):
+        received = []
+        engine = make_engine()
+        register_action(engine, "consume", lambda meta, params: received.append(params))
+        rule = {
+            "rule_id": "r_config001",
+            "name": "触发配置测试",
+            "event": {
+                "type": "hotkey",
+                "binding_id": "t_hotkey001",
+                "params": {"hotkey": "ctrl+alt+t"},
+            },
+            "actions": [{
+                "type": "consume",
+                "binding_id": "a_consume001",
+                "params": {
+                    "value": {
+                        "$ref": {
+                            "scope": "trigger_config",
+                            "node": "t_hotkey001",
+                            "path": ["hotkey"],
+                        }
+                    }
+                },
+            }],
+        }
+
+        engine.run_manual_rule_snapshot(rule, 0)
+        for thread in engine._manual_threads:
+            thread.join(timeout=5)
+
+        assert received == [{"value": "ctrl+alt+t"}]
+
+    def test_failed_manual_assertion_marks_workflow_failed_without_exposing_values(self):
+        events = []
+        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        register_action(engine, "result", lambda meta, params: {"token": "actual-secret"})
+        context = build_context(
+            "断言测试", "manual", {}, [], "r_assert001", "run_assert001"
+        )
+        context["manual_test"] = {
+            "start_index": 0,
+            "end_index": 0,
+            "assertions": [{
+                "step_id": "a_result001",
+                "path": ["token"],
+                "operator": "equals",
+                "expected": "expected-secret",
+            }],
+        }
+
+        engine.execute_workflow(
+            "r_assert001",
+            {"actions": [{"type": "result", "binding_id": "a_result001", "params": {}}]},
+            "断言测试",
+            context,
+        )
+
+        assertion_event = [data for name, data in events if name == "test_assertions_completed"][0]
+        completed = [data for name, data in events if name == "workflow_completed"][0]
+        assert assertion_event["passed"] == 0
+        assert "actual-secret" not in repr(assertion_event)
+        assert "expected-secret" not in repr(assertion_event)
+        assert completed["status"] == "failed"
+        assert completed["failure_kind"] == "assertion"
+
+    def test_contains_assertion_handles_text_lists_and_object_subsets(self):
+        events = []
+        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        register_action(
+            engine,
+            "result",
+            lambda meta, params: {
+                "text": "NotmyFault automation",
+                "items": ["one", "two", "three"],
+                "meta": {"ready": True, "count": 3},
+            },
+        )
+        context = build_context("包含断言", "manual", {}, [], "r_contains001", "run_contains001")
+        context["manual_test"] = {
+            "start_index": 0,
+            "end_index": 0,
+            "assertions": [
+                {"step_id": "a_result001", "path": ["text"], "operator": "contains", "expected": "automation"},
+                {"step_id": "a_result001", "path": ["items"], "operator": "contains", "expected": ["one", "three"]},
+                {"step_id": "a_result001", "path": ["meta"], "operator": "contains", "expected": {"ready": True}},
+            ],
+        }
+
+        engine.execute_workflow(
+            "r_contains001",
+            {"actions": [{"type": "result", "binding_id": "a_result001", "params": {}}]},
+            "包含断言",
+            context,
+        )
+
+        assertion_event = [data for name, data in events if name == "test_assertions_completed"][0]
+        assert assertion_event["passed"] == 3
+        assert assertion_event["total"] == 3
+
+    def test_sensitive_action_result_is_masked_in_event(self):
+        events = []
+        engine = make_engine(on_event=lambda t, p: events.append((t, p)))
+        register_action(
+            engine,
+            "secret",
+            lambda meta, params: {"token": "TOP_SECRET", "ok": True},
+            meta={
+                "outputs": [
+                    {"name": "token", "type": "string", "sensitive": True},
+                    {"name": "ok", "type": "bool"},
+                ],
+            },
+        )
+
+        ok, result = engine._run_action(
+            {"type": "secret", "params": {}}, "规则A", _context()
+        )
+
+        assert ok is True
+        assert result["token"] == "TOP_SECRET"
+        executed = [p for t, p in events if t == "action_executed"]
+        assert executed[0]["result"] == {"token": "***", "ok": True}
+
+    def test_action_event_contains_plugin_controlled_safe_summaries(self):
+        events = []
+        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        register_action(
+            engine,
+            "summarize",
+            lambda meta, params: {
+                "count": 3,
+                "body": "PRIVATE_RESULT",
+                "secret": "OUTPUT_SECRET",
+            },
+            meta={
+                "params": [
+                    {"name": "message", "label": "消息", "type": "string"},
+                    {"name": "mode", "label": "模式", "type": "select", "summary": "value"},
+                    {"name": "token", "label": "令牌", "type": "string", "summary": "value", "sensitive": True},
+                    {"name": "hidden", "label": "隐藏", "type": "string", "summary": "hidden"},
+                ],
+                "outputs": [
+                    {"name": "count", "label": "数量", "type": "number", "summary": "value"},
+                    {"name": "body", "label": "正文", "type": "string"},
+                    {"name": "secret", "label": "密文", "type": "string", "summary": "value", "sensitive": True},
+                ],
+            },
+        )
+
+        engine._run_action(
+            {
+                "type": "summarize",
+                "params": {
+                    "message": "PRIVATE_INPUT",
+                    "mode": "safe",
+                    "token": "INPUT_SECRET",
+                    "hidden": "HIDDEN_INPUT",
+                },
+            },
+            "规则A",
+            _context(),
+        )
+
+        event = next(data for name, data in events if name == "action_executed")
+        assert [item["display"] for item in event["input_summary"]] == [
+            "文本 · 13 字符", "safe", "敏感值已隐藏",
+        ]
+        assert [item["display"] for item in event["output_summary"]] == [
+            "3", "文本 · 14 字符", "敏感值已隐藏",
+        ]
+        assert "PRIVATE_INPUT" not in repr(event["input_summary"])
+        assert "PRIVATE_RESULT" not in repr(event["output_summary"])
+        assert event["params"]["token"] == "***"
+        assert event["result"]["secret"] == "***"
+
+    def test_sensitive_action_param_is_masked_in_failure_without_context_binding(self):
+        events = []
+        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+
+        def fail(meta, params):
+            raise RuntimeError(f"拒绝令牌 {params['token']}")
+
+        register_action(
+            engine,
+            "secret_param",
+            fail,
+            meta={
+                "params": [{
+                    "name": "token",
+                    "label": "令牌",
+                    "type": "string",
+                    "sensitive": True,
+                }],
+            },
+        )
+
+        ok, result = engine._run_action(
+            {"type": "secret_param", "params": {"token": "DIRECT_SECRET"}},
+            "规则A",
+            _context(),
+        )
+
+        event = next(data for name, data in events if name == "error")
+        assert ok is False
+        assert "DIRECT_SECRET" not in result
+        assert "DIRECT_SECRET" not in event["error"]
+        assert event["input_summary"][0]["display"] == "敏感值已隐藏"
+
+    def test_sensitive_value_is_masked_inside_action_parameter(self):
+        events = []
+        engine = make_engine(on_event=lambda t, p: events.append((t, p)))
+        engine.triggers_meta["clipboard"] = {
+            "outputs": [
+                {"name": "text", "type": "string", "sensitive": True},
+            ],
+        }
+        register_action(engine, "consume", lambda meta, params: None)
+        context = build_context(
+            "规则A", "clipboard", {"text": "TOP_SECRET"}, []
+        )
+
+        engine._run_action(
+            {
+                "type": "consume",
+                "params": {"message": "Bearer {{ event.payload.text }}"},
+            },
+            "规则A",
+            context,
+        )
+
+        executed = [p for t, p in events if t == "action_executed"]
+        assert executed[0]["params"]["message"] == "Bearer ***"
+
+    def test_sensitive_value_is_masked_in_action_errors_and_logs(self, capsys):
+        events = []
+        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        engine.triggers_meta["clipboard"] = {
+            "outputs": [
+                {"name": "text", "type": "string", "sensitive": True},
+            ],
+        }
+
+        def fail_with_input(meta, params):
+            raise RuntimeError(f"不能处理 {params['message']}")
+
+        register_action(engine, "consume", fail_with_input)
+        context = build_context(
+            "规则A", "clipboard", {"text": "TOP_SECRET"}, []
+        )
+
+        ok, result = engine._run_action(
+            {
+                "type": "consume",
+                "params": {
+                    "message": {
+                        "$ref": {
+                            "scope": "event",
+                            "path": ["text"],
+                        }
+                    }
+                },
+            },
+            "规则A",
+            context,
+        )
+
+        output = capsys.readouterr()
+        error_event = next(data for name, data in events if name == "error")
+        assert ok is False
+        assert "TOP_SECRET" not in str(result)
+        assert "TOP_SECRET" not in error_event["error"]
+        assert "TOP_SECRET" not in output.out + output.err
+        assert "***" in error_event["error"]
 
     def test_on_event_error_callback(self):
         events = []
@@ -206,6 +616,282 @@ class TestExecuteAction:
 
         assert after == [1]
 
+    def test_pipeline_runs_failure_actions_before_continuing_main_flow(self):
+        engine = make_engine()
+        calls = []
+        register_action(engine, "broken", lambda meta, params: 1 / 0)
+        register_action(engine, "recover", lambda meta, params: calls.append("recover"))
+        register_action(engine, "after", lambda meta, params: calls.append("after"))
+        context = _context()
+
+        engine.execute_workflow(
+            "wf",
+            {"actions": [
+                {
+                    "type": "broken",
+                    "binding_id": "a_bad001",
+                    "params": {},
+                    "on_error": "continue",
+                    "failure_actions": [{
+                        "type": "recover",
+                        "binding_id": "a_rec001",
+                        "params": {},
+                    }],
+                },
+                {"type": "after", "binding_id": "a_after001", "params": {}},
+            ]},
+            "规则",
+            context,
+        )
+
+        assert calls == ["recover", "after"]
+        assert context["steps"]["a_bad001"]["status"] == "failed"
+        assert context["steps"]["a_rec001"]["status"] == "ok"
+
+    def test_pipeline_does_not_run_failure_actions_after_success(self):
+        engine = make_engine()
+        calls = []
+        register_action(engine, "works", lambda meta, params: calls.append("main"))
+        register_action(engine, "recover", lambda meta, params: calls.append("recover"))
+
+        engine.execute_workflow(
+            "wf",
+            {"actions": [{
+                "type": "works",
+                "binding_id": "a_main001",
+                "params": {},
+                "failure_actions": [{
+                    "type": "recover",
+                    "binding_id": "a_rec001",
+                    "params": {},
+                }],
+            }]},
+            "规则",
+            _context(),
+        )
+
+        assert calls == ["main"]
+
+    def test_failed_recovery_stops_remaining_failure_actions(self):
+        engine = make_engine()
+        calls = []
+        register_action(engine, "broken", lambda meta, params: 1 / 0)
+        register_action(engine, "recover_broken", lambda meta, params: 1 / 0)
+        register_action(engine, "recover_after", lambda meta, params: calls.append("recover_after"))
+
+        engine.execute_workflow(
+            "wf",
+            {"actions": [{
+                "type": "broken",
+                "binding_id": "a_bad001",
+                "params": {},
+                "failure_actions": [
+                    {"type": "recover_broken", "binding_id": "a_rec001", "params": {}},
+                    {"type": "recover_after", "binding_id": "a_rec002", "params": {}},
+                ],
+            }]},
+            "规则",
+            _context(),
+        )
+
+        assert calls == []
+
+    def test_cancel_run_interrupts_context_action_without_recovery(self):
+        events = []
+        started = threading.Event()
+        recovered = []
+        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+
+        def run_with_context(meta, params, context):
+            started.set()
+            cancellation = context["runtime"]["cancellation"]
+            cancellation.wait(5)
+            cancellation.raise_if_cancelled()
+
+        register_action(
+            engine,
+            "waitable",
+            lambda meta, params: None,
+            meta={
+                "execution_api": "context-v1",
+                "cancellation_api": "runtime-v1",
+            },
+            module=types.SimpleNamespace(run_with_context=run_with_context),
+        )
+        register_action(
+            engine, "recover", lambda meta, params: recovered.append(1)
+        )
+        context = build_context(
+            "规则", "manual", {}, [], run_id="run_cancel001"
+        )
+        thread = threading.Thread(
+            target=engine.execute_workflow,
+            args=(
+                "wf",
+                {"actions": [{
+                    "type": "waitable",
+                    "binding_id": "a_wait001",
+                    "params": {},
+                    "failure_actions": [{
+                        "type": "recover",
+                        "binding_id": "a_recover001",
+                        "params": {},
+                    }],
+                }]},
+                "规则",
+                context,
+            ),
+        )
+
+        thread.start()
+        assert started.wait(timeout=2)
+        assert engine.cancel_run("run_cancel001") is True
+        thread.join(timeout=2)
+
+        assert thread.is_alive() is False
+        assert recovered == []
+        assert context["steps"]["a_wait001"]["status"] == "cancelled"
+        completed = [data for name, data in events if name == "workflow_completed"]
+        assert completed[-1]["status"] == "cancelled"
+        assert engine.cancel_run("run_cancel001") is False
+
+    def test_action_timeout_uses_plugin_cancellation_contract(
+        self, monkeypatch
+    ):
+        events = []
+        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+
+        def short_cancellation(run_event=None, shutdown_event=None, timeout_seconds=None):
+            return ActionCancellation(
+                run_event,
+                shutdown_event,
+                0.01 if timeout_seconds is not None else None,
+            )
+
+        def run_with_context(meta, params, context):
+            cancellation = context["runtime"]["cancellation"]
+            cancellation.wait(1)
+            cancellation.raise_if_cancelled()
+
+        monkeypatch.setattr(
+            workflow_executor_module, "ActionCancellation", short_cancellation
+        )
+        register_action(
+            engine,
+            "waitable",
+            lambda meta, params: None,
+            meta={
+                "execution_api": "context-v1",
+                "cancellation_api": "runtime-v1",
+            },
+            module=types.SimpleNamespace(run_with_context=run_with_context),
+        )
+        context = _context()
+
+        engine.execute_workflow(
+            "wf",
+            {"actions": [{
+                "type": "waitable",
+                "binding_id": "a_wait001",
+                "params": {},
+                "timeout_seconds": 1,
+            }]},
+            "规则",
+            context,
+        )
+
+        assert context["steps"]["a_wait001"]["status"] == "timed_out"
+        assert any(name == "action_timed_out" for name, _data in events)
+
+    def test_cancel_run_interrupts_retry_wait(self):
+        events = []
+        attempted = threading.Event()
+        attempts = []
+        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+
+        def broken(meta, params):
+            attempts.append(1)
+            attempted.set()
+            raise RuntimeError("boom")
+
+        register_action(engine, "broken", broken)
+        context = build_context(
+            "规则", "manual", {}, [], run_id="run_retry001"
+        )
+        thread = threading.Thread(
+            target=engine.execute_workflow,
+            args=(
+                "wf",
+                {"actions": [{
+                    "type": "broken",
+                    "binding_id": "a_broken001",
+                    "params": {},
+                    "retry": 1,
+                    "retry_delay_seconds": 30,
+                }]},
+                "规则",
+                context,
+            ),
+        )
+
+        thread.start()
+        assert attempted.wait(timeout=2)
+        assert engine.cancel_run("run_retry001") is True
+        thread.join(timeout=2)
+
+        assert thread.is_alive() is False
+        assert attempts == [1]
+        assert any(name == "action_cancelled" for name, _data in events)
+        completed = [data for name, data in events if name == "workflow_completed"]
+        assert completed[-1]["status"] == "cancelled"
+
+    def test_engine_shutdown_marks_cooperative_action_cancelled(self):
+        events = []
+        started = threading.Event()
+        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        engine._shutdown_flag = threading.Event()
+
+        def run_with_context(meta, params, context):
+            started.set()
+            cancellation = context["runtime"]["cancellation"]
+            cancellation.wait(5)
+            cancellation.raise_if_cancelled()
+
+        register_action(
+            engine,
+            "waitable",
+            lambda meta, params: None,
+            meta={
+                "execution_api": "context-v1",
+                "cancellation_api": "runtime-v1",
+            },
+            module=types.SimpleNamespace(run_with_context=run_with_context),
+        )
+        thread = threading.Thread(
+            target=engine.execute_workflow,
+            args=(
+                "wf",
+                {"actions": [{
+                    "type": "waitable",
+                    "binding_id": "a_wait001",
+                    "params": {},
+                }]},
+                "规则",
+                build_context(
+                    "规则", "manual", {}, [], run_id="run_shutdown001"
+                ),
+            ),
+        )
+
+        thread.start()
+        assert started.wait(timeout=2)
+        engine._shutdown_flag.set()
+        thread.join(timeout=2)
+
+        assert thread.is_alive() is False
+        completed = [data for name, data in events if name == "workflow_completed"]
+        assert completed[-1]["status"] == "cancelled"
+
     def test_exponential_retry_waits_longer_after_each_failure(self, monkeypatch):
         events = []
         engine = make_engine(on_event=lambda name, data: events.append((name, data)))
@@ -216,7 +902,11 @@ class TestExecuteAction:
             attempts.append(1)
             raise RuntimeError("boom")
 
-        monkeypatch.setattr(workflow_executor_module.time, "sleep", waits.append)
+        monkeypatch.setattr(
+            workflow_executor_module.ActionCancellation,
+            "wait",
+            lambda self, seconds: waits.append(seconds) or False,
+        )
         register_action(engine, "flaky", flaky)
 
         engine._run_action(
@@ -235,6 +925,24 @@ class TestExecuteAction:
         assert waits == [2, 4, 8]
         error = next(data for name, data in events if name == "error")
         assert error["attempt"] == 4
+
+    def test_admin_rejection_is_not_retried(self):
+        engine = make_engine()
+        attempts = []
+
+        def rejected(meta, params):
+            attempts.append(1)
+            raise AdminExecutionBlocked("用户拒绝")
+
+        register_action(engine, "admin_action", rejected)
+        ok, _result = engine._run_action(
+            {"type": "admin_action", "params": {}, "retry": 3},
+            "规则",
+            _context(),
+        )
+
+        assert ok is False
+        assert attempts == [1]
 
     def test_precondition_allows_ready_workflow(self):
         engine = make_engine()
@@ -285,6 +993,118 @@ class TestExecuteAction:
         assert "wf" in engine._deferred_workflows
         assert any(t == "workflow_deferred" for t, _ in events)
         engine._cancel_deferred_workflows()
+
+    def test_cancel_run_removes_deferred_timer(self):
+        events = []
+        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        module = types.SimpleNamespace(
+            check_precondition=lambda meta, params, context: {
+                "ok": False,
+                "reason": "目录仍在使用",
+                "retry_after_seconds": 30,
+            }
+        )
+        register_action(
+            engine,
+            "doc_check",
+            lambda meta, params: None,
+            meta={"precondition_api": "context-v1"},
+            module=module,
+        )
+        context = build_context(
+            "规则", "manual", {}, [], run_id="run_deferred001"
+        )
+
+        engine.execute_workflow(
+            "wf",
+            {"preconditions": [{
+                "type": "doc_check",
+                "binding_id": "p_doc001",
+                "params": {},
+            }], "actions": []},
+            "规则",
+            context,
+        )
+
+        assert "wf" in engine._deferred_workflows
+        assert engine.cancel_run("run_deferred001") is True
+        assert "wf" not in engine._deferred_workflows
+        completed = [data for name, data in events if name == "workflow_completed"]
+        assert completed[-1]["status"] == "cancelled"
+
+    def test_repeated_deferred_workflow_completes_coalesced_run(self):
+        events = []
+        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        module = types.SimpleNamespace(
+            check_precondition=lambda meta, params, context: {
+                "ok": False,
+                "reason": "目录仍在使用",
+                "retry_after_seconds": 30,
+            }
+        )
+        register_action(
+            engine,
+            "doc_check",
+            lambda meta, params: None,
+            meta={"precondition_api": "context-v1"},
+            module=module,
+        )
+        rule = {
+            "preconditions": [{
+                "type": "doc_check",
+                "binding_id": "p_doc001",
+                "params": {},
+            }],
+            "actions": [],
+        }
+        first = build_context("规则", "manual", {}, [], run_id="run_deferred001")
+        second = build_context("规则", "manual", {}, [], run_id="run_deferred002")
+
+        engine.execute_workflow("wf", rule, "规则", first)
+        engine.execute_workflow("wf", rule, "规则", second)
+
+        completed = [data for name, data in events if name == "workflow_completed"]
+        assert completed[-1]["run_id"] == "run_deferred002"
+        assert completed[-1]["status"] == "cancelled"
+        assert "run_deferred002" not in engine._workflow_executor._run_cancel_events
+        engine._cancel_deferred_workflows()
+
+    def test_cancel_deferred_workflows_completes_runs(self):
+        events = []
+        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        module = types.SimpleNamespace(
+            check_precondition=lambda meta, params, context: {
+                "ok": False,
+                "reason": "目录仍在使用",
+                "retry_after_seconds": 30,
+            }
+        )
+        register_action(
+            engine,
+            "doc_check",
+            lambda meta, params: None,
+            meta={"precondition_api": "context-v1"},
+            module=module,
+        )
+        context = build_context("规则", "manual", {}, [], run_id="run_deferred003")
+        engine.execute_workflow(
+            "wf",
+            {"preconditions": [{
+                "type": "doc_check",
+                "binding_id": "p_doc001",
+                "params": {},
+            }], "actions": []},
+            "规则",
+            context,
+        )
+
+        engine._cancel_deferred_workflows()
+
+        completed = [data for name, data in events if name == "workflow_completed"]
+        assert completed[-1]["run_id"] == "run_deferred003"
+        assert completed[-1]["status"] == "cancelled"
+        assert not engine._deferred_workflows
+        assert "run_deferred003" not in engine._workflow_executor._run_cancel_events
 
     def test_validate_params_called(self):
         engine = make_engine()
@@ -477,6 +1297,19 @@ class TestShutdown:
             t.join(timeout=5)
         assert calls == [1]
 
+    def test_shutdown_drains_actions_before_plugin_teardown(self):
+        engine = make_engine()
+        calls = []
+        engine._wait_active_actions = lambda timeout=60.0: calls.append("drain") or True
+        engine._plugin_modules["plug"] = types.SimpleNamespace(
+            teardown=lambda: calls.append("teardown")
+        )
+
+        engine.shutdown()
+
+        assert calls == ["drain", "teardown"]
+        assert engine._plugin_modules == {}
+
     def test_start_revokes_privilege_session_when_runtime_fails(self, monkeypatch):
         from notmyfault.platform import platform_support
         monkeypatch.setattr(platform_support, "show_notification", lambda *a, **k: None)
@@ -484,6 +1317,25 @@ class TestShutdown:
         # 没有任何触发器时 _run 直接返回，start() 仍应撤销权限会话
         engine.start(shutdown_event=threading.Event())
         assert engine._privilege_session_closed is True
+
+    def test_close_can_retry_after_unclean_shutdown(self):
+        engine = make_engine()
+        calls = []
+        engine._sudo = types.SimpleNamespace(
+            end_engine_session=lambda token: calls.append(token)
+        )
+        engine._shutdown_clean = False
+
+        engine.close()
+
+        assert engine._privilege_session_closed is False
+        assert calls == []
+
+        engine._shutdown_clean = True
+        engine.close()
+
+        assert engine._privilege_session_closed is True
+        assert calls == [engine._engine_token]
 
     def test_wait_active_actions_completes(self):
         engine = make_engine()

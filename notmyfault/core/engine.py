@@ -1,14 +1,34 @@
-"""NotmyFault 规则引擎负责加载插件、匹配规则和执行动作"""
+"""NotmyFault 规则引擎的装配入口和生命周期管理。
+
+这里负责创建各协作对象并串起启动、主循环和关闭流程：
+- 管理员授权在 core/admin_session.py 的 AdminSessionManager
+- 事件分发在 core/event_bus.py 的 EventBus
+- 热重载在 core/hot_reloader.py 的 RulesHotReloader
+- 插件加载走 security/plugin_loader.py 的 PluginLoader
+- 工作流执行在 core/workflow_executor.py 的 WorkflowExecutor
+- 触发器线程管理在 core/trigger_supervisor.py 的 TriggerSupervisor
+
+engine 上保留了一批同名转发方法和兼容属性，旧插件、Dashboard、
+API server 和测试仍按老名字访问，改动这些名字会破坏调用方。
+"""
 import copy
 import os
 import sys
 import threading
 import time
 import traceback
+import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from notmyfault.config import CONFIG_FILE, ConfigValidationError, load_verified_config
+from notmyfault.config import (
+    RULES_FILE,
+    get_admin_authorization_mode,
+    load_verified_rules,
+)
+from notmyfault.core.admin_session import AdminSessionManager
 from notmyfault.core.diagnostics import Diagnostics
+from notmyfault.core.event_bus import EventBus
+from notmyfault.core.hot_reloader import RulesHotReloader
 from notmyfault.core.logging import engine_error, engine_info, engine_warn
 from notmyfault.security.plugin_loader import (
     PluginKind,
@@ -66,7 +86,10 @@ class AutomationEngine:
 
         from notmyfault.security import sudo as _sudo
         self._sudo = _sudo
-        self._engine_token: str = _sudo.begin_engine_session()
+        self._admin_authorization_mode = get_admin_authorization_mode(config)
+        self._engine_token: str = _sudo.begin_engine_session(
+            authorization_mode=self._admin_authorization_mode,
+        )
         self._privilege_session_closed = False
         self._close_lock = threading.Lock()
         # 关闭时若还有线程没退干净，跳过撤销权限，免得截断仍在跑的动作
@@ -105,6 +128,19 @@ class AutomationEngine:
             engine_token=self._engine_token,
             integrity_errors=self._plugin_integrity_errors,
         )
+        # rules 和 meta 走 lambda 运行时取值，锁和条件运行时传同一个对象
+        self._event_bus = EventBus(
+            rules_fn=lambda: self.rules,
+            rules_lock=self._rules_lock,
+            condition_runtime=self._condition_runtime,
+            triggers_meta_fn=lambda: self.triggers_meta,
+            actions_meta_fn=lambda: self.actions_meta,
+            is_shutdown_fn=lambda: bool(
+                self._shutdown_flag and self._shutdown_flag.is_set()
+            ),
+            safe_on_event=self._safe_on_event,
+            execute_workflow_cb=self.execute_workflow,
+        )
         self._workflow_executor = WorkflowExecutor(
             actions_meta=lambda: self.actions_meta,
             actions_funcs=lambda: self.actions_funcs,
@@ -117,6 +153,7 @@ class AutomationEngine:
             execute_workflow=lambda *args: self.execute_workflow(*args),
             execute_actions=lambda *args: self.execute_actions(*args),
             run_action=lambda *args: self._run_action(*args),
+            action_resolver=self._plugin_registry.resolve_action,
             sensitive_values=self._collect_sensitive_values,
         )
         # 旧扩展和测试仍直接读取这些同步对象
@@ -126,10 +163,39 @@ class AutomationEngine:
         self._deferred_workflows_lock = (
             self._workflow_executor.deferred_workflows_lock
         )
+        # 告警回调运行时才找 _alert_user，构造后替换告警回调仍然生效
+        self._admin_session = AdminSessionManager(
+            sudo=self._sudo,
+            engine_token=self._engine_token,
+            authorization_mode=self._admin_authorization_mode,
+            rules_fn=lambda: self.rules,
+            triggers_meta_fn=lambda: self.triggers_meta,
+            actions_meta_fn=lambda: self.actions_meta,
+            alert_cb=lambda title, message, open_dashboard=False: self._alert_user(
+                title, message, open_dashboard=open_dashboard
+            ),
+        )
+        # RULES_FILE 在 lambda 执行时才取值，测试 monkeypatch 模块属性仍生效
+        self._hot_reloader = RulesHotReloader(
+            rules_path_fn=lambda: RULES_FILE,
+            load_rules_fn=load_verified_rules,
+            stop_triggers_fn=self._stop_trigger_threads,
+            apply_rules_fn=self._apply_hot_reload_rules,
+            cancel_deferred_fn=self._cancel_deferred_workflows,
+            validate_rules_fn=self._validate_all_rules,
+            start_triggers_fn=self._start_trigger_threads,
+            recheck_admin_fn=self._admin_session.recheck_after_reload,
+            diagnostics=self._diag_obj,
+            alert_cb=lambda title, message: self._alert_user(title, message),
+        )
 
     @property
     def _active_actions(self) -> int:
         return self._workflow_executor.active_actions
+
+    @property
+    def admin_authorization_mode(self) -> str:
+        return self._admin_authorization_mode
 
     # 这些属性转发到 TriggerSupervisor，旧调用方仍可直接访问
     @property
@@ -261,6 +327,7 @@ class AutomationEngine:
                 "errors": snap["plugin_errors"][-20:],
                 "error_count": len(snap["plugin_errors"]),
                 "admin_plugins": self._sudo.get_authorized_plugins(),
+                "admin_authorization": self._sudo.get_authorization_status(),
                 "integrity_errors": self._plugin_integrity_errors[-10:],
             },
             "rules": {
@@ -281,11 +348,6 @@ class AutomationEngine:
             },
             "errors": snap["errors"][-20:],
         }
-
-    @staticmethod
-    def _get_rule_events(rule: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """从规则中提取所有事件条件"""
-        return get_rule_events(rule)
 
     def auto_load(self, load_paths) -> None:
         """扫描并加载插件，支持多个目录或单个目录参数"""
@@ -346,6 +408,16 @@ class AutomationEngine:
             )
         print()
 
+    # 管理员授权逻辑在 AdminSessionManager 里，保留老名字，测试直接调用
+    def _required_admin_plugins(self) -> list[str]:
+        return self._admin_session.required_admin_plugins()
+
+    def _authorize_admin_rules_at_startup(self) -> None:
+        self._admin_session.authorize_at_startup()
+
+    def _recheck_admin_session(self) -> None:
+        self._admin_session.recheck_after_reload()
+
     def _load_plugins(
         self,
         base_dir: str,
@@ -370,6 +442,25 @@ class AutomationEngine:
             store_name=store_name,
             origin=origin,
         )
+
+    def component(self, plugin_id: str, component_id: str) -> Optional[Any]:
+        """返回插件声明的组件模块，没有声明或加载失败时为 None"""
+        components = self._plugin_registry.components.get(plugin_id)
+        if not components:
+            return None
+        return components.get(component_id)
+
+    @property
+    def extensions(self):
+        return self._plugin_registry.extensions
+
+    def extension_handler(self, plugin_id: str, command_id: str):
+        handler = self.extensions.handler(plugin_id, command_id)
+        if handler is not None:
+            return handler
+        if plugin_id in self.actions_meta:
+            self._plugin_registry.resolve_action(plugin_id)
+        return self.extensions.handler(plugin_id, command_id)
 
     def _validate_all_rules(self) -> Tuple[int, int]:
         """校验规则引用和参数并记录问题"""
@@ -402,112 +493,27 @@ class AutomationEngine:
 
         return valid, total
 
+    # 事件分发逻辑在 EventBus 里，保留老名字，触发器线程和测试直接调用
     def emit_event(
         self,
         event_type: str,
         event_payload: Dict[str, Any],
         instance: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """按事件版本匹配规则并分发事件"""
-        if self._shutdown_flag and self._shutdown_flag.is_set():
-            print(f"[EventBus] Engine正在关闭，忽略事件: [{event_type}]")
-            return
-
-        semantic = self.triggers_meta.get(event_type, {}).get("semantic", "oneshot")
-        # 声明 sensitive 的输出字段不写明文，日志和事件推送都用掉过掩码的副本
-        masked_payload = self._mask_event_payload(event_type, event_payload)
-        print(
-            f"[EventBus] 收到广播事件: [{event_type}] ({semantic}) -> {masked_payload}"
-        )
-
-        with self._rules_lock:
-            # 规则快照在锁内复制，动作执行在锁外进行
-            rules_snapshot = list(self.rules)
-
-        for rule_index, rule in enumerate(rules_snapshot):
-            rule_key = f"{rule_index}:{rule.get('name', '')}"
-            if not self._condition_runtime.match(
-                rule_key,
-                rule,
-                event_type,
-                event_payload,
-                instance=instance,
-            ):
-                continue
-
-            rule_name = rule.get("name", "未命名规则")
-            print(f"[EventBus] [OK] 匹配到规则: <{rule_name}>, 准备分发动作！")
-            self._safe_on_event(
-                "rule_triggered",
-                {
-                    "rule_name": rule_name,
-                    "event_type": event_type,
-                    "event_payload": masked_payload,
-                },
-            )
-            context = build_context(
-                rule_name,
-                event_type,
-                event_payload,
-                self._condition_runtime.last_match(rule_key),
-            )
-            self.execute_workflow(rule_key, rule, rule_name, context)
+        self._event_bus.emit_event(event_type, event_payload, instance=instance)
 
     def call_notmyfault(self, event_data: Dict[str, Any]) -> None:
-        """接收触发器线程推送的外部事件"""
-        event_type = event_data.get("trigger_id")
-        event_payload = event_data.get("triggered_params", {})
-        if not isinstance(event_type, str) or not isinstance(event_payload, dict):
-            engine_warn("忽略格式无效的外部事件")
-            return
-        self.emit_event(event_type, event_payload)
+        self._event_bus.call_notmyfault(event_data)
 
     def _mask_event_payload(
         self, event_type: str, payload: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """把触发器 outputs 声明 sensitive 的字段换成掩码再对外输出"""
-        outputs = self.triggers_meta.get(event_type, {}).get("outputs") or []
-        sensitive_names = {
-            output.get("name")
-            for output in outputs
-            if isinstance(output, dict) and output.get("sensitive") is True
-        }
-        if not sensitive_names or not isinstance(payload, dict):
-            return payload
-        masked = dict(payload)
-        for name in sensitive_names:
-            if name in masked:
-                masked[name] = "***"
-        return masked
+        return self._event_bus._mask_event_payload(event_type, payload)
 
     def _collect_sensitive_values(self, context: Dict[str, Any]) -> set:
-        """收集上下文里声明 sensitive 的字段当前值，用于掩码动作参数"""
-        values: set = set()
+        return self._event_bus._collect_sensitive_values(context)
 
-        def collect(meta: Dict[str, Any], payload: Any) -> None:
-            if not isinstance(payload, dict):
-                return
-            for output in meta.get("outputs") or []:
-                if not isinstance(output, dict) or output.get("sensitive") is not True:
-                    continue
-                value = payload.get(output.get("name"))
-                if isinstance(value, str) and value:
-                    values.add(value)
-
-        event = context.get("event") or {}
-        collect(
-            self.triggers_meta.get(event.get("type", ""), {}),
-            event.get("payload"),
-        )
-        for trigger in (context.get("triggers") or {}).values():
-            if isinstance(trigger, dict):
-                collect(
-                    self.triggers_meta.get(trigger.get("type", ""), {}),
-                    trigger.get("payload"),
-                )
-        return values
-
-    def run_manual_rule(self, rule_index: int) -> tuple[bool, str]:
+    def run_manual_rule(self, rule_index: int) -> tuple[bool, str] | tuple[bool, str, str]:
         """从 Dashboard 立即执行指定规则"""
         with self._rules_lock:
             if rule_index < 0 or rule_index >= len(self.rules):
@@ -522,11 +528,17 @@ class AutomationEngine:
         rule_index: int = -1,
         trigger_payloads: Optional[Dict[str, Dict[str, Any]]] = None,
         event_payload: Optional[Dict[str, Any]] = None,
-    ) -> tuple[bool, str]:
+        step_outputs: Optional[Dict[str, Any]] = None,
+        start_step_id: str = "",
+        end_step_id: str = "",
+        test_assertions: Optional[List[Dict[str, Any]]] = None,
+    ) -> tuple[bool, str, str]:
         """执行调用方传入的规则快照"""
         rule = copy.deepcopy(rule)
 
         rule_name = rule.get("name", f"规则 #{rule_index + 1}")
+        rule_id = rule.get("rule_id", "")
+        run_id = f"run_{uuid.uuid4().hex}"
         manual_payload = (
             dict(event_payload)
             if isinstance(event_payload, dict)
@@ -537,33 +549,72 @@ class AutomationEngine:
             "manual",
             manual_payload,
             [],
+            rule_id,
+            run_id,
         )
-        if isinstance(trigger_payloads, dict):
-            event_types = {
-                event.get("binding_id"): event.get("type", "")
-                for event in get_rule_events(rule)
-            }
-            leaf_configs = {
-                event.get("binding_id"): event.get("params", {})
-                for event in get_rule_events(rule)
-            }
-            context["triggers"] = {
-                binding_id: {
-                    "type": event_types.get(binding_id, ""),
-                    "payload": copy.deepcopy(payload),
-                    "config": copy.deepcopy(leaf_configs.get(binding_id, {})),
+        actions = rule.get("actions", [])
+        if not isinstance(actions, list):
+            actions = []
+        action_ids = [
+            action.get("binding_id", "") if isinstance(action, dict) else ""
+            for action in actions
+        ]
+        start_index = action_ids.index(start_step_id) if start_step_id in action_ids else 0
+        end_index = (
+            action_ids.index(end_step_id)
+            if end_step_id in action_ids
+            else len(actions) - 1
+        )
+        selected_count = max(0, end_index - start_index + 1) if actions else 0
+        context["manual_test"] = {
+            "start_step_id": start_step_id,
+            "end_step_id": end_step_id,
+            "start_index": start_index,
+            "end_index": end_index,
+            "assertions": copy.deepcopy(test_assertions or []),
+        }
+        if isinstance(step_outputs, dict):
+            for action_index, action in enumerate(actions[:start_index]):
+                if not isinstance(action, dict):
+                    continue
+                step_id = action.get("binding_id")
+                if not isinstance(step_id, str) or step_id not in step_outputs:
+                    continue
+                record = {
+                    "type": action.get("type", "action"),
+                    "status": "ok",
+                    "result": copy.deepcopy(step_outputs[step_id]),
+                    "error": None,
+                    "provided": True,
                 }
-                for binding_id, payload in trigger_payloads.items()
-                if isinstance(binding_id, str) and isinstance(payload, dict)
+                context["steps"][step_id] = record
+                context["steps"][f"{action.get('type', 'action')}_{action_index + 1}"] = record
+        supplied_trigger_payloads = trigger_payloads if isinstance(trigger_payloads, dict) else {}
+        context["triggers"] = {
+            event.get("binding_id"): {
+                "type": event.get("type", ""),
+                "payload": copy.deepcopy(
+                    supplied_trigger_payloads.get(event.get("binding_id"), {})
+                ),
+                "config": copy.deepcopy(event.get("params", {})),
             }
+            for event in get_rule_events(rule)
+            if isinstance(event.get("binding_id"), str)
+        }
         self._safe_on_event("rule_triggered", {
+            "rule_id": rule_id,
+            "run_id": run_id,
             "rule_name": rule_name,
             "event_type": "manual",
+            "action_count": selected_count,
+            "start_step_id": start_step_id,
+            "end_step_id": end_step_id,
+            "assertion_count": len(test_assertions or []),
             "event_payload": manual_payload,
         })
         thread = threading.Thread(
             target=self.execute_workflow,
-            args=(f"manual:{rule_index}", rule, rule_name, context),
+            args=(f"manual:{rule_id or rule_index}", rule, rule_name, context),
             name=f"ManualRule-{rule_index}",
             daemon=True,
         )
@@ -574,7 +625,7 @@ class AutomationEngine:
             ]
             self._manual_threads.append(thread)
         thread.start()
-        return True, "已开始执行"
+        return True, "已开始执行", run_id
 
     def execute_workflow(
         self,
@@ -618,13 +669,16 @@ class AutomationEngine:
     def _cancel_deferred_workflows(self) -> None:
         self._workflow_executor.cancel_deferred_workflows()
 
+    def cancel_run(self, run_id: str) -> bool:
+        return self._workflow_executor.cancel_run(run_id)
+
     def execute_actions(
         self,
         actions: List[Dict[str, Any]],
         rule_name: str,
         context: Dict[str, Any],
-    ) -> None:
-        self._workflow_executor.execute_actions(actions, rule_name, context)
+    ) -> bool:
+        return self._workflow_executor.execute_actions(actions, rule_name, context)
 
     def execute_action(
         self,
@@ -677,11 +731,21 @@ class AutomationEngine:
         with self._close_lock:
             if self._privilege_session_closed:
                 return
+            if not self._shutdown_clean:
+                engine_warn("关闭时仍有线程未完全退出，保留本代权限会话不撤销")
+                return
+            self._sudo.end_engine_session(self._engine_token)
             self._privilege_session_closed = True
-        if not self._shutdown_clean:
-            engine_warn("关闭时仍有线程未完全退出，保留本代权限会话不撤销")
-            return
-        self._sudo.end_engine_session(self._engine_token)
+
+    def _apply_hot_reload_rules(
+        self, new_rules: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        # 锁内整体替换规则并重置条件运行时，返回换之前的规则
+        with self._rules_lock:
+            old_rules = list(self.rules)
+            self.rules = new_rules
+            self._condition_runtime.reset()
+        return old_rules
 
     def _run(
         self, shutdown_event: "threading.Event | None" = None
@@ -712,6 +776,8 @@ class AutomationEngine:
         if os.name == "nt":
             from Win_toaster.AUMID_Register import register_toaster
             register_toaster()
+
+        self._authorize_admin_rules_at_startup()
         show_notification("NotmyFault 已加载", "")
 
         thread_count = self._start_trigger_threads()
@@ -733,101 +799,39 @@ class AutomationEngine:
             return
 
         se = self._shutdown_flag
-        config_mtime = (
-            os.path.getmtime(CONFIG_FILE) if os.path.exists(CONFIG_FILE) else 0
-        )
-        self._hot_reload_error_reported = False
+        self._hot_reloader.begin()
 
         try:
             while not se.is_set():
                 se.wait(1)
-                new_mtime = config_mtime
-
-                try:
-                    new_mtime = (
-                        os.path.getmtime(CONFIG_FILE)
-                        if os.path.exists(CONFIG_FILE)
-                        else 0
-                    )
-                    if new_mtime > config_mtime:
-                        # 文件写入中被读取时可能出现临时 JSON 错误，下一轮继续尝试
-                        new_config = load_verified_config()
-                        new_rules = new_config["rules"]
-
-                        # 旧触发器仍在运行时先等待退出，再决定是否加载新配置
-                        if not self._stop_trigger_threads(timeout=30):
-                            message = "旧触发器未能在 30 秒内退出，已拒绝应用新配置"
-                            if not self._hot_reload_error_reported:
-                                self._diag_obj.inc_hot_reload_error()
-                                engine_error("hot_reload_error", error=message)
-                                print(f"[Engine] [!!] {message}", file=sys.stderr)
-                                self._alert_user("热重载被拒绝", message)
-                                self._hot_reload_error_reported = True
-                            continue
-
-                        with self._rules_lock:
-                            old_rule_count = len(self.rules)
-                            self.rules = new_rules
-                            self._condition_runtime.reset()
-                        self._cancel_deferred_workflows()
-
-                        print(
-                            f"[Engine] 配置已热加载（{old_rule_count} -> {len(new_rules)} 条规则）"
-                        )
-                        self._hot_reload_error_reported = False
-                        self._validate_all_rules()
-
-                        started = self._start_trigger_threads(new_rules)
-                        if started == 0:
-                            print("[Engine] 热加载后无可用触发器，保持Engine运行")
-                        config_mtime = new_mtime
-                except ConfigValidationError as e:
-                    self._diag_obj.inc_hot_reload_error()
-                    engine_error("hot_reload_error", error=str(e))
-                    print(
-                        f"[Engine] 热加载配置校验失败: {e}",
-                        file=sys.stderr,
-                    )
-                    if not self._hot_reload_error_reported:
-                        self._hot_reload_error_reported = True
-                        self._alert_user(
-                            "配置校验失败",
-                            "config.json 未通过格式、签名或安全校验，热加载失败；请修改后重新保存",
-                        )
-                    # 校验失败后记录当前修改时间，等文件再次保存再重试
-                    config_mtime = new_mtime
-                except OSError as e:
-                    print(
-                        f"[Engine] 读取配置文件失败: {e}",
-                        file=sys.stderr,
-                    )
-                except Exception:
-                    print(
-                        "[Engine] 热加载配置失败:",
-                        file=sys.stderr,
-                    )
-                    traceback.print_exc(file=sys.stderr)
+                self._hot_reloader.check_once()
         except KeyboardInterrupt:
             print("[Engine] 主程序收到中断，退出中...")
 
+        from notmyfault.security.admin_prompt import cancel_pending_admin_requests
+
+        cancel_pending_admin_requests()
         self._cancel_deferred_workflows()
         stopped = self._stop_trigger_threads(timeout=30)
         manual_stopped = self._join_manual_threads()
-        self._shutdown_plugins()
         drained = self._wait_active_actions()
+        self._shutdown_plugins()
         self._shutdown_clean = bool(stopped and manual_stopped and drained)
 
     def _join_manual_threads(self, timeout: float = 10.0) -> bool:
         """等待手工规则线程退出，返回是否全部退出"""
         with self._manual_threads_lock:
             threads = list(self._manual_threads)
-            self._manual_threads.clear()
         deadline = time.time() + timeout
         for thread in threads:
             remaining = deadline - time.time()
             if remaining > 0:
                 thread.join(timeout=remaining)
-        return all(not thread.is_alive() for thread in threads)
+        with self._manual_threads_lock:
+            self._manual_threads = [
+                thread for thread in self._manual_threads if thread.is_alive()
+            ]
+            return not self._manual_threads
 
     def _shutdown_plugins(self) -> None:
         # 先在锁内认领清理权，再在锁外调用插件 teardown()
@@ -854,6 +858,7 @@ class AutomationEngine:
                     engine_error(
                         "teardown_failed", plugin=plugin_id, error=traceback.format_exc()[-500:]
                     )
+        self._plugin_registry.clear()
 
     def _wait_active_actions(self, timeout: float = 60.0) -> bool:
         return self._workflow_executor.wait_active_actions(timeout=timeout)
@@ -862,10 +867,15 @@ class AutomationEngine:
         # API、信号和 finally 可能同时调用 shutdown()，每个清理步骤都支持重复执行
         if self._shutdown_flag:
             self._shutdown_flag.set()
+        from notmyfault.security.admin_prompt import cancel_pending_admin_requests
+
+        cancel_pending_admin_requests()
         self._trigger_supervisor.request_stop_all()
         self._cancel_deferred_workflows()
         stopped = self._stop_trigger_threads(timeout=30)
         manual_stopped = self._join_manual_threads()
-        self._shutdown_plugins()
         drained = self._wait_active_actions()
+        self._shutdown_plugins()
         self._shutdown_clean = bool(stopped and manual_stopped and drained)
+        if self._shutdown_clean:
+            self.close()

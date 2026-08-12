@@ -9,8 +9,10 @@ from types import SimpleNamespace
 import pytest
 
 from notmyfault import config as config_mod
+from notmyfault.core.diagnostics import Diagnostics
 from notmyfault.core import logging as englog
 from notmyfault.core.engine import AutomationEngine
+from notmyfault.core.hot_reloader import RulesHotReloader
 from notmyfault.host import app as host_app
 
 
@@ -25,58 +27,65 @@ def isolated_config(tmp_path, monkeypatch):
     """配置读写全部指向临时目录，避免触碰真实用户配置"""
     config_file = str(tmp_path / "config.json")
     monkeypatch.setattr(config_mod, "CONFIG_FILE", config_file)
+    monkeypatch.setattr(config_mod, "RULES_FILE", str(tmp_path / "rules.json"))
     return config_file
 
 
 class TestAPIConfigRoundtrip:
     def test_api_read_modify_verify(self, isolated_config):
-        config = config_mod.get_config()
-        assert isinstance(config.get("rules"), list)
+        assert config_mod.get_rules() == []
 
-        config["rules"].append({
+        assert config_mod.save_rules([{
             "name": "集成规则",
             "event": {"type": "hotkey", "params": {"key": "f9"}},
             "actions": [{"type": "noop", "params": {}}],
-        })
-        assert config_mod.save_config(config) is True
+        }]) is True
 
-        reloaded = config_mod.load_verified_config()
-        names = [rule["name"] for rule in reloaded["rules"]]
+        names = [rule["name"] for rule in config_mod.load_verified_rules()]
         assert "集成规则" in names
 
 
 class TestConfigEnginePipeline:
     def test_config_written_engine_reads_rules(self, isolated_config):
-        config_mod.save_config({"rules": [{
+        config_mod.save_config({})
+        config_mod.save_rules([{
             "name": "r1",
             "event": {"type": "hotkey", "params": {}},
             "actions": [{"type": "noop", "params": {}}],
-        }]})
+        }])
         config = config_mod.load_verified_config()
+        config["rules"] = config_mod.load_verified_rules()
         engine = AutomationEngine(config)
         assert len(engine.rules) == 1
         assert engine.rules[0]["name"] == "r1"
 
     def test_config_modification_picked_up(self, isolated_config):
-        config_mod.save_config({"rules": [{
+        config_mod.save_config({})
+        config_mod.save_rules([{
             "name": "旧规则",
             "event": {"type": "hotkey", "params": {}},
             "actions": [{"type": "noop", "params": {}}],
-        }]})
-        config = config_mod.load_verified_config()
-        config["rules"][0]["name"] = "新规则"
-        config_mod.save_config(config)
-        reloaded = config_mod.load_verified_config()
-        assert reloaded["rules"][0]["name"] == "新规则"
+        }])
+        rules = config_mod.load_verified_rules()
+        rules[0]["name"] = "新规则"
+        config_mod.save_rules(rules)
+        assert config_mod.load_verified_rules()[0]["name"] == "新规则"
 
     def test_legacy_config_to_engine(self, isolated_config):
-        config_mod.save_config({"processes": [{
+        # 旧格式 config.json 直接落盘，模拟升级前的真实文件
+        legacy = {"processes": [{
             "process_name": "WeChat.exe",
             "software_name": "微信",
             "volume_action": "max",
             "notification": {"title": "微信运行", "message": "音量最大"},
-        }]})
-        config = config_mod.load_verified_config()
+        }]}
+        config_mod._get_or_create_secret()
+        legacy[config_mod._SIGNATURE_KEY] = config_mod._sign_config(legacy)
+        with open(config_mod.CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(legacy, f, ensure_ascii=False)
+        # 加载设置时自动把旧进程列表拆分到 rules.json
+        config = config_mod.get_config()
+        config["rules"] = config_mod.get_rules()
         engine = AutomationEngine(config)
         rule = engine.rules[0]
         assert rule["event"]["type"] == "process_state"
@@ -84,12 +93,13 @@ class TestConfigEnginePipeline:
         assert rule["actions"][0]["type"] == "set_volume"
 
     def test_legacy_trigger_config_normalized(self, isolated_config):
-        config_mod.save_config({"rules": [{
+        config_mod.save_config({})
+        config_mod.save_rules([{
             "name": "r1",
             "trigger": {"type": "hotkey", "params": {}},
             "actions": [{"type": "noop", "params": {}}],
-        }]})
-        rule = config_mod.load_verified_config()["rules"][0]
+        }])
+        rule = config_mod.load_verified_rules()[0]
         assert "trigger" not in rule
         assert rule["event"]["type"] == "hotkey"
 
@@ -141,7 +151,8 @@ class TestHotReloadIntegration:
     def test_hot_reload_picks_up_changes(self, tmp_path, monkeypatch, isolated_config):
         from notmyfault.core import engine as engine_mod
         from notmyfault.platform import platform_support
-        monkeypatch.setattr(engine_mod, "CONFIG_FILE", isolated_config)
+        rules_file = str(tmp_path / "rules.json")
+        monkeypatch.setattr(engine_mod, "RULES_FILE", rules_file)
         monkeypatch.setattr(platform_support, "show_notification", lambda *a, **k: None)
 
         def rule(name):
@@ -151,8 +162,11 @@ class TestHotReloadIntegration:
                 "actions": [{"type": "noop", "params": {}}],
             }
 
-        config_mod.save_config({"rules": [rule("r1")]})
-        engine = AutomationEngine(config_mod.load_verified_config())
+        config_mod.save_config({})
+        config_mod.save_rules([rule("r1")])
+        config = config_mod.load_verified_config()
+        config["rules"] = config_mod.load_verified_rules()
+        engine = AutomationEngine(config)
         engine._alert_user = lambda *a, **k: None
         engine.triggers_funcs["hotkey"] = lambda meta, config, emit, stop: stop.wait(30)
         engine.triggers_meta["hotkey"] = {}
@@ -171,7 +185,7 @@ class TestHotReloadIntegration:
 
             # 触发 mtime 变化后引擎应在轮询中应用新规则
             time.sleep(0.01)
-            config_mod.save_config({"rules": [rule("r1"), rule("r2")]})
+            config_mod.save_rules([rule("r1"), rule("r2")])
             deadline = time.monotonic() + 8
             while len(engine.rules) < 2:
                 if time.monotonic() > deadline:
@@ -182,6 +196,48 @@ class TestHotReloadIntegration:
             shutdown.set()
             thread.join(timeout=10)
         assert not thread.is_alive()
+
+    def test_hot_reload_restores_old_rules_after_trigger_start_failure(self, monkeypatch):
+        old_rules = [{"name": "旧规则"}]
+        new_rules = [{"name": "新规则"}]
+        active_rules = list(old_rules)
+        stopped = []
+        started = []
+        alerts = []
+
+        def apply_rules(rules):
+            previous = list(active_rules)
+            active_rules[:] = rules
+            return previous
+
+        def start_triggers(rules):
+            started.append(list(rules))
+            if rules == new_rules:
+                raise RuntimeError("新触发器启动失败")
+            return 1
+
+        reloader = RulesHotReloader(
+            rules_path_fn=lambda: "rules.json",
+            load_rules_fn=lambda: new_rules,
+            stop_triggers_fn=lambda timeout: stopped.append(timeout) or True,
+            apply_rules_fn=apply_rules,
+            cancel_deferred_fn=lambda: None,
+            validate_rules_fn=lambda: None,
+            start_triggers_fn=start_triggers,
+            recheck_admin_fn=lambda: None,
+            diagnostics=Diagnostics(),
+            alert_cb=lambda title, message: alerts.append((title, message)),
+        )
+        reloader._rules_mtime = 1.0
+        monkeypatch.setattr(reloader, "current_mtime", lambda: 2.0)
+
+        reloader.check_once()
+
+        assert active_rules == old_rules
+        assert started == [new_rules, old_rules]
+        assert len(stopped) == 2
+        assert reloader._rules_mtime == 2.0
+        assert alerts == [("热加载失败", "新规则未能启动，已尝试恢复原有规则")]
 
 
 class TestLoggingPipeline:

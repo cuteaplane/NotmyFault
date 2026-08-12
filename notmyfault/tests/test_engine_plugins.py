@@ -139,6 +139,53 @@ class TestEngineStart:
         assert diag["plugins"]["triggers_loaded"] == 0
         assert diag["rules"]["total"] == 1
 
+    def test_admin_startup_only_counts_plugins_used_by_enabled_rules(self):
+        engine = AutomationEngine({
+            "rules": [
+                {
+                    "name": "启用规则",
+                    "event": {"type": "manual", "params": {}},
+                    "actions": [{"type": "admin_action", "params": {}}],
+                },
+                {
+                    "name": "停用规则",
+                    "enabled": False,
+                    "event": {"type": "admin_trigger", "params": {}},
+                    "actions": [{"type": "unused_admin", "params": {}}],
+                },
+            ]
+        })
+        engine.actions_meta.update({
+            "admin_action": {"permissions": ["admin"]},
+            "unused_admin": {"permissions": ["admin"]},
+        })
+        engine.triggers_meta["admin_trigger"] = {"permissions": ["admin"]}
+
+        assert engine._required_admin_plugins() == ["admin_action"]
+
+    def test_engine_start_requests_session_for_admin_rules(self, monkeypatch):
+        engine = AutomationEngine({
+            "settings": {"admin_authorization_mode": "engine_start"},
+            "rules": [
+                {
+                    "name": "管理员规则",
+                    "event": {"type": "manual", "params": {}},
+                    "actions": [{"type": "admin_action", "params": {}}],
+                }
+            ],
+        })
+        engine.actions_meta["admin_action"] = {"permissions": ["admin"]}
+        calls = []
+        monkeypatch.setattr(
+            engine._sudo,
+            "start_admin_session",
+            lambda token: calls.append(token) or True,
+        )
+
+        engine._authorize_admin_rules_at_startup()
+
+        assert calls == [engine._engine_token]
+
     def test_start_no_trigger_threads_alerts(self, monkeypatch):
         from notmyfault.platform import platform_support
         monkeypatch.setattr(platform_support, "show_notification", lambda *a, **k: None)
@@ -199,8 +246,10 @@ class TestLoadPlugins:
     def test_missing_run_function(self, tmp_path):
         loader, registry, errors, _ = make_loader(tmp_path)
         write_plugin(tmp_path / "actions", "no_run", make_meta(), "x = 1\n")
+        # 发现阶段不执行代码，缺 run() 要到首次物化才暴露
         loaded, failed, _, _ = load_actions(loader, tmp_path)
-        assert (loaded, failed) == (0, 1)
+        assert (loaded, failed) == (1, 0)
+        assert registry.resolve_action("plug_a") is None
         assert any("缺少 run() 函数" in msg for _, _, msg in errors)
 
     def test_python_import_error(self, tmp_path):
@@ -210,7 +259,8 @@ class TestLoadPlugins:
             "raise ImportError('依赖缺失')\n",
         )
         loaded, failed, _, _ = load_actions(loader, tmp_path)
-        assert (loaded, failed) == (0, 1)
+        assert (loaded, failed) == (1, 0)
+        assert registry.resolve_action("plug_a") is None
         assert any("Python 加载异常" in msg for _, _, msg in errors)
 
     def test_plugin_disabled(self, tmp_path, capsys):
@@ -223,13 +273,50 @@ class TestLoadPlugins:
         assert meta_store == {}
         assert "已禁用" in capsys.readouterr().out
 
+    def test_config_disabled_list_skips_builtin_plugin(self, tmp_path):
+        config = {"disabled_plugins": {"triggers": [], "actions": ["plug_a"]}}
+        loader, registry, errors, _ = make_loader(tmp_path, config=config)
+        write_plugin(tmp_path / "actions", "good", make_meta(), CLEAN_RUN)
+        loaded, failed, meta_store, func_store = load_actions(loader, tmp_path)
+        assert (loaded, failed) == (0, 0)
+        assert meta_store == {}
+
+    def test_config_disabled_list_skips_user_plugin(self, tmp_path):
+        # 开关插件只写 config，加载器对用户插件同样要认这份名单
+        config = {"disabled_plugins": {"triggers": [], "actions": ["plug_a"]}}
+        loader, registry, errors, _ = make_loader(tmp_path, config=config)
+        write_plugin(tmp_path / "actions", "good", make_meta(), CLEAN_RUN)
+        loaded, failed, meta_store, func_store = load_actions(
+            loader, tmp_path, origin="user"
+        )
+        assert (loaded, failed) == (0, 0)
+        assert meta_store == {}
+
+    def test_user_plugin_loads_when_not_in_disabled_list(self, tmp_path, monkeypatch):
+        from notmyfault.security import plugins as security_plugins
+        monkeypatch.setattr(
+            security_plugins, "_PLUGIN_MANIFEST_FILE", str(tmp_path / "manifest.json")
+        )
+        config = {"disabled_plugins": {"triggers": [], "actions": []}}
+        loader, registry, errors, _ = make_loader(tmp_path, config=config)
+        write_plugin(tmp_path / "actions", "good", make_meta(), CLEAN_RUN)
+        loaded, failed, meta_store, func_store = load_actions(
+            loader, tmp_path, origin="user"
+        )
+        assert (loaded, failed) == (1, 0)
+        assert meta_store["plug_a"]["origin"] == "user"
+
     def test_successful_plugin_load(self, tmp_path):
         loader, registry, errors, _ = make_loader(tmp_path)
         write_plugin(tmp_path / "actions", "good", make_meta(), CLEAN_RUN)
         loaded, failed, meta_store, func_store = load_actions(loader, tmp_path)
         assert (loaded, failed) == (1, 0)
-        assert callable(func_store["plug_a"])
+        # 动作插件懒物化：发现阶段只写 meta，首次解析才导入
+        assert func_store == {}
         assert meta_store["plug_a"]["origin"] == "builtin"
+        assert registry.get_module("plug_a") is None
+        assert callable(registry.resolve_action("plug_a"))
+        assert callable(func_store["plug_a"])
         assert registry.get_module("plug_a") is not None
         assert errors == []
 
@@ -241,9 +328,12 @@ class TestLoadPlugins:
             "raise RuntimeError('boom')\n",
         )
         loaded, failed, meta_store, _ = load_actions(loader, tmp_path)
-        assert (loaded, failed) == (1, 1)
+        # 两个插件都通过发现阶段，损坏的那个要到物化才失败
+        assert (loaded, failed) == (2, 0)
         assert "aaa_good" in meta_store
-        assert "bbb_broken" not in meta_store
+        assert "bbb_broken" in meta_store
+        assert registry.resolve_action("bbb_broken") is None
+        assert "bbb_broken" not in registry.actions_funcs
 
     @pytest.mark.parametrize(
         "folder_name",
@@ -326,6 +416,8 @@ class TestLoadPlugins:
             loader, tmp_path, meta_store, func_store
         )
         assert (loaded, failed) == (1, 0)
+        # 懒物化后才走 sudo 授权
+        registry.resolve_action("adminp")
         assert sudo.calls == [("authorize", "adminp")]
 
         # 用户覆盖版没有声明 admin，旧授权必须被撤销且不再重新授权
@@ -380,8 +472,10 @@ class TestSecurityScanIntegration:
             make_meta("declared", permissions=["external_binary"]), code,
         )
         sign_with_test_key(folder, monkeypatch)
-        loaded, failed, _, _ = load_actions(loader, tmp_path)
+        loaded, failed, _, func_store = load_actions(loader, tmp_path)
         assert (loaded, failed) == (1, 0)
+        assert callable(registry.resolve_action("declared"))
+        assert "declared" in func_store
         assert errors == []
 
     def test_strict_rejects_undeclared_subprocess(self, tmp_path, monkeypatch):
@@ -433,6 +527,24 @@ class TestSecurityScanIntegration:
         # 验签失败必须发生在模块导入之前
         assert not marker.exists()
         assert any("签名无效" in msg for _, _, msg in errors)
+
+    def test_strict_loads_user_plugin_signed_by_legacy_local_key(
+        self, tmp_path, monkeypatch
+    ):
+        from notmyfault.security import plugins as security_plugins
+
+        # 用户插件的哈希清单写进临时目录，不碰真实配置目录
+        monkeypatch.setattr(
+            security_plugins, "_PLUGIN_MANIFEST_FILE", str(tmp_path / "manifest.json")
+        )
+        loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
+        folder = write_plugin(tmp_path / "actions", "legacy", make_meta("legacy"), CLEAN_RUN)
+        sign_with_test_key(folder, monkeypatch)
+        # 旧格式签名只有 signature.sig，目录里没有 public_key.pem
+        assert not (folder / "public_key.pem").exists()
+        loaded, failed, meta_store, _ = load_actions(loader, tmp_path, origin="user")
+        assert (loaded, failed) == (1, 0)
+        assert meta_store["legacy"]["signature_kind"] == "official-legacy"
 
 
 def test_engine_keeps_plugin_loader_compatibility_exports():
