@@ -56,7 +56,7 @@ def _enable_shutdown_privilege():
         pass
 
 
-def run(action_info, params):
+def _execute(params, cancellation=None):
     action = params.get("action", "shutdown")
     force = params.get("force", False)
     confirm = params.get("confirm", False)
@@ -78,11 +78,18 @@ def run(action_info, params):
             "shutdown_system 需要显式设置 confirm=true 才会执行，防止误触发关机"
         )
     if not isinstance(force, bool):
-        force = bool(force)
+        raise ValueError(f"force 必须为布尔值，实际: {force!r}")
 
     if delay > 0:
         print(f"[Action:shutdown_system] 等待 {delay}s 后执行: {action}")
-        time.sleep(delay)
+        if cancellation is not None:
+            if cancellation.wait(delay):
+                cancellation.raise_if_cancelled()
+        else:
+            time.sleep(delay)
+
+    if cancellation is not None:
+        cancellation.raise_if_cancelled()
 
     print(f"[Action:shutdown_system] 执行: {action} (force={force})")
 
@@ -124,3 +131,15 @@ def run(action_info, params):
         raise RuntimeError(
             f"系统未能执行 {action}（可能被其他程序阻止或权限不足）"
         )
+
+
+def run(action_info, params):
+    return _execute(params)
+
+
+def run_with_context(action_info, params, context):
+    runtime = context.get("runtime", {})
+    cancellation = runtime.get("cancellation") if isinstance(runtime, dict) else None
+    if cancellation is None:
+        raise RuntimeError("shutdown_system 缺少 runtime-v1 取消对象")
+    return _execute(params, cancellation)
