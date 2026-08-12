@@ -6,16 +6,20 @@ import types
 import pytest
 
 from notmyfault.security import sudo
+from notmyfault.security import admin_prompt
 
 TOKEN = "test-engine-token"
 
 
 @pytest.fixture(autouse=True)
-def clean_sudo_state():
+def clean_sudo_state(monkeypatch):
+    monkeypatch.setattr(admin_prompt, "confirm_admin_request", lambda *a, **k: True)
     yield
     sudo._engine_token = None
     sudo._admin_plugins.clear()
     sudo._admin_by_module.clear()
+    sudo._authorization_mode = "direct"
+    sudo._admin_broker = None
 
 
 def make_plugin_module(name="notmyfault.action_testplug"):
@@ -33,7 +37,7 @@ def call_from(module, func, *args, **kwargs):
 @pytest.fixture
 def authorized_plugin(monkeypatch):
     """返回 (module, captured)：插件已授权，subprocess.run 被替换为记录器"""
-    sudo.begin_engine_session(TOKEN)
+    sudo.begin_engine_session(TOKEN, authorization_mode="per_execution")
     module = make_plugin_module()
     sudo.authorize_plugin("testplug", TOKEN, module=module)
     captured = {}
@@ -204,6 +208,87 @@ def test_engine_session_rotation_revokes_old_token_and_authorizations():
     assert sudo.end_engine_session(old_token) is False
     assert sudo.end_engine_session(new_token) is True
     assert sudo._engine_token is None
+
+
+def test_per_execution_rejects_when_notification_not_approved(
+    authorized_plugin, monkeypatch
+):
+    module, captured = authorized_plugin
+    monkeypatch.setattr(admin_prompt, "confirm_admin_request", lambda *a, **k: False)
+    with pytest.raises(PermissionError, match="未确认"):
+        call_from(module, sudo.run_as_admin, ["cmd.exe"])
+    assert "cmd" not in captured
+
+
+def test_engine_start_mode_uses_existing_broker(monkeypatch):
+    calls = []
+
+    class FakeBroker:
+        def execute(self, command, wait, timeout):
+            calls.append((command, wait, timeout))
+            return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    sudo.begin_engine_session(TOKEN, authorization_mode="engine_start")
+    module = make_plugin_module()
+    sudo.authorize_plugin("testplug", TOKEN, module=module)
+    sudo._admin_broker = FakeBroker()
+
+    result = call_from(module, sudo.run_as_admin, ["cmd.exe", "/c", "whoami"], timeout=9)
+    assert result.stdout == "ok"
+    assert calls == [(["cmd.exe", "/c", "whoami"], True, 9)]
+
+
+def test_engine_start_mode_falls_back_to_per_execution(monkeypatch, capsys):
+    """engine_start 没有 broker 时降级为单次确认提权，不直接报未授权"""
+    sudo.begin_engine_session(TOKEN, authorization_mode="engine_start")
+    module = make_plugin_module()
+    sudo.authorize_plugin("testplug", TOKEN, module=module)
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(sudo.subprocess, "run", fake_run)
+
+    result = call_from(module, sudo.run_as_admin, ["cmd.exe"])
+    assert result.returncode == 0
+    # 降级走的是 UAC 单次提权通道
+    assert captured["cmd"][0] == "powershell"
+    assert "降级为单次确认提权" in capsys.readouterr().err
+
+
+def test_engine_start_fallback_respects_user_decline(monkeypatch):
+    sudo.begin_engine_session(TOKEN, authorization_mode="engine_start")
+    module = make_plugin_module()
+    sudo.authorize_plugin("testplug", TOKEN, module=module)
+    monkeypatch.setattr(admin_prompt, "confirm_admin_request", lambda *a, **k: False)
+
+    with pytest.raises(PermissionError, match="未确认"):
+        call_from(module, sudo.run_as_admin, ["cmd.exe"])
+
+
+def test_start_admin_session_is_closed_with_engine_session(monkeypatch):
+    closed = []
+
+    class FakeBroker:
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(
+        sudo._AdminBrokerClient,
+        "start",
+        classmethod(lambda cls, timeout=60: FakeBroker()),
+    )
+    sudo.begin_engine_session(TOKEN, authorization_mode="engine_start")
+
+    assert sudo.start_admin_session(TOKEN) is True
+    assert sudo.get_authorization_status() == {
+        "mode": "engine_start",
+        "session_active": True,
+    }
+    assert sudo.end_engine_session(TOKEN) is True
+    assert closed == [True]
 
 
 def test_override_does_not_inherit_admin(monkeypatch):

@@ -358,7 +358,11 @@ def main():
 
 
 if __name__ == "__main__":
-    if "--enable-autostart" in sys.argv or "--disable-autostart" in sys.argv:
+    if "--admin-broker" in sys.argv:
+        from notmyfault.security.admin_broker import main as admin_broker_main
+        index = sys.argv.index("--admin-broker")
+        raise SystemExit(admin_broker_main(sys.argv[index + 1:index + 2]))
+    elif "--enable-autostart" in sys.argv or "--disable-autostart" in sys.argv:
         if os.name == "nt":
             raise SystemExit("出于安全考虑，请通过 Windows 托盘菜单管理开机自启")
         from notmyfault.platform.platform_support import set_linux_autostart
