@@ -40,9 +40,14 @@ class TestPluginFiles:
         sub = tmp_path / "sub"
         sub.mkdir()
         (sub / "d.json").write_text("{}")
+        hidden = tmp_path / ".hidden"
+        hidden.mkdir()
+        (hidden / "e.py").write_text("VALUE = 1")
         files = signing.plugin_files(tmp_path)
         rel = [f.relative_to(tmp_path).as_posix() for f in files]
-        assert rel == ["a.json", "b.py", "bin/tool.exe", "c.txt", "sub/d.json"]
+        assert rel == [
+            ".hidden/e.py", "a.json", "b.py", "bin/tool.exe", "c.txt", "sub/d.json"
+        ]
 
 
 class TestLoadPrivateKey:

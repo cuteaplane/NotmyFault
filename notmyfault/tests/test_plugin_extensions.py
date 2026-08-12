@@ -371,6 +371,23 @@ class TestLazyLoading:
         loader, registry, errors = make_loader(tmp_path)
         assert registry.resolve_action("ghost") is None
 
+    def test_materialize_rejects_files_changed_after_discovery(self, tmp_path):
+        loader, registry, errors = make_loader(tmp_path)
+        folder = write_plugin(
+            tmp_path / "actions",
+            "changed",
+            make_meta("changed_a"),
+            "def run(meta, params):\n    return 'original'\n",
+        )
+        loaded, failed, _, _ = load_actions(loader, tmp_path)
+        assert (loaded, failed) == (1, 0)
+        (folder / "action.py").write_text(
+            "def run(meta, params):\n    return 'changed'\n",
+            encoding="utf-8",
+        )
+        assert registry.resolve_action("changed_a") is None
+        assert any("校验后发生变化" in message for _, _, message in errors)
+
 
 class TestEngineLazyWorkflow:
     def test_lazy_action_materialized_on_first_workflow(self, tmp_path, monkeypatch):

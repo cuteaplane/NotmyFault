@@ -1,5 +1,6 @@
 """加载插件并完成元数据校验、安全检查、导入、注册和 setup，加载器只依赖调用方提供的运行时协作者且不持有 AutomationEngine。"""
 
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -59,6 +60,17 @@ _IGNORED_PLUGIN_DIRECTORY_NAMES = frozenset(
 def _is_ignored_plugin_directory(folder_name: str) -> bool:
     """识别插件根目录里由解释器或开发工具生成的目录"""
     return folder_name.startswith(".") or folder_name in _IGNORED_PLUGIN_DIRECTORY_NAMES
+
+
+def _snapshot_plugin_files(folder_path: str) -> Dict[str, str] | None:
+    snapshot: Dict[str, str] = {}
+    try:
+        for path in plugin_files(folder_path):
+            relative = os.path.relpath(str(path), folder_path).replace(os.sep, "/")
+            snapshot[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    except (OSError, ValueError):
+        return None
+    return snapshot
 
 
 def _current_platform_name() -> str:
@@ -492,6 +504,18 @@ class PluginLoader:
             caps = set().union(
                 *(scan_plugin_capabilities(path) for path in python_files)
             )
+            file_snapshot = _snapshot_plugin_files(folder_path)
+            if file_snapshot is None:
+                reason = "无法读取插件文件，拒绝加载"
+                failed_count += 1
+                self._diagnostics.record_plugin_error(store_name, plugin_id, reason)
+                engine_error(
+                    "plugin_load_failed",
+                    plugin=plugin_id,
+                    type=store_name,
+                    reason=reason,
+                )
+                continue
 
             # self_elevation 始终拒绝，插件只能通过 sudo.run_as_admin 提权并声明 admin。
             if "self_elevation" in caps:
@@ -627,6 +651,8 @@ class PluginLoader:
                 "prev": None,
                 "previous_root": previous_root,
                 "previous_path": previous_path,
+                "file_snapshot": file_snapshot,
+                "signature_kind": signature_kind,
             }
 
             if plugin_type == "action":
@@ -754,6 +780,14 @@ class PluginLoader:
                     type=store_name,
                     reason=reason,
                 )
+
+            expected_signature = entry.get("signature_kind", "none")
+            if plugin_signature_kind(folder_path, origin) != expected_signature:
+                fail("插件签名在物化前发生变化，拒绝导入")
+                return None
+            if _snapshot_plugin_files(folder_path) != entry.get("file_snapshot"):
+                fail("插件文件在校验后发生变化，拒绝导入")
+                return None
 
             sys.modules.pop(module_name, None)
             spec = importlib.util.spec_from_file_location(module_name, py_file)

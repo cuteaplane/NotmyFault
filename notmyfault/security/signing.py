@@ -35,10 +35,7 @@ def plugin_files(plugin_dir) -> list[Path]:
         if f.name in _SIGNATURE_ARTIFACT_NAMES:
             continue
         relative_parts = f.relative_to(plugin_root).parts[:-1]
-        if any(
-            part.startswith(".") or part in _GENERATED_DIR_NAMES
-            for part in relative_parts
-        ):
+        if any(part in _GENERATED_DIR_NAMES for part in relative_parts):
             continue
         files.append(f)
     return files
