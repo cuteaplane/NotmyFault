@@ -295,9 +295,11 @@ class TestMacroComponent:
         class FakeRecorder:
             instances = []
 
-            def __init__(self, mouse_resolver=None, keyboard_window_resolver=None):
+            def __init__(self, mouse_resolver=None, keyboard_window_resolver=None,
+                         keyboard_password_resolver=None):
                 self.mouse_resolver = mouse_resolver
                 self.keyboard_window_resolver = keyboard_window_resolver
+                self.keyboard_password_resolver = keyboard_password_resolver
                 self.recording = False
                 self.started_at = 10.0
                 self.events = [{"kind": "keyboard", "timestamp": 10.2}]
@@ -339,6 +341,7 @@ class TestMacroComponent:
         )
         assert started["data"]["recording"] is True
         assert FakeRecorder.instances[0].keyboard_window_resolver is macro_component.capture_foreground_window
+        assert FakeRecorder.instances[0].keyboard_password_resolver is macro_component.is_focused_password_control
         assert started["data"]["window_action"] == "minimize"
         assert macro_component.recording_status(context, {})["data"]["recording"] is True
         stopped = macro_component.stop_recording(context, {})

@@ -9,6 +9,7 @@ from notmyfault.native.uia import (
     DesktopElementError,
     capture_element_at,
     capture_foreground_window,
+    is_focused_password_control,
     validate_window_signature,
 )
 
@@ -218,6 +219,7 @@ def start_recording(context, payload):
     recorder = InputRecorder(
         mouse_resolver=capture_element_at,
         keyboard_window_resolver=capture_foreground_window,
+        keyboard_password_resolver=is_focused_password_control,
     )
     try:
         recorder.start()
