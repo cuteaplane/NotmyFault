@@ -1,13 +1,28 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, nextTick, onMounted } from 'vue'
 import { store } from '../../lib/store'
 import { apiRead, apiWrite, loadPlugins, getSchema } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
 import { alertDialog, confirmDialog } from '../../lib/dialog'
+import { useEngineControl } from '../../composables/useEngineControl'
 import PluginCard from '../PluginCard.vue'
+
+const { restartEngine } = useEngineControl()
 
 const tab = ref('triggers')
 const list = computed(() => store.pluginsData[tab.value] || {})
+const query = ref('')
+const searchRef = ref(null)
+const focusedPluginId = ref('')
+const focusReason = ref('')
+const filteredList = computed(() => {
+  const q = query.value.trim().toLowerCase()
+  if (!q) return list.value
+  return Object.fromEntries(Object.entries(list.value).filter(([id, meta]) => (
+    [id, meta?.name, meta?.description].some(value => String(value || '').toLowerCase().includes(q))
+  )))
+})
+const focusedPluginMissing = computed(() => focusedPluginId.value && !list.value[focusedPluginId.value])
 const tabCounts = computed(() => ({
   triggers: Object.keys(store.pluginsData.triggers || {}).length,
   actions: Object.keys(store.pluginsData.actions || {}).length,
@@ -35,11 +50,21 @@ async function refresh() {
   store.schema = sch
 }
 
+// 插件变更要重启引擎才生效，直接问用户要不要现在重启。
+async function promptRestart(message) {
+  if (!await confirmDialog('重启引擎使更改生效？', message, '立即重启')) return
+  await restartEngine()
+}
+
 async function togglePlugin(pid) {
   try {
     const r = await apiWrite('/api/plugins/toggle', 'POST', { type: tab.value, id: pid })
     const d = await r.json()
-    if (d.ok) { snackbar(d.restart_required ? '状态已更新，需重启引擎生效' : '状态已更新'); await refresh() }
+    if (d.ok) {
+      await refresh()
+      if (d.restart_required) await promptRestart('刚才的插件状态变更会在引擎重启后生效。')
+      else snackbar('状态已更新')
+    }
     else alertDialog('操作失败', d.error || '未知错误')
   } catch (e) { alertDialog('请求失败', e.message) }
 }
@@ -49,7 +74,7 @@ async function uninstallPlugin(pid) {
   try {
     const r = await apiWrite('/api/plugins/' + tab.value + '/' + pid, 'DELETE')
     const d = await r.json()
-    if (d.ok) { snackbar('已卸载，需重启引擎生效'); await refresh() }
+    if (d.ok) { await refresh(); await promptRestart('刚卸载的插件会在引擎重启后完全移除。') }
     else alertDialog('卸载失败', d.error || '未知错误')
   } catch (e) { alertDialog('请求失败', e.message) }
 }
@@ -127,11 +152,11 @@ async function doInstall() {
     const r = await apiWrite('/api/plugins/install', 'POST', fd, true)
     const d = await r.json()
     if (d.ok) {
-      snackbar('插件 "' + d.id + '" 安装成功，需重启引擎生效')
       showInstall.value = false
       preview.value = null
       forceInstall.value = false
       await refresh()
+      await promptRestart('插件 "' + d.id + '" 已安装，引擎重启后即可使用。')
     } else { installError.value = d.error || '安装失败，请重试' }
   } catch (e) { alertDialog('请求失败', e.message) }
 }
@@ -147,7 +172,23 @@ function retryPreview() {
   if (fileForUpload.value) uploadPreview(fileForUpload.value)
 }
 
-onMounted(refresh)
+async function consumePluginFocus() {
+  const focus = store.pendingPluginFocus
+  if (!focus) return
+  store.pendingPluginFocus = null
+  tab.value = focus.kind === 'trigger' ? 'triggers' : 'actions'
+  focusedPluginId.value = focus.id || ''
+  focusReason.value = focus.reason || ''
+  query.value = focus.id || ''
+  await nextTick()
+  searchRef.value?.focus()
+  document.querySelector('.plugin-card.focused')?.scrollIntoView?.({ block: 'center' })
+}
+
+onMounted(async () => {
+  await refresh()
+  await consumePluginFocus()
+})
 </script>
 
 <template>
@@ -163,13 +204,26 @@ onMounted(refresh)
         动作<span class="ml-1.5 inline-flex min-w-5 items-center justify-center rounded-full bg-on-surface/10 px-1.5 py-0.5 text-label-s">{{ tabCounts.actions }}</span>
       </button>
     </div>
+    <div class="plugin-tools">
+      <label class="plugin-search">
+        <span class="material-symbols-outlined">search</span>
+        <input ref="searchRef" v-model="query" type="search" aria-label="搜索插件" autocomplete="off" spellcheck="false" placeholder="搜索名称、说明或插件 ID">
+      </label>
+      <p v-if="focusReason" class="plugin-focus-reason"><span class="material-symbols-outlined">info</span>{{ focusReason }}</p>
+    </div>
+    <div v-if="focusedPluginMissing" class="plugin-missing-callout">
+      <span class="material-symbols-outlined">extension_off</span>
+      <div><b>未找到插件 {{ focusedPluginId }}</b><p>请安装对应的 .nmfp 插件包；安装完成后可以继续使用刚才的模板。</p></div>
+      <button class="btn btn-filled" @click="openInstall"><span class="material-symbols-outlined">install_desktop</span>安装插件</button>
+    </div>
     <Transition name="content-swap" mode="out-in">
       <div :key="tab" class="plugin-tab-content">
-        <div v-if="!Object.keys(list).length" class="empty-state">
-          <div class="material-symbols-outlined">extension_off</div><h3>暂无插件</h3><p>安装插件或启动引擎后刷新</p>
+        <div v-if="!Object.keys(filteredList).length" class="empty-state">
+          <div class="material-symbols-outlined">extension_off</div><h3>{{ query ? '没有匹配的插件' : '暂无插件' }}</h3><p>{{ query ? '可以清除搜索，或安装对应插件。' : '安装插件或启动引擎后刷新' }}</p>
         </div>
         <div v-else class="plugin-grid">
-          <PluginCard v-for="(meta, pid) in list" :key="pid" :pid="pid" :meta="meta" :type="tab"
+          <PluginCard v-for="(meta, pid) in filteredList" :key="pid" :pid="pid" :meta="meta" :type="tab"
+            :class="{ focused: focusedPluginId === pid }"
             @toggle="togglePlugin" @uninstall="uninstallPlugin" />
         </div>
       </div>

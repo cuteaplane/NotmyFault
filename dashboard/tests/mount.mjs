@@ -4,6 +4,7 @@ import { JSDOM } from 'jsdom'
 import fs from 'fs'
 import path from 'path'
 import { pathToFileURL } from 'url'
+import { buildRunExport } from '../src/lib/runExport.js'
 
 const distDir = process.env.DASHBOARD_DIST_DIR || 'dist'
 const dom = new JSDOM('<!DOCTYPE html><html><head></head><body><div id="app"></div></body></html>', {
@@ -13,8 +14,16 @@ const { window } = dom
 
 // mock API + SSE（不依赖真实引擎）
 const bridgeCalls = []
+const windowStateCalls = []
 let savedRulesPayload = null
 let mockEngineRunning = true
+let mockEngineState = 'running'
+let slowStopPolls = 0
+let simulateSlowStop = false
+let launchCalls = 0
+let mockAdminAuthorization = 'per_execution'
+let exportedRunBlob = null
+let exportedRunFileName = ''
 window.matchMedia = () => ({ matches: false, addEventListener(){}, removeEventListener(){} })
 window.ResizeObserver = class {
   constructor(callback) { this.callback = callback }
@@ -22,9 +31,13 @@ window.ResizeObserver = class {
   disconnect() {}
 }
 window.EventSource = class { constructor(){} addEventListener(){} close(){} }
+window.URL.createObjectURL = blob => { exportedRunBlob = blob; return 'blob:notmyfault-run-export' }
+window.URL.revokeObjectURL = () => {}
+window.HTMLAnchorElement.prototype.click = function() { exportedRunFileName = this.download }
 // Dashboard 只支持 pywebview；提供完整的最小 bridge 契约。
 window.pywebview = { api: {
   get_config: async () => ({ rules: [{
+    rule_id: 'r_mount001',
     name: '挂载测试规则',
     folder: '测试',
     condition: {
@@ -41,32 +54,200 @@ window.pywebview = { api: {
         },
       ],
     },
-    actions: [{ type: 'notify', params: {} }],
+    actions: [{ binding_id: 'a_mount001', type: 'notify', params: {} }],
   }] }),
   save_config: async (rules) => {
     savedRulesPayload = JSON.parse(JSON.stringify(rules))
     return { ok: true }
   },
   get_api_token: async () => 'test-token',
-  get_engine_status: async () => ({ api_alive:true, engine_running:mockEngineRunning, engine_state:mockEngineRunning ? 'running' : 'stopped', security_mode:'permissive', rules_count:1, triggers_count:1, actions_count:1, pid:1234 }),
-  stop_engine: async () => { mockEngineRunning = false; return { ok:true, stopping:false } },
-  launch_engine: async () => { mockEngineRunning = true; return { ok:true, api_alive:true, engine_running:true, engine_state:'running' } },
+  get_engine_status: async () => {
+    if (mockEngineState === 'stopping') {
+      if (slowStopPolls > 0) slowStopPolls--
+      else mockEngineState = 'stopped'
+    }
+    mockEngineRunning = mockEngineState === 'running'
+    return { api_alive:true, engine_running:mockEngineRunning, engine_state:mockEngineState, security_mode:'permissive', rules_count:1, triggers_count:1, actions_count:1, pid:1234 }
+  },
+  stop_engine: async () => {
+    mockEngineRunning = false
+    if (simulateSlowStop) {
+      mockEngineState = 'stopping'
+      slowStopPolls = 2
+      return { ok:true, stopped:false, stopping:true }
+    }
+    mockEngineState = 'stopped'
+    return { ok:true, stopped:true, stopping:false }
+  },
+  launch_engine: async () => {
+    launchCalls++
+    if (mockEngineState !== 'stopped') return { ok:false, error:'engine_stopping' }
+    mockEngineState = 'running'
+    mockEngineRunning = true
+    return { ok:true, api_alive:true, engine_running:true, engine_state:'running' }
+  },
   shutdown_engine: async () => ({ ok:true }),
+  set_window_state: async (action) => {
+    windowStateCalls.push(action)
+    return { ok:true, action }
+  },
   request_api: async (path, method, data) => {
     bridgeCalls.push({ path, method, data })
     if (path === '/api/config/security-status') return { status:'ok', reason:'', summary:null }
+    if (path === '/api/settings/admin-authorization' && method === 'GET') {
+      return { mode:mockAdminAuthorization, effective_mode:'per_execution', supported_modes:['per_execution','engine_start'], restart_required:false }
+    }
+    if (path === '/api/settings/admin-authorization' && method === 'PUT') {
+      mockAdminAuthorization = data.mode
+      return { ok:true, mode:data.mode, effective_mode:'per_execution', restart_required:data.mode !== 'per_execution' }
+    }
+    if (path === '/api/rules/validate') return { ok:true, valid:true, issues:[], summary:{ errors:0, warnings:0 } }
+    if (path === '/api/rules/draft' && method === 'POST') return {
+      ok:true, source:'local', ready:true,
+      draft:{ name:'每天 08:30 提醒我提交月报', folder:'未分类', event:{ type:'time_schedule', params:{ time:'08:30' } }, actions:[{ type:'notify', params:{ title:'NotmyFault', message:'提交月报' } }] },
+      interpretation:{ trigger:{ type:'time_schedule', name:'定时' }, actions:[{ type:'notify', name:'显示通知' }] },
+      assumptions:[], missing:[], unavailable:[],
+    }
+    if (/^\/api\/rules\/\d+\/run$/.test(path) && method === 'POST') return { ok:true, action_count:1, run_id:'run_test001' }
+    if (path === '/api/runs/run_test001/cancel' && method === 'POST') return { ok:true, message:'已请求停止这次运行' }
+    if (path === '/api/desktop-elements/capture' && method === 'POST') return { ok:true, selector:{
+      version:1,
+      window:{ process:'notepad.exe', name:'无标题 - 记事本', control_type:50032, class_name:'Notepad' },
+      target:{ automation_id:'FileSave', name:'保存', control_type:50000, class_name:'Button' },
+      ancestors:[], captured_at:'2026-08-10T00:00:00Z', bounds:{ left:10, top:10, width:80, height:30 },
+      capabilities:{ invoke:true, focus:true, set_text:true, read_text:true },
+      display:{ control:'保存', control_type:'按钮', window:'无标题 - 记事本', app:'notepad.exe' },
+    } }
+    if (path === '/api/desktop-elements/check' && method === 'POST') return { ok:true, display:data.selector.display, capabilities:{ invoke:true, focus:true } }
+    if (path.startsWith('/api/runs?')) return { runs:[{
+      run_id:'run_mount001', rule_id:'r_mount001', rule_name:'挂载测试规则', event_type:'manual',
+      status:'failed', started_at:1723000000, finished_at:1723000000.2,
+      duration_ms:200, action_count:1, replayable:false,
+      error:{ code:'test_failure', message:'测试动作失败' },
+      steps:[{
+        step_id:'a_mount001', action_type:'notify', status:'failed', duration_ms:180, attempt:1, error:'测试动作失败',
+        input_summary:[{ name:'message', label:'消息', type:'string', display:'文本 · 12 字符', redacted:false }],
+        output_summary:[{ name:'delivered', label:'已送达', type:'bool', display:'布尔值', redacted:false }],
+      }],
+    }] }
+    if (path === '/api/plugins/toggle') return { ok:true, restart_required:true }
+    if (path === '/api/plugins/components') return {
+      components: [
+        { plugin_id:'hotkey', kind:'triggers', id:'record', name:'录制热键', api:'component-v1', param_types:['hotkey'], ui:{ button_label:'录制', icon:'keyboard' }, vue:'', available:true },
+        { plugin_id:'uia_control', kind:'actions', id:'record', name:'录制屏幕控件', api:'component-v1', param_types:['uia_selector'], ui:{ button_label:'录制桌面步骤', icon:'screen_record' }, vue:'', available:true },
+      ],
+    }
+    if (path === '/api/plugins/extensions') return {
+      commands: [],
+      parameter_editors: [{
+        plugin_id:'macro_run', id:'macro_editor', parameter:'macro', data_type:'mouse_macro',
+        command:'open_macro', view:'macro_workbench',
+        ui:{ control:'button', empty_label:'录制操作宏', icon:'movie', description:'由插件管理' },
+      }],
+      views: [{ plugin_id:'macro_run', id:'macro_workbench', title:'操作宏编辑器', window_controls:['minimize','restore'] }],
+      data_types: [{ plugin_id:'macro_run', id:'mouse_macro', version:1, binding:'private' }],
+    }
+    if (path === '/api/plugins/macro_run/extensions/views/macro_workbench/page') {
+      return { ok:true, html:'<h1>操作宏插件页面</h1>' }
+    }
+    if (path === '/api/plugins/macro_run/extensions/commands/open_macro/invoke' && method === 'POST') {
+      const current = data.current_value?.data || data.current_value || {}
+      return { ok:true, session_id:'s_macro', view:'macro_workbench', state:{ steps:current.steps || [] }, close:false }
+    }
+    if (path === '/api/plugins/macro_run/extensions/commands/start_recording/invoke' && method === 'POST') {
+      return { ok:true, session_id:'s_macro', close:false, data:{
+        recording:true, event_count:0, elapsed_seconds:0, stop_hotkey:'Ctrl+Shift+F10',
+        ...(data.payload?.minimize_window ? { window_action:'minimize' } : {}),
+      } }
+    }
+    if (path === '/api/plugins/macro_run/extensions/commands/commit_macro/invoke' && method === 'POST') {
+      const steps = Array.isArray(data.payload?.steps) ? data.payload.steps : []
+      return {
+        ok:true, session_id:'s_macro', close:true,
+        value:{
+          '$type':'com.test.macro/mouse_macro@1',
+          summary:`1 个操作宏 · ${steps.length} 步`,
+          data:{ version:1, steps },
+        },
+      }
+    }
+    if (path === '/api/plugins/macro_run/extensions/sessions/s_macro' && method === 'DELETE') {
+      return { ok:true }
+    }
+    if (path === '/api/plugins/uia_control/components/record/invoke' && method === 'POST') {
+      if (data?.method === 'check') return {
+        ok:true, session_id:'s_uia',
+        data:{ ok:true, data:{ ok:true, display:data.payload?.selector?.display || {}, capabilities:{ invoke:true, focus:true } } },
+      }
+      if (data?.method === 'to_actions') {
+        const steps = Array.isArray(data.payload?.steps) ? data.payload.steps : []
+        const actions = steps.map(step => {
+          const selector = step.selector || {}
+          if (step.operation === 'wait_present') return {
+            type:'uia_wait',
+            params:{ target:selector, wait_seconds:Number(step.waitSeconds) || 30 },
+          }
+          if (step.operation === 'focus_window') return {
+            type:'uia_focus_window', params:{ target:selector },
+          }
+          if (step.operation === 'read_text') return {
+            type:'uia_read_text', params:{ target:selector },
+          }
+          return {
+            type:'uia_control',
+            params:{
+              target:selector,
+              operation:['focus','set_text'].includes(step.operation) ? step.operation : 'invoke',
+              text:step.operation === 'set_text' ? String(step.text || '') : '',
+            },
+          }
+        })
+        return { ok:true, session_id:'s_uia', data:{ ok:true, data:{ actions } } }
+      }
+      return { ok:true, session_id:'s_uia', data:{ ok:true, data:{ selector:{
+        version:1,
+        window:{ process:'notepad.exe', name:'无标题 - 记事本', control_type:50032, class_name:'Notepad' },
+        target:{ automation_id:'FileSave', name:'保存', control_type:50000, class_name:'Button' },
+        ancestors:[], captured_at:'2026-08-10T00:00:00Z', bounds:{ left:10, top:10, width:80, height:30 },
+        capabilities:{ invoke:true, focus:true, set_text:true, read_text:true },
+        display:{ control:'保存', control_type:'按钮', window:'无标题 - 记事本', app:'notepad.exe' },
+      } } } }
+    }
+    if (path === '/api/plugins/hotkey/components/record/invoke' && method === 'POST') {
+      return { ok:true, session_id:'s_hot', data:{ ok:true, data:{ hotkey:'Ctrl+Shift+M' } } }
+    }
     if (path.includes('/api/plugins/list')) return { triggers: T, actions: A }
     if (path.includes('/api/plugins')) return { triggers: T, actions: A }
     return { ok:true }
   },
 } }
 const T = {
-  window_title: { id:'window_title', name:'窗口标题检测', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['native_api'], params:[], outputs:[{ name:'matched_title', label:'匹配标题', type:'string', sensitive:true }] },
+  window_title: { id:'window_title', name:'窗口标题检测', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['native_api','admin'], params:[], outputs:[{ name:'matched_title', label:'匹配标题', type:'string', sensitive:true }, { name:'state', label:'窗口状态', type:'string' }] },
   window_title_alt: { id:'window_title_alt', name:'窗口标题备用', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['native_api'], params:[], outputs:[{ name:'matched_title', label:'匹配标题', type:'string', sensitive:true }] },
   time_schedule: { id:'time_schedule', name:'定时', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:[], params:[], outputs:[] },
   clipboard: { id:'clipboard', name:'剪贴板监控', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['clipboard','native_api'], params:[], outputs:[] },
 }
-const A = { notify: { id:'notify', name:'显示通知', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:[], params:[{ name:'message', label:'消息', type:'string', default:'' }] } }
+const A = {
+  notify: { id:'notify', name:'显示通知', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['admin'], params:[{ name:'message', label:'消息', type:'string', default:'' }], outputs:[{ name:'delivered', label:'已送达', type:'bool' }] },
+  uia_control: { id:'uia_control', name:'操作屏幕控件', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['native_api','screen_reader'], params:[
+    { name:'target', label:'屏幕控件', type:'uia_selector', value_type:'object' },
+    { name:'operation', label:'怎么操作', type:'select', default:'invoke', options:[{ value:'invoke', label:'按下控件' }, { value:'focus', label:'让控件获得焦点' }, { value:'set_text', label:'写入文本' }] },
+    { name:'text', label:'要写入的文本', type:'textarea', default:'', sensitive:true, summary:'hidden', visible_when:{ operation:['set_text'] } },
+  ], outputs:[] },
+  uia_wait: { id:'uia_wait', name:'等待屏幕控件出现', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['native_api','screen_reader'], cancellation_api:'runtime-v1', params:[
+    { name:'target', label:'屏幕控件', type:'uia_selector', value_type:'object' },
+    { name:'wait_seconds', label:'最多等待（秒）', type:'number', default:30 },
+  ], outputs:[{ name:'found', label:'已经出现', type:'bool' }] },
+  uia_focus_window: { id:'uia_focus_window', name:'切换到录制窗口', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['native_api','screen_reader'], params:[
+    { name:'target', label:'窗口里的控件', type:'uia_selector', value_type:'object' },
+  ], outputs:[{ name:'focused', label:'已经切换', type:'bool' }] },
+  uia_read_text: { id:'uia_read_text', name:'读取屏幕控件文本', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['native_api','screen_reader'], params:[
+    { name:'target', label:'屏幕控件', type:'uia_selector', value_type:'object' },
+  ], outputs:[{ name:'text', label:'读取的文本', type:'string', sensitive:true, summary:'hidden' }] },
+  macro_run: { id:'macro_run', name:'宏录制动作', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:[], params:[
+    { name:'macro', label:'操作宏', type:'plugin_data', data_type:'mouse_macro', value_type:'object', summary:'hidden' },
+  ], outputs:[] },
+}
 window.fetch = async (url) => {
   const u = String(url); const j = (o) => ({ json: async () => o, ok: true, status: 200 })
   if (u.includes('/api/plugins/list')) return j({ triggers: T, actions: A })
@@ -86,6 +267,25 @@ Object.defineProperty(global, 'navigator', { value: window.navigator, configurab
 global.requestAnimationFrame = (cb) => setTimeout(cb, 0)
 global.cancelAnimationFrame = (id) => clearTimeout(id)
 global.fetch = window.fetch  // 覆盖 node 原生 fetch，确保用 mock
+
+const safeExportProbe = buildRunExport([{
+  run_id:'run_export001', rule_name:'导出测试', event_type:'manual', status:'succeeded',
+  event_payload:{ secret:'不能导出' },
+  steps:[{
+    step_id:'a_export001', action_type:'notify', status:'succeeded', params:{ secret:'不能导出' },
+    input_summary:[{ name:'message', label:'消息', type:'string', display:'文本 · 4 字符', redacted:false, raw:'不能导出' }],
+  }],
+}], { status:'all', timeRange:'7d', actionType:'notify', search:'' }, new Date('2026-08-10T00:00:00Z'))
+const safeExportText = JSON.stringify(safeExportProbe)
+const safeRunExportOk = safeExportProbe.format === 'NotmyFault run diagnostics'
+  && safeExportProbe.filters.time_range === '7d'
+  && safeExportProbe.runs[0].duration_ms === null
+  && safeExportProbe.runs[0].steps[0].input_summary[0].display === '文本 · 4 字符'
+  && !safeExportText.includes('不能导出')
+  && !safeExportText.includes('event_payload')
+  && !safeExportText.includes('params')
+console.log((safeRunExportOk?'PASS':'FAIL')+' - run export keeps only redacted diagnostic fields')
+if (!safeRunExportOk) process.exit(1)
 
 const jsFile = fs.readdirSync(path.join(distDir, 'assets')).find(f => f.endsWith('.js'))
 await import(pathToFileURL(path.resolve(distDir, 'assets', jsFile)).href)
@@ -110,6 +310,15 @@ let ok = true
 for (const [name, pass] of checks) { console.log((pass?'PASS':'FAIL')+' - '+name); if(!pass) ok=false }
 if (!ok) { console.error(html.substring(0, 600)); process.exit(1) }
 
+const homeNav = [...document.querySelectorAll('.nav-item')].find(
+  button => button.textContent.includes('首页'),
+)
+const homeRoleOk = !document.querySelector('.dashboard-home .automation-create-panel')
+  && !document.querySelector('.dashboard-home .automation-template')
+  && !document.querySelector('.dashboard-first-run')
+console.log((homeRoleOk?'PASS':'FAIL')+' - home stays focused on status after automations exist')
+if (!homeRoleOk) process.exit(1)
+
 const pauseAutomation = [...document.querySelectorAll('button')].find(
   button => button.textContent.includes('暂停自动化'),
 )
@@ -122,13 +331,94 @@ const pausedControlsOk = pausedControls.length === 2
 console.log((pausedControlsOk?'PASS':'FAIL')+' - paused automation reveals two unified engine controls')
 if (!pausedControlsOk) process.exit(1)
 
-const rulesNav = [...document.querySelectorAll('button')].find(
-  button => button.textContent.includes('规则'),
+const rulesNav = [...document.querySelectorAll('.nav-item')].find(
+  button => button.textContent.includes('自动化'),
 )
 rulesNav?.click()
 await new Promise(r => setTimeout(r, 50))
+const automationPageOk = document.querySelector('.rules-library')?.textContent.includes('创建、测试和管理这台电脑上的自动化')
+  && !document.querySelector('.automation-create-panel')
+;[...document.querySelectorAll('.rules-library button')].find(button => button.textContent.includes('创建自动化'))?.click()
+await new Promise(r => setTimeout(r, 40))
+const automationTemplatesOk = [...document.querySelectorAll('.automation-template')].some(
+  button => button.textContent.includes('U盘插入后备份文件'),
+) && [...document.querySelectorAll('.automation-template')].some(
+  button => button.textContent.includes('每天固定时间提醒我') && button.textContent.includes('可以直接使用'),
+) && !document.querySelector('.automation-create-panel')?.textContent.includes('直接打开空白编辑器')
+console.log((automationPageOk && automationTemplatesOk?'PASS':'FAIL')+' - automation page owns creation and outcome examples')
+if (!automationPageOk || !automationTemplatesOk) process.exit(1)
+
+const naturalDescription = document.querySelector('#natural-draft-description')
+if (naturalDescription) {
+  naturalDescription.value = '每天 08:30 提醒我提交月报'
+  naturalDescription.dispatchEvent(new window.Event('input', { bubbles:true }))
+}
+await new Promise(r => setTimeout(r, 20))
+;[...document.querySelectorAll('.natural-draft-form button')].find(
+  button => button.textContent.includes('先看看草稿'),
+)?.click()
+await new Promise(r => setTimeout(r, 50))
+const naturalPreviewOk = document.querySelector('.natural-draft-sentence')?.textContent.includes('定时')
+  && document.querySelector('.natural-draft-sentence')?.textContent.includes('显示通知')
+  && document.querySelector('.natural-draft-privacy')?.textContent.includes('不会发到网络')
+  && bridgeCalls.some(call => call.path === '/api/rules/draft' && call.method === 'POST')
+;[...document.querySelectorAll('.natural-draft-result button')].find(
+  button => button.textContent.includes('进编辑器检查'),
+)?.click()
+await new Promise(r => setTimeout(r, 60))
+const naturalDraftOk = document.querySelector('.rule-title-capsule')?.textContent.includes('每天 08:30 提醒我提交月报')
+  && document.querySelector('.graph-node-trigger')?.textContent.includes('定时')
+  && document.querySelector('.graph-node-action')?.textContent.includes('显示通知')
+console.log((naturalPreviewOk && naturalDraftOk?'PASS':'FAIL')+' - local sentence drafting previews before opening an editable rule')
+if (!naturalPreviewOk || !naturalDraftOk) process.exit(1)
+document.querySelector('.rule-back-btn')?.click()
+await new Promise(r => setTimeout(r, 50))
+;[...document.querySelectorAll('.rules-library button')].find(button => button.textContent.includes('创建自动化'))?.click()
+await new Promise(r => setTimeout(r, 40))
+
+const openQuickCreate = () => [...document.querySelectorAll('.automation-create-panel button')].find(
+  button => button.textContent.includes('自己搭一个'),
+)
+openQuickCreate()?.click()
+await new Promise(r => setTimeout(r, 100))
+const quickCreateFocusOk = document.querySelector('.quick-create-dialog')?.textContent.includes('什么时候开始')
+  && document.activeElement === document.querySelector('.quick-create-search input')
+document.querySelector('.quick-create-backdrop')?.dispatchEvent(new window.KeyboardEvent('keydown', { key:'Escape', bubbles:true }))
+await new Promise(r => setTimeout(r, 300))
+const quickCreateEscapeOk = !document.querySelector('.quick-create-dialog')
+  && document.activeElement?.textContent.includes('自己搭一个')
+console.log((quickCreateFocusOk && quickCreateEscapeOk?'PASS':'FAIL')+' - quick create focuses search and closes with Escape')
+if (!quickCreateFocusOk || !quickCreateEscapeOk) process.exit(1)
+
+openQuickCreate()?.click()
+await new Promise(r => setTimeout(r, 100))
+;[...document.querySelectorAll('.quick-create-option')].find(button => button.textContent.includes('定时'))?.click()
+await new Promise(r => setTimeout(r, 30))
+const quickCreateSecondStepOk = document.querySelector('.quick-create-dialog')?.textContent.includes('接着要做什么')
+  && document.querySelector('.quick-create-sentence')?.textContent.includes('定时')
+;[...document.querySelectorAll('.quick-create-option')].find(button => button.textContent.includes('显示通知'))?.click()
+await new Promise(r => setTimeout(r, 30))
+;[...document.querySelectorAll('.quick-create-foot button')].find(button => button.textContent.includes('在编辑器中继续'))?.click()
+await new Promise(r => setTimeout(r, 80))
+const quickCreateDraftOk = document.querySelector('.rule-title-capsule')?.textContent.includes('定时后显示通知')
+  && document.querySelector('.graph-node-trigger')?.textContent.includes('定时')
+  && document.querySelector('.graph-node-action')?.textContent.includes('显示通知')
+console.log((quickCreateSecondStepOk && quickCreateDraftOk?'PASS':'FAIL')+' - automation page opens a real prefilled rule draft')
+if (!quickCreateSecondStepOk || !quickCreateDraftOk) process.exit(1)
+document.querySelector('.rule-back-btn')?.click()
+await new Promise(r => setTimeout(r, 50))
 document.querySelector('.rule-library-row')?.click()
 await new Promise(r => setTimeout(r, 50))
+const ruleCheckButton = [...document.querySelectorAll('button')].find(
+  button => button.textContent.includes('规则检查'),
+)
+ruleCheckButton?.click()
+await new Promise(r => setTimeout(r, 50))
+const ruleCheckerOk = !!ruleCheckButton
+  && bridgeCalls.some(call => call.path === '/api/rules/validate' && call.method === 'POST')
+  && document.querySelector('.flow-validation')?.textContent.includes('规则可以保存')
+console.log((ruleCheckerOk?'PASS':'FAIL')+' - rule checker validates the current draft before save')
+if (!ruleCheckerOk) process.exit(1)
 const editorHeaderOk = document.querySelector('.rule-title-capsule')?.textContent.includes('挂载测试规则')
   && document.querySelector('.rule-title-edit .material-symbols-outlined')?.textContent === 'edit'
   && document.querySelector('.rule-folder-button')?.textContent.includes('测试')
@@ -143,6 +433,30 @@ const cleanRuleNameInput = ruleNameInput?.type === 'text'
   && ruleNameInput?.getAttribute('spellcheck') === 'false'
 console.log((cleanRuleNameInput?'PASS':'FAIL')+' - rule name editor suppresses native input decorations')
 if (!cleanRuleNameInput) process.exit(1)
+ruleNameInput.value = '临时规则名称'
+ruleNameInput.dispatchEvent(new window.Event('input', { bubbles: true }))
+await new Promise(r => setTimeout(r, 350))
+const draftRecovery = JSON.parse(window.localStorage.getItem('notmyfault.ruleDraft.v1') || 'null')
+const draftRecoveryStored = /^r_[a-z0-9_]{6,64}$/.test(draftRecovery?.ruleId || '')
+  && !Object.prototype.hasOwnProperty.call(draftRecovery || {}, 'ruleIndex')
+const draftDifferenceShown = document.querySelector('.draft-change-strip')?.textContent.includes('名称已改')
+const undoDraftButton = document.querySelector('.rule-history-actions button:first-child')
+const redoDraftButton = document.querySelector('.rule-history-actions button:last-child')
+undoDraftButton?.click()
+await new Promise(r => setTimeout(r, 80))
+const undoDraftOk = document.querySelector('.rule-title-capsule input')?.value === '挂载测试规则'
+redoDraftButton?.click()
+await new Promise(r => setTimeout(r, 80))
+const redoDraftOk = document.querySelector('.rule-title-capsule input')?.value === '临时规则名称'
+document.querySelector('.rule-history-actions button:first-child')?.click()
+await new Promise(r => setTimeout(r, 100))
+const draftRecoveryCleared = !window.localStorage.getItem('notmyfault.ruleDraft.v1')
+console.log((undoDraftOk && redoDraftOk?'PASS':'FAIL')+' - rule draft supports undo and redo history')
+if (!undoDraftOk || !redoDraftOk) process.exit(1)
+console.log((draftRecoveryStored && draftRecoveryCleared?'PASS':'FAIL')+' - unsaved draft recovery follows the history state')
+if (!draftRecoveryStored || !draftRecoveryCleared) process.exit(1)
+console.log((draftDifferenceShown && !document.querySelector('.draft-change-strip')?'PASS':'FAIL')+' - draft summary explains changes and clears after undo')
+if (!draftDifferenceShown || document.querySelector('.draft-change-strip')) process.exit(1)
 window.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
 await new Promise(r => setTimeout(r, 20))
 document.querySelector('.rule-folder-button')?.click()
@@ -207,6 +521,9 @@ const typedPortsOk = portsStartCollapsed
   && document.querySelectorAll('.graph-node-trigger .data-port-column-output .data-port-row').length > 0
   && document.querySelectorAll('.graph-node-action .data-port-column-input .data-port-row').length > 0
   && document.querySelector('.data-type-chip')?.textContent.length > 0
+  && Number.parseFloat(document.querySelector('.graph-node-trigger')?.style.height) === 208
+  && Number.parseFloat(document.querySelector('.graph-node-action')?.style.height) === 218
+  && document.querySelectorAll('.graph-node-body.has-admin').length >= 2
 console.log((typedPortsOk?'PASS':'FAIL')+' - typed data ports expand on demand')
 if (!typedPortsOk) process.exit(1)
 
@@ -358,6 +675,7 @@ outputPort?.dispatchEvent(new window.MouseEvent('pointerdown', { bubbles: true, 
 await new Promise(r => setTimeout(r, 20))
 const dragTemporarilyExpandsCompatibleInputs = document.querySelectorAll('.graph-node-action .data-port-column-input .data-port-row').length > 0
   && document.querySelectorAll('.graph-node.data-incompatible').length > 0
+  && !document.querySelector('.node-inspector')
 console.log((dragTemporarilyExpandsCompatibleInputs?'PASS':'FAIL')+' - data drag reveals only compatible inputs')
 if (!dragTemporarilyExpandsCompatibleInputs) process.exit(1)
 viewportEl?.dispatchEvent(new window.Event('pointercancel', { bubbles: true }))
@@ -372,6 +690,7 @@ const inputPort = document.querySelector('.graph-node-action .data-port-column-i
 inputPort?.dispatchEvent(new window.MouseEvent('pointerup', { bubbles: true, button: 0, clientX: 330, clientY: 160 }))
 await new Promise(r => setTimeout(r, 20))
 const dragBindingOk = document.querySelectorAll('.node-link-data').length === 1
+  && !document.querySelector('.node-inspector')
 console.log((dragBindingOk?'PASS':'FAIL')+' - dragging typed ports creates a data binding')
 if (!dragBindingOk) process.exit(1)
 
@@ -416,11 +735,82 @@ const saveRun = [...document.querySelectorAll('button')].find(
 )
 saveRun?.click()
 await new Promise(r => setTimeout(r, 100))
+const testPrepDialog = document.querySelector('.test-prep-dialog')
+const testPrepShowsRoute = testPrepDialog?.textContent.includes('模拟触发数据')
+  && testPrepDialog?.textContent.includes('运行当前规则')
+  && testPrepDialog?.textContent.includes('查看每步结果')
+  && testPrepDialog?.textContent.includes('选择执行范围')
+  && testPrepDialog?.textContent.includes('测试断言')
+const sensitiveTestInput = testPrepDialog?.querySelector('input[type="password"]')
+const reusableTestInput = testPrepDialog?.querySelector('input[type="text"]')
+if (sensitiveTestInput) {
+  sensitiveTestInput.value = '测试敏感标题'
+  sensitiveTestInput.dispatchEvent(new window.Event('input', { bubbles: true }))
+}
+if (reusableTestInput) {
+  reusableTestInput.value = 'opened'
+  reusableTestInput.dispatchEvent(new window.Event('input', { bubbles: true }))
+}
+const rangeModeSelect = testPrepDialog?.querySelector('.test-range-controls select')
+if (rangeModeSelect) {
+  rangeModeSelect.value = 'from'
+  rangeModeSelect.dispatchEvent(new window.Event('change', { bubbles: true }))
+}
+await new Promise(r => setTimeout(r, 20))
+;[...(testPrepDialog?.querySelectorAll('button') || [])].find(
+  button => button.textContent.includes('添加断言'),
+)?.click()
+await new Promise(r => setTimeout(r, 20))
+const assertionExpected = testPrepDialog?.querySelector('.test-assertion-row input')
+if (assertionExpected) {
+  assertionExpected.value = 'true'
+  assertionExpected.dispatchEvent(new window.Event('input', { bubbles: true }))
+}
+;[...(testPrepDialog?.querySelectorAll('button') || [])].find(
+  button => button.textContent.includes('用这些数据运行'),
+)?.click()
+await new Promise(r => setTimeout(r, 100))
+const savedTestData = window.localStorage.getItem('notmyfault.ruleTestData.v1') || ''
+const testPrepSafe = testPrepShowsRoute && !!sensitiveTestInput
+  && !savedTestData.includes('测试敏感标题')
+  && savedTestData.includes('opened')
+console.log((testPrepSafe?'PASS':'FAIL')+' - test preparation groups data and never persists sensitive values')
+if (!testPrepSafe) process.exit(1)
+const stopTestButton = [...document.querySelectorAll('.test-result-dialog button')].find(
+  button => button.textContent.includes('停止测试'),
+)
+stopTestButton?.click()
+await new Promise(r => setTimeout(r, 30))
+const testRunCanStop = !!stopTestButton && bridgeCalls.some(call =>
+  call.path === '/api/runs/run_test001/cancel' && call.method === 'POST'
+)
+console.log((testRunCanStop?'PASS':'FAIL')+' - a running manual test can be stopped')
+if (!testRunCanStop) process.exit(1)
+;[...document.querySelectorAll('.test-result-dialog button')].find(
+  button => button.textContent.includes('关闭'),
+)?.click()
+await new Promise(r => setTimeout(r, 20))
+saveRun?.click()
+await new Promise(r => setTimeout(r, 100))
+const restoredTestDialog = document.querySelector('.test-prep-dialog')
+const testDataRestored = restoredTestDialog?.querySelector('input[type="text"]')?.value === 'opened'
+  && restoredTestDialog?.querySelector('input[type="password"]')?.value === ''
+console.log((testDataRestored?'PASS':'FAIL')+' - test preparation restores only non-sensitive values')
+if (!testDataRestored) process.exit(1)
+;[...restoredTestDialog.querySelectorAll('button')].find(
+  button => button.textContent.includes('取消'),
+)?.click()
+await new Promise(r => setTimeout(r, 20))
 const snapshotCall = bridgeCalls.find(call => call.path === '/api/rules/0/run')
 const snapshotBinding = snapshotCall?.data?.rule?.actions?.[0]?.params?.message?.$ref
 const snapshotOk = snapshotCall?.data?.rule?.name === '挂载测试规则'
+  && /^r_[a-z0-9_]{6,64}$/.test(snapshotCall?.data?.rule?.rule_id || '')
   && snapshotBinding?.scope === 'trigger'
   && snapshotBinding?.path?.[0] === 'matched_title'
+  && Object.values(snapshotCall?.data?.trigger_payloads || {}).some(payload => payload.matched_title === '测试敏感标题')
+  && snapshotCall?.data?.start_step_id === 'a_mount001'
+  && snapshotCall?.data?.test_assertions?.[0]?.step_id === 'a_mount001'
+  && snapshotCall?.data?.test_assertions?.[0]?.expected === true
 console.log((snapshotOk?'PASS':'FAIL')+' - test-rule sends exact saved rule snapshot')
 if (!snapshotOk) process.exit(1)
 
@@ -674,7 +1064,7 @@ console.log((deleteRelayoutOk?'PASS':'FAIL')+' - deleting an inserted action rel
 if (!deleteRelayoutOk) process.exit(1)
 
 // D. requestTestContext：空 path（完整 payload）必须写入 trigger_payloads / event_payload
-const { requestTestContext } = await import('../src/lib/bindings.js')
+const { buildAllTestInputFields, buildPreparedTestContext, buildTestInputFields, requestTestContext } = await import('../src/lib/bindings.js')
 const ctxSchema = {
   triggers: { window_title: { name:'窗口标题检测', outputs:[{ name:'matched_title', label:'匹配标题', type:'string' }] } },
   actions: {},
@@ -693,6 +1083,46 @@ const fullPayloadOk = testCtx?.trigger_payloads?.t_full01?.matched_title === '�
 console.log((fullPayloadOk?'PASS':'FAIL')+' - requestTestContext writes full payload for empty path')
 if (!fullPayloadOk) process.exit(1)
 
+const preparedFields = buildTestInputFields(ctxRule, ctxSchema)
+const preparedContext = buildPreparedTestContext([
+  { key:'count', scope:'event', node:'', path:['count'], type:'number', required:true },
+  { key:'ready', scope:'event', node:'', path:['ready'], type:'bool', required:true },
+  { key:'meta', scope:'trigger', node:'t_full01', path:['meta'], type:'object', required:true },
+], { count:'12.5', ready:true, meta:'{"source":"test"}' })
+const preparedTypesOk = preparedFields.length === 2
+  && preparedFields.every(field => field.path[0] === 'matched_title')
+  && preparedContext.event_payload.count === 12.5
+  && preparedContext.event_payload.ready === true
+  && preparedContext.trigger_payloads.t_full01.meta.source === 'test'
+console.log((preparedTypesOk?'PASS':'FAIL')+' - prepared test data follows output types and expands full payload references')
+if (!preparedTypesOk) process.exit(1)
+
+const partialSchema = {
+  triggers: {},
+  actions: {
+    produce: { name:'生成数据', outputs:[{ name:'url', label:'链接', type:'string' }] },
+    consume: { name:'打开链接', outputs:[{ name:'opened', label:'打开数量', type:'number' }] },
+  },
+}
+const partialRule = {
+  actions: [
+    { binding_id:'a_source001', type:'produce', params:{} },
+    { binding_id:'a_target001', type:'consume', params:{ url:{ $ref:{ scope:'step', node:'a_source001', path:['url'] } } } },
+  ],
+}
+const partialFields = buildTestInputFields(partialRule, partialSchema, { startStepId:'a_target001' })
+const partialContext = buildPreparedTestContext(partialFields, {
+  [partialFields[0].key]:'https://example.com',
+})
+const allPartialFields = buildAllTestInputFields(partialRule, partialSchema)
+const partialInputsOk = partialFields.length === 1
+  && partialFields[0].scope === 'step'
+  && partialFields[0].node === 'a_source001'
+  && partialContext.step_outputs.a_source001.url === 'https://example.com'
+  && allPartialFields.some(field => field.scope === 'step')
+console.log((partialInputsOk?'PASS':'FAIL')+' - partial test run collects skipped upstream action outputs')
+if (!partialInputsOk) process.exit(1)
+
 const navHasEngineControl = !!document.querySelector('.nav-engine-ctl')
 console.log((!navHasEngineControl?'PASS':'FAIL')+' - navigation has no duplicate engine controls')
 if (navHasEngineControl) process.exit(1)
@@ -708,10 +1138,359 @@ const permissionLabelsOk = permissionChipTexts.length > 0
   && permissionChipTexts.every(Boolean)
   && permissionChipTexts.includes('content_paste剪贴板')
 const securitySpacingOk = !!document.querySelector('.config-security-status')
+const adminAuthorizationOptions = [...document.querySelectorAll('.admin-auth-option')]
+const adminAuthorizationTextOk = adminAuthorizationOptions.length === 2
+  && adminAuthorizationOptions.some(button => button.textContent.includes('引擎启动时授权一次'))
+  && adminAuthorizationOptions.some(button => button.textContent.includes('保留两分钟'))
 console.log((permissionLabelsOk?'PASS':'FAIL')+' - every registered permission renders a non-empty label')
 if (!permissionLabelsOk) process.exit(1)
 console.log((securitySpacingOk?'PASS':'FAIL')+' - config status keeps dedicated spacing from the security banner')
 if (!securitySpacingOk) process.exit(1)
+console.log((adminAuthorizationTextOk?'PASS':'FAIL')+' - security view offers both admin authorization modes')
+if (!adminAuthorizationTextOk) process.exit(1)
+adminAuthorizationOptions.find(button => button.textContent.includes('引擎启动时授权一次'))?.click()
+await new Promise(r => setTimeout(r, 50))
+const adminAuthorizationSaved = bridgeCalls.some(call =>
+  call.path === '/api/settings/admin-authorization'
+  && call.method === 'PUT'
+  && call.data?.mode === 'engine_start'
+)
+console.log((adminAuthorizationSaved?'PASS':'FAIL')+' - admin authorization selection is saved')
+if (!adminAuthorizationSaved) process.exit(1)
+
+const logsNav = [...document.querySelectorAll('.nav-item')].find(
+  button => button.textContent.includes('日志'),
+)
+logsNav?.click()
+await new Promise(r => setTimeout(r, 80))
+const runCenterOk = document.querySelector('.run-center-page')?.textContent.includes('运行记录')
+  && document.querySelector('.run-card')?.textContent.includes('挂载测试规则')
+  && document.querySelector('.run-card')?.textContent.includes('失败')
+const runActionFilter = document.querySelector('.run-action-filter')
+runActionFilter.value = 'notify'
+runActionFilter.dispatchEvent(new window.Event('change', { bubbles:true }))
+await new Promise(r => setTimeout(r, 20))
+const runActionFilterOk = document.querySelectorAll('.run-card').length === 1
+  && runActionFilter.selectedOptions[0]?.textContent.includes('显示通知')
+const runTimeFilter = document.querySelector('.run-time-filter')
+runTimeFilter.value = '24h'
+runTimeFilter.dispatchEvent(new window.Event('change', { bubbles:true }))
+await new Promise(r => setTimeout(r, 20))
+const runTimeFilterOk = !document.querySelector('.run-card')
+  && document.querySelector('.run-empty')?.textContent.includes('没有符合条件的运行')
+runTimeFilter.value = 'all'
+runTimeFilter.dispatchEvent(new window.Event('change', { bubbles:true }))
+await new Promise(r => setTimeout(r, 20))
+document.querySelector('.run-export-btn')?.click()
+await new Promise(r => setTimeout(r, 20))
+const runExportConfirmOk = document.querySelector('.app-dialog')?.textContent.includes('不包含触发输入、动作参数、动作返回值或测试期望值')
+document.querySelector('.app-dialog .btn-filled')?.click()
+await new Promise(r => setTimeout(r, 20))
+const runExportDownloadOk = exportedRunBlob?.type === 'application/json;charset=utf-8'
+  && exportedRunBlob.size > 0
+  && /^NotmyFault-run-diagnostics-\d{8}-\d{6}\.json$/.test(exportedRunFileName)
+console.log((runActionFilterOk && runTimeFilterOk?'PASS':'FAIL')+' - run center filters by action and time range')
+if (!runActionFilterOk || !runTimeFilterOk) process.exit(1)
+console.log((runExportConfirmOk && runExportDownloadOk?'PASS':'FAIL')+' - run center confirms and downloads a redacted export')
+if (!runExportConfirmOk || !runExportDownloadOk) process.exit(1)
+document.querySelector('.run-card-main')?.click()
+await new Promise(r => setTimeout(r, 20))
+const runStepsOk = document.querySelector('.run-step')?.textContent.includes('显示通知')
+  && document.querySelector('.step-summary-strip')?.textContent.includes('输入')
+  && document.querySelector('.step-summary-strip')?.textContent.includes('消息')
+  && document.querySelector('.step-summary-strip')?.textContent.includes('输出')
+  && document.querySelector('.step-summary-strip')?.textContent.includes('已送达')
+  && document.querySelector('.run-card-actions button[disabled]')?.textContent.includes('重新运行')
+document.querySelector('.run-step-open')?.click()
+await new Promise(r => setTimeout(r, 80))
+const failedStepJumpOk = document.querySelector('.node-inspector')?.textContent.includes('显示通知')
+const failureSettings = document.querySelector('.node-inspector .action-failure-settings')
+const failurePolicySelect = failureSettings?.querySelector('.action-failure-policy select')
+failurePolicySelect.value = 'continue'
+failurePolicySelect.dispatchEvent(new window.Event('change', { bubbles:true }))
+const retrySelect = failureSettings?.querySelector('.action-retry-settings select')
+retrySelect.value = '2'
+retrySelect.dispatchEvent(new window.Event('change', { bubbles:true }))
+await new Promise(r => setTimeout(r, 30))
+const retryDelayInput = failureSettings?.querySelector('.action-delay-field input')
+retryDelayInput.value = '3'
+retryDelayInput.dispatchEvent(new window.Event('input', { bubbles:true }))
+const retryBackoffSelect = [...failureSettings.querySelectorAll('.action-retry-body select')].at(-1)
+retryBackoffSelect.value = 'exponential'
+retryBackoffSelect.dispatchEvent(new window.Event('change', { bubbles:true }))
+await new Promise(r => setTimeout(r, 30))
+const actionFailureSettingsOk = failureSettings?.textContent.includes('停止，不再执行后面的动作')
+  && failureSettings.textContent.includes('继续执行后面的动作')
+  && failureSettings.textContent.includes('重试可能重复发通知、写文件或启动程序')
+  && failureSettings.textContent.includes('插件没有提供安全停止能力')
+  && document.querySelector('.classic-rule-editor .action-flow-card .flow-card-copy small')?.textContent.includes('失败后继续 · 最多重试 2 次')
+console.log((runCenterOk && runStepsOk?'PASS':'FAIL')+' - run center summarizes runs and expands step details')
+if (!runCenterOk || !runStepsOk) process.exit(1)
+console.log((failedStepJumpOk?'PASS':'FAIL')+' - failed run step opens the matching editor node')
+if (!failedStepJumpOk) process.exit(1)
+console.log((actionFailureSettingsOk?'PASS':'FAIL')+' - action editor exposes stop, continue and retry settings')
+if (!actionFailureSettingsOk) process.exit(1)
+
+const addFailureAction = [...failureSettings.querySelectorAll('button')].find(
+  button => button.textContent.includes('添加补救动作'),
+)
+addFailureAction?.click()
+await new Promise(r => setTimeout(r, 20))
+const failurePickerOk = document.querySelector('.plugin-picker-dialog')?.textContent.includes('添加补救动作')
+document.querySelector('.plugin-picker-item')?.click()
+await new Promise(r => setTimeout(r, 40))
+const controlLabels = [...document.querySelectorAll('.node-link-label')].map(label => label.textContent)
+const failureBranchOk = failurePickerOk
+  && document.querySelectorAll('.graph-node-failure-action').length === 1
+  && controlLabels.includes('失败时')
+  && controlLabels.includes('处理后继续')
+  && document.querySelector('.node-inspector')?.textContent.includes('这个动作只会在上方主动作最终失败时执行')
+  && document.querySelector('.classic-rule-editor .action-flow-card .flow-card-copy small')?.textContent.includes('1 个补救动作')
+console.log((failureBranchOk?'PASS':'FAIL')+' - failed actions can run an editable recovery branch')
+if (!failureBranchOk) process.exit(1)
+
+const replaceRecoveryType = document.querySelector('.node-inspector .plugin-type-button')
+replaceRecoveryType?.click()
+await new Promise(r => setTimeout(r, 20))
+;[...document.querySelectorAll('.plugin-picker-item')].find(
+  button => button.textContent.includes('操作屏幕控件'),
+)?.click()
+await new Promise(r => setTimeout(r, 40))
+const chooseDesktopElement = [...document.querySelectorAll('.uia-selector-field button')].find(
+  button => button.textContent.includes('选择屏幕上的控件'),
+)
+chooseDesktopElement?.click()
+await new Promise(r => setTimeout(r, 60))
+const desktopElementCard = document.querySelector('.uia-selector-card')
+const verifyDesktopElement = [...document.querySelectorAll('.uia-selector-field button')].find(
+  button => button.textContent.trim() === '检查',
+)
+verifyDesktopElement?.click()
+await new Promise(r => setTimeout(r, 40))
+const desktopSelectorOk = desktopElementCard?.textContent.includes('保存')
+  && desktopElementCard.textContent.includes('notepad.exe')
+  && bridgeCalls.some(call => (
+    call.path === '/api/plugins/uia_control/components/record/invoke'
+    && call.data?.method === 'capture'
+  ))
+  && bridgeCalls.some(call => (
+    call.path === '/api/plugins/uia_control/components/record/invoke'
+    && call.data?.method === 'check'
+  ))
+  && document.querySelector('.uia-selector-status')?.textContent.includes('检查通过')
+console.log((desktopSelectorOk?'PASS':'FAIL')+' - screen control selector captures and rechecks a UIA target')
+if (!desktopSelectorOk) process.exit(1)
+
+const actionCountBeforeRecording = document.querySelectorAll('.graph-node-action').length
+;[...document.querySelectorAll('.node-canvas-toolbar button')].find(
+  button => button.textContent.includes('录制桌面步骤'),
+)?.click()
+await new Promise(r => setTimeout(r, 30))
+let recordNext = [...document.querySelectorAll('.desktop-recorder-dialog button')].find(
+  button => button.textContent.includes('选择第一个控件'),
+)
+recordNext?.click()
+await new Promise(r => setTimeout(r, 40))
+recordNext = [...document.querySelectorAll('.desktop-recorder-dialog button')].find(
+  button => button.textContent.includes('选择下一个控件'),
+)
+recordNext?.click()
+await new Promise(r => setTimeout(r, 40))
+document.querySelector('.desktop-recorder-steps li .icon-btn-danger')?.click()
+await new Promise(r => setTimeout(r, 20))
+const recordedStepCount = document.querySelectorAll('.desktop-recorder-steps li').length
+const recordedOperation = document.querySelector('.desktop-recorder-steps select')
+if (recordedOperation) {
+  recordedOperation.value = 'set_text'
+  recordedOperation.dispatchEvent(new window.Event('change', { bubbles:true }))
+}
+await new Promise(r => setTimeout(r, 20))
+const recordedText = document.querySelector('.desktop-recorder-text textarea')
+if (recordedText) {
+  recordedText.value = '月度报告'
+  recordedText.dispatchEvent(new window.Event('input', { bubbles:true }))
+}
+;[...document.querySelectorAll('.desktop-recorder-foot button')].find(
+  button => button.textContent.includes('加入 1 个步骤'),
+)?.click()
+await new Promise(r => setTimeout(r, 50))
+const recorderOk = recordedStepCount === 1
+  && !document.querySelector('.desktop-recorder-dialog')
+  && document.querySelectorAll('.graph-node-action').length === actionCountBeforeRecording + 1
+  && [...document.querySelectorAll('.graph-node-action')].some(node => node.textContent.includes('操作屏幕控件'))
+  && [...document.querySelectorAll('.node-inspector textarea')].some(input => input.value === '月度报告')
+console.log((recorderOk?'PASS':'FAIL')+' - desktop recording session deletes mistakes and inserts editable steps')
+if (!recorderOk) process.exit(1)
+
+const actionCountBeforeRead = document.querySelectorAll('.graph-node-action').length
+;[...document.querySelectorAll('.node-canvas-toolbar button')].find(
+  button => button.textContent.includes('录制桌面步骤'),
+)?.click()
+await new Promise(r => setTimeout(r, 20))
+;[...document.querySelectorAll('.desktop-recorder-dialog button')].find(
+  button => button.textContent.includes('选择第一个控件'),
+)?.click()
+await new Promise(r => setTimeout(r, 40))
+const readOperation = document.querySelector('.desktop-recorder-steps select')
+if (readOperation) {
+  readOperation.value = 'read_text'
+  readOperation.dispatchEvent(new window.Event('change', { bubbles:true }))
+}
+await new Promise(r => setTimeout(r, 20))
+;[...document.querySelectorAll('.desktop-recorder-foot button')].find(
+  button => button.textContent.includes('加入 1 个步骤'),
+)?.click()
+await new Promise(r => setTimeout(r, 50))
+const recordedReadOk = document.querySelectorAll('.graph-node-action').length === actionCountBeforeRead + 1
+  && [...document.querySelectorAll('.graph-node-action')].some(node => node.textContent.includes('读取屏幕控件文本'))
+  && document.querySelector('.node-inspector .workflow-output-hint')?.textContent.includes('读取的文本')
+console.log((recordedReadOk?'PASS':'FAIL')+' - recorded text reading exposes a sensitive bindable output')
+if (!recordedReadOk) process.exit(1)
+
+// 私有数据参数只显示插件编辑入口。
+;[...document.querySelectorAll('button')].find(
+  button => button.textContent.includes('普通模式'),
+)?.click()
+await new Promise(r => setTimeout(r, 30))
+;[...document.querySelectorAll('.flow-add-control button')].find(
+  button => button.textContent.includes('添加动作'),
+)?.click()
+await new Promise(r => setTimeout(r, 30))
+;[...document.querySelectorAll('.plugin-picker-item')].find(
+  button => button.textContent.includes('宏录制动作'),
+)?.click()
+await new Promise(r => setTimeout(r, 40))
+;[...document.querySelectorAll('.action-flow-card')].at(-1)?.querySelector('summary')?.click()
+await new Promise(r => setTimeout(r, 30))
+const macroCaptureButton = [...document.querySelectorAll('.plugin-data-field button')].find(
+  button => button.textContent.includes('录制操作宏'),
+)
+macroCaptureButton?.click()
+await new Promise(r => setTimeout(r, 50))
+const macroFrame = document.querySelector('.extension-page-frame')
+const macroFullPageOpen = !!document.querySelector('body > .extension-page-layer')
+  && document.querySelector('.extension-page-head button')?.title.includes('Esc')
+if (macroFrame?.contentWindow) {
+  window.dispatchEvent(new window.MessageEvent('message', {
+    source: macroFrame.contentWindow,
+    data: {
+      source:'notmyfault:extension-view', type:'invoke', request_id:'record-1',
+      command:'start_recording', payload:{ append:true, minimize_window:true },
+    },
+  }))
+  await new Promise(r => setTimeout(r, 30))
+  window.dispatchEvent(new window.MessageEvent('message', {
+    source: macroFrame.contentWindow,
+    data: {
+      source:'notmyfault:extension-view', type:'invoke', request_id:'commit-1',
+      command:'commit_macro', payload:{ steps:[{ selector:{ display:{ control:'保存' } }, operation:'invoke' }] },
+    },
+  }))
+}
+await new Promise(r => setTimeout(r, 50))
+const macroCaptured = bridgeCalls.some(call => (
+  call.path === '/api/plugins/macro_run/extensions/commands/start_recording/invoke'
+  && call.data?.session_id === 's_macro'
+)) && bridgeCalls.some(call => (
+  call.path === '/api/plugins/macro_run/extensions/commands/commit_macro/invoke'
+  && call.data?.session_id === 's_macro'
+)) && windowStateCalls.includes('minimize')
+  && document.querySelector('.plugin-data-field')?.textContent.includes('1 个操作宏 · 1 步')
+const macroPageSource = macroFrame?.getAttribute('srcdoc') || ''
+const macroPageOk = macroPageSource.includes('操作宏插件页面')
+  && macroPageSource.includes('Content-Security-Policy')
+  && macroPageSource.includes("connect-src 'none'")
+console.log((macroCaptured && macroPageOk && macroFullPageOpen?'PASS':'FAIL')+' - private macro data is edited through the full-page plugin extension view')
+if (!macroCaptured || !macroPageOk || !macroFullPageOpen) process.exit(1)
+
+const reopenMacroButton = [...document.querySelectorAll('.plugin-data-field button')].find(
+  button => button.textContent.includes('1 个操作宏 · 1 步'),
+)
+reopenMacroButton?.click()
+await new Promise(r => setTimeout(r, 50))
+const reopenedMacroFrame = document.querySelector('.extension-page-frame')
+const initMessages = []
+if (reopenedMacroFrame?.contentWindow) {
+  reopenedMacroFrame.contentWindow.postMessage = message => initMessages.push(message)
+  window.dispatchEvent(new window.MessageEvent('message', {
+    source: reopenedMacroFrame.contentWindow,
+    data: { source:'notmyfault:extension-view', type:'ready' },
+  }))
+}
+await new Promise(r => setTimeout(r, 20))
+const reopenCall = [...bridgeCalls].reverse().find(call => (
+  call.path === '/api/plugins/macro_run/extensions/commands/open_macro/invoke'
+))
+const macroReopensWithSavedSteps = reopenCall?.data?.current_value?.data?.steps?.length === 1
+  && initMessages.some(message => message.type === 'init' && message.state?.steps?.length === 1)
+  && reopenedMacroFrame?.getAttribute('srcdoc')?.includes('"steps":[{')
+console.log((macroReopensWithSavedSteps?'PASS':'FAIL')+' - saved private macro reopens with its recorded steps')
+if (!macroReopensWithSavedSteps) process.exit(1)
+document.querySelector('.extension-page-head button')?.click()
+await new Promise(r => setTimeout(r, 20))
+
+// 从规则页离开后再切页不应白屏（嵌套 Transition 叠在同一元素时 leave 永不结束）。
+homeNav?.click()
+await new Promise(r => setTimeout(r, 50))
+const backToHomeOk = !!document.querySelector('.apatch-hero') && !document.querySelector('.rules-library')
+console.log((backToHomeOk?'PASS':'FAIL')+' - leaving the rules page still mounts the next view')
+if (!backToHomeOk) process.exit(1)
+
+// 创建入口和用途示例只在自动化页出现，缺少插件时定向到插件页。
+rulesNav?.click()
+await new Promise(r => setTimeout(r, 50))
+;[...document.querySelectorAll('button')].find(
+  button => button.textContent.includes('创建自动化'),
+)?.click()
+await new Promise(r => setTimeout(r, 50))
+const unavailableTemplate = [...document.querySelectorAll('.automation-template')].find(
+  button => button.textContent.includes('U盘插入后备份文件'),
+)
+const unavailableTemplateShown = unavailableTemplate?.textContent.includes('缺少')
+unavailableTemplate?.click()
+await new Promise(r => setTimeout(r, 100))
+const unavailableTemplateRouted = document.querySelector('.plugin-search input')?.value === 'usb_insert'
+  && document.querySelector('.plugin-missing-callout')?.textContent.includes('未找到插件 usb_insert')
+console.log((unavailableTemplateShown && unavailableTemplateRouted?'PASS':'FAIL')+' - unavailable templates route to the required plugin')
+if (!unavailableTemplateShown || !unavailableTemplateRouted) process.exit(1)
+
+mockEngineState = 'running'
+mockEngineRunning = true
+simulateSlowStop = true
+const targetedPluginSearch = document.querySelector('.plugin-search input')
+targetedPluginSearch.value = ''
+targetedPluginSearch.dispatchEvent(new window.Event('input', { bubbles:true }))
+await new Promise(r => setTimeout(r, 40))
+document.querySelector('.plugin-card .switch input')?.dispatchEvent(new window.Event('change', { bubbles: true }))
+await new Promise(r => setTimeout(r, 50))
+const restartConfirm = [...document.querySelectorAll('.app-dialog button')].find(
+  button => button.textContent.includes('立即重启'),
+)
+restartConfirm?.click()
+await new Promise(r => setTimeout(r, 1800))
+const slowRestartOk = launchCalls === 1 && mockEngineState === 'running'
+console.log((slowRestartOk?'PASS':'FAIL')+' - plugin restart waits until stopping reaches stopped')
+if (!slowRestartOk) process.exit(1)
+
+// 删除最后一条自动化后，首页只显示一次去往自动化页的首次引导。
+rulesNav?.click()
+await new Promise(r => setTimeout(r, 60))
+document.querySelector('.rule-library-row .icon-btn-danger')?.click()
+await new Promise(r => setTimeout(r, 30))
+;[...document.querySelectorAll('.app-dialog button')].find(button => button.textContent.trim() === '删除')?.click()
+await new Promise(r => setTimeout(r, 80))
+const emptyAutomationPageOk = !!document.querySelector('.automation-create-panel')
+  && !document.querySelector('.rule-library-row')
+homeNav?.click()
+await new Promise(r => setTimeout(r, 60))
+const firstRunHomeOk = document.querySelector('.dashboard-first-run')?.textContent.includes('创建第一条自动化')
+  && !document.querySelector('.dashboard-home .automation-template')
+document.querySelector('.dashboard-first-run button')?.click()
+await new Promise(r => setTimeout(r, 60))
+const firstRunRoutedOk = !!document.querySelector('.automation-create-panel')
+  && document.querySelector('.rules-library')?.textContent.includes('创建、测试和管理这台电脑上的自动化')
+console.log((emptyAutomationPageOk && firstRunHomeOk && firstRunRoutedOk?'PASS':'FAIL')+' - empty home points once to the automation page')
+if (!emptyAutomationPageOk || !firstRunHomeOk || !firstRunRoutedOk) process.exit(1)
 
 console.log('\nDashboard mount test: PASS')
 process.exit(0)

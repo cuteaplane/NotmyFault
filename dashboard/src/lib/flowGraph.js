@@ -1,6 +1,7 @@
 export const FLOW_NODE_WIDTH = 228
 export const FLOW_NODE_PORT_Y = 58
 export const FLOW_NODE_BASE_HEIGHT = 116
+export const FLOW_NODE_ADMIN_EXTRA_HEIGHT = 14
 export const FLOW_DATA_SUMMARY_HEIGHT = 30
 // 数据端口的纵坐标由节点边框、标题、正文和分隔线高度相加得到。
 export const FLOW_DATA_PORT_Y = 128
@@ -175,9 +176,10 @@ export function buildFlowGraph({
   })
 
   const actions = Array.isArray(rule.actions) ? rule.actions : []
+  const actionNodes = []
   actions.forEach((item, index) => {
     const id = `action-${item.binding_id || index}`
-    nodes.push({
+    const actionNode = {
       id,
       kind: 'action',
       index,
@@ -191,14 +193,20 @@ export function buildFlowGraph({
       admin: isAdmin(item, 'action'),
       hasInput: true,
       hasOutput: true,
-    })
+      availableStepIds: actions.slice(0, index).map(action => action.binding_id).filter(Boolean),
+    }
+    nodes.push(actionNode)
+    actionNodes.push(actionNode)
+    const previousAction = actions[index - 1]
     edges.push({
       id: `${previousId}-${id}`,
       from: previousId,
       to: id,
       kind: 'pipeline',
       channel: 'control',
-      label: index || preconditions.length ? '然后' : '执行',
+      label: previousAction?.failure_actions?.length
+        ? '成功后'
+        : (index || preconditions.length ? '然后' : '执行'),
       insertActionIndex: index,
     })
     previousId = id
@@ -223,8 +231,58 @@ export function buildFlowGraph({
     to: 'add-action',
     kind: 'add',
     channel: 'control',
-    label: '',
+    label: actions.at(-1)?.failure_actions?.length ? '成功后' : '',
     insertActionIndex: actions.length,
+  })
+
+  actions.forEach((action, actionIndex) => {
+    const failureActions = Array.isArray(action.failure_actions) ? action.failure_actions : []
+    if (!failureActions.length) return
+    const parentNode = actionNodes[actionIndex]
+    const availableStepIds = actions.slice(0, actionIndex).map(item => item.binding_id).filter(Boolean)
+    let branchPreviousId = parentNode.id
+    failureActions.forEach((failureAction, failureIndex) => {
+      const id = `failure-action-${failureAction.binding_id || `${actionIndex}-${failureIndex}`}`
+      const node = {
+        id,
+        kind: 'failure-action',
+        index: failureIndex,
+        parentIndex: actionIndex,
+        source: failureAction,
+        x: parentNode.x + (failureIndex + 1) * FLOW_COLUMN_STEP,
+        y: pipelineY + FLOW_ROW_STEP,
+        icon: 'build',
+        kicker: `补救 ${failureIndex + 1}`,
+        label: actionName(failureAction),
+        meta: describeItem(failureAction, 'action'),
+        admin: isAdmin(failureAction, 'action'),
+        hasInput: true,
+        hasOutput: true,
+        availableStepIds: [...availableStepIds],
+      }
+      nodes.push(node)
+      edges.push({
+        id: `${branchPreviousId}-${id}`,
+        from: branchPreviousId,
+        to: id,
+        kind: 'failure',
+        channel: 'control',
+        label: failureIndex ? '然后' : '失败时',
+      })
+      if (failureAction.binding_id) availableStepIds.push(failureAction.binding_id)
+      branchPreviousId = id
+    })
+    if (action.on_error === 'continue') {
+      const nextId = actionNodes[actionIndex + 1]?.id || 'add-action'
+      edges.push({
+        id: `${branchPreviousId}-${nextId}-recover`,
+        from: branchPreviousId,
+        to: nextId,
+        kind: 'failure-continue',
+        channel: 'control',
+        label: '处理后继续',
+      })
+    }
   })
 
   return { nodes, edges }

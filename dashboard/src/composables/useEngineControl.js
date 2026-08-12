@@ -89,10 +89,12 @@ export function useEngineControl() {
         let current = { ...status }
         while (Date.now() < deadline) {
           current = await getEngineStatus()
-          if (!current.engine_running || !current.api_alive) break
+          if (!current.api_alive || current.engine_state === 'stopped') break
           await new Promise(resolve => setTimeout(resolve, 500))
         }
-        if (current.engine_running) throw new Error('引擎停止超时，请稍后重试')
+        if (current.api_alive && current.engine_state !== 'stopped') {
+          throw new Error('引擎停止超时，请稍后重试')
+        }
       }
       const r2 = await window.pywebview.api.launch_engine()
       if (!r2.ok) throw new Error(r2.error || '启动失败')

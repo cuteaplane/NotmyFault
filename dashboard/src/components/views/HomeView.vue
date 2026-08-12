@@ -23,9 +23,17 @@ const modeLabel = computed(() => {
 })
 // 引擎启动失败或被拒绝时，pausedError 保存后台返回的原因。
 const pausedError = computed(() => store.engineStatus.last_error || '')
+const showFirstAutomationGuide = computed(() => store.configLoaded
+  && isControllerOnline.value
+  && !store.configData.rules?.length)
 
 function goSecurity() {
   if (window.__nmf && window.__nmf.switchPage) window.__nmf.switchPage('security')
+}
+
+function goAutomations() {
+  store.pendingAutomationCreate = true
+  window.__nmf?.switchPage?.('rules')
 }
 
 async function loadStats() {
@@ -125,9 +133,21 @@ watch(isRunning, (running) => {
 
 <template>
   <section class="page active dashboard-home">
-    <div class="page-head"><h2>引擎状态</h2><div class="actions">
+    <div class="page-head"><h2>首页</h2><div class="actions">
       <button class="btn btn-outlined" @click="refreshHome"><span class="material-symbols-outlined">refresh</span>刷新</button>
     </div></div>
+
+    <section v-if="showFirstAutomationGuide" class="dashboard-first-run">
+      <span class="material-symbols-outlined">account_tree</span>
+      <div>
+        <small>第一次使用</small>
+        <h3>创建第一条自动化</h3>
+        <p>前往“自动化”页，从常见用途开始，或者自己指定什么时候开始、接着做什么。</p>
+      </div>
+      <button class="btn btn-filled" @click="goAutomations">前往自动化<span class="material-symbols-outlined">arrow_forward</span></button>
+    </section>
+
+    <h2 class="dashboard-section-title">引擎状态</h2>
 
     <div class="apatch-hero" :class="isStarting ? 'starting' : isStopping ? 'stopping' : isRunning ? 'running' : isControllerOnline ? 'stopped' : 'offline'">
       <div class="hero-left">

@@ -10,7 +10,8 @@ import AboutView from './components/views/AboutView.vue'
 import AppDialog from './components/AppDialog.vue'
 import { store } from './lib/store'
 import { snack } from './lib/notify'
-import { loadConfig, loadPlugins, getSchema, getEngineStatus } from './lib/api'
+import { loadConfig, loadPlugins, getSchema, getEngineStatus, getPluginComponents, getPluginExtensions } from './lib/api'
+import { ensureRuleIds } from './lib/bindings'
 import { useTheme } from './composables/useTheme'
 
 const { init: initTheme } = useTheme()
@@ -26,6 +27,9 @@ let sseAbort = null
 let sseRetry = 0
 const SSE_MAX = 10
 let sseReconnectTimer = null
+let sseEventSeq = 0
+// 规则测试回显只关心这几类执行事件。
+const RULE_EVENTS = ['action_executed', 'action_skipped', 'workflow_failed', 'workflow_deferred', 'workflow_completed', 'test_assertions_completed', 'error']
 const timers = []
 function setTracked(fn, ms) { const id = setInterval(fn, ms); timers.push(id); return id }
 
@@ -44,9 +48,13 @@ async function refreshAll() {
   updateStatus(status)
   if (!status.api_alive) return
   try {
-    const [sch, plugins] = await Promise.all([getSchema(), loadPlugins()])
+    const [sch, plugins, components, extensions] = await Promise.all([
+      getSchema(), loadPlugins(), getPluginComponents(), getPluginExtensions(),
+    ])
     store.schema = sch
     store.pluginsData = plugins
+    store.components = components
+    store.extensions = extensions
   } catch (e) { /* 引擎离线时刷新配置失败，继续保留旧数据。 */ }
 }
 
@@ -111,8 +119,14 @@ function dispatchSSEEvent(eventName, dataText) {
       engine_running: d.state === 'running',
     })
     if (d.state === 'running') refreshAll()
-  } else if (eventName === 'action_executed') {
+  } else if (eventName === 'action_executed' || eventName === 'workflow_completed') {
     store.refreshSignal++
+  }
+  if (RULE_EVENTS.includes(eventName)) {
+    let d = {}
+    try { d = JSON.parse(dataText) } catch (err) { return }
+    store.engineEvents.push({ name: eventName, data: d, seq: ++sseEventSeq })
+    if (store.engineEvents.length > 40) store.engineEvents.splice(0, store.engineEvents.length - 40)
   }
 }
 
@@ -174,8 +188,11 @@ onMounted(async () => {
   // main.js 挂载 Vue 前已检查 pywebview bridge。
   try {
     const cfg = await loadConfig()
-    store.configData = cfg && cfg.rules ? cfg : { rules: [] }
+    store.configData = cfg && cfg.rules
+      ? { ...cfg, rules: ensureRuleIds(cfg.rules) }
+      : { rules: [] }
   } catch (e) { store.configData = { rules: [] } }
+  finally { store.configLoaded = true }
   await refreshAll()
   if (store.controllerOnline) connectSSE()
   setTracked(refreshStatus, 2000)

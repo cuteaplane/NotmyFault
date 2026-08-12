@@ -5,6 +5,8 @@ import {
   getEngineStatus,
   getConfigSecurityStatus,
   approveConfigSecurity,
+  getAdminAuthorizationSetting,
+  updateAdminAuthorizationSetting,
 } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
 import { alertDialog, confirmDialog } from '../../lib/dialog'
@@ -37,6 +39,13 @@ const oL = { builtin: '内置', user: '用户', third_party: '第三方' }
 
 const configSec = ref({ status: 'loading', reason: '', summary: null })
 const approving = ref(false)
+const adminAuth = ref({
+  mode: 'per_execution',
+  effective_mode: null,
+  supported_modes: ['per_execution'],
+  restart_required: false,
+})
+const savingAdminAuth = ref(false)
 const HIGH_RISK = ['run_powershell', 'shutdown_system', 'kill_process']
 
 async function loadConfigSecurity() {
@@ -60,6 +69,39 @@ async function approveConfig() {
     alertDialog('重新签名失败', e.message)
   } finally {
     approving.value = false
+  }
+}
+
+async function loadAdminAuthorization() {
+  try {
+    const result = await getAdminAuthorizationSetting()
+    adminAuth.value = {
+      ...adminAuth.value,
+      ...result,
+      supported_modes: Array.isArray(result.supported_modes)
+        ? result.supported_modes
+        : ['per_execution'],
+    }
+  } catch (e) {
+    snackbar('无法读取管理员授权方式')
+  }
+}
+
+async function selectAdminAuthorization(mode) {
+  if (savingAdminAuth.value || mode === adminAuth.value.mode) return
+  savingAdminAuth.value = true
+  try {
+    const result = await updateAdminAuthorizationSetting(mode)
+    if (!result.ok) {
+      alertDialog('保存失败', result.error || '无法保存管理员授权方式')
+      return
+    }
+    adminAuth.value = { ...adminAuth.value, ...result }
+    snackbar(result.restart_required ? '已保存，重启引擎后生效' : '管理员授权方式已保存')
+  } catch (e) {
+    alertDialog('保存失败', e.message)
+  } finally {
+    savingAdminAuth.value = false
   }
 }
 
@@ -99,7 +141,7 @@ async function load() {
     mode.value = s.security_mode || 'unknown'
   } catch (e) { mode.value = 'unknown' }
 }
-onMounted(() => { load(); loadConfigSecurity() })
+onMounted(() => { load(); loadConfigSecurity(); loadAdminAuthorization() })
 </script>
 
 <template>
@@ -109,45 +151,88 @@ onMounted(() => { load(); loadConfigSecurity() })
     </div></div>
 
     <Transition name="status-strip" mode="out-in">
-    <div v-if="configSec.status === 'tampered'" key="tampered" class="config-security-status rounded-lg border border-error/40 bg-error/10 p-4">
-      <div class="flex items-center gap-2">
-        <span class="material-symbols-outlined text-error">shield_person</span>
-        <h3 class="font-bold text-error">配置可能被篡改，引擎已暂停</h3>
-      </div>
-      <p class="mt-1 text-body-s text-on-surface-variant">{{ configSec.reason }}</p>
-      <div v-if="configSec.summary" class="mt-3">
-        <p class="text-body-s font-semibold">当前配置摘要（共 {{ configSec.summary.rule_count }} 条规则）：</p>
-        <div class="mt-2 max-h-48 overflow-y-auto rounded-md bg-surface-c-low p-3">
-          <div v-for="(rule, i) in configSec.summary.rules" :key="i" class="border-b border-on-surface/10 py-1 last:border-0">
-            <span class="text-body-s font-medium">{{ i + 1 }}. {{ rule.name }}</span>
-            <span class="ml-2 flex flex-wrap gap-1">
+    <div v-if="configSec.status === 'tampered'" key="tampered"
+      class="config-security-status config-security-panel config-security-panel-danger">
+      <header class="config-security-head">
+        <span class="material-symbols-outlined config-security-icon">shield_person</span>
+        <div>
+          <h3>配置可能被篡改，引擎已暂停</h3>
+          <p>{{ configSec.reason }}</p>
+        </div>
+      </header>
+      <div v-if="configSec.summary" class="config-security-summary">
+        <div class="config-security-summary-title">
+          <span>当前规则摘要</span>
+          <strong>{{ configSec.summary.rule_count }} 条</strong>
+        </div>
+        <div class="config-security-rule-list">
+          <div v-for="(rule, i) in configSec.summary.rules" :key="i" class="config-security-rule">
+            <span>{{ i + 1 }}. {{ rule.name }}</span>
+            <span class="config-security-rule-actions">
               <span v-for="(a, j) in rule.actions" :key="j" class="chip"
                     :class="a.high_risk ? 'chip-admin' : 'chip-clean'">{{ a.type }}</span>
             </span>
           </div>
+          <div v-if="!configSec.summary.rules.length" class="config-security-rule-empty">当前没有规则</div>
         </div>
-        <p class="mt-2 text-body-s text-warn">
-          红色标记为高风险动作（PowerShell 执行 / 系统控制 / 进程终止），请仔细核对是否为你本人配置。
+        <p class="config-security-risk">
+          <span class="material-symbols-outlined">warning</span>
+          <span>红色标记为高风险动作（PowerShell 执行 / 系统控制 / 进程终止），请确认它们由你本人配置。</span>
         </p>
       </div>
-      <div class="mt-3 flex flex-wrap gap-2">
-        <button class="btn btn-primary" :disabled="approving" @click="approveConfig">
-          <span class="material-symbols-outlined">verified</span>{{ approving ? '重新签名中…' : '我已确认无误，重新签名' }}
+      <footer class="config-security-actions">
+        <p>
+          <span class="material-symbols-outlined">backup</span>
+          <span>重新签名前，设置与规则会分别备份到 config.json.bak 和 rules.json.bak。</span>
+        </p>
+        <button class="btn btn-filled" :disabled="approving" @click="approveConfig">
+          <span class="material-symbols-outlined">verified</span>{{ approving ? '重新签名中…' : '我已确认，重新签名' }}
         </button>
+      </footer>
+    </div>
+    <div v-else-if="configSec.status === 'ok'" key="ok"
+      class="config-security-status config-security-panel config-security-panel-ok config-security-panel-compact">
+      <span class="material-symbols-outlined config-security-icon">verified</span>
+      <div>
+        <strong>完整性正常</strong>
+        <p>设置与规则的签名均有效。</p>
       </div>
-      <p class="mt-2 text-body-s text-on-surface-variant">当前内容已自动备份到 config.json.bak，可随时手动恢复。</p>
     </div>
-    <div v-else-if="configSec.status === 'ok'" key="ok" class="config-security-status flex items-center gap-2 rounded-lg border border-success/40 bg-success/10 p-3">
-      <span class="material-symbols-outlined text-success">verified</span>
-      <span class="text-body-s">配置签名有效，完整性正常。</span>
-    </div>
-    <div v-else-if="configSec.status === 'unreadable'" key="unreadable" class="config-security-status rounded-lg border border-warn/40 bg-warn/10 p-3">
-      <span class="text-body-s text-warn">配置无法读取：{{ configSec.reason }}</span>
+    <div v-else-if="configSec.status === 'unreadable'" key="unreadable"
+      class="config-security-status config-security-panel config-security-panel-warn config-security-panel-compact">
+      <span class="material-symbols-outlined config-security-icon">warning</span>
+      <div>
+        <strong>配置无法读取</strong>
+        <p>{{ configSec.reason }}</p>
+      </div>
     </div>
     </Transition>
 
     <div class="sec-banner" :class="modeInfo.c"><span class="material-symbols-outlined sec-banner-ico">shield</span>
       <div><div class="sec-banner-title">安全模式：{{ modeInfo.l }}</div><p class="sec-banner-desc">{{ modeInfo.d }}</p></div></div>
+
+    <h4 class="sec-h">管理员授权方式</h4>
+    <div class="admin-auth-settings">
+      <button type="button" class="admin-auth-option"
+        :class="{ selected: adminAuth.mode === 'engine_start' }"
+        :disabled="savingAdminAuth || !adminAuth.supported_modes.includes('engine_start')"
+        @click="selectAdminAuthorization('engine_start')">
+        <span class="material-symbols-outlined">verified_user</span>
+        <span><b>引擎启动时授权一次</b><small>存在使用管理员插件的启用规则时，启动阶段显示一次 UAC。本代引擎后续通过管理员代理执行这些命令。<template v-if="!adminAuth.supported_modes.includes('engine_start')">当前系统不支持此方式。</template></small></span>
+        <span class="material-symbols-outlined auth-check">{{ adminAuth.mode === 'engine_start' ? 'radio_button_checked' : 'radio_button_unchecked' }}</span>
+      </button>
+      <button type="button" class="admin-auth-option"
+        :class="{ selected: adminAuth.mode === 'per_execution' }"
+        :disabled="savingAdminAuth"
+        @click="selectAdminAuthorization('per_execution')">
+        <span class="material-symbols-outlined">touch_app</span>
+        <span><b>每次执行时确认</b><small>先显示保留两分钟的 NotmyFault 通知；点击“允许并继续”后，才为该次命令显示 UAC。关闭或超时未处理时不执行。</small></span>
+        <span class="material-symbols-outlined auth-check">{{ adminAuth.mode === 'per_execution' ? 'radio_button_checked' : 'radio_button_unchecked' }}</span>
+      </button>
+    </div>
+    <p v-if="adminAuth.restart_required" class="admin-auth-restart">
+      <span class="material-symbols-outlined">restart_alt</span>当前引擎仍使用上一次设置，重启引擎后生效。
+    </p>
     <div class="stat-grid">
       <div class="stat-card"><div class="material-symbols-outlined stat-ico text-error">admin_panel_settings</div><div class="stat-val">{{ counts.admin }}</div><div class="stat-lbl">管理员权限</div></div>
       <div class="stat-card"><div class="material-symbols-outlined stat-ico text-warn">code</div><div class="stat-val">{{ counts.native }}</div><div class="stat-lbl">原生 API</div></div>

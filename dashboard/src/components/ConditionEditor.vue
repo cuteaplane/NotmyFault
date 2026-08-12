@@ -120,7 +120,7 @@ function moveChild(index, offset) {
                 <span class="material-symbols-outlined">arrow_forward</span>
               </button>
             </div>
-            <div class="param-grid"><ParamInput v-for="param in eventParams(child)" :key="param.name" :def="param" v-model="child.params[param.name]" /></div>
+            <div class="param-grid"><ParamInput v-for="param in eventParams(child)" :key="param.name" :def="param" :plugin-id="child.type" v-model="child.params[param.name]" /></div>
           </div>
         </details>
         <ConditionEditor v-else-if="isObjectNode(child)" :node="child" nested @remove="removeChild(index)" />

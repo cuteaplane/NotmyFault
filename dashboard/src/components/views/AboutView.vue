@@ -1,9 +1,32 @@
 <script setup>
-import { computed } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { store } from '../../lib/store'
 import { appLogoUrl } from '../../lib/branding'
+import OriginDialog from '../OriginDialog.vue'
 
 const appVersion = __APP_VERSION__
+
+// 科乐美秘技：在关于页依次输入序列解锁起源彩蛋，按错即重置。
+const KONAMI_SEQUENCE = [
+  'ArrowUp', 'ArrowUp', 'ArrowDown', 'ArrowDown',
+  'ArrowLeft', 'ArrowRight', 'ArrowLeft', 'ArrowRight', 'b', 'a',
+]
+let konamiProgress = 0
+const showOrigin = ref(false)
+function onKonamiKey(event) {
+  const key = event.key.length === 1 ? event.key.toLowerCase() : event.key
+  if (key === KONAMI_SEQUENCE[konamiProgress]) {
+    konamiProgress++
+    if (konamiProgress === KONAMI_SEQUENCE.length) {
+      konamiProgress = 0
+      showOrigin.value = true
+    }
+  } else {
+    konamiProgress = key === KONAMI_SEQUENCE[0] ? 1 : 0
+  }
+}
+onMounted(() => window.addEventListener('keydown', onKonamiKey))
+onUnmounted(() => window.removeEventListener('keydown', onKonamiKey))
 
 const ruleCount = computed(() => store.configData?.rules?.length || 0)
 const triggerCount = computed(() => Object.keys(store.pluginsData?.triggers || {}).length)
@@ -60,8 +83,7 @@ const runtimeInfo = computed(() => [
           <span>GPL-3.0</span>
         </div>
         <p>
-          运行在本机的自动化工具。规则按「条件 → 检查 → 动作」组织，由引擎在后台执行；
-          关闭管理窗口不影响已经启动的自动化。
+          拓展万千
         </p>
       </header>
 
@@ -84,9 +106,9 @@ const runtimeInfo = computed(() => [
 
           <section class="about-section">
             <header class="about-section-head">
-              <h4>规则</h4>
+              <h4>自动化结构</h4>
             </header>
-            <p class="about-section-lead">一条规则由三步组成，规则页负责编辑和校验，不用手写 JSON。</p>
+            <p class="about-section-lead">一条自动化由三步组成，自动化页负责创建、编辑和检查。</p>
             <div class="about-flow">
               <article v-for="(s, i) in ruleFlow" :key="s.step">
                 <span class="about-flow-index">{{ String(i + 1).padStart(2, '0') }}</span>
@@ -146,5 +168,7 @@ const runtimeInfo = computed(() => [
         <span>问题反馈请附系统版本、复现步骤与最新日志</span>
       </footer>
     </div>
+
+    <OriginDialog v-if="showOrigin" @close="showOrigin = false" />
   </section>
 </template>

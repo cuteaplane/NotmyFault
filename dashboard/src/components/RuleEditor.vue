@@ -15,6 +15,7 @@ import {
   FLOW_DATA_PORT_STEP,
   FLOW_DATA_PORT_Y,
   FLOW_DATA_SUMMARY_HEIGHT,
+  FLOW_NODE_ADMIN_EXTRA_HEIGHT,
   FLOW_NODE_BASE_HEIGHT,
   FLOW_NODE_WIDTH,
   buildFlowGraph,
@@ -22,6 +23,7 @@ import {
 } from '../lib/flowGraph'
 import {
   buildBindingSources,
+  buildFailureBindingSources,
   buildNodeDataPorts,
   createBindingId,
   deriveDataEdges,
@@ -37,14 +39,20 @@ import ConditionEditor from './ConditionEditor.vue'
 import PluginPicker from './PluginPicker.vue'
 import FolderPicker from './FolderPicker.vue'
 import ActionFailureSettings from './ActionFailureSettings.vue'
+import DesktopRecorderDialog from './DesktopRecorderDialog.vue'
+import { validateRuleDraft } from '../lib/api'
 
 const props = defineProps({
   rule: Object,
   dirty: Boolean,
   testing: Boolean,
+  canUndo: Boolean,
+  canRedo: Boolean,
+  changeSummary: { type: Array, default: () => [] },
   folders: { type: Array, default: () => [] },
+  initialNodeId: { type: String, default: '' },
 })
-const emit = defineEmits(['back', 'delete', 'save', 'save-run'])
+const emit = defineEmits(['back', 'delete', 'save', 'save-run', 'undo', 'redo'])
 
 const newTriggerType = ref('')
 const newActionType = ref('')
@@ -61,6 +69,7 @@ const dataDrag = ref(null)
 const dataDropTarget = ref(null)
 const picker = ref({ open: false, kind: 'action', mode: 'append', index: null, path: [], op: 'any' })
 const folderPickerOpen = ref(false)
+const desktopRecorderOpen = ref(false)
 const editingRuleName = ref(false)
 const ruleNameInput = ref(null)
 let dragState = null
@@ -89,6 +98,12 @@ const triggerGroups = computed(() => groupTriggerKeys(triggerKeys.value))
 const actionKeys = computed(() => Object.keys(store.schema.actions).filter(
   key => store.schema.actions[key]?.platform_compatible !== false
 ))
+// 录制入口由插件的 uia_selector 采集组件声明驱动，不写死具体插件。
+const desktopRecorder = computed(() => store.components.find(component => (
+  component.available
+  && (component.param_types || []).includes('uia_selector')
+)) || null)
+const desktopRecorderAvailable = computed(() => !!desktopRecorder.value)
 const preconditionKeys = computed(() => actionKeys.value.filter(
   key => store.schema.actions[key]?.precondition_api === 'context-v1'
 ))
@@ -111,7 +126,19 @@ function actionFailureSummary(action) {
   const parts = [action?.on_error === 'continue' ? '失败后继续' : '失败后停止']
   const retries = Math.min(Math.max(Number(action?.retry || 0), 0), 3)
   if (retries) parts.push(`最多重试 ${retries} 次`)
+  if (action?.timeout_seconds) parts.push(`最多运行 ${action.timeout_seconds} 秒`)
+  if (action?.failure_actions?.length) parts.push(`${action.failure_actions.length} 个补救动作`)
   return parts.join(' · ')
+}
+function validUiaSelector(value) {
+  return value && typeof value === 'object'
+    && value.version === 1
+    && value.window && typeof value.window === 'object'
+    && value.target && typeof value.target === 'object'
+    && Number.isInteger(value.target.control_type)
+    && ['automation_id', 'name', 'class_name'].some(
+      key => typeof value.target[key] === 'string' && value.target[key],
+    )
 }
 function formatParamValue(value, def) {
   if (isReference(value)) return '运行数据'
@@ -210,8 +237,10 @@ const graph = computed(() => {
       : node.dataOutputs.filter(port => boundOutputs.has(port.name))
     const hasDataPorts = !!(node.dataInputs.length || node.dataOutputs.length)
     const dataPortRows = Math.max(visibleDataInputs.length, visibleDataOutputs.length)
-    const dataStartY = FLOW_NODE_BASE_HEIGHT + (hasDataPorts ? FLOW_DATA_SUMMARY_HEIGHT : 0)
-    const footerHeight = ['action', 'precondition'].includes(node.kind) ? 34 : node.kind === 'condition' ? 40 : 0
+    const contentExtraHeight = node.admin ? FLOW_NODE_ADMIN_EXTRA_HEIGHT : 0
+    const dataStartY = FLOW_NODE_BASE_HEIGHT + contentExtraHeight
+      + (hasDataPorts ? FLOW_DATA_SUMMARY_HEIGHT : 0)
+    const footerHeight = ['action', 'failure-action', 'precondition'].includes(node.kind) ? 34 : node.kind === 'condition' ? 40 : 0
     return {
       ...node,
       visibleDataInputs,
@@ -221,6 +250,7 @@ const graph = computed(() => {
       dataInputY: portYMap(visibleDataInputs, dataStartY),
       dataOutputY: portYMap(visibleDataOutputs, dataStartY),
       height: FLOW_NODE_BASE_HEIGHT
+        + contentExtraHeight
         + (hasDataPorts ? FLOW_DATA_SUMMARY_HEIGHT : 0)
         + dataPortRows * FLOW_DATA_PORT_STEP
         + footerHeight,
@@ -254,6 +284,9 @@ const selectedKind = computed(() => {
 })
 const selectedIndex = computed(() => selectedGraphNode.value?.index ?? -1)
 const selectedAction = computed(() => selectedKind.value === 'action' ? props.rule.actions?.[selectedIndex.value] : null)
+const selectedFailureAction = computed(() => selectedKind.value === 'failure-action'
+  ? props.rule.actions?.[selectedGraphNode.value?.parentIndex]?.failure_actions?.[selectedIndex.value]
+  : null)
 const selectedPrecondition = computed(() => selectedKind.value === 'precondition' ? props.rule.preconditions?.[selectedIndex.value] : null)
 const selectedConditionNode = computed(() => (
   ['condition', 'trigger'].includes(selectedKind.value) && selectedGraphNode.value?.path
@@ -269,75 +302,195 @@ const selectedConditionParent = computed(() => {
   return parent
 })
 
-const validationIssues = computed(() => {
+const clientValidationIssues = computed(() => {
   const issues = []
+  const add = (message, target = '') => issues.push({ severity: 'error', message, target })
   function validateCondition(node, path = '触发条件') {
-    if (!node || typeof node !== 'object') { issues.push(`${path}格式无效`); return }
+    if (!node || typeof node !== 'object') { add(`${path}格式无效`, 'trigger'); return }
     const leaf = !!node.type && !node.children && !node.events
     if (leaf) {
       if (
         !store.schema.triggers[node.type]
         || store.schema.triggers[node.type]?.platform_compatible === false
-      ) issues.push(`${path}引用了当前系统不可用的触发器`)
-      if (node.params != null && (typeof node.params !== 'object' || Array.isArray(node.params))) issues.push(`${path}参数格式无效`)
+      ) add(`${path}引用了当前系统不可用的触发器`, 'trigger')
+      if (node.params != null && (typeof node.params !== 'object' || Array.isArray(node.params))) add(`${path}参数格式无效`, 'trigger')
       return
     }
-    if (!['any', 'all'].includes(node.op)) issues.push(`${path}的组合方式无效`)
+    if (!['any', 'all'].includes(node.op)) add(`${path}的组合方式无效`, 'trigger')
     if (!Array.isArray(node.children) || !node.children.length) {
-      issues.push(`${path}组不能为空`)
+      add(`${path}组不能为空`, 'trigger')
       return
     }
     if ('within_seconds' in node) {
       const seconds = Number(node.within_seconds)
-      if (!Number.isFinite(seconds) || seconds <= 0) issues.push(`${path}的时间窗口必须大于 0`)
+      if (!Number.isFinite(seconds) || seconds <= 0) add(`${path}的时间窗口必须大于 0`, 'trigger')
     }
     node.children.forEach((child, index) => validateCondition(child, `${path} ${index + 1}`))
   }
-  if (!String(props.rule.name || '').trim()) issues.push('请填写规则名称')
-  if (props.rule.event && props.rule.condition) issues.push('单个触发条件和组合条件不能同时存在')
-  if (!props.rule.event && !props.rule.condition) issues.push('请选择至少一个触发条件')
+  if (!String(props.rule.name || '').trim()) add('请填写规则名称', 'name')
+  if (props.rule.event && props.rule.condition) add('单个触发条件和组合条件不能同时存在', 'trigger')
+  if (!props.rule.event && !props.rule.condition) add('请选择至少一个触发条件', 'trigger')
   if (props.rule.event) validateCondition(props.rule.event)
   if (props.rule.condition) validateCondition(conditionNode.value)
   const actions = Array.isArray(props.rule.actions) ? props.rule.actions : []
-  if (!Array.isArray(props.rule.actions)) issues.push('动作列表格式无效')
-  if (!actions.length) issues.push('请添加至少一个执行动作')
+  if (!Array.isArray(props.rule.actions)) add('动作列表格式无效', 'actions')
+  if (!actions.length) add('请添加至少一个执行动作', 'actions')
+  function validateTimeout(action, label, nodeId) {
+    if (action?.timeout_seconds == null) return
+    const seconds = Number(action.timeout_seconds)
+    if (!Number.isFinite(seconds) || seconds < 1 || seconds > 86400) {
+      add(`${label}的最长运行时间必须是 1 到 86400 秒`, nodeId)
+      return
+    }
+    if (store.schema.actions[action.type]?.cancellation_api !== 'runtime-v1') {
+      add(`${label}不能安全停止，不能设置最长运行时间`, nodeId)
+    }
+  }
   actions.forEach((action, index) => {
     if (
       !store.schema.actions[action?.type]
       || store.schema.actions[action?.type]?.platform_compatible === false
-    ) issues.push(`动作 ${index + 1} 引用了当前系统不可用的插件`)
-    if (action?.params != null && (typeof action.params !== 'object' || Array.isArray(action.params))) issues.push(`动作 ${index + 1} 参数格式无效`)
+    ) add(`动作 ${index + 1} 引用了当前系统不可用的插件`, `action:${index}`)
+    if (action?.params != null && (typeof action.params !== 'object' || Array.isArray(action.params))) add(`动作 ${index + 1} 参数格式无效`, `action:${index}`)
+    validateTimeout(action, `动作 ${index + 1}`, `action:${index}`)
     const sources = actionBindingSources(index)
     for (const def of actionParams(action)) {
       const value = action?.params?.[def.name]
+      if (def.type === 'uia_selector' && !isReference(value)) {
+        if (!validUiaSelector(value)) add(`动作 ${index + 1} 还没有选择有效的屏幕控件`, `action:${index}`)
+      }
       if (!isReference(value)) continue
       const source = sources.find(item => JSON.stringify(item.value) === JSON.stringify(value))
-      if (!source) issues.push(`动作 ${index + 1} 的“${def.label || def.name}”引用了不可用数据`)
+      if (!source) add(`动作 ${index + 1} 的“${def.label || def.name}”引用了不可用数据`, `action:${index}`)
       else if (!typesCompatible(source.type, def.value_type || def.type)) {
-        issues.push(`动作 ${index + 1} 的“${def.label || def.name}”数据类型不兼容`)
+        add(`动作 ${index + 1} 的“${def.label || def.name}”数据类型不兼容`, `action:${index}`)
       }
     }
+    ;(Array.isArray(action?.failure_actions) ? action.failure_actions : []).forEach((failureAction, failureIndex) => {
+      if (
+        !store.schema.actions[failureAction?.type]
+        || store.schema.actions[failureAction?.type]?.platform_compatible === false
+      ) add(`动作 ${index + 1} 的补救动作 ${failureIndex + 1} 不可用`, `action:${index}`)
+      if (failureAction?.params != null && (typeof failureAction.params !== 'object' || Array.isArray(failureAction.params))) {
+        add(`动作 ${index + 1} 的补救动作 ${failureIndex + 1} 参数格式无效`, `action:${index}`)
+      }
+      validateTimeout(failureAction, `动作 ${index + 1} 的补救动作 ${failureIndex + 1}`, `action:${index}`)
+      const failureSources = failureActionBindingSources(index, failureIndex)
+      for (const def of actionParams(failureAction)) {
+        const value = failureAction?.params?.[def.name]
+        if (def.type === 'uia_selector' && !isReference(value)) {
+          if (!validUiaSelector(value)) add(`动作 ${index + 1} 的补救动作 ${failureIndex + 1} 还没有选择有效的屏幕控件`, `action:${index}`)
+        }
+        if (!isReference(value)) continue
+        const source = failureSources.find(item => JSON.stringify(item.value) === JSON.stringify(value))
+        if (!source) add(`动作 ${index + 1} 的补救动作 ${failureIndex + 1} 引用了不可用数据`, `action:${index}`)
+        else if (!typesCompatible(source.type, def.value_type || def.type)) {
+          add(`动作 ${index + 1} 的补救动作 ${failureIndex + 1} 数据类型不兼容`, `action:${index}`)
+        }
+      }
+    })
   })
   const preconditions = props.rule.preconditions == null
     ? []
     : Array.isArray(props.rule.preconditions) ? props.rule.preconditions : null
-  if (preconditions === null) issues.push('开始前确认列表格式无效')
+  if (preconditions === null) add('开始前确认列表格式无效', 'preconditions')
   ;(preconditions || []).forEach((item, index) => {
-    if (!preconditionKeys.value.includes(item?.type)) issues.push(`开始前确认 ${index + 1} 不可用`)
-    if (item?.params != null && (typeof item.params !== 'object' || Array.isArray(item.params))) issues.push(`开始前确认 ${index + 1} 参数格式无效`)
+    if (!preconditionKeys.value.includes(item?.type)) add(`开始前确认 ${index + 1} 不可用`, `precondition:${index}`)
+    if (item?.params != null && (typeof item.params !== 'object' || Array.isArray(item.params))) add(`开始前确认 ${index + 1} 参数格式无效`, `precondition:${index}`)
     const sources = preconditionBindingSources()
     for (const def of actionParams(item)) {
       const value = item?.params?.[def.name]
       if (!isReference(value)) continue
       const source = sources.find(candidate => JSON.stringify(candidate.value) === JSON.stringify(value))
-      if (!source) issues.push(`开始前确认 ${index + 1} 的“${def.label || def.name}”引用了不可用数据`)
+      if (!source) add(`开始前确认 ${index + 1} 的“${def.label || def.name}”引用了不可用数据`, `precondition:${index}`)
       else if (!typesCompatible(source.type, def.value_type || def.type)) {
-        issues.push(`开始前确认 ${index + 1} 的“${def.label || def.name}”数据类型不兼容`)
+        add(`开始前确认 ${index + 1} 的“${def.label || def.name}”数据类型不兼容`, `precondition:${index}`)
       }
     }
   })
   return issues
 })
+
+const serverValidationIssues = ref([])
+const checkingRule = ref(false)
+const checkerError = ref('')
+let checkerTimer = null
+let checkerSequence = 0
+
+function issueTarget(issue) {
+  const text = `${issue.location || ''} ${issue.message || ''}`
+  const action = text.match(/actions\[(\d+)\]/)
+  if (action) return `action:${action[1]}`
+  const precondition = text.match(/preconditions\[(\d+)\]/)
+  if (precondition) return `precondition:${precondition[1]}`
+  if (/event|condition|触发器|触发条件/.test(text)) return 'trigger'
+  if (/name 不能为空|规则名称/.test(text)) return 'name'
+  return ''
+}
+
+const validationIssues = computed(() => {
+  const combined = [
+    ...clientValidationIssues.value,
+    ...serverValidationIssues.value.map(issue => ({
+      ...issue,
+      target: issueTarget(issue),
+    })),
+  ]
+  const seen = new Set()
+  return combined.filter(issue => {
+    if (seen.has(issue.message)) return false
+    seen.add(issue.message)
+    return true
+  })
+})
+const validationErrorCount = computed(() => validationIssues.value.filter(issue => issue.severity !== 'warning').length)
+const validationWarningCount = computed(() => validationIssues.value.filter(issue => issue.severity === 'warning').length)
+
+async function runRuleCheck() {
+  if (checkerTimer) { clearTimeout(checkerTimer); checkerTimer = null }
+  const sequence = ++checkerSequence
+  checkingRule.value = true
+  checkerError.value = ''
+  try {
+    const result = await validateRuleDraft(JSON.parse(JSON.stringify(props.rule)))
+    if (sequence !== checkerSequence) return
+    if (!result?.ok || !Array.isArray(result.issues)) {
+      checkerError.value = result?.error || '检查服务没有返回有效结果'
+      serverValidationIssues.value = []
+      return
+    }
+    serverValidationIssues.value = result.issues
+  } catch (error) {
+    if (sequence !== checkerSequence) return
+    checkerError.value = error.message || '无法连接规则检查服务'
+    serverValidationIssues.value = []
+  } finally {
+    if (sequence === checkerSequence) checkingRule.value = false
+  }
+}
+
+function scheduleRuleCheck() {
+  if (checkerTimer) clearTimeout(checkerTimer)
+  checkerTimer = setTimeout(runRuleCheck, 350)
+}
+
+function focusValidationIssue(issue) {
+  if (issue.target === 'name') { startRuleNameEdit(); return }
+  editorMode.value = 'canvas'
+  nextTick(() => {
+    if (issue.target === 'trigger') selectNode(isCondition.value ? 'condition-root' : 'trigger')
+    else if (issue.target === 'actions') selectNode('add-action')
+    else if (issue.target?.startsWith('action:')) {
+      const action = props.rule.actions?.[Number(issue.target.split(':')[1])]
+      if (action) selectNode(`action-${action.binding_id}`)
+    } else if (issue.target?.startsWith('precondition:')) {
+      const item = props.rule.preconditions?.[Number(issue.target.split(':')[1])]
+      if (item) selectNode(`precondition-${item.binding_id}`)
+    }
+  })
+}
+
+watch(() => JSON.stringify(props.rule), scheduleRuleCheck, { immediate: true })
 
 function setSingleTrigger(type) {
   if (!type) return
@@ -428,6 +581,17 @@ function addAction(type = newActionType.value || actionKeys.value[0], insertInde
   selectedNodeId.value = `action-${action.binding_id}`
   newActionType.value = ''
 }
+function insertRecordedSteps(actions) {
+  if (!Array.isArray(actions) || !actions.length) return
+  if (!Array.isArray(props.rule.actions)) props.rule.actions = []
+  const inserted = actions.map(action => ({
+    ...action,
+    binding_id: createBindingId('action'),
+  }))
+  props.rule.actions.push(...inserted)
+  selectedNodeId.value = `action-${inserted[inserted.length - 1].binding_id}`
+  nodePositions.value = {}
+}
 function changeAction(action, type) {
   action.type = type
   action.params = buildDefaultParams(store.schema.actions[type])
@@ -475,6 +639,9 @@ function actionOutputHint(action, index) {
 function actionBindingSources(index) {
   return buildBindingSources(props.rule, index, store.schema)
 }
+function failureActionBindingSources(actionIndex, failureIndex) {
+  return buildFailureBindingSources(props.rule, actionIndex, failureIndex, store.schema)
+}
 function preconditionBindingSources() {
   return buildBindingSources(props.rule, 0, store.schema, {
     allowSteps: false,
@@ -486,6 +653,39 @@ function removePrecondition(index) {
   selectedNodeId.value = props.rule.preconditions.length
     ? `precondition-${props.rule.preconditions[Math.min(index, props.rule.preconditions.length - 1)].binding_id}`
     : 'trigger'
+}
+function addFailureAction(actionIndex, type) {
+  const action = props.rule.actions?.[actionIndex]
+  if (!action || !type) return
+  if (!Array.isArray(action.failure_actions)) action.failure_actions = []
+  const failureAction = {
+    binding_id: createBindingId('action'),
+    type,
+    params: buildDefaultParams(store.schema.actions[type]),
+  }
+  action.failure_actions.push(failureAction)
+  selectedNodeId.value = `failure-action-${failureAction.binding_id}`
+}
+function removeFailureAction(actionIndex, failureIndex) {
+  const failureActions = props.rule.actions?.[actionIndex]?.failure_actions
+  if (!Array.isArray(failureActions)) return
+  failureActions.splice(failureIndex, 1)
+  if (!failureActions.length) delete props.rule.actions[actionIndex].failure_actions
+  selectedNodeId.value = `action-${props.rule.actions[actionIndex].binding_id}`
+}
+function moveFailureAction(actionIndex, failureIndex, offset) {
+  const failureActions = props.rule.actions?.[actionIndex]?.failure_actions
+  const target = failureIndex + offset
+  if (!Array.isArray(failureActions) || target < 0 || target >= failureActions.length) return
+  const [failureAction] = failureActions.splice(failureIndex, 1)
+  failureActions.splice(target, 0, failureAction)
+  selectedNodeId.value = `failure-action-${failureAction.binding_id}`
+}
+function requestAddFailureAction(actionIndex) {
+  openPluginPicker('action', { mode: 'failure-action', parentIndex: actionIndex, title: '添加补救动作' })
+}
+function requestReplaceFailureAction(actionIndex, failureIndex) {
+  openPluginPicker('action', { mode: 'replace-failure-action', parentIndex: actionIndex, failureIndex, title: '更换补救动作' })
 }
 function selectNode(id) {
   if (suppressNodeClickId === id) {
@@ -499,12 +699,23 @@ function selectNode(id) {
   selectedNodeId.value = id
 }
 
+function focusInitialNode(id) {
+  if (!id) return
+  editorMode.value = 'canvas'
+  nextTick(() => {
+    if (layoutNodes.value.some(node => node.id === id)) selectNode(id)
+  })
+}
+watch(() => props.initialNodeId, focusInitialNode, { immediate: true })
+
 function openPluginPicker(kind, options = {}) {
   picker.value = {
     open: true,
     kind,
     mode: options.mode || kind,
     index: options.index ?? null,
+    parentIndex: options.parentIndex ?? null,
+    failureIndex: options.failureIndex ?? null,
     path: options.path || [],
     op: options.op || 'any',
     title: options.title || '',
@@ -565,6 +776,11 @@ function choosePlugin(key) {
   else if (context.mode === 'action') addAction(key, context.index)
   else if (context.mode === 'replace-action') {
     const action = props.rule.actions?.[context.index]
+    if (action) changeAction(action, key)
+  }
+  else if (context.mode === 'failure-action') addFailureAction(context.parentIndex, key)
+  else if (context.mode === 'replace-failure-action') {
+    const action = props.rule.actions?.[context.parentIndex]?.failure_actions?.[context.failureIndex]
     if (action) changeAction(action, key)
   }
   else if (context.mode === 'precondition') addPrecondition(key)
@@ -665,15 +881,16 @@ function dataReference(node, port) {
 }
 function canConnectDataPorts(sourceNode, sourcePort, targetNode, targetPort) {
   if (!sourcePort.required || !typesCompatible(sourcePort.type, targetPort.type)) return false
-  if (sourceNode.kind === 'action') {
-    return targetNode.kind === 'action' && sourceNode.index < targetNode.index
+  if (['action', 'failure-action'].includes(sourceNode.kind)) {
+    return ['action', 'failure-action'].includes(targetNode.kind)
+      && (targetNode.availableStepIds || []).includes(sourceNode.source.binding_id)
   }
   if (sourceNode.kind !== 'trigger') return false
   if (targetNode.kind === 'precondition') {
     const guaranteed = guaranteedTriggerIds(props.rule.condition || props.rule.event)
     return guaranteed.has(sourceNode.source.binding_id)
   }
-  return targetNode.kind === 'action'
+  return ['action', 'failure-action'].includes(targetNode.kind)
 }
 function inputPortAt(event) {
   const target = event.target?.closest?.('[data-input-node][data-input-port]')
@@ -696,7 +913,6 @@ function updateDataDropTarget(event) {
 function startDataDrag(event, node, port) {
   if (event.button !== 0 || !port.required) return
   event.stopPropagation()
-  selectedNodeId.value = node.id
   dataDrag.value = {
     sourceNodeId: node.id,
     sourcePortName: port.name,
@@ -715,7 +931,6 @@ function endDataDrag(event) {
   if (source && sourcePort && target && canConnectDataPorts(source, sourcePort, target.node, target.port)) {
     target.node.source.params ||= {}
     target.node.source.params[target.port.name] = dataReference(source, sourcePort)
-    selectedNodeId.value = target.node.id
   }
   dataDrag.value = null
   dataDropTarget.value = null
@@ -1006,9 +1221,25 @@ onUnmounted(() => {
   resizeObserver?.disconnect()
   if (camAnimTimer) clearTimeout(camAnimTimer)
   if (suppressNodeClickTimer) clearTimeout(suppressNodeClickTimer)
+  if (checkerTimer) clearTimeout(checkerTimer)
+  checkerSequence++
   window.removeEventListener('keydown', onEditorKeydown)
 })
 function onEditorKeydown(event) {
+  const target = event.target
+  const editingText = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement
+  if ((event.ctrlKey || event.metaKey) && !editingText) {
+    if (event.key.toLowerCase() === 'z' && !event.shiftKey && props.canUndo) {
+      event.preventDefault()
+      emit('undo')
+      return
+    }
+    if ((event.key.toLowerCase() === 'y' || (event.key.toLowerCase() === 'z' && event.shiftKey)) && props.canRedo) {
+      event.preventDefault()
+      emit('redo')
+      return
+    }
+  }
   if (event.key !== 'Escape') return
   if (picker.value.open) closePluginPicker()
   else if (folderPickerOpen.value) folderPickerOpen.value = false
@@ -1047,17 +1278,37 @@ function onEditorKeydown(event) {
         </button>
       </div>
       <div class="rule-editor-actions">
-        <span v-if="dirty" class="draft-state"><span></span>未保存</span>
+        <div class="rule-history-actions" aria-label="草稿历史">
+          <button class="icon-btn" :disabled="!canUndo" title="撤销（Ctrl+Z）" @click="emit('undo')"><span class="material-symbols-outlined">undo</span></button>
+          <button class="icon-btn" :disabled="!canRedo" title="重做（Ctrl+Y）" @click="emit('redo')"><span class="material-symbols-outlined">redo</span></button>
+        </div>
+        <button class="btn btn-text rule-check-btn" :disabled="checkingRule" title="立即检查当前草稿" @click="runRuleCheck">
+          <span v-if="checkingRule" class="spinner"></span>
+          <span v-else class="material-symbols-outlined">fact_check</span>
+          {{ checkingRule ? '检查中…' : '规则检查' }}
+          <span v-if="validationErrorCount" class="rule-check-count">{{ validationErrorCount }}</span>
+        </button>
         <button class="btn btn-text danger-text" @click="emit('delete')"><span class="material-symbols-outlined">delete</span>删除</button>
-        <button class="btn btn-outlined rule-test-btn" :disabled="validationIssues.length || testing"
+        <button class="btn btn-outlined rule-test-btn" :disabled="validationErrorCount || testing"
           title="保存当前修改，并真实执行一次规则中的动作" @click="emit('save-run')">
           <span v-if="testing" class="spinner"></span>
           <span v-else class="material-symbols-outlined">experiment</span>
           {{ testing ? '测试中…' : '测试规则' }}
         </button>
-        <button class="btn btn-filled" :disabled="validationIssues.length || !dirty" @click="emit('save')"><span class="material-symbols-outlined">save</span>保存规则</button>
+        <button class="btn btn-filled" :disabled="validationErrorCount || !dirty" @click="emit('save')"><span class="material-symbols-outlined">save</span>保存规则</button>
       </div>
     </div>
+
+    <Transition name="status-strip">
+      <div v-if="dirty" class="draft-change-strip" aria-live="polite">
+        <span class="material-symbols-outlined">difference</span>
+        <b>未保存</b>
+        <div class="draft-change-items">
+          <span v-for="item in changeSummary" :key="item">{{ item }}</span>
+        </div>
+        <small>保存后应用</small>
+      </div>
+    </Transition>
 
     <main v-show="editorMode === 'canvas'" class="node-editor-workspace" :class="{ 'editor-mode-active': editorMode === 'canvas' }">
       <section class="node-canvas-panel" aria-label="规则节点画布">
@@ -1065,6 +1316,7 @@ function onEditorKeydown(event) {
           <div class="node-canvas-tools">
             <button class="btn btn-text btn-sm" @click="selectNode(isCondition ? 'condition-root' : 'trigger')"><span class="material-symbols-outlined">bolt</span>触发条件</button>
             <button v-if="preconditionKeys.length" class="btn btn-text btn-sm" @click="openPluginPicker('precondition', { mode: 'precondition', title: '添加开始前确认' })"><span class="material-symbols-outlined">verified_user</span>添加确认</button>
+            <button v-if="desktopRecorderAvailable" class="btn btn-text btn-sm" @click="desktopRecorderOpen = true"><span class="material-symbols-outlined">screen_record</span>{{ desktopRecorder.ui?.button_label || '录制桌面步骤' }}</button>
             <button class="btn btn-text btn-sm" @click="selectNode('add-action')"><span class="material-symbols-outlined">add</span>添加动作</button>
           </div>
           <div class="node-canvas-toolbar-side">
@@ -1121,7 +1373,7 @@ function onEditorKeydown(event) {
                 <span>{{ node.kicker }}</span>
                 <span class="material-symbols-outlined node-drag-handle">drag_indicator</span>
               </header>
-              <div class="graph-node-body">
+              <div class="graph-node-body" :class="{ 'has-admin': node.admin }">
                 <b>{{ node.label }}</b>
                 <small :title="node.meta">{{ node.meta }}</small>
                 <span v-if="node.admin" class="node-admin">管理员权限</span>
@@ -1156,6 +1408,11 @@ function onEditorKeydown(event) {
                 <button class="icon-btn" :disabled="node.index === rule.actions.length - 1" title="稍后执行" @click.stop="moveAction(node.index, 1)"><span class="material-symbols-outlined">arrow_forward</span></button>
                 <button class="icon-btn icon-btn-danger" title="删除动作" @click.stop="removeAction(node.index)"><span class="material-symbols-outlined">delete</span></button>
               </footer>
+              <footer v-else-if="node.kind === 'failure-action'" class="graph-node-actions">
+                <button class="icon-btn" :disabled="node.index === 0" title="上移" @click.stop="moveFailureAction(node.parentIndex, node.index, -1)"><span class="material-symbols-outlined">arrow_back</span></button>
+                <button class="icon-btn" :disabled="node.index === rule.actions[node.parentIndex].failure_actions.length - 1" title="下移" @click.stop="moveFailureAction(node.parentIndex, node.index, 1)"><span class="material-symbols-outlined">arrow_forward</span></button>
+                <button class="icon-btn icon-btn-danger" title="删除补救动作" @click.stop="removeFailureAction(node.parentIndex, node.index)"><span class="material-symbols-outlined">delete</span></button>
+              </footer>
               <footer v-else-if="node.kind === 'precondition'" class="graph-node-actions">
                 <span></span><span></span>
                 <button class="icon-btn icon-btn-danger" title="删除确认" @click.stop="removePrecondition(node.index)"><span class="material-symbols-outlined">delete</span></button>
@@ -1186,10 +1443,10 @@ function onEditorKeydown(event) {
       <aside v-if="selectedNodeId" :key="selectedNodeId" class="node-inspector" role="complementary" aria-label="节点设置" @pointerdown.stop>
         <header class="node-inspector-head">
           <span class="material-symbols-outlined">
-            {{ selectedKind === 'invalid' ? 'error' : selectedKind === 'condition' ? 'alt_route' : selectedKind === 'trigger' ? 'bolt' : selectedKind.includes('precondition') ? 'verified_user' : selectedKind === 'action' ? 'play_arrow' : 'add' }}
+            {{ selectedKind === 'invalid' ? 'error' : selectedKind === 'condition' ? 'alt_route' : selectedKind === 'trigger' ? 'bolt' : selectedKind.includes('precondition') ? 'verified_user' : selectedKind === 'failure-action' ? 'build' : selectedKind === 'action' ? 'play_arrow' : 'add' }}
           </span>
           <div><small>节点设置</small><h2>
-            {{ selectedKind === 'invalid' ? '无效条件' : selectedKind === 'condition' ? '逻辑组' : selectedKind === 'trigger' ? '触发条件' : selectedKind === 'precondition' ? '开始前确认' : selectedKind === 'action' ? `动作 ${selectedIndex + 1}` : selectedKind === 'add-precondition' ? '添加确认' : '添加动作' }}
+            {{ selectedKind === 'invalid' ? '无效条件' : selectedKind === 'condition' ? '逻辑组' : selectedKind === 'trigger' ? '触发条件' : selectedKind === 'precondition' ? '开始前确认' : selectedKind === 'failure-action' ? `补救动作 ${selectedIndex + 1}` : selectedKind === 'action' ? `动作 ${selectedIndex + 1}` : selectedKind === 'add-precondition' ? '添加确认' : '添加动作' }}
           </h2></div>
           <button class="icon-btn node-inspector-close" title="关闭设置" @click="selectedNodeId = null"><span class="material-symbols-outlined">close</span></button>
         </header>
@@ -1234,7 +1491,7 @@ function onEditorKeydown(event) {
                   <span class="material-symbols-outlined">arrow_forward</span>
                 </button>
               </div>
-              <div class="param-grid"><ParamInput v-for="param in eventParams(selectedConditionNode)" :key="param.name" :def="param" v-model="selectedConditionNode.params[param.name]" /></div>
+              <div class="param-grid"><ParamInput v-for="param in eventParams(selectedConditionNode)" :key="param.name" :def="param" :plugin-id="selectedConditionNode.type" v-model="selectedConditionNode.params[param.name]" /></div>
               <div class="inspector-action-row">
                 <button class="btn btn-text btn-sm" @click="moveSelectedCondition(-1)"><span class="material-symbols-outlined">arrow_upward</span>上移</button>
                 <button class="btn btn-text btn-sm" @click="moveSelectedCondition(1)"><span class="material-symbols-outlined">arrow_downward</span>下移</button>
@@ -1251,7 +1508,7 @@ function onEditorKeydown(event) {
                   <span class="material-symbols-outlined">arrow_forward</span>
                 </button>
               </div>
-              <div class="param-grid"><ParamInput v-for="param in eventParams(rule.event)" :key="param.name" :def="param" v-model="rule.event.params[param.name]" /></div>
+              <div class="param-grid"><ParamInput v-for="param in eventParams(rule.event)" :key="param.name" :def="param" :plugin-id="rule.event.type" v-model="rule.event.params[param.name]" /></div>
               <div class="inspector-upgrade-grid">
                 <button class="btn btn-tonal btn-sm" @click="openPluginPicker('trigger', { mode: 'upgrade', op: 'all', title: '添加“并且”条件' })"><span class="material-symbols-outlined">done_all</span>并且满足</button>
                 <button class="btn btn-tonal btn-sm" @click="openPluginPicker('trigger', { mode: 'upgrade', op: 'any', title: '添加“或者”条件' })"><span class="material-symbols-outlined">alt_route</span>或者满足</button>
@@ -1270,7 +1527,7 @@ function onEditorKeydown(event) {
                 <option v-for="key in preconditionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option>
               </select>
             </label>
-            <div class="param-grid"><ParamInput v-for="param in actionParams(selectedPrecondition)" :key="param.name" :def="param" v-model="selectedPrecondition.params[param.name]" allow-binding :binding-sources="preconditionBindingSources()" /></div>
+            <div class="param-grid"><ParamInput v-for="param in actionParams(selectedPrecondition)" :key="param.name" :def="param" :plugin-id="selectedPrecondition.type" v-model="selectedPrecondition.params[param.name]" allow-binding :binding-sources="preconditionBindingSources()" /></div>
             <button class="btn btn-text btn-sm danger-text inspector-switch" @click="removePrecondition(selectedIndex)"><span class="material-symbols-outlined">delete</span>删除确认</button>
           </template>
 
@@ -1283,14 +1540,39 @@ function onEditorKeydown(event) {
                 <span class="material-symbols-outlined">arrow_forward</span>
               </button>
             </div>
-            <div class="param-grid"><ParamInput v-for="param in actionParams(selectedAction)" :key="param.name" :def="param" v-model="selectedAction.params[param.name]" allow-binding :binding-sources="actionBindingSources(selectedIndex)" /></div>
+            <div class="param-grid"><ParamInput v-for="param in actionParams(selectedAction)" :key="param.name" :def="param" :plugin-id="selectedAction.type" v-model="selectedAction.params[param.name]" allow-binding :binding-sources="actionBindingSources(selectedIndex)" /></div>
             <div v-if="actionOutputHint(selectedAction, selectedIndex)" class="workflow-output-hint">后续步骤可引用：<code>{{ actionOutputHint(selectedAction, selectedIndex) }}</code></div>
-            <ActionFailureSettings :action="selectedAction" :meta="store.schema.actions[selectedAction.type]" />
+            <ActionFailureSettings :action="selectedAction" :meta="store.schema.actions[selectedAction.type]" :schema="store.schema.actions"
+              :binding-sources="failureIndex => failureActionBindingSources(selectedIndex, failureIndex)"
+              @add-failure-action="requestAddFailureAction(selectedIndex)"
+              @replace-failure-action="failureIndex => requestReplaceFailureAction(selectedIndex, failureIndex)"
+              @remove-failure-action="failureIndex => removeFailureAction(selectedIndex, failureIndex)"
+              @move-failure-action="(failureIndex, offset) => moveFailureAction(selectedIndex, failureIndex, offset)" />
             <div class="inspector-action-row">
               <button class="btn btn-text btn-sm" :disabled="selectedIndex === 0" @click="moveAction(selectedIndex, -1)"><span class="material-symbols-outlined">arrow_back</span>提前</button>
               <button class="btn btn-text btn-sm" :disabled="selectedIndex === rule.actions.length - 1" @click="moveAction(selectedIndex, 1)">稍后<span class="material-symbols-outlined">arrow_forward</span></button>
               <button class="btn btn-text btn-sm" @click="duplicateAction(selectedIndex)"><span class="material-symbols-outlined">content_copy</span>复制</button>
               <button class="btn btn-text btn-sm danger-text" @click="removeAction(selectedIndex)"><span class="material-symbols-outlined">delete</span>删除</button>
+            </div>
+          </template>
+
+          <template v-else-if="selectedKind === 'failure-action' && selectedFailureAction">
+            <p class="inspector-lead">这个动作只会在上方主动作最终失败时执行。</p>
+            <div class="field"><span class="field-label">补救动作类型</span>
+              <button class="plugin-type-button" type="button"
+                @click="requestReplaceFailureAction(selectedGraphNode.parentIndex, selectedIndex)">
+                <span class="material-symbols-outlined">build</span>
+                <span>{{ actionName(selectedFailureAction) }}</span>
+                <span class="material-symbols-outlined">arrow_forward</span>
+              </button>
+            </div>
+            <div class="param-grid"><ParamInput v-for="param in actionParams(selectedFailureAction)" :key="param.name" :def="param" :plugin-id="selectedFailureAction.type" v-model="selectedFailureAction.params[param.name]" allow-binding :binding-sources="failureActionBindingSources(selectedGraphNode.parentIndex, selectedIndex)" /></div>
+            <p class="failure-action-note">{{ selectedFailureAction.on_error === 'continue' ? '如果它也失败，会继续执行剩余补救动作。' : '如果它也失败，会停止剩余补救动作。' }}</p>
+            <button class="btn btn-tonal btn-sm" @click="selectedNodeId = `action-${rule.actions[selectedGraphNode.parentIndex].binding_id}`"><span class="material-symbols-outlined">tune</span>设置重试和失败处理</button>
+            <div class="inspector-action-row">
+              <button class="btn btn-text btn-sm" :disabled="selectedIndex === 0" @click="moveFailureAction(selectedGraphNode.parentIndex, selectedIndex, -1)"><span class="material-symbols-outlined">arrow_back</span>提前</button>
+              <button class="btn btn-text btn-sm" :disabled="selectedIndex === rule.actions[selectedGraphNode.parentIndex].failure_actions.length - 1" @click="moveFailureAction(selectedGraphNode.parentIndex, selectedIndex, 1)">稍后<span class="material-symbols-outlined">arrow_forward</span></button>
+              <button class="btn btn-text btn-sm danger-text" @click="removeFailureAction(selectedGraphNode.parentIndex, selectedIndex)"><span class="material-symbols-outlined">delete</span>删除</button>
             </div>
           </template>
 
@@ -1337,7 +1619,7 @@ function onEditorKeydown(event) {
                   <span class="material-symbols-outlined">arrow_forward</span>
                 </button>
               </div>
-              <div class="param-grid"><ParamInput v-for="param in eventParams(rule.event)" :key="param.name" :def="param" v-model="rule.event.params[param.name]" /></div>
+              <div class="param-grid"><ParamInput v-for="param in eventParams(rule.event)" :key="param.name" :def="param" :plugin-id="rule.event.type" v-model="rule.event.params[param.name]" /></div>
             </div>
           </details>
           <div v-else class="flow-empty-card">
@@ -1363,7 +1645,7 @@ function onEditorKeydown(event) {
             <summary><span class="material-symbols-outlined flow-kind-icon">verified</span><span class="flow-card-copy"><b>{{ actionName(item) }}</b><small>开始前确认</small></span><button class="icon-btn icon-btn-danger" title="移除确认" @click.prevent.stop="removePrecondition(index)"><span class="material-symbols-outlined">delete</span></button><span class="material-symbols-outlined flow-expand">expand_more</span></summary>
             <div class="flow-card-body">
               <label class="field field-wide"><span class="field-label">确认方式</span><select class="select" :value="item.type" @change="changePrecondition(item, $event.target.value)"><option v-for="key in preconditionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option></select></label>
-              <div class="param-grid"><ParamInput v-for="param in actionParams(item)" :key="param.name" :def="param" v-model="item.params[param.name]" allow-binding :binding-sources="preconditionBindingSources()" /></div>
+              <div class="param-grid"><ParamInput v-for="param in actionParams(item)" :key="param.name" :def="param" :plugin-id="item.type" v-model="item.params[param.name]" allow-binding :binding-sources="preconditionBindingSources()" /></div>
             </div>
           </details>
           <div class="flow-add-control"><button class="btn btn-tonal" @click="openPluginPicker('precondition', { mode: 'precondition', title: '添加开始前确认' })"><span class="material-symbols-outlined">add</span>添加确认</button></div>
@@ -1373,7 +1655,7 @@ function onEditorKeydown(event) {
       <section class="automation-stage stage-then">
         <div class="stage-rail stage-rail-last"><span class="stage-node"><span class="material-symbols-outlined">play_arrow</span></span></div>
         <div class="stage-content">
-          <header class="stage-head"><div><span class="stage-kicker">然后</span><h2>按顺序执行这些动作</h2></div><span class="stage-required">必填</span></header>
+          <header class="stage-head"><div><span class="stage-kicker">然后</span><h2>按顺序执行这些动作</h2></div><div class="stage-head-tools"><button v-if="desktopRecorderAvailable" class="btn btn-text btn-sm" @click="desktopRecorderOpen = true"><span class="material-symbols-outlined">screen_record</span>{{ desktopRecorder.ui?.button_label || '录制桌面步骤' }}</button><span class="stage-required">必填</span></div></header>
           <details v-for="(action, index) in rule.actions" :key="action" class="flow-card action-flow-card" :open="rule.actions.length === 1">
             <summary>
               <span class="flow-card-index">{{ index + 1 }}</span><span class="flow-card-copy"><b>{{ actionName(action) }}</b><small>第 {{ index + 1 }} 步 · {{ actionFailureSummary(action) }}</small></span>
@@ -1390,9 +1672,14 @@ function onEditorKeydown(event) {
                   <span class="material-symbols-outlined">arrow_forward</span>
                 </button>
               </div>
-              <div class="param-grid"><ParamInput v-for="param in actionParams(action)" :key="param.name" :def="param" v-model="action.params[param.name]" allow-binding :binding-sources="actionBindingSources(index)" /></div>
+              <div class="param-grid"><ParamInput v-for="param in actionParams(action)" :key="param.name" :def="param" :plugin-id="action.type" v-model="action.params[param.name]" allow-binding :binding-sources="actionBindingSources(index)" /></div>
               <div v-if="actionOutputHint(action, index)" class="workflow-output-hint">后续步骤可引用：<code>{{ actionOutputHint(action, index) }}</code></div>
-              <ActionFailureSettings :action="action" :meta="store.schema.actions[action.type]" />
+              <ActionFailureSettings :action="action" :meta="store.schema.actions[action.type]" :schema="store.schema.actions"
+                :binding-sources="failureIndex => failureActionBindingSources(index, failureIndex)"
+                @add-failure-action="requestAddFailureAction(index)"
+                @replace-failure-action="failureIndex => requestReplaceFailureAction(index, failureIndex)"
+                @remove-failure-action="failureIndex => removeFailureAction(index, failureIndex)"
+                @move-failure-action="(failureIndex, offset) => moveFailureAction(index, failureIndex, offset)" />
             </div>
           </details>
           <div v-if="!rule.actions?.length" class="flow-inline-empty">还没有动作。规则触发后不会执行任何操作。</div>
@@ -1401,9 +1688,24 @@ function onEditorKeydown(event) {
       </section>
     </main>
 
-    <footer class="flow-validation" :class="{ valid: !validationIssues.length }">
-      <span class="material-symbols-outlined">{{ validationIssues.length ? 'error' : 'check_circle' }}</span>
-      <div><b>{{ validationIssues.length ? `${validationIssues.length} 项需要处理` : '规则可以保存' }}</b><p v-if="validationIssues.length">{{ validationIssues.join(' · ') }}</p><p v-else>修改只会在保存后应用到引擎。</p></div>
+    <footer class="flow-validation" :class="{ valid: !validationErrorCount, warning: !validationErrorCount && validationWarningCount }">
+      <span class="material-symbols-outlined">{{ validationErrorCount ? 'error' : validationWarningCount ? 'warning' : 'check_circle' }}</span>
+      <div class="flow-validation-body">
+        <b v-if="validationErrorCount">{{ validationErrorCount }} 项需要处理</b>
+        <b v-else-if="validationWarningCount">可以保存，另有 {{ validationWarningCount }} 项提醒</b>
+        <b v-else>{{ checkingRule ? '正在检查当前草稿…' : '规则可以保存' }}</b>
+        <div v-if="validationIssues.length" class="flow-validation-list">
+          <button v-for="(issue, index) in validationIssues" :key="`${issue.message}-${index}`" type="button"
+            :class="`flow-validation-item ${issue.severity === 'warning' ? 'warning' : ''}`"
+            :disabled="!issue.target" @click="focusValidationIssue(issue)">
+            <span class="material-symbols-outlined">{{ issue.severity === 'warning' ? 'warning' : 'error' }}</span>
+            <span>{{ issue.message }}</span>
+            <span v-if="issue.target" class="material-symbols-outlined">arrow_forward</span>
+          </button>
+        </div>
+        <p v-else-if="checkerError" class="flow-validation-service-error">在线检查暂不可用：{{ checkerError }}。保存时仍会由后台校验。</p>
+        <p v-else-if="!checkingRule">修改只会在保存后应用到引擎。</p>
+      </div>
     </footer>
 
     <PluginPicker :open="picker.open" :kind="picker.kind"
@@ -1412,5 +1714,8 @@ function onEditorKeydown(event) {
       :title="picker.title" @close="closePluginPicker" @select="choosePlugin" />
     <FolderPicker :open="folderPickerOpen" :folders="folders" :current="currentFolderName"
       @close="folderPickerOpen = false" @select="chooseFolder" />
+    <DesktopRecorderDialog :open="desktopRecorderOpen"
+      :plugin-id="desktopRecorder?.plugin_id" :component-id="desktopRecorder?.id || 'record'"
+      @close="desktopRecorderOpen = false" @insert="insertRecordedSteps" />
   </section>
 </template>

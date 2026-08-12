@@ -77,6 +77,116 @@ export async function runRule(ruleIndex, rule = null, testContext = null) {
   return await res.json()
 }
 
+export async function cancelRun(runId) {
+  const res = await apiWrite(
+    `/api/runs/${encodeURIComponent(runId)}/cancel`,
+    'POST',
+  )
+  return await res.json()
+}
+
+export async function captureDesktopElement(delaySeconds = 3) {
+  const res = await apiWrite(
+    '/api/desktop-elements/capture',
+    'POST',
+    { delay_seconds: delaySeconds },
+  )
+  return await res.json()
+}
+
+export async function getPluginComponents() {
+  const res = await apiRead('/api/plugins/components')
+  const data = await res.json()
+  return Array.isArray(data?.components) ? data.components : []
+}
+
+export async function getPluginExtensions() {
+  const res = await apiRead('/api/plugins/extensions')
+  const data = await res.json()
+  return {
+    commands: Array.isArray(data?.commands) ? data.commands : [],
+    parameter_editors: Array.isArray(data?.parameter_editors) ? data.parameter_editors : [],
+    views: Array.isArray(data?.views) ? data.views : [],
+    data_types: Array.isArray(data?.data_types) ? data.data_types : [],
+  }
+}
+
+export async function invokeExtensionCommand(
+  pluginId,
+  commandId,
+  {
+    payload = null,
+    sessionId = '',
+    sourceKind = '',
+    sourceId = '',
+    currentValue = null,
+  } = {},
+) {
+  const body = { payload }
+  if (sessionId) body.session_id = sessionId
+  else {
+    body.source_kind = sourceKind
+    body.source_id = sourceId
+    body.current_value = currentValue
+  }
+  const res = await apiWrite(
+    `/api/plugins/${encodeURIComponent(pluginId)}/extensions/commands/${encodeURIComponent(commandId)}/invoke`,
+    'POST',
+    body,
+  )
+  return await res.json()
+}
+
+export async function getExtensionViewPage(pluginId, viewId) {
+  const res = await apiRead(
+    `/api/plugins/${encodeURIComponent(pluginId)}/extensions/views/${encodeURIComponent(viewId)}/page`,
+  )
+  const data = await res.json()
+  if (!res.ok || data?.ok === false || typeof data?.html !== 'string') {
+    throw new Error(data?.error || '无法加载插件视图')
+  }
+  return data.html
+}
+
+export async function closeExtensionSession(pluginId, sessionId) {
+  if (!sessionId) return { ok: true }
+  const res = await apiWrite(
+    `/api/plugins/${encodeURIComponent(pluginId)}/extensions/sessions/${encodeURIComponent(sessionId)}`,
+    'DELETE',
+  )
+  return await res.json()
+}
+
+export async function invokeComponent(pluginId, componentId, method, payload = null, sessionId = '') {
+  const body = { method, payload }
+  if (sessionId) body.session_id = sessionId
+  const res = await apiWrite(
+    `/api/plugins/${encodeURIComponent(pluginId)}/components/${encodeURIComponent(componentId)}/invoke`,
+    'POST',
+    body,
+  )
+  return await res.json()
+}
+
+export async function checkDesktopElement(selector) {
+  const res = await apiWrite(
+    '/api/desktop-elements/check',
+    'POST',
+    { selector },
+  )
+  return await res.json()
+}
+
+export async function validateRuleDraft(rule) {
+  const res = await apiWrite('/api/rules/validate', 'POST', { rule })
+  return await res.json()
+}
+
+export async function draftRuleFromText(description) {
+  const res = await apiWrite('/api/rules/draft', 'POST', { description })
+  return await res.json()
+}
+
 export async function loadPlugins() {
   try {
     const r = await apiRead('/api/plugins/list')
@@ -112,9 +222,34 @@ export async function approveConfigSecurity() {
   return await r.json()
 }
 
+export async function getAdminAuthorizationSetting() {
+  const r = await apiRead('/api/settings/admin-authorization')
+  return await r.json()
+}
+
+export async function updateAdminAuthorizationSetting(mode) {
+  const r = await apiWrite('/api/settings/admin-authorization', 'PUT', { mode })
+  return await r.json()
+}
+
 export async function readLogRaw(lines = 300) {
   try { return await window.pywebview.api.read_log_raw(lines) }
   catch (e) { return '读取日志失败: ' + e.message }
+}
+
+export async function readLogEntries(lines = 600) {
+  try { return await window.pywebview.api.read_log_entries(lines) }
+  catch (e) { return [{ ts: '', level: 'ERROR', text: '读取日志失败: ' + e.message, data: null }] }
+}
+
+export async function listLogFiles() {
+  try { return await window.pywebview.api.list_log_files() }
+  catch (e) { return [] }
+}
+
+export async function readLogFileEntries(name, lines = 600) {
+  try { return await window.pywebview.api.read_log_file_entries(name, lines) }
+  catch (e) { return [] }
 }
 
 // 诊断优先从认证 HTTP 读取引擎实时数据，离线时读取 bridge 日志，因为日志只有 action_failed，无法统计成功次数。
@@ -141,4 +276,20 @@ export async function readDiagnostics() {
   } catch (e) {
     return null
   }
+}
+
+export async function listRuns(limit = 100) {
+  try {
+    const response = await apiRead(`/api/runs?limit=${limit}`)
+    const data = await response.json()
+    return Array.isArray(data?.runs) ? data.runs : []
+  } catch (e) {
+    return []
+  }
+}
+
+export async function getRun(runId) {
+  const response = await apiRead(`/api/runs/${encodeURIComponent(runId)}`)
+  if (!response.ok) return null
+  return await response.json()
 }

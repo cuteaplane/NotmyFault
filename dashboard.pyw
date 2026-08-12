@@ -22,13 +22,13 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import webview
-from notmyfault.config import CONFIG_FILE
+from notmyfault.config import RULES_FILE
 from notmyfault.platform.platform_support import get_config_dir, launch_python_entry
 from notmyfault.security.plugin_schema import scan_plugins
 
 API = "http://127.0.0.1:19198"
 # API 令牌与 notmyfault/api_server.py 共用，文件放在配置目录下
-API_TOKEN_FILE = os.path.join(os.path.dirname(CONFIG_FILE), ".api_token")
+API_TOKEN_FILE = os.path.join(get_config_dir(), ".api_token")
 
 
 def _get_plugins_schema() -> dict:
@@ -120,6 +120,21 @@ class DashboardAPI:
         # pywebview 枚举公开属性时会递归访问 Window，原生窗口保存在私有属性中
         self._window = None
 
+    def set_window_state(self, action: str) -> dict:
+        if action not in ("minimize", "restore"):
+            return {"ok": False, "error": "不支持的窗口操作"}
+        if self._window is None:
+            return {"ok": False, "error": "Dashboard 窗口尚未就绪"}
+        try:
+            if action == "minimize":
+                self._window.minimize()
+            else:
+                self._window.restore()
+                self._window.show()
+            return {"ok": True, "action": action}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
     def launch_engine(self) -> dict:
         """保证后台服务在线，并启动自动化核心"""
         status = self.get_engine_status()
@@ -186,11 +201,21 @@ class DashboardAPI:
         return {"ok": False, "error": last_error or "后台服务启动超时"}
 
     def get_config(self) -> dict:
-        """直接读取 JSON 配置文件，文件不存在则返回默认规则"""
+        """有效规则先补齐身份，验签失败时保留原文供安全页核对"""
         try:
-            if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
+            if os.path.exists(RULES_FILE):
+                with open(RULES_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                rules = data.get("rules", []) if isinstance(data, dict) else []
+                rules = rules if isinstance(rules, list) else []
+                try:
+                    from notmyfault.config import load_verified_rules, save_rules
+                    normalized = load_verified_rules()
+                    if normalized != rules:
+                        save_rules(normalized)
+                    return {"rules": normalized}
+                except Exception:
+                    return {"rules": rules}
         except Exception as e:
             return {"_error": str(e), "rules": []}
         return {"rules": []}
@@ -198,21 +223,15 @@ class DashboardAPI:
     def save_config(self, rules: list) -> dict:
         try:
             from notmyfault.config import (
-                save_config as _save,
-                _normalize_config,
+                save_rules as _save_rules,
+                _normalize_rules,
                 _validate_rules_safety,
             )
             from notmyfault.core.rules import (
                 validate_rule_bindings,
                 validate_rules_structure,
             )
-            config = self.get_config()
-            if not isinstance(config, dict) or config.get("_error"):
-                config = {}
-            config.pop("_signature", None)
-            config["rules"] = rules
-            config = _normalize_config(config)
-            normalized_rules = config.get("rules", [])
+            normalized_rules = _normalize_rules(rules)
             structure_errors = validate_rules_structure(normalized_rules)
             if structure_errors:
                 return {
@@ -243,7 +262,7 @@ class DashboardAPI:
                     "error": "规则安全校验失败",
                     "details": errors[:10],
                 }
-            ok = _save(config)
+            ok = _save_rules(normalized_rules)
             return {"ok": ok, "rules": normalized_rules if ok else None}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -274,11 +293,18 @@ class DashboardAPI:
                 return json.loads(urllib.request.urlopen(req, timeout=5).read())
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", errors="replace")
-                last_error = f"HTTP {e.code}: {detail}"
+                try:
+                    error_payload = json.loads(detail)
+                except (TypeError, ValueError):
+                    error_payload = {}
+                if not isinstance(error_payload, dict):
+                    error_payload = {}
+                last_error = error_payload.get("error") or f"HTTP {e.code}: {detail}"
                 if e.code == 403 and attempt == 0:
                     time.sleep(0.05)
                     continue
                 return {
+                    **error_payload,
                     "ok": False,
                     "error": last_error,
                     "status": e.code,
@@ -333,7 +359,7 @@ class DashboardAPI:
         """彻底退出引擎进程"""
         return self._auth_request("/api/engine/shutdown")
 
-    _LOG_DIR = os.path.join(os.path.dirname(CONFIG_FILE), "logs")
+    _LOG_DIR = os.path.join(get_config_dir(), "logs")
 
     def _get_latest_log(self):
         from notmyfault.core.logging import get_latest_log
@@ -384,17 +410,44 @@ class DashboardAPI:
         except Exception as e:
             return []
 
+    def read_log_file_entries(self, name: str, lines: int = 600) -> list:
+        """读取指定历史日志文件末尾 N 行，返回解析后的结构化条目列表"""
+        try:
+            # 文件名只认 engine-*.log，堵住 ../ 之类构造出来的路径
+            if (
+                not isinstance(name, str)
+                or os.path.basename(name) != name
+                or not (name.startswith("engine-") and name.endswith(".log"))
+            ):
+                return []
+            log_path = os.path.join(self._LOG_DIR, name)
+            if not os.path.isfile(log_path):
+                return []
+            from notmyfault.core.logging import read_log_entries as _read
+            return _read(log_path, lines=lines)
+        except Exception as e:
+            return [{"ts": "", "level": "ERROR", "text": f"读取日志失败: {e}", "data": None}]
+
+
+
+class _DashboardStaticHandler(http.server.SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        super().end_headers()
 
 
 def _start_static_server(directory, port=DASHBOARD_PORT):
     """pywebview 从 file:// 加载 ES 模块会被 CORS 拦截，因此用本地 HTTP 服务托管并在端口占用时递增重试"""
-    Handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=directory)
+    Handler = functools.partial(_DashboardStaticHandler, directory=directory)
     for p in range(port, port + 20):
         try:
             httpd = socketserver.TCPServer(("127.0.0.1", p), Handler)
             httpd.daemon_threads = True
             threading.Thread(target=httpd.serve_forever, daemon=True).start()
-            return httpd, f"http://127.0.0.1:{p}/"
+            version = int(os.path.getmtime(os.path.join(directory, "index.html")))
+            return httpd, f"http://127.0.0.1:{p}/?v={version}"
         except OSError:
             continue
     return None, None
