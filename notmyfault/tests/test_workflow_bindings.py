@@ -29,7 +29,28 @@ ACTIONS_META = {
         "params": [{"name": "url", "type": "string", "label": "地址"}],
         "outputs": [{"name": "status", "type": "string"}],
     },
+    "plugin_document": {
+        "params": [{
+            "name": "document",
+            "type": "plugin_data",
+            "value_type": "object",
+            "label": "插件文档",
+        }],
+    },
 }
+
+
+def test_plugin_data_cannot_bind_trigger_or_action_output():
+    rule = _rule(
+        _leaf("usb_insert", "t_usb001"),
+        [{
+            "type": "plugin_document",
+            "binding_id": "a_doc001",
+            "params": {"document": _ref("trigger", "t_usb001", ["drive"])},
+        }],
+    )
+    issues = validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META)
+    assert [issue["code"] for issue in issues] == ["private_plugin_data"]
 
 
 def _ref(scope, node=None, path=None):
@@ -197,6 +218,60 @@ def test_event_reference_and_legacy_template_remain_supported():
     )
     # event scope 与旧模板都不应产生静态问题
     assert validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META) == []
+
+
+def test_failure_actions_can_use_earlier_main_and_recovery_outputs():
+    rule = _rule(
+        _leaf("usb_insert", "t_usb001"),
+        [
+            {"type": "open_url", "binding_id": "a_early01", "params": {"url": "x"}},
+            {
+                "type": "open_url",
+                "binding_id": "a_parent1",
+                "params": {"url": "x"},
+                "failure_actions": [
+                    {
+                        "type": "open_url",
+                        "binding_id": "a_recover1",
+                        "params": {"url": _ref("step", "a_early01", ["status"])},
+                    },
+                    {
+                        "type": "notify",
+                        "binding_id": "a_recover2",
+                        "params": {"message": _ref("step", "a_recover1", ["status"])},
+                    },
+                ],
+            },
+        ],
+    )
+
+    assert validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META) == []
+
+
+def test_failure_branch_and_main_flow_cannot_use_conditional_recovery_outputs():
+    rule = _rule(
+        _leaf("usb_insert", "t_usb001"),
+        [
+            {
+                "type": "open_url",
+                "binding_id": "a_parent1",
+                "params": {"url": "x"},
+                "failure_actions": [{
+                    "type": "notify",
+                    "binding_id": "a_recover1",
+                    "params": {"message": _ref("step", "a_parent1", ["status"])},
+                }],
+            },
+            {
+                "type": "notify",
+                "binding_id": "a_after01",
+                "params": {"message": _ref("step", "a_recover1", ["status"])},
+            },
+        ],
+    )
+
+    codes = [issue["code"] for issue in validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META)]
+    assert codes == ["forward_reference", "forward_reference"]
 
 
 def test_reference_iterator_reports_nested_parameter_location():
