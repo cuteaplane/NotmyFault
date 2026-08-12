@@ -46,10 +46,16 @@ class FakeEngine:
     def __init__(self):
         self.triggers_meta = {}
         self.calls = []
+        self.cancel_calls = []
+        self.cancel_result = True
 
     def run_manual_rule_snapshot(self, rule, index, **kwargs):
         self.calls.append({"rule": rule, "index": index, "kwargs": kwargs})
-        return True, "已执行"
+        return True, "已执行", "run_fake001"
+
+    def cancel_run(self, run_id):
+        self.cancel_calls.append(run_id)
+        return self.cancel_result
 
 
 @pytest.fixture
@@ -57,6 +63,9 @@ def api_env(tmp_path, monkeypatch):
     config_file = str(tmp_path / "config.json")
     monkeypatch.setattr(api_server, "CONFIG_FILE", config_file)
     monkeypatch.setattr(config_mod, "CONFIG_FILE", config_file)
+    rules_file = str(tmp_path / "rules.json")
+    monkeypatch.setattr(api_server, "RULES_FILE", rules_file)
+    monkeypatch.setattr(config_mod, "RULES_FILE", rules_file)
     monkeypatch.setattr(api_server, "API_TOKEN_FILE", str(tmp_path / ".api_token"))
     runner = FakeRunner()
     api = EngineAPI(runner)
@@ -78,6 +87,76 @@ def simple_rule():
         "event": {"type": "usb_insert", "params": {}},
         "actions": [{"type": "open_url", "params": {"url": "http://example.com"}}],
     }
+
+
+def _desktop_selector():
+    return {
+        "version": 1,
+        "window": {
+            "process": "notepad.exe",
+            "name": "无标题 - 记事本",
+            "control_type": 50032,
+        },
+        "target": {
+            "automation_id": "FileSave",
+            "name": "保存",
+            "control_type": 50000,
+        },
+        "ancestors": [],
+        "display": {
+            "control": "保存",
+            "control_type": "按钮",
+            "window": "无标题 - 记事本",
+            "app": "notepad.exe",
+        },
+    }
+
+
+def test_capture_desktop_element_waits_then_returns_selector(
+    api_env, monkeypatch
+):
+    from notmyfault.native import uia
+
+    waits = []
+
+    async def no_wait(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr(api_server.asyncio, "sleep", no_wait)
+    monkeypatch.setattr(
+        uia, "capture_element_under_cursor", _desktop_selector
+    )
+
+    response = api_env.client.post(
+        "/api/desktop-elements/capture",
+        json={"delay_seconds": 2},
+        headers=api_env.headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["selector"]["target"]["name"] == "保存"
+    assert waits == [2.0]
+
+
+def test_check_desktop_element_reports_locator_error(api_env, monkeypatch):
+    from notmyfault.native import uia
+
+    def missing(_selector):
+        raise uia.DesktopElementError(
+            "element_not_found", "窗口已经打开，但找不到录制的控件"
+        )
+
+    monkeypatch.setattr(uia, "check_selector", missing)
+
+    response = api_env.client.post(
+        "/api/desktop-elements/check",
+        json={"selector": _desktop_selector()},
+        headers=api_env.headers,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "element_not_found"
+    assert "找不到录制的控件" in response.json()["error"]
 
 
 def bound_rule():
@@ -161,16 +240,74 @@ class TestConfigHelpers:
         assert api_env.api._load_config() == {"rules": []}
 
     def test_save_config_success(self, api_env):
-        assert api_env.api._save_config({"rules": []}) is True
+        assert api_env.api._save_config({}) is True
         assert os.path.exists(api_server.CONFIG_FILE)
 
     def test_save_and_load_roundtrip(self, api_env):
-        config = {"rules": [{"name": "r"}], "custom_key": 123}
+        config = {"custom_key": 123}
         assert api_env.api._save_config(config) is True
         loaded = api_env.api._load_config()
-        assert loaded["rules"] == [{"name": "r"}]
         assert loaded["custom_key"] == 123
+        assert "rules" not in loaded
         assert "_signature" not in loaded
+
+    def test_load_rules_file_missing(self, api_env):
+        assert api_env.api._load_rules() == []
+
+    def test_save_and_load_rules_roundtrip(self, api_env):
+        assert api_env.api._save_rules([simple_rule()]) is True
+        loaded = api_env.api._load_rules()
+        assert len(loaded) == 1
+        assert loaded[0]["name"] == "通知规则"
+
+
+class TestAdminAuthorizationSettings:
+    def test_get_defaults_to_per_execution(self, api_env):
+        response = api_env.client.get(
+            "/api/settings/admin-authorization", headers=api_env.headers
+        )
+        assert response.status_code == 200
+        assert response.json()["mode"] == "per_execution"
+
+    @pytest.mark.skipif(os.name != "nt", reason="启动时一次授权只支持 Windows")
+    def test_put_saves_mode_and_reports_restart(self, api_env):
+        api_env.runner.current_engine = SimpleNamespace(
+            admin_authorization_mode="per_execution"
+        )
+        response = api_env.client.put(
+            "/api/settings/admin-authorization",
+            json={"mode": "engine_start"},
+            headers=api_env.headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["restart_required"] is True
+        saved = api_env.api._load_config()
+        assert saved["settings"]["admin_authorization_mode"] == "engine_start"
+
+    def test_put_rejects_unknown_mode(self, api_env):
+        response = api_env.client.put(
+            "/api/settings/admin-authorization",
+            json={"mode": "unrestricted"},
+            headers=api_env.headers,
+        )
+        assert response.status_code == 400
+
+    def test_put_rejects_tampered_config(self, api_env):
+        assert api_env.api._save_config({"custom_flag": "keep"}) is True
+        with open(api_server.CONFIG_FILE, "r", encoding="utf-8") as file:
+            tampered = json.load(file)
+        tampered["custom_flag"] = "changed outside NotmyFault"
+        with open(api_server.CONFIG_FILE, "w", encoding="utf-8") as file:
+            json.dump(tampered, file, ensure_ascii=False)
+
+        response = api_env.client.put(
+            "/api/settings/admin-authorization",
+            json={"mode": "per_execution"},
+            headers=api_env.headers,
+        )
+
+        assert response.status_code == 409
+        assert "完整性校验" in response.json()["error"]
 
 
 class TestEngineEndpoints:
@@ -239,7 +376,7 @@ class TestEngineEndpoints:
                 {"type": "open_url", "params": {"url": "http://example.org"}},
             ],
         )
-        assert api_env.api._save_config({"rules": [rule]}) is True
+        assert api_env.api._save_rules([rule]) is True
         body = api_env.client.get(
             "/api/engine/status", headers=api_env.headers
         ).json()
@@ -332,6 +469,40 @@ class TestEventStream:
         packet = queue.get_nowait()
         assert before <= packet["ts"] <= time.time()
 
+    def test_run_event_is_saved_without_sse_subscriber(self, api_env):
+        api_env.api.push_event(
+            "rule_triggered",
+            {
+                "run_id": "run_offline",
+                "rule_id": "r_rule001",
+                "rule_name": "离线运行",
+                "event_type": "manual",
+                "action_count": 0,
+            },
+        )
+        api_env.api.push_event(
+            "workflow_completed",
+            {
+                "run_id": "run_offline",
+                "rule_id": "r_rule001",
+                "rule_name": "离线运行",
+                "status": "succeeded",
+            },
+        )
+
+        response = api_env.client.get("/api/runs", headers=api_env.headers)
+
+        assert response.status_code == 200
+        assert response.json()["runs"][0]["run_id"] == "run_offline"
+        assert response.json()["runs"][0]["status"] == "succeeded"
+
+    def test_get_missing_run_returns_404(self, api_env):
+        response = api_env.client.get(
+            "/api/runs/run_missing", headers=api_env.headers
+        )
+
+        assert response.status_code == 404
+
     def test_push_event_multiple_subscribers(self, api_env):
         api = api_env.api
 
@@ -412,7 +583,7 @@ class TestRulesEndpoints:
 
     def test_get_rules_with_data(self, api_env):
         rules = [simple_rule()]
-        assert api_env.api._save_config({"rules": rules}) is True
+        assert api_env.api._save_rules(rules) is True
         response = api_env.client.get("/api/rules", headers=api_env.headers)
         assert response.status_code == 200
         got = response.json()["rules"]
@@ -481,6 +652,49 @@ class TestRulesEndpoints:
         assert warning["location"] == "actions[0]"
         assert "重试可能重复产生结果" in warning["message"]
 
+    def test_validate_rule_draft_checks_failure_action_plugins(self, api_env):
+        rule = simple_rule()
+        rule["actions"][0]["failure_actions"] = [{
+            "type": "missing_action",
+            "params": {},
+        }]
+
+        response = api_env.client.post(
+            "/api/rules/validate",
+            json={"rule": rule},
+            headers=api_env.headers,
+        )
+
+        assert response.status_code == 200
+        issue = next(
+            issue
+            for issue in response.json()["issues"]
+            if issue["code"] == "plugin_reference"
+        )
+        assert response.json()["valid"] is False
+        assert issue["location"] == "actions[0].failure_actions[0]"
+        assert "补救动作 1" in issue["message"]
+
+    def test_validate_rule_draft_rejects_timeout_without_safe_cancel(self, api_env):
+        rule = simple_rule()
+        rule["actions"][0]["timeout_seconds"] = 60
+
+        response = api_env.client.post(
+            "/api/rules/validate",
+            json={"rule": rule},
+            headers=api_env.headers,
+        )
+
+        assert response.status_code == 200
+        issue = next(
+            issue
+            for issue in response.json()["issues"]
+            if issue["code"] == "timeout_not_supported"
+        )
+        assert response.json()["valid"] is False
+        assert issue["location"] == "actions[0]"
+        assert "不支持安全取消" in issue["message"]
+
     def test_validate_rule_draft_reports_unsafe_command_without_writing(self, api_env):
         rule = simple_rule()
         rule["actions"] = [{
@@ -501,6 +715,55 @@ class TestRulesEndpoints:
             for issue in response.json()["issues"]
         )
         assert not os.path.exists(api_server.RULES_FILE)
+
+    def test_local_rule_draft_previews_without_saving(self, api_env):
+        response = api_env.client.post(
+            "/api/rules/draft",
+            json={"description": "每天 08:30 提醒我提交月报"},
+            headers=api_env.headers,
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["source"] == "local"
+        assert body["draft"]["event"]["type"] == "time_schedule"
+        assert body["draft"]["event"]["params"]["time"] == "08:30"
+        assert body["draft"]["actions"][0]["type"] == "notify"
+        assert body["draft"]["actions"][0]["params"]["message"] == "提交月报"
+        assert body["validation"]["ok"] is True
+        assert not os.path.exists(api_server.RULES_FILE)
+
+    def test_usb_backup_draft_binds_inserted_drive(self, api_env):
+        response = api_env.client.post(
+            "/api/rules/draft",
+            json={"description": "U盘插入后备份文件"},
+            headers=api_env.headers,
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        trigger_id = body["draft"]["event"]["binding_id"]
+        source = body["draft"]["actions"][0]["params"]["source"]
+        assert source == {
+            "$ref": {
+                "scope": "trigger",
+                "node": trigger_id,
+                "path": ["actual_drive"],
+            }
+        }
+        assert body["assumptions"] == ["文件来源使用本次插入的 U 盘"]
+        assert all("源路径" not in item for item in body["missing"])
+        assert any("目标路径" in item for item in body["missing"])
+
+    def test_local_rule_draft_rejects_empty_description(self, api_env):
+        response = api_env.client.post(
+            "/api/rules/draft",
+            json={"description": "  "},
+            headers=api_env.headers,
+        )
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "empty_description"
 
     def test_put_rules_invalid_json(self, api_env):
         response = api_env.client.put(
@@ -525,9 +788,11 @@ class TestRulesEndpoints:
         assert response.status_code == 200
         body = response.json()
         assert body["ok"] is True
-        saved = api_env.api._load_config()["rules"]
+        assert body["rules"][0]["rule_id"].startswith("r_")
+        saved = api_env.api._load_rules()
         assert len(saved) == 1
         assert saved[0]["name"] == "通知规则"
+        assert saved[0]["rule_id"] == body["rules"][0]["rule_id"]
 
     def test_rules_roundtrip(self, api_env):
         put = api_env.client.put(
@@ -537,14 +802,48 @@ class TestRulesEndpoints:
         got = api_env.client.get("/api/rules", headers=api_env.headers).json()["rules"]
         assert got == put.json()["rules"]
 
-    def test_put_rules_preserves_unrelated_config_keys(self, api_env):
-        assert api_env.api._save_config({"rules": [], "custom_flag": "keep"}) is True
+    def test_put_rules_does_not_rewrite_config(self, api_env):
+        # 规则单独落 rules.json，保存规则不再重写 config.json
+        assert api_env.api._save_config({"custom_flag": "keep"}) is True
         response = api_env.client.put(
             "/api/rules", json={"rules": [simple_rule()]}, headers=api_env.headers
         )
         assert response.status_code == 200
         loaded = api_env.api._load_config()
         assert loaded["custom_flag"] == "keep"
+
+    def test_put_rules_rejects_tampered_rules_file(self, api_env):
+        assert api_env.api._save_rules([simple_rule()]) is True
+        with open(api_server.RULES_FILE, "r", encoding="utf-8") as file:
+            tampered = json.load(file)
+        tampered["rules"][0]["name"] = "changed outside NotmyFault"
+        with open(api_server.RULES_FILE, "w", encoding="utf-8") as file:
+            json.dump(tampered, file, ensure_ascii=False)
+
+        response = api_env.client.put(
+            "/api/rules", json={"rules": [simple_rule()]}, headers=api_env.headers
+        )
+
+        assert response.status_code == 409
+        assert "完整性校验" in response.json()["error"]
+
+    def test_run_rule_rejects_tampered_rules_file(self, api_env):
+        rule = simple_rule()
+        assert api_env.api._save_rules([rule]) is True
+        with open(api_server.RULES_FILE, "r", encoding="utf-8") as file:
+            tampered = json.load(file)
+        tampered["rules"][0]["actions"][0]["params"]["url"] = "https://evil.test"
+        with open(api_server.RULES_FILE, "w", encoding="utf-8") as file:
+            json.dump(tampered, file, ensure_ascii=False)
+        engine = FakeEngine()
+        api_env.runner.current_engine = engine
+
+        response = api_env.client.post(
+            "/api/rules/0/run", json={"rule": rule}, headers=api_env.headers
+        )
+
+        assert response.status_code == 409
+        assert engine.calls == []
 
     def test_put_rules_rejects_empty_nested_condition_group(self, api_env):
         rule = make_rule(
@@ -578,7 +877,37 @@ class TestRulesEndpoints:
     def _install_engine(self, api_env):
         engine = FakeEngine()
         api_env.runner.current_engine = engine
-        assert api_env.api._save_config({"rules": [bound_rule()]}) is True
+        assert api_env.api._save_rules([bound_rule()]) is True
+        return engine
+
+    def _install_partial_engine(self, api_env):
+        rule = {
+            "name": "局部运行规则",
+            "event": {"type": "hotkey", "params": {}, "binding_id": "t_hotkey001"},
+            "actions": [
+                {
+                    "type": "append_text",
+                    "binding_id": "a_first001",
+                    "params": {"file": "a.txt", "text": "hello"},
+                },
+                {
+                    "type": "open_url",
+                    "binding_id": "a_second001",
+                    "params": {
+                        "url": {
+                            "$ref": {
+                                "scope": "step",
+                                "node": "a_first001",
+                                "path": ["file"],
+                            }
+                        }
+                    },
+                },
+            ],
+        }
+        engine = FakeEngine()
+        api_env.runner.current_engine = engine
+        assert api_env.api._save_rules([rule]) is True
         return engine
 
     def test_manual_run_requires_trigger_payload_for_bound_rule(self, api_env):
@@ -598,14 +927,151 @@ class TestRulesEndpoints:
         )
         assert response.status_code == 200, response.text
         assert response.json()["ok"] is True
+        assert response.json()["run_id"] == "run_fake001"
         assert len(engine.calls) == 1
         assert engine.calls[0]["kwargs"]["trigger_payloads"] == {
             "t_usb001": {"drive_letter": "E:"}
         }
 
+    def test_cancel_run_forwards_to_active_engine(self, api_env):
+        engine = self._install_engine(api_env)
+
+        response = api_env.client.post(
+            "/api/runs/run_fake001/cancel", headers=api_env.headers
+        )
+
+        assert response.status_code == 200
+        assert response.json()["ok"] is True
+        assert engine.cancel_calls == ["run_fake001"]
+
+    def test_cancel_run_returns_not_found_after_completion(self, api_env):
+        engine = self._install_engine(api_env)
+        engine.cancel_result = False
+
+        response = api_env.client.post(
+            "/api/runs/run_finished/cancel", headers=api_env.headers
+        )
+
+        assert response.status_code == 404
+        assert response.json()["ok"] is False
+
+    def test_partial_run_requires_skipped_upstream_result(self, api_env):
+        engine = self._install_partial_engine(api_env)
+
+        response = api_env.client.post(
+            "/api/rules/0/run",
+            json={"start_step_id": "a_second001"},
+            headers=api_env.headers,
+        )
+
+        assert response.status_code == 400
+        assert response.json()["required_step_ids"] == ["a_first001"]
+        assert engine.calls == []
+
+    def test_partial_run_passes_range_upstream_results_and_assertions(self, api_env):
+        engine = self._install_partial_engine(api_env)
+        assertions = [
+            {
+                "step_id": "a_second001",
+                "path": ["opened"],
+                "operator": "gte",
+                "expected": 1,
+            }
+        ]
+
+        response = api_env.client.post(
+            "/api/rules/0/run",
+            json={
+                "start_step_id": "a_second001",
+                "step_outputs": {"a_first001": {"file": "https://example.com"}},
+                "test_assertions": assertions,
+            },
+            headers=api_env.headers,
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["action_count"] == 1
+        kwargs = engine.calls[0]["kwargs"]
+        assert kwargs["start_step_id"] == "a_second001"
+        assert kwargs["step_outputs"]["a_first001"]["file"] == "https://example.com"
+        assert kwargs["test_assertions"] == assertions
+
+    def test_partial_run_rejects_missing_referenced_upstream_field(self, api_env):
+        engine = self._install_partial_engine(api_env)
+
+        response = api_env.client.post(
+            "/api/rules/0/run",
+            json={
+                "start_step_id": "a_second001",
+                "step_outputs": {"a_first001": {"other": "value"}},
+            },
+            headers=api_env.headers,
+        )
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "invalid_test_payload"
+        assert "file" in response.json()["details"][0]
+        assert engine.calls == []
+
+    def test_partial_run_rejects_non_object_step_outputs(self, api_env):
+        engine = self._install_partial_engine(api_env)
+
+        response = api_env.client.post(
+            "/api/rules/0/run",
+            json={"start_step_id": "a_second001", "step_outputs": []},
+            headers=api_env.headers,
+        )
+
+        assert response.status_code == 400
+        assert "上游动作结果必须是 JSON 对象" in response.json()["error"]
+        assert engine.calls == []
+
+    def test_partial_run_rejects_reversed_range(self, api_env):
+        engine = self._install_partial_engine(api_env)
+
+        response = api_env.client.post(
+            "/api/rules/0/run",
+            json={"start_step_id": "a_second001", "end_step_id": "a_first001"},
+            headers=api_env.headers,
+        )
+
+        assert response.status_code == 400
+        assert "起始动作不能晚于结束动作" in response.json()["error"]
+        assert engine.calls == []
+
+    def test_manual_run_rejects_unknown_trigger_context(self, api_env):
+        engine = self._install_engine(api_env)
+
+        response = api_env.client.post(
+            "/api/rules/0/run",
+            json={
+                "trigger_payloads": {
+                    "t_usb001": {"drive_letter": "E:"},
+                    "t_unknown": {"secret": "value"},
+                }
+            },
+            headers=api_env.headers,
+        )
+
+        assert response.status_code == 400
+        assert response.json()["code"] == "invalid_test_payload"
+        assert engine.calls == []
+
+    def test_manual_run_rejects_oversized_test_context(self, api_env):
+        engine = self._install_engine(api_env)
+
+        response = api_env.client.post(
+            "/api/rules/0/run",
+            content=json.dumps({"event_payload": {"text": "x" * (1024 * 1024)}}),
+            headers={**api_env.headers, "Content-Type": "application/json"},
+        )
+
+        assert response.status_code == 413
+        assert engine.calls == []
+
     def test_manual_run_uses_verified_saved_snapshot(self, api_env):
         engine = self._install_engine(api_env)
-        saved = api_env.api._load_config()["rules"][0]
+        saved = api_env.api._load_rules()[0]
         response = api_env.client.post(
             "/api/rules/0/run",
             json={
@@ -620,7 +1086,7 @@ class TestRulesEndpoints:
 
     def test_manual_run_rejects_stale_snapshot(self, api_env):
         engine = self._install_engine(api_env)
-        stale = api_env.api._load_config()["rules"][0]
+        stale = api_env.api._load_rules()[0]
         stale = {**stale, "name": "被改过的规则"}
         response = api_env.client.post(
             "/api/rules/0/run", json={"rule": stale}, headers=api_env.headers
@@ -699,3 +1165,119 @@ class TestScanPlugins:
         write_plugin_dir(tmp_path, "actions", "demo", make_meta(), "action.json")
         found = api_server._scan_plugins(str(tmp_path), "actions", "action.json")
         assert set(found) == {"demo"}
+
+
+class FakeComponent:
+    """测试用组件，模拟“录制热键”式的一次调用采集"""
+
+    def invoke(self, session, method, payload):
+        if method == "capture":
+            session.set_status("已采集")
+            return {"ok": True, "data": {"hotkey": "Ctrl+Shift+M"}}
+        if method == "accumulate":
+            session.data.setdefault("items", []).append(payload)
+            return {"ok": True, "data": {"items": list(session.data["items"])}}
+        if method == "close":
+            return {"ok": True, "close": True, "data": {}}
+        return {"ok": False, "error": f"未知方法: {method}"}
+
+
+def make_component_engine(component):
+    return SimpleNamespace(
+        actions_meta={
+            "demo_action": {
+                "id": "demo_action",
+                "name": "演示动作",
+                "description": "测试录制组件",
+                "components": [{
+                    "id": "record",
+                    "name": "录制",
+                    "entrypoint": "component.py",
+                    "ui": {"button_label": "录制演示动作"},
+                }],
+            }
+        },
+        triggers_meta={},
+        component=lambda plugin_id, component_id: (
+            component if plugin_id == "demo_action" and component_id == "record" else None
+        ),
+    )
+
+
+class TestComponentEndpoints:
+    def test_list_requires_engine(self, api_env):
+        response = api_env.client.get("/api/plugins/components", headers=api_env.headers)
+        assert response.status_code == 200
+        assert response.json()["components"] == []
+
+    def test_list_and_invoke_flow(self, api_env):
+        api_env.runner.current_engine = make_component_engine(FakeComponent())
+        listed = api_env.client.get(
+            "/api/plugins/components", headers=api_env.headers
+        ).json()
+        assert listed["components"][0]["plugin_id"] == "demo_action"
+        assert listed["components"][0]["id"] == "record"
+        assert listed["components"][0]["available"] is True
+        assert listed["components"][0]["ui"]["button_label"] == "录制演示动作"
+
+        captured = api_env.client.post(
+            "/api/plugins/demo_action/components/record/invoke",
+            json={"method": "capture"},
+            headers=api_env.headers,
+        )
+        assert captured.status_code == 200
+        body = captured.json()
+        assert body["data"]["data"]["hotkey"] == "Ctrl+Shift+M"
+        assert body["status"] == "已采集"
+        session_id = body["session_id"]
+
+        accumulated = api_env.client.post(
+            "/api/plugins/demo_action/components/record/invoke",
+            json={"method": "accumulate", "payload": {"step": 1}, "session_id": session_id},
+            headers=api_env.headers,
+        )
+        assert accumulated.status_code == 200
+        assert accumulated.json()["data"]["data"]["items"] == [{"step": 1}]
+
+        closed = api_env.client.post(
+            "/api/plugins/demo_action/components/record/invoke",
+            json={"method": "close", "session_id": session_id},
+            headers=api_env.headers,
+        )
+        assert closed.status_code == 200
+        assert api_env.api._component_sessions.get(session_id) is None
+
+    def test_unknown_action_or_session_rejected(self, api_env):
+        api_env.runner.current_engine = make_component_engine(FakeComponent())
+        response = api_env.client.post(
+            "/api/plugins/missing/components/record/invoke",
+            json={"method": "capture"},
+            headers=api_env.headers,
+        )
+        assert response.status_code == 404
+
+        response = api_env.client.post(
+            "/api/plugins/demo_action/components/record/invoke",
+            json={"method": "capture", "session_id": "not-a-session"},
+            headers=api_env.headers,
+        )
+        assert response.status_code == 404
+
+    def test_component_endpoints_require_auth(self, api_env):
+        api_env.runner.current_engine = make_component_engine(FakeComponent())
+        response = api_env.client.get("/api/plugins/components")
+        assert response.status_code == 403
+        response = api_env.client.post(
+            "/api/plugins/demo_action/components/record/invoke"
+        )
+        assert response.status_code == 403
+
+    def test_component_failure_returns_400(self, api_env):
+        api_env.runner.current_engine = make_component_engine(FakeComponent())
+        response = api_env.client.post(
+            "/api/plugins/demo_action/components/record/invoke",
+            json={"method": "nope"},
+            headers=api_env.headers,
+        )
+        assert response.status_code == 400
+        assert "未知方法" in response.json()["error"]

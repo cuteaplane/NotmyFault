@@ -3,10 +3,11 @@ import sys
 import threading
 from typing import Any, Callable, Dict, Optional
 
-from notmyfault.config import get_config
+from notmyfault.config import get_config, get_rules, save_config
 from notmyfault.core.engine import AutomationEngine
 from notmyfault.platform.platform_support import get_config_dir
 import glob
+import json
 import subprocess as _sp
 
 
@@ -102,11 +103,96 @@ def _get_plugin_paths():
     return paths
 
 
+def migrate_user_plugin_enabled_state(
+    config: Dict[str, Any], user_dir: Optional[str] = None
+) -> list[str]:
+    """旧版开关插件会直接改用户插件的签名 json，这里把 json 里的 enabled: false 搬进 config 的 disabled_plugins，并把 json 改回 true，返回迁移的插件 id 列表。"""
+    if user_dir is None:
+        user_dir = os.path.join(get_config_dir(), "plugins")
+    if not os.path.isdir(user_dir):
+        return []
+
+    disabled = config.get("disabled_plugins", {})
+    if not isinstance(disabled, dict):
+        disabled = {"triggers": [], "actions": []}
+        config["disabled_plugins"] = disabled
+
+    migrated: list[str] = []
+    pending_rewrites: list[tuple[str, Dict[str, Any]]] = []
+    for ptype, json_name in (("triggers", "trigger.json"), ("actions", "action.json")):
+        ptype_root = os.path.join(user_dir, ptype)
+        if not os.path.isdir(ptype_root):
+            continue
+        disabled_list = disabled.get(ptype, [])
+        if not isinstance(disabled_list, list):
+            disabled_list = []
+            disabled[ptype] = disabled_list
+        for folder_name in sorted(os.listdir(ptype_root)):
+            json_path = os.path.join(ptype_root, folder_name, json_name)
+            if not os.path.isfile(json_path):
+                continue
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+            if not isinstance(meta, dict) or meta.get("enabled") is not False:
+                continue
+            pid = meta.get("id") or folder_name
+            if pid not in disabled_list:
+                disabled_list.append(pid)
+            meta["enabled"] = True
+            pending_rewrites.append((json_path, meta))
+            migrated.append(pid)
+
+    if not migrated:
+        return []
+
+    # config 先落盘再改 json，保存失败时插件保持 json 里的禁用状态。
+    if not save_config(config):
+        print("[Plugins] 迁移开关状态后保存 config 失败，json 保持不动", file=sys.stderr)
+        return []
+
+    from notmyfault.security.plugins import (
+        compute_file_hash,
+        load_plugin_manifest,
+        save_plugin_manifest,
+    )
+
+    manifest = load_plugin_manifest()
+    manifest_changed = False
+    for json_path, meta in pending_rewrites:
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            print(f"[Plugins] 迁移 {meta.get('id')} 失败，写回 json 出错: {e}", file=sys.stderr)
+            continue
+        # 改过的 json 重新记一次哈希基线，不然完整性校验会一直报文件被修改。
+        pid = meta.get("id")
+        json_name = os.path.basename(json_path)
+        new_hash = compute_file_hash(json_path)
+        if pid and new_hash is not None:
+            manifest.setdefault(pid, {})[json_name] = new_hash
+            manifest_changed = True
+    if manifest_changed:
+        save_plugin_manifest(manifest)
+
+    print(
+        f"[Plugins] 已把 {len(migrated)} 个用户插件的开关状态迁到 config: "
+        f"{', '.join(migrated)}；这些插件的签名已失效，重新安装插件包可恢复"
+    )
+    return migrated
+
+
 def create_engine(
     on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> AutomationEngine:
     _ensure_first_run_build()
     config = get_config()
+    migrate_user_plugin_enabled_state(config)
+    # 规则拆到 rules.json 后单独加载，引擎仍收带 rules 的合并 dict
+    config["rules"] = get_rules()
     engine = AutomationEngine(config, on_event=on_event)
     engine.auto_load(_get_plugin_paths())
     return engine

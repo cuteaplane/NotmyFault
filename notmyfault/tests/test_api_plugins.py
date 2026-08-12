@@ -60,7 +60,7 @@ def make_meta(ptype, **overrides):
     return meta
 
 
-def build_nmfp(tmp_path, meta, ptype, tag="pkg"):
+def build_nmfp(tmp_path, meta, ptype, tag="pkg", sign=False):
     """把插件目录打包成 nmfp，归档内恰好一个插件文件夹"""
     json_name = "trigger.json" if ptype == "triggers" else "action.json"
     source = tmp_path / f"src_{tag}" / f"plugin_{tag}"
@@ -71,11 +71,15 @@ def build_nmfp(tmp_path, meta, ptype, tag="pkg"):
     (source / "main.py").write_text(
         "def run(event, params):\n    return True\n", encoding="utf-8"
     )
+    if sign:
+        from notmyfault.security.signing import self_sign_plugin
+        self_sign_plugin(source, Ed25519PrivateKey.generate())
     archive = tmp_path / f"plugin_{tag}.nmfp"
     folder = f"plugin_{tag}"
     with py7zr.SevenZipFile(str(archive), "w") as zf:
-        zf.write(source / json_name, f"{folder}/{json_name}")
-        zf.write(source / "main.py", f"{folder}/main.py")
+        for path in sorted(source.rglob("*")):
+            if path.is_file():
+                zf.write(path, f"{folder}/{path.relative_to(source).as_posix()}")
     return archive
 
 
@@ -142,7 +146,20 @@ class TestPluginInstall:
         assert install_file(api_env.client, api_env.headers, archive).json()["ok"]
         dest = api_env.user_dir / "triggers" / meta["id"]
         assert (dest / "trigger.json").exists()
+        # 引擎不再代签，归档没带签名的插件按未签名安装
+        assert not (dest / "signature.sig").exists()
+
+    def test_install_keeps_author_signature(self, api_env):
+        write_test_key(api_env.tmp_path / "private")
+        meta = make_meta("triggers")
+        archive = build_nmfp(
+            api_env.tmp_path, meta, "triggers", tag="selfsigned", sign=True
+        )
+        assert install_file(api_env.client, api_env.headers, archive).json()["ok"]
+        dest = api_env.user_dir / "triggers" / meta["id"]
+        # 作者随包携带的签名和公钥原样保留，引擎不重签
         assert (dest / "signature.sig").exists()
+        assert (dest / "public_key.pem").exists()
 
     def test_install_action_success(self, api_env):
         write_test_key(api_env.tmp_path / "private")
@@ -280,6 +297,84 @@ class TestPluginList:
         assert "usb_insert" in body["triggers"]
         assert body["triggers"]["usb_insert"]["origin"] == "builtin"
         assert "open_url" in body["actions"]
+
+
+class TestPluginToggle:
+    def place_user_plugin(self, api_env, ptype="actions", pid="myplug", enabled=True):
+        json_name = "action.json" if ptype == "actions" else "trigger.json"
+        plugin_dir = api_env.user_dir / ptype / pid
+        plugin_dir.mkdir(parents=True)
+        content = json.dumps(
+            make_meta(ptype, id=pid, enabled=enabled), ensure_ascii=False
+        )
+        (plugin_dir / json_name).write_text(content, encoding="utf-8")
+        return plugin_dir, json_name, content
+
+    def toggle(self, api_env, ptype, pid):
+        return api_env.client.post(
+            "/api/plugins/toggle",
+            headers=api_env.headers,
+            json={"type": ptype, "id": pid},
+        )
+
+    def read_saved_config(self, api_env):
+        with open(config_mod.CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_toggle_user_plugin_keeps_json_untouched(self, api_env):
+        plugin_dir, json_name, original = self.place_user_plugin(api_env)
+        body = self.toggle(api_env, "actions", "myplug").json()
+        assert body["ok"] is True
+        assert body["enabled"] is False
+        assert body["origin"] == "user"
+        # 带签名的 json 一个字节都不该动，禁用状态进 config
+        assert (plugin_dir / json_name).read_text(encoding="utf-8") == original
+        saved = self.read_saved_config(api_env)
+        assert saved["disabled_plugins"]["actions"] == ["myplug"]
+
+    def test_toggle_rejects_tampered_config(self, api_env):
+        self.place_user_plugin(api_env)
+        assert api_env.api._save_config({"custom_flag": "keep"}) is True
+        tampered = self.read_saved_config(api_env)
+        tampered["custom_flag"] = "changed outside NotmyFault"
+        with open(config_mod.CONFIG_FILE, "w", encoding="utf-8") as file:
+            json.dump(tampered, file, ensure_ascii=False)
+
+        response = self.toggle(api_env, "actions", "myplug")
+
+        assert response.json()["ok"] is False
+        assert "完整性校验" in response.json()["error"]
+        assert self.read_saved_config(api_env)["custom_flag"] == "changed outside NotmyFault"
+
+    def test_toggle_user_plugin_twice_restores_enabled(self, api_env):
+        plugin_dir, json_name, original = self.place_user_plugin(api_env)
+        assert self.toggle(api_env, "actions", "myplug").json()["enabled"] is False
+        body = self.toggle(api_env, "actions", "myplug").json()
+        assert body["ok"] is True
+        assert body["enabled"] is True
+        assert (plugin_dir / json_name).read_text(encoding="utf-8") == original
+        saved = self.read_saved_config(api_env)
+        assert saved["disabled_plugins"]["actions"] == []
+
+    def test_toggle_builtin_plugin_writes_config(self, api_env):
+        body = self.toggle(api_env, "actions", "open_url").json()
+        assert body["ok"] is True
+        assert body["enabled"] is False
+        assert body["origin"] == "builtin"
+        saved = self.read_saved_config(api_env)
+        assert saved["disabled_plugins"]["actions"] == ["open_url"]
+
+    def test_toggle_missing_plugin_rejected(self, api_env):
+        body = self.toggle(api_env, "actions", "no_such_plugin").json()
+        assert body["ok"] is False
+
+    def test_list_marks_config_disabled_user_plugin(self, api_env):
+        self.place_user_plugin(api_env)
+        self.toggle(api_env, "actions", "myplug")
+        body = api_env.client.get(
+            "/api/plugins/list", headers=api_env.headers
+        ).json()
+        assert body["actions"]["myplug"]["enabled"] is False
 
 
 class TestPluginUninstall:
