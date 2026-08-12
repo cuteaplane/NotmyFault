@@ -467,6 +467,7 @@ class TestAuthorSelfSigning:
         assert plugin_signature_kind(str(official_folder), "builtin") == "official"
         # 公钥表验签通过但类型单独区分，不会和作者自签混淆
         assert plugin_signature_kind(str(official_folder), "user") == "official-legacy"
+        assert plugin_signature_kind(str(official_folder), "third_party") == "none"
 
         # 作者自签不在官方公钥表里，不能冒充官方签名
         author_folder = write_plugin(

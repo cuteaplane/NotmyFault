@@ -396,6 +396,9 @@ def plugin_signature_kind(plugin_dir: str, origin: str = "builtin") -> str:
             return "none"
         return "author" if _verify_sig_with_keys(plugin_dir, [pub]) else "none"
 
+    if origin == "third_party":
+        return "none"
+
     # 旧安装流程用本地密钥代签的用户插件目录里没有 public_key.pem，退回官方和用户公钥表验签。
     try:
         from notmyfault.security.signing_keys import get_public_keys
