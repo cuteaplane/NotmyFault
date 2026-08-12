@@ -150,6 +150,29 @@ class TestScanPluginSecurity:
         risks = self._scan(tmp_path, "import ctypes\nctypes.windll.user32.GetForegroundWindow()\n")
         assert any(r["id"] == "native_call" and r["level"] == PERM_RISK_MEDIUM for r in risks)
 
+    def test_detect_dynamic_import(self, tmp_path):
+        risks = self._scan(tmp_path, "import importlib\nimportlib.import_module(name)\n")
+        assert any(r["id"] == "dynamic_import" for r in risks)
+
+    def test_detect_registry_access(self, tmp_path):
+        risks = self._scan(tmp_path, "import winreg\nwinreg.OpenKey(root, name)\n")
+        assert any(r["id"] == "registry_access" for r in risks)
+
+    def test_resolves_import_aliases(self, tmp_path):
+        risks = self._scan(
+            tmp_path,
+            "import subprocess as process\nprocess.run(['tool'])\n",
+        )
+        assert any(r["id"] == "subprocess" for r in risks)
+
+    def test_comments_and_strings_do_not_create_risks(self, tmp_path):
+        risks = self._scan(
+            tmp_path,
+            "# subprocess.run(['tool'])\n"
+            "message = \"eval(user_input) requests.get(url)\"\n",
+        )
+        assert risks == []
+
     def test_nonexistent_directory_returns_empty(self):
         assert scan_plugin_security("/path/does/not/exist") == []
 

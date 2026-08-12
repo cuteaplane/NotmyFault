@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import re
@@ -140,16 +141,59 @@ def is_known_permission(perm: str) -> bool:
     return perm in PERMISSION_REGISTRY
 
 
-# 每项依次保存风险 id、标签、等级和搜索词。
-_RISK_PATTERNS: List[Tuple[str, str, str, List[str]]] = [
-    ("code_injection", "代码注入", PERM_RISK_HIGH, ["eval(", "exec(", "compile(", "__import__"]),
-    ("subprocess", "子进程", PERM_RISK_HIGH, ["subprocess.", "os.system", "os.popen"]),
-    ("dynamic_import", "动态导入", PERM_RISK_MEDIUM, ["importlib.", "__import__"]),
-    ("file_write", "文件写入", PERM_RISK_MEDIUM, ["open(", "shutil.copy", "shutil.move"]),
-    ("network_request", "网络请求", PERM_RISK_MEDIUM, ["requests.", "urllib.", "socket."]),
-    ("registry_access", "注册表访问", PERM_RISK_HIGH, ["winreg.", "_winreg."]),
-    ("native_call", "原生调用", PERM_RISK_MEDIUM, ["ctypes.", "ctypes.windll"]),
-]
+_RISK_INFO = {
+    "code_injection": ("代码注入", PERM_RISK_HIGH),
+    "subprocess": ("子进程", PERM_RISK_HIGH),
+    "dynamic_import": ("动态导入", PERM_RISK_MEDIUM),
+    "file_write": ("文件写入", PERM_RISK_MEDIUM),
+    "network_request": ("网络请求", PERM_RISK_MEDIUM),
+    "registry_access": ("注册表访问", PERM_RISK_HIGH),
+    "native_call": ("原生调用", PERM_RISK_MEDIUM),
+}
+
+
+def _resolved_name(
+    node: ast.AST,
+    module_aliases: Dict[str, str],
+    imported_symbols: Dict[str, str],
+) -> str | None:
+    if isinstance(node, ast.Name):
+        return imported_symbols.get(node.id, module_aliases.get(node.id, node.id))
+    if isinstance(node, ast.Attribute):
+        owner = _resolved_name(node.value, module_aliases, imported_symbols)
+        if owner:
+            return owner + "." + node.attr
+    return None
+
+
+def _risk_ids_for_name(name: str, is_call: bool) -> List[str]:
+    risk_ids: List[str] = []
+    if is_call and name in {
+        "eval", "exec", "compile", "__import__",
+        "builtins.eval", "builtins.exec", "builtins.compile", "builtins.__import__",
+    }:
+        risk_ids.append("code_injection")
+    if name in {"__import__", "builtins.__import__"}:
+        if "code_injection" not in risk_ids:
+            risk_ids.append("code_injection")
+        risk_ids.append("dynamic_import")
+    if name.startswith("subprocess.") or name in {"os.system", "os.popen"}:
+        risk_ids.append("subprocess")
+    if name.startswith("importlib."):
+        risk_ids.append("dynamic_import")
+    if is_call and (
+        name in {"open", "builtins.open"}
+        or name.startswith("shutil.copy")
+        or name == "shutil.move"
+    ):
+        risk_ids.append("file_write")
+    if name.startswith(("requests.", "urllib.", "socket.")):
+        risk_ids.append("network_request")
+    if name.startswith(("winreg.", "_winreg.")):
+        risk_ids.append("registry_access")
+    if name.startswith("ctypes."):
+        risk_ids.append("native_call")
+    return risk_ids
 
 
 def scan_plugin_security(plugin_dir: str) -> List[Dict[str, Any]]:
@@ -168,18 +212,56 @@ def scan_plugin_security(plugin_dir: str) -> List[Dict[str, Any]]:
                 source = f.read()
         except OSError:
             continue
+        try:
+            tree = ast.parse(source, filename=fpath)
+        except SyntaxError:
+            continue
 
-        for pattern_id, label, level, terms in _RISK_PATTERNS:
-            for term in terms:
-                if term in source:
-                    risks.append({
-                        "id": pattern_id,
-                        "label": label,
-                        "level": level,
-                        "detail": f"文件 \"{fname}\" 中发现 \"{term}\"",
-                        "file": fname,
-                    })
-                    break
+        module_aliases: Dict[str, str] = {}
+        imported_symbols: Dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    local_name = alias.asname or alias.name.split(".")[0]
+                    module_aliases[local_name] = (
+                        alias.name if alias.asname else alias.name.split(".")[0]
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                module_name = node.module or ""
+                for alias in node.names:
+                    imported_symbols[alias.asname or alias.name] = (
+                        module_name + "." + alias.name
+                    ).strip(".")
+
+        findings: Dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                name = _resolved_name(node.func, module_aliases, imported_symbols)
+                is_call = True
+            elif isinstance(node, ast.Attribute):
+                name = _resolved_name(node, module_aliases, imported_symbols)
+                is_call = False
+            elif isinstance(node, ast.Name) and node.id == "__import__":
+                name = _resolved_name(node, module_aliases, imported_symbols)
+                is_call = False
+            else:
+                continue
+            if not name:
+                continue
+            for risk_id in _risk_ids_for_name(name, is_call):
+                findings.setdefault(risk_id, name)
+
+        for risk_id, (label, level) in _RISK_INFO.items():
+            evidence = findings.get(risk_id)
+            if evidence is None:
+                continue
+            risks.append({
+                "id": risk_id,
+                "label": label,
+                "level": level,
+                "detail": f"文件 \"{fname}\" 中发现 \"{evidence}\"",
+                "file": fname,
+            })
     return risks
 
 
