@@ -63,9 +63,10 @@ class RulesHotReloader:
             print(f"[Engine] 热加载失败，已恢复 {restored} 个旧触发器", file=sys.stderr)
             self._rules_mtime = new_mtime
             return True
-        except Exception:
-            print("[Engine] 恢复旧规则失败:", file=sys.stderr)
+        except Exception as error:
+            print(f"[Engine] 恢复旧规则失败: {error}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
+            engine_error("hot_reload_restore_error", error=str(error))
             return False
 
     def check_once(self) -> None:
@@ -75,7 +76,7 @@ class RulesHotReloader:
 
         try:
             new_mtime = self.current_mtime()
-            if new_mtime > self._rules_mtime:
+            if new_mtime != self._rules_mtime:
                 # 文件写入中被读取时可能出现临时 JSON 错误，下一轮继续尝试
                 new_rules = self._load_rules_fn()
 
@@ -105,8 +106,9 @@ class RulesHotReloader:
                 self._recheck_admin_fn()
                 self._rules_mtime = new_mtime
         except ConfigValidationError as e:
+            restored = True
             if previous_rules is not None:
-                self._restore_previous_rules(previous_rules, new_mtime)
+                restored = self._restore_previous_rules(previous_rules, new_mtime)
             self._diagnostics.inc_hot_reload_error()
             engine_error("hot_reload_error", error=str(e))
             print(
@@ -118,6 +120,11 @@ class RulesHotReloader:
                 self._alert_cb(
                     "规则校验失败",
                     "rules.json 未通过格式、签名或安全校验，热加载失败；请修改后重新保存",
+                )
+            if not restored:
+                self._alert_cb(
+                    "规则恢复失败",
+                    "热加载失败且原有规则恢复失败，请重启引擎",
                 )
             # 校验失败后记录当前修改时间，等文件再次保存再重试
             self._rules_mtime = new_mtime
@@ -134,9 +141,12 @@ class RulesHotReloader:
             traceback.print_exc(file=sys.stderr)
             if previous_rules is None:
                 return
-            self._restore_previous_rules(previous_rules, new_mtime)
+            restored = self._restore_previous_rules(previous_rules, new_mtime)
             self._diagnostics.inc_hot_reload_error()
             engine_error("hot_reload_error", error=str(error))
-            if not self._error_reported:
+            if not restored:
+                self._alert_cb("规则恢复失败", "热加载失败且原有规则恢复失败，请重启引擎")
+            elif not self._error_reported:
                 self._alert_cb("热加载失败", "新规则未能启动，已尝试恢复原有规则")
+            if not self._error_reported:
                 self._error_reported = True

@@ -148,6 +148,73 @@ class TestEngineEventPipeline:
 
 
 class TestHotReloadIntegration:
+    def test_hot_reload_detects_timestamp_moving_backwards(self, monkeypatch):
+        active_rules = [{"name": "旧规则"}]
+        new_rules = [{"name": "新规则"}]
+        alerts = []
+
+        def apply_rules(rules):
+            previous = list(active_rules)
+            active_rules[:] = rules
+            return previous
+
+        reloader = RulesHotReloader(
+            rules_path_fn=lambda: "rules.json",
+            load_rules_fn=lambda: new_rules,
+            stop_triggers_fn=lambda timeout: True,
+            apply_rules_fn=apply_rules,
+            cancel_deferred_fn=lambda: None,
+            validate_rules_fn=lambda: None,
+            start_triggers_fn=lambda rules: 1,
+            recheck_admin_fn=lambda: None,
+            diagnostics=Diagnostics(),
+            alert_cb=lambda title, message: alerts.append((title, message)),
+        )
+        reloader._rules_mtime = 2.0
+        monkeypatch.setattr(reloader, "current_mtime", lambda: 1.0)
+
+        reloader.check_once()
+
+        assert active_rules == new_rules
+        assert reloader._rules_mtime == 1.0
+        assert alerts == []
+
+    def test_hot_reload_reports_restore_failure(self, monkeypatch):
+        old_rules = [{"name": "旧规则"}]
+        new_rules = [{"name": "新规则"}]
+        active_rules = list(old_rules)
+        alerts = []
+
+        def apply_rules(rules):
+            previous = list(active_rules)
+            active_rules[:] = rules
+            return previous
+
+        def start_triggers(_rules):
+            raise RuntimeError("触发器启动失败")
+
+        reloader = RulesHotReloader(
+            rules_path_fn=lambda: "rules.json",
+            load_rules_fn=lambda: new_rules,
+            stop_triggers_fn=lambda timeout: True,
+            apply_rules_fn=apply_rules,
+            cancel_deferred_fn=lambda: None,
+            validate_rules_fn=lambda: None,
+            start_triggers_fn=start_triggers,
+            recheck_admin_fn=lambda: None,
+            diagnostics=Diagnostics(),
+            alert_cb=lambda title, message: alerts.append((title, message)),
+        )
+        reloader._rules_mtime = 1.0
+        monkeypatch.setattr(reloader, "current_mtime", lambda: 2.0)
+
+        reloader.check_once()
+
+        assert active_rules == old_rules
+        assert alerts == [
+            ("规则恢复失败", "热加载失败且原有规则恢复失败，请重启引擎")
+        ]
+
     def test_hot_reload_picks_up_changes(self, tmp_path, monkeypatch, isolated_config):
         from notmyfault.core import engine as engine_mod
         from notmyfault.platform import platform_support
