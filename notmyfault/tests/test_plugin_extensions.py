@@ -710,11 +710,34 @@ def install_file(client, headers, archive):
         )
 
 
+def preview_file(client, headers, archive):
+    with open(archive, "rb") as file:
+        return client.post(
+            "/api/plugins/preview",
+            headers=headers,
+            files={"file": (archive.name, file, "application/octet-stream")},
+        )
+
+
 def python_step(code):
     return f'"{sys.executable}" -c "{code}"'
 
 
 class TestInstallBuildHook:
+    def test_direct_install_with_build_hook_requires_preview(self, api_env):
+        meta = make_meta("actions", build={
+            "command": [python_step("pass")],
+        })
+        archive = build_nmfp_with_files(
+            api_env.tmp_path, meta, "actions", "direct_build"
+        )
+
+        response = install_file(api_env.client, api_env.headers, archive)
+
+        assert response.status_code == 400
+        assert "请先预览后安装" in response.json()["error"]
+        assert any(risk["id"] == "build_hook" for risk in response.json()["risks"])
+
     def test_preview_reports_build_without_running_it(self, api_env):
         marker = api_env.tmp_path / "preview-build-ran.txt"
         meta = make_meta("actions", build={
@@ -752,7 +775,13 @@ class TestInstallBuildHook:
             "outputs": ["built.bin"],
         })
         archive = build_nmfp_with_files(api_env.tmp_path, meta, "actions", "built")
-        response = install_file(api_env.client, api_env.headers, archive)
+        preview = preview_file(api_env.client, api_env.headers, archive)
+        assert preview.status_code == 200, preview.text
+        response = api_env.client.post(
+            "/api/plugins/install",
+            headers=api_env.headers,
+            data={"preview_token": preview.json()["preview_token"]},
+        )
         assert response.status_code == 200, response.text
         assert response.json()["ok"] is True
         dest = api_env.user_dir / "actions" / meta["id"]
@@ -763,7 +792,13 @@ class TestInstallBuildHook:
             "command": [python_step("raise SystemExit(3)")],
         })
         archive = build_nmfp_with_files(api_env.tmp_path, meta, "actions", "boom")
-        response = install_file(api_env.client, api_env.headers, archive)
+        preview = preview_file(api_env.client, api_env.headers, archive)
+        assert preview.status_code == 200, preview.text
+        response = api_env.client.post(
+            "/api/plugins/install",
+            headers=api_env.headers,
+            data={"preview_token": preview.json()["preview_token"]},
+        )
         assert response.status_code == 400
         assert "build 命令失败" in response.json()["error"]
 
@@ -773,7 +808,13 @@ class TestInstallBuildHook:
             "outputs": ["nothere.bin"],
         })
         archive = build_nmfp_with_files(api_env.tmp_path, meta, "actions", "miss")
-        response = install_file(api_env.client, api_env.headers, archive)
+        preview = preview_file(api_env.client, api_env.headers, archive)
+        assert preview.status_code == 200, preview.text
+        response = api_env.client.post(
+            "/api/plugins/install",
+            headers=api_env.headers,
+            data={"preview_token": preview.json()["preview_token"]},
+        )
         assert response.status_code == 400
         assert "build 产物不存在" in response.json()["error"]
 
@@ -785,7 +826,13 @@ class TestInstallBuildHook:
         archive = build_nmfp_with_files(
             api_env.tmp_path, meta, "actions", "stripped", sign=True
         )
-        response = install_file(api_env.client, api_env.headers, archive)
+        preview = preview_file(api_env.client, api_env.headers, archive)
+        assert preview.status_code == 200, preview.text
+        response = api_env.client.post(
+            "/api/plugins/install",
+            headers=api_env.headers,
+            data={"preview_token": preview.json()["preview_token"]},
+        )
         assert response.status_code == 200, response.text
         dest = api_env.user_dir / "actions" / meta["id"]
         # 编译产物不继承归档签名，按未签名插件处理

@@ -1390,6 +1390,36 @@ class EngineAPI:
         async def plugins_list():
             return self._list_all_plugins()
 
+        def _scan_plugin_install_risks(root_path, json_name, meta):
+            risks = scan_plugin_security(root_path)
+            build = meta.get("build") if isinstance(meta, dict) else None
+            if isinstance(build, dict) and (
+                build.get("command") or build.get("outputs")
+            ):
+                risks.append({
+                    "id": "build_hook",
+                    "label": "安装时执行构建命令",
+                    "level": "high",
+                    "detail": "点击安装后会以当前用户身份执行插件包声明的 build 命令。",
+                    "file": json_name,
+                })
+
+            borrowed_findings = []
+            for py_file in sorted(Path(root_path).rglob("*.py")):
+                if not py_file.is_file():
+                    continue
+                borrowed_findings.extend(scan_borrowed_privilege(str(py_file)))
+            if borrowed_findings:
+                risks.append({
+                    "id": "borrowed_privilege",
+                    "label": "借壳提权嫌疑",
+                    "level": "high",
+                    "detail": "插件代码可能借其他已授权插件的身份请求管理员权限: "
+                    + "；".join(sorted(set(borrowed_findings))[:3]),
+                    "file": "*.py",
+                })
+            return risks
+
         @app.post("/api/plugins/toggle")
         async def plugin_toggle(request: Request):
             await self._verify_auth(request)
@@ -1472,36 +1502,7 @@ class EngineAPI:
                 schema_valid = ok
                 schema_errors = errors[:5] if errors else []
 
-                risks = scan_plugin_security(root_path)
-                build = meta.get("build") if isinstance(meta, dict) else None
-                if isinstance(build, dict) and (
-                    build.get("command") or build.get("outputs")
-                ):
-                    risks.append({
-                        "id": "build_hook",
-                        "label": "安装时执行构建命令",
-                        "level": "high",
-                        "detail": "点击安装后会以当前用户身份执行插件包声明的 build 命令。",
-                        "file": json_name,
-                    })
-
-                # 扫描导入或调用其他插件模块的代码。
-                borrowed_findings = []
-                for py_file in sorted(Path(root_path).rglob("*.py")):
-                    if not py_file.is_file():
-                        continue
-                    borrowed_findings.extend(
-                        scan_borrowed_privilege(str(py_file))
-                    )
-                if borrowed_findings:
-                    risks.append({
-                        "id": "borrowed_privilege",
-                        "label": "借壳提权嫌疑",
-                        "level": "high",
-                        "detail": "插件代码可能借其他已授权插件的身份请求管理员权限: "
-                        + "；".join(sorted(set(borrowed_findings))[:3]),
-                        "file": "*.py",
-                    })
+                risks = _scan_plugin_install_risks(root_path, json_name, meta)
 
                 perms = meta.get("permissions", [])
                 perm_analysis = []
@@ -1653,6 +1654,16 @@ class EngineAPI:
                     ok, errors = validate_plugin_meta(meta, plugin_type)
                     if not ok:
                         return JSONResponse({"ok": False, "error": "schema 校验失败: " + "; ".join(errors[:3])}, status_code=400)
+                    risks = _scan_plugin_install_risks(root_path, json_name, meta)
+                    if risks:
+                        return JSONResponse(
+                            {
+                                "ok": False,
+                                "error": "插件存在安全风险，请先预览后安装",
+                                "risks": risks,
+                            },
+                            status_code=400,
+                        )
 
                 except ValueError as ve:
                     # 解压检查失败时删除临时文件和目录。
