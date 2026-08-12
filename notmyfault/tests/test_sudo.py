@@ -67,8 +67,9 @@ class TestRunAsAdmin:
             "powershell",
             "-NoProfile",
             "-Command",
-            "Start-Process -FilePath 'cmd.exe'"
-            " -ArgumentList '/c', 'dir' -Verb RunAs -Wait",
+            "$process = Start-Process -FilePath 'cmd.exe'"
+            " -ArgumentList '/c', 'dir' -Verb RunAs -Wait -PassThru; "
+            "exit $process.ExitCode",
         ]
 
     def test_ps_quote_simple(self, authorized_plugin):
@@ -82,12 +83,20 @@ class TestRunAsAdmin:
         # PowerShell 单引号内的单引号必须双写转义
         assert "'it''s a test'" in captured["cmd"][3]
 
+    def test_ps_quote_empty_argument(self, authorized_plugin):
+        module, captured = authorized_plugin
+        call_from(module, sudo.run_as_admin, ["tool.exe", ""])
+        assert "-ArgumentList ''" in captured["cmd"][3]
+
     def test_single_executable_no_args(self, authorized_plugin):
         module, captured = authorized_plugin
         call_from(module, sudo.run_as_admin, ["notepad.exe"])
         script = captured["cmd"][3]
         assert "-ArgumentList" not in script
-        assert script == "Start-Process -FilePath 'notepad.exe' -Verb RunAs -Wait"
+        assert script == (
+            "$process = Start-Process -FilePath 'notepad.exe'"
+            " -Verb RunAs -Wait -PassThru; exit $process.ExitCode"
+        )
 
     def test_wait_false(self, authorized_plugin, monkeypatch):
         module, captured = authorized_plugin
@@ -102,6 +111,8 @@ class TestRunAsAdmin:
         assert len(popened) == 1
         cmd, kwargs = popened[0]
         assert "-Wait" not in cmd[3]
+        assert "-PassThru" not in cmd[3]
+        assert "$process" not in cmd[3]
         assert kwargs["stdin"] is subprocess.DEVNULL
 
     def test_returns_completed_process(self, authorized_plugin):

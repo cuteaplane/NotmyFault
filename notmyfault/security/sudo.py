@@ -480,12 +480,18 @@ def _run_with_uac(
 
         executable = _ps_quote(command[0])
         arguments = ", ".join(_ps_quote(argument) for argument in command[1:])
-        ps_script = (
+        start_process = (
             f"Start-Process -FilePath {executable}"
             + (f" -ArgumentList {arguments}" if arguments else "")
             + " -Verb RunAs"
-            + (" -Wait" if wait else "")
         )
+        if wait:
+            ps_script = (
+                f"$process = {start_process} -Wait -PassThru; "
+                "exit $process.ExitCode"
+            )
+        else:
+            ps_script = start_process
         elevated_command = ["powershell", "-NoProfile", "-Command", ps_script]
     else:
         pkexec = shutil.which("pkexec")
