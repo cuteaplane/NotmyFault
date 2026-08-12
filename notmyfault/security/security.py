@@ -69,7 +69,6 @@ def detect_security_mode() -> SecurityMode:
         paths.append(os.path.join(sys._MEIPASS, "build.json"))
     paths += [
         str(_PROJECT_ROOT / "build.json"),
-        os.path.join(os.getcwd(), "build.json"),
     ]
     for _bp in paths:
         try:
