@@ -8,8 +8,12 @@ class _LASTINPUTINFO(ctypes.Structure):
 
 
 if os.name == "nt":
-    # GetTickCount 默认按 c_int 返回，运行 25 天后变负数，用 64 位版本
-    ctypes.windll.kernel32.GetTickCount64.restype = ctypes.c_ulonglong
+    # dwTime 是 32 位 tick，差值按 DWORD 回绕
+    ctypes.windll.kernel32.GetTickCount.restype = ctypes.c_uint
+
+
+def _tick_delta_seconds(tick: int, last_input: int) -> float:
+    return ((tick - last_input) & 0xFFFFFFFF) / 1000.0
 
 
 def _get_idle_seconds() -> float:
@@ -21,8 +25,8 @@ def _get_idle_seconds() -> float:
     lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)
     if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
         return 0.0
-    tick = ctypes.windll.kernel32.GetTickCount64()
-    return (tick - lii.dwTime) / 1000.0
+    tick = ctypes.windll.kernel32.GetTickCount()
+    return _tick_delta_seconds(tick, lii.dwTime)
 
 
 def run(meta, config, emit_event, shutdown_event):
