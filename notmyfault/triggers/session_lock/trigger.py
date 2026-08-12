@@ -71,7 +71,7 @@ class SessionLockTrigger(PollingTrigger):
             return
         state = "locked" if locked else "unlocked"
         if self._last_state is None:
-            # 首轮只记基线，不发事件
+            # 第一轮只记录当前状态，不触发
             self._last_state = state
             return
         if state == self._last_state:

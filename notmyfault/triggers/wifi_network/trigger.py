@@ -67,7 +67,7 @@ class WifiNetworkTrigger(PollingTrigger):
     def poll(self) -> None:
         current = _current_ssid()
         if self._last_ssid is None:
-            # 首轮只记基线，不发事件
+            # 第一轮只记录当前状态，不触发
             self._last_ssid = current
             return
         if current == self._last_ssid:

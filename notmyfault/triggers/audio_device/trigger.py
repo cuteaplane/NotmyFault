@@ -77,7 +77,7 @@ class AudioDeviceTrigger(PollingTrigger):
             current = devices.get(flow, "")
             previous = self._last_ids.get(flow)
             if previous is None:
-                # 首轮只记基线，不发事件
+                # 第一轮只记录当前状态，不触发
                 self._last_ids[flow] = current
                 continue
             if current != previous:
