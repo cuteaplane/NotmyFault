@@ -27,17 +27,22 @@ class TestPluginFiles:
         (tmp_path / "signature.sig").write_bytes(b"sig")
         assert signing.plugin_files(tmp_path) == []
 
-    def test_returns_py_and_json_sorted(self, tmp_path):
+    def test_returns_all_regular_files_sorted(self, tmp_path):
+        # 二进制和其他资源都进签名清单，只排除签名产物和生成目录
         (tmp_path / "b.py").write_text("x = 1")
         (tmp_path / "a.json").write_text("{}")
-        (tmp_path / "c.txt").write_text("ignored")
+        (tmp_path / "c.txt").write_text("included")
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "tool.exe").write_bytes(b"\x00")
         (tmp_path / "signature.sig").write_bytes(b"sig")
+        (tmp_path / "public_key.pem").write_text("key")
         sub = tmp_path / "sub"
         sub.mkdir()
         (sub / "d.json").write_text("{}")
         files = signing.plugin_files(tmp_path)
         rel = [f.relative_to(tmp_path).as_posix() for f in files]
-        assert rel == ["a.json", "b.py", "sub/d.json"]
+        assert rel == ["a.json", "b.py", "bin/tool.exe", "c.txt", "sub/d.json"]
 
 
 class TestLoadPrivateKey:

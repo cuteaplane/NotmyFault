@@ -16,15 +16,31 @@ def _get_crypto():
     return ed25519, Encoding, PrivateFormat, PublicFormat, NoEncryption, BestAvailableEncryption, load_pem_private_key, Ed25519PrivateKey
 
 
+# 插件目录里解释器和开发工具生成的目录不进签名清单。
+_GENERATED_DIR_NAMES = frozenset({"__pycache__", "__pypackages__", "node_modules"})
+# 签名文件自身和随包公钥不能被签名覆盖，否则签名改变清单就循环了。
+_SIGNATURE_ARTIFACT_NAMES = frozenset({"signature.sig", "public_key.pem"})
+
+
 def plugin_files(plugin_dir) -> list[Path]:
-    """返回按相对路径排序的 .py 和 .json 文件并排除签名文件，sign_plugin 与 verify_plugin_sig 必须使用同一清单。"""
+    """返回插件目录内全部常规文件，sign_plugin 与 verify_plugin_sig 必须使用同一清单。"""
     files = []
+    plugin_root = Path(plugin_dir)
     for f in sorted(
-        Path(plugin_dir).rglob("*"),
-        key=lambda path: path.relative_to(plugin_dir).as_posix(),
+        plugin_root.rglob("*"),
+        key=lambda path: path.relative_to(plugin_root).as_posix(),
     ):
-        if f.is_file() and f.suffix in (".py", ".json") and f.name != "signature.sig":
-            files.append(f)
+        if not f.is_file():
+            continue
+        if f.name in _SIGNATURE_ARTIFACT_NAMES:
+            continue
+        relative_parts = f.relative_to(plugin_root).parts[:-1]
+        if any(
+            part.startswith(".") or part in _GENERATED_DIR_NAMES
+            for part in relative_parts
+        ):
+            continue
+        files.append(f)
     return files
 
 
@@ -57,6 +73,27 @@ def sign_plugin(plugin_dir: Path, json_name: str, private_key=None) -> bool:
     payload = b"".join(f.read_bytes() for f in files)
     sig = private_key.sign(hashlib.sha256(payload).digest())
     (plugin_dir / "signature.sig").write_bytes(sig)
+    return True
+
+
+def export_public_key(private_key, out_path: Path) -> Path:
+    """把私钥配套的公钥写成 PEM，作者自签时随插件目录一起分发。"""
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding, PublicFormat,
+    )
+    out_path = Path(out_path)
+    out_path.write_bytes(
+        private_key.public_key().public_bytes(
+            Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+        )
+    )
+    return out_path
+
+
+def self_sign_plugin(plugin_dir: Path, private_key) -> bool:
+    """作者用自己的私钥签名插件，并把配套公钥写进插件目录。"""
+    sign_plugin(Path(plugin_dir), "", private_key=private_key)
+    export_public_key(private_key, Path(plugin_dir) / "public_key.pem")
     return True
 
 

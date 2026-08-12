@@ -11,6 +11,7 @@ import traceback
 from typing import Any, Callable, Dict, Literal, Optional, Tuple
 
 from notmyfault.core.logging import engine_error, engine_info, engine_warn
+from notmyfault.extensions.registry import ExtensionRegistry
 from notmyfault.security.plugin_schema import (
     check_permissions_conform,
     is_known_permission,
@@ -18,6 +19,7 @@ from notmyfault.security.plugin_schema import (
 )
 from notmyfault.security.plugins import (
     check_sudo_import,
+    plugin_signature_kind,
     scan_borrowed_privilege,
     scan_plugin_capabilities,
     verify_plugin_integrity,
@@ -25,12 +27,25 @@ from notmyfault.security.plugins import (
 )
 from notmyfault.security.security import SecurityMode
 from notmyfault.security.signing import plugin_files
+from notmyfault.security import plugin_resources
 
 # 旧调用仍通过这两个别名访问校验函数。
 _validate_plugin_meta = validate_plugin_meta
 _check_sudo_import = check_sudo_import
 
 PluginKind = Literal["trigger", "action"]
+
+
+def _version_info(meta: Dict[str, Any]) -> str:
+    if meta.get("version_code") is not None:
+        return f" v{meta['version_code']}"
+    return ""
+
+
+def _perm_info(meta: Dict[str, Any]) -> str:
+    if meta.get("permissions"):
+        return f" [权限: {', '.join(meta['permissions'])}]"
+    return ""
 
 _IGNORED_PLUGIN_DIRECTORY_NAMES = frozenset(
     {
@@ -92,6 +107,31 @@ class PluginRegistry:
         self.actions_funcs: Dict[str, Callable[..., Any]] = {}
         # 模块表按 plugin id 存储模块，trigger 和 action 不能使用同一个 id。
         self.modules: Dict[str, Any] = {}
+        # 已发现但还没导入的动作插件，第一次执行时才导入。
+        self.pending: Dict[str, Dict[str, Any]] = {}
+        # 插件根目录，plugin_resource 靠它定位插件自带的二进制和资源。
+        self.plugin_roots: Dict[str, str] = {}
+        self.plugin_kinds: Dict[str, PluginKind] = {}
+        # 插件声明的组件模块，按插件 id 再按组件 id 索引。
+        self.components: Dict[str, Dict[str, Any]] = {}
+        self.extensions = ExtensionRegistry()
+        # 每个插件插进 sys.path 的目录，卸载时按这份清单移除。
+        self.sys_path_entries: Dict[str, str] = {}
+        self._action_materializer: Optional[Callable[[str], Any]] = None
+
+    def set_action_materializer(self, callback: Callable[[str], Any]) -> None:
+        self._action_materializer = callback
+
+    def resolve_action(self, plugin_id: str) -> Optional[Callable[..., Any]]:
+        """返回动作入口函数，还没导入的插件在这里触发首次导入。"""
+        run = self.actions_funcs.get(plugin_id)
+        if run is not None:
+            return run
+        materializer = self._action_materializer
+        if materializer is None:
+            return None
+        materializer(plugin_id)
+        return self.actions_funcs.get(plugin_id)
 
     def stores(
         self, kind: PluginKind
@@ -116,13 +156,67 @@ class PluginRegistry:
         func_store[plugin_id] = run
         meta_store[plugin_id] = meta
         self.modules[plugin_id] = module
+        self.plugin_kinds[plugin_id] = kind
 
     def unregister(self, kind: PluginKind, plugin_id: str) -> None:
         # 回滚和卸载都从三个表中删除同一 plugin id。
         meta_store, func_store = self.stores(kind)
         func_store.pop(plugin_id, None)
         meta_store.pop(plugin_id, None)
-        self.modules.pop(plugin_id, None)
+        module = self.modules.pop(plugin_id, None)
+        if module is not None:
+            sys.modules.pop(getattr(module, "__name__", ""), None)
+        self.pending.pop(plugin_id, None)
+        self.plugin_roots.pop(plugin_id, None)
+        self.plugin_kinds.pop(plugin_id, None)
+        components = self.components.pop(plugin_id, None)
+        if components:
+            for component in components.values():
+                sys.modules.pop(getattr(component, "__name__", ""), None)
+        self.extensions.unregister_plugin(plugin_id)
+        self._cleanup_plugin_path(plugin_id)
+
+    def clear(self) -> None:
+        """清理本代引擎加载的插件模块和导入路径。"""
+        for plugin_id in tuple(self.sys_path_entries):
+            self._cleanup_plugin_path(plugin_id)
+        for module in tuple(self.modules.values()):
+            sys.modules.pop(getattr(module, "__name__", ""), None)
+        for components in tuple(self.components.values()):
+            for component in components.values():
+                sys.modules.pop(getattr(component, "__name__", ""), None)
+        self.triggers_meta.clear()
+        self.triggers_funcs.clear()
+        self.actions_meta.clear()
+        self.actions_funcs.clear()
+        self.modules.clear()
+        self.pending.clear()
+        self.plugin_roots.clear()
+        self.plugin_kinds.clear()
+        self.components.clear()
+        self.extensions.clear()
+
+    def _cleanup_plugin_path(self, plugin_id: str) -> None:
+        """移除插件插进 sys.path 的目录和从该目录导入的模块"""
+        root = self.sys_path_entries.pop(plugin_id, None)
+        if root is None:
+            return
+        try:
+            sys.path.remove(root)
+        except ValueError:
+            pass
+        for name, mod in list(sys.modules.items()):
+            if name.startswith("notmyfault."):
+                continue
+            mod_file = getattr(mod, "__file__", None)
+            if not mod_file:
+                continue
+            try:
+                inside = os.path.commonpath((os.path.realpath(mod_file), root)) == root
+            except ValueError:
+                inside = False
+            if inside:
+                sys.modules.pop(name, None)
 
 
 class PluginLoader:
@@ -146,6 +240,11 @@ class PluginLoader:
         self._sudo = sudo
         self._engine_token = engine_token
         self._integrity_errors = integrity_errors
+        # 多个工作流线程可能同时首次执行同一个懒加载动作。
+        self._materialize_lock = threading.Lock()
+        registry.set_action_materializer(self.materialize_pending_action)
+        # plugin_resource 需要注册表里的插件根目录才能定位插件自带资源。
+        plugin_resources.set_registry(registry)
 
     def _restore_override(
         self,
@@ -267,6 +366,23 @@ class PluginLoader:
                 )
                 continue
 
+            # build 钩子是作者现场编译的直通通道，内置插件走构建流程不需要它
+            if origin == "builtin" and isinstance(meta.get("build"), dict):
+                reason = "内置插件不允许携带 build 编译钩子"
+                print(
+                    f'[Engine] [!!] 插件 "{plugin_id}" {reason}，跳过',
+                    file=sys.stderr,
+                )
+                failed_count += 1
+                self._diagnostics.record_plugin_error(store_name, plugin_id, reason)
+                engine_error(
+                    "plugin_load_failed",
+                    plugin=plugin_id,
+                    type=store_name,
+                    reason=reason,
+                )
+                continue
+
             try:
                 py_file = resolve_plugin_entrypoint(
                     folder_path,
@@ -310,18 +426,19 @@ class PluginLoader:
                 )
                 continue
 
-            if origin == "builtin":
-                disabled_cfg = self._config.get("disabled_plugins", {})
-                ptype_key = "triggers" if store_name == "Trigger" else "actions"
-                disabled_list = disabled_cfg.get(ptype_key, []) if isinstance(disabled_cfg, dict) else []
-                if plugin_id in disabled_list:
-                    print(
-                        f'[Engine] 插件 "{plugin_id}" ({meta["name"]}) 已被用户禁用，跳过'
-                    )
-                    continue
+            # 禁用名单写在 config 里，对内置和用户插件都生效，json 里的 enabled 只表示作者出厂状态。
+            disabled_cfg = self._config.get("disabled_plugins", {})
+            ptype_key = "triggers" if store_name == "Trigger" else "actions"
+            disabled_list = disabled_cfg.get(ptype_key, []) if isinstance(disabled_cfg, dict) else []
+            if plugin_id in disabled_list:
+                print(
+                    f'[Engine] 插件 "{plugin_id}" ({meta["name"]}) 已被用户禁用，跳过'
+                )
+                continue
 
-            # strict 模式在 exec_module 前检查签名，其他模式保留签名失败时的降级加载。
-            signature_ok = verify_plugin_sig(folder_path, origin)
+            # strict 模式在导入前检查签名，其他模式保留签名失败时的降级加载。
+            signature_kind = plugin_signature_kind(folder_path, origin)
+            signature_ok = signature_kind != "none"
             if not signature_ok:
                 if self._security_mode == SecurityMode.STRICT:
                     reason = "签名无效"
@@ -438,8 +555,8 @@ class PluginLoader:
             # 内置插件使用构建时 Ed25519 签名，用户插件记录首次文件哈希，完整性失败只告警。
             if origin != "builtin":
                 integrity_files = [
-                    (json_filename, json_file),
-                    (os.path.relpath(py_file, folder_path), py_file),
+                    (path.relative_to(folder_path).as_posix(), str(path))
+                    for path in plugin_files(folder_path)
                 ]
                 integrity_ok, integrity_msg = verify_plugin_integrity(
                     plugin_id, integrity_files
@@ -468,23 +585,189 @@ class PluginLoader:
                     engine_warn(f"borrowed_privilege: {plugin_id} {'; '.join(borrowed_findings)}")
                     self._integrity_errors.append(warning)
 
-            # 模块导入从这里开始，签名和能力检查在调用前完成。
+            # 发现阶段到此为止，元数据先入账，模块导入推迟到物化阶段。
+            existing_kind = self._registry.plugin_kinds.get(plugin_id)
+            if existing_kind is not None and existing_kind != plugin_type:
+                reason = (
+                    f"插件 id 已被{'触发器' if existing_kind == 'trigger' else '动作'}使用"
+                )
+                failed_count += 1
+                self._diagnostics.record_plugin_error(store_name, plugin_id, reason)
+                engine_error(
+                    "plugin_load_failed",
+                    plugin=plugin_id,
+                    type=store_name,
+                    reason=reason,
+                )
+                continue
+
+            previous_root = self._registry.plugin_roots.get(plugin_id)
+            previous_path = self._registry.sys_path_entries.get(plugin_id)
+            meta_with_origin = {
+                **meta,
+                "origin": origin,
+                "signature_kind": signature_kind,
+            }
+            self._registry.plugin_roots[plugin_id] = folder_path
+            self._registry.plugin_kinds[plugin_id] = plugin_type
+            self._registry.extensions.register_manifest(
+                plugin_id, plugin_type, meta_with_origin, folder_path
+            )
+            entry = {
+                "kind": plugin_type,
+                "plugin_id": plugin_id,
+                "folder_path": folder_path,
+                "entry_path": py_file,
+                "meta": meta_with_origin,
+                "origin": origin,
+                "module_prefix": module_prefix,
+                "store_name": store_name,
+                "func_store": func_store,
+                "meta_store": meta_store,
+                "prev": None,
+                "previous_root": previous_root,
+                "previous_path": previous_path,
+            }
+
+            if plugin_type == "action":
+                old_module = self._registry.get_module(plugin_id)
+                if old_module is not None:
+                    # 覆盖已加载的旧动作时立即导入，meta 和函数保持同一代
+                    entry["prev"] = (
+                        old_module,
+                        meta_store.get(plugin_id),
+                        func_store.get(plugin_id),
+                    )
+                    if self.materialize_entry(entry) is None:
+                        failed_count += 1
+                        continue
+                else:
+                    # 动作第一次被执行时才导入，先写 meta 让规则校验认识它
+                    self._registry.pending[plugin_id] = entry
+                    meta_store[plugin_id] = meta_with_origin
+                loaded_count += 1
+                print(
+                    f"[Engine] 装载{store_name}: {meta['name']} ({plugin_id})"
+                    f"{_version_info(meta)}{_perm_info(meta)}"
+                )
+                continue
+
+            # 触发器要常驻运行，启动时就导入
+            if self.materialize_entry(entry) is None:
+                failed_count += 1
+                continue
+            loaded_count += 1
+
+        return loaded_count, failed_count
+
+    def materialize_pending_action(self, plugin_id: str) -> Optional[Any]:
+        """导入还没加载的动作插件，没有对应待物化条目时返回 None"""
+        entry = self._registry.pending.get(plugin_id)
+        if entry is None:
+            return None
+        return self.materialize_entry(entry)
+
+    def materialize_entry(self, entry: Dict[str, Any]) -> Optional[Any]:
+        """导入插件模块并完成注册、setup 和提权授权，失败返回 None"""
+        plugin_type = entry["kind"]
+        plugin_id = entry["plugin_id"]
+        folder_path = entry["folder_path"]
+        py_file = entry["entry_path"]
+        module_prefix = entry["module_prefix"]
+        store_name = entry["store_name"]
+        meta = entry["meta"]
+        origin = entry["origin"]
+        func_store = entry["func_store"]
+        meta_store = entry["meta_store"]
+        prev = entry.get("prev")
+        previous_root = entry.get("previous_root")
+        previous_path = entry.get("previous_path")
+
+        with self._materialize_lock:
+            # 覆盖场景带着 prev 进来，必须先走完替换，缓存短路只对首次物化生效
+            if plugin_type == "action" and prev is None and plugin_id in func_store:
+                return func_store[plugin_id]
+
+            if prev is None and self._registry.get_module(plugin_id) is not None:
+                old_origin = meta_store.get(plugin_id, {}).get("origin", "builtin")
+                engine_info(f"{store_name} \"{plugin_id}\": {old_origin} -> {origin} override")
+                prev = (
+                    self._registry.get_module(plugin_id),
+                    meta_store.get(plugin_id),
+                    func_store.get(plugin_id),
+                )
+            if prev is not None:
+                self._registry.unregister(plugin_type, plugin_id)
+                # 直接调用 _load_plugins() 时也要清理传入的存储字典。
+                func_store.pop(plugin_id, None)
+                meta_store.pop(plugin_id, None)
+
+            self._registry.plugin_roots[plugin_id] = folder_path
+            self._registry.plugin_kinds[plugin_id] = plugin_type
+            self._registry.extensions.register_manifest(
+                plugin_id, plugin_type, meta, folder_path
+            )
+
+            # 插件目录放进 sys.path，入口文件才能 import 到兄弟模块
+            root = os.path.realpath(folder_path)
+            if root not in sys.path:
+                sys.path.insert(0, root)
+            self._registry.sys_path_entries[plugin_id] = root
+
             module_name = f"{module_prefix}{plugin_id}"
+
+            def fail(reason: str) -> None:
+                sys.modules.pop(module_name, None)
+                self._registry.extensions.unregister_plugin(plugin_id)
+                self._registry._cleanup_plugin_path(plugin_id)
+                self._registry.plugin_roots.pop(plugin_id, None)
+                self._registry.plugin_kinds.pop(plugin_id, None)
+                if prev is not None:
+                    self._restore_override(
+                        plugin_type, plugin_id, prev, func_store, meta_store
+                    )
+                    if previous_root is not None:
+                        self._registry.plugin_roots[plugin_id] = previous_root
+                    if previous_path is not None:
+                        if previous_path not in sys.path:
+                            sys.path.insert(0, previous_path)
+                        self._registry.sys_path_entries[plugin_id] = previous_path
+                    old_module, old_meta, _old_run = prev
+                    if old_meta is not None and previous_root is not None:
+                        self._registry.extensions.register_manifest(
+                            plugin_id, plugin_type, old_meta, previous_root
+                        )
+                        old_path = getattr(old_module, "__file__", None)
+                        if isinstance(old_path, str):
+                            self._load_extensions(
+                                plugin_id,
+                                previous_root,
+                                old_meta,
+                                module_prefix,
+                                old_module,
+                                old_path,
+                            )
+                self._diagnostics.record_plugin_error(store_name, plugin_id, reason)
+                engine_error(
+                    "plugin_load_failed",
+                    plugin=plugin_id,
+                    type=store_name,
+                    reason=reason,
+                )
+
+            sys.modules.pop(module_name, None)
             spec = importlib.util.spec_from_file_location(module_name, py_file)
             if spec is None or spec.loader is None:
                 print(
                     f"[Engine] 无法创建模块规格，跳过: {py_file}",
                     file=sys.stderr,
                 )
-                failed_count += 1
-                self._diagnostics.record_plugin_error(
-                    store_name, plugin_id, "无法创建模块规格"
-                )
-                engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason="无法创建模块规格")
-                continue
+                fail("无法创建模块规格")
+                return None
 
             try:
                 module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
                 spec.loader.exec_module(module)
             except Exception:
                 print(
@@ -492,24 +775,16 @@ class PluginLoader:
                     file=sys.stderr,
                 )
                 traceback.print_exc(file=sys.stderr)
-                failed_count += 1
-                self._diagnostics.record_plugin_error(
-                    store_name, plugin_id, f"Python 加载异常: {traceback.format_exc()[-200:]}"
-                )
-                engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason="Python 加载异常")
-                continue
+                fail(f"Python 加载异常: {traceback.format_exc()[-200:]}")
+                return None
 
             if not hasattr(module, "run"):
                 print(
                     f"[Engine] 插件 \"{plugin_id}\" ({meta['name']}) 缺少 run() 函数，跳过",
                     file=sys.stderr,
                 )
-                failed_count += 1
-                self._diagnostics.record_plugin_error(
-                    store_name, plugin_id, "缺少 run() 函数"
-                )
-                engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason="缺少 run() 函数")
-                continue
+                fail("缺少 run() 函数")
+                return None
 
             # event-v1 接收配置列表，event-v2 为每条规则使用独立配置，启动线程前先验证入口。
             if plugin_type == "trigger" and meta.get("trigger_api") in ("event-v1", "event-v2"):
@@ -520,33 +795,16 @@ class PluginLoader:
                 except (TypeError, ValueError) as exc:
                     message = f"{meta['trigger_api']} 入口不兼容: {exc}"
                     print(f'[Engine] 触发器 "{plugin_id}" {message}', file=sys.stderr)
-                    failed_count += 1
-                    self._diagnostics.record_plugin_error(store_name, plugin_id, message)
-                    engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason=message)
-                    continue
+                    fail(message)
+                    return None
 
-            # 覆盖插件时先保存旧状态并卸载注册项，teardown() 由新插件 setup() 成功后触发。
-            prev: Optional[Tuple[Any, Any, Any]] = None
-            if self._registry.get_module(plugin_id) is not None:
-                old_origin = meta_store.get(plugin_id, {}).get("origin", "builtin")
-                engine_info(f"{store_name} \"{plugin_id}\": {old_origin} -> {origin} override")
-                prev = (
-                    self._registry.get_module(plugin_id),
-                    meta_store.get(plugin_id),
-                    func_store.get(plugin_id),
-                )
-                self._registry.unregister(plugin_type, plugin_id)
-                # 直接调用 _load_plugins() 时也要清理传入的存储字典。
-                func_store.pop(plugin_id, None)
-                meta_store.pop(plugin_id, None)
             self._registry.register(
-                plugin_type, plugin_id, {**meta, "origin": origin}, getattr(module, "run"), module
+                plugin_type, plugin_id, meta, getattr(module, "run"), module
             )
             # 显式写入维持 _load_plugins() 返回字典的历史行为。
             func_store[plugin_id] = getattr(module, "run")
-            meta_store[plugin_id] = {**meta, "origin": origin}
-
-            loaded_count += 1
+            meta_store[plugin_id] = meta
+            self._registry.pending.pop(plugin_id, None)
 
             # setup() 返回失败时回滚注册表，覆盖加载还会恢复旧插件。
             if plugin_type == "trigger" and hasattr(module, "setup"):
@@ -561,14 +819,8 @@ class PluginLoader:
                         self._registry.unregister(plugin_type, plugin_id)
                         func_store.pop(plugin_id, None)
                         meta_store.pop(plugin_id, None)
-                        self._restore_override(plugin_type, plugin_id, prev, func_store, meta_store)
-                        loaded_count -= 1
-                        failed_count += 1
-                        self._diagnostics.record_plugin_error(
-                            store_name, plugin_id, "setup() 返回 False"
-                        )
-                        engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason="setup() 返回 False")
-                        continue
+                        fail("setup() 返回 False")
+                        return None
                 except Exception:
                     print(
                         f"[Engine] 触发器 \"{plugin_id}\" setup() 执行异常:",
@@ -578,14 +830,8 @@ class PluginLoader:
                     self._registry.unregister(plugin_type, plugin_id)
                     func_store.pop(plugin_id, None)
                     meta_store.pop(plugin_id, None)
-                    self._restore_override(plugin_type, plugin_id, prev, func_store, meta_store)
-                    loaded_count -= 1
-                    failed_count += 1
-                    self._diagnostics.record_plugin_error(
-                        store_name, plugin_id, "setup() 执行异常"
-                    )
-                    engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason="setup() 执行异常")
-                    continue
+                    fail("setup() 执行异常")
+                    return None
 
             # 新插件 setup() 成功后才调用旧插件 teardown()。
             if prev is not None and prev[0] is not None and hasattr(prev[0], "teardown"):
@@ -607,17 +853,176 @@ class PluginLoader:
                     print(f"[Engine] [!!] 插件 \"{plugin_id}\" 管理员权限注册失败: {e}", file=sys.stderr)
                     engine_error("admin_registration_failed", plugin=plugin_id, error=str(e))
 
-            version_info = (
-                f" v{meta['version_code']}"
-                if meta.get("version_code") is not None
-                else ""
-            )
-            perm_info = ""
-            if meta.get("permissions"):
-                perm_info = f" [权限: {', '.join(meta['permissions'])}]"
+            # 组件是附加协议：只有声明了 components 的插件才进入组件加载。
+            if isinstance(meta.get("components"), list) and meta["components"]:
+                self._load_components(
+                    plugin_id, folder_path, meta, module_prefix
+                )
+            if isinstance(meta.get("contributes"), dict):
+                self._load_extensions(
+                    plugin_id, folder_path, meta, module_prefix, module, py_file
+                )
 
             print(
-                f"[Engine] 装载{store_name}: {meta['name']} ({plugin_id}){version_info}{perm_info}"
+                f"[Engine] 装载{store_name}: {meta['name']} ({plugin_id})"
+                f"{_version_info(meta)}{_perm_info(meta)}"
             )
+            return module
 
-        return loaded_count, failed_count
+    def _load_components(
+        self,
+        plugin_id: str,
+        folder_path: str,
+        meta: Dict[str, Any],
+        module_prefix: str,
+    ) -> Optional[Any]:
+        """导入插件声明的组件，入口缺 invoke 或导入失败时不注册"""
+        components = meta.get("components")
+        if not isinstance(components, list) or not components:
+            return None
+        root = os.path.realpath(folder_path)
+        loaded: Dict[str, Any] = {}
+        for component in components:
+            if not isinstance(component, dict):
+                continue
+            component_id = component.get("id")
+            if not isinstance(component_id, str):
+                continue
+            entrypoint = str(component.get("entrypoint", "component.py"))
+            component_path = os.path.realpath(os.path.join(root, entrypoint))
+            try:
+                inside = os.path.commonpath((component_path, root)) == root
+            except ValueError:
+                inside = False
+            if not inside or not os.path.isfile(component_path):
+                self._diagnostics.record_plugin_error(
+                    "plugin", plugin_id, f"组件 {component_id} 入口缺失: {entrypoint}"
+                )
+                continue
+
+            module_name = f"{module_prefix}{plugin_id}__component_{component_id}"
+            sys.modules.pop(module_name, None)
+            spec = importlib.util.spec_from_file_location(
+                module_name, component_path
+            )
+            if spec is None or spec.loader is None:
+                self._diagnostics.record_plugin_error(
+                    "plugin", plugin_id, f"组件 {component_id} 无法创建模块规格"
+                )
+                continue
+            try:
+                component_module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = component_module
+                spec.loader.exec_module(component_module)
+            except Exception:
+                print(
+                    f"[Engine] 插件 \"{plugin_id}\" 组件 {component_id} "
+                    f"导入异常 ({component_path}):",
+                    file=sys.stderr,
+                )
+                traceback.print_exc(file=sys.stderr)
+                self._diagnostics.record_plugin_error(
+                    "plugin", plugin_id, f"组件 {component_id} 导入异常"
+                )
+                continue
+
+            if not hasattr(component_module, "invoke"):
+                self._diagnostics.record_plugin_error(
+                    "plugin", plugin_id, f"组件 {component_id} 缺少 invoke 函数"
+                )
+                continue
+            loaded[component_id] = component_module
+        if loaded:
+            self._registry.components[plugin_id] = loaded
+        return loaded or None
+
+    def _load_extensions(
+        self,
+        plugin_id: str,
+        folder_path: str,
+        meta: Dict[str, Any],
+        module_prefix: str,
+        primary_module: Any,
+        primary_path: str,
+    ) -> Optional[Any]:
+        """导入命令处理函数，同一个 Python 文件只创建一个模块。"""
+        contributes = meta.get("contributes")
+        if not isinstance(contributes, dict):
+            return None
+        commands = contributes.get("commands")
+        if not isinstance(commands, list) or not commands:
+            return None
+        root = os.path.realpath(folder_path)
+        primary_path = os.path.realpath(primary_path)
+        loaded_modules: Dict[str, Any] = {primary_path: primary_module}
+        registered = 0
+        for command in commands:
+            if not isinstance(command, dict):
+                continue
+            command_id = command.get("id")
+            handler_ref = command.get("handler")
+            if not isinstance(command_id, str) or not isinstance(handler_ref, str):
+                continue
+            entrypoint, symbol = handler_ref.rsplit(":", 1)
+            command_path = os.path.realpath(os.path.join(root, entrypoint))
+            try:
+                inside = os.path.commonpath((command_path, root)) == root
+            except ValueError:
+                inside = False
+            if not inside or not os.path.isfile(command_path):
+                self._diagnostics.record_plugin_error(
+                    "plugin", plugin_id, f"扩展命令 {command_id} 入口缺失: {entrypoint}"
+                )
+                continue
+
+            command_module = loaded_modules.get(command_path)
+            if command_module is None:
+                module_name = (
+                    f"{module_prefix}{plugin_id}__extension_"
+                    f"{len(loaded_modules)}"
+                )
+                sys.modules.pop(module_name, None)
+                spec = importlib.util.spec_from_file_location(module_name, command_path)
+                if spec is None or spec.loader is None:
+                    self._diagnostics.record_plugin_error(
+                        "plugin", plugin_id, f"扩展命令 {command_id} 无法创建模块规格"
+                    )
+                    continue
+                try:
+                    command_module = importlib.util.module_from_spec(spec)
+                    sys.modules[module_name] = command_module
+                    spec.loader.exec_module(command_module)
+                except Exception:
+                    print(
+                        f"[Engine] 插件 \"{plugin_id}\" 扩展命令 {command_id} "
+                        f"导入异常 ({command_path}):",
+                        file=sys.stderr,
+                    )
+                    traceback.print_exc(file=sys.stderr)
+                    self._diagnostics.record_plugin_error(
+                        "plugin", plugin_id, f"扩展命令 {command_id} 导入异常"
+                    )
+                    sys.modules.pop(module_name, None)
+                    continue
+                loaded_modules[command_path] = command_module
+
+            handler = getattr(command_module, symbol, None)
+            if not callable(handler):
+                self._diagnostics.record_plugin_error(
+                    "plugin", plugin_id, f"扩展命令 {command_id} 缺少函数 {symbol}"
+                )
+                continue
+            try:
+                inspect.signature(handler).bind(object(), {})
+            except (TypeError, ValueError) as exc:
+                self._diagnostics.record_plugin_error(
+                    "plugin",
+                    plugin_id,
+                    f"扩展命令 {command_id} 参数不兼容: {exc}",
+                )
+                continue
+            self._registry.extensions.register_command(
+                plugin_id, command_id, handler, command_module
+            )
+            registered += 1
+        return registered or None

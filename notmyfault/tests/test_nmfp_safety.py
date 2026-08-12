@@ -6,6 +6,7 @@ import py7zr
 import pytest
 
 from notmyfault.host import api_server
+import pack_plugin
 
 
 def make_archive(tmp_path, entries):
@@ -113,3 +114,33 @@ def test_absolute_path_is_sanitized_by_py7zr(tmp_path):
         names = [info.filename for info in zf.list()]
     assert names == ["evil.txt"]
     assert not any("\\" in n or "/" == n[:1] for n in names)
+
+
+def test_pack_all_prefix_preserves_plugin_subdirectories(tmp_path):
+    plugin_dir = tmp_path / "plugins" / "actions" / "demo"
+    nested_dir = plugin_dir / "lib"
+    nested_dir.mkdir(parents=True)
+    (plugin_dir / "action.json").write_text(
+        """{
+            "id": "demo",
+            "name": "测试插件",
+            "description": "测试",
+            "enabled": true,
+            "version_code": 1,
+            "version": "1.0",
+            "package_name": "com.test.demo"
+        }""",
+        encoding="utf-8",
+    )
+    (plugin_dir / "action.py").write_text("def run(meta, params): pass\n", encoding="utf-8")
+    (nested_dir / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    archive_path = pack_plugin.pack_plugin(
+        plugin_dir,
+        output_dir=tmp_path / "dist",
+        arc_prefix="demo",
+    )
+
+    with py7zr.SevenZipFile(archive_path) as zf:
+        names = zf.getnames()
+    assert "demo/lib/helper.py" in names

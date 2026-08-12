@@ -146,6 +146,63 @@ class TestScanPlugins:
 
 
 class TestValidatePluginMetaPermissions:
+    def test_uia_selector_param_type_is_valid(self):
+        ok, errors = validate_plugin_meta(
+            make_meta(params=[{
+                "name": "target",
+                "type": "uia_selector",
+                "label": "屏幕控件",
+                "value_type": "object",
+            }]),
+            "action",
+        )
+        assert ok is True
+        assert errors == []
+
+    def test_param_required_flag_is_boolean(self):
+        ok, errors = validate_plugin_meta(
+            make_meta(params=[{
+                "name": "target",
+                "type": "uia_selector",
+                "label": "屏幕控件",
+                "required": "yes",
+            }]),
+            "action",
+        )
+        assert ok is False
+        assert "params[0].required 必须为布尔值" in errors
+
+    def test_action_cancellation_contract_requires_context_execution(self):
+        ok, errors = validate_plugin_meta(
+            make_meta(
+                execution_api="context-v1",
+                cancellation_api="runtime-v1",
+            ),
+            "action",
+        )
+        assert ok is True
+        assert errors == []
+
+        ok, errors = validate_plugin_meta(
+            make_meta(cancellation_api="runtime-v1"), "action"
+        )
+        assert ok is False
+        assert (
+            "cancellation_api=runtime-v1 需要 execution_api=context-v1"
+            in errors
+        )
+
+    def test_action_cancellation_contract_rejects_unknown_version(self):
+        ok, errors = validate_plugin_meta(
+            make_meta(
+                execution_api="context-v1",
+                cancellation_api="runtime-v2",
+            ),
+            "action",
+        )
+        assert ok is False
+        assert "cancellation_api 目前仅支持 runtime-v1" in errors
+
     def test_action_idempotent_flag_is_boolean(self):
         ok, errors = validate_plugin_meta(make_meta(idempotent=True), "action")
         assert ok is True
@@ -213,3 +270,164 @@ class TestValidatePluginMetaPermissions:
         ok, errors = validate_plugin_meta(meta, "trigger")
         assert ok is False
         assert any("重复名称: x" in e for e in errors)
+
+    def test_summary_policy_is_validated_for_params_and_outputs(self):
+        meta = make_meta(
+            params=[{
+                "name": "token",
+                "type": "string",
+                "label": "令牌",
+                "sensitive": True,
+                "summary": "hidden",
+            }],
+            outputs=[{
+                "name": "count",
+                "type": "number",
+                "label": "数量",
+                "summary": "value",
+            }],
+        )
+
+        ok, errors = validate_plugin_meta(meta, "action")
+
+        assert ok is True
+        assert errors == []
+
+    def test_invalid_summary_policy_and_sensitive_type_are_rejected(self):
+        meta = make_meta(
+            params=[{
+                "name": "token",
+                "type": "string",
+                "label": "令牌",
+                "sensitive": "yes",
+                "summary": "raw",
+            }],
+            outputs=[{
+                "name": "result",
+                "type": "string",
+                "label": "结果",
+                "summary": "raw",
+            }],
+        )
+
+        ok, errors = validate_plugin_meta(meta, "action")
+
+        assert ok is False
+        assert any("params[0].sensitive 必须为布尔值" in error for error in errors)
+        assert any("params[0].summary 无效" in error for error in errors)
+        assert any("outputs[0].summary 无效" in error for error in errors)
+
+
+class TestComponentsField:
+    def test_valid_components_declaration_passes(self):
+        meta = make_meta(components=[{
+            "id": "record",
+            "name": "录制",
+            "description": "采集数据",
+            "entrypoint": "component.py",
+            "api": "component-v1",
+            "ui": {
+                "button_label": "录制",
+                "icon": "keyboard",
+                "description": "点一下开始采集",
+            },
+        }])
+        ok, errors = validate_plugin_meta(meta, "action")
+        assert ok is True, errors
+
+    def test_components_requires_nonempty_list(self):
+        for bad in ("yes", [], [{"id": "x"}]):
+            ok, errors = validate_plugin_meta(make_meta(components=bad), "action")
+            assert ok is False, bad
+
+    def test_entrypoint_must_stay_inside_plugin_dir(self):
+        for bad in ("../escape.py", "/absolute.py", "sub\\component.py"):
+            ok, errors = validate_plugin_meta(
+                make_meta(components=[{
+                    "id": "record",
+                    "name": "录制",
+                    "entrypoint": bad,
+                }]),
+                "action",
+            )
+            assert ok is False, bad
+            assert any("插件目录内" in error for error in errors), bad
+
+    def test_duplicate_component_id_rejected(self):
+        ok, errors = validate_plugin_meta(
+            make_meta(components=[
+                {"id": "record", "name": "录制", "entrypoint": "component.py"},
+                {"id": "record", "name": "录制", "entrypoint": "component.py"},
+            ]),
+            "action",
+        )
+        assert ok is False
+        assert any("重复 id" in error for error in errors)
+
+    def test_ui_is_validated(self):
+        ok, errors = validate_plugin_meta(
+            make_meta(components=[{
+                "id": "record",
+                "name": "录制",
+                "entrypoint": "component.py",
+                "ui": {"bogus": "x", "button_label": 1},
+            }]),
+            "action",
+        )
+        assert ok is False
+        assert any("components[0].ui 包含未知字段" in error for error in errors)
+        assert any("components[0].ui.button_label 必须是字符串" in error for error in errors)
+
+    def test_param_types_are_validated(self):
+        meta = make_meta(components=[{
+            "id": "record",
+            "name": "录制",
+            "entrypoint": "component.py",
+            "param_types": ["hotkey", "bogus"],
+        }])
+        ok, errors = validate_plugin_meta(meta, "action")
+        assert ok is False
+        assert any("param_types 包含无效参数类型" in error for error in errors)
+
+    def test_macro_param_and_capture_only_are_supported(self):
+        meta = make_meta(params=[{
+            "name": "macro",
+            "label": "操作宏",
+            "type": "macro",
+            "capture_only": True,
+        }])
+        ok, errors = validate_plugin_meta(meta, "action")
+        assert ok is True, errors
+
+    def test_capture_only_must_be_boolean(self):
+        meta = make_meta(params=[{
+            "name": "macro",
+            "label": "操作宏",
+            "type": "macro",
+            "capture_only": "yes",
+        }])
+        ok, errors = validate_plugin_meta(meta, "action")
+        assert ok is False
+        assert any("capture_only 必须为布尔值" in error for error in errors)
+
+    def test_unknown_component_field_rejected(self):
+        ok, errors = validate_plugin_meta(
+            make_meta(components=[{
+                "id": "record",
+                "name": "录制",
+                "entrypoint": "component.py",
+                "api": "recording-v1",
+            }]),
+            "action",
+        )
+        assert ok is False
+        assert any("components[0].api 目前仅支持" in error for error in errors)
+
+    def test_trigger_allows_components(self):
+        meta = make_meta(components=[{
+            "id": "record",
+            "name": "录制热键",
+            "entrypoint": "component.py",
+        }])
+        ok, errors = validate_plugin_meta(meta, "trigger")
+        assert ok is True, errors

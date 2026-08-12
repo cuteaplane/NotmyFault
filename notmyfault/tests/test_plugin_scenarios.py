@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from notmyfault.core.workflow import ActionCancellation, ActionCancelled
 from notmyfault.security.plugin_loader import PluginLoader, PluginRegistry
 from notmyfault.security.plugin_schema import validate_plugin_meta
 from notmyfault.security.security import SecurityMode
@@ -25,6 +26,10 @@ NEW_ACTIONS = [
     "open_url",
     "power_plan",
     "send_keys",
+    "uia_control",
+    "uia_focus_window",
+    "uia_read_text",
+    "uia_wait",
     "window_pin",
 ]
 NEW_TRIGGERS = [
@@ -724,6 +729,122 @@ def test_wifi_network_validate_rejects_bad_config():
     )
     with pytest.raises(ValueError, match="必须填写目标 SSID"):
         missing.validate()
+
+
+def test_shutdown_system_delay_can_be_cancelled_before_system_call():
+    mod = load_plugin("actions", "shutdown_system")
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    with pytest.raises(ActionCancelled, match="动作已取消"):
+        mod.run_with_context(
+            {},
+            {
+                "action": "shutdown",
+                "confirm": True,
+                "delay_seconds": 3600,
+            },
+            {
+                "runtime": {
+                    "cancellation": ActionCancellation(cancel_event)
+                }
+            },
+        )
+
+
+def test_shutdown_system_rejects_non_boolean_force():
+    mod = load_plugin("actions", "shutdown_system")
+
+    with pytest.raises(ValueError, match="force 必须为布尔值"):
+        mod.run_with_context(
+            {},
+            {"action": "shutdown", "confirm": True, "force": "false"},
+            {"runtime": {"cancellation": ActionCancellation(threading.Event())}},
+        )
+
+
+def _sample_uia_selector():
+    return {
+        "version": 1,
+        "window": {"process": "notepad.exe"},
+        "target": {"name": "保存", "control_type": 50000},
+    }
+
+
+def test_uia_control_passes_selector_operation_and_cancellation(monkeypatch):
+    mod = load_plugin("actions", "uia_control")
+    calls = []
+    cancellation = object()
+    selector = _sample_uia_selector()
+    monkeypatch.setattr(
+        mod,
+        "perform_selector",
+        lambda target, operation, token, text: calls.append(
+            (target, operation, token, text)
+        ) or {"operation": operation},
+    )
+
+    result = mod.run_with_context(
+        {},
+        {"target": selector, "operation": "set_text", "text": "示例"},
+        {"runtime": {"cancellation": cancellation}},
+    )
+
+    assert result == {"operation": "set_text"}
+    assert calls == [(selector, "set_text", cancellation, "示例")]
+
+
+def test_uia_wait_passes_selector_timeout_and_cancellation(monkeypatch):
+    mod = load_plugin("actions", "uia_wait")
+    calls = []
+    cancellation = object()
+    selector = _sample_uia_selector()
+    monkeypatch.setattr(
+        mod,
+        "wait_for_selector",
+        lambda target, timeout, token: calls.append(
+            (target, timeout, token)
+        ) or {"found": True},
+    )
+
+    result = mod.run_with_context(
+        {},
+        {"target": selector, "wait_seconds": 45},
+        {"runtime": {"cancellation": cancellation}},
+    )
+
+    assert result == {"found": True}
+    assert calls == [(selector, 45, cancellation)]
+
+
+@pytest.mark.parametrize(
+    ("plugin_id", "function_name", "expected"),
+    [
+        ("uia_focus_window", "focus_selector_window", {"focused": True}),
+        ("uia_read_text", "read_selector_text", {"text": "示例"}),
+    ],
+)
+def test_uia_window_and_text_actions_pass_cancellation(
+    monkeypatch, plugin_id, function_name, expected
+):
+    mod = load_plugin("actions", plugin_id)
+    calls = []
+    cancellation = object()
+    selector = _sample_uia_selector()
+    monkeypatch.setattr(
+        mod,
+        function_name,
+        lambda target, token: calls.append((target, token)) or expected,
+    )
+
+    result = mod.run_with_context(
+        {},
+        {"target": selector},
+        {"runtime": {"cancellation": cancellation}},
+    )
+
+    assert result == expected
+    assert calls == [(selector, cancellation)]
 
 
 # ------------------------------------------------------------ 元数据与加载

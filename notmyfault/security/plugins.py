@@ -345,24 +345,14 @@ def scan_borrowed_privilege(py_file_path: str) -> list[str]:
     return sorted(set(findings))
 
 
-def verify_plugin_sig(plugin_dir: str, origin: str = "builtin") -> bool:
-    """校验插件签名文件和签名覆盖的源码清单，任何异常都按验签失败处理"""
-    try:
-        from notmyfault.security.signing_keys import get_public_keys
-        pub_keys = get_public_keys()
-        if not pub_keys:
-            return False
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-        pubs = [Ed25519PublicKey.from_public_bytes(k) for k in pub_keys]
-    except Exception:
-        return False
+def _verify_sig_with_keys(plugin_dir: str, pubs) -> bool:
+    """用给定公钥列表校验 signature.sig，清单与签名时保持同一份。"""
     sig_file = os.path.join(plugin_dir, "signature.sig")
     if not os.path.exists(sig_file):
         return False
     try:
         with open(sig_file, "rb") as f:
             sig = f.read()
-        # 签名和校验使用同一份文件清单，合法签名才能通过校验。
         from notmyfault.security.signing import plugin_files
         payload = b"".join(f.read_bytes() for f in plugin_files(plugin_dir))
     except OSError:
@@ -375,6 +365,52 @@ def verify_plugin_sig(plugin_dir: str, origin: str = "builtin") -> bool:
         except Exception:
             continue
     return False
+
+
+def plugin_signature_kind(plugin_dir: str, origin: str = "builtin") -> str:
+    """返回签名来源：official、author、official-legacy 或 none，验签失败一律算 none"""
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except Exception:
+        return "none"
+
+    if origin == "builtin":
+        try:
+            from notmyfault.security.signing_keys import get_public_keys
+            pub_keys = get_public_keys()
+            if not pub_keys:
+                return "none"
+            pubs = [Ed25519PublicKey.from_public_bytes(k) for k in pub_keys]
+        except Exception:
+            return "none"
+        return "official" if _verify_sig_with_keys(plugin_dir, pubs) else "none"
+
+    # 非内置插件由作者自签，公钥随插件目录分发，验的是没被篡改过。
+    key_path = os.path.join(plugin_dir, "public_key.pem")
+    if os.path.exists(key_path):
+        try:
+            from cryptography.hazmat.primitives.serialization import load_pem_public_key
+            with open(key_path, "rb") as f:
+                pub = load_pem_public_key(f.read())
+        except Exception:
+            return "none"
+        return "author" if _verify_sig_with_keys(plugin_dir, [pub]) else "none"
+
+    # 旧安装流程用本地密钥代签的用户插件目录里没有 public_key.pem，退回官方和用户公钥表验签。
+    try:
+        from notmyfault.security.signing_keys import get_public_keys
+        pub_keys = get_public_keys()
+        if not pub_keys:
+            return "none"
+        pubs = [Ed25519PublicKey.from_public_bytes(k) for k in pub_keys]
+    except Exception:
+        return "none"
+    return "official-legacy" if _verify_sig_with_keys(plugin_dir, pubs) else "none"
+
+
+def verify_plugin_sig(plugin_dir: str, origin: str = "builtin") -> bool:
+    """校验插件签名文件和签名覆盖的文件清单，任何异常都按验签失败处理"""
+    return plugin_signature_kind(plugin_dir, origin) != "none"
 
 
 _PLUGIN_MANIFEST_FILE = os.path.join(os.path.dirname(CONFIG_FILE), "plugin_manifest.json")
