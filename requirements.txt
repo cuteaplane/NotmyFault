@@ -13,5 +13,6 @@ pystray; sys_platform == "linux"
 
 pywebview; sys_platform == "win32"
 pywin32; sys_platform == "win32"
+comtypes; sys_platform == "win32"
 windows-toasts; sys_platform == "win32"
 pycaw; sys_platform == "win32"
