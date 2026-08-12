@@ -68,7 +68,8 @@ def pack_plugin(plugin_dir: Path, output_dir: Path = DIST_DIR, arc_prefix: str |
     with py7zr.SevenZipFile(nmfp_path, mode="w") as archive:
         for fpath, arcname in files:
             if arc_prefix is not None:
-                arcname = f"{arc_prefix}/{fpath.name}"
+                relative = fpath.relative_to(plugin_dir).as_posix()
+                arcname = f"{arc_prefix}/{relative}"
             archive.write(fpath, arcname=arcname)
 
     print(f"+ {ptype:8s} {plugin_id:20s} -> {nmfp_path} ({len(files)} files)")
