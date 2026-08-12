@@ -3,6 +3,7 @@ import ast
 import hashlib
 import json
 import os
+import tempfile
 from typing import List, Optional, Set, Tuple
 
 from notmyfault.config import CONFIG_FILE
@@ -439,24 +440,40 @@ def load_plugin_manifest() -> dict[str, dict[str, str]]:
     return {}
 
 
-def save_plugin_manifest(manifest: dict[str, dict[str, str]]) -> None:
-    """原子写入插件哈希清单，失败时直接写入"""
+def save_plugin_manifest(manifest: dict[str, dict[str, str]]) -> bool:
+    """用同目录临时文件原子写入插件哈希清单"""
+    manifest_dir = os.path.dirname(_PLUGIN_MANIFEST_FILE) or "."
+    tmp_path: str | None = None
+    fd = -1
     try:
-        os.makedirs(os.path.dirname(_PLUGIN_MANIFEST_FILE), exist_ok=True)
-        tmp_path = _PLUGIN_MANIFEST_FILE + ".tmp"
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(manifest, f, indent=2, sort_keys=True)
-            os.replace(tmp_path, _PLUGIN_MANIFEST_FILE)
-        except OSError:
+        os.makedirs(manifest_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=os.path.basename(_PLUGIN_MANIFEST_FILE) + ".",
+            suffix=".tmp",
+            dir=manifest_dir,
+            text=True,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = -1
+            json.dump(manifest, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, _PLUGIN_MANIFEST_FILE)
+        tmp_path = None
+        return True
+    except OSError:
+        return False
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
             try:
                 os.remove(tmp_path)
             except OSError:
                 pass
-            with open(_PLUGIN_MANIFEST_FILE, "w", encoding="utf-8") as f:
-                json.dump(manifest, f, indent=2, sort_keys=True)
-    except OSError:
-        pass
 
 
 def verify_plugin_integrity(
@@ -464,23 +481,34 @@ def verify_plugin_integrity(
 ) -> Tuple[bool, str]:
     """校验插件文件与清单的一致性并记录首次哈希"""
     manifest = load_plugin_manifest()
+    has_existing = plugin_id in manifest
     existing = manifest.get(plugin_id, {})
-    all_match = True
+    current: dict[str, str] = {}
+    present_files: set[str] = set()
     messages: List[str] = []
     for file_type, file_path in files:
+        present_files.add(file_type)
         current_hash = compute_file_hash(file_path)
         if current_hash is None:
             messages.append("无法读取 " + file_type)
-            all_match = False
             continue
-        expected_hash = existing.get(file_type)
-        if expected_hash is not None and current_hash != expected_hash:
+        current[file_type] = current_hash
+
+    if has_existing:
+        for file_type in sorted(existing.keys() - present_files):
+            messages.append(file_type + " 文件已被删除")
+        for file_type in sorted(present_files - existing.keys()):
+            messages.append(file_type + " 文件为清单外新增")
+        for file_type in sorted(existing.keys() & current.keys()):
+            expected_hash = existing[file_type]
+            if current[file_type] == expected_hash:
+                continue
             messages.append(file_type + " 文件已被修改！（期望 " + expected_hash[:12] + "...）")
-            all_match = False
-            # 不匹配时保留旧基线，否则篡改一次后下次就静默了
-            continue
-        manifest.setdefault(plugin_id, {})[file_type] = current_hash
-    save_plugin_manifest(manifest)
-    if not all_match:
+
+    if messages:
         return False, "；".join(messages)
+    if not has_existing:
+        manifest[plugin_id] = current
+        if not save_plugin_manifest(manifest):
+            return False, "无法保存完整性清单"
     return True, "完整性校验通过"
