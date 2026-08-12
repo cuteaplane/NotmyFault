@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>操作宏编辑器</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+    background: #fdfcff;
+    color: #1a1c1e;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { min-width: 320px; margin: 0; background: #fdfcff; color: #1a1c1e; }
+  button, select, input, textarea { font: inherit; }
+  button { cursor: pointer; }
+  button:disabled { cursor: wait; opacity: .56; }
+  .shell { min-height: 100vh; padding-bottom: 72px; }
+  .recorder {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 20px;
+    align-items: center;
+    min-height: 82px;
+    padding: 14px clamp(20px, 4vw, 44px);
+    border-bottom: 1px solid #c3c6cf;
+    background: #fdfcff;
+  }
+  .recorder-copy { min-width: 0; }
+  .recorder-state { display: flex; align-items: center; gap: 9px; margin: 0 0 4px; font-size: 17px; font-weight: 650; }
+  .state-mark { width: 10px; height: 10px; border-radius: 50%; background: #73777f; }
+  .state-mark.live { background: #ba1a1a; box-shadow: 0 0 0 6px rgba(186,26,26,.12); animation: pulse 1.35s ease-in-out infinite; }
+  .recorder-copy p { max-width: 720px; margin: 0; color: #43474e; font-size: 13px; line-height: 20px; }
+  .recorder-actions { display: flex; align-items: center; gap: 10px; }
+  .button {
+    min-height: 42px;
+    border: 0;
+    border-radius: 999px;
+    padding: 0 20px;
+    font-weight: 650;
+  }
+  .button.primary { background: #0061a4; color: #fff; }
+  .button.stop { background: #ffdad6; color: #410002; }
+  .button.tonal { background: #dae2f9; color: #131c2b; }
+  .recording-options {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+    min-height: 64px;
+    padding: 8px clamp(20px, 4vw, 44px);
+    border-bottom: 1px solid #e1e2e8;
+    background: #f6f3fc;
+    color: #43474e;
+    font-size: 12px;
+  }
+  .switch-setting { display: inline-flex; align-items: center; gap: 12px; cursor: pointer; }
+  .switch-copy { display: grid; gap: 1px; }
+  .switch-copy strong { color: #1a1c1e; font-size: 13px; font-weight: 650; }
+  .switch-copy small { color: #73777f; font-size: 11px; }
+  .switch-control { position: relative; width: 52px; height: 32px; flex: none; }
+  .switch-control input { position: absolute; width: 1px; height: 1px; margin: 0; opacity: 0; }
+  .switch-track { position: absolute; inset: 0; border: 2px solid #777b83; border-radius: 999px; background: #e1e2e8; transition: background .16s, border-color .16s; }
+  .switch-thumb { position: absolute; top: 50%; left: 6px; width: 16px; height: 16px; border-radius: 50%; background: #777b83; transform: translateY(-50%); transition: left .16s, width .16s, height .16s, background .16s; }
+  .switch-control input:checked + .switch-track { border-color: #0061a4; background: #0061a4; }
+  .switch-control input:checked + .switch-track .switch-thumb { left: 24px; width: 24px; height: 24px; background: #fff; }
+  .switch-control input:focus-visible + .switch-track { outline: 3px solid rgba(0,97,164,.26); outline-offset: 2px; }
+  .switch-control input:disabled + .switch-track { opacity: .38; }
+  .hotkey { display: inline-flex; align-items: center; gap: 8px; }
+  kbd { border: 1px solid #c3c6cf; border-bottom-width: 2px; border-radius: 6px; padding: 2px 7px; background: #fff; color: #1a1c1e; font: 600 11px/18px "Segoe UI", sans-serif; }
+  .workspace { max-width: 1120px; margin: 0 auto; padding: 20px clamp(20px, 4vw, 44px) 40px; }
+  .workspace-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
+  .workspace-head h2 { margin: 0; font-size: 18px; font-weight: 650; }
+  .count { padding: 6px 12px; border-radius: 999px; background: #d1e4ff; color: #001d36; font-size: 12px; font-weight: 700; }
+  .empty {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    min-height: 104px;
+    border-radius: 16px;
+    padding: 20px 22px;
+    background: #f6f3fc;
+    color: #43474e;
+    text-align: left;
+  }
+  .empty-mark { width: 48px; height: 48px; display: grid; flex: none; place-items: center; border-radius: 15px; background: #d1e4ff; color: #0061a4; font-size: 22px; }
+  .empty-copy { min-width: 0; }
+  .empty b { display: block; margin-bottom: 4px; color: #1a1c1e; font-size: 15px; }
+  .empty span { font-size: 12px; line-height: 19px; }
+  .timeline { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }
+  .timeline-item { position: relative; padding-left: 42px; }
+  .timeline-item::before { content: ""; position: absolute; left: 15px; top: 0; bottom: 0; width: 2px; background: #d8d9df; }
+  .timeline-item:last-child::before { bottom: calc(100% - 70px); }
+  .timeline-dot { position: absolute; z-index: 1; left: 7px; top: 48px; width: 18px; height: 18px; border: 4px solid #fdfcff; border-radius: 50%; background: #0061a4; box-shadow: 0 0 0 1px #0061a4; }
+  .delay-row { display: flex; align-items: center; gap: 7px; min-height: 34px; color: #73777f; font-size: 11px; }
+  .delay-row input { width: 66px; border: 0; border-bottom: 1px solid #9da1a9; background: transparent; color: inherit; padding: 3px 2px; text-align: right; outline: none; }
+  .delay-row input:focus { border-color: #0061a4; color: #0061a4; }
+  .step {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 16px;
+    margin-bottom: 14px;
+    border: 1px solid #c3c6cf;
+    border-radius: 14px;
+    padding: 15px 16px;
+    background: #fff;
+  }
+  .step-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .kind { flex: none; padding: 4px 8px; border-radius: 7px; background: #dae2f9; color: #293041; font-size: 11px; font-weight: 700; }
+  .kind.keyboard { background: #f4d9ff; color: #422c4e; }
+  .kind.coordinate { background: #e6e3eb; color: #43474e; }
+  .step-title { min-width: 0; overflow: hidden; margin: 0; font-size: 14px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+  .step-context { margin: 5px 0 0; overflow: hidden; color: #73777f; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+  .step-fields { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+  .step-fields label { display: grid; min-width: 190px; flex: 1 1 190px; gap: 4px; color: #43474e; font-size: 11px; font-weight: 650; }
+  select, .field-input { width: 100%; min-width: 190px; min-height: 48px; border: 1px solid #777b83; border-radius: 8px; background-color: #fff; color: #1a1c1e; padding: 10px 14px; outline: none; }
+  select { appearance: none; padding-right: 44px; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 24 24'%3E%3Cpath fill='%2343474e' d='m7 10 5 5 5-5z'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 14px center; }
+  textarea.field-input { min-height: 68px; resize: vertical; }
+  select:focus, .field-input:focus { border-color: #0061a4; box-shadow: 0 0 0 2px rgba(0,97,164,.12); }
+  .step-actions { display: flex; gap: 3px; }
+  .icon-button { width: 36px; height: 36px; display: grid; place-items: center; border: 0; border-radius: 50%; background: transparent; color: #43474e; font-size: 18px; }
+  .icon-button:hover { background: #ece9f1; }
+  .icon-button.remove:hover { background: #ffdad6; color: #93000a; }
+  .step-actions .remove { min-height: 36px; padding: 0 12px; background: transparent; color: #ba1a1a; font-size: 12px; }
+  .step-actions .remove:hover { background: #ffdad6; color: #93000a; }
+  .status { position: fixed; right: 24px; bottom: 82px; z-index: 3; max-width: min(460px, calc(100vw - 48px)); border-radius: 12px; padding: 11px 14px; background: #2f3033; color: #f1f0f4; font-size: 12px; box-shadow: 0 4px 12px rgba(0,0,0,.24); }
+  .status.error { background: #8c1d18; }
+  .footer { position: fixed; z-index: 2; right: 0; bottom: 0; left: 0; display: flex; justify-content: flex-end; gap: 10px; min-height: 64px; padding: 10px clamp(20px, 4vw, 44px); border-top: 1px solid #c3c6cf; background: rgba(253,252,255,.96); backdrop-filter: blur(10px); }
+  .footer .cancel { background: transparent; color: #43474e; }
+  .footer .save { background: #0061a4; color: #fff; }
+  @keyframes pulse { 50% { opacity: .55; transform: scale(.86); } }
+  @media (max-width: 720px) {
+    .recorder { grid-template-columns: 1fr; gap: 14px; padding-top: 18px; }
+    .recorder-actions { justify-content: flex-start; }
+    .recording-options { align-items: stretch; flex-direction: column; padding-top: 12px; padding-bottom: 12px; }
+    .hotkey { flex-wrap: wrap; }
+    .workspace { padding-top: 18px; }
+    .step { grid-template-columns: 1fr; }
+    .step-actions { justify-content: flex-end; }
+    .step-fields { display: grid; }
+    select, .field-input { width: 100%; min-width: 0; }
+  }
+  @media (prefers-color-scheme: dark) {
+    :root, body { background: #131318; color: #e3e2e6; }
+    .recorder { border-color: #43474e; background: #131318; }
+    .recorder-copy p, .recording-options, .step-context { color: #c3c6cf; }
+    .recording-options { border-color: #35353b; background: #1b1b21; }
+    .switch-copy strong { color: #e3e2e6; }
+    .switch-copy small { color: #9da1a9; }
+    .switch-track { border-color: #8d9199; background: #35353b; }
+    .switch-thumb { background: #c3c6cf; }
+    .switch-control input:checked + .switch-track { border-color: #9ecaff; background: #9ecaff; }
+    .switch-control input:checked + .switch-track .switch-thumb { background: #003258; }
+    .button.primary, .footer .save { background: #9ecaff; color: #003258; }
+    .button.tonal { background: #3c4458; color: #dae2f9; }
+    .button.stop { background: #93000a; color: #ffdad6; }
+    kbd, .step, select, .field-input { border-color: #8d9199; background-color: #1b1b21; color: #e3e2e6; }
+    select { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 24 24'%3E%3Cpath fill='%23c3c6cf' d='m7 10 5 5 5-5z'/%3E%3C/svg%3E"); }
+    .count, .empty-mark { background: #00497d; color: #d1e4ff; }
+    .empty { border-color: #73777f; background: #1b1b21; color: #c3c6cf; }
+    .empty b, .step-title { color: #e3e2e6; }
+    .timeline-item::before { background: #43474e; }
+    .timeline-dot { border-color: #131318; background: #9ecaff; box-shadow: 0 0 0 1px #9ecaff; }
+    .kind { background: #3c4458; color: #dae2f9; }
+    .kind.keyboard { background: #553a63; color: #f4d9ff; }
+    .kind.coordinate { background: #35353b; color: #c3c6cf; }
+    .icon-button { color: #c3c6cf; }
+    .icon-button:hover { background: #2a2a30; }
+    .footer { border-color: #43474e; background: rgba(19,19,24,.96); }
+    .footer .cancel { color: #c3c6cf; }
+  }
+  @media (prefers-reduced-motion: reduce) { .state-mark.live { animation: none; } }
+</style>
+</head>
+<body>
+  <main class="shell">
+    <section class="recorder">
+      <div class="recorder-copy">
+        <h1 class="recorder-state"><span id="stateMark" class="state-mark"></span><span id="stateTitle">准备录制</span></h1>
+        <p id="stateDescription">开始后照常操作电脑。鼠标点击优先记录为可跟随窗口移动的控件，识别失败时使用屏幕坐标。</p>
+      </div>
+      <div class="recorder-actions">
+        <button id="startButton" class="button primary" type="button">● 开始录制</button>
+        <button id="stopButton" class="button stop" type="button" hidden>■ 停止录制</button>
+      </div>
+    </section>
+    <section class="recording-options">
+      <label class="switch-setting" for="minimizeOption">
+        <span class="switch-copy"><strong>开始后最小化 NotmyFault</strong><small>录制停止后自动恢复</small></span>
+        <span class="switch-control">
+          <input id="minimizeOption" type="checkbox" role="switch" checked>
+          <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+        </span>
+      </label>
+      <span class="hotkey">录制过程中按 <kbd>Ctrl</kbd><span>+</span><kbd>Shift</kbd><span>+</span><kbd>F10</kbd> 停止并返回</span>
+    </section>
+    <section class="workspace">
+      <div class="workspace-head">
+        <h2>操作时间线</h2>
+        <span id="stepCount" class="count">0 步</span>
+      </div>
+      <div id="empty" class="empty">
+        <div class="empty-mark">◎</div>
+        <div class="empty-copy">
+          <b>走一遍，操作会自动出现在这里</b>
+          <span>录制会保存鼠标、键盘和每次操作之间的等待时间。请不要在录制中输入密码。</span>
+        </div>
+      </div>
+      <ol id="timeline" class="timeline" hidden></ol>
+    </section>
+    <div id="status" class="status" hidden></div>
+    <footer class="footer">
+      <button id="cancelButton" class="button cancel" type="button">取消</button>
+      <button id="saveButton" class="button save" type="button">保存操作宏</button>
+    </footer>
+  </main>
+<script>
+  const hostSource = 'notmyfault:extension-host'
+  const viewSource = 'notmyfault:extension-view'
+  const controlOperations = [
+    ['invoke', '按下控件'], ['focus', '移动焦点'], ['set_text', '写入文本'],
+    ['wait_present', '等待控件出现'], ['focus_window', '切换到所在窗口'], ['read_text', '读取控件文本'],
+  ]
+  const coordinateOperations = [
+    ['left_click', '单击左键'], ['double_click', '双击左键'], ['right_click', '单击右键'],
+    ['middle_click', '单击中键'], ['move', '移动鼠标'], ['scroll', '滚动滚轮'],
+    ['left_down', '按下左键'], ['left_up', '松开左键'],
+    ['right_down', '按下右键'], ['right_up', '松开右键'],
+    ['middle_down', '按下中键'], ['middle_up', '松开中键'],
+  ]
+  const keyNames = {
+    8:'Backspace', 9:'Tab', 13:'Enter', 16:'Shift', 17:'Ctrl', 18:'Alt', 27:'Esc', 32:'Space',
+    33:'Page Up', 34:'Page Down', 35:'End', 36:'Home', 37:'←', 38:'↑', 39:'→', 40:'↓',
+    45:'Insert', 46:'Delete', 91:'Win', 92:'Win', 160:'Shift', 161:'Shift', 162:'Ctrl', 163:'Ctrl', 164:'Alt', 165:'Alt',
+  }
+  const pending = new Map()
+  let requestSequence = 0
+  let steps = []
+  let recording = false
+  let busy = false
+  let pollTimer = 0
+
+  function invoke(command, payload) {
+    const requestId = 'macro-' + (++requestSequence)
+    window.parent.postMessage({ source:viewSource, type:'invoke', request_id:requestId, command, payload:payload || {} }, '*')
+    return new Promise(function (resolve) { pending.set(requestId, resolve) })
+  }
+
+  function setStatus(message, isError, persistent) {
+    const node = document.getElementById('status')
+    node.textContent = message || ''
+    node.className = isError ? 'status error' : 'status'
+    node.hidden = !message
+    window.clearTimeout(setStatus.timer)
+    if (message && !persistent) setStatus.timer = window.setTimeout(function () { node.hidden = true }, 3200)
+  }
+
+  function keyName(vk) {
+    if (keyNames[vk]) return keyNames[vk]
+    if (vk >= 48 && vk <= 90) return String.fromCharCode(vk)
+    if (vk >= 112 && vk <= 123) return 'F' + String(vk - 111)
+    return '键 ' + String(vk)
+  }
+
+  function keyboardSummary(step) {
+    const names = (Array.isArray(step.events) ? step.events : [])
+      .filter(function (event) { return event.event === 'down' })
+      .map(function (event) { return keyName(Number(event.vk)) })
+    if (!names.length) return '键盘输入'
+    const shown = names.slice(0, 8)
+    const joiner = shown.some(function (name) { return ['Ctrl','Shift','Alt','Win'].includes(name) }) ? ' + ' : '  '
+    return shown.join(joiner) + (names.length > shown.length ? '…' : '')
+  }
+
+  function stepInfo(step) {
+    if (step.kind === 'keyboard') {
+      const target = step.window && (step.window.process || step.window.name)
+      return { kind:'键盘', kindClass:'keyboard', title:keyboardSummary(step), context:(target ? '发送到 ' + target + ' · ' : '') + (step.events || []).length + ' 个按键事件' }
+    }
+    if (step.kind === 'control' || step.selector) {
+      const display = step.selector && step.selector.display || {}
+      return { kind:'控件', kindClass:'', title:display.control || '未命名控件', context:(display.app || '未知程序') + ' · ' + (display.window || '未命名窗口') }
+    }
+    const point = step.point || {}
+    const operation = coordinateOperations.find(function (item) { return item[0] === step.operation })
+    return { kind:'坐标', kindClass:'coordinate', title:(operation && operation[1] || '鼠标操作') + ' (' + String(point.x ?? '?') + ', ' + String(point.y ?? '?') + ')', context:'屏幕绝对坐标' }
+  }
+
+  function operationSelect(step) {
+    const select = document.createElement('select')
+    const entries = step.kind === 'control' || step.selector ? controlOperations : coordinateOperations
+    entries.forEach(function (entry) {
+      const option = document.createElement('option')
+      option.value = entry[0]
+      option.textContent = entry[1]
+      option.selected = entry[0] === step.operation
+      select.appendChild(option)
+    })
+    select.addEventListener('change', function () { step.operation = select.value; render() })
+    return select
+  }
+
+  function addOperationFields(container, step) {
+    if (step.operation === 'set_text') {
+      const label = document.createElement('label')
+      const input = document.createElement('textarea')
+      input.className = 'field-input'; input.value = String(step.text || '')
+      input.addEventListener('input', function () { step.text = input.value })
+      label.append('写入内容'); label.appendChild(input); container.appendChild(label)
+    }
+    if (step.operation === 'wait_present') {
+      const label = document.createElement('label')
+      const input = document.createElement('input')
+      input.className = 'field-input'; input.type = 'number'; input.min = '0.1'; input.max = '300'; input.step = '0.5'
+      input.value = String(Number(step.wait_seconds || 30))
+      input.addEventListener('input', function () { step.wait_seconds = Number(input.value) || 30 })
+      label.append('最长等待（秒）'); label.appendChild(input); container.appendChild(label)
+    }
+    if (step.operation === 'scroll') {
+      const label = document.createElement('label')
+      const input = document.createElement('input')
+      input.className = 'field-input'; input.type = 'number'; input.step = '120'
+      input.value = String(Number(step.mouse_data || 0))
+      input.addEventListener('input', function () { step.mouse_data = Number(input.value) || 0 })
+      label.append('滚轮增量'); label.appendChild(input); container.appendChild(label)
+    }
+  }
+
+  function render() {
+    document.getElementById('stateMark').className = recording ? 'state-mark live' : 'state-mark'
+    document.getElementById('stateTitle').textContent = recording ? '正在录制操作' : '准备录制'
+    document.getElementById('stateDescription').textContent = recording
+      ? '请切换到目标程序并完成操作。鼠标、键盘和等待时间正在记录。'
+      : '开始后照常操作电脑。鼠标点击优先记录为可跟随窗口移动的控件，识别失败时使用屏幕坐标。'
+    document.getElementById('startButton').hidden = recording
+    document.getElementById('stopButton').hidden = !recording
+    document.getElementById('saveButton').disabled = recording || busy
+    document.getElementById('cancelButton').disabled = busy
+    document.getElementById('minimizeOption').disabled = recording
+    document.getElementById('stepCount').textContent = steps.length + ' 步'
+    const empty = document.getElementById('empty')
+    const timeline = document.getElementById('timeline')
+    empty.hidden = steps.length > 0
+    timeline.hidden = steps.length === 0
+    timeline.replaceChildren()
+    steps.forEach(function (step, index) {
+      const info = stepInfo(step)
+      const item = document.createElement('li')
+      item.className = 'timeline-item'
+      const dot = document.createElement('span')
+      dot.className = 'timeline-dot'
+      const delay = document.createElement('div')
+      delay.className = 'delay-row'
+      delay.append('等待')
+      const delayInput = document.createElement('input')
+      delayInput.type = 'number'; delayInput.min = '0'; delayInput.max = '600'; delayInput.step = '0.1'
+      delayInput.value = String(Number(step.delay_seconds || 0).toFixed(1))
+      delayInput.setAttribute('aria-label', '第 ' + (index + 1) + ' 步之前等待秒数')
+      delayInput.addEventListener('input', function () { step.delay_seconds = Number(delayInput.value) || 0 })
+      delay.appendChild(delayInput); delay.append('秒')
+      const card = document.createElement('article')
+      card.className = 'step'
+      const main = document.createElement('div')
+      const head = document.createElement('div'); head.className = 'step-head'
+      const badge = document.createElement('span'); badge.className = 'kind ' + info.kindClass; badge.textContent = info.kind
+      const title = document.createElement('p'); title.className = 'step-title'; title.textContent = info.title
+      head.appendChild(badge); head.appendChild(title)
+      const context = document.createElement('p'); context.className = 'step-context'; context.textContent = info.context
+      main.appendChild(head); main.appendChild(context)
+      if (step.kind !== 'keyboard') {
+        const fields = document.createElement('div'); fields.className = 'step-fields'
+        const label = document.createElement('label'); label.append('执行动作'); label.appendChild(operationSelect(step))
+        fields.appendChild(label); addOperationFields(fields, step); main.appendChild(fields)
+      }
+      const actions = document.createElement('div'); actions.className = 'step-actions'
+      const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button remove'; remove.title = '删除这一步'; remove.textContent = '删除'
+      remove.addEventListener('click', function () { steps.splice(index, 1); render() }); actions.appendChild(remove)
+      card.appendChild(main); card.appendChild(actions)
+      item.appendChild(dot); item.appendChild(delay); item.appendChild(card); timeline.appendChild(item)
+    })
+  }
+
+  function applyRecordingResult(data) {
+    recording = Boolean(data && data.recording)
+    if (!recording && Array.isArray(data && data.steps)) steps = JSON.parse(JSON.stringify(data.steps))
+    if (!recording) {
+      window.clearInterval(pollTimer); pollTimer = 0
+      setStatus(data && data.error || '录制完成，已生成 ' + steps.length + ' 个步骤', Boolean(data && data.error), false)
+    }
+    render()
+  }
+
+  async function startRecording() {
+    if (busy || recording) return
+    busy = true; render(); setStatus('正在启动全局录制…', false, true)
+    try {
+      const response = await invoke('start_recording', {
+        append:true,
+        steps,
+        minimize_window:document.getElementById('minimizeOption').checked,
+      })
+      if (!response || !response.ok) throw new Error(response && response.error || '录制启动失败')
+      applyRecordingResult(response.data || {})
+      pollTimer = window.setInterval(pollRecording, 500)
+      setStatus('', false, false)
+    } catch (error) {
+      setStatus(error.message || '录制启动失败', true, true)
+    } finally { busy = false; render() }
+  }
+
+  async function pollRecording() {
+    if (!recording) return
+    try {
+      const response = await invoke('recording_status', {})
+      if (!response || !response.ok) throw new Error(response && response.error || '读取录制状态失败')
+      applyRecordingResult(response.data || {})
+    } catch (error) {
+      window.clearInterval(pollTimer); pollTimer = 0
+      setStatus(error.message || '读取录制状态失败', true, true)
+    }
+  }
+
+  async function stopRecording() {
+    if (busy || !recording) return
+    busy = true; render(); setStatus('正在整理录制内容…', false, true)
+    try {
+      const response = await invoke('stop_recording', {})
+      if (!response || !response.ok) throw new Error(response && response.error || '停止录制失败')
+      applyRecordingResult(response.data || {})
+    } catch (error) { setStatus(error.message || '停止录制失败', true, true) }
+    finally { busy = false; render() }
+  }
+
+  async function save() {
+    if (recording) { setStatus('请先停止录制', true, false); return }
+    if (!steps.length) { setStatus('请先录制至少一个操作', true, false); return }
+    busy = true; render(); setStatus('正在保存操作宏…', false, true)
+    try {
+      const response = await invoke('commit_macro', { steps })
+      if (!response || !response.ok) throw new Error(response && response.error || '操作宏保存失败')
+    } catch (error) { busy = false; render(); setStatus(error.message || '操作宏保存失败', true, true) }
+  }
+
+  async function cancel() {
+    if (busy) return
+    busy = true; render()
+    try {
+      const response = await invoke('cancel_macro', {})
+      if (!response || !response.ok) throw new Error(response && response.error || '取消失败')
+    }
+    catch (error) { busy = false; render(); setStatus(error.message || '取消失败', true, true) }
+  }
+
+  window.addEventListener('message', function (event) {
+    const message = event.data || {}
+    if (event.source !== window.parent || message.source !== hostSource) return
+    if (message.type === 'init') {
+      const state = message.state || {}
+      steps = Array.isArray(state.steps) ? JSON.parse(JSON.stringify(state.steps)) : []
+      recording = Boolean(state.recording); render(); return
+    }
+    if (message.type === 'window-error') { setStatus(message.error || '窗口操作失败', true, true); return }
+    if (message.type !== 'result' || typeof message.request_id !== 'string') return
+    const resolve = pending.get(message.request_id)
+    if (!resolve) return
+    pending.delete(message.request_id); resolve(message.response || { ok:false, error:'插件宿主没有返回结果' })
+  })
+
+  document.getElementById('startButton').addEventListener('click', startRecording)
+  document.getElementById('stopButton').addEventListener('click', stopRecording)
+  document.getElementById('saveButton').addEventListener('click', save)
+  document.getElementById('cancelButton').addEventListener('click', cancel)
+  document.addEventListener('keydown', function (event) {
+    if (event.key !== 'Escape' || recording || busy) return
+    event.preventDefault()
+    window.parent.postMessage({ source:viewSource, type:'close' }, '*')
+  })
+  render()
+  window.parent.postMessage({ source:viewSource, type:'ready' }, '*')
+</script>
+</body>
+</html>

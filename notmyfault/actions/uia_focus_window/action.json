@@ -1,0 +1,30 @@
+{
+    "id": "uia_focus_window",
+    "name": "切换到录制窗口",
+    "description": "切换到所选屏幕控件所属的窗口",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.uia_focus_window",
+    "enabled": true,
+    "execution_api": "context-v1",
+    "cancellation_api": "runtime-v1",
+    "platforms": ["windows"],
+    "entrypoints": {"windows": "action.py"},
+    "permissions": ["native_api", "screen_reader"],
+    "params": [
+        {
+            "name": "target",
+            "label": "窗口里的控件",
+            "type": "uia_selector",
+            "value_type": "object",
+            "required": true,
+            "sensitive": true,
+            "summary": "hidden"
+        }
+    ],
+    "outputs": [
+        {"name": "focused", "label": "已经切换", "type": "bool", "summary": "value"},
+        {"name": "display", "label": "窗口说明", "type": "object", "summary": "shape"}
+    ],
+    "idempotent": true
+}
