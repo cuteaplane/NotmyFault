@@ -87,13 +87,16 @@ class InputRecorder:
         mouse_resolver: Callable[[int, int], Any] | None = None,
         keyboard_window_resolver: Callable[[], Any] | None = None,
         resolve_timeout: float = 0.25,
+        keyboard_password_resolver: Callable[[], Any] | None = None,
     ) -> None:
         self._mouse_resolver = mouse_resolver
         self._keyboard_window_resolver = keyboard_window_resolver
+        self._keyboard_password_resolver = keyboard_password_resolver
         self._resolve_timeout = max(0.0, min(float(resolve_timeout), 0.5))
         self._events: list[dict] = []
         self._events_lock = threading.RLock()
         self._pressed_keys: set[int] = set()
+        self._skipped_keys: set[int] = set()
         self._pressed_buttons: set[str] = set()
         self._last_move: tuple[float, int, int] | None = None
         self._stop_event = threading.Event()
@@ -219,6 +222,16 @@ class InputRecorder:
             return
         self._resolve_queue.put(("keyboard_window", event, None))
 
+    def _resolve_keyboard_password(self) -> bool:
+        if self._keyboard_password_resolver is None:
+            return False
+        result = {"value": True}
+        done = threading.Event()
+        self._resolve_queue.put(("keyboard_password", result, done))
+        if not done.wait(self._resolve_timeout):
+            return True
+        return bool(result.get("value", True))
+
     def _resolve_loop(self) -> None:
         while True:
             task = self._resolve_queue.get()
@@ -229,21 +242,25 @@ class InputRecorder:
                 with per_monitor_dpi_context():
                     if kind == "mouse":
                         value = self._mouse_resolver(event["x"], event["y"])
+                    elif kind == "keyboard_password":
+                        value = bool(self._keyboard_password_resolver())
                     else:
                         value = self._keyboard_window_resolver()
             except Exception as exc:
-                value = None
+                value = True if kind == "keyboard_password" else None
                 error = str(exc)
             else:
                 error = ""
             with self._events_lock:
                 if kind == "mouse":
                     event["selector"] = value
+                elif kind == "keyboard_password":
+                    event["value"] = value
                 elif isinstance(value, dict) and value:
                     event["window"] = value
                 if error and kind == "mouse":
                     event["selector_error"] = error[:240]
-                elif error:
+                elif error and kind == "keyboard_window":
                     event["window_error"] = error[:240]
             if done is not None:
                 done.set()
@@ -277,6 +294,14 @@ class InputRecorder:
             self._stop_event.set()
             ctypes.windll.user32.PostQuitMessage(0)
             return True
+        if state == "up" and vk in self._skipped_keys:
+            self._skipped_keys.discard(vk)
+            return False
+        if self._resolve_keyboard_password():
+            if state == "down":
+                self._skipped_keys.add(vk)
+            return False
+        self._skipped_keys.discard(vk)
         with self._events_lock:
             starts_group = not self._events or self._events[-1].get("kind") != "keyboard"
         event = self._append({

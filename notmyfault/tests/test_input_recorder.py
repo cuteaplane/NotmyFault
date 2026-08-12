@@ -1,6 +1,15 @@
 """全局输入事件转换为操作宏步骤。"""
 
-from notmyfault.native.input_recorder import _signed_word, build_macro_steps
+import threading
+
+from notmyfault.native.input_recorder import (
+    KBDLLHOOKSTRUCT,
+    InputRecorder,
+    WM_KEYDOWN,
+    WM_KEYUP,
+    _signed_word,
+    build_macro_steps,
+)
 
 
 SCREEN = {"left": 0, "top": 0, "width": 1920, "height": 1080}
@@ -15,6 +24,26 @@ SELECTOR = {
 def test_signed_word_reads_mouse_wheel_delta():
     assert _signed_word(120 << 16) == 120
     assert _signed_word((0x10000 - 120) << 16) == -120
+
+
+def test_keyboard_events_in_password_control_are_not_recorded():
+    recorder = InputRecorder(
+        keyboard_password_resolver=lambda: True,
+        resolve_timeout=0.1,
+    )
+    resolver_thread = threading.Thread(
+        target=recorder._resolve_loop,
+        daemon=True,
+    )
+    resolver_thread.start()
+    data = KBDLLHOOKSTRUCT(65, 30, 0, 1, 0)
+    try:
+        assert recorder._keyboard_event(WM_KEYDOWN, data) is False
+        assert recorder._keyboard_event(WM_KEYUP, data) is False
+        assert recorder.snapshot()["events"] == []
+    finally:
+        recorder._resolve_queue.put(None)
+        resolver_thread.join(timeout=1)
 
 
 def test_click_keyboard_and_wheel_keep_timing_and_uia_selector():

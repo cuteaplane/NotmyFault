@@ -386,6 +386,18 @@ def capture_foreground_window() -> Dict[str, Any]:
     return validate_window_signature(signature)
 
 
+def is_focused_password_control() -> bool:
+    """返回当前焦点控件是否声明为密码输入控件，读取失败时按密码控件处理。"""
+    if sys.platform != "win32":
+        return False
+    try:
+        with _automation() as (automation, _uia):
+            element = automation.GetFocusedElement()
+            return bool(_current(element, "CurrentIsPassword", False))
+    except Exception:
+        return True
+
+
 def validate_selector(selector: Any) -> Dict[str, Any]:
     if not isinstance(selector, dict) or selector.get("version") != 1:
         raise DesktopElementError(
