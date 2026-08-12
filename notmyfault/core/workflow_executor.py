@@ -674,22 +674,34 @@ class WorkflowExecutor:
             return False, "引擎正在关闭"
 
         action_type = action.get("type")
-        if action_type == "run_powershell":
+        dynamic_parameter_error = ""
+        dynamic_parameter_name = ""
+        if action_type in ("run_powershell", "launch_program"):
             raw_params = action.get("params", {})
-            raw_command = (
-                raw_params.get("command") if isinstance(raw_params, dict) else None
+            dynamic_parameter_name = (
+                "command" if action_type == "run_powershell" else "path"
             )
-            # 写入侧只拦了 $ref，旧模板字符串在这里兜底
-            if is_reference(raw_command) or contains_legacy_template(raw_command):
-                self._diagnostics.inc_action_fail()
-                engine_error(
-                    "unsafe_dynamic_parameter",
-                    action_type=action_type,
-                    rule_name=rule_name,
-                    error="PowerShell 命令不允许来自运行时数据",
+            raw_value = (
+                raw_params.get(dynamic_parameter_name)
+                if isinstance(raw_params, dict)
+                else None
+            )
+            if is_reference(raw_value) or contains_legacy_template(raw_value):
+                dynamic_parameter_error = (
+                    "PowerShell 命令不允许来自运行时数据"
+                    if action_type == "run_powershell"
+                    else "程序路径不允许来自运行时数据"
                 )
-                self._on_event(
-                    "workflow_failed",
+        if dynamic_parameter_error:
+            self._diagnostics.inc_action_fail()
+            engine_error(
+                "unsafe_dynamic_parameter",
+                action_type=action_type,
+                rule_name=rule_name,
+                error=dynamic_parameter_error,
+            )
+            self._on_event(
+                "workflow_failed",
                 {
                     "action_type": action_type,
                     "rule_id": context.get("rule", {}).get("id", ""),
@@ -697,17 +709,20 @@ class WorkflowExecutor:
                     "rule_name": rule_name,
                     "step_id": action.get("binding_id") or action_type,
                     "error": {
-                            "code": "unsafe_dynamic_parameter",
-                            "location": "actions.run_powershell.params.command",
-                            "message": "PowerShell 命令不允许来自运行时数据",
-                        },
+                        "code": "unsafe_dynamic_parameter",
+                        "location": (
+                            f"actions.{action_type}.params."
+                            f"{dynamic_parameter_name}"
+                        ),
+                        "message": dynamic_parameter_error,
                     },
-                )
-                print(
-                    f"[Engine] [!!] 拦截 run_powershell 动态命令: {rule_name}",
-                    file=sys.stderr,
-                )
-                return False, "PowerShell 命令不允许来自运行时数据"
+                },
+            )
+            print(
+                f"[Engine] [!!] 拦截 {action_type} 动态参数: {rule_name}",
+                file=sys.stderr,
+            )
+            return False, dynamic_parameter_error
         try:
             params = resolve_value(
                 action.get("params", {}),

@@ -45,6 +45,24 @@ class TestExecuteAction:
         assert ok is False
         assert "ghost" in result
 
+    def test_launch_program_rejects_dynamic_path(self):
+        engine = make_engine()
+        register_action(engine, "launch_program", lambda meta, params: None)
+        ok, result = engine._run_action(
+            {
+                "type": "launch_program",
+                "params": {
+                    "path": {
+                        "$ref": {"scope": "event", "path": ["program"]}
+                    }
+                },
+            },
+            "规则",
+            _context(),
+        )
+        assert ok is False
+        assert result == "程序路径不允许来自运行时数据"
+
     def test_execute_during_shutdown(self):
         engine = make_engine()
         register_action(engine, "noop", lambda meta, params: None)
