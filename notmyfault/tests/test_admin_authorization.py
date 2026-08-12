@@ -4,6 +4,7 @@ import inspect
 import importlib
 import os
 import subprocess
+import sys
 import threading
 from types import SimpleNamespace
 
@@ -128,3 +129,35 @@ def test_broker_timeout_output_bytes_are_decoded(monkeypatch):
     assert response["error"] == "timeout"
     assert response["stdout"] == "partial"
     assert response["stderr"] == "timed out"
+
+
+def test_broker_rejects_malformed_packet(monkeypatch):
+    writes = []
+    closed = []
+    handle = object()
+    fake_file = SimpleNamespace(
+        GENERIC_READ=1,
+        GENERIC_WRITE=2,
+        OPEN_EXISTING=3,
+        CreateFile=lambda *args: handle,
+        CloseHandle=lambda value: closed.append(value),
+    )
+    fake_pipe = SimpleNamespace(WaitNamedPipe=lambda *args: None)
+    monkeypatch.setitem(sys.modules, "win32file", fake_file)
+    monkeypatch.setitem(sys.modules, "win32pipe", fake_pipe)
+    monkeypatch.setattr(admin_broker.os, "name", "nt")
+    monkeypatch.setattr(
+        admin_broker,
+        "read_packet",
+        lambda value: (_ for _ in ()).throw(ValueError("broken")),
+    )
+    monkeypatch.setattr(
+        admin_broker,
+        "write_packet",
+        lambda value, payload: writes.append(payload),
+    )
+
+    assert admin_broker.run(r"\\.\pipe\NotmyFaultAdmin-test") == 4
+    assert writes[0]["op"] == "ready"
+    assert writes[1] == {"ok": False, "error": "管理员代理消息格式无效"}
+    assert closed == [handle]

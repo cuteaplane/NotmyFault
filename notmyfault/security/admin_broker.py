@@ -133,7 +133,20 @@ def run(pipe_name: str) -> int:
     try:
         write_packet(handle, {"op": "ready", "pid": os.getpid()})
         while True:
-            request = read_packet(handle)
+            try:
+                request = read_packet(handle)
+            except (ValueError, UnicodeError) as error:
+                try:
+                    write_packet(handle, {"ok": False, "error": "管理员代理消息格式无效"})
+                except Exception:
+                    pass
+                print(f"[AdminBroker] 消息格式无效: {error}", file=sys.stderr)
+                return 4
+            except (EOFError, OSError):
+                return 0
+            except Exception as error:
+                print(f"[AdminBroker] 读取消息失败: {error}", file=sys.stderr)
+                return 4
             operation = request.get("op")
             if operation == "shutdown":
                 write_packet(handle, {"ok": True})
