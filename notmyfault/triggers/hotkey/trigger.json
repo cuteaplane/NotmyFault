@@ -10,6 +10,19 @@
     "platforms": ["windows"],
     "enabled": true,
     "permissions": ["native_api"],
+    "components": [
+        {
+            "id": "record",
+            "name": "录制热键",
+            "description": "按下按键后返回对应的热键",
+            "entrypoint": "component.py",
+            "param_types": ["hotkey"],
+            "ui": {
+                "button_label": "录制",
+                "icon": "keyboard"
+            }
+        }
+    ],
     "outputs": [
         {"name": "hotkey", "label": "触发热键", "type": "string"}
     ],
