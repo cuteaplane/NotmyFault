@@ -1,6 +1,6 @@
 # NotmyFault
 
-一个仍在抢救中草台班本地桌面自动化工具。
+一个仍在抢救中的草台班本地桌面自动化工具。
 
 NotmyFault 让你用“条件 → 检查 → 动作”的方式告诉电脑以后该怎么做。例如：
 
@@ -11,35 +11,51 @@ NotmyFault 让你用“条件 → 检查 → 动作”的方式告诉电脑以�
     → 显示一条通知
 ```
 
-不稳定，目前最适合愿意测试、提交日志和接受配置变化的 Alpha 用户。
+当前版本 `alpha-0.14.0pre1`。不稳定，适合愿意测试、提交日志和接受配置变化的 Alpha 用户。
 
-## 当前状态
-
-当前版本：`alpha-0.11.0`
-
-[查看 alpha-0.11.0 更新日志](CHANGELOG.md#alpha-0110)
+## 平台支持
 
 | 平台 | 状态 | 说明 |
 | --- | --- | --- |
-| Windows | 主要开发平台 | 核心引擎、Dashboard 和大多数内置插件可用 |
-| Linux | 实验性支持 | 不同桌面环境差异较大，Wayland 会限制全局热键和窗口检测 |
-| macOS | 暂不支持 | 插件协议预留了平台字段，但尚未完成适配 |
+| Windows | 主要开发平台 | 引擎、Dashboard 和大多数内置插件可用 |
+| Linux | 实验性（糟糕）支持 | 桌面环境差异较大；Wayland 下全局热键和窗口标题检测不可用 |
+| macOS | 暂不，也可能是永不支持 | 插件协议预留了平台字段，尚未适配 |
 
 ## 已经能做什么
 
-- 用定时、热键、进程、剪贴板、文件夹、设备、电源和网络状态触发规则。
-- 使用可嵌套的 `AND` / `OR` 条件树组合多个条件。
-- 按顺序执行多个动作，并在后续步骤中引用上一步的结果。
-- 在动作开始前检查文件是否仍在写入、文档是否还在编辑。
-- 调整音量和亮度、启动或结束程序、操作文件、截图、通知、HTTP 请求等。
-- 场景化插件：电量阈值与电源计划、计划任务、音频设备变化与媒体控制、
-  快捷方式、文本输入、追加日志、清空剪贴板、开机启动、WiFi 环境感知、
-  锁屏检测、窗口置顶等。
-- 将触发器和动作作为插件独立加载，并检查权限、签名和平台兼容性。
-- 后台引擎与 Dashboard 分离；关闭管理窗口不会自动停止已经运行的引擎。
-- 记录执行日志、动作成功/失败和触发器崩溃信息。
+内置插件现有 19 个触发器、29 个动作。
 
-内置插件目前包括 19 个触发器和 24 个动作。部分功能依赖操作系统或硬件支持：例如 Windows 全局热键、窗口标题检测，以及外接显示器的亮度控制。
+触发器按用途：
+
+- 时间：定时、计划任务、开机启动、手动触发。
+- 输入与状态：全局热键、空闲检测、锁屏/解锁、系统资源占用。
+- 电源与设备：电源状态、电量阈值、蓝牙设备、音频设备、USB 设备。
+- 网络：网络连通状态、WiFi 网络变化。
+- 软件状态：进程启动/退出、窗口标题变化。
+- 内容变化：剪贴板变化、文件夹变化。
+
+动作按用途：
+
+- 音量、显示器亮度、电源计划、关机。
+- 启动或结束程序、打开 URL、创建快捷方式。
+- 文件操作，以及在操作前等待文件停止写入。
+- 剪贴板读取/清空/写入、文本输入、发送按键、追加日志。
+- 截图、桌面通知、文本转语音。
+- HTTP 请求、PowerShell 脚本。
+- 锁屏、蓝牙开关、壁纸、窗口置顶。
+- UIA 系列：控件操作、聚焦窗口、宏录制与回放、读取文本、等待元素。
+
+组合方式：
+
+- 单个触发条件用 `event`，复杂条件用可嵌套的 AND / OR 条件树。
+- 多个动作按顺序执行，后面的动作可以引用上一步的结果。
+- 触发器和动作作为插件独立加载，加载前检查权限、签名和平台兼容性。
+- 引擎与 Dashboard 分离：关闭管理窗口不会停止后台引擎。
+- 执行日志、动作成功/失败和触发器崩溃信息都记录在日志里。
+
+完整插件清单见 Dashboard 的插件页；源码在 `notmyfault/triggers/` 和 `notmyfault/actions/`。
+
+部分功能依赖操作系统或硬件：Windows 全局热键、窗口标题检测、外接显示器亮度控制。
 
 ## 从源码运行
 
@@ -62,12 +78,17 @@ cd dashboard
 npm install
 npm run build
 cd ..
+```
 
-.\.venv\Scripts\python build.py --security-mode=permissive
+```powershell
 .\.venv\Scripts\python dashboard.pyw
 ```
 
-Dashboard 打开后可以启动、暂停和重启后台引擎。只想运行后台服务时：
+Dashboard 打开后可以启动、暂停和重启后台引擎。
+第一次启动时如果缺少签名或 build.json，引擎会自动完成一次
+permissive 开发构建；需要其他安全模式时先手动执行“构建与签名”里的命令。
+
+只想运行后台引擎：
 
 ```powershell
 .\.venv\Scripts\python NOTMYFAULT.pyw
@@ -75,7 +96,7 @@ Dashboard 打开后可以启动、暂停和重启后台引擎。只想运行后�
 
 ### Linux
 
-Linux 支持仍处于实验阶段。以 Ubuntu 系桌面为例：
+Linux 支持仍处于**极其糟糕的**实验阶段。以 Ubuntu 系桌面为例：
 
 ```bash
 git clone https://github.com/cuteaplane/notmyfault.git
@@ -88,8 +109,9 @@ cd dashboard
 npm install
 npm run build
 cd ..
+```
 
-./.venv/bin/python build.py --security-mode=permissive
+```bash
 ./.venv/bin/python dashboard.pyw
 ```
 
@@ -99,23 +121,26 @@ cd ..
 sudo apt install wl-clipboard gnome-screenshot brightnessctl xprintidle
 ```
 
-Wayland 默认禁止普通应用监听全局按键或枚举其他应用的窗口标题。NotmyFault 会跳过明确不兼容的平台插件，但不能绕过桌面系统自身的安全限制。
+Wayland 默认禁止普通应用监听全局按键或枚举其他应用的窗口标题。NotmyFault
+会跳过明确不兼容的平台插件，但不能绕过桌面系统自身的安全限制。
 
-## 为什么首次运行需要 `build.py`
+## 构建与签名
 
-NotmyFault 会验证插件签名和核心文件完整性。直接从源码运行前，需要生成本地构建信息并为当前源码签名：
+NotmyFault 验证插件签名和核心文件完整性。构建入口是 `build.py`：
 
-```bash
-python build.py --security-mode=permissive
-```
+| 命令 | 作用 |
+| --- | --- |
+| `python build.py build` | strict 构建：生成密码加密的私钥，签名全部插件和 build.json。不带子命令时默认执行它 |
+| `python build.py build --security-mode=permissive` | 本地开发构建：使用不加密私钥，全程免密码 |
+| `python build.py verify` | 校验所有插件签名，有缺失或无效时以非零退出码结束 |
+| `python build.py init-keys` | 生成 Ed25519 密钥对；`--encrypt` 加密私钥，`--force` 覆盖已有密钥 |
+| `python build.py version` | 查看密钥状态、公钥指纹和插件签名数量 |
 
-修改内置插件或核心源码后需要重新执行该命令，否则旧签名会失效。
-
-`permissive` 适合本地开发和 Alpha 测试。默认的 `strict` 模式会要求加密签名密钥，面向正式构建：
-
-```bash
-python build.py
-```
+- 私钥放在 `.private/`，不检入 git；内置公钥写入 `notmyfault/security/signing_keys.py`。
+- 修改内置插件或核心源码后需要重新 build，否则旧签名失效。
+- 安全模式有 strict / normal / permissive 三档。引擎按环境变量
+  `NOTMYFAULT_MODE`、签名 build.json、默认 strict 的顺序决定当前模式。
+- normal 和 permissive 都使用不加密私钥，适合本地开发和测试。
 
 ## 规则模型
 
@@ -162,24 +187,37 @@ python build.py
 }
 ```
 
-一般不需要手写 JSON，Dashboard 会负责编辑和校验规则。
+一般不需要手写 JSON，Dashboard 负责编辑和校验规则。
+条件树节点和数据引用格式见 [docs/rule-schema-v2.md](docs/rule-schema-v2.md)。
 
 ## 数据位置
 
-| 平台 | 配置与日志目录 |
+| 平台 | 目录 |
 | --- | --- |
 | Windows | `%APPDATA%\NotmyFault\` |
 | Linux | `$XDG_CONFIG_HOME/notmyfault/`，未设置时为 `~/.config/notmyfault/` |
 
-本地 API 监听 `127.0.0.1:19198`，但它使用 Dashboard 管理的本机认证令牌。项目目前不提供“随便打开浏览器或直接 curl 就能管理”的模式。
+该目录下：
+
+- `config.json`：引擎配置。
+- `rules.json`：规则。
+- `logs/`：执行日志。
+- `plugins/`：用户安装的插件。
+- `.api_token`：Dashboard 与本地 API 之间共享的认证令牌。
+
+本地 API 监听 `127.0.0.1:19198`，只接受本机请求和上述令牌认证。
+项目不提供“随便打开浏览器或直接 curl 就能管理”的模式。
+Dashboard 是 pywebview 桌面客户端，不是远程管理后台。
 
 ## 开发与验证
 
 后端测试：
 
 ```bash
-python -m pytest notmyfault/tests -q
+python -m pytest -q
 ```
+
+测试目录为 `notmyfault/tests/` 和 `tests/`（pytest.ini 的 testpaths）。
 
 Dashboard 构建与挂载测试：
 
@@ -188,13 +226,19 @@ cd dashboard
 npm test
 ```
 
+等于 `vite build && node tests/mount.mjs && node tests/macro-page.mjs`。
+
 验证插件签名：
 
 ```bash
 python build.py verify
 ```
 
-插件格式、条件树、动作上下文和目录说明见 [开发文档](docs/DEVELOPMENT.md)。
+`notmyfault/simulator/` 提供模拟环境，可以在不接触真实系统的情况下跑规则；
+对应测试见 `notmyfault/tests/test_simulator.py`。
+
+插件格式、条件树、动作上下文和目录说明见 [开发文档](docs/DEVELOPMENT.md)；
+Windows 原生调用边界见 [docs/native-safety.md](docs/native-safety.md)。
 
 ## 已知限制
 
@@ -202,10 +246,9 @@ python build.py verify
 - Linux 尚未覆盖足够多的桌面环境和发行版。
 - 部分插件名称和参数仍然偏开发者视角，用户友好度还在改进。
 - 显示器亮度、蓝牙、睡眠等系统功能会受到驱动、权限和硬件能力限制。
-- Dashboard 是桌面客户端，不是远程管理后台。
-- 目前没有稳定版安装包承诺；从源码运行仍需要 Python 和 Node.js。
+- 目前没有稳定版安装包；从源码运行仍需要 Python 和 Node.js。
 
-遇到问题时，请附上操作系统、复现步骤以及最新的日志文件
+遇到问题时，请附上操作系统、复现步骤以及 `logs/` 里最新的日志文件。
 
 ## License
 
