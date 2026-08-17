@@ -18,8 +18,8 @@ def _get_crypto():
 
 # 插件目录里解释器和开发工具生成的目录不进签名清单。
 _GENERATED_DIR_NAMES = frozenset({"__pycache__", "__pypackages__", "node_modules"})
-# 签名文件自身和随包公钥不能被签名覆盖，否则签名改变清单就循环了。
-_SIGNATURE_ARTIFACT_NAMES = frozenset({"signature.sig", "public_key.pem"})
+# 签名文件、随包公钥和公钥副签都不能进签名清单，否则签名和清单会互相咬住。
+_SIGNATURE_ARTIFACT_NAMES = frozenset({"signature.sig", "public_key.pem", "public_key.sig"})
 
 
 def plugin_files(plugin_dir) -> list[Path]:
@@ -53,12 +53,15 @@ def load_private_key(path: Path, password: Optional[str] = None):
     if data.startswith(b"-----BEGIN "):
         try:
             return load_pem_private_key(data, password=None)
-        except Exception:
+        except (TypeError, ValueError):
+            # 密钥有加密，需要提供密码
             if password is not None:
                 return load_pem_private_key(data, password=password.encode())
             import getpass
             pw = getpass.getpass("请输入签名密码: ")
             return load_pem_private_key(data, password=pw.encode())
+        except Exception as exc:
+            raise RuntimeError(f"私钥文件无法解析，可能已损坏: {exc}") from exc
 
     return Ed25519PrivateKey.from_private_bytes(data)
 
@@ -92,6 +95,38 @@ def self_sign_plugin(plugin_dir: Path, private_key) -> bool:
     sign_plugin(Path(plugin_dir), "", private_key=private_key)
     export_public_key(private_key, Path(plugin_dir) / "public_key.pem")
     return True
+
+
+def counter_sign_author_key(plugin_dir: Path, private_key) -> Path:
+    """用用户私钥副签作者公钥，副签文件写在插件目录里。"""
+    key_path = Path(plugin_dir) / "public_key.pem"
+    data = key_path.read_bytes()
+    sig = private_key.sign(hashlib.sha256(data).digest())
+    sig_path = Path(plugin_dir) / "public_key.sig"
+    sig_path.write_bytes(sig)
+    return sig_path
+
+
+def verify_author_key_counter_signature(plugin_dir: Path, public_keys: list[bytes]) -> bool:
+    """校验作者公钥是否被任一用户公钥副签过。"""
+    key_path = Path(plugin_dir) / "public_key.pem"
+    sig_path = Path(plugin_dir) / "public_key.sig"
+    if not key_path.exists() or not sig_path.exists():
+        return False
+    try:
+        data = key_path.read_bytes()
+        sig = sig_path.read_bytes()
+    except OSError:
+        return False
+    digest = hashlib.sha256(data).digest()
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    for pub_bytes in public_keys:
+        try:
+            Ed25519PublicKey.from_public_bytes(pub_bytes).verify(sig, digest)
+            return True
+        except Exception:
+            continue
+    return False
 
 
 def sign_file(path, private_key) -> None:
