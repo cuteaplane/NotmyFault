@@ -24,7 +24,7 @@ function goSettings() {
 </script>
 
 <template>
-  <section class="page active ai-view">
+  <section class="page active ai-view" style="display:flex;flex-direction:column">
     <div class="page-head">
       <div>
         <h2>AI 起草</h2>

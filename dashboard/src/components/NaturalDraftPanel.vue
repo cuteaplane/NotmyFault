@@ -1,11 +1,12 @@
 <script setup>
-import { nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import MarkdownIt from 'markdown-it'
 import { streamRuleDraftWithAI } from '../lib/api'
 import { store } from '../lib/store'
 
 const MAX_HISTORY_ITEMS = 40
 const MAX_MESSAGE_CHARS = 4000
+const SCROLL_FOLLOW_SLACK = 150
 
 const emit = defineEmits(['create'])
 const composer = ref('')
@@ -14,10 +15,19 @@ const messages = ref([])
 const pendingConsent = ref(null)
 const conversationRef = ref(null)
 const composerRef = ref(null)
-const streamNotice = ref('')
+const userScrolledUp = ref(false)
 let messageId = 0
 let activeController = null
 let activeMessageId = null
+
+const QUICK_CHIPS = [
+  { label: '定时提醒', prompt: '每天早上 9 点提醒我处理邮件' },
+  { label: 'USB 触发', prompt: '插入 USB 设备时自动备份桌面文件夹到 U 盘' },
+  { label: '文件监听', prompt: '某个文件夹有新文件时给我发桌面通知' },
+  { label: '定时脚本', prompt: '每周五 18:00 运行一个 Python 脚本' },
+]
+
+const showWelcome = computed(() => messages.value.length === 0)
 
 const markdown = new MarkdownIt({ html: false, linkify: true, breaks: true })
 const defaultLinkOpen = markdown.renderer.rules.link_open || ((tokens, index, options, _env, self) => (
@@ -110,7 +120,22 @@ function assistantSummary(result) {
 
 async function scrollConversation() {
   await nextTick()
-  if (conversationRef.value) conversationRef.value.scrollTop = conversationRef.value.scrollHeight
+  const container = conversationRef.value
+  if (!container || userScrolledUp.value) return
+  container.scrollTop = container.scrollHeight
+}
+
+// 用户往上翻时暂停自动跟随，回到底部附近再恢复。
+function onConversationScroll() {
+  const container = conversationRef.value
+  if (!container) return
+  const distance = container.scrollHeight - container.scrollTop - container.clientHeight
+  userScrolledUp.value = distance > SCROLL_FOLLOW_SLACK
+}
+
+function jumpToLatest() {
+  userScrolledUp.value = false
+  void scrollConversation()
 }
 
 async function appendMessage(role, content, result = null, state = {}) {
@@ -125,7 +150,6 @@ async function appendMessage(role, content, result = null, state = {}) {
     reasoning: '',
     reasoningOpen: false,
     reasoningDone: false,
-    status: '',
   }
   messages.value.push(message)
   await scrollConversation()
@@ -146,7 +170,13 @@ function finishResult(message, result) {
   message.result = result
   message.transient = false
   message.streaming = false
+  settleReasoning(message)
+}
+
+// 思考结束就收起推理区，让答案回到视线中心；用户想回看仍可自己展开。
+function settleReasoning(message) {
   message.reasoningDone = !!message.reasoning
+  if (message.reasoningDone) message.reasoningOpen = false
 }
 
 function finishError(message, text) {
@@ -154,7 +184,7 @@ function finishError(message, text) {
   message.result = { result_type: 'assistant_message', message: text }
   message.transient = false
   message.streaming = false
-  message.reasoningDone = !!message.reasoning
+  settleReasoning(message)
 }
 
 function requestMessages() {
@@ -166,10 +196,7 @@ function requestMessages() {
 }
 
 function handleStreamEvent(message, event, markDone) {
-  if (event.type === 'status') {
-    message.status = event.data?.status === 'started' ? '正在准备回复' : ''
-    return
-  }
+  if (event.type === 'status') return
   if (event.type === 'reasoning') {
     const delta = String(event.data?.delta ?? '')
     if (delta) {
@@ -184,7 +211,6 @@ function handleStreamEvent(message, event, markDone) {
     const delta = String(event.data?.delta ?? '')
     if (delta) {
       message.content += delta
-      message.status = '正在回复'
       void scrollConversation()
     }
     return
@@ -192,11 +218,13 @@ function handleStreamEvent(message, event, markDone) {
   if (event.type === 'result') {
     finishResult(message, event.data)
     void scrollConversation()
+    markDone()
     return
   }
   if (event.type === 'error') {
     finishError(message, assistantMessage(event.data))
     void scrollConversation()
+    markDone()
     return
   }
   if (event.type === 'done') markDone()
@@ -206,7 +234,8 @@ async function sendTurn(content, consent = null) {
   const text = clipContent(content)
   if (!text || drafting.value) return
 
-  streamNotice.value = ''
+  // 自己发言等于回到当下，重新贴住底部。
+  userScrolledUp.value = false
   drafting.value = true
   await appendMessage('user', text)
   const message = await appendMessage('assistant', '', null, { transient: true, streaming: true })
@@ -243,7 +272,7 @@ async function sendTurn(content, consent = null) {
     }
     if (!controller.signal.aborted) {
       message.streaming = false
-      message.reasoningDone = !!message.reasoning
+      settleReasoning(message)
       await scrollConversation()
       await nextTick()
       composerRef.value?.focus()
@@ -261,8 +290,19 @@ function stopDrafting() {
   if (message) {
     message.streaming = false
     message.stopped = true
-    message.reasoningDone = !!message.reasoning
+    settleReasoning(message)
   }
+  void nextTick(() => composerRef.value?.focus())
+}
+
+// 结束一轮探索后清空重来，避免历史干扰后续起草。
+function clearConversation() {
+  if (drafting.value) return
+  if (!messages.value.length) return
+  if (!window.confirm('清空当前对话？已生成的草稿和插件提案都会消失。')) return
+  messages.value = []
+  pendingConsent.value = null
+  userScrolledUp.value = false
   void nextTick(() => composerRef.value?.focus())
 }
 
@@ -270,7 +310,29 @@ async function sendMessage() {
   const text = clipContent(composer.value)
   if (!text) return
   composer.value = ''
+  void nextTick(() => { growTextarea() })
   await sendTurn(text)
+}
+
+function sendChip(prompt) {
+  if (drafting.value) return
+  void sendTurn(prompt)
+}
+
+// Auto-grow the textarea as the user types
+function growTextarea() {
+  const el = composerRef.value
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = Math.min(el.scrollHeight, 200) + 'px'
+}
+
+// Enter submits, Shift+Enter inserts newline
+function onComposerKeydown(e) {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    e.preventDefault()
+    sendMessage()
+  }
 }
 
 async function approvePluginProposal(result) {
@@ -316,20 +378,64 @@ onUnmounted(() => { activeController?.abort() })
 <template>
   <section class="ai-draft-panel flex h-full min-h-0 flex-col gap-3">
 
-    <div v-if="messages.length" ref="conversationRef"
+    <!-- Welcome / empty state -->
+    <transition name="ai-welcome">
+      <div v-if="showWelcome" class="ai-welcome-state flex min-h-0 flex-1 flex-col items-center justify-center gap-5 pb-4">
+        <span class="material-symbols-outlined ai-welcome-icon">auto_awesome</span>
+        <div class="text-center">
+          <p class="text-title-m text-on-surface">用自然语言描述你想自动化的事</p>
+          <p class="mt-1 text-body-s text-on-surface-variant">AI 会把它变成可直接送进编辑器的规则草稿，或提出缺少的插件能力提案。</p>
+        </div>
+        <div class="ai-quick-chips" role="list" aria-label="快速开始">
+          <button
+            v-for="chip in QUICK_CHIPS"
+            :key="chip.label"
+            type="button"
+            class="ai-quick-chip"
+            role="listitem"
+            :disabled="drafting"
+            @click="sendChip(chip.prompt)"
+          >
+            <span class="material-symbols-outlined">chevron_right</span>{{ chip.label }}
+          </button>
+        </div>
+      </div>
+    </transition>
+
+    <!-- Conversation -->
+    <div v-if="!showWelcome && messages.length > 0" class="ai-conversation-header">
+      <button v-if="userScrolledUp" class="btn btn-text btn-sm" type="button" @click="jumpToLatest">
+        <span class="material-symbols-outlined">arrow_downward</span>回到底部
+      </button>
+      <div class="flex-1"></div>
+      <button class="btn btn-text btn-sm" type="button" :disabled="drafting" @click="clearConversation">
+        <span class="material-symbols-outlined">refresh</span>新对话
+      </button>
+    </div>
+
+    <div v-if="!showWelcome" ref="conversationRef"
       class="natural-draft-conversation flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto pr-1!"
-      role="log" tabindex="0" :aria-busy="drafting" aria-live="polite" aria-label="AI 草稿对话">
+      role="log" tabindex="0" :aria-busy="drafting" aria-live="polite" aria-label="AI 草稿对话"
+      @scroll.passive="onConversationScroll">
       <article v-for="message in messages" :key="message.id" class="natural-draft-message min-w-0"
         :class="message.role === 'user' ? 'self-end max-w-4/5 rounded-md bg-primary-container px-3! py-2! text-body-m text-on-primary-container' : 'w-full'">
-        <details v-if="message.role === 'assistant' && message.reasoning" class="natural-draft-reasoning mb-2 rounded-md bg-surface-c px-3! py-2!"
-          :open="message.reasoningOpen" @toggle="message.reasoningOpen = $event.currentTarget.open">
-          <summary class="flex cursor-pointer list-none items-center gap-2 text-label-m text-on-surface-variant">
+        <div v-if="message.role === 'assistant' && message.reasoning"
+          class="natural-draft-reasoning mb-2 rounded-md bg-surface-c"
+          :class="{ 'reasoning-open': message.reasoningOpen }">
+          <button
+            type="button"
+            class="reasoning-toggle flex w-full cursor-pointer items-center gap-2 px-3! py-2! text-label-m text-on-surface-variant"
+            :aria-expanded="String(message.reasoningOpen)"
+            @click="message.reasoningOpen = !message.reasoningOpen"
+          >
             <span class="material-symbols-outlined text-body-l">psychology</span>
-            <span class="min-w-0 flex-1">{{ message.reasoningDone ? '思考已结束' : '正在思考…' }}</span>
-            <span class="material-symbols-outlined text-body-l">{{ message.reasoningOpen ? 'expand_less' : 'expand_more' }}</span>
-          </summary>
-          <p class="mt-2! whitespace-pre-wrap break-words text-body-s text-on-surface-variant">{{ message.reasoning }}</p>
-        </details>
+            <span class="min-w-0 flex-1 text-left">{{ message.reasoningDone ? '思考过程' : '正在思考…' }}</span>
+            <span class="material-symbols-outlined reasoning-chevron text-body-l">expand_more</span>
+          </button>
+          <div class="reasoning-body">
+            <p class="px-3! pb-2! whitespace-pre-wrap break-words text-body-s text-on-surface-variant">{{ message.reasoning }}</p>
+          </div>
+        </div>
         <template v-if="message.role === 'user'">
           <b class="block text-label-s">你</b>
           <p class="mt-1! whitespace-pre-wrap break-words">{{ message.content }}</p>
@@ -446,11 +552,22 @@ onUnmounted(() => { activeController?.abort() })
         </template>
 
         <template v-else>
-          <div class="rounded-md bg-surface-c-low px-3! py-2! text-body-m text-on-surface">
+          <div class="ai-msg-bubble rounded-md bg-surface-c-low px-3! py-2! text-body-m text-on-surface">
             <b class="block text-label-s text-primary">AI</b>
-            <div v-if="message.content" class="natural-draft-markdown mt-1! break-words" v-html="renderMarkdown(message.content)"></div>
-            <p v-else class="mt-1! text-body-s text-on-surface-variant">{{ message.status || '正在等待 AI 回复…' }}</p>
-            <p v-if="message.stopped" class="mt-1! text-body-s text-on-surface-variant">已停止</p>
+            <!-- Waiting for first token -->
+            <div v-if="message.streaming && !message.content" class="ai-typing-dots mt-2!" aria-label="AI 正在思考">
+              <span></span><span></span><span></span>
+            </div>
+            <!-- Streaming: plain text + blinking cursor -->
+            <div v-else-if="message.streaming && message.content"
+              class="mt-1! whitespace-pre-wrap break-words text-body-m">{{ message.content }}<span class="ai-stream-cursor" aria-hidden="true"></span></div>
+            <!-- Finished: rendered markdown -->
+            <div v-else-if="message.content"
+              class="natural-draft-markdown mt-1! break-words"
+              v-html="renderMarkdown(message.content)"></div>
+            <p v-if="message.stopped" class="mt-2! flex items-center gap-1 text-body-s text-on-surface-variant">
+              <span class="material-symbols-outlined" style="font-size:15px">stop_circle</span>已停止
+            </p>
           </div>
         </template>
       </article>
@@ -458,19 +575,34 @@ onUnmounted(() => { activeController?.abort() })
 
     <form class="natural-draft-form mt-0! flex shrink-0 flex-col gap-2" @submit.prevent="sendMessage">
       <label for="natural-draft-description" class="sr-only">你想自动化什么</label>
-      <div class="natural-draft-entry grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
-        <textarea id="natural-draft-description" ref="composerRef" v-model="composer" class="text-field textarea-field"
-          :maxlength="MAX_MESSAGE_CHARS" rows="2" placeholder="例如：每天 08:30 提醒我提交月报，USB 插入时自动备份文件"
-          :disabled="drafting"></textarea>
-        <button v-if="drafting" class="natural-draft-stop btn btn-outlined" type="button" @click="stopDrafting">
-          <span class="material-symbols-outlined">stop_circle</span>停止
-        </button>
-        <button v-else class="btn btn-filled" type="submit" :disabled="!composer.trim()">
-          <span class="material-symbols-outlined">send</span>发送
-        </button>
+      <div class="natural-draft-entry">
+        <textarea
+          id="natural-draft-description"
+          ref="composerRef"
+          v-model="composer"
+          class="text-field textarea-field natural-draft-textarea"
+          :maxlength="MAX_MESSAGE_CHARS"
+          rows="1"
+          placeholder="描述你想自动化的事，Enter 发送，Shift+Enter 换行"
+          :disabled="drafting"
+          @input="growTextarea"
+          @keydown="onComposerKeydown"
+        ></textarea>
+        <div class="natural-draft-actions">
+          <button v-if="drafting" class="btn btn-outlined natural-draft-stop w-full" type="button" @click="stopDrafting">
+            <span class="material-symbols-outlined">stop_circle</span>停止
+          </button>
+          <button v-else class="btn btn-filled w-full" type="submit" :disabled="!composer.trim()">
+            <span class="material-symbols-outlined">send</span>发送
+          </button>
+        </div>
       </div>
-      <p v-if="streamNotice" class="natural-draft-status text-body-s text-on-surface-variant" aria-live="polite">{{ streamNotice }}</p>
+      <p class="text-body-s text-on-surface-variant" style="padding-left:2px">
+        <span class="material-symbols-outlined" style="font-size:13px;vertical-align:middle">lock</span>
+        消息仅发往你配置的 AI 服务，不经过 NotmyFault 服务器。
+      </p>
 
     </form>
+
   </section>
 </template>

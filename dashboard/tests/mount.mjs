@@ -1506,18 +1506,16 @@ const adminAuthorizationSaved = bridgeCalls.some(call =>
 console.log((adminAuthorizationSaved?'PASS':'FAIL')+' - admin authorization selection is saved')
 if (!adminAuthorizationSaved) process.exit(1)
 
-rulesNav?.click()
+const aiNav = [...document.querySelectorAll('.nav-item')].find(
+  button => button.textContent.includes('AI 起草'),
+)
+aiNav?.click()
 await new Promise(r => setTimeout(r, 50))
-;[...document.querySelectorAll('.rules-library button')].find(button => button.textContent.includes('创建自动化'))?.click()
-await new Promise(r => setTimeout(r, 40))
-openBlankRule()?.click()
-await new Promise(r => setTimeout(r, 50))
-const aiLauncher = document.querySelector('.rule-editor-ai-launcher')
-aiLauncher?.click()
-await new Promise(r => setTimeout(r, 30))
-const aiPanelOpensBesideEditor = aiLauncher?.getAttribute('aria-expanded') === 'true'
-  && document.querySelector('#rule-ai-draft-panel')
-  && document.querySelector('#natural-draft-description')
+const aiPanelOpensBesideEditor = !!document.querySelector('.ai-view .ai-draft-panel')
+  && !!document.querySelector('#natural-draft-description')
+const aiWelcomeShowsQuickChips = [...document.querySelectorAll('.ai-quick-chip')].length > 0
+console.log((aiWelcomeShowsQuickChips?'PASS':'FAIL')+' - AI page greets with quick-start chips before any turn')
+if (!aiWelcomeShowsQuickChips) process.exit(1)
 const aiChatStart = aiDraftCalls.length
 const longTriggerName = '定时：在连续多个条件满足后仍需完整显示的中文触发标签'
 const longActionName = '显示通知：包含较长说明且不应省略或截断的中文动作标签'
@@ -1557,8 +1555,11 @@ const firstTurnPreservesHistory = firstAiTurn?.messages?.length === 1
 const streamedMarkdownRendersSafely = document.querySelector('.natural-draft-markdown strong')?.textContent === '请补充'
   && !document.querySelector('.natural-draft-markdown script')
   && !document.querySelector('.natural-draft-markdown img')
-const reasoningFinishedCollapsed = document.querySelector('.natural-draft-reasoning')?.textContent.includes('思考已结束')
-  && document.querySelector('.natural-draft-reasoning')?.open === false
+const reasoningPanel = document.querySelector('.natural-draft-reasoning')
+const reasoningFinishedCollapsed = !!reasoningPanel
+  && reasoningPanel.textContent.includes('思考过程')
+  && !reasoningPanel.classList.contains('reasoning-open')
+  && reasoningPanel.querySelector('.reasoning-toggle')?.getAttribute('aria-expanded') === 'false'
 
 mockAiDraftResultType = 'rule_draft'
 await sendNaturalDraft('通知内容写成今天的日报')
@@ -1623,18 +1624,12 @@ if (!aiDraftPreviewOk || !aiDraftReviewOnlyOk || !noDuplicateFinalAssistant) {
   console.error(JSON.stringify({ aiDraftCalls, aiDraftPreviewOk, aiDraftReviewOnlyOk, noDuplicateFinalAssistant, savedRulesPayload, firstAiTurn, secondAiTurn, composerStaysUsable }))
   process.exit(1)
 }
-document.querySelector('.rule-back-btn')?.click()
-await new Promise(r => setTimeout(r, 50))
 mockAiDraftResultType = 'plugin_proposal'
 const proposalCallStart = bridgeCalls.length
 const proposalSaveStart = saveConfigCalls.length
 const proposalAiStart = aiDraftCalls.length
-;[...document.querySelectorAll('.rules-library button')].find(button => button.textContent.includes('创建自动化'))?.click()
-await new Promise(r => setTimeout(r, 40))
-openBlankRule()?.click()
+aiNav?.click()
 await new Promise(r => setTimeout(r, 50))
-document.querySelector('.rule-editor-ai-launcher')?.click()
-await new Promise(r => setTimeout(r, 30))
 await sendNaturalDraft('根据天气情况生成状态报告')
 await new Promise(r => setTimeout(r, 50))
 const proposalAiTurn = aiDraftCalls[proposalAiStart]
@@ -1748,6 +1743,46 @@ console.log((abortStaysQuiet ? 'PASS' : 'FAIL') + ' - stopping an AI stream retu
 if (!abortStaysQuiet) process.exit(1)
 mockAiStreamMode = 'normal'
 mockAiDraftResultType = 'rule_draft'
+
+// 用户上翻读历史时，AI 的流式输出不该把视图拽回底部；用户自己发言才回到当下。
+const followPanel = document.querySelector('.natural-draft-conversation')
+Object.defineProperty(followPanel, 'clientHeight', { configurable:true, value:200 })
+Object.defineProperty(followPanel, 'scrollHeight', { configurable:true, value:1000 })
+mockAiDraftDelay = 120
+void sendNaturalDraft('再补一个每天下班提醒')
+await new Promise(r => setTimeout(r, 25))
+followPanel.scrollTop = 100
+followPanel.dispatchEvent(new window.Event('scroll', { bubbles:true }))
+await new Promise(r => setTimeout(r, 20))
+const jumpToLatestAppears = [...document.querySelectorAll('.ai-conversation-header button')].some(
+  button => button.textContent.includes('回到底部'),
+)
+await new Promise(r => setTimeout(r, 140))
+mockAiDraftDelay = 0
+const scrollFollowPausedWhileReadingBack = followPanel.scrollTop === 100
+;[...document.querySelectorAll('.ai-conversation-header button')].find(
+  button => button.textContent.includes('回到底部'),
+)?.click()
+await new Promise(r => setTimeout(r, 30))
+const jumpToLatestResumesFollow = followPanel.scrollTop === followPanel.scrollHeight
+window.confirm = () => true
+;[...document.querySelectorAll('.ai-conversation-header button')].find(
+  button => button.textContent.includes('新对话'),
+)?.click()
+await new Promise(r => setTimeout(r, 40))
+const newConversationResetsToWelcome = !document.querySelector('.natural-draft-conversation')
+  && [...document.querySelectorAll('.ai-quick-chip')].length > 0
+  && !document.querySelector('.natural-draft-result')
+const scrollAndResetOk = jumpToLatestAppears
+  && scrollFollowPausedWhileReadingBack
+  && jumpToLatestResumesFollow
+  && newConversationResetsToWelcome
+console.log((scrollAndResetOk?'PASS':'FAIL')+' - reading back pauses auto-scroll and new conversation clears the session')
+if (!scrollAndResetOk) {
+  console.error(JSON.stringify({ jumpToLatestAppears, scrollFollowPausedWhileReadingBack, jumpToLatestResumesFollow, newConversationResetsToWelcome }))
+  process.exit(1)
+}
+
 const aiKeyDeleteStart = bridgeCalls.length
 settingsNav?.click()
 await new Promise(r => setTimeout(r, 50))
