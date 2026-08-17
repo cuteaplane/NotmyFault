@@ -137,33 +137,6 @@ class SimTimeManager:
         self._now = dt
 
 
-class SimBluetoothManager:
-    def __init__(self):
-        self._devices: Dict[str, bool] = {}
-
-    def connect(self, device_name: str) -> None:
-        self._devices[device_name] = True
-
-    def disconnect(self, device_name: str) -> None:
-        self._devices[device_name] = False
-
-    def remove(self, device_name: str) -> None:
-        self._devices.pop(device_name, None)
-
-    def clear(self) -> None:
-        self._devices.clear()
-
-    def query_powershell(self, script: str) -> Tuple[str, str, int]:
-        """返回蓝牙查询的 stdout、stderr 和 returncode。"""
-        lines = []
-        for name, connected in self._devices.items():
-            base_iid = "DEV_" + str(abs(hash(name)) % 100000).zfill(5)
-            conn_str = "yes" if connected else "no"
-            lines.append(f"{name}|{conn_str}|{base_iid}")
-        stdout = "\n".join(lines)
-        return (stdout, "", 0)
-
-
 class SimulatedEnvironment:
     """组合各个状态管理器，为测试提供统一接口。"""
     def __init__(self, start_time: Optional[datetime] = None):
@@ -172,13 +145,11 @@ class SimulatedEnvironment:
         self.windows = SimWindowManager()
         self.idle = SimIdleManager()
         self.time = SimTimeManager(start_time)
-        self.bluetooth = SimBluetoothManager()
 
     def reset(self) -> None:
-        """清空进程、USB、窗口和蓝牙，并重置空闲时间与时钟。"""
+        """清空进程、USB 和窗口，并重置空闲时间与时钟。"""
         self.processes.clear()
         self.usb.clear()
         self.windows.clear()
         self.idle.set_idle(0.0)
         self.time.set_now(datetime(2026, 6, 1, 0, 0, 0))
-        self.bluetooth.clear()

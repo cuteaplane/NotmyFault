@@ -84,10 +84,10 @@ class SimulatedRunner:
             config["rules"] = copy.deepcopy(_SIM_DEMO_RULES)
         self.engine = AutomationEngine(config, on_event=self._on)
         self.engine._alert_user = lambda *a, **kw: None
-        for t in ["process_state","usb_insert","time_schedule","window_title","idle_detect","bluetooth_device"]:
+        for t in ["process_state","usb_insert","time_schedule","window_title","idle_detect"]:
             self.engine.triggers_funcs[t] = lambda m,c,e,se=None: None
             self.engine.triggers_meta[t] = {"semantic": "state"}
-        for a in ["set_volume","notify","launch_program","kill_process","lock_screen","run_powershell","bluetooth_toggle"]:
+        for a in ["set_volume","notify","launch_program","kill_process","lock_screen","run_powershell"]:
             self.engine.actions_funcs[a] = lambda m,p: None
             self.engine.actions_meta[a] = {}
 
