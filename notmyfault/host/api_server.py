@@ -3,6 +3,7 @@
 import json
 import secrets
 import os
+import queue
 import re
 import sys
 import asyncio
@@ -18,7 +19,6 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 from notmyfault.core.bindings import iter_legacy_event_payload_paths, iter_references
 from notmyfault.core.run_history import RunHistory
-from notmyfault.core.rule_drafting import draft_rule_from_text
 from notmyfault.components.session import ComponentSessionManager
 from notmyfault.extensions.protocol import (
     OwnedValueError,
@@ -34,12 +34,28 @@ from notmyfault.config import (
     ensure_rule_binding_ids,
     ensure_rule_id,
     get_admin_authorization_mode,
+    get_admin_rule_key_verification,
+    get_ai_drafting_settings,
     load_verified_config,
     load_verified_rules,
     save_config as config_save,
     save_rules as rules_save,
 )
+from notmyfault.host.ai_plugin_source import review_plugin_source
+from notmyfault.host.ai_proposals import parse_plugin_proposal
+from notmyfault.host.ai_provider import (
+    AIProviderIdleTimeoutError,
+    OpenAICompatibleDraftProvider,
+    draft_from_openai_compatible,
+)
 from notmyfault.platform.platform_support import get_config_dir
+from notmyfault.security import api_key_store
+from notmyfault.security.api_key_store import (
+    KeyStoreError,
+    KeyStoreInvalidKeyError,
+    KeyStoreStatus,
+    KeyStoreUnsupportedError,
+)
 from notmyfault.security.plugin_schema import (
     scan_plugins,
     validate_plugin_meta,
@@ -51,7 +67,11 @@ from notmyfault.security.plugin_schema import (
     check_payload_contract,
     PERMISSION_REGISTRY,
 )
-from notmyfault.security.plugins import scan_borrowed_privilege
+from notmyfault.security.plugins import plugin_signature_kind, scan_borrowed_privilege
+from notmyfault.security.rule_approval import (
+    AdminRuleApprovalError,
+    require_admin_rule_approval,
+)
 from notmyfault.security.security import detect_security_mode, SecurityMode
 from notmyfault.core.rules import (
     get_rule_events,
@@ -94,6 +114,65 @@ _NMFP_EXECUTABLE_EXTENSIONS = frozenset(
     {".exe", ".dll", ".bin", ".com", ".scr", ".sys", ".msi", ".cpl"}
 )
 
+# 密钥存储状态映射成稳定的接口字符串，密钥本身绝不出现在响应里。
+_API_KEY_STATUS_LABELS: Dict[KeyStoreStatus, str] = {
+    KeyStoreStatus.STORED: "saved",
+    KeyStoreStatus.ABSENT: "none",
+    KeyStoreStatus.UNSUPPORTED: "unsupported",
+    KeyStoreStatus.CORRUPT: "corrupt",
+}
+
+_AI_DRAFT_MAX_MESSAGES = 40
+_AI_DRAFT_MAX_CONTENT_CHARS = 4000
+# 插件 id 规则要和 ai_plugin_source 里的那份一致。
+_AI_CONSENT_PLUGIN_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
+
+
+class _ConsentRequired(Exception):
+    """模型要生成插件源码，但这次请求没带同意。"""
+
+
+def _validate_ai_messages(
+    value: Any,
+) -> tuple[List[Dict[str, str]] | None, str | None]:
+    """返回规范化后的多轮消息，不合法时返回 (None, 错误说明)。"""
+    if not isinstance(value, list) or not value:
+        return None, "messages 必须是非空列表"
+    if len(value) > _AI_DRAFT_MAX_MESSAGES:
+        return None, f"messages 最多 {_AI_DRAFT_MAX_MESSAGES} 条"
+    normalized: List[Dict[str, str]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            return None, f"messages[{index}] 必须是对象"
+        if set(item.keys()) != {"role", "content"}:
+            return None, f"messages[{index}] 只能包含 role 和 content"
+        role = item.get("role")
+        content = item.get("content")
+        if role not in ("user", "assistant"):
+            return None, f"messages[{index}].role 必须是 user 或 assistant"
+        if not isinstance(content, str) or not content.strip():
+            return None, f"messages[{index}].content 必须是非空字符串"
+        if len(content) > _AI_DRAFT_MAX_CONTENT_CHARS:
+            return None, f"messages[{index}].content 超过 {_AI_DRAFT_MAX_CONTENT_CHARS} 字符"
+        normalized.append({"role": role, "content": content})
+    if normalized[-1]["role"] != "user":
+        return None, "最后一条消息必须是 user 角色"
+    return normalized, None
+
+
+def _validate_ai_consent(value: Any) -> tuple[Dict[str, str] | None, str | None]:
+    """返回同意里的插件 id；缺省返回 (None, None)，不合法返回 (None, 错误说明)。"""
+    if value is None:
+        return None, None
+    if not isinstance(value, dict):
+        return None, "consent 必须是对象"
+    if set(value.keys()) != {"plugin_id"}:
+        return None, "consent 只能包含 plugin_id"
+    plugin_id = value.get("plugin_id")
+    if not isinstance(plugin_id, str) or not _AI_CONSENT_PLUGIN_ID_RE.match(plugin_id):
+        return None, "consent.plugin_id 无效"
+    return {"plugin_id": plugin_id}, None
+
 
 def _extract_nmfp_safely(archive_path: str, extract_dir: str, password: str | None) -> None:
     """解压 nmfp 插件包并检查路径、条目数和解压体积，发现违规时抛 ValueError。"""
@@ -121,18 +200,15 @@ def _extract_nmfp_safely(archive_path: str, extract_dir: str, password: str | No
             ):
                 raise ValueError(f"插件包包含非法路径: {name}")
             if getattr(info, "is_symlink", False):
-                extension = os.path.splitext(normalized)[1].lower()
-                if extension in _NMFP_EXECUTABLE_EXTENSIONS:
-                    raise ValueError(f"插件包包含可执行文件的符号链接: {name}")
+                raise ValueError(f"插件包包含符号链接，拒绝安装: {name}")
         zf.extractall(extract_dir)
 
     # 解压后再扫一遍磁盘，拦住归档元数据没有标记 symlink 的漏网条目。
     for base, _dirs, file_names in os.walk(extract_dir):
         for file_name in file_names:
             full_path = os.path.join(base, file_name)
-            extension = os.path.splitext(file_name)[1].lower()
-            if os.path.islink(full_path) and extension in _NMFP_EXECUTABLE_EXTENSIONS:
-                raise ValueError(f"插件包包含可执行文件的符号链接: {file_name}")
+            if os.path.islink(full_path):
+                raise ValueError(f"插件包包含符号链接，拒绝安装: {file_name}")
 
 
 def _run_plugin_build_hook(root_path: str, meta: dict) -> None:
@@ -176,39 +252,152 @@ def _run_plugin_build_hook(root_path: str, meta: dict) -> None:
             os.unlink(signature_path)
 
 
+def _restrict_token_file(path: str) -> None:
+    """只给当前用户保留令牌文件访问权限。"""
+    if os.name != "nt":
+        os.chmod(path, 0o600)
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    token_query = 0x0008
+    token_user_class = 1
+    dacl_security_information = 0x00000004
+    protected_dacl_security_information = 0x80000000
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    advapi32.OpenProcessToken.argtypes = (
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    )
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = (
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.LPWSTR),
+    )
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = (
+        wintypes.BOOL
+    )
+    advapi32.SetFileSecurityW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+    )
+    advapi32.SetFileSecurityW.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.LocalFree.argtypes = (wintypes.HLOCAL,)
+
+    class SidAndAttributes(ctypes.Structure):
+        _fields_ = (("sid", wintypes.LPVOID), ("attributes", wintypes.DWORD))
+
+    class TokenUser(ctypes.Structure):
+        _fields_ = (("user", SidAndAttributes),)
+
+    process_token = wintypes.HANDLE()
+    sid_text = wintypes.LPWSTR()
+    security_descriptor = wintypes.LPVOID()
+    try:
+        if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(), token_query, ctypes.byref(process_token)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        required = wintypes.DWORD()
+        advapi32.GetTokenInformation(
+            process_token,
+            token_user_class,
+            None,
+            0,
+            ctypes.byref(required),
+        )
+        if not required.value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        token_buffer = ctypes.create_string_buffer(required.value)
+        if not advapi32.GetTokenInformation(
+            process_token,
+            token_user_class,
+            token_buffer,
+            required,
+            ctypes.byref(required),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        user = ctypes.cast(token_buffer, ctypes.POINTER(TokenUser)).contents
+        if not advapi32.ConvertSidToStringSidW(
+            user.user.sid, ctypes.byref(sid_text)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        sddl = f"D:P(A;;FA;;;{sid_text.value})"
+        if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl,
+            1,
+            ctypes.byref(security_descriptor),
+            None,
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        security_information = (
+            dacl_security_information | protected_dacl_security_information
+        )
+        if not advapi32.SetFileSecurityW(
+            path,
+            security_information,
+            security_descriptor,
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+    except OSError as exc:
+        raise RuntimeError("无法设置 API 令牌文件权限") from exc
+    finally:
+        if security_descriptor:
+            kernel32.LocalFree(security_descriptor)
+        if sid_text:
+            kernel32.LocalFree(sid_text)
+        if process_token:
+            kernel32.CloseHandle(process_token)
+
+
 def _secure_write_token(path: str, token: str) -> None:
-    """写入 token 文件并设置当前用户权限。"""
+    """先限制空文件权限，再写入并替换令牌文件。"""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = os.path.join(
+        directory,
+        f".{os.path.basename(path)}.{secrets.token_hex(8)}.tmp",
+    )
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-    except OSError:
-        pass
-    try:
-        # 先写临时文件再原子替换，读取方拿到完整 token。
-        tmp_path = path + ".tmp"
-        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(token)
+        fd = os.open(
+            tmp_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        os.close(fd)
+        _restrict_token_file(tmp_path)
+        with open(tmp_path, "w", encoding="utf-8", newline="") as token_file:
+            token_file.write(token)
+            token_file.flush()
+            os.fsync(token_file.fileno())
         os.replace(tmp_path, path)
-        # Windows 上用 icacls 移除继承权限，只授予当前用户完全控制。
-        if os.name == "nt":
-            try:
-                import subprocess as _sp
-                userdomain = os.environ.get("USERDOMAIN", "")
-                username = os.environ.get("USERNAME") or os.getlogin()
-                full_user = f"{userdomain}\\{username}" if userdomain else username
-                r1 = _sp.run(
-                    ["icacls", path, "/grant:r", f"{full_user}:F"],
-                    capture_output=True, timeout=5,
-                )
-                if r1.returncode == 0:
-                    _sp.run(
-                        ["icacls", path, "/inheritance:r"],
-                        capture_output=True, timeout=5,
-                    )
-            except Exception:
-                pass
-    except OSError:
-        pass
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
 
 
 def _load_or_create_api_token(path: str) -> str:
@@ -218,6 +407,7 @@ def _load_or_create_api_token(path: str) -> str:
             token = f.read().strip()
         if len(token) == 64:
             int(token, 16)
+            _secure_write_token(path, token)
             return token
     except (OSError, ValueError):
         pass
@@ -257,6 +447,7 @@ class EngineAPI:
         self._engine_ref = None
         self._component_sessions = ComponentSessionManager()
         self._extension_sessions = ExtensionSessionManager()
+        self.ai_draft_provider = None
 
         # 预览 token 映射到解压目录、根路径、元数据、类型和创建时间。
         self._pending_previews: Dict[str, Any] = {}
@@ -471,6 +662,36 @@ class EngineAPI:
     def _get_user_plugins_dir(self) -> str:
         return os.path.join(get_config_dir(), "plugins")
 
+    def _bluetooth_plugin_status(self) -> Dict[str, Any]:
+        plugin_dir = _PKG_ROOT / "bundled" / "actions" / "bluetooth_toggle"
+        meta_path = plugin_dir / "action.json"
+        destination = (
+            Path(self._get_user_plugins_dir()) / "actions" / "bluetooth_toggle"
+        )
+        if not meta_path.is_file():
+            return {"available": False, "installed": destination.is_dir(), "meta": None}
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"available": False, "installed": destination.is_dir(), "meta": None}
+        valid, _errors = validate_plugin_meta(meta, "action")
+        signature_path = plugin_dir / "signature.sig"
+        signature_ok = (
+            plugin_signature_kind(str(plugin_dir), "builtin") == "official"
+            if signature_path.is_file()
+            else detect_security_mode() == SecurityMode.PERMISSIVE
+        )
+        available = bool(
+            valid
+            and meta.get("id") == "bluetooth_toggle"
+            and signature_ok
+        )
+        return {
+            "available": available,
+            "installed": (destination / "action.json").is_file(),
+            "meta": meta,
+        }
+
     @staticmethod
     def _is_safe_plugin_id(pid: str) -> bool:
         """检查插件 id 不含路径分隔符或连续点。"""
@@ -479,6 +700,26 @@ class EngineAPI:
         if "/" in pid or "\\" in pid or ".." in pid:
             return False
         return True
+
+    @staticmethod
+    def _counter_sign_author_key(plugin_dir: str, password: str) -> str | None:
+        """用用户私钥副签作者公钥，返回错误文本，成功返回 None。"""
+        from notmyfault.security.signing import (
+            counter_sign_author_key,
+            load_private_key,
+        )
+        priv = _PRIVATE_DIR / "signing_private_key.pem"
+        if not priv.exists():
+            return "缺少签名私钥，无法信任作者自签插件"
+        encrypted = priv.read_bytes()[:20].startswith(b"-----BEGIN ENCRYPTED")
+        if encrypted and not password:
+            return "安装作者自签插件需要输入签名私钥密码"
+        try:
+            private_key = load_private_key(priv, password=password or None)
+            counter_sign_author_key(plugin_dir, private_key)
+        except Exception as error:
+            return f"签名私钥密码错误或副签失败: {error}"
+        return None
 
     def _find_plugin_by_package(self, package_name: str):
         """按 package_name 查找用户插件，返回类型、id 和元数据。"""
@@ -669,6 +910,203 @@ class EngineAPI:
             return {"ok": False, "error": str(e)}
 
 
+    @staticmethod
+    def _api_key_status_label() -> str:
+        """把存储状态映射成稳定字符串，读取失败按损坏处理，绝不回传密钥。"""
+        try:
+            status = api_key_store.api_key_status()
+        except KeyStoreError:
+            return "corrupt"
+        return _API_KEY_STATUS_LABELS.get(status, "corrupt")
+
+    @staticmethod
+    def _load_saved_api_key() -> str | None:
+        """读取保存的 AI API key，缺密钥、损坏或平台不支持时返回 None。"""
+        try:
+            return api_key_store.load_api_key()
+        except KeyStoreError:
+            return None
+
+    def _build_configured_ai_provider(
+        self, body: Dict[str, Any], settings: Dict[str, Any]
+    ) -> OpenAICompatibleDraftProvider:
+        endpoint_url = body.get("endpoint_url") or settings.get("endpoint_url")
+        model = body.get("model") or settings.get("model")
+        # 请求自带的非空 key 优先，否则回落到用户保存的 key。
+        api_key = body.get("api_key") or self._load_saved_api_key()
+        if not endpoint_url or not model or not api_key:
+            raise ValueError("AI draft provider input missing")
+        return OpenAICompatibleDraftProvider(
+            endpoint_url=endpoint_url,
+            model=model,
+            api_key=api_key,
+            api_format=settings.get("api_format", "chat_completions"),
+        )
+
+    def _finalize_ai_result(
+        self, provider_result: Any, consent: Dict[str, str] | None
+    ) -> Dict[str, Any]:
+        """把供应商结果转成最终 API 响应体；需同意却未同意时抛 _ConsentRequired。"""
+        if not isinstance(provider_result, dict):
+            raise ValueError("invalid AI draft result")
+        result_type = provider_result.get("result_type", "rule_draft")
+        if result_type == "assistant_message":
+            message = provider_result.get("message")
+            if (
+                not isinstance(message, str)
+                or not message.strip()
+                or len(message) > _AI_DRAFT_MAX_CONTENT_CHARS
+            ):
+                raise ValueError("invalid AI assistant message")
+            return {
+                "ok": True,
+                "source": "ai",
+                "result_type": "assistant_message",
+                "message": message,
+            }
+        if result_type == "plugin_proposal":
+            proposal = provider_result.get("proposal")
+            if not isinstance(proposal, dict):
+                raise ValueError("invalid AI plugin proposal")
+            return {
+                "ok": True,
+                "source": "ai",
+                "result_type": "plugin_proposal",
+                "proposal": dict(parse_plugin_proposal(proposal)),
+            }
+        if result_type == "plugin_source":
+            if consent is None:
+                raise _ConsentRequired()
+            # 模型给的原样值，交给 review_plugin_source 校验。
+            kind: Any = provider_result.get("kind")
+            manifest: Any = provider_result.get("manifest")
+            source: Any = provider_result.get("source")
+            plugin = review_plugin_source(kind, manifest, source, consent["plugin_id"])
+            return {
+                "ok": True,
+                "source": "ai",
+                "result_type": "plugin_source",
+                "plugin": plugin,
+            }
+        if result_type != "rule_draft":
+            raise ValueError("unknown AI draft result type")
+        candidates = provider_result.get("candidates")
+        if not isinstance(candidates, list) or len(candidates) != 1:
+            raise ValueError("invalid AI draft candidates")
+        candidate = candidates[0]
+        if not isinstance(candidate, dict):
+            raise ValueError("invalid AI draft candidate")
+        draft = dict(candidate)
+        if "event" not in draft and isinstance(draft.get("trigger"), dict):
+            draft["event"] = draft.pop("trigger")
+        draft = ensure_rule_binding_ids(draft)
+        return {
+            "ok": True,
+            "source": "ai",
+            "result_type": "rule_draft",
+            "draft": draft,
+            "validation": self._validate_rule_draft(draft),
+        }
+
+    @staticmethod
+    def _sse(event: str, payload: Dict[str, Any]) -> str:
+        return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    async def _run_ai_stream(
+        self,
+        request: Request,
+        make_stream,
+        consent: Dict[str, str] | None,
+    ):
+        """把同步流生成器桥接成 SSE，逐条产出完整 SSE 字符串。"""
+        yield self._sse("status", {"status": "started"})
+        items: queue.Queue = queue.Queue()
+        cancel_event = threading.Event()
+
+        def run() -> None:
+            failure: Exception | None = None
+            generator = None
+            try:
+                generator = make_stream(cancel_event.is_set)
+                for kind, payload in generator:
+                    if cancel_event.is_set():
+                        break
+                    items.put(("event", kind, payload))
+            except Exception as error:
+                failure = error
+            finally:
+                if generator is not None:
+                    generator.close()
+            if cancel_event.is_set():
+                return
+            marker = ("error", failure) if failure is not None else ("finish", None)
+            items.put(marker)
+
+        worker = threading.Thread(target=run, daemon=True, name="ai-draft-stream")
+        worker.start()
+
+        finalized = False
+        disconnected = False
+        try:
+            while True:
+                if await request.is_disconnected():
+                    disconnected = True
+                    break
+                try:
+                    item = items.get_nowait()
+                except queue.Empty:
+                    if not worker.is_alive():
+                        break
+                    await asyncio.sleep(0.01)
+                    continue
+                tag = item[0]
+                if tag == "event":
+                    _tag, kind, payload = item
+                    if finalized:
+                        continue
+                    if kind == "reasoning":
+                        yield self._sse("reasoning", {"delta": payload})
+                    elif kind == "text":
+                        yield self._sse("text", {"delta": payload})
+                    elif kind == "result":
+                        finalized = True
+                        try:
+                            result = self._finalize_ai_result(payload, consent)
+                        except _ConsentRequired:
+                            yield self._sse("error", {
+                                "code": "consent_required",
+                                "error": "生成插件源码需要用户同意",
+                            })
+                        except Exception:
+                            yield self._sse("error", {
+                                "code": "ai_provider_failed",
+                                "error": "AI 草稿服务暂不可用",
+                            })
+                        else:
+                            yield self._sse("result", result)
+                elif tag == "error":
+                    if not finalized:
+                        finalized = True
+                        failure = item[1]
+                        if isinstance(failure, AIProviderIdleTimeoutError):
+                            payload = {
+                                "code": "idle_timeout",
+                                "error": "AI 服务长时间没有返回内容",
+                            }
+                        else:
+                            payload = {
+                                "code": "ai_provider_failed",
+                                "error": "AI 草稿服务暂不可用",
+                            }
+                        yield self._sse("error", payload)
+                    break
+                elif tag == "finish":
+                    break
+        finally:
+            cancel_event.set()
+        if not disconnected:
+            yield self._sse("done", {"status": "done"})
+
     def _load_config(self) -> Dict[str, Any]:
         try:
             if os.path.exists(CONFIG_FILE):
@@ -693,18 +1131,11 @@ class EngineAPI:
         return load_verified_config()
 
     def _load_rules(self) -> List[Dict[str, Any]]:
-        """读 rules.json 里的规则，文件缺失或损坏时返回空列表"""
+        """读 rules.json 里的规则，验签失败、缺失或损坏时返回空列表"""
         try:
-            if os.path.exists(RULES_FILE):
-                with open(RULES_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                rules = data.get("rules", []) if isinstance(data, dict) else []
-                return rules if isinstance(rules, list) else []
-        except json.JSONDecodeError:
-            print("[API] 规则文件 JSON 格式错误，返回空规则列表", file=sys.stderr)
-        except OSError as e:
-            print(f"[API] 读取规则文件失败: {e}，返回空规则列表", file=sys.stderr)
-        return []
+            return load_verified_rules()
+        except ConfigValidationError:
+            return []
 
     def _save_rules(self, rules: List[Dict[str, Any]]) -> bool:
         return rules_save(rules)
@@ -792,7 +1223,8 @@ class EngineAPI:
             return {"ok": True, "message": "shutting_down"}
 
         @app.get("/api/engine/status")
-        async def engine_status():
+        async def engine_status(request: Request):
+            await self._verify_auth(request)
             rules = self._load_rules()
             trigger_types = {
                 event.get("type")
@@ -864,8 +1296,59 @@ class EngineAPI:
                 )
             return self._validate_rule_draft(body["rule"])
 
-        @app.post("/api/rules/draft")
-        async def rules_draft(request: Request):
+        @app.get("/api/settings/ai-drafting")
+        async def ai_drafting_settings(request: Request):
+            await self._verify_auth(request)
+            settings = get_ai_drafting_settings(self._load_config())
+            settings["api_key_status"] = self._api_key_status_label()
+            return settings
+
+        @app.put("/api/settings/ai-drafting/api-key")
+        async def save_ai_api_key(request: Request):
+            await self._verify_auth(request)
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse(
+                    {"ok": False, "error": "无效的 JSON 请求体"},
+                    status_code=400,
+                )
+            key = body.get("api_key") if isinstance(body, dict) else None
+            if not isinstance(key, str) or not key.strip():
+                return JSONResponse(
+                    {"ok": False, "error": "API key 不能为空"}, status_code=400
+                )
+            try:
+                api_key_store.save_api_key(key)
+            except KeyStoreInvalidKeyError:
+                return JSONResponse(
+                    {"ok": False, "error": "API key 无效"}, status_code=400
+                )
+            except KeyStoreUnsupportedError:
+                return JSONResponse(
+                    {"ok": False, "error": "当前平台不支持保存 API key"},
+                    status_code=409,
+                )
+            except KeyStoreError:
+                return JSONResponse(
+                    {"ok": False, "error": "无法保存 API key"}, status_code=500
+                )
+            return {"ok": True, "api_key_status": self._api_key_status_label()}
+
+        @app.delete("/api/settings/ai-drafting/api-key")
+        async def delete_ai_api_key(request: Request):
+            await self._verify_auth(request)
+            try:
+                api_key_store.delete_api_key()
+            except KeyStoreError:
+                return JSONResponse(
+                    {"ok": False, "error": "无法删除 API key"}, status_code=500
+                )
+            return {"ok": True, "api_key_status": self._api_key_status_label()}
+
+
+        @app.put("/api/settings/ai-drafting")
+        async def update_ai_drafting_settings(request: Request):
             await self._verify_auth(request)
             try:
                 body = await request.json()
@@ -876,44 +1359,191 @@ class EngineAPI:
                 )
             if not isinstance(body, dict):
                 return JSONResponse(
-                    {"ok": False, "error": "请求体必须是对象"},
+                    {"ok": False, "error": "请求体必须是 JSON 对象"},
                     status_code=400,
                 )
-            result = draft_rule_from_text(
-                body.get("description"),
-                self._get_plugins_schema(),
+            try:
+                config = self._load_config_for_update()
+            except ConfigValidationError as error:
+                return JSONResponse(
+                    {"ok": False, "error": f"配置未通过完整性校验: {error}"},
+                    status_code=409,
+                )
+            settings = config.get("settings")
+            if not isinstance(settings, dict):
+                settings = {}
+            settings["ai_drafting"] = {
+                "enabled": body.get("enabled") if isinstance(body.get("enabled"), bool) else False,
+                "endpoint_url": body.get("endpoint_url") if isinstance(body.get("endpoint_url"), str) else "",
+                "model": body.get("model") if isinstance(body.get("model"), str) else "",
+                "api_format": body.get("api_format") if body.get("api_format") in {"chat_completions", "responses"} else "chat_completions",
+            }
+            config["settings"] = settings
+            if not self._save_config(config):
+                return JSONResponse(
+                    {"ok": False, "error": "无法保存配置"}, status_code=500
+                )
+            return {"ok": True, "settings": get_ai_drafting_settings(config)}
+
+        @app.post("/api/rules/draft/ai")
+        async def ai_rules_draft(request: Request):
+            await self._verify_auth(request)
+            settings = get_ai_drafting_settings(self._load_config())
+            if not settings["enabled"]:
+                return JSONResponse(
+                    {"ok": False, "code": "ai_disabled"}, status_code=403
+                )
+            try:
+                body = await request.json()
+                if not isinstance(body, dict):
+                    return JSONResponse(
+                        {"ok": False, "error": "请求体必须是 JSON 对象"},
+                        status_code=400,
+                    )
+                messages, message_error = _validate_ai_messages(body.get("messages"))
+                if message_error is not None or messages is None:
+                    return JSONResponse(
+                        {"ok": False, "error": message_error or "messages 无效"},
+                        status_code=400,
+                    )
+                consent, consent_error = _validate_ai_consent(body.get("consent"))
+                if consent_error is not None:
+                    return JSONResponse(
+                        {"ok": False, "error": consent_error}, status_code=400
+                    )
+                allow_plugin_source = consent is not None
+                schema = self._get_plugins_schema()
+                provider = self.ai_draft_provider
+                if callable(provider):
+                    provider_result = await asyncio.to_thread(
+                        provider, messages, schema, allow_plugin_source
+                    )
+                else:
+                    def call_configured_provider():
+                        return draft_from_openai_compatible(
+                            self._build_configured_ai_provider(body, settings),
+                            messages,
+                            schema,
+                            allow_plugin_source=allow_plugin_source,
+                        )
+
+                    provider_result = await asyncio.to_thread(
+                        call_configured_provider
+                    )
+                try:
+                    return self._finalize_ai_result(provider_result, consent)
+                except _ConsentRequired:
+                    return JSONResponse(
+                        {
+                            "ok": False,
+                            "code": "consent_required",
+                            "error": "生成插件源码需要用户同意",
+                        },
+                        status_code=409,
+                    )
+            except Exception:
+                return JSONResponse(
+                    {"ok": False, "code": "ai_provider_failed", "error": "AI 草稿服务暂不可用"},
+                    status_code=502,
+                )
+
+        @app.post("/api/rules/draft/ai/stream")
+        async def ai_rules_draft_stream(request: Request):
+            await self._verify_auth(request)
+            settings = get_ai_drafting_settings(self._load_config())
+            if not settings["enabled"]:
+                return JSONResponse(
+                    {"ok": False, "code": "ai_disabled"}, status_code=403
+                )
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse(
+                    {"ok": False, "error": "请求体必须是 JSON 对象"}, status_code=400
+                )
+            if not isinstance(body, dict):
+                return JSONResponse(
+                    {"ok": False, "error": "请求体必须是 JSON 对象"}, status_code=400
+                )
+            messages, message_error = _validate_ai_messages(body.get("messages"))
+            if message_error is not None or messages is None:
+                return JSONResponse(
+                    {"ok": False, "error": message_error or "messages 无效"},
+                    status_code=400,
+                )
+            consent, consent_error = _validate_ai_consent(body.get("consent"))
+            if consent_error is not None:
+                return JSONResponse(
+                    {"ok": False, "error": consent_error}, status_code=400
+                )
+            allow_plugin_source = consent is not None
+            schema = self._get_plugins_schema()
+            provider: Any = self.ai_draft_provider
+
+            def make_stream(should_stop):
+                if provider is not None:
+                    stream = getattr(provider, "stream", None)
+                    if callable(stream):
+                        return stream(
+                            messages, schema, allow_plugin_source=allow_plugin_source
+                        )
+                    if callable(provider):
+                        def fallback():
+                            yield ("result", provider(messages, schema, allow_plugin_source))
+
+                        return fallback()
+                configured = self._build_configured_ai_provider(body, settings)
+                return configured.stream(
+                    messages,
+                    schema,
+                    allow_plugin_source=allow_plugin_source,
+                    should_stop=should_stop,
+                )
+
+            return StreamingResponse(
+                self._run_ai_stream(request, make_stream, consent),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
             )
-            if not result.get("ok"):
-                return JSONResponse(result, status_code=400)
-            draft = result.get("draft")
-            if isinstance(draft, dict):
-                draft = ensure_rule_binding_ids(draft)
-                event = draft.get("event", {})
-                if event.get("type") == "usb_insert":
-                    trigger_id = event.get("binding_id", "")
-                    for action in draft.get("actions", []):
-                        if (
-                            action.get("type") == "file_operation"
-                            and not action.get("params", {}).get("source")
-                            and trigger_id
-                        ):
-                            action["params"]["source"] = {
-                                "$ref": {
-                                    "scope": "trigger",
-                                    "node": trigger_id,
-                                    "path": ["actual_drive"],
-                                }
-                            }
-                            result["missing"] = [
-                                item for item in result.get("missing", [])
-                                if "源路径" not in item
-                            ]
-                            result.setdefault("assumptions", []).append(
-                                "文件来源使用本次插入的 U 盘"
-                            )
-                result["draft"] = draft
-                result["validation"] = self._validate_rule_draft(draft)
-            return result
+
+        @app.post("/api/rules/approve")
+        async def rules_approve(request: Request):
+            await self._verify_auth(request)
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse(
+                    {"ok": False, "error": "无效的 JSON 请求体"},
+                    status_code=400,
+                )
+            rules = body.get("rules") if isinstance(body, dict) else None
+            if not isinstance(rules, list):
+                return JSONResponse(
+                    {"ok": False, "error": "rules 必须是列表"}, status_code=400
+                )
+            try:
+                config = self._load_config()
+                require_admin_rule_approval(
+                    [],
+                    rules,
+                    self._get_plugins_schema(),
+                    body.get("admin_key_password"),
+                    key_verification=get_admin_rule_key_verification(config),
+                )
+            except AdminRuleApprovalError as error:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "code": error.code,
+                        "error": str(error),
+                        "plugins": error.plugins,
+                    },
+                    status_code=409,
+                )
+            return {"ok": True}
 
         @app.put("/api/rules")
         async def rules_save(request: Request):
@@ -988,14 +1618,36 @@ class EngineAPI:
                     status_code=400,
                 )
 
+            previous_rules = []
             if os.path.exists(RULES_FILE):
                 try:
-                    load_verified_rules()
+                    previous_rules = load_verified_rules()
                 except ConfigValidationError as error:
                     return JSONResponse(
                         {"ok": False, "error": f"现有规则未通过完整性校验: {error}"},
                         status_code=409,
                     )
+
+            try:
+                require_admin_rule_approval(
+                    previous_rules,
+                    normalized_rules,
+                    schema,
+                    body.get("admin_key_password"),
+                    key_verification=get_admin_rule_key_verification(
+                        self._load_config(),
+                    ),
+                )
+            except AdminRuleApprovalError as error:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "code": error.code,
+                        "error": str(error),
+                        "plugins": error.plugins,
+                    },
+                    status_code=409,
+                )
 
             # 规则只落 rules.json，不再连带重写设置文件
             ok = self._save_rules(normalized_rules)
@@ -1231,14 +1883,14 @@ class EngineAPI:
 
             if not isinstance(test_assertions, list) or len(test_assertions) > _TEST_ASSERTION_MAX_COUNT:
                 return JSONResponse(
-                    {"ok": False, "error": "测试断言必须是数组，且不能超过 50 条"},
+                    {"ok": False, "error": "测试结果检查必须是数组，且不能超过 50 条"},
                     status_code=400,
                 )
             normalized_assertions = []
             for assertion_index, assertion in enumerate(test_assertions):
                 if not isinstance(assertion, dict):
                     return JSONResponse(
-                        {"ok": False, "error": f"测试断言 #{assertion_index + 1} 必须是对象"},
+                    {"ok": False, "error": f"检查项 #{assertion_index + 1} 必须是对象"},
                         status_code=400,
                     )
                 step_id = assertion.get("step_id")
@@ -1256,7 +1908,7 @@ class EngineAPI:
                     )
                 ):
                     return JSONResponse(
-                        {"ok": False, "error": f"测试断言 #{assertion_index + 1} 无效"},
+                    {"ok": False, "error": f"检查项 #{assertion_index + 1} 无效"},
                         status_code=400,
                     )
                 normalized = {
@@ -1267,7 +1919,7 @@ class EngineAPI:
                 if operator != "exists":
                     if "expected" not in assertion:
                         return JSONResponse(
-                            {"ok": False, "error": f"测试断言 #{assertion_index + 1} 缺少期望值"},
+                    {"ok": False, "error": f"检查项 #{assertion_index + 1} 缺少期望值"},
                             status_code=400,
                         )
                     normalized["expected"] = assertion["expected"]
@@ -1389,6 +2041,53 @@ class EngineAPI:
         @app.get("/api/plugins/list")
         async def plugins_list():
             return self._list_all_plugins()
+
+        @app.get("/api/settings/bluetooth")
+        async def bluetooth_settings(request: Request):
+            await self._verify_auth(request)
+            return self._bluetooth_plugin_status()
+
+        @app.post("/api/settings/bluetooth/install")
+        async def install_bluetooth(request: Request):
+            await self._verify_auth(request)
+            status = self._bluetooth_plugin_status()
+            if not status["available"]:
+                return JSONResponse(
+                    {"ok": False, "error": "蓝牙开关插件缺失或签名无效"},
+                    status_code=400,
+                )
+            source = _PKG_ROOT / "bundled" / "actions" / "bluetooth_toggle"
+            destination = (
+                Path(self._get_user_plugins_dir()) / "actions" / "bluetooth_toggle"
+            )
+            if destination.exists():
+                return {"ok": True, "restart_required": True}
+            import shutil
+
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copytree(source, destination)
+                copied_signature = destination / "signature.sig"
+                if (
+                    copied_signature.is_file()
+                    and plugin_signature_kind(str(destination), "user") != "official-legacy"
+                ):
+                    shutil.rmtree(destination, ignore_errors=True)
+                    return JSONResponse(
+                        {"ok": False, "error": "复制后的蓝牙开关插件签名无效"},
+                        status_code=400,
+                    )
+            except OSError as error:
+                shutil.rmtree(destination, ignore_errors=True)
+                return JSONResponse(
+                    {"ok": False, "error": str(error)}, status_code=400
+                )
+            return {"ok": True, "restart_required": True}
+
+        @app.post("/api/settings/bluetooth/uninstall")
+        async def uninstall_bluetooth(request: Request):
+            await self._verify_auth(request)
+            return self._uninstall_plugin("actions", "bluetooth_toggle")
 
         def _scan_plugin_install_risks(root_path, json_name, meta):
             risks = scan_plugin_security(root_path)
@@ -1592,6 +2291,9 @@ class EngineAPI:
             password = str(form.get("password", "") or "")
             if not isinstance(password, str):
                 password = ""
+            signing_password = str(form.get("signing_password", "") or "")
+            if not isinstance(signing_password, str):
+                signing_password = ""
             force = str(form.get("force", "")).lower() in ("1", "true", "yes")
 
             tmp = None
@@ -1691,6 +2393,16 @@ class EngineAPI:
                         {"ok": False, "error": str(build_error)},
                         status_code=400,
                     )
+                # 作者自签的插件先由用户私钥副签作者公钥，再落盘。
+                if os.path.exists(os.path.join(root_path, "public_key.pem")):
+                    counter_error = self._counter_sign_author_key(
+                        root_path, signing_password,
+                    )
+                    if counter_error:
+                        return JSONResponse(
+                            {"ok": False, "error": counter_error},
+                            status_code=400,
+                        )
                 pkg = meta.get("package_name", "")
                 new_vc = meta.get("version_code", 0)
                 pid = meta.get("id", os.path.basename(root_path) if root_path else "")
@@ -1736,7 +2448,7 @@ class EngineAPI:
 
                 dest = os.path.join(user_dir, ptype, pid)
 
-                # 用户插件由作者用自己的密钥签名并随包携带 public_key.pem，引擎不再代签
+                # 引擎不重签插件文件，只副签作者公钥
 
                 if os.path.exists(dest):
                     shutil.rmtree(dest, ignore_errors=True)
@@ -1927,6 +2639,46 @@ class EngineAPI:
                 "effective_mode": effective,
                 "restart_required": bool(engine is not None and effective != mode),
             }
+
+        @app.get("/api/settings/admin-rule-verification")
+        async def admin_rule_verification_setting():
+            config = self._load_config()
+            return {
+                "key_verification": get_admin_rule_key_verification(config),
+            }
+
+        @app.put("/api/settings/admin-rule-verification")
+        async def update_admin_rule_verification_setting(request: Request):
+            try:
+                body = await request.json()
+            except Exception:
+                body = None
+            value = body.get("key_verification") if isinstance(body, dict) else None
+            if not isinstance(value, bool):
+                return JSONResponse(
+                    {"ok": False, "error": "key_verification 必须是布尔值"},
+                    status_code=400,
+                )
+            try:
+                config = self._load_config_for_update()
+            except ConfigValidationError as error:
+                return JSONResponse(
+                    {"ok": False, "error": f"配置未通过完整性校验: {error}"},
+                    status_code=409,
+                )
+            settings = config.get("settings")
+            if not isinstance(settings, dict):
+                settings = {}
+            else:
+                settings = dict(settings)
+            settings["admin_rule_key_verification"] = value
+            config["settings"] = settings
+            if not self._save_config(config):
+                return JSONResponse(
+                    {"ok": False, "error": "无法保存验证设置"},
+                    status_code=500,
+                )
+            return {"ok": True, "key_verification": value}
 
         @app.post("/api/config/security-approve")
         async def config_security_approve(request: Request):
