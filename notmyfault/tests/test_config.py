@@ -89,6 +89,16 @@ class TestDangerousCommand:
         result = config_mod._has_dangerous_command("$a = $env:TEMP + '\\p.exe'")
         assert result == "环境变量拼接"
 
+    def test_dotnet_process_elevation_blocked(self):
+        command = (
+            "$p=New-Object System.Diagnostics.ProcessStartInfo;"
+            "$p.FileName='cmd.exe';"
+            "$p.Arguments='/c whoami';"
+            "$p.Verb='runas';"
+            "[System.Diagnostics.Process]::Start($p)"
+        )
+        assert config_mod._has_dangerous_command(command) is not None
+
     def test_rule_safety_rejects_bypass(self):
         rules = [
             {
@@ -266,10 +276,71 @@ class TestGetConfig:
 
 
 class TestNormalizeConfig:
+    def test_ai_drafting_settings_default_without_secret_fields(self):
+        result = config_mod.get_ai_drafting_settings({})
+
+        assert result == {
+            "enabled": False,
+            "endpoint_url": "",
+            "model": "",
+            "api_format": "chat_completions",
+        }
+        assert "api_key" not in result
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"settings": None},
+            {"settings": {"ai_drafting": None}},
+            {"settings": {"ai_drafting": {"enabled": "yes"}}},
+            {
+                "settings": {
+                    "ai_drafting": {
+                        "enabled": True,
+                        "endpoint_url": 123,
+                        "model": None,
+                        "api_key": "not-a-real-secret",
+                    }
+                }
+            },
+        ],
+    )
+    def test_ai_drafting_settings_normalizes_partial_config_without_api_key(
+        self, config,
+    ):
+        result = config_mod.get_ai_drafting_settings(config)
+
+        assert set(result) == {"enabled", "endpoint_url", "model", "api_format"}
+        assert "api_key" not in result
+        assert isinstance(result["enabled"], bool)
+        assert isinstance(result["endpoint_url"], str)
+        assert isinstance(result["model"], str)
+
+    def test_ai_drafting_settings_preserves_non_secret_values(self):
+        result = config_mod.get_ai_drafting_settings({
+            "settings": {
+                "ai_drafting": {
+                    "enabled": True,
+                    "endpoint_url": "https://example.invalid/v1",
+                    "model": "draft-model",
+                }
+            }
+        })
+
+        assert result == {
+            "enabled": True,
+            "endpoint_url": "https://example.invalid/v1",
+            "model": "draft-model",
+            "api_format": "chat_completions",
+        }
+
     def test_empty_dict(self):
         assert config_mod._normalize_config({}) == {
             "schema_version": 2,
-            "settings": {"admin_authorization_mode": "per_execution"},
+            "settings": {
+                "admin_authorization_mode": "per_execution",
+                "admin_rule_key_verification": True,
+            },
         }
 
     def test_none_input(self):
@@ -367,6 +438,24 @@ class TestNormalizeConfig:
             "settings": {"admin_authorization_mode": "always"},
         })
         assert result["settings"]["admin_authorization_mode"] == "per_execution"
+
+    def test_admin_rule_key_verification_defaults_to_true(self):
+        result = config_mod._normalize_config({"rules": []})
+        assert result["settings"]["admin_rule_key_verification"] is True
+
+    def test_admin_rule_key_verification_false_is_kept(self):
+        result = config_mod._normalize_config({
+            "rules": [],
+            "settings": {"admin_rule_key_verification": False},
+        })
+        assert result["settings"]["admin_rule_key_verification"] is False
+
+    def test_invalid_admin_rule_key_verification_is_replaced(self):
+        result = config_mod._normalize_config({
+            "rules": [],
+            "settings": {"admin_rule_key_verification": "off"},
+        })
+        assert result["settings"]["admin_rule_key_verification"] is True
 
     def test_trigger_to_event_migration(self):
         config = {

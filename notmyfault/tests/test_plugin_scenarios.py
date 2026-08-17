@@ -327,6 +327,16 @@ def test_send_keys_type_text_builds_unicode_inputs(monkeypatch):
     assert sent[1].ki.dwFlags == mod.KEYEVENTF_UNICODE | mod.KEYEVENTF_KEYUP
 
 
+def test_send_keys_type_text_splits_surrogate_pairs(monkeypatch):
+    mod = load_plugin("actions", "send_keys")
+    sent = []
+    monkeypatch.setattr(mod, "_send", sent.extend)
+    mod.run({}, {"mode": "type_text", "text": "😀"})
+    # 😀 = U+1F600，拆成高代理 0xD83D 和低代理 0xDE00，各发一次按下和抬起
+    assert [inp.ki.wScan for inp in sent] == [0xD83D, 0xD83D, 0xDE00, 0xDE00]
+    assert all(inp.ki.wVk == 0 for inp in sent)
+
+
 def test_send_keys_rejects_bad_input():
     mod = load_plugin("actions", "send_keys")
     with pytest.raises(ValueError, match="未知模式"):

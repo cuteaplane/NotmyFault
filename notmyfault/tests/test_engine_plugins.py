@@ -199,6 +199,7 @@ class TestEngineStart:
         engine._alert_user = (
             lambda title, message, open_dashboard=False: alerts.append((title, open_dashboard))
         )
+        engine._security_mode = SecurityMode.PERMISSIVE
         engine.start(shutdown_event=threading.Event())
         assert any("启动失败" in title and dashboard for title, dashboard in alerts)
 
@@ -360,10 +361,12 @@ class TestLoadPlugins:
             code, json_name="trigger.json", py_name="trigger.py",
         )
         loaded, failed, meta_store, func_store = load_triggers(loader, tmp_path)
-        assert (loaded, failed) == (0, 1)
+        assert (loaded, failed) == (1, 0)
+        assert registry.resolve_trigger("bad_setup") is None
         assert "bad_setup" not in func_store
         assert "bad_setup" not in meta_store
         assert registry.get_module("bad_setup") is None
+        assert any("setup() 执行异常" in msg for _, _, msg in errors)
 
     def test_setup_returns_false(self, tmp_path):
         loader, registry, errors, _ = make_loader(tmp_path)
@@ -378,8 +381,10 @@ class TestLoadPlugins:
             code, json_name="trigger.json", py_name="trigger.py",
         )
         loaded, failed, meta_store, func_store = load_triggers(loader, tmp_path)
-        assert (loaded, failed) == (0, 1)
+        assert (loaded, failed) == (1, 0)
+        assert registry.resolve_trigger("no_setup") is None
         assert "no_setup" not in func_store
+        assert "no_setup" not in meta_store
         assert any("setup() 返回 False" in msg for _, _, msg in errors)
 
     def test_sudo_import_warning_no_admin_permission(self, tmp_path, capsys):
@@ -452,8 +457,11 @@ class TestSecurityScanIntegration:
             make_meta("badapi", trigger_api="event-v1"),
             code, json_name="trigger.json", py_name="trigger.py",
         )
-        loaded, failed, _, _ = load_triggers(loader, tmp_path)
-        assert (loaded, failed) == (0, 1)
+        loaded, failed, meta_store, func_store = load_triggers(loader, tmp_path)
+        assert (loaded, failed) == (1, 0)
+        assert registry.resolve_trigger("badapi") is None
+        assert "badapi" not in func_store
+        assert "badapi" not in meta_store
         assert any("event-v1 入口不兼容" in msg for _, _, msg in errors)
 
     def test_permissive_warns_but_loads(self, tmp_path, capsys):
@@ -545,6 +553,80 @@ class TestSecurityScanIntegration:
         loaded, failed, meta_store, _ = load_actions(loader, tmp_path, origin="user")
         assert (loaded, failed) == (1, 0)
         assert meta_store["legacy"]["signature_kind"] == "official-legacy"
+
+    def test_strict_rejects_self_signed_admin_plugin(self, tmp_path, monkeypatch):
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        from notmyfault.security import plugins as security_plugins
+        from notmyfault.security import signing
+
+        monkeypatch.setattr(
+            security_plugins, "_PLUGIN_MANIFEST_FILE", str(tmp_path / "manifest.json")
+        )
+        loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
+        admin_code = (
+            "from notmyfault.security.sudo import run_as_admin\n"
+            "def run(meta, params):\n"
+            "    return None\n"
+        )
+        folder = write_plugin(
+            tmp_path / "actions", "selfadmin",
+            make_meta("selfadmin", permissions=["admin"]), admin_code,
+        )
+        key = ed25519.Ed25519PrivateKey.generate()
+        signing.self_sign_plugin(folder, private_key=key)
+        loaded, failed, _, _ = load_actions(loader, tmp_path, origin="user")
+        assert (loaded, failed) == (0, 1)
+        assert any("未使用官方签名" in msg for _, _, msg in errors)
+
+    def test_strict_loads_officially_signed_admin_plugin(self, tmp_path, monkeypatch):
+        from notmyfault.security import plugins as security_plugins
+
+        monkeypatch.setattr(
+            security_plugins, "_PLUGIN_MANIFEST_FILE", str(tmp_path / "manifest.json")
+        )
+        loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
+        admin_code = (
+            "from notmyfault.security.sudo import run_as_admin\n"
+            "def run(meta, params):\n"
+            "    return None\n"
+        )
+        folder = write_plugin(
+            tmp_path / "actions", "officialadmin",
+            make_meta("officialadmin", permissions=["admin"]), admin_code,
+        )
+        sign_with_test_key(folder, monkeypatch)
+        loaded, failed, meta_store, _ = load_actions(loader, tmp_path, origin="user")
+        assert (loaded, failed) == (1, 0)
+        assert meta_store["officialadmin"]["signature_kind"] == "official-legacy"
+
+    def test_author_signature_requires_user_counter_signature(self, tmp_path, monkeypatch):
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        from notmyfault.security import plugins as security_plugins
+        from notmyfault.security import signing, signing_keys
+
+        monkeypatch.setattr(
+            security_plugins, "_PLUGIN_MANIFEST_FILE", str(tmp_path / "manifest.json")
+        )
+        folder = write_plugin(tmp_path / "actions", "authored", make_meta("authored"), CLEAN_RUN)
+        author_key = ed25519.Ed25519PrivateKey.generate()
+        signing.self_sign_plugin(folder, private_key=author_key)
+
+        loader, _, errors, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
+        loaded, failed, _, _ = load_actions(loader, tmp_path, origin="user")
+        assert (loaded, failed) == (0, 1)
+        assert any("签名无效" in msg for _, _, msg in errors)
+
+        user_key = ed25519.Ed25519PrivateKey.generate()
+        user_pub = user_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [user_pub])
+        signing.counter_sign_author_key(folder, private_key=user_key)
+
+        loader2, _, errors2, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
+        loaded, failed, meta_store, _ = load_actions(loader2, tmp_path, origin="user")
+        assert (loaded, failed) == (1, 0)
+        assert meta_store["authored"]["signature_kind"] == "author"
+        assert errors2 == []
 
 
 def test_engine_keeps_plugin_loader_compatibility_exports():

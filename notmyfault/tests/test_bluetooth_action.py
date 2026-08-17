@@ -10,7 +10,7 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_module():
-    path = PKG_ROOT / "actions" / "bluetooth_toggle" / "action.py"
+    path = PKG_ROOT / "bundled" / "actions" / "bluetooth_toggle" / "action.py"
     spec = importlib.util.spec_from_file_location("bluetooth_toggle_under_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

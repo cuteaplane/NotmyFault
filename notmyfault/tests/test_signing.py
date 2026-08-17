@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives.serialization import (
     Encoding,
     NoEncryption,
     PrivateFormat,
+    PublicFormat,
 )
 
 from notmyfault.security import signing
@@ -107,6 +108,25 @@ class TestSignPlugin:
         payload = b"".join(f.read_bytes() for f in signing.plugin_files(tmp_path))
         with pytest.raises(InvalidSignature):
             key.public_key().verify(sig, hashlib.sha256(payload).digest())
+
+
+class TestCounterSignAuthorKey:
+    def test_counter_sign_roundtrip(self, tmp_path):
+        author_key = make_key()
+        user_key = make_key()
+        user_pub = user_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        signing.export_public_key(author_key, tmp_path / "public_key.pem")
+        signing.counter_sign_author_key(tmp_path, private_key=user_key)
+        assert (tmp_path / "public_key.sig").exists()
+        assert signing.verify_author_key_counter_signature(tmp_path, [user_pub])
+        assert not signing.verify_author_key_counter_signature(
+            tmp_path, [author_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)]
+        )
+
+    def test_missing_counter_signature_fails(self, tmp_path):
+        author_key = make_key()
+        signing.export_public_key(author_key, tmp_path / "public_key.pem")
+        assert not signing.verify_author_key_counter_signature(tmp_path, [b"\x00" * 32])
 
 
 class TestKeyStatus:

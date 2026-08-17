@@ -117,6 +117,41 @@ def write_test_key(private_dir, encrypted=False):
     (private_dir / "signing_private_key.pem").write_bytes(pem)
 
 
+def place_bundled_bluetooth(api_env, monkeypatch, *, sign=True):
+    from notmyfault.security import signing, signing_keys
+
+    package_root = api_env.tmp_path / "package"
+    plugin_dir = package_root / "bundled" / "actions" / "bluetooth_toggle"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "action.json").write_text(
+        json.dumps(
+            make_meta(
+                "actions",
+                id="bluetooth_toggle",
+                name="蓝牙开关",
+                package_name="io.github.notmyfault.bluetooth_toggle",
+                permissions=["admin", "external_binary"],
+                platforms=["windows", "linux"],
+            ),
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (plugin_dir / "action.py").write_text(
+        "def run(meta, params):\n    return {'ok': True}\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(api_server, "_PKG_ROOT", package_root)
+    if sign:
+        private_key = Ed25519PrivateKey.generate()
+        public_key = private_key.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+        monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [public_key])
+        signing.sign_plugin(plugin_dir, "action.json", private_key=private_key)
+    return plugin_dir
+
+
 class TestPluginInstall:
     def test_install_trigger(self, api_env):
         write_test_key(api_env.tmp_path / "private")
@@ -155,7 +190,8 @@ class TestPluginInstall:
         archive = build_nmfp(
             api_env.tmp_path, meta, "triggers", tag="selfsigned", sign=True
         )
-        assert install_file(api_env.client, api_env.headers, archive).json()["ok"]
+        response = install_file(api_env.client, api_env.headers, archive)
+        assert response.json()["ok"], response.text
         dest = api_env.user_dir / "triggers" / meta["id"]
         # 作者随包携带的签名和公钥原样保留，引擎不重签
         assert (dest / "signature.sig").exists()
@@ -297,6 +333,79 @@ class TestPluginList:
         assert "usb_insert" in body["triggers"]
         assert body["triggers"]["usb_insert"]["origin"] == "builtin"
         assert "open_url" in body["actions"]
+
+
+class TestBundledBluetooth:
+    def test_permissive_mode_accepts_unsigned_bundle(self, api_env, monkeypatch):
+        from notmyfault.security.security import SecurityMode
+
+        place_bundled_bluetooth(api_env, monkeypatch, sign=False)
+        monkeypatch.setattr(
+            api_server, "detect_security_mode", lambda: SecurityMode.PERMISSIVE
+        )
+
+        response = api_env.client.get(
+            "/api/settings/bluetooth", headers=api_env.headers
+        )
+
+        assert response.status_code == 200
+        assert response.json()["available"] is True
+
+    def test_status_reports_signed_bundle_not_installed(self, api_env, monkeypatch):
+        place_bundled_bluetooth(api_env, monkeypatch)
+
+        response = api_env.client.get(
+            "/api/settings/bluetooth", headers=api_env.headers
+        )
+
+        assert response.status_code == 200
+        assert response.json()["available"] is True
+        assert response.json()["installed"] is False
+        assert response.json()["meta"]["id"] == "bluetooth_toggle"
+
+    def test_install_copies_signed_bundle_as_user_plugin(self, api_env, monkeypatch):
+        place_bundled_bluetooth(api_env, monkeypatch)
+
+        response = api_env.client.post(
+            "/api/settings/bluetooth/install", headers=api_env.headers
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True, "restart_required": True}
+        destination = api_env.user_dir / "actions" / "bluetooth_toggle"
+        assert (destination / "action.json").exists()
+        listed = api_env.client.get(
+            "/api/plugins/list", headers=api_env.headers
+        ).json()
+        assert listed["actions"]["bluetooth_toggle"]["origin"] == "user"
+
+    def test_install_rejects_tampered_bundle(self, api_env, monkeypatch):
+        plugin_dir = place_bundled_bluetooth(api_env, monkeypatch)
+        (plugin_dir / "action.py").write_text(
+            "def run(meta, params):\n    return {'tampered': True}\n", encoding="utf-8"
+        )
+
+        response = api_env.client.post(
+            "/api/settings/bluetooth/install", headers=api_env.headers
+        )
+
+        assert response.status_code == 400
+        assert response.json()["ok"] is False
+        assert not (api_env.user_dir / "actions" / "bluetooth_toggle").exists()
+
+    def test_uninstall_removes_installed_bluetooth_action(self, api_env, monkeypatch):
+        place_bundled_bluetooth(api_env, monkeypatch)
+        api_env.client.post(
+            "/api/settings/bluetooth/install", headers=api_env.headers
+        )
+
+        response = api_env.client.post(
+            "/api/settings/bluetooth/uninstall", headers=api_env.headers
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True, "restart_required": True}
+        assert not (api_env.user_dir / "actions" / "bluetooth_toggle").exists()
 
 
 class TestPluginToggle:

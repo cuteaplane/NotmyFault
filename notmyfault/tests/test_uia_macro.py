@@ -351,6 +351,12 @@ class TestMacroComponent:
         context.session.close()
         assert FakeRecorder.instances[0].recording is False
 
+        replacement_context = self.make_context({"version": 1, "steps": STEPS})
+        macro_component.open_macro(replacement_context, {})
+        macro_component.start_recording(replacement_context, {})
+        assert replacement_context.session.data["recording_base"] == []
+        replacement_context.session.close()
+
     def test_commit_rejects_active_recording(self, monkeypatch):
         class FakeRecorder:
             recording = True

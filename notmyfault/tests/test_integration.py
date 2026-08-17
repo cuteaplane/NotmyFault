@@ -14,6 +14,7 @@ from notmyfault.core import logging as englog
 from notmyfault.core.engine import AutomationEngine
 from notmyfault.core.hot_reloader import RulesHotReloader
 from notmyfault.host import app as host_app
+from notmyfault.security.security import SecurityMode
 
 
 def make_engine(rules=None, on_event=None):
@@ -235,6 +236,7 @@ class TestHotReloadIntegration:
         config["rules"] = config_mod.load_verified_rules()
         engine = AutomationEngine(config)
         engine._alert_user = lambda *a, **k: None
+        engine._security_mode = SecurityMode.PERMISSIVE
         engine.triggers_funcs["hotkey"] = lambda meta, config, emit, stop: stop.wait(30)
         engine.triggers_meta["hotkey"] = {}
         engine.actions_funcs["noop"] = lambda meta, params: None

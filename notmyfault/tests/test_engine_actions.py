@@ -294,7 +294,7 @@ class TestExecuteAction:
         engine = make_engine(on_event=lambda name, data: events.append((name, data)))
         register_action(engine, "result", lambda meta, params: {"token": "actual-secret"})
         context = build_context(
-            "断言测试", "manual", {}, [], "r_assert001", "run_assert001"
+            "结果检查测试", "manual", {}, [], "r_assert001", "run_assert001"
         )
         context["manual_test"] = {
             "start_index": 0,
@@ -310,7 +310,7 @@ class TestExecuteAction:
         engine.execute_workflow(
             "r_assert001",
             {"actions": [{"type": "result", "binding_id": "a_result001", "params": {}}]},
-            "断言测试",
+            "结果检查测试",
             context,
         )
 
@@ -334,7 +334,7 @@ class TestExecuteAction:
                 "meta": {"ready": True, "count": 3},
             },
         )
-        context = build_context("包含断言", "manual", {}, [], "r_contains001", "run_contains001")
+        context = build_context("包含检查", "manual", {}, [], "r_contains001", "run_contains001")
         context["manual_test"] = {
             "start_index": 0,
             "end_index": 0,
@@ -348,7 +348,7 @@ class TestExecuteAction:
         engine.execute_workflow(
             "r_contains001",
             {"actions": [{"type": "result", "binding_id": "a_result001", "params": {}}]},
-            "包含断言",
+            "包含检查",
             context,
         )
 

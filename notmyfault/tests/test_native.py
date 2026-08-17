@@ -296,6 +296,66 @@ def test_uia_invoke_clicks_element_bounds_when_pattern_is_missing(monkeypatch):
     assert result["operation"] == "invoke"
 
 
+@pytest.mark.parametrize(
+    ("process", "expected"),
+    [
+        (
+            "StartMenuExperienceHost.exe",
+            [("left_click", {"x": 100, "y": 100})],
+        ),
+        ("notepad.exe", [("invoke", None)]),
+    ],
+)
+def test_uia_invoke_uses_physical_click_only_for_shell_controls(
+    monkeypatch, process, expected
+):
+    from notmyfault.native import uia
+
+    @contextmanager
+    def automation():
+        yield object(), SimpleNamespace(
+            UIA_InvokePatternId=10000,
+            IUIAutomationInvokePattern=object(),
+        )
+
+    class Pattern:
+        @staticmethod
+        def QueryInterface(_interface):
+            return Pattern()
+
+        @staticmethod
+        def Invoke():
+            calls.append(("invoke", None))
+
+    class StartMenuElement:
+        CurrentIsPassword = False
+        CurrentBoundingRectangle = SimpleNamespace(
+            left=40, top=80, right=160, bottom=120
+        )
+
+        @staticmethod
+        def GetCurrentPattern(_pattern_id):
+            return Pattern()
+
+    calls = []
+    selector = _selector()
+    selector["window"]["process"] = process
+    monkeypatch.setattr(uia, "_automation", automation)
+    monkeypatch.setattr(
+        uia, "_locate", lambda _automation, _uia, _selector: StartMenuElement()
+    )
+    monkeypatch.setattr(
+        uia,
+        "perform_coordinate",
+        lambda point, operation, cancellation: calls.append((operation, point)),
+    )
+
+    result = uia.perform_selector(selector, "invoke")
+
+    assert calls == expected
+    assert result["operation"] == "invoke"
+
+
 def test_uia_captures_foreground_window_signature(monkeypatch):
     from notmyfault import native
     from notmyfault.native import uia

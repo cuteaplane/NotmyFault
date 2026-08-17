@@ -310,6 +310,51 @@ class TestAdminAuthorizationSettings:
         assert "完整性校验" in response.json()["error"]
 
 
+class TestAdminRuleVerificationSettings:
+    def test_get_defaults_to_true(self, api_env):
+        response = api_env.client.get(
+            "/api/settings/admin-rule-verification", headers=api_env.headers
+        )
+        assert response.status_code == 200
+        assert response.json()["key_verification"] is True
+
+    def test_put_saves_value(self, api_env):
+        response = api_env.client.put(
+            "/api/settings/admin-rule-verification",
+            json={"key_verification": False},
+            headers=api_env.headers,
+        )
+        assert response.status_code == 200
+        assert response.json() == {"ok": True, "key_verification": False}
+        saved = api_env.api._load_config()
+        assert saved["settings"]["admin_rule_key_verification"] is False
+
+    def test_put_rejects_non_bool(self, api_env):
+        response = api_env.client.put(
+            "/api/settings/admin-rule-verification",
+            json={"key_verification": "off"},
+            headers=api_env.headers,
+        )
+        assert response.status_code == 400
+
+    def test_put_rejects_tampered_config(self, api_env):
+        assert api_env.api._save_config({"custom_flag": "keep"}) is True
+        with open(api_server.CONFIG_FILE, "r", encoding="utf-8") as file:
+            tampered = json.load(file)
+        tampered["custom_flag"] = "changed outside NotmyFault"
+        with open(api_server.CONFIG_FILE, "w", encoding="utf-8") as file:
+            json.dump(tampered, file, ensure_ascii=False)
+
+        response = api_env.client.put(
+            "/api/settings/admin-rule-verification",
+            json={"key_verification": False},
+            headers=api_env.headers,
+        )
+
+        assert response.status_code == 409
+        assert "完整性校验" in response.json()["error"]
+
+
 class TestEngineEndpoints:
     def test_start_engine(self, api_env):
         response = api_env.client.post("/api/engine/start", headers=api_env.headers)
@@ -387,6 +432,56 @@ class TestEngineEndpoints:
     def test_unauthenticated_read_is_rejected(self, api_env):
         response = api_env.client.get("/api/rules")
         assert response.status_code == 403
+
+    def test_token_file_is_restricted_before_secret_is_written(
+        self, tmp_path, monkeypatch
+    ):
+        path = tmp_path / ".api_token"
+        checked = []
+
+        def restrict(candidate):
+            checked.append(candidate)
+            with open(candidate, encoding="utf-8") as candidate_file:
+                assert candidate_file.read() == ""
+
+        monkeypatch.setattr(api_server, "_restrict_token_file", restrict)
+        api_server._secure_write_token(str(path), "a" * 64)
+
+        assert len(checked) == 1
+        assert path.read_text(encoding="utf-8") == "a" * 64
+        assert not list(tmp_path.glob("*.tmp"))
+
+    def test_token_write_keeps_previous_file_when_acl_fails(
+        self, tmp_path, monkeypatch
+    ):
+        path = tmp_path / ".api_token"
+        path.write_text("b" * 64, encoding="utf-8")
+
+        def reject(_candidate):
+            raise RuntimeError("权限失败")
+
+        monkeypatch.setattr(api_server, "_restrict_token_file", reject)
+        with pytest.raises(RuntimeError, match="权限失败"):
+            api_server._secure_write_token(str(path), "c" * 64)
+
+        assert path.read_text(encoding="utf-8") == "b" * 64
+        assert not list(tmp_path.glob("*.tmp"))
+
+    def test_valid_token_is_rewritten_with_current_permissions(
+        self, tmp_path, monkeypatch
+    ):
+        path = tmp_path / ".api_token"
+        token = "d" * 64
+        path.write_text(token, encoding="utf-8")
+        rewrites = []
+        monkeypatch.setattr(
+            api_server,
+            "_secure_write_token",
+            lambda candidate, value: rewrites.append((candidate, value)),
+        )
+
+        assert api_server._load_or_create_api_token(str(path)) == token
+        assert rewrites == [(str(path), token)]
 
     def test_invalid_disk_token_is_repaired_for_next_request(self, api_env):
         stale = "0" * 64
@@ -716,55 +811,6 @@ class TestRulesEndpoints:
         )
         assert not os.path.exists(api_server.RULES_FILE)
 
-    def test_local_rule_draft_previews_without_saving(self, api_env):
-        response = api_env.client.post(
-            "/api/rules/draft",
-            json={"description": "每天 08:30 提醒我提交月报"},
-            headers=api_env.headers,
-        )
-
-        assert response.status_code == 200
-        body = response.json()
-        assert body["source"] == "local"
-        assert body["draft"]["event"]["type"] == "time_schedule"
-        assert body["draft"]["event"]["params"]["time"] == "08:30"
-        assert body["draft"]["actions"][0]["type"] == "notify"
-        assert body["draft"]["actions"][0]["params"]["message"] == "提交月报"
-        assert body["validation"]["ok"] is True
-        assert not os.path.exists(api_server.RULES_FILE)
-
-    def test_usb_backup_draft_binds_inserted_drive(self, api_env):
-        response = api_env.client.post(
-            "/api/rules/draft",
-            json={"description": "U盘插入后备份文件"},
-            headers=api_env.headers,
-        )
-
-        assert response.status_code == 200
-        body = response.json()
-        trigger_id = body["draft"]["event"]["binding_id"]
-        source = body["draft"]["actions"][0]["params"]["source"]
-        assert source == {
-            "$ref": {
-                "scope": "trigger",
-                "node": trigger_id,
-                "path": ["actual_drive"],
-            }
-        }
-        assert body["assumptions"] == ["文件来源使用本次插入的 U 盘"]
-        assert all("源路径" not in item for item in body["missing"])
-        assert any("目标路径" in item for item in body["missing"])
-
-    def test_local_rule_draft_rejects_empty_description(self, api_env):
-        response = api_env.client.post(
-            "/api/rules/draft",
-            json={"description": "  "},
-            headers=api_env.headers,
-        )
-
-        assert response.status_code == 400
-        assert response.json()["code"] == "empty_description"
-
     def test_put_rules_invalid_json(self, api_env):
         response = api_env.client.put(
             "/api/rules",
@@ -793,6 +839,116 @@ class TestRulesEndpoints:
         assert len(saved) == 1
         assert saved[0]["name"] == "通知规则"
         assert saved[0]["rule_id"] == body["rules"][0]["rule_id"]
+
+    def test_put_admin_rule_requests_key_password_in_strict_mode(
+        self, api_env, monkeypatch
+    ):
+        from notmyfault.security import rule_approval
+        from notmyfault.security.security import SecurityMode
+
+        monkeypatch.setattr(
+            rule_approval, "detect_security_mode", lambda: SecurityMode.STRICT,
+        )
+        monkeypatch.setattr(
+            rule_approval,
+            "key_status",
+            lambda: {"exists": True, "encrypted": True},
+        )
+        api_env.api._get_plugins_schema = lambda: {
+            "triggers": {"usb_insert": {"permissions": []}},
+            "actions": {"bluetooth_toggle": {"permissions": ["admin"]}},
+        }
+        rule = simple_rule()
+        rule["actions"] = [{"type": "bluetooth_toggle", "params": {}}]
+
+        response = api_env.client.put(
+            "/api/rules", json={"rules": [rule]}, headers=api_env.headers
+        )
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "admin_key_required"
+        assert response.json()["plugins"] == ["bluetooth_toggle"]
+
+    def test_put_admin_rule_skips_key_check_when_verification_off(
+        self, api_env, monkeypatch
+    ):
+        from notmyfault.security import rule_approval
+        from notmyfault.security.security import SecurityMode
+
+        monkeypatch.setattr(
+            rule_approval, "detect_security_mode", lambda: SecurityMode.STRICT,
+        )
+        assert api_env.api._save_config(
+            {"settings": {"admin_rule_key_verification": False}}
+        ) is True
+        api_env.api._get_plugins_schema = lambda: {
+            "triggers": {"usb_insert": {"permissions": []}},
+            "actions": {"bluetooth_toggle": {"permissions": ["admin"]}},
+        }
+        rule = simple_rule()
+        rule["actions"] = [{"type": "bluetooth_toggle", "params": {}}]
+
+        response = api_env.client.put(
+            "/api/rules", json={"rules": [rule]}, headers=api_env.headers
+        )
+
+        assert response.status_code == 200
+        assert response.json()["ok"] is True
+
+    def test_approve_admin_rule_skips_key_check_when_verification_off(
+        self, api_env, monkeypatch
+    ):
+        from notmyfault.security import rule_approval
+        from notmyfault.security.security import SecurityMode
+
+        monkeypatch.setattr(
+            rule_approval, "detect_security_mode", lambda: SecurityMode.STRICT,
+        )
+        assert api_env.api._save_config(
+            {"settings": {"admin_rule_key_verification": False}}
+        ) is True
+        api_env.api._get_plugins_schema = lambda: {
+            "triggers": {"usb_insert": {"permissions": []}},
+            "actions": {"bluetooth_toggle": {"permissions": ["admin"]}},
+        }
+        rule = simple_rule()
+        rule["actions"] = [{"type": "bluetooth_toggle", "params": {}}]
+
+        response = api_env.client.post(
+            "/api/rules/approve",
+            json={"rules": [rule], "admin_key_password": ""},
+            headers=api_env.headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+
+    def test_put_unchanged_admin_rule_does_not_request_password(
+        self, api_env, monkeypatch
+    ):
+        from notmyfault.security import rule_approval
+        from notmyfault.security.security import SecurityMode
+
+        modes = iter([SecurityMode.NORMAL, SecurityMode.STRICT])
+        monkeypatch.setattr(rule_approval, "detect_security_mode", lambda: next(modes))
+        api_env.api._get_plugins_schema = lambda: {
+            "triggers": {"usb_insert": {"permissions": []}},
+            "actions": {"bluetooth_toggle": {"permissions": ["admin"]}},
+        }
+        rule = simple_rule()
+        rule["actions"] = [{"type": "bluetooth_toggle", "params": {}}]
+        first = api_env.client.put(
+            "/api/rules", json={"rules": [rule]}, headers=api_env.headers
+        )
+        assert first.status_code == 200
+
+        second = api_env.client.put(
+            "/api/rules",
+            json={"rules": first.json()["rules"]},
+            headers=api_env.headers,
+        )
+
+        assert second.status_code == 200
 
     def test_rules_roundtrip(self, api_env):
         put = api_env.client.put(
@@ -856,7 +1012,14 @@ class TestRulesEndpoints:
         assert response.status_code == 400
         assert response.json()["error"] == "规则结构校验失败"
 
-    def test_put_rules_accepts_typed_trigger_binding(self, api_env):
+    def test_put_rules_accepts_typed_trigger_binding(self, api_env, monkeypatch):
+        from notmyfault.security import rule_approval
+        from notmyfault.security.security import SecurityMode
+
+        # 这条规则含高危动作，测试只看绑定结构，把审批模式设为 NORMAL
+        monkeypatch.setattr(
+            rule_approval, "detect_security_mode", lambda: SecurityMode.NORMAL,
+        )
         rule = typed_binding_rule("delay_seconds")
         response = api_env.client.put(
             "/api/rules", json={"rules": [rule]}, headers=api_env.headers
@@ -1281,3 +1444,45 @@ class TestComponentEndpoints:
         )
         assert response.status_code == 400
         assert "未知方法" in response.json()["error"]
+
+
+class TestAiDraftStreamEndpoint:
+    def test_stream_endpoint_returns_normalized_event_stream(self, api_env, monkeypatch):
+        assert api_env.api._save_config({
+            "settings": {
+                "ai_drafting": {
+                    "enabled": True,
+                    "endpoint_url": "https://example.invalid/v1",
+                    "model": "test-model",
+                }
+            }
+        }) is True
+
+        class StreamProvider:
+            def stream(self, messages, schema, allow_plugin_source=False):
+                yield ("text", "好的")
+                yield ("result", {
+                    "ok": True,
+                    "result_type": "assistant_message",
+                    "message": "我可以帮你起草规则。",
+                })
+
+        monkeypatch.setattr(api_env.api, "ai_draft_provider", StreamProvider(), raising=False)
+
+        with api_env.client.stream(
+            "POST", "/api/rules/draft/ai/stream",
+            json={"messages": [{"role": "user", "content": "每天九点提醒我"}]},
+            headers=api_env.headers,
+        ) as response:
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("text/event-stream")
+            body = b"".join(response.iter_bytes()).decode("utf-8")
+
+        assert "event: status" in body
+        assert "event: text" in body
+        assert "event: result" in body
+        assert "event: done" in body
+        assert '"result_type": "assistant_message"' in body
+        assert body.index("event: status") < body.index("event: text")
+        assert body.index("event: text") < body.index("event: result")
+        assert body.index("event: result") < body.index("event: done")
