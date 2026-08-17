@@ -123,7 +123,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "actions": []
     },
     "settings": {
-        "admin_authorization_mode": "per_execution"
+        "admin_authorization_mode": "per_execution",
+        "admin_rule_key_verification": True
     }
 }
 
@@ -135,6 +136,35 @@ def get_admin_authorization_mode(config: Dict[str, Any]) -> str:
     settings = config.get("settings") if isinstance(config, dict) else None
     mode = settings.get("admin_authorization_mode") if isinstance(settings, dict) else None
     return mode if mode in ADMIN_AUTHORIZATION_MODES else "per_execution"
+
+
+def get_admin_rule_key_verification(config: Dict[str, Any]) -> bool:
+    """读取创建管理员规则时是否验证签名私钥，缺失时默认验证。"""
+    settings = config.get("settings") if isinstance(config, dict) else None
+    value = settings.get("admin_rule_key_verification") if isinstance(settings, dict) else None
+    return value if isinstance(value, bool) else True
+
+
+def get_ai_drafting_settings(config: Dict[str, Any]) -> Dict[str, Any]:
+    """返回不含秘密字段的 AI 规则草稿设置。"""
+    settings = config.get("settings") if isinstance(config, dict) else None
+    raw = settings.get("ai_drafting") if isinstance(settings, dict) else None
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "enabled": raw.get("enabled") if isinstance(raw.get("enabled"), bool) else False,
+        "endpoint_url": (
+            raw.get("endpoint_url")
+            if isinstance(raw.get("endpoint_url"), str)
+            else ""
+        ),
+        "model": raw.get("model") if isinstance(raw.get("model"), str) else "",
+        "api_format": (
+            raw.get("api_format")
+            if raw.get("api_format") in {"chat_completions", "responses"}
+            else "chat_completions"
+        ),
+    }
 
 CONFIG_FILE = os.path.join(get_config_dir(), "config.json")
 RULES_FILE = os.path.join(get_config_dir(), "rules.json")
@@ -318,6 +348,8 @@ _DANGEROUS_PATTERNS = [
     "Set-MpPreference", "Add-MpPreference", "New-Service",
     "Set-ItemProperty", "New-ItemProperty",
     "reg add", "sc config", "bcdedit",
+    # 高危：提权
+    "runas", "processstartinfo", "system.diagnostics.process",
     # 高危：脚本块/间接调用绕过
     "[scriptblock]::create", "[scriptblock]::",
     "get-command", "get-alias",
@@ -718,6 +750,9 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     else:
         settings = dict(settings)
     settings["admin_authorization_mode"] = get_admin_authorization_mode(result)
+    settings["admin_rule_key_verification"] = get_admin_rule_key_verification(result)
+    if "ai_drafting" in settings:
+        settings["ai_drafting"] = get_ai_drafting_settings(result)
     result["settings"] = settings
     return result
 

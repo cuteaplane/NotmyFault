@@ -46,18 +46,33 @@ def _notify_first_run_mode(mode: str) -> None:
 _PKG_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _shipped_plugin_directories() -> list[str]:
+    plugin_specs = (
+        ("actions", "action.json"),
+        ("triggers", "trigger.json"),
+        (os.path.join("bundled", "actions"), "action.json"),
+        (os.path.join("bundled", "triggers"), "trigger.json"),
+    )
+    return [
+        os.path.dirname(meta_path)
+        for relative_root, json_name in plugin_specs
+        for meta_path in glob.glob(
+            os.path.join(_PKG_ROOT, relative_root, "*", json_name)
+        )
+    ]
+
+
 def _ensure_first_run_build() -> None:
     if getattr(sys, "frozen", False):
         return
     src_dir = _PKG_ROOT
     build_json = os.path.join(src_dir, "..", "build.json")
     build_py = os.path.join(src_dir, "..", "build.py")
-    sig_files = glob.glob(os.path.join(src_dir, "actions", "*", "signature.sig"))
-    sig_files += glob.glob(os.path.join(src_dir, "triggers", "*", "signature.sig"))
-    plugin_dirs = glob.glob(os.path.join(src_dir, "actions", "*"))
-    plugin_dirs += glob.glob(os.path.join(src_dir, "triggers", "*"))
-    plugin_dirs = [d for d in plugin_dirs if os.path.isdir(d) and not d.endswith("__pycache__")]
-    needs_build = not os.path.exists(build_json) or len(sig_files) < len(plugin_dirs)
+    plugin_dirs = _shipped_plugin_directories()
+    needs_build = not os.path.exists(build_json) or any(
+        not os.path.isfile(os.path.join(plugin_dir, "signature.sig"))
+        for plugin_dir in plugin_dirs
+    )
     if not needs_build:
         return
     print("[FirstRun] Detected missing signatures or build file, running first-time build...")

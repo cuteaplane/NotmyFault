@@ -8,7 +8,7 @@ import sys
 from typing import Any, Callable, Dict, List
 
 from notmyfault.core.logging import engine_warn
-from notmyfault.core.rules import get_rule_events
+from notmyfault.core.rules import get_rule_admin_plugins
 
 
 class AdminSessionManager:
@@ -43,27 +43,9 @@ class AdminSessionManager:
         for rule in self._rules_fn():
             if not isinstance(rule, dict) or rule.get("enabled") is False:
                 continue
-            for event in get_rule_events(rule):
-                plugin_id = event.get("type")
-                meta = triggers_meta.get(plugin_id, {})
-                if "admin" in (meta.get("permissions") or []):
-                    required.add(plugin_id)
-            for field in ("preconditions", "actions"):
-                items = rule.get(field, [])
-                if not isinstance(items, list):
-                    continue
-                pending = list(items)
-                while pending:
-                    item = pending.pop()
-                    if not isinstance(item, dict):
-                        continue
-                    plugin_id = item.get("type")
-                    meta = actions_meta.get(plugin_id, {})
-                    if "admin" in (meta.get("permissions") or []):
-                        required.add(plugin_id)
-                    failure_actions = item.get("failure_actions", [])
-                    if isinstance(failure_actions, list):
-                        pending.extend(failure_actions)
+            required.update(get_rule_admin_plugins(
+                rule, triggers_meta, actions_meta,
+            ))
         return sorted(required)
 
     def authorize_at_startup(self) -> None:
