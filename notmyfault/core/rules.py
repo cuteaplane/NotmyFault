@@ -56,6 +56,36 @@ def get_rule_events(rule: Dict[str, Any]) -> List[Dict[str, Any]]:
     return list(iter_condition_events(get_rule_condition(rule)))
 
 
+def get_rule_admin_plugins(
+    rule: Dict[str, Any],
+    triggers_meta: Dict[str, Dict[str, Any]],
+    actions_meta: Dict[str, Dict[str, Any]],
+) -> List[str]:
+    """返回规则引用的管理员插件，包含失败后动作。"""
+    required = set()
+    for event in get_rule_events(rule):
+        plugin_id = event.get("type")
+        if "admin" in (triggers_meta.get(plugin_id, {}).get("permissions") or []):
+            required.add(plugin_id)
+
+    for field in ("preconditions", "actions"):
+        items = rule.get(field, [])
+        if not isinstance(items, list):
+            continue
+        pending = list(items)
+        while pending:
+            item = pending.pop()
+            if not isinstance(item, dict):
+                continue
+            plugin_id = item.get("type")
+            if "admin" in (actions_meta.get(plugin_id, {}).get("permissions") or []):
+                required.add(plugin_id)
+            failure_actions = item.get("failure_actions", [])
+            if isinstance(failure_actions, list):
+                pending.extend(failure_actions)
+    return sorted(required)
+
+
 def validate_condition_tree(node: Dict[str, Any] | None) -> List[str]:
     """校验可序列化的条件树结构和运算符"""
     errors: List[str] = []
