@@ -9,34 +9,51 @@ from typing import List, Optional, Set, Tuple
 from notmyfault.config import CONFIG_FILE
 
 
+def parse_plugin_source(source: str) -> ast.Module:
+    """解析插件源码，语法错误返回空模块"""
+    try:
+        return ast.parse(source)
+    except Exception:
+        return ast.Module(body=[], type_ignores=[])
+
+
+def _check_sudo_from_tree(tree: ast.Module) -> bool:
+    """检查已解析的模块树是否导入 notmyfault.security.sudo"""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in (
+                    "notmyfault.security.sudo",
+                    "notmyfault.security",
+                ):
+                    return True
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "notmyfault.security.sudo":
+                return True
+            if node.module == "notmyfault":
+                for alias in node.names:
+                    if alias.name == "sudo":
+                        return True
+            if node.module == "notmyfault.security":
+                for alias in node.names:
+                    if alias.name == "sudo":
+                        return True
+    return False
+
+
+def check_sudo_import_from_source(source: str) -> bool:
+    """用 AST 检查源码是否导入 notmyfault.security.sudo。"""
+    return _check_sudo_from_tree(parse_plugin_source(source))
+
+
 def check_sudo_import(py_file_path: str) -> bool:
     """用 AST 检查源码是否导入 notmyfault.security.sudo。"""
     try:
         with open(py_file_path, "r", encoding="utf-8") as f:
             source = f.read()
-        tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.name in (
-                        "notmyfault.security.sudo",
-                        "notmyfault.security",
-                    ):
-                        return True
-            elif isinstance(node, ast.ImportFrom):
-                if node.module == "notmyfault.security.sudo":
-                    return True
-                if node.module == "notmyfault":
-                    for alias in node.names:
-                        if alias.name == "sudo":
-                            return True
-                if node.module == "notmyfault.security":
-                    for alias in node.names:
-                        if alias.name == "sudo":
-                            return True
-        return False
     except Exception:
         return False
+    return check_sudo_import_from_source(source)
 
 
 _NATIVE_MODULES = {"ctypes", "win32api", "win32con", "pywintypes", "_winapi"}
@@ -56,15 +73,9 @@ _DYNAMIC_EXEC_FUNCS = {"exec", "eval", "compile"}
 _BUILTIN_OWNERS = {"builtins", "__builtins__"}
 
 
-def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
-    """用 AST 记录插件使用的 native_api、external_binary、self_elevation 和 dynamic_exec"""
+def _scan_capabilities_from_tree(tree: ast.Module) -> Set[str]:
+    """记录模块树里的 native_api、external_binary、self_elevation 和 dynamic_exec"""
     caps: Set[str] = set()
-    try:
-        with open(py_file_path, "r", encoding="utf-8") as f:
-            source = f.read()
-        tree = ast.parse(source)
-    except Exception:
-        return caps
 
     # 同时记录 import 别名，覆盖 os as system 和 importlib as il。
     module_aliases: dict[str, str] = {}
@@ -221,19 +232,28 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
     return caps
 
 
+def scan_plugin_capabilities_from_source(source: str) -> Set[str]:
+    """用 AST 记录源码使用的 native_api、external_binary、self_elevation 和 dynamic_exec"""
+    return _scan_capabilities_from_tree(parse_plugin_source(source))
+
+
+def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
+    """用 AST 记录插件使用的 native_api、external_binary、self_elevation 和 dynamic_exec"""
+    try:
+        with open(py_file_path, "r", encoding="utf-8") as f:
+            source = f.read()
+    except Exception:
+        return set()
+    return scan_plugin_capabilities_from_source(source)
+
+
 _PLUGIN_MODULE_PREFIXES = ("notmyfault.action_", "notmyfault.trigger_")
 _DYNAMIC_EXEC_BYPASS = {"exec", "eval", "compile", "__import__"}
 
 
-def scan_borrowed_privilege(py_file_path: str) -> list[str]:
-    """检查插件是否调用已加载的插件模块或动态执行函数"""
+def _scan_borrowed_from_tree(tree: ast.Module) -> list[str]:
+    """检查模块树是否调用已加载的插件模块或动态执行函数"""
     findings: list[str] = []
-    try:
-        with open(py_file_path, "r", encoding="utf-8") as f:
-            source = f.read()
-        tree = ast.parse(source)
-    except Exception:
-        return findings
 
     # 记录别名指向的完整模块名。
     module_aliases: dict[str, str] = {}
@@ -346,6 +366,46 @@ def scan_borrowed_privilege(py_file_path: str) -> list[str]:
     return sorted(set(findings))
 
 
+def scan_borrowed_privilege_from_source(source: str) -> list[str]:
+    """检查源码是否调用已加载的插件模块或动态执行函数"""
+    return _scan_borrowed_from_tree(parse_plugin_source(source))
+
+
+def scan_borrowed_privilege(py_file_path: str) -> list[str]:
+    """检查插件是否调用已加载的插件模块或动态执行函数"""
+    try:
+        with open(py_file_path, "r", encoding="utf-8") as f:
+            source = f.read()
+    except Exception:
+        return []
+    return scan_borrowed_privilege_from_source(source)
+
+
+def analyze_plugin_source(
+    source: str, *, include_borrowed: bool = True
+) -> tuple[Set[str], bool, list[str]]:
+    """一次解析返回能力集合、sudo 导入和借壳扫描结果"""
+    tree = parse_plugin_source(source)
+    borrowed = _scan_borrowed_from_tree(tree) if include_borrowed else []
+    return (
+        _scan_capabilities_from_tree(tree),
+        _check_sudo_from_tree(tree),
+        borrowed,
+    )
+
+
+def _verify_sig_with_payload(sig: bytes, payload: bytes, pubs) -> bool:
+    """用给定公钥列表验 payload 的 SHA-256 摘要签名，验不过返回 False"""
+    digest = hashlib.sha256(payload).digest()
+    for pub in pubs:
+        try:
+            pub.verify(sig, digest)
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def _verify_sig_with_keys(plugin_dir: str, pubs) -> bool:
     """用给定公钥列表校验 signature.sig，清单与签名时保持同一份。"""
     sig_file = os.path.join(plugin_dir, "signature.sig")
@@ -358,21 +418,25 @@ def _verify_sig_with_keys(plugin_dir: str, pubs) -> bool:
         payload = b"".join(f.read_bytes() for f in plugin_files(plugin_dir))
     except OSError:
         return False
-    digest = hashlib.sha256(payload).digest()
-    for pub in pubs:
-        try:
-            pub.verify(sig, digest)
-            return True
-        except Exception:
-            continue
-    return False
+    return _verify_sig_with_payload(sig, payload, pubs)
 
 
-def plugin_signature_kind(plugin_dir: str, origin: str = "builtin") -> str:
+def plugin_signature_kind_from_payload(
+    plugin_dir: str, origin: str, payload: bytes
+) -> str:
     """返回签名来源：official、author、official-legacy 或 none，验签失败一律算 none"""
     try:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     except Exception:
+        return "none"
+
+    sig_file = os.path.join(plugin_dir, "signature.sig")
+    if not os.path.exists(sig_file):
+        return "none"
+    try:
+        with open(sig_file, "rb") as f:
+            sig = f.read()
+    except OSError:
         return "none"
 
     if origin == "builtin":
@@ -384,7 +448,7 @@ def plugin_signature_kind(plugin_dir: str, origin: str = "builtin") -> str:
             pubs = [Ed25519PublicKey.from_public_bytes(k) for k in pub_keys]
         except Exception:
             return "none"
-        return "official" if _verify_sig_with_keys(plugin_dir, pubs) else "none"
+        return "official" if _verify_sig_with_payload(sig, payload, pubs) else "none"
 
     # 非内置插件由作者自签，公钥随插件目录分发，验的是没被篡改过。
     key_path = os.path.join(plugin_dir, "public_key.pem")
@@ -395,7 +459,7 @@ def plugin_signature_kind(plugin_dir: str, origin: str = "builtin") -> str:
                 pub = load_pem_public_key(f.read())
         except Exception:
             return "none"
-        return "author" if _verify_sig_with_keys(plugin_dir, [pub]) else "none"
+        return "author" if _verify_sig_with_payload(sig, payload, [pub]) else "none"
 
     if origin == "third_party":
         return "none"
@@ -409,7 +473,17 @@ def plugin_signature_kind(plugin_dir: str, origin: str = "builtin") -> str:
         pubs = [Ed25519PublicKey.from_public_bytes(k) for k in pub_keys]
     except Exception:
         return "none"
-    return "official-legacy" if _verify_sig_with_keys(plugin_dir, pubs) else "none"
+    return "official-legacy" if _verify_sig_with_payload(sig, payload, pubs) else "none"
+
+
+def plugin_signature_kind(plugin_dir: str, origin: str = "builtin") -> str:
+    """返回签名来源：official、author、official-legacy 或 none，验签失败一律算 none"""
+    try:
+        from notmyfault.security.signing import plugin_files
+        payload = b"".join(f.read_bytes() for f in plugin_files(plugin_dir))
+    except OSError:
+        return "none"
+    return plugin_signature_kind_from_payload(plugin_dir, origin, payload)
 
 
 def verify_plugin_sig(plugin_dir: str, origin: str = "builtin") -> bool:
@@ -476,39 +550,47 @@ def save_plugin_manifest(manifest: dict[str, dict[str, str]]) -> bool:
                 pass
 
 
-def verify_plugin_integrity(
-    plugin_id: str, files: List[Tuple[str, str]]
+def verify_plugin_integrity_from_hashes(
+    plugin_id: str, current_hashes: dict[str, str]
 ) -> Tuple[bool, str]:
-    """校验插件文件与清单的一致性并记录首次哈希"""
+    """按清单比对文件哈希并记录首次值，空串哈希表示读不了的文件"""
     manifest = load_plugin_manifest()
     has_existing = plugin_id in manifest
     existing = manifest.get(plugin_id, {})
-    current: dict[str, str] = {}
-    present_files: set[str] = set()
+    present_files: set[str] = set(current_hashes.keys())
+    readable: dict[str, str] = {
+        file_type: h for file_type, h in current_hashes.items() if h
+    }
     messages: List[str] = []
-    for file_type, file_path in files:
-        present_files.add(file_type)
-        current_hash = compute_file_hash(file_path)
-        if current_hash is None:
+    for file_type, h in current_hashes.items():
+        if not h:
             messages.append("无法读取 " + file_type)
-            continue
-        current[file_type] = current_hash
 
     if has_existing:
         for file_type in sorted(existing.keys() - present_files):
             messages.append(file_type + " 文件已被删除")
         for file_type in sorted(present_files - existing.keys()):
             messages.append(file_type + " 文件为清单外新增")
-        for file_type in sorted(existing.keys() & current.keys()):
+        for file_type in sorted(existing.keys() & readable.keys()):
             expected_hash = existing[file_type]
-            if current[file_type] == expected_hash:
+            if readable[file_type] == expected_hash:
                 continue
             messages.append(file_type + " 文件已被修改！（期望 " + expected_hash[:12] + "...）")
 
     if messages:
         return False, "；".join(messages)
     if not has_existing:
-        manifest[plugin_id] = current
+        manifest[plugin_id] = readable
         if not save_plugin_manifest(manifest):
             return False, "无法保存完整性清单"
     return True, "完整性校验通过"
+
+
+def verify_plugin_integrity(
+    plugin_id: str, files: List[Tuple[str, str]]
+) -> Tuple[bool, str]:
+    """校验插件文件与清单的一致性并记录首次哈希"""
+    current: dict[str, str] = {}
+    for file_type, file_path in files:
+        current[file_type] = compute_file_hash(file_path) or ""
+    return verify_plugin_integrity_from_hashes(plugin_id, current)

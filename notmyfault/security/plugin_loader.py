@@ -9,6 +9,8 @@ import posixpath
 import sys
 import threading
 import traceback
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, Literal, Optional, Tuple
 
 from notmyfault.core.logging import engine_error, engine_info, engine_warn
@@ -19,11 +21,14 @@ from notmyfault.security.plugin_schema import (
     validate_plugin_meta,
 )
 from notmyfault.security.plugins import (
+    analyze_plugin_source,
     check_sudo_import,
     plugin_signature_kind,
+    plugin_signature_kind_from_payload,
     scan_borrowed_privilege,
     scan_plugin_capabilities,
     verify_plugin_integrity,
+    verify_plugin_integrity_from_hashes,
     verify_plugin_sig,
 )
 from notmyfault.security.security import SecurityMode
@@ -71,6 +76,38 @@ def _snapshot_plugin_files(folder_path: str) -> Dict[str, str] | None:
     except (OSError, ValueError):
         return None
     return snapshot
+
+
+@dataclass
+class PluginTree:
+    files: list[Path]
+    file_snapshot: dict[str, str]
+    py_sources: dict[str, str]
+    payload: bytes
+
+
+def inspect_plugin_tree(folder_path: str) -> Optional[PluginTree]:
+    """一次读完整棵插件目录，签名校验和源码导入共用这一份数据。"""
+    try:
+        files = plugin_files(folder_path)
+        snapshot: dict[str, str] = {}
+        py_sources: dict[str, str] = {}
+        parts: list[bytes] = []
+        for path in files:
+            data = path.read_bytes()
+            relative = os.path.relpath(str(path), folder_path).replace(os.sep, "/")
+            snapshot[relative] = hashlib.sha256(data).hexdigest()
+            parts.append(data)
+            if path.suffix == ".py":
+                py_sources[str(path)] = data.decode("utf-8", errors="replace")
+    except (OSError, ValueError):
+        return None
+    return PluginTree(
+        files=files,
+        file_snapshot=snapshot,
+        py_sources=py_sources,
+        payload=b"".join(parts),
+    )
 
 
 def _current_platform_name() -> str:
@@ -130,9 +167,13 @@ class PluginRegistry:
         # 每个插件插进 sys.path 的目录，卸载时按这份清单移除。
         self.sys_path_entries: Dict[str, str] = {}
         self._action_materializer: Optional[Callable[[str], Any]] = None
+        self._trigger_materializer: Optional[Callable[[str], Any]] = None
 
     def set_action_materializer(self, callback: Callable[[str], Any]) -> None:
         self._action_materializer = callback
+
+    def set_trigger_materializer(self, callback: Callable[[str], Any]) -> None:
+        self._trigger_materializer = callback
 
     def resolve_action(self, plugin_id: str) -> Optional[Callable[..., Any]]:
         """返回动作入口函数，还没导入的插件在这里触发首次导入。"""
@@ -144,6 +185,17 @@ class PluginRegistry:
             return None
         materializer(plugin_id)
         return self.actions_funcs.get(plugin_id)
+
+    def resolve_trigger(self, plugin_id: str) -> Optional[Callable[..., Any]]:
+        """返回触发器入口函数，还没导入的插件在这里触发首次导入。"""
+        run = self.triggers_funcs.get(plugin_id)
+        if run is not None:
+            return run
+        materializer = self._trigger_materializer
+        if materializer is None:
+            return None
+        materializer(plugin_id)
+        return self.triggers_funcs.get(plugin_id)
 
     def stores(
         self, kind: PluginKind
@@ -255,6 +307,7 @@ class PluginLoader:
         # 多个工作流线程可能同时首次执行同一个懒加载动作。
         self._materialize_lock = threading.Lock()
         registry.set_action_materializer(self.materialize_pending_action)
+        registry.set_trigger_materializer(self.materialize_pending_trigger)
         # plugin_resource 需要注册表里的插件根目录才能定位插件自带资源。
         plugin_resources.set_registry(registry)
 
@@ -294,6 +347,8 @@ class PluginLoader:
         root_dir = os.path.join(base_dir, plugins_dir)
         loaded_count = 0
         failed_count = 0
+        # 成功名单攒到最后一条输出，避免每个插件 print 一次拖慢启动。
+        loaded_summaries: list[str] = []
 
         if not os.path.isdir(root_dir):
             print(f"[Engine] 插件目录不存在，跳过: {root_dir}", file=sys.stderr)
@@ -448,8 +503,40 @@ class PluginLoader:
                 )
                 continue
 
+            # 单次遍历：读文件、算哈希、拼签名 payload、留 py 源码，后面的检查共用这份结果。
+            tree = inspect_plugin_tree(folder_path)
+            if tree is None:
+                reason = "无法读取插件文件，拒绝加载"
+                failed_count += 1
+                self._diagnostics.record_plugin_error(store_name, plugin_id, reason)
+                engine_error(
+                    "plugin_load_failed",
+                    plugin=plugin_id,
+                    type=store_name,
+                    reason=reason,
+                )
+                continue
+            file_snapshot = tree.file_snapshot
+
             # strict 模式在导入前检查签名，其他模式保留签名失败时的降级加载。
-            signature_kind = plugin_signature_kind(folder_path, origin)
+            signature_kind = plugin_signature_kind_from_payload(
+                folder_path, origin, tree.payload
+            )
+            if (
+                self._security_mode == SecurityMode.STRICT
+                and origin == "user"
+                and signature_kind == "author"
+                and "admin" not in (meta.get("permissions") or [])
+            ):
+                from notmyfault.security.signing import (
+                    verify_author_key_counter_signature,
+                )
+                from notmyfault.security.signing_keys import get_public_keys
+
+                if not verify_author_key_counter_signature(
+                    Path(folder_path), get_public_keys()
+                ):
+                    signature_kind = "none"
             signature_ok = signature_kind != "none"
             if not signature_ok:
                 if self._security_mode == SecurityMode.STRICT:
@@ -495,27 +582,19 @@ class PluginLoader:
                     )
                     continue
 
-            # 先完成 AST 扫描，再执行模块导入。
-            python_files = [
-                str(path)
-                for path in plugin_files(folder_path)
-                if path.suffix == ".py"
-            ]
-            caps = set().union(
-                *(scan_plugin_capabilities(path) for path in python_files)
-            )
-            file_snapshot = _snapshot_plugin_files(folder_path)
-            if file_snapshot is None:
-                reason = "无法读取插件文件，拒绝加载"
-                failed_count += 1
-                self._diagnostics.record_plugin_error(store_name, plugin_id, reason)
-                engine_error(
-                    "plugin_load_failed",
-                    plugin=plugin_id,
-                    type=store_name,
-                    reason=reason,
+            # 每个 .py 只 parse 一次；内置插件不做借壳扫描。
+            caps: set[str] = set()
+            uses_sudo = False
+            borrowed_findings: list[str] = []
+            include_borrowed = origin != "builtin"
+            for _py_path, source in tree.py_sources.items():
+                file_caps, file_uses_sudo, file_borrowed = analyze_plugin_source(
+                    source, include_borrowed=include_borrowed
                 )
-                continue
+                caps |= file_caps
+                uses_sudo = uses_sudo or file_uses_sudo
+                if include_borrowed:
+                    borrowed_findings.extend(file_borrowed)
 
             # self_elevation 始终拒绝，插件只能通过 sudo.run_as_admin 提权并声明 admin。
             if "self_elevation" in caps:
@@ -551,8 +630,28 @@ class PluginLoader:
                     continue
 
             # strict 模式要求导入 sudo 与声明 admin 同时出现，缺一项即拒绝。
-            uses_sudo = any(check_sudo_import(path) for path in python_files)
             has_admin = "admin" in (meta.get("permissions") or [])
+            # admin 能走 sudo 提权，作者自签的公钥谁都能造，strict 只认官方签名。
+            if (
+                self._security_mode == SecurityMode.STRICT
+                and has_admin
+                and signature_kind not in ("official", "official-legacy")
+            ):
+                reason = "声明了 'admin' 权限但未使用官方签名"
+                print(
+                    f'[Engine] [!!] 插件 "{plugin_id}" {reason}，'
+                    "strict 模式不加载",
+                    file=sys.stderr,
+                )
+                failed_count += 1
+                self._diagnostics.record_plugin_error(store_name, plugin_id, reason)
+                engine_error(
+                    "plugin_load_failed",
+                    plugin=plugin_id,
+                    type=store_name,
+                    reason=reason,
+                )
+                continue
             if uses_sudo and not has_admin:
                 reason = "import 了 notmyfault.security.sudo 但未在元数据中声明 'admin' 权限"
                 print(
@@ -578,12 +677,8 @@ class PluginLoader:
 
             # 内置插件使用构建时 Ed25519 签名，用户插件记录首次文件哈希，完整性失败只告警。
             if origin != "builtin":
-                integrity_files = [
-                    (path.relative_to(folder_path).as_posix(), str(path))
-                    for path in plugin_files(folder_path)
-                ]
-                integrity_ok, integrity_msg = verify_plugin_integrity(
-                    plugin_id, integrity_files
+                integrity_ok, integrity_msg = verify_plugin_integrity_from_hashes(
+                    plugin_id, file_snapshot
                 )
                 if not integrity_ok:
                     warning = (
@@ -594,12 +689,6 @@ class PluginLoader:
                     engine_warn(f"integrity_check: {integrity_msg}")
                     self._integrity_errors.append(warning)
 
-                # 扫描用户插件对已加载插件模块的导入和调用，命中时记录告警。
-                borrowed_findings = []
-                for path in python_files:
-                    borrowed_findings.extend(
-                        scan_borrowed_privilege(path)
-                    )
                 if borrowed_findings:
                     warning = (
                         f"[Engine] [安全] 插件 \"{plugin_id}\" 存在借壳提权嫌疑: "
@@ -672,18 +761,32 @@ class PluginLoader:
                     self._registry.pending[plugin_id] = entry
                     meta_store[plugin_id] = meta_with_origin
                 loaded_count += 1
-                print(
-                    f"[Engine] 装载{store_name}: {meta['name']} ({plugin_id})"
-                    f"{_version_info(meta)}{_perm_info(meta)}"
+                loaded_summaries.append(plugin_id)
+                continue
+
+            # 触发器第一次被规则引用时才导入，先写 meta 让规则校验认识它
+            old_module = self._registry.get_module(plugin_id)
+            if old_module is not None:
+                # 覆盖已加载的旧触发器时立即导入，meta 和函数保持同一代
+                entry["prev"] = (
+                    old_module,
+                    meta_store.get(plugin_id),
+                    func_store.get(plugin_id),
                 )
-                continue
-
-            # 触发器要常驻运行，启动时就导入
-            if self.materialize_entry(entry) is None:
-                failed_count += 1
-                continue
+                if self.materialize_entry(entry, announce=False) is None:
+                    failed_count += 1
+                    continue
+            else:
+                self._registry.pending[plugin_id] = entry
+                meta_store[plugin_id] = meta_with_origin
             loaded_count += 1
+            loaded_summaries.append(plugin_id)
 
+        if loaded_summaries:
+            print(
+                f"[Engine] 装载{store_name} {loaded_count} 个: "
+                + ", ".join(loaded_summaries)
+            )
         return loaded_count, failed_count
 
     def materialize_pending_action(self, plugin_id: str) -> Optional[Any]:
@@ -693,7 +796,16 @@ class PluginLoader:
             return None
         return self.materialize_entry(entry)
 
-    def materialize_entry(self, entry: Dict[str, Any]) -> Optional[Any]:
+    def materialize_pending_trigger(self, plugin_id: str) -> Optional[Any]:
+        """导入还没加载的触发器插件，没有对应待物化条目时返回 None"""
+        entry = self._registry.pending.get(plugin_id)
+        if entry is None:
+            return None
+        return self.materialize_entry(entry)
+
+    def materialize_entry(
+        self, entry: Dict[str, Any], *, announce: bool = True
+    ) -> Optional[Any]:
         """导入插件模块并完成注册、setup 和提权授权，失败返回 None"""
         plugin_type = entry["kind"]
         plugin_id = entry["plugin_id"]
@@ -711,7 +823,7 @@ class PluginLoader:
 
         with self._materialize_lock:
             # 覆盖场景带着 prev 进来，必须先走完替换，缓存短路只对首次物化生效
-            if plugin_type == "action" and prev is None and plugin_id in func_store:
+            if prev is None and plugin_id in func_store:
                 return func_store[plugin_id]
 
             if prev is None and self._registry.get_module(plugin_id) is not None:
@@ -773,6 +885,10 @@ class PluginLoader:
                                 old_module,
                                 old_path,
                             )
+                else:
+                    self._registry.pending.pop(plugin_id, None)
+                    func_store.pop(plugin_id, None)
+                    meta_store.pop(plugin_id, None)
                 self._diagnostics.record_plugin_error(store_name, plugin_id, reason)
                 engine_error(
                     "plugin_load_failed",
@@ -782,10 +898,18 @@ class PluginLoader:
                 )
 
             expected_signature = entry.get("signature_kind", "none")
-            if plugin_signature_kind(folder_path, origin) != expected_signature:
+            # 物化前再读一轮目录，签名和快照共用这一次结果。
+            tree = inspect_plugin_tree(folder_path)
+            if tree is None:
+                fail("无法读取插件文件，拒绝导入")
+                return None
+            if (
+                plugin_signature_kind_from_payload(folder_path, origin, tree.payload)
+                != expected_signature
+            ):
                 fail("插件签名在物化前发生变化，拒绝导入")
                 return None
-            if _snapshot_plugin_files(folder_path) != entry.get("file_snapshot"):
+            if tree.file_snapshot != entry.get("file_snapshot"):
                 fail("插件文件在校验后发生变化，拒绝导入")
                 return None
 
@@ -868,9 +992,10 @@ class PluginLoader:
                     return None
 
             # 新插件 setup() 成功后才调用旧插件 teardown()。
-            if prev is not None and prev[0] is not None and hasattr(prev[0], "teardown"):
+            previous_module = prev[0] if prev is not None else None
+            if previous_module is not None and hasattr(previous_module, "teardown"):
                 try:
-                    prev[0].teardown()
+                    previous_module.teardown()
                 except Exception:
                     engine_warn(f"override teardown \"{plugin_id}\" 异常: {traceback.format_exc()[-200:]}")
 
@@ -897,10 +1022,11 @@ class PluginLoader:
                     plugin_id, folder_path, meta, module_prefix, module, py_file
                 )
 
-            print(
-                f"[Engine] 装载{store_name}: {meta['name']} ({plugin_id})"
-                f"{_version_info(meta)}{_perm_info(meta)}"
-            )
+            if announce:
+                print(
+                    f"[Engine] 装载{store_name}: {meta['name']} ({plugin_id})"
+                    f"{_version_info(meta)}{_perm_info(meta)}"
+                )
             return module
 
     def _load_components(
