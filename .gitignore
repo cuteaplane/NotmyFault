@@ -7,7 +7,7 @@ __pycache__/
 *$py.class
 *.pyc
 .pytest-review-*/
-
+.omo/
 # Distribution / packaging
 dist/
 build/
@@ -60,7 +60,7 @@ notmyfault/integrity.json
 _patch_dash.py
 .qoder-cn/
 DECOUPLING.md
-
+.playwright-mcp/
 # 测试沙箱残留（含敏感凭据）
 sandbox_appdata/
 

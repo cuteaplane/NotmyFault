@@ -29,8 +29,6 @@ from notmyfault.security.plugin_schema import scan_plugins
 API = "http://127.0.0.1:19198"
 # API 令牌与 notmyfault/api_server.py 共用，文件放在配置目录下
 API_TOKEN_FILE = os.path.join(get_config_dir(), ".api_token")
-
-
 def _get_plugins_schema() -> dict:
     base = os.path.join(PROJECT_ROOT, "notmyfault")
     result = {
@@ -220,9 +218,11 @@ class DashboardAPI:
             return {"_error": str(e), "rules": []}
         return {"rules": []}
 
-    def save_config(self, rules: list) -> dict:
+    def save_config(self, rules: list, admin_key_password: str = "") -> dict:
         try:
             from notmyfault.config import (
+                ConfigValidationError,
+                load_verified_rules,
                 save_rules as _save_rules,
                 _normalize_rules,
                 _validate_rules_safety,
@@ -262,6 +262,33 @@ class DashboardAPI:
                     "error": "规则安全校验失败",
                     "details": errors[:10],
                 }
+            previous_rules = []
+            if os.path.exists(RULES_FILE):
+                try:
+                    previous_rules = load_verified_rules()
+                except ConfigValidationError as error:
+                    return {
+                        "ok": False,
+                        "error": f"现有规则未通过完整性校验: {error}",
+                    }
+            from notmyfault.security.rule_approval import (
+                AdminRuleApprovalError,
+                require_admin_rule_approval,
+            )
+            try:
+                require_admin_rule_approval(
+                    previous_rules,
+                    normalized_rules,
+                    schema,
+                    admin_key_password,
+                )
+            except AdminRuleApprovalError as error:
+                return {
+                    "ok": False,
+                    "code": error.code,
+                    "error": str(error),
+                    "plugins": error.plugins,
+                }
             ok = _save_rules(normalized_rules)
             return {"ok": ok, "rules": normalized_rules if ok else None}
         except Exception as e:
@@ -274,7 +301,13 @@ class DashboardAPI:
         except (OSError, IOError):
             return ""
 
-    def _auth_request(self, path: str, method: str = "POST", data: dict = None) -> dict:
+    def _auth_request(
+        self,
+        path: str,
+        method: str = "POST",
+        data: dict = None,
+        timeout: float = 5,
+    ) -> dict:
         """发送带认证的 HTTP 请求，认证失败时重读令牌并重试一次"""
         last_error = ""
         for attempt in range(2):
@@ -290,7 +323,7 @@ class DashboardAPI:
                     req.add_header("Authorization", f"Bearer {token}")
                 if data is not None:
                     req.add_header("Content-Type", "application/json")
-                return json.loads(urllib.request.urlopen(req, timeout=5).read())
+                return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", errors="replace")
                 try:
@@ -323,7 +356,8 @@ class DashboardAPI:
         """通过 pywebview bridge 转发 Dashboard 的 JSON API 请求"""
         if not isinstance(path, str) or not path.startswith("/api/"):
             return {"ok": False, "error": "无效的 API 路径", "status": 400}
-        return self._auth_request(path, method.upper(), data)
+        timeout = 30 if path == "/api/rules/draft/ai" else 5
+        return self._auth_request(path, method.upper(), data, timeout=timeout)
 
     def get_engine_status(self) -> dict:
         result = self._auth_request("/api/engine/status", "GET")

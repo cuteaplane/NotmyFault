@@ -5,7 +5,12 @@ ROOT = Path(__file__).parent.resolve()
 PRIVATE_DIR = ROOT / ".private"
 PRIVATE_KEY_FILE = PRIVATE_DIR / "signing_private_key.pem"
 SIGNING_MODULE = ROOT / "notmyfault" / "security" / "signing_keys.py"
-PLUGIN_DIRS = [("actions", "action.json"), ("triggers", "trigger.json")]
+PLUGIN_DIRS = [
+    (Path("actions"), "action.json"),
+    (Path("triggers"), "trigger.json"),
+    (Path("bundled") / "actions", "action.json"),
+    (Path("bundled") / "triggers", "trigger.json"),
+]
 
 def _get_crypto():
     from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -278,7 +283,7 @@ def _build_integrity_manifest(private_key) -> None:
     for p in sorted(pkg_dir.rglob("*.py")):
         rel = p.relative_to(pkg_dir).as_posix()
         parts = rel.split("/")
-        if parts[0] in ("tests", "simulator", "actions", "__pycache__") or "__pycache__" in parts:
+        if parts[0] in ("tests", "simulator", "actions", "bundled", "__pycache__") or "__pycache__" in parts:
             continue
         if parts[0] == "triggers" and rel not in ("triggers/__init__.py", "triggers/base.py"):
             continue
