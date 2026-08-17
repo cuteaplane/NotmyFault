@@ -147,7 +147,6 @@ function finishResult(message, result) {
   message.transient = false
   message.streaming = false
   message.reasoningDone = !!message.reasoning
-  message.reasoningOpen = false
 }
 
 function finishError(message, text) {
@@ -156,7 +155,6 @@ function finishError(message, text) {
   message.transient = false
   message.streaming = false
   message.reasoningDone = !!message.reasoning
-  message.reasoningOpen = false
 }
 
 function requestMessages() {
@@ -246,7 +244,6 @@ async function sendTurn(content, consent = null) {
     if (!controller.signal.aborted) {
       message.streaming = false
       message.reasoningDone = !!message.reasoning
-      message.reasoningOpen = false
       await scrollConversation()
       await nextTick()
       composerRef.value?.focus()
@@ -265,7 +262,6 @@ function stopDrafting() {
     message.streaming = false
     message.stopped = true
     message.reasoningDone = !!message.reasoning
-    message.reasoningOpen = false
   }
   void nextTick(() => composerRef.value?.focus())
 }
@@ -292,6 +288,24 @@ function openDraft(result) {
   if (result?.draft) emit('create', result.draft)
 }
 
+function downloadFile(filename, text) {
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' }))
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(a.href)
+}
+
+function downloadPluginDraft(result) {
+  const manifest = result?.manifest ?? result?.plugin?.manifest ?? result?.plugin_source?.manifest
+  const source = result?.source_code ?? result?.plugin?.source_code ?? result?.plugin?.source
+    ?? result?.plugin_source?.source_code ?? result?.plugin_source?.source
+    ?? result?.code ?? (result?.source === 'ai' ? '' : result?.source)
+  const id = (manifest?.id || 'plugin').replace(/[^a-zA-Z0-9_-]/g, '_')
+  if (manifest) downloadFile(`${id}.action.json`, JSON.stringify(manifest, null, 2))
+  if (source) downloadFile(`${id}.action.py`, String(source))
+}
+
 onMounted(async () => {
   await nextTick()
   composerRef.value?.focus()
@@ -301,13 +315,6 @@ onUnmounted(() => { activeController?.abort() })
 
 <template>
   <section class="ai-draft-panel flex h-full min-h-0 flex-col gap-3">
-    <div class="natural-draft-intro shrink-0">
-      <span class="material-symbols-outlined">chat_bubble</span>
-      <div>
-        <b>直接说你想让电脑做什么</b>
-        <small>可以继续补充或修改，AI 会保留这次对话里的上下文。</small>
-      </div>
-    </div>
 
     <div v-if="messages.length" ref="conversationRef"
       class="natural-draft-conversation flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto pr-1!"
@@ -429,6 +436,12 @@ onUnmounted(() => { activeController?.abort() })
               <h4 class="text-label-m text-on-surface-variant">插件源码</h4>
               <pre tabindex="0" class="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-surface-c-lowest p-3! font-mono text-body-s text-on-surface">{{ pluginSource(message.result) }}</pre>
             </section>
+            <footer class="mt-3! flex items-center justify-between gap-3">
+              <small class="text-body-s text-on-surface-variant">未保存、未签名、未安装——需人工审阅后自行打包安装。</small>
+              <button class="btn btn-tonal" type="button" @click="downloadPluginDraft(message.result)">
+                <span class="material-symbols-outlined">download</span>下载草稿文件
+              </button>
+            </footer>
           </div>
         </template>
 
@@ -444,10 +457,10 @@ onUnmounted(() => { activeController?.abort() })
     </div>
 
     <form class="natural-draft-form mt-0! flex shrink-0 flex-col gap-2" @submit.prevent="sendMessage">
-      <label for="natural-draft-description">{{ messages.length ? '继续补充或修改你的想法' : '你想自动化什么？' }}</label>
+      <label for="natural-draft-description" class="sr-only">你想自动化什么</label>
       <div class="natural-draft-entry grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
         <textarea id="natural-draft-description" ref="composerRef" v-model="composer" class="text-field textarea-field"
-          :maxlength="MAX_MESSAGE_CHARS" rows="2" placeholder="例如：每天 08:30 提醒我提交月报"
+          :maxlength="MAX_MESSAGE_CHARS" rows="2" placeholder="例如：每天 08:30 提醒我提交月报，USB 插入时自动备份文件"
           :disabled="drafting"></textarea>
         <button v-if="drafting" class="natural-draft-stop btn btn-outlined" type="button" @click="stopDrafting">
           <span class="material-symbols-outlined">stop_circle</span>停止
@@ -457,7 +470,7 @@ onUnmounted(() => { activeController?.abort() })
         </button>
       </div>
       <p v-if="streamNotice" class="natural-draft-status text-body-s text-on-surface-variant" aria-live="polite">{{ streamNotice }}</p>
-      <small class="natural-draft-privacy"><span class="material-symbols-outlined">lock</span>对话内容以及可用插件的名称和参数定义会发送到设置中的 AI 服务；结果只作为草稿，不会自动保存、安装或运行。</small>
+
     </form>
   </section>
 </template>

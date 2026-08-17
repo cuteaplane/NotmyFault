@@ -10,6 +10,7 @@ const items = [
   { page: 'plugins', icon: 'extension', label: '插件', needs: true },
   { page: 'security', icon: 'shield', label: '安全', needs: true },
   { page: 'rules', icon: 'account_tree', label: '自动化', needs: true },
+  { page: 'ai', icon: 'auto_awesome', label: 'AI 起草', needs: true },
   { page: 'logs', icon: 'article', label: '日志', needs: true },
   { page: 'settings', icon: 'settings', label: '设置', needs: true },
 ]

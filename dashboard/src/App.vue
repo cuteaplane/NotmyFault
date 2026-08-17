@@ -7,6 +7,7 @@ import SecurityView from './components/views/SecurityView.vue'
 import SettingsView from './components/views/SettingsView.vue'
 import RulesView from './components/views/RulesView.vue'
 import LogsView from './components/views/LogsView.vue'
+import AiView from './components/views/AiView.vue'
 import AppDialog from './components/AppDialog.vue'
 import { store } from './lib/store'
 import { snack } from './lib/notify'
@@ -16,7 +17,7 @@ import { useTheme } from './composables/useTheme'
 
 const { init: initTheme } = useTheme()
 const currentPage = ref('home')
-const views = { home: HomeView, plugins: PluginsView, security: SecurityView, settings: SettingsView, rules: RulesView, logs: LogsView }
+const views = { home: HomeView, plugins: PluginsView, security: SecurityView, settings: SettingsView, rules: RulesView, logs: LogsView, ai: AiView }
 
 function switchPage(p) {
   if (p === currentPage.value || !views[p]) return

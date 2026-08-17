@@ -40,7 +40,6 @@ import PluginPicker from './PluginPicker.vue'
 import FolderPicker from './FolderPicker.vue'
 import ActionFailureSettings from './ActionFailureSettings.vue'
 import DesktopRecorderDialog from './DesktopRecorderDialog.vue'
-import NaturalDraftPanel from './NaturalDraftPanel.vue'
 import { validateRuleDraft } from '../lib/api'
 
 const props = defineProps({
@@ -53,7 +52,7 @@ const props = defineProps({
   folders: { type: Array, default: () => [] },
   initialNodeId: { type: String, default: '' },
 })
-const emit = defineEmits(['back', 'delete', 'save', 'save-run', 'undo', 'redo', 'ai-draft'])
+const emit = defineEmits(['back', 'delete', 'save', 'save-run', 'undo', 'redo'])
 
 const newTriggerType = ref('')
 const newActionType = ref('')
@@ -73,8 +72,6 @@ const folderPickerOpen = ref(false)
 const desktopRecorderOpen = ref(false)
 const editingRuleName = ref(false)
 const ruleNameInput = ref(null)
-const aiDraftOpen = ref(false)
-const aiDraftLauncher = ref(null)
 let dragState = null
 const currentFolderName = computed(() => {
   const folder = String(props.rule.folder || '').trim()
@@ -93,18 +90,6 @@ function finishRuleNameEdit() {
 function chooseFolder(folder) {
   props.rule.folder = String(folder || '').trim()
   folderPickerOpen.value = false
-}
-function openAIDraftPanel() {
-  aiDraftOpen.value = true
-}
-async function closeAIDraftPanel() {
-  aiDraftOpen.value = false
-  await nextTick()
-  aiDraftLauncher.value?.focus()
-}
-function createAIDraft(draft) {
-  aiDraftOpen.value = false
-  emit('ai-draft', draft)
 }
 const triggerKeys = computed(() => Object.keys(store.schema.triggers).filter(
   key => store.schema.triggers[key]?.platform_compatible !== false
@@ -1259,7 +1244,6 @@ function onEditorKeydown(event) {
   if (picker.value.open) closePluginPicker()
   else if (folderPickerOpen.value) folderPickerOpen.value = false
   else if (editingRuleName.value) finishRuleNameEdit()
-  else if (aiDraftOpen.value) void closeAIDraftPanel()
   else selectedNodeId.value = null
 }
 </script>
@@ -1727,34 +1711,6 @@ function onEditorKeydown(event) {
     </footer>
     </div>
 
-    <aside v-if="store.aiDrafting.enabled" class="rule-editor-ai-rail order-first flex min-w-0 flex-col gap-2 lg:order-none lg:sticky lg:top-4 lg:w-auto lg:shrink-0">
-      <button ref="aiDraftLauncher" class="rule-editor-ai-launcher btn btn-tonal w-full justify-center lg:h-44! lg:w-12! lg:flex-col lg:px-0!"
-        type="button" :aria-expanded="aiDraftOpen" aria-controls="rule-ai-draft-panel"
-        :aria-label="aiDraftOpen ? '收起 AI 规则起草面板' : '打开 AI 规则起草面板'"
-        @click="aiDraftOpen ? closeAIDraftPanel() : openAIDraftPanel()">
-        <span class="material-symbols-outlined">auto_awesome</span>
-        <span class="lg:[writing-mode:vertical-rl]">AI 起草</span>
-      </button>
-      <Transition
-        enter-active-class="transition duration-200 ease-out motion-reduce:transition-none"
-        enter-from-class="translate-x-3 opacity-0 motion-reduce:translate-x-0"
-        leave-active-class="transition duration-150 ease-in motion-reduce:transition-none"
-        leave-to-class="translate-x-3 opacity-0 motion-reduce:translate-x-0"
-      >
-        <section v-if="aiDraftOpen" id="rule-ai-draft-panel" class="min-w-0 overflow-hidden rounded-md border border-outline-variant bg-surface-c-low shadow-elev1 lg:w-[22rem]"
-          aria-label="AI 规则起草面板">
-          <header class="flex items-center justify-between gap-3 border-b border-outline-variant bg-surface-c px-3! py-2!">
-            <div class="min-w-0"><b class="block text-title-s">AI 规则起草</b><small class="block break-words text-body-s text-on-surface-variant">先讨论，再把候选规则送进编辑器检查。</small></div>
-            <button class="icon-btn shrink-0" type="button" title="关闭 AI 规则起草" aria-label="关闭 AI 规则起草" @click="closeAIDraftPanel">
-              <span class="material-symbols-outlined">close</span>
-            </button>
-          </header>
-          <div class="h-[34rem] min-h-0 max-h-[calc(100dvh-10rem)] p-3!">
-            <NaturalDraftPanel @create="createAIDraft" />
-          </div>
-        </section>
-      </Transition>
-    </aside>
     </div>
 
     <PluginPicker :open="picker.open" :kind="picker.kind"

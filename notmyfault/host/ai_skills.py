@@ -138,6 +138,14 @@ def plugin_authoring_guidance() -> str:
         "4. 触发器入口 run(meta, config, emit_event, shutdown_event)，用 emit_event(dict) 上报事件；"
         "动作入口 run(action_info, params)，context-v1 动作用 run_with_context(action_info, params, context)。",
         f"5. 参数类型仅限：{param_types}；输出类型仅限：{output_types}；权限仅限：{permissions}。",
+        "6. ctypes 规范（违反会导致堆损坏崩溃，无 traceback）：所有 ctypes.windll 函数必须显式声明 argtypes 和 restype；"
+        "多线程共享的原生段必须用 notmyfault.native.NATIVE_LOCK（RLock）包裹；禁止裸调用未声明类型的 ctypes 函数。",
+        "7. 插件自带资源用 notmyfault.security.plugin_resources.plugin_resource(plugin_id, *path) 定位，"
+        "禁止用 __file__ 自拼路径。",
+        "8. 需要提权时在 manifest 声明 permissions: [\"admin\"]，调用 notmyfault.security.sudo.run_as_admin([...])，"
+        "禁止直接调 ctypes ShellExecuteEx/CreateProcess 绕过授权通道。",
+        "9. COM、音频驱动等崩溃风险高的原生库必须放子进程隔离（subprocess.run），"
+        "子进程 stdin 用 sys.stdin.buffer.read().decode('utf-8') 读取，避免中文 Windows GBK 乱码。",
     ])
 
 
