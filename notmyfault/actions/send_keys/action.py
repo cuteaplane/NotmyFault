@@ -99,13 +99,26 @@ def _send(inputs: list[INPUT]) -> None:
             )
 
 
-def _type_unicode(text: str) -> None:
-    inputs = []
+def _utf16_code_units(text: str) -> list[int]:
+    """把文本拆成 UTF-16 码元，UNICODE 模式的 wScan 一次只能带一个码元。"""
+    units = []
     for ch in text:
         code = ord(ch)
+        if code <= 0xFFFF:
+            units.append(code)
+            continue
+        code -= 0x10000
+        units.append(0xD800 + (code >> 10))
+        units.append(0xDC00 + (code & 0x3FF))
+    return units
+
+
+def _type_unicode(text: str) -> None:
+    inputs = []
+    for code in _utf16_code_units(text):
         # UNICODE 模式下 wVk 必须为 0，字符放 wScan
-        inputs.append(_key_input(0, code & 0xFFFF, KEYEVENTF_UNICODE))
-        inputs.append(_key_input(0, code & 0xFFFF, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
+        inputs.append(_key_input(0, code, KEYEVENTF_UNICODE))
+        inputs.append(_key_input(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
     _send(inputs)
 
 

@@ -59,6 +59,11 @@ _CONTROL_NAMES = {
     50033: "桌面",
 }
 
+_PHYSICAL_INVOKE_PROCESSES = {
+    "shellexperiencehost.exe",
+    "startmenuexperiencehost.exe",
+}
+
 
 def control_type_name(control_type: Any) -> str:
     try:
@@ -107,6 +112,30 @@ def _compact_signature(signature: Dict[str, Any]) -> Dict[str, Any]:
         for key, value in signature.items()
         if value not in ("", 0, None)
     }
+
+
+def _requires_physical_invoke(selector: Dict[str, Any]) -> bool:
+    window = selector.get("window")
+    if not isinstance(window, dict):
+        return False
+    process = os.path.basename(_text(window.get("process"), 160)).casefold()
+    return process in _PHYSICAL_INVOKE_PROCESSES
+
+
+def _click_element_center(element: Any, cancellation: Any = None) -> None:
+    bounds = _bounds(element)
+    if not bounds.get("width") or not bounds.get("height"):
+        raise DesktopElementError(
+            "invoke_not_supported", "这个控件既不支持直接按下，也没有可点击的屏幕范围"
+        )
+    perform_coordinate(
+        {
+            "x": bounds["left"] + bounds["width"] // 2,
+            "y": bounds["top"] + bounds["height"] // 2,
+        },
+        "left_click",
+        cancellation,
+    )
 
 
 def _bounds(element: Any) -> Dict[str, int]:
@@ -637,26 +666,16 @@ def perform_selector(
                 raise DesktopElementError(
                     "set_text_not_supported", "这个控件不支持直接写入文本"
                 ) from exc
+        elif _requires_physical_invoke(selector):
+            _click_element_center(element, cancellation)
         else:
             try:
                 pattern = element.GetCurrentPattern(
                     uia.UIA_InvokePatternId
                 ).QueryInterface(uia.IUIAutomationInvokePattern)
                 pattern.Invoke()
-            except Exception as exc:
-                bounds = _bounds(element)
-                if not bounds.get("width") or not bounds.get("height"):
-                    raise DesktopElementError(
-                        "invoke_not_supported", "这个控件既不支持直接按下，也没有可点击的屏幕范围"
-                    ) from exc
-                perform_coordinate(
-                    {
-                        "x": bounds["left"] + bounds["width"] // 2,
-                        "y": bounds["top"] + bounds["height"] // 2,
-                    },
-                    "left_click",
-                    cancellation,
-                )
+            except Exception:
+                _click_element_center(element, cancellation)
         return {
             "operation": operation,
             "display": _describe(selector),

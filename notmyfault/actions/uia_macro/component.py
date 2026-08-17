@@ -201,7 +201,7 @@ def start_recording(context, payload):
     if isinstance(current, InputRecorder):
         _recording_result(context)
     options = payload if isinstance(payload, dict) else {}
-    append = options.get("append") is not False
+    append = options.get("append") is True
     minimize_window = options.get("minimize_window") is True
     base_steps = (
         copy.deepcopy(context.session.data.get("steps", [])) if append else []

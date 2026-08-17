@@ -56,6 +56,7 @@
     color: #43474e;
     font-size: 12px;
   }
+  .recording-switches { display: flex; align-items: center; gap: 24px; }
   .switch-setting { display: inline-flex; align-items: center; gap: 12px; cursor: pointer; }
   .switch-copy { display: grid; gap: 1px; }
   .switch-copy strong { color: #1a1c1e; font-size: 13px; font-weight: 650; }
@@ -187,13 +188,22 @@
       </div>
     </section>
     <section class="recording-options">
-      <label class="switch-setting" for="minimizeOption">
-        <span class="switch-copy"><strong>开始后最小化 NotmyFault</strong><small>录制停止后自动恢复</small></span>
-        <span class="switch-control">
-          <input id="minimizeOption" type="checkbox" role="switch" checked>
-          <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
-        </span>
-      </label>
+      <div class="recording-switches">
+        <label class="switch-setting" for="minimizeOption">
+          <span class="switch-copy"><strong>开始后最小化 NotmyFault</strong><small>录制停止后自动恢复</small></span>
+          <span class="switch-control">
+            <input id="minimizeOption" type="checkbox" role="switch" checked>
+            <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+          </span>
+        </label>
+        <label class="switch-setting" for="appendOption">
+          <span class="switch-copy"><strong>追加到现有步骤</strong><small>关闭时，重新录制会替换当前时间线</small></span>
+          <span class="switch-control">
+            <input id="appendOption" type="checkbox" role="switch">
+            <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+          </span>
+        </label>
+      </div>
       <span class="hotkey">录制过程中按 <kbd>Ctrl</kbd><span>+</span><kbd>Shift</kbd><span>+</span><kbd>F10</kbd> 停止并返回</span>
     </section>
     <section class="workspace">
@@ -335,10 +345,12 @@
       ? '请切换到目标程序并完成操作。鼠标、键盘和等待时间正在记录。'
       : '开始后照常操作电脑。鼠标点击优先记录为可跟随窗口移动的控件，识别失败时使用屏幕坐标。'
     document.getElementById('startButton').hidden = recording
+    document.getElementById('startButton').textContent = steps.length ? '● 重新录制' : '● 开始录制'
     document.getElementById('stopButton').hidden = !recording
     document.getElementById('saveButton').disabled = recording || busy
     document.getElementById('cancelButton').disabled = busy
     document.getElementById('minimizeOption').disabled = recording
+    document.getElementById('appendOption').disabled = recording || steps.length === 0
     document.getElementById('stepCount').textContent = steps.length + ' 步'
     const empty = document.getElementById('empty')
     const timeline = document.getElementById('timeline')
@@ -397,8 +409,8 @@
     busy = true; render(); setStatus('正在启动全局录制…', false, true)
     try {
       const response = await invoke('start_recording', {
-        append:true,
-        steps,
+        append:document.getElementById('appendOption').checked && steps.length > 0,
+        steps:document.getElementById('appendOption').checked ? steps : [],
         minimize_window:document.getElementById('minimizeOption').checked,
       })
       if (!response || !response.ok) throw new Error(response && response.error || '录制启动失败')
