@@ -209,7 +209,7 @@ class WorkflowExecutor:
         self, context: Dict[str, Any]
     ) -> threading.Event:
         event = context.get("_run_cancel_event")
-        if not isinstance(event, type(threading.Event())):
+        if not isinstance(event, threading.Event):
             event = threading.Event()
             context["_run_cancel_event"] = event
         run_id = _run_id(context)
@@ -531,7 +531,7 @@ class WorkflowExecutor:
             deferred = list(self._deferred_run_contexts.values())
             for context, _rule_name in deferred:
                 event = context.get("_run_cancel_event")
-                if isinstance(event, type(threading.Event())):
+                if isinstance(event, threading.Event):
                     event.set()
         with self.deferred_workflows_lock:
             timers = list(self.deferred_workflows.values())

@@ -704,6 +704,10 @@ class AutomationEngine:
         # event-v1 每类触发器共用一条线程，event-v2 每个配置使用独立实例
         aggregated = aggregate_trigger_params(rules)
 
+        # 规则驱动的懒加载：只物化被规则引用的触发器，未引用的保持 pending
+        for trigger_id in aggregated:
+            self._plugin_registry.resolve_trigger(trigger_id)
+
         return self._trigger_supervisor.start(
             aggregated=aggregated,
             triggers_funcs=self.triggers_funcs,
@@ -865,7 +869,7 @@ class AutomationEngine:
 
     def shutdown(self) -> None:
         # API、信号和 finally 可能同时调用 shutdown()，每个清理步骤都支持重复执行
-        if self._shutdown_flag:
+        if self._shutdown_flag is not None:
             self._shutdown_flag.set()
         from notmyfault.security.admin_prompt import cancel_pending_admin_requests
 

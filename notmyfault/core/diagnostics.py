@@ -8,6 +8,8 @@ class Diagnostics:
     """线程安全的诊断数据容器"""
 
     _MAX_ERRORS = 50
+    _MAX_PLUGIN_ERRORS = 200
+    _MAX_RULE_ISSUES = 500
 
     def __init__(self) -> None:
         # 错误列表超过上限时删除最早的记录
@@ -35,6 +37,8 @@ class Diagnostics:
     def record_plugin_error(self, store: str, plugin_id: str, reason: str) -> None:
         with self._lock:
             self._data["plugin_errors"].append((store, plugin_id, reason))
+            if len(self._data["plugin_errors"]) > self._MAX_PLUGIN_ERRORS:
+                del self._data["plugin_errors"][: len(self._data["plugin_errors"]) - self._MAX_PLUGIN_ERRORS]
 
     def reset_rule_issues(self) -> None:
         with self._lock:
@@ -43,6 +47,8 @@ class Diagnostics:
     def add_rule_issue(self, rule_name: str, issue: str) -> None:
         with self._lock:
             self._data["rule_issues"].append((rule_name, issue))
+            if len(self._data["rule_issues"]) > self._MAX_RULE_ISSUES:
+                del self._data["rule_issues"][: len(self._data["rule_issues"]) - self._MAX_RULE_ISSUES]
 
     def inc_action_ok(self) -> None:
         with self._lock:
