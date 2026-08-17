@@ -59,9 +59,9 @@ export async function loadConfig() {
   return await window.pywebview.api.get_config()
 }
 
-export async function saveConfig(rules) {
+export async function saveConfig(rules, adminKeyPassword = '') {
   if (!hasBridge()) throw new Error('Dashboard 桌面桥接尚未就绪')
-  return await window.pywebview.api.save_config(rules)
+  return await window.pywebview.api.save_config(rules, adminKeyPassword)
 }
 
 export async function runRule(ruleIndex, rule = null, testContext = null) {
@@ -182,8 +182,107 @@ export async function validateRuleDraft(rule) {
   return await res.json()
 }
 
-export async function draftRuleFromText(description) {
-  const res = await apiWrite('/api/rules/draft', 'POST', { description })
+const AI_DRAFT_EVENT_TYPES = new Set(['status', 'reasoning', 'text', 'result', 'error', 'done'])
+const AI_DRAFT_HISTORY_LIMIT = 40
+const AI_DRAFT_MESSAGE_LIMIT = 4000
+
+function aiDraftRequestBody(messages, consent = null, apiKey = '') {
+  const body = {
+    messages: (Array.isArray(messages) ? messages : [])
+      .filter(message => message?.role === 'user' || message?.role === 'assistant')
+      .map(message => ({
+        role: message.role,
+        content: String(message.content ?? '').trim().slice(0, AI_DRAFT_MESSAGE_LIMIT),
+      }))
+      .filter(message => message.content)
+      .slice(-AI_DRAFT_HISTORY_LIMIT),
+  }
+  const pluginId = typeof consent?.plugin_id === 'string' ? consent.plugin_id.trim() : ''
+  const key = typeof apiKey === 'string' ? apiKey.trim() : ''
+  if (pluginId) body.consent = { plugin_id: pluginId }
+  if (key) body.api_key = key
+  return body
+}
+
+function dispatchAIDraftEvent(eventName, dataText, onEvent) {
+  if (!AI_DRAFT_EVENT_TYPES.has(eventName) || !dataText) return
+  onEvent({ type: eventName, data: JSON.parse(dataText) })
+}
+
+export async function consumeAIDraftSSE(body, onEvent, signal) {
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let eventName = ''
+  let dataLines = []
+  const flushEvent = () => {
+    if (dataLines.length) dispatchAIDraftEvent(eventName, dataLines.join('\n'), onEvent)
+    eventName = ''
+    dataLines = []
+  }
+  const consumeLine = (line) => {
+    if (line === '') {
+      flushEvent()
+      return
+    }
+    if (line.startsWith(':')) return
+    if (line.startsWith('event:')) {
+      eventName = line.slice(6).trim()
+      return
+    }
+    if (line.startsWith('data:')) {
+      dataLines.push(line.startsWith('data: ') ? line.slice(6) : line.slice(5))
+    }
+  }
+  const consumeBuffer = () => {
+    let lineEnd
+    while ((lineEnd = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, lineEnd).replace(/\r$/, '')
+      buffer = buffer.slice(lineEnd + 1)
+      consumeLine(line)
+    }
+  }
+  const cancelReader = () => { void reader.cancel().catch(() => {}) }
+  signal?.addEventListener('abort', cancelReader, { once: true })
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      consumeBuffer()
+    }
+    buffer += decoder.decode()
+    consumeBuffer()
+    if (buffer) consumeLine(buffer.replace(/\r$/, ''))
+    flushEvent()
+  } finally {
+    signal?.removeEventListener('abort', cancelReader)
+  }
+}
+
+export async function streamRuleDraftWithAI(messages, {
+  consent = null,
+  apiKey = '',
+  signal,
+  onEvent = () => {},
+} = {}) {
+  const response = await fetchAuthenticated('/api/rules/draft/ai/stream', {
+    method: 'POST',
+    headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
+    body: JSON.stringify(aiDraftRequestBody(messages, consent, apiKey)),
+    signal,
+  })
+  if (!response.ok || !response.body) {
+    let message = `AI 草稿服务请求失败（${response.status}）`
+    const data = await response.json().catch(() => null)
+    if (typeof data?.error === 'string' && data.error) message = data.error
+    throw new Error(message)
+  }
+  await consumeAIDraftSSE(response.body, onEvent, signal)
+}
+
+export async function draftRuleWithAI(messages, consent = null, apiKey = '') {
+  const res = await apiWrite('/api/rules/draft/ai', 'POST', aiDraftRequestBody(messages, consent, apiKey))
   return await res.json()
 }
 
@@ -229,6 +328,60 @@ export async function getAdminAuthorizationSetting() {
 
 export async function updateAdminAuthorizationSetting(mode) {
   const r = await apiWrite('/api/settings/admin-authorization', 'PUT', { mode })
+  return await r.json()
+}
+
+export async function getAdminRuleVerificationSetting() {
+  const r = await apiRead('/api/settings/admin-rule-verification')
+  return await r.json()
+}
+
+export async function updateAdminRuleVerificationSetting(keyVerification) {
+  const r = await apiWrite('/api/settings/admin-rule-verification', 'PUT', {
+    key_verification: keyVerification,
+  })
+  return await r.json()
+}
+
+export async function getAIDraftingSetting() {
+  const r = await apiRead('/api/settings/ai-drafting')
+  return await r.json()
+}
+
+export async function updateAIDraftingSetting(settings) {
+  const r = await apiWrite('/api/settings/ai-drafting', 'PUT', settings)
+  return await r.json()
+}
+
+export async function saveAIApiKey(apiKey) {
+  const r = await apiWrite('/api/settings/ai-drafting/api-key', 'PUT', { api_key: apiKey })
+  return await r.json()
+}
+
+export async function deleteAIApiKey() {
+  const r = await apiWrite('/api/settings/ai-drafting/api-key', 'DELETE')
+  return await r.json()
+}
+
+export async function getBluetoothSetting() {
+  const r = await apiRead('/api/settings/bluetooth')
+  return await r.json()
+}
+
+export async function installBluetoothPlugin() {
+  const r = await apiWrite('/api/settings/bluetooth/install', 'POST')
+  return await r.json()
+}
+
+export async function uninstallBluetoothPlugin() {
+  const r = await apiWrite('/api/settings/bluetooth/uninstall', 'POST')
+  return await r.json()
+}
+
+export async function approveRuleDraft(rule, adminKeyPassword = '') {
+  const r = await apiWrite('/api/rules/approve', 'POST', {
+    rules: [rule], admin_key_password: adminKeyPassword,
+  })
   return await r.json()
 }
 

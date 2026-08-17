@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
 import { store } from '../lib/store'
+import BaseDialog from './BaseDialog.vue'
 
 const props = defineProps({
   open: Boolean,
@@ -63,8 +64,7 @@ function choose(key) {
 </script>
 
 <template>
-  <Transition name="picker-surface">
-  <div v-if="open" class="plugin-picker-backdrop" @pointerdown.self="emit('close')" @keydown.esc="emit('close')">
+  <BaseDialog :open="open" @close="emit('close')">
     <section class="plugin-picker-dialog" role="dialog" aria-modal="true" :aria-label="title || '选择插件'">
       <header class="plugin-picker-head">
         <div><small>{{ kind === 'trigger' ? '触发方式' : kind === 'precondition' ? '开始前确认' : '执行动作' }}</small><h2>{{ title || '选择插件' }}</h2></div>
@@ -91,6 +91,5 @@ function choose(key) {
         <div v-if="!visibleGroups.length" class="plugin-picker-empty">没有找到匹配的插件。</div>
       </div>
     </section>
-  </div>
-  </Transition>
+  </BaseDialog>
 </template>

@@ -1,40 +1,45 @@
 <script setup>
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { buildAllTestInputFields, buildPreparedTestContext, buildTestInputFields, normalizedType, outputDefs } from '../lib/bindings'
+import BaseDialog from './BaseDialog.vue'
 
 const props = defineProps({
+  open: Boolean,
   ruleName: { type: String, default: '未命名规则' },
-  rule: { type: Object, required: true },
+  rule: { type: Object, default: null },
   schema: { type: Object, required: true },
   savedValues: { type: Object, default: () => ({}) },
 })
 const emit = defineEmits(['cancel', 'run'])
 
-const allFields = buildAllTestInputFields(props.rule, props.schema)
-const values = ref(Object.fromEntries(allFields.map(field => [
-  field.key,
-  Object.prototype.hasOwnProperty.call(props.savedValues, field.key)
-    ? props.savedValues[field.key]
-    : field.defaultValue,
-])))
+const allFields = computed(() => props.rule ? buildAllTestInputFields(props.rule, props.schema) : [])
+function buildValues() {
+  return Object.fromEntries(allFields.value.map(field => [
+    field.key,
+    Object.prototype.hasOwnProperty.call(props.savedValues, field.key)
+      ? props.savedValues[field.key]
+      : field.defaultValue,
+  ]))
+}
+const values = ref(buildValues())
 const errors = ref({})
 const submitError = ref('')
 const remember = ref(true)
 const dialogRef = ref(null)
 const rangeMode = ref('all')
-const selectedStepId = ref(props.rule.actions?.[0]?.binding_id || '')
+const selectedStepId = ref('')
 const assertions = ref([])
 
-const actions = computed(() => props.rule.actions || [])
+const actions = computed(() => props.rule?.actions || [])
 const selectedIndex = computed(() => Math.max(0, actions.value.findIndex(action => action.binding_id === selectedStepId.value)))
 const startStepId = computed(() => rangeMode.value === 'from' ? selectedStepId.value : '')
 const endStepId = computed(() => rangeMode.value === 'until' ? selectedStepId.value : '')
 const startIndex = computed(() => rangeMode.value === 'from' ? selectedIndex.value : 0)
 const endIndex = computed(() => rangeMode.value === 'until' ? selectedIndex.value : actions.value.length - 1)
-const fields = computed(() => buildTestInputFields(props.rule, props.schema, {
+const fields = computed(() => props.rule ? buildTestInputFields(props.rule, props.schema, {
   startStepId: startStepId.value,
   endStepId: endStepId.value,
-}))
+}) : [])
 const selectedActionCount = computed(() => Math.max(0, endIndex.value - startIndex.value + 1))
 
 const groups = computed(() => {
@@ -95,7 +100,7 @@ function removeAssertion(index) {
 function normalizeAssertions() {
   return assertions.value.map((assertion, index) => {
     const source = sourceForAssertion(assertion)
-    if (!source) throw new Error(`断言 #${index + 1} 的动作输出不在本次运行范围内`)
+    if (!source) throw new Error(`检查项 #${index + 1} 的动作输出不在本次运行范围内`)
     const result = { step_id: source.stepId, path: source.path, operator: assertion.operator }
     if (assertion.operator !== 'exists') {
       const field = { type: source.type, required: true }
@@ -105,7 +110,7 @@ function normalizeAssertions() {
           { expected: assertion.expected },
         ).event_payload.value
       } catch (error) {
-        throw new Error(`断言 #${index + 1}：${error.message}`)
+        throw new Error(`检查项 #${index + 1}：${error.message}`)
       }
     }
     return result
@@ -151,15 +156,23 @@ function submit() {
   }
 }
 
-onMounted(async () => {
+watch(() => props.open, async open => {
+  if (!open) return
+  values.value = buildValues()
+  errors.value = {}
+  submitError.value = ''
+  assertions.value = []
+  rangeMode.value = 'all'
+  selectedStepId.value = props.rule?.actions?.[0]?.binding_id || ''
+  remember.value = true
   await nextTick()
   dialogRef.value?.querySelector('input:not([type="checkbox"]), textarea, input[type="checkbox"]')?.focus()
 })
 </script>
 
 <template>
-  <div class="modal-overlay test-prep-overlay" @click.self="emit('cancel')">
-    <section ref="dialogRef" class="test-prep-dialog" role="dialog" aria-modal="true" aria-labelledby="test-prep-title" aria-describedby="test-prep-warning" @keydown.esc.prevent="emit('cancel')">
+  <BaseDialog :open="open" @close="emit('cancel')">
+    <section ref="dialogRef" class="test-prep-dialog" role="dialog" aria-modal="true" aria-labelledby="test-prep-title" aria-describedby="test-prep-warning">
       <header class="test-prep-head">
         <div>
           <span class="test-prep-eyebrow">运行预检</span>
@@ -213,17 +226,17 @@ onMounted(async () => {
         </section>
 
         <section class="test-source-group test-assertion-group">
-          <header><span class="material-symbols-outlined">fact_check</span><div><b>测试断言</b><small>只判断本次手动测试，不会改变规则的正式运行</small></div></header>
+          <header><span class="material-symbols-outlined">fact_check</span><div><b>结果检查</b><small>只判断本次手动测试，不会改变规则的正式运行</small></div></header>
           <div v-if="assertions.length" class="test-assertion-list">
             <div v-for="(assertion, index) in assertions" :key="index" class="test-assertion-row">
               <select v-model="assertion.sourceKey" class="text-field" @change="assertion.operator = 'equals'"><option v-for="source in assertionSources" :key="source.key" :value="source.key">{{ source.label }}</option></select>
               <select v-model="assertion.operator" class="text-field"><option v-for="operator in assertionOperators(assertion)" :key="operator.value" :value="operator.value">{{ operator.label }}</option></select>
               <input v-if="assertion.operator !== 'exists'" v-model="assertion.expected" class="text-field" placeholder="期望值" autocomplete="off">
-              <button class="icon-btn" title="删除断言" @click="removeAssertion(index)"><span class="material-symbols-outlined">delete</span></button>
+              <button class="icon-btn" title="删除检查项" @click="removeAssertion(index)"><span class="material-symbols-outlined">delete</span></button>
             </div>
           </div>
-          <button class="btn btn-outlined test-add-assertion" :disabled="!assertionSources.length || assertions.length >= 50" @click="addAssertion"><span class="material-symbols-outlined">add</span>添加断言</button>
-          <p v-if="!assertionSources.length" class="test-empty-copy">本次范围内的动作没有可断言的非敏感输出。</p>
+          <button class="btn btn-outlined test-add-assertion" :disabled="!assertionSources.length || assertions.length >= 50" @click="addAssertion"><span class="material-symbols-outlined">add</span>添加检查项</button>
+          <p v-if="!assertionSources.length" class="test-empty-copy">本次范围内的动作没有可检查的非敏感输出。</p>
         </section>
       </div>
 
@@ -235,5 +248,5 @@ onMounted(async () => {
         </div>
       </footer>
     </section>
-  </div>
+  </BaseDialog>
 </template>

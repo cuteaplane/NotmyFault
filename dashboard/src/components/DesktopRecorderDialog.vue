@@ -1,6 +1,7 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import { hasBridge, invokeComponent } from '../lib/api'
+import BaseDialog from './BaseDialog.vue'
 
 const props = defineProps({
   open: Boolean,
@@ -123,9 +124,8 @@ watch(() => props.open, open => {
 </script>
 
 <template>
-  <Transition name="picker-surface">
-    <div v-if="open" class="desktop-recorder-backdrop" @pointerdown.self="!selecting && emit('close')" @keydown.esc="!selecting && emit('close')">
-      <section class="desktop-recorder-dialog" role="dialog" aria-modal="true" aria-labelledby="desktop-recorder-title">
+  <BaseDialog :open="open" :closable="!selecting" :layer-top="true" @close="emit('close')">
+    <section class="desktop-recorder-dialog" role="dialog" aria-modal="true" aria-labelledby="desktop-recorder-title">
         <header class="desktop-recorder-head">
           <div>
             <small>桌面步骤录制</small>
@@ -194,6 +194,5 @@ watch(() => props.open, open => {
           </div>
         </footer>
       </section>
-    </div>
-  </Transition>
+  </BaseDialog>
 </template>

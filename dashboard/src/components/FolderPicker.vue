@@ -1,5 +1,6 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
+import BaseDialog from './BaseDialog.vue'
 
 const props = defineProps({
   open: Boolean,
@@ -37,9 +38,8 @@ function createAndSelect() {
 </script>
 
 <template>
-  <Transition name="picker-surface">
-    <div v-if="open" class="plugin-picker-backdrop" @pointerdown.self="emit('close')" @keydown.esc="emit('close')">
-      <section class="plugin-picker-dialog folder-picker-dialog" role="dialog" aria-modal="true" aria-label="管理规则文件夹">
+  <BaseDialog :open="open" @close="emit('close')">
+    <section class="plugin-picker-dialog folder-picker-dialog" role="dialog" aria-modal="true" aria-label="管理规则文件夹">
         <header class="plugin-picker-head">
           <div><small>规则归档</small><h2>管理文件夹</h2></div>
           <button class="icon-btn" title="关闭" @click="emit('close')"><span class="material-symbols-outlined">close</span></button>
@@ -74,6 +74,5 @@ function createAndSelect() {
           <div v-if="query && !visibleFolders.length && !canCreate" class="plugin-picker-empty">没有找到其他文件夹。</div>
         </div>
       </section>
-    </div>
-  </Transition>
+  </BaseDialog>
 </template>

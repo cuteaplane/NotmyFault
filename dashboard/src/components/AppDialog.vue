@@ -1,32 +1,28 @@
 <script setup>
-import { nextTick, ref, watch } from 'vue'
+import BaseDialog from './BaseDialog.vue'
 import { dialogState, closeDialog } from '../lib/dialog'
 
 const toneIcons = { error: 'error', warn: 'warning', info: 'info' }
-const backdrop = ref(null)
-
-// 打开后把焦点移到遮罩，ESC 的 keydown 才能冒泡到这里。
-watch(() => dialogState.open, async open => {
-  if (!open) return
-  await nextTick()
-  backdrop.value?.focus()
-})
 </script>
 
 <template>
-  <Transition name="picker-surface">
-  <div ref="backdrop" v-if="dialogState.open" class="plugin-picker-backdrop" tabindex="-1"
-    @pointerdown.self="closeDialog(dialogState.kind !== 'confirm')"
-    @keydown.esc="closeDialog(dialogState.kind !== 'confirm')">
+  <BaseDialog :open="dialogState.open" :closable="dialogState.kind === 'alert'" @close="closeDialog(true)">
     <section class="app-dialog" role="dialog" aria-modal="true" :aria-label="dialogState.title">
-      <span class="material-symbols-outlined app-dialog-ico" :class="'tone-' + dialogState.tone">{{ toneIcons[dialogState.tone] || 'info' }}</span>
+      <span class="material-symbols-outlined app-dialog-ico" :class="'tone-' + dialogState.tone">{{ dialogState.kind === 'password' ? 'encrypted' : (toneIcons[dialogState.tone] || 'info') }}</span>
       <h3 class="dialog-title">{{ dialogState.title }}</h3>
       <p class="dialog-sub">{{ dialogState.message }}</p>
+      <input v-if="dialogState.kind === 'password'" v-model="dialogState.inputValue"
+        class="text-field app-dialog-password" type="password" autocomplete="current-password"
+        placeholder="输入签名私钥密码" autofocus @keydown.enter="dialogState.inputValue && closeDialog(dialogState.inputValue)">
+      <span v-if="dialogState.kind === 'password' && dialogState.inputError" class="test-field-error">
+        <span class="material-symbols-outlined">error</span>{{ dialogState.inputError }}
+      </span>
       <div class="dialog-actions">
-        <button v-if="dialogState.kind === 'confirm'" class="btn btn-text" @click="closeDialog(false)">取消</button>
-        <button class="btn btn-filled" @click="closeDialog(true)">{{ dialogState.confirmLabel }}</button>
+        <button v-if="dialogState.kind !== 'alert'" class="btn btn-text" @click="closeDialog(false)">取消</button>
+        <button v-if="dialogState.kind === 'password'" class="btn btn-filled"
+          :disabled="!dialogState.inputValue" @click="closeDialog(dialogState.inputValue)">{{ dialogState.confirmLabel }}</button>
+        <button v-else class="btn btn-filled" @click="closeDialog(true)">{{ dialogState.confirmLabel }}</button>
       </div>
     </section>
-  </div>
-  </Transition>
+  </BaseDialog>
 </template>

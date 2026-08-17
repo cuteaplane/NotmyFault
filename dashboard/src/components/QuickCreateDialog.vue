@@ -2,6 +2,7 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import { store } from '../lib/store'
 import { groupActionKeys, groupTriggerKeys } from '../lib/utils'
+import BaseDialog from './BaseDialog.vue'
 
 const props = defineProps({ open: Boolean })
 const emit = defineEmits(['close', 'create'])
@@ -95,9 +96,8 @@ watch(() => props.open, open => {
 </script>
 
 <template>
-  <Transition name="picker-surface">
-    <div v-if="open" class="quick-create-backdrop" @pointerdown.self="emit('close')" @keydown.esc="emit('close')">
-      <section class="quick-create-dialog" role="dialog" aria-modal="true" aria-labelledby="quick-create-title">
+  <BaseDialog :open="open" @close="emit('close')">
+    <section class="quick-create-dialog" role="dialog" aria-modal="true" aria-labelledby="quick-create-title">
         <header class="quick-create-head">
           <div>
             <small>新建自动化 · 第 {{ step === 'trigger' ? '1' : '2' }} 步，共 2 步</small>
@@ -142,6 +142,5 @@ watch(() => props.open, open => {
           </button>
         </footer>
       </section>
-    </div>
-  </Transition>
+  </BaseDialog>
 </template>

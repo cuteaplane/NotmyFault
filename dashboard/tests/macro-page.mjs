@@ -60,6 +60,8 @@ const pageOk = scriptErrors.length === 0
   && window.document.getElementById('stepCount')?.textContent === '2 步'
   && window.document.getElementById('empty')?.hidden === true
   && window.document.querySelector('#minimizeOption[role="switch"]')?.checked === true
+  && window.document.querySelector('#appendOption[role="switch"]')?.checked === false
+  && window.document.getElementById('startButton')?.textContent.includes('重新录制')
   && window.document.querySelector('.step-actions .remove')?.textContent === '删除'
   && !window.document.querySelector('[title="检查这一步"]')
 
@@ -68,3 +70,16 @@ if (!pageOk) {
   console.error(scriptErrors)
   process.exit(1)
 }
+
+const invokes = []
+window.postMessage = message => invokes.push(message)
+window.document.getElementById('startButton')?.click()
+await new Promise(resolve => window.setTimeout(resolve, 0))
+const replacementStartsClean = invokes.some(message => (
+  message.type === 'invoke'
+  && message.command === 'start_recording'
+  && message.payload?.append === false
+  && message.payload?.steps?.length === 0
+))
+console.log((replacementStartsClean ? 'PASS' : 'FAIL') + ' - re-recording replaces existing macro steps by default')
+if (!replacementStartsClean) process.exit(1)

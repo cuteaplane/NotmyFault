@@ -406,7 +406,7 @@ onUnmounted(() => {
             </div>
             <div v-if="run.assertions_total" class="run-message" :class="run.assertions_passed === run.assertions_total ? 'assertion-ok' : 'failed'">
               <span class="material-symbols-outlined">fact_check</span>
-              测试断言 {{ run.assertions_passed }} / {{ run.assertions_total }} 通过
+              结果检查 {{ run.assertions_passed }} / {{ run.assertions_total }} 通过
             </div>
 
             <div class="run-step-list">
@@ -442,7 +442,7 @@ onUnmounted(() => {
             <div v-if="run.assertion_results?.length" class="run-assertion-list">
               <div v-for="(assertion, index) in run.assertion_results" :key="`${assertion.step_id}-${index}`" class="run-assertion" :class="{ passed: assertion.passed }">
                 <span class="material-symbols-outlined">{{ assertion.passed ? 'check_circle' : 'cancel' }}</span>
-                <span><strong>断言 {{ index + 1 }}{{ assertion.path?.length ? ` · ${assertion.path.join('.')}` : '' }}</strong><small>{{ assertion.message }}</small></span>
+                <span><strong>检查项 {{ index + 1 }}{{ assertion.path?.length ? ` · ${assertion.path.join('.')}` : '' }}</strong><small>{{ assertion.message }}</small></span>
               </div>
             </div>
 

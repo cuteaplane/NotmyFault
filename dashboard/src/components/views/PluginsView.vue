@@ -6,6 +6,7 @@ import { snackbar } from '../../lib/notify'
 import { alertDialog, confirmDialog } from '../../lib/dialog'
 import { useEngineControl } from '../../composables/useEngineControl'
 import PluginCard from '../PluginCard.vue'
+import BaseDialog from '../BaseDialog.vue'
 
 const { restartEngine } = useEngineControl()
 
@@ -229,9 +230,8 @@ onMounted(async () => {
       </div>
     </Transition>
 
-    <Transition name="dialog-pop">
-    <div v-if="showInstall" class="modal-overlay" @click.self="showInstall = false">
-      <div class="preview-dialog">
+    <BaseDialog :open="showInstall" @close="showInstall = false">
+      <div v-if="showInstall" class="preview-dialog">
         <Transition name="dialog-stage" mode="out-in">
         <div v-if="!preview && !previewLoading && !previewError" key="choose" class="preview-step">
           <span class="material-symbols-outlined dialog-ico">install_desktop</span>
@@ -356,12 +356,10 @@ onMounted(async () => {
         </div>
         </Transition>
       </div>
-    </div>
-    </Transition>
+    </BaseDialog>
 
-    <Transition name="dialog-pop">
-    <div v-if="showKey" class="modal-overlay" @click.self="cancelKey">
-      <div class="install-dialog">
+    <BaseDialog :open="showKey" @close="cancelKey">
+      <div v-if="showKey" class="install-dialog">
         <span class="material-symbols-outlined dialog-ico">key</span>
         <h3 class="dialog-title">NotmyFault 安装密钥</h3>
         <p class="dialog-sub">安装 NotmyFault 时输入的密钥</p>
@@ -371,7 +369,6 @@ onMounted(async () => {
           <button class="btn btn-filled" @click="submitKey">确认</button>
         </div>
       </div>
-    </div>
-    </Transition>
+    </BaseDialog>
   </section>
 </template>

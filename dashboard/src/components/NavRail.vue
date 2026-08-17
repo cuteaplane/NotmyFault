@@ -11,7 +11,7 @@ const items = [
   { page: 'security', icon: 'shield', label: '安全', needs: true },
   { page: 'rules', icon: 'account_tree', label: '自动化', needs: true },
   { page: 'logs', icon: 'article', label: '日志', needs: true },
-  { page: 'about', icon: 'info', label: '关于', needs: false },
+  { page: 'settings', icon: 'settings', label: '设置', needs: true },
 ]
 </script>
 

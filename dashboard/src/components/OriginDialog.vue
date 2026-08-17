@@ -1,10 +1,12 @@
 <script setup>
 import { ref } from 'vue'
 import { store } from '../lib/store'
-import { saveConfig } from '../lib/api'
+import { saveRulesWithApproval } from '../lib/ruleSave'
 import { snackbar } from '../lib/notify'
 import { ORIGIN_STORY, ORIGIN_RULES } from '../lib/origin'
+import BaseDialog from './BaseDialog.vue'
 
+const props = defineProps({ open: Boolean })
 const emit = defineEmits(['close'])
 const saving = ref(false)
 
@@ -22,7 +24,8 @@ async function openOriginRule(rule) {
       r => !rules.some(e => e.name === r.name),
     )
     const nextRules = [...clone(rules), ...missing.map(clone)]
-    const result = await saveConfig(nextRules)
+    const result = await saveRulesWithApproval(nextRules)
+    if (result?.cancelled) return
     if (!result?.ok) {
       snackbar(result?.error || '导入起源规则失败')
       return
@@ -47,7 +50,7 @@ function jumpToRule(rule) {
 </script>
 
 <template>
-  <div class="modal-overlay" @click.self="emit('close')">
+  <BaseDialog :open="open" @close="emit('close')">
     <div class="origin-dialog">
       <button class="icon-btn origin-close" title="关闭" @click="emit('close')">
         <span class="material-symbols-outlined">close</span>
@@ -72,5 +75,5 @@ function jumpToRule(rule) {
       </div>
       <p class="origin-hint">↑ ↑ ↓ ↓ ← → ← → B A  感动不指甲强</p>
     </div>
-  </div>
+  </BaseDialog>
 </template>

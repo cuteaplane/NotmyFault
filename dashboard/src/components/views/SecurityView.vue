@@ -5,8 +5,6 @@ import {
   getEngineStatus,
   getConfigSecurityStatus,
   approveConfigSecurity,
-  getAdminAuthorizationSetting,
-  updateAdminAuthorizationSetting,
 } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
 import { alertDialog, confirmDialog } from '../../lib/dialog'
@@ -39,13 +37,6 @@ const oL = { builtin: '内置', user: '用户', third_party: '第三方' }
 
 const configSec = ref({ status: 'loading', reason: '', summary: null })
 const approving = ref(false)
-const adminAuth = ref({
-  mode: 'per_execution',
-  effective_mode: null,
-  supported_modes: ['per_execution'],
-  restart_required: false,
-})
-const savingAdminAuth = ref(false)
 const HIGH_RISK = ['run_powershell', 'shutdown_system', 'kill_process']
 
 async function loadConfigSecurity() {
@@ -69,39 +60,6 @@ async function approveConfig() {
     alertDialog('重新签名失败', e.message)
   } finally {
     approving.value = false
-  }
-}
-
-async function loadAdminAuthorization() {
-  try {
-    const result = await getAdminAuthorizationSetting()
-    adminAuth.value = {
-      ...adminAuth.value,
-      ...result,
-      supported_modes: Array.isArray(result.supported_modes)
-        ? result.supported_modes
-        : ['per_execution'],
-    }
-  } catch (e) {
-    snackbar('无法读取管理员授权方式')
-  }
-}
-
-async function selectAdminAuthorization(mode) {
-  if (savingAdminAuth.value || mode === adminAuth.value.mode) return
-  savingAdminAuth.value = true
-  try {
-    const result = await updateAdminAuthorizationSetting(mode)
-    if (!result.ok) {
-      alertDialog('保存失败', result.error || '无法保存管理员授权方式')
-      return
-    }
-    adminAuth.value = { ...adminAuth.value, ...result }
-    snackbar(result.restart_required ? '已保存，重启引擎后生效' : '管理员授权方式已保存')
-  } catch (e) {
-    alertDialog('保存失败', e.message)
-  } finally {
-    savingAdminAuth.value = false
   }
 }
 
@@ -141,7 +99,7 @@ async function load() {
     mode.value = s.security_mode || 'unknown'
   } catch (e) { mode.value = 'unknown' }
 }
-onMounted(() => { load(); loadConfigSecurity(); loadAdminAuthorization() })
+onMounted(() => { load(); loadConfigSecurity() })
 </script>
 
 <template>
@@ -211,28 +169,6 @@ onMounted(() => { load(); loadConfigSecurity(); loadAdminAuthorization() })
     <div class="sec-banner" :class="modeInfo.c"><span class="material-symbols-outlined sec-banner-ico">shield</span>
       <div><div class="sec-banner-title">安全模式：{{ modeInfo.l }}</div><p class="sec-banner-desc">{{ modeInfo.d }}</p></div></div>
 
-    <h4 class="sec-h">管理员授权方式</h4>
-    <div class="admin-auth-settings">
-      <button type="button" class="admin-auth-option"
-        :class="{ selected: adminAuth.mode === 'engine_start' }"
-        :disabled="savingAdminAuth || !adminAuth.supported_modes.includes('engine_start')"
-        @click="selectAdminAuthorization('engine_start')">
-        <span class="material-symbols-outlined">verified_user</span>
-        <span><b>引擎启动时授权一次</b><small>存在使用管理员插件的启用规则时，启动阶段显示一次 UAC。本代引擎后续通过管理员代理执行这些命令。<template v-if="!adminAuth.supported_modes.includes('engine_start')">当前系统不支持此方式。</template></small></span>
-        <span class="material-symbols-outlined auth-check">{{ adminAuth.mode === 'engine_start' ? 'radio_button_checked' : 'radio_button_unchecked' }}</span>
-      </button>
-      <button type="button" class="admin-auth-option"
-        :class="{ selected: adminAuth.mode === 'per_execution' }"
-        :disabled="savingAdminAuth"
-        @click="selectAdminAuthorization('per_execution')">
-        <span class="material-symbols-outlined">touch_app</span>
-        <span><b>每次执行时确认</b><small>先显示保留两分钟的 NotmyFault 通知；点击“允许并继续”后，才为该次命令显示 UAC。关闭或超时未处理时不执行。</small></span>
-        <span class="material-symbols-outlined auth-check">{{ adminAuth.mode === 'per_execution' ? 'radio_button_checked' : 'radio_button_unchecked' }}</span>
-      </button>
-    </div>
-    <p v-if="adminAuth.restart_required" class="admin-auth-restart">
-      <span class="material-symbols-outlined">restart_alt</span>当前引擎仍使用上一次设置，重启引擎后生效。
-    </p>
     <div class="stat-grid">
       <div class="stat-card"><div class="material-symbols-outlined stat-ico text-error">admin_panel_settings</div><div class="stat-val">{{ counts.admin }}</div><div class="stat-lbl">管理员权限</div></div>
       <div class="stat-card"><div class="material-symbols-outlined stat-ico text-warn">code</div><div class="stat-val">{{ counts.native }}</div><div class="stat-lbl">原生 API</div></div>

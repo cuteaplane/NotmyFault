@@ -20,4 +20,7 @@ export const store = reactive({
   pendingRuleDraft: null,
   pendingPluginFocus: null,
   pendingAutomationCreate: false,
+  aiDrafting: { enabled: false, endpoint_url: '', model: '', api_format: 'chat_completions' },
+  aiApiKey: '',
+  aiApiKeyStatus: 'none',
 })

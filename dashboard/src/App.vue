@@ -4,9 +4,9 @@ import NavRail from './components/NavRail.vue'
 import HomeView from './components/views/HomeView.vue'
 import PluginsView from './components/views/PluginsView.vue'
 import SecurityView from './components/views/SecurityView.vue'
+import SettingsView from './components/views/SettingsView.vue'
 import RulesView from './components/views/RulesView.vue'
 import LogsView from './components/views/LogsView.vue'
-import AboutView from './components/views/AboutView.vue'
 import AppDialog from './components/AppDialog.vue'
 import { store } from './lib/store'
 import { snack } from './lib/notify'
@@ -16,7 +16,7 @@ import { useTheme } from './composables/useTheme'
 
 const { init: initTheme } = useTheme()
 const currentPage = ref('home')
-const views = { home: HomeView, plugins: PluginsView, security: SecurityView, rules: RulesView, logs: LogsView, about: AboutView }
+const views = { home: HomeView, plugins: PluginsView, security: SecurityView, settings: SettingsView, rules: RulesView, logs: LogsView }
 
 function switchPage(p) {
   if (p === currentPage.value || !views[p]) return
@@ -175,7 +175,7 @@ async function consumeSSE(res, abort) {
 
 // 后台控制服务离线时返回首页，自动化暂停时仍可编辑。
 watch(() => store.controllerOnline, (on) => {
-  if (!on && ['plugins', 'rules', 'logs', 'security'].includes(currentPage.value)) {
+  if (!on && ['plugins', 'rules', 'logs', 'security', 'settings'].includes(currentPage.value)) {
     switchPage('home')
   }
 })

@@ -1,7 +1,8 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { store } from '../../lib/store'
-import { cancelRun, runRule, saveConfig } from '../../lib/api'
+import { cancelRun, runRule } from '../../lib/api'
+import { approveRuleBeforeEditing, saveRulesWithApproval } from '../../lib/ruleSave'
 import { snackbar } from '../../lib/notify'
 import { alertDialog, confirmDialog } from '../../lib/dialog'
 import { normalizeRuleDraft } from '../../lib/utils'
@@ -11,7 +12,7 @@ import { automationTemplates, createQuickDraft, instantiateTemplate, templateAva
 import RuleEditor from '../RuleEditor.vue'
 import QuickCreateDialog from '../QuickCreateDialog.vue'
 import TestRunDialog from '../TestRunDialog.vue'
-import NaturalDraftPanel from '../NaturalDraftPanel.vue'
+import BaseDialog from '../BaseDialog.vue'
 
 const activeRuleIndex = ref(null)
 const draftRule = ref(null)
@@ -44,7 +45,9 @@ const TEST_DATA_KEY = 'notmyfault.ruleTestData.v1'
 const showCreatePanel = ref(false)
 const showQuickCreate = ref(false)
 const quickCreateReturnFocus = ref(null)
-const createPanelVisible = computed(() => !store.configData.rules.length || showCreatePanel.value)
+const createPanelVisible = computed(() => (
+  store.aiDrafting.enabled && (!store.configData.rules.length || showCreatePanel.value)
+))
 
 const ruleFolders = computed(() => {
   const folders = new Map()
@@ -215,6 +218,10 @@ async function addRule(seed = null) {
   else await restoreDraftRecovery(-1)
   resetDraftHistory()
 }
+function createAutomation() {
+  if (store.aiDrafting.enabled) showCreatePanel.value = true
+  else addRule()
+}
 async function leaveEditor() {
   if (isDirty.value && !await confirmDialog('要放弃这些修改吗？', `尚未保存：${draftChangeText.value}。`, '放弃')) return
   activeRuleIndex.value = null
@@ -239,7 +246,8 @@ function triggerSummary(rule) {
 }
 
 async function persistRules(nextRules, successMessage) {
-  const result = await saveConfig(nextRules)
+  const result = await saveRulesWithApproval(nextRules)
+  if (result?.cancelled) return null
   if (!result?.ok) {
     const details = Array.isArray(result?.details) ? result.details.join(' · ') : ''
     throw new Error([result?.error || '未知错误', details].filter(Boolean).join('：'))
@@ -263,6 +271,7 @@ async function doSave(runAfter = false) {
       nextRules,
       runAfter ? '规则已保存，正在启动测试' : '规则已保存',
     )
+    if (!savedRules) return
     activeRuleIndex.value = savedIndex
     draftRule.value = clone(savedRules[savedIndex])
     baseline.value = JSON.stringify(draftRule.value)
@@ -280,7 +289,8 @@ async function deleteRule(index) {
   try {
     const nextRules = clone(store.configData.rules)
     nextRules.splice(index, 1)
-    await persistRules(nextRules, '规则已删除')
+    const savedRules = await persistRules(nextRules, '规则已删除')
+    if (!savedRules) return
     if (activeRuleIndex.value === index) leaveEditorAfterDelete()
   } catch (error) {
     alertDialog('删除失败', error.message)
@@ -498,8 +508,8 @@ const testSummary = computed(() => {
   if (t.steps.some(s => s.status === 'timed_out')) return '有动作超过允许的运行时间。'
   if (t.steps.some(s => s.status === 'fail')) return '有步骤执行失败，请查看下方详情。'
   if (t.steps.some(s => s.status === 'deferred')) return '前置条件不满足，本次测试没有执行动作。'
-  if (t.assertions?.total && t.assertions.passed < t.assertions.total) return `动作已执行，但 ${t.assertions.total - t.assertions.passed} 条测试断言未通过。`
-  if (t.assertions?.total) return `全部 ${t.steps.length} 个动作执行成功，${t.assertions.total} 条断言均通过。`
+  if (t.assertions?.total && t.assertions.passed < t.assertions.total) return `动作已执行，但 ${t.assertions.total - t.assertions.passed} 项检查未通过。`
+  if (t.assertions?.total) return `全部 ${t.steps.length} 个动作执行成功，${t.assertions.total} 项检查均通过。`
   return `全部 ${t.steps.length} 个动作执行成功。`
 })
 
@@ -507,7 +517,12 @@ const templates = computed(() => automationTemplates.map(template => ({
   ...template,
   availability: templateAvailability(template, store),
 })))
-function addTemplate(t) {
+async function openCandidateRule(rule) {
+  const approval = await approveRuleBeforeEditing(rule)
+  if (!approval?.ok) return
+  await addRule(rule)
+}
+async function addTemplate(t) {
   if (!t.availability.available) {
     store.pendingPluginFocus = {
       kind: t.availability.kind,
@@ -518,7 +533,7 @@ function addTemplate(t) {
     window.__nmf?.switchPage?.('plugins')
     return
   }
-  addRule(instantiateTemplate(t))
+  await openCandidateRule(instantiateTemplate(t))
 }
 function openQuickCreate(event) {
   quickCreateReturnFocus.value = event?.currentTarget || null
@@ -529,12 +544,12 @@ async function closeQuickCreate() {
   await nextTick()
   quickCreateReturnFocus.value?.focus()
 }
-function createQuickAutomation(selection) {
+async function createQuickAutomation(selection) {
   showQuickCreate.value = false
-  addRule(createQuickDraft(selection.triggerType, selection.actionType, store.schema))
+  await openCandidateRule(createQuickDraft(selection.triggerType, selection.actionType, store.schema))
 }
-function createNaturalDraft(draft) {
-  addRule(draft)
+async function createNaturalDraft(draft) {
+  await openCandidateRule(draft)
 }
 async function openTestStep(step) {
   const result = testResult.value
@@ -555,7 +570,7 @@ onMounted(() => {
   }
   if (store.pendingAutomationCreate) {
     store.pendingAutomationCreate = false
-    showCreatePanel.value = true
+    createAutomation()
   }
   // 起源彩蛋指定了待打开的规则，按名字定位后打开编辑器，用完清掉。
   if (store.pendingRuleId || store.pendingRuleName) {
@@ -584,13 +599,13 @@ onMounted(() => {
     :initial-node-id="pendingEditorNodeId"
     :can-undo="canUndoDraft" :can-redo="canRedoDraft"
     @back="leaveEditor" @delete="deleteActiveRule" @save="doSave(false)" @save-run="doSave(true)"
-    @undo="undoDraft" @redo="redoDraft" />
+    @undo="undoDraft" @redo="redoDraft" @ai-draft="createNaturalDraft" />
 
   <section v-else key="library" class="page active rules-library">
     <div class="page-head">
       <div><h2>自动化</h2><p class="page-subtitle">创建、测试和管理这台电脑上的自动化。</p></div>
       <div class="actions">
-        <button class="btn btn-filled" @click="showCreatePanel = true"><span class="material-symbols-outlined">add</span>创建自动化</button>
+        <button class="btn btn-filled" @click="createAutomation"><span class="material-symbols-outlined">add</span>创建自动化</button>
       </div>
     </div>
     <section v-if="createPanelVisible" class="automation-create-panel">
@@ -601,11 +616,11 @@ onMounted(() => {
           <p>选择一个常见用途，或者先指定什么时候开始、接着做什么。</p>
         </div>
         <div class="actions">
+          <button class="btn btn-text" @click="addRule"><span class="material-symbols-outlined">edit_note</span>空白规则</button>
           <button class="btn btn-tonal" @click="openQuickCreate"><span class="material-symbols-outlined">account_tree</span>自己搭一个</button>
           <button v-if="store.configData.rules.length" class="icon-btn" title="收起创建区" @click="showCreatePanel = false"><span class="material-symbols-outlined">close</span></button>
         </div>
       </header>
-      <NaturalDraftPanel @create="createNaturalDraft" />
       <div class="automation-template-grid">
         <button v-for="t in templates" :key="t.id" class="automation-template" :class="{ unavailable: !t.availability.available }" @click="addTemplate(t)">
           <span class="automation-template-icon material-symbols-outlined">{{ t.icon }}</span>
@@ -639,17 +654,14 @@ onMounted(() => {
     <QuickCreateDialog :open="showQuickCreate" @close="closeQuickCreate" @create="createQuickAutomation" />
   </section>
   </Transition>
-  <Transition name="dialog-pop">
-    <TestRunDialog v-if="testPreparation"
-      :rule-name="testPreparation.snapshot.name"
-      :rule="testPreparation.snapshot"
-      :schema="store.schema"
-      :saved-values="testPreparation.savedValues"
-      @cancel="cancelTestPreparation" @run="submitTestPreparation" />
-  </Transition>
-  <Transition name="dialog-pop">
-  <div v-if="testResult" class="modal-overlay" @click.self="closeTestResult">
-    <div class="test-result-dialog">
+  <TestRunDialog :open="!!testPreparation"
+    :rule-name="testPreparation?.snapshot?.name"
+    :rule="testPreparation?.snapshot"
+    :schema="store.schema"
+    :saved-values="testPreparation?.savedValues"
+    @cancel="cancelTestPreparation" @run="submitTestPreparation" />
+  <BaseDialog :open="!!testResult" @close="closeTestResult">
+  <div v-if="testResult" class="test-result-dialog">
       <span class="material-symbols-outlined dialog-ico">experiment</span>
       <h3 class="dialog-title">规则测试</h3>
       <p class="dialog-sub">{{ testResult.ruleName }}</p>
@@ -677,7 +689,7 @@ onMounted(() => {
         </div>
         <div v-for="(assertion, i) in testResult.assertions?.results || []" :key="'assertion-' + i" class="test-step" :class="assertion.passed ? 'test-step-ok' : 'test-step-fail'">
           <span class="material-symbols-outlined">{{ assertion.passed ? 'fact_check' : 'rule' }}</span>
-          <div><b>断言 {{ i + 1 }}{{ assertion.path?.length ? ` · ${assertion.path.join('.')}` : '' }}</b><small>{{ assertion.message }}</small></div>
+          <div><b>检查项 {{ i + 1 }}{{ assertion.path?.length ? ` · ${assertion.path.join('.')}` : '' }}</b><small>{{ assertion.message }}</small></div>
         </div>
       </div>
       <p v-if="testSummary" class="test-summary"
@@ -691,8 +703,7 @@ onMounted(() => {
         </button>
         <button class="btn btn-filled" @click="closeTestResult">关闭</button>
       </div>
-    </div>
   </div>
-  </Transition>
+  </BaseDialog>
   </div>
 </template>
