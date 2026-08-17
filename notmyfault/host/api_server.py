@@ -1077,10 +1077,10 @@ class EngineAPI:
                                 "code": "consent_required",
                                 "error": "生成插件源码需要用户同意",
                             })
-                        except Exception:
+                        except Exception as _fe:
                             yield self._sse("error", {
                                 "code": "ai_provider_failed",
-                                "error": "AI 草稿服务暂不可用",
+                                "error": f"处理结果失败：{_fe}",
                             })
                         else:
                             yield self._sse("result", result)
@@ -1091,12 +1091,13 @@ class EngineAPI:
                         if isinstance(failure, AIProviderIdleTimeoutError):
                             payload = {
                                 "code": "idle_timeout",
-                                "error": "AI 服务长时间没有返回内容",
+                                "error": "AI 服务超过 120 秒没有返回内容，可能是模型响应太慢或网络问题",
                             }
                         else:
+                            err_detail = str(failure) if failure else "未知错误"
                             payload = {
                                 "code": "ai_provider_failed",
-                                "error": "AI 草稿服务暂不可用",
+                                "error": f"AI 服务返回错误：{err_detail}",
                             }
                         yield self._sse("error", payload)
                     break
@@ -1498,6 +1499,7 @@ class EngineAPI:
                     schema,
                     allow_plugin_source=allow_plugin_source,
                     should_stop=should_stop,
+                    idle_timeout=120,
                 )
 
             return StreamingResponse(

@@ -2425,7 +2425,8 @@ class TestAiStreamEndpoint:
 
         events = parse_sse_events(content)
         assert [name for name, _ in events] == ["status", "reasoning", "error", "done"]
-        assert events[2][1] == {"code": "ai_provider_failed", "error": "AI 草稿服务暂不可用"}
+        assert events[2][1]["code"] == "ai_provider_failed"
+        assert "AI 服务返回错误" in events[2][1]["error"]
         assert events[3][1] == {"status": "done"}
 
     def test_stream_endpoint_idle_timeout_emits_specific_error(self, api_env, monkeypatch):
@@ -2444,10 +2445,8 @@ class TestAiStreamEndpoint:
 
         events = parse_sse_events(content)
         assert [name for name, _ in events] == ["status", "error", "done"]
-        assert events[1][1] == {
-            "code": "idle_timeout",
-            "error": "AI 服务长时间没有返回内容",
-        }
+        assert events[1][1]["code"] == "idle_timeout"
+        assert "120" in events[1][1]["error"] or "超时" in events[1][1]["error"]
 
     def test_stream_endpoint_plugin_source_without_consent_errors(self, api_env, monkeypatch):
         assert api_env.api._save_config(enabled_ai_config()) is True

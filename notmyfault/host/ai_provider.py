@@ -29,7 +29,7 @@ from notmyfault.host.ai_tools import (
 _REQUEST_TIMEOUT_SECONDS = 120
 _MAX_RESPONSE_BYTES = 1024 * 1024
 # 流式读每次阻塞等待的上限；上游停住这么久就判超时。
-_IDLE_TIMEOUT_SECONDS = 30
+_IDLE_TIMEOUT_SECONDS = 120
 _STREAM_CHUNK_BYTES = 8192
 _PROXY_FAKE_IPV4_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 
