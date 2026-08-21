@@ -92,6 +92,7 @@ def setup_logging(log_dir: str) -> str:
     sys.stdout = _TimestampWriter(log_fp, sys.__stdout__ or _devnull, _log_io_lock)  # type: ignore
     sys.stderr = _TimestampWriter(log_fp, sys.__stderr__ or _devnull, _log_io_lock)  # type: ignore
     print(f"--- NotmyFault 引擎启动 {datetime.now().isoformat()} ---")
+    print(f"------     Welcome to NotmyFault!    ------")
     return log_path
 
 

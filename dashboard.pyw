@@ -26,6 +26,34 @@ from notmyfault.config import RULES_FILE
 from notmyfault.platform.platform_support import get_config_dir, launch_python_entry
 from notmyfault.security.plugin_schema import scan_plugins
 
+def _patch_qt_permission_policy():
+    try:
+        from webview.platforms import qt
+    except ImportError:
+        return
+
+    page = qt.BrowserView.WebPage
+    policy = page.PermissionPolicy
+    feature = page.Feature
+    media_features = (
+        feature.MediaAudioCapture,
+        feature.MediaVideoCapture,
+        feature.MediaAudioVideoCapture,
+    )
+
+    def handle_permission(self, url, requested_feature):
+        local_page = url.scheme() == "http" and url.host() in {"127.0.0.1", "localhost"}
+        allowed = requested_feature in media_features or (
+            requested_feature == feature.ClipboardReadWrite and local_page
+        )
+        permission = (
+            policy.PermissionGrantedByUser if allowed else policy.PermissionDeniedByUser
+        )
+        self.setFeaturePermission(url, requested_feature, permission)
+
+    page.onFeaturePermissionRequested = handle_permission
+
+
 API = "http://127.0.0.1:19198"
 # API 令牌与 notmyfault/api_server.py 共用，文件放在配置目录下
 API_TOKEN_FILE = os.path.join(get_config_dir(), ".api_token")
@@ -532,6 +560,9 @@ def _resolve_dashboard_url():
     return None, None
 
 def main():
+    if sys.platform.startswith("linux"):
+        _patch_qt_permission_policy()
+
     try:
         control_server, show_requested, quit_requested = _claim_dashboard_instance()
     except RuntimeError as error:

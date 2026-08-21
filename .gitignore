@@ -14,7 +14,6 @@ build/
 *.egg-info/
 *.egg
 .gitignore
-
 # Virtual environments
 venv/
 .venv/
@@ -65,3 +64,4 @@ DECOUPLING.md
 sandbox_appdata/
 
 .git_commit_msg.txt
+/agent_files/mtkclient/
