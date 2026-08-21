@@ -7,17 +7,16 @@ import SecurityView from './components/views/SecurityView.vue'
 import SettingsView from './components/views/SettingsView.vue'
 import RulesView from './components/views/RulesView.vue'
 import LogsView from './components/views/LogsView.vue'
-import AiView from './components/views/AiView.vue'
 import AppDialog from './components/AppDialog.vue'
 import { store } from './lib/store'
 import { snack } from './lib/notify'
-import { loadConfig, loadPlugins, getSchema, getEngineStatus, getPluginComponents, getPluginExtensions } from './lib/api'
+import { loadConfig, loadPlugins, getSchema, getEngineStatus, getPluginComponents, getPluginExtensions, getAIDraftingSetting } from './lib/api'
 import { ensureRuleIds } from './lib/bindings'
 import { useTheme } from './composables/useTheme'
 
 const { init: initTheme } = useTheme()
 const currentPage = ref('home')
-const views = { home: HomeView, plugins: PluginsView, security: SecurityView, settings: SettingsView, rules: RulesView, logs: LogsView, ai: AiView }
+const views = { home: HomeView, plugins: PluginsView, security: SecurityView, settings: SettingsView, rules: RulesView, logs: LogsView }
 
 function switchPage(p) {
   if (p === currentPage.value || !views[p]) return
@@ -34,6 +33,36 @@ const RULE_EVENTS = ['action_executed', 'action_skipped', 'workflow_failed', 'wo
 const timers = []
 function setTracked(fn, ms) { const id = setInterval(fn, ms); timers.push(id); return id }
 
+const OFFLINE_STATUS = { api_alive: false, engine_running: false, engine_state: 'offline' }
+const CONFIG_LOAD_ATTEMPTS = 30
+const CONFIG_LOAD_INTERVAL = 150
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function applyConfig(cfg) {
+  if (!cfg || !Array.isArray(cfg.rules)) return false
+  store.configData = { ...cfg, rules: ensureRuleIds(cfg.rules) }
+  store.configLoaded = true
+  return true
+}
+
+async function loadConfigData() {
+  return applyConfig(await loadConfig())
+}
+
+async function loadConfigAtStartup() {
+  for (let attempt = 0; attempt < CONFIG_LOAD_ATTEMPTS; attempt++) {
+    if (store.configLoaded) return true
+    if (await loadConfigData().catch(() => false)) return true
+    await delay(CONFIG_LOAD_INTERVAL)
+  }
+  store.configData = { rules: [] }
+  store.configLoaded = true
+  return false
+}
+
 function updateStatus(s) {
   store.engineStatus = { ...store.engineStatus, ...s }
   if ('api_alive' in s) store.controllerOnline = s.api_alive === true
@@ -42,12 +71,12 @@ function updateStatus(s) {
   document.body.classList.toggle('engine-online', store.engineOnline)
 }
 
-async function refreshAll() {
-  const status = await getEngineStatus().catch(() => ({
-    api_alive: false, engine_running: false, engine_state: 'offline',
-  }))
-  updateStatus(status)
-  if (!status.api_alive) return
+async function refreshAll(status = null) {
+  const currentStatus = status || await getEngineStatus().catch(() => OFFLINE_STATUS)
+  updateStatus(currentStatus)
+  if (!currentStatus.api_alive) return
+  await loadConfigData().catch(() => {})
+  void loadAISettingsOnce()
   try {
     const [sch, plugins, components, extensions] = await Promise.all([
       getSchema(), loadPlugins(), getPluginComponents(), getPluginExtensions(),
@@ -56,19 +85,30 @@ async function refreshAll() {
     store.pluginsData = plugins
     store.components = components
     store.extensions = extensions
-  } catch (e) { /* 引擎离线时刷新配置失败，继续保留旧数据。 */ }
+  } catch (e) { /* 后台短暂不可用时保留已加载的数据。 */ }
 }
 
 async function refreshStatus() {
   const wasOnline = store.controllerOnline
-  const status = await getEngineStatus().catch(() => ({
-    api_alive: false, engine_running: false, engine_state: 'offline',
-  }))
+  const status = await getEngineStatus().catch(() => OFFLINE_STATUS)
   updateStatus(status)
-  if (!wasOnline && status.api_alive) {
-    refreshAll()
+  if (!status.api_alive) return
+  if (!wasOnline) {
+    refreshAll(status)
     connectSSE()
   }
+}
+
+// AI 设置只在启动后读一次；设置页里未保存的编辑不该被引擎重启刷新覆盖。
+let aiSettingsLoaded = false
+async function loadAISettingsOnce() {
+  if (aiSettingsLoaded) return
+  try {
+    const { api_key_status: aiApiKeyStatus, ...aiDrafting } = await getAIDraftingSetting()
+    store.aiDrafting = { ...store.aiDrafting, ...aiDrafting }
+    store.aiApiKeyStatus = aiApiKeyStatus || 'none'
+    aiSettingsLoaded = true
+  } catch { /* API 未就绪时下次引擎事件再试。 */ }
 }
 
 async function connectSSE() {
@@ -186,16 +226,13 @@ window.__nmf = { refreshAll, updateStatus, switchPage }
 
 onMounted(async () => {
   initTheme()
-  // main.js 挂载 Vue 前已检查 pywebview bridge。
-  try {
-    const cfg = await loadConfig()
-    store.configData = cfg && cfg.rules
-      ? { ...cfg, rules: ensureRuleIds(cfg.rules) }
-      : { rules: [] }
-  } catch (e) { store.configData = { rules: [] } }
-  finally { store.configLoaded = true }
-  await refreshAll()
-  if (store.controllerOnline) connectSSE()
+  void loadConfigAtStartup()
+  const status = await getEngineStatus().catch(() => OFFLINE_STATUS)
+  updateStatus(status)
+  if (status.api_alive) {
+    await refreshAll(status)
+    connectSSE()
+  }
   setTracked(refreshStatus, 2000)
   setTracked(() => store.refreshSignal++, 30000)
 })

@@ -182,7 +182,7 @@ export async function validateRuleDraft(rule) {
   return await res.json()
 }
 
-const AI_DRAFT_EVENT_TYPES = new Set(['status', 'reasoning', 'text', 'result', 'error', 'done'])
+const AI_DRAFT_EVENT_TYPES = new Set(['status', 'reasoning', 'text', 'progress', 'result', 'error', 'done'])
 const AI_DRAFT_HISTORY_LIMIT = 40
 const AI_DRAFT_MESSAGE_LIMIT = 4000
 

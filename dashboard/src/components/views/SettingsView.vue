@@ -23,54 +23,121 @@ import OriginDialog from '../OriginDialog.vue'
 const adminAuth = ref({ mode: 'per_execution', supported_modes: ['per_execution'], restart_required: false })
 const adminRuleVerification = ref(true)
 const savingAdminAuth = ref(false)
-const savingAI = ref(false)
+const savingAIFeature = ref(false)
+const savingAIService = ref(false)
 const savingAIKey = ref(false)
 const savingVerification = ref(false)
 const bluetooth = ref({ available: false, installed: false, meta: null })
 const savingBluetooth = ref(false)
+const aiSavedSnapshot = ref(null)
+const aiServiceDraft = ref({ endpoint_url: '', model: '', api_format: 'chat_completions' })
+const aiKeyEditorOpen = ref(false)
+const currentPage = ref('root')
+const settingsTransition = ref('settings-forward')
+const q = ref('')
+
+const authOptions = [
+  { mode: 'engine_start', icon: 'verified_user', title: '引擎启动时授权一次', sub: '本次引擎运行期间复用管理员授权。' },
+  { mode: 'per_execution', icon: 'touch_app', title: '每次执行时确认', sub: '每次管理员命令都需要单独确认。' },
+]
+
+const pageTitles = {
+  root: '设置',
+  auth: '安全与授权',
+  ai: 'AI 功能',
+  'ai-service': '服务配置',
+  'ai-key': 'API 密钥',
+  plugins: '可选插件',
+  about: '关于 NotmyFault',
+}
+
 const selectedAIProvider = computed({
-  get: () => aiProviderIdFor(store.aiDrafting),
+  get: () => aiProviderIdFor(aiServiceDraft.value),
   set: providerId => {
     const preset = aiProviderPresets.find(item => item.id === providerId)
     if (!preset) return
-    store.aiDrafting.endpoint_url = preset.endpointUrl
-    store.aiDrafting.model = preset.model
-    store.aiDrafting.api_format = preset.apiFormat
+    aiServiceDraft.value = {
+      endpoint_url: preset.endpointUrl,
+      model: preset.model,
+      api_format: preset.apiFormat,
+    }
   },
 })
 
-const authOptions = [
-  { mode: 'engine_start', icon: 'verified_user', title: '引擎启动时授权一次', sub: '启动阶段确认一次，本次引擎运行期间复用管理员代理。' },
-  { mode: 'per_execution', icon: 'touch_app', title: '每次执行时确认', sub: '每次管理员命令都需单独确认，未确认不执行。' },
-]
-
-const aiApiKeyStatusInfo = computed(() => ({
-  none: { label: '未保存', description: '输入密钥后可仅用于本次会话，也可以安全保存到系统密钥库。' },
-  saved: { label: '已保存', description: '已保存到系统密钥库，生成草稿时会自动使用。' },
-  unsupported: { label: '不支持保存', description: '当前平台不支持安全保存密钥，仍可仅用于本次 Dashboard 会话。' },
-  corrupt: { label: '需要处理', description: '保存的密钥无法读取，请替换或删除该保存项。' },
-}[store.aiApiKeyStatus] || {
-  label: '未保存', description: '输入密钥后可仅用于本次会话，也可以安全保存到系统密钥库。',
-}))
-
+const aiServiceDirty = computed(() => {
+  if (!aiSavedSnapshot.value) return false
+  return ['endpoint_url', 'model', 'api_format'].some(key => (
+    aiServiceDraft.value[key] !== aiSavedSnapshot.value[key]
+  ))
+})
 const aiApiKeyPersistenceUnsupported = computed(() => store.aiApiKeyStatus === 'unsupported')
 const canDeleteSavedAIKey = computed(() => ['saved', 'corrupt'].includes(store.aiApiKeyStatus))
-const aiApiKeySaveLabel = computed(() => (
-  store.aiApiKeyStatus === 'saved' || store.aiApiKeyStatus === 'corrupt'
-    ? '替换 API 密钥'
-    : '保存 API 密钥'
-))
+const aiApiKeyStatusInfo = computed(() => ({
+  none: { label: '未设置', icon: 'key_off', cls: '' },
+  saved: { label: '已保存', icon: 'check_circle', cls: 'is-saved' },
+  unsupported: { label: '不支持安全保存', icon: 'block', cls: 'is-warning' },
+  corrupt: { label: '需要更改', icon: 'error', cls: 'is-error' },
+}[store.aiApiKeyStatus] || { label: '未设置', icon: 'key_off', cls: '' }))
+
+const appVersion = __APP_VERSION__
+const ruleCount = computed(() => store.configData?.rules?.length || 0)
+const triggerCount = computed(() => Object.keys(store.pluginsData?.triggers || {}).length)
+const actionCount = computed(() => Object.keys(store.pluginsData?.actions || {}).length)
+const modeLabel = computed(() => ({ strict: '严格', normal: '标准', permissive: '宽松' })[store.engineStatus?.security_mode] || '未知')
+const adminAuthLabel = computed(() => authOptions.find(option => option.mode === adminAuth.value.mode)?.title || '未设置')
+const aiProviderLabel = computed(() => {
+  const provider = aiProviderPresets.find(item => item.id === aiProviderIdFor(aiSavedSnapshot.value || store.aiDrafting))
+  return provider?.label || (store.aiDrafting.endpoint_url ? '自定义' : '未设置')
+})
+
+const rootItems = computed(() => [
+  { page: 'auth', icon: 'shield_lock', title: '安全与授权', value: adminAuthLabel.value, terms: '管理员 授权 签名 验证' },
+  { page: 'ai', icon: 'auto_awesome', title: 'AI 功能', value: store.aiDrafting.enabled ? '已开启' : '已关闭', terms: '规则 草稿 服务商 api 密钥 模型' },
+  { page: 'plugins', icon: 'extension', title: '可选插件', value: bluetooth.value.installed ? '已安装 1 个' : '未安装', terms: '蓝牙 安装 插件' },
+  { page: 'about', icon: 'info', title: '关于 NotmyFault', value: appVersion, terms: '版本 环境 平台 技术栈' },
+])
+const filteredRootItems = computed(() => {
+  const query = q.value.trim().toLowerCase()
+  if (!query) return rootItems.value
+  return rootItems.value.filter(item => `${item.title} ${item.value} ${item.terms}`.toLowerCase().includes(query))
+})
+
+const runtimeInfo = computed(() => [
+  { icon: 'info', key: '版本', val: 'NotmyFault ' + appVersion },
+  { icon: 'shield', key: '安全模式', val: modeLabel.value },
+  { icon: 'rule', key: '已配置规则', val: ruleCount.value + ' 条' },
+  { icon: 'memory', key: '触发器插件', val: triggerCount.value ? triggerCount.value + ' 个' : '引擎离线时不可用' },
+  { icon: 'bolt', key: '动作插件', val: actionCount.value ? actionCount.value + ' 个' : '引擎离线时不可用' },
+  { icon: 'lan', key: '本地 API', val: '127.0.0.1:19198 · 本机令牌认证' },
+])
+const platforms = [
+  { icon: 'desktop_windows', name: 'Windows', state: '主要开发平台', cls: 'text-success' },
+  { icon: 'terminal', name: 'Linux', state: '实验性支持', cls: 'text-warn' },
+  { icon: 'laptop_mac', name: 'macOS', state: '暂不支持', cls: 'text-outline' },
+]
+const techStack = ['Python 引擎', 'Vue 3', 'FastAPI 本地服务', 'SSE 事件推送']
+
+function applyAISavedSettings(settings) {
+  store.aiDrafting = { ...store.aiDrafting, ...settings }
+  aiSavedSnapshot.value = { ...store.aiDrafting }
+  aiServiceDraft.value = {
+    endpoint_url: store.aiDrafting.endpoint_url,
+    model: store.aiDrafting.model,
+    api_format: store.aiDrafting.api_format,
+  }
+}
 
 async function load() {
   try {
     adminAuth.value = { ...adminAuth.value, ...await getAdminAuthorizationSetting() }
     adminRuleVerification.value = (await getAdminRuleVerificationSetting()).key_verification === true
     const { api_key_status: aiApiKeyStatus, ...aiDrafting } = await getAIDraftingSetting()
-    store.aiDrafting = { ...store.aiDrafting, ...aiDrafting }
+    applyAISavedSettings(aiDrafting)
     store.aiApiKeyStatus = aiApiKeyStatus || 'none'
     bluetooth.value = await getBluetoothSetting()
   } catch { snackbar('无法读取设置') }
 }
+
 async function selectAdminAuthorization(mode) {
   if (savingAdminAuth.value || mode === adminAuth.value.mode) return
   savingAdminAuth.value = true
@@ -81,6 +148,7 @@ async function selectAdminAuthorization(mode) {
     snackbar(result.restart_required ? '已保存，重启引擎后生效' : '管理员授权方式已保存')
   } catch (error) { alertDialog('保存失败', error.message) } finally { savingAdminAuth.value = false }
 }
+
 async function toggleAdminRuleVerification() {
   if (savingVerification.value) return
   savingVerification.value = true
@@ -88,18 +156,48 @@ async function toggleAdminRuleVerification() {
     const result = await updateAdminRuleVerificationSetting(!adminRuleVerification.value)
     if (!result.ok) return alertDialog('保存失败', result.error || '无法保存验证设置')
     adminRuleVerification.value = result.key_verification === true
-    snackbar(adminRuleVerification.value ? '已开启：创建管理员规则时要求验证签名私钥' : '已关闭：创建管理员规则不再要求验证签名私钥')
+    snackbar(adminRuleVerification.value ? '管理员规则验证已开启' : '管理员规则验证已关闭')
   } catch (error) { alertDialog('保存失败', error.message) } finally { savingVerification.value = false }
 }
-async function saveAI() {
-  savingAI.value = true
+
+async function toggleAIDrafting() {
+  if (savingAIFeature.value) return
+  savingAIFeature.value = true
   try {
-    const result = await updateAIDraftingSetting(store.aiDrafting)
+    const result = await updateAIDraftingSetting({
+      ...(aiSavedSnapshot.value || store.aiDrafting),
+      enabled: !store.aiDrafting.enabled,
+    })
     if (!result.ok) return alertDialog('保存失败', result.error || '无法保存 AI 设置')
-    store.aiDrafting = { ...store.aiDrafting, ...result.settings }
-    snackbar('AI 设置已保存')
-  } catch (error) { alertDialog('保存失败', error.message) } finally { savingAI.value = false }
+    applyAISavedSettings(result.settings)
+    snackbar(store.aiDrafting.enabled ? 'AI 规则草稿已开启' : 'AI 规则草稿已关闭')
+  } catch (error) { alertDialog('保存失败', error.message) } finally { savingAIFeature.value = false }
 }
+
+async function saveAIService() {
+  if (savingAIService.value || !aiServiceDirty.value) return
+  savingAIService.value = true
+  try {
+    const result = await updateAIDraftingSetting({
+      ...(aiSavedSnapshot.value || store.aiDrafting),
+      ...aiServiceDraft.value,
+    })
+    if (!result.ok) return alertDialog('保存失败', result.error || '无法保存 AI 设置')
+    applyAISavedSettings(result.settings)
+    snackbar('服务配置已保存')
+  } catch (error) { alertDialog('保存失败', error.message) } finally { savingAIService.value = false }
+}
+
+function editAIKey() {
+  store.aiApiKey = ''
+  aiKeyEditorOpen.value = true
+}
+
+function cancelAIKeyEdit() {
+  store.aiApiKey = ''
+  aiKeyEditorOpen.value = false
+}
+
 async function saveAIKey() {
   if (savingAIKey.value || aiApiKeyPersistenceUnsupported.value || !store.aiApiKey) return
   savingAIKey.value = true
@@ -108,9 +206,11 @@ async function saveAIKey() {
     if (!result.ok) return alertDialog('保存失败', result.error || '无法保存 AI API 密钥')
     store.aiApiKeyStatus = result.api_key_status || 'saved'
     store.aiApiKey = ''
-    snackbar('AI API 密钥已安全保存')
+    aiKeyEditorOpen.value = false
+    snackbar('API 密钥已保存')
   } catch (error) { alertDialog('保存失败', error.message) } finally { savingAIKey.value = false }
 }
+
 async function deleteAIKey() {
   if (savingAIKey.value || !canDeleteSavedAIKey.value) return
   savingAIKey.value = true
@@ -118,9 +218,12 @@ async function deleteAIKey() {
     const result = await deleteAIApiKey()
     if (!result.ok) return alertDialog('删除失败', result.error || '无法删除 AI API 密钥')
     store.aiApiKeyStatus = result.api_key_status || 'none'
-    snackbar('已删除保存的 AI API 密钥')
+    store.aiApiKey = ''
+    aiKeyEditorOpen.value = false
+    snackbar('API 密钥已删除')
   } catch (error) { alertDialog('删除失败', error.message) } finally { savingAIKey.value = false }
 }
+
 async function changeBluetoothInstallation() {
   if (savingBluetooth.value || !bluetooth.value.available) return
   savingBluetooth.value = true
@@ -133,11 +236,18 @@ async function changeBluetoothInstallation() {
     snackbar(bluetooth.value.installed ? '蓝牙开关已安装，重启引擎后生效' : '蓝牙开关已移除，重启引擎后生效')
   } catch (error) { alertDialog('操作失败', error.message) } finally { savingBluetooth.value = false }
 }
-onMounted(load)
 
-const appVersion = __APP_VERSION__
+function openSettingsPage(page) {
+  settingsTransition.value = 'settings-forward'
+  currentPage.value = page
+  q.value = ''
+}
 
-// 科乐美秘技：在设置页依次输入序列解锁起源彩蛋，按错即重置。
+function goBack() {
+  settingsTransition.value = 'settings-back'
+  currentPage.value = currentPage.value.startsWith('ai-') ? 'ai' : 'root'
+}
+
 const KONAMI_SEQUENCE = [
   'ArrowUp', 'ArrowUp', 'ArrowDown', 'ArrowDown',
   'ArrowLeft', 'ArrowRight', 'ArrowLeft', 'ArrowRight', 'b', 'a',
@@ -156,218 +266,148 @@ function onKonamiKey(event) {
     konamiProgress = key === KONAMI_SEQUENCE[0] ? 1 : 0
   }
 }
-onMounted(() => window.addEventListener('keydown', onKonamiKey))
-onUnmounted(() => window.removeEventListener('keydown', onKonamiKey))
 
-const ruleCount = computed(() => store.configData?.rules?.length || 0)
-const triggerCount = computed(() => Object.keys(store.pluginsData?.triggers || {}).length)
-const actionCount = computed(() => Object.keys(store.pluginsData?.actions || {}).length)
-const modeLabel = computed(() => {
-  const m = store.engineStatus?.security_mode
-  return ({ strict: '严格', normal: '标准', permissive: '宽松' })[m] || '未知'
+onMounted(() => {
+  load()
+  window.addEventListener('keydown', onKonamiKey)
 })
-
-const runtimeInfo = computed(() => [
-  { icon: 'info', key: '版本', val: 'NotmyFault ' + appVersion },
-  { icon: 'shield', key: '安全模式', val: modeLabel.value },
-  { icon: 'rule', key: '已配置规则', val: ruleCount.value + ' 条' },
-  { icon: 'memory', key: '触发器插件', val: triggerCount.value ? triggerCount.value + ' 个' : '引擎离线时不可用' },
-  { icon: 'bolt', key: '动作插件', val: actionCount.value ? actionCount.value + ' 个' : '引擎离线时不可用' },
-  { icon: 'lan', key: '本地 API', val: '127.0.0.1:19198 · 本机令牌认证' },
-])
-
-const platforms = [
-  { icon: 'desktop_windows', name: 'Windows', state: '主要开发平台', cls: 'text-success' },
-  { icon: 'terminal', name: 'Linux', state: '实验性支持', cls: 'text-warn' },
-  { icon: 'laptop_mac', name: 'macOS', state: '暂不支持', cls: 'text-outline' },
-]
-
-const techStack = ['Python 引擎', 'Vue 3', 'FastAPI 本地服务', 'SSE 事件推送']
-
-// 搜索命中才算可见：标题、副标题和右侧值都参与匹配。
-const q = ref('')
-const query = computed(() => q.value.trim().toLowerCase())
-const hit = (...parts) => !query.value || parts.join(' ').toLowerCase().includes(query.value)
-const showSuggest = computed(() => !query.value)
-const showAuth = computed(() => hit(
-  '授权与安全', '管理员授权方式',
-  ...authOptions.flatMap(o => [o.title, o.sub]),
-  '管理员规则验证', '创建管理员规则时要求验证签名私钥',
-))
-const showAi = computed(() => hit(
-  '实验功能', '实验性 AI 规则草稿', 'AI 只生成候选草稿，由你检查后手动保存',
-  '服务商', ...aiProviderPresets.map(provider => provider.label),
-  'OpenAI 兼容地址', '模型', '接口格式', 'AI API 密钥', '保存 API 密钥', '删除已保存的密钥', '保存 AI 设置',
-))
-const showBluetooth = computed(() => hit(
-  '可选插件', '蓝牙开关', '安装蓝牙开关', '用户插件',
-))
-const showAbout = computed(() => hit(
-  '关于 NotmyFault', 'NotmyFault', '拓展万千', '平台支持', '技术栈', '配置与日志',
-  ...runtimeInfo.value.flatMap(r => [r.key, r.val]),
-  ...platforms.flatMap(p => [p.name, p.state]),
-))
-const noResults = computed(() => query.value !== '' && !showAuth.value && !showAi.value && !showBluetooth.value && !showAbout.value)
-// 列表行直接按命中过滤后再渲染，v-show 挂在 v-for 行上会被编译成稳定片段，查询变化时不重算。
-const visibleRuntimeInfo = computed(() => runtimeInfo.value.filter(r => hit(r.key, r.val)))
-const visiblePlatforms = computed(() => platforms.filter(p => hit('平台支持', p.name, p.state)))
-
-const suggestions = computed(() => [
-  { icon: 'shield', cls: 'a16-ico-primary', title: '安全模式', val: modeLabel.value, page: 'security' },
-  { icon: 'rule', cls: 'a16-ico-tertiary', title: '自动化规则', val: ruleCount.value + ' 条', page: 'rules' },
-  { icon: 'extension', cls: 'a16-ico-success', title: '插件', val: actionCount.value || triggerCount.value ? triggerCount.value + ' 触发器 · ' + actionCount.value + ' 动作' : '引擎离线时不可用', page: 'plugins' },
-])
-
-function openPage(page) {
-  if (window.__nmf) window.__nmf.switchPage(page)
-}
-function scrollToAbout() {
-  document.querySelector('.settings-about-card')?.scrollIntoView?.({ behavior: 'smooth', block: 'start' })
-}
+onUnmounted(() => window.removeEventListener('keydown', onKonamiKey))
 </script>
 
 <template>
   <section class="page active settings-page">
-    <div class="a16-canvas">
-      <header class="a16-head">
-        <h2>设置</h2>
-        <button type="button" class="a16-profile" title="查看关于信息" @click="scrollToAbout">
-          <img :src="appLogoUrl" alt="">
-          <span class="a16-profile-body"><b>NotmyFault</b><small>{{ appVersion }} · Alpha</small></span>
-          <span class="material-symbols-outlined">expand_more</span>
+    <div class="a16-canvas settings-shell">
+      <Transition :name="settingsTransition" mode="out-in">
+        <div :key="currentPage" class="settings-stage">
+          <header class="settings-toolbar">
+        <button v-if="currentPage !== 'root'" type="button" class="settings-back" aria-label="返回" @click="goBack">
+          <span class="material-symbols-outlined">arrow_back</span>
         </button>
+        <h2>{{ pageTitles[currentPage] }}</h2>
       </header>
 
-      <label class="a16-search">
-        <span class="material-symbols-outlined">search</span>
-        <input v-model="q" type="search" aria-label="搜索设置" autocomplete="off" spellcheck="false" placeholder="搜索设置">
-        <button v-if="q" type="button" class="a16-search-clear" aria-label="清空搜索" @click="q = ''"><span class="material-symbols-outlined">close</span></button>
-      </label>
+      <template v-if="currentPage === 'root'">
+        <label class="a16-search settings-search">
+          <span class="material-symbols-outlined">search</span>
+          <input v-model="q" type="search" aria-label="搜索设置" autocomplete="off" spellcheck="false" placeholder="搜索设置">
+          <button v-if="q" type="button" class="a16-search-clear" aria-label="清空搜索" @click="q = ''"><span class="material-symbols-outlined">close</span></button>
+        </label>
+        <section v-if="filteredRootItems.length" class="a16-card settings-root-list">
+          <button v-for="item in filteredRootItems" :key="item.page" type="button" class="a16-row" @click="openSettingsPage(item.page)">
+            <span class="material-symbols-outlined a16-row-ico">{{ item.icon }}</span>
+            <span class="a16-row-body"><span class="a16-row-title">{{ item.title }}</span></span>
+            <span class="a16-row-val">{{ item.value }}</span>
+            <span class="material-symbols-outlined settings-chevron">chevron_right</span>
+          </button>
+        </section>
+        <p v-else class="a16-empty">没有找到设置</p>
+      </template>
 
-      <div v-show="showSuggest" class="a16-suggest">
-        <button v-for="s in suggestions" :key="s.title" type="button" class="a16-suggest-card" @click="openPage(s.page)">
-          <span class="a16-suggest-ico" :class="s.cls"><span class="material-symbols-outlined">{{ s.icon }}</span></span>
-          <span class="a16-suggest-body"><b>{{ s.title }}</b><small>{{ s.val }}</small></span>
-        </button>
-      </div>
-
-      <div v-show="showAuth">
-        <h3 class="a16-section-label">授权与安全</h3>
-        <section class="a16-card">
-          <button v-for="o in authOptions" :key="o.mode" type="button"
-            class="a16-row admin-auth-option" :class="{ selected: adminAuth.mode === o.mode }"
-            :disabled="savingAdminAuth || (o.mode === 'engine_start' && !adminAuth.supported_modes.includes('engine_start'))"
-            @click="selectAdminAuthorization(o.mode)">
-            <span class="material-symbols-outlined a16-row-ico">{{ o.icon }}</span>
-            <span class="a16-row-body"><span class="a16-row-title">{{ o.title }}</span><span class="a16-row-sub">{{ o.sub }}</span></span>
-            <span class="material-symbols-outlined a16-radio">{{ adminAuth.mode === o.mode ? 'radio_button_checked' : 'radio_button_unchecked' }}</span>
+      <section v-else-if="currentPage === 'auth'" class="settings-subpage">
+        <div class="a16-card">
+          <button v-for="option in authOptions" :key="option.mode" type="button"
+            class="a16-row admin-auth-option" :class="{ selected: adminAuth.mode === option.mode }"
+            :disabled="savingAdminAuth || (option.mode === 'engine_start' && !adminAuth.supported_modes.includes('engine_start'))"
+            @click="selectAdminAuthorization(option.mode)">
+            <span class="material-symbols-outlined a16-row-ico">{{ option.icon }}</span>
+            <span class="a16-row-body"><span class="a16-row-title">{{ option.title }}</span><span class="a16-row-sub">{{ option.sub }}</span></span>
+            <span class="material-symbols-outlined a16-radio" :aria-label="adminAuth.mode === option.mode ? '已选择' : '未选择'">{{ adminAuth.mode === option.mode ? 'radio_button_checked' : 'radio_button_unchecked' }}</span>
           </button>
           <div class="a16-row admin-rule-verification-settings">
             <span class="material-symbols-outlined a16-row-ico">key</span>
-            <span class="a16-row-body">
-              <span class="a16-row-title">管理员规则验证</span>
-              <span class="a16-row-sub">创建管理员规则时要求验证签名私钥</span>
-            </span>
-            <label class="switch">
-              <input type="checkbox" :checked="adminRuleVerification" :disabled="savingVerification" @change="toggleAdminRuleVerification">
-              <span class="switch-track"><span class="switch-thumb"></span></span>
-            </label>
+            <span class="a16-row-body"><span class="a16-row-title">管理员规则验证</span><span class="a16-row-sub">创建管理员规则时验证签名私钥</span></span>
+            <label class="switch"><input type="checkbox" :checked="adminRuleVerification" :disabled="savingVerification" @change="toggleAdminRuleVerification"><span class="switch-track"><span class="switch-thumb"></span></span></label>
           </div>
-          <p v-if="adminAuth.restart_required" class="a16-note"><span class="material-symbols-outlined">restart_alt</span>重启引擎后生效。</p>
-        </section>
-      </div>
+        </div>
+        <p v-if="adminAuth.restart_required" class="settings-inline-note">重启引擎后生效</p>
+      </section>
 
-      <div v-show="showAi">
-        <h3 class="a16-section-label">实验功能</h3>
-        <section class="a16-card ai-drafting-settings">
+      <section v-else-if="currentPage === 'ai'" class="settings-subpage ai-drafting-settings">
+        <div class="a16-card">
           <div class="a16-row">
             <span class="material-symbols-outlined a16-row-ico">auto_awesome</span>
-            <span class="a16-row-body">
-              <span class="a16-row-title">实验性 AI 规则草稿</span>
-              <span class="a16-row-sub">AI 只生成候选草稿，由你检查后手动保存</span>
-            </span>
-            <label class="switch">
-              <input v-model="store.aiDrafting.enabled" type="checkbox">
-              <span class="switch-track"><span class="switch-thumb"></span></span>
-            </label>
+            <span class="a16-row-body"><span class="a16-row-title">AI 规则草稿</span></span>
+            <label class="switch"><input type="checkbox" :checked="store.aiDrafting.enabled" :disabled="savingAIFeature" @change="toggleAIDrafting"><span class="switch-track"><span class="switch-thumb"></span></span></label>
           </div>
-          <div class="a16-panel">
-            <div class="a16-fields">
-               <label class="a16-field">服务商<select v-model="selectedAIProvider" name="ai-provider" class="text-field"><option v-for="provider in aiProviderPresets" :key="provider.id" :value="provider.id">{{ provider.label }}</option><option value="custom">自定义</option></select></label>
-               <label class="a16-field">OpenAI 兼容地址<input v-model="store.aiDrafting.endpoint_url" name="ai-endpoint" class="text-field" type="url" placeholder="https://example.com/v1"></label>
-               <label class="a16-field">模型<input v-model="store.aiDrafting.model" name="ai-model" class="text-field" placeholder="model-name"></label>
-               <label class="a16-field">接口格式<select v-model="store.aiDrafting.api_format" name="ai-api-format" class="text-field"><option value="chat_completions">Chat Completions</option><option value="responses">Responses API</option></select></label>
-             </div>
-             <div class="a16-row">
-               <span class="material-symbols-outlined a16-row-ico">key</span>
-               <span class="a16-row-body">
-                 <span class="a16-row-title">AI API 密钥</span>
-                 <span class="a16-row-sub">{{ aiApiKeyStatusInfo.description }}</span>
-               </span>
-               <span class="a16-row-val">{{ aiApiKeyStatusInfo.label }}</span>
-             </div>
-             <label class="a16-field">本次会话 API 密钥<input v-model="store.aiApiKey" class="text-field" type="password" autocomplete="off" placeholder="可仅用于本次会话，或安全保存"></label>
-             <p v-if="store.aiApiKeyStatus === 'corrupt'" class="a16-note"><span class="material-symbols-outlined">warning</span>请输入新的密钥后替换，或删除损坏的保存项后重新保存。</p>
-             <p v-else class="a16-note">发送草稿请求时会将你的描述和可用插件名称发往配置的远程服务。保存的密钥不会显示在 Dashboard 中。</p>
-             <div class="a16-actions">
-               <button class="btn btn-filled" :disabled="savingAI" @click="saveAI">{{ savingAI ? '保存中…' : '保存 AI 设置' }}</button>
-               <button class="btn btn-tonal" :disabled="savingAIKey || aiApiKeyPersistenceUnsupported || !store.aiApiKey" @click="saveAIKey">{{ savingAIKey ? '保存中…' : aiApiKeySaveLabel }}</button>
-               <button v-if="canDeleteSavedAIKey" class="btn btn-outlined" :disabled="savingAIKey" @click="deleteAIKey">删除已保存的密钥</button>
-             </div>
-           </div>
-        </section>
-      </div>
+          <button type="button" class="a16-row" @click="openSettingsPage('ai-service')">
+            <span class="material-symbols-outlined a16-row-ico">dns</span>
+            <span class="a16-row-body"><span class="a16-row-title">服务配置</span></span>
+            <span class="a16-row-val">{{ aiServiceDirty ? '未保存' : aiProviderLabel }}</span>
+            <span class="material-symbols-outlined settings-chevron">chevron_right</span>
+          </button>
+          <button type="button" class="a16-row" @click="openSettingsPage('ai-key')">
+            <span class="material-symbols-outlined a16-row-ico">key</span>
+            <span class="a16-row-body"><span class="a16-row-title">API 密钥</span></span>
+            <span class="a16-row-val" :class="{ 'settings-state-success': store.aiApiKeyStatus === 'saved' }">{{ aiApiKeyStatusInfo.label }}</span>
+            <span class="material-symbols-outlined settings-chevron">chevron_right</span>
+          </button>
+        </div>
+      </section>
 
-      <div v-show="showBluetooth">
-        <h3 class="a16-section-label">可选插件</h3>
-        <section class="a16-card bluetooth-settings">
+      <section v-else-if="currentPage === 'ai-service'" class="settings-subpage ai-drafting-settings">
+        <div class="a16-card settings-form-card">
+          <div class="a16-fields">
+            <label class="a16-field">服务商<select v-model="selectedAIProvider" name="ai-provider" class="text-field"><option v-for="provider in aiProviderPresets" :key="provider.id" :value="provider.id">{{ provider.label }}</option><option value="custom">自定义</option></select></label>
+            <label class="a16-field">服务商 API 兼容地址<input v-model="aiServiceDraft.endpoint_url" name="ai-endpoint" class="text-field" type="url" placeholder="https://example.com/v1"></label>
+            <label class="a16-field">模型<input v-model="aiServiceDraft.model" name="ai-model" class="text-field" placeholder="model-name"></label>
+            <label class="a16-field">接口格式<select v-model="aiServiceDraft.api_format" name="ai-api-format" class="text-field"><option value="chat_completions">Chat Completions</option><option value="responses">Responses API</option></select></label>
+          </div>
+          <div v-if="aiServiceDirty" class="settings-save-bar">
+            <span>有未保存的更改</span>
+            <button class="btn btn-filled" :disabled="savingAIService" @click="saveAIService">{{ savingAIService ? '保存中…' : '保存' }}</button>
+          </div>
+        </div>
+      </section>
+
+      <section v-else-if="currentPage === 'ai-key'" class="settings-subpage ai-drafting-settings">
+        <div class="a16-card settings-key-card">
+          <div class="settings-key-status" :class="aiApiKeyStatusInfo.cls">
+            <span class="material-symbols-outlined">{{ aiApiKeyStatusInfo.icon }}</span>
+            <strong>{{ aiApiKeyStatusInfo.label }}</strong>
+          </div>
+          <template v-if="aiKeyEditorOpen">
+            <label class="a16-field settings-key-input">API 密钥<input v-model="store.aiApiKey" class="text-field" type="password" autocomplete="off"></label>
+            <div class="settings-key-actions">
+              <button class="btn btn-text" :disabled="savingAIKey" @click="cancelAIKeyEdit">取消</button>
+              <button v-if="!aiApiKeyPersistenceUnsupported" class="btn btn-filled" :disabled="savingAIKey || !store.aiApiKey" @click="saveAIKey">{{ savingAIKey ? '保存中…' : '保存 API 密钥' }}</button>
+            </div>
+          </template>
+          <div v-else class="settings-key-actions">
+            <button class="btn btn-filled" :disabled="aiApiKeyPersistenceUnsupported" @click="editAIKey">{{ canDeleteSavedAIKey ? '更改 API 密钥' : '添加 API 密钥' }}</button>
+            <button v-if="canDeleteSavedAIKey" class="btn btn-outlined" :disabled="savingAIKey" @click="deleteAIKey">删除 API 密钥</button>
+          </div>
+        </div>
+      </section>
+
+      <section v-else-if="currentPage === 'plugins'" class="settings-subpage">
+        <div class="a16-card bluetooth-settings">
           <div class="a16-row">
             <span class="material-symbols-outlined a16-row-ico">bluetooth</span>
-            <span class="a16-row-body">
-              <span class="a16-row-title">蓝牙开关</span>
-              <span class="a16-row-sub">{{ bluetooth.installed ? '已安装到用户插件目录' : bluetooth.available ? '需要时安装，不随引擎默认加载' : '当前安装包未包含此插件' }}</span>
-            </span>
-            <span class="a16-row-val">{{ bluetooth.installed ? '已安装' : '未安装' }}</span>
+            <span class="a16-row-body"><span class="a16-row-title">蓝牙开关</span></span>
+            <span class="a16-row-val" :class="{ 'settings-state-success': bluetooth.installed }">{{ bluetooth.installed ? '已安装' : '未安装' }}</span>
           </div>
-          <div class="a16-panel">
-            <p class="a16-note">安装后可在规则中开启、关闭或查询蓝牙状态。更改安装状态后需要重启引擎。</p>
-            <div class="a16-actions"><button class="btn btn-filled" :disabled="savingBluetooth || !bluetooth.available" @click="changeBluetoothInstallation">{{ savingBluetooth ? '处理中…' : bluetooth.installed ? '移除蓝牙开关' : '安装蓝牙开关' }}</button></div>
+          <div class="settings-plugin-actions">
+            <button class="btn btn-filled" :disabled="savingBluetooth || !bluetooth.available" @click="changeBluetoothInstallation">{{ savingBluetooth ? '处理中…' : bluetooth.installed ? '移除' : '安装' }}</button>
           </div>
-        </section>
-      </div>
+        </div>
+      </section>
 
-      <div v-show="showAbout">
-        <h3 class="a16-section-label">关于 NotmyFault</h3>
-        <section class="a16-card settings-about-card">
-          <header class="a16-brand">
-            <img class="a16-brand-logo" :src="appLogoUrl" alt="">
-            <span class="a16-brand-body"><b>NotmyFault</b><small>拓展万千</small></span>
-            <span class="a16-badges"><span class="chip chip-clean">{{ appVersion }}</span><span class="chip">Alpha</span><span class="chip">GPL-3.0</span></span>
-          </header>
-          <div v-for="r in visibleRuntimeInfo" :key="r.key" class="a16-row">
-            <span class="material-symbols-outlined a16-row-ico">{{ r.icon }}</span>
-            <span class="a16-row-body"><span class="a16-row-title">{{ r.key }}</span></span>
-            <span class="a16-row-val">{{ r.val }}</span>
-          </div>
+      <section v-else-if="currentPage === 'about'" class="settings-subpage">
+        <div class="a16-card settings-about-card">
+          <header class="a16-brand"><img class="a16-brand-logo" :src="appLogoUrl" alt=""><span class="a16-brand-body"><b>NotmyFault</b><small>{{ appVersion }}</small></span><span class="a16-badges"><span class="chip">Alpha</span><span class="chip">GPL-3.0</span></span></header>
+          <div v-for="item in runtimeInfo" :key="item.key" class="a16-row"><span class="material-symbols-outlined a16-row-ico">{{ item.icon }}</span><span class="a16-row-body"><span class="a16-row-title">{{ item.key }}</span></span><span class="a16-row-val">{{ item.val }}</span></div>
           <p class="a16-sub-label">平台支持</p>
-          <div v-for="p in visiblePlatforms" :key="p.name" class="a16-row a16-row-sm">
-            <span class="material-symbols-outlined a16-row-ico">{{ p.icon }}</span>
-            <span class="a16-row-body"><span class="a16-row-title">{{ p.name }}</span></span>
-            <span class="a16-row-val" :class="p.cls">{{ p.state }}</span>
-          </div>
-          <p class="a16-note">配置与日志位于 <code>%APPDATA%\NotmyFault\</code>，Linux 为 <code>~/.config/notmyfault/</code>。</p>
+          <div v-for="platform in platforms" :key="platform.name" class="a16-row a16-row-sm"><span class="material-symbols-outlined a16-row-ico">{{ platform.icon }}</span><span class="a16-row-body"><span class="a16-row-title">{{ platform.name }}</span></span><span class="a16-row-val" :class="platform.cls">{{ platform.state }}</span></div>
+          <p class="a16-sub-label">配置目录</p>
+          <div class="settings-paths"><code>%APPDATA%\NotmyFault\</code><code>~/.config/notmyfault/</code></div>
           <p class="a16-sub-label">技术栈</p>
-          <div class="a16-stack"><span v-for="t in techStack" :key="t">{{ t }}</span></div>
-          <footer class="a16-foot">
-            <span>&copy; 2026 NotmyFault Project</span>
-            <span>问题反馈请附系统版本、复现步骤与最新日志</span>
-          </footer>
-        </section>
-      </div>
-
-      <p v-if="noResults" class="a16-empty">没有找到与“{{ q.trim() }}”相关的设置</p>
+          <div class="a16-stack"><span v-for="item in techStack" :key="item">{{ item }}</span></div>
+          <footer class="a16-foot"><span>&copy; 2026 NotmyFault Project</span></footer>
+        </div>
+      </section>
+        </div>
+      </Transition>
     </div>
-
     <OriginDialog :open="showOrigin" @close="showOrigin = false" />
   </section>
 </template>

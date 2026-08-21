@@ -40,6 +40,7 @@ import PluginPicker from './PluginPicker.vue'
 import FolderPicker from './FolderPicker.vue'
 import ActionFailureSettings from './ActionFailureSettings.vue'
 import DesktopRecorderDialog from './DesktopRecorderDialog.vue'
+import NaturalDraftPanel from './NaturalDraftPanel.vue'
 import { validateRuleDraft } from '../lib/api'
 
 const props = defineProps({
@@ -52,17 +53,112 @@ const props = defineProps({
   folders: { type: Array, default: () => [] },
   initialNodeId: { type: String, default: '' },
 })
-const emit = defineEmits(['back', 'delete', 'save', 'save-run', 'undo', 'redo'])
+const emit = defineEmits(['back', 'delete', 'save', 'save-run', 'undo', 'redo', 'ai-draft'])
 
 const newTriggerType = ref('')
 const newActionType = ref('')
 const newPreconditionType = ref('')
+
+const aiEnabled = computed(() => store.aiDrafting?.enabled)
+const aiPanelOpen = ref(false)
+const aiPanelRef = ref(null)
 function savedEditorMode() {
   try { return localStorage.getItem('notmyfault.ruleEditorMode') === 'form' ? 'form' : 'canvas' }
   catch { return 'canvas' }
 }
 const editorMode = ref(savedEditorMode())
 const selectedNodeId = ref(null)
+
+
+const wideLayout = ref(false)
+let wideLayoutMedia = null
+let inspectorBeforeAi = null
+function syncWideLayout(event) {
+  wideLayout.value = event.matches
+  if (wideLayout.value && inspectorBeforeAi && !selectedNodeId.value) {
+    selectedNodeId.value = inspectorBeforeAi
+    inspectorBeforeAi = null
+  }
+}
+function setAiPanel(open) {
+  if (open === aiPanelOpen.value) return
+  if (open) {
+    if (!wideLayout.value && selectedNodeId.value) {
+      inspectorBeforeAi = selectedNodeId.value
+      selectedNodeId.value = null
+    }
+    aiPanelOpen.value = true
+  } else {
+    aiPanelOpen.value = false
+    if (inspectorBeforeAi && !selectedNodeId.value) selectedNodeId.value = inspectorBeforeAi
+    inspectorBeforeAi = null
+  }
+}
+function toggleAiPanel() {
+  setAiPanel(!aiPanelOpen.value)
+}
+watch(selectedNodeId, id => {
+  if (id && aiPanelOpen.value) {
+    inspectorBeforeAi = null
+    if (!wideLayout.value) setAiPanel(false)
+  }
+})
+const hasSidePanels = computed(() => (
+  aiPanelOpen.value || (editorMode.value === 'canvas' && !!selectedNodeId.value)
+))
+function onAiDraft(draft) {
+  emit('ai-draft', draft)
+}
+function highlightNodeById(nodeId) {
+  if (!nodeId) return
+  selectedNodeId.value = nodeId
+}
+function newAiConversation() {
+  aiPanelRef.value?.requestNewConversation?.()
+}
+
+const aiMenuOpen = ref(false)
+function openAiSettings() {
+  aiMenuOpen.value = false
+  window.__nmf?.switchPage?.('settings')
+}
+function downloadAiConversation() {
+  aiMenuOpen.value = false
+  aiPanelRef.value?.downloadConversation?.()
+}
+
+
+const AI_PANEL_MIN_WIDTH = 420
+const AI_PANEL_MAX_WIDTH = 560
+const aiPanelWidth = ref(480)
+let aiResizeState = null
+function startAiPanelResize(event) {
+  aiResizeState = { startX: event.clientX, startWidth: aiPanelWidth.value }
+  document.body.classList.add('ai-panel-resizing')
+  window.addEventListener('pointermove', onAiPanelResize)
+  window.addEventListener('pointerup', stopAiPanelResize)
+  event.preventDefault()
+}
+function onAiPanelResize(event) {
+  if (!aiResizeState) return
+  const next = aiResizeState.startWidth + (aiResizeState.startX - event.clientX)
+  aiPanelWidth.value = Math.min(AI_PANEL_MAX_WIDTH, Math.max(AI_PANEL_MIN_WIDTH, next))
+}
+function stopAiPanelResize() {
+  if (!aiResizeState) return
+  aiResizeState = null
+  document.body.classList.remove('ai-panel-resizing')
+  window.removeEventListener('pointermove', onAiPanelResize)
+  window.removeEventListener('pointerup', stopAiPanelResize)
+  try { localStorage.setItem('notmyfault.aiPanelWidth', String(aiPanelWidth.value)) } catch {}
+}
+
+const aiContextRule = computed(() => {
+  const rule = props.rule
+  if (!rule) return null
+  const nodes = 1 + (rule.preconditions?.length || 0) + (rule.actions?.length || 0)
+  return { name: rule.name || '未命名规则', nodes }
+})
 const nodePositions = ref({})
 const portExpansion = ref({})
 const dataDrag = ref(null)
@@ -1216,6 +1312,15 @@ function observeViewport() {
 onMounted(() => {
   observeViewport()
   window.addEventListener('keydown', onEditorKeydown)
+  aiPanelOpen.value = store.pendingAiPanel === true
+  store.pendingAiPanel = false
+  const savedWidth = Number(localStorage.getItem('notmyfault.aiPanelWidth'))
+  if (savedWidth >= AI_PANEL_MIN_WIDTH && savedWidth <= AI_PANEL_MAX_WIDTH) {
+    aiPanelWidth.value = savedWidth
+  }
+  wideLayoutMedia = window.matchMedia('(min-width: 1360px)')
+  wideLayout.value = wideLayoutMedia.matches
+  wideLayoutMedia.addEventListener?.('change', syncWideLayout)
 })
 onUnmounted(() => {
   resizeObserver?.disconnect()
@@ -1224,6 +1329,8 @@ onUnmounted(() => {
   if (checkerTimer) clearTimeout(checkerTimer)
   checkerSequence++
   window.removeEventListener('keydown', onEditorKeydown)
+  wideLayoutMedia?.removeEventListener?.('change', syncWideLayout)
+  stopAiPanelResize()
 })
 function onEditorKeydown(event) {
   const target = event.target
@@ -1249,7 +1356,7 @@ function onEditorKeydown(event) {
 </script>
 
 <template>
-  <section class="rule-editor-page flow-rule-editor">
+  <section class="rule-editor-page flow-rule-editor" :class="{ 'with-side-panels': hasSidePanels }">
     <header class="rule-editor-head flow-editor-head">
       <div class="rule-editor-identity">
         <button class="btn btn-text rule-back-btn" @click="emit('back')"><span class="material-symbols-outlined">arrow_back</span>全部规则</button>
@@ -1278,6 +1385,10 @@ function onEditorKeydown(event) {
         </button>
       </div>
       <div class="rule-editor-actions">
+        <button v-if="aiEnabled" class="icon-btn" :class="{ 'ai-panel-active': aiPanelOpen }"
+          :title="aiPanelOpen ? '收起 AI 起草' : '打开 AI 起草'" @click="toggleAiPanel">
+          <span class="material-symbols-outlined">auto_awesome</span>
+        </button>
         <div class="rule-history-actions" aria-label="草稿历史">
           <button class="icon-btn" :disabled="!canUndo" title="撤销（Ctrl+Z）" @click="emit('undo')"><span class="material-symbols-outlined">undo</span></button>
           <button class="icon-btn" :disabled="!canRedo" title="重做（Ctrl+Y）" @click="emit('redo')"><span class="material-symbols-outlined">redo</span></button>
@@ -1310,8 +1421,8 @@ function onEditorKeydown(event) {
       </div>
     </Transition>
 
-    <div class="rule-editor-main-grid flex min-h-0 flex-col gap-3 lg:flex-row lg:items-start">
-    <div class="min-w-0 flex-1">
+    <div class="rule-editor-main-grid">
+    <div class="editor-canvas-column">
     <main v-show="editorMode === 'canvas'" class="node-editor-workspace" :class="{ 'editor-mode-active': editorMode === 'canvas' }">
       <section class="node-canvas-panel" aria-label="规则节点画布">
         <div class="node-canvas-toolbar">
@@ -1441,162 +1552,7 @@ function onEditorKeydown(event) {
         <div class="canvas-help"><span class="material-symbols-outlined">pan_tool</span>拖空白处平移 · 从输出端口拖至输入端口绑定数据 · 实线为控制流，虚线为数据流</div>
       </section>
 
-      <Transition name="node-inspector-slide" mode="out-in">
-      <aside v-if="selectedNodeId" :key="selectedNodeId" class="node-inspector" role="complementary" aria-label="节点设置" @pointerdown.stop>
-        <header class="node-inspector-head">
-          <span class="material-symbols-outlined">
-            {{ selectedKind === 'invalid' ? 'error' : selectedKind === 'condition' ? 'alt_route' : selectedKind === 'trigger' ? 'bolt' : selectedKind.includes('precondition') ? 'verified_user' : selectedKind === 'failure-action' ? 'build' : selectedKind === 'action' ? 'play_arrow' : 'add' }}
-          </span>
-          <div><small>节点设置</small><h2>
-            {{ selectedKind === 'invalid' ? '无效条件' : selectedKind === 'condition' ? '逻辑组' : selectedKind === 'trigger' ? '触发条件' : selectedKind === 'precondition' ? '开始前确认' : selectedKind === 'failure-action' ? `补救动作 ${selectedIndex + 1}` : selectedKind === 'action' ? `动作 ${selectedIndex + 1}` : selectedKind === 'add-precondition' ? '添加确认' : '添加动作' }}
-          </h2></div>
-          <button class="icon-btn node-inspector-close" title="关闭设置" @click="selectedNodeId = null"><span class="material-symbols-outlined">close</span></button>
-        </header>
-        <div class="node-inspector-body">
-          <template v-if="selectedKind === 'invalid'">
-            <p class="inspector-lead">这个条件节点格式无效，无法编辑。删除后可从所属逻辑组重新添加。</p>
-            <button class="btn btn-text btn-sm danger-text" @click="removeSelectedCondition"><span class="material-symbols-outlined">delete</span>删除无效节点</button>
-          </template>
-
-          <template v-else-if="selectedKind === 'condition' && selectedConditionNode">
-            <p class="inspector-lead">进入此节点的分支会按这里的逻辑汇合，再继续向右执行。</p>
-            <label class="field"><span class="field-label">组合方式</span>
-              <select v-model="selectedConditionNode.op" class="select" @change="changeConditionOp">
-                <option value="any">任一满足（OR）</option>
-                <option value="all">全部满足（AND）</option>
-              </select>
-            </label>
-            <label v-if="selectedConditionNode.op === 'all'" class="field"><span class="field-label">完成时间窗口（秒，可选）</span>
-              <input v-model.number="selectedConditionNode.within_seconds" type="number" min="1" class="text-field" placeholder="不限制">
-            </label>
-            <div class="inspector-add-grid">
-              <button class="btn btn-tonal btn-sm" :disabled="!triggerKeys.length" @click="requestConditionChild(selectedGraphNode, false)"><span class="material-symbols-outlined">add</span>添加条件</button>
-              <button class="btn btn-tonal btn-sm" :disabled="!triggerKeys.length" @click="requestConditionChild(selectedGraphNode, true)"><span class="material-symbols-outlined">account_tree</span>添加子组</button>
-            </div>
-            <div v-if="selectedConditionPath.length" class="inspector-action-row">
-              <button class="btn btn-text btn-sm" @click="moveSelectedCondition(-1)"><span class="material-symbols-outlined">arrow_upward</span>上移</button>
-              <button class="btn btn-text btn-sm" @click="moveSelectedCondition(1)"><span class="material-symbols-outlined">arrow_downward</span>下移</button>
-              <button class="btn btn-text btn-sm" @click="duplicateSelectedCondition"><span class="material-symbols-outlined">content_copy</span>复制</button>
-              <button class="btn btn-text btn-sm danger-text" @click="removeSelectedCondition"><span class="material-symbols-outlined">delete</span>删除</button>
-            </div>
-            <button v-else class="btn btn-text btn-sm inspector-switch" @click="useSingleEvent"><span class="material-symbols-outlined">filter_1</span>改为单个条件</button>
-          </template>
-
-          <template v-else-if="selectedKind === 'trigger'">
-            <template v-if="isCondition && selectedConditionNode">
-              <p class="inspector-lead">此事件是一个独立分支；它会连接到所属逻辑组。</p>
-              <div class="field"><span class="field-label">触发方式</span>
-                <button class="plugin-type-button" type="button"
-                  @click="openPluginPicker('trigger', { mode: 'replace-condition-trigger', path: selectedConditionPath, title: '更换触发方式' })">
-                  <span class="material-symbols-outlined">bolt</span>
-                  <span>{{ eventName(selectedConditionNode) }}</span>
-                  <span class="material-symbols-outlined">arrow_forward</span>
-                </button>
-              </div>
-              <div class="param-grid"><ParamInput v-for="param in eventParams(selectedConditionNode)" :key="param.name" :def="param" :plugin-id="selectedConditionNode.type" v-model="selectedConditionNode.params[param.name]" /></div>
-              <div class="inspector-action-row">
-                <button class="btn btn-text btn-sm" @click="moveSelectedCondition(-1)"><span class="material-symbols-outlined">arrow_upward</span>上移</button>
-                <button class="btn btn-text btn-sm" @click="moveSelectedCondition(1)"><span class="material-symbols-outlined">arrow_downward</span>下移</button>
-                <button class="btn btn-text btn-sm" @click="duplicateSelectedCondition"><span class="material-symbols-outlined">content_copy</span>复制</button>
-                <button class="btn btn-text btn-sm danger-text" @click="removeSelectedCondition"><span class="material-symbols-outlined">delete</span>删除</button>
-              </div>
-            </template>
-            <template v-else-if="rule.event">
-              <div class="field"><span class="field-label">触发方式</span>
-                <button class="plugin-type-button" type="button"
-                  @click="openPluginPicker('trigger', { mode: 'replace-trigger', title: '更换触发方式' })">
-                  <span class="material-symbols-outlined">bolt</span>
-                  <span>{{ eventName(rule.event) }}</span>
-                  <span class="material-symbols-outlined">arrow_forward</span>
-                </button>
-              </div>
-              <div class="param-grid"><ParamInput v-for="param in eventParams(rule.event)" :key="param.name" :def="param" :plugin-id="rule.event.type" v-model="rule.event.params[param.name]" /></div>
-              <div class="inspector-upgrade-grid">
-                <button class="btn btn-tonal btn-sm" @click="openPluginPicker('trigger', { mode: 'upgrade', op: 'all', title: '添加“并且”条件' })"><span class="material-symbols-outlined">done_all</span>并且满足</button>
-                <button class="btn btn-tonal btn-sm" @click="openPluginPicker('trigger', { mode: 'upgrade', op: 'any', title: '添加“或者”条件' })"><span class="material-symbols-outlined">alt_route</span>或者满足</button>
-              </div>
-            </template>
-            <template v-else>
-              <p class="inspector-lead">选择一个事件作为流程起点。</p>
-              <button class="btn btn-filled inspector-primary" @click="openPluginPicker('trigger', { mode: 'set-trigger', title: '选择触发方式' })">选择触发方式</button>
-            </template>
-          </template>
-
-          <template v-else-if="selectedKind === 'precondition' && selectedPrecondition">
-            <p class="inspector-lead">确认未通过时，引擎会稍后重试。</p>
-            <label class="field"><span class="field-label">确认方式</span>
-              <select class="select" :value="selectedPrecondition.type" @change="changePrecondition(selectedPrecondition, $event.target.value)">
-                <option v-for="key in preconditionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option>
-              </select>
-            </label>
-            <div class="param-grid"><ParamInput v-for="param in actionParams(selectedPrecondition)" :key="param.name" :def="param" :plugin-id="selectedPrecondition.type" v-model="selectedPrecondition.params[param.name]" allow-binding :binding-sources="preconditionBindingSources()" /></div>
-            <button class="btn btn-text btn-sm danger-text inspector-switch" @click="removePrecondition(selectedIndex)"><span class="material-symbols-outlined">delete</span>删除确认</button>
-          </template>
-
-          <template v-else-if="selectedKind === 'action' && selectedAction">
-            <div class="field"><span class="field-label">动作类型</span>
-              <button class="plugin-type-button" type="button"
-                @click="openPluginPicker('action', { mode: 'replace-action', index: selectedIndex, title: '更换动作类型' })">
-                <span class="material-symbols-outlined">play_arrow</span>
-                <span>{{ actionName(selectedAction) }}</span>
-                <span class="material-symbols-outlined">arrow_forward</span>
-              </button>
-            </div>
-            <div class="param-grid"><ParamInput v-for="param in actionParams(selectedAction)" :key="param.name" :def="param" :plugin-id="selectedAction.type" v-model="selectedAction.params[param.name]" allow-binding :binding-sources="actionBindingSources(selectedIndex)" /></div>
-            <div v-if="actionOutputHint(selectedAction, selectedIndex)" class="workflow-output-hint">后续步骤可引用：<code>{{ actionOutputHint(selectedAction, selectedIndex) }}</code></div>
-            <ActionFailureSettings :action="selectedAction" :meta="store.schema.actions[selectedAction.type]" :schema="store.schema.actions"
-              :binding-sources="failureIndex => failureActionBindingSources(selectedIndex, failureIndex)"
-              @add-failure-action="requestAddFailureAction(selectedIndex)"
-              @replace-failure-action="failureIndex => requestReplaceFailureAction(selectedIndex, failureIndex)"
-              @remove-failure-action="failureIndex => removeFailureAction(selectedIndex, failureIndex)"
-              @move-failure-action="(failureIndex, offset) => moveFailureAction(selectedIndex, failureIndex, offset)" />
-            <div class="inspector-action-row">
-              <button class="btn btn-text btn-sm" :disabled="selectedIndex === 0" @click="moveAction(selectedIndex, -1)"><span class="material-symbols-outlined">arrow_back</span>提前</button>
-              <button class="btn btn-text btn-sm" :disabled="selectedIndex === rule.actions.length - 1" @click="moveAction(selectedIndex, 1)">稍后<span class="material-symbols-outlined">arrow_forward</span></button>
-              <button class="btn btn-text btn-sm" @click="duplicateAction(selectedIndex)"><span class="material-symbols-outlined">content_copy</span>复制</button>
-              <button class="btn btn-text btn-sm danger-text" @click="removeAction(selectedIndex)"><span class="material-symbols-outlined">delete</span>删除</button>
-            </div>
-          </template>
-
-          <template v-else-if="selectedKind === 'failure-action' && selectedFailureAction">
-            <p class="inspector-lead">这个动作只会在上方主动作最终失败时执行。</p>
-            <div class="field"><span class="field-label">补救动作类型</span>
-              <button class="plugin-type-button" type="button"
-                @click="requestReplaceFailureAction(selectedGraphNode.parentIndex, selectedIndex)">
-                <span class="material-symbols-outlined">build</span>
-                <span>{{ actionName(selectedFailureAction) }}</span>
-                <span class="material-symbols-outlined">arrow_forward</span>
-              </button>
-            </div>
-            <div class="param-grid"><ParamInput v-for="param in actionParams(selectedFailureAction)" :key="param.name" :def="param" :plugin-id="selectedFailureAction.type" v-model="selectedFailureAction.params[param.name]" allow-binding :binding-sources="failureActionBindingSources(selectedGraphNode.parentIndex, selectedIndex)" /></div>
-            <p class="failure-action-note">{{ selectedFailureAction.on_error === 'continue' ? '如果它也失败，会继续执行剩余补救动作。' : '如果它也失败，会停止剩余补救动作。' }}</p>
-            <button class="btn btn-tonal btn-sm" @click="selectedNodeId = `action-${rule.actions[selectedGraphNode.parentIndex].binding_id}`"><span class="material-symbols-outlined">tune</span>设置重试和失败处理</button>
-            <div class="inspector-action-row">
-              <button class="btn btn-text btn-sm" :disabled="selectedIndex === 0" @click="moveFailureAction(selectedGraphNode.parentIndex, selectedIndex, -1)"><span class="material-symbols-outlined">arrow_back</span>提前</button>
-              <button class="btn btn-text btn-sm" :disabled="selectedIndex === rule.actions[selectedGraphNode.parentIndex].failure_actions.length - 1" @click="moveFailureAction(selectedGraphNode.parentIndex, selectedIndex, 1)">稍后<span class="material-symbols-outlined">arrow_forward</span></button>
-              <button class="btn btn-text btn-sm danger-text" @click="removeFailureAction(selectedGraphNode.parentIndex, selectedIndex)"><span class="material-symbols-outlined">delete</span>删除</button>
-            </div>
-          </template>
-
-          <template v-else-if="selectedKind === 'add-precondition'">
-            <p class="inspector-lead">在执行动作前增加一项确认。</p>
-            <label class="field"><span class="field-label">确认方式</span>
-              <select v-model="newPreconditionType" class="select"><option value="" disabled>选择确认方式…</option><option v-for="key in preconditionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option></select>
-            </label>
-            <button class="btn btn-filled inspector-primary" :disabled="!newPreconditionType" @click="addPrecondition"><span class="material-symbols-outlined">add</span>添加确认</button>
-          </template>
-
-          <template v-else>
-            <p class="inspector-lead">选择动作并把它接到流程末尾。</p>
-            <label class="field"><span class="field-label">动作类型</span>
-              <select v-model="newActionType" class="select"><option value="" disabled>选择动作…</option><option v-for="key in actionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option></select>
-            </label>
-            <button class="btn btn-filled inspector-primary" :disabled="!newActionType" @click="addAction"><span class="material-symbols-outlined">add</span>添加动作</button>
-          </template>
-        </div>
-      </aside>
-      </Transition>
-    </main>
+          </main>
 
     <main v-show="editorMode === 'form'" class="automation-flow classic-rule-editor" :class="{ 'editor-mode-active': editorMode === 'form' }">
       <section class="automation-stage stage-when">
@@ -1710,6 +1666,187 @@ function onEditorKeydown(event) {
       </div>
     </footer>
     </div>
+
+    <Transition name="node-inspector-slide" mode="out-in">
+        <aside v-if="selectedNodeId && editorMode === 'canvas'" :key="selectedNodeId" class="node-inspector" role="complementary" aria-label="节点设置" @pointerdown.stop>
+          <header class="node-inspector-head">
+            <span class="material-symbols-outlined">
+              {{ selectedKind === 'invalid' ? 'error' : selectedKind === 'condition' ? 'alt_route' : selectedKind === 'trigger' ? 'bolt' : selectedKind.includes('precondition') ? 'verified_user' : selectedKind === 'failure-action' ? 'build' : selectedKind === 'action' ? 'play_arrow' : 'add' }}
+            </span>
+            <div><small>节点设置</small><h2>
+              {{ selectedKind === 'invalid' ? '无效条件' : selectedKind === 'condition' ? '逻辑组' : selectedKind === 'trigger' ? '触发条件' : selectedKind === 'precondition' ? '开始前确认' : selectedKind === 'failure-action' ? `补救动作 ${selectedIndex + 1}` : selectedKind === 'action' ? `动作 ${selectedIndex + 1}` : selectedKind === 'add-precondition' ? '添加确认' : '添加动作' }}
+            </h2></div>
+            <button class="icon-btn node-inspector-close" title="关闭设置" @click="selectedNodeId = null"><span class="material-symbols-outlined">close</span></button>
+          </header>
+          <div class="node-inspector-body">
+            <template v-if="selectedKind === 'invalid'">
+              <p class="inspector-lead">这个条件节点格式无效，无法编辑。删除后可从所属逻辑组重新添加。</p>
+              <button class="btn btn-text btn-sm danger-text" @click="removeSelectedCondition"><span class="material-symbols-outlined">delete</span>删除无效节点</button>
+            </template>
+
+            <template v-else-if="selectedKind === 'condition' && selectedConditionNode">
+              <p class="inspector-lead">进入此节点的分支会按这里的逻辑汇合，再继续向右执行。</p>
+              <label class="field"><span class="field-label">组合方式</span>
+                <select v-model="selectedConditionNode.op" class="select" @change="changeConditionOp">
+                  <option value="any">任一满足（OR）</option>
+                  <option value="all">全部满足（AND）</option>
+                </select>
+              </label>
+              <label v-if="selectedConditionNode.op === 'all'" class="field"><span class="field-label">完成时间窗口（秒，可选）</span>
+                <input v-model.number="selectedConditionNode.within_seconds" type="number" min="1" class="text-field" placeholder="不限制">
+              </label>
+              <div class="inspector-add-grid">
+                <button class="btn btn-tonal btn-sm" :disabled="!triggerKeys.length" @click="requestConditionChild(selectedGraphNode, false)"><span class="material-symbols-outlined">add</span>添加条件</button>
+                <button class="btn btn-tonal btn-sm" :disabled="!triggerKeys.length" @click="requestConditionChild(selectedGraphNode, true)"><span class="material-symbols-outlined">account_tree</span>添加子组</button>
+              </div>
+              <div v-if="selectedConditionPath.length" class="inspector-action-row">
+                <button class="btn btn-text btn-sm" @click="moveSelectedCondition(-1)"><span class="material-symbols-outlined">arrow_upward</span>上移</button>
+                <button class="btn btn-text btn-sm" @click="moveSelectedCondition(1)"><span class="material-symbols-outlined">arrow_downward</span>下移</button>
+                <button class="btn btn-text btn-sm" @click="duplicateSelectedCondition"><span class="material-symbols-outlined">content_copy</span>复制</button>
+                <button class="btn btn-text btn-sm danger-text" @click="removeSelectedCondition"><span class="material-symbols-outlined">delete</span>删除</button>
+              </div>
+              <button v-else class="btn btn-text btn-sm inspector-switch" @click="useSingleEvent"><span class="material-symbols-outlined">filter_1</span>改为单个条件</button>
+            </template>
+
+            <template v-else-if="selectedKind === 'trigger'">
+              <template v-if="isCondition && selectedConditionNode">
+                <p class="inspector-lead">此事件是一个独立分支；它会连接到所属逻辑组。</p>
+                <div class="field"><span class="field-label">触发方式</span>
+                  <button class="plugin-type-button" type="button"
+                    @click="openPluginPicker('trigger', { mode: 'replace-condition-trigger', path: selectedConditionPath, title: '更换触发方式' })">
+                    <span class="material-symbols-outlined">bolt</span>
+                    <span>{{ eventName(selectedConditionNode) }}</span>
+                    <span class="material-symbols-outlined">arrow_forward</span>
+                  </button>
+                </div>
+                <div class="param-grid"><ParamInput v-for="param in eventParams(selectedConditionNode)" :key="param.name" :def="param" :plugin-id="selectedConditionNode.type" v-model="selectedConditionNode.params[param.name]" /></div>
+                <div class="inspector-action-row">
+                  <button class="btn btn-text btn-sm" @click="moveSelectedCondition(-1)"><span class="material-symbols-outlined">arrow_upward</span>上移</button>
+                  <button class="btn btn-text btn-sm" @click="moveSelectedCondition(1)"><span class="material-symbols-outlined">arrow_downward</span>下移</button>
+                  <button class="btn btn-text btn-sm" @click="duplicateSelectedCondition"><span class="material-symbols-outlined">content_copy</span>复制</button>
+                  <button class="btn btn-text btn-sm danger-text" @click="removeSelectedCondition"><span class="material-symbols-outlined">delete</span>删除</button>
+                </div>
+              </template>
+              <template v-else-if="rule.event">
+                <div class="field"><span class="field-label">触发方式</span>
+                  <button class="plugin-type-button" type="button"
+                    @click="openPluginPicker('trigger', { mode: 'replace-trigger', title: '更换触发方式' })">
+                    <span class="material-symbols-outlined">bolt</span>
+                    <span>{{ eventName(rule.event) }}</span>
+                    <span class="material-symbols-outlined">arrow_forward</span>
+                  </button>
+                </div>
+                <div class="param-grid"><ParamInput v-for="param in eventParams(rule.event)" :key="param.name" :def="param" :plugin-id="rule.event.type" v-model="rule.event.params[param.name]" /></div>
+                <div class="inspector-upgrade-grid">
+                  <button class="btn btn-tonal btn-sm" @click="openPluginPicker('trigger', { mode: 'upgrade', op: 'all', title: '添加“并且”条件' })"><span class="material-symbols-outlined">done_all</span>并且满足</button>
+                  <button class="btn btn-tonal btn-sm" @click="openPluginPicker('trigger', { mode: 'upgrade', op: 'any', title: '添加“或者”条件' })"><span class="material-symbols-outlined">alt_route</span>或者满足</button>
+                </div>
+              </template>
+              <template v-else>
+                <p class="inspector-lead">选择一个事件作为流程起点。</p>
+                <button class="btn btn-filled inspector-primary" @click="openPluginPicker('trigger', { mode: 'set-trigger', title: '选择触发方式' })">选择触发方式</button>
+              </template>
+            </template>
+
+            <template v-else-if="selectedKind === 'precondition' && selectedPrecondition">
+              <p class="inspector-lead">确认未通过时，引擎会稍后重试。</p>
+              <label class="field"><span class="field-label">确认方式</span>
+                <select class="select" :value="selectedPrecondition.type" @change="changePrecondition(selectedPrecondition, $event.target.value)">
+                  <option v-for="key in preconditionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option>
+                </select>
+              </label>
+              <div class="param-grid"><ParamInput v-for="param in actionParams(selectedPrecondition)" :key="param.name" :def="param" :plugin-id="selectedPrecondition.type" v-model="selectedPrecondition.params[param.name]" allow-binding :binding-sources="preconditionBindingSources()" /></div>
+              <button class="btn btn-text btn-sm danger-text inspector-switch" @click="removePrecondition(selectedIndex)"><span class="material-symbols-outlined">delete</span>删除确认</button>
+            </template>
+
+            <template v-else-if="selectedKind === 'action' && selectedAction">
+              <div class="field"><span class="field-label">动作类型</span>
+                <button class="plugin-type-button" type="button"
+                  @click="openPluginPicker('action', { mode: 'replace-action', index: selectedIndex, title: '更换动作类型' })">
+                  <span class="material-symbols-outlined">play_arrow</span>
+                  <span>{{ actionName(selectedAction) }}</span>
+                  <span class="material-symbols-outlined">arrow_forward</span>
+                </button>
+              </div>
+              <div class="param-grid"><ParamInput v-for="param in actionParams(selectedAction)" :key="param.name" :def="param" :plugin-id="selectedAction.type" v-model="selectedAction.params[param.name]" allow-binding :binding-sources="actionBindingSources(selectedIndex)" /></div>
+              <div v-if="actionOutputHint(selectedAction, selectedIndex)" class="workflow-output-hint">后续步骤可引用：<code>{{ actionOutputHint(selectedAction, selectedIndex) }}</code></div>
+              <ActionFailureSettings :action="selectedAction" :meta="store.schema.actions[selectedAction.type]" :schema="store.schema.actions"
+                :binding-sources="failureIndex => failureActionBindingSources(selectedIndex, failureIndex)"
+                @add-failure-action="requestAddFailureAction(selectedIndex)"
+                @replace-failure-action="failureIndex => requestReplaceFailureAction(selectedIndex, failureIndex)"
+                @remove-failure-action="failureIndex => removeFailureAction(selectedIndex, failureIndex)"
+                @move-failure-action="(failureIndex, offset) => moveFailureAction(selectedIndex, failureIndex, offset)" />
+              <div class="inspector-action-row">
+                <button class="btn btn-text btn-sm" :disabled="selectedIndex === 0" @click="moveAction(selectedIndex, -1)"><span class="material-symbols-outlined">arrow_back</span>提前</button>
+                <button class="btn btn-text btn-sm" :disabled="selectedIndex === rule.actions.length - 1" @click="moveAction(selectedIndex, 1)">稍后<span class="material-symbols-outlined">arrow_forward</span></button>
+                <button class="btn btn-text btn-sm" @click="duplicateAction(selectedIndex)"><span class="material-symbols-outlined">content_copy</span>复制</button>
+                <button class="btn btn-text btn-sm danger-text" @click="removeAction(selectedIndex)"><span class="material-symbols-outlined">delete</span>删除</button>
+              </div>
+            </template>
+
+            <template v-else-if="selectedKind === 'failure-action' && selectedFailureAction">
+              <p class="inspector-lead">这个动作只会在上方主动作最终失败时执行。</p>
+              <div class="field"><span class="field-label">补救动作类型</span>
+                <button class="plugin-type-button" type="button"
+                  @click="requestReplaceFailureAction(selectedGraphNode.parentIndex, selectedIndex)">
+                  <span class="material-symbols-outlined">build</span>
+                  <span>{{ actionName(selectedFailureAction) }}</span>
+                  <span class="material-symbols-outlined">arrow_forward</span>
+                </button>
+              </div>
+              <div class="param-grid"><ParamInput v-for="param in actionParams(selectedFailureAction)" :key="param.name" :def="param" :plugin-id="selectedFailureAction.type" v-model="selectedFailureAction.params[param.name]" allow-binding :binding-sources="failureActionBindingSources(selectedGraphNode.parentIndex, selectedIndex)" /></div>
+              <p class="failure-action-note">{{ selectedFailureAction.on_error === 'continue' ? '如果它也失败，会继续执行剩余补救动作。' : '如果它也失败，会停止剩余补救动作。' }}</p>
+              <button class="btn btn-tonal btn-sm" @click="selectedNodeId = `action-${rule.actions[selectedGraphNode.parentIndex].binding_id}`"><span class="material-symbols-outlined">tune</span>设置重试和失败处理</button>
+              <div class="inspector-action-row">
+                <button class="btn btn-text btn-sm" :disabled="selectedIndex === 0" @click="moveFailureAction(selectedGraphNode.parentIndex, selectedIndex, -1)"><span class="material-symbols-outlined">arrow_back</span>提前</button>
+                <button class="btn btn-text btn-sm" :disabled="selectedIndex === rule.actions[selectedGraphNode.parentIndex].failure_actions.length - 1" @click="moveFailureAction(selectedGraphNode.parentIndex, selectedIndex, 1)">稍后<span class="material-symbols-outlined">arrow_forward</span></button>
+                <button class="btn btn-text btn-sm danger-text" @click="removeFailureAction(selectedGraphNode.parentIndex, selectedIndex)"><span class="material-symbols-outlined">delete</span>删除</button>
+              </div>
+            </template>
+
+            <template v-else-if="selectedKind === 'add-precondition'">
+              <p class="inspector-lead">在执行动作前增加一项确认。</p>
+              <label class="field"><span class="field-label">确认方式</span>
+                <select v-model="newPreconditionType" class="select"><option value="" disabled>选择确认方式…</option><option v-for="key in preconditionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option></select>
+              </label>
+              <button class="btn btn-filled inspector-primary" :disabled="!newPreconditionType" @click="addPrecondition"><span class="material-symbols-outlined">add</span>添加确认</button>
+            </template>
+
+            <template v-else>
+              <p class="inspector-lead">选择动作并把它接到流程末尾。</p>
+              <label class="field"><span class="field-label">动作类型</span>
+                <select v-model="newActionType" class="select"><option value="" disabled>选择动作…</option><option v-for="key in actionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option></select>
+              </label>
+              <button class="btn btn-filled inspector-primary" :disabled="!newActionType" @click="addAction"><span class="material-symbols-outlined">add</span>添加动作</button>
+            </template>
+          </div>
+        </aside>
+        </Transition>
+
+    <Transition name="ai-panel-slide">
+      <aside v-if="aiEnabled && aiPanelOpen" class="ai-editor-panel" :style="{ width: aiPanelWidth + 'px' }"
+        role="complementary" aria-label="AI 助手">
+        <div class="ai-panel-resize" title="拖动调整宽度" @pointerdown="startAiPanelResize"></div>
+        <header class="ai-editor-panel-head">
+          <span class="material-symbols-outlined ai-panel-head-icon">auto_awesome</span>
+          <b>AI 助手</b>
+          <div class="flex-1"></div>
+          <button class="icon-btn ai-panel-head-btn" title="新对话" @click="newAiConversation"><span class="material-symbols-outlined">refresh</span></button>
+          <button class="icon-btn ai-panel-head-btn" title="更多" @click="aiMenuOpen = !aiMenuOpen"><span class="material-symbols-outlined">more_vert</span></button>
+          <button class="icon-btn ai-panel-head-btn" title="关闭" @click="toggleAiPanel"><span class="material-symbols-outlined">close</span></button>
+        </header>
+        <Transition name="ai-msg">
+          <div v-if="aiMenuOpen" class="ai-panel-menu-backdrop" @click="aiMenuOpen = false"></div>
+        </Transition>
+        <div v-if="aiMenuOpen" class="ai-panel-menu">
+          <button type="button" @click="openAiSettings"><span class="material-symbols-outlined">settings</span>AI 设置</button>
+          <button type="button" @click="downloadAiConversation"><span class="material-symbols-outlined">download</span>下载对话记录</button>
+        </div>
+        <div class="ai-editor-panel-body">
+          <NaturalDraftPanel ref="aiPanelRef" :context-rule="aiContextRule" :full-rule="rule" @create="onAiDraft" @highlight-node="highlightNodeById" />
+        </div>
+      </aside>
+    </Transition>
 
     </div>
 

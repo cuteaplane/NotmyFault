@@ -1,33 +1,45 @@
 <script setup>
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import MarkdownIt from 'markdown-it'
-import { streamRuleDraftWithAI } from '../lib/api'
+import { apiWrite, getSchema, loadPlugins, streamRuleDraftWithAI } from '../lib/api'
+import { computeChangeSet } from '../lib/ruleDiff'
+import { confirmDialog, passwordDialog } from '../lib/dialog'
+import { snackbar } from '../lib/notify'
 import { store } from '../lib/store'
 
+const STORAGE_KEY = 'nmf_ai_conversation'
 const MAX_HISTORY_ITEMS = 40
 const MAX_MESSAGE_CHARS = 4000
 const SCROLL_FOLLOW_SLACK = 150
+const SAVE_CONVERSATION_DELAY_MS = 500
+const COMPOSER_MAX_HEIGHT = 120
 
-const emit = defineEmits(['create'])
+const props = defineProps({
+  contextRule: { type: Object, default: null },
+  fullRule: { type: Object, default: null },
+})
+
+const emit = defineEmits(['create', 'highlight-node'])
 const composer = ref('')
 const drafting = ref(false)
+const installingPlugin = ref(false)
 const messages = ref([])
-const pendingConsent = ref(null)
 const conversationRef = ref(null)
 const composerRef = ref(null)
 const userScrolledUp = ref(false)
 let messageId = 0
 let activeController = null
 let activeMessageId = null
-
-const QUICK_CHIPS = [
-  { label: '定时提醒', prompt: '每天早上 9 点提醒我处理邮件' },
-  { label: 'USB 触发', prompt: '插入 USB 设备时自动备份桌面文件夹到 U 盘' },
-  { label: '文件监听', prompt: '某个文件夹有新文件时给我发桌面通知' },
-  { label: '定时脚本', prompt: '每周五 18:00 运行一个 Python 脚本' },
-]
+let saveConversationTimer = 0
 
 const showWelcome = computed(() => messages.value.length === 0)
+
+const contextChipLabel = computed(() => {
+  const rule = props.contextRule
+  if (!rule) return '当前规则'
+  const name = String(rule.name || '未命名规则').trim() || '未命名规则'
+  return `当前规则 · ${name} · ${rule.nodes} 节点`
+})
 
 const markdown = new MarkdownIt({ html: false, linkify: true, breaks: true })
 const defaultLinkOpen = markdown.renderer.rules.link_open || ((tokens, index, options, _env, self) => (
@@ -62,9 +74,81 @@ function proposalId(result) {
   return clipContent(result?.proposal?.id || result?.plugin_id || result?.plugin?.id || result?.id)
 }
 
+function pluginKind(result) {
+  const manifest = result?.manifest ?? result?.plugin?.manifest ?? result?.plugin_source?.manifest
+  const kind = result?.plugin?.kind ?? manifest?.kind ?? result?.proposal?.kind ?? result?.kind
+  return kind === 'trigger' ? 'trigger' : 'action'
+}
+
+function pluginFileId(result) {
+  return (proposalId(result) || 'plugin').replace(/[^a-zA-Z0-9_-]/g, '_')
+}
+
 function assistantMessage(result) {
   return clipContent(result?.message || result?.content || result?.error)
     || '我还需要一点信息，才能继续起草。'
+}
+function formatErrorMessage(rawError) {
+  const code = rawError?.code
+  const text = String(rawError?.error || rawError?.message || rawError?.content || '').trim()
+
+  const httpStatus = text.match(/HTTP\s+(\d{3})/)?.[1]
+    || text.match(/请求失败（(\d{3})）/)?.[1]
+
+  if (code === 'idle_timeout') {
+    return 'AI 服务超过 120 秒未返回内容。\n请检查网络连接，或稍后重试。'
+  }
+
+  if (code === 'consent_required') {
+    return '生成插件源码需要你的明确同意。\n点击提案里的同意按钮后继续。'
+  }
+
+  if (code === 'ai_provider_failed') {
+    return joinErrorParts(text, providerErrorCause(text, httpStatus))
+  }
+
+  return text || 'AI 草稿请求失败，请重试。'
+}
+
+function joinErrorParts(rawText, cause) {
+  // 后端的 ai_provider_failed 文案已经带上同一句前缀。
+  const raw = rawText ? (rawText.startsWith('AI 服务返回错误：') ? rawText : `AI 服务返回错误：${rawText}`) : ''
+  const hint = cause ? `可能的原因：${cause}` : ''
+  return [raw, hint].filter(Boolean).join('\n\n') || 'AI 服务调用失败，请重试。'
+}
+
+function providerErrorCause(text, httpStatus) {
+  if (!text) return 'AI 服务调用失败，请检查 API Key、模型名称和 endpoint 地址。'
+  if (httpStatus === '400') return '请检查接口格式和模型名称，或换一种描述重试。'
+  if (httpStatus === '401') return '请检查 API Key 是否有效，以及是否有当前模型的调用权限。'
+  if (httpStatus === '403') return '当前 API Key 可能没有这个模型的调用权限，请到 AI 服务后台检查授权。'
+  if (httpStatus === '404') return '找不到这个模型或 endpoint 路径，请检查模型名称和接口格式。'
+  if (httpStatus === '405') return '这个 endpoint 不支持当前请求方式，请检查地址末尾的接口路径。'
+  if (httpStatus === '408') return '等待请求超时，请检查网络后重试。'
+  if (httpStatus === '429') return '请求太频繁或额度不足，请稍后重试或检查账户额度。'
+  if (httpStatus && Number(httpStatus) >= 500) return '服务端暂时不可用，请稍后重试。'
+  const paramMatch = text.match(/proposal\.parameters\[(\d+)\]\.(\w+)\s*必须是非空字符串/)
+  if (paramMatch) {
+    const index = parseInt(paramMatch[1], 10) + 1
+    const field = paramMatch[2]
+    const fieldMap = { name: '参数名', type: '参数类型', label: '参数标签' }
+    return `AI 生成的插件提案缺少第 ${index} 个参数的${fieldMap[field] || field}，请换一种说法重试。`
+  }
+  if (text.includes('草稿请求失败') || text.includes('网络') || text.includes('连接')) {
+    return '无法连接 AI 服务，请检查网络、endpoint 地址和防火墙设置。'
+  }
+  return ''
+}
+
+function formatClientError(reason) {
+  if (reason?.name === 'AbortError') return '已停止生成。'
+  if (reason?.name === 'TypeError') return '无法连接草稿服务。\n请检查 Dashboard 和网络状态。'
+  const text = String(reason?.message || '')
+  const httpStatus = text.match(/HTTP\s+(\d{3})/)?.[1] || text.match(/请求失败（(\d{3})）/)?.[1]
+  if (httpStatus) {
+    return formatErrorMessage({ code: 'ai_provider_failed', error: `AI 服务返回 HTTP ${httpStatus}` })
+  }
+  return text || '草稿服务暂时不可用，请重试。'
 }
 
 function triggerName(result) {
@@ -72,10 +156,44 @@ function triggerName(result) {
   return store.schema.triggers?.[triggerType]?.name || triggerType || '还没听清什么时候开始'
 }
 
-function actionNames(result) {
-  return (result?.draft?.actions || []).map(action => (
-    store.schema.actions?.[action.type]?.name || action.type
+function nodeNames(nodes) {
+  return (nodes || []).map(node => (
+    store.schema.actions?.[node.type]?.name || node.type
   )).filter(Boolean)
+}
+
+function actionNames(result) {
+  return nodeNames(result?.draft?.actions)
+}
+
+function preconditionNames(result) {
+  return nodeNames(result?.draft?.preconditions)
+}
+
+function ruleNodeCount(result) {
+  const draft = result?.draft
+  if (!draft) return ''
+  const count = 1 + (draft.preconditions?.length || 0) + (draft.actions?.length || 0)
+  return `${count} 个节点`
+}
+
+function ruleParamRows(result) {
+  const draft = result?.draft
+  if (!draft) return []
+  const rows = []
+  const push = (nodeLabel, params) => {
+    Object.entries(params || {}).forEach(([key, value]) => {
+      rows.push({ node: nodeLabel, key, value: typeof value === 'string' ? value : JSON.stringify(value) })
+    })
+  }
+  push(triggerName(result), draft.event?.params)
+  ;(draft.preconditions || []).forEach((node, index) => {
+    push(`检查 ${index + 1}`, node.params)
+  })
+  ;(draft.actions || []).forEach((node, index) => {
+    push(`动作 ${index + 1}`, node.params)
+  })
+  return rows
 }
 
 function validationIssues(result) {
@@ -103,19 +221,126 @@ function pluginSource(result) {
 function assistantSummary(result) {
   if (result?.result_type === 'assistant_message') return assistantMessage(result)
   if (result?.result_type === 'rule_draft') {
-    const actions = actionNames(result).join('、') || '待补充动作'
-    return clipContent(`已生成规则草稿：当 ${triggerName(result)}，然后 ${actions}。可在编辑器检查。`)
+    const parts = [`当 ${triggerName(result)}`]
+    const checks = preconditionNames(result)
+    if (checks.length) parts.push(`检查 ${checks.join('、')}`)
+    parts.push(`然后 ${actionNames(result).join('、') || '待补充动作'}`)
+    return clipContent(`已生成规则草稿：${parts.join('，')}。`)
   }
   if (result?.result_type === 'plugin_proposal') {
     const id = proposalId(result) || '未命名插件'
     const name = clipContent(result?.proposal?.name) || id
-    return clipContent(`已提出插件能力提案：${name}（${id}）。等待是否同意生成插件草稿。`)
+    return clipContent(`已提出插件能力提案：${name}（${id}）。`)
   }
   if (result?.result_type === 'plugin_source') {
     const id = proposalId(result) || '未命名插件'
-    return `已生成插件草稿 ${id} 供人工审阅。源代码未保存、未签名、未安装、未运行。`
+    return `插件 ${id} 已生成，可直接安装。`
   }
   return assistantMessage(result)
+}
+
+function formatTime(timestamp) {
+  if (!timestamp) return ''
+  const diff = Date.now() - timestamp
+  if (diff < 60000) return '刚刚'
+  if (diff < 3600000) return `${Math.floor(diff / 60000)} 分钟前`
+  const date = new Date(timestamp)
+  const now = new Date()
+  if (date.toDateString() === now.toDateString()) {
+    return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+  }
+  return date.toLocaleString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+}
+
+
+
+function draftEditsCurrentRule(draft) {
+  const rule = props.fullRule
+  if (!rule || !draft) return false
+  const known = new Set()
+  for (const node of rule.actions || []) if (node?.binding_id) known.add(node.binding_id)
+  for (const node of rule.preconditions || []) if (node?.binding_id) known.add(node.binding_id)
+  if (!known.size) return false
+  const shares = list => Array.isArray(list) && list.some(node => node?.binding_id && known.has(node.binding_id))
+  return shares(draft.actions) || shares(draft.preconditions)
+}
+
+function computeMessageChangeSet(message) {
+  if (!message.result || message.result.result_type !== 'rule_draft') return []
+  if (!props.fullRule) return []
+  const draft = message.result.draft
+  if (!draft) return []
+  if (!draftEditsCurrentRule(draft)) return []
+  return computeChangeSet(props.fullRule, draft, store.schema)
+}
+
+function hasHighImpactActions(draft) {
+  if (!draft) return []
+  const issues = []
+  const checkAction = (action, label) => {
+    if (!action) return
+    const meta = store.schema.actions?.[action.type]
+    if ((meta?.permissions || []).includes('admin')) {
+      issues.push(label + ' 需要管理员权限')
+    }
+  }
+  ;(draft.actions || []).forEach((a, i) => checkAction(a, '动作 ' + (i + 1)))
+  return issues
+}
+
+function highlightNode(nodeLabel, target, index) {
+  if (!props.fullRule) return
+  let nodeId = null
+  if (target === 'action' && props.fullRule.actions?.[index]?.binding_id) {
+    nodeId = 'action-' + props.fullRule.actions[index].binding_id
+  } else if (target === 'precondition' && props.fullRule.preconditions?.[index]?.binding_id) {
+    nodeId = 'precondition-' + props.fullRule.preconditions[index].binding_id
+  } else if (target === 'trigger') {
+    nodeId = 'trigger'
+  }
+  if (nodeId) emit('highlight-node', nodeId)
+}
+
+function applyChangeSet(draft) {
+  if (!draft) return
+  emit('create', draft)
+}
+
+function ensureActivity(message) {
+  if (!message.activity) {
+    message.activity = { steps: [], open: true, finished: false, failed: false }
+  }
+  return message.activity
+}
+
+function addActivityStep(message, label, state = 'running') {
+  const activity = ensureActivity(message)
+  if (!activity.steps.some(step => step.label === label)) {
+    activity.steps.push({ label, state })
+  }
+}
+
+function completeActivityStep(message, label) {
+  const step = message.activity?.steps.find(item => item.label === label)
+  if (step) step.state = 'done'
+}
+
+function finishActivity(message, failed = false) {
+  const activity = message.activity
+  if (!activity) return
+  activity.steps.forEach(step => { step.state = 'done' })
+  activity.finished = true
+  activity.failed = failed
+  activity.open = false
+}
+
+function activityHeadline(message) {
+  const activity = message.activity
+  if (!activity) return ''
+  if (activity.failed) return '已中断'
+  if (activity.finished) return `已完成 · ${activity.steps.length} 步`
+  const running = activity.steps.find(step => step.state === 'running')
+  return running ? running.label : '正在处理…'
 }
 
 async function scrollConversation() {
@@ -142,18 +367,25 @@ async function appendMessage(role, content, result = null, state = {}) {
   const message = {
     id: ++messageId,
     role,
+    timestamp: Date.now(),
     content: String(content ?? ''),
     result,
+    error: false,
+    activity: null,
+    requestMessageId: state.requestMessageId || null,
+    retryPrompt: '',
+    retryConsent: null,
     transient: state.transient === true,
     streaming: state.streaming === true,
     stopped: false,
     reasoning: '',
-    reasoningOpen: false,
-    reasoningDone: false,
+    reasoningOpen: true,
+    ruleDetailsOpen: false,
   }
   messages.value.push(message)
   await scrollConversation()
-  return message
+  // 裸对象的后续改动不会触发 Vue 更新，这里返回 messages 数组里的代理对象。
+  return messages.value[messages.value.length - 1]
 }
 
 function messageById(id) {
@@ -168,61 +400,147 @@ function finishResult(message, result) {
       ? assistantMessage(result)
       : assistantSummary(result)
   message.result = result
+  message.error = false
   message.transient = false
   message.streaming = false
-  settleReasoning(message)
+  message.retryPrompt = ''
+  message.retryConsent = null
+  finishActivity(message)
 }
 
-// 思考结束就收起推理区，让答案回到视线中心；用户想回看仍可自己展开。
-function settleReasoning(message) {
-  message.reasoningDone = !!message.reasoning
-  if (message.reasoningDone) message.reasoningOpen = false
-}
-
-function finishError(message, text) {
+function finishError(message, text, retryPrompt = '', retryConsent = null) {
   message.content = text
-  message.result = { result_type: 'assistant_message', message: text }
+  message.result = null
+  message.error = true
   message.transient = false
   message.streaming = false
-  settleReasoning(message)
+  message.retryPrompt = retryPrompt
+  message.retryConsent = retryConsent
+  finishActivity(message, true)
 }
 
 function requestMessages() {
+  const ignoredRequestIds = new Set(messages.value
+    .filter(message => message.role === 'assistant' && (message.error || message.stopped))
+    .map(message => message.requestMessageId)
+    .filter(Boolean))
   return messages.value
     .filter(message => !message.transient && (message.role === 'user' || message.role === 'assistant'))
+    .filter(message => !message.error && !message.stopped && !ignoredRequestIds.has(message.id))
     .map(message => ({ role: message.role, content: clipContent(message.content) }))
     .filter(message => message.content)
     .slice(-MAX_HISTORY_ITEMS)
 }
+function loadConversation() {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY)
+    if (!saved) return
+    const parsed = JSON.parse(saved)
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      messages.value = parsed.map(msg => {
+        const activity = msg.activity
+          ? {
+            ...msg.activity,
+            open: false,
 
-function handleStreamEvent(message, event, markDone) {
-  if (event.type === 'status') return
+            finished: true,
+            failed: msg.activity.finished ? msg.activity.failed : true,
+          }
+          : null
+        return {
+          ...msg,
+          timestamp: msg.timestamp || Date.now(),
+          transient: false,
+          streaming: false,
+          stopped: false,
+          error: msg.error === true,
+          progress: null,
+          activity,
+          requestMessageId: msg.requestMessageId || null,
+          retryPrompt: typeof msg.retryPrompt === 'string' ? msg.retryPrompt : '',
+          retryConsent: msg.error === true ? msg.retryConsent || null : null,
+          ruleDetailsOpen: false,
+          reasoningOpen: false,
+        }
+      })
+      messageId = Math.max(...parsed.map(m => m.id || 0), 0)
+    }
+  } catch (err) {
+    console.warn('加载对话失败:', err)
+  }
+}
+
+function saveConversation() {
+  try {
+    const toSave = messages.value
+      .filter(m => !m.transient)
+      .slice(-MAX_HISTORY_ITEMS)
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave))
+  } catch (err) {
+    console.warn('保存对话失败:', err)
+  }
+}
+
+function scheduleSaveConversation() {
+  window.clearTimeout(saveConversationTimer)
+  saveConversationTimer = window.setTimeout(saveConversation, SAVE_CONVERSATION_DELAY_MS)
+}
+
+function flushSaveConversation() {
+  window.clearTimeout(saveConversationTimer)
+  saveConversationTimer = 0
+  saveConversation()
+}
+
+function handleStreamEvent(message, event, markDone, retryPrompt = '', retryConsent = null) {
+  if (event.type === 'status') {
+    ensureActivity(message)
+    addActivityStep(message, '连接 AI 服务', 'done')
+    return
+  }
   if (event.type === 'reasoning') {
     const delta = String(event.data?.delta ?? '')
     if (delta) {
+      addActivityStep(message, '分析需求', 'running')
       message.reasoning += delta
-      message.reasoningOpen = true
-      message.reasoningDone = false
       void scrollConversation()
+    }
+    return
+  }
+  if (event.type === 'progress') {
+    const phase = event.data?.phase
+    if (phase === 'drafting') {
+      completeActivityStep(message, '分析需求')
+      addActivityStep(message, '生成草稿', 'running')
+    } else if (phase === 'assembled') {
+      completeActivityStep(message, '生成草稿')
+    } else if (phase === 'validating') {
+      completeActivityStep(message, '生成草稿')
+      addActivityStep(message, '校验规则结构', 'running')
     }
     return
   }
   if (event.type === 'text') {
     const delta = String(event.data?.delta ?? '')
     if (delta) {
+      if (message.reasoning && !message.content) message.reasoningOpen = false
+      completeActivityStep(message, '分析需求')
+      addActivityStep(message, '生成回复', 'running')
       message.content += delta
       void scrollConversation()
     }
     return
   }
   if (event.type === 'result') {
+    completeActivityStep(message, '生成回复')
+    completeActivityStep(message, '校验规则结构')
     finishResult(message, event.data)
     void scrollConversation()
     markDone()
     return
   }
   if (event.type === 'error') {
-    finishError(message, assistantMessage(event.data))
+    finishError(message, formatErrorMessage(event.data), retryPrompt, retryConsent)
     void scrollConversation()
     markDone()
     return
@@ -237,8 +555,12 @@ async function sendTurn(content, consent = null) {
   // 自己发言等于回到当下，重新贴住底部。
   userScrolledUp.value = false
   drafting.value = true
-  await appendMessage('user', text)
-  const message = await appendMessage('assistant', '', null, { transient: true, streaming: true })
+  const requestMessage = await appendMessage('user', text)
+  const message = await appendMessage('assistant', '', null, {
+    requestMessageId: requestMessage.id,
+    transient: true,
+    streaming: true,
+  })
   const controller = new AbortController()
   let receivedDone = false
   activeController = controller
@@ -249,20 +571,19 @@ async function sendTurn(content, consent = null) {
       apiKey: store.aiApiKey,
       signal: controller.signal,
       onEvent: event => {
-        if (!controller.signal.aborted) handleStreamEvent(message, event, () => { receivedDone = true })
+        if (!controller.signal.aborted) {
+          handleStreamEvent(message, event, () => { receivedDone = true }, text, consent)
+        }
       },
     })
     if (!controller.signal.aborted && !receivedDone) {
-      finishError(message, '连接已中断，请检查网络后重试。')
+      finishError(message, '连接已中断，请检查网络后重试。', text, consent)
     } else if (!controller.signal.aborted && message.transient) {
-      finishError(message, '草稿服务没有返回结果，请重试。')
+      finishError(message, '草稿服务没有返回结果，请重试。', text, consent)
     }
   } catch (reason) {
     if (!controller.signal.aborted) {
-      const messageText = reason?.name === 'TypeError'
-        ? '连接已中断，请检查网络后重试。'
-        : reason?.message || '草稿服务暂时不可用。'
-      finishError(message, messageText)
+      finishError(message, formatClientError(reason), text, consent)
     }
   } finally {
     if (activeController === controller) {
@@ -272,10 +593,10 @@ async function sendTurn(content, consent = null) {
     }
     if (!controller.signal.aborted) {
       message.streaming = false
-      settleReasoning(message)
+      finishActivity(message, message.error)
       await scrollConversation()
       await nextTick()
-      composerRef.value?.focus()
+      composerRef.value?.focus({ preventScroll: true })
     }
   }
 }
@@ -290,21 +611,58 @@ function stopDrafting() {
   if (message) {
     message.streaming = false
     message.stopped = true
-    settleReasoning(message)
+    message.transient = false
+    finishActivity(message, true)
   }
-  void nextTick(() => composerRef.value?.focus())
+  void nextTick(() => composerRef.value?.focus({ preventScroll: true }))
+}
+
+function isLatestMessage(message) {
+  return messages.value.at(-1)?.id === message.id
+}
+
+async function retryFailedMessage(message) {
+  if (drafting.value || !message.error || !message.retryPrompt || !isLatestMessage(message)) return
+  const failedIndex = messages.value.findIndex(item => item.id === message.id)
+  if (failedIndex < 0) return
+  const requestIndex = messages.value.findIndex(item => item.id === message.requestMessageId)
+  if (requestIndex >= 0 && requestIndex < failedIndex) {
+    messages.value.splice(requestIndex, failedIndex - requestIndex + 1)
+  } else {
+    messages.value.splice(failedIndex, 1)
+  }
+  await sendTurn(message.retryPrompt, message.retryConsent)
 }
 
 // 结束一轮探索后清空重来，避免历史干扰后续起草。
-function clearConversation() {
+async function clearConversation() {
   if (drafting.value) return
   if (!messages.value.length) return
-  if (!window.confirm('清空当前对话？已生成的草稿和插件提案都会消失。')) return
+  if (!await confirmDialog('清空当前对话？', '已生成的草稿和插件提案都会消失。', '清空')) return
   messages.value = []
-  pendingConsent.value = null
+  localStorage.removeItem(STORAGE_KEY)
   userScrolledUp.value = false
-  void nextTick(() => composerRef.value?.focus())
+  void nextTick(() => composerRef.value?.focus({ preventScroll: true }))
 }
+
+async function requestNewConversation() {
+  await clearConversation()
+}
+
+function downloadConversation() {
+  const payload = messages.value
+    .filter(m => !m.transient)
+    .map(({ id, role, timestamp, content, stopped, error }) => ({ id, role, timestamp, content, stopped, error }))
+  if (!payload.length) return
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = 'notmyfault-ai-conversation.json'
+  a.click()
+  URL.revokeObjectURL(a.href)
+}
+
+defineExpose({ requestNewConversation, downloadConversation })
 
 async function sendMessage() {
   const text = clipContent(composer.value)
@@ -319,15 +677,13 @@ function sendChip(prompt) {
   void sendTurn(prompt)
 }
 
-// Auto-grow the textarea as the user types
 function growTextarea() {
   const el = composerRef.value
   if (!el) return
   el.style.height = 'auto'
-  el.style.height = Math.min(el.scrollHeight, 200) + 'px'
+  el.style.height = Math.min(el.scrollHeight, COMPOSER_MAX_HEIGHT) + 'px'
 }
 
-// Enter submits, Shift+Enter inserts newline
 function onComposerKeydown(e) {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault()
@@ -338,24 +694,21 @@ function onComposerKeydown(e) {
 async function approvePluginProposal(result) {
   const id = proposalId(result)
   if (!id || drafting.value) return
-  pendingConsent.value = { plugin_id: id }
-  try {
-    await sendTurn(`我同意生成插件草稿：${id}`, pendingConsent.value)
-  } finally {
-    pendingConsent.value = null
-  }
+  await sendTurn(`我同意生成插件草稿：${id}`, { plugin_id: id })
 }
 
 function openDraft(result) {
   if (result?.draft) emit('create', result.draft)
 }
 
-function downloadFile(filename, text) {
+function _downloadBlob(filename, content, mime = 'text/plain') {
+  const blob = new Blob([content], { type: mime })
+  const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
-  a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' }))
+  a.href = url
   a.download = filename
   a.click()
-  URL.revokeObjectURL(a.href)
+  URL.revokeObjectURL(url)
 }
 
 function downloadPluginDraft(result) {
@@ -363,246 +716,503 @@ function downloadPluginDraft(result) {
   const source = result?.source_code ?? result?.plugin?.source_code ?? result?.plugin?.source
     ?? result?.plugin_source?.source_code ?? result?.plugin_source?.source
     ?? result?.code ?? (result?.source === 'ai' ? '' : result?.source)
-  const id = (manifest?.id || 'plugin').replace(/[^a-zA-Z0-9_-]/g, '_')
-  if (manifest) downloadFile(`${id}.action.json`, JSON.stringify(manifest, null, 2))
-  if (source) downloadFile(`${id}.action.py`, String(source))
+  const id = pluginFileId(result)
+  const kind = pluginKind(result)
+  if (manifest) _downloadBlob(`${id}.${kind}.json`, JSON.stringify(manifest, null, 2))
+  if (source) _downloadBlob(`${id}.${kind}.py`, String(source))
 }
 
+async function requestPluginInstall(payload) {
+  const r = await apiWrite('/api/plugins/install-source', 'POST', payload)
+  return await r.json()
+}
+
+async function installPluginDraft(result) {
+  if (installingPlugin.value) return
+  const plugin = result?.plugin || {}
+  const manifest = plugin.manifest ?? result?.manifest
+  const source = plugin.source ?? pluginSource(result)
+  const kind = pluginKind(result)
+  const id = plugin.id || proposalId(result)
+  if (!manifest || !source || !id) return
+  installingPlugin.value = true
+  try {
+    let data = await requestPluginInstall({ kind, manifest, source, plugin_id: id })
+    if (!data.ok && data.code === 'key_password_required') {
+      const password = await passwordDialog('需要签名私钥密码', '安装 AI 插件需要用你的签名私钥签名。')
+      if (typeof password !== 'string') return
+      data = await requestPluginInstall({ kind, manifest, source, plugin_id: id, password })
+    }
+    if (!data.ok) {
+      snackbar(data.error || '插件安装失败')
+      return
+    }
+    snackbar(`插件 ${id} 已安装，重启引擎后生效`)
+    const [plugins, schema] = await Promise.all([loadPlugins(), getSchema()])
+    store.pluginsData = plugins
+    store.schema = schema
+  } catch (error) {
+    snackbar(error?.message || '插件安装失败')
+  } finally {
+    installingPlugin.value = false
+  }
+}
+
+watch(messages, scheduleSaveConversation, { deep: true })
+
 onMounted(async () => {
+  loadConversation()
   await nextTick()
-  composerRef.value?.focus()
+  composerRef.value?.focus({ preventScroll: true })
+  void scrollConversation()
 })
-onUnmounted(() => { activeController?.abort() })
+onUnmounted(() => {
+  activeController?.abort()
+  flushSaveConversation()
+})
 </script>
 
 <template>
-  <section class="ai-draft-panel flex h-full min-h-0 flex-col gap-3">
+  <section class="ai-draft-panel natural-draft-panel flex h-full min-h-0 flex-1 flex-col">
 
-    <!-- Welcome / empty state -->
-    <transition name="ai-welcome">
-      <div v-if="showWelcome" class="ai-welcome-state flex min-h-0 flex-1 flex-col items-center justify-center gap-5 pb-4">
-        <span class="material-symbols-outlined ai-welcome-icon">auto_awesome</span>
-        <div class="text-center">
-          <p class="text-title-m text-on-surface">用自然语言描述你想自动化的事</p>
-          <p class="mt-1 text-body-s text-on-surface-variant">AI 会把它变成可直接送进编辑器的规则草稿，或提出缺少的插件能力提案。</p>
-        </div>
-        <div class="ai-quick-chips" role="list" aria-label="快速开始">
-          <button
-            v-for="chip in QUICK_CHIPS"
-            :key="chip.label"
-            type="button"
-            class="ai-quick-chip"
-            role="listitem"
-            :disabled="drafting"
-            @click="sendChip(chip.prompt)"
-          >
-            <span class="material-symbols-outlined">chevron_right</span>{{ chip.label }}
-          </button>
-        </div>
+    <div v-if="showWelcome" class="ai-empty ai-empty-enter flex min-h-0 flex-1 flex-col items-center justify-center gap-1.5 px-6 text-center">
+      <span class="material-symbols-outlined text-[36px]! text-primary">auto_awesome</span>
+      <p class="m-0 mt-2 text-title-m text-on-surface">AI 自动化助手</p>
+      <p class="m-0 text-body-s text-on-surface-variant">用自然语言创建、修改或检查当前自动化规则。</p>
+      <div class="mt-4 flex flex-wrap justify-center gap-2">
+        <button type="button" class="ai-empty-chip" :disabled="drafting" @click="sendChip('帮我创建一条新的自动化规则')">创建自动化</button>
+        <button type="button" class="ai-empty-chip" :disabled="drafting" @click="sendChip('检查当前规则是否存在问题')">检查当前规则</button>
       </div>
-    </transition>
-
-    <!-- Conversation -->
-    <div v-if="!showWelcome && messages.length > 0" class="ai-conversation-header">
-      <button v-if="userScrolledUp" class="btn btn-text btn-sm" type="button" @click="jumpToLatest">
-        <span class="material-symbols-outlined">arrow_downward</span>回到底部
-      </button>
-      <div class="flex-1"></div>
-      <button class="btn btn-text btn-sm" type="button" :disabled="drafting" @click="clearConversation">
-        <span class="material-symbols-outlined">refresh</span>新对话
-      </button>
+      <p class="m-0 mt-4 text-label-s text-on-surface-variant opacity-70">例如：打开 PowerPoint 时将系统音量设为 30%</p>
     </div>
 
-    <div v-if="!showWelcome" ref="conversationRef"
-      class="natural-draft-conversation flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto pr-1!"
-      role="log" tabindex="0" :aria-busy="drafting" aria-live="polite" aria-label="AI 草稿对话"
-      @scroll.passive="onConversationScroll">
-      <article v-for="message in messages" :key="message.id" class="natural-draft-message min-w-0"
-        :class="message.role === 'user' ? 'self-end max-w-4/5 rounded-md bg-primary-container px-3! py-2! text-body-m text-on-primary-container' : 'w-full'">
-        <div v-if="message.role === 'assistant' && message.reasoning"
-          class="natural-draft-reasoning mb-2 rounded-md bg-surface-c"
-          :class="{ 'reasoning-open': message.reasoningOpen }">
-          <button
-            type="button"
-            class="reasoning-toggle flex w-full cursor-pointer items-center gap-2 px-3! py-2! text-label-m text-on-surface-variant"
-            :aria-expanded="String(message.reasoningOpen)"
-            @click="message.reasoningOpen = !message.reasoningOpen"
-          >
-            <span class="material-symbols-outlined text-body-l">psychology</span>
-            <span class="min-w-0 flex-1 text-left">{{ message.reasoningDone ? '思考过程' : '正在思考…' }}</span>
-            <span class="material-symbols-outlined reasoning-chevron text-body-l">expand_more</span>
-          </button>
-          <div class="reasoning-body">
-            <p class="px-3! pb-2! whitespace-pre-wrap break-words text-body-s text-on-surface-variant">{{ message.reasoning }}</p>
-          </div>
-        </div>
-        <template v-if="message.role === 'user'">
-          <b class="block text-label-s">你</b>
-          <p class="mt-1! whitespace-pre-wrap break-words">{{ message.content }}</p>
-        </template>
+    <div v-else class="relative flex min-h-0 flex-1 flex-col">
+      <div ref="conversationRef"
+        class="natural-draft-conversation min-h-0 flex-1 overflow-y-auto"
+        role="log" tabindex="0" :aria-busy="drafting" aria-live="polite" aria-label="AI 对话"
+        @scroll.passive="onConversationScroll">
+        <TransitionGroup name="ai-msg" tag="div" class="ai-turns">
+          <article v-for="message in messages" :key="message.id" class="ai-message" :class="message.role">
+            <template v-if="message.role === 'user'">
+              <div class="ai-meta user"><span>你</span><span class="ai-meta-time">{{ formatTime(message.timestamp) }}</span></div>
+              <div class="ai-user-bubble">{{ message.content }}</div>
+            </template>
 
-        <template v-else-if="message.result?.result_type === 'rule_draft'">
-          <div class="natural-draft-result rounded-md bg-surface-c-low p-3!">
-            <div class="natural-draft-result-head">
-              <div><small>我理解的是</small><b>{{ message.result.draft ? '先按这个结构起草' : '还缺少关键信息' }}</b></div>
-              <span class="chip">AI 候选草稿</span>
-            </div>
-            <div class="natural-draft-sentence">
-              <span><i>当</i><b class="min-w-0 break-words overflow-visible! text-clip! whitespace-normal!">{{ triggerName(message.result) }}</b></span>
-              <span class="material-symbols-outlined">arrow_forward</span>
-              <span><i>然后</i><b class="min-w-0 break-words overflow-visible! text-clip! whitespace-normal!">{{ actionNames(message.result).length ? actionNames(message.result).join('、') : '还没听清要做什么' }}</b></span>
-            </div>
-            <div v-if="validationIssues(message.result).length" class="natural-draft-check">
-              <b>规则检查还发现：</b>
-              <ul>
-                <li v-for="issue in validationIssues(message.result)" :key="`${issue.code}-${issue.message}`">
-                  <span class="material-symbols-outlined">{{ issue.severity === 'warning' ? 'warning' : 'error' }}</span>{{ issue.message }}
-                </li>
-              </ul>
-            </div>
-            <footer>
-              <small>这里不会替你做决定。所有参数仍会经过普通规则检查。</small>
-              <button class="btn btn-tonal" type="button" :disabled="!message.result.draft" @click="openDraft(message.result)">
-                进编辑器检查<span class="material-symbols-outlined">arrow_forward</span>
-              </button>
-            </footer>
-          </div>
-        </template>
-
-        <template v-else-if="message.result?.result_type === 'plugin_proposal' && message.result.proposal">
-          <div class="natural-draft-result rounded-md bg-surface-c-low p-3!">
-            <div class="natural-draft-result-head">
-              <div>
-                <small>当前插件目录缺少所需能力</small>
-                <h3><b>只读能力提案：{{ message.result.proposal.name }}</b></h3>
+            <template v-else>
+              <div class="ai-meta assistant">
+                <span class="material-symbols-outlined">auto_awesome</span>
+                <span>AI 助手</span>
+                <span class="ai-meta-time">{{ formatTime(message.timestamp) }}</span>
               </div>
-              <span class="chip">未安装 · 仅供人工评审</span>
-            </div>
-            <ul class="natural-draft-notes" aria-label="能力提案基本信息">
-              <li><span class="material-symbols-outlined">extension</span><span class="min-w-0 break-words"><b>类型：</b>{{ message.result.proposal.kind === 'trigger' ? '触发器' : '动作' }}</span></li>
-              <li><span class="material-symbols-outlined">fingerprint</span><span class="min-w-0 break-all"><b>插件 ID：</b>{{ proposalId(message.result) }}</span></li>
-              <li v-if="message.result.proposal.description"><span class="material-symbols-outlined">description</span><span class="min-w-0 break-words"><b>说明：</b>{{ message.result.proposal.description }}</span></li>
-            </ul>
-            <div v-if="message.result.proposal.permissions?.length" class="natural-draft-missing" aria-label="已知权限">
-              <b>已知权限：</b>
-              <span v-for="permission in message.result.proposal.permissions" :key="permission" class="break-all">{{ permission }}</span>
-            </div>
-            <section v-if="message.result.proposal.parameters?.length" class="natural-draft-check">
-              <h4>参数：</h4>
-              <ul>
-                <li v-for="parameter in message.result.proposal.parameters" :key="parameter.name">
-                  <span class="material-symbols-outlined">tune</span><span class="min-w-0 break-words"><b>{{ parameter.label || parameter.name }}</b>（{{ parameter.type }}）</span>
-                </li>
-              </ul>
-            </section>
-            <section v-if="message.result.proposal.outputs?.length" class="natural-draft-check">
-              <h4>输出：</h4>
-              <ul>
-                <li v-for="output in message.result.proposal.outputs" :key="output.name">
-                  <span class="material-symbols-outlined">output</span><span class="min-w-0 break-words"><b>{{ output.label || output.name }}</b>（{{ output.type }}）</span>
-                </li>
-              </ul>
-            </section>
-            <section v-if="message.result.proposal.rationale" class="natural-draft-check">
-              <h4>提出理由：</h4>
-              <ul><li><span class="material-symbols-outlined">info</span><span class="min-w-0 break-words">{{ message.result.proposal.rationale }}</span></li></ul>
-            </section>
-            <section v-if="message.result.proposal.acceptance_criteria?.length" class="natural-draft-check">
-              <h4>验收标准：</h4>
-              <ul>
-                <li v-for="criterion in message.result.proposal.acceptance_criteria" :key="criterion">
-                  <span class="material-symbols-outlined">check_circle</span><span class="min-w-0 break-words">{{ criterion }}</span>
-                </li>
-              </ul>
-            </section>
-            <footer>
-              <small>这只是能力提案：未安装、未签名、未保存，也不会运行；必须先经人工评审。</small>
-              <button class="btn btn-tonal" type="button" :disabled="drafting || !proposalId(message.result)"
-                @click="approvePluginProposal(message.result)">
-                同意生成插件草稿<span class="material-symbols-outlined">arrow_forward</span>
-              </button>
-            </footer>
-          </div>
-        </template>
 
-        <template v-else-if="message.result?.result_type === 'plugin_source'">
-          <div class="natural-draft-result natural-draft-source rounded-md bg-surface-c-low p-3!">
-            <div class="natural-draft-result-head">
-              <div>
-                <small>仅供人工审阅</small>
-                <b>插件草稿：{{ proposalId(message.result) || '未命名插件' }}</b>
+              <div v-if="message.error" class="ai-error" role="alert">
+                <div class="ai-error-head"><span class="material-symbols-outlined">warning</span><b>无法生成结果</b></div>
+                <p>{{ message.content }}</p>
+                <button v-if="message.retryPrompt" class="ai-error-retry" type="button"
+                  :disabled="drafting || !isLatestMessage(message)" @click="retryFailedMessage(message)">
+                  <span class="material-symbols-outlined">refresh</span>重新尝试
+                </button>
               </div>
-              <span class="chip break-words">未保存、未签名、未安装、未运行</span>
-            </div>
-            <section class="mt-3! grid gap-2">
-              <h4 class="text-label-m text-on-surface-variant">插件清单</h4>
-              <pre tabindex="0" class="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-surface-c-lowest p-3! font-mono text-body-s text-on-surface">{{ pluginManifest(message.result) }}</pre>
-            </section>
-            <section class="mt-3! grid gap-2">
-              <h4 class="text-label-m text-on-surface-variant">插件源码</h4>
-              <pre tabindex="0" class="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-surface-c-lowest p-3! font-mono text-body-s text-on-surface">{{ pluginSource(message.result) }}</pre>
-            </section>
-            <footer class="mt-3! flex items-center justify-between gap-3">
-              <small class="text-body-s text-on-surface-variant">未保存、未签名、未安装——需人工审阅后自行打包安装。</small>
-              <button class="btn btn-tonal" type="button" @click="downloadPluginDraft(message.result)">
-                <span class="material-symbols-outlined">download</span>下载草稿文件
-              </button>
-            </footer>
-          </div>
-        </template>
 
-        <template v-else>
-          <div class="ai-msg-bubble rounded-md bg-surface-c-low px-3! py-2! text-body-m text-on-surface">
-            <b class="block text-label-s text-primary">AI</b>
-            <!-- Waiting for first token -->
-            <div v-if="message.streaming && !message.content" class="ai-typing-dots mt-2!" aria-label="AI 正在思考">
-              <span></span><span></span><span></span>
-            </div>
-            <!-- Streaming: plain text + blinking cursor -->
-            <div v-else-if="message.streaming && message.content"
-              class="mt-1! whitespace-pre-wrap break-words text-body-m">{{ message.content }}<span class="ai-stream-cursor" aria-hidden="true"></span></div>
-            <!-- Finished: rendered markdown -->
-            <div v-else-if="message.content"
-              class="natural-draft-markdown mt-1! break-words"
-              v-html="renderMarkdown(message.content)"></div>
-            <p v-if="message.stopped" class="mt-2! flex items-center gap-1 text-body-s text-on-surface-variant">
-              <span class="material-symbols-outlined" style="font-size:15px">stop_circle</span>已停止
-            </p>
-          </div>
-        </template>
-      </article>
+              <template v-else>
+                <div v-if="message.activity && message.activity.steps.length" class="ai-activity"
+                  :class="{ open: message.activity.open || !message.activity.finished, failed: message.activity.failed, finished: message.activity.finished }">
+                  <button type="button" class="ai-activity-toggle"
+                    :aria-expanded="String(message.activity.open)"
+                    @click="message.activity.open = !message.activity.open">
+                    <span v-if="message.activity.failed" class="material-symbols-outlined">error</span>
+                    <span v-else-if="message.activity.finished" class="material-symbols-outlined">check_circle</span>
+                    <span v-else class="material-symbols-outlined ai-activity-spin">progress_activity</span>
+                    <span>{{ activityHeadline(message) }}</span>
+                    <span v-if="message.activity.finished" class="material-symbols-outlined ai-activity-chevron">expand_more</span>
+                  </button>
+                  <div class="ai-activity-body">
+                    <div class="ai-activity-steps">
+                      <div v-for="step in message.activity.steps" :key="step.label" class="ai-activity-step" :class="step.state">
+                        <span v-if="step.state === 'done'" class="material-symbols-outlined">check</span>
+                        <span v-else class="material-symbols-outlined ai-activity-spin">progress_activity</span>
+                        <span>{{ step.label }}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div v-if="message.reasoning" class="ai-reasoning" :class="{ open: message.reasoningOpen }">
+                  <button type="button" class="ai-reasoning-toggle"
+                    :aria-expanded="String(message.reasoningOpen)"
+                    @click="message.reasoningOpen = !message.reasoningOpen">
+                    <span class="material-symbols-outlined">psychology</span>
+                    <span class="ai-reasoning-label">思考过程</span>
+                    <span class="material-symbols-outlined ai-reasoning-chevron">expand_more</span>
+                  </button>
+                  <div class="ai-reasoning-body">
+                    <div class="ai-reasoning-scroll">
+                      <p class="ai-reasoning-text">{{ message.reasoning }}</p>
+                    </div>
+                  </div>
+                </div>
+
+                <div v-if="message.result?.result_type === 'rule_draft'" class="ai-rule-card">
+                  <template v-if="computeMessageChangeSet(message).length">
+                    <div class="ai-rule-head">
+                      <span class="ai-card-kicker"><span class="material-symbols-outlined">difference</span>建议更改</span>
+                      <span class="ai-rule-counts">{{ computeMessageChangeSet(message).length }} 项修改</span>
+                    </div>
+                    <div class="ai-changeset-list">
+                      <div v-for="(item, ci) in computeMessageChangeSet(message)" :key="ci"
+                        class="ai-changeset-item" :class="'ai-changeset-' + item.op"
+                        :clickable="item.target === 'action' || item.target === 'precondition' || item.target === 'trigger'"
+                        @click="highlightNode(item.label, item.target, item.index)">
+                        <span class="ai-changeset-op">{{ item.op === 'add' ? 'A' : item.op === 'delete' ? 'D' : 'M' }}</span>
+                        <span class="ai-changeset-label">{{ item.label }}</span>
+                        <span v-if="item.detail" class="ai-changeset-detail">{{ item.detail }}</span>
+                      </div>
+                    </div>
+                    <div v-if="hasHighImpactActions(message.result.draft).length" class="ai-security-warn">
+                      <span class="material-symbols-outlined">shield</span>
+                      <div>
+                        <b>此修改包含需要额外确认的操作</b>
+                        <ul><li v-for="(w, wi) in hasHighImpactActions(message.result.draft)" :key="wi">{{ w }}</li></ul>
+                        <small>请在应用前检查生成内容。</small>
+                      </div>
+                    </div>
+                    <div class="ai-rule-foot">
+                      <button class="btn btn-text btn-sm" type="button" @click="message.ruleDetailsOpen = !message.ruleDetailsOpen">
+                        {{ message.ruleDetailsOpen ? '收起详情' : '查看详情' }}
+                      </button>
+                      <button class="btn btn-tonal btn-sm" type="button" :disabled="!message.result.draft" @click="applyChangeSet(message.result.draft)">
+                        全部应用<span class="material-symbols-outlined">arrow_forward</span>
+                      </button>
+                    </div>
+                  </template>
+                  <template v-else>
+                    <div class="ai-rule-head">
+                      <span class="ai-card-kicker"><span class="material-symbols-outlined">layers</span>候选规则</span>
+                      <span class="ai-rule-counts">{{ ruleNodeCount(message.result) }}</span>
+                    </div>
+                    <div class="ai-rule-flow">
+                      <div class="ai-mini-node">
+                        <span class="material-symbols-outlined">bolt</span>
+                        <span class="min-w-0 flex-1 truncate">{{ triggerName(message.result) }}</span>
+                      </div>
+                      <div v-for="name in preconditionNames(message.result)" :key="`check-${name}`" class="ai-mini-node">
+                        <span class="material-symbols-outlined">verified_user</span>
+                        <span class="min-w-0 flex-1 truncate">{{ name }}</span>
+                      </div>
+                      <div v-for="name in actionNames(message.result)" :key="`action-${name}`" class="ai-mini-node">
+                        <span class="material-symbols-outlined">play_arrow</span>
+                        <span class="min-w-0 flex-1 truncate">{{ name }}</span>
+                      </div>
+                    </div>
+                    <div class="ai-rule-foot">
+                      <button class="btn btn-text btn-sm" type="button" @click="message.ruleDetailsOpen = !message.ruleDetailsOpen">
+                        {{ message.ruleDetailsOpen ? '收起参数' : '查看参数' }}
+                      </button>
+                      <button class="btn btn-tonal btn-sm" type="button" :disabled="!message.result.draft" @click="openDraft(message.result)">
+                        应用到编辑器<span class="material-symbols-outlined">arrow_forward</span>
+                      </button>
+                    </div>
+                  </template>
+                  <div v-if="validationIssues(message.result).length" class="ai-issues">
+                    <div v-for="issue in validationIssues(message.result)" :key="`${issue.code}-${issue.message}`" class="ai-issue">
+                      <span class="material-symbols-outlined">{{ issue.severity === 'warning' ? 'warning' : 'error' }}</span>{{ issue.message }}
+                    </div>
+                  </div>
+                  <div v-if="message.ruleDetailsOpen" class="ai-rule-params">
+                    <div v-for="row in ruleParamRows(message.result)" :key="`${row.node}-${row.key}`" class="ai-rule-param-row">
+                      <span>{{ row.node }}</span>
+                      <code>{{ row.key }} = {{ row.value }}</code>
+                    </div>
+                  </div>
+                </div>
+
+                <div v-else-if="message.result?.result_type === 'plugin_proposal' && message.result.proposal" class="ai-card">
+                  <div class="ai-card-head">
+                    <span class="material-symbols-outlined">extension</span>
+                    <div class="min-w-0 flex-1">
+                      <b class="ai-card-title">{{ message.result.proposal.name }}</b>
+                      <small class="ai-card-kicker">缺少能力提案 · {{ message.result.proposal.kind === 'trigger' ? '触发器' : '动作' }}</small>
+                    </div>
+                  </div>
+                  <p v-if="message.result.proposal.description" class="ai-card-desc">{{ message.result.proposal.description }}</p>
+                  <div class="ai-card-rows">
+                    <div class="ai-row"><span><span class="material-symbols-outlined">code</span>ID</span><code>{{ proposalId(message.result) }}</code></div>
+                    <div v-if="message.result.proposal.parameters?.length" class="ai-row">
+                      <span><span class="material-symbols-outlined">settings</span>参数</span>
+                      <div class="ai-list">{{ message.result.proposal.parameters.map(p => `${p.label || p.name}（${p.type}）`).join('、') }}</div>
+                    </div>
+                    <div v-if="message.result.proposal.outputs?.length" class="ai-row">
+                      <span><span class="material-symbols-outlined">output</span>输出</span>
+                      <div class="ai-list">{{ message.result.proposal.outputs.map(o => `${o.label || o.name}（${o.type}）`).join('、') }}</div>
+                    </div>
+                    <div v-if="message.result.proposal.permissions?.length" class="ai-row">
+                      <span><span class="material-symbols-outlined">shield</span>权限</span>
+                      <div class="ai-list">{{ message.result.proposal.permissions.join('、') }}</div>
+                    </div>
+                    <div v-if="message.result.proposal.rationale" class="ai-row">
+                      <span><span class="material-symbols-outlined">lightbulb</span>理由</span>
+                      <div class="ai-list">{{ message.result.proposal.rationale }}</div>
+                    </div>
+                    <div v-if="message.result.proposal.acceptance_criteria?.length" class="ai-row">
+                      <span><span class="material-symbols-outlined">check_circle</span>验收</span>
+                      <div class="ai-list">{{ message.result.proposal.acceptance_criteria.join('；') }}</div>
+                    </div>
+                  </div>
+                  <div class="ai-card-foot">
+                    <button class="btn btn-tonal btn-sm" type="button" :disabled="drafting || !proposalId(message.result)"
+                      @click="approvePluginProposal(message.result)">
+                      同意生成插件草稿<span class="material-symbols-outlined">arrow_forward</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div v-else-if="message.result?.result_type === 'plugin_source'" class="ai-card natural-draft-source">
+                  <div class="ai-card-head">
+                    <span class="material-symbols-outlined">extension</span>
+                    <div class="min-w-0 flex-1">
+                      <b class="ai-card-title">{{ proposalId(message.result) || '未命名插件' }}</b>
+                      <small class="ai-card-kicker">插件已生成 · 可直接安装</small>
+                    </div>
+                  </div>
+                  <div class="ai-card-rows">
+                    <div class="ai-row"><span>清单</span><pre tabindex="0" class="ai-pre">{{ pluginManifest(message.result) }}</pre></div>
+                    <div class="ai-row"><span>源码</span><pre tabindex="0" class="ai-pre">{{ pluginSource(message.result) }}</pre></div>
+                  </div>
+                  <div class="ai-card-foot">
+                    <button class="btn btn-text btn-sm" type="button" @click="downloadPluginDraft(message.result)">
+                      <span class="material-symbols-outlined">download</span>下载文件
+                    </button>
+                    <button class="btn btn-filled btn-sm" type="button" :disabled="installingPlugin" @click="installPluginDraft(message.result)">
+                      <span class="material-symbols-outlined" :class="{ 'animate-spin': installingPlugin }">{{ installingPlugin ? 'progress_activity' : 'check_circle' }}</span>{{ installingPlugin ? '正在安装…' : '安装插件' }}
+                    </button>
+                  </div>
+                </div>
+
+                <div v-else-if="message.content" class="ai-content">
+                  <div v-if="message.streaming" class="ai-stream-text">{{ message.content }}<span class="ai-stream-cursor" aria-hidden="true"></span></div>
+                  <div v-else class="natural-draft-markdown" v-html="renderMarkdown(message.content)"></div>
+                </div>
+
+                <div v-if="message.stopped" class="ai-stopped"><span class="material-symbols-outlined">stop_circle</span>已停止</div>
+              </template>
+            </template>
+          </article>
+        </TransitionGroup>
+      </div>
+      <Transition name="ai-msg">
+        <button v-if="userScrolledUp" type="button" class="ai-jump-latest" @click="jumpToLatest">
+          <span class="material-symbols-outlined">arrow_downward</span>回到底部
+        </button>
+      </Transition>
     </div>
 
-    <form class="natural-draft-form mt-0! flex shrink-0 flex-col gap-2" @submit.prevent="sendMessage">
-      <label for="natural-draft-description" class="sr-only">你想自动化什么</label>
-      <div class="natural-draft-entry">
-        <textarea
-          id="natural-draft-description"
-          ref="composerRef"
-          v-model="composer"
-          class="text-field textarea-field natural-draft-textarea"
-          :maxlength="MAX_MESSAGE_CHARS"
-          rows="1"
-          placeholder="描述你想自动化的事，Enter 发送，Shift+Enter 换行"
-          :disabled="drafting"
-          @input="growTextarea"
-          @keydown="onComposerKeydown"
-        ></textarea>
-        <div class="natural-draft-actions">
-          <button v-if="drafting" class="btn btn-outlined natural-draft-stop w-full" type="button" @click="stopDrafting">
-            <span class="material-symbols-outlined">stop_circle</span>停止
-          </button>
-          <button v-else class="btn btn-filled w-full" type="submit" :disabled="!composer.trim()">
-            <span class="material-symbols-outlined">send</span>发送
-          </button>
-        </div>
+    <form class="ai-composer flex flex-none flex-col gap-2" @submit.prevent="sendMessage">
+      <label for="natural-draft-description" class="sr-only">描述你想创建或修改的自动化</label>
+      <textarea
+        id="natural-draft-description"
+        ref="composerRef"
+        v-model="composer"
+        class="ai-composer-input"
+        :maxlength="MAX_MESSAGE_CHARS"
+        rows="2"
+        placeholder="描述你想创建或修改的自动化……"
+        :disabled="drafting"
+        @input="growTextarea"
+        @keydown="onComposerKeydown"
+      ></textarea>
+      <div class="ai-composer-row">
+        <span class="ai-context-chip" :title="contextChipLabel">
+          <span class="material-symbols-outlined">layers</span>
+          <span class="truncate">{{ contextChipLabel }}</span>
+        </span>
+        <div class="min-w-0 flex-1"></div>
+        <span class="ai-mode-chip" title="AI 会自动调用规则工具完成任务">Agent</span>
+        <button v-if="drafting" type="button" class="ai-send-btn ai-stop-btn" title="停止生成" @click="stopDrafting">
+          <span class="material-symbols-outlined">stop_circle</span>
+        </button>
+        <button v-else type="submit" class="ai-send-btn" :disabled="!composer.trim()" title="发送（Enter）">
+          <span class="material-symbols-outlined">send</span>
+        </button>
       </div>
-      <p class="text-body-s text-on-surface-variant" style="padding-left:2px">
-        <span class="material-symbols-outlined" style="font-size:13px;vertical-align:middle">lock</span>
-        消息仅发往你配置的 AI 服务，不经过 NotmyFault 服务器。
-      </p>
-
     </form>
 
   </section>
 </template>
+
+<style scoped>
+/* P0 修复：AI Panel flex 布局 + Conversation 滚动容器 */
+/* min-width:0 必须有：flex item 的 min-width:auto 会取子树 min-content，
+   长代码行会把面板撑到内容宽后被 overflow:hidden 裁切。 */
+.ai-draft-panel{display:flex;flex:1 1 0%;flex-direction:column;height:100%;min-height:0;min-width:0;max-width:100%}
+.natural-draft-conversation{flex:1;min-height:0;overflow-y:auto;padding:16px}
+
+.ai-turns{display:flex;flex-direction:column;gap:22px}
+.ai-message{display:flex;min-width:0;max-width:100%;flex-direction:column;gap:8px}
+
+
+.ai-meta{display:flex;align-items:center;gap:6px;margin-bottom:8px;font:var(--ts-label-m);color:var(--md-on-surface-variant)}
+.ai-meta .material-symbols-outlined{font-size:14px;color:var(--md-primary)}
+.ai-meta.user{justify-content:flex-end}
+.ai-meta-time{margin-left:auto;opacity:.7}
+
+
+.ai-user-bubble{max-width:78%;min-width:0;align-self:flex-end;padding:8px 12px;border-radius:12px 12px 4px 12px;background:var(--md-surface-c-high);color:var(--md-on-surface);font-size:14px;line-height:22px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
+
+
+.ai-content{width:100%;min-width:0;max-width:100%;font-size:14px;line-height:22px;color:var(--md-on-surface);overflow-wrap:anywhere;word-break:break-word}
+.ai-stream-text{white-space:pre-wrap;word-break:break-word}
+.ai-stream-cursor{display:inline-block;width:2px;height:14px;margin-left:1px;background:var(--md-primary);vertical-align:-2px;animation:ai-cursor-blink 1s step-end infinite}
+@keyframes ai-cursor-blink{50%{opacity:0}}
+
+.natural-draft-markdown :deep(p){margin:0 0 8px}
+.natural-draft-markdown :deep(p:last-child){margin-bottom:0}
+.natural-draft-markdown :deep(ul),.natural-draft-markdown :deep(ol){margin:0 0 8px;padding-left:18px}
+.natural-draft-markdown :deep(li){margin:2px 0}
+.natural-draft-markdown :deep(pre){margin:0 0 8px;padding:8px 10px;border-radius:var(--r-sm);background:var(--md-surface-c-low);overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:13px;line-height:19px}
+.natural-draft-markdown :deep(code){font-family:ui-monospace,Consolas,monospace;font-size:13px}
+.natural-draft-markdown :deep(:not(pre)>code){padding:1px 5px;border-radius:4px;background:var(--md-surface-c-low)}
+.natural-draft-markdown :deep(a){color:var(--md-primary)}
+.natural-draft-markdown :deep(h1),.natural-draft-markdown :deep(h2),.natural-draft-markdown :deep(h3),.natural-draft-markdown :deep(h4){margin:8px 0 6px;font-size:14px;font-weight:600}
+
+
+.ai-activity{margin-bottom:4px;font:var(--ts-label-m);color:var(--md-on-surface-variant)}
+.ai-activity-toggle{display:flex;width:100%;align-items:center;gap:6px;padding:2px 0;border:none;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
+.ai-activity-toggle>.material-symbols-outlined{flex:none;font-size:15px}
+.ai-activity.finished .ai-activity-toggle>.material-symbols-outlined:first-child{color:var(--md-success)}
+.ai-activity.failed .ai-activity-toggle>.material-symbols-outlined:first-child{color:var(--md-error)}
+.ai-activity-spin{animation:ai-activity-rotate 1.6s linear infinite}
+@keyframes ai-activity-rotate{to{transform:rotate(360deg)}}
+.ai-activity-chevron{margin-left:auto;font-size:16px;transition:transform .2s ease}
+.ai-activity.open .ai-activity-chevron{transform:rotate(180deg)}
+/* overflow:hidden 让 0fr 折叠真正归零；纵向 padding 移到子项，
+   否则 padding 会成为 fr 轨道（minmax(auto,0fr)）的最小高度。 */
+.ai-activity-body{display:grid;grid-template-rows:0fr;transition:grid-template-rows .2s ease;overflow:hidden}
+.ai-activity.open .ai-activity-body{grid-template-rows:1fr}
+.ai-activity-steps{min-height:0;max-height:180px;overflow-y:auto;display:flex;flex-direction:column;gap:4px;padding:0 0 0 21px}
+.ai-activity-step:first-child{margin-top:8px}
+.ai-activity-step:last-child{margin-bottom:4px}
+.ai-activity-step{display:flex;align-items:center;gap:6px;font-size:13px}
+.ai-activity-step .material-symbols-outlined{flex:none;font-size:13px}
+.ai-activity-step.done .material-symbols-outlined{color:var(--md-success)}
+.ai-activity-step:not(.done){opacity:.85}
+.ai-reasoning{margin-bottom:4px;font:var(--ts-label-m);color:var(--md-on-surface-variant)}
+.ai-reasoning-toggle{display:flex;width:100%;align-items:center;gap:6px;padding:2px 0;border:none;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
+.ai-reasoning-toggle>.material-symbols-outlined{flex:none;font-size:15px}
+.ai-reasoning-label{flex:none}
+.ai-reasoning-chevron{margin-left:auto;font-size:16px;transition:transform .2s ease}
+.ai-reasoning.open .ai-reasoning-chevron{transform:rotate(180deg)}
+.ai-reasoning-body{display:grid;grid-template-rows:0fr;transition:grid-template-rows .2s ease;overflow:hidden}
+.ai-reasoning.open .ai-reasoning-body{grid-template-rows:1fr}
+.ai-reasoning-scroll{min-height:0;max-height:200px;overflow-y:auto;padding:0 0 0 21px}
+.ai-reasoning-text{margin:8px 0 4px;white-space:pre-wrap;word-break:break-word;font:var(--ts-body-s);color:var(--md-on-surface-variant)}
+
+
+.ai-rule-card{display:flex;flex-direction:column;gap:12px;width:100%;min-width:0;max-width:100%;padding:14px;border:1px solid var(--md-outline-variant);border-radius:var(--r-md);background:var(--md-surface-c-low)}
+.ai-rule-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.ai-card-kicker{display:inline-flex;align-items:center;gap:6px;color:var(--md-primary);font:var(--ts-label-m);font-weight:500}
+.ai-card-kicker .material-symbols-outlined{font-size:18px}
+.ai-rule-counts{font:var(--ts-label-m);color:var(--md-on-surface-variant)}
+.ai-rule-flow{display:flex;flex-direction:column;gap:0}
+.ai-mini-node{display:flex;align-items:center;gap:8px;min-height:32px;min-width:0;padding:6px 10px;border:1px solid var(--md-outline-variant);border-radius:var(--r-sm);background:var(--md-surface);font-size:13px;line-height:18px;color:var(--md-on-surface)}
+.ai-mini-node .material-symbols-outlined{flex:none;font-size:16px;color:var(--md-primary)}
+.ai-mini-node>span:last-child{min-width:0;flex:1}
+.ai-mini-node+.ai-mini-node{margin-top:10px;position:relative}
+.ai-mini-node+.ai-mini-node::before{content:'';position:absolute;left:17px;top:-10px;height:10px;border-left:2px solid var(--md-outline-variant)}
+.ai-rule-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.ai-rule-params{display:flex;flex-direction:column;gap:6px;padding-top:12px;margin-top:4px;border-top:1px dashed var(--md-outline-variant)}
+.ai-rule-param-row{display:grid;grid-template-columns:auto minmax(0,1fr);gap:10px;font-size:12px;line-height:17px;color:var(--md-on-surface-variant)}
+.ai-rule-param-row>span:first-child{white-space:nowrap}
+.ai-rule-param-row code{font-family:ui-monospace,Consolas,monospace;font-size:12px;word-break:break-all;color:var(--md-on-surface);overflow-wrap:anywhere}
+
+
+.ai-card{display:flex;flex-direction:column;gap:12px;width:100%;min-width:0;max-width:100%;padding:14px;border:1px solid var(--md-outline-variant);border-radius:var(--r-md);background:var(--md-surface-c-low)}
+.ai-card-head{display:flex;align-items:center;gap:8px;min-width:0}
+.ai-card-head>.material-symbols-outlined{flex:none;font-size:18px;color:var(--md-primary)}
+.ai-card-title{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:var(--ts-title-s);color:var(--md-on-surface)}
+.ai-card-desc{margin:0;font-size:13px;line-height:19px;color:var(--md-on-surface-variant);overflow-wrap:anywhere}
+.ai-card-rows{display:flex;flex-direction:column;gap:8px}
+.ai-row{display:grid;grid-template-columns:auto minmax(0,1fr);gap:10px;font-size:13px;line-height:19px;color:var(--md-on-surface)}
+.ai-row>span:first-child{display:inline-flex;align-items:center;gap:6px;color:var(--md-on-surface-variant);font-weight:500;white-space:nowrap}
+.ai-row>span:first-child .material-symbols-outlined{font-size:18px}
+.ai-row code{font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:17px;word-break:break-all;color:var(--md-on-surface);overflow-wrap:anywhere}
+.ai-list{min-width:0;overflow-wrap:anywhere}
+.ai-card-foot{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.ai-pre{max-height:160px;overflow:auto;margin:0;padding:8px 10px;border-radius:var(--r-sm);background:var(--md-surface-c-lowest);font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:17px;white-space:pre-wrap;word-break:break-all}
+
+
+.ai-issues{display:flex;flex-direction:column;gap:4px;padding:8px 10px;border-radius:var(--r-sm);background:color-mix(in srgb,var(--md-warn) 9%,transparent)}
+.ai-issue{display:flex;align-items:flex-start;gap:6px;font-size:12px;line-height:17px;color:var(--md-on-surface-variant)}
+.ai-issue .material-symbols-outlined{flex:none;margin-top:1px;font-size:14px;color:var(--md-warn)}
+
+.ai-error{display:flex;flex-direction:column;gap:8px;width:100%;min-width:0;max-width:100%;padding:12px 14px;border:1px solid color-mix(in srgb,var(--md-error) 35%,transparent);border-left:3px solid var(--md-error);border-radius:var(--r-sm);background:var(--md-error-container);color:var(--md-on-error-container)}
+.ai-error-head{display:flex;align-items:center;gap:6px;font:var(--ts-label-m)}
+.ai-error-head .material-symbols-outlined{flex:none;font-size:16px}
+.ai-error p{margin:0;font-size:13px;line-height:19px;white-space:pre-line;overflow-wrap:anywhere}
+.ai-error-retry{display:inline-flex;align-items:center;gap:5px;align-self:flex-start;height:32px;padding:0 14px;border:none;border-radius:var(--r-full);background:color-mix(in srgb,var(--md-on-error-container) 12%,transparent);color:var(--md-on-error-container);font:var(--ts-label-m);cursor:pointer}
+.ai-error-retry:disabled{opacity:.5;cursor:default}
+.ai-error-retry .material-symbols-outlined{flex:none;font-size:15px}
+
+.ai-stopped{display:flex;align-items:center;gap:5px;font:var(--ts-label-m);color:var(--md-on-surface-variant)}
+.ai-stopped .material-symbols-outlined{flex:none;font-size:14px}
+
+.ai-msg-move{transition:transform .18s ease}
+
+.ai-jump-latest{position:absolute;right:8px;bottom:10px;z-index:5;display:inline-flex;align-items:center;gap:4px;height:28px;padding:0 10px;border:1px solid var(--md-outline-variant);border-radius:var(--r-full);background:var(--md-surface-c-highest);color:var(--md-on-surface-variant);font:var(--ts-label-s);box-shadow:var(--md-elev2);cursor:pointer}
+.ai-jump-latest .material-symbols-outlined{font-size:14px}
+
+
+.ai-composer{flex:0 0 auto;flex-direction:column;gap:8px;padding:12px 14px;border-top:1px solid var(--md-outline-variant);background:var(--md-surface-c)}
+.ai-composer-input{width:100%;min-height:56px;max-height:120px;resize:none;overflow-y:auto;padding:10px 12px;border:1px solid var(--md-outline);border-radius:var(--r-sm);background:var(--md-surface-c-lowest);color:var(--md-on-surface);font:var(--ts-body-m);line-height:22px;outline:none;transition:border-color .15s ease}
+.ai-composer-input:focus{border-color:var(--md-primary)}
+.ai-composer-input:disabled{opacity:.6}
+.ai-composer-input::placeholder{color:var(--md-on-surface-variant);opacity:.75}
+.ai-composer-row{display:flex;align-items:center;gap:8px;min-width:0}
+.ai-context-chip{display:inline-flex;max-width:58%;align-items:center;gap:5px;height:26px;padding:0 10px;border-radius:var(--r-full);background:var(--md-surface-c-high);color:var(--md-on-surface-variant);font:var(--ts-label-s);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ai-context-chip .material-symbols-outlined{flex:none;font-size:14px;color:var(--md-primary)}
+.ai-mode-chip{display:inline-flex;align-items:center;height:26px;padding:0 10px;border-radius:var(--r-full);background:var(--md-secondary-container);color:var(--md-on-secondary-container);font:var(--ts-label-s);font-weight:500}
+.ai-send-btn{display:inline-flex;align-items:center;justify-content:center;flex:none;width:38px;height:38px;border:none;border-radius:var(--r-full);background:var(--md-primary);color:var(--md-on-primary);cursor:pointer;transition:background-color .15s ease,opacity .15s ease}
+.ai-send-btn .material-symbols-outlined{flex:none;font-size:19px}
+.ai-send-btn:hover:not(:disabled){box-shadow:var(--md-elev1)}
+.ai-send-btn:disabled{background:var(--md-surface-c-high);color:color-mix(in srgb,var(--md-on-surface-variant) 55%,transparent);cursor:default}
+.ai-stop-btn{background:var(--md-error-container);color:var(--md-on-error-container)}
+.ai-stop-btn:hover{box-shadow:var(--md-elev1)}
+
+
+.ai-empty-chip{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 14px;border:1px solid var(--md-outline-variant);border-radius:var(--r-full);background:transparent;color:var(--md-primary);font:var(--ts-label-m);cursor:pointer;transition:background-color .15s ease,color .15s ease,border-color .15s ease}
+.ai-empty-chip:hover:not(:disabled){background:var(--md-primary-container);color:var(--md-on-primary-container);border-color:transparent}
+.ai-empty-chip:focus-visible{outline:2px solid var(--md-primary);outline-offset:2px}
+.ai-empty-chip:disabled{opacity:.5;cursor:default}
+
+
+.ai-changeset-list{display:flex;flex-direction:column;gap:2px;margin-top:4px}
+.ai-changeset-item{display:grid;grid-template-columns:24px auto minmax(0,1fr);align-items:center;gap:8px;padding:6px 8px;border-radius:var(--r-xs);font-size:13px;line-height:18px;color:var(--md-on-surface);transition:background .12s ease}
+.ai-changeset-item[clickable]{cursor:pointer}
+.ai-changeset-item[clickable]:hover{background:color-mix(in srgb,var(--md-primary) 8%,transparent)}
+.ai-changeset-op{display:flex;width:20px;height:20px;align-items:center;justify-content:center;border-radius:var(--r-xs);font-size:11px;font-weight:600;font-family:ui-monospace,Consolas,monospace}
+.ai-changeset-modify .ai-changeset-op{background:var(--md-primary-container);color:var(--md-on-primary-container)}
+.ai-changeset-add .ai-changeset-op{background:var(--md-success-container);color:var(--md-success)}
+.ai-changeset-delete .ai-changeset-op{background:var(--md-error-container);color:var(--md-on-error-container)}
+.ai-changeset-label{font-weight:500;white-space:nowrap}
+.ai-changeset-detail{min-width:0;color:var(--md-on-surface-variant);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.ai-security-warn{display:flex;gap:10px;padding:10px 12px;border:1px solid color-mix(in srgb,var(--md-warn) 40%,var(--md-outline-variant));border-radius:var(--r-sm);background:color-mix(in srgb,var(--md-warn) 8%,var(--md-surface-c-low));font-size:13px;line-height:19px;margin-top:8px}
+.ai-security-warn>.material-symbols-outlined{flex:none;font-size:18px;color:var(--md-warn);margin-top:2px}
+.ai-security-warn b{display:block;font-weight:500;margin-bottom:4px}
+.ai-security-warn ul{margin:0;padding-left:18px}
+.ai-security-warn li{margin:2px 0;color:var(--md-on-surface-variant)}
+.ai-security-warn small{display:block;margin-top:6px;color:var(--md-on-surface-variant);font-size:12px}
+
+.ai-empty-enter{animation:ai-empty-arrive .3s cubic-bezier(.16,1,.3,1) both}
+@keyframes ai-empty-arrive{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+
+.ai-msg-enter-active{transition:opacity .2s ease-out,transform .22s cubic-bezier(.16,1,.3,1)}
+.ai-msg-enter-from{opacity:0;transform:translateY(8px)}
+.ai-msg-leave-active{transition:opacity .12s ease-in}
+.ai-msg-leave-to{opacity:0}
+
+.natural-draft-conversation{scroll-behavior:smooth}
+
+@media (prefers-reduced-motion:reduce){
+  .ai-changeset-item,.ai-empty-enter,.ai-msg-enter-active,.ai-msg-leave-active,.ai-msg-move,.ai-activity-chevron,.ai-activity-body,.ai-reasoning-chevron,.ai-reasoning-body,.ai-stream-cursor,.ai-activity-spin{transition:none;animation:none}
+}
+</style>

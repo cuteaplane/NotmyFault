@@ -25,12 +25,15 @@ let requireEarlyApproval = false
 const earlyApprovalAttempts = []
 const aiDraftCalls = []
 const mockPluginId = `weather_report_${'long_ascii_plugin_identifier_'.repeat(4)}`
+let mockPluginKind = 'action'
 let mockAiDraftResultType = 'assistant_message'
 let mockAiDraftDelay = 0
 let mockAiDraftError = ''
 let mockAiStreamMode = 'normal'
 let mockEngineRunning = true
 let mockEngineState = 'running'
+let engineStatusReads = 0
+let configReads = 0
 let slowStopPolls = 0
 let simulateSlowStop = false
 let launchCalls = 0
@@ -41,6 +44,7 @@ let mockAiApiKeyStatus = 'none'
 let mockBluetoothInstalled = false
 let exportedRunBlob = null
 let exportedRunFileName = ''
+const exportedFileNames = []
 const textEncoder = new TextEncoder()
 
 function pause(ms) {
@@ -80,7 +84,7 @@ function mockAiDraftResult() {
     return {
       ok:true, source:'ai', result_type:'plugin_proposal',
       proposal:{
-        kind:'action', id:mockPluginId, name:'天气状态报告',
+        kind:mockPluginKind, id:mockPluginId, name:'天气状态报告',
         description:'汇总当前天气和本地环境状态，供后续自动化引用。',
         permissions:['network'],
         parameters:[{ name:'location', label:'地点', type:'string' }],
@@ -94,7 +98,7 @@ function mockAiDraftResult() {
     return {
       ok:true, source:'ai', result_type:'plugin_source',
       plugin_id:mockPluginId,
-      manifest:{ id:mockPluginId, kind:'action', name:'天气状态报告' },
+      manifest:{ id:mockPluginId, kind:mockPluginKind, name:'天气状态报告' },
       source_code:"def run():\n  return '<script>review only</script>'",
     }
   }
@@ -119,14 +123,20 @@ function mockAiStreamResponse() {
     : result.result_type === 'rule_draft'
       ? '正在整理规则草稿。'
       : '正在整理结果。'
-  return sseResponse([
+  const events = [
     ': keepalive\n\n',
     sseFrame('status', { status:'started' }),
     sseFrame('reasoning', { delta:'正在检查可用条件。' }),
     sseFrame('text', { delta:text }),
-    sseFrame('result', result),
-    sseFrame('done', { status:'done' }),
-  ])
+  ]
+  if (result.result_type !== 'assistant_message') {
+    events.push(
+      sseFrame('progress', { phase:'drafting', received:64 }),
+      sseFrame('progress', { phase:'validating', received:0 }),
+    )
+  }
+  events.push(sseFrame('result', result), sseFrame('done', { status:'done' }))
+  return sseResponse(events)
 }
 window.matchMedia = () => ({ matches: false, addEventListener(){}, removeEventListener(){} })
 window.ResizeObserver = class {
@@ -137,10 +147,16 @@ window.ResizeObserver = class {
 window.EventSource = class { constructor(){} addEventListener(){} close(){} }
 window.URL.createObjectURL = blob => { exportedRunBlob = blob; return 'blob:notmyfault-run-export' }
 window.URL.revokeObjectURL = () => {}
-window.HTMLAnchorElement.prototype.click = function() { exportedRunFileName = this.download }
+window.HTMLAnchorElement.prototype.click = function() {
+  exportedRunFileName = this.download
+  exportedFileNames.push(this.download)
+}
 // Dashboard 只支持 pywebview；提供完整的最小 bridge 契约。
 window.pywebview = { api: {
-  get_config: async () => ({ rules: [{
+  get_config: async () => {
+    configReads++
+    if (configReads === 1) throw new Error('bridge not ready')
+    return { rules: [{
     rule_id: 'r_mount001',
     name: '挂载测试规则',
     folder: '测试',
@@ -159,7 +175,8 @@ window.pywebview = { api: {
       ],
     },
     actions: [{ binding_id: 'a_mount001', type: 'notify', params: {} }],
-  }] }),
+    }] }
+  },
   save_config: async (rules, adminKeyPassword = '') => {
     saveConfigCalls.push({ password: adminKeyPassword, rules: JSON.parse(JSON.stringify(rules)) })
     if (requireAdminRulePassword) {
@@ -183,6 +200,10 @@ window.pywebview = { api: {
   },
   get_api_token: async () => 'test-token',
   get_engine_status: async () => {
+    engineStatusReads++
+    if (engineStatusReads === 1) {
+      return { api_alive:false, engine_running:false, engine_state:'offline' }
+    }
     if (mockEngineState === 'stopping') {
       if (slowStopPolls > 0) slowStopPolls--
       else mockEngineState = 'stopped'
@@ -389,6 +410,9 @@ window.pywebview = { api: {
     if (path === '/api/plugins/hotkey/components/record/invoke' && method === 'POST') {
       return { ok:true, session_id:'s_hot', data:{ ok:true, data:{ hotkey:'Ctrl+Shift+M' } } }
     }
+    if (path === '/api/plugins/install-source' && method === 'POST') {
+      return { ok:true, id:data?.plugin_id, type:'actions', signed:false, restart_required:true }
+    }
     if (path.includes('/api/plugins/list')) return { triggers: T, actions: A }
     if (path.includes('/api/plugins')) return { triggers: T, actions: A }
     return { ok:true }
@@ -461,9 +485,9 @@ async function checkDraftStreamParser() {
   const calls = []
   let tokenReads = 0
   const received = []
-  const streamText = ': keepalive\r\n\r\nevent: status\r\ndata: {"status":"started"}\r\n\r\nevent: text\r\ndata: {"delta":"跨块中文"}\r\n\r\nevent: done\r\ndata: {"status":"done"}\r\n\r\n'
+  const streamText = ': keepalive\r\n\r\nevent: status\r\ndata: {"status":"started"}\r\n\r\nevent: progress\r\ndata: {"phase":"drafting","received":128}\r\n\r\nevent: text\r\ndata: {"delta":"跨块中文"}\r\n\r\nevent: done\r\ndata: {"status":"done"}\r\n\r\n'
   const bytes = textEncoder.encode(streamText)
-  const splitAt = textEncoder.encode(': keepalive\r\n\r\nevent: status\r\ndata: {"status":"started"}\r\n\r\nevent: text\r\ndata: {"delta":"').length + 1
+  const splitAt = textEncoder.encode(': keepalive\r\n\r\nevent: status\r\ndata: {"status":"started"}\r\n\r\nevent: progress\r\ndata: {"phase":"drafting","received":128}\r\n\r\nevent: text\r\ndata: {"delta":"').length + 1
   window.pywebview.api.get_api_token = async () => `stream-token-${++tokenReads}`
   window.fetch = async (_url, options = {}) => {
     calls.push(options)
@@ -488,8 +512,10 @@ async function checkDraftStreamParser() {
   return calls.length === 2
     && tokenReads === 2
     && calls[1]?.headers?.Authorization === 'Bearer stream-token-2'
-    && received.map(event => event.type).join('|') === 'status|text|done'
-    && received[1]?.data?.delta === '跨块中文'
+    && received.map(event => event.type).join('|') === 'status|progress|text|done'
+    && received[1]?.data?.phase === 'drafting'
+    && received[1]?.data?.received === 128
+    && received[2]?.data?.delta === '跨块中文'
     && bridgeCalls.length === bridgeCount
 }
 
@@ -518,8 +544,19 @@ if (!safeRunExportOk) process.exit(1)
 
 const jsFile = fs.readdirSync(path.join(distDir, 'assets')).find(f => f.endsWith('.js'))
 await import(pathToFileURL(path.resolve(distDir, 'assets', jsFile)).href)
-await new Promise(r => setTimeout(r, 1000))
+await new Promise(r => setTimeout(r, 100))
 
+const offlineHtml = document.getElementById('app').innerHTML
+const offlineStateOk = offlineHtml.includes('引擎未运行')
+  && offlineHtml.includes('启动引擎')
+  && !offlineHtml.includes('正在连接后台服务')
+  && !offlineHtml.includes('Dashboard 正在确认')
+  && !offlineHtml.includes('后台服务未启动')
+  && !document.querySelector('.apatch-hero.offline .spinner')
+console.log((offlineStateOk?'PASS':'FAIL')+' - offline home shows the final state without a connection spinner')
+if (!offlineStateOk) process.exit(1)
+
+await new Promise(r => setTimeout(r, 2100))
 const html = document.getElementById('app').innerHTML
 const versionSource = fs.readFileSync(path.resolve('../notmyfault/version.py'), 'utf8')
 const expectedVersion = versionSource.match(/^__version__\s*=\s*["']([^"']+)["']/m)?.[1]
@@ -531,10 +568,13 @@ const checks = [
   ['apatch-hero', html.includes('apatch-hero')],
   ['home heading', html.includes('引擎状态')],
   ['engine running', html.includes('运行中')],
-  ['security mode', html.includes('宽松')],
   ['dashboard version follows Python package', !!expectedVersion && html.includes(expectedVersion)],
   ['full engine stop stays hidden while automation runs', !html.includes('彻底停止引擎')],
 ]
+const startupRetryOk = engineStatusReads >= 2 && configReads >= 2
+  && document.querySelector('.dashboard-metrics')?.textContent.includes('1')
+  && !document.querySelector('.dashboard-first-run')
+checks.push(['status polling restores engine state and startup config retries', startupRetryOk])
 let ok = true
 for (const [name, pass] of checks) { console.log((pass?'PASS':'FAIL')+' - '+name); if(!pass) ok=false }
 if (!ok) { console.error(html.substring(0, 600)); process.exit(1) }
@@ -582,11 +622,11 @@ const earlySettingsNav = [...document.querySelectorAll('.nav-item')].find(
 )
 earlySettingsNav?.click()
 await new Promise(r => setTimeout(r, 50))
+;[...document.querySelectorAll('.settings-root-list button')].find(button => button.textContent.includes('AI 功能'))?.click()
+await new Promise(r => setTimeout(r, 20))
 const earlyAiEnabled = document.querySelector('.ai-drafting-settings input[type="checkbox"]')
-if (earlyAiEnabled) {
-  earlyAiEnabled.checked = true
-  earlyAiEnabled.dispatchEvent(new window.Event('change', { bubbles:true }))
-}
+earlyAiEnabled?.click()
+await new Promise(r => setTimeout(r, 50))
 rulesNav?.click()
 await new Promise(r => setTimeout(r, 50))
 ;[...document.querySelectorAll('.rules-library button')].find(button => button.textContent.includes('创建自动化'))?.click()
@@ -1404,15 +1444,56 @@ const settingsNav = [...document.querySelectorAll('.nav-item')].find(
 )
 settingsNav?.click()
 await new Promise(r => setTimeout(r, 50))
+const rootSettingsText = document.querySelector('.settings-root-list')?.textContent || ''
+const rootSettingsOk = ['安全与授权', 'AI 功能', '可选插件', '关于 NotmyFault'].every(label => rootSettingsText.includes(label))
+  && !document.querySelector('.settings-nav')
+  && !document.querySelector('.a16-profile')
+console.log((rootSettingsOk?'PASS':'FAIL')+' - settings uses Android-style subpages without a side rail or profile capsule')
+if (!rootSettingsOk) process.exit(1)
+
+;[...document.querySelectorAll('.settings-root-list button')].find(button => button.textContent.includes('安全与授权'))?.click()
+await new Promise(r => setTimeout(r, 20))
 const adminAuthorizationOptions = [...document.querySelectorAll('.admin-auth-option')]
 const settingsControlsOk = adminAuthorizationOptions.length === 2
   && adminAuthorizationOptions.some(button => button.textContent.includes('引擎启动时授权一次'))
   && adminAuthorizationOptions.some(button => button.textContent.includes('每次执行时确认'))
-  && document.querySelector('.ai-drafting-settings')?.textContent.includes('实验性 AI 规则草稿')
-  && document.querySelector('.bluetooth-settings')?.textContent.includes('蓝牙开关')
-  && document.querySelector('.admin-rule-verification-settings')?.textContent.includes('创建管理员规则时要求验证签名私钥')
-console.log((settingsControlsOk?'PASS':'FAIL')+' - settings owns admin authorization and experimental AI drafting')
+  && document.querySelector('.admin-rule-verification-settings')?.textContent.includes('创建管理员规则时验证签名私钥')
+  && !document.querySelector('.ai-drafting-settings')
+  && !document.querySelector('.bluetooth-settings')
+console.log((settingsControlsOk?'PASS':'FAIL')+' - each settings subpage renders only its own controls')
 if (!settingsControlsOk) process.exit(1)
+const adminRuleVerificationCheckbox = document.querySelector('.admin-rule-verification-settings input[type="checkbox"]')
+const verificationDefaultOn = adminRuleVerificationCheckbox?.checked === true
+adminRuleVerificationCheckbox?.click()
+await new Promise(r => setTimeout(r, 50))
+const verificationSaved = bridgeCalls.some(call =>
+  call.path === '/api/settings/admin-rule-verification'
+  && call.method === 'PUT'
+  && call.data?.key_verification === false
+)
+console.log((verificationDefaultOn && verificationSaved?'PASS':'FAIL')+' - admin rule verification toggle defaults on and saves')
+if (!verificationDefaultOn || !verificationSaved) process.exit(1)
+adminAuthorizationOptions.find(button => button.textContent.includes('引擎启动时授权一次'))?.click()
+await new Promise(r => setTimeout(r, 50))
+const adminAuthorizationSaved = bridgeCalls.some(call =>
+  call.path === '/api/settings/admin-authorization'
+  && call.method === 'PUT'
+  && call.data?.mode === 'engine_start'
+)
+console.log((adminAuthorizationSaved?'PASS':'FAIL')+' - admin authorization selection is saved')
+if (!adminAuthorizationSaved) process.exit(1)
+document.querySelector('.settings-back')?.click()
+await new Promise(r => setTimeout(r, 20))
+
+;[...document.querySelectorAll('.settings-root-list button')].find(button => button.textContent.includes('AI 功能'))?.click()
+await new Promise(r => setTimeout(r, 20))
+const aiMenuOk = document.querySelector('.ai-drafting-settings')?.textContent.includes('AI 规则草稿')
+  && document.querySelector('.ai-drafting-settings')?.textContent.includes('服务配置')
+  && document.querySelector('.ai-drafting-settings')?.textContent.includes('API 密钥')
+console.log((aiMenuOk?'PASS':'FAIL')+' - AI settings are split into feature, service, and API key pages')
+if (!aiMenuOk) process.exit(1)
+;[...document.querySelectorAll('.ai-drafting-settings button')].find(button => button.textContent.includes('服务配置'))?.click()
+await new Promise(r => setTimeout(r, 20))
 const aiProvider = document.querySelector('.ai-drafting-settings select[name="ai-provider"]')
 const aiProviderLabels = [...(aiProvider?.options || [])].map(option => option.textContent)
 const aiProvidersOk = ['OpenAI', 'DeepSeek', 'Gemini', '通义千问', '智谱 GLM', 'Moonshot / Kimi']
@@ -1430,92 +1511,95 @@ await new Promise(r => setTimeout(r, 20))
 const providerPresetApplied = document.querySelector('.ai-drafting-settings input[name="ai-endpoint"]')?.value === 'https://api.openai.com/v1'
   && document.querySelector('.ai-drafting-settings input[name="ai-model"]')?.value === 'gpt-5.4'
   && document.querySelector('.ai-drafting-settings select[name="ai-api-format"]')?.value === 'responses'
+  && document.querySelector('.ai-drafting-settings')?.textContent.includes('服务商 API 兼容地址')
 console.log((aiProvidersOk && providerPresetApplied && providerFormatMismatchIsCustom?'PASS':'FAIL')+' - common AI provider preset fills and matches endpoint model and format')
 if (!aiProvidersOk || !providerPresetApplied || !providerFormatMismatchIsCustom) process.exit(1)
-const bluetoothInstallButton = [...document.querySelectorAll('.bluetooth-settings button')]
-  .find(button => button.textContent.includes('安装蓝牙开关'))
-bluetoothInstallButton?.click()
-await new Promise(r => setTimeout(r, 50))
-const bluetoothInstalled = bridgeCalls.some(call => (
-  call.path === '/api/settings/bluetooth/install' && call.method === 'POST'
-)) && document.querySelector('.bluetooth-settings')?.textContent.includes('已安装')
-console.log((bluetoothInstalled?'PASS':'FAIL')+' - settings installs the bundled Bluetooth action as a user plugin')
-if (!bluetoothInstalled) process.exit(1)
-const adminRuleVerificationCheckbox = document.querySelector('.admin-rule-verification-settings input[type="checkbox"]')
-const verificationDefaultOn = adminRuleVerificationCheckbox?.checked === true
-adminRuleVerificationCheckbox?.click()
-await new Promise(r => setTimeout(r, 50))
-const verificationSaved = bridgeCalls.some(call =>
-  call.path === '/api/settings/admin-rule-verification'
-  && call.method === 'PUT'
-  && call.data?.key_verification === false
-)
-console.log((verificationDefaultOn && verificationSaved?'PASS':'FAIL')+' - admin rule verification toggle defaults on and saves')
-if (!verificationDefaultOn || !verificationSaved) process.exit(1)
-const settingsAboutOk = document.querySelector('.settings-page .settings-about-card')?.textContent.includes('NotmyFault')
-  && document.querySelector('.settings-page')?.textContent.includes('平台支持')
-  && document.querySelector('.settings-page')?.textContent.includes('技术栈')
-  && document.querySelector('.settings-page')?.textContent.includes('拓展万千')
-const noAboutNav = ![...document.querySelectorAll('.nav-item')].some(button => button.textContent.includes('关于'))
-console.log((settingsAboutOk && noAboutNav?'PASS':'FAIL')+' - about page lives inside settings without its own nav entry')
-if (!settingsAboutOk || !noAboutNav) process.exit(1)
-const aiKeyInput = document.querySelector('.ai-drafting-settings input[type="password"]')
-const aiEnabled = document.querySelector('.ai-drafting-settings input[type="checkbox"]')
 const aiEndpoint = document.querySelector('.ai-drafting-settings input[name="ai-endpoint"]')
 const aiModel = document.querySelector('.ai-drafting-settings input[name="ai-model"]')
+if (aiEndpoint) { aiEndpoint.value = 'https://api.example.com/v1'; aiEndpoint.dispatchEvent(new window.Event('input', { bubbles:true })) }
+if (aiModel) { aiModel.value = 'test-model'; aiModel.dispatchEvent(new window.Event('input', { bubbles:true })) }
+;[...document.querySelectorAll('.ai-drafting-settings button')].find(button => button.textContent.trim() === '保存')?.click()
+await new Promise(r => setTimeout(r, 50))
+const aiSettingsSavedWithoutKey = bridgeCalls.some(call => call.path === '/api/settings/ai-drafting'
+  && call.method === 'PUT' && call.data?.enabled === true && !('api_key' in call.data))
+document.querySelector('.settings-back')?.click()
+await new Promise(r => setTimeout(r, 20))
+;[...document.querySelectorAll('.ai-drafting-settings button')].find(button => button.textContent.includes('API 密钥'))?.click()
+await new Promise(r => setTimeout(r, 20))
+;[...document.querySelectorAll('.ai-drafting-settings button')].find(button => button.textContent.includes('添加 API 密钥'))?.click()
+await new Promise(r => setTimeout(r, 20))
+const aiKeyInput = document.querySelector('.ai-drafting-settings input[type="password"]')
 const testApiKey = 'saved-key-for-mount-test'
 const aiKeyPersistenceStart = bridgeCalls.length
 if (aiKeyInput) {
   aiKeyInput.value = testApiKey
   aiKeyInput.dispatchEvent(new window.Event('input', { bubbles:true }))
 }
-if (aiEnabled) { aiEnabled.checked = true; aiEnabled.dispatchEvent(new window.Event('change', { bubbles:true })) }
-if (aiEndpoint) { aiEndpoint.value = 'https://api.example.com/v1'; aiEndpoint.dispatchEvent(new window.Event('input', { bubbles:true })) }
-if (aiModel) { aiModel.value = 'test-model'; aiModel.dispatchEvent(new window.Event('input', { bubbles:true })) }
-;[...document.querySelectorAll('.ai-drafting-settings button')].find(button => button.textContent.includes('保存 AI 设置'))?.click()
-await new Promise(r => setTimeout(r, 50))
+await new Promise(r => setTimeout(r, 20))
 ;[...document.querySelectorAll('.ai-drafting-settings button')].find(button => button.textContent.includes('保存 API 密钥'))?.click()
 await new Promise(r => setTimeout(r, 50))
-const aiSettingsSavedWithoutKey = bridgeCalls.some(call => call.path === '/api/settings/ai-drafting'
-  && call.method === 'PUT' && call.data?.enabled === true && !('api_key' in call.data))
 const aiKeyPersistenceCalls = bridgeCalls.slice(aiKeyPersistenceStart)
 const secretSentOnlyToKeySaveEndpoint = aiKeyPersistenceCalls.every(call => (
   !JSON.stringify(call.data || {}).includes(testApiKey)
   || (call.path === '/api/settings/ai-drafting/api-key' && call.method === 'PUT')
 ))
-const savedKeyStatusRenders = document.querySelector('.ai-drafting-settings')?.textContent.includes('已保存')
-const savedKeyInputClears = aiKeyInput?.value === ''
-  && [...document.querySelectorAll('.ai-drafting-settings input')].every(input => input.value !== testApiKey)
+const savedKeyStatusRenders = document.querySelector('.settings-key-status.is-saved')?.textContent.includes('已保存')
+const savedKeyInputIsHidden = !document.querySelector('.ai-drafting-settings input[type="password"]')
+  && [...document.querySelectorAll('.ai-drafting-settings button')].some(button => button.textContent.includes('更改 API 密钥'))
 const keyPersistenceHasNoRuleOrPluginEffects = !aiKeyPersistenceCalls.some(call => (
   /^\/api\/(?:rules|plugins)(?:\/|$)/.test(call.path)
 ))
 const aiKeySavedSecurely = aiSettingsSavedWithoutKey
   && secretSentOnlyToKeySaveEndpoint
   && savedKeyStatusRenders
-  && savedKeyInputClears
+  && savedKeyInputIsHidden
   && keyPersistenceHasNoRuleOrPluginEffects
-console.log((aiKeySavedSecurely?'PASS':'FAIL')+' - saved AI keys use the dedicated endpoint, clear the input, and render saved status')
+console.log((aiKeySavedSecurely?'PASS':'FAIL')+' - saved AI keys show a green state and hide the editor until changed')
 if (!aiKeySavedSecurely) process.exit(1)
-adminAuthorizationOptions.find(button => button.textContent.includes('引擎启动时授权一次'))?.click()
-await new Promise(r => setTimeout(r, 50))
-const adminAuthorizationSaved = bridgeCalls.some(call =>
-  call.path === '/api/settings/admin-authorization'
-  && call.method === 'PUT'
-  && call.data?.mode === 'engine_start'
-)
-console.log((adminAuthorizationSaved?'PASS':'FAIL')+' - admin authorization selection is saved')
-if (!adminAuthorizationSaved) process.exit(1)
+document.querySelector('.settings-back')?.click()
+await new Promise(r => setTimeout(r, 20))
+document.querySelector('.settings-back')?.click()
+await new Promise(r => setTimeout(r, 20))
 
-const aiNav = [...document.querySelectorAll('.nav-item')].find(
-  button => button.textContent.includes('AI 起草'),
-)
-aiNav?.click()
+;[...document.querySelectorAll('.settings-root-list button')].find(button => button.textContent.includes('可选插件'))?.click()
+await new Promise(r => setTimeout(r, 20))
+const bluetoothInstallButton = [...document.querySelectorAll('.bluetooth-settings button')]
+  .find(button => button.textContent.trim() === '安装')
+bluetoothInstallButton?.click()
 await new Promise(r => setTimeout(r, 50))
-const aiPanelOpensBesideEditor = !!document.querySelector('.ai-view .ai-draft-panel')
+const bluetoothInstalled = bridgeCalls.some(call => (
+  call.path === '/api/settings/bluetooth/install' && call.method === 'POST'
+)) && document.querySelector('.bluetooth-settings')?.textContent.includes('已安装')
+console.log((bluetoothInstalled?'PASS':'FAIL')+' - optional plugins live on their own settings page')
+if (!bluetoothInstalled) process.exit(1)
+document.querySelector('.settings-back')?.click()
+await new Promise(r => setTimeout(r, 20))
+
+;[...document.querySelectorAll('.settings-root-list button')].find(button => button.textContent.includes('关于 NotmyFault'))?.click()
+await new Promise(r => setTimeout(r, 20))
+const settingsAboutOk = document.querySelector('.settings-page .settings-about-card')?.textContent.includes('NotmyFault')
+  && document.querySelector('.settings-page')?.textContent.includes('平台支持')
+  && document.querySelector('.settings-page')?.textContent.includes('技术栈')
+const noAboutNav = ![...document.querySelectorAll('.nav-item')].some(button => button.textContent.includes('关于'))
+console.log((settingsAboutOk && noAboutNav?'PASS':'FAIL')+' - about stays inside settings as a subpage')
+if (!settingsAboutOk || !noAboutNav) process.exit(1)
+rulesNav?.click()
+await new Promise(r => setTimeout(r, 50))
+;[...document.querySelectorAll('.rules-library button')].find(
+  button => button.textContent.includes('创建自动化'),
+)?.click()
+await new Promise(r => setTimeout(r, 50))
+;[...document.querySelectorAll('.automation-create-panel button')].find(
+  button => button.textContent.includes('AI 起草'),
+)?.click()
+await new Promise(r => setTimeout(r, 80))
+const aiPanelOpensInEditor = !!document.querySelector('.ai-editor-panel .ai-draft-panel')
   && !!document.querySelector('#natural-draft-description')
-const aiWelcomeShowsQuickChips = [...document.querySelectorAll('.ai-quick-chip')].length > 0
-console.log((aiWelcomeShowsQuickChips?'PASS':'FAIL')+' - AI page greets with quick-start chips before any turn')
-if (!aiWelcomeShowsQuickChips) process.exit(1)
+const aiEmptyStateOk = document.querySelector('.ai-editor-panel')?.textContent.includes('AI 自动化助手')
+  && [...document.querySelectorAll('.ai-empty-chip')].length === 2
+console.log((aiEmptyStateOk && aiPanelOpensInEditor?'PASS':'FAIL')+' - AI assistant opens as an editor side panel with a restrained empty state')
+if (!aiEmptyStateOk || !aiPanelOpensInEditor) process.exit(1)
+
 const aiChatStart = aiDraftCalls.length
 const longTriggerName = '定时：在连续多个条件满足后仍需完整显示的中文触发标签'
 const longActionName = '显示通知：包含较长说明且不应省略或截断的中文动作标签'
@@ -1530,8 +1614,8 @@ async function sendNaturalDraft(message) {
   composer.value = message
   composer.dispatchEvent(new window.Event('input', { bubbles:true }))
   await new Promise(r => setTimeout(r, 20))
-  ;[...document.querySelectorAll('.natural-draft-form button')].find(
-    button => button.textContent.includes('发送'),
+  ;[...document.querySelectorAll('.ai-composer button')].find(
+    button => (button.title || '').includes('发送'),
   )?.click()
 }
 
@@ -1551,22 +1635,32 @@ const firstTurnPreservesHistory = firstAiTurn?.messages?.length === 1
   && firstAiTurn.messages[0]?.content === '每天九点提醒我检查日报'
   && !('consent' in firstAiTurn)
   && !('api_key' in firstAiTurn)
-  && document.querySelector('.natural-draft-conversation')?.textContent.includes('请补充提醒的具体内容。')
+  && conversation?.textContent.includes('请补充提醒的具体内容。')
+const userBubbleRenders = [...document.querySelectorAll('.ai-user-bubble')].some(
+  bubble => bubble.textContent === '每天九点提醒我检查日报'
+)
 const streamedMarkdownRendersSafely = document.querySelector('.natural-draft-markdown strong')?.textContent === '请补充'
   && !document.querySelector('.natural-draft-markdown script')
   && !document.querySelector('.natural-draft-markdown img')
-const reasoningPanel = document.querySelector('.natural-draft-reasoning')
-const reasoningFinishedCollapsed = !!reasoningPanel
+const activityPanel = document.querySelector('.ai-activity')
+const activityShowsStepsNotReasoning = !!activityPanel
+  && activityPanel.classList.contains('finished')
+  && activityPanel.textContent.includes('已完成')
+  && !!activityPanel.querySelector('.ai-activity-chevron')
+  && activityPanel.querySelectorAll('.ai-activity-step').length >= 2
+  && !activityPanel.textContent.includes('正在检查可用条件。')
+const reasoningPanel = document.querySelector('.ai-reasoning')
+const reasoningStreamVisible = !!reasoningPanel
+  && !!reasoningPanel.querySelector('.ai-reasoning-chevron')
   && reasoningPanel.textContent.includes('思考过程')
-  && !reasoningPanel.classList.contains('reasoning-open')
-  && reasoningPanel.querySelector('.reasoning-toggle')?.getAttribute('aria-expanded') === 'false'
+  && reasoningPanel.textContent.includes('正在检查可用条件。')
 
 mockAiDraftResultType = 'rule_draft'
 await sendNaturalDraft('通知内容写成今天的日报')
 await new Promise(r => setTimeout(r, 50))
 const secondAiTurn = aiDraftCalls[aiChatStart + 1]
 const secondTurnPreservesHistory = secondAiTurn?.messages?.length === 3
-  && secondAiTurn.messages.map(message => `${message.role}:${message.content}`).join('|') === [
+  && secondAiTurn.messages.map(message => message.role + ':' + message.content).join('|') === [
     'user:每天九点提醒我检查日报',
     'assistant:**请补充**提醒的具体内容。',
     'user:通知内容写成今天的日报',
@@ -1574,35 +1668,43 @@ const secondTurnPreservesHistory = secondAiTurn?.messages?.length === 3
   && !('consent' in secondAiTurn)
   && !('api_key' in secondAiTurn)
   && !secondAiTurn.messages.some(message => message.content.includes('正在检查可用条件。'))
-const noOldDraftLabel = ![...document.querySelectorAll('button')].some(button => button.textContent.includes('先看看草稿'))
-const composerStaysUsable = !!document.querySelector('#natural-draft-description:not([disabled])') && noOldDraftLabel
-const longRuleLabelsCanWrap = [...document.querySelectorAll('.natural-draft-sentence b')].length === 2
-  && [...document.querySelectorAll('.natural-draft-sentence b')].every(label => (
-    label.classList.contains('break-words')
-  ))
-  && document.querySelector('.natural-draft-sentence')?.textContent.includes(longTriggerName)
-  && document.querySelector('.natural-draft-sentence')?.textContent.includes(longActionName)
+const ruleCard = document.querySelector('.ai-rule-card')
+const rulePreviewCardOk = !!ruleCard
+  && ruleCard.textContent.includes('候选规则')
+  && ruleCard.textContent.includes('2 个节点')
+  && ruleCard.textContent.includes(longTriggerName)
+  && ruleCard.textContent.includes(longActionName)
+  && ruleCard.querySelectorAll('.ai-mini-node').length === 2
+  && !![...(ruleCard?.querySelectorAll('button') || [])].find(b => b.textContent.includes('应用到编辑器'))
+const composerStaysUsable = !!document.querySelector('#natural-draft-description:not([disabled])')
 const conversationFollowsLatest = conversation.scrollTop === conversation.scrollHeight
-const aiDraftPreviewOk = document.querySelector('.natural-draft-result')?.textContent.includes('AI 候选草稿')
+const noStreamingLeftoverText = !conversation?.textContent.includes('正在整理规则草稿。')
+  && document.querySelectorAll('.ai-rule-card').length === 1
+const aiDraftPreviewOk = rulePreviewCardOk
   && firstTurnPreservesHistory
   && secondTurnPreservesHistory
-  && aiPanelOpensBesideEditor
+  && aiPanelOpensInEditor
+  && userBubbleRenders
   && streamedMarkdownRendersSafely
-  && reasoningFinishedCollapsed
+  && activityShowsStepsNotReasoning
+  && reasoningStreamVisible
   && composerStaysUsable
   && chatScrollIsKeyboardReachable
   && chatBusyWhileRequesting
   && composerRestoresFocus
-  && longRuleLabelsCanWrap
   && conversationFollowsLatest
-const noDuplicateFinalAssistant = document.querySelectorAll('.natural-draft-result').length === 1
-  && !document.querySelector('.natural-draft-conversation')?.textContent.includes('正在整理规则草稿。')
+  && noStreamingLeftoverText
+console.log((aiDraftPreviewOk?'PASS':'FAIL')+' - AI drafting flows flat with agent activity and a rule preview card')
+if (!aiDraftPreviewOk) {
+  console.error(JSON.stringify({ firstAiTurn, secondAiTurn, userBubbleRenders, streamedMarkdownRendersSafely, activityShowsStepsNotReasoning, reasoningStreamVisible, rulePreviewCardOk, conversationFollowsLatest, noStreamingLeftoverText }))
+  process.exit(1)
+}
 T.time_schedule.name = originalTriggerName
 A.notify.name = originalActionName
 requireEarlyApproval = true
 earlyApprovalAttempts.length = 0
-;[...document.querySelectorAll('.natural-draft-result button')].find(
-  button => button.textContent.includes('进编辑器检查'),
+;[...(ruleCard?.querySelectorAll('button') || [])].find(
+  button => button.textContent.includes('应用到编辑器'),
 )?.click()
 await new Promise(r => setTimeout(r, 60))
 const aiDraftNeedsApproval = document.querySelector('.app-dialog')?.textContent.includes('确认后才会打开规则编辑器')
@@ -1619,25 +1721,23 @@ const aiDraftReviewOnlyOk = document.querySelector('.rule-title-capsule')?.textC
   && savedRulesPayload?.[0]?.name !== 'AI 候选草稿'
   && aiDraftNeedsApproval
   && earlyApprovalAttempts.join('|') === '|dashboard-secret'
-console.log((aiDraftPreviewOk && aiDraftReviewOnlyOk && noDuplicateFinalAssistant?'PASS':'FAIL')+' - AI drafting streams one assistant turn and opens candidates through approval')
-if (!aiDraftPreviewOk || !aiDraftReviewOnlyOk || !noDuplicateFinalAssistant) {
-  console.error(JSON.stringify({ aiDraftCalls, aiDraftPreviewOk, aiDraftReviewOnlyOk, noDuplicateFinalAssistant, savedRulesPayload, firstAiTurn, secondAiTurn, composerStaysUsable }))
+console.log((aiDraftReviewOnlyOk?'PASS':'FAIL')+' - rule drafts open the editor only after admin approval')
+if (!aiDraftReviewOnlyOk) {
+  console.error(JSON.stringify({ earlyApprovalAttempts, aiDraftNeedsApproval, savedRulesPayload }))
   process.exit(1)
 }
+
 mockAiDraftResultType = 'plugin_proposal'
 const proposalCallStart = bridgeCalls.length
 const proposalSaveStart = saveConfigCalls.length
 const proposalAiStart = aiDraftCalls.length
-aiNav?.click()
-await new Promise(r => setTimeout(r, 50))
 await sendNaturalDraft('根据天气情况生成状态报告')
 await new Promise(r => setTimeout(r, 50))
 const proposalAiTurn = aiDraftCalls[proposalAiStart]
-const proposalResult = document.querySelector('.natural-draft-result')
+const proposalResult = [...document.querySelectorAll('.ai-card')].at(-1)
 const proposalText = proposalResult?.textContent || ''
 const proposalDisplaysSafeMetadata = [
-  '当前插件目录缺少所需能力',
-  '未安装 · 仅供人工评审',
+  '缺少能力提案',
   '动作',
   '天气状态报告',
   mockPluginId,
@@ -1654,28 +1754,30 @@ const proposalDisplaysSafeMetadata = [
 const consentButton = [...(proposalResult?.querySelectorAll('button') || [])].find(
   button => button.textContent.includes('同意生成插件草稿'),
 )
-const longPluginIdCanWrap = proposalResult?.querySelector('.natural-draft-notes li:nth-child(2) > span:last-child')
-  ?.classList.contains('min-w-0')
-  && proposalResult?.querySelector('.natural-draft-notes li:nth-child(2) > span:last-child')
-    ?.classList.contains('break-all')
+const pluginIdRowRenders = [...(proposalResult?.querySelectorAll('code') || [])].some(
+  code => code.textContent === mockPluginId
+)
 const proposalMutationCalls = bridgeCalls.slice(proposalCallStart).filter(call => (
   /^\/api\/(?:plugins|rules)(?:\/|$)/.test(call.path)
   && call.path !== '/api/rules/draft/ai'
 ))
+const proposalAiTurnOk = proposalAiTurn?.messages?.at(-1)?.role === 'user'
+  && proposalAiTurn.messages.at(-1)?.content === '根据天气情况生成状态报告'
+  && proposalAiTurn.messages.length === 5
+  && !('api_key' in proposalAiTurn)
+  && !('consent' in proposalAiTurn)
 const proposalReviewOnlyOk = proposalDisplaysSafeMetadata
+  && pluginIdRowRenders
   && !!consentButton
   && proposalResult?.querySelectorAll('button').length === 1
   && proposalMutationCalls.length === 0
   && saveConfigCalls.length === proposalSaveStart
-  && proposalAiTurn?.messages?.length === 1
-  && proposalAiTurn.messages[0]?.content === '根据天气情况生成状态报告'
-  && !('api_key' in proposalAiTurn)
-  && !('consent' in proposalAiTurn)
-  && longPluginIdCanWrap
+  && proposalAiTurnOk
 if (!proposalReviewOnlyOk) {
-  console.error(JSON.stringify({ proposalText, proposalMutationCalls, proposalAiTurn, aiDraftCalls }))
+  console.error(JSON.stringify({ proposalText, proposalMutationCalls, proposalAiTurn, consentButton }))
   process.exit(1)
 }
+console.log((proposalReviewOnlyOk?'PASS':'FAIL')+' - capability proposals render read-only metadata with a single consent action')
 
 mockAiDraftResultType = 'plugin_source'
 const consentAiStart = aiDraftCalls.length
@@ -1689,8 +1791,8 @@ const sourceText = sourceResult?.textContent || ''
 const consentSendsExactPluginId = consentCalls.length === 1
   && JSON.stringify(consentTurn?.consent) === JSON.stringify({ plugin_id:mockPluginId })
   && consentTurn?.messages?.at(-1)?.role === 'user'
-  && consentTurn?.messages?.at(-1)?.content === `我同意生成插件草稿：${mockPluginId}`
-const sourceRendersReviewOnly = sourceText.includes('未保存、未签名、未安装、未运行')
+  && consentTurn?.messages?.at(-1)?.content === ('我同意生成插件草稿：' + mockPluginId)
+const sourceRendersInstallable = sourceText.includes('插件已生成')
   && sourceText.includes(mockPluginId)
   && sourceText.includes('<script>review only</script>')
   && sourceResult?.querySelectorAll('pre').length === 2
@@ -1701,11 +1803,58 @@ const consentSideEffects = bridgeCalls.slice(consentSideEffectStart).filter(call
   /^\/api\/(?:plugins|rules)(?:\/|$)/.test(call.path)
   && call.path !== '/api/rules/draft/ai'
 ))
-console.log((consentSendsExactPluginId && sourceRendersReviewOnly && consentSideEffects.length === 0?'PASS':'FAIL')+' - plugin consent generates an escaped review-only source card without plugin or rule side effects')
-if (!consentSendsExactPluginId || !sourceRendersReviewOnly || consentSideEffects.length) {
+console.log((consentSendsExactPluginId && sourceRendersInstallable && consentSideEffects.length === 0?'PASS':'FAIL')+' - plugin consent renders an installable source card without side effects')
+if (!consentSendsExactPluginId || !sourceRendersInstallable || consentSideEffects.length) {
   console.error(JSON.stringify({ consentCalls, sourceText, consentSideEffects }))
   process.exit(1)
 }
+
+const actionDownloadStart = exportedFileNames.length
+;[...(sourceResult?.querySelectorAll('button') || [])].find(
+  button => button.textContent.includes('下载文件'),
+)?.click()
+const actionDownloadNames = exportedFileNames.slice(actionDownloadStart)
+const actionDownloadsUsePluginId = actionDownloadNames.includes(`${mockPluginId}.action.json`)
+  && actionDownloadNames.includes(`${mockPluginId}.action.py`)
+
+const installStart = bridgeCalls.length
+;[...(sourceResult?.querySelectorAll('button') || [])].find(
+  button => button.textContent.includes('安装插件'),
+)?.click()
+await new Promise(r => setTimeout(r, 80))
+const installCalls = bridgeCalls.slice(installStart).filter(call => call.path === '/api/plugins/install-source')
+const installPayload = installCalls[0]?.data
+const pluginInstalledDirectly = installCalls.length === 1
+  && installCalls[0]?.method === 'POST'
+  && installPayload?.plugin_id === mockPluginId
+  && installPayload?.kind === 'action'
+  && installPayload?.manifest?.id === mockPluginId
+  && typeof installPayload?.source === 'string'
+  && !('password' in installPayload)
+const installNoticeUsesPluginId = document.querySelector('.snackbar')?.textContent.includes(`插件 ${mockPluginId} 已安装`)
+console.log((pluginInstalledDirectly && actionDownloadsUsePluginId && installNoticeUsesPluginId?'PASS':'FAIL')+' - AI plugin files keep their id and install through the source endpoint')
+if (!pluginInstalledDirectly || !actionDownloadsUsePluginId || !installNoticeUsesPluginId) {
+  console.error(JSON.stringify({ installCalls, actionDownloadNames, installNoticeUsesPluginId }))
+  process.exit(1)
+}
+
+mockPluginKind = 'trigger'
+const triggerDownloadStart = exportedFileNames.length
+await sendNaturalDraft('生成前台窗口切换触发器源码')
+await new Promise(r => setTimeout(r, 50))
+const triggerSourceResult = [...document.querySelectorAll('.natural-draft-source')].at(-1)
+;[...(triggerSourceResult?.querySelectorAll('button') || [])].find(
+  button => button.textContent.includes('下载文件'),
+)?.click()
+const triggerDownloadNames = exportedFileNames.slice(triggerDownloadStart)
+const triggerDownloadsUsePluginId = triggerDownloadNames.includes(`${mockPluginId}.trigger.json`)
+  && triggerDownloadNames.includes(`${mockPluginId}.trigger.py`)
+console.log((triggerDownloadsUsePluginId?'PASS':'FAIL')+' - trigger plugin downloads use trigger filenames')
+if (!triggerDownloadsUsePluginId) {
+  console.error(JSON.stringify({ triggerDownloadNames }))
+  process.exit(1)
+}
+mockPluginKind = 'action'
 
 mockAiDraftError = 'AI 模拟错误：请稍后重试'
 await sendNaturalDraft('继续说明这个草稿')
@@ -1714,29 +1863,43 @@ const afterSourceTurn = aiDraftCalls.at(-1)
 const sourceStaysOutOfHistory = !afterSourceTurn?.messages?.some(message => (
   message.content.includes('<script>review only</script>')
 )) && !('consent' in afterSourceTurn)
-const visibleErrorMessages = [...document.querySelectorAll('.natural-draft-conversation .natural-draft-message')]
+const visibleErrorMessages = [...document.querySelectorAll('.natural-draft-conversation .ai-message')]
   .filter(message => message.textContent.includes(mockAiDraftError))
+const retryButton = document.querySelector('.ai-error-retry')
+const errorCallCount = aiDraftCalls.length
+retryButton?.click()
+await new Promise(r => setTimeout(r, 50))
+const retryTurn = aiDraftCalls.at(-1)
+const errorRetryKeepsOneRequest = aiDraftCalls.length === errorCallCount + 1
+  && retryTurn?.messages?.at(-1)?.content === '继续说明这个草稿'
+  && retryTurn.messages.filter(message => message.content === '继续说明这个草稿').length === 1
 const errorAnnouncedOnce = visibleErrorMessages.length === 1
-  && document.querySelectorAll('[role="alert"]').length === 0
-console.log((sourceStaysOutOfHistory && errorAnnouncedOnce?'PASS':'FAIL')+' - generated source stays out of history and errors announce once in the conversation')
-if (!sourceStaysOutOfHistory || !errorAnnouncedOnce) {
-  console.error(JSON.stringify({ afterSourceTurn, visibleErrorMessages:visibleErrorMessages.length, alerts:document.querySelectorAll('[role="alert"]').length }))
+  && document.querySelectorAll('.ai-error[role="alert"]').length === 1
+  && errorRetryKeepsOneRequest
+await new Promise(r => setTimeout(r, 550))
+const savedConversation = JSON.parse(window.localStorage.getItem('nmf_ai_conversation') || '[]')
+const conversationPersistsAfterRetry = savedConversation.length > 0
+  && savedConversation.at(-1)?.error === true
+  && savedConversation.at(-1)?.retryPrompt === '继续说明这个草稿'
+console.log((sourceStaysOutOfHistory && errorAnnouncedOnce && conversationPersistsAfterRetry?'PASS':'FAIL')+' - generated source stays out of history and errors can be retried')
+if (!sourceStaysOutOfHistory || !errorAnnouncedOnce || !conversationPersistsAfterRetry) {
+  console.error(JSON.stringify({ afterSourceTurn, visibleErrorMessages:visibleErrorMessages.length, retryTurn, savedConversation }))
   process.exit(1)
 }
 mockAiDraftError = ''
 mockAiStreamMode = 'stalled'
 await sendNaturalDraft('这条流我想停止')
 await new Promise(r => setTimeout(r, 30))
-const stopDraftButton = [...document.querySelectorAll('.natural-draft-form button')].find(
-  button => button.textContent.includes('停止'),
+const stopDraftButton = [...document.querySelectorAll('.ai-composer button')].find(
+  button => (button.title || '').includes('停止'),
 )
 stopDraftButton?.click()
 await new Promise(r => setTimeout(r, 30))
-const stoppedLabels = [...document.querySelectorAll('.natural-draft-message, .natural-draft-status')]
+const stoppedLabels = [...document.querySelectorAll('.ai-message')]
   .filter(element => element.textContent.includes('已停止'))
 const abortStaysQuiet = stoppedLabels.length === 1
   && document.activeElement === document.querySelector('#natural-draft-description')
-  && ![...document.querySelectorAll('.natural-draft-message')].some(message => (
+  && ![...document.querySelectorAll('.ai-message')].some(message => (
     message.textContent.includes('连接已中断') || message.textContent.includes('草稿服务暂时不可用')
   ))
 console.log((abortStaysQuiet ? 'PASS' : 'FAIL') + ' - stopping an AI stream returns to idle without an error turn')
@@ -1744,54 +1907,63 @@ if (!abortStaysQuiet) process.exit(1)
 mockAiStreamMode = 'normal'
 mockAiDraftResultType = 'rule_draft'
 
-// 用户上翻读历史时，AI 的流式输出不该把视图拽回底部；用户自己发言才回到当下。
+
 const followPanel = document.querySelector('.natural-draft-conversation')
 Object.defineProperty(followPanel, 'clientHeight', { configurable:true, value:200 })
 Object.defineProperty(followPanel, 'scrollHeight', { configurable:true, value:1000 })
 mockAiDraftDelay = 120
 void sendNaturalDraft('再补一个每天下班提醒')
 await new Promise(r => setTimeout(r, 25))
+const resumedAiTurn = aiDraftCalls.at(-1)
+const failedAndStoppedTurnsStayOutOfHistory = !resumedAiTurn?.messages?.some(message => (
+  message.content === '继续说明这个草稿' || message.content === '这条流我想停止'
+))
 followPanel.scrollTop = 100
 followPanel.dispatchEvent(new window.Event('scroll', { bubbles:true }))
 await new Promise(r => setTimeout(r, 20))
-const jumpToLatestAppears = [...document.querySelectorAll('.ai-conversation-header button')].some(
-  button => button.textContent.includes('回到底部'),
-)
+const jumpToLatestAppears = !!document.querySelector('.ai-jump-latest')
 await new Promise(r => setTimeout(r, 140))
 mockAiDraftDelay = 0
 const scrollFollowPausedWhileReadingBack = followPanel.scrollTop === 100
-;[...document.querySelectorAll('.ai-conversation-header button')].find(
-  button => button.textContent.includes('回到底部'),
-)?.click()
+document.querySelector('.ai-jump-latest')?.click()
 await new Promise(r => setTimeout(r, 30))
 const jumpToLatestResumesFollow = followPanel.scrollTop === followPanel.scrollHeight
-window.confirm = () => true
-;[...document.querySelectorAll('.ai-conversation-header button')].find(
-  button => button.textContent.includes('新对话'),
+
+document.querySelector('.ai-editor-panel-head button[title="新对话"]')?.click()
+await new Promise(r => setTimeout(r, 30))
+const resetUsesAppDialog = !!document.querySelector('.app-dialog')?.textContent.includes('清空当前对话')
+;[...document.querySelectorAll('.app-dialog .btn-filled')].find(
+  button => button.textContent.includes('清空'),
 )?.click()
 await new Promise(r => setTimeout(r, 40))
 const newConversationResetsToWelcome = !document.querySelector('.natural-draft-conversation')
-  && [...document.querySelectorAll('.ai-quick-chip')].length > 0
-  && !document.querySelector('.natural-draft-result')
-const scrollAndResetOk = jumpToLatestAppears
+  && [...document.querySelectorAll('.ai-empty-chip')].length === 2
+  && !document.querySelector('.ai-rule-card')
+const scrollAndResetOk = failedAndStoppedTurnsStayOutOfHistory
+  && jumpToLatestAppears
   && scrollFollowPausedWhileReadingBack
   && jumpToLatestResumesFollow
+  && resetUsesAppDialog
   && newConversationResetsToWelcome
-console.log((scrollAndResetOk?'PASS':'FAIL')+' - reading back pauses auto-scroll and new conversation clears the session')
+console.log((scrollAndResetOk?'PASS':'FAIL')+' - failed and stopped turns stay out of history while scroll and reset remain stable')
 if (!scrollAndResetOk) {
-  console.error(JSON.stringify({ jumpToLatestAppears, scrollFollowPausedWhileReadingBack, jumpToLatestResumesFollow, newConversationResetsToWelcome }))
+  console.error(JSON.stringify({ failedAndStoppedTurnsStayOutOfHistory, jumpToLatestAppears, scrollFollowPausedWhileReadingBack, jumpToLatestResumesFollow, resetUsesAppDialog, newConversationResetsToWelcome }))
   process.exit(1)
 }
 
 const aiKeyDeleteStart = bridgeCalls.length
 settingsNav?.click()
 await new Promise(r => setTimeout(r, 50))
-;[...document.querySelectorAll('.ai-drafting-settings button')].find(button => button.textContent.includes('删除已保存的密钥'))?.click()
+;[...document.querySelectorAll('.settings-root-list button')].find(button => button.textContent.includes('AI 功能'))?.click()
+await new Promise(r => setTimeout(r, 20))
+;[...document.querySelectorAll('.ai-drafting-settings button')].find(button => button.textContent.includes('API 密钥'))?.click()
+await new Promise(r => setTimeout(r, 20))
+;[...document.querySelectorAll('.ai-drafting-settings button')].find(button => button.textContent.includes('删除 API 密钥'))?.click()
 await new Promise(r => setTimeout(r, 50))
 const aiKeyDeleteCalls = bridgeCalls.slice(aiKeyDeleteStart)
 const savedKeyDeleted = aiKeyDeleteCalls.some(call => (
   call.path === '/api/settings/ai-drafting/api-key' && call.method === 'DELETE'
-)) && document.querySelector('.ai-drafting-settings')?.textContent.includes('未保存')
+)) && document.querySelector('.settings-key-status')?.textContent.includes('未设置')
 const keyDeleteHasNoRuleOrPluginEffects = !aiKeyDeleteCalls.some(call => (
   /^\/api\/(?:rules|plugins)(?:\/|$)/.test(call.path)
 ))

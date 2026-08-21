@@ -10,17 +10,12 @@ const { starting, stopping, shuttingDown, syncStatus, startEngine, stopEngine, s
 const stats = ref({ rules: '-', triggers: '-', actions: '-', pid: '-' })
 const diag = ref(null)
 let diagTimer = null
-const appVersion = __APP_VERSION__
 
 const isRunning = computed(() => store.engineStatus.engine_running === true)
 const isControllerOnline = computed(() => store.engineStatus.api_alive === true)
 const engineState = computed(() => store.engineStatus.engine_state || (isRunning.value ? 'running' : 'offline'))
 const isStarting = computed(() => starting.value || engineState.value === 'starting')
 const isStopping = computed(() => stopping.value || engineState.value === 'stopping')
-const modeLabel = computed(() => {
-  const m = store.engineStatus.security_mode
-  return ({ strict: '严格', normal: '标准', permissive: '宽松' })[m] || '-'
-})
 // 引擎启动失败或被拒绝时，pausedError 保存后台返回的原因。
 const pausedError = computed(() => store.engineStatus.last_error || '')
 const showFirstAutomationGuide = computed(() => store.configLoaded
@@ -114,8 +109,23 @@ function refreshHome() {
   snackbar('已刷新')
 }
 
+function syncStats(status) {
+  stats.value = status.api_alive === true
+    ? {
+        rules: status.rules_count != null ? status.rules_count : '-',
+        triggers: status.triggers_count != null ? status.triggers_count : '-',
+        actions: status.actions_count != null ? status.actions_count : '-',
+        pid: status.pid || '-',
+      }
+    : { rules: '-', triggers: '-', actions: '-', pid: '-' }
+}
+
+watch(() => store.engineStatus, (status) => {
+  syncStats(status)
+  loadDiag()
+}, { immediate: true, deep: true })
+
 onMounted(() => {
-  loadStats()
   if (hasBridge()) diagTimer = setInterval(loadDiag, 30000)
 })
 onUnmounted(() => { if (diagTimer) clearInterval(diagTimer) })
@@ -156,18 +166,13 @@ watch(isRunning, (running) => {
           <span v-else class="material-symbols-outlined">{{ isRunning ? 'task_alt' : isControllerOnline ? 'pause_circle' : 'cloud_off' }}</span>
         </div>
         <div>
-          <h3>{{ isStarting ? '启动中…' : isStopping ? '暂停中…' : isRunning ? '自动化运行中' : isControllerOnline ? '自动化已暂停' : '后台服务未启动' }}</h3>
-          <p v-if="isStarting">正在连接后台服务并加载规则…</p>
-          <p v-else-if="isStopping">触发器正在安全退出，托盘与配置服务会保持在线。</p>
-          <p v-else-if="isRunning">PID {{ stats.pid }} · {{ modeLabel }} · 127.0.0.1:19198</p>
-          <p v-else-if="isControllerOnline">PID {{ stats.pid }} · 可继续编辑规则或重新启动自动化</p>
-          <p v-else>Dashboard 会为你启动后台服务、托盘与自动化引擎</p>
+          <h3>{{ isStarting ? '启动中…' : isStopping ? '暂停中…' : isRunning ? '运行中' : isControllerOnline ? '已暂停' : '引擎未运行' }}</h3>
         </div>
       </div>
       <!-- 按钮区域在启动、运行、停止和关闭中只显示一个状态。 -->
       <div class="actions">
         <button v-if="!isRunning && !isStarting && !isStopping" class="btn hero-control hero-control-primary" @click="startEngine">
-          <span class="material-symbols-outlined">play_arrow</span>{{ isControllerOnline ? '启动自动化' : '启动后台服务' }}</button>
+          <span class="material-symbols-outlined">play_arrow</span>{{ isControllerOnline ? '启动自动化' : '启动引擎' }}</button>
         <button v-if="isStarting" class="btn hero-control hero-control-primary" disabled>
           <span class="spinner"></span>启动中...</button>
         <button v-if="isRunning && !isStopping" class="btn hero-control hero-control-primary" @click="stopEngine">
@@ -252,33 +257,5 @@ watch(isRunning, (running) => {
       </section>
     </template>
 
-    <template v-else>
-    <section class="dashboard-card dashboard-system">
-      <header class="dashboard-card-head">
-        <div>
-          <h3>系统信息</h3>
-        </div>
-      </header>
-      <div class="dashboard-system-grid">
-        <div v-for="info in [
-            { icon: 'info', key: '版本', val: 'NotmyFault ' + appVersion },
-            { icon: 'shield', key: '安全模式', val: modeLabel },
-            { icon: 'folder', key: '配置目录', val: '%APPDATA%/NotmyFault/' },
-            { icon: 'rule', key: '已配置规则', val: (store.configData?.rules?.length || 0) + ' 条' },
-          ]" :key="info.key" class="dashboard-system-row">
-          <span class="material-symbols-outlined">{{ info.icon }}</span>
-          <div>
-            <span>{{ info.key }}</span>
-            <strong>{{ info.val }}</strong>
-          </div>
-        </div>
-      </div>
-    </section>
-    <div class="empty-state" style="padding:32px 20px">
-      <div class="material-symbols-outlined">power_off</div>
-      <h3>后台服务未启动</h3>
-      <p>点击上方按钮，同时启动托盘、配置服务和自动化引擎</p>
-    </div>
-    </template>
   </section>
 </template>

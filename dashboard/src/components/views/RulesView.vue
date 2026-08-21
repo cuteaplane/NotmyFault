@@ -222,6 +222,11 @@ function createAutomation() {
   if (store.aiDrafting.enabled) showCreatePanel.value = true
   else addRule()
 }
+async function createWithAi() {
+  showCreatePanel.value = false
+  store.pendingAiPanel = true
+  await addRule()
+}
 async function leaveEditor() {
   if (isDirty.value && !await confirmDialog('要放弃这些修改吗？', `尚未保存：${draftChangeText.value}。`, '放弃')) return
   activeRuleIndex.value = null
@@ -616,6 +621,7 @@ onMounted(() => {
           <p>选择一个常见用途，或者先指定什么时候开始、接着做什么。</p>
         </div>
         <div class="actions">
+          <button v-if="store.aiDrafting.enabled" class="btn btn-tonal" @click="createWithAi"><span class="material-symbols-outlined">auto_awesome</span>AI 起草</button>
           <button class="btn btn-text" @click="addRule"><span class="material-symbols-outlined">edit_note</span>空白规则</button>
           <button class="btn btn-tonal" @click="openQuickCreate"><span class="material-symbols-outlined">account_tree</span>自己搭一个</button>
           <button v-if="store.configData.rules.length" class="icon-btn" title="收起创建区" @click="showCreatePanel = false"><span class="material-symbols-outlined">close</span></button>

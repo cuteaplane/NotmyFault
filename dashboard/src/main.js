@@ -13,8 +13,10 @@ function start() {
   createApp(App).mount('#app')
 }
 
-// Dashboard 只在 pywebview 中运行，收到 pywebviewready 后才挂载 Vue。
+// 桌面 WebView 等桥接就绪，普通浏览器直接挂载供预览和开发调试使用。
 if (window.pywebview && window.pywebview.api) {
+  start()
+} else if (!window.pywebview) {
   start()
 } else {
   window.addEventListener('pywebviewready', start, { once: true })
