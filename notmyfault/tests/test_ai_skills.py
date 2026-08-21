@@ -37,10 +37,10 @@ def tool_schema(catalog, name):
 
 
 class TestBuildRuleDraftingSkill:
-    def test_returns_skill_with_rule_plugin_and_reply_tools(self):
+    def test_returns_skill_with_rule_and_plugin_tools(self):
         skill = build_rule_drafting_skill(make_catalog())
         assert isinstance(skill, SkillSpec)
-        assert skill.tool_names() == {"propose_rule_draft", "propose_plugin", "reply"}
+        assert skill.tool_names() == {"propose_rule_draft", "propose_plugin"}
 
     def test_rule_event_enum_is_sorted_trigger_ids(self):
         schema = tool_schema(make_catalog(), "propose_rule_draft")
@@ -116,7 +116,7 @@ class TestPluginSourceGating:
 
     def test_consent_keeps_existing_tools(self):
         skill = build_rule_drafting_skill(make_catalog(), allow_plugin_source=True)
-        assert {"propose_rule_draft", "propose_plugin", "reply"} <= skill.tool_names()
+        assert {"propose_rule_draft", "propose_plugin"} <= skill.tool_names()
 
     def test_source_tool_schema_is_strict(self):
         skill = build_rule_drafting_skill(make_catalog(), allow_plugin_source=True)
@@ -165,11 +165,14 @@ class TestPluginAuthoringGuidance:
         assert "用户路径" in text
         assert "参数" in text
 
-    def test_guidance_is_generalized_and_review_only(self):
+    def test_guidance_is_generalized_and_includes_examples(self):
         text = plugin_authoring_guidance()
         assert "一类任务" in text
-        assert "审查" in text
-        assert "不自动" in text
+        assert "安全审查" in text
+        assert "action.json + action.py" in text
+        assert "trigger.json + trigger.py" in text
+        assert "def run(action_info, params):" in text
+        assert "package_name" in text
 
 
 class TestDefinitionsNesting:

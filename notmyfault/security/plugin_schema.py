@@ -51,6 +51,10 @@ _PLUGIN_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 _COMPONENT_ID_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]*$")
 
 
+def is_valid_plugin_id(plugin_id: str) -> bool:
+    return bool(_PLUGIN_ID_RE.match(plugin_id))
+
+
 def current_platform_name() -> str:
     if sys.platform == "win32":
         return "windows"

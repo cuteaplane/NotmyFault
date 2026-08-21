@@ -10,15 +10,14 @@ from notmyfault.host.ai_proposals import PluginCatalog, _OUTPUT_TYPES, _PARAM_TY
 from notmyfault.host.ai_tools import (
     JSON,
     PLUGIN_SOURCE_TOOL,
-    REPLY_TOOL,
     SkillSpec,
     ToolSpec,
 )
 from notmyfault.security.plugin_schema import PERMISSION_REGISTRY
 
 _SKILL_DESCRIPTION = (
-    "先看目录里有没有能满足需求的触发器和动作：有就用规则草稿工具，缺了就用提案工具，"
-    "需要文字说明或澄清就用回复工具；仅在用户明确要求生成源码时使用源码工具。"
+    "先看目录里有没有能满足需求的触发器和动作：有就用规则草稿工具，缺了就用提案工具；"
+    "需要文字说明、澄清或追问时直接用普通文字回复，不要调工具，这样用户能看到流式输出。"
 )
 _RULE_DRAFT_DESCRIPTION = (
     "目录里已有能满足需求的触发器和动作时，选这个工具，把需求写成规则候选。"
@@ -86,6 +85,11 @@ def _rule_draft_parameters(catalog: PluginCatalog) -> JSON:
         "properties": {
             "name": {"type": "string"},
             "event": _node_schema(_sorted_ids(catalog, "triggers")),
+            "preconditions": {
+                "type": "array",
+                "description": "执行前检查，全部通过才继续动作；仅在用户明确提出条件时填写。",
+                "items": _node_schema(_sorted_ids(catalog, "actions")),
+            },
             "actions": {
                 "type": "array",
                 "items": _node_schema(_sorted_ids(catalog, "actions")),
@@ -129,7 +133,7 @@ def plugin_authoring_guidance() -> str:
     output_types = ", ".join(sorted(_OUTPUT_TYPES))
     permissions = ", ".join(sorted(PERMISSION_REGISTRY))
     return "\n".join([
-        "插件源码创作准则（manifest 与源码仅供审查，不自动保存、安装或执行）：",
+        "插件源码创作准则（生成后会经安全审查再交给用户安装）：",
         "1. 一次只设计一个可配置的触发器或动作，用参数覆盖一类任务，不要为某个具体应用或任务写死插件。",
         "2. 禁止写死具体 QQ 号、窗口标题或用户路径，把它们做成参数交给用户填写。",
         "3. manifest 必填 id、name、description、enabled、version_code、version、package_name；"
@@ -146,6 +150,17 @@ def plugin_authoring_guidance() -> str:
         "禁止直接调 ctypes ShellExecuteEx/CreateProcess 绕过授权通道。",
         "9. COM、音频驱动等崩溃风险高的原生库必须放子进程隔离（subprocess.run），"
         "子进程 stdin 用 sys.stdin.buffer.read().decode('utf-8') 读取，避免中文 Windows GBK 乱码。",
+        "10. 目录布局：动作插件是 action.json + action.py，触发器插件是 trigger.json + trigger.py，"
+        "都放在以插件 id 命名的文件夹里；manifest 不写 entrypoints 时引擎按这些文件名加载。",
+        "动作 manifest 示例："
+        '{"id":"my_tool","name":"我的工具","description":"做什么","enabled":true,'
+        '"version_code":1,"version":"1.0.0","package_name":"com.example.my_tool",'
+        '"params":[{"name":"target","label":"目标","type":"string","required":true}],'
+        '"outputs":[{"name":"result","label":"结果","type":"string"}]}',
+        "动作源码示例："
+        "def run(action_info, params):\n"
+        "    target = params.get('target', '')\n"
+        "    return {'result': target.upper()}",
     ])
 
 
@@ -163,7 +178,6 @@ def build_rule_drafting_skill(
             description=_PLUGIN_PROPOSAL_DESCRIPTION,
             parameters=_plugin_proposal_parameters(),
         ),
-        REPLY_TOOL,
     ]
     if allow_plugin_source:
         tools.append(PLUGIN_SOURCE_TOOL)

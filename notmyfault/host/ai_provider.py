@@ -10,6 +10,7 @@ import socket
 from http.client import HTTPException
 from typing import Any, Callable, Dict, Iterator
 from urllib import parse, request
+from urllib.error import HTTPError
 
 from notmyfault.host.ai_proposals import parse_plugin_proposal, parse_rule_draft
 from notmyfault.host.ai_skills import build_rule_drafting_skill, plugin_authoring_guidance
@@ -38,6 +39,11 @@ class AIProviderIdleTimeoutError(ValueError):
     """AI 流长时间没有返回任何内容。"""
 
 
+class AIProviderRequestError(ValueError):
+    """文案是自己代码拼的固定话术，可以透给用户。
+    模型返回内容校验失败的 ValueError 会把模型的内容带进异常文本，不能透"""
+
+
 class _NoRedirects(request.HTTPRedirectHandler):
     # 30x 一律不跟：标准库会抛 HTTPError，默认处理器则会自己去请求 Location 里的新地址。
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -47,6 +53,28 @@ class _NoRedirects(request.HTTPRedirectHandler):
 def _build_request_opener() -> request.OpenerDirector:
     # 单独包一层，测试会把它整个换成假网络。
     return request.build_opener(_NoRedirects())
+
+
+def _request_failure_message(error: Exception) -> str:
+    if not isinstance(error, HTTPError):
+        return "AI 草稿请求失败：无法连接 AI 服务"
+    code = error.code
+    reasons = {
+        400: "请求参数或模型名不被服务接受",
+        401: "API Key 未通过验证",
+        403: "API Key 没有调用权限",
+        404: "endpoint 路径或模型不存在",
+        405: "endpoint 不支持当前请求方式",
+        408: "服务端等待请求超时",
+        429: "请求太频繁或额度不足",
+    }
+    if 300 <= code < 400:
+        reason = "endpoint 地址要求重定向"
+    elif 500 <= code < 600:
+        reason = "服务端暂时不可用"
+    else:
+        reason = reasons.get(code, "请求被服务端拒绝")
+    return f"AI 服务返回 HTTP {code}：{reason}"
 
 
 def _is_private_host(host: str) -> bool:
@@ -85,8 +113,11 @@ def _catalog_prompt(schema: Dict[str, Any]) -> str:
         "你是 NotmyFault 规则草稿助手。",
         "先读下面的插件目录，挑出能满足用户需求的能力。",
         "目录里已有能满足需求的触发器和动作时调 propose_rule_draft，缺能力时调 propose_plugin。",
+        "用户明确提出执行前条件时，把条件动作填进 preconditions。",
+        "需要澄清、解释或追问时直接用普通文字回复，不要调工具，让用户看到流式输出。",
         "一次只调一个工具。触发器 id、动作 id 和参数名只能用目录里的。",
         "用户没给的值不要编；有 default 的参数可以用 default，否则省略。",
+        "动作的 outputs 可以给后续动作的参数提供数据来源，起草多步规则时优先串联已有输出。",
         "可用触发器:",
     ]
     if isinstance(triggers, dict):
@@ -104,9 +135,24 @@ def _catalog_prompt(schema: Dict[str, Any]) -> str:
             action_name = meta.get("name", action_id) if isinstance(meta, dict) else action_id
             description = meta.get("description", "") if isinstance(meta, dict) else ""
             params = meta.get("params", []) if isinstance(meta, dict) else []
+            extras = []
+            if isinstance(meta, dict):
+                outputs = meta.get("outputs") or []
+                if isinstance(outputs, list) and outputs:
+                    extras.append(
+                        "outputs="
+                        + json.dumps(outputs, ensure_ascii=False, separators=(',', ':'))
+                    )
+                permissions = meta.get("permissions") or []
+                if isinstance(permissions, list) and permissions:
+                    extras.append(
+                        "permissions=" + json.dumps(permissions, ensure_ascii=False)
+                    )
+            suffix = ("; " + "; ".join(extras)) if extras else ""
             lines.append(
                 f"- {action_id}: {action_name}; {description}; "
                 f"params={json.dumps(params, ensure_ascii=False, separators=(',', ':'))}"
+                f"{suffix}"
             )
     return "\n".join(lines)
 
@@ -185,8 +231,8 @@ class _ChatStreamAccumulator:
         self._text = ""
         self._tool_calls: dict[int, dict] = {}
 
-    def feed(self, event: dict) -> list[tuple[str, str]]:
-        deltas: list[tuple[str, str]] = []
+    def feed(self, event: dict) -> list[tuple[str, Any]]:
+        deltas: list[tuple[str, Any]] = []
         choices = event.get("choices")
         first = choices[0] if isinstance(choices, list) and choices else None
         delta = first.get("delta") if isinstance(first, dict) else None
@@ -201,6 +247,7 @@ class _ChatStreamAccumulator:
             deltas.append(("text", content))
         tool_calls = delta.get("tool_calls")
         if isinstance(tool_calls, list):
+            saw_tool_delta = False
             for call in tool_calls:
                 if not isinstance(call, dict):
                     continue
@@ -216,6 +263,13 @@ class _ChatStreamAccumulator:
                     arguments = function.get("arguments")
                     if isinstance(arguments, str):
                         slot["arguments"] += arguments
+                    saw_tool_delta = True
+            if saw_tool_delta:
+                received = sum(len(item["arguments"]) for item in self._tool_calls.values())
+                deltas.append(("progress", {
+                    "phase": "drafting",
+                    "received": received,
+                }))
         return deltas
 
     def body(self) -> dict:
@@ -236,8 +290,8 @@ class _ResponsesStreamAccumulator:
         self._call: dict = {"name": "", "arguments": "", "call_id": None}
         self._completed: dict | None = None
 
-    def feed(self, event: dict) -> list[tuple[str, str]]:
-        deltas: list[tuple[str, str]] = []
+    def feed(self, event: dict) -> list[tuple[str, Any]]:
+        deltas: list[tuple[str, Any]] = []
         event_type = event.get("type")
         if event_type == "response.output_text.delta":
             delta = event.get("delta")
@@ -255,6 +309,10 @@ class _ResponsesStreamAccumulator:
             delta = event.get("delta")
             if isinstance(delta, str):
                 self._call["arguments"] += delta
+                deltas.append(("progress", {
+                    "phase": "drafting",
+                    "received": len(self._call["arguments"]),
+                }))
         elif event_type == "response.function_call_arguments.done":
             arguments = event.get("arguments")
             if isinstance(arguments, str):
@@ -271,6 +329,17 @@ class _ResponsesStreamAccumulator:
                 arguments = item.get("arguments")
                 if isinstance(arguments, str):
                     self._call["arguments"] = arguments
+                deltas.append(("progress", {
+                    "phase": "assembled",
+                    "received": len(self._call["arguments"]),
+                }))
+        elif event_type == "response.output_item.added":
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                deltas.append(("progress", {
+                    "phase": "drafting",
+                    "received": len(self._call["arguments"]),
+                }))
         elif event_type == "response.completed":
             response = event.get("response")
             if isinstance(response, dict):
@@ -307,14 +376,14 @@ class OpenAICompatibleDraftProvider:
         api_format: str = "chat_completions",
     ):
         if not isinstance(endpoint_url, str):
-            raise ValueError("AI 草稿端点必须是字符串")
+            raise AIProviderRequestError("AI 草稿端点必须是字符串")
         parsed = parse.urlparse(endpoint_url)
         if parsed.scheme != "https":
-            raise ValueError("AI 草稿端点必须是 HTTPS")
+            raise AIProviderRequestError("AI 草稿端点必须是 HTTPS")
         if _is_private_host(parsed.hostname or ""):
-            raise ValueError("AI 草稿端点不能指向内网地址")
+            raise AIProviderRequestError("AI 草稿端点不能指向内网地址")
         if api_format not in {"chat_completions", "responses"}:
-            raise ValueError("AI 草稿接口格式无效")
+            raise AIProviderRequestError("AI 草稿接口格式无效")
         endpoint_url = endpoint_url.rstrip("/")
         suffix = "/responses" if api_format == "responses" else "/chat/completions"
         self._request_url = (
@@ -362,7 +431,7 @@ class OpenAICompatibleDraftProvider:
 
     def _build_request(self, payload: Dict[str, Any], *, stream: bool = False) -> request.Request:
         if _is_private_host(self._request_host):
-            raise ValueError("AI 草稿端点不能指向内网地址")
+            raise AIProviderRequestError("AI 草稿端点不能指向内网地址")
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers: Dict[str, str] = {
             "Authorization": f"Bearer {self._api_key}",
@@ -384,13 +453,13 @@ class OpenAICompatibleDraftProvider:
             with self._opener.open(req, timeout=_REQUEST_TIMEOUT_SECONDS) as response:
                 raw = response.read()
         except (OSError, HTTPException) as error:
-            raise ValueError("AI 草稿请求失败") from error
+            raise AIProviderRequestError(_request_failure_message(error)) from error
         if len(raw) > _MAX_RESPONSE_BYTES:
-            raise ValueError("AI 返回内容过大")
+            raise AIProviderRequestError("AI 返回内容过大")
         try:
             return json.loads(raw)
         except ValueError:
-            raise ValueError("AI 返回的不是有效 JSON") from None
+            raise AIProviderRequestError("AI 返回的不是有效 JSON") from None
 
     def stream(
         self,
@@ -437,7 +506,7 @@ class OpenAICompatibleDraftProvider:
                         break
                     total_bytes += len(chunk)
                     if total_bytes > _MAX_RESPONSE_BYTES:
-                        raise ValueError("AI 返回内容过大")
+                        raise AIProviderRequestError("AI 返回内容过大")
                     for event in decoder.feed(chunk):
                         if event is _STREAM_DONE:
                             finished = True
@@ -455,7 +524,7 @@ class OpenAICompatibleDraftProvider:
         except (socket.timeout, TimeoutError) as error:
             raise AIProviderIdleTimeoutError("AI 草稿请求超时") from error
         except (OSError, HTTPException) as error:
-            raise ValueError("AI 草稿请求失败") from error
+            raise AIProviderRequestError(_request_failure_message(error)) from error
 
         body = accumulator.body()
         if self._api_format == "responses":
@@ -473,6 +542,7 @@ class OpenAICompatibleDraftProvider:
                 "message": fallback,
             })
         else:
+            yield ("progress", {"phase": "validating", "received": 0})
             yield ("result", _dispatch_tool_call(call, schema))
 
 

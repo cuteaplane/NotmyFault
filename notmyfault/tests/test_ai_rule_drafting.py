@@ -254,12 +254,15 @@ class RecordingProvider:
 class StubOpener:
     """记录 open 的请求，直接回一个现成响应。"""
 
-    def __init__(self, response):
+    def __init__(self, response, error=None):
         self.calls = []
         self.response = response
+        self.error = error
 
     def open(self, request, timeout=None):
         self.calls.append((request, timeout))
+        if self.error is not None:
+            raise self.error
         return self.response
 
 
@@ -541,7 +544,7 @@ class TestAiRuleDrafting:
         assert expected_input_key in request_body
         assert request_body["tool_choice"] == "auto"
         assert _request_tool_names(request_body) == {
-            "propose_rule_draft", "propose_plugin", "reply",
+            "propose_rule_draft", "propose_plugin",
         }
 
     @pytest.mark.parametrize(
@@ -701,7 +704,7 @@ class TestAiRuleDrafting:
             model="draft-model",
             api_key="unit-test-secret",
         )
-        with pytest.raises(ValueError, match="AI 草稿请求失败"):
+        with pytest.raises(ValueError, match="AI 服务返回 HTTP 301：endpoint 地址要求重定向"):
             provider(single_user_message("插入 U 盘后打开网站"), {"triggers": {}, "actions": {}})
         assert contacted == []
 
@@ -874,7 +877,7 @@ class TestAiRuleDrafting:
         assert b"unit-test-secret" not in request.data
         body = json.loads(request.data)
         assert body["tool_choice"] == "auto"
-        assert _request_tool_names(body) == {"propose_rule_draft", "propose_plugin", "reply"}
+        assert _request_tool_names(body) == {"propose_rule_draft", "propose_plugin"}
         system_prompt = body["messages"][0]["content"]
         assert "usb_insert" in system_prompt
         assert "U 盘插入" in system_prompt
@@ -883,7 +886,7 @@ class TestAiRuleDrafting:
         assert "只输出一个 JSON" not in system_prompt
         assert "一类任务" in system_prompt
         assert "run(meta, config, emit_event, shutdown_event)" in system_prompt
-        assert "仅供审查" in system_prompt
+        assert "安全审查" in system_prompt
 
         with pytest.raises(ValueError, match="HTTPS") as https_error:
             OpenAICompatibleDraftProvider(
@@ -1366,12 +1369,7 @@ class TestMultiTurnMessages:
     def test_system_prompt_contains_catalog_and_authoring_guidance(self):
         from notmyfault.host.ai_provider import OpenAICompatibleDraftProvider
 
-        response_payload = {"choices": [{"message": {"tool_calls": [{
-            "function": {
-                "name": "propose_rule_draft",
-                "arguments": json.dumps(ai_selector()),
-            },
-        }]}}]}
+        response_payload = {"choices": [{"message": {"content": "好的"}}]}
         provider = OpenAICompatibleDraftProvider(
             endpoint_url="https://example.invalid/v1",
             model="draft-model",
@@ -1389,7 +1387,9 @@ class TestMultiTurnMessages:
         assert "time_schedule" in system  # 目录
         assert "一类任务" in system  # 泛化
         assert "run(meta, config, emit_event, shutdown_event)" in system  # 文档
-        assert "仅供审查" in system  # 源码警告
+        assert "安全审查" in system
+        assert "普通文字回复" in system
+        assert "action.json + action.py" in system
 
     def test_missing_messages_rejected(self, api_env):
         assert api_env.api._save_config(enabled_ai_config()) is True
@@ -1502,8 +1502,9 @@ class TestReplyAndPluginSource:
             ),
         ],
     )
-    def test_reply_tool_dispatches_assistant_message(self, api_format, body):
+    def test_removed_reply_tool_is_rejected(self, api_format, body):
         from notmyfault.host.ai_provider import OpenAICompatibleDraftProvider
+        from notmyfault.host.ai_tools import ToolCallError
 
         provider = OpenAICompatibleDraftProvider(
             endpoint_url="https://example.invalid/v1",
@@ -1512,6 +1513,38 @@ class TestReplyAndPluginSource:
             api_format=api_format,
         )
         setattr(provider, "_opener", StubOpener(FakeJsonResponse(body)))
+
+        with pytest.raises(ToolCallError):
+            provider(single_user_message("你能做什么"), {
+                "triggers": {"time_schedule": {"name": "定时"}},
+                "actions": {"notify": {"name": "显示通知"}},
+            })
+
+    @pytest.mark.parametrize(
+        ("api_format", "text_body"),
+        [
+            (
+                "chat_completions",
+                {"choices": [{"message": {"content": "我可以帮你起草规则。"}}]},
+            ),
+            (
+                "responses",
+                {"output": [{"type": "message", "content": [
+                    {"type": "output_text", "text": "我可以帮你起草规则。"},
+                ]}]},
+            ),
+        ],
+    )
+    def test_plain_text_reply_streams_as_assistant_message(self, api_format, text_body):
+        from notmyfault.host.ai_provider import OpenAICompatibleDraftProvider
+
+        provider = OpenAICompatibleDraftProvider(
+            endpoint_url="https://example.invalid/v1",
+            model="draft-model",
+            api_key="unit-test-secret",
+            api_format=api_format,
+        )
+        setattr(provider, "_opener", StubOpener(FakeJsonResponse(text_body)))
 
         result = provider(single_user_message("你能做什么"), {
             "triggers": {"time_schedule": {"name": "定时"}},
@@ -1523,16 +1556,10 @@ class TestReplyAndPluginSource:
             "result_type": "assistant_message",
             "message": "我可以帮你起草规则。",
         }
-
     def test_source_tool_absent_without_consent(self):
         from notmyfault.host.ai_provider import OpenAICompatibleDraftProvider
 
-        response_payload = {"choices": [{"message": {"tool_calls": [{
-            "function": {
-                "name": "reply",
-                "arguments": json.dumps({"message": "好的"}),
-            },
-        }]}}]}
+        response_payload = {"choices": [{"message": {"content": "好的"}}]}
         provider = OpenAICompatibleDraftProvider(
             endpoint_url="https://example.invalid/v1",
             model="draft-model",
@@ -1549,12 +1576,7 @@ class TestReplyAndPluginSource:
     def test_source_tool_present_with_consent(self):
         from notmyfault.host.ai_provider import OpenAICompatibleDraftProvider
 
-        response_payload = {"choices": [{"message": {"tool_calls": [{
-            "function": {
-                "name": "reply",
-                "arguments": json.dumps({"message": "好的"}),
-            },
-        }]}}]}
+        response_payload = {"choices": [{"message": {"content": "好的"}}]}
         provider = OpenAICompatibleDraftProvider(
             endpoint_url="https://example.invalid/v1",
             model="draft-model",
@@ -1780,7 +1802,7 @@ class TestReplyAndPluginSource:
 
     @pytest.mark.parametrize(
         "message",
-        ["", "   ", "x" * 4001, 123],
+        ["", "   ", "x" * (api_server._AI_MAX_ASSISTANT_CHARS + 1), 123],
         ids=["empty", "whitespace", "oversized", "non_string"],
     )
     def test_empty_or_oversized_assistant_response_rejected(
@@ -2165,6 +2187,11 @@ class TestAiStreamProvider:
         kinds = [kind for kind, _payload in events]
         assert ("reasoning", "先想") in events
         assert ("text", "好的，") in events
+        progress_events = [payload for kind, payload in events if kind == "progress"]
+        assert {"phase": "drafting", "received": 0} in progress_events
+        assert {"phase": "drafting", "received": split} in progress_events
+        assert {"phase": "drafting", "received": len(arguments)} in progress_events
+        assert events[-2] == ("progress", {"phase": "validating", "received": 0})
         assert kinds[-1] == "result"
         result = events[-1][1]
         assert result["result_type"] == "rule_draft"
@@ -2209,6 +2236,11 @@ class TestAiStreamProvider:
 
         assert ("reasoning", "先想") in events
         assert ("text", "好的，") in events
+        progress_events = [payload for kind, payload in events if kind == "progress"]
+        assert {"phase": "drafting", "received": 0} in progress_events
+        assert {"phase": "drafting", "received": split} in progress_events
+        assert {"phase": "assembled", "received": len(arguments)} in progress_events
+        assert events[-2] == ("progress", {"phase": "validating", "received": 0})
         result = events[-1][1]
         assert result["result_type"] == "rule_draft"
         assert result["candidates"][0]["event"]["type"] == "time_schedule"
@@ -2306,6 +2338,38 @@ class TestAiStreamProvider:
         with pytest.raises(ValueError, match="超时"):
             list(provider.stream(single_user_message("你好"), {"triggers": {}, "actions": {}}))
 
+    def test_provider_http_error_keeps_status(self):
+        from urllib.error import HTTPError
+        from notmyfault.host.ai_provider import OpenAICompatibleDraftProvider
+
+        provider = OpenAICompatibleDraftProvider(
+            endpoint_url="https://example.invalid/v1",
+            model="draft-model",
+            api_key="unit-test-secret",
+        )
+        setattr(provider, "_opener", StubOpener(None, HTTPError(
+            provider._request_url, 401, "Unauthorized", {}, None,
+        )))
+
+        with pytest.raises(ValueError, match="HTTP 401：API Key 未通过验证"):
+            provider(single_user_message("你好"), {"triggers": {}, "actions": {}})
+
+    def test_stream_http_error_keeps_status(self):
+        from urllib.error import HTTPError
+        from notmyfault.host.ai_provider import OpenAICompatibleDraftProvider
+
+        provider = OpenAICompatibleDraftProvider(
+            endpoint_url="https://example.invalid/v1",
+            model="draft-model",
+            api_key="unit-test-secret",
+        )
+        setattr(provider, "_opener", StubOpener(None, HTTPError(
+            provider._request_url, 429, "Too Many Requests", {}, None,
+        )))
+
+        with pytest.raises(ValueError, match="HTTP 429：请求太频繁或额度不足"):
+            list(provider.stream(single_user_message("你好"), {"triggers": {}, "actions": {}}))
+
     def test_stream_oversize_body_rejected(self, monkeypatch):
         from notmyfault.host import ai_provider
         from notmyfault.host.ai_provider import OpenAICompatibleDraftProvider
@@ -2351,6 +2415,7 @@ class TestAiStreamEndpoint:
         provider = StreamingProvider([
             ("reasoning", "先想"),
             ("text", "好的，"),
+            ("progress", {"phase": "drafting", "received": 128}),
             ("result", {
                 "ok": True, "result_type": "assistant_message",
                 "message": "我可以帮你起草规则。",
@@ -2370,15 +2435,18 @@ class TestAiStreamEndpoint:
             content = b"".join(response.iter_bytes()).decode("utf-8")
 
         events = parse_sse_events(content)
-        assert [name for name, _ in events] == ["status", "reasoning", "text", "result", "done"]
+        assert [name for name, _ in events] == [
+            "status", "reasoning", "text", "progress", "result", "done",
+        ]
         assert events[0][1] == {"status": "started"}
         assert events[1][1] == {"delta": "先想"}
         assert events[2][1] == {"delta": "好的，"}
-        assert events[3][1] == {
+        assert events[3][1] == {"phase": "drafting", "received": 128}
+        assert events[4][1] == {
             "ok": True, "source": "ai", "result_type": "assistant_message",
             "message": "我可以帮你起草规则。",
         }
-        assert events[4][1] == {"status": "done"}
+        assert events[5][1] == {"status": "done"}
         assert provider.calls[0]["allow_plugin_source"] is False
 
     def test_stream_endpoint_result_matches_json_endpoint(self, api_env, monkeypatch):

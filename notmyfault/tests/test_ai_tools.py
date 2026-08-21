@@ -6,7 +6,6 @@ from notmyfault.host import ai_tools
 from notmyfault.host.ai_tools import (
     DEFAULT_SKILL,
     PLUGIN_SOURCE_TOOL,
-    REPLY_TOOL,
     RULE_DRAFT_TOOL,
     SkillSpec,
     ToolCall,
@@ -59,13 +58,12 @@ class TestSkillAllowlist:
         assert DEFAULT_SKILL.tool_names() == {
             "propose_rule_draft",
             "propose_plugin",
-            "reply",
         }
 
     def test_has_tool_rejects_unknown(self):
         assert DEFAULT_SKILL.has_tool("propose_rule_draft") is True
         assert DEFAULT_SKILL.has_tool("propose_plugin") is True
-        assert DEFAULT_SKILL.has_tool("reply") is True
+        assert DEFAULT_SKILL.has_tool("reply") is False
         assert DEFAULT_SKILL.has_tool("propose_plugin_source") is False
         assert DEFAULT_SKILL.has_tool("install_plugin") is False
 
@@ -83,7 +81,7 @@ class TestSkillAllowlist:
 class TestToolDefinitions:
     def test_chat_definitions_nest_under_function(self):
         definitions = json.loads(json.dumps(chat_tool_definitions(DEFAULT_SKILL)))
-        assert [d["type"] for d in definitions] == ["function", "function", "function"]
+        assert [d["type"] for d in definitions] == ["function", "function"]
         names = {d["function"]["name"] for d in definitions}
         assert names == DEFAULT_SKILL.tool_names()
         for d in definitions:
@@ -92,7 +90,7 @@ class TestToolDefinitions:
 
     def test_responses_definitions_are_flat(self):
         definitions = json.loads(json.dumps(responses_tool_definitions(DEFAULT_SKILL)))
-        assert [d["type"] for d in definitions] == ["function", "function", "function"]
+        assert [d["type"] for d in definitions] == ["function", "function"]
         names = {d["name"] for d in definitions}
         assert names == DEFAULT_SKILL.tool_names()
         for d in definitions:
@@ -206,16 +204,8 @@ class TestExtractResponsesToolCall:
 
 
 class TestStructuredReplyTool:
-    def test_reply_tool_schema_is_strict(self):
-        schema = json.loads(json.dumps(REPLY_TOOL.parameters))
-        assert schema["type"] == "object"
-        assert schema["additionalProperties"] is False
-        assert schema["required"] == ["message"]
-        assert set(schema["properties"]) == {"message"}
-        assert schema["properties"]["message"] == {"type": "string"}
-
-    def test_reply_tool_in_default_skill(self):
-        assert DEFAULT_SKILL.has_tool("reply") is True
+    def test_reply_tool_not_in_default_skill(self):
+        assert DEFAULT_SKILL.has_tool("reply") is False
 
 
 class TestPluginSourceTool:

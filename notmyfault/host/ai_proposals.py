@@ -6,7 +6,6 @@ parse_plugin_proposal 校验提案的字段、id、权限和参数/输出条目�
 
 from __future__ import annotations
 
-import re
 from typing import Mapping, TypeAlias
 
 from notmyfault.host.ai_tools import (
@@ -16,7 +15,7 @@ from notmyfault.host.ai_tools import (
     _require_object,
     _require_str,
 )
-from notmyfault.security.plugin_schema import is_known_permission
+from notmyfault.security.plugin_schema import is_known_permission, is_valid_plugin_id
 
 PluginCatalog: TypeAlias = Mapping[str, Mapping[str, JSON]]
 
@@ -58,7 +57,7 @@ def _catalog_map(catalog: PluginCatalog, key: str) -> dict[str, JSON]:
     return value
 
 
-_RULE_FIELDS = frozenset({"name", "event", "actions"})
+_RULE_FIELDS = frozenset({"name", "event", "preconditions", "actions"})
 _NODE_FIELDS = frozenset({"type", "params"})
 
 
@@ -70,6 +69,12 @@ def parse_rule_draft(
     event = _require_object(args.get("event"), "rule.event", "rule_invalid")
     actions = _require_list(
         args.get("actions"), "rule.actions", "rule_invalid", nonempty=True
+    )
+    raw_preconditions = args.get("preconditions")
+    if raw_preconditions is None:
+        raw_preconditions = []
+    preconditions = _require_list(
+        raw_preconditions, "rule.preconditions", "rule_invalid"
     )
     triggers = _catalog_map(catalog, "triggers")
     actions_meta = _catalog_map(catalog, "actions")
@@ -84,11 +89,25 @@ def parse_rule_draft(
                 "动作",
             )
         )
-    return {
+    normalized_preconditions: list[JSON] = []
+    for index, precondition in enumerate(preconditions):
+        location = f"preconditions[{index}]"
+        normalized_preconditions.append(
+            _parse_node(
+                _require_object(precondition, location, "rule_invalid"),
+                actions_meta,
+                location,
+                "检查",
+            )
+        )
+    draft: dict[str, JSON] = {
         "name": name,
         "event": _parse_node(event, triggers, "event", "触发器"),
         "actions": normalized,
     }
+    if normalized_preconditions:
+        draft["preconditions"] = normalized_preconditions
+    return draft
 
 
 def _parse_node(
@@ -112,7 +131,6 @@ def _parse_node(
     return {"type": node_type, "params": dict(params)}
 
 
-_PROPOSAL_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 _PLUGIN_KINDS = frozenset({"trigger", "action"})
 _PARAM_TYPES = frozenset({
     "string", "number", "select", "bool", "time", "hotkey", "path",
@@ -226,7 +244,7 @@ def parse_plugin_proposal(args: Mapping[str, JSON]) -> Mapping[str, JSON]:
     for field in ("name", "description"):
         proposal[field] = _require_str(args[field], f"proposal.{field}", "proposal_invalid")
     plugin_id = _require_str(args["id"], "proposal.id", "proposal_invalid")
-    if not _PROPOSAL_ID_RE.match(plugin_id):
+    if not is_valid_plugin_id(plugin_id):
         raise ToolCallError("proposal_invalid", f"proposal.id 格式无效: {plugin_id!r}")
     proposal["id"] = plugin_id
     if "permissions" in args:

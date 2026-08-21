@@ -83,13 +83,6 @@ _PLUGIN_PROPOSAL_PARAMETERS: JSON = {
     "additionalProperties": False,
 }
 
-_REPLY_PARAMETERS: JSON = {
-    "type": "object",
-    "properties": {"message": {"type": "string"}},
-    "required": ["message"],
-    "additionalProperties": False,
-}
-
 _PLUGIN_SOURCE_PARAMETERS: JSON = {
     "type": "object",
     "properties": {
@@ -111,11 +104,6 @@ PLUGIN_PROPOSAL_TOOL = ToolSpec(
     description="为目录覆盖不到的能力生成只读的元数据提案，不含源码也不安装。",
     parameters=_PLUGIN_PROPOSAL_PARAMETERS,
 )
-REPLY_TOOL = ToolSpec(
-    name="reply",
-    description="用文字回复用户：澄清需求、解释方案或说明为什么无法满足。",
-    parameters=_REPLY_PARAMETERS,
-)
 PLUGIN_SOURCE_TOOL = ToolSpec(
     name="propose_plugin_source",
     description="用户明确允许时生成插件 manifest 与 Python 源码，仅供审查，不保存不安装。",
@@ -123,8 +111,8 @@ PLUGIN_SOURCE_TOOL = ToolSpec(
 )
 DEFAULT_SKILL = SkillSpec(
     name="rule_drafting",
-    description="规则草稿、能力提案与文字回复，只读，不落盘、不安装、不执行。",
-    tools=(RULE_DRAFT_TOOL, PLUGIN_PROPOSAL_TOOL, REPLY_TOOL),
+    description="规则草稿与能力提案，文字回复直接用普通文本，不落盘、不安装、不执行。",
+    tools=(RULE_DRAFT_TOOL, PLUGIN_PROPOSAL_TOOL),
 )
 
 

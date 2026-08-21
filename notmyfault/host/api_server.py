@@ -41,10 +41,11 @@ from notmyfault.config import (
     save_config as config_save,
     save_rules as rules_save,
 )
-from notmyfault.host.ai_plugin_source import review_plugin_source
+from notmyfault.host.ai_plugin_source import AIPluginSourceError, review_plugin_source
 from notmyfault.host.ai_proposals import parse_plugin_proposal
 from notmyfault.host.ai_provider import (
     AIProviderIdleTimeoutError,
+    AIProviderRequestError,
     OpenAICompatibleDraftProvider,
     draft_from_openai_compatible,
 )
@@ -63,6 +64,7 @@ from notmyfault.security.plugin_schema import (
     check_permissions_conform,
     get_permission_info,
     is_known_permission,
+    is_valid_plugin_id,
     current_platform_name,
     check_payload_contract,
     PERMISSION_REGISTRY,
@@ -124,8 +126,16 @@ _API_KEY_STATUS_LABELS: Dict[KeyStoreStatus, str] = {
 
 _AI_DRAFT_MAX_MESSAGES = 40
 _AI_DRAFT_MAX_CONTENT_CHARS = 4000
-# 插件 id 规则要和 ai_plugin_source 里的那份一致。
-_AI_CONSENT_PLUGIN_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
+# 流式时用户已经看过全文，回复不按输入的 4000 上限掐断，超过 10 万字符直接拒绝
+_AI_MAX_ASSISTANT_CHARS = 100_000
+
+
+def _ai_error_detail(error: Exception | None) -> str:
+    """能透给用户的错误文案。AIProviderRequestError 的文案是固定话术；
+    模型返回内容校验失败的 ValueError 文本里带模型内容，一律换固定文案"""
+    if error is not None and isinstance(error, AIProviderRequestError):
+        return str(error)
+    return "AI 草稿服务暂不可用"
 
 
 class _ConsentRequired(Exception):
@@ -169,7 +179,7 @@ def _validate_ai_consent(value: Any) -> tuple[Dict[str, str] | None, str | None]
     if set(value.keys()) != {"plugin_id"}:
         return None, "consent 只能包含 plugin_id"
     plugin_id = value.get("plugin_id")
-    if not isinstance(plugin_id, str) or not _AI_CONSENT_PLUGIN_ID_RE.match(plugin_id):
+    if not isinstance(plugin_id, str) or not is_valid_plugin_id(plugin_id):
         return None, "consent.plugin_id 无效"
     return {"plugin_id": plugin_id}, None
 
@@ -935,7 +945,7 @@ class EngineAPI:
         # 请求自带的非空 key 优先，否则回落到用户保存的 key。
         api_key = body.get("api_key") or self._load_saved_api_key()
         if not endpoint_url or not model or not api_key:
-            raise ValueError("AI draft provider input missing")
+            raise AIProviderRequestError("AI 服务未配置：请先在设置中填写端点地址、模型名称并保存 API Key")
         return OpenAICompatibleDraftProvider(
             endpoint_url=endpoint_url,
             model=model,
@@ -955,9 +965,10 @@ class EngineAPI:
             if (
                 not isinstance(message, str)
                 or not message.strip()
-                or len(message) > _AI_DRAFT_MAX_CONTENT_CHARS
             ):
                 raise ValueError("invalid AI assistant message")
+            if len(message) > _AI_MAX_ASSISTANT_CHARS:
+                raise AIProviderRequestError("AI 回复内容过大")
             return {
                 "ok": True,
                 "source": "ai",
@@ -1068,6 +1079,8 @@ class EngineAPI:
                         yield self._sse("reasoning", {"delta": payload})
                     elif kind == "text":
                         yield self._sse("text", {"delta": payload})
+                    elif kind == "progress":
+                        yield self._sse("progress", payload)
                     elif kind == "result":
                         finalized = True
                         try:
@@ -1080,7 +1093,7 @@ class EngineAPI:
                         except Exception as _fe:
                             yield self._sse("error", {
                                 "code": "ai_provider_failed",
-                                "error": f"处理结果失败：{_fe}",
+                                "error": f"处理结果失败：{_ai_error_detail(_fe)}",
                             })
                         else:
                             yield self._sse("result", result)
@@ -1094,7 +1107,7 @@ class EngineAPI:
                                 "error": "AI 服务超过 120 秒没有返回内容，可能是模型响应太慢或网络问题",
                             }
                         else:
-                            err_detail = str(failure) if failure else "未知错误"
+                            err_detail = _ai_error_detail(failure)
                             payload = {
                                 "code": "ai_provider_failed",
                                 "error": f"AI 服务返回错误：{err_detail}",
@@ -1396,25 +1409,30 @@ class EngineAPI:
                 )
             try:
                 body = await request.json()
-                if not isinstance(body, dict):
-                    return JSONResponse(
-                        {"ok": False, "error": "请求体必须是 JSON 对象"},
-                        status_code=400,
-                    )
-                messages, message_error = _validate_ai_messages(body.get("messages"))
-                if message_error is not None or messages is None:
-                    return JSONResponse(
-                        {"ok": False, "error": message_error or "messages 无效"},
-                        status_code=400,
-                    )
-                consent, consent_error = _validate_ai_consent(body.get("consent"))
-                if consent_error is not None:
-                    return JSONResponse(
-                        {"ok": False, "error": consent_error}, status_code=400
-                    )
-                allow_plugin_source = consent is not None
-                schema = self._get_plugins_schema()
-                provider = self.ai_draft_provider
+            except Exception:
+                return JSONResponse(
+                    {"ok": False, "error": "无效的 JSON 请求体"}, status_code=400
+                )
+            if not isinstance(body, dict):
+                return JSONResponse(
+                    {"ok": False, "error": "请求体必须是 JSON 对象"},
+                    status_code=400,
+                )
+            messages, message_error = _validate_ai_messages(body.get("messages"))
+            if message_error is not None or messages is None:
+                return JSONResponse(
+                    {"ok": False, "error": message_error or "messages 无效"},
+                    status_code=400,
+                )
+            consent, consent_error = _validate_ai_consent(body.get("consent"))
+            if consent_error is not None:
+                return JSONResponse(
+                    {"ok": False, "error": consent_error}, status_code=400
+                )
+            allow_plugin_source = consent is not None
+            schema = self._get_plugins_schema()
+            provider = self.ai_draft_provider
+            try:
                 if callable(provider):
                     provider_result = await asyncio.to_thread(
                         provider, messages, schema, allow_plugin_source
@@ -1431,20 +1449,33 @@ class EngineAPI:
                     provider_result = await asyncio.to_thread(
                         call_configured_provider
                     )
-                try:
-                    return self._finalize_ai_result(provider_result, consent)
-                except _ConsentRequired:
-                    return JSONResponse(
-                        {
-                            "ok": False,
-                            "code": "consent_required",
-                            "error": "生成插件源码需要用户同意",
-                        },
-                        status_code=409,
-                    )
-            except Exception:
+            except Exception as error:
                 return JSONResponse(
-                    {"ok": False, "code": "ai_provider_failed", "error": "AI 草稿服务暂不可用"},
+                    {
+                        "ok": False,
+                        "code": "ai_provider_failed",
+                        "error": f"AI 服务返回错误：{_ai_error_detail(error)}",
+                    },
+                    status_code=502,
+                )
+            try:
+                return self._finalize_ai_result(provider_result, consent)
+            except _ConsentRequired:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "code": "consent_required",
+                        "error": "生成插件源码需要用户同意",
+                    },
+                    status_code=409,
+                )
+            except Exception as error:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "code": "ai_provider_failed",
+                        "error": f"处理结果失败：{_ai_error_detail(error)}",
+                    },
                     status_code=502,
                 )
 
@@ -1490,7 +1521,9 @@ class EngineAPI:
                         )
                     if callable(provider):
                         def fallback():
-                            yield ("result", provider(messages, schema, allow_plugin_source))
+                            yield ("result", provider(
+                                messages, schema, allow_plugin_source=allow_plugin_source
+                            ))
 
                         return fallback()
                 configured = self._build_configured_ai_provider(body, settings)
@@ -2485,6 +2518,190 @@ class EngineAPI:
                 header = f.read(20)
             encrypted = header.startswith(b"-----BEGIN ENCRYPTED")
             return {"exists": True, "encrypted": encrypted}
+
+        @app.post("/api/plugins/install-source")
+        async def plugin_install_source(request: Request):
+            await self._verify_auth(request)
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse(
+                    {"ok": False, "error": "无效的 JSON 请求体"}, status_code=400
+                )
+            if not isinstance(body, dict):
+                return JSONResponse(
+                    {"ok": False, "error": "请求体必须是 JSON 对象"}, status_code=400
+                )
+            kind = body.get("kind")
+            manifest = body.get("manifest")
+            source = body.get("source")
+            plugin_id = body.get("plugin_id")
+            password = body.get("password") if isinstance(body.get("password"), str) else ""
+            if (
+                not isinstance(kind, str)
+                or not isinstance(manifest, dict)
+                or not isinstance(source, str)
+                or not isinstance(plugin_id, str)
+            ):
+                return JSONResponse(
+                    {"ok": False, "error": "kind、manifest、source、plugin_id 都是必填"},
+                    status_code=400,
+                )
+            try:
+                review = review_plugin_source(kind, manifest, source, plugin_id)
+            except AIPluginSourceError as error:
+                return JSONResponse(
+                    {"ok": False, "error": error.message, "code": error.code},
+                    status_code=400,
+                )
+
+            if not self._is_safe_plugin_id(plugin_id):
+                return JSONResponse(
+                    {"ok": False, "error": "插件 id 含非法字符（禁止路径分隔符）"},
+                    status_code=400,
+                )
+
+            perms = manifest.get("permissions", [])
+            sec_mode = detect_security_mode()
+            if sec_mode == SecurityMode.STRICT:
+                perm_conform, _ = check_permissions_conform(perms)
+                if not perm_conform:
+                    unknown = [p for p in perms if not is_known_permission(p)]
+                    return JSONResponse(
+                        {"ok": False, "error": f"严格模式下拒绝安装：插件请求了未知权限: {', '.join(unknown)}"},
+                        status_code=400,
+                    )
+
+            import shutil
+            import tempfile
+            ptype = "triggers" if kind == "trigger" else "actions"
+            json_name = "trigger.json" if kind == "trigger" else "action.json"
+            py_name = "trigger.py" if kind == "trigger" else "action.py"
+            user_plugins_dir = Path(self._get_user_plugins_dir())
+            dest = user_plugins_dir / ptype / plugin_id
+            ptype_dir = dest.parent
+            if not os.path.normpath(dest).startswith(
+                os.path.normpath(ptype_dir) + os.sep
+            ):
+                return JSONResponse(
+                    {"ok": False, "error": "插件路径越界"}, status_code=400
+                )
+
+            priv = _PRIVATE_DIR / "signing_private_key.pem"
+            signed = False
+            key_error: str | None = None
+            private_key = None
+            if priv.exists():
+                encrypted = priv.read_bytes()[:20].startswith(b"-----BEGIN ENCRYPTED")
+                if encrypted and not password:
+                    key_error = "key_password_required"
+                else:
+                    try:
+                        from notmyfault.security.signing import (
+                            load_private_key as _load_key,
+                        )
+                        private_key = _load_key(priv, password=password or None)
+                    except Exception as error:
+                        key_error = f"签名私钥密码错误或无法加载: {error}"
+            else:
+                key_error = "缺少签名私钥，先运行 python build.py init-keys 生成"
+
+            if key_error is not None and sec_mode == SecurityMode.STRICT:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "error": f"{key_error}；严格模式没有签名无法加载插件",
+                        "code": "key_password_required" if key_error == "key_password_required" else "signing_unavailable",
+                    },
+                    status_code=400,
+                )
+
+            staging_dir: Path | None = None
+            backup_dir: Path | None = None
+            old_plugin_moved = False
+            try:
+                user_plugins_dir.mkdir(parents=True, exist_ok=True)
+                ptype_dir.mkdir(parents=True, exist_ok=True)
+                staging_dir = Path(tempfile.mkdtemp(
+                    prefix=f".{ptype}-{plugin_id}-install-",
+                    dir=user_plugins_dir,
+                ))
+                with open(staging_dir / json_name, "w", encoding="utf-8") as f:
+                    json.dump(review["manifest"], f, ensure_ascii=False, indent=2)
+                with open(staging_dir / py_name, "w", encoding="utf-8") as f:
+                    f.write(review["source"])
+                if private_key is not None:
+                    from notmyfault.security.signing import sign_plugin
+                    try:
+                        sign_plugin(staging_dir, json_name, private_key)
+                        signed = True
+                    except Exception:
+                        if sec_mode == SecurityMode.STRICT:
+                            return JSONResponse(
+                                {"ok": False, "error": "插件签名失败"}, status_code=500
+                            )
+
+                if dest.exists():
+                    backup_dir = user_plugins_dir / (
+                        f".{ptype}-{plugin_id}-backup-{secrets.token_hex(8)}"
+                    )
+                    os.replace(dest, backup_dir)
+                    old_plugin_moved = True
+                try:
+                    os.replace(staging_dir, dest)
+                    staging_dir = None
+                except OSError as install_error:
+                    if old_plugin_moved and backup_dir is not None:
+                        try:
+                            os.replace(backup_dir, dest)
+                            backup_dir = None
+                            old_plugin_moved = False
+                        except OSError as restore_error:
+                            return JSONResponse(
+                                {
+                                    "ok": False,
+                                    "error": (
+                                        "替换插件目录失败，旧插件保留在备份目录: "
+                                        f"{restore_error}"
+                                    ),
+                                },
+                                status_code=500,
+                            )
+                    raise install_error
+            except OSError as error:
+                return JSONResponse(
+                    {"ok": False, "error": f"写入插件文件失败: {error}"},
+                    status_code=500,
+                )
+            finally:
+                if staging_dir is not None:
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                if backup_dir is not None and not old_plugin_moved:
+                    shutil.rmtree(backup_dir, ignore_errors=True)
+
+            if backup_dir is not None:
+                shutil.rmtree(backup_dir, ignore_errors=True)
+
+            # 旧哈希记录删除后，下一次加载会重新记录当前文件。
+            try:
+                from notmyfault.security.plugins import (
+                    load_plugin_manifest,
+                    save_plugin_manifest,
+                )
+                manifest_hashes = load_plugin_manifest()
+                if plugin_id in manifest_hashes:
+                    del manifest_hashes[plugin_id]
+                    save_plugin_manifest(manifest_hashes)
+            except Exception:
+                pass
+
+            return {
+                "ok": True,
+                "id": plugin_id,
+                "type": ptype,
+                "signed": signed,
+                "restart_required": True,
+            }
 
         @app.delete("/api/plugins/{ptype}/{pid}")
         async def plugin_uninstall(ptype: str, pid: str, request: Request):

@@ -272,3 +272,29 @@ class TestNoSideEffects:
         assert proposal_args == proposal_snapshot
         assert proposal is not proposal_args
         json.dumps(proposal)
+
+
+class TestParseRuleDraftPreconditions:
+    def test_preconditions_use_action_catalog(self):
+        args = rule_args(
+            preconditions=[{"type": "notify", "params": {"message": "确认"}}]
+        )
+        result = parse_rule_draft(args, make_catalog())
+        assert result["preconditions"] == [
+            {"type": "notify", "params": {"message": "确认"}}
+        ]
+
+    def test_preconditions_omitted_when_absent(self):
+        result = parse_rule_draft(rule_args(), make_catalog())
+        assert "preconditions" not in result
+
+    def test_preconditions_reject_unknown_action(self):
+        args = rule_args(preconditions=[{"type": "nope", "params": {}}])
+        with pytest.raises(ToolCallError) as exc:
+            parse_rule_draft(args, make_catalog())
+        assert exc.value.code == "rule_invalid"
+
+    def test_preconditions_reject_trigger_type(self):
+        args = rule_args(preconditions=[{"type": "usb_insert", "params": {}}])
+        with pytest.raises(ToolCallError):
+            parse_rule_draft(args, make_catalog())

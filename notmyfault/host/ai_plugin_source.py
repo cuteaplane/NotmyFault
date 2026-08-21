@@ -8,15 +8,11 @@ review_plugin_source 吃四样结构化输入：kind、清单、源码和用户�
 from __future__ import annotations
 
 import ast
-import re
 from copy import deepcopy
 from typing import Any, Mapping
 
-from notmyfault.security.plugin_schema import validate_plugin_meta
+from notmyfault.security.plugin_schema import is_valid_plugin_id, validate_plugin_meta
 from notmyfault.security.plugins import analyze_plugin_source
-
-# 插件 id 只允许字母/数字/下划线/连字符，路径分隔符会把 id 变成路径。
-_PLUGIN_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 
 _PLUGIN_KINDS = frozenset({"trigger", "action"})
 
@@ -119,7 +115,7 @@ def review_plugin_source(
             "invalid_kind", f"kind 必须是 trigger 或 action，实际: {kind!r}"
         )
 
-    if not isinstance(expected_id, str) or not _PLUGIN_ID_RE.match(expected_id):
+    if not isinstance(expected_id, str) or not is_valid_plugin_id(expected_id):
         raise AIPluginSourceError(
             "invalid_id", f"expected_id 不是合法插件 id: {expected_id!r}"
         )

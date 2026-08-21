@@ -542,3 +542,187 @@ class TestPluginUninstall:
     def test_no_auth_rejected(self, api_env):
         response = api_env.client.delete("/api/plugins/triggers/myplug")
         assert response.status_code == 403
+
+
+class TestInstallSource:
+    @staticmethod
+    def install_payload(plugin_id="ai_echo"):
+        return {
+            "kind": "action",
+            "plugin_id": plugin_id,
+            "manifest": {
+                "id": plugin_id,
+                "name": "AI 回声",
+                "description": "把输入原样返回",
+                "enabled": True,
+                "version_code": 1,
+                "version": "1.0.0",
+                "package_name": "com.ai.echo",
+                "params": [{"name": "text", "label": "文本", "type": "string"}],
+                "outputs": [{"name": "result", "label": "回声", "type": "string"}],
+            },
+            "source": "def run(action_info, params):\n    return {'result': params.get('text', '')}\n",
+        }
+
+    @staticmethod
+    def install(api_env, payload):
+        return api_env.client.post(
+            "/api/plugins/install-source",
+            headers=api_env.headers,
+            json=payload,
+        )
+
+    @staticmethod
+    def write_existing_plugin(api_env):
+        plugin_dir = api_env.user_dir / "actions" / "ai_echo"
+        plugin_dir.mkdir(parents=True)
+        old_manifest = '{"id":"ai_echo","version":"old"}'
+        old_source = "def run(action_info, params):\n    return {'result': 'old'}\n"
+        (plugin_dir / "action.json").write_text(old_manifest, encoding="utf-8")
+        (plugin_dir / "action.py").write_text(old_source, encoding="utf-8")
+        return plugin_dir, old_manifest, old_source
+
+    def test_installs_without_key_in_permissive_mode(self, api_env, monkeypatch):
+        from notmyfault.security.security import SecurityMode
+
+        monkeypatch.setattr(
+            api_server, "detect_security_mode", lambda: SecurityMode.PERMISSIVE
+        )
+        response = self.install(api_env, self.install_payload())
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ok"] is True
+        assert data["id"] == "ai_echo"
+        assert data["type"] == "actions"
+        assert data["signed"] is False
+        assert data["restart_required"] is True
+
+        plugin_dir = api_env.user_dir / "actions" / "ai_echo"
+        assert (plugin_dir / "action.json").is_file()
+        assert (plugin_dir / "action.py").is_file()
+        meta = json.loads((plugin_dir / "action.json").read_text(encoding="utf-8"))
+        assert meta["id"] == "ai_echo"
+        assert "def run(action_info, params)" in (
+            plugin_dir / "action.py"
+        ).read_text(encoding="utf-8")
+
+    def test_rejects_manifest_id_mismatch(self, api_env, monkeypatch):
+        from notmyfault.security.security import SecurityMode
+
+        monkeypatch.setattr(
+            api_server, "detect_security_mode", lambda: SecurityMode.PERMISSIVE
+        )
+        payload = self.install_payload()
+        payload["plugin_id"] = "other_id"
+        response = self.install(api_env, payload)
+        assert response.status_code == 400
+        assert response.json()["ok"] is False
+        assert response.json()["code"] == "id_mismatch"
+
+    def test_rejects_source_without_entrypoint(self, api_env, monkeypatch):
+        from notmyfault.security.security import SecurityMode
+
+        monkeypatch.setattr(
+            api_server, "detect_security_mode", lambda: SecurityMode.PERMISSIVE
+        )
+        payload = self.install_payload()
+        payload["source"] = "x = 1\n"
+        response = self.install(api_env, payload)
+        assert response.status_code == 400
+        assert response.json()["code"] == "missing_entrypoint"
+
+    def test_strict_mode_without_key_rejected(self, api_env, monkeypatch):
+        from notmyfault.security.security import SecurityMode
+
+        monkeypatch.setattr(
+            api_server, "detect_security_mode", lambda: SecurityMode.STRICT
+        )
+        response = self.install(api_env, self.install_payload())
+        assert response.status_code == 400
+        assert response.json()["code"] == "signing_unavailable"
+
+    def test_reinstall_overwrites_files(self, api_env, monkeypatch):
+        from notmyfault.security.security import SecurityMode
+
+        monkeypatch.setattr(
+            api_server, "detect_security_mode", lambda: SecurityMode.PERMISSIVE
+        )
+        assert self.install(api_env, self.install_payload()).json()["ok"] is True
+        payload = self.install_payload()
+        payload["source"] = (
+            "def run(action_info, params):\n    return {'result': 'v2'}\n"
+        )
+        response = self.install(api_env, payload)
+        assert response.status_code == 200
+        plugin_dir = api_env.user_dir / "actions" / "ai_echo"
+        assert "v2" in (plugin_dir / "action.py").read_text(encoding="utf-8")
+
+    def test_write_failure_keeps_existing_plugin(self, api_env, monkeypatch):
+        import builtins
+
+        from notmyfault.security.security import SecurityMode
+
+        monkeypatch.setattr(
+            api_server, "detect_security_mode", lambda: SecurityMode.PERMISSIVE
+        )
+        plugin_dir, old_manifest, old_source = self.write_existing_plugin(api_env)
+        original_open = builtins.open
+
+        def fail_source_write(path, mode="r", *args, **kwargs):
+            if "w" in mode and str(path).endswith("action.py"):
+                raise OSError("source write failed")
+            return original_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", fail_source_write)
+        response = self.install(api_env, self.install_payload())
+        assert response.status_code == 500
+        assert (plugin_dir / "action.json").read_text(encoding="utf-8") == old_manifest
+        assert (plugin_dir / "action.py").read_text(encoding="utf-8") == old_source
+        assert sorted(path.name for path in api_env.user_dir.iterdir()) == ["actions"]
+
+    def test_signing_failure_keeps_existing_plugin(self, api_env, monkeypatch):
+        from notmyfault.security import signing
+        from notmyfault.security.security import SecurityMode
+
+        monkeypatch.setattr(
+            api_server, "detect_security_mode", lambda: SecurityMode.STRICT
+        )
+        write_test_key(api_env.tmp_path / "private")
+        plugin_dir, old_manifest, old_source = self.write_existing_plugin(api_env)
+
+        def fail_signing(*args, **kwargs):
+            raise RuntimeError("signing failed")
+
+        monkeypatch.setattr(signing, "sign_plugin", fail_signing)
+        response = self.install(api_env, self.install_payload())
+        assert response.status_code == 500
+        assert (plugin_dir / "action.json").read_text(encoding="utf-8") == old_manifest
+        assert (plugin_dir / "action.py").read_text(encoding="utf-8") == old_source
+        assert sorted(path.name for path in api_env.user_dir.iterdir()) == ["actions"]
+
+    def test_replace_failure_restores_existing_plugin(self, api_env, monkeypatch):
+        from notmyfault.security.security import SecurityMode
+
+        monkeypatch.setattr(
+            api_server, "detect_security_mode", lambda: SecurityMode.PERMISSIVE
+        )
+        plugin_dir, old_manifest, old_source = self.write_existing_plugin(api_env)
+        original_replace = api_server.os.replace
+
+        def fail_new_directory_replace(source, destination):
+            if "-install-" in str(source) and destination == plugin_dir:
+                raise OSError("replace failed")
+            return original_replace(source, destination)
+
+        monkeypatch.setattr(api_server.os, "replace", fail_new_directory_replace)
+        response = self.install(api_env, self.install_payload())
+        assert response.status_code == 500
+        assert (plugin_dir / "action.json").read_text(encoding="utf-8") == old_manifest
+        assert (plugin_dir / "action.py").read_text(encoding="utf-8") == old_source
+        assert sorted(path.name for path in api_env.user_dir.iterdir()) == ["actions"]
+
+    def test_no_auth_rejected(self, api_env):
+        response = api_env.client.post(
+            "/api/plugins/install-source", json=self.install_payload()
+        )
+        assert response.status_code == 403
