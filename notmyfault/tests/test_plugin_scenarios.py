@@ -3,6 +3,7 @@
 import ctypes
 import importlib.util
 import json
+import os
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,7 +14,7 @@ import pytest
 
 from notmyfault.core.workflow import ActionCancellation, ActionCancelled
 from notmyfault.security.plugin_loader import PluginLoader, PluginRegistry
-from notmyfault.security.plugin_schema import validate_plugin_meta
+from notmyfault.security.plugin_schema import current_platform_name, validate_plugin_meta
 from notmyfault.security.security import SecurityMode
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +33,13 @@ NEW_ACTIONS = [
     "uia_wait",
     "window_pin",
 ]
+WINDOWS_ONLY_ACTIONS = {
+    "power_plan",
+    "uia_control",
+    "uia_focus_window",
+    "uia_read_text",
+    "uia_wait",
+}
 NEW_TRIGGERS = [
     "audio_device",
     "battery_level",
@@ -123,6 +131,7 @@ def test_append_text_writes_timestamped_lines(tmp_path):
 # ------------------------------------------------------------- clipboard_clear
 
 
+@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 走剪贴板 API")
 def test_clipboard_clear_windows_flow(monkeypatch):
     mod = load_plugin("actions", "clipboard_clear")
     user32 = MagicMock()
@@ -170,6 +179,7 @@ def test_create_shortcut_requires_name_and_target():
         mod.run({}, {"name": "快捷"})
 
 
+@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 创建 lnk")
 def test_create_shortcut_passes_values_via_env(monkeypatch):
     mod = load_plugin("actions", "create_shortcut")
     captured = {}
@@ -218,6 +228,7 @@ def _patch_media_user32(monkeypatch, mod):
     return user32
 
 
+@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 发送 APPCOMMAND")
 def test_media_control_dispatches_appcommand(monkeypatch):
     mod = load_plugin("actions", "media_control")
     user32 = _patch_media_user32(monkeypatch, mod)
@@ -264,6 +275,7 @@ def test_open_url_requires_input():
 # ---------------------------------------------------------------- power_plan
 
 
+@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 支持 powercfg")
 def test_power_plan_runs_powercfg(monkeypatch):
     mod = load_plugin("actions", "power_plan")
     captured = {}
@@ -279,12 +291,14 @@ def test_power_plan_runs_powercfg(monkeypatch):
     assert captured["cmd"][2] == result["guid"]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 支持 powercfg")
 def test_power_plan_custom_guid_required():
     mod = load_plugin("actions", "power_plan")
     with pytest.raises(ValueError, match="必须提供 GUID"):
         mod.run({}, {"plan": "custom"})
 
 
+@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 支持 powercfg")
 def test_power_plan_failure_raises(monkeypatch):
     mod = load_plugin("actions", "power_plan")
     monkeypatch.setattr(
@@ -299,6 +313,7 @@ def test_power_plan_failure_raises(monkeypatch):
 # ------------------------------------------------------------------ send_keys
 
 
+@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 SendInput ABI")
 def test_send_keys_hotkey_order_and_modifiers(monkeypatch):
     mod = load_plugin("actions", "send_keys")
     sent = []
@@ -315,6 +330,7 @@ def test_send_keys_hotkey_order_and_modifiers(monkeypatch):
     ]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 SendInput ABI")
 def test_send_keys_type_text_builds_unicode_inputs(monkeypatch):
     mod = load_plugin("actions", "send_keys")
     sent = []
@@ -327,6 +343,7 @@ def test_send_keys_type_text_builds_unicode_inputs(monkeypatch):
     assert sent[1].ki.dwFlags == mod.KEYEVENTF_UNICODE | mod.KEYEVENTF_KEYUP
 
 
+@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 需要 UTF-16 代理对")
 def test_send_keys_type_text_splits_surrogate_pairs(monkeypatch):
     mod = load_plugin("actions", "send_keys")
     sent = []
@@ -335,6 +352,38 @@ def test_send_keys_type_text_splits_surrogate_pairs(monkeypatch):
     # 😀 = U+1F600，拆成高代理 0xD83D 和低代理 0xDE00，各发一次按下和抬起
     assert [inp.ki.wScan for inp in sent] == [0xD83D, 0xD83D, 0xDE00, 0xDE00]
     assert all(inp.ki.wVk == 0 for inp in sent)
+
+
+# Windows 上 run() 走 SendInput，会把组合键真的按进系统
+@pytest.mark.skipif(os.name != "posix", reason="仅 Linux 调用 xdotool/ydotool")
+def test_send_keys_linux_dispatches_input_tool(monkeypatch):
+    mod = load_plugin("actions", "send_keys")
+    commands = []
+    monkeypatch.setattr(mod.shutil, "which", lambda name: "/usr/bin/xdotool")
+    monkeypatch.setattr(
+        mod.subprocess,
+        "run",
+        lambda cmd, **kwargs: commands.append(cmd) or SimpleNamespace(returncode=0),
+    )
+    assert mod.run({}, {"mode": "hotkey", "keys": "ctrl+win+enter"}) == {
+        "mode": "hotkey"
+    }
+    assert commands[-1] == [
+        "/usr/bin/xdotool",
+        "key",
+        "--clearmodifiers",
+        "ctrl+super+Return",
+    ]
+    assert mod.run({}, {"mode": "type_text", "text": "a中😀"}) == {
+        "mode": "type_text"
+    }
+    assert commands[-1] == [
+        "/usr/bin/xdotool",
+        "type",
+        "--clearmodifiers",
+        "--",
+        "a中😀",
+    ]
 
 
 def test_send_keys_rejects_bad_input():
@@ -359,6 +408,7 @@ def _patch_pin_user32(monkeypatch, mod, exstyle=0):
     return user32
 
 
+@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 user32 ABI")
 def test_window_pin_toggle_pins_active_window(monkeypatch):
     mod = load_plugin("actions", "window_pin")
     user32 = _patch_pin_user32(monkeypatch, mod)
@@ -367,6 +417,7 @@ def test_window_pin_toggle_pins_active_window(monkeypatch):
     assert user32.SetWindowPos.call_args.args[1] == mod.HWND_TOPMOST
 
 
+@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 user32 ABI")
 def test_window_pin_unpin_uses_notopmost(monkeypatch):
     mod = load_plugin("actions", "window_pin")
     user32 = _patch_pin_user32(monkeypatch, mod, exstyle=mod.WS_EX_TOPMOST)
@@ -375,12 +426,35 @@ def test_window_pin_unpin_uses_notopmost(monkeypatch):
     assert user32.SetWindowPos.call_args.args[1] == mod.HWND_NOTOPMOST
 
 
+@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 user32 ABI")
 def test_window_pin_title_target_resolves_window(monkeypatch):
     mod = load_plugin("actions", "window_pin")
     _patch_pin_user32(monkeypatch, mod)
     monkeypatch.setattr(mod, "_find_windows_by_title", lambda kw: [42])
     result = mod.run({}, {"action": "pin", "target": "title", "title": "记事本"})
     assert result == {"state": "pinned", "hwnd": 42}
+
+
+# Windows 上 run() 走 user32，会真的置顶前台窗口
+@pytest.mark.skipif(os.name != "posix", reason="仅 Linux 调用 wmctrl")
+def test_window_pin_linux_dispatches_wmctrl(monkeypatch):
+    mod = load_plugin("actions", "window_pin")
+    commands = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="0x2a host 0 记事本\n", stderr="")
+
+    monkeypatch.setattr(mod.shutil, "which", lambda name: "/usr/bin/wmctrl")
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod.run({}, {"action": "pin", "target": "title", "title": "记事本"}) == {
+        "state": "pinned",
+        "window_id": "0x2a",
+    }
+    assert commands == [
+        ["/usr/bin/wmctrl", "-l"],
+        ["/usr/bin/wmctrl", "-i", "-r", "0x2a", "-b", "add,above"],
+    ]
 
 
 def test_window_pin_rejects_bad_input():
@@ -921,7 +995,12 @@ def test_new_plugins_loaded_by_engine():
         store_name="Trigger",
         origin="builtin",
     )
-    for name in NEW_ACTIONS:
+    expected_actions = [
+        name
+        for name in NEW_ACTIONS
+        if current_platform_name() == "windows" or name not in WINDOWS_ONLY_ACTIONS
+    ]
+    for name in expected_actions:
         assert name in actions_meta, f"动作 {name} 未被引擎加载"
     for name in NEW_TRIGGERS:
         assert name in triggers_meta, f"触发器 {name} 未被引擎加载"

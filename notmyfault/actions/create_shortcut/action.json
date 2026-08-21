@@ -6,7 +6,7 @@
     "version": "1.0",
     "package_name": "io.github.notmyfault.create_shortcut",
     "enabled": true,
-    "platforms": ["windows"],
+    "platforms": ["windows", "linux"],
     "permissions": ["external_binary"],
     "outputs": [
         {"name": "shortcut_path", "label": "快捷方式路径", "type": "string"}

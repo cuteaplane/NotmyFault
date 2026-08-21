@@ -1,6 +1,7 @@
 import ctypes
 import math
 import os
+import shutil
 import subprocess
 import time
 
@@ -234,8 +235,11 @@ def run(action_info, params):
 
             if action in ("set_brightness", "low_brightness", "high_brightness"):
                 brightness = _brightness_level(params)
+                brightnessctl = shutil.which("brightnessctl")
+                if not brightnessctl:
+                    raise RuntimeError("缺少亮度控制后端，请安装 brightnessctl")
                 result = subprocess.run(
-                    ["brightnessctl", "set", f"{brightness}%"],
+                    [brightnessctl, "set", f"{brightness}%"],
                     capture_output=True,
                     text=True,
                     errors="replace",

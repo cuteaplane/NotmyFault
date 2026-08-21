@@ -6,7 +6,10 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 PKG_ROOT = Path(__file__).resolve().parents[1]
+WINDOWS_ONLY = pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 WinRT/PnP")
 
 
 def load_module():
@@ -17,6 +20,7 @@ def load_module():
     return module
 
 
+@WINDOWS_ONLY
 def test_query_uses_winrt_when_available(monkeypatch):
     module = load_module()
     payload = {
@@ -37,6 +41,7 @@ def test_query_uses_winrt_when_available(monkeypatch):
     }
 
 
+@WINDOWS_ONLY
 def test_falls_back_to_elevated_pnp_and_verifies_state(monkeypatch, tmp_path):
     module = load_module()
     # WinRT 查询被策略拒绝，触发提权 PnP 回退
@@ -73,6 +78,40 @@ def test_falls_back_to_elevated_pnp_and_verifies_state(monkeypatch, tmp_path):
     assert not os.path.exists(result_path)
 
 
+# Windows 上 run() 走 WinRT/PnP，会真的碰蓝牙适配器
+@pytest.mark.skipif(os.name != "posix", reason="仅 Linux 调用 bluetoothctl")
+def test_linux_query_and_toggle_use_bluetoothctl(monkeypatch):
+    module = load_module()
+    commands = []
+    responses = iter(["Powered: yes", "Powered: yes", "Powered: yes", "Powered: no"])
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        if command[1] == "show":
+            output = next(responses)
+        else:
+            output = ""
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    assert module.run({}, {"action": "query"}) == {
+        "ok": True,
+        "method": "bluetoothctl",
+        "state": "on",
+    }
+    assert module.run({}, {"action": "toggle"}) == {
+        "ok": True,
+        "method": "bluetoothctl",
+        "state": "off",
+    }
+    assert commands == [
+        ["bluetoothctl", "show"],
+        ["bluetoothctl", "show"],
+        ["bluetoothctl", "show"],
+        ["bluetoothctl", "power", "off"],
+        ["bluetoothctl", "show"],
+    ]
+
+
 def test_pnp_script_filters_physical_adapters_and_writes_result_file():
     module = load_module()
 
@@ -85,3 +124,12 @@ def test_pnp_script_filters_physical_adapters_and_writes_result_file():
     # 路径中的单引号按 PowerShell 规则加倍转义
     quoted = module._pnp_control_script("on", "C:/it's/result.json")
     assert "'C:/it''s/result.json'" in quoted
+    responses = iter(["Powered: yes", "Powered: yes", "Powered: yes", "Powered: no"])
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        if command[1] == "show":
+            output = next(responses)
+        else:
+            output = ""
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")

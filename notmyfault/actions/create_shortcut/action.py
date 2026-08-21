@@ -1,5 +1,5 @@
-"""创建快捷方式动作：用 PowerShell 的 WScript.Shell 在桌面或开始菜单创建 .lnk 文件
-参数通过环境变量传给子进程，路径拼接在 PowerShell 内完成
+"""创建快捷方式动作
+Windows 用 PowerShell WScript.Shell 创建 .lnk；Linux 创建 .desktop 文件
 """
 
 import os
@@ -30,18 +30,63 @@ Write-Output $path
 
 def run(action_info, params):
     if sys.platform != "win32":
-        raise RuntimeError("创建快捷方式仅支持 Windows")
+        return _run_linux(action_info, params)
+    return _run_windows(action_info, params)
 
+
+def _validate_common(params) -> tuple[str, str, str]:
     name = str(params.get("name", "") or "").strip()
     target = str(params.get("target_path", "") or "").strip()
     if not name:
         raise ValueError("未指定快捷方式名称")
-    # name 会拼进 Join-Path，带分隔符就能写到桌面和开始菜单之外
     if any(ch in name for ch in ("\\", "/", ":")) or ".." in name:
         raise ValueError(f"快捷方式名称不合法: {name!r}")
     if not target:
         raise ValueError("未指定快捷方式目标路径")
     location = str(params.get("location", "desktop") or "desktop")
+    return name, target, location
+
+
+def _run_linux(action_info, params):
+    from pathlib import Path
+
+    name, target, location = _validate_common(params)
+    if location not in ("desktop", "applications"):
+        raise ValueError(f"无效的创建位置: {location!r}（可选: desktop/applications）")
+
+    desktop_entry = (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        f"Name={name}\n"
+        f"Exec={target}\n"
+        "Terminal=false\n"
+    )
+    arguments = str(params.get("arguments", "") or "").strip()
+    if arguments:
+        desktop_entry = desktop_entry.replace(
+            f"Exec={target}", f"Exec={target} {arguments}"
+        )
+
+    if location == "desktop":
+        base_dir = Path.home() / "Desktop"
+        if not base_dir.is_dir():
+            base_dir = Path.home() / "桌面"
+    else:
+        xdg_data = os.environ.get("XDG_DATA_HOME")
+        base_dir = Path(xdg_data) if xdg_data else Path.home() / ".local" / "share"
+        base_dir = base_dir / "applications"
+
+    base_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = name.replace("/", "_").replace(" ", "_")
+    desktop_path = base_dir / f"{safe_name}.desktop"
+    desktop_path.write_text(desktop_entry, encoding="utf-8")
+    desktop_path.chmod(0o755)
+    print(f"[Action:create_shortcut] 已创建: {desktop_path}")
+    return {"shortcut_path": str(desktop_path)}
+
+
+def _run_windows(action_info, params):
+    name, target, location = _validate_common(params)
     if location not in ("desktop", "start_menu"):
         raise ValueError(f"无效的创建位置: {location!r}（可选: desktop/start_menu）")
 

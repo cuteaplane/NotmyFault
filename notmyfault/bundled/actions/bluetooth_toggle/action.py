@@ -1,8 +1,7 @@
-"""Windows 蓝牙无线电开关
+"""蓝牙无线电开关
 
-Windows 并没有一个在所有硬件、驱动和系统版本上都可靠的“蓝牙总开关”
-优先使用 WinRT Radio API；它被策略或驱动拒绝时，才使用需要 UAC 的 PnP
-适配器回退方案，两条路径都返回可验证的结果
+Windows 优先使用 WinRT Radio API，被策略或驱动拒绝时回退到 UAC PnP；
+Linux 使用 bluetoothctl。两条平台路径都返回可验证的结果
 """
 from __future__ import annotations
 
