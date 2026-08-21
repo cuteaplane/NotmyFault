@@ -22,19 +22,19 @@ class TestHotkeyCapture:
     def test_modifier_and_key_returned(self):
         session = ComponentSession("hotkey", "record", {})
         key_down = fake_keys({0x11, 0x10, 0x41})  # Ctrl+Shift+A
-        result = hotkey_component._wait_for_hotkey(session, 0.5, key_down)
+        result = hotkey_component._wait_for_hotkey_windows(session, 0.5, key_down)
         assert result["hotkey"] == "Ctrl+Shift+A"
 
     def test_escape_cancels(self):
         session = ComponentSession("hotkey", "record", {})
         key_down = fake_keys({0x1B})
-        result = hotkey_component._wait_for_hotkey(session, 0.5, key_down)
+        result = hotkey_component._wait_for_hotkey_windows(session, 0.5, key_down)
         assert result == {"cancelled": True}
 
     def test_timeout_returns_timed_out(self, monkeypatch):
         session = ComponentSession("hotkey", "record", {})
         monkeypatch.setattr(hotkey_component.time, "monotonic", lambda: 100.0)
-        result = hotkey_component._wait_for_hotkey(
+        result = hotkey_component._wait_for_hotkey_windows(
             session, 0.0, fake_keys(set())
         )
         assert result == {"timed_out": True}
@@ -42,7 +42,7 @@ class TestHotkeyCapture:
     def test_invoke_capture_returns_hotkey(self, monkeypatch):
         monkeypatch.setattr(
             hotkey_component,
-            "_wait_for_hotkey",
+            "_wait_for_hotkey_windows",
             lambda session, timeout: {"hotkey": "Ctrl+A"},
         )
         session = ComponentSession("hotkey", "record", {})

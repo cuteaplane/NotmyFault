@@ -1,5 +1,5 @@
 """锁屏状态触发器：检测 Windows 锁屏和解锁
-PowerShell 子进程读取 LockApp 和 logonui 进程，两次连续采样一致后发送状态变化
+Windows 用 PowerShell 读 LockApp/logonui 进程；Linux 用 loginctl 查 LockedHint
 """
 
 import os
@@ -14,9 +14,13 @@ _POWERSHELL_QUERY = (
 
 
 def _is_locked() -> bool | None:
-    """返回锁屏状态，查询失败返回 None，poll 本轮直接返回"""
-    if os.name != "nt":
-        return None
+    """返回锁屏状态，查询失败返回 None"""
+    if os.name == "nt":
+        return _is_locked_windows()
+    return _is_locked_linux()
+
+
+def _is_locked_windows() -> bool | None:
     try:
         result = subprocess.run(
             [
@@ -45,6 +49,33 @@ def _is_locked() -> bool | None:
                 return True
             if value == "False":
                 return False
+    return None
+
+
+def _is_locked_linux() -> bool | None:
+    import shutil
+    if not shutil.which("loginctl"):
+        return None
+    session_id = os.environ.get("XDG_SESSION_ID", "")
+    if not session_id:
+        return None
+    try:
+        result = subprocess.run(
+            ["loginctl", "show-session", session_id, "-p", "LockedHint"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    text = result.stdout.strip().lower()
+    if text == "lockedhint=yes":
+        return True
+    if text == "lockedhint=no":
+        return False
     return None
 
 

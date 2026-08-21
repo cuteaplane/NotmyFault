@@ -8,25 +8,25 @@ import psutil
 
 from notmyfault.triggers.base import PollingTrigger
 
-# 多线程并发调用 ctypes 需显式声明类型
-from ctypes import wintypes
-_kernel32 = ctypes.windll.kernel32
-_user32 = ctypes.windll.user32
-_kernel32.GetSystemPowerStatus.argtypes = [ctypes.c_void_p]
-_kernel32.GetSystemPowerStatus.restype = ctypes.c_bool
-_kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
-_kernel32.GetModuleHandleW.restype = wintypes.HMODULE
-_user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
-                                 wintypes.UINT, wintypes.UINT, wintypes.UINT]
-_user32.PeekMessageW.restype = wintypes.BOOL
-_user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
-_user32.TranslateMessage.restype = wintypes.BOOL
-_user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
-_user32.DispatchMessageW.restype = ctypes.c_long
-_user32.DestroyWindow.argtypes = [wintypes.HWND]
-_user32.DestroyWindow.restype = wintypes.BOOL
-_user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
-_user32.UnregisterClassW.restype = wintypes.BOOL
+if os.name == "nt":
+    from ctypes import wintypes
+    _kernel32 = ctypes.windll.kernel32
+    _user32 = ctypes.windll.user32
+    _kernel32.GetSystemPowerStatus.argtypes = [ctypes.c_void_p]
+    _kernel32.GetSystemPowerStatus.restype = ctypes.c_bool
+    _kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    _kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+    _user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                     wintypes.UINT, wintypes.UINT, wintypes.UINT]
+    _user32.PeekMessageW.restype = wintypes.BOOL
+    _user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    _user32.TranslateMessage.restype = wintypes.BOOL
+    _user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    _user32.DispatchMessageW.restype = ctypes.c_long
+    _user32.DestroyWindow.argtypes = [wintypes.HWND]
+    _user32.DestroyWindow.restype = wintypes.BOOL
+    _user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+    _user32.UnregisterClassW.restype = wintypes.BOOL
 
 WM_POWERBROADCAST = 0x0218
 PBT_APMRESUMEAUTOMATIC = 0x0012

@@ -1,39 +1,66 @@
-import ctypes
+"""窗口标题状态检测：目标窗口出现 / 关闭时触发
+Windows 用 EnumWindows；Linux 用 xdotool（仅 X11，Wayland 不可用）
+"""
+
+import os
+import shutil
+import subprocess
 
 from notmyfault.triggers.base import PollingTrigger
 
 
 def _get_window_titles() -> dict:
-    """枚举所有可见窗口，返回 {hwnd: title} 字典"""
-    # argtypes 声明在 notmyfault.native，多线程并发调用 ctypes 时持锁
-    from notmyfault.native import NATIVE_LOCK, typed_user32
+    if os.name == "nt":
+        return _get_window_titles_windows()
+    return _get_window_titles_linux()
+
+
+def _get_window_titles_windows() -> dict:
+    import ctypes
+    from notmyfault.native import NATIVE_LOCK, typed_user32, WNDENUMPROC
     user32 = typed_user32()
-    with NATIVE_LOCK:
-        return _get_window_titles_locked(user32)
-
-
-def _get_window_titles_locked(user32) -> dict:
-    from notmyfault.native import WNDENUMPROC
     titles = {}
+    with NATIVE_LOCK:
+        def enum_callback(hwnd, _):
+            if user32.IsWindowVisible(hwnd):
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buf, length + 1)
+                    title = buf.value
+                    if title.strip():
+                        titles[hwnd] = title
+            return True
+        user32.EnumWindows(WNDENUMPROC(enum_callback), 0)
+    return titles
 
-    def enum_callback(hwnd, _):
-        if user32.IsWindowVisible(hwnd):
-            length = user32.GetWindowTextLengthW(hwnd)
-            if length > 0:
-                buf = ctypes.create_unicode_buffer(length + 1)
-                user32.GetWindowTextW(hwnd, buf, length + 1)
-                title = buf.value
-                if title.strip():
-                    titles[hwnd] = title
-        return True  # 继续枚举
 
-    user32.EnumWindows(WNDENUMPROC(enum_callback), 0)
+def _get_window_titles_linux() -> dict:
+    xdotool = shutil.which("xdotool")
+    if not xdotool:
+        return {}
+    try:
+        result = subprocess.run(
+            [xdotool, "search", "--name", "", "getwindowname"],
+            capture_output=True, text=True, errors="replace", timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if result.returncode != 0:
+        return {}
+    titles = {}
+    lines = result.stdout.strip().splitlines()
+    i = 0
+    while i < len(lines) - 1:
+        wid = lines[i].strip()
+        title = lines[i + 1].strip()
+        if wid.isdigit() and title:
+            titles[wid] = title
+        i += 2
     return titles
 
 
 class WindowTitleTrigger(PollingTrigger):
-    """窗口标题状态检测：目标窗口出现 / 关闭时触发"""
-
     interval = 3.0
     native = True
 
@@ -42,9 +69,7 @@ class WindowTitleTrigger(PollingTrigger):
             raise ValueError("未配置标题关键词（title_pattern 为空）")
         state = self.config.get("state", "opened")
         if state not in ("opened", "closed"):
-            raise ValueError(
-                f"无效的窗口状态: {state!r}（可选: opened/closed）"
-            )
+            raise ValueError(f"无效的窗口状态: {state!r}（可选: opened/closed）")
 
     def setup(self):
         self.pattern = str(self.config.get("title_pattern", "")).strip().lower()
@@ -54,7 +79,6 @@ class WindowTitleTrigger(PollingTrigger):
 
     def poll(self):
         titles = _get_window_titles()
-        # 找出实际命中的标题，可能同时命中多个窗口
         matched_titles = [t for t in titles.values() if self.pattern in t.lower()]
         matched = bool(matched_titles)
 

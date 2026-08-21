@@ -1,5 +1,5 @@
 """WiFi 网络变化触发器：连上或断开指定 SSID 时发送事件
-通过 netsh wlan show interfaces 子进程读取当前 SSID，UTF-8 解码失败时尝试 GBK
+Windows 用 netsh wlan show interfaces；Linux 用 nmcli -t -f ACTIVE,SSID dev wifi
 """
 
 import os
@@ -23,8 +23,12 @@ def _decode_netsh(raw: bytes) -> str:
 
 def _current_ssid() -> str:
     """返回当前 WiFi SSID，未连接或查询失败时返回空字符串"""
-    if os.name != "nt":
-        return ""
+    if os.name == "nt":
+        return _current_ssid_windows()
+    return _current_ssid_linux()
+
+
+def _current_ssid_windows() -> str:
     try:
         result = subprocess.run(
             ["netsh", "wlan", "show", "interfaces"],
@@ -40,8 +44,29 @@ def _current_ssid() -> str:
     for line in text.splitlines():
         match = _SSID_LINE_RE.match(line)
         if match:
-            # 取 SSID 行冒号后面的内容，再去掉两端引号
             return match.group(1).strip().strip('"')
+    return ""
+
+
+def _current_ssid_linux() -> str:
+    import shutil
+    if not shutil.which("nmcli"):
+        return ""
+    try:
+        result = subprocess.run(
+            ["nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    for line in result.stdout.splitlines():
+        if line.startswith("yes:"):
+            return line[4:]
     return ""
 
 

@@ -8,7 +8,7 @@
     "version": "1.0",
     "package_name": "io.github.notmyfault.audio_device",
     "enabled": true,
-    "platforms": ["windows"],
+    "platforms": ["windows", "linux"],
     "permissions": ["external_binary"],
     "outputs": [
         {"name": "device_type", "label": "设备类型", "type": "string"},
