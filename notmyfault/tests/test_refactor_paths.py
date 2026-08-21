@@ -3,6 +3,8 @@
 import os
 from pathlib import Path
 
+import pytest
+
 import notmyfault
 from notmyfault.host import alert
 from notmyfault.security import security as security_mod
@@ -33,6 +35,7 @@ def test_source_dashboard_entry_is_resolved_from_project_root():
     assert os.path.exists(dashboard_path)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="源码托盘当前仅导入 Windows 模块")
 def test_source_tray_assets_are_resolved_from_project_root():
     from notmyfault.host import tray
 

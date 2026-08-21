@@ -356,6 +356,7 @@ def test_uia_invoke_uses_physical_click_only_for_shell_controls(
     assert result["operation"] == "invoke"
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="UIA 仅 Windows")
 def test_uia_captures_foreground_window_signature(monkeypatch):
     from notmyfault import native
     from notmyfault.native import uia

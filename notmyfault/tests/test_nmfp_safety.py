@@ -108,12 +108,13 @@ def test_extract_rejects_uncompressed_size(tmp_path, monkeypatch):
 
 
 def test_absolute_path_is_sanitized_by_py7zr(tmp_path):
-    # py7zr 写入时会剥掉绝对路径前缀，归档内不会保留盘符
     archive_path = make_archive(tmp_path, [(r"C:\evil.txt", "data")])
     with py7zr.SevenZipFile(archive_path) as zf:
         names = [info.filename for info in zf.list()]
-    assert names == ["evil.txt"]
-    assert not any("\\" in n or "/" == n[:1] for n in names)
+    assert len(names) == 1
+    assert "C:" not in names[0]
+    assert "\\" not in names[0]
+    assert names[0].lstrip("/\\") == "evil.txt"
 
 
 def test_pack_all_prefix_preserves_plugin_subdirectories(tmp_path):

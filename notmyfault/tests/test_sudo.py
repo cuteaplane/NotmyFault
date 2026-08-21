@@ -1,6 +1,7 @@
 """run_as_admin 提权命令生成与插件授权会话管理"""
 
 import gc
+import os
 import subprocess
 import types
 import weakref
@@ -11,6 +12,7 @@ from notmyfault.security import sudo
 from notmyfault.security import admin_prompt
 
 TOKEN = "test-engine-token"
+WINDOWS_ONLY = pytest.mark.skipif(os.name != "nt", reason="仅 Windows 走 UAC PowerShell")
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +62,7 @@ class TestRunAsAdmin:
         with pytest.raises(ValueError):
             sudo.run_as_admin([])
 
+    @WINDOWS_ONLY
     def test_basic_command_generates_correct_ps(self, authorized_plugin):
         module, captured = authorized_plugin
         call_from(module, sudo.run_as_admin, ["cmd.exe", "/c", "dir"])
@@ -72,22 +75,26 @@ class TestRunAsAdmin:
             "exit $process.ExitCode",
         ]
 
+    @WINDOWS_ONLY
     def test_ps_quote_simple(self, authorized_plugin):
         module, captured = authorized_plugin
         call_from(module, sudo.run_as_admin, ["notepad.exe", "plain"])
         assert "'plain'" in captured["cmd"][3]
 
+    @WINDOWS_ONLY
     def test_ps_quote_with_apostrophe(self, authorized_plugin):
         module, captured = authorized_plugin
         call_from(module, sudo.run_as_admin, ["notepad.exe", "it's a test"])
         # PowerShell 单引号内的单引号必须双写转义
         assert "'it''s a test'" in captured["cmd"][3]
 
+    @WINDOWS_ONLY
     def test_ps_quote_empty_argument(self, authorized_plugin):
         module, captured = authorized_plugin
         call_from(module, sudo.run_as_admin, ["tool.exe", ""])
         assert "-ArgumentList ''" in captured["cmd"][3]
 
+    @WINDOWS_ONLY
     def test_single_executable_no_args(self, authorized_plugin):
         module, captured = authorized_plugin
         call_from(module, sudo.run_as_admin, ["notepad.exe"])
@@ -98,6 +105,7 @@ class TestRunAsAdmin:
             " -Verb RunAs -Wait -PassThru; exit $process.ExitCode"
         )
 
+    @WINDOWS_ONLY
     def test_wait_false(self, authorized_plugin, monkeypatch):
         module, captured = authorized_plugin
         popened = []
@@ -272,6 +280,7 @@ def test_engine_session_rotation_revokes_old_token_and_authorizations():
     assert sudo._engine_token is None
 
 
+@WINDOWS_ONLY
 def test_per_execution_rejects_when_notification_not_approved(
     authorized_plugin, monkeypatch
 ):
@@ -300,6 +309,7 @@ def test_engine_start_mode_uses_existing_broker(monkeypatch):
     assert calls == [(["cmd.exe", "/c", "whoami"], True, 9)]
 
 
+@WINDOWS_ONLY
 def test_engine_start_mode_falls_back_to_per_execution(monkeypatch, capsys):
     """engine_start 没有 broker 时降级为单次确认提权，不直接报未授权"""
     sudo.begin_engine_session(TOKEN, authorization_mode="engine_start")
@@ -320,6 +330,7 @@ def test_engine_start_mode_falls_back_to_per_execution(monkeypatch, capsys):
     assert "降级为单次确认提权" in capsys.readouterr().err
 
 
+@WINDOWS_ONLY
 def test_engine_start_fallback_respects_user_decline(monkeypatch):
     sudo.begin_engine_session(TOKEN, authorization_mode="engine_start")
     module = make_plugin_module()

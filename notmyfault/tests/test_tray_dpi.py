@@ -2,6 +2,10 @@
 
 import ctypes
 
+import pytest
+
+pytest.importorskip("win32api")
+
 from notmyfault.host import tray
 
 

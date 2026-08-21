@@ -1,6 +1,13 @@
 """屏幕坐标鼠标输入。"""
 
+import sys
+
 import pytest
+
+pytestmark = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="屏幕坐标鼠标仅 Windows",
+)
 
 import notmyfault.native.mouse as mouse
 

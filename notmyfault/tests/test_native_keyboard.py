@@ -1,8 +1,14 @@
 """Windows 键盘事件校验与回放。"""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
+
+pytestmark = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="键盘 SendInput 仅 Windows",
+)
 
 import notmyfault.native.keyboard as keyboard
 
