@@ -1,9 +1,10 @@
-"""Windows DPAPI 当前用户作用域下的 AI API 密钥持久化。"""
+"""AI API 密钥持久化，Windows 用 DPAPI，Linux 用 Secret Service。"""
 
 from __future__ import annotations
 
 import os
 import secrets
+from contextlib import contextmanager
 from enum import Enum
 
 from notmyfault.platform.platform_support import get_config_dir
@@ -39,12 +40,26 @@ class KeyStoreStatus(Enum):
     CORRUPT = "corrupt"
 
 
+_SECRET_SERVICE_LABEL = "NotmyFault AI API Key"
+_SECRET_SERVICE_ATTRIBUTES = {
+    "application": "NotmyFault",
+    "purpose": "ai_api_key",
+}
+
+
 def _is_windows() -> bool:
     return os.name == "nt"
 
 
 def supports_persistence() -> bool:
-    return _is_windows()
+    if _is_windows():
+        return True
+    try:
+        with _secret_service_collection():
+            pass
+    except KeyStoreError:
+        return False
+    return True
 
 
 def _key_file_path() -> str:
@@ -247,22 +262,129 @@ def _atomic_write_bytes(path: str, data: bytes) -> None:
             pass
 
 
-def save_api_key(key: str) -> None:
-    if not _is_windows():
-        raise KeyStoreUnsupportedError("当前平台不支持 DPAPI 密钥存储")
+@contextmanager
+def _secret_service_collection():
+    try:
+        import secretstorage
+
+        connection = secretstorage.dbus_init()
+    except Exception as error:
+        raise KeyStoreUnsupportedError("Secret Service 不可用") from error
+
+    try:
+        collection = secretstorage.get_default_collection(connection)
+        # secretstorage 解锁成功返回 False，取消返回 True
+        if collection.is_locked() and collection.unlock():
+            raise KeyStoreUnsupportedError("Secret Service 集合已锁定")
+        yield collection
+    except KeyStoreError:
+        raise
+    except Exception as error:
+        raise KeyStoreUnsupportedError("Secret Service 不可用") from error
+    finally:
+        connection.close()
+
+
+def _find_secret_service_item(collection):
+    if collection is None:
+        raise KeyStoreUnsupportedError("Secret Service 不可用")
+    try:
+        for item in collection.search_items(_SECRET_SERVICE_ATTRIBUTES):
+            return item
+    except Exception as error:
+        raise KeyStoreError("读取 Secret Service 密钥失败") from error
+    return None
+
+
+def _save_secret_service_key(key: str) -> None:
+    with _secret_service_collection() as collection:
+        try:
+            collection.create_item(
+                _SECRET_SERVICE_LABEL,
+                _SECRET_SERVICE_ATTRIBUTES,
+                key.encode("utf-8"),
+                replace=True,
+            )
+        except Exception as error:
+            raise KeyStoreError("写入 Secret Service 密钥失败") from error
+
+
+def _load_secret_service_key() -> str | None:
+    try:
+        with _secret_service_collection() as collection:
+            item = _find_secret_service_item(collection)
+            if item is None:
+                return None
+            try:
+                if item.is_locked() and item.unlock():
+                    raise KeyStoreError("Secret Service 密钥已锁定")
+                plaintext = item.get_secret()
+                return plaintext.decode("utf-8")
+            except KeyStoreError:
+                raise
+            except UnicodeDecodeError as error:
+                raise KeyStoreDecryptError("密钥密文无法解密") from error
+            except Exception as error:
+                raise KeyStoreError("读取 Secret Service 密钥失败") from error
+    except KeyStoreUnsupportedError:
+        return None
+
+
+def _delete_secret_service_key() -> None:
+    try:
+        with _secret_service_collection() as collection:
+            item = _find_secret_service_item(collection)
+            if item is None:
+                return
+            try:
+                item.delete()
+            except Exception as error:
+                raise KeyStoreError("删除 Secret Service 密钥失败") from error
+    except KeyStoreUnsupportedError:
+        return
+
+
+def _secret_service_status() -> KeyStoreStatus:
+    try:
+        with _secret_service_collection() as collection:
+            item = _find_secret_service_item(collection)
+            if item is None:
+                return KeyStoreStatus.ABSENT
+            if item.is_locked():
+                return KeyStoreStatus.STORED
+            try:
+                item.get_secret().decode("utf-8")
+            except UnicodeDecodeError:
+                return KeyStoreStatus.CORRUPT
+            except Exception:
+                return KeyStoreStatus.CORRUPT
+            return KeyStoreStatus.STORED
+    except KeyStoreUnsupportedError:
+        return KeyStoreStatus.UNSUPPORTED
+
+
+def _validate_key(key: str) -> str:
     normalized_key = key.strip()
     if not normalized_key:
         raise KeyStoreInvalidKeyError("API key 不能为空")
     if len(normalized_key) > _MAX_KEY_LENGTH:
         raise KeyStoreInvalidKeyError(f"API key 超过 {_MAX_KEY_LENGTH} 字符上限")
-    _atomic_write_bytes(
-        _key_file_path(), _protect_bytes(normalized_key.encode("utf-8"))
-    )
+    return normalized_key
+
+
+def save_api_key(key: str) -> None:
+    normalized_key = _validate_key(key)
+    if _is_windows():
+        _atomic_write_bytes(
+            _key_file_path(), _protect_bytes(normalized_key.encode("utf-8"))
+        )
+        return
+    _save_secret_service_key(normalized_key)
 
 
 def load_api_key() -> str | None:
     if not _is_windows():
-        return None
+        return _load_secret_service_key()
     try:
         with open(_key_file_path(), "rb") as key_file:
             ciphertext = key_file.read()
@@ -279,6 +401,7 @@ def load_api_key() -> str | None:
 
 def delete_api_key() -> None:
     if not _is_windows():
+        _delete_secret_service_key()
         return
     try:
         os.unlink(_key_file_path())
@@ -288,7 +411,7 @@ def delete_api_key() -> None:
 
 def api_key_status() -> KeyStoreStatus:
     if not _is_windows():
-        return KeyStoreStatus.UNSUPPORTED
+        return _secret_service_status()
     try:
         with open(_key_file_path(), "rb") as key_file:
             ciphertext = key_file.read()
