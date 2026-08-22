@@ -7,11 +7,18 @@ const originClass = computed(() => props.meta.origin === 'builtin' ? 'chip-origi
 const perms = computed(() => props.meta.permissions || [])
 const isEnabled = computed(() => props.meta.enabled !== false)
 const isCompatible = computed(() => props.meta.platform_compatible !== false)
+const availability = computed(() => props.meta.availability || 'available')
+const unavailableReasons = computed(() => props.meta.unavailable_reasons || [])
+const availabilityLabel = computed(() => {
+  if (!isCompatible.value || availability.value === 'unavailable') return '当前系统不可用'
+  if (availability.value === 'partial') return '部分可用'
+  return ''
+})
 const canUninstall = computed(() => props.meta.origin === 'user' || props.meta.origin === 'third_party')
 </script>
 
 <template>
-  <div class="plugin-card" :class="{ disabled: !isEnabled || !isCompatible }">
+  <div class="plugin-card" :class="{ disabled: !isEnabled || !isCompatible || availability === 'unavailable' }">
     <div class="plugin-card-head">
       <span class="material-symbols-outlined ico">{{ type === 'actions' ? 'bolt' : 'memory' }}</span>
       <div><div class="plugin-card-name">{{ meta.name || pid }}</div><div class="plugin-card-id">{{ pid }}</div></div>
@@ -23,12 +30,13 @@ const canUninstall = computed(() => props.meta.origin === 'user' || props.meta.o
       <span v-if="perms.includes('admin')" class="chip chip-admin">管理员</span>
       <span v-if="perms.includes('native_api')" class="chip chip-native">原生API</span>
       <span v-if="perms.includes('external_binary')" class="chip chip-external">外部程序</span>
-      <span v-if="!isCompatible" class="chip chip-error">当前系统不支持</span>
+      <span v-if="availabilityLabel" class="chip" :class="availability === 'partial' ? 'chip-warn' : 'chip-error'">{{ availabilityLabel }}</span>
+      <span v-for="reason in unavailableReasons" :key="reason" class="chip chip-warn" :title="reason">{{ reason }}</span>
       <span v-if="meta._error" class="chip chip-error">{{ String(meta._error).substring(0, 40) }}</span>
     </div>
     <div class="plugin-card-foot">
-      <label class="switch"><input type="checkbox" :checked="isEnabled" :disabled="!isCompatible" @change="emit('toggle', pid)">
-        <span class="switch-track"><span class="switch-thumb"></span></span><span>{{ !isCompatible ? '不兼容' : isEnabled ? '已启用' : '已禁用' }}</span></label>
+      <label class="switch"><input type="checkbox" :checked="isEnabled" :disabled="!isCompatible || availability === 'unavailable'" @change="emit('toggle', pid)">
+        <span class="switch-track"><span class="switch-thumb"></span></span><span>{{ !isCompatible || availability === 'unavailable' ? '不可用' : isEnabled ? '已启用' : '已禁用' }}</span></label>
       <button v-if="canUninstall" class="icon-btn icon-btn-danger" @click="emit('uninstall', pid)" title="卸载">
         <span class="material-symbols-outlined">delete</span></button>
     </div>

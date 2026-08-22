@@ -187,12 +187,29 @@ function chooseFolder(folder) {
   props.rule.folder = String(folder || '').trim()
   folderPickerOpen.value = false
 }
+const concurrencyMode = computed(() => props.rule.concurrency?.mode || 'parallel')
+function setConcurrencyMode(mode) {
+  if (mode === 'parallel') delete props.rule.concurrency
+  else props.rule.concurrency = { ...(props.rule.concurrency || {}), mode }
+}
+// 平台不匹配、缺能力或被用户禁用都算不可选，原因展示给已引用它的规则
+function pluginUnavailableReason(kind, type) {
+  const meta = store.schema[kind]?.[type]
+  if (!meta) return '未安装'
+  if (meta.enabled === false) return '插件已禁用'
+  if (meta.platform_compatible === false || meta.availability === 'unavailable') {
+    const reasons = Array.isArray(meta.unavailable_reasons) ? meta.unavailable_reasons : []
+    return reasons.join('；') || '当前系统不可用'
+  }
+  if (meta._error) return String(meta._error)
+  return ''
+}
 const triggerKeys = computed(() => Object.keys(store.schema.triggers).filter(
-  key => store.schema.triggers[key]?.platform_compatible !== false
+  key => !pluginUnavailableReason('triggers', key)
 ))
 const triggerGroups = computed(() => groupTriggerKeys(triggerKeys.value))
 const actionKeys = computed(() => Object.keys(store.schema.actions).filter(
-  key => store.schema.actions[key]?.platform_compatible !== false
+  key => !pluginUnavailableReason('actions', key)
 ))
 // 录制入口由插件的 uia_selector 采集组件声明驱动，不写死具体插件。
 const desktopRecorder = computed(() => store.components.find(component => (
@@ -405,10 +422,8 @@ const clientValidationIssues = computed(() => {
     if (!node || typeof node !== 'object') { add(`${path}格式无效`, 'trigger'); return }
     const leaf = !!node.type && !node.children && !node.events
     if (leaf) {
-      if (
-        !store.schema.triggers[node.type]
-        || store.schema.triggers[node.type]?.platform_compatible === false
-      ) add(`${path}引用了当前系统不可用的触发器`, 'trigger')
+      const triggerReason = pluginUnavailableReason('triggers', node.type)
+      if (triggerReason) add(`${path}引用了当前系统不可用的触发器（${triggerReason}）`, 'trigger')
       if (node.params != null && (typeof node.params !== 'object' || Array.isArray(node.params))) add(`${path}参数格式无效`, 'trigger')
       return
     }
@@ -443,10 +458,8 @@ const clientValidationIssues = computed(() => {
     }
   }
   actions.forEach((action, index) => {
-    if (
-      !store.schema.actions[action?.type]
-      || store.schema.actions[action?.type]?.platform_compatible === false
-    ) add(`动作 ${index + 1} 引用了当前系统不可用的插件`, `action:${index}`)
+    const actionReason = pluginUnavailableReason('actions', action?.type)
+    if (actionReason) add(`动作 ${index + 1} 引用了当前系统不可用的插件（${actionReason}）`, `action:${index}`)
     if (action?.params != null && (typeof action.params !== 'object' || Array.isArray(action.params))) add(`动作 ${index + 1} 参数格式无效`, `action:${index}`)
     validateTimeout(action, `动作 ${index + 1}`, `action:${index}`)
     const sources = actionBindingSources(index)
@@ -463,10 +476,8 @@ const clientValidationIssues = computed(() => {
       }
     }
     ;(Array.isArray(action?.failure_actions) ? action.failure_actions : []).forEach((failureAction, failureIndex) => {
-      if (
-        !store.schema.actions[failureAction?.type]
-        || store.schema.actions[failureAction?.type]?.platform_compatible === false
-      ) add(`动作 ${index + 1} 的补救动作 ${failureIndex + 1} 不可用`, `action:${index}`)
+      const failureReason = pluginUnavailableReason('actions', failureAction?.type)
+      if (failureReason) add(`动作 ${index + 1} 的补救动作 ${failureIndex + 1} 不可用（${failureReason}）`, `action:${index}`)
       if (failureAction?.params != null && (typeof failureAction.params !== 'object' || Array.isArray(failureAction.params))) {
         add(`动作 ${index + 1} 的补救动作 ${failureIndex + 1} 参数格式无效`, `action:${index}`)
       }
@@ -1591,6 +1602,14 @@ function onEditorKeydown(event) {
               <button class="btn btn-text btn-sm" @click="openPluginPicker('trigger', { mode: 'upgrade', op: 'any', title: '添加“或者”条件' })"><span class="material-symbols-outlined">alt_route</span>或者满足</button>
             </template>
             <button v-if="isCondition" class="btn btn-text btn-sm" @click="useSingleEvent"><span class="material-symbols-outlined">filter_1</span>改为单个条件</button>
+            <label class="field rule-concurrency-field"><span class="field-label">重复触发</span>
+              <select class="select" :value="concurrencyMode" @change="setConcurrencyMode($event.target.value)">
+                <option value="parallel">同时运行（默认）</option>
+                <option value="single">运行中忽略新触发</option>
+                <option value="queue">排队依次执行</option>
+                <option value="replace">取消旧的执行最新的</option>
+              </select>
+            </label>
           </div>
         </div>
       </section>

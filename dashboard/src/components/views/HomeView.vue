@@ -1,13 +1,14 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { store } from '../../lib/store'
-import { getEngineStatus, readDiagnostics, hasBridge } from '../../lib/api'
+import { getEngineStatus, readDiagnostics, readPlatformCapabilities, hasBridge } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
 import { useEngineControl } from '../../composables/useEngineControl'
 
 // 引擎启停逻辑与 NavRail 快捷按钮共享 starting、stopping 等状态。
 const { starting, stopping, shuttingDown, syncStatus, startEngine, stopEngine, shutdownEngine } = useEngineControl()
 const stats = ref({ rules: '-', triggers: '-', actions: '-', pid: '-' })
+const schedulerText = ref('0 / 0')
 const diag = ref(null)
 let diagTimer = null
 
@@ -35,6 +36,8 @@ async function loadStats() {
   try {
     const s = await getEngineStatus()
     await syncStatus(s)
+    const scheduler = s.scheduler || {}
+    schedulerText.value = `${scheduler.running ?? 0} / ${scheduler.queued ?? 0}`
     if (s.api_alive === true) {
       stats.value = {
         rules: s.rules_count != null ? s.rules_count : '-',
@@ -57,6 +60,20 @@ async function loadDiag() {
   if (!isRunning.value) { diag.value = null; return }
   diag.value = await readDiagnostics()
 }
+
+// 系统能力报告不依赖引擎运行状态，加载一次就够
+const platformReport = ref(null)
+onMounted(async () => { platformReport.value = await readPlatformCapabilities() })
+const capabilityRows = computed(() => {
+  const caps = platformReport.value?.capabilities || {}
+  return Object.entries(caps).map(([id, entry]) => ({
+    id,
+    backend: entry.backend || '',
+    state: entry.available ? (entry.degraded ? '部分可用' : '可用') : '不可用',
+    reason: entry.reason || '',
+    cls: entry.available ? (entry.degraded ? 'diag-warn' : 'diag-ok') : 'diag-err',
+  }))
+})
 
 const diagPlugins = computed(() => {
   const d = diag.value
@@ -126,7 +143,8 @@ watch(() => store.engineStatus, (status) => {
 }, { immediate: true, deep: true })
 
 onMounted(() => {
-  if (hasBridge()) diagTimer = setInterval(loadDiag, 30000)
+  // 引擎空闲没有 SSE 时靠这个定时器兜着，排队数字和诊断一起刷新
+  if (hasBridge()) diagTimer = setInterval(() => { loadDiag(); loadStats() }, 30000)
 })
 onUnmounted(() => { if (diagTimer) clearInterval(diagTimer) })
 // SSE 事件到达时重新读取统计，并由 loadStats 更新诊断。
@@ -216,6 +234,7 @@ watch(isRunning, (running) => {
               { icon: 'memory', val: stats.triggers, lbl: '活跃触发器' },
               { icon: 'bolt', val: stats.actions, lbl: '动作类型' },
               { icon: 'dns', val: stats.pid, lbl: '进程 PID' },
+              { icon: 'stacks', val: schedulerText, lbl: '正在运行 / 排队' },
             ]" :key="s.lbl" class="dashboard-metric">
             <span class="material-symbols-outlined dashboard-metric-icon">{{ s.icon }}</span>
             <div>
@@ -254,6 +273,13 @@ watch(isRunning, (running) => {
         <div v-else class="dashboard-diagnostic-empty diag-ok">
           <span class="material-symbols-outlined">check_circle</span>暂无异常记录
         </div>
+        <details v-if="capabilityRows.length" class="dashboard-capability-report">
+          <summary>系统能力（{{ platformReport.platform }}{{ platformReport.session_type ? ' · ' + platformReport.session_type : '' }}）</summary>
+          <div v-for="row in capabilityRows" :key="row.id" class="dashboard-diagnostic-row">
+            <span>{{ row.id }}</span>
+            <span class="dashboard-diagnostic-value" :class="row.cls" :title="row.reason || row.backend">{{ row.state }}{{ row.backend ? ' · ' + row.backend : '' }}</span>
+          </div>
+        </details>
       </section>
     </template>
 

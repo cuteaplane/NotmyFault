@@ -281,11 +281,6 @@ export async function streamRuleDraftWithAI(messages, {
   await consumeAIDraftSSE(response.body, onEvent, signal)
 }
 
-export async function draftRuleWithAI(messages, consent = null, apiKey = '') {
-  const res = await apiWrite('/api/rules/draft/ai', 'POST', aiDraftRequestBody(messages, consent, apiKey))
-  return await res.json()
-}
-
 export async function loadPlugins() {
   try {
     const r = await apiRead('/api/plugins/list')
@@ -445,4 +440,13 @@ export async function getRun(runId) {
   const response = await apiRead(`/api/runs/${encodeURIComponent(runId)}`)
   if (!response.ok) return null
   return await response.json()
+}
+
+// 平台能力报告：每个能力带 available / backend / reason / degraded
+export async function readPlatformCapabilities() {
+  try {
+    const r = await apiRead('/api/platform')
+    if (!r.ok) return null
+    return await r.json()
+  } catch (e) { return null }
 }

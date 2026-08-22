@@ -32,6 +32,7 @@ const showInstall = ref(false)
 const showKey = ref(false)
 const keyPw = ref('')
 const forceInstall = ref(false)
+const buildHookConfirmed = ref(false)
 const fileInput = ref(null)
 let keyResolve = null
 
@@ -86,6 +87,7 @@ function openInstall() {
   previewError.value = ''
   fileForUpload.value = null
   forceInstall.value = false
+  buildHookConfirmed.value = false
   installError.value = ''
 }
 
@@ -109,6 +111,27 @@ function riskClass(level) {
   const m = { none: 'risk-none', low: 'risk-low', medium: 'risk-med', high: 'risk-high', unknown: 'risk-unknown' }
   return 'risk-badge ' + (m[level] || '')
 }
+
+const updateKindLabel = {
+  new: '全新安装',
+  upgrade: `升级`,
+  downgrade: '降级',
+  reinstall: '同版本重装',
+}
+function updateKindChipClass(kind) {
+  return kind === 'downgrade' ? 'chip chip-error'
+    : kind === 'upgrade' ? 'chip chip-clean'
+      : 'chip'
+}
+function diffRows(diff) {
+  if (!diff) return []
+  return [
+    ...diff.added.map(item => ({ item, sign: '+', cls: 'diff-add' })),
+    ...diff.removed.map(item => ({ item, sign: '-', cls: 'diff-remove' })),
+  ]
+}
+const hasBuildHookRisk = computed(() =>
+  (preview.value?.risks || []).some(risk => risk.id === 'build_hook'))
 
 async function uploadPreview(file) {
   previewLoading.value = true
@@ -271,10 +294,25 @@ onMounted(async () => {
                     {{ preview.plugin.type === 'triggers' ? '触发器' : '动作' }}
                   </span>
                   <span class="chip">v{{ preview.plugin.version }}</span>
+                  <span v-if="preview.update_diff?.update && preview.update_diff.update.kind !== 'new'"
+                    class="chip" :class="updateKindChipClass(preview.update_diff.update.kind)">
+                    {{ updateKindLabel[preview.update_diff.update.kind] }}
+                    v{{ preview.update_diff.update.installed_version_code }} →
+                    v{{ preview.update_diff.update.incoming_version_code }}
+                  </span>
                   <span v-if="preview.plugin.platform_compatible === false" class="chip chip-error">
                     当前系统不兼容
                   </span>
                   <span v-if="preview.plugin.author" class="chip">{{ preview.plugin.author }}</span>
+                </div>
+
+                <div v-if="preview.update_diff?.signature_identity_changed" class="preview-section warn">
+                  <div class="preview-section-title">
+                    <span class="material-symbols-outlined">gpp_maybe</span>签名身份变了
+                  </div>
+                  <div class="preview-section-body">
+                    <p class="risk-item">这个包的签名者和已安装版本不同（{{ preview.update_diff.signature_old }} → {{ preview.update_diff.signature_new }}），确认来源可信再装</p>
+                  </div>
                 </div>
                 <p class="preview-desc" v-if="preview.plugin.description">{{ preview.plugin.description }}</p>
                 <p class="preview-pkg">{{ preview.plugin.package_name }}</p>
@@ -329,12 +367,36 @@ onMounted(async () => {
               </div>
             </div>
 
+            <div v-if="diffRows(preview.update_diff?.permission_diff).length
+              || diffRows(preview.update_diff?.capability_diff).length" class="preview-section">
+              <div class="preview-section-title">
+                <span class="material-symbols-outlined">difference</span>和已安装版本的差别
+              </div>
+              <div class="preview-section-body">
+                <template v-if="diffRows(preview.update_diff.permission_diff).length">
+                  <p class="diff-caption">权限</p>
+                  <p v-for="row in diffRows(preview.update_diff.permission_diff)" :key="'p' + row.item"
+                    class="diff-row" :class="row.cls"><span>{{ row.sign }}</span>{{ row.item }}</p>
+                </template>
+                <template v-if="diffRows(preview.update_diff.capability_diff).length">
+                  <p class="diff-caption">系统能力</p>
+                  <p v-for="row in diffRows(preview.update_diff.capability_diff)" :key="'c' + row.item"
+                    class="diff-row" :class="row.cls"><span>{{ row.sign }}</span>{{ row.item }}</p>
+                </template>
+              </div>
+            </div>
+
             <div v-if="!preview.risks.length && preview.permission_conform" class="preview-section">
               <div class="preview-section-title">
                 <span class="material-symbols-outlined">check_circle</span>安全检查
               </div>
               <p class="safe-notice">未发现安全风险，权限符合规范</p>
             </div>
+          </div>
+
+          <div v-if="hasBuildHookRisk" class="preview-install-error">
+            <span class="material-symbols-outlined">dangerous</span>
+            这个插件声明了构建钩子，点安装会以你的身份执行它自带的命令。只给信得过的来源装
           </div>
 
           <div v-if="installError" class="preview-install-error">
@@ -345,10 +407,14 @@ onMounted(async () => {
             <label class="check-row" v-if="preview.plugin.package_name">
               <input type="checkbox" v-model="forceInstall">强制覆盖已安装的同包名插件
             </label>
+            <label class="check-row" v-if="hasBuildHookRisk">
+              <input type="checkbox" v-model="buildHookConfirmed">我确认执行这个插件的构建命令
+            </label>
             <div class="preview-foot-actions">
               <button class="btn btn-text" @click="showInstall = false">取消</button>
               <button class="btn btn-filled" @click="doInstall"
-                :disabled="!preview.permission_conform && store.engineStatus?.security_mode === 'strict'">
+                :disabled="(!preview.permission_conform && store.engineStatus?.security_mode === 'strict')
+                  || (hasBuildHookRisk && !buildHookConfirmed)">
                 <span class="material-symbols-outlined">download</span>安装
               </button>
             </div>
