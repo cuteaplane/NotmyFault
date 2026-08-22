@@ -1,44 +1,19 @@
 """发送按键动作：向当前活动窗口输入文本或发送组合键
-Windows 用 SendInput；Linux 用 xdotool 或 ydotool
+Windows 用 SendInput；Linux 走 InputBackend（xdotool 或 ydotool）
 """
 
 import os
-import shutil
 import subprocess
 
 from notmyfault.native import NATIVE_LOCK
 
 _LINUX_MODIFIERS = {"ctrl", "shift", "alt", "super", "win"}
-_LINUX_SPECIAL_KEYS = {
-    "enter": "Return", "return": "Return", "tab": "Tab", "space": "space",
-    "backspace": "BackSpace", "delete": "Delete", "escape": "Escape", "esc": "Escape",
-    "home": "Home", "end": "End", "pgup": "Page_Up", "pgdn": "Page_Down",
-    "up": "Up", "down": "Down", "left": "Left", "right": "Right",
-    "capslock": "Caps_Lock", "f1": "F1", "f2": "F2", "f3": "F3", "f4": "F4",
-    "f5": "F5", "f6": "F6", "f7": "F7", "f8": "F8", "f9": "F9", "f10": "F10",
-    "f11": "F11", "f12": "F12",
-}
-
-
-def _find_input_tool() -> str | None:
-    return shutil.which("xdotool") or shutil.which("ydotool")
 
 
 def _linux_type_text(text: str) -> None:
-    tool = _find_input_tool()
-    if not tool:
-        raise RuntimeError("缺少输入后端，请安装 xdotool 或 ydotool")
-    tool_name = os.path.basename(tool)
-    if tool_name == "xdotool":
-        subprocess.run(
-            [tool, "type", "--clearmodifiers", "--", text],
-            check=True, timeout=30,
-        )
-    else:
-        subprocess.run(
-            [tool, "type", "--", text],
-            check=True, timeout=30,
-        )
+    from notmyfault.platform.backends import InputBackend
+
+    InputBackend().type_text(text)
 
 
 def _linux_send_hotkey(keys: str) -> None:
@@ -54,42 +29,9 @@ def _linux_send_hotkey(keys: str) -> None:
             if main_key_seen:
                 raise ValueError(f"组合键只能包含一个主键: {keys!r}")
             main_key_seen = True
-    tool = _find_input_tool()
-    if not tool:
-        raise RuntimeError("缺少输入后端，请安装 xdotool 或 ydotool")
-    tool_name = os.path.basename(tool)
-    if tool_name == "xdotool":
-        xdo_parts = []
-        for part in parts:
-            if part in _LINUX_SPECIAL_KEYS:
-                xdo_parts.append(_LINUX_SPECIAL_KEYS[part])
-            elif part in _LINUX_MODIFIERS:
-                xdo_parts.append(part.replace("win", "super"))
-            elif len(part) == 1:
-                xdo_parts.append(part)
-            else:
-                xdo_parts.append(part)
-        combo = "+".join(xdo_parts)
-        subprocess.run(
-            [tool, "key", "--clearmodifiers", combo],
-            check=True, timeout=10,
-        )
-    else:
-        ydo_parts = []
-        for part in parts:
-            if part in _LINUX_SPECIAL_KEYS:
-                ydo_parts.append(_LINUX_SPECIAL_KEYS[part])
-            elif part in _LINUX_MODIFIERS:
-                ydo_parts.append(part.replace("win", "super"))
-            elif len(part) == 1:
-                ydo_parts.append(part)
-            else:
-                ydo_parts.append(part)
-        combo = "+".join(ydo_parts)
-        subprocess.run(
-            [tool, "key", combo],
-            check=True, timeout=10,
-        )
+    from notmyfault.platform.backends import InputBackend
+
+    InputBackend().send_hotkey(parts)
 
 
 if os.name == "nt":

@@ -22,25 +22,12 @@ def set_volume(action):
     scalar = _VOLUME_LEVELS[action_lower]
 
     if os.name != "nt":
+        from notmyfault.platform.backends import AudioBackend
+
         percent = round(scalar * 100)
-        result = subprocess.run(
-            ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{percent}%"],
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=5,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "wpctl 设置音量失败")
-        result = subprocess.run(
-            ["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "1" if action_lower == "mute" else "0"],
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=5,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "wpctl 设置静音失败")
+        backend = AudioBackend()
+        backend.set_volume(percent)
+        backend.set_mute(action_lower == "mute")
         return
 
     from pycaw.pycaw import AudioUtilities

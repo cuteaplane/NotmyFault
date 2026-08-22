@@ -5,6 +5,7 @@
     "version_code": 2,
     "version": "1.1",
     "package_name": "io.github.notmyfault.screenshot",
+    "requires_capabilities": ["screen.capture"],
     "enabled": true,
     "permissions": ["screen_reader", "filesystem", "native_api", "external_binary"],
     "params": [

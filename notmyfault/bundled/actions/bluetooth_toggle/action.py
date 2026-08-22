@@ -207,9 +207,13 @@ def run(_action_info, params):
 
 
 def _run_linux_bluetooth(action: str) -> dict[str, Any]:
+    from notmyfault.platform.linux_support import require_command
+
+    bluetoothctl = require_command("蓝牙开关", "bluetoothctl")
+
     def query_state() -> str:
         result = subprocess.run(
-            ["bluetoothctl", "show"],
+            [bluetoothctl, "show"],
             capture_output=True,
             text=True,
             errors="replace",
@@ -223,7 +227,7 @@ def _run_linux_bluetooth(action: str) -> dict[str, Any]:
     target = ("off" if current == "on" else "on") if action == "toggle" else action
     if target != "query":
         result = subprocess.run(
-            ["bluetoothctl", "power", target],
+            [bluetoothctl, "power", target],
             capture_output=True,
             text=True,
             errors="replace",

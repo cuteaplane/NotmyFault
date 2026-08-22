@@ -12,8 +12,11 @@ def run(action_info, params):
         print("[Action:lock_screen] 屏幕已锁定")
         return
 
+    from notmyfault.platform.linux_support import require_command
+
+    loginctl = require_command("锁屏", "loginctl")
     result = subprocess.run(
-        ["loginctl", "lock-session"],
+        [loginctl, "lock-session"],
         capture_output=True,
         text=True,
         errors="replace",

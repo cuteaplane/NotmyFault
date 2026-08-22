@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -77,7 +78,10 @@ def run(action_info, params):
     print(f"[Action:text_to_speech] 播报: {text[:60]}...")
 
     if os.name != "nt":
-        command = ["spd-say", "--wait"]
+        from notmyfault.platform.linux_support import require_command
+
+        speaker = require_command("语音播报", "spd-say")
+        command = [speaker, "--wait"]
         try:
             if rate:
                 command.extend(["--rate", str(max(-100, min(100, int(rate) * 10)))])
@@ -85,8 +89,9 @@ def run(action_info, params):
                 command.extend(["--volume", str(max(-100, min(100, int(volume) - 100)))])
         except (TypeError, ValueError):
             raise ValueError(f"rate/volume 必须是数字，实际: rate={rate!r} volume={volume!r}") from None
-        if voice_name:
-            command.extend(["--language", voice_name])
+        # spd-say 的 --language 只认 BCP 47 语言代码；Windows 声音名传过去只会报错
+        if voice_name and re.fullmatch(r"[a-z]{2,3}(-[A-Za-z0-9]{2,8})*", str(voice_name)):
+            command.extend(["--language", str(voice_name)])
         command.append(text)
         result = subprocess.run(
             command,

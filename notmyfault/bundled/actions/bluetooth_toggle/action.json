@@ -5,6 +5,7 @@
     "version_code": 3,
     "version": "1.2",
     "package_name": "io.github.notmyfault.bluetooth_toggle",
+    "requires_capabilities": ["bluetooth.control"],
     "enabled": true,
     "permissions": [
         "admin",

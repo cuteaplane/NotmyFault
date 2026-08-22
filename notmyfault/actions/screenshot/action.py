@@ -46,10 +46,6 @@ def run(action_info, params):
             command = [executable, "-f", str(capture_path)]
             if mode == "active_window":
                 command.insert(1, "-w")
-        elif session_type() == "wayland" and (executable := command_path("grim")):
-            if mode == "active_window":
-                raise RuntimeError("grim 无法安全识别 GNOME 当前窗口，请安装 gnome-screenshot")
-            command = [executable, str(capture_path)]
         elif executable := command_path("spectacle"):
             command = [
                 executable,
@@ -62,7 +58,11 @@ def run(action_info, params):
         elif executable := command_path("import"):
             command = [executable, "-window", "root", str(capture_path)]
         else:
-            raise RuntimeError("缺少截图后端，请安装 gnome-screenshot")
+            from notmyfault.platform.linux_support import BackendMissingError
+
+            raise BackendMissingError(
+                "依赖缺失：屏幕截图需要 gnome-screenshot、spectacle 或 ImageMagick import"
+            )
 
         if command:
             result = subprocess.run(

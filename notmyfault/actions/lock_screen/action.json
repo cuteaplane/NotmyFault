@@ -1,10 +1,13 @@
 {
     "id": "lock_screen",
     "name": "锁定屏幕",
-    "description": "立即锁定 Windows 工作站",
+    "description": "立即锁定屏幕（Windows 用 LockWorkStation，Linux 用 loginctl）",
     "version_code": 1,
     "version": "1.0",
     "package_name": "io.github.notmyfault.lock_screen",
+    "requires_capabilities": [
+        "session.lock"
+    ],
     "enabled": true,
     "permissions": [
         "native_api",

@@ -1,7 +1,6 @@
 import ctypes
 import math
 import os
-import shutil
 import subprocess
 import time
 
@@ -231,13 +230,11 @@ def run(action_info, params):
 
     try:
         if os.name != "nt":
-            from notmyfault.platform.linux_support import desktop_environment
+            from notmyfault.platform.linux_support import desktop_environment, require_command
 
             if action in ("set_brightness", "low_brightness", "high_brightness"):
                 brightness = _brightness_level(params)
-                brightnessctl = shutil.which("brightnessctl")
-                if not brightnessctl:
-                    raise RuntimeError("缺少亮度控制后端，请安装 brightnessctl")
+                brightnessctl = require_command("亮度控制", "brightnessctl")
                 result = subprocess.run(
                     [brightnessctl, "set", f"{brightness}%"],
                     capture_output=True,
