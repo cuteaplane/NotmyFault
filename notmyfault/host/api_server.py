@@ -512,6 +512,35 @@ class EngineAPI:
             except Exception:
                 pass
 
+    def _annotate_availability(self, meta: Dict[str, Any]) -> None:
+        """给插件 meta 补 platform_compatible / availability / unavailable_reasons"""
+        from notmyfault.platform.capabilities import (
+            is_capability_compatible,
+            probe_capabilities,
+        )
+        from notmyfault.security.plugin_loader import is_plugin_platform_compatible
+
+        platform_compatible = is_plugin_platform_compatible(meta)
+        capability_ok, problems = is_capability_compatible(meta)
+        reasons = [f"{p['capability']}: {p['reason']}" for p in problems]
+        meta["platform_compatible"] = platform_compatible
+        meta["capability_compatible"] = capability_ok
+        if not platform_compatible:
+            meta["availability"] = "unavailable"
+            meta["unavailable_reasons"] = ["当前平台不支持"]
+        elif not capability_ok:
+            meta["availability"] = "unavailable"
+            meta["unavailable_reasons"] = reasons
+        else:
+            required = meta.get("requires_capabilities") or []
+            degraded = [
+                f"{cid}: {entry['reason']}"
+                for cid, entry in probe_capabilities().items()
+                if entry["degraded"] and cid in required
+            ]
+            meta["availability"] = "partial" if degraded else "available"
+            meta["unavailable_reasons"] = degraded
+
     def _get_plugins_schema(self) -> Dict[str, Any]:
         base = str(_PKG_ROOT)
         result: Dict[str, Dict] = {
@@ -525,6 +554,32 @@ class EngineAPI:
                 for pid, meta in scan_plugins(user_dir, ptype, json_name).items():
                     if pid not in result[ptype]:
                         result[ptype][pid] = meta
+        # config 禁用名单和加载期错误也要进 schema，规则编辑器才知道哪些插件选不得
+        disabled = self._load_config().get("disabled_plugins", {})
+        if not isinstance(disabled, dict):
+            disabled = {}
+        engine = self._resolve_current_engine()
+        plugin_errors: list = []
+        get_diagnostics = getattr(engine, "get_diagnostics", None)
+        if callable(get_diagnostics):
+            plugin_errors = (
+                get_diagnostics().get("plugins", {}).get("errors", [])
+            )
+        for ptype in ("triggers", "actions"):
+            ptype_key = "triggers" if ptype == "triggers" else "actions"
+            disabled_set = set(disabled.get(ptype_key, []))
+            for pid, meta in result[ptype].items():
+                if not isinstance(meta, dict):
+                    continue
+                if pid in disabled_set:
+                    meta["enabled"] = False
+                for err in plugin_errors:
+                    if len(err) < 3 or err[1] != pid:
+                        continue
+                    err_category = "triggers" if err[0] == "Trigger" else "actions"
+                    if err_category == ptype:
+                        meta.setdefault("_error", err[2])
+                self._annotate_availability(meta)
         return result
 
     def _validate_rule_draft(self, rule: Any) -> Dict[str, Any]:
@@ -576,6 +631,15 @@ class EngineAPI:
                         f"触发器“{plugin.get('name') or event.get('type')}”不支持当前系统",
                         "event",
                     )
+                elif plugin.get("availability") == "unavailable":
+                    reasons = "；".join(plugin.get("unavailable_reasons") or [])
+                    add(
+                        "error",
+                        "capability_incompatible",
+                        f"触发器“{plugin.get('name') or event.get('type')}”"
+                        f"当前系统缺少能力（{reasons}）",
+                        "event",
+                    )
 
             for field in ("preconditions", "actions"):
                 for index, item in enumerate(normalized.get(field, [])):
@@ -610,6 +674,17 @@ class EngineAPI:
                                 "error",
                                 "platform_incompatible",
                                 f"{label}“{plugin.get('name') or action_item.get('type')}”不支持当前系统",
+                                location,
+                            )
+                        elif plugin.get("availability") == "unavailable":
+                            reasons = "；".join(
+                                plugin.get("unavailable_reasons") or []
+                            )
+                            add(
+                                "error",
+                                "capability_incompatible",
+                                f"{label}“{plugin.get('name') or action_item.get('type')}”"
+                                f"当前系统缺少能力（{reasons}）",
                                 location,
                             )
                         elif (
@@ -745,6 +820,89 @@ class EngineAPI:
                     return ptype, pid, meta
         return None
 
+    def _classify_update(self, meta: dict) -> dict:
+        """安装前按 package_name + version_code 判断这次是哪种安装"""
+        pkg = meta.get("package_name", "")
+        new_vc = meta.get("version_code", 0)
+        existing = self._find_plugin_by_package(pkg)
+        if not existing:
+            return {"kind": "new", "package_name": pkg}
+        ex_ptype, ex_pid, ex_meta = existing
+        ex_vc = ex_meta.get("version_code", 0)
+        if new_vc > ex_vc:
+            kind = "upgrade"
+        elif new_vc < ex_vc:
+            kind = "downgrade"
+        else:
+            kind = "reinstall"
+        return {
+            "kind": kind,
+            "package_name": pkg,
+            "installed_id": ex_pid,
+            "installed_type": ex_ptype,
+            "installed_version": ex_meta.get("version", ""),
+            "installed_version_code": ex_vc,
+            "incoming_version_code": new_vc,
+        }
+
+    @staticmethod
+    def _list_diff(old_items, new_items):
+        old, new = set(old_items or []), set(new_items or [])
+        return {"added": sorted(new - old), "removed": sorted(old - new)}
+
+    def _signature_identity(self, root_path: str) -> str:
+        """插件签名身份：作者公钥的指纹，官方签名没有公钥文件"""
+        import hashlib
+
+        key_file = os.path.join(root_path, "public_key.pem")
+        try:
+            with open(key_file, "rb") as f:
+                return "author:" + hashlib.sha256(f.read()).hexdigest()[:16]
+        except OSError:
+            return "official"
+
+    def _update_diff(self, root_path: str, meta: dict) -> dict:
+        """对已安装的同包插件算权限、能力和签名身份的差别"""
+        classification = self._classify_update(meta)
+        if classification["kind"] == "new":
+            return {"update": classification}
+        user_dir = self._get_user_plugins_dir()
+        installed_dir = os.path.join(
+            user_dir, classification["installed_type"], classification["installed_id"]
+        )
+        json_name = (
+            "trigger.json" if classification["installed_type"] == "triggers" else "action.json"
+        )
+        installed_meta = {}
+        try:
+            with open(os.path.join(installed_dir, json_name), "r", encoding="utf-8") as f:
+                installed_meta = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            installed_meta = {}
+        if not installed_meta:
+            for pid, scanned in scan_plugins(
+                user_dir, classification["installed_type"], json_name
+            ).items():
+                if pid == classification["installed_id"]:
+                    installed_meta = scanned
+                    break
+
+        old_identity = self._signature_identity(installed_dir)
+        new_identity = self._signature_identity(root_path)
+        return {
+            "update": classification,
+            "permission_diff": self._list_diff(
+                installed_meta.get("permissions"), meta.get("permissions")
+            ),
+            "capability_diff": self._list_diff(
+                installed_meta.get("requires_capabilities"),
+                meta.get("requires_capabilities"),
+            ),
+            "signature_identity_changed": old_identity != new_identity,
+            "signature_old": old_identity,
+            "signature_new": new_identity,
+        }
+
     def _list_all_plugins(self) -> Dict[str, Any]:
         base = str(_PKG_ROOT)
         user_dir = self._get_user_plugins_dir()
@@ -813,6 +971,12 @@ class EngineAPI:
                 if pid in result[ptype]:
                     result[ptype][pid]["enabled"] = False
 
+        # 平台和能力分开判断，界面据此显示可用 / 部分可用 / 当前系统不可用
+        for ptype in ("triggers", "actions"):
+            for pid, meta in result[ptype].items():
+                if isinstance(meta, dict):
+                    self._annotate_availability(meta)
+
         # 把运行时诊断中的插件错误合并到列表。
         engine = self._resolve_current_engine()
         if engine is not None:
@@ -833,6 +997,18 @@ class EngineAPI:
         if engine is not None:
             return engine
         return self._engine_ref
+
+    def _scheduler_summary(self) -> Dict[str, Any]:
+        engine = self._resolve_current_engine()
+        stats_fn = getattr(engine, "scheduler_stats", None)
+        if not callable(stats_fn):
+            return {"running": 0, "queued": 0, "rules": {}}
+        rules = stats_fn()
+        return {
+            "running": sum(item["running"] for item in rules.values()),
+            "queued": sum(item["queued"] for item in rules.values()),
+            "rules": rules,
+        }
 
     def _start_runtime(self) -> bool:
         start = getattr(self._engine, "start_engine", None)
@@ -901,6 +1077,33 @@ class EngineAPI:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    _BACKUP_SUFFIX = ".nmf-backup"
+
+    def _backup_plugin(self, user_dir: str, ptype: str, pid: str) -> str | None:
+        """把插件目录挪进备份位置，同一插件只留最近一份"""
+        import shutil
+
+        source = os.path.join(user_dir, ptype, pid)
+        if not os.path.isdir(source):
+            return None
+        backup = source + self._BACKUP_SUFFIX
+        if os.path.exists(backup):
+            shutil.rmtree(backup, ignore_errors=True)
+        shutil.move(source, backup)
+        return backup
+
+    def _rollback_plugin(self, backups) -> None:
+        """安装或更新后校验失败时，用备份把旧版本原样搬回去"""
+        import shutil
+
+        for backup in backups:
+            if not backup or not os.path.isdir(backup):
+                continue
+            original = backup[: -len(self._BACKUP_SUFFIX)]
+            if os.path.exists(original):
+                shutil.rmtree(original, ignore_errors=True)
+            shutil.move(backup, original)
+
     def _uninstall_plugin(self, ptype: str, pid: str) -> dict:
         if not self._is_safe_plugin_id(pid):
             return {"ok": False, "error": "插件 id 含非法字符（禁止路径分隔符）"}
@@ -915,6 +1118,10 @@ class EngineAPI:
         try:
             import shutil
             shutil.rmtree(plugin_dir)
+            # 卸载连更新备份一起删，不留可被重新装回的旧副本
+            backup = plugin_dir + self._BACKUP_SUFFIX
+            if os.path.exists(backup):
+                shutil.rmtree(backup, ignore_errors=True)
             return {"ok": True, "restart_required": True}
         except OSError as e:
             return {"ok": False, "error": str(e)}
@@ -1274,18 +1481,22 @@ class EngineAPI:
                 "actions_count": len(action_types),
                 "security_mode": detect_security_mode().value,
                 "last_error": getattr(self._engine, "last_error", None),
+                "scheduler": self._scheduler_summary(),
             }
 
         @app.get("/api/platform")
         async def platform_status():
+            from notmyfault.platform.capabilities import probe_capabilities
+
             if sys.platform.startswith("linux"):
                 from notmyfault.platform.linux_support import capability_report
+
                 return capability_report()
             return {
                 "platform": "windows" if sys.platform == "win32" else sys.platform,
                 "desktop": None,
                 "session_type": None,
-                "capabilities": {},
+                "capabilities": probe_capabilities(),
                 "limitations": {},
             }
 
@@ -2261,6 +2472,8 @@ class EngineAPI:
 
                 perm_conform, perm_errors = check_permissions_conform(perms)
 
+                update_diff = self._update_diff(root_path, meta)
+
                 preview_token = secrets.token_hex(16)
                 self._pending_previews[preview_token] = {
                     "extract_dir": extract_dir,
@@ -2302,6 +2515,7 @@ class EngineAPI:
                     "risks": risks,
                     "schema_valid": schema_valid,
                     "schema_errors": schema_errors,
+                    "update_diff": update_diff,
                 }
             except ValueError as ve:
                 # 解压检查失败时删除临时文件和目录。
@@ -2340,6 +2554,7 @@ class EngineAPI:
                 meta = preview["meta"]
                 ptype = preview["ptype"]
                 json_name = preview["json_name"]
+                plugin_type = "trigger" if ptype == "triggers" else "action"
                 extract_dir = preview.get("extract_dir")
             else:
                 # 没有预览 token 时直接处理上传文件。
@@ -2470,6 +2685,7 @@ class EngineAPI:
                     )
 
                 existing = self._find_plugin_by_package(pkg)
+                backups = []
                 if existing:
                     ex_ptype, ex_pid, ex_meta = existing
                     ex_vc = ex_meta.get("version_code", 0)
@@ -2479,22 +2695,73 @@ class EngineAPI:
                             {"ok": False,
                              "error": f"已安装更高版本 v{ex_vc}，如需降级请勾选「强制覆盖」后重试"},
                             status_code=400)
-                    shutil.rmtree(os.path.join(user_dir, ex_ptype, ex_pid), ignore_errors=True)
+                    # 更新前先备份旧目录，装坏了用它还原；成功后也留着最近这一份
+                    backup = self._backup_plugin(user_dir, ex_ptype, ex_pid)
+                    if backup:
+                        backups.append(backup)
+                # 同包插件可能连 id 一起改了名，新位置如有旧目录也一并备份
+                if not existing or existing[1] != pid:
+                    backup = self._backup_plugin(user_dir, ptype, pid)
+                    if backup:
+                        backups.append(backup)
 
                 dest = os.path.join(user_dir, ptype, pid)
 
-                # 引擎不重签插件文件，只副签作者公钥
+                try:
+                    if os.path.exists(dest):
+                        shutil.rmtree(dest, ignore_errors=True)
+                    shutil.copytree(
+                        root_path, dest,
+                        dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'),
+                    )
+                except Exception as install_error:
+                    self._rollback_plugin(backups)
+                    return JSONResponse(
+                        {"ok": False,
+                         "error": f"安装失败，已恢复旧版本: {install_error}"},
+                        status_code=500,
+                    )
 
-                if os.path.exists(dest):
-                    shutil.rmtree(dest, ignore_errors=True)
-                shutil.copytree(
-                    root_path, dest,
-                    dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc'),
+                # 落盘后再校验一遍：schema 必须过；安全扫描只拦 preview 之后
+                # 新冒出来的风险，build hook 这类用户在预览里已经确认过的不再拦
+                try:
+                    with open(os.path.join(dest, json_name), "r", encoding="utf-8") as f:
+                        written_meta = json.load(f)
+                except (json.JSONDecodeError, OSError) as read_error:
+                    self._rollback_plugin(backups)
+                    return JSONResponse(
+                        {"ok": False,
+                         "error": f"安装后清单校验失败，已恢复旧版本: {read_error}"},
+                        status_code=500,
+                    )
+                written_ok, written_errors = validate_plugin_meta(
+                    written_meta, plugin_type
                 )
+                previewed_risk_ids = {
+                    risk.get("id") for risk in _scan_plugin_install_risks(
+                        root_path, json_name, meta
+                    )
+                }
+                written_risks = [
+                    risk
+                    for risk in _scan_plugin_install_risks(dest, json_name, written_meta)
+                    if risk.get("id") not in previewed_risk_ids
+                ]
+                if not written_ok or written_risks:
+                    self._rollback_plugin(backups)
+                    return JSONResponse(
+                        {"ok": False,
+                         "error": "安装后校验失败，已恢复旧版本: "
+                                  + ("; ".join(written_errors[:3]) if not written_ok else "构建产物引入了新的风险"),
+                         "risks": written_risks,
+                        },
+                        status_code=400,
+                    )
 
                 return {"ok": True, "id": pid, "type": ptype, "package_name": pkg,
-                        "version_code": new_vc, "restart_required": True}
+                        "version_code": new_vc, "restart_required": True,
+                        "backup_kept": bool(backups)}
             finally:
                 if not preview_token and extract_dir:
                     if tmp is not None:
