@@ -7,6 +7,7 @@
     "version_code": 1,
     "version": "1.0",
     "package_name": "io.github.notmyfault.clipboard",
+    "requires_capabilities": ["clipboard.read"],
     "enabled": true,
     "permissions": ["clipboard", "native_api"],
     "outputs": [

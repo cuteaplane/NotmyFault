@@ -5,7 +5,9 @@ Windows 用 EnumWindows；Linux 用 xdotool（仅 X11，Wayland 不可用）
 import os
 import shutil
 import subprocess
+import sys
 
+from notmyfault.platform.linux_support import BackendMissingError
 from notmyfault.triggers.base import PollingTrigger
 
 
@@ -70,6 +72,8 @@ class WindowTitleTrigger(PollingTrigger):
         state = self.config.get("state", "opened")
         if state not in ("opened", "closed"):
             raise ValueError(f"无效的窗口状态: {state!r}（可选: opened/closed）")
+        if sys.platform != "win32" and not shutil.which("xdotool"):
+            raise BackendMissingError("依赖缺失：窗口标题监视需要 xdotool")
 
     def setup(self):
         self.pattern = str(self.config.get("title_pattern", "")).strip().lower()

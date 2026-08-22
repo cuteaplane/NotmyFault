@@ -155,8 +155,10 @@ else:
                 from Xlib import X, XK
                 from Xlib.display import Display
             except ImportError:
-                raise RuntimeError(
-                    "Linux 全局热键需要 python-xlib，请运行 pip install python-xlib"
+                from notmyfault.platform.linux_support import BackendMissingError
+
+                raise BackendMissingError(
+                    "依赖缺失：全局热键需要 python-xlib（pip install python-xlib）"
                 )
             modifiers, main_key_name = _parse_x11_hotkey(self._raw)
             if not main_key_name:
@@ -201,6 +203,11 @@ else:
                     root = self._disp.screen().root
                     root.ungrab_key(self._keycode, 0, False)
                     self._disp.sync()
+                except Exception:
+                    pass
+            if hasattr(self, '_disp'):
+                try:
+                    self._disp.close()
                 except Exception:
                     pass
 

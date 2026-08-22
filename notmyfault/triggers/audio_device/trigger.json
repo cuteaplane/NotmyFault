@@ -8,6 +8,7 @@
     "version": "1.0",
     "package_name": "io.github.notmyfault.audio_device",
     "enabled": true,
+    "requires_capabilities": ["audio.device_query"],
     "platforms": ["windows", "linux"],
     "permissions": ["external_binary"],
     "outputs": [

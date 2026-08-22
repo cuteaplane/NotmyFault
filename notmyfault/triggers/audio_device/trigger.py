@@ -5,6 +5,7 @@ Windows 用 PowerShell MediaDevice API；Linux 用 wpctl 或 pactl
 import os
 import subprocess
 
+from notmyfault.platform.backends import BackendError
 from notmyfault.triggers.base import PollingTrigger
 
 _POWERSHELL_QUERY = r"""
@@ -55,59 +56,12 @@ def _query_default_devices_windows() -> dict[str, str]:
 
 
 def _query_default_devices_linux() -> dict[str, str]:
-    import shutil
-    if shutil.which("wpctl"):
-        return _query_wpctl()
-    if shutil.which("pactl"):
-        return _query_pactl()
-    return {}
+    from notmyfault.platform.backends import AudioBackend
 
-
-def _query_wpctl() -> dict[str, str]:
-    devices: dict[str, str] = {}
     try:
-        result = subprocess.run(
-            ["wpctl", "status"],
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
+        return AudioBackend().default_devices()
+    except BackendError:
         return {}
-    if result.returncode != 0:
-        return {}
-    for line in result.stdout.splitlines():
-        stripped = line.strip()
-        if "*+" in stripped or "* " in stripped:
-            # 带星号的行是默认设备，提取 id
-            import re
-            match = re.search(r"(\d+)\.\s", stripped)
-            if match:
-                device_id = match.group(1)
-                if "Sinks" in result.stdout.split(stripped)[0][-200:]:
-                    devices.setdefault("render", device_id)
-                elif "Sources" in result.stdout.split(stripped)[0][-200:]:
-                    devices.setdefault("capture", device_id)
-    return devices
-
-
-def _query_pactl() -> dict[str, str]:
-    devices: dict[str, str] = {}
-    for flow, prop in (("render", "Default Sink"), ("capture", "Default Source")):
-        try:
-            result = subprocess.run(
-                ["pactl", "get-default-sink" if flow == "render" else "get-default-source"],
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=5,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if result.returncode == 0:
-            devices[flow] = result.stdout.strip()
-    return devices
 
 
 class AudioDeviceTrigger(PollingTrigger):
