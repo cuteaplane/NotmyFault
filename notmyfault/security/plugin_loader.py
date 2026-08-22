@@ -63,8 +63,12 @@ _IGNORED_PLUGIN_DIRECTORY_NAMES = frozenset(
 
 
 def _is_ignored_plugin_directory(folder_name: str) -> bool:
-    """识别插件根目录里由解释器或开发工具生成的目录"""
-    return folder_name.startswith(".") or folder_name in _IGNORED_PLUGIN_DIRECTORY_NAMES
+    """识别插件根目录里由解释器、开发工具或更新备份生成的目录"""
+    return (
+        folder_name.startswith(".")
+        or folder_name in _IGNORED_PLUGIN_DIRECTORY_NAMES
+        or folder_name.endswith(".nmf-backup")
+    )
 
 
 def _snapshot_plugin_files(folder_path: str) -> Dict[str, str] | None:
@@ -419,6 +423,17 @@ class PluginLoader:
                 )
                 continue
 
+            # 禁用名单写在 config 里，对内置和用户插件都生效，json 里的 enabled 只表示作者出厂状态。
+            # 检查放在最前面：用户禁用的插件不该再记平台或能力错误
+            disabled_cfg = self._config.get("disabled_plugins", {})
+            ptype_key = "triggers" if store_name == "Trigger" else "actions"
+            disabled_list = disabled_cfg.get(ptype_key, []) if isinstance(disabled_cfg, dict) else []
+            if plugin_id in disabled_list:
+                print(
+                    f'[Engine] 插件 "{plugin_id}" ({meta["name"]}) 已被用户禁用，跳过'
+                )
+                continue
+
             if not is_plugin_platform_compatible(meta):
                 supported = ", ".join(
                     meta.get("platforms") or (meta.get("entrypoints") or {}).keys()
@@ -430,6 +445,50 @@ class PluginLoader:
                 engine_info(
                     f"plugin_platform_skipped: {plugin_id} "
                     f"current={_current_platform_name()} supported={supported}"
+                )
+                continue
+
+            from notmyfault.platform.capabilities import is_capability_compatible
+
+            capability_ok, capability_problems = is_capability_compatible(meta)
+            if not capability_ok:
+                reasons = "；".join(
+                    f"{p['capability']}: {p['reason']}" for p in capability_problems
+                )
+                print(
+                    f'[Engine] 插件 "{plugin_id}" ({meta["name"]}) 当前系统缺少能力，'
+                    f"跳过（{reasons}）",
+                    file=sys.stderr,
+                )
+                failed_count += 1
+                self._diagnostics.record_plugin_error(
+                    store_name, plugin_id, f"能力缺失: {reasons}"
+                )
+                engine_error(
+                    "plugin_load_failed",
+                    plugin=plugin_id,
+                    type=store_name,
+                    reason=f"能力缺失: {reasons}",
+                )
+                continue
+
+            from notmyfault.core.plugin_api import engines_compatibility
+
+            engines_ok, engines_reason = engines_compatibility(meta)
+            if not engines_ok:
+                print(
+                    f'[Engine] 插件 "{plugin_id}" ({meta["name"]}) {engines_reason}，跳过',
+                    file=sys.stderr,
+                )
+                failed_count += 1
+                self._diagnostics.record_plugin_error(
+                    store_name, plugin_id, engines_reason
+                )
+                engine_error(
+                    "plugin_load_failed",
+                    plugin=plugin_id,
+                    type=store_name,
+                    reason=engines_reason,
                 )
                 continue
 
@@ -490,16 +549,6 @@ class PluginLoader:
                     plugin=plugin_id,
                     type=store_name,
                     reason=reason,
-                )
-                continue
-
-            # 禁用名单写在 config 里，对内置和用户插件都生效，json 里的 enabled 只表示作者出厂状态。
-            disabled_cfg = self._config.get("disabled_plugins", {})
-            ptype_key = "triggers" if store_name == "Trigger" else "actions"
-            disabled_list = disabled_cfg.get(ptype_key, []) if isinstance(disabled_cfg, dict) else []
-            if plugin_id in disabled_list:
-                print(
-                    f'[Engine] 插件 "{plugin_id}" ({meta["name"]}) 已被用户禁用，跳过'
                 )
                 continue
 
@@ -912,6 +961,26 @@ class PluginLoader:
             if tree.file_snapshot != entry.get("file_snapshot"):
                 fail("插件文件在校验后发生变化，拒绝导入")
                 return None
+
+            # isolated 动作不在引擎进程里 import：模块加载就崩的插件正是要隔离的对象，
+            # 直接注册一个起子进程的包装函数
+            if (
+                plugin_type == "action"
+                and meta.get("execution_mode") == "isolated"
+            ):
+                from notmyfault.core.plugin_worker import run_isolated_action
+
+                def isolated_run(_meta, params, _entry=py_file, _info=meta):
+                    ok, result = run_isolated_action(_entry, _info, params, {})
+                    if not ok:
+                        raise RuntimeError(f"isolated worker 执行失败: {result}")
+                    return result
+
+                self._registry.register(plugin_type, plugin_id, meta, isolated_run, None)
+                func_store[plugin_id] = isolated_run
+                meta_store[plugin_id] = meta
+                self._registry.pending.pop(plugin_id, None)
+                return meta
 
             sys.modules.pop(module_name, None)
             spec = importlib.util.spec_from_file_location(module_name, py_file)

@@ -10,12 +10,15 @@ _REQUIRED_META_FIELDS = {"id", "name", "description", "enabled", "version_code",
 _TRIGGER_OPTIONAL_FIELDS = {
     "semantic", "params", "permissions", "origin", "trigger_api", "platforms",
     "entrypoints", "outputs", "build", "components", "contributes",
+    "requires_capabilities", "engines",
 }
 _ACTION_OPTIONAL_FIELDS = {
     "params", "permissions", "origin", "execution_api", "precondition_api",
     "outputs", "platforms", "entrypoints", "build", "idempotent",
-    "cancellation_api", "components", "contributes",
+    "cancellation_api", "components", "contributes", "requires_capabilities",
+    "execution_mode", "engines",
 }
+_ALLOWED_EXECUTION_MODES = {"in-process", "isolated"}
 _ALLOWED_SEMANTICS = {"state", "oneshot"}
 _ALLOWED_PARAM_TYPES = {
     "string", "number", "select", "bool", "time", "hotkey", "path",
@@ -669,6 +672,31 @@ def validate_plugin_meta(
         if meta["origin"] not in _ALLOWED_ORIGINS:
             errors.append("origin invalid: " + meta["origin"])
 
+    if "execution_mode" in meta:
+        # isolated 是给第三方动作做故障隔离的实验字段，内置插件必须走进程内
+        if meta.get("execution_mode") not in _ALLOWED_EXECUTION_MODES:
+            errors.append(
+                "execution_mode 必须是 in-process 或 isolated，实际: "
+                f"{meta.get('execution_mode')!r}"
+            )
+        elif meta.get("origin") == "builtin" and meta["execution_mode"] == "isolated":
+            errors.append("内置插件不允许 execution_mode: isolated")
+
+    if "engines" in meta:
+        engines = meta["engines"]
+        if not isinstance(engines, dict):
+            errors.append("engines 必须是对象")
+        else:
+            api_version = engines.get("notmyfault_api")
+            if api_version is None:
+                pass
+            elif (
+                isinstance(api_version, bool)
+                or not isinstance(api_version, int)
+                or api_version < 1
+            ):
+                errors.append("engines.notmyfault_api 必须是正整数")
+
     if "platforms" in meta:
         platforms = meta["platforms"]
         if not isinstance(platforms, list) or not platforms:
@@ -679,6 +707,24 @@ def validate_plugin_meta(
                     errors.append(
                         f"platforms 包含无效平台: {platform!r}"
                         f"（允许: {', '.join(sorted(_ALLOWED_PLATFORMS))}）"
+                    )
+
+    if "requires_capabilities" in meta:
+        from notmyfault.platform.capabilities import CAPABILITY_IDS
+
+        required = meta["requires_capabilities"]
+        if not isinstance(required, list) or not required:
+            errors.append("字段 'requires_capabilities' 必须是非空数组")
+        else:
+            for capability in required:
+                if not isinstance(capability, str):
+                    errors.append(
+                        f"requires_capabilities 中的值必须是字符串，实际: {type(capability).__name__}"
+                    )
+                elif capability not in CAPABILITY_IDS:
+                    errors.append(
+                        f"未知能力 id: {capability!r}"
+                        f"（允许: {', '.join(sorted(CAPABILITY_IDS))}）"
                     )
 
     if "entrypoints" in meta:
@@ -894,10 +940,10 @@ def scan_plugins(base_dir: str, plugins_dir: str, json_filename: str) -> Dict[st
         return result
 
     for folder_name in sorted(os.listdir(root)):
-        # 与加载器一致，跳过解释器和开发工具生成的目录。
+        # 与加载器一致，跳过解释器和开发工具生成的目录；.nmf-backup 是更新时留下的旧版本备份
         if folder_name.startswith(".") or folder_name in (
             "__pycache__", "__pypackages__", "node_modules",
-        ):
+        ) or folder_name.endswith(".nmf-backup"):
             continue
         folder_path = os.path.join(root, folder_name)
         if not os.path.isdir(folder_path):
