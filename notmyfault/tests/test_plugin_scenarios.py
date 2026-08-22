@@ -355,35 +355,34 @@ def test_send_keys_type_text_splits_surrogate_pairs(monkeypatch):
 
 
 # Windows 上 run() 走 SendInput，会把组合键真的按进系统
-@pytest.mark.skipif(os.name != "posix", reason="仅 Linux 调用 xdotool/ydotool")
+@pytest.mark.skipif(os.name != "posix", reason="仅 Linux 走 InputBackend")
 def test_send_keys_linux_dispatches_input_tool(monkeypatch):
     mod = load_plugin("actions", "send_keys")
-    commands = []
-    monkeypatch.setattr(mod.shutil, "which", lambda name: "/usr/bin/xdotool")
+    calls = []
+
+    class FakeInputBackend:
+        def __init__(self):
+            pass
+
+        def type_text(self, text):
+            calls.append(("type", text))
+
+        def send_hotkey(self, parts):
+            calls.append(("hotkey", list(parts)))
+
     monkeypatch.setattr(
-        mod.subprocess,
-        "run",
-        lambda cmd, **kwargs: commands.append(cmd) or SimpleNamespace(returncode=0),
+        "notmyfault.platform.backends.InputBackend", FakeInputBackend
     )
     assert mod.run({}, {"mode": "hotkey", "keys": "ctrl+win+enter"}) == {
         "mode": "hotkey"
     }
-    assert commands[-1] == [
-        "/usr/bin/xdotool",
-        "key",
-        "--clearmodifiers",
-        "ctrl+super+Return",
-    ]
+    # 动作只负责拆分和校验，按键名翻译在 InputBackend 里
+    assert calls[-1] == ("hotkey", ["ctrl", "win", "enter"])
     assert mod.run({}, {"mode": "type_text", "text": "a中😀"}) == {
         "mode": "type_text"
     }
-    assert commands[-1] == [
-        "/usr/bin/xdotool",
-        "type",
-        "--clearmodifiers",
-        "--",
-        "a中😀",
-    ]
+    assert calls[-1] == ("type", "a中😀")
+
 
 
 def test_send_keys_rejects_bad_input():

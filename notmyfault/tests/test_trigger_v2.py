@@ -82,7 +82,7 @@ class TriggerV2Tests:
             "demo_trigger", {"value": 42}, instance={"config": {"watch": "folder_a"}}
         )
 
-        matches = engine._condition_runtime.last_match("0:v2 绑定规则")
+        matches = engine._condition_runtime.last_match("v2 绑定规则")
         assert len(matches) == 1
         assert matches[0]["binding_id"] == "t_demo001"
         assert matches[0]["payload"] == {"value": 42}
@@ -267,7 +267,7 @@ class V2ContractTests:
         )
 
         assert any(event_type == "trigger_payload_invalid" for event_type, _ in events)
-        assert engine._condition_runtime.last_match("0:契约规则") == []
+        assert engine._condition_runtime.last_match("契约规则") == []
 
 
 class V2MatchingTests:
