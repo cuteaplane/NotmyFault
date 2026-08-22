@@ -8,6 +8,21 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from notmyfault.platform.backends import (
+    BackendMissingError,
+    ClipboardBackend,
+    default_runner,
+)
+
+
+def require_command(capability: str, *names: str) -> str:
+    for name in names:
+        if path := shutil.which(name):
+            return path
+    raise BackendMissingError(
+        f"依赖缺失：{capability} 需要 " + " 或 ".join(names)
+    )
+
 
 def command_path(*names: str) -> str | None:
     for name in names:
@@ -52,33 +67,11 @@ def run_command(command: list[str], timeout: float = 10) -> subprocess.Completed
 
 
 def get_clipboard_text() -> str | None:
-    if executable := command_path("wl-paste"):
-        result = run_command([executable, "--no-newline"], timeout=3)
-    elif executable := command_path("xclip"):
-        result = run_command([executable, "-selection", "clipboard", "-o"], timeout=3)
-    elif executable := command_path("xsel"):
-        result = run_command([executable, "--clipboard", "--output"], timeout=3)
-    else:
-        raise RuntimeError("缺少剪贴板后端：Wayland 请安装 wl-clipboard，X11 请安装 xclip")
-    return result.stdout if result.returncode == 0 else None
+    return ClipboardBackend(default_runner).read_text()
 
 
 def set_clipboard_text(text: str) -> None:
-    if executable := command_path("wl-copy"):
-        command = [executable]
-    elif executable := command_path("xclip"):
-        command = [executable, "-selection", "clipboard"]
-    elif executable := command_path("xsel"):
-        command = [executable, "--clipboard", "--input"]
-    else:
-        raise RuntimeError("缺少剪贴板后端：Wayland 请安装 wl-clipboard，X11 请安装 xclip")
-    subprocess.run(
-        command,
-        input=text,
-        text=True,
-        timeout=3,
-        check=True,
-    )
+    ClipboardBackend(default_runner).write_text(text)
 
 
 def get_idle_seconds() -> float:
@@ -104,7 +97,9 @@ def get_idle_seconds() -> float:
         result = run_command([executable], timeout=3)
         if result.returncode == 0:
             return int(result.stdout.strip()) / 1000
-    raise RuntimeError("当前桌面没有可用的空闲时间后端")
+    raise BackendMissingError(
+        "依赖缺失：空闲时间检测需要 gdbus（GNOME）或 xprintidle（X11）"
+    )
 
 
 def default_output_path(prefix: str, extension: str) -> Path:
@@ -119,36 +114,14 @@ def default_output_path(prefix: str, extension: str) -> Path:
 
 
 def capability_report() -> dict[str, object]:
-    """返回当前 Linux 桌面可用后端，供诊断页和 API 展示"""
-    commands = {
-        "notification": command_path("notify-send"),
-        "clipboard_read": command_path("wl-paste", "xclip", "xsel"),
-        "clipboard_write": command_path("wl-copy", "xclip", "xsel"),
-        "screenshot": (
-            "xdg-desktop-portal"
-            if session_type() == "wayland" and command_path("gdbus")
-            else command_path("gnome-screenshot", "grim", "spectacle", "import")
-        ),
-        "brightness": command_path("brightnessctl"),
-        "audio": command_path("wpctl", "pactl", "amixer"),
-        "bluetooth": command_path("bluetoothctl"),
-        "text_to_speech": command_path("spd-say", "espeak"),
-        "screen_lock": command_path("loginctl"),
-        "powershell": command_path("pwsh", "powershell"),
-    }
-    capabilities = {
-        name: {"available": bool(path), "backend": path}
-        for name, path in commands.items()
-    }
-    capabilities["tray"] = {
-        "available": session_type() == "x11",
-        "backend": "pystray-xembed" if session_type() == "x11" else None,
-    }
+    """诊断页用的平台报告，capabilities 每项带 available / backend / reason / degraded"""
+    from notmyfault.platform.capabilities import probe_capabilities
+
     return {
         "platform": "linux",
         "desktop": desktop_environment(),
         "session_type": session_type(),
-        "capabilities": capabilities,
+        "capabilities": probe_capabilities(),
         "limitations": {
             "global_hotkey": (
                 "Wayland 不允许普通应用全局监听按键"
