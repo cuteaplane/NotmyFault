@@ -30,6 +30,7 @@ from notmyfault.core.diagnostics import Diagnostics
 from notmyfault.core.event_bus import EventBus
 from notmyfault.core.hot_reloader import RulesHotReloader
 from notmyfault.core.logging import engine_error, engine_info, engine_warn
+from notmyfault.core import plugin_worker
 from notmyfault.security.plugin_loader import (
     PluginKind,
     PluginLoader,
@@ -44,6 +45,7 @@ from notmyfault.security.plugin_loader import (
     verify_plugin_integrity,
     verify_plugin_sig,
 )
+from notmyfault.core.rule_scheduler import RuleScheduler
 from notmyfault.core.rules import (
     ConditionRuntime,
     aggregate_trigger_params,
@@ -140,6 +142,7 @@ class AutomationEngine:
             ),
             safe_on_event=self._safe_on_event,
             execute_workflow_cb=self.execute_workflow,
+            scheduler_submit_fn=lambda *args: self._rule_scheduler.submit(*args),
         )
         self._workflow_executor = WorkflowExecutor(
             actions_meta=lambda: self.actions_meta,
@@ -156,6 +159,15 @@ class AutomationEngine:
             action_resolver=self._plugin_registry.resolve_action,
             sensitive_values=self._collect_sensitive_values,
         )
+        # 同一规则反复触发时先到这里决定丢弃、排队还是直接跑
+        self._rule_scheduler = RuleScheduler(
+            execute_fn=self.execute_workflow,
+            cancel_run_fn=self._workflow_executor.cancel_run,
+            is_deferred_fn=self._workflow_executor.is_run_deferred,
+            on_history_event=self._safe_on_event,
+        )
+        # isolated 动作崩了通过这个回调推 plugin_worker_crashed 事件
+        plugin_worker.set_crash_callback(self._safe_on_event)
         # 旧扩展和测试仍直接读取这些同步对象
         self._action_lock = self._workflow_executor.action_lock
         self._action_done = self._workflow_executor.action_done
@@ -233,6 +245,11 @@ class AutomationEngine:
 
     def _safe_on_event(self, event_type: str, payload: Dict[str, Any]) -> None:
         """调用外部事件回调并记录回调异常"""
+        if event_type in ("workflow_completed", "workflow_failed"):
+            scheduler = getattr(self, "_rule_scheduler", None)
+            if scheduler is not None:
+                # deferred 的 run 靠终态事件退场，排队中的下一条也在这里补发
+                scheduler.on_run_event(event_type, payload.get("run_id"))
         if not self.on_event:
             return
         # UI 或 SSE 推送失败时记录错误并继续分发
@@ -313,6 +330,10 @@ class AutomationEngine:
                 err[-200:],
                 open_dashboard=False,
             )
+
+    def scheduler_stats(self) -> Dict[str, Dict[str, int]]:
+        """每个规则当前的运行数和排队数，状态接口展示用"""
+        return self._rule_scheduler.stats()
 
     def get_diagnostics(self) -> Dict[str, Any]:
         """返回当前诊断数据供 Dashboard 展示"""
@@ -749,6 +770,22 @@ class AutomationEngine:
             old_rules = list(self.rules)
             self.rules = new_rules
             self._condition_runtime.reset()
+        # 被删掉的规则连排队中的 run 一起丢弃；还在的规则排队条目用入队时的快照
+        def rule_key_of(rule: Dict[str, Any]) -> str:
+            # 和 EventBus 的调度 key 同算法：rule_id 优先，规则名兜底
+            return str(rule.get("rule_id", "")) or str(rule.get("name", ""))
+
+        new_keys = {
+            rule_key_of(rule)
+            for rule in new_rules
+            if isinstance(rule, dict)
+        }
+        for rule in old_rules:
+            if not isinstance(rule, dict):
+                continue
+            key = rule_key_of(rule)
+            if key not in new_keys:
+                self._rule_scheduler.drop_rule(key)
         return old_rules
 
     def _run(
@@ -815,10 +852,13 @@ class AutomationEngine:
         from notmyfault.security.admin_prompt import cancel_pending_admin_requests
 
         cancel_pending_admin_requests()
+        # 停止链路两条：shutdown() 和这里的循环退出，调度队列两边都要丢并写 history
+        self._rule_scheduler.shutdown()
         self._cancel_deferred_workflows()
         stopped = self._stop_trigger_threads(timeout=30)
         manual_stopped = self._join_manual_threads()
         drained = self._wait_active_actions()
+        plugin_worker.shutdown_all()
         self._shutdown_plugins()
         self._shutdown_clean = bool(stopped and manual_stopped and drained)
 
@@ -874,11 +914,13 @@ class AutomationEngine:
         from notmyfault.security.admin_prompt import cancel_pending_admin_requests
 
         cancel_pending_admin_requests()
+        self._rule_scheduler.shutdown()
         self._trigger_supervisor.request_stop_all()
         self._cancel_deferred_workflows()
         stopped = self._stop_trigger_threads(timeout=30)
         manual_stopped = self._join_manual_threads()
         drained = self._wait_active_actions()
+        plugin_worker.shutdown_all()
         self._shutdown_plugins()
         self._shutdown_clean = bool(stopped and manual_stopped and drained)
         if self._shutdown_clean:

@@ -24,6 +24,7 @@ class EventBus:
         is_shutdown_fn: Callable[[], bool],
         safe_on_event: Callable[[str, Dict[str, Any]], None],
         execute_workflow_cb: Callable[..., None],
+        scheduler_submit_fn: Callable[..., str] | None = None,
     ) -> None:
         self._rules_fn = rules_fn
         # 和 engine 共用同一把锁对象，快照和热重载换规则才不会打架
@@ -34,6 +35,8 @@ class EventBus:
         self._is_shutdown_fn = is_shutdown_fn
         self._safe_on_event = safe_on_event
         self._execute_workflow_cb = execute_workflow_cb
+        # 有调度器时先决定跑不跑，没有就直接执行，旧测试路径走这里
+        self._scheduler_submit_fn = scheduler_submit_fn
 
     def emit_event(
         self,
@@ -57,9 +60,10 @@ class EventBus:
             # 规则快照在锁内复制，动作执行在锁外进行
             rules_snapshot = list(self._rules_fn())
 
-        for rule_index, rule in enumerate(rules_snapshot):
+        for rule in rules_snapshot:
             rule_id = rule.get("rule_id", "")
-            rule_key = rule_id or f"{rule_index}:{rule.get('name', '')}"
+            # 调度 key 用 rule_id，没有就用规则名；带数组下标会在规则重排后串到别的规则
+            rule_key = rule_id or str(rule.get("name", ""))
             if not self._condition_runtime.match(
                 rule_key,
                 rule,
@@ -91,7 +95,10 @@ class EventBus:
                 rule_id,
                 run_id,
             )
-            self._execute_workflow_cb(rule_key, rule, rule_name, context)
+            if self._scheduler_submit_fn is not None:
+                self._scheduler_submit_fn(rule_key, rule, rule_name, context)
+            else:
+                self._execute_workflow_cb(rule_key, rule, rule_name, context)
 
     def call_notmyfault(self, event_data: Dict[str, Any]) -> None:
         """接收触发器线程推送的外部事件"""

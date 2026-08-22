@@ -134,6 +134,32 @@ def validate_rule_structure(rule: Any) -> List[str]:
     if not str(rule.get("name", "")).strip():
         errors.append("name 不能为空")
 
+    if "concurrency" in rule:
+        concurrency = rule["concurrency"]
+        if not isinstance(concurrency, dict):
+            errors.append("concurrency 必须是对象")
+        else:
+            mode = concurrency.get("mode", "parallel")
+            if mode not in ("single", "queue", "replace", "parallel"):
+                errors.append(
+                    "concurrency.mode 必须是 single / queue / replace / parallel"
+                )
+            for field, ceiling in (
+                ("max_concurrency", 32),
+                ("queue_limit", 1000),
+            ):
+                if field not in concurrency:
+                    continue
+                value = concurrency[field]
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or not 1 <= value <= ceiling
+                ):
+                    errors.append(
+                        f"concurrency.{field} 必须是 1 到 {ceiling} 的整数"
+                    )
+
     has_event = "event" in rule or "trigger" in rule
     has_condition = "condition" in rule
     if has_event and has_condition:

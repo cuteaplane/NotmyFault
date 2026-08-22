@@ -248,6 +248,11 @@ class WorkflowExecutor:
             },
         )
 
+    def is_run_deferred(self, run_id: str) -> bool:
+        """run 是否处于 deferred 等待重试状态，调度器据此把它算作活跃 run"""
+        with self._run_cancel_lock:
+            return run_id in self._deferred_run_keys
+
     def cancel_run(self, run_id: str) -> bool:
         with self._run_cancel_lock:
             event = self._run_cancel_events.get(run_id)
@@ -700,24 +705,26 @@ class WorkflowExecutor:
                 rule_name=rule_name,
                 error=dynamic_parameter_error,
             )
-            self._on_event(
-                "workflow_failed",
-                {
-                    "action_type": action_type,
-                    "rule_id": context.get("rule", {}).get("id", ""),
-                    "run_id": _run_id(context),
-                    "rule_name": rule_name,
-                    "step_id": action.get("binding_id") or action_type,
-                    "error": {
-                        "code": "unsafe_dynamic_parameter",
-                        "location": (
-                            f"actions.{action_type}.params."
-                            f"{dynamic_parameter_name}"
-                        ),
-                        "message": dynamic_parameter_error,
+            # workflow_failed 是终态，只有第一个终态事件能发出去
+            if self._finish_run(context):
+                self._on_event(
+                    "workflow_failed",
+                    {
+                        "action_type": action_type,
+                        "rule_id": context.get("rule", {}).get("id", ""),
+                        "run_id": _run_id(context),
+                        "rule_name": rule_name,
+                        "step_id": action.get("binding_id") or action_type,
+                        "error": {
+                            "code": "unsafe_dynamic_parameter",
+                            "location": (
+                                f"actions.{action_type}.params."
+                                f"{dynamic_parameter_name}"
+                            ),
+                            "message": dynamic_parameter_error,
+                        },
                     },
-                },
-            )
+                )
             print(
                 f"[Engine] [!!] 拦截 {action_type} 动态参数: {rule_name}",
                 file=sys.stderr,
@@ -731,17 +738,18 @@ class WorkflowExecutor:
             )
         except BindingResolutionError as exc:
             self._diagnostics.inc_action_fail()
-            self._on_event(
-                "workflow_failed",
-                {
-                    "action_type": action_type,
-                    "rule_id": context.get("rule", {}).get("id", ""),
-                    "run_id": _run_id(context),
-                    "rule_name": rule_name,
-                    "step_id": action.get("binding_id") or action_type,
-                    "error": exc.as_dict(),
-                },
-            )
+            if self._finish_run(context):
+                self._on_event(
+                    "workflow_failed",
+                    {
+                        "action_type": action_type,
+                        "rule_id": context.get("rule", {}).get("id", ""),
+                        "run_id": _run_id(context),
+                        "rule_name": rule_name,
+                        "step_id": action.get("binding_id") or action_type,
+                        "error": exc.as_dict(),
+                    },
+                )
             print(
                 f"[Engine] action \"{action_type}\" 数据绑定失败: {exc}",
                 file=sys.stderr,
@@ -794,7 +802,7 @@ class WorkflowExecutor:
                 print(validation_error, file=sys.stderr)
 
         with self.action_lock:
-            # 在锁内再查一次 shutdown，堵住检查后、计数前被并发关闭的窗口
+            # 在锁内再查一次 shutdown，两次检查之间引擎可能已经开始关闭
             shutdown_event = self._shutdown_event()
             if shutdown_event and shutdown_event.is_set():
                 return False, "引擎正在关闭"

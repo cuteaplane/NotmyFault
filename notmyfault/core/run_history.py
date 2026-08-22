@@ -8,6 +8,8 @@ import os
 import threading
 from typing import Any, Dict, Iterable
 
+from notmyfault.core import run_lifecycle as lifecycle
+
 
 _RUN_EVENT_TYPES = frozenset(
     {
@@ -21,6 +23,9 @@ _RUN_EVENT_TYPES = frozenset(
         "action_timed_out",
         "test_assertions_completed",
         "error",
+        "run_queued",
+        "run_dropped",
+        "run_replaced",
     }
 )
 
@@ -58,6 +63,10 @@ def _safe_event(packet: Dict[str, Any]) -> Dict[str, Any] | None:
     event_type = packet.get("type")
     data = packet.get("data")
     if event_type not in _RUN_EVENT_TYPES or not isinstance(data, dict):
+        return None
+    # 比当前版本新的事件格式读不懂，整条丢弃，等引擎升级后再解释
+    schema = packet.get("schema")
+    if isinstance(schema, int) and schema > lifecycle.RUN_EVENT_SCHEMA_VERSION:
         return None
     run_id = data.get("run_id")
     if not isinstance(run_id, str) or not run_id:
@@ -116,11 +125,14 @@ def _safe_event(packet: Dict[str, Any]) -> Dict[str, Any] | None:
             for result in raw_results[:50]
             if isinstance(result, dict)
         ]
-    return {
+    saved = {
         "type": event_type,
         "data": kept,
         "ts": packet.get("ts"),
     }
+    if packet.get("schema") is not None:
+        saved["schema"] = packet.get("schema")
+    return saved
 
 
 def _new_run(data: Dict[str, Any], timestamp: Any) -> Dict[str, Any]:
@@ -159,6 +171,10 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
     event_type = packet["type"]
     data = packet["data"]
     timestamp = packet.get("ts")
+    # 到终点的 run 不再吃任何事件。重复 complete / cancel / resume 在写入侧
+    # 被 _finish_run 挡掉，迟到的在这里跳过
+    if lifecycle.is_terminal(run["status"]):
+        return
     if event_type == "rule_triggered":
         run.update(
             rule_id=data.get("rule_id", run["rule_id"]),
@@ -222,17 +238,26 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
             if "output_summary" in data:
                 step["output_summary"] = data["output_summary"]
 
+    new_status = lifecycle.status_after(event_type, data, run["status"])
     if event_type == "workflow_deferred":
-        run["status"] = "deferred"
+        run["status"] = new_status or run["status"]
         run["deferred_reason"] = data.get("reason")
         run["retry_after_seconds"] = data.get("retry_after_seconds")
+    elif event_type == "run_queued":
+        run["status"] = new_status or run["status"]
+        run["queued_reason"] = data.get("reason")
+    elif event_type in ("run_dropped", "run_replaced"):
+        run["status"] = new_status or run["status"]
+        run["drop_reason"] = data.get("reason")
+        run["finished_at"] = timestamp
+        run["duration_ms"] = _duration_ms(run["started_at"], timestamp)
     elif event_type == "workflow_failed":
-        run["status"] = "failed"
+        run["status"] = new_status or run["status"]
         run["error"] = data.get("error")
         run["finished_at"] = timestamp
         run["duration_ms"] = _duration_ms(run["started_at"], timestamp)
     elif event_type == "workflow_completed":
-        run["status"] = data.get("status", "succeeded")
+        run["status"] = new_status or run["status"]
         run["assertions_passed"] = int(
             data.get("assertions_passed", run["assertions_passed"]) or 0
         )
@@ -244,6 +269,9 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
         run["duration_ms"] = data.get(
             "duration_ms", _duration_ms(run["started_at"], timestamp)
         )
+    elif new_status == "running":
+        # deferred 的 run 收到动作事件说明重试已经跑起来了
+        run["status"] = "running"
 
 
 def build_runs(events: Iterable[Dict[str, Any]]) -> list[Dict[str, Any]]:
@@ -307,6 +335,9 @@ class RunHistory:
         self._event_count = len(events)
 
     def record(self, packet: Dict[str, Any]) -> None:
+        # 每条事件带格式版本，读侧遇到没有 schema 字段的旧事件按 v1 解释
+        if isinstance(packet, dict) and "schema" not in packet:
+            packet = {**packet, "schema": lifecycle.RUN_EVENT_SCHEMA_VERSION}
         safe_packet = _safe_event(packet)
         if safe_packet is None:
             return
