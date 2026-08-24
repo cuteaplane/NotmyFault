@@ -1,8 +1,8 @@
 import os
 import ctypes
-import subprocess
-from pathlib import Path
 from datetime import datetime
+
+from notmyfault.platform.backends import ScreenshotBackend, default_runner
 
 if os.name == "nt":
     user32 = ctypes.windll.user32
@@ -26,62 +26,9 @@ def run(action_info, params):
     print(f"[Action:screenshot] 截取{mode} -> {output_path}")
 
     if os.name != "nt":
-        from notmyfault.platform.linux_support import command_path, session_type
-
-        destination = Path(output_path).expanduser()
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        capture_path = destination
-        if fmt.lower() in ("jpg", "jpeg"):
-            capture_path = destination.with_suffix(".capture.png")
-
-        if session_type() == "wayland":
-            from notmyfault.platform.portal_screenshot import take_screenshot
-
-            take_screenshot(
-                str(capture_path),
-                interactive=mode == "active_window",
-            )
-            command = None
-        elif executable := command_path("gnome-screenshot"):
-            command = [executable, "-f", str(capture_path)]
-            if mode == "active_window":
-                command.insert(1, "-w")
-        elif executable := command_path("spectacle"):
-            command = [
-                executable,
-                "-b",
-                "-n",
-                "-a" if mode == "active_window" else "-f",
-                "-o",
-                str(capture_path),
-            ]
-        elif executable := command_path("import"):
-            command = [executable, "-window", "root", str(capture_path)]
-        else:
-            from notmyfault.platform.linux_support import BackendMissingError
-
-            raise BackendMissingError(
-                "依赖缺失：屏幕截图需要 gnome-screenshot、spectacle 或 ImageMagick import"
-            )
-
-        if command:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=30,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(result.stderr.strip() or "截图命令失败")
-
-        if capture_path != destination:
-            from PIL import Image
-            with Image.open(capture_path) as image:
-                image.convert("RGB").save(destination, "JPEG", quality=92)
-            capture_path.unlink(missing_ok=True)
-        print(f"[Action:screenshot] 截图已保存: {destination}")
-        return str(destination)
+        result = ScreenshotBackend(default_runner).capture(output_path, mode, fmt)
+        print(f"[Action:screenshot] 截图已保存: {result}")
+        return result
 
     hdc_screen = None
     hdc_mem = None

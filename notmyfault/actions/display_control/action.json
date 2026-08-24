@@ -5,7 +5,6 @@
     "version_code": 3,
     "version": "1.2",
     "package_name": "io.github.notmyfault.display_control",
-    "requires_capabilities": ["display.brightness"],
     "enabled": true,
     "permissions": ["native_api", "external_binary"],
     "params": [

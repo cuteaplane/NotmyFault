@@ -4,6 +4,8 @@ import os
 import subprocess
 import time
 
+from notmyfault.platform.backends import DisplayBackend, default_runner
+
 HWND_BROADCAST = 0xFFFF
 WM_SYSCOMMAND = 0x0112
 SC_MONITORPOWER = 0xF170
@@ -230,49 +232,14 @@ def run(action_info, params):
 
     try:
         if os.name != "nt":
-            from notmyfault.platform.linux_support import desktop_environment, require_command
-
+            backend = DisplayBackend(default_runner)
             if action in ("set_brightness", "low_brightness", "high_brightness"):
                 brightness = _brightness_level(params)
-                brightnessctl = require_command("亮度控制", "brightnessctl")
-                result = subprocess.run(
-                    [brightnessctl, "set", f"{brightness}%"],
-                    capture_output=True,
-                    text=True,
-                    errors="replace",
-                    timeout=5,
-                )
-            elif action in ("off", "on") and desktop_environment() == "gnome":
-                result = subprocess.run(
-                    [
-                        "gdbus",
-                        "call",
-                        "--session",
-                        "--dest",
-                        "org.gnome.ScreenSaver",
-                        "--object-path",
-                        "/org/gnome/ScreenSaver",
-                        "--method",
-                        "org.gnome.ScreenSaver.SetActive",
-                        "true" if action == "off" else "false",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    errors="replace",
-                    timeout=5,
-                )
+                backend.set_brightness(brightness)
             elif action in ("off", "on"):
-                result = subprocess.run(
-                    ["xset", "dpms", "force", action],
-                    capture_output=True,
-                    text=True,
-                    errors="replace",
-                    timeout=5,
-                )
+                backend.set_power(action)
             else:
                 raise ValueError(f"不支持的显示器操作: {action}")
-            if result.returncode != 0:
-                raise RuntimeError(result.stderr.strip() or "Linux 显示器命令失败")
             print(f"[Action:display_control] 操作完成: {action}")
             return {"action": action}
 

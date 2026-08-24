@@ -3,65 +3,12 @@ Windows 用 SetWindowPos；Linux 用 wmctrl（仅 X11）
 """
 
 import os
-import shutil
-import subprocess
+
+from notmyfault.platform.backends import WindowBackend, default_runner
 
 
 def _run_linux(action: str, target: str, title: str) -> dict:
-    if target == "title" and not title:
-        raise ValueError("按标题匹配时必须填写窗口标题")
-    from notmyfault.platform.linux_support import require_command
-
-    wmctrl = require_command("窗口置顶", "wmctrl")
-    if target == "title" and title:
-        result = subprocess.run(
-            [wmctrl, "-l"], capture_output=True, text=True, errors="replace", timeout=5,
-        )
-        if result.returncode != 0:
-            raise RuntimeError("wmctrl -l 失败")
-        wid = None
-        for line in result.stdout.splitlines():
-            if title.lower() in line.lower():
-                wid = line.split()[0]
-                break
-        if not wid:
-            raise RuntimeError(f"未找到标题包含 \"{title}\" 的窗口")
-    else:
-        result = subprocess.run(
-            [wmctrl, "-l"], capture_output=True, text=True, errors="replace", timeout=5,
-        )
-        if result.returncode != 0:
-            raise RuntimeError("wmctrl -l 失败")
-        lines = result.stdout.strip().splitlines()
-        if not lines:
-            raise RuntimeError("没有可见窗口")
-        wid = lines[0].split()[0]
-
-    if action == "toggle":
-        # wmctrl -l 看不出置顶状态，用 xprop 查；没有 xprop 就当作未置顶处理
-        pinned = False
-        xprop = shutil.which("xprop")
-        if xprop:
-            state = subprocess.run(
-                [xprop, "-id", wid, "_NET_WM_STATE"],
-                capture_output=True, text=True, errors="replace", timeout=5,
-            )
-            pinned = "_NET_WM_STATE_ABOVE" in state.stdout
-        action = "unpin" if pinned else "pin"
-
-    if action == "pin":
-        subprocess.run(
-            [wmctrl, "-i", "-r", wid, "-b", "add,above"],
-            check=True, timeout=5,
-        )
-        state = "pinned"
-    else:
-        subprocess.run(
-            [wmctrl, "-i", "-r", wid, "-b", "remove,above"],
-            check=True, timeout=5,
-        )
-        state = "unpinned"
-    return {"state": state, "window_id": wid}
+    return WindowBackend(default_runner).set_pinned(action, target, title)
 
 
 if os.name == "nt":
