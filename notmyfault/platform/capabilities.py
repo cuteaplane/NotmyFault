@@ -1,10 +1,3 @@
-"""能力模型：按固定 id 查询当前系统能做什么
-
-每个能力返回 available / backend / reason / degraded 四个字段。
-available=False 才算不可用，loader 会跳过声明了该能力的插件；
-degraded=True 不阻止加载，插件的主路径能用，界面显示“部分可用”
-"""
-
 from __future__ import annotations
 
 import os
@@ -98,12 +91,23 @@ def _probe_windows(capability: str) -> dict:
 def _probe_linux(capability: str) -> dict:
     from notmyfault.platform.linux_support import session_type
 
-    wayland = session_type() == "wayland"
+    session = session_type()
+    wayland = session == "wayland"
     if capability == CLIPBOARD_READ:
-        path, reason = _linux_command("wl-paste", "xclip", "xsel")
+        names = (
+            ("wl-paste",)
+            if wayland
+            else (("xclip", "xsel") if session == "x11" else ("wl-paste", "xclip", "xsel"))
+        )
+        path, reason = _linux_command(*names)
         return _entry(bool(path), path, reason)
     if capability == CLIPBOARD_WRITE:
-        path, reason = _linux_command("wl-copy", "xclip", "xsel")
+        names = (
+            ("wl-copy",)
+            if wayland
+            else (("xclip", "xsel") if session == "x11" else ("wl-copy", "xclip", "xsel"))
+        )
+        path, reason = _linux_command(*names)
         return _entry(bool(path), path, reason)
     if capability == INPUT_SEND:
         path, reason = _linux_command("xdotool", "ydotool")
@@ -136,8 +140,7 @@ def _probe_linux(capability: str) -> dict:
                     return _entry(True, "xdg-desktop-portal+dbus_next")
             except (ImportError, ValueError):
                 pass
-            path, reason = _linux_command("grim")
-            return _entry(bool(path), path, reason)
+            return _entry(False, None, "未安装 dbus-next，无法调用截图 portal")
         path, reason = _linux_command("gnome-screenshot", "spectacle", "import")
         return _entry(bool(path), path, reason)
     if capability == DISPLAY_BRIGHTNESS:
@@ -176,11 +179,6 @@ def probe_capabilities() -> dict[str, dict]:
 
 
 def missing_capabilities(required: list[str]) -> list[dict]:
-    """对照 requires_capabilities 清单返回缺失项。
-
-    degraded 不算缺失：插件能加载、声明的能力主路径能用，只是某个功能子集不行，
-    loader 不因此跳过插件，界面把它显示成“部分可用”。
-    """
     report = probe_capabilities()
     problems = []
     for capability in required:

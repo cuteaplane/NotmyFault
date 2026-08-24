@@ -1,15 +1,10 @@
-"""Linux 外部命令 backend：CommandRunner 统一执行，input / audio / clipboard 三类
-
-错误分四类，kind 字段给上层认：unsupported 是平台不对，backend_missing 是
-命令没装，permission_denied 是命令在但系统拒绝执行，backend_failed 是执行
-失败或输出没法用
-"""
 from __future__ import annotations
 
 import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Iterable
 
@@ -35,8 +30,6 @@ class BackendFailedError(BackendError):
 
 
 class CommandRunner:
-    """外部命令统一执行入口，超时和找不到命令在这里转成结构化错误"""
-
     def run(
         self,
         args: list[str],
@@ -73,7 +66,7 @@ default_runner = CommandRunner()
 
 
 def _require_linux() -> None:
-    if os.name == "nt":
+    if not sys.platform.startswith("linux"):
         raise BackendUnsupportedError("这个 backend 只在 Linux 上可用")
 
 
@@ -169,8 +162,7 @@ class AudioBackend:
 
     def default_devices(self) -> dict[str, str]:
         """默认播放 / 录音设备 id，命令缺失或查询失败返回空字典"""
-        if os.name == "nt":
-            raise BackendUnsupportedError("这个 backend 只在 Linux 上可用")
+        _require_linux()
         if self._runner.which("wpctl"):
             return self._devices_from_wpctl()
         if self._runner.which("pactl"):
@@ -277,3 +269,163 @@ class ClipboardBackend:
         result = self._runner.run([path, *args], timeout=3, input=text)
         if result.returncode != 0:
             raise BackendFailedError(_failed_detail(result))
+
+
+class WindowBackend:
+    def __init__(self, runner: CommandRunner | None = None) -> None:
+        self._runner = runner or default_runner
+
+    def _wmctrl(self) -> str:
+        _require_linux()
+        path = self._runner.which("wmctrl")
+        if not path:
+            raise BackendMissingError("依赖缺失：窗口置顶需要 wmctrl")
+        return path
+
+    def _find_window(self, wmctrl: str, target: str, title: str) -> str:
+        result = self._runner.run([wmctrl, "-l"], timeout=5)
+        if result.returncode != 0:
+            raise BackendFailedError(_failed_detail(result))
+
+        lines = result.stdout.strip().splitlines()
+        if target == "title":
+            for line in lines:
+                if title.lower() in line.lower():
+                    return line.split()[0]
+            raise BackendFailedError(f'未找到标题包含 "{title}" 的窗口')
+        if not lines:
+            raise BackendFailedError("没有可见窗口")
+        return lines[0].split()[0]
+
+    def set_pinned(self, action: str, target: str, title: str = "") -> dict[str, str]:
+        if target == "title" and not title:
+            raise ValueError("按标题匹配时必须填写窗口标题")
+
+        wmctrl = self._wmctrl()
+        window_id = self._find_window(wmctrl, target, title)
+        if action == "toggle":
+            pinned = False
+            if xprop := self._runner.which("xprop"):
+                result = self._runner.run(
+                    [xprop, "-id", window_id, "_NET_WM_STATE"],
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    pinned = "_NET_WM_STATE_ABOVE" in result.stdout
+            action = "unpin" if pinned else "pin"
+
+        change = "add,above" if action == "pin" else "remove,above"
+        result = self._runner.run(
+            [wmctrl, "-i", "-r", window_id, "-b", change],
+            timeout=5,
+        )
+        if result.returncode != 0:
+            raise BackendFailedError(_failed_detail(result))
+        return {
+            "state": "pinned" if action == "pin" else "unpinned",
+            "window_id": window_id,
+        }
+
+
+class DisplayBackend:
+    def __init__(self, runner: CommandRunner | None = None) -> None:
+        self._runner = runner or default_runner
+
+    def set_brightness(self, percent: int) -> None:
+        _require_linux()
+        brightnessctl = self._runner.which("brightnessctl")
+        if not brightnessctl:
+            raise BackendMissingError("依赖缺失：亮度控制需要 brightnessctl")
+        result = self._runner.run(
+            [brightnessctl, "set", f"{percent}%"],
+            timeout=5,
+        )
+        if result.returncode != 0:
+            raise BackendFailedError(_failed_detail(result))
+
+    def set_power(self, action: str) -> None:
+        _require_linux()
+        from notmyfault.platform.linux_support import desktop_environment
+
+        if desktop_environment() == "gnome":
+            executable = self._runner.which("gdbus")
+            if not executable:
+                raise BackendMissingError("依赖缺失：显示器开关需要 gdbus")
+            args = [
+                executable,
+                "call",
+                "--session",
+                "--dest",
+                "org.gnome.ScreenSaver",
+                "--object-path",
+                "/org/gnome/ScreenSaver",
+                "--method",
+                "org.gnome.ScreenSaver.SetActive",
+                "true" if action == "off" else "false",
+            ]
+        else:
+            executable = self._runner.which("xset")
+            if not executable:
+                raise BackendMissingError("依赖缺失：显示器开关需要 xset")
+            args = [executable, "dpms", "force", action]
+
+        result = self._runner.run(args, timeout=5)
+        if result.returncode != 0:
+            raise BackendFailedError(_failed_detail(result))
+
+
+class ScreenshotBackend:
+    def __init__(self, runner: CommandRunner | None = None) -> None:
+        self._runner = runner or default_runner
+
+    def capture(self, output_path: str, mode: str, fmt: str) -> str:
+        _require_linux()
+        from notmyfault.platform.linux_support import session_type
+
+        destination = Path(output_path).expanduser()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        capture_path = destination
+        if fmt.lower() in ("jpg", "jpeg"):
+            capture_path = destination.with_suffix(".capture.png")
+
+        if session_type() == "wayland":
+            from notmyfault.platform.portal_screenshot import take_screenshot
+
+            take_screenshot(
+                str(capture_path),
+                interactive=mode == "active_window",
+            )
+        else:
+            command = self._x11_command(capture_path, mode)
+            result = self._runner.run(command, timeout=30)
+            if result.returncode != 0:
+                raise BackendFailedError(_failed_detail(result))
+
+        if capture_path != destination:
+            from PIL import Image
+
+            with Image.open(capture_path) as image:
+                image.convert("RGB").save(destination, "JPEG", quality=92)
+            capture_path.unlink(missing_ok=True)
+        return str(destination)
+
+    def _x11_command(self, capture_path: Path, mode: str) -> list[str]:
+        if executable := self._runner.which("gnome-screenshot"):
+            command = [executable, "-f", str(capture_path)]
+            if mode == "active_window":
+                command.insert(1, "-w")
+            return command
+        if executable := self._runner.which("spectacle"):
+            return [
+                executable,
+                "-b",
+                "-n",
+                "-a" if mode == "active_window" else "-f",
+                "-o",
+                str(capture_path),
+            ]
+        if executable := self._runner.which("import"):
+            return [executable, "-window", "root", str(capture_path)]
+        raise BackendMissingError(
+            "依赖缺失：屏幕截图需要 gnome-screenshot、spectacle 或 ImageMagick import"
+        )
