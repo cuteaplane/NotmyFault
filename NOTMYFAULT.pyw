@@ -9,12 +9,22 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
 from notmyfault.host.app import create_engine
-from notmyfault.host.api_server import EngineAPI
-from notmyfault.config import CONFIG_FILE
+from notmyfault.application_paths import ApplicationPaths
+from notmyfault.config import SignedConfigStore
+from notmyfault.host.api_server import create_api_server
+from notmyfault.host.api.auth import ApiTokenStore
+from notmyfault.host.api.desktop_elements import NativeDesktopElements
+from notmyfault.host.api.events import EventBroker
+from notmyfault.host.api.plugin_installation import (
+    PendingPreviewStore,
+    PluginFileSystem,
+    PluginTemporaryStorage,
+)
+from notmyfault.host.plugin_registry import PluginRegistryClient
+from notmyfault.core.run_history import RunHistory
+from notmyfault.security.api_key_store import AIKeyStore
 from notmyfault.core.logging import init_session_log
 from notmyfault.core.runtime_controller import RuntimeController
-
-LOG_DIR = os.path.join(os.path.dirname(CONFIG_FILE), "logs")
 
 # Dashboard 控制端口和退出协议与 dashboard.pyw 共用，直接导入会拉起 webview 依赖
 _DASHBOARD_CONTROL_PORT = 19197
@@ -87,11 +97,12 @@ def setup_logging(log_dir: str) -> str:
             self.file.flush()
             self.orig.flush()
 
-    # pythonw.exe 没有控制台时标准输出可能为 None，需要用 os.devnull 兜底
+    # pythonw.exe 没有控制台时标准输出可能为 None，日志改写器使用 os.devnull
     _devnull = open(os.devnull, "w")
     sys.stdout = _TimestampWriter(log_fp, sys.__stdout__ or _devnull, _log_io_lock)  # type: ignore
     sys.stderr = _TimestampWriter(log_fp, sys.__stderr__ or _devnull, _log_io_lock)  # type: ignore
-    print(f"--- NotmyFault 引擎启动 {datetime.now().isoformat()} ---")
+    print(f"--------     NotmyFault Engine     --------")
+    print(f"------ {datetime.now().isoformat()} ------")
     print(f"------     Welcome to NotmyFault!    ------")
     return log_path
 
@@ -125,13 +136,18 @@ def _open_dashboard():
 class EngineRunner:
     """桌面后台连接运行时、HTTP API、托盘与进程"""
 
-    def __init__(self):
+    def __init__(self, paths, store, engine_factory=create_engine):
+        self._paths = paths
+        self._store = store
         self._api = None
         self._tray = None
         self._api_socket = None
         self._force_exit_armed = threading.Event()
         self._runtime = RuntimeController(
-            create_engine,
+            lambda on_event=None: engine_factory(
+                store=self._store,
+                on_event=on_event,
+            ),
             failure_listener=self._handle_engine_failure,
         )
         self._runtime.add_state_listener(self._handle_engine_state)
@@ -172,7 +188,7 @@ class EngineRunner:
         if self._tray:
             self._tray.set_engine_state(state)
         if self._api:
-            self._api.push_event("engine_state_changed", {"state": state})
+            self._api.publish_event("engine_state_changed", {"state": state})
 
     def _handle_engine_failure(self, error: Exception) -> None:
         if self._tray:
@@ -183,24 +199,18 @@ class EngineRunner:
         except Exception:
             pass
 
-    def _start_engine_core(self):
+    def start_engine(self) -> bool:
         """启动引擎线程并返回是否创建新线程，停机线程未收尾时返回 False"""
         return self._runtime.start()
 
-    def start_engine(self) -> bool:
-        return self._start_engine_core()
-
-    def _stop_engine(self):
-        return self._runtime.stop(timeout=5)
-
     def stop_engine(self) -> bool:
-        return self._stop_engine()
+        return self._runtime.stop(timeout=5)
 
     def _toggle_engine(self):
         if self.engine_state == "running":
-            self._stop_engine()
+            self.stop_engine()
         elif self.engine_state == "stopped":
-            self._start_engine_core()
+            self.start_engine()
         else:
             print(f"[Tray] 引擎正处于 {self.engine_state}，忽略重复切换")
 
@@ -208,17 +218,17 @@ class EngineRunner:
         """退出时依次关闭引擎、HTTP 服务、Dashboard 和进程"""
         print("[Tray] 用户请求退出")
         _notify_dashboard_quit()
-        self._stop_engine()
-        self._request_process_shutdown(force_after=5)
+        self.stop_engine()
+        self.request_process_shutdown(force_after=5)
 
-    def _request_process_shutdown(self, force_after: float = 10) -> None:
+    def request_process_shutdown(self, force_after: float = 10) -> None:
         """关闭托盘和 API，等待超时后强制结束进程"""
         if self.engine_thread and self.engine_thread.is_alive():
             self._runtime.request_stop()
         else:
             self.shutdown_event.set()
-        if self._api and self._api._server:
-            self._api._server.should_exit = True
+        if self._api:
+            self._api.stop()
         if self._tray:
             self._tray.stop()
         if self._force_exit_armed.is_set():
@@ -230,9 +240,6 @@ class EngineRunner:
             time.sleep(force_after)
             os._exit(0)
         threading.Thread(target=_force, daemon=True).start()
-
-    def request_process_shutdown(self, force_after: float = 10) -> None:
-        self._request_process_shutdown(force_after=force_after)
 
     @staticmethod
     def _check_already_running(port: int = 19198) -> bool:
@@ -265,12 +272,13 @@ class EngineRunner:
             return None
 
     def run(self):
-        log_path = setup_logging(LOG_DIR)
+        log_dir = str(self._paths.logs_dir)
+        log_path = setup_logging(log_dir)
 
         print("=" * 50)
-        print("  NotmyFault Engine ")
+        print(" 拉起 NotmyFault Engine ......")
         print("=" * 50)
-        print(f"  日志目录: {LOG_DIR}")
+        print(f"  日志目录: {log_dir}")
         print(f"  当前日志: {log_path}")
 
         # 先独占监听端口再启动引擎，先调用 connect() 再 bind() 会让两个实例同时通过检查
@@ -290,11 +298,28 @@ class EngineRunner:
             return
 
         try:
-            self._api = EngineAPI(self)
-            self._runtime.set_event_sink(self._api.push_event)
+            api_token_store = ApiTokenStore(self._paths.api_token_file)
+            ai_key_store = AIKeyStore(self._paths.ai_api_key_file)
+            run_history = RunHistory(str(self._paths.run_history_file))
+            event_broker = EventBroker(run_history)
+            self._api = create_api_server(
+                engine_runner=self,
+                store=self._store,
+                paths=self._paths,
+                token_store=api_token_store,
+                ai_key_store=ai_key_store,
+                plugin_file_system=PluginFileSystem(),
+                pending_previews=PendingPreviewStore(),
+                plugin_temporary_storage=PluginTemporaryStorage(),
+                desktop_elements=NativeDesktopElements(),
+                plugin_registry=PluginRegistryClient(),
+                run_history=run_history,
+                event_broker=event_broker,
+            )
+            self._runtime.set_event_sink(self._api.publish_event)
 
             print("[启动] 启动主引擎...")
-            self._start_engine_core()
+            self.start_engine()
 
             if _HAS_TRAY:
                 self._tray = TrayIcon(
@@ -331,7 +356,7 @@ class EngineRunner:
             self.engine_thread.join(timeout=5)
             if self.engine_thread.is_alive():
                 print("[Cleanup] 引擎线程仍未退出，已安排强制终止", file=sys.stderr)
-                self._request_process_shutdown(force_after=5)
+                self.request_process_shutdown(force_after=5)
         if self._tray:
             self._tray.show_balloon("NotmyFault", "引擎已停止", 1)
         if self._api_socket is not None:
@@ -341,7 +366,7 @@ class EngineRunner:
                 pass
             self._api_socket = None
         print("[Cleanup] Done! ")
-        print(f"--- 引擎关闭 {datetime.now().isoformat()} ---")
+        print(f"--- 引擎关闭! {datetime.now().isoformat()} ---")
 
 
 def main():
@@ -349,12 +374,14 @@ def main():
     from notmyfault.security.security import is_admin_process
     if is_admin_process():
         print(
-            "[Engine] [!!] NotmyFault 拒绝以管理员身份启动：请用普通用户权限运行"
-            "插件需要提权时将通过 notmyfault.security.sudo.run_as_admin 弹出 UAC 授权",
+            "[Engine] [!!] NotmyFault 不允许以管理员身份启动：请用普通用户权限运行"
+            "插件需要提权时将通过弹出 UAC 授权",
             file=sys.stderr,
         )
         raise SystemExit(1)
-    runner = EngineRunner()
+    paths = ApplicationPaths.default()
+    store = SignedConfigStore(paths)
+    runner = EngineRunner(paths, store)
     runner.run()
 
 

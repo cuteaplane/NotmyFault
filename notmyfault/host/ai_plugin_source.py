@@ -1,33 +1,28 @@
-"""AI 生成插件源码的只读审查。
-
-review_plugin_source 吃四样结构化输入：kind、清单、源码和用户同意生成的
-插件草稿 id，产出可 JSON 化的审查产物。它只做校验和 AST 扫描，不写盘、不签名、
-不导入、不执行也不重载任何东西。
-"""
-
 from __future__ import annotations
 
 import ast
 from copy import deepcopy
 from typing import Any, Mapping
 
-from notmyfault.security.plugin_schema import is_valid_plugin_id, validate_plugin_meta
+from notmyfault.security.plugin_schema import (
+    current_platform_name,
+    get_permission_info,
+    is_valid_plugin_id,
+    scan_plugin_source_security,
+    validate_plugin_meta,
+)
 from notmyfault.security.plugins import analyze_plugin_source
 
 _PLUGIN_KINDS = frozenset({"trigger", "action"})
 
-# 会引入构建钩子、备用入口、组件或贡献行为的清单字段。
 _UNSUPPORTED_MANIFEST_FIELDS = frozenset(
     {"build", "entrypoints", "components", "contributes"}
 )
 
-# 自行提权（self_elevation）和动态执行（dynamic_exec）。
 _FORBIDDEN_CAPABILITIES = frozenset({"self_elevation", "dynamic_exec"})
 
 
 class AIPluginSourceError(ValueError):
-    """AI 生成插件源码审查失败，code 稳定可断言。"""
-
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
@@ -43,7 +38,6 @@ def _top_level_functions(tree: ast.Module) -> dict[str, ast.FunctionDef]:
 
 
 def _positional_arity(func: ast.FunctionDef) -> tuple[int, int | None]:
-    # vararg 时上限不封顶。
     args = func.args
     required = len(args.posonlyargs) + len(args.args) - len(args.defaults)
     if args.vararg is not None:
@@ -94,7 +88,6 @@ def _require_entrypoints(
                 )
         return
 
-    # 触发器 event-v1 / event-v2 的 run 按 run(meta, config, emit_event, shutdown_event) 绑定。
     if manifest.get("trigger_api") in ("event-v1", "event-v2"):
         if not _accepts_positional(run, 4):
             raise AIPluginSourceError(
@@ -103,13 +96,62 @@ def _require_entrypoints(
             )
 
 
+def _generated_test_source(kind: str) -> str:
+    source_name = "action.py" if kind == "action" else "trigger.py"
+    return (
+        "import importlib.util\n"
+        "from pathlib import Path\n\n\n"
+        "def test_plugin_entrypoint_is_importable():\n"
+        f"    source = Path(__file__).with_name({source_name!r})\n"
+        "    spec = importlib.util.spec_from_file_location('plugin_under_test', source)\n"
+        "    assert spec is not None and spec.loader is not None\n"
+        "    module = importlib.util.module_from_spec(spec)\n"
+        "    spec.loader.exec_module(module)\n"
+        "    assert callable(module.run)\n"
+    )
+
+
+def _compatibility_notes(kind: str, manifest: Mapping[str, Any]) -> list[str]:
+    platforms = manifest.get("platforms")
+    if isinstance(platforms, list) and platforms:
+        platform_note = "声明支持平台: " + ", ".join(platforms)
+    else:
+        platform_note = "未限制平台；实际兼容性仍取决于源码和运行环境"
+    capabilities = manifest.get("requires_capabilities")
+    capability_note = (
+        "所需系统能力: " + ", ".join(capabilities)
+        if isinstance(capabilities, list) and capabilities
+        else "未声明额外系统能力"
+    )
+    api_name = manifest.get("execution_api") if kind == "action" else manifest.get("trigger_api")
+    return [
+        platform_note,
+        capability_note,
+        f"当前检查平台: {current_platform_name()}",
+        f"入口 API: {api_name or 'legacy'}",
+    ]
+
+
+def _permission_explanations(manifest: Mapping[str, Any]) -> list[dict[str, str]]:
+    result = []
+    permissions = manifest.get("permissions")
+    for permission in permissions if isinstance(permissions, list) else []:
+        info = get_permission_info(permission) or {}
+        result.append({
+            "permission": permission,
+            "label": str(info.get("label", permission)),
+            "risk": str(info.get("risk", "unknown")),
+            "description": str(info.get("description", "")),
+        })
+    return result
+
+
 def review_plugin_source(
     kind: str,
     manifest: Mapping[str, Any],
     source: str,
     expected_id: str,
 ) -> dict[str, Any]:
-    """校验并审查一份 AI 生成的插件源码，通过则返回只读审查产物。"""
     if kind not in _PLUGIN_KINDS:
         raise AIPluginSourceError(
             "invalid_kind", f"kind 必须是 trigger 或 action，实际: {kind!r}"
@@ -158,6 +200,16 @@ def review_plugin_source(
     _require_entrypoints(kind, manifest, functions)
 
     capabilities, uses_sudo, borrowed = analyze_plugin_source(source)
+    source_name = "action.py" if kind == "action" else "trigger.py"
+    scanner_findings = scan_plugin_source_security(source, source_name)
+    if borrowed:
+        scanner_findings.append({
+            "id": "borrowed_privilege",
+            "label": "借用其他插件能力",
+            "level": "high",
+            "detail": "源码引用了其他已加载插件: " + ", ".join(sorted(set(borrowed))),
+            "file": source_name,
+        })
 
     forbidden = sorted(_FORBIDDEN_CAPABILITIES & capabilities)
     if forbidden:
@@ -174,9 +226,21 @@ def review_plugin_source(
         "id": manifest_id,
         "manifest": deepcopy(manifest),
         "source": source,
+        "tests": _generated_test_source(kind),
+        "compatibility_notes": _compatibility_notes(kind, manifest),
+        "permissions_explanation": _permission_explanations(manifest),
+        "check": {
+            "ok": True,
+            "schema": "ok",
+            "entrypoint": "ok",
+            "platform": current_platform_name(),
+            "scanner_findings": scanner_findings,
+            "revision_required": bool(scanner_findings),
+        },
         "findings": {
             "capabilities": sorted(capabilities),
             "uses_sudo": uses_sudo,
             "borrowed": list(borrowed),
+            "risks": scanner_findings,
         },
     }
