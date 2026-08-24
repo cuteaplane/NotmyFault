@@ -127,6 +127,33 @@ function stepNumber(run, step, fallback) {
   return index >= 0 ? index + 1 : fallback
 }
 
+function stepContext(run, step) {
+  const rule = matchingRule(run)
+  const actions = rule?.actions || []
+  const action = actions.find(item => item.binding_id === step.step_id)
+  if (action) return { kind: 'action', label: '' }
+  for (const parent of actions) {
+    const failure = (parent.failure_actions || []).find(item => item.binding_id === step.step_id)
+    if (failure) {
+      return {
+        kind: 'failure',
+        label: `“${actionName(parent.type)}”的失败处理`,
+      }
+    }
+  }
+  return { kind: 'action', label: '' }
+}
+
+function hasPreconditions(run) {
+  return Boolean(run.precondition_count || matchingRule(run)?.preconditions?.length)
+}
+
+function preconditionText(run) {
+  if (run.deferred_reason) return run.deferred_reason
+  if (run.steps?.length || ['succeeded', 'failed', 'cancelled'].includes(run.status)) return '检查通过'
+  return '等待检查结果'
+}
+
 function formatTime(timestamp) {
   if (!timestamp) return '时间未知'
   const date = new Date(timestamp * 1000)
@@ -410,15 +437,30 @@ onUnmounted(() => {
             </div>
 
             <div class="run-step-list">
+              <div class="run-step succeeded run-timeline-fixed">
+                <span class="run-step-index"><span class="material-symbols-outlined">bolt</span></span>
+                <span class="run-step-copy"><strong>触发</strong><small>{{ triggerName(run.event_type) }}</small></span>
+                <span class="run-step-actions"><span class="material-symbols-outlined run-step-state">check</span></span>
+              </div>
+              <div v-if="hasPreconditions(run)" class="run-step run-timeline-fixed" :class="run.deferred_reason ? 'deferred' : 'succeeded'">
+                <span class="run-step-index"><span class="material-symbols-outlined">rule</span></span>
+                <span class="run-step-copy">
+                  <strong>执行前检查</strong>
+                  <small>{{ preconditionText(run) }}<template v-if="run.retry_after_seconds"> · {{ run.retry_after_seconds }} 秒后再检查</template></small>
+                </span>
+                <span class="run-step-actions"><span class="material-symbols-outlined run-step-state">{{ run.deferred_reason ? 'schedule' : 'check' }}</span></span>
+              </div>
               <div v-for="(step, index) in run.steps" :key="step.step_id" class="run-step" :class="step.status">
                 <span class="run-step-index">{{ stepNumber(run, step, index + 1) }}</span>
                 <span class="run-step-copy">
                   <strong>{{ actionName(step.action_type) }}</strong>
+                  <small v-if="stepContext(run, step).kind === 'failure'">失败处理 · {{ stepContext(run, step).label }}</small>
                   <small v-if="step.status === 'skipped'">{{ step.reason || '已跳过' }}</small>
                   <small v-else-if="step.status === 'failed'">{{ errorText(step.error) || '执行失败' }}</small>
                   <small v-else-if="step.status === 'cancelled'">已安全停止</small>
                   <small v-else-if="step.status === 'timed_out'">超过允许的运行时间</small>
-                  <small v-else>{{ formatDuration(step.duration_ms) }}<template v-if="step.attempt > 1"> · 第 {{ step.attempt }} 次尝试</template></small>
+                  <small v-else>{{ formatDuration(step.duration_ms) }}<template v-if="step.attempt > 1"> · 共尝试 {{ step.attempt }} 次</template></small>
+                  <code class="run-step-binding">{{ step.step_id }}</code>
                   <div v-if="step.input_summary?.length || step.output_summary?.length" class="step-summary-strip run-step-summary">
                     <div v-if="step.input_summary?.length" class="step-summary-side">
                       <span class="step-summary-kind"><span class="material-symbols-outlined">login</span>输入</span>
@@ -437,6 +479,14 @@ onUnmounted(() => {
                 </span>
               </div>
               <div v-if="!run.steps.length" class="run-no-steps">{{ run.action_count ? '尚未收到动作结果' : '这条规则没有动作' }}</div>
+              <div class="run-step run-timeline-fixed" :class="run.status">
+                <span class="run-step-index"><span class="material-symbols-outlined">flag</span></span>
+                <span class="run-step-copy">
+                  <strong>本次运行</strong>
+                  <small>{{ runMeta(run.status).label }} · {{ formatDuration(run.duration_ms) }}</small>
+                </span>
+                <span class="run-step-actions"><span class="material-symbols-outlined run-step-state">{{ runMeta(run.status).icon }}</span></span>
+              </div>
             </div>
 
             <div v-if="run.assertion_results?.length" class="run-assertion-list">

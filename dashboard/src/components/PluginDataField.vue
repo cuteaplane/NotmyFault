@@ -7,6 +7,7 @@ import ExtensionViewPage from './ExtensionViewPage.vue'
 const props = defineProps({
   editor: { type: Object, required: true },
   modelValue: { type: [Object, Array, String, Number, Boolean], default: null },
+  sensitive: { type: Boolean, default: false },
 })
 const emit = defineEmits(['update:modelValue'])
 const opening = ref(false)
@@ -25,7 +26,8 @@ const view = computed(() => store.extensions.views.find(item => (
   item.plugin_id === props.editor.plugin_id && item.id === viewId.value
 )) || null)
 const buttonText = computed(() => (
-  summary.value || props.editor.ui?.empty_label || props.editor.title || '编辑'
+  (props.sensitive && summary.value ? '敏感数据已保存' : summary.value)
+  || props.editor.ui?.empty_label || props.editor.title || '编辑'
 ))
 
 async function openEditor() {

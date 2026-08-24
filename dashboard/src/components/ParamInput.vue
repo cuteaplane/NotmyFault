@@ -187,7 +187,8 @@ function clearDesktopElement() {
     <BindingPicker v-if="bindingOpen" :sources="bindingSources" :target-type="bindingType"
       @select="useBinding" @cancel="bindingOpen = false" />
     <PluginDataField v-else-if="!bound && dataEditor" :editor="dataEditor"
-      :model-value="props.modelValue" @update:model-value="emit('update:modelValue', $event)" />
+      :model-value="props.modelValue" :sensitive="props.def.sensitive === true"
+      @update:model-value="emit('update:modelValue', $event)" />
     <p v-else-if="!bound && type === 'plugin_data'" class="plugin-data-error">
       自动化引擎运行后可以编辑这项插件数据。
     </p>

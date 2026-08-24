@@ -694,7 +694,22 @@ function onComposerKeydown(e) {
 async function approvePluginProposal(result) {
   const id = proposalId(result)
   if (!id || drafting.value) return
-  await sendTurn(`我同意生成插件草稿：${id}`, { plugin_id: id })
+  await sendTurn(`我同意生成插件草稿：${id}`, {
+    plugin_id: id,
+    permissions: result?.proposal?.permissions || [],
+  })
+}
+
+async function requestPluginRepair(result) {
+  const plugin = result?.plugin || {}
+  const id = plugin.id || proposalId(result)
+  const findings = plugin?.check?.scanner_findings || []
+  if (!id || !findings.length || drafting.value) return
+  const detail = findings.map(item => `${item.id}: ${item.detail}`).join('；')
+  await sendTurn(`插件草稿 ${id} 的静态扫描发现：${detail}。请移除这些风险并重新生成完整插件草稿。`, {
+    plugin_id: id,
+    permissions: plugin?.manifest?.permissions || [],
+  })
 }
 
 function openDraft(result) {
@@ -720,6 +735,7 @@ function downloadPluginDraft(result) {
   const kind = pluginKind(result)
   if (manifest) _downloadBlob(`${id}.${kind}.json`, JSON.stringify(manifest, null, 2))
   if (source) _downloadBlob(`${id}.${kind}.py`, String(source))
+  if (result?.plugin?.tests) _downloadBlob(`${id}.test_plugin.py`, result.plugin.tests)
 }
 
 async function requestPluginInstall(payload) {
@@ -971,18 +987,33 @@ onUnmounted(() => {
                     <span class="material-symbols-outlined">extension</span>
                     <div class="min-w-0 flex-1">
                       <b class="ai-card-title">{{ proposalId(message.result) || '未命名插件' }}</b>
-                      <small class="ai-card-kicker">插件已生成 · 可直接安装</small>
+                      <small class="ai-card-kicker">{{ message.result.plugin?.check?.revision_required ? '插件已生成 · 静态扫描待修正' : '插件已生成 · 可审阅安装' }}</small>
                     </div>
                   </div>
                   <div class="ai-card-rows">
                     <div class="ai-row"><span>清单</span><pre tabindex="0" class="ai-pre">{{ pluginManifest(message.result) }}</pre></div>
                     <div class="ai-row"><span>源码</span><pre tabindex="0" class="ai-pre">{{ pluginSource(message.result) }}</pre></div>
+                    <div v-if="message.result.plugin?.compatibility_notes?.length" class="ai-row">
+                      <span>兼容性</span><div class="ai-list">{{ message.result.plugin.compatibility_notes.join('；') }}</div>
+                    </div>
+                    <div v-if="message.result.plugin?.permissions_explanation?.length" class="ai-row">
+                      <span>权限说明</span><div class="ai-list">{{ message.result.plugin.permissions_explanation.map(item => `${item.label}（${item.risk}）：${item.description}`).join('；') }}</div>
+                    </div>
+                    <div class="ai-row">
+                      <span>plugin check</span><div class="ai-list">schema {{ message.result.plugin?.check?.schema }} · entrypoint {{ message.result.plugin?.check?.entrypoint }} · {{ message.result.plugin?.check?.platform }}</div>
+                    </div>
+                    <div v-if="message.result.plugin?.check?.scanner_findings?.length" class="ai-row">
+                      <span>扫描结果</span><div class="ai-list">{{ message.result.plugin.check.scanner_findings.map(item => `${item.label}：${item.detail}`).join('；') }}</div>
+                    </div>
                   </div>
                   <div class="ai-card-foot">
                     <button class="btn btn-text btn-sm" type="button" @click="downloadPluginDraft(message.result)">
                       <span class="material-symbols-outlined">download</span>下载文件
                     </button>
-                    <button class="btn btn-filled btn-sm" type="button" :disabled="installingPlugin" @click="installPluginDraft(message.result)">
+                    <button v-if="message.result.plugin?.check?.revision_required" class="btn btn-tonal btn-sm" type="button" :disabled="drafting" @click="requestPluginRepair(message.result)">
+                      <span class="material-symbols-outlined">auto_fix_high</span>让 AI 修正
+                    </button>
+                    <button v-else class="btn btn-filled btn-sm" type="button" :disabled="installingPlugin" @click="installPluginDraft(message.result)">
                       <span class="material-symbols-outlined" :class="{ 'animate-spin': installingPlugin }">{{ installingPlugin ? 'progress_activity' : 'check_circle' }}</span>{{ installingPlugin ? '正在安装…' : '安装插件' }}
                     </button>
                   </div>

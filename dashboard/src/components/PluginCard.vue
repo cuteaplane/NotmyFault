@@ -5,6 +5,12 @@ const emit = defineEmits(['toggle', 'uninstall'])
 const oL = { builtin: '内置', user: '用户', third_party: '第三方' }
 const originClass = computed(() => props.meta.origin === 'builtin' ? 'chip-origin-builtin' : 'chip-origin-user')
 const perms = computed(() => props.meta.permissions || [])
+const capabilities = computed(() => props.meta.requires_capabilities || [])
+const apiVersion = computed(() => props.meta.engines?.notmyfault_api)
+const executionMode = computed(() => props.meta.execution_mode || 'in-process')
+const entryApi = computed(() => props.type === 'actions'
+  ? props.meta.execution_api || 'legacy'
+  : props.meta.trigger_api || 'legacy')
 const isEnabled = computed(() => props.meta.enabled !== false)
 const isCompatible = computed(() => props.meta.platform_compatible !== false)
 const availability = computed(() => props.meta.availability || 'available')
@@ -30,6 +36,11 @@ const canUninstall = computed(() => props.meta.origin === 'user' || props.meta.o
       <span v-if="perms.includes('admin')" class="chip chip-admin">管理员</span>
       <span v-if="perms.includes('native_api')" class="chip chip-native">原生API</span>
       <span v-if="perms.includes('external_binary')" class="chip chip-external">外部程序</span>
+      <span v-for="permission in perms.filter(item => !['admin', 'native_api', 'external_binary'].includes(item))" :key="permission" class="chip">权限 {{ permission }}</span>
+      <span v-for="capability in capabilities" :key="capability" class="chip">能力 {{ capability }}</span>
+      <span v-if="apiVersion" class="chip">Plugin API v{{ apiVersion }}</span>
+      <span class="chip">入口 {{ entryApi }}</span>
+      <span class="chip">{{ executionMode === 'isolated' ? '隔离进程' : '引擎进程' }}</span>
       <span v-if="availabilityLabel" class="chip" :class="availability === 'partial' ? 'chip-warn' : 'chip-error'">{{ availabilityLabel }}</span>
       <span v-for="reason in unavailableReasons" :key="reason" class="chip chip-warn" :title="reason">{{ reason }}</span>
       <span v-if="meta._error" class="chip chip-error">{{ String(meta._error).substring(0, 40) }}</span>

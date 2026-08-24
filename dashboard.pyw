@@ -22,8 +22,9 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import webview
-from notmyfault.config import RULES_FILE
-from notmyfault.platform.platform_support import get_config_dir, launch_python_entry
+from notmyfault.application_paths import ApplicationPaths
+from notmyfault.config import SignedConfigStore
+from notmyfault.platform.platform_support import launch_python_entry
 from notmyfault.security.plugin_schema import scan_plugins
 
 def _patch_qt_permission_policy():
@@ -55,15 +56,13 @@ def _patch_qt_permission_policy():
 
 
 API = "http://127.0.0.1:19198"
-# API 令牌与 notmyfault/api_server.py 共用，文件放在配置目录下
-API_TOKEN_FILE = os.path.join(get_config_dir(), ".api_token")
-def _get_plugins_schema() -> dict:
-    base = os.path.join(PROJECT_ROOT, "notmyfault")
+def _get_plugins_schema(paths: ApplicationPaths) -> dict:
+    base = str(paths.package_root)
     result = {
         "triggers": scan_plugins(base, "triggers", "trigger.json"),
         "actions": scan_plugins(base, "actions", "action.json"),
     }
-    user_dir = os.path.join(get_config_dir(), "plugins")
+    user_dir = str(paths.user_plugins_dir)
     if os.path.isdir(user_dir):
         for plugin_type in ("triggers", "actions"):
             filename = "trigger.json" if plugin_type == "triggers" else "action.json"
@@ -142,8 +141,13 @@ def _claim_dashboard_instance(port: int = DASHBOARD_CONTROL_PORT):
 class DashboardAPI:
     """提供给前端 JavaScript 调用的 Python 接口"""
 
-    def __init__(self):
-        # pywebview 枚举公开属性时会递归访问 Window，原生窗口保存在私有属性中
+    def __init__(
+        self,
+        store: SignedConfigStore | None = None,
+        paths: ApplicationPaths | None = None,
+    ) -> None:
+        self._paths = paths or ApplicationPaths.default()
+        self._store = store or SignedConfigStore(self._paths)
         self._window = None
 
     def set_window_state(self, action: str) -> dict:
@@ -229,16 +233,15 @@ class DashboardAPI:
     def get_config(self) -> dict:
         """有效规则先补齐身份，验签失败时保留原文供安全页核对"""
         try:
-            if os.path.exists(RULES_FILE):
-                with open(RULES_FILE, "r", encoding="utf-8") as f:
+            if self._paths.rules_file.exists():
+                with open(self._paths.rules_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 rules = data.get("rules", []) if isinstance(data, dict) else []
                 rules = rules if isinstance(rules, list) else []
                 try:
-                    from notmyfault.config import load_verified_rules, save_rules
-                    normalized = load_verified_rules()
+                    normalized = self._store.load_verified_rules()
                     if normalized != rules:
-                        save_rules(normalized)
+                        self._store.save_rules(normalized)
                     return {"rules": normalized}
                 except Exception:
                     return {"rules": rules}
@@ -250,16 +253,14 @@ class DashboardAPI:
         try:
             from notmyfault.config import (
                 ConfigValidationError,
-                load_verified_rules,
-                save_rules as _save_rules,
-                _normalize_rules,
-                _validate_rules_safety,
+                normalize_rules,
+                validate_rules_safety,
             )
             from notmyfault.core.rules import (
                 validate_rule_bindings,
                 validate_rules_structure,
             )
-            normalized_rules = _normalize_rules(rules)
+            normalized_rules = normalize_rules(rules)
             structure_errors = validate_rules_structure(normalized_rules)
             if structure_errors:
                 return {
@@ -267,7 +268,7 @@ class DashboardAPI:
                     "error": "规则结构校验失败",
                     "details": structure_errors[:10],
                 }
-            schema = _get_plugins_schema()
+            schema = _get_plugins_schema(self._paths)
             binding_issues = []
             for index, rule in enumerate(normalized_rules):
                 for issue in validate_rule_bindings(
@@ -283,7 +284,7 @@ class DashboardAPI:
                     "error": "规则数据绑定无效",
                     "details": binding_issues[:20],
                 }
-            _warnings, errors = _validate_rules_safety(normalized_rules)
+            _warnings, errors = validate_rules_safety(normalized_rules)
             if errors:
                 return {
                     "ok": False,
@@ -291,9 +292,9 @@ class DashboardAPI:
                     "details": errors[:10],
                 }
             previous_rules = []
-            if os.path.exists(RULES_FILE):
+            if self._paths.rules_file.exists():
                 try:
-                    previous_rules = load_verified_rules()
+                    previous_rules = self._store.load_verified_rules()
                 except ConfigValidationError as error:
                     return {
                         "ok": False,
@@ -317,14 +318,14 @@ class DashboardAPI:
                     "error": str(error),
                     "plugins": error.plugins,
                 }
-            ok = _save_rules(normalized_rules)
+            ok = self._store.save_rules(normalized_rules)
             return {"ok": ok, "rules": normalized_rules if ok else None}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
     def _get_api_token(self) -> str:
         try:
-            with open(API_TOKEN_FILE, "r") as f:
+            with open(self._paths.api_token_file, "r") as f:
                 return f.read().strip()
         except (OSError, IOError):
             return ""
@@ -421,11 +422,9 @@ class DashboardAPI:
         """彻底退出引擎进程"""
         return self._auth_request("/api/engine/shutdown")
 
-    _LOG_DIR = os.path.join(get_config_dir(), "logs")
-
     def _get_latest_log(self):
         from notmyfault.core.logging import get_latest_log
-        return get_latest_log(self._LOG_DIR)
+        return get_latest_log(str(self._paths.logs_dir))
 
     def read_log_entries(self, lines: int = 500) -> list:
         """读取最新日志末尾 N 行，返回解析后的结构化条目列表"""
@@ -595,7 +594,8 @@ def main():
         return
     icon_path = os.path.join(PROJECT_ROOT, "logo.ico")
 
-    api = DashboardAPI()
+    paths = ApplicationPaths.default()
+    api = DashboardAPI(SignedConfigStore(paths), paths)
 
     window = webview.create_window(
         title="NotmyFault",

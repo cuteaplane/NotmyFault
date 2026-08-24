@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, nextTick, onMounted } from 'vue'
 import { store } from '../../lib/store'
-import { apiRead, apiWrite, loadPlugins, getSchema } from '../../lib/api'
+import { apiDownload, apiRead, apiWrite, loadPlugins, getSchema } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
 import { alertDialog, confirmDialog } from '../../lib/dialog'
 import { useEngineControl } from '../../composables/useEngineControl'
@@ -30,7 +30,7 @@ const tabCounts = computed(() => ({
 }))
 const showInstall = ref(false)
 const showKey = ref(false)
-const keyPw = ref('')
+const signingPassword = ref('')
 const forceInstall = ref(false)
 const buildHookConfirmed = ref(false)
 const fileInput = ref(null)
@@ -41,6 +41,72 @@ const previewLoading = ref(false)
 const previewError = ref('')
 const fileForUpload = ref(null)
 const installError = ref('')
+const showRegistry = ref(false)
+const registryUrl = ref(localStorage.getItem('nmf-plugin-registry-url') || '')
+const registryPlugins = ref([])
+const registryLoading = ref(false)
+const registryError = ref('')
+const registryDownloading = ref('')
+const installedPackages = computed(() => new Set(
+  Object.values(store.pluginsData.triggers || {}).concat(Object.values(store.pluginsData.actions || {}))
+    .map(meta => meta?.package_name)
+    .filter(Boolean),
+))
+
+async function loadRegistry() {
+  const url = registryUrl.value.trim()
+  if (!url) {
+    registryError.value = '请输入插件索引地址'
+    return
+  }
+  registryLoading.value = true
+  registryError.value = ''
+  try {
+    const response = await apiWrite('/api/plugins/registry', 'POST', { url })
+    const data = await response.json()
+    if (!data.ok) {
+      registryError.value = data.error || '读取插件索引失败'
+      return
+    }
+    localStorage.setItem('nmf-plugin-registry-url', url)
+    registryPlugins.value = data.plugins || []
+  } catch (error) {
+    registryError.value = error.message || '读取插件索引失败'
+  } finally {
+    registryLoading.value = false
+  }
+}
+
+async function previewRegistryPlugin(entry) {
+  const identity = `${entry.package_name}@${entry.version}`
+  registryDownloading.value = identity
+  registryError.value = ''
+  try {
+    const response = await apiDownload('/api/plugins/registry/download', {
+      url: registryUrl.value.trim(),
+      package_name: entry.package_name,
+      version: entry.version,
+    })
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}))
+      registryError.value = data.error || '下载插件包失败'
+      return
+    }
+    const archive = await response.blob()
+    const file = new File(
+      [archive],
+      `${entry.package_name}-${entry.version}.nmfp`,
+      { type: 'application/octet-stream' },
+    )
+    openInstall()
+    fileForUpload.value = file
+    await uploadPreview(file)
+  } catch (error) {
+    registryError.value = error.message || '下载插件包失败'
+  } finally {
+    registryDownloading.value = ''
+  }
+}
 
 async function refresh() {
   // 引擎离线时接口会失败，插件页保留上次数据。
@@ -89,6 +155,7 @@ function openInstall() {
   forceInstall.value = false
   buildHookConfirmed.value = false
   installError.value = ''
+  signingPassword.value = ''
 }
 
 function cancelKey() {
@@ -97,7 +164,7 @@ function cancelKey() {
 }
 
 function submitKey() {
-  if (!keyPw.value.trim()) return
+  if (!signingPassword.value.trim()) return
   showKey.value = false
   if (keyResolve) { keyResolve(true); keyResolve = null }
 }
@@ -140,7 +207,6 @@ async function uploadPreview(file) {
   try {
     const fd = new FormData()
     fd.append('file', file)
-    if (keyPw.value) fd.append('password', keyPw.value)
     const r = await apiWrite('/api/plugins/preview', 'POST', fd, true)
     const d = await r.json()
     if (!d.ok) { previewError.value = d.error || '预览失败'; return }
@@ -153,13 +219,13 @@ async function doInstall() {
   if (!preview.value) return
   const p = preview.value
 
-  if (!keyPw.value) {
+  if (!signingPassword.value) {
     try {
       const r = await apiRead('/api/plugins/key-status')
       if (r.ok) {
         const ks = await r.json()
         if (ks.encrypted) {
-          keyPw.value = ''
+          signingPassword.value = ''
           showKey.value = true
           const ok = await new Promise(res => { keyResolve = res })
           if (!ok) return
@@ -170,7 +236,7 @@ async function doInstall() {
 
   const fd = new FormData()
   fd.append('preview_token', p.preview_token)
-  if (keyPw.value) fd.append('password', keyPw.value)
+  if (signingPassword.value) fd.append('signing_password', signingPassword.value)
   if (forceInstall.value) fd.append('force', 'true')
   try {
     const r = await apiWrite('/api/plugins/install', 'POST', fd, true)
@@ -218,8 +284,42 @@ onMounted(async () => {
 <template>
   <section class="page active">
     <div class="page-head"><h2>插件管理</h2><div class="actions">
+      <button class="btn btn-tonal" @click="showRegistry = !showRegistry"><span class="material-symbols-outlined">deployed_code</span>插件索引</button>
       <button class="btn btn-filled" @click="openInstall"><span class="material-symbols-outlined">install_desktop</span>安装插件</button>
     </div></div>
+    <section v-if="showRegistry" class="plugin-registry-panel">
+      <div class="plugin-registry-head">
+        <div>
+          <h3>只读插件索引</h3>
+          <p>填写 registry.json 的 HTTPS 地址。下载后仍会进入本地安全预览，不会直接安装。</p>
+        </div>
+        <div class="plugin-registry-load">
+          <input v-model="registryUrl" class="text-field" type="url" spellcheck="false" placeholder="https://raw.githubusercontent.com/.../registry.json" @keyup.enter="loadRegistry">
+          <button class="btn btn-filled" :disabled="registryLoading" @click="loadRegistry">{{ registryLoading ? '读取中…' : '读取索引' }}</button>
+        </div>
+      </div>
+      <p v-if="registryError" class="plugin-registry-error"><span class="material-symbols-outlined">warning</span>{{ registryError }}</p>
+      <div v-if="registryPlugins.length" class="plugin-registry-grid">
+        <article v-for="entry in registryPlugins" :key="entry.package_name + '@' + entry.version" class="plugin-registry-card">
+          <div>
+            <h4>{{ entry.name }}</h4>
+            <p>{{ entry.package_name }}</p>
+          </div>
+          <div class="preview-meta">
+            <span class="chip">v{{ entry.version }}</span>
+            <span v-for="platform in entry.supported_platforms" :key="platform" class="chip">{{ platform }}</span>
+            <span class="chip" :class="installedPackages.has(entry.package_name) ? 'chip-clean' : ''">{{ installedPackages.has(entry.package_name) ? '已安装' : '未安装' }}</span>
+          </div>
+          <div class="plugin-registry-actions">
+            <a class="btn btn-text" :href="entry.homepage" target="_blank" rel="noreferrer">主页</a>
+            <button class="btn btn-filled btn-sm" :disabled="registryDownloading === entry.package_name + '@' + entry.version" @click="previewRegistryPlugin(entry)">
+              {{ registryDownloading === entry.package_name + '@' + entry.version ? '下载中…' : installedPackages.has(entry.package_name) ? '检查更新' : '下载并检查' }}
+            </button>
+          </div>
+        </article>
+      </div>
+      <p v-else-if="!registryLoading && !registryError" class="plugin-registry-empty">索引尚未读取。</p>
+    </section>
     <div class="tabs">
       <button class="tab" :class="{ active: tab === 'triggers' }" @click="tab = 'triggers'">
         触发器<span class="ml-1.5 inline-flex min-w-5 items-center justify-center rounded-full bg-on-surface/10 px-1.5 py-0.5 text-label-s">{{ tabCounts.triggers }}</span>
@@ -429,7 +529,7 @@ onMounted(async () => {
         <span class="material-symbols-outlined dialog-ico">key</span>
         <h3 class="dialog-title">NotmyFault 安装密钥</h3>
         <p class="dialog-sub">安装 NotmyFault 时输入的密钥</p>
-        <input type="password" v-model="keyPw" class="text-field" placeholder="输入密钥" style="width:100%;text-align:center">
+        <input type="password" v-model="signingPassword" class="text-field" placeholder="输入私钥密码" style="width:100%;text-align:center">
         <div class="dialog-actions">
           <button class="btn btn-text" @click="cancelKey">取消</button>
           <button class="btn btn-filled" @click="submitKey">确认</button>

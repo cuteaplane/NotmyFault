@@ -54,6 +54,16 @@ export async function apiWrite(path, method, body, isForm) {
   return res
 }
 
+export async function apiDownload(path, body) {
+  const res = await fetchAuthenticated(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  })
+  if (res.status === 403) throw new Error('Dashboard 与后台服务认证不同步')
+  return res
+}
+
 export async function loadConfig() {
   if (!hasBridge()) throw new Error('Dashboard 桌面桥接尚未就绪')
   return await window.pywebview.api.get_config()
@@ -198,8 +208,14 @@ function aiDraftRequestBody(messages, consent = null, apiKey = '') {
       .slice(-AI_DRAFT_HISTORY_LIMIT),
   }
   const pluginId = typeof consent?.plugin_id === 'string' ? consent.plugin_id.trim() : ''
+  const permissions = Array.isArray(consent?.permissions)
+    ? [...new Set(consent.permissions
+      .filter(permission => typeof permission === 'string')
+      .map(permission => permission.trim())
+      .filter(Boolean))]
+    : []
   const key = typeof apiKey === 'string' ? apiKey.trim() : ''
-  if (pluginId) body.consent = { plugin_id: pluginId }
+  if (pluginId) body.consent = { plugin_id: pluginId, permissions }
   if (key) body.api_key = key
   return body
 }
