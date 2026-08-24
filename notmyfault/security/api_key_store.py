@@ -6,10 +6,7 @@ import os
 import secrets
 from contextlib import contextmanager
 from enum import Enum
-
-from notmyfault.platform.platform_support import get_config_dir
-
-_KEY_FILE_NAME = ".ai_api_key"
+from pathlib import Path
 _MAX_KEY_LENGTH = 4096
 # 解密要拿同样的熵，所以熵写死成常量。
 _ENTROPY = b"NotmyFault-AI-API-Key"
@@ -51,7 +48,7 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
-def supports_persistence() -> bool:
+def _supports_persistence() -> bool:
     if _is_windows():
         return True
     try:
@@ -60,10 +57,6 @@ def supports_persistence() -> bool:
     except KeyStoreError:
         return False
     return True
-
-
-def _key_file_path() -> str:
-    return os.path.join(get_config_dir(), _KEY_FILE_NAME)
 
 
 def _load_crypt32():
@@ -372,55 +365,58 @@ def _validate_key(key: str) -> str:
     return normalized_key
 
 
-def save_api_key(key: str) -> None:
-    normalized_key = _validate_key(key)
-    if _is_windows():
-        _atomic_write_bytes(
-            _key_file_path(), _protect_bytes(normalized_key.encode("utf-8"))
-        )
-        return
-    _save_secret_service_key(normalized_key)
+class AIKeyStore:
+    def __init__(self, key_file: str | os.PathLike[str]) -> None:
+        self._key_file = Path(key_file)
 
+    def supports_persistence(self) -> bool:
+        return _supports_persistence()
 
-def load_api_key() -> str | None:
-    if not _is_windows():
-        return _load_secret_service_key()
-    try:
-        with open(_key_file_path(), "rb") as key_file:
-            ciphertext = key_file.read()
-    except FileNotFoundError:
-        return None
-    except OSError as error:
-        raise KeyStoreError("读取密钥文件失败") from error
-    plaintext = _unprotect_bytes(ciphertext)
-    try:
-        return plaintext.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise KeyStoreDecryptError("密钥密文无法解密") from error
+    def save_api_key(self, key: str) -> None:
+        normalized_key = _validate_key(key)
+        if _is_windows():
+            _atomic_write_bytes(
+                str(self._key_file),
+                _protect_bytes(normalized_key.encode("utf-8")),
+            )
+            return
+        _save_secret_service_key(normalized_key)
 
+    def load_api_key(self) -> str | None:
+        if not _is_windows():
+            return _load_secret_service_key()
+        try:
+            ciphertext = self._key_file.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise KeyStoreError("读取密钥文件失败") from error
+        plaintext = _unprotect_bytes(ciphertext)
+        try:
+            return plaintext.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise KeyStoreDecryptError("密钥密文无法解密") from error
 
-def delete_api_key() -> None:
-    if not _is_windows():
-        _delete_secret_service_key()
-        return
-    try:
-        os.unlink(_key_file_path())
-    except FileNotFoundError:
-        pass
+    def delete_api_key(self) -> None:
+        if not _is_windows():
+            _delete_secret_service_key()
+            return
+        try:
+            self._key_file.unlink()
+        except FileNotFoundError:
+            pass
 
-
-def api_key_status() -> KeyStoreStatus:
-    if not _is_windows():
-        return _secret_service_status()
-    try:
-        with open(_key_file_path(), "rb") as key_file:
-            ciphertext = key_file.read()
-    except FileNotFoundError:
-        return KeyStoreStatus.ABSENT
-    except OSError:
-        return KeyStoreStatus.CORRUPT
-    try:
-        _unprotect_bytes(ciphertext)
-    except KeyStoreDecryptError:
-        return KeyStoreStatus.CORRUPT
-    return KeyStoreStatus.STORED
+    def api_key_status(self) -> KeyStoreStatus:
+        if not _is_windows():
+            return _secret_service_status()
+        try:
+            ciphertext = self._key_file.read_bytes()
+        except FileNotFoundError:
+            return KeyStoreStatus.ABSENT
+        except OSError:
+            return KeyStoreStatus.CORRUPT
+        try:
+            _unprotect_bytes(ciphertext)
+        except KeyStoreDecryptError:
+            return KeyStoreStatus.CORRUPT
+        return KeyStoreStatus.STORED

@@ -203,72 +203,77 @@ def _risk_ids_for_name(name: str, is_call: bool) -> List[str]:
     return risk_ids
 
 
+def scan_plugin_source_security(
+    source: str, filename: str = "plugin.py"
+) -> List[Dict[str, Any]]:
+    risks: List[Dict[str, Any]] = []
+    try:
+        tree = ast.parse(source, filename=filename)
+    except (SyntaxError, ValueError):
+        return risks
+
+    module_aliases: Dict[str, str] = {}
+    imported_symbols: Dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                local_name = alias.asname or alias.name.split(".")[0]
+                module_aliases[local_name] = (
+                    alias.name if alias.asname else alias.name.split(".")[0]
+                )
+        elif isinstance(node, ast.ImportFrom):
+            module_name = node.module or ""
+            for alias in node.names:
+                imported_symbols[alias.asname or alias.name] = (
+                    module_name + "." + alias.name
+                ).strip(".")
+
+    findings: Dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = _resolved_name(node.func, module_aliases, imported_symbols)
+            is_call = True
+        elif isinstance(node, ast.Attribute):
+            name = _resolved_name(node, module_aliases, imported_symbols)
+            is_call = False
+        elif isinstance(node, ast.Name) and node.id == "__import__":
+            name = _resolved_name(node, module_aliases, imported_symbols)
+            is_call = False
+        else:
+            continue
+        if not name:
+            continue
+        for risk_id in _risk_ids_for_name(name, is_call):
+            findings.setdefault(risk_id, name)
+
+    for risk_id, (label, level) in _RISK_INFO.items():
+        evidence = findings.get(risk_id)
+        if evidence is None:
+            continue
+        risks.append({
+            "id": risk_id,
+            "label": label,
+            "level": level,
+            "detail": f"文件 \"{filename}\" 中发现 \"{evidence}\"",
+            "file": filename,
+        })
+    return risks
+
+
 def scan_plugin_security(plugin_dir: str) -> List[Dict[str, Any]]:
     """扫描插件目录下的 .py 文件，返回发现的风险列表"""
     risks: List[Dict[str, Any]] = []
     if not os.path.isdir(plugin_dir):
         return risks
-
     for fpath_obj in sorted(Path(plugin_dir).rglob("*.py")):
         if not fpath_obj.is_file():
             continue
-        fpath = str(fpath_obj)
         fname = fpath_obj.relative_to(plugin_dir).as_posix()
         try:
-            with open(fpath, "r", encoding="utf-8", errors="replace") as f:
-                source = f.read()
+            source = fpath_obj.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        try:
-            tree = ast.parse(source, filename=fpath)
-        except SyntaxError:
-            continue
-
-        module_aliases: Dict[str, str] = {}
-        imported_symbols: Dict[str, str] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    local_name = alias.asname or alias.name.split(".")[0]
-                    module_aliases[local_name] = (
-                        alias.name if alias.asname else alias.name.split(".")[0]
-                    )
-            elif isinstance(node, ast.ImportFrom):
-                module_name = node.module or ""
-                for alias in node.names:
-                    imported_symbols[alias.asname or alias.name] = (
-                        module_name + "." + alias.name
-                    ).strip(".")
-
-        findings: Dict[str, str] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                name = _resolved_name(node.func, module_aliases, imported_symbols)
-                is_call = True
-            elif isinstance(node, ast.Attribute):
-                name = _resolved_name(node, module_aliases, imported_symbols)
-                is_call = False
-            elif isinstance(node, ast.Name) and node.id == "__import__":
-                name = _resolved_name(node, module_aliases, imported_symbols)
-                is_call = False
-            else:
-                continue
-            if not name:
-                continue
-            for risk_id in _risk_ids_for_name(name, is_call):
-                findings.setdefault(risk_id, name)
-
-        for risk_id, (label, level) in _RISK_INFO.items():
-            evidence = findings.get(risk_id)
-            if evidence is None:
-                continue
-            risks.append({
-                "id": risk_id,
-                "label": label,
-                "level": level,
-                "detail": f"文件 \"{fname}\" 中发现 \"{evidence}\"",
-                "file": fname,
-            })
+        risks.extend(scan_plugin_source_security(source, fname))
     return risks
 
 
@@ -763,6 +768,8 @@ def validate_plugin_meta(
             errors.append("cancellation_api 目前仅支持 runtime-v1")
         if meta.get("execution_api") != "context-v1":
             errors.append("cancellation_api=runtime-v1 需要 execution_api=context-v1")
+        if meta.get("execution_mode") == "isolated":
+            errors.append("isolated 动作暂不支持 cancellation_api")
     if "build" in meta:
         errors.extend(_validate_build_field(meta["build"]))
     if "components" in meta:

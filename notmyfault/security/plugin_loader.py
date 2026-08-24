@@ -299,6 +299,7 @@ class PluginLoader:
         sudo: Any,
         engine_token: str,
         integrity_errors: list[str],
+        plugin_manifest_path: str,
     ) -> None:
         # 加载器只保存 registry、config 和 diagnostics 等传入对象。
         self._registry = registry
@@ -308,6 +309,7 @@ class PluginLoader:
         self._sudo = sudo
         self._engine_token = engine_token
         self._integrity_errors = integrity_errors
+        self._plugin_manifest_path = plugin_manifest_path
         # 多个工作流线程可能同时首次执行同一个懒加载动作。
         self._materialize_lock = threading.Lock()
         registry.set_action_materializer(self.materialize_pending_action)
@@ -351,7 +353,7 @@ class PluginLoader:
         root_dir = os.path.join(base_dir, plugins_dir)
         loaded_count = 0
         failed_count = 0
-        # 成功名单攒到最后一条输出，避免每个插件 print 一次拖慢启动。
+        # 成功名单合成一条日志，逐个输出会拖慢启动
         loaded_summaries: list[str] = []
 
         if not os.path.isdir(root_dir):
@@ -424,7 +426,6 @@ class PluginLoader:
                 continue
 
             # 禁用名单写在 config 里，对内置和用户插件都生效，json 里的 enabled 只表示作者出厂状态。
-            # 检查放在最前面：用户禁用的插件不该再记平台或能力错误
             disabled_cfg = self._config.get("disabled_plugins", {})
             ptype_key = "triggers" if store_name == "Trigger" else "actions"
             disabled_list = disabled_cfg.get(ptype_key, []) if isinstance(disabled_cfg, dict) else []
@@ -492,7 +493,7 @@ class PluginLoader:
                 )
                 continue
 
-            # build 钩子是作者现场编译的直通通道，内置插件走构建流程不需要它
+            # build 钩子会在本机执行作者命令，内置插件只接受构建产物
             if origin == "builtin" and isinstance(meta.get("build"), dict):
                 reason = "内置插件不允许携带 build 编译钩子"
                 print(
@@ -567,7 +568,6 @@ class PluginLoader:
                 continue
             file_snapshot = tree.file_snapshot
 
-            # strict 模式在导入前检查签名，其他模式保留签名失败时的降级加载。
             signature_kind = plugin_signature_kind_from_payload(
                 folder_path, origin, tree.payload
             )
@@ -727,7 +727,9 @@ class PluginLoader:
             # 内置插件使用构建时 Ed25519 签名，用户插件记录首次文件哈希，完整性失败只告警。
             if origin != "builtin":
                 integrity_ok, integrity_msg = verify_plugin_integrity_from_hashes(
-                    plugin_id, file_snapshot
+                    plugin_id,
+                    file_snapshot,
+                    self._plugin_manifest_path,
                 )
                 if not integrity_ok:
                     warning = (
@@ -747,7 +749,6 @@ class PluginLoader:
                     engine_warn(f"borrowed_privilege: {plugin_id} {'; '.join(borrowed_findings)}")
                     self._integrity_errors.append(warning)
 
-            # 发现阶段到此为止，元数据先入账，模块导入推迟到物化阶段。
             existing_kind = self._registry.plugin_kinds.get(plugin_id)
             if existing_kind is not None and existing_kind != plugin_type:
                 reason = (
@@ -796,7 +797,6 @@ class PluginLoader:
             if plugin_type == "action":
                 old_module = self._registry.get_module(plugin_id)
                 if old_module is not None:
-                    # 覆盖已加载的旧动作时立即导入，meta 和函数保持同一代
                     entry["prev"] = (
                         old_module,
                         meta_store.get(plugin_id),
@@ -806,17 +806,14 @@ class PluginLoader:
                         failed_count += 1
                         continue
                 else:
-                    # 动作第一次被执行时才导入，先写 meta 让规则校验认识它
                     self._registry.pending[plugin_id] = entry
                     meta_store[plugin_id] = meta_with_origin
                 loaded_count += 1
                 loaded_summaries.append(plugin_id)
                 continue
 
-            # 触发器第一次被规则引用时才导入，先写 meta 让规则校验认识它
             old_module = self._registry.get_module(plugin_id)
             if old_module is not None:
-                # 覆盖已加载的旧触发器时立即导入，meta 和函数保持同一代
                 entry["prev"] = (
                     old_module,
                     meta_store.get(plugin_id),
@@ -871,7 +868,6 @@ class PluginLoader:
         previous_path = entry.get("previous_path")
 
         with self._materialize_lock:
-            # 覆盖场景带着 prev 进来，必须先走完替换，缓存短路只对首次物化生效
             if prev is None and plugin_id in func_store:
                 return func_store[plugin_id]
 
@@ -947,7 +943,7 @@ class PluginLoader:
                 )
 
             expected_signature = entry.get("signature_kind", "none")
-            # 物化前再读一轮目录，签名和快照共用这一次结果。
+            # 导入前再读一轮目录，签名和文件快照共用这次结果
             tree = inspect_plugin_tree(folder_path)
             if tree is None:
                 fail("无法读取插件文件，拒绝导入")
@@ -962,8 +958,6 @@ class PluginLoader:
                 fail("插件文件在校验后发生变化，拒绝导入")
                 return None
 
-            # isolated 动作不在引擎进程里 import：模块加载就崩的插件正是要隔离的对象，
-            # 直接注册一个起子进程的包装函数
             if (
                 plugin_type == "action"
                 and meta.get("execution_mode") == "isolated"
@@ -976,6 +970,15 @@ class PluginLoader:
                         raise RuntimeError(f"isolated worker 执行失败: {result}")
                     return result
 
+                def isolated_run_with_context(
+                    _meta, params, context, _entry=py_file, _info=meta
+                ):
+                    ok, result = run_isolated_action(_entry, _info, params, context)
+                    if not ok:
+                        raise RuntimeError(f"isolated worker 执行失败: {result}")
+                    return result
+
+                setattr(isolated_run, "run_with_context", isolated_run_with_context)
                 self._registry.register(plugin_type, plugin_id, meta, isolated_run, None)
                 func_store[plugin_id] = isolated_run
                 meta_store[plugin_id] = meta

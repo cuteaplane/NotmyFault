@@ -6,7 +6,7 @@ import os
 import tempfile
 from typing import List, Optional, Set, Tuple
 
-from notmyfault.config import CONFIG_FILE
+from notmyfault.application_paths import ApplicationPaths
 
 
 def parse_plugin_source(source: str) -> ast.Module:
@@ -491,9 +491,6 @@ def verify_plugin_sig(plugin_dir: str, origin: str = "builtin") -> bool:
     return plugin_signature_kind(plugin_dir, origin) != "none"
 
 
-_PLUGIN_MANIFEST_FILE = os.path.join(os.path.dirname(CONFIG_FILE), "plugin_manifest.json")
-
-
 def compute_file_hash(file_path: str) -> str | None:
     """计算文件 SHA-256，读取失败时返回 None"""
     try:
@@ -503,26 +500,33 @@ def compute_file_hash(file_path: str) -> str | None:
         return None
 
 
-def load_plugin_manifest() -> dict[str, dict[str, str]]:
+def load_plugin_manifest(
+    path: str | os.PathLike[str] | None = None,
+) -> dict[str, dict[str, str]]:
     """加载插件 hash 清单，文件不存在或损坏时返回空字典。"""
     try:
-        if os.path.exists(_PLUGIN_MANIFEST_FILE):
-            with open(_PLUGIN_MANIFEST_FILE, "r", encoding="utf-8") as f:
+        manifest_path = path or ApplicationPaths.default().plugin_manifest_file
+        if os.path.exists(manifest_path):
+            with open(manifest_path, "r", encoding="utf-8") as f:
                 return json.load(f)
     except (json.JSONDecodeError, OSError):
         pass
     return {}
 
 
-def save_plugin_manifest(manifest: dict[str, dict[str, str]]) -> bool:
+def save_plugin_manifest(
+    manifest: dict[str, dict[str, str]],
+    path: str | os.PathLike[str] | None = None,
+) -> bool:
     """用同目录临时文件原子写入插件哈希清单"""
-    manifest_dir = os.path.dirname(_PLUGIN_MANIFEST_FILE) or "."
+    manifest_path = os.fspath(path or ApplicationPaths.default().plugin_manifest_file)
+    manifest_dir = os.path.dirname(manifest_path) or "."
     tmp_path: str | None = None
     fd = -1
     try:
         os.makedirs(manifest_dir, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(
-            prefix=os.path.basename(_PLUGIN_MANIFEST_FILE) + ".",
+            prefix=os.path.basename(manifest_path) + ".",
             suffix=".tmp",
             dir=manifest_dir,
             text=True,
@@ -532,7 +536,7 @@ def save_plugin_manifest(manifest: dict[str, dict[str, str]]) -> bool:
             json.dump(manifest, f, indent=2, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, _PLUGIN_MANIFEST_FILE)
+        os.replace(tmp_path, manifest_path)
         tmp_path = None
         return True
     except OSError:
@@ -551,10 +555,12 @@ def save_plugin_manifest(manifest: dict[str, dict[str, str]]) -> bool:
 
 
 def verify_plugin_integrity_from_hashes(
-    plugin_id: str, current_hashes: dict[str, str]
+    plugin_id: str,
+    current_hashes: dict[str, str],
+    manifest_path: str | os.PathLike[str] | None = None,
 ) -> Tuple[bool, str]:
     """按清单比对文件哈希并记录首次值，空串哈希表示读不了的文件"""
-    manifest = load_plugin_manifest()
+    manifest = load_plugin_manifest(manifest_path)
     has_existing = plugin_id in manifest
     existing = manifest.get(plugin_id, {})
     present_files: set[str] = set(current_hashes.keys())
@@ -581,16 +587,20 @@ def verify_plugin_integrity_from_hashes(
         return False, "；".join(messages)
     if not has_existing:
         manifest[plugin_id] = readable
-        if not save_plugin_manifest(manifest):
+        if not save_plugin_manifest(manifest, manifest_path):
             return False, "无法保存完整性清单"
     return True, "完整性校验通过"
 
 
 def verify_plugin_integrity(
-    plugin_id: str, files: List[Tuple[str, str]]
+    plugin_id: str,
+    files: List[Tuple[str, str]],
+    manifest_path: str | os.PathLike[str] | None = None,
 ) -> Tuple[bool, str]:
     """校验插件文件与清单的一致性并记录首次哈希"""
     current: dict[str, str] = {}
     for file_type, file_path in files:
         current[file_type] = compute_file_hash(file_path) or ""
-    return verify_plugin_integrity_from_hashes(plugin_id, current)
+    return verify_plugin_integrity_from_hashes(
+        plugin_id, current, manifest_path
+    )
