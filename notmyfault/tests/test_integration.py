@@ -2,75 +2,80 @@
 
 import json
 import os
+import hashlib
+import hmac
 import threading
 import time
 from types import SimpleNamespace
 
 import pytest
 
-from notmyfault import config as config_mod
 from notmyfault.core.diagnostics import Diagnostics
 from notmyfault.core import logging as englog
-from notmyfault.core.engine import AutomationEngine
+from notmyfault.tests.api_support import (
+    create_test_engine,
+    make_paths,
+    make_store,
+)
 from notmyfault.core.hot_reloader import RulesHotReloader
 from notmyfault.host import app as host_app
 from notmyfault.security.security import SecurityMode
 
 
 def make_engine(rules=None, on_event=None):
-    engine = AutomationEngine({"rules": rules or []}, on_event=on_event)
+    engine = create_test_engine({"rules": rules or []}, on_event=on_event)
     engine._alert_user = lambda *a, **k: None
     return engine
 
 
 @pytest.fixture
-def isolated_config(tmp_path, monkeypatch):
-    """配置读写全部指向临时目录，避免触碰真实用户配置"""
-    config_file = str(tmp_path / "config.json")
-    monkeypatch.setattr(config_mod, "CONFIG_FILE", config_file)
-    monkeypatch.setattr(config_mod, "RULES_FILE", str(tmp_path / "rules.json"))
-    return config_file
+def isolated_config(tmp_path):
+    paths = make_paths(tmp_path)
+    return SimpleNamespace(paths=paths, store=make_store(paths))
 
 
 class TestAPIConfigRoundtrip:
     def test_api_read_modify_verify(self, isolated_config):
-        assert config_mod.get_rules() == []
+        store = isolated_config.store
+        assert store.load_rules() == []
 
-        assert config_mod.save_rules([{
+        assert store.save_rules([{
             "name": "集成规则",
             "event": {"type": "hotkey", "params": {"key": "f9"}},
             "actions": [{"type": "noop", "params": {}}],
         }]) is True
 
-        names = [rule["name"] for rule in config_mod.load_verified_rules()]
+        names = [rule["name"] for rule in store.load_verified_rules()]
         assert "集成规则" in names
 
 
 class TestConfigEnginePipeline:
     def test_config_written_engine_reads_rules(self, isolated_config):
-        config_mod.save_config({})
-        config_mod.save_rules([{
+        store = isolated_config.store
+        store.save_config({})
+        store.save_rules([{
             "name": "r1",
             "event": {"type": "hotkey", "params": {}},
             "actions": [{"type": "noop", "params": {}}],
         }])
-        config = config_mod.load_verified_config()
-        config["rules"] = config_mod.load_verified_rules()
-        engine = AutomationEngine(config)
+        config = store.load_verified_config()
+        config["rules"] = store.load_verified_rules()
+        engine = create_test_engine(config, rules_store=store)
         assert len(engine.rules) == 1
         assert engine.rules[0]["name"] == "r1"
 
     def test_config_modification_picked_up(self, isolated_config):
-        config_mod.save_config({})
-        config_mod.save_rules([{
+        store = isolated_config.store
+        store.save_config({})
+        store.save_rules([{
             "name": "旧规则",
             "event": {"type": "hotkey", "params": {}},
             "actions": [{"type": "noop", "params": {}}],
         }])
-        rules = config_mod.load_verified_rules()
+        rules = store.load_verified_rules()
         rules[0]["name"] = "新规则"
-        config_mod.save_rules(rules)
-        assert config_mod.load_verified_rules()[0]["name"] == "新规则"
+        store.save_rules(rules)
+        assert store.load_verified_rules()[0]["name"] == "新规则"
 
     def test_legacy_config_to_engine(self, isolated_config):
         # 旧格式 config.json 直接落盘，模拟升级前的真实文件
@@ -80,27 +85,38 @@ class TestConfigEnginePipeline:
             "volume_action": "max",
             "notification": {"title": "微信运行", "message": "音量最大"},
         }]}
-        config_mod._get_or_create_secret()
-        legacy[config_mod._SIGNATURE_KEY] = config_mod._sign_config(legacy)
-        with open(config_mod.CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(legacy, f, ensure_ascii=False)
+        paths = isolated_config.paths
+        store = isolated_config.store
+        secret = paths.config_secret_file.read_bytes()
+        content = json.dumps(legacy, sort_keys=True, ensure_ascii=False, default=str)
+        legacy["_signature"] = hmac.new(
+            secret,
+            content.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        paths.config_file.write_text(
+            json.dumps(legacy, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        paths.rules_file.unlink()
         # 加载设置时自动把旧进程列表拆分到 rules.json
-        config = config_mod.get_config()
-        config["rules"] = config_mod.get_rules()
-        engine = AutomationEngine(config)
+        config = store.load_config()
+        config["rules"] = store.load_rules()
+        engine = create_test_engine(config, rules_store=store)
         rule = engine.rules[0]
         assert rule["event"]["type"] == "process_state"
         assert rule["event"]["params"]["process_name"] == "WeChat.exe"
         assert rule["actions"][0]["type"] == "set_volume"
 
     def test_legacy_trigger_config_normalized(self, isolated_config):
-        config_mod.save_config({})
-        config_mod.save_rules([{
+        store = isolated_config.store
+        store.save_config({})
+        store.save_rules([{
             "name": "r1",
             "trigger": {"type": "hotkey", "params": {}},
             "actions": [{"type": "noop", "params": {}}],
         }])
-        rule = config_mod.load_verified_rules()[0]
+        rule = store.load_verified_rules()[0]
         assert "trigger" not in rule
         assert rule["event"]["type"] == "hotkey"
 
@@ -128,6 +144,7 @@ class TestEngineEventPipeline:
         engine.actions_meta["consume"] = {}
 
         engine.emit_event("usb_insert", {"drive": "E:"})
+        assert engine._rule_scheduler.wait_for_idle(timeout=5)
         assert received == {"drive": "E:"}
         types = [t for t, _ in events]
         assert "rule_triggered" in types
@@ -145,6 +162,7 @@ class TestEngineEventPipeline:
         engine._shutdown_flag = threading.Event()
         engine._shutdown_flag.set()
         engine.emit_event("hotkey", {})
+        assert engine._rule_scheduler.wait_for_idle(timeout=5)
         assert ran == []
 
 
@@ -216,11 +234,8 @@ class TestHotReloadIntegration:
             ("规则恢复失败", "热加载失败且原有规则恢复失败，请重启引擎")
         ]
 
-    def test_hot_reload_picks_up_changes(self, tmp_path, monkeypatch, isolated_config):
-        from notmyfault.core import engine as engine_mod
+    def test_hot_reload_picks_up_changes(self, monkeypatch, isolated_config):
         from notmyfault.platform import platform_support
-        rules_file = str(tmp_path / "rules.json")
-        monkeypatch.setattr(engine_mod, "RULES_FILE", rules_file)
         monkeypatch.setattr(platform_support, "show_notification", lambda *a, **k: None)
 
         def rule(name):
@@ -230,11 +245,12 @@ class TestHotReloadIntegration:
                 "actions": [{"type": "noop", "params": {}}],
             }
 
-        config_mod.save_config({})
-        config_mod.save_rules([rule("r1")])
-        config = config_mod.load_verified_config()
-        config["rules"] = config_mod.load_verified_rules()
-        engine = AutomationEngine(config)
+        store = isolated_config.store
+        store.save_config({})
+        store.save_rules([rule("r1")])
+        config = store.load_verified_config()
+        config["rules"] = store.load_verified_rules()
+        engine = create_test_engine(config, rules_store=store)
         engine._alert_user = lambda *a, **k: None
         engine._security_mode = SecurityMode.PERMISSIVE
         engine.triggers_funcs["hotkey"] = lambda meta, config, emit, stop: stop.wait(30)
@@ -254,7 +270,7 @@ class TestHotReloadIntegration:
 
             # 触发 mtime 变化后引擎应在轮询中应用新规则
             time.sleep(0.01)
-            config_mod.save_rules([rule("r1"), rule("r2")])
+            store.save_rules([rule("r1"), rule("r2")])
             deadline = time.monotonic() + 8
             while len(engine.rules) < 2:
                 if time.monotonic() > deadline:

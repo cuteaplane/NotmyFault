@@ -1,5 +1,3 @@
-"""内置插件场景：8 个动作与 6 个触发器的行为、校验和元数据"""
-
 import ctypes
 import importlib.util
 import json
@@ -434,26 +432,25 @@ def test_window_pin_title_target_resolves_window(monkeypatch):
     assert result == {"state": "pinned", "hwnd": 42}
 
 
-# Windows 上 run() 走 user32，会真的置顶前台窗口
-@pytest.mark.skipif(os.name != "posix", reason="仅 Linux 调用 wmctrl")
 def test_window_pin_linux_dispatches_wmctrl(monkeypatch):
     mod = load_plugin("actions", "window_pin")
-    commands = []
+    calls = []
 
-    def fake_run(cmd, **kwargs):
-        commands.append(cmd)
-        return SimpleNamespace(returncode=0, stdout="0x2a host 0 记事本\n", stderr="")
+    class FakeWindowBackend:
+        def __init__(self, runner):
+            calls.append(runner)
 
-    monkeypatch.setattr(mod.shutil, "which", lambda name: "/usr/bin/wmctrl")
-    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        def set_pinned(self, action, target, title):
+            calls.append((action, target, title))
+            return {"state": "pinned", "window_id": "0x2a"}
+
+    monkeypatch.setattr(mod, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(mod, "WindowBackend", FakeWindowBackend)
     assert mod.run({}, {"action": "pin", "target": "title", "title": "记事本"}) == {
         "state": "pinned",
         "window_id": "0x2a",
     }
-    assert commands == [
-        ["/usr/bin/wmctrl", "-l"],
-        ["/usr/bin/wmctrl", "-i", "-r", "0x2a", "-b", "add,above"],
-    ]
+    assert calls == [mod.default_runner, ("pin", "title", "记事本")]
 
 
 def test_window_pin_rejects_bad_input():
@@ -959,7 +956,7 @@ class SudoStub:
         pass
 
 
-def test_new_plugins_loaded_by_engine():
+def test_new_plugins_loaded_by_engine(tmp_path):
     loader = PluginLoader(
         registry=PluginRegistry(),
         config={},
@@ -968,6 +965,7 @@ def test_new_plugins_loaded_by_engine():
         sudo=SudoStub(),
         engine_token="token",
         integrity_errors=[],
+        plugin_manifest_path=str(tmp_path / "manifest.json"),
     )
     base = str(PKG_ROOT)
     actions_meta: dict = {}

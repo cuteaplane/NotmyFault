@@ -2,6 +2,9 @@
 
 import threading
 import time
+import runpy
+import signal
+from pathlib import Path
 
 from notmyfault.core.runtime_controller import RuntimeController
 
@@ -53,6 +56,33 @@ def test_runtime_controller_owns_generation_and_current_engine():
     assert controller.status().generation == 2
     assert controller.current_engine is created[1]
     controller.stop()
+
+
+def test_desktop_runner_forwards_event_sink_to_engine_factory(monkeypatch, tmp_path):
+    launcher_path = Path(__file__).resolve().parents[2] / "NOTMYFAULT.pyw"
+    namespace = runpy.run_path(str(launcher_path), run_name="notmyfault_launcher_test")
+    observed = {}
+    engine = object()
+
+    def create_engine(*, store, on_event=None):
+        observed["store"] = store
+        observed["on_event"] = on_event
+        return engine
+
+    monkeypatch.setattr(signal, "signal", lambda *args: None)
+    paths = namespace["ApplicationPaths"](
+        config_dir=tmp_path / "config",
+        package_root=tmp_path / "package",
+        project_root=tmp_path,
+    )
+    store = namespace["SignedConfigStore"](paths)
+    runner = namespace["EngineRunner"](paths, store, create_engine)
+    event_sink = lambda event_type, data: None
+
+    created = runner._runtime._engine_factory(on_event=event_sink)
+
+    assert created is engine
+    assert observed == {"store": runner._store, "on_event": event_sink}
 
 
 def test_runtime_controller_rejects_restart_while_old_thread_is_stopping():

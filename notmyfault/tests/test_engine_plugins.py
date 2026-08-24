@@ -1,5 +1,3 @@
-"""引擎插件加载流水线、安全扫描和注册表行为"""
-
 import json
 import threading
 from pathlib import Path
@@ -7,13 +5,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from notmyfault.core.engine import AutomationEngine
+from notmyfault.tests.api_support import create_test_engine
 from notmyfault.security.plugin_loader import PluginLoader, PluginRegistry
 from notmyfault.security.security import SecurityMode
 
 
 def make_engine(rules=None):
-    engine = AutomationEngine({"rules": rules or []})
+    engine = create_test_engine({"rules": rules or []})
     engine._alert_user = lambda *a, **k: None
     return engine
 
@@ -68,6 +66,7 @@ def make_loader(tmp_path, mode=SecurityMode.PERMISSIVE, config=None):
         sudo=sudo,
         engine_token="token",
         integrity_errors=[],
+        plugin_manifest_path=str(tmp_path / "manifest.json"),
     )
     return loader, registry, plugin_errors, sudo
 
@@ -127,7 +126,7 @@ CLEAN_RUN = "def run(meta, params):\n    return None\n"
 
 class TestEngineStart:
     def test_engine_no_rules(self):
-        engine = AutomationEngine({})
+        engine = create_test_engine({})
         assert engine.rules == []
         engine.emit_event("hotkey", {})
 
@@ -140,7 +139,7 @@ class TestEngineStart:
         assert diag["rules"]["total"] == 1
 
     def test_admin_startup_only_counts_plugins_used_by_enabled_rules(self):
-        engine = AutomationEngine({
+        engine = create_test_engine({
             "rules": [
                 {
                     "name": "启用规则",
@@ -164,7 +163,7 @@ class TestEngineStart:
         assert engine._required_admin_plugins() == ["admin_action"]
 
     def test_engine_start_requests_session_for_admin_rules(self, monkeypatch):
-        engine = AutomationEngine({
+        engine = create_test_engine({
             "settings": {"admin_authorization_mode": "engine_start"},
             "rules": [
                 {
@@ -293,11 +292,7 @@ class TestLoadPlugins:
         assert (loaded, failed) == (0, 0)
         assert meta_store == {}
 
-    def test_user_plugin_loads_when_not_in_disabled_list(self, tmp_path, monkeypatch):
-        from notmyfault.security import plugins as security_plugins
-        monkeypatch.setattr(
-            security_plugins, "_PLUGIN_MANIFEST_FILE", str(tmp_path / "manifest.json")
-        )
+    def test_user_plugin_loads_when_not_in_disabled_list(self, tmp_path):
         config = {"disabled_plugins": {"triggers": [], "actions": []}}
         loader, registry, errors, _ = make_loader(tmp_path, config=config)
         write_plugin(tmp_path / "actions", "good", make_meta(), CLEAN_RUN)
@@ -400,11 +395,7 @@ class TestLoadPlugins:
         assert (loaded, failed) == (1, 0)
         assert "未在元数据中声明" in capsys.readouterr().err
 
-    def test_override_plugin_does_not_inherit_admin(self, tmp_path, monkeypatch):
-        from notmyfault.security import plugins as security_plugins
-        monkeypatch.setattr(
-            security_plugins, "_PLUGIN_MANIFEST_FILE", str(tmp_path / "manifest.json")
-        )
+    def test_override_plugin_does_not_inherit_admin(self, tmp_path):
         loader, registry, errors, sudo = make_loader(tmp_path, mode=SecurityMode.NORMAL)
         meta_store, func_store = {}, {}
 
@@ -436,12 +427,8 @@ class TestLoadPlugins:
 
 
 class TestSecurityScanIntegration:
-    def test_builtin_plugin_does_not_use_user_hash_cache(self, tmp_path, monkeypatch):
-        from notmyfault.security import plugins as security_plugins
+    def test_builtin_plugin_does_not_use_user_hash_cache(self, tmp_path):
         manifest_path = tmp_path / "manifest.json"
-        monkeypatch.setattr(
-            security_plugins, "_PLUGIN_MANIFEST_FILE", str(manifest_path)
-        )
         loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.NORMAL)
         write_plugin(tmp_path / "actions", "good", make_meta(), CLEAN_RUN)
         loaded, failed, _, _ = load_actions(loader, tmp_path)
@@ -539,12 +526,6 @@ class TestSecurityScanIntegration:
     def test_strict_loads_user_plugin_signed_by_legacy_local_key(
         self, tmp_path, monkeypatch
     ):
-        from notmyfault.security import plugins as security_plugins
-
-        # 用户插件的哈希清单写进临时目录，不碰真实配置目录
-        monkeypatch.setattr(
-            security_plugins, "_PLUGIN_MANIFEST_FILE", str(tmp_path / "manifest.json")
-        )
         loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
         folder = write_plugin(tmp_path / "actions", "legacy", make_meta("legacy"), CLEAN_RUN)
         sign_with_test_key(folder, monkeypatch)
@@ -554,14 +535,10 @@ class TestSecurityScanIntegration:
         assert (loaded, failed) == (1, 0)
         assert meta_store["legacy"]["signature_kind"] == "official-legacy"
 
-    def test_strict_rejects_self_signed_admin_plugin(self, tmp_path, monkeypatch):
+    def test_strict_rejects_self_signed_admin_plugin(self, tmp_path):
         from cryptography.hazmat.primitives.asymmetric import ed25519
-        from notmyfault.security import plugins as security_plugins
         from notmyfault.security import signing
 
-        monkeypatch.setattr(
-            security_plugins, "_PLUGIN_MANIFEST_FILE", str(tmp_path / "manifest.json")
-        )
         loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
         admin_code = (
             "from notmyfault.security.sudo import run_as_admin\n"
@@ -579,11 +556,6 @@ class TestSecurityScanIntegration:
         assert any("未使用官方签名" in msg for _, _, msg in errors)
 
     def test_strict_loads_officially_signed_admin_plugin(self, tmp_path, monkeypatch):
-        from notmyfault.security import plugins as security_plugins
-
-        monkeypatch.setattr(
-            security_plugins, "_PLUGIN_MANIFEST_FILE", str(tmp_path / "manifest.json")
-        )
         loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
         admin_code = (
             "from notmyfault.security.sudo import run_as_admin\n"
@@ -602,12 +574,8 @@ class TestSecurityScanIntegration:
     def test_author_signature_requires_user_counter_signature(self, tmp_path, monkeypatch):
         from cryptography.hazmat.primitives.asymmetric import ed25519
         from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-        from notmyfault.security import plugins as security_plugins
         from notmyfault.security import signing, signing_keys
 
-        monkeypatch.setattr(
-            security_plugins, "_PLUGIN_MANIFEST_FILE", str(tmp_path / "manifest.json")
-        )
         folder = write_plugin(tmp_path / "actions", "authored", make_meta("authored"), CLEAN_RUN)
         author_key = ed25519.Ed25519PrivateKey.generate()
         signing.self_sign_plugin(folder, private_key=author_key)

@@ -1,10 +1,8 @@
-"""Linux backend 门面：CommandRunner 结构化错误 + input / audio / clipboard 的命令拼装"""
-
-import subprocess
+import tempfile
 import sys
-import time
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from notmyfault.platform.backends import (
@@ -15,7 +13,10 @@ from notmyfault.platform.backends import (
     BackendUnsupportedError,
     ClipboardBackend,
     CommandRunner,
+    DisplayBackend,
     InputBackend,
+    ScreenshotBackend,
+    WindowBackend,
 )
 
 
@@ -41,10 +42,8 @@ class FakeRunner:
 
 
 class LinuxPathTest(unittest.TestCase):
-    """跑在 Windows 上也假装 posix，专测 Linux 分支的命令拼装"""
-
     def setUp(self):
-        patcher = patch("notmyfault.platform.backends.os.name", "posix")
+        patcher = patch("notmyfault.platform.backends.sys.platform", "linux")
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -122,7 +121,7 @@ class InputBackendTests(LinuxPathTest):
 
     def test_windows_raises_unsupported(self):
         runner = FakeRunner(paths={"xdotool": "/usr/bin/xdotool"})
-        with patch("notmyfault.platform.backends.os.name", "nt"):
+        with patch("notmyfault.platform.backends.sys.platform", "win32"):
             with self.assertRaises(BackendUnsupportedError):
                 InputBackend(runner).type_text("hi")
 
@@ -277,3 +276,161 @@ class ClipboardBackendTests(LinuxPathTest):
         )
         with self.assertRaises(BackendFailedError):
             ClipboardBackend(runner).write_text("x")
+
+
+class WindowBackendTests(LinuxPathTest):
+    def test_title_match_and_pin(self):
+        runner = FakeRunner(
+            paths={"wmctrl": "/usr/bin/wmctrl"},
+            results=[ok(stdout="0x1 host 旧窗口\n0x2 host 记事本\n"), ok()],
+        )
+
+        result = WindowBackend(runner).set_pinned("pin", "title", "记事本")
+
+        self.assertEqual(result, {"state": "pinned", "window_id": "0x2"})
+        self.assertEqual(runner.calls[0]["args"], ["/usr/bin/wmctrl", "-l"])
+        self.assertEqual(
+            runner.calls[1]["args"],
+            ["/usr/bin/wmctrl", "-i", "-r", "0x2", "-b", "add,above"],
+        )
+
+    def test_toggle_reads_xprop_state(self):
+        runner = FakeRunner(
+            paths={"wmctrl": "/usr/bin/wmctrl", "xprop": "/usr/bin/xprop"},
+            results=[
+                ok(stdout="0x2 host 记事本\n"),
+                ok(stdout="_NET_WM_STATE(ATOM) = _NET_WM_STATE_ABOVE"),
+                ok(),
+            ],
+        )
+
+        result = WindowBackend(runner).set_pinned("toggle", "active")
+
+        self.assertEqual(result["state"], "unpinned")
+        self.assertEqual(
+            runner.calls[-1]["args"],
+            ["/usr/bin/wmctrl", "-i", "-r", "0x2", "-b", "remove,above"],
+        )
+
+    def test_missing_wmctrl_raises(self):
+        with self.assertRaises(BackendMissingError):
+            WindowBackend(FakeRunner()).set_pinned("pin", "active")
+
+    def test_window_command_failure_raises(self):
+        runner = FakeRunner(
+            paths={"wmctrl": "/usr/bin/wmctrl"},
+            results=[ok(stderr="no display", returncode=1)],
+        )
+        with self.assertRaisesRegex(BackendFailedError, "no display"):
+            WindowBackend(runner).set_pinned("pin", "active")
+
+
+class DisplayBackendTests(LinuxPathTest):
+    def test_brightness_uses_brightnessctl(self):
+        runner = FakeRunner(paths={"brightnessctl": "/usr/bin/brightnessctl"})
+
+        DisplayBackend(runner).set_brightness(40)
+
+        self.assertEqual(
+            runner.calls[0]["args"],
+            ["/usr/bin/brightnessctl", "set", "40%"],
+        )
+
+    def test_gnome_power_uses_gdbus(self):
+        runner = FakeRunner(paths={"gdbus": "/usr/bin/gdbus"})
+        with patch(
+            "notmyfault.platform.linux_support.desktop_environment",
+            return_value="gnome",
+        ):
+            DisplayBackend(runner).set_power("off")
+
+        self.assertEqual(runner.calls[0]["args"][-1], "true")
+        self.assertIn("org.gnome.ScreenSaver.SetActive", runner.calls[0]["args"])
+
+    def test_x11_power_uses_xset(self):
+        runner = FakeRunner(paths={"xset": "/usr/bin/xset"})
+        with patch(
+            "notmyfault.platform.linux_support.desktop_environment",
+            return_value="unknown",
+        ):
+            DisplayBackend(runner).set_power("on")
+
+        self.assertEqual(
+            runner.calls[0]["args"],
+            ["/usr/bin/xset", "dpms", "force", "on"],
+        )
+
+    def test_missing_brightnessctl_raises(self):
+        with self.assertRaises(BackendMissingError):
+            DisplayBackend(FakeRunner()).set_brightness(40)
+
+
+class ScreenshotBackendTests(LinuxPathTest):
+    def test_active_window_uses_gnome_screenshot(self):
+        runner = FakeRunner(paths={"gnome-screenshot": "/usr/bin/gnome-screenshot"})
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "notmyfault.platform.linux_support.session_type",
+            return_value="x11",
+        ):
+            destination = str(Path(temp_dir) / "shot.png")
+            result = ScreenshotBackend(runner).capture(
+                destination,
+                "active_window",
+                "png",
+            )
+
+        self.assertEqual(result, destination)
+        self.assertEqual(
+            runner.calls[0]["args"],
+            ["/usr/bin/gnome-screenshot", "-w", "-f", destination],
+        )
+        self.assertEqual(runner.calls[0]["timeout"], 30)
+
+    def test_fullscreen_falls_back_to_spectacle(self):
+        runner = FakeRunner(paths={"spectacle": "/usr/bin/spectacle"})
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "notmyfault.platform.linux_support.session_type",
+            return_value="x11",
+        ):
+            destination = str(Path(temp_dir) / "shot.png")
+            ScreenshotBackend(runner).capture(destination, "fullscreen", "png")
+
+        self.assertEqual(
+            runner.calls[0]["args"],
+            ["/usr/bin/spectacle", "-b", "-n", "-f", "-o", destination],
+        )
+
+    def test_wayland_uses_portal(self):
+        calls = []
+        portal = types.ModuleType("notmyfault.platform.portal_screenshot")
+        portal.take_screenshot = (
+            lambda path, interactive: calls.append((path, interactive))
+        )
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "notmyfault.platform.linux_support.session_type",
+            return_value="wayland",
+        ), patch.dict(
+            sys.modules,
+            {"notmyfault.platform.portal_screenshot": portal},
+        ):
+            destination = str(Path(temp_dir) / "shot.png")
+            result = ScreenshotBackend(FakeRunner()).capture(
+                destination,
+                "active_window",
+                "png",
+            )
+
+        self.assertEqual(result, destination)
+        self.assertEqual(calls, [(destination, True)])
+
+    def test_missing_screenshot_command_raises(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "notmyfault.platform.linux_support.session_type",
+            return_value="x11",
+        ):
+            with self.assertRaises(BackendMissingError):
+                ScreenshotBackend(FakeRunner()).capture(
+                    str(Path(temp_dir) / "shot.png"),
+                    "fullscreen",
+                    "png",
+                )

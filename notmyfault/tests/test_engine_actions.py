@@ -8,14 +8,14 @@ import types
 
 import pytest
 
-from notmyfault.core.engine import AutomationEngine
+from notmyfault.tests.api_support import create_test_engine
 from notmyfault.core import workflow_executor as workflow_executor_module
 from notmyfault.core.workflow import ActionCancellation, build_context
 from notmyfault.security.errors import AdminExecutionBlocked
 
 
 def make_engine(rules=None, on_event=None):
-    engine = AutomationEngine({"rules": rules or []}, on_event=on_event)
+    engine = create_test_engine({"rules": rules or []}, on_event=on_event)
     engine._alert_user = lambda *a, **k: None
     return engine
 
@@ -1182,7 +1182,7 @@ class TestExecuteAction:
             "check_file_locks": False,
             "check_document_windows": False,
         }
-        # 首次检查只能建立观察基线，不允许直接放行
+        # 第一次检查只记录当前状态，不触发动作
         first = mod.check_precondition({}, params, {})
         assert first["ok"] is False
         second = mod.check_precondition({}, params, {})

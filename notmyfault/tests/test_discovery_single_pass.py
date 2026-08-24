@@ -56,6 +56,7 @@ def make_loader(tmp_path, mode=SecurityMode.PERMISSIVE):
         sudo=SudoStub(),
         engine_token="token",
         integrity_errors=[],
+        plugin_manifest_path=str(tmp_path / "manifest.json"),
     )
     return loader, registry, plugin_errors
 

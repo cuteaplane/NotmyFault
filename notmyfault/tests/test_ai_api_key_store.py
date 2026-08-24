@@ -12,8 +12,6 @@ from notmyfault.security import api_key_store as store
 
 @pytest.fixture
 def fake_dpapi(monkeypatch):
-    """把 DPAPI 替换成 base64，密文不含明文，测试不依赖真实 Windows DPAPI。"""
-
     def protect(plaintext: bytes) -> bytes:
         return base64.b64encode(plaintext)
 
@@ -28,12 +26,14 @@ def fake_dpapi(monkeypatch):
 
 
 @pytest.fixture
-def isolated_store(tmp_path, monkeypatch):
-    """把密钥文件指到临时目录，并把 ACL 换成空操作。"""
-    path = tmp_path / ".ai_api_key"
-    monkeypatch.setattr(store, "_key_file_path", lambda: str(path))
+def key_file(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "_restrict_key_file", lambda candidate: None)
-    return path
+    return tmp_path / ".ai_api_key"
+
+
+@pytest.fixture
+def key_store(key_file):
+    return store.AIKeyStore(key_file)
 
 
 @pytest.fixture(autouse=True)
@@ -42,11 +42,14 @@ def dpapi_backend(monkeypatch):
 
 
 class TestSupportsPersistence:
-    def test_windows_is_supported(self, monkeypatch):
+    def test_windows_is_supported(self, tmp_path, monkeypatch):
         monkeypatch.setattr(store, "_is_windows", lambda: True)
-        assert store.supports_persistence() is True
+        key_store = store.AIKeyStore(tmp_path / ".ai_api_key")
+        assert key_store.supports_persistence() is True
 
-    def test_non_windows_without_secret_service_is_unsupported(self, monkeypatch):
+    def test_non_windows_without_secret_service_is_unsupported(
+        self, tmp_path, monkeypatch
+    ):
         monkeypatch.setattr(store, "_is_windows", lambda: False)
 
         @contextmanager
@@ -55,41 +58,40 @@ class TestSupportsPersistence:
             yield
 
         monkeypatch.setattr(store, "_secret_service_collection", unavailable)
-        assert store.supports_persistence() is False
+        key_store = store.AIKeyStore(tmp_path / ".ai_api_key")
+        assert key_store.supports_persistence() is False
 
 
 class TestSaveAndLoad:
-    def test_round_trip(self, isolated_store, fake_dpapi):
+    def test_round_trip(self, key_store, fake_dpapi):
         key = "sk-test-secret-12345"
-        store.save_api_key(key)
-        assert store.load_api_key() == key
+        key_store.save_api_key(key)
+        assert key_store.load_api_key() == key
 
-    def test_encrypted_at_rest_no_plaintext(self, isolated_store, fake_dpapi):
+    def test_encrypted_at_rest_no_plaintext(self, key_store, key_file, fake_dpapi):
         key = "sk-plaintext-must-not-leak"
-        store.save_api_key(key)
-        assert key.encode("utf-8") not in isolated_store.read_bytes()
+        key_store.save_api_key(key)
+        assert key.encode("utf-8") not in key_file.read_bytes()
 
-    def test_overwrite_replaces_previous(self, isolated_store, fake_dpapi):
-        store.save_api_key("first-key")
-        store.save_api_key("second-key")
-        assert store.load_api_key() == "second-key"
+    def test_overwrite_replaces_previous(self, key_store, fake_dpapi):
+        key_store.save_api_key("first-key")
+        key_store.save_api_key("second-key")
+        assert key_store.load_api_key() == "second-key"
 
     def test_leading_and_trailing_whitespace_is_removed(
-        self, isolated_store, fake_dpapi
+        self, key_store, fake_dpapi
     ):
-        store.save_api_key("  sk-test-secret  \r\n")
-        assert store.load_api_key() == "sk-test-secret"
+        key_store.save_api_key("  sk-test-secret  \r\n")
+        assert key_store.load_api_key() == "sk-test-secret"
 
-    def test_no_temp_file_residue(self, isolated_store, fake_dpapi, tmp_path):
-        store.save_api_key("secret")
+    def test_no_temp_file_residue(self, key_store, fake_dpapi, tmp_path):
+        key_store.save_api_key("secret")
         assert not list(tmp_path.glob("*.tmp"))
 
     def test_restrict_runs_on_empty_tmp_before_write(
         self, monkeypatch, tmp_path, fake_dpapi
     ):
-        monkeypatch.setattr(
-            store, "_key_file_path", lambda: str(tmp_path / ".ai_api_key")
-        )
+        key_store = store.AIKeyStore(tmp_path / ".ai_api_key")
         seen = []
 
         def restrict(candidate):
@@ -98,87 +100,90 @@ class TestSaveAndLoad:
             seen.append(candidate)
 
         monkeypatch.setattr(store, "_restrict_key_file", restrict)
-        store.save_api_key("secret")
+        key_store.save_api_key("secret")
         assert len(seen) == 1
 
 
 class TestAbsentAndCorrupt:
-    def test_load_absent_returns_none(self, isolated_store, fake_dpapi):
-        assert store.load_api_key() is None
+    def test_load_absent_returns_none(self, key_store, fake_dpapi):
+        assert key_store.load_api_key() is None
 
-    def test_status_absent(self, isolated_store, fake_dpapi):
-        assert store.api_key_status() is store.KeyStoreStatus.ABSENT
+    def test_status_absent(self, key_store, fake_dpapi):
+        assert key_store.api_key_status() is store.KeyStoreStatus.ABSENT
 
-    def test_load_corrupt_raises(self, isolated_store, fake_dpapi):
-        isolated_store.write_bytes(b"not-a-valid-encrypted-blob")
+    def test_load_corrupt_raises(self, key_store, key_file, fake_dpapi):
+        key_file.write_bytes(b"not-a-valid-encrypted-blob")
         with pytest.raises(store.KeyStoreDecryptError):
-            store.load_api_key()
+            key_store.load_api_key()
 
-    def test_status_corrupt(self, isolated_store, fake_dpapi):
-        isolated_store.write_bytes(b"garbage")
-        assert store.api_key_status() is store.KeyStoreStatus.CORRUPT
+    def test_status_corrupt(self, key_store, key_file, fake_dpapi):
+        key_file.write_bytes(b"garbage")
+        assert key_store.api_key_status() is store.KeyStoreStatus.CORRUPT
 
-    def test_status_stored(self, isolated_store, fake_dpapi):
-        store.save_api_key("secret")
-        assert store.api_key_status() is store.KeyStoreStatus.STORED
+    def test_status_stored(self, key_store, fake_dpapi):
+        key_store.save_api_key("secret")
+        assert key_store.api_key_status() is store.KeyStoreStatus.STORED
 
 
 class TestDelete:
-    def test_delete_is_idempotent_when_absent(self, isolated_store, fake_dpapi):
-        store.delete_api_key()
-        store.delete_api_key()
-        assert not isolated_store.exists()
+    def test_delete_is_idempotent_when_absent(self, key_store, key_file, fake_dpapi):
+        key_store.delete_api_key()
+        key_store.delete_api_key()
+        assert not key_file.exists()
 
-    def test_delete_removes_then_again(self, isolated_store, fake_dpapi):
-        store.save_api_key("secret")
-        assert isolated_store.exists()
-        store.delete_api_key()
-        assert not isolated_store.exists()
-        store.delete_api_key()
-        assert not isolated_store.exists()
-        assert store.load_api_key() is None
+    def test_delete_removes_then_again(self, key_store, key_file, fake_dpapi):
+        key_store.save_api_key("secret")
+        assert key_file.exists()
+        key_store.delete_api_key()
+        assert not key_file.exists()
+        key_store.delete_api_key()
+        assert not key_file.exists()
+        assert key_store.load_api_key() is None
 
 
 class TestInvalidKey:
-    def test_empty_key_rejected(self, isolated_store, fake_dpapi):
+    def test_empty_key_rejected(self, key_store, fake_dpapi):
         with pytest.raises(store.KeyStoreInvalidKeyError):
-            store.save_api_key("")
+            key_store.save_api_key("")
 
-    def test_whitespace_only_key_rejected(self, isolated_store, fake_dpapi):
+    def test_whitespace_only_key_rejected(self, key_store, fake_dpapi):
         with pytest.raises(store.KeyStoreInvalidKeyError):
-            store.save_api_key("   ")
+            key_store.save_api_key("   ")
 
-    def test_oversized_key_rejected(self, isolated_store, fake_dpapi):
+    def test_oversized_key_rejected(self, key_store, fake_dpapi):
         with pytest.raises(store.KeyStoreInvalidKeyError):
-            store.save_api_key("x" * (store._MAX_KEY_LENGTH + 1))
+            key_store.save_api_key("x" * (store._MAX_KEY_LENGTH + 1))
 
-    def test_max_length_key_accepted(self, isolated_store, fake_dpapi):
+    def test_max_length_key_accepted(self, key_store, fake_dpapi):
         key = "x" * store._MAX_KEY_LENGTH
-        store.save_api_key(key)
-        assert store.load_api_key() == key
+        key_store.save_api_key(key)
+        assert key_store.load_api_key() == key
 
 
 class TestUnsupportedPlatform:
-    def test_save_raises_unsupported(self, monkeypatch):
+    def test_save_raises_unsupported(self, tmp_path, monkeypatch):
         monkeypatch.setattr(store, "_is_windows", lambda: False)
         self._disable_secret_service(monkeypatch)
+        key_store = store.AIKeyStore(tmp_path / ".ai_api_key")
         with pytest.raises(store.KeyStoreUnsupportedError):
-            store.save_api_key("secret")
+            key_store.save_api_key("secret")
 
-    def test_load_returns_none_on_unsupported(self, monkeypatch):
+    def test_load_returns_none_on_unsupported(self, tmp_path, monkeypatch):
         monkeypatch.setattr(store, "_is_windows", lambda: False)
         self._disable_secret_service(monkeypatch)
-        assert store.load_api_key() is None
+        key_store = store.AIKeyStore(tmp_path / ".ai_api_key")
+        assert key_store.load_api_key() is None
 
-    def test_status_unsupported(self, monkeypatch):
+    def test_status_unsupported(self, tmp_path, monkeypatch):
         monkeypatch.setattr(store, "_is_windows", lambda: False)
         self._disable_secret_service(monkeypatch)
-        assert store.api_key_status() is store.KeyStoreStatus.UNSUPPORTED
+        key_store = store.AIKeyStore(tmp_path / ".ai_api_key")
+        assert key_store.api_key_status() is store.KeyStoreStatus.UNSUPPORTED
 
-    def test_delete_noop_on_unsupported(self, monkeypatch):
+    def test_delete_noop_on_unsupported(self, tmp_path, monkeypatch):
         monkeypatch.setattr(store, "_is_windows", lambda: False)
         self._disable_secret_service(monkeypatch)
-        store.delete_api_key()
+        store.AIKeyStore(tmp_path / ".ai_api_key").delete_api_key()
 
     @staticmethod
     def _disable_secret_service(monkeypatch):
@@ -194,24 +199,25 @@ class TestRealDpapi:
     @pytest.mark.skipif(os.name != "nt", reason="需要 Windows")
     def test_real_dpapi_round_trip(self, tmp_path, monkeypatch):
         path = tmp_path / ".ai_api_key"
-        monkeypatch.setattr(store, "_key_file_path", lambda: str(path))
+        key_store = store.AIKeyStore(path)
         key = "sk-real-dpapi-round-trip"
-        store.save_api_key(key)
-        assert store.load_api_key() == key
+        key_store.save_api_key(key)
+        assert key_store.load_api_key() == key
         assert key.encode("utf-8") not in path.read_bytes()
-        store.delete_api_key()
+        key_store.delete_api_key()
         assert not path.exists()
 
 
 class TestSecretService:
-    def test_round_trip_replaces_item_and_keeps_attributes(self, monkeypatch):
+    def test_round_trip_replaces_item_and_keeps_attributes(self, tmp_path, monkeypatch):
         collection = FakeSecretCollection()
         self._use_collection(monkeypatch, collection)
+        key_store = store.AIKeyStore(tmp_path / ".ai_api_key")
 
-        store.save_api_key("  sk-linux-secret  ")
-        store.save_api_key("sk-linux-secret-2")
+        key_store.save_api_key("  sk-linux-secret  ")
+        key_store.save_api_key("sk-linux-secret-2")
 
-        assert store.load_api_key() == "sk-linux-secret-2"
+        assert key_store.load_api_key() == "sk-linux-secret-2"
         assert collection.labels == [
             "NotmyFault AI API Key",
             "NotmyFault AI API Key",
@@ -225,35 +231,38 @@ class TestSecretService:
             b"sk-linux-secret-2",
         ]
 
-    def test_absent_and_delete_are_idempotent(self, monkeypatch):
+    def test_absent_and_delete_are_idempotent(self, tmp_path, monkeypatch):
         collection = FakeSecretCollection()
         self._use_collection(monkeypatch, collection)
+        key_store = store.AIKeyStore(tmp_path / ".ai_api_key")
 
-        assert store.api_key_status() is store.KeyStoreStatus.ABSENT
-        assert store.load_api_key() is None
-        store.delete_api_key()
+        assert key_store.api_key_status() is store.KeyStoreStatus.ABSENT
+        assert key_store.load_api_key() is None
+        key_store.delete_api_key()
 
-        store.save_api_key("sk-to-delete")
+        key_store.save_api_key("sk-to-delete")
         item = collection.item
-        store.delete_api_key()
+        key_store.delete_api_key()
         assert item.deleted is True
-        assert store.api_key_status() is store.KeyStoreStatus.ABSENT
+        assert key_store.api_key_status() is store.KeyStoreStatus.ABSENT
 
-    def test_locked_item_reports_stored_and_load_unlocks(self, monkeypatch):
+    def test_locked_item_reports_stored_and_load_unlocks(self, tmp_path, monkeypatch):
         collection = FakeSecretCollection()
         collection.item = FakeSecretItem(b"sk-locked", locked=True)
         self._use_collection(monkeypatch, collection)
+        key_store = store.AIKeyStore(tmp_path / ".ai_api_key")
 
-        assert store.api_key_status() is store.KeyStoreStatus.STORED
-        assert store.load_api_key() == "sk-locked"
+        assert key_store.api_key_status() is store.KeyStoreStatus.STORED
+        assert key_store.load_api_key() == "sk-locked"
         assert collection.item.unlock_calls == 1
 
-    def test_invalid_key_is_rejected_before_keyring_write(self, monkeypatch):
+    def test_invalid_key_is_rejected_before_keyring_write(self, tmp_path, monkeypatch):
         collection = FakeSecretCollection()
         self._use_collection(monkeypatch, collection)
+        key_store = store.AIKeyStore(tmp_path / ".ai_api_key")
 
         with pytest.raises(store.KeyStoreInvalidKeyError):
-            store.save_api_key("   ")
+            key_store.save_api_key("   ")
         assert collection.item is None
 
     @staticmethod

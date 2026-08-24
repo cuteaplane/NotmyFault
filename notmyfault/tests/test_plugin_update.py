@@ -1,192 +1,333 @@
-"""插件安装的更新语义：分类、diff、备份和回滚"""
+from __future__ import annotations
 
 import json
-import shutil
+import sys
+import types
+from pathlib import Path
 
-from fastapi.testclient import TestClient
+import pytest
 
-from notmyfault.tests.test_api_plugins import (
-    FakeRunner,
-    build_nmfp,
-    install_file,
-    make_meta,
-    upload_preview,
+from notmyfault.host.api.plugin_installation import (
+    PendingPreviewStore,
+    PluginFileSystem,
 )
+from notmyfault.host.api.services.plugin_catalog import PluginCatalogService
+from notmyfault.host.api.services.plugin_installation import (
+    PluginInstallationError,
+    PluginInstallationService,
+)
+from notmyfault.host.plugin_registry import PluginRegistryClient
+from notmyfault.tests.api_support import make_api_env
+from notmyfault.tests.api_support import make_paths, make_store
+from notmyfault.tests.test_api_plugins import build_nmfp, make_meta, post_archive
 
 
-def make_env(tmp_path, monkeypatch):
-    import notmyfault.config as config_mod
-    from notmyfault.host import api_server
-    from notmyfault.host.api_server import EngineAPI
+def test_preview_rejects_directory_tampering_and_deletes_temporary_tree(tmp_path):
+    previews = PendingPreviewStore()
+    env = make_api_env(tmp_path, pending_previews=previews)
+    archive = build_nmfp(tmp_path, make_meta("actions"), "actions", "tamper")
+    preview = post_archive(env, "/api/plugins/preview", archive).json()
+    token = preview["preview_token"]
+    extract_dir = previews[token]["extract_dir"]
+    root_path = previews[token]["root_path"]
+    with open(f"{root_path}/action.py", "a", encoding="utf-8") as file:
+        file.write("\nprint('changed')\n")
+    response = env.client.post(
+        "/api/plugins/install",
+        data={"preview_token": token},
+        headers=env.headers,
+    )
+    assert response.status_code == 409
+    assert token not in previews
+    assert not Path(extract_dir).exists()
 
-    config_file = str(tmp_path / "config.json")
-    monkeypatch.setattr(api_server, "CONFIG_FILE", config_file)
-    monkeypatch.setattr(config_mod, "CONFIG_FILE", config_file)
-    monkeypatch.setattr(api_server, "API_TOKEN_FILE", str(tmp_path / ".api_token"))
-    monkeypatch.setattr(api_server, "_PRIVATE_DIR", tmp_path / "private")
-    api = EngineAPI(FakeRunner())
-    user_dir = tmp_path / "user_plugins"
-    api._get_user_plugins_dir = lambda: str(user_dir)
-    client = TestClient(api.app)
-    headers = {"Authorization": f"Bearer {api_server.API_TOKEN}"}
-    return api, client, headers, user_dir
+
+def test_expired_preview_cannot_be_used(tmp_path):
+    now = [100.0]
+    previews = PendingPreviewStore(clock=lambda: now[0], ttl_seconds=1800)
+    env = make_api_env(tmp_path, pending_previews=previews)
+    archive = build_nmfp(tmp_path, make_meta("actions"), "actions", "expire")
+    token = post_archive(env, "/api/plugins/preview", archive).json()[
+        "preview_token"
+    ]
+    now[0] += 1801
+    response = env.client.post(
+        "/api/plugins/install",
+        data={"preview_token": token},
+        headers=env.headers,
+    )
+    assert response.status_code == 400
+    assert token not in previews
 
 
-def action_meta(**overrides):
+def test_changed_package_id_is_backed_up_and_uninstall_removes_backup(tmp_path):
+    env = make_api_env(tmp_path)
+    first = build_nmfp(tmp_path, make_meta("actions"), "actions", "old")
+    assert post_archive(env, "/api/plugins/install", first).status_code == 200
+    second = build_nmfp(
+        tmp_path,
+        make_meta("actions", id="new_id", version_code=2),
+        "actions",
+        "new",
+    )
+    assert post_archive(env, "/api/plugins/install", second).status_code == 200
+    backup = env.paths.user_plugins_dir / "actions" / "demo_actions.nmf-backup"
+    assert backup.is_dir()
+    response = env.client.delete(
+        "/api/plugins/actions/new_id", headers=env.headers
+    )
+    assert response.json()["ok"] is True
+    assert not backup.exists()
+
+
+def test_update_after_id_change_keeps_only_latest_backup(tmp_path):
+    env = make_api_env(tmp_path)
+    first = build_nmfp(tmp_path, make_meta("actions"), "actions", "first-id")
+    assert post_archive(env, "/api/plugins/install", first).status_code == 200
+    renamed_meta = make_meta("actions", id="new_id", version_code=2)
+    second = build_nmfp(tmp_path, renamed_meta, "actions", "second-id")
+    assert post_archive(env, "/api/plugins/install", second).status_code == 200
+    third = build_nmfp(
+        tmp_path,
+        make_meta("actions", id="new_id", version_code=3),
+        "actions",
+        "third-id",
+    )
+
+    assert post_archive(env, "/api/plugins/install", third).status_code == 200
+
+    action_root = env.paths.user_plugins_dir / "actions"
+    backups = sorted(action_root.glob("*.nmf-backup"))
+    assert [path.name for path in backups] == ["new_id.nmf-backup"]
+    backup_meta = json.loads(
+        (backups[0] / "action.json").read_text(encoding="utf-8")
+    )
+    assert backup_meta["version_code"] == 2
+
+
+def test_preview_reports_permission_and_version_differences(tmp_path):
+    env = make_api_env(tmp_path)
+    first = build_nmfp(
+        tmp_path,
+        make_meta("actions", permissions=[]),
+        "actions",
+        "base",
+    )
+    assert post_archive(env, "/api/plugins/install", first).status_code == 200
+    update = build_nmfp(
+        tmp_path,
+        make_meta("actions", version_code=2, permissions=["network"]),
+        "actions",
+        "update",
+    )
+    preview = post_archive(env, "/api/plugins/preview", update).json()
+    assert preview["update_diff"]["update"]["kind"] == "upgrade"
+    assert preview["update_diff"]["permission_diff"]["added"] == ["network"]
+
+
+def test_build_output_with_new_risk_keeps_installed_version(tmp_path):
+    env = make_api_env(tmp_path)
+
+    def build_hook(root_path, meta):
+        if meta.get("version_code") == 2:
+            (root_path / "generated.py").write_text(
+                "import subprocess\nsubprocess.run(['generated-tool'])\n",
+                encoding="utf-8",
+            )
+
+    service = PluginInstallationService(
+        env.paths,
+        env.store,
+        PluginCatalogService(env.paths, env.store, env.runner),
+        PluginFileSystem(),
+        PendingPreviewStore(),
+        PluginRegistryClient(),
+        build_hook=build_hook,
+    )
+    base = build_nmfp(tmp_path, make_meta("actions"), "actions", "build-base")
+    assert service.install(base.read_bytes())["ok"] is True
+
+    update = build_nmfp(
+        tmp_path,
+        make_meta("actions", version_code=2),
+        "actions",
+        "build-update",
+    )
+    preview = service.preview(update.read_bytes())
+    with pytest.raises(PluginInstallationError) as excinfo:
+        service.install(None, preview_token=preview["preview_token"])
+
+    assert excinfo.value.status_code == 400
+    assert "构建产物引入了新的风险" in excinfo.value.body["error"]
+    manifest_path = (
+        env.paths.user_plugins_dir / "actions" / "demo_actions" / "action.json"
+    )
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["version_code"] == 1
+
+
+def _write_action(
+    path: Path,
+    plugin_id: str,
+    version_code: int,
+    source: str,
+) -> None:
+    path.mkdir(parents=True)
     meta = make_meta(
         "actions",
-        id="update_demo",
-        package_name="com.test.update_demo",
-        permissions=["notification"],
+        id=plugin_id,
+        package_name="com.test.restart_restore",
+        version_code=version_code,
+        version=f"{version_code}.0",
     )
-    meta.update(overrides)
-    return meta
+    (path / "action.json").write_text(
+        json.dumps(meta, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (path / "action.py").write_text(source, encoding="utf-8")
 
 
-class TestClassify:
-    def test_new_install(self, tmp_path, monkeypatch):
-        api, client, headers, _ = make_env(tmp_path, monkeypatch)
-        result = api._classify_update(action_meta())
-        assert result["kind"] == "new"
+def _prepare_engine_recovery(monkeypatch, tmp_path):
+    from notmyfault.host import app
+    from notmyfault.security.security import SecurityMode
 
-    def test_upgrade_and_downgrade_and_reinstall(self, tmp_path, monkeypatch):
-        api, client, headers, user_dir = make_env(tmp_path, monkeypatch)
-        v1 = build_nmfp(tmp_path, action_meta(version_code=1), "actions", tag="v1")
-        assert install_file(client, headers, v1).json()["ok"] is True
-
-        assert api._classify_update(action_meta(version_code=2))["kind"] == "upgrade"
-        assert api._classify_update(action_meta(version_code=1))["kind"] == "reinstall"
-        assert api._classify_update(action_meta(version_code=0))["kind"] == "downgrade"
-
-    def test_identity_uses_package_name_not_folder(self, tmp_path, monkeypatch):
-        # 目录名变了还是同一个包，按 package_name 认出来
-        api, client, headers, user_dir = make_env(tmp_path, monkeypatch)
-        v1 = build_nmfp(tmp_path, action_meta(version_code=1), "actions", tag="a1")
-        assert install_file(client, headers, v1).json()["ok"] is True
-
-        renamed = action_meta(version_code=2, id="update_demo_renamed")
-        v2 = build_nmfp(tmp_path, renamed, "actions", tag="a2")
-        result = api._classify_update(renamed)
-        assert result["kind"] == "upgrade"
-        assert result["installed_id"] == "update_demo"
+    paths = make_paths(tmp_path)
+    store = make_store(paths)
+    monkeypatch.setattr(app, "_ensure_first_run_build", lambda: None)
+    monkeypatch.setattr(
+        app,
+        "_get_plugin_paths",
+        lambda _store: [(str(paths.user_plugins_dir), "user")],
+    )
+    monkeypatch.setattr(
+        "notmyfault.core.engine._detect_security_mode",
+        lambda: SecurityMode.PERMISSIVE,
+    )
+    alerts = []
+    alert_module = types.ModuleType("notmyfault.host.alert")
+    alert_module.alert_user = lambda *args, **kwargs: alerts.append((args, kwargs))
+    monkeypatch.setitem(sys.modules, "notmyfault.host.alert", alert_module)
+    return app, paths, store, alerts
 
 
-class TestPreviewDiff:
-    def test_preview_diff_permissions_and_capabilities(self, tmp_path, monkeypatch):
-        api, client, headers, _ = make_env(tmp_path, monkeypatch)
-        v1 = build_nmfp(
-            tmp_path,
-            action_meta(
-                version_code=1,
-                permissions=["notification", "filesystem"],
-                requires_capabilities=["clipboard.read"],
-            ),
-            "actions",
-            tag="d1",
+def test_engine_start_restores_backup_when_updated_plugin_cannot_import(
+    monkeypatch,
+    tmp_path,
+):
+    app, paths, store, alerts = _prepare_engine_recovery(monkeypatch, tmp_path)
+    action_root = paths.user_plugins_dir / "actions"
+    old_backup = action_root / "old_id.nmf-backup"
+    new_plugin = action_root / "new_id"
+    _write_action(
+        old_backup,
+        "old_id",
+        1,
+        "def run(meta, params):\n    return {'version': 1}\n",
+    )
+    _write_action(
+        new_plugin,
+        "new_id",
+        2,
+        "raise RuntimeError('broken update')\n",
+    )
+    events = []
+
+    engine = app.create_engine(
+        store,
+        on_event=lambda event_type, data: events.append((event_type, data)),
+    )
+    try:
+        restored = action_root / "old_id"
+        assert restored.is_dir()
+        assert not old_backup.exists()
+        assert not new_plugin.exists()
+        restored_meta = json.loads(
+            (restored / "action.json").read_text(encoding="utf-8")
         )
-        assert install_file(client, headers, v1).json()["ok"] is True
-
-        v2 = build_nmfp(
-            tmp_path,
-            action_meta(
-                version_code=2,
-                permissions=["notification", "process"],
-                requires_capabilities=["clipboard.read", "display.brightness"],
-            ),
-            "actions",
-            tag="d2",
-        )
-        response = upload_preview(client, headers, v2)
-        body = response.json()
-        assert body["ok"] is True
-        diff = body["update_diff"]
-        assert diff["update"]["kind"] == "upgrade"
-        assert diff["permission_diff"] == {"added": ["process"], "removed": ["filesystem"]}
-        assert diff["capability_diff"] == {
-            "added": ["display.brightness"],
-            "removed": [],
-        }
-        assert diff["signature_identity_changed"] is False
-
-    def test_preview_flags_signature_identity_change(self, tmp_path, monkeypatch):
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-        from notmyfault.security.signing import self_sign_plugin
-
-        api, client, headers, _ = make_env(tmp_path, monkeypatch)
-        # 官方签名装 v1，作者自签的 v2 进来时签名身份要标出来
-        v1 = build_nmfp(tmp_path, action_meta(version_code=1), "actions", tag="s1")
-        assert install_file(client, headers, v1).json()["ok"] is True
-
-        v2 = build_nmfp(
-            tmp_path, action_meta(version_code=2), "actions", tag="s2", sign=True
-        )
-        body = upload_preview(client, headers, v2).json()
-        assert body["update_diff"]["signature_identity_changed"] is True
+        assert restored_meta["version_code"] == 1
+        assert engine.actions_funcs["old_id"]({}, {}) == {"version": 1}
+        assert events == [
+            (
+                "plugin_update_rolled_back",
+                {
+                    "plugins": [
+                        {
+                            "id": "old_id",
+                            "package_name": "com.test.restart_restore",
+                            "version_code": 1,
+                        }
+                    ]
+                },
+            )
+        ]
+        assert len(alerts) == 1
+    finally:
+        engine.shutdown()
 
 
-class TestBackupAndRollback:
-    def test_successful_update_keeps_one_backup(self, tmp_path, monkeypatch):
-        api, client, headers, user_dir = make_env(tmp_path, monkeypatch)
-        v1 = build_nmfp(tmp_path, action_meta(version_code=1), "actions", tag="b1")
-        assert install_file(client, headers, v1).json()["ok"] is True
+def test_engine_start_keeps_loadable_update_and_backup(monkeypatch, tmp_path):
+    app, paths, store, alerts = _prepare_engine_recovery(monkeypatch, tmp_path)
+    action_root = paths.user_plugins_dir / "actions"
+    backup = action_root / "demo.nmf-backup"
+    current = action_root / "demo"
+    _write_action(
+        backup,
+        "demo",
+        1,
+        "def run(meta, params):\n    return {'version': 1}\n",
+    )
+    _write_action(
+        current,
+        "demo",
+        2,
+        "def run(meta, params):\n    return {'version': 2}\n",
+    )
+    events = []
 
-        v2 = build_nmfp(tmp_path, action_meta(version_code=2), "actions", tag="b2")
-        result = install_file(client, headers, v2).json()
-        assert result["ok"] is True
-        assert result["backup_kept"] is True
-
-        backup = user_dir / "actions" / "update_demo.nmf-backup"
+    engine = app.create_engine(
+        store,
+        on_event=lambda event_type, data: events.append((event_type, data)),
+    )
+    try:
+        assert current.is_dir()
         assert backup.is_dir()
-        backup_meta = json.loads((backup / "action.json").read_text(encoding="utf-8"))
-        assert backup_meta["version_code"] == 1
-
-        # 再装一版，备份只剩最近一份（v2）
-        v3 = build_nmfp(tmp_path, action_meta(version_code=3), "actions", tag="b3")
-        assert install_file(client, headers, v3).json()["ok"] is True
-        backup_meta = json.loads((backup / "action.json").read_text(encoding="utf-8"))
-        assert backup_meta["version_code"] == 2
-
-    def test_rollback_on_written_manifest_corruption(self, tmp_path, monkeypatch):
-        api, client, headers, user_dir = make_env(tmp_path, monkeypatch)
-        v1 = build_nmfp(tmp_path, action_meta(version_code=1), "actions", tag="r1")
-        assert install_file(client, headers, v1).json()["ok"] is True
-
-        # 直接把备份还原逻辑对上：写坏的目标目录在落盘校验时会被回滚
-        plugin_dir = user_dir / "actions" / "update_demo"
-        backup = api._backup_plugin(str(user_dir), "actions", "update_demo")
-        assert backup is not None
-        # 模拟 copytree 装了一半失败后的状态
-        plugin_dir.mkdir(parents=True, exist_ok=True)
-        (plugin_dir / "action.json").write_text("{broken", encoding="utf-8")
-        api._rollback_plugin([backup])
-        restored = json.loads((plugin_dir / "action.json").read_text(encoding="utf-8"))
-        assert restored["version_code"] == 1
-        assert not (user_dir / "actions" / "update_demo.nmf-backup").exists()
-
-    def test_scan_ignores_backup_directories(self, tmp_path, monkeypatch):
-        api, client, headers, user_dir = make_env(tmp_path, monkeypatch)
-        v1 = build_nmfp(tmp_path, action_meta(version_code=1), "actions", tag="i1")
-        assert install_file(client, headers, v1).json()["ok"] is True
-        v2 = build_nmfp(tmp_path, action_meta(version_code=2), "actions", tag="i2")
-        assert install_file(client, headers, v2).json()["ok"] is True
-
-        from notmyfault.security.plugin_schema import scan_plugins
-
-        found = scan_plugins(str(user_dir), "actions", "action.json")
-        assert "update_demo" in found
-        assert not any(pid.endswith("nmf-backup") for pid in found)
-
-        # 分类也认的是主目录，不会把备份当已安装版本
-        assert api._classify_update(action_meta(version_code=3))["kind"] == "upgrade"
+        assert engine.actions_funcs["demo"]({}, {}) == {"version": 2}
+        assert events == []
+        assert alerts == []
+    finally:
+        engine.shutdown()
 
 
-class TestBuildHookGate:
-    def test_install_reports_backup_kept_field(self, tmp_path, monkeypatch):
-        api, client, headers, user_dir = make_env(tmp_path, monkeypatch)
-        v1 = build_nmfp(tmp_path, action_meta(version_code=1), "actions", tag="k1")
-        assert install_file(client, headers, v1).json()["ok"] is True
-        v2 = build_nmfp(tmp_path, action_meta(version_code=2), "actions", tag="k2")
-        body = install_file(client, headers, v2).json()
-        assert body["ok"] is True
-        assert body["backup_kept"] is True
+def test_engine_start_does_not_check_disabled_update(monkeypatch, tmp_path):
+    app, paths, store, alerts = _prepare_engine_recovery(monkeypatch, tmp_path)
+    config = store.load_config()
+    config["disabled_plugins"] = {"triggers": [], "actions": ["demo"]}
+    assert store.save_config(config)
+    action_root = paths.user_plugins_dir / "actions"
+    backup = action_root / "demo.nmf-backup"
+    current = action_root / "demo"
+    _write_action(
+        backup,
+        "demo",
+        1,
+        "def run(meta, params):\n    return {'version': 1}\n",
+    )
+    _write_action(
+        current,
+        "demo",
+        2,
+        "raise RuntimeError('disabled update')\n",
+    )
+    events = []
+
+    engine = app.create_engine(
+        store,
+        on_event=lambda event_type, data: events.append((event_type, data)),
+    )
+    try:
+        assert current.is_dir()
+        assert backup.is_dir()
+        assert "demo" not in engine.actions_funcs
+        assert events == []
+        assert alerts == []
+    finally:
+        engine.shutdown()

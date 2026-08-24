@@ -203,6 +203,18 @@ class TestValidatePluginMetaPermissions:
         assert ok is False
         assert "cancellation_api 目前仅支持 runtime-v1" in errors
 
+    def test_isolated_action_rejects_runtime_cancellation(self):
+        ok, errors = validate_plugin_meta(
+            make_meta(
+                execution_mode="isolated",
+                execution_api="context-v1",
+                cancellation_api="runtime-v1",
+            ),
+            "action",
+        )
+        assert ok is False
+        assert "isolated 动作暂不支持 cancellation_api" in errors
+
     def test_action_idempotent_flag_is_boolean(self):
         ok, errors = validate_plugin_meta(make_meta(idempotent=True), "action")
         assert ok is True

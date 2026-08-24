@@ -4,6 +4,7 @@ from notmyfault.core.bindings import (
     iter_legacy_event_payload_paths,
     references_available,
     resolve_value,
+    unavailable_references,
 )
 
 
@@ -53,6 +54,18 @@ class StructuredBindingTests:
         assert not references_available(
             self._ref("step", "s1", ["url"]), context
         )
+
+    def test_unavailable_references_keep_parameter_location_and_source(self):
+        value = {
+            "message": self._ref("trigger", "t_usb", ["drive"]),
+            "url": self._ref("step", "s1", ["url"]),
+        }
+        missing = unavailable_references(value, {"triggers": {}, "steps": {}})
+
+        assert [(item.location, item.reference["node"]) for item in missing] == [
+            ("$.message", "t_usb"),
+            ("$.url", "s1"),
+        ]
 
     def test_reference_availability_only_checks_source_participation(self):
         # 来源参与了运行即算可用，具体路径存不存在留到运行时报错

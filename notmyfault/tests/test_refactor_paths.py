@@ -7,8 +7,11 @@ import pytest
 
 import notmyfault
 from notmyfault.host import alert
+from notmyfault.application_paths import ApplicationPaths
+from notmyfault.platform.platform_support import get_config_dir
 from notmyfault.security import security as security_mod
 from notmyfault.security import signing
+from notmyfault.security import signing_keys
 
 
 def test_package_and_project_roots_survive_subpackage_moves():
@@ -26,6 +29,20 @@ def test_signing_uses_project_private_directory():
     assert signing.PRIVATE_KEY_FILE == (
         security_mod._PROJECT_ROOT / ".private" / "signing_private_key.pem"
     )
+
+
+def test_application_paths_keep_existing_physical_locations():
+    paths = ApplicationPaths.default()
+    config_dir = Path(get_config_dir())
+    assert paths.config_file == config_dir / "config.json"
+    assert paths.rules_file == config_dir / "rules.json"
+    assert paths.config_secret_file == config_dir / ".config_secret"
+    assert paths.api_token_file == config_dir / ".api_token"
+    assert paths.ai_api_key_file == config_dir / ".ai_api_key"
+    assert paths.logs_dir == config_dir / "logs"
+    assert paths.user_plugins_dir == config_dir / "plugins"
+    assert paths.plugin_private_key_file == signing.PRIVATE_KEY_FILE
+    assert paths.plugin_public_key_file == Path(signing_keys._USER_PUBLIC_KEY_PATH)
 
 
 def test_source_dashboard_entry_is_resolved_from_project_root():

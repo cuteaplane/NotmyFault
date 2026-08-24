@@ -320,20 +320,21 @@ class TestSignatureKindFromPayload:
 
 
 class TestIntegrityFromHashes:
-    def test_parity_with_path_api(self, tmp_path, monkeypatch):
+    def test_parity_with_path_api(self, tmp_path):
         manifest_path = tmp_path / "config" / "plugin_manifest.json"
-        monkeypatch.setattr(
-            security_plugins, "_PLUGIN_MANIFEST_FILE", str(manifest_path)
-        )
         plugin_dir = tmp_path / "plugin"
         plugin_dir.mkdir()
         (plugin_dir / "action.json").write_text("{}", encoding="utf-8")
         (plugin_dir / "action.py").write_text("def run(): pass\n", encoding="utf-8")
         files = [(p.name, str(p)) for p in sorted(plugin_dir.iterdir()) if p.is_file()]
 
-        ok_path, msg_path = verify_plugin_integrity("demo", files)
+        ok_path, msg_path = verify_plugin_integrity(
+            "demo", files, manifest_path
+        )
         hashes = {name: compute_file_hash(path) for name, path in files}
-        ok_hashes, msg_hashes = verify_plugin_integrity_from_hashes("demo", hashes)
+        ok_hashes, msg_hashes = verify_plugin_integrity_from_hashes(
+            "demo", hashes, manifest_path
+        )
         assert ok_path is ok_hashes is True
         assert msg_path == msg_hashes == "完整性校验通过"
 
@@ -341,9 +342,13 @@ class TestIntegrityFromHashes:
         (plugin_dir / "action.py").write_text(
             "def run():\n    return 1\n", encoding="utf-8"
         )
-        ok_path, msg_path = verify_plugin_integrity("demo", files)
+        ok_path, msg_path = verify_plugin_integrity(
+            "demo", files, manifest_path
+        )
         hashes = {name: compute_file_hash(path) for name, path in files}
-        ok_hashes, msg_hashes = verify_plugin_integrity_from_hashes("demo", hashes)
+        ok_hashes, msg_hashes = verify_plugin_integrity_from_hashes(
+            "demo", hashes, manifest_path
+        )
         assert ok_path is ok_hashes is False
         assert msg_path == msg_hashes
         assert "action.py 文件已被修改" in msg_hashes

@@ -20,6 +20,7 @@ def test_run_history_builds_completed_run_with_steps(tmp_path):
             rule_name="测试规则",
             event_type="manual",
             action_count=2,
+            precondition_count=1,
             event_payload={"secret": "不能落盘"},
         )
     )
@@ -81,6 +82,7 @@ def test_run_history_builds_completed_run_with_steps(tmp_path):
 
     assert run["status"] == "succeeded"
     assert run["duration_ms"] == 500
+    assert run["precondition_count"] == 1
     assert [step["status"] for step in run["steps"]] == ["succeeded", "skipped"]
     assert run["steps"][0]["duration_ms"] == 180
     assert run["steps"][0]["input_summary"][0]["display"] == "文本 · 4 字符"

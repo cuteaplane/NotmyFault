@@ -7,6 +7,7 @@
 from notmyfault.core import engine
 from notmyfault.core.engine import AutomationEngine
 from notmyfault.security import plugin_loader
+from notmyfault.tests.api_support import create_test_engine
 
 # 旧代码 from notmyfault.core.engine import ... 在用这些名字
 _PLUGIN_LOADER_COMPAT_EXPORTS = [
@@ -72,8 +73,8 @@ def test_engine_reexports_plugin_loader_names():
         assert getattr(engine, name) is getattr(plugin_loader, name), name
 
 
-def test_engine_module_has_rules_file():
-    assert hasattr(engine, "RULES_FILE")
+def test_engine_module_has_no_rules_path_global():
+    assert not hasattr(engine, "RULES_FILE")
 
 
 def test_automation_engine_class_methods():
@@ -82,7 +83,7 @@ def test_automation_engine_class_methods():
 
 
 def test_automation_engine_instance_attrs():
-    instance = AutomationEngine({"rules": []})
+    instance = create_test_engine({"rules": []})
     instance._alert_user = lambda *a, **k: None
     for name in _INSTANCE_ATTRS:
         assert hasattr(instance, name), name

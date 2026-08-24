@@ -14,23 +14,19 @@ def _files(plugin_dir: Path) -> list[tuple[str, str]]:
     ]
 
 
-def _set_manifest_path(tmp_path, monkeypatch) -> Path:
-    manifest_path = tmp_path / "config" / "plugin_manifest.json"
-    monkeypatch.setattr(
-        security_plugins, "_PLUGIN_MANIFEST_FILE", str(manifest_path)
-    )
-    return manifest_path
+def _manifest_path(tmp_path) -> Path:
+    return tmp_path / "config" / "plugin_manifest.json"
 
 
-def test_first_check_records_all_files(tmp_path, monkeypatch):
-    manifest_path = _set_manifest_path(tmp_path, monkeypatch)
+def test_first_check_records_all_files(tmp_path):
+    manifest_path = _manifest_path(tmp_path)
     plugin_dir = tmp_path / "plugin"
     plugin_dir.mkdir()
     (plugin_dir / "action.json").write_text("{}", encoding="utf-8")
     (plugin_dir / "action.py").write_text("def run(): pass\n", encoding="utf-8")
 
     ok, message = security_plugins.verify_plugin_integrity(
-        "demo", _files(plugin_dir)
+        "demo", _files(plugin_dir), manifest_path
     )
 
     assert ok is True
@@ -39,18 +35,20 @@ def test_first_check_records_all_files(tmp_path, monkeypatch):
     assert set(manifest["demo"]) == {"action.json", "action.py"}
 
 
-def test_changed_file_keeps_original_manifest(tmp_path, monkeypatch):
-    manifest_path = _set_manifest_path(tmp_path, monkeypatch)
+def test_changed_file_keeps_original_manifest(tmp_path):
+    manifest_path = _manifest_path(tmp_path)
     plugin_dir = tmp_path / "plugin"
     plugin_dir.mkdir()
     action_path = plugin_dir / "action.py"
     action_path.write_text("old\n", encoding="utf-8")
-    security_plugins.verify_plugin_integrity("demo", _files(plugin_dir))
+    security_plugins.verify_plugin_integrity(
+        "demo", _files(plugin_dir), manifest_path
+    )
     original = manifest_path.read_bytes()
 
     action_path.write_text("new\n", encoding="utf-8")
     ok, message = security_plugins.verify_plugin_integrity(
-        "demo", _files(plugin_dir)
+        "demo", _files(plugin_dir), manifest_path
     )
 
     assert ok is False
@@ -58,17 +56,19 @@ def test_changed_file_keeps_original_manifest(tmp_path, monkeypatch):
     assert manifest_path.read_bytes() == original
 
 
-def test_added_file_is_reported_and_not_recorded(tmp_path, monkeypatch):
-    manifest_path = _set_manifest_path(tmp_path, monkeypatch)
+def test_added_file_is_reported_and_not_recorded(tmp_path):
+    manifest_path = _manifest_path(tmp_path)
     plugin_dir = tmp_path / "plugin"
     plugin_dir.mkdir()
     (plugin_dir / "action.py").write_text("old\n", encoding="utf-8")
-    security_plugins.verify_plugin_integrity("demo", _files(plugin_dir))
+    security_plugins.verify_plugin_integrity(
+        "demo", _files(plugin_dir), manifest_path
+    )
     original = manifest_path.read_bytes()
 
     (plugin_dir / "helper.py").write_text("value = 1\n", encoding="utf-8")
     ok, message = security_plugins.verify_plugin_integrity(
-        "demo", _files(plugin_dir)
+        "demo", _files(plugin_dir), manifest_path
     )
 
     assert ok is False
@@ -76,20 +76,22 @@ def test_added_file_is_reported_and_not_recorded(tmp_path, monkeypatch):
     assert manifest_path.read_bytes() == original
 
 
-def test_deleted_file_is_reported_and_manifest_is_kept(tmp_path, monkeypatch):
-    manifest_path = _set_manifest_path(tmp_path, monkeypatch)
+def test_deleted_file_is_reported_and_manifest_is_kept(tmp_path):
+    manifest_path = _manifest_path(tmp_path)
     plugin_dir = tmp_path / "plugin"
     plugin_dir.mkdir()
     action_path = plugin_dir / "action.py"
     helper_path = plugin_dir / "helper.py"
     action_path.write_text("old\n", encoding="utf-8")
     helper_path.write_text("value = 1\n", encoding="utf-8")
-    security_plugins.verify_plugin_integrity("demo", _files(plugin_dir))
+    security_plugins.verify_plugin_integrity(
+        "demo", _files(plugin_dir), manifest_path
+    )
     original = manifest_path.read_bytes()
 
     helper_path.unlink()
     ok, message = security_plugins.verify_plugin_integrity(
-        "demo", _files(plugin_dir)
+        "demo", _files(plugin_dir), manifest_path
     )
 
     assert ok is False
@@ -98,7 +100,7 @@ def test_deleted_file_is_reported_and_manifest_is_kept(tmp_path, monkeypatch):
 
 
 def test_replace_failure_keeps_old_manifest(tmp_path, monkeypatch):
-    manifest_path = _set_manifest_path(tmp_path, monkeypatch)
+    manifest_path = _manifest_path(tmp_path)
     manifest_path.parent.mkdir(parents=True)
     manifest_path.write_text('{"old": {}}', encoding="utf-8")
     monkeypatch.setattr(
@@ -107,7 +109,7 @@ def test_replace_failure_keeps_old_manifest(tmp_path, monkeypatch):
         lambda source, target: (_ for _ in ()).throw(OSError("busy")),
     )
 
-    saved = security_plugins.save_plugin_manifest({"new": {}})
+    saved = security_plugins.save_plugin_manifest({"new": {}}, manifest_path)
 
     assert saved is False
     assert json.loads(manifest_path.read_text(encoding="utf-8")) == {"old": {}}
@@ -115,14 +117,18 @@ def test_replace_failure_keeps_old_manifest(tmp_path, monkeypatch):
 
 
 def test_first_check_reports_manifest_write_failure(tmp_path, monkeypatch):
-    _set_manifest_path(tmp_path, monkeypatch)
+    manifest_path = _manifest_path(tmp_path)
     plugin_dir = tmp_path / "plugin"
     plugin_dir.mkdir()
     (plugin_dir / "action.py").write_text("value = 1\n", encoding="utf-8")
-    monkeypatch.setattr(security_plugins, "save_plugin_manifest", lambda manifest: False)
+    monkeypatch.setattr(
+        security_plugins,
+        "save_plugin_manifest",
+        lambda manifest, path=None: False,
+    )
 
     ok, message = security_plugins.verify_plugin_integrity(
-        "demo", _files(plugin_dir)
+        "demo", _files(plugin_dir), manifest_path
     )
 
     assert ok is False
@@ -130,7 +136,7 @@ def test_first_check_reports_manifest_write_failure(tmp_path, monkeypatch):
 
 
 def test_each_save_uses_a_different_temp_file(tmp_path, monkeypatch):
-    _set_manifest_path(tmp_path, monkeypatch)
+    manifest_path = _manifest_path(tmp_path)
     paths = []
     real_replace = security_plugins.os.replace
 
@@ -140,7 +146,7 @@ def test_each_save_uses_a_different_temp_file(tmp_path, monkeypatch):
 
     monkeypatch.setattr(security_plugins.os, "replace", record_replace)
 
-    assert security_plugins.save_plugin_manifest({"first": {}}) is True
-    assert security_plugins.save_plugin_manifest({"second": {}}) is True
+    assert security_plugins.save_plugin_manifest({"first": {}}, manifest_path) is True
+    assert security_plugins.save_plugin_manifest({"second": {}}, manifest_path) is True
     assert len(paths) == 2
     assert paths[0] != paths[1]

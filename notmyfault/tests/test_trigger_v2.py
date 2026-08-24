@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from notmyfault.core.bindings import BindingResolutionError, resolve_reference
-from notmyfault.core.engine import AutomationEngine
+from notmyfault.tests.api_support import create_test_engine
 from notmyfault.core.rules import ConditionRuntime, config_fingerprint
 from notmyfault.core.trigger_supervisor import TriggerSupervisor
 from notmyfault.core.workflow import build_context
@@ -40,7 +40,7 @@ def builtin_trigger_metas():
 
 
 def make_engine(rule):
-    engine = AutomationEngine({"rules": [rule] if rule else []})
+    engine = create_test_engine({"rules": [rule] if rule else []})
     return engine
 
 

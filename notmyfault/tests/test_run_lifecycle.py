@@ -4,13 +4,14 @@ import json
 import threading
 import uuid
 
-from notmyfault.core.engine import AutomationEngine
+from notmyfault.tests.api_support import create_test_engine
 from notmyfault.core.rule_scheduler import RuleScheduler
 from notmyfault.core.run_history import RunHistory, build_runs
 from notmyfault.core.run_lifecycle import (
     RUN_EVENT_SCHEMA_VERSION,
     status_after,
 )
+from notmyfault.core.workflow import build_context
 
 
 def packets(*events):
@@ -115,7 +116,7 @@ class TestSchemaVersion:
 
 class TestExecutorSingleTerminal:
     def _make_engine(self, events):
-        engine = AutomationEngine(
+        engine = create_test_engine(
             {"rules": []}, on_event=lambda kind, data: events.append((kind, data))
         )
         engine._alert_user = lambda *a, **k: None
@@ -137,6 +138,7 @@ class TestExecutorSingleTerminal:
         engine.rules = [rule]
         engine.triggers_meta.setdefault("hotkey", {"semantic": "oneshot"})
         engine.emit_event("hotkey", {})
+        assert engine._rule_scheduler.wait_for_idle(timeout=5)
 
         terminals = [e for e in events if e[0] in ("workflow_failed", "workflow_completed")]
         assert len(terminals) == 1
@@ -155,6 +157,7 @@ class TestExecutorSingleTerminal:
         engine.rules = [rule]
         engine.triggers_meta.setdefault("hotkey", {"semantic": "oneshot"})
         engine.emit_event("hotkey", {})
+        assert engine._rule_scheduler.wait_for_idle(timeout=5)
         run_id = [e[1]["run_id"] for e in events if e[0] == "rule_triggered"][0]
 
         assert engine.cancel_run(run_id) is False
@@ -194,7 +197,7 @@ class TestStopPathDropsQueue:
             "concurrency": {"mode": "queue"},
             "actions": [{"type": "noop", "params": {}}],
         }
-        engine = AutomationEngine(
+        engine = create_test_engine(
             {"rules": [rule]}, on_event=lambda kind, data: events.append((kind, data))
         )
         engine._alert_user = lambda *a, **k: None
@@ -206,8 +209,12 @@ class TestStopPathDropsQueue:
         from notmyfault.core.rule_scheduler import RuleScheduler
 
         scheduler = engine._rule_scheduler
-        context1 = {"run": {"id": "run_stop_a"}, "rule": {"id": "rule-stop-1"}}
-        context2 = {"run": {"id": "run_stop_b"}, "rule": {"id": "rule-stop-1"}}
+        context1 = build_context(
+            "停止路径规则", "hotkey", {"key": "f3"}, [], "rule-stop-1", "run_stop_a"
+        )
+        context2 = build_context(
+            "停止路径规则", "hotkey", {"key": "f3"}, [], "rule-stop-1", "run_stop_b"
+        )
         holder = {}
         thread = threading.Thread(
             target=lambda: holder.__setitem__(
@@ -231,11 +238,12 @@ class TestStopPathDropsQueue:
         assert dropped[0][1]["reason"] == "引擎关闭"
         release.set()
         thread.join(timeout=5)
+        assert scheduler.wait_for_idle(timeout=5)
 
 
 class TestReplaceCancelWindow:
     def test_replace_retries_until_cancel_registered(self):
-        # 旧 run 刚起跑、取消事件还没登记进 executor 时，replace 要重试到能取消为止
+        # 旧 run 刚启动时可能还没有取消事件，replace 要等到能取消再返回
         import time as time_mod
 
         runtime_calls = {"registered": False}

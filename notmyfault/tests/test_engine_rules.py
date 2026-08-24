@@ -4,7 +4,7 @@ import threading
 
 import pytest
 
-from notmyfault.core.engine import AutomationEngine
+from notmyfault.tests.api_support import create_test_engine
 from notmyfault.core.rules import (
     ConditionRuntime,
     get_rule_events,
@@ -16,7 +16,7 @@ from notmyfault.core.rules import (
 
 
 def make_engine(rules=None, on_event=None):
-    engine = AutomationEngine({"rules": rules or []}, on_event=on_event)
+    engine = create_test_engine({"rules": rules or []}, on_event=on_event)
     engine._alert_user = lambda *a, **k: None
     return engine
 
@@ -24,6 +24,11 @@ def make_engine(rules=None, on_event=None):
 def register_action(engine, action_type, func, meta=None):
     engine.actions_funcs[action_type] = func
     engine.actions_meta[action_type] = meta or {}
+
+
+def emit_and_wait(engine, event_type, payload):
+    engine.emit_event(event_type, payload)
+    assert engine._rule_scheduler.wait_for_idle(timeout=5)
 
 
 class TestCallNotmyfault:
@@ -108,7 +113,7 @@ class TestEventDispatching:
             }]
         )
         register_action(engine, "noop", lambda meta, params: ran.append(1))
-        engine.emit_event("hotkey", {"key": "f1"})
+        emit_and_wait(engine, "hotkey", {"key": "f1"})
         assert ran == [1]
 
     def test_non_matching_type_no_dispatch(self):
@@ -121,7 +126,7 @@ class TestEventDispatching:
             }]
         )
         register_action(engine, "noop", lambda meta, params: ran.append(1))
-        engine.emit_event("usb_insert", {})
+        emit_and_wait(engine, "usb_insert", {})
         assert ran == []
 
     def test_non_matching_params_no_dispatch(self):
@@ -134,7 +139,7 @@ class TestEventDispatching:
             }]
         )
         register_action(engine, "noop", lambda meta, params: ran.append(1))
-        engine.emit_event("hotkey", {"key": "f2"})
+        emit_and_wait(engine, "hotkey", {"key": "f2"})
         assert ran == []
 
     def test_missing_params_no_dispatch(self):
@@ -147,7 +152,7 @@ class TestEventDispatching:
             }]
         )
         register_action(engine, "noop", lambda meta, params: ran.append(1))
-        engine.emit_event("hotkey", {})
+        emit_and_wait(engine, "hotkey", {})
         assert ran == []
 
     def test_extra_params_no_block(self):
@@ -160,7 +165,7 @@ class TestEventDispatching:
             }]
         )
         register_action(engine, "noop", lambda meta, params: ran.append(1))
-        engine.emit_event("hotkey", {"key": "f1", "extra": "x"})
+        emit_and_wait(engine, "hotkey", {"key": "f1", "extra": "x"})
         assert ran == [1]
 
     def test_partial_params_match(self):
@@ -173,7 +178,7 @@ class TestEventDispatching:
             }]
         )
         register_action(engine, "noop", lambda meta, params: ran.append(1))
-        engine.emit_event("hotkey", {"key": "f1", "mods": ["ctrl"]})
+        emit_and_wait(engine, "hotkey", {"key": "f1", "mods": ["ctrl"]})
         assert ran == [1]
 
     def test_multiple_actions_in_single_rule(self):
@@ -190,7 +195,7 @@ class TestEventDispatching:
         )
         register_action(engine, "first", lambda meta, params: order.append("first"))
         register_action(engine, "second", lambda meta, params: order.append("second"))
-        engine.emit_event("hotkey", {})
+        emit_and_wait(engine, "hotkey", {})
         assert order == ["first", "second"]
 
     def test_multiple_rules_same_event(self):
@@ -208,8 +213,8 @@ class TestEventDispatching:
             },
         ])
         register_action(engine, "noop", lambda meta, params: ran.append(params["tag"]))
-        engine.emit_event("hotkey", {})
-        assert ran == [1, 2]
+        emit_and_wait(engine, "hotkey", {})
+        assert sorted(ran) == [1, 2]
 
     def test_nested_all_condition_requires_both_events(self):
         ran = []
@@ -225,9 +230,9 @@ class TestEventDispatching:
             "actions": [{"type": "noop", "params": {}}],
         }])
         register_action(engine, "noop", lambda meta, params: ran.append(1))
-        engine.emit_event("evt_a", {})
+        emit_and_wait(engine, "evt_a", {})
         assert ran == []
-        engine.emit_event("evt_b", {})
+        emit_and_wait(engine, "evt_b", {})
         assert ran == [1]
 
     def test_rule_with_old_trigger_key(self):
@@ -238,12 +243,12 @@ class TestEventDispatching:
             "actions": [{"type": "noop", "params": {}}],
         }])
         register_action(engine, "noop", lambda meta, params: ran.append(1))
-        engine.emit_event("hotkey", {})
+        emit_and_wait(engine, "hotkey", {})
         assert ran == [1]
 
     def test_emit_no_rules(self):
         engine = make_engine()
-        engine.emit_event("hotkey", {})
+        emit_and_wait(engine, "hotkey", {})
 
     def test_empty_action_list_no_crash(self):
         engine = make_engine(rules=[{
@@ -251,7 +256,7 @@ class TestEventDispatching:
             "event": {"type": "hotkey", "params": {}},
             "actions": [],
         }])
-        engine.emit_event("hotkey", {})
+        emit_and_wait(engine, "hotkey", {})
 
     def test_emit_during_shutdown(self):
         ran = []
@@ -263,7 +268,7 @@ class TestEventDispatching:
         register_action(engine, "noop", lambda meta, params: ran.append(1))
         engine._shutdown_flag = threading.Event()
         engine._shutdown_flag.set()
-        engine.emit_event("hotkey", {})
+        emit_and_wait(engine, "hotkey", {})
         assert ran == []
 
     def test_on_event_callback_fires(self):
@@ -277,7 +282,7 @@ class TestEventDispatching:
             on_event=lambda t, p: events.append((t, p)),
         )
         register_action(engine, "noop", lambda meta, params: None)
-        engine.emit_event("hotkey", {})
+        emit_and_wait(engine, "hotkey", {})
         triggered = [p for t, p in events if t == "rule_triggered"]
         assert len(triggered) == 1
         assert triggered[0]["rule_id"] == ""

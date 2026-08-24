@@ -239,7 +239,12 @@ class TestAcceptMinimal:
             "capabilities": [],
             "uses_sudo": False,
             "borrowed": [],
+            "risks": [],
         }
+        assert "test_plugin_entrypoint_is_importable" in result["tests"]
+        assert result["check"]["ok"] is True
+        assert result["check"]["scanner_findings"] == []
+        assert len(result["compatibility_notes"]) == 4
 
     def test_accepts_minimal_trigger(self):
         result = review_plugin_source(
@@ -298,6 +303,16 @@ class TestReviewMetadata:
         assert result["manifest"]["permissions"] is not manifest["permissions"]
         manifest["permissions"].append("network")
         assert result["manifest"]["permissions"] == ["notification"]
+
+    def test_explains_permissions_and_returns_scanner_findings(self):
+        manifest = action_manifest(permissions=["filesystem"])
+        source = "def run(meta, params):\n    return open(params['path']).read()\n"
+
+        result = review_plugin_source("action", manifest, source, "notify_world")
+
+        assert result["permissions_explanation"][0]["permission"] == "filesystem"
+        assert result["permissions_explanation"][0]["risk"] == "high"
+        assert result["check"]["scanner_findings"][0]["id"] == "file_write"
 
 
 class TestNoSideEffects:

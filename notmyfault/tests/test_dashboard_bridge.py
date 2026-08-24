@@ -4,6 +4,9 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+from notmyfault.config import SignedConfigStore
+from notmyfault.tests.api_support import make_paths
+
 
 def load_dashboard_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "webview", SimpleNamespace())
@@ -18,27 +21,19 @@ def load_dashboard_module(monkeypatch):
 def test_first_rule_save_checks_approval_without_loading_missing_file(
     tmp_path, monkeypatch
 ):
-    import notmyfault.config as config_mod
     from notmyfault.security import rule_approval
 
     dashboard = load_dashboard_module(monkeypatch)
-    rules_file = tmp_path / "rules.json"
-    monkeypatch.setattr(dashboard, "RULES_FILE", str(rules_file))
+    paths = make_paths(tmp_path)
+    store = SignedConfigStore(paths)
     monkeypatch.setattr(
         dashboard,
         "_get_plugins_schema",
-        lambda: {
+        lambda paths: {
             "triggers": {"usb_insert": {"permissions": []}},
             "actions": {"notify": {"permissions": []}},
         },
     )
-    monkeypatch.setattr(
-        config_mod,
-        "load_verified_rules",
-        lambda: (_ for _ in ()).throw(AssertionError("不应读取不存在的规则文件")),
-    )
-    saved = []
-    monkeypatch.setattr(config_mod, "save_rules", lambda rules: saved.append(rules) or True)
     approvals = []
     monkeypatch.setattr(
         rule_approval,
@@ -53,17 +48,21 @@ def test_first_rule_save_checks_approval_without_loading_missing_file(
         "actions": [{"type": "notify", "params": {}}],
     }
 
-    result = dashboard.DashboardAPI().save_config([rule], "one-time-password")
+    result = dashboard.DashboardAPI(store, paths).save_config(
+        [rule],
+        "one-time-password",
+    )
 
     assert result["ok"] is True
     assert approvals[0][0] == []
     assert approvals[0][3] == "one-time-password"
-    assert saved == [result["rules"]]
+    assert store.load_verified_rules() == result["rules"]
 
 
-def test_ai_draft_bridge_waits_longer_than_regular_requests(monkeypatch):
+def test_ai_draft_bridge_waits_longer_than_regular_requests(tmp_path, monkeypatch):
     dashboard = load_dashboard_module(monkeypatch)
-    api = dashboard.DashboardAPI()
+    paths = make_paths(tmp_path)
+    api = dashboard.DashboardAPI(SignedConfigStore(paths), paths)
     monkeypatch.setattr(api, "_get_api_token", lambda: "test-token")
     observed_timeouts = []
 

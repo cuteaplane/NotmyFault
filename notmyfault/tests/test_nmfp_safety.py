@@ -1,16 +1,13 @@
-"""nmfp 插件包解压安全：路径穿越、解压炸弹与 py7zr 行为"""
-
 from types import SimpleNamespace
 
 import py7zr
 import pytest
 
-from notmyfault.host import api_server
+from notmyfault.security.plugin_package import PluginPackageLimits, extract_nmfp
 import pack_plugin
 
 
 def make_archive(tmp_path, entries):
-    """entries: [(arcname, content)]，返回生成的 .nmfp 路径"""
     archive_path = str(tmp_path / "plugin.nmfp")
     src = tmp_path / "src.txt"
     with py7zr.SevenZipFile(archive_path, "w") as zf:
@@ -21,10 +18,9 @@ def make_archive(tmp_path, entries):
 
 
 class FakeArchive:
-    """只返回构造好的条目清单，不真实解压"""
-
-    def __init__(self, infos):
+    def __init__(self, infos, raw_infos=None):
         self.infos = infos
+        self.files = raw_infos or infos
         self.extract_called = False
 
     def __enter__(self):
@@ -40,8 +36,8 @@ class FakeArchive:
         self.extract_called = True
 
 
-def install_fake_archive(monkeypatch, infos):
-    archive = FakeArchive(infos)
+def install_fake_archive(monkeypatch, infos, raw_infos=None):
+    archive = FakeArchive(infos, raw_infos)
 
     def factory(path, mode="r", password=None):
         return archive
@@ -59,7 +55,7 @@ def test_extract_accepts_normal_plugin(tmp_path):
         ],
     )
     extract_dir = tmp_path / "out"
-    api_server._extract_nmfp_safely(archive_path, str(extract_dir), None)
+    extract_nmfp(archive_path, str(extract_dir), None, PluginPackageLimits())
     assert (extract_dir / "demo_plugin" / "action.json").exists()
     assert (extract_dir / "demo_plugin" / "action.py").exists()
 
@@ -70,7 +66,7 @@ def test_extract_rejects_absolute_path(tmp_path, monkeypatch):
         [SimpleNamespace(filename="C:\\Windows\\evil.dll", uncompressed=10)],
     )
     with pytest.raises(ValueError) as excinfo:
-        api_server._extract_nmfp_safely("x.nmfp", str(tmp_path), None)
+        extract_nmfp("x.nmfp", str(tmp_path), None, PluginPackageLimits())
     assert "非法路径" in str(excinfo.value)
 
 
@@ -80,31 +76,54 @@ def test_extract_rejects_parent_traversal(tmp_path, monkeypatch):
         [SimpleNamespace(filename="../evil.py", uncompressed=10)],
     )
     with pytest.raises(ValueError) as excinfo:
-        api_server._extract_nmfp_safely("x.nmfp", str(tmp_path), None)
+        extract_nmfp("x.nmfp", str(tmp_path), None, PluginPackageLimits())
     assert "非法路径" in str(excinfo.value)
 
 
 def test_extract_rejects_too_many_entries(tmp_path, monkeypatch):
-    monkeypatch.setattr(api_server, "_NMFP_MAX_ENTRIES", 2)
     infos = [
         SimpleNamespace(filename=f"plugin/file{i}.txt", uncompressed=1)
         for i in range(3)
     ]
     install_fake_archive(monkeypatch, infos)
     with pytest.raises(ValueError) as excinfo:
-        api_server._extract_nmfp_safely("x.nmfp", str(tmp_path), None)
+        extract_nmfp(
+            "x.nmfp",
+            str(tmp_path),
+            None,
+            PluginPackageLimits(max_entries=2),
+        )
     assert "条目过多" in str(excinfo.value)
 
 
 def test_extract_rejects_uncompressed_size(tmp_path, monkeypatch):
-    monkeypatch.setattr(api_server, "_NMFP_MAX_UNCOMPRESSED", 100)
     infos = [
         SimpleNamespace(filename="plugin/big.bin", uncompressed=1024 * 1024)
     ]
     install_fake_archive(monkeypatch, infos)
     with pytest.raises(ValueError) as excinfo:
-        api_server._extract_nmfp_safely("x.nmfp", str(tmp_path), None)
+        extract_nmfp(
+            "x.nmfp",
+            str(tmp_path),
+            None,
+            PluginPackageLimits(max_uncompressed_bytes=100),
+        )
     assert "体积过大" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("attribute", ["is_symlink", "is_junction", "is_socket"])
+def test_extract_rejects_archive_links_and_special_files(
+    tmp_path, monkeypatch, attribute
+):
+    listed = [SimpleNamespace(filename="plugin/link", uncompressed=1)]
+    raw = SimpleNamespace(filename="plugin/link", **{attribute: True})
+    archive = install_fake_archive(monkeypatch, listed, [raw])
+
+    with pytest.raises(ValueError) as excinfo:
+        extract_nmfp("x.nmfp", str(tmp_path), None, PluginPackageLimits())
+
+    assert "链接或特殊文件" in str(excinfo.value)
+    assert archive.extract_called is False
 
 
 def test_absolute_path_is_sanitized_by_py7zr(tmp_path):

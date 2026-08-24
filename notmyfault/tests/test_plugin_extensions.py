@@ -3,19 +3,14 @@
 import json
 import os
 import sys
+import base64
 from pathlib import Path
 from types import SimpleNamespace
 
-import py7zr
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from fastapi.testclient import TestClient
 
-import notmyfault.config as config_mod
-from notmyfault.core.engine import AutomationEngine
-from notmyfault.host import api_server
-from notmyfault.host.api_server import EngineAPI
-from notmyfault.security import plugins as security_plugins
+from notmyfault.tests.api_support import create_test_engine
 from notmyfault.security import signing
 from notmyfault.security import sudo
 from notmyfault.security.plugin_loader import PluginLoader, PluginRegistry
@@ -71,6 +66,7 @@ def make_loader(tmp_path, mode=SecurityMode.PERMISSIVE):
         sudo=SudoStub(),
         engine_token="token",
         integrity_errors=[],
+        plugin_manifest_path=str(tmp_path / "manifest.json"),
     )
     return loader, registry, plugin_errors
 
@@ -340,7 +336,6 @@ class TestLazyLoading:
         write_plugin(tmp_path / "actions", "lazy", make_meta("lazy_a"), code)
         loaded, failed, meta_store, func_store = load_actions(loader, tmp_path)
         assert (loaded, failed) == (1, 0)
-        # 发现阶段只登记 meta，不导入模块
         assert "lazy_a" in meta_store
         assert func_store == {}
         assert not marker.exists()
@@ -393,10 +388,7 @@ class TestEngineLazyWorkflow:
     def test_lazy_action_materialized_on_first_workflow(self, tmp_path, monkeypatch):
         # 源码运行默认 strict，未签名用户插件会被拒，这里切到宽松模式
         monkeypatch.setenv("NOTMYFAULT_MODE", "alpha")
-        monkeypatch.setattr(
-            security_plugins, "_PLUGIN_MANIFEST_FILE", str(tmp_path / "manifest.json")
-        )
-        engine = AutomationEngine({"rules": [{
+        engine = create_test_engine({"rules": [{
             "name": "懒加载规则",
             "event": {"type": "manual", "params": {}},
             "actions": [{"type": "lazy_wf", "params": {}}],
@@ -428,6 +420,7 @@ class TestEngineLazyWorkflow:
         assert not marker.exists()
 
         engine.emit_event("manual", {})
+        assert engine._rule_scheduler.wait_for_idle(timeout=5)
         assert marker.exists()
         assert "lazy_wf" in engine.actions_funcs
 
@@ -518,9 +511,6 @@ class TestAuthorSelfSigning:
 
     def test_user_integrity_covers_all_files(self, tmp_path, monkeypatch):
         manifest_path = tmp_path / "manifest.json"
-        monkeypatch.setattr(
-            security_plugins, "_PLUGIN_MANIFEST_FILE", str(manifest_path)
-        )
         loader, registry, errors = make_loader(tmp_path)
         folder = write_plugin(
             tmp_path / "actions", "integ", make_meta("integ"),
@@ -626,7 +616,7 @@ class TestAdminSessionRecheck:
             }],
             "settings": {"admin_authorization_mode": mode},
         }
-        engine = AutomationEngine(config)
+        engine = create_test_engine(config)
         engine.actions_meta["admin_action"] = {"permissions": ["admin"]}
         return engine
 
@@ -657,228 +647,3 @@ class TestAdminSessionRecheck:
         )
         engine._recheck_admin_session()
         assert alerts == []
-
-class FakeRunner:
-    engine_running = False
-    engine_state = "stopped"
-    current_engine = None
-
-    def start_engine(self):
-        return True
-
-    def stop_engine(self):
-        return True
-
-    def request_process_shutdown(self, force_after=10):
-        pass
-
-
-@pytest.fixture
-def api_env(tmp_path, monkeypatch):
-    config_file = str(tmp_path / "config.json")
-    monkeypatch.setattr(api_server, "CONFIG_FILE", config_file)
-    monkeypatch.setattr(config_mod, "CONFIG_FILE", config_file)
-    monkeypatch.setattr(api_server, "API_TOKEN_FILE", str(tmp_path / ".api_token"))
-    monkeypatch.setattr(api_server, "_PRIVATE_DIR", tmp_path / "private")
-    api = EngineAPI(FakeRunner())
-    user_dir = tmp_path / "user_plugins"
-    api._get_user_plugins_dir = lambda: str(user_dir)
-    client = TestClient(api.app)
-    headers = {"Authorization": f"Bearer {api_server.API_TOKEN}"}
-    return SimpleNamespace(
-        api=api, client=client, headers=headers, tmp_path=tmp_path, user_dir=user_dir
-    )
-
-
-def build_nmfp_with_files(tmp_path, meta, ptype, tag, extra=None, sign=False):
-    """归档内恰好一个插件文件夹，extra 是相对路径到内容的映射"""
-    json_name = "trigger.json" if ptype == "triggers" else "action.json"
-    source = tmp_path / f"src_{tag}" / f"plugin_{tag}"
-    source.mkdir(parents=True)
-    (source / json_name).write_text(
-        json.dumps(meta, ensure_ascii=False), encoding="utf-8"
-    )
-    (source / "main.py").write_text(
-        "def run(event, params):\n    return True\n", encoding="utf-8"
-    )
-    for rel_path, content in (extra or {}).items():
-        target = source / rel_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if isinstance(content, bytes):
-            target.write_bytes(content)
-        else:
-            target.write_text(content, encoding="utf-8")
-    if sign:
-        signing.self_sign_plugin(source, Ed25519PrivateKey.generate())
-    archive = tmp_path / f"plugin_{tag}.nmfp"
-    folder = f"plugin_{tag}"
-    with py7zr.SevenZipFile(str(archive), "w") as zf:
-        for path in sorted(source.rglob("*")):
-            if path.is_file():
-                zf.write(path, f"{folder}/{path.relative_to(source).as_posix()}")
-    return archive
-
-
-def install_file(client, headers, archive):
-    with open(archive, "rb") as f:
-        return client.post(
-            "/api/plugins/install",
-            headers=headers,
-            files={"file": (archive.name, f, "application/octet-stream")},
-        )
-
-
-def preview_file(client, headers, archive):
-    with open(archive, "rb") as file:
-        return client.post(
-            "/api/plugins/preview",
-            headers=headers,
-            files={"file": (archive.name, file, "application/octet-stream")},
-        )
-
-
-def python_step(code):
-    return f'"{sys.executable}" -c "{code}"'
-
-
-class TestInstallBuildHook:
-    def test_direct_install_with_build_hook_requires_preview(self, api_env):
-        meta = make_meta("actions", build={
-            "command": [python_step("pass")],
-        })
-        archive = build_nmfp_with_files(
-            api_env.tmp_path, meta, "actions", "direct_build"
-        )
-
-        response = install_file(api_env.client, api_env.headers, archive)
-
-        assert response.status_code == 400
-        assert "请先预览后安装" in response.json()["error"]
-        assert any(risk["id"] == "build_hook" for risk in response.json()["risks"])
-
-    def test_preview_reports_build_without_running_it(self, api_env):
-        marker = api_env.tmp_path / "preview-build-ran.txt"
-        meta = make_meta("actions", build={
-            "command": [python_step(
-                f"import pathlib; pathlib.Path(r'{marker}').write_text('ran')"
-            )],
-        })
-        archive = build_nmfp_with_files(
-            api_env.tmp_path, meta, "actions", "preview_build"
-        )
-
-        with open(archive, "rb") as file:
-            preview = api_env.client.post(
-                "/api/plugins/preview",
-                headers=api_env.headers,
-                files={"file": (archive.name, file, "application/octet-stream")},
-            )
-
-        assert preview.status_code == 200, preview.text
-        assert not marker.exists()
-        assert any(risk["id"] == "build_hook" for risk in preview.json()["risks"])
-
-        install = api_env.client.post(
-            "/api/plugins/install",
-            headers=api_env.headers,
-            data={"preview_token": preview.json()["preview_token"]},
-        )
-
-        assert install.status_code == 200, install.text
-        assert marker.read_text(encoding="utf-8") == "ran"
-
-    def test_build_hook_runs_and_outputs_installed(self, api_env):
-        meta = make_meta("actions", build={
-            "command": [python_step("import pathlib; pathlib.Path('built.bin').write_bytes(b'x')")],
-            "outputs": ["built.bin"],
-        })
-        archive = build_nmfp_with_files(api_env.tmp_path, meta, "actions", "built")
-        preview = preview_file(api_env.client, api_env.headers, archive)
-        assert preview.status_code == 200, preview.text
-        response = api_env.client.post(
-            "/api/plugins/install",
-            headers=api_env.headers,
-            data={"preview_token": preview.json()["preview_token"]},
-        )
-        assert response.status_code == 200, response.text
-        assert response.json()["ok"] is True
-        dest = api_env.user_dir / "actions" / meta["id"]
-        assert (dest / "built.bin").exists()
-
-    def test_build_hook_failure_blocks_install(self, api_env):
-        meta = make_meta("actions", build={
-            "command": [python_step("raise SystemExit(3)")],
-        })
-        archive = build_nmfp_with_files(api_env.tmp_path, meta, "actions", "boom")
-        preview = preview_file(api_env.client, api_env.headers, archive)
-        assert preview.status_code == 200, preview.text
-        response = api_env.client.post(
-            "/api/plugins/install",
-            headers=api_env.headers,
-            data={"preview_token": preview.json()["preview_token"]},
-        )
-        assert response.status_code == 400
-        assert "build 命令失败" in response.json()["error"]
-
-    def test_build_hook_missing_output_blocks_install(self, api_env):
-        meta = make_meta("actions", build={
-            "command": [python_step("pass")],
-            "outputs": ["nothere.bin"],
-        })
-        archive = build_nmfp_with_files(api_env.tmp_path, meta, "actions", "miss")
-        preview = preview_file(api_env.client, api_env.headers, archive)
-        assert preview.status_code == 200, preview.text
-        response = api_env.client.post(
-            "/api/plugins/install",
-            headers=api_env.headers,
-            data={"preview_token": preview.json()["preview_token"]},
-        )
-        assert response.status_code == 400
-        assert "build 产物不存在" in response.json()["error"]
-
-    def test_build_hook_strips_archive_signature(self, api_env):
-        meta = make_meta("actions", build={
-            "command": [python_step("import pathlib; pathlib.Path('built.bin').write_bytes(b'x')")],
-            "outputs": ["built.bin"],
-        })
-        archive = build_nmfp_with_files(
-            api_env.tmp_path, meta, "actions", "stripped", sign=True
-        )
-        preview = preview_file(api_env.client, api_env.headers, archive)
-        assert preview.status_code == 200, preview.text
-        response = api_env.client.post(
-            "/api/plugins/install",
-            headers=api_env.headers,
-            data={"preview_token": preview.json()["preview_token"]},
-        )
-        assert response.status_code == 200, response.text
-        dest = api_env.user_dir / "actions" / meta["id"]
-        # 编译产物不继承归档签名，按未签名插件处理
-        assert not (dest / "signature.sig").exists()
-        assert not (dest / "public_key.pem").exists()
-
-    def test_symlink_executable_rejected(self, api_env):
-        meta = make_meta("actions")
-        source = api_env.tmp_path / "src_sym" / "plugin_sym"
-        source.mkdir(parents=True)
-        (source / "action.json").write_text(
-            json.dumps(meta, ensure_ascii=False), encoding="utf-8"
-        )
-        (source / "main.py").write_text(
-            "def run(event, params):\n    return True\n", encoding="utf-8"
-        )
-        target = api_env.tmp_path / "real_target.txt"
-        target.write_text("target")
-        link = source / "loader.exe"
-        try:
-            os.symlink(str(target), str(link))
-        except OSError:
-            pytest.skip("当前系统不允许创建符号链接")
-        archive = api_env.tmp_path / "plugin_sym.nmfp"
-        with py7zr.SevenZipFile(str(archive), "w") as zf:
-            for path in sorted(source.rglob("*")):
-                if path.is_file() or path.is_symlink():
-                    zf.write(path, f"plugin_sym/{path.relative_to(source).as_posix()}")
-        response = install_file(api_env.client, api_env.headers, archive)
-        assert response.status_code == 400
-        assert "符号链接" in response.json()["error"]

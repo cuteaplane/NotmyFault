@@ -1,9 +1,11 @@
 """display_control 动作插件的亮度控制与错误传播测试。"""
 
 import importlib.util
+import json
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +18,12 @@ def load_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_manifest_does_not_gate_power_actions_on_brightness():
+    path = PKG_ROOT / "actions" / "display_control" / "action.json"
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    assert "display.brightness" not in meta.get("requires_capabilities", [])
 
 
 def _failing_setter(message):
@@ -54,30 +62,41 @@ def test_set_brightness_fails_when_no_backend_can_verify_change(monkeypatch):
         module.run({}, {"action": "set_brightness", "brightness": 40})
 
 
-# Windows 上 run() 走 WMI/DDC，会真的改屏幕亮度
-@pytest.mark.skipif(os.name != "posix", reason="仅 Linux 调用 brightnessctl")
 def test_linux_brightness_missing_backend_raises_runtime_error(monkeypatch):
     module = load_module()
-    monkeypatch.setattr(module.shutil, "which", lambda name: None)
-    with pytest.raises(RuntimeError, match="缺少亮度控制后端"):
+
+    class MissingDisplayBackend:
+        def __init__(self, runner):
+            pass
+
+        def set_brightness(self, brightness):
+            from notmyfault.platform.backends import BackendMissingError
+
+            raise BackendMissingError("依赖缺失：亮度控制需要 brightnessctl")
+
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(module, "DisplayBackend", MissingDisplayBackend)
+    with pytest.raises(RuntimeError, match="依赖缺失"):
         module.run({}, {"action": "set_brightness", "brightness": 40})
 
 
-# Windows 上 run() 走 WMI/DDC，会真的改屏幕亮度
-@pytest.mark.skipif(os.name != "posix", reason="仅 Linux 调用 brightnessctl")
 def test_linux_brightness_sets_detected_tool(monkeypatch):
     module = load_module()
-    commands = []
-    monkeypatch.setattr(module.shutil, "which", lambda name: "/usr/bin/brightnessctl")
-    monkeypatch.setattr(
-        module.subprocess,
-        "run",
-        lambda cmd, **kwargs: commands.append(cmd) or subprocess.CompletedProcess(cmd, 0),
-    )
+    calls = []
+
+    class FakeDisplayBackend:
+        def __init__(self, runner):
+            calls.append(runner)
+
+        def set_brightness(self, brightness):
+            calls.append(brightness)
+
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(module, "DisplayBackend", FakeDisplayBackend)
     assert module.run({}, {"action": "set_brightness", "brightness": 40}) == {
         "action": "set_brightness",
     }
-    assert commands == [["/usr/bin/brightnessctl", "set", "40%"]]
+    assert calls == [module.default_runner, 40]
 
 
 def test_windows_brightness_action_returns_verified_result(monkeypatch):

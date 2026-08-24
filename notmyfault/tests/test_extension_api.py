@@ -3,7 +3,7 @@
 import json
 from types import SimpleNamespace
 
-from fastapi.testclient import TestClient
+import pytest
 
 from notmyfault.extensions.protocol import (
     OwnedValueError,
@@ -11,8 +11,9 @@ from notmyfault.extensions.protocol import (
     unpack_owned_value,
 )
 from notmyfault.extensions.registry import ExtensionRegistry
-from notmyfault.host import api_server
-from notmyfault.host.api_server import EngineAPI
+from notmyfault.extensions.session import ExtensionSessionManager
+from notmyfault.core.run_summary import summarize_fields
+from notmyfault.tests.api_support import FakeRunner, make_api_env
 from notmyfault.security.plugin_loader import PluginLoader, PluginRegistry
 from notmyfault.security.plugin_schema import validate_plugin_meta
 from notmyfault.security.security import SecurityMode
@@ -88,21 +89,14 @@ class ExtensionEngine:
         return context.result({"secret": True})
 
 
-def make_client(tmp_path, monkeypatch):
-    monkeypatch.setattr(api_server, "CONFIG_FILE", str(tmp_path / "config.json"))
-    monkeypatch.setattr(api_server, "API_TOKEN_FILE", str(tmp_path / ".api_token"))
-    monkeypatch.setattr(api_server, "_PRIVATE_DIR", tmp_path / "private")
+def make_client(tmp_path, engine=None):
     (tmp_path / "editor.html").write_text("<h1>插件页面</h1>", encoding="utf-8")
-    runner = SimpleNamespace(
-        current_engine=ExtensionEngine(tmp_path),
-        engine_running=True,
-        engine_state="running",
-    )
-    api = EngineAPI(runner)
-    return (
-        TestClient(api.app),
-        {"Authorization": f"Bearer {api_server.API_TOKEN}"},
-    )
+    runner = FakeRunner()
+    runner.current_engine = engine or ExtensionEngine(tmp_path)
+    runner.engine_running = True
+    runner.engine_state = "running"
+    env = make_api_env(tmp_path, runner=runner)
+    return env.client, env.headers
 
 
 def test_owned_value_round_trip_and_owner_check():
@@ -118,6 +112,32 @@ def test_owned_value_round_trip_and_owner_check():
         assert "归属不匹配" in str(error)
     else:
         raise AssertionError("其他插件不应读取这项数据")
+
+
+def test_owned_value_rejects_oversized_data():
+    with pytest.raises(OwnedValueError) as error:
+        make_owned_value(
+            "com.example.sample",
+            "document",
+            2,
+            {"text": "x" * (1024 * 1024)},
+            "大文档",
+        )
+    assert "不能超过 1024 KiB" in str(error.value)
+
+
+def test_sensitive_plugin_data_uses_redacted_run_summary():
+    meta = extension_meta()
+    meta["params"][0]["sensitive"] = True
+    ok, errors = validate_plugin_meta(meta, "action")
+    assert ok is True
+    assert errors == []
+    value = make_owned_value(
+        "com.example.sample", "document", 2, {"token": "secret"}, "机密文档"
+    )
+    summary = summarize_fields({"document": value}, meta["params"])
+    assert summary[0]["display"] == "敏感值已隐藏"
+    assert summary[0]["redacted"] is True
 
 
 def test_contribution_schema_checks_references():
@@ -173,6 +193,7 @@ def test_action_extension_commands_follow_lazy_loading(tmp_path):
         sudo=sudo,
         engine_token="token",
         integrity_errors=[],
+        plugin_manifest_path=str(tmp_path / "manifest.json"),
     )
     loaded, failed = loader.load(
         base_dir=str(tmp_path),
@@ -191,8 +212,8 @@ def test_action_extension_commands_follow_lazy_loading(tmp_path):
     assert callable(registry.extensions.handler("sample", "open"))
 
 
-def test_extension_command_session_and_private_value(tmp_path, monkeypatch):
-    client, headers = make_client(tmp_path, monkeypatch)
+def test_extension_command_session_and_private_value(tmp_path):
+    client, headers = make_client(tmp_path)
     opened = client.post(
         "/api/plugins/sample/extensions/commands/open/invoke",
         headers=headers,
@@ -233,8 +254,8 @@ def test_extension_command_session_and_private_value(tmp_path, monkeypatch):
     assert expired.status_code == 404
 
 
-def test_extension_rejects_owned_value_from_other_plugin(tmp_path, monkeypatch):
-    client, headers = make_client(tmp_path, monkeypatch)
+def test_extension_rejects_owned_value_from_other_plugin(tmp_path):
+    client, headers = make_client(tmp_path)
     other_value = make_owned_value(
         "com.example.other", "document", 2, {"text": "x"}, "其他文档"
     )
@@ -252,8 +273,8 @@ def test_extension_rejects_owned_value_from_other_plugin(tmp_path, monkeypatch):
     assert "归属不匹配" in response.json()["error"]
 
 
-def test_extension_session_can_be_closed_without_plugin_command(tmp_path, monkeypatch):
-    client, headers = make_client(tmp_path, monkeypatch)
+def test_extension_session_can_be_closed_without_plugin_command(tmp_path):
+    client, headers = make_client(tmp_path)
     opened = client.post(
         "/api/plugins/sample/extensions/commands/open/invoke",
         headers=headers,
@@ -277,10 +298,71 @@ def test_extension_session_can_be_closed_without_plugin_command(tmp_path, monkey
     assert resumed.status_code == 404
 
 
-def test_extension_view_uses_declared_file(tmp_path, monkeypatch):
-    client, headers = make_client(tmp_path, monkeypatch)
+def test_extension_view_uses_declared_file(tmp_path):
+    client, headers = make_client(tmp_path)
     response = client.get(
         "/api/plugins/sample/extensions/views/editor/page", headers=headers
     )
     assert response.status_code == 200
     assert response.json()["html"] == "<h1>插件页面</h1>"
+
+
+def test_extension_view_rejects_page_outside_plugin_root(tmp_path):
+    outside = tmp_path.parent / "outside-plugin-page.html"
+    outside.write_text("<h1>不应读取</h1>", encoding="utf-8")
+    engine = ExtensionEngine(tmp_path)
+    meta = extension_meta()
+    meta["contributes"]["views"][0]["page"] = "../outside-plugin-page.html"
+    engine.extensions.register_manifest("sample", "action", meta, str(tmp_path))
+    client, headers = make_client(tmp_path, engine)
+
+    response = client.get(
+        "/api/plugins/sample/extensions/views/editor/page", headers=headers
+    )
+
+    assert response.status_code == 404
+    assert "不应读取" not in response.text
+
+
+def test_extension_exception_is_logged_but_not_returned(tmp_path):
+    engine = ExtensionEngine(tmp_path)
+
+    def fail(_context, _payload):
+        raise RuntimeError("unit-test-secret-extension-detail")
+
+    engine.extensions.register_command("sample", "open", fail, engine)
+    client, headers = make_client(tmp_path, engine)
+    response = client.post(
+        "/api/plugins/sample/extensions/commands/open/invoke",
+        headers=headers,
+        json={
+            "source_kind": "parameter_editors",
+            "source_id": "document_editor",
+            "payload": {},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "插件命令调用失败"
+    assert "unit-test-secret-extension-detail" not in response.text
+
+
+def test_extension_session_manager_drop_all_runs_cleanup():
+    manager = ExtensionSessionManager()
+    cleaned = []
+    session = manager.create(
+        plugin_id="sample",
+        command_id="open",
+        plugin_meta=extension_meta(),
+        source_kind="parameter_editors",
+        source_id="document_editor",
+        allowed_commands={"open"},
+        data_type={"id": "document", "version": 2},
+        current_value=None,
+    )
+    session.add_cleanup(lambda: cleaned.append(True))
+
+    manager.drop_all()
+
+    assert manager.get(session.session_id) is None
+    assert cleaned == [True]

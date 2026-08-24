@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from notmyfault.security import plugins as security_plugins
 from notmyfault.security.plugins import (
     scan_borrowed_privilege,
     scan_plugin_capabilities,
@@ -132,9 +131,6 @@ class SudoStub:
 
 
 def test_loader_warns_on_borrowed_privilege(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(
-        security_plugins, "_PLUGIN_MANIFEST_FILE", str(tmp_path / "manifest.json")
-    )
     folder = tmp_path / "actions" / "borrow"
     folder.mkdir(parents=True)
     (folder / "action.json").write_text(
@@ -173,6 +169,7 @@ def test_loader_warns_on_borrowed_privilege(tmp_path, monkeypatch, capsys):
         sudo=SudoStub(),
         engine_token="token",
         integrity_errors=integrity_errors,
+        plugin_manifest_path=str(tmp_path / "manifest.json"),
     )
     loaded, failed = loader.load(
         base_dir=str(tmp_path),

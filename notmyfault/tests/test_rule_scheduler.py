@@ -1,5 +1,4 @@
-"""RuleScheduler 并发语义：single / queue / replace / parallel 与竞态场景"""
-
+import copy
 import threading
 import time
 import uuid
@@ -27,6 +26,7 @@ class FakeRuntime:
         self.cancelled = []         # 被 cancel_run 的 run_id
         self.deferred = set()       # 处于 deferred 的 run_id
         self.history = []           # (事件类型, run_id, reason)
+        self.observed_rules = []
         self.block = threading.Event()
         self.blocking = True
 
@@ -36,6 +36,7 @@ class FakeRuntime:
             self.block.wait(timeout=10)
         with self.lock:
             self.executed.append((rule_key, rule.get("name", ""), run_id))
+            self.observed_rules.append((run_id, copy.deepcopy(rule)))
 
     def cancel_run(self, run_id):
         with self.lock:
@@ -68,7 +69,6 @@ def make_scheduler(rule, runtime):
 
 
 def submit_async(scheduler, rule, rule_key, holder, index, context=None):
-    """提交放线程里跑；started 的 run 会内联执行，可能阻塞到 block 放行"""
     context = context or make_context()
 
     def run():
@@ -89,6 +89,35 @@ def wait_until(predicate, timeout=5, message="条件超时"):
 
 
 class TestSingleMode:
+    def test_started_run_does_not_block_submitter(self):
+        entered = threading.Event()
+        release = threading.Event()
+        worker_thread = {}
+
+        def execute(rule_key, rule, rule_name, context):
+            worker_thread["id"] = threading.get_ident()
+            entered.set()
+            release.wait(timeout=10)
+
+        scheduler = RuleScheduler(
+            execute_fn=execute,
+            cancel_run_fn=lambda run_id: True,
+            is_deferred_fn=lambda run_id: False,
+        )
+        caller_thread = threading.get_ident()
+        started = time.perf_counter()
+        try:
+            assert scheduler.submit(
+                "key", {"concurrency": {"mode": "single"}}, "规则", make_context()
+            ) == "started"
+            assert time.perf_counter() - started < 0.5
+            assert entered.wait(timeout=5)
+            assert worker_thread["id"] != caller_thread
+        finally:
+            release.set()
+            wait_until(lambda: scheduler.stats()["key"]["running"] == 0)
+            scheduler.shutdown()
+
     def test_drops_new_events_while_running(self):
         runtime = FakeRuntime()
         rule = {"name": "规则", "concurrency": {"mode": "single"}}
@@ -168,7 +197,11 @@ class TestQueueMode:
 
     def test_queue_freezes_rule_snapshot(self):
         runtime = FakeRuntime()
-        rule = {"name": "旧名字", "concurrency": {"mode": "queue"}}
+        rule = {
+            "name": "旧名字",
+            "concurrency": {"mode": "queue"},
+            "actions": [{"type": "notify", "params": {"message": "旧值"}}],
+        }
         scheduler = make_scheduler(rule, runtime)
         first_thread, _ = submit_async(scheduler, rule, "key", {}, 0)
         wait_until(lambda: scheduler.stats().get("key", {}).get("running") == 1)
@@ -179,14 +212,19 @@ class TestQueueMode:
         )
         queued_thread.join(timeout=5)
         rule["name"] = "新名字"
+        rule["actions"][0]["params"]["message"] = "新值"
 
         runtime.block.set()
         first_thread.join(timeout=5)
         wait_until(lambda: len(runtime.executed) == 2, message="排队 run 没执行")
 
-        # 排队条目用入队时的快照，改名后执行的仍是旧名字；直跑的那条拿的是活引用
         names_by_run = {item[2]: item[1] for item in runtime.executed}
         assert names_by_run[queued_context["run"]["id"]] == "旧名字"
+        rules_by_run = dict(runtime.observed_rules)
+        assert (
+            rules_by_run[queued_context["run"]["id"]]["actions"][0]["params"]["message"]
+            == "旧值"
+        )
 
     def test_queue_limit_drops_overflow(self):
         runtime = FakeRuntime()
@@ -405,12 +443,10 @@ class TestRunHistoryEvents:
 
 
 class TestEngineWiring:
-    """引擎链路上的调度行为：EventBus 匹配出的 run 先过 RuleScheduler"""
-
     def _make_engine(self, rule, on_event):
-        from notmyfault.core.engine import AutomationEngine
+        from notmyfault.tests.api_support import create_test_engine
 
-        engine = AutomationEngine({"rules": [rule]}, on_event=on_event)
+        engine = create_test_engine({"rules": [rule]}, on_event=on_event)
         engine._alert_user = lambda *a, **k: None
         engine.triggers_meta.setdefault("hotkey", {"semantic": "oneshot"})
         return engine

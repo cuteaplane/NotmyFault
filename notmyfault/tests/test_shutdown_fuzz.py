@@ -1,21 +1,18 @@
-"""shutdown 压力场景：正常退出、触发器卡住、动作卡住、deferred workflow 存在时退出"""
-
 import threading
 
 import pytest
 
-from notmyfault.core.engine import AutomationEngine
+from notmyfault.tests.api_support import create_test_engine
 from notmyfault.core.workflow import build_context
 
 
 def make_engine():
-    engine = AutomationEngine({"rules": []})
+    engine = create_test_engine({"rules": []})
     engine._alert_user = lambda *a, **k: None
     return engine
 
 
 def shorten_timeouts(engine, seconds=0.5):
-    """把 shutdown 里写死的 30s/60s 等待压短，卡住场景才能在测试里跑完"""
     supervisor_stop = engine._trigger_supervisor.stop
     engine._stop_trigger_threads = lambda timeout=30: supervisor_stop(seconds)
     wait_actions = engine._workflow_executor.wait_active_actions

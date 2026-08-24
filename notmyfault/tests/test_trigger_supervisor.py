@@ -291,8 +291,8 @@ class TestMissingAlert:
 
 class TestEngineCompat:
     def _engine(self):
-        from notmyfault.core.engine import AutomationEngine
-        return AutomationEngine({"rules": []})
+        from notmyfault.tests.api_support import create_test_engine
+        return create_test_engine({"rules": []})
 
     def test_property_proxy_same_object(self):
         engine = self._engine()

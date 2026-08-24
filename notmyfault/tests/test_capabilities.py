@@ -44,6 +44,34 @@ class ProbeStructureTests(unittest.TestCase):
         self.assertFalse(brightness["available"])
         self.assertIn("brightnessctl", brightness["reason"])
 
+    def test_linux_clipboard_probe_matches_wayland_backend(self):
+        def only_xclip(name):
+            return "/usr/bin/xclip" if name == "xclip" else None
+
+        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"), \
+                patch("notmyfault.platform.linux_support.shutil.which", side_effect=only_xclip):
+            result = capabilities._probe_linux(capabilities.CLIPBOARD_READ)
+        self.assertFalse(result["available"])
+        self.assertIn("wl-paste", result["reason"])
+
+    def test_linux_clipboard_probe_matches_x11_backend(self):
+        def only_wayland(name):
+            return "/usr/bin/wl-paste" if name == "wl-paste" else None
+
+        with patch("notmyfault.platform.linux_support.session_type", return_value="x11"), \
+                patch("notmyfault.platform.linux_support.shutil.which", side_effect=only_wayland):
+            result = capabilities._probe_linux(capabilities.CLIPBOARD_READ)
+        self.assertFalse(result["available"])
+        self.assertIn("xclip", result["reason"])
+
+    def test_wayland_screen_capture_requires_portal_client(self):
+        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"), \
+                patch("importlib.util.find_spec", return_value=None), \
+                patch("notmyfault.platform.linux_support.shutil.which", return_value="/usr/bin/grim"):
+            result = capabilities._probe_linux(capabilities.SCREEN_CAPTURE)
+        self.assertFalse(result["available"])
+        self.assertIn("dbus-next", result["reason"])
+
 
 class CompatibilityTests(unittest.TestCase):
     def test_manifest_without_requirements_is_compatible(self):

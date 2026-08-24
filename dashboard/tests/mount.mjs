@@ -24,6 +24,7 @@ const saveConfigCalls = []
 let requireEarlyApproval = false
 const earlyApprovalAttempts = []
 const aiDraftCalls = []
+const pluginInstallForms = []
 const mockPluginId = `weather_report_${'long_ascii_plugin_identifier_'.repeat(4)}`
 let mockPluginKind = 'action'
 let mockAiDraftResultType = 'assistant_message'
@@ -325,6 +326,7 @@ window.pywebview = { api: {
       }],
     }] }
     if (path === '/api/plugins/toggle') return { ok:true, restart_required:true }
+    if (path === '/api/plugins/key-status') return { exists:true, encrypted:true }
     if (path === '/api/plugins/components') return {
       components: [
         { plugin_id:'hotkey', kind:'triggers', id:'record', name:'录制热键', api:'component-v1', param_types:['hotkey'], ui:{ button_label:'录制', icon:'keyboard' }, vue:'', available:true },
@@ -459,6 +461,21 @@ window.fetch = async (url, options = {}) => {
       })
     }
     return mockAiStreamResponse()
+  }
+  if (u.endsWith('/api/plugins/preview')) return j({
+    ok:true,
+    preview_token:'preview-author-signed',
+    plugin:{
+      id:'author_signed', name:'作者自签插件', description:'测试副签密码字段',
+      version:'1.0', version_code:1, package_name:'com.test.author_signed',
+      type:'actions', platform_compatible:true,
+    },
+    permissions:[], permission_conform:true, permission_errors:[], risks:[],
+    schema_valid:true, schema_errors:[], update_diff:{ update:{ kind:'new' } },
+  })
+  if (u.endsWith('/api/plugins/install')) {
+    pluginInstallForms.push(Object.fromEntries(options.body.entries()))
+    return j({ ok:true, id:'author_signed', restart_required:true })
   }
   if (u.includes('/api/plugins/list')) return j({ triggers: T, actions: A })
   if (u.includes('/api/plugins')) return j({ triggers: T, actions: A })
@@ -1788,8 +1805,8 @@ const consentCalls = aiDraftCalls.slice(consentAiStart)
 const consentTurn = consentCalls[0]
 const sourceResult = document.querySelector('.natural-draft-source')
 const sourceText = sourceResult?.textContent || ''
-const consentSendsExactPluginId = consentCalls.length === 1
-  && JSON.stringify(consentTurn?.consent) === JSON.stringify({ plugin_id:mockPluginId })
+const consentSendsApprovedPlugin = consentCalls.length === 1
+  && JSON.stringify(consentTurn?.consent) === JSON.stringify({ plugin_id:mockPluginId, permissions:['network'] })
   && consentTurn?.messages?.at(-1)?.role === 'user'
   && consentTurn?.messages?.at(-1)?.content === ('我同意生成插件草稿：' + mockPluginId)
 const sourceRendersInstallable = sourceText.includes('插件已生成')
@@ -1803,8 +1820,8 @@ const consentSideEffects = bridgeCalls.slice(consentSideEffectStart).filter(call
   /^\/api\/(?:plugins|rules)(?:\/|$)/.test(call.path)
   && call.path !== '/api/rules/draft/ai'
 ))
-console.log((consentSendsExactPluginId && sourceRendersInstallable && consentSideEffects.length === 0?'PASS':'FAIL')+' - plugin consent renders an installable source card without side effects')
-if (!consentSendsExactPluginId || !sourceRendersInstallable || consentSideEffects.length) {
+console.log((consentSendsApprovedPlugin && sourceRendersInstallable && consentSideEffects.length === 0?'PASS':'FAIL')+' - plugin consent keeps approved permissions and renders an installable source card without side effects')
+if (!consentSendsApprovedPlugin || !sourceRendersInstallable || consentSideEffects.length) {
   console.error(JSON.stringify({ consentCalls, sourceText, consentSideEffects }))
   process.exit(1)
 }
@@ -2074,7 +2091,7 @@ console.log((runExportConfirmOk && runExportDownloadOk?'PASS':'FAIL')+' - run ce
 if (!runExportConfirmOk || !runExportDownloadOk) process.exit(1)
 document.querySelector('.run-card-main')?.click()
 await new Promise(r => setTimeout(r, 20))
-const runStepsOk = document.querySelector('.run-step')?.textContent.includes('显示通知')
+const runStepsOk = document.querySelector('.run-step:not(.run-timeline-fixed)')?.textContent.includes('显示通知')
   && document.querySelector('.step-summary-strip')?.textContent.includes('输入')
   && document.querySelector('.step-summary-strip')?.textContent.includes('消息')
   && document.querySelector('.step-summary-strip')?.textContent.includes('输出')
@@ -2419,6 +2436,38 @@ const firstRunRoutedOk = !!document.querySelector('.automation-create-panel')
   && document.querySelector('.rules-library')?.textContent.includes('创建、测试和管理这台电脑上的自动化')
 console.log((emptyAutomationPageOk && firstRunHomeOk && firstRunRoutedOk?'PASS':'FAIL')+' - empty home points once to the automation page')
 if (!emptyAutomationPageOk || !firstRunHomeOk || !firstRunRoutedOk) process.exit(1)
+
+const pluginsNav = [...document.querySelectorAll('.nav-item')].find(
+  item => item.textContent.includes('插件'),
+)
+pluginsNav?.click()
+await pause(80)
+;[...document.querySelectorAll('.page-head button')].find(
+  button => button.textContent.includes('安装插件'),
+)?.click()
+await pause(20)
+const packageInput = document.querySelector('input[type="file"][accept=".nmfp"]')
+Object.defineProperty(packageInput, 'files', {
+  configurable:true,
+  value:[new window.File(['package'], 'author-signed.nmfp')],
+})
+packageInput.dispatchEvent(new window.Event('change', { bubbles:true }))
+await pause(80)
+document.querySelector('.preview-foot-actions .btn-filled')?.click()
+await pause(40)
+const signingPasswordInput = document.querySelector('.install-dialog input[type="password"]')
+signingPasswordInput.value = 'local-signing-password'
+signingPasswordInput.dispatchEvent(new window.Event('input', { bubbles:true }))
+;[...document.querySelectorAll('.install-dialog button')].find(
+  button => button.textContent.trim() === '确认',
+)?.click()
+await pause(100)
+const signingPasswordUsesDedicatedField = pluginInstallForms.length === 1
+  && pluginInstallForms[0].preview_token === 'preview-author-signed'
+  && pluginInstallForms[0].signing_password === 'local-signing-password'
+  && !('password' in pluginInstallForms[0])
+console.log((signingPasswordUsesDedicatedField?'PASS':'FAIL')+' - author counter-signing uses the signing_password form field')
+if (!signingPasswordUsesDedicatedField) process.exit(1)
 
 console.log('\nDashboard mount test: PASS')
 process.exit(0)
