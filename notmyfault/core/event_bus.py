@@ -1,9 +1,3 @@
-"""事件分发，从 engine.py 拆出。
-
-收到触发器事件后：掩码 sensitive 字段、锁内取规则快照、锁外用
-ConditionRuntime 逐条匹配，命中就发 rule_triggered 事件并交给
-workflow 执行。call_notmyfault 是触发器线程推送外部事件的入口。
-"""
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
@@ -84,6 +78,7 @@ class EventBus:
                     "rule_name": rule_name,
                     "event_type": event_type,
                     "action_count": len(rule.get("actions", [])),
+                    "precondition_count": len(rule.get("preconditions", [])),
                     "event_payload": masked_payload,
                 },
             )

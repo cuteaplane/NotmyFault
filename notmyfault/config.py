@@ -8,7 +8,7 @@ import secrets
 import sys
 from typing import Any, Dict, List
 
-from notmyfault.platform.platform_support import get_config_dir
+from notmyfault.application_paths import ApplicationPaths
 from notmyfault.core.bindings import is_reference
 
 
@@ -166,36 +166,6 @@ def get_ai_drafting_settings(config: Dict[str, Any]) -> Dict[str, Any]:
         ),
     }
 
-CONFIG_FILE = os.path.join(get_config_dir(), "config.json")
-RULES_FILE = os.path.join(get_config_dir(), "rules.json")
-def _backup_path() -> str:
-    return CONFIG_FILE + ".bak"
-
-
-def _rules_backup_path() -> str:
-    return RULES_FILE + ".bak"
-
-
-def _premigration_backup_path() -> str:
-    return CONFIG_FILE + ".premigration.bak"
-
-
-def _keep_premigration_backup() -> None:
-    """拆分前留一份旧配置全量快照，.bak 只有一代，后面的保存会把它冲掉"""
-    backup = _premigration_backup_path()
-    if os.path.exists(backup):
-        return
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as src:
-            content = src.read()
-        with open(backup, "w", encoding="utf-8") as dst:
-            dst.write(content)
-    except OSError:
-        pass  # 备份失败不是致命错误
-
-
-def _secret_path() -> str:
-    return os.path.join(os.path.dirname(CONFIG_FILE), ".config_secret")
 _SIGNATURE_KEY = "_signature"
 
 
@@ -226,111 +196,6 @@ def _secure_write_secret(path: str, data: bytes) -> None:
                 pass
     except OSError:
         pass
-
-
-def _get_or_create_secret() -> bytes:
-    """读取配置签名密钥，不存在时创建一个只供当前用户访问的密钥"""
-    config_dir = os.path.dirname(CONFIG_FILE)
-    if config_dir:
-        os.makedirs(config_dir, exist_ok=True)
-
-    if os.path.exists(_secret_path()):
-        try:
-            with open(_secret_path(), "rb") as f:
-                return f.read()
-        except OSError:
-            pass
-
-    secret = secrets.token_bytes(32)
-    _secure_write_secret(_secret_path(), secret)
-    return secret
-
-
-def _sign_config(config: dict) -> str:
-    """按排序后的 JSON 计算可复现的 HMAC-SHA256 配置签名"""
-    secret = _get_or_create_secret()
-    content = json.dumps(config, sort_keys=True, ensure_ascii=False, default=str)
-    return hmac.new(secret, content.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-def _verify_config(config: dict, signature: str) -> bool:
-    expected = _sign_config(config)
-    return hmac.compare_digest(expected, signature)
-
-
-def _is_secret_installed() -> bool:
-    return os.path.exists(_secret_path())
-
-
-def _write_signed_json(path: str, backup_path: str, data: Dict[str, Any]) -> bool:
-    """备份、签名、tmp 原子写入，写入失败时用备份回滚"""
-    try:
-        target_dir = os.path.dirname(path)
-        if target_dir:
-            os.makedirs(target_dir, exist_ok=True)
-
-        # 写入新内容前复制当前文件作为备份
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as src:
-                    with open(backup_path, "w", encoding="utf-8") as dst:
-                        dst.write(src.read())
-            except OSError:
-                pass  # 备份失败不是致命错误
-
-        # 先为实际写入内容计算签名
-        to_save = dict(data)
-        to_save[_SIGNATURE_KEY] = _sign_config(to_save)
-        tmp_path = path + ".tmp"
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(to_save, f, ensure_ascii=False, indent=4)
-            os.replace(tmp_path, path)
-        except OSError:
-            # Windows 目标文件被占用时直接写入原文件，并在写入失败时用备份恢复
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-            backup = None
-            try:
-                with open(path, "r", encoding="utf-8") as bf:
-                    backup = bf.read()
-            except OSError:
-                pass
-            try:
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(to_save, f, ensure_ascii=False, indent=4)
-            except OSError:
-                if backup is not None:
-                    try:
-                        with open(path, "w", encoding="utf-8") as f:
-                            f.write(backup)
-                    except OSError:
-                        pass
-                raise
-        return True
-    except OSError as e:
-        print(f"[Config] 写入 {os.path.basename(path)} 失败: {e}", file=sys.stderr)
-        return False
-
-
-def save_config(config: Dict[str, Any]) -> bool:
-    """规范化设置并写入签名，规则单独存放在 rules.json"""
-    to_save = _normalize_config(config)
-    if not isinstance(to_save, dict):
-        print("[Config] 保存配置失败: 配置根节点必须是对象", file=sys.stderr)
-        return False
-    return _write_signed_json(CONFIG_FILE, _backup_path(), to_save)
-
-
-def save_rules(rules: list) -> bool:
-    """规范化规则列表并签名写入 rules.json"""
-    if not isinstance(rules, list):
-        print("[Config] 保存规则失败: rules 必须是列表", file=sys.stderr)
-        return False
-    data = {"schema_version": 2, "rules": _normalize_rules(rules)}
-    return _write_signed_json(RULES_FILE, _rules_backup_path(), data)
 
 
 _DANGEROUS_PATTERNS = [
@@ -429,6 +294,14 @@ def _validate_rules_safety(rules: list) -> tuple[list[str], list[str]]:
     return warnings, errors
 
 
+def validate_rules_safety(rules: list) -> tuple[list[str], list[str]]:
+    return _validate_rules_safety(rules)
+
+
+def normalize_rules(rules: Any) -> List[Dict[str, Any]]:
+    return _normalize_rules(rules)
+
+
 class ConfigValidationError(ValueError):
     """运行时配置未通过完整性或安全校验"""
 
@@ -445,58 +318,6 @@ def _validate_rules_for_runtime(rules: List[Dict[str, Any]]) -> None:
             "规则安全校验失败: " + "; ".join(safety_errors[:3])
         )
 
-
-def load_verified_config() -> Dict[str, Any]:
-    """读取通过签名和结构校验的设置快照，规则校验见 load_verified_rules"""
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as config_file:
-            raw = json.load(config_file)
-    except (json.JSONDecodeError, OSError) as e:
-        raise ConfigValidationError(f"配置文件无法解析: {e}") from e
-
-    if not isinstance(raw, dict):
-        raise ConfigValidationError("配置根节点必须是对象")
-
-    signature = raw.pop(_SIGNATURE_KEY, "")
-    if not _is_secret_installed():
-        raise ConfigValidationError("配置签名密钥缺失")
-    if not signature:
-        raise ConfigValidationError("配置缺少签名")
-    if not _verify_config(raw, signature):
-        raise ConfigValidationError("配置签名校验失败")
-
-    normalized = _normalize_config(raw)
-    if not isinstance(normalized, dict):
-        raise ConfigValidationError("规范化后的配置必须是对象")
-    return normalized
-
-
-def load_verified_rules() -> List[Dict[str, Any]]:
-    """读取通过签名、结构和安全校验的规则快照，供热重载使用"""
-    try:
-        with open(RULES_FILE, "r", encoding="utf-8") as rules_file:
-            raw = json.load(rules_file)
-    except (json.JSONDecodeError, OSError) as e:
-        raise ConfigValidationError(f"规则文件无法解析: {e}") from e
-
-    if not isinstance(raw, dict):
-        raise ConfigValidationError("规则文件根节点必须是对象")
-
-    signature = raw.pop(_SIGNATURE_KEY, "")
-    if not _is_secret_installed():
-        raise ConfigValidationError("规则签名密钥缺失")
-    if not signature:
-        raise ConfigValidationError("规则缺少签名")
-    if not _verify_config(raw, signature):
-        raise ConfigValidationError("规则签名校验失败")
-
-    rules = raw.get("rules")
-    if not isinstance(rules, list):
-        raise ConfigValidationError("rules 必须是列表")
-
-    normalized = _normalize_rules(rules)
-    _validate_rules_for_runtime(normalized)
-    return normalized
 
 def _normalize_condition(condition: Any) -> Any:
     """把旧条件树转换成统一的 op 和 children 格式"""
@@ -763,252 +584,404 @@ def _default_v2_config() -> Dict[str, Any]:
     return normalized
 
 
-def get_config() -> Dict[str, Any]:
-    """加载配置并校验签名和安全规则"""
-    config_dir = os.path.dirname(CONFIG_FILE)
-    if config_dir and not os.path.exists(config_dir):
-        os.makedirs(config_dir, exist_ok=True)
+class SignedConfigStore:
+    def __init__(self, paths: ApplicationPaths) -> None:
+        self.paths = paths
 
-    if not os.path.exists(CONFIG_FILE):
-        default_config = _default_v2_config()
-        save_config(default_config)
-        print("[DEBUG] Default config created.")
-        return default_config
+    @property
+    def config_path(self) -> str:
+        return str(self.paths.config_file)
 
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as config_file:
-            raw = config_file.read()
-        config = json.loads(raw)
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"[ERROR] 配置文件损坏 ({e})，尝试从备份恢复...", file=sys.stderr)
-        recovered = _try_recover_from_backup()
-        if recovered is not None:
-            return recovered
-        print("[ERROR] 备份也无效，使用默认配置覆盖", file=sys.stderr)
-        default_config = _default_v2_config()
-        save_config(default_config)
-        return default_config
+    @property
+    def rules_path(self) -> str:
+        return str(self.paths.rules_file)
 
-    signature = config.pop(_SIGNATURE_KEY, "")
-    has_secret = _is_secret_installed()
+    @property
+    def plugin_manifest_path(self) -> str:
+        return str(self.paths.plugin_manifest_file)
 
-    if not has_secret:
-        # 缺少密钥时无法验证配置，攻击者可伪造文件，因此暂停引擎并要求用户确认
-        raise ConfigValidationError(
-            "配置签名密钥缺失，无法验证配置完整性，文件可能被篡改。"
-            f"引擎已暂停。请在 Dashboard「安全与权限」页核对配置摘要后重新签名；"
-            f"确认无异常后可删除 {CONFIG_FILE} 让引擎重新生成默认配置。"
+    @property
+    def _secret_path(self) -> str:
+        return str(self.paths.config_secret_file)
+
+    def _get_or_create_secret(self) -> bytes:
+        self.paths.config_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            return self.paths.config_secret_file.read_bytes()
+        except OSError:
+            secret = secrets.token_bytes(32)
+            _secure_write_secret(self._secret_path, secret)
+            return secret
+
+    def _sign(self, data: Dict[str, Any]) -> str:
+        content = json.dumps(data, sort_keys=True, ensure_ascii=False, default=str)
+        return hmac.new(
+            self._get_or_create_secret(),
+            content.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _verify(self, data: Dict[str, Any], signature: str) -> bool:
+        return hmac.compare_digest(self._sign(data), signature)
+
+    def _write_signed_json(
+        self,
+        path: str,
+        backup_path: str,
+        data: Dict[str, Any],
+    ) -> bool:
+        try:
+            target_dir = os.path.dirname(path)
+            if target_dir:
+                os.makedirs(target_dir, exist_ok=True)
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as src:
+                        with open(backup_path, "w", encoding="utf-8") as dst:
+                            dst.write(src.read())
+                except OSError:
+                    pass
+
+            to_save = dict(data)
+            to_save[_SIGNATURE_KEY] = self._sign(to_save)
+            tmp_path = path + ".tmp"
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as file:
+                    json.dump(to_save, file, ensure_ascii=False, indent=4)
+                os.replace(tmp_path, path)
+            except OSError:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                old_content = None
+                try:
+                    with open(path, "r", encoding="utf-8") as file:
+                        old_content = file.read()
+                except OSError:
+                    pass
+                try:
+                    with open(path, "w", encoding="utf-8") as file:
+                        json.dump(to_save, file, ensure_ascii=False, indent=4)
+                except OSError:
+                    if old_content is not None:
+                        try:
+                            with open(path, "w", encoding="utf-8") as file:
+                                file.write(old_content)
+                        except OSError:
+                            pass
+                    raise
+            return True
+        except OSError as error:
+            print(
+                f"[Config] 写入 {os.path.basename(path)} 失败: {error}",
+                file=sys.stderr,
+            )
+            return False
+
+    def save_config(self, config: Dict[str, Any]) -> bool:
+        normalized = _normalize_config(config)
+        if not isinstance(normalized, dict):
+            print("[Config] 保存配置失败: 配置根节点必须是对象", file=sys.stderr)
+            return False
+        return self._write_signed_json(
+            self.config_path,
+            self.config_path + ".bak",
+            normalized,
         )
 
-    if not signature:
-        # 没有签名时无法验证配置，暂停引擎等待用户确认
-        raise ConfigValidationError(
-            "配置文件缺少签名，可能被篡改。引擎已暂停。"
-            "请在 Dashboard「安全与权限」页核对配置摘要后重新签名。"
+    def save_rules(self, rules: List[Dict[str, Any]]) -> bool:
+        if not isinstance(rules, list):
+            print("[Config] 保存规则失败: rules 必须是列表", file=sys.stderr)
+            return False
+        data = {"schema_version": 2, "rules": _normalize_rules(rules)}
+        return self._write_signed_json(
+            self.rules_path,
+            self.rules_path + ".bak",
+            data,
         )
 
-    if not _verify_config(config, signature):
-        # 签名校验失败说明文件被修改，暂停引擎并保留用户配置
-        raise ConfigValidationError(
-            "配置文件签名校验失败，文件可能被篡改。引擎已暂停。"
-            "请在 Dashboard「安全与权限」页核对配置摘要后重新签名；"
-            "如需找回旧版本，可检查 config.json.bak。"
-        )
+    def _read_signed(self, path: str, label: str) -> Dict[str, Any]:
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                raw = json.load(file)
+        except (json.JSONDecodeError, OSError) as error:
+            raise ConfigValidationError(f"{label}文件无法解析: {error}") from error
+        if not isinstance(raw, dict):
+            raise ConfigValidationError(f"{label}文件根节点必须是对象")
+        signature = raw.pop(_SIGNATURE_KEY, "")
+        if not self.paths.config_secret_file.is_file():
+            raise ConfigValidationError(f"{label}签名密钥缺失")
+        if not signature:
+            raise ConfigValidationError(f"{label}缺少签名")
+        if not self._verify(raw, signature):
+            raise ConfigValidationError(f"{label}签名校验失败")
+        return raw
 
-    # 验签通过后才做拆分，避免把被篡改的规则搬进 rules.json
-    _migrate_rules_file()
+    def load_verified_config(self) -> Dict[str, Any]:
+        normalized = _normalize_config(self._read_signed(self.config_path, "配置"))
+        if not isinstance(normalized, dict):
+            raise ConfigValidationError("规范化后的配置必须是对象")
+        return normalized
 
-    normalized = _normalize_config(config)
-    migrated = normalized != config
-    config = normalized
+    def load_verified_rules(self) -> List[Dict[str, Any]]:
+        raw = self._read_signed(self.rules_path, "规则")
+        rules = raw.get("rules")
+        if not isinstance(rules, list):
+            raise ConfigValidationError("rules 必须是列表")
+        normalized = _normalize_rules(rules)
+        _validate_rules_for_runtime(normalized)
+        return normalized
 
-    # 校验通过后用规范化结果重新签名并原子写回
-    save_config(config)
+    def _keep_premigration_backup(self) -> None:
+        backup = self.config_path + ".premigration.bak"
+        if os.path.exists(backup):
+            return
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as src:
+                content = src.read()
+            with open(backup, "w", encoding="utf-8") as dst:
+                dst.write(content)
+        except OSError:
+            pass
 
-    if migrated:
-        print("[DEBUG] Legacy config migrated to new rule format.")
+    def _merge_legacy_rules(self, legacy_rules: List[Dict[str, Any]]) -> bool:
+        existing = self.load_verified_rules()
+        existing_ids = {rule.get("rule_id") for rule in existing}
+        additions = [
+            rule for rule in legacy_rules if rule.get("rule_id") not in existing_ids
+        ]
+        return self.save_rules(existing + additions)
 
-    print("[DEBUG] Config loaded:", config)
-    return config
+    def _migrate_rules_file(self) -> None:
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as file:
+                raw = json.load(file)
+        except (json.JSONDecodeError, OSError):
+            return
+        if not isinstance(raw, dict) or (
+            "rules" not in raw and "processes" not in raw
+        ):
+            return
 
-
-def _read_rules_content() -> List[Dict[str, Any]]:
-    """读取通过签名和安全校验的现有规则。"""
-    return load_verified_rules()
-
-
-def _merge_rules_into_file(legacy_rules: List[Dict[str, Any]]) -> bool:
-    """把旧配置的规则并进 rules.json，rule_id 已在文件里的跳过，迁移重跑不追加重复条目"""
-    existing = _read_rules_content()
-    existing_ids = {rule.get("rule_id") for rule in existing}
-    new_rules = [
-        rule for rule in legacy_rules if rule.get("rule_id") not in existing_ids
-    ]
-    return save_rules(existing + new_rules)
-
-
-def _migrate_rules_file() -> None:
-    """把旧 config.json 的规则拆进 rules.json，rules.json 已存在时追加旧规则再瘦身"""
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return  # config.json 不可读时由 get_config 的容错链路处理
-    if not isinstance(raw, dict) or ("rules" not in raw and "processes" not in raw):
-        return
-
-    _keep_premigration_backup()
-    legacy = dict(raw)
-    legacy.pop(_SIGNATURE_KEY, None)
-    legacy_rules = _extract_legacy_rules(legacy)
-    if os.path.exists(RULES_FILE):
-        # rules.json 已存在也要合并，跳过直接瘦身会把旧规则静默丢掉
-        if legacy_rules and not _merge_rules_into_file(legacy_rules):
-            raise ConfigValidationError("规则文件写入失败，无法完成规则合并")
-    else:
-        # 先写 rules.json 再瘦身 config.json，任一步失败都中止，避免规则丢失
-        if not save_rules(legacy_rules):
+        self._keep_premigration_backup()
+        legacy = dict(raw)
+        legacy.pop(_SIGNATURE_KEY, None)
+        legacy_rules = _extract_legacy_rules(legacy)
+        if os.path.exists(self.rules_path):
+            if legacy_rules and not self._merge_legacy_rules(legacy_rules):
+                raise ConfigValidationError("规则文件写入失败，无法完成规则合并")
+        elif not self.save_rules(legacy_rules):
             raise ConfigValidationError("规则文件写入失败，无法完成规则拆分")
-    stripped = {
-        k: v for k, v in raw.items()
-        if k not in ("rules", "processes", _SIGNATURE_KEY)
-    }
-    if not save_config(stripped):
-        raise ConfigValidationError("配置文件写入失败，无法完成规则拆分")
-    if legacy_rules:
-        print(
-            f"[Config] 已把 {len(legacy_rules)} 条规则从 config.json 拆分到 rules.json"
-        )
 
+        stripped = {
+            key: value
+            for key, value in raw.items()
+            if key not in ("rules", "processes", _SIGNATURE_KEY)
+        }
+        if not self.save_config(stripped):
+            raise ConfigValidationError("配置文件写入失败，无法完成规则拆分")
+        if legacy_rules:
+            print(
+                f"[Config] 已把 {len(legacy_rules)} 条规则从 config.json 拆分到 rules.json"
+            )
 
-def get_rules() -> List[Dict[str, Any]]:
-    """加载规则，首次运行时从旧 config.json 迁移"""
-    rules_dir = os.path.dirname(RULES_FILE)
-    if rules_dir and not os.path.exists(rules_dir):
-        os.makedirs(rules_dir, exist_ok=True)
-
-    _migrate_rules_file()
-
-    if not os.path.exists(RULES_FILE):
-        # 全新安装没有可迁移的规则，写入空规则文件
-        save_rules([])
-        print("[DEBUG] Empty rules.json created.")
-        return []
-
-    try:
-        with open(RULES_FILE, "r", encoding="utf-8") as rules_file:
-            data = json.loads(rules_file.read())
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"[ERROR] 规则文件损坏 ({e})，尝试从备份恢复...", file=sys.stderr)
-        recovered = _try_recover_rules_from_backup()
-        if recovered is not None:
-            return recovered
-        print("[ERROR] 备份也无效，重置为空规则", file=sys.stderr)
-        save_rules([])
-        return []
-
-    if not isinstance(data, dict):
-        print("[ERROR] 规则文件结构异常，尝试从备份恢复...", file=sys.stderr)
-        recovered = _try_recover_rules_from_backup()
-        if recovered is not None:
-            return recovered
-        save_rules([])
-        return []
-
-    signature = data.pop(_SIGNATURE_KEY, "")
-    if not _is_secret_installed():
-        # 缺少密钥时无法验证规则，暂停引擎并要求用户确认
-        raise ConfigValidationError(
-            "规则签名密钥缺失，无法验证规则完整性，文件可能被篡改。"
-            f"引擎已暂停。请在 Dashboard「安全与权限」页核对规则摘要后重新签名；"
-            f"确认无异常后可删除 {RULES_FILE} 从空规则重新开始。"
-        )
-
-    if not signature:
-        raise ConfigValidationError(
-            "规则文件缺少签名，可能被篡改。引擎已暂停。"
-            "请在 Dashboard「安全与权限」页核对规则摘要后重新签名。"
-        )
-
-    if not _verify_config(data, signature):
-        raise ConfigValidationError(
-            "规则文件签名校验失败，文件可能被篡改。引擎已暂停。"
-            "请在 Dashboard「安全与权限」页核对规则摘要后重新签名；"
-            "如需找回旧版本，可检查 rules.json.bak。"
-        )
-
-    raw_rules = data.get("rules", [])
-    if not isinstance(raw_rules, list):
-        raise ConfigValidationError("rules 必须是列表")
-    rules = _normalize_rules(raw_rules)
-    _validate_rules_for_runtime(rules)
-
-    # 校验通过后用规范化结果重新签名并原子写回
-    save_rules(rules)
-
-    print(f"[DEBUG] Rules loaded: {len(rules)} 条")
-    return rules
-
-
-def _try_recover_from_backup() -> Dict[str, Any] | None:
-    """校验备份签名后恢复配置"""
-    if not os.path.exists(_backup_path()):
-        return None
-    try:
-        with open(_backup_path(), "r", encoding="utf-8") as f:
-            raw = f.read()
-        config = json.loads(raw)
-        signature = config.pop(_SIGNATURE_KEY, "")
-        if not _is_secret_installed():
-            # 备份也无法验证，缺少签名密钥时拒绝恢复
-            print("[WARN] 签名密钥缺失，无法验证备份，拒绝恢复", file=sys.stderr)
+    def _recover_config(self) -> Dict[str, Any] | None:
+        backup = self.config_path + ".bak"
+        try:
+            with open(backup, "r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (json.JSONDecodeError, OSError):
             return None
-        if signature and _verify_config(config, signature):
-            # 先确认旧规则写进 rules.json 再瘦身 config.json，写失败时备份原文件不动
-            legacy_rules = _extract_legacy_rules(config)
-            if legacy_rules:
-                merged = (
-                    _merge_rules_into_file(legacy_rules)
-                    if os.path.exists(RULES_FILE)
-                    else save_rules(legacy_rules)
-                )
-                if not merged:
-                    print("[ERROR] 规则文件写入失败，放弃备份恢复", file=sys.stderr)
-                    return None
-            print("[INFO] 从备份成功恢复配置", file=sys.stderr)
-            normalized = _normalize_config(config)
-            save_config(normalized)
-            return normalized
-        print("[WARN] 备份文件无有效签名，拒绝恢复", file=sys.stderr)
-        return None
-    except Exception as e:
-        print(f"[ERROR] 备份恢复失败: {e}", file=sys.stderr)
-        return None
-
-
-def _try_recover_rules_from_backup() -> List[Dict[str, Any]] | None:
-    """校验 rules.json.bak 签名后恢复规则"""
-    backup = _rules_backup_path()
-    if not os.path.exists(backup):
-        return None
-    try:
-        with open(backup, "r", encoding="utf-8") as f:
-            data = json.loads(f.read())
         if not isinstance(data, dict):
-            print("[WARN] 规则备份结构异常，拒绝恢复", file=sys.stderr)
             return None
         signature = data.pop(_SIGNATURE_KEY, "")
-        if not _is_secret_installed():
-            print("[WARN] 签名密钥缺失，无法验证规则备份，拒绝恢复", file=sys.stderr)
+        if not self.paths.config_secret_file.is_file():
             return None
-        if signature and _verify_config(data, signature):
-            print("[INFO] 从备份成功恢复规则", file=sys.stderr)
-            rules = _normalize_rules(data.get("rules", []))
-            _validate_rules_for_runtime(rules)
-            save_rules(rules)
-            return rules
-        print("[WARN] 规则备份无有效签名，拒绝恢复", file=sys.stderr)
-        return None
-    except Exception as e:
-        print(f"[ERROR] 规则备份恢复失败: {e}", file=sys.stderr)
-        return None
+        if not signature or not self._verify(data, signature):
+            return None
+        legacy_rules = _extract_legacy_rules(data)
+        if legacy_rules:
+            merged = (
+                self._merge_legacy_rules(legacy_rules)
+                if os.path.exists(self.rules_path)
+                else self.save_rules(legacy_rules)
+            )
+            if not merged:
+                return None
+        normalized = _normalize_config(data)
+        if not isinstance(normalized, dict) or not self.save_config(normalized):
+            return None
+        return normalized
+
+    def _recover_rules(self) -> List[Dict[str, Any]] | None:
+        backup = self.rules_path + ".bak"
+        try:
+            with open(backup, "r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (json.JSONDecodeError, OSError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        signature = data.pop(_SIGNATURE_KEY, "")
+        if not self.paths.config_secret_file.is_file():
+            return None
+        if not signature or not self._verify(data, signature):
+            return None
+        rules = _normalize_rules(data.get("rules", []))
+        _validate_rules_for_runtime(rules)
+        return rules if self.save_rules(rules) else None
+
+    def load_config(self) -> Dict[str, Any]:
+        self.paths.config_dir.mkdir(parents=True, exist_ok=True)
+        if not os.path.exists(self.config_path):
+            default = _default_v2_config()
+            self.save_config(default)
+            return default
+        try:
+            config = self.load_verified_config()
+        except ConfigValidationError as error:
+            if "无法解析" not in str(error):
+                raise
+            recovered = self._recover_config()
+            if recovered is not None:
+                return recovered
+            default = _default_v2_config()
+            self.save_config(default)
+            return default
+        self._migrate_rules_file()
+        self.save_config(config)
+        return config
+
+    def load_rules(self) -> List[Dict[str, Any]]:
+        self.paths.config_dir.mkdir(parents=True, exist_ok=True)
+        self._migrate_rules_file()
+        if not os.path.exists(self.rules_path):
+            self.save_rules([])
+            return []
+        try:
+            rules = self.load_verified_rules()
+        except ConfigValidationError as error:
+            if not any(
+                marker in str(error) for marker in ("无法解析", "根节点")
+            ):
+                raise
+            recovered = self._recover_rules()
+            if recovered is not None:
+                return recovered
+            self.save_rules([])
+            return []
+        self.save_rules(rules)
+        return rules
+
+    def inspect_security(self) -> Dict[str, Any]:
+        status: Dict[str, Any] = {"status": "ok", "reason": "", "summary": None}
+        has_secret = self.paths.config_secret_file.is_file()
+        if not has_secret:
+            status["status"] = "tampered"
+            status["reason"] = (
+                "配置签名密钥缺失，无法验证配置是否被篡改。"
+                "引擎已暂停，请核对下方配置摘要后选择处理方式。"
+            )
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as file:
+                config = json.load(file)
+        except (json.JSONDecodeError, OSError):
+            return {"status": "unreadable", "reason": "配置文件无法读取", "summary": None}
+        if not isinstance(config, dict):
+            return {"status": "unreadable", "reason": "配置根节点不是对象", "summary": None}
+        signature = config.pop(_SIGNATURE_KEY, "")
+        if has_secret and (not signature or not self._verify(config, signature)):
+            status["status"] = "tampered"
+            status["reason"] = (
+                "配置签名校验失败，文件可能被篡改。"
+                "引擎已暂停，请核对下方配置摘要后选择处理方式。"
+            )
+
+        rules: List[Any] = []
+        if os.path.exists(self.rules_path):
+            try:
+                with open(self.rules_path, "r", encoding="utf-8") as file:
+                    rules_data = json.load(file)
+            except (json.JSONDecodeError, OSError):
+                return {"status": "unreadable", "reason": "规则文件无法读取", "summary": None}
+            if not isinstance(rules_data, dict):
+                return {"status": "unreadable", "reason": "规则文件根节点不是对象", "summary": None}
+            rules_signature = rules_data.pop(_SIGNATURE_KEY, "")
+            if has_secret and (
+                not rules_signature or not self._verify(rules_data, rules_signature)
+            ):
+                status["status"] = "tampered"
+                status["reason"] = (
+                    "规则签名校验失败，文件可能被篡改。"
+                    "引擎已暂停，请核对下方规则摘要后选择处理方式。"
+                )
+            loaded = rules_data.get("rules", [])
+            if isinstance(loaded, list):
+                rules = loaded
+
+        high_risk_actions = {"run_powershell", "shutdown_system", "kill_process"}
+        status["summary"] = {
+            "rule_count": len(rules),
+            "rules": [
+                {
+                    "name": (
+                        rule.get("name", f"规则 #{index + 1}")
+                        if isinstance(rule, dict)
+                        else f"规则 #{index + 1}"
+                    ),
+                    "actions": [
+                        {
+                            "type": action.get("type", "?"),
+                            "high_risk": action.get("type") in high_risk_actions,
+                        }
+                        for action in rule.get("actions", [])
+                        if isinstance(rule, dict) and isinstance(action, dict)
+                    ],
+                }
+                for index, rule in enumerate(rules)
+            ],
+        }
+        return status
+
+    def approve_current_files(self) -> None:
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as file:
+                config = json.load(file)
+        except (json.JSONDecodeError, OSError) as error:
+            raise ConfigValidationError(f"配置文件无法解析: {error}") from error
+        if not isinstance(config, dict):
+            raise ConfigValidationError("配置根节点不是对象")
+        config.pop(_SIGNATURE_KEY, None)
+        normalized_config = _normalize_config(config)
+        if not isinstance(normalized_config, dict):
+            raise ConfigValidationError("配置根节点不是对象")
+
+        normalized_rules: List[Dict[str, Any]] | None = None
+        if os.path.exists(self.rules_path):
+            try:
+                with open(self.rules_path, "r", encoding="utf-8") as file:
+                    rules_data = json.load(file)
+            except (json.JSONDecodeError, OSError) as error:
+                raise ConfigValidationError(f"规则文件无法解析: {error}") from error
+            if not isinstance(rules_data, dict):
+                raise ConfigValidationError("规则文件根节点不是对象")
+            rules_data.pop(_SIGNATURE_KEY, None)
+            rules = rules_data.get("rules", [])
+            if not isinstance(rules, list):
+                rules = []
+            normalized_rules = _normalize_rules(rules)
+            _validate_rules_for_runtime(normalized_rules)
+            from notmyfault.core.rules import validate_rules_structure
+
+            structure_errors = validate_rules_structure(normalized_rules)
+            if structure_errors:
+                raise ConfigValidationError(
+                    "规则包含结构无效的规则，拒绝重新签名: "
+                    + "; ".join(structure_errors[:3])
+                )
+
+        if not self.save_config(normalized_config):
+            raise ConfigValidationError("重新签名失败")
+        if normalized_rules is not None and not self.save_rules(normalized_rules):
+            raise ConfigValidationError("规则重新签名失败")

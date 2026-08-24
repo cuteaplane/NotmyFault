@@ -1,20 +1,14 @@
-"""规则并发调度
-
-同一规则被反复触发时在这里决定新事件怎么办：single 丢弃、queue 排队、
-replace 取消旧 run 换新的、parallel 直接并行。EventBus 只负责把事件匹配成
-一次 run 请求，进不进执行由这里说了算；单次 run 的执行仍在 WorkflowExecutor。
-
-排队条目在入队时冻结规则快照，热重载改了规则也不影响已排队的 run；
-规则被删掉时排队的 run 丢弃并写 run history。
-"""
+import copy
 import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict
 
 MODES = ("single", "queue", "replace", "parallel")
 DEFAULT_MODE = "parallel"
 DEFAULT_MAX_CONCURRENCY = 1
 DEFAULT_QUEUE_LIMIT = 20
+DEFAULT_WORKERS = 8
 
 
 def _concurrency_config(rule: Dict[str, Any]) -> Dict[str, Any]:
@@ -47,13 +41,26 @@ class RuleScheduler:
         is_deferred_fn: Callable[[str], bool],
         on_history_event: Callable[[str, Dict[str, Any]], None] | None = None,
         spawn_thread_fn: Callable[[Callable[[], None]], None] | None = None,
+        prepare_run_fn: Callable[[Dict[str, Any]], None] | None = None,
+        max_workers: int = DEFAULT_WORKERS,
     ) -> None:
         self._execute_fn = execute_fn
         self._cancel_run_fn = cancel_run_fn
         self._is_deferred_fn = is_deferred_fn
         self._on_history_event = on_history_event or (lambda kind, data: None)
-        self._spawn_thread = spawn_thread_fn or self._spawn_daemon
+        self._prepare_run = prepare_run_fn or (lambda context: None)
+        self._executor: ThreadPoolExecutor | None = None
+        if spawn_thread_fn is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="RuleWorkflow",
+            )
+            self._spawn_thread = self._executor.submit
+        else:
+            self._spawn_thread = spawn_thread_fn
         self._lock = threading.RLock()
+        self._workers_done = threading.Condition(self._lock)
+        self._worker_count = 0
         # rule_key -> 活跃 run_id 集合，deferred 的 run 也在里面
         self._active_runs: Dict[str, set[str]] = {}
         # rule_key -> 排队条目（规则快照 + context）
@@ -61,10 +68,6 @@ class RuleScheduler:
         # rule_key -> queue 模式的并发配置，入队时的规则快照说了算
         self._queue_configs: Dict[str, Dict[str, Any]] = {}
         self._shutting_down = False
-
-    @staticmethod
-    def _spawn_daemon(target: Callable[[], None]) -> None:
-        threading.Thread(target=target, daemon=True).start()
 
     def stats(self) -> Dict[str, Dict[str, int]]:
         """供状态接口展示每个规则的运行数和排队数"""
@@ -96,6 +99,7 @@ class RuleScheduler:
             active = self._active_runs.setdefault(rule_key, set())
 
             if mode == "parallel":
+                self._prepare_run(context)
                 active.add(run_id)
                 run_now = True
                 decision = "started"
@@ -104,6 +108,7 @@ class RuleScheduler:
                 if active:
                     self._emit_history("run_dropped", rule, run_id, rule_name, "已有运行中的 run")
                     return "dropped"
+                self._prepare_run(context)
                 active.add(run_id)
                 run_now = True
                 decision = "started"
@@ -114,6 +119,7 @@ class RuleScheduler:
                 # 锁外再取消，cancel 回调可能反过来碰调度器
                 to_cancel = list(active)
                 active.clear()
+                self._prepare_run(context)
                 active.add(run_id)
                 run_now = True
                 decision = "replaced"
@@ -122,6 +128,7 @@ class RuleScheduler:
                 queue = self._queues.setdefault(rule_key, deque())
                 max_concurrency = config.get("max_concurrency", DEFAULT_MAX_CONCURRENCY)
                 if len(active) < max_concurrency:
+                    self._prepare_run(context)
                     active.add(run_id)
                     run_now = True
                     decision = "started"
@@ -130,7 +137,7 @@ class RuleScheduler:
                     return "dropped"
                 else:
                     # 规则快照入队时冻结，热重载改规则不影响这条
-                    frozen_rule = dict(rule)
+                    frozen_rule = copy.deepcopy(rule)
                     queue.append((frozen_rule, rule_name, context, run_id))
                     self._queue_configs[rule_key] = config
                     self._emit_history("run_queued", rule, run_id, rule_name, f"排队中（第 {len(queue)} 个）")
@@ -139,14 +146,18 @@ class RuleScheduler:
         if mode == "replace":
             for old_run_id in to_cancel:
                 self._cancel_with_retry(old_run_id)
-        # 执行放锁外，长动作不能挡住别的规则提交
         if run_now:
-            self._run_entry(rule_key, rule, rule_name, context, run_id)
+            self._dispatch_entry(
+                rule_key,
+                copy.deepcopy(rule),
+                rule_name,
+                context,
+                run_id,
+            )
         return decision
 
     def _cancel_with_retry(self, run_id: str) -> None:
-        # 刚起跑的 run 要过一会儿才把取消事件登记进 executor，登记前 cancel 返回
-        # False，这里重试等到登记或确认 run 已经结束
+        # run 线程可能晚一步创建取消事件，短暂重试可接住刚启动的 run
         import time
 
         for _ in range(20):
@@ -197,6 +208,20 @@ class RuleScheduler:
                 queue.clear()
             self._queues.clear()
             self._queue_configs.clear()
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=False)
+
+    def wait_for_idle(self, timeout: float = 60.0) -> bool:
+        import time
+
+        deadline = time.monotonic() + timeout
+        with self._workers_done:
+            while self._worker_count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._workers_done.wait(timeout=remaining)
+            return True
 
     def _rule_key_of(self, run_id: str) -> str | None:
         for rule_key, runs in self._active_runs.items():
@@ -205,6 +230,8 @@ class RuleScheduler:
         return None
 
     def _dispatch_queued_locked(self, rule_key: str) -> None:
+        if self._shutting_down:
+            return
         queue = self._queues.get(rule_key)
         active = self._active_runs.get(rule_key)
         if not queue or active is None:
@@ -213,12 +240,42 @@ class RuleScheduler:
         max_concurrency = config.get("max_concurrency", DEFAULT_MAX_CONCURRENCY)
         while queue and len(active) < max_concurrency:
             rule, rule_name, context, run_id = queue.popleft()
-
-            def entry(rk=rule_key, r=rule, rn=rule_name, c=context, rid=run_id):
-                self._run_entry(rk, r, rn, c, rid)
-
+            self._prepare_run(context)
             active.add(run_id)
+            self._dispatch_entry(rule_key, rule, rule_name, context, run_id)
+
+    def _dispatch_entry(
+        self,
+        rule_key: str,
+        rule: Dict[str, Any],
+        rule_name: str,
+        context: Dict[str, Any],
+        run_id: str,
+    ) -> None:
+        with self._workers_done:
+            self._worker_count += 1
+
+        def entry() -> None:
+            try:
+                self._run_entry(rule_key, rule, rule_name, context, run_id)
+            finally:
+                with self._workers_done:
+                    self._worker_count -= 1
+                    self._workers_done.notify_all()
+
+        try:
             self._spawn_thread(entry)
+        except Exception:
+            with self._workers_done:
+                self._worker_count -= 1
+                active = self._active_runs.get(rule_key)
+                if active is not None:
+                    active.discard(run_id)
+                self._emit_history(
+                    "run_dropped", rule, run_id, rule_name, "无法启动工作线程"
+                )
+                self._workers_done.notify_all()
+            raise
 
     def _run_entry(
         self,
@@ -228,8 +285,7 @@ class RuleScheduler:
         context: Dict[str, Any],
         run_id: str,
     ) -> None:
-        # execute_fn 抛异常也必须把 run 从活跃集合去掉，
-        # 否则这条规则以后 single 永远丢事件、queue 永远排队
+        # execute_fn 报错后仍要移除 run，否则 single 一直丢事件且 queue 一直排队
         try:
             self._execute_fn(rule_key, rule, rule_name, context)
         except Exception:

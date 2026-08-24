@@ -128,6 +128,13 @@ class ExtensionSessionManager:
         for session in sessions:
             session.close()
 
+    def drop_all(self) -> None:
+        with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        for session in sessions:
+            session.close()
+
     def _cleanup(self) -> None:
         now = time.time()
         with self._lock:

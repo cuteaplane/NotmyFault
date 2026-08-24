@@ -1,16 +1,3 @@
-"""NotmyFault 规则引擎的装配入口和生命周期管理。
-
-这里负责创建各协作对象并串起启动、主循环和关闭流程：
-- 管理员授权在 core/admin_session.py 的 AdminSessionManager
-- 事件分发在 core/event_bus.py 的 EventBus
-- 热重载在 core/hot_reloader.py 的 RulesHotReloader
-- 插件加载走 security/plugin_loader.py 的 PluginLoader
-- 工作流执行在 core/workflow_executor.py 的 WorkflowExecutor
-- 触发器线程管理在 core/trigger_supervisor.py 的 TriggerSupervisor
-
-engine 上保留了一批同名转发方法和兼容属性，旧插件、Dashboard、
-API server 和测试仍按老名字访问，改动这些名字会破坏调用方。
-"""
 import copy
 import os
 import sys
@@ -18,12 +5,10 @@ import threading
 import time
 import traceback
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 from notmyfault.config import (
-    RULES_FILE,
     get_admin_authorization_mode,
-    load_verified_rules,
 )
 from notmyfault.core.admin_session import AdminSessionManager
 from notmyfault.core.diagnostics import Diagnostics
@@ -63,6 +48,16 @@ from notmyfault.core.workflow import build_context
 from notmyfault.core.workflow_executor import WorkflowExecutor
 
 
+class RulesStorePort(Protocol):
+    @property
+    def rules_path(self) -> str: ...
+
+    @property
+    def plugin_manifest_path(self) -> str: ...
+
+    def load_verified_rules(self) -> List[Dict[str, Any]]: ...
+
+
 class AutomationEngine:
     """加载插件、匹配规则并执行动作"""
 
@@ -70,9 +65,12 @@ class AutomationEngine:
         self,
         config: Dict[str, Any],
         on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        *,
+        rules_store: RulesStorePort,
     ) -> None:
         # 热重载只替换 rules，构造函数传入的 config 保持原对象
         self.config = config
+        self._rules_store = rules_store
         self.rules: List[Dict[str, Any]] = config.get("rules", [])
         self.on_event = on_event
 
@@ -94,7 +92,7 @@ class AutomationEngine:
         )
         self._privilege_session_closed = False
         self._close_lock = threading.Lock()
-        # 关闭时若还有线程没退干净，跳过撤销权限，免得截断仍在跑的动作
+        # 关闭时还有线程运行就保留授权，动作结束前可能继续请求提权
         self._shutdown_clean = True
         self._manual_threads: List[threading.Thread] = []
         self._manual_threads_lock = threading.Lock()
@@ -129,6 +127,7 @@ class AutomationEngine:
             sudo=self._sudo,
             engine_token=self._engine_token,
             integrity_errors=self._plugin_integrity_errors,
+            plugin_manifest_path=rules_store.plugin_manifest_path,
         )
         # rules 和 meta 走 lambda 运行时取值，锁和条件运行时传同一个对象
         self._event_bus = EventBus(
@@ -165,6 +164,7 @@ class AutomationEngine:
             cancel_run_fn=self._workflow_executor.cancel_run,
             is_deferred_fn=self._workflow_executor.is_run_deferred,
             on_history_event=self._safe_on_event,
+            prepare_run_fn=self._workflow_executor.prepare_run,
         )
         # isolated 动作崩了通过这个回调推 plugin_worker_crashed 事件
         plugin_worker.set_crash_callback(self._safe_on_event)
@@ -187,10 +187,9 @@ class AutomationEngine:
                 title, message, open_dashboard=open_dashboard
             ),
         )
-        # RULES_FILE 在 lambda 执行时才取值，测试 monkeypatch 模块属性仍生效
         self._hot_reloader = RulesHotReloader(
-            rules_path_fn=lambda: RULES_FILE,
-            load_rules_fn=load_verified_rules,
+            rules_path_fn=lambda: self._rules_store.rules_path,
+            load_rules_fn=self._rules_store.load_verified_rules,
             stop_triggers_fn=self._stop_trigger_threads,
             apply_rules_fn=self._apply_hot_reload_rules,
             cancel_deferred_fn=self._cancel_deferred_workflows,
@@ -483,6 +482,38 @@ class AutomationEngine:
             self._plugin_registry.resolve_action(plugin_id)
         return self.extensions.handler(plugin_id, command_id)
 
+    def check_plugin_load(
+        self,
+        plugin_kind: str,
+        plugin_id: str,
+        folder_path: str,
+    ) -> bool:
+        """导入指定插件并运行 setup，入口或附加模块加载失败时返回 False。"""
+        loaded_root = self._plugin_registry.plugin_roots.get(plugin_id)
+        if not loaded_root or os.path.realpath(loaded_root) != os.path.realpath(
+            folder_path
+        ):
+            return False
+        before = len(self._diag_obj.snapshot()["plugin_errors"])
+        try:
+            if plugin_kind == "trigger":
+                entry = self._plugin_registry.resolve_trigger(plugin_id)
+            elif plugin_kind == "action":
+                entry = self._plugin_registry.resolve_action(plugin_id)
+            else:
+                raise ValueError(f"未知插件类型: {plugin_kind}")
+        except Exception as error:
+            self._diag_obj.record_plugin_error(
+                plugin_kind,
+                plugin_id,
+                f"插件导入异常: {error}",
+            )
+            return False
+        errors = self._diag_obj.snapshot()["plugin_errors"][before:]
+        return entry is not None and not any(
+            len(item) >= 2 and item[1] == plugin_id for item in errors
+        )
+
     def _validate_all_rules(self) -> Tuple[int, int]:
         """校验规则引用和参数并记录问题"""
         # 复制规则列表后再校验，热重载线程可以同时准备下一份配置
@@ -628,6 +659,7 @@ class AutomationEngine:
             "rule_name": rule_name,
             "event_type": "manual",
             "action_count": selected_count,
+            "precondition_count": len(rule.get("preconditions", [])),
             "start_step_id": start_step_id,
             "end_step_id": end_step_id,
             "assertion_count": len(test_assertions or []),
@@ -639,7 +671,6 @@ class AutomationEngine:
             name=f"ManualRule-{rule_index}",
             daemon=True,
         )
-        # 登记手工规则线程，shutdown 时要等它们退出再排空动作
         with self._manual_threads_lock:
             self._manual_threads = [
                 item for item in self._manual_threads if item.is_alive()
@@ -772,7 +803,7 @@ class AutomationEngine:
             self._condition_runtime.reset()
         # 被删掉的规则连排队中的 run 一起丢弃；还在的规则排队条目用入队时的快照
         def rule_key_of(rule: Dict[str, Any]) -> str:
-            # 和 EventBus 的调度 key 同算法：rule_id 优先，规则名兜底
+            # 调度 key 与 EventBus 一致，先取 rule_id，没有时取规则名
             return str(rule.get("rule_id", "")) or str(rule.get("name", ""))
 
         new_keys = {
@@ -857,10 +888,12 @@ class AutomationEngine:
         self._cancel_deferred_workflows()
         stopped = self._stop_trigger_threads(timeout=30)
         manual_stopped = self._join_manual_threads()
-        drained = self._wait_active_actions()
+        scheduled_stopped, drained = self._wait_runtime_work()
         plugin_worker.shutdown_all()
         self._shutdown_plugins()
-        self._shutdown_clean = bool(stopped and manual_stopped and drained)
+        self._shutdown_clean = bool(
+            stopped and manual_stopped and scheduled_stopped and drained
+        )
 
     def _join_manual_threads(self, timeout: float = 10.0) -> bool:
         """等待手工规则线程退出，返回是否全部退出"""
@@ -907,6 +940,13 @@ class AutomationEngine:
     def _wait_active_actions(self, timeout: float = 60.0) -> bool:
         return self._workflow_executor.wait_active_actions(timeout=timeout)
 
+    def _wait_runtime_work(self, timeout: float = 60.0) -> tuple[bool, bool]:
+        deadline = time.monotonic() + timeout
+        scheduled_stopped = self._rule_scheduler.wait_for_idle(timeout=timeout)
+        remaining = max(deadline - time.monotonic(), 0.0)
+        drained = self._wait_active_actions(timeout=remaining)
+        return scheduled_stopped, drained
+
     def shutdown(self) -> None:
         # API、信号和 finally 可能同时调用 shutdown()，每个清理步骤都支持重复执行
         if self._shutdown_flag is not None:
@@ -919,9 +959,11 @@ class AutomationEngine:
         self._cancel_deferred_workflows()
         stopped = self._stop_trigger_threads(timeout=30)
         manual_stopped = self._join_manual_threads()
-        drained = self._wait_active_actions()
+        scheduled_stopped, drained = self._wait_runtime_work()
         plugin_worker.shutdown_all()
         self._shutdown_plugins()
-        self._shutdown_clean = bool(stopped and manual_stopped and drained)
+        self._shutdown_clean = bool(
+            stopped and manual_stopped and scheduled_stopped and drained
+        )
         if self._shutdown_clean:
             self.close()

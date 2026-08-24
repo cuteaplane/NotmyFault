@@ -80,6 +80,7 @@ def _safe_event(packet: Dict[str, Any]) -> Dict[str, Any] | None:
             "rule_name",
             "event_type",
             "action_count",
+            "precondition_count",
             "start_step_id",
             "end_step_id",
             "assertion_count",
@@ -146,6 +147,7 @@ def _new_run(data: Dict[str, Any], timestamp: Any) -> Dict[str, Any]:
         "finished_at": None,
         "duration_ms": None,
         "action_count": int(data.get("action_count", 0) or 0),
+        "precondition_count": int(data.get("precondition_count", 0) or 0),
         "start_step_id": data.get("start_step_id", ""),
         "end_step_id": data.get("end_step_id", ""),
         "assertions_passed": 0,
@@ -181,6 +183,9 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
             rule_name=data.get("rule_name", run["rule_name"]),
             event_type=data.get("event_type", run["event_type"]),
             action_count=int(data.get("action_count", run["action_count"]) or 0),
+            precondition_count=int(
+                data.get("precondition_count", run["precondition_count"]) or 0
+            ),
             start_step_id=data.get("start_step_id", run["start_step_id"]),
             end_step_id=data.get("end_step_id", run["end_step_id"]),
             assertions_total=int(data.get("assertion_count", run["assertions_total"]) or 0),

@@ -1,15 +1,8 @@
-"""isolated action 的父进程端：起子进程、收结果、管超时和回收
-
-目标是故障隔离，不是安全 sandbox：动作代码在自己的进程里崩，引擎照常活着。
-manifest 写 "execution_mode": "isolated" 的 action 走这里，其余仍进进程内执行。
-每次执行起一个短命子进程；引擎 shutdown 时 shutdown_all() 把还活着的子进程
-terminate 掉。
-"""
 import subprocess
 import sys
 import threading
 
-# worker 各阶段的等待上限（秒）：执行结果、退出宽限；解释器启动耗时算进执行超时
+# 动作执行和退出的等待上限，解释器启动时间算在动作超时内
 EXECUTE_TIMEOUT = 120.0
 EXIT_TIMEOUT = 5.0
 
@@ -65,6 +58,21 @@ def _stop_process(process: subprocess.Popen) -> None:
             pass
 
 
+def _drain_stderr(stream) -> None:
+    target = sys.stderr
+    try:
+        for line in stream:
+            if target is None:
+                continue
+            try:
+                target.write(line)
+                target.flush()
+            except (OSError, ValueError):
+                target = None
+    finally:
+        stream.close()
+
+
 def run_isolated_action(
     entry: str,
     action_info: dict,
@@ -72,7 +80,6 @@ def run_isolated_action(
     context: dict,
     execute_timeout: float = EXECUTE_TIMEOUT,
 ):
-    """在子进程里跑一次 action，返回 (ok, result 或错误消息)"""
     request = {
         "entry": entry,
         "action_info": action_info,
@@ -90,11 +97,16 @@ def run_isolated_action(
     )
     with _lock:
         _live_processes.add(process)
+    assert process.stderr is not None
+    stderr_thread = threading.Thread(
+        target=_drain_stderr,
+        args=(process.stderr,),
+        daemon=True,
+    )
+    stderr_thread.start()
     timed_out = threading.Event()
 
     def watchdog():
-        if timed_out.wait(timeout=execute_timeout):
-            return
         timed_out.set()
         _stop_process(process)
 
@@ -108,6 +120,7 @@ def run_isolated_action(
         with _lock:
             _live_processes.discard(process)
         _stop_process(process)
+        stderr_thread.join(timeout=EXIT_TIMEOUT)
 
 
 def _drive(process, request, execute_timeout, timed_out):

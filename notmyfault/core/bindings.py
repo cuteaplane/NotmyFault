@@ -220,19 +220,25 @@ def contains_legacy_template(value: Any) -> bool:
     return False
 
 
-def references_available(value: Any, context: Dict[str, Any]) -> bool:
-    """返回结构化绑定的来源是否参与了本次工作流运行"""
+def unavailable_references(
+    value: Any, context: Dict[str, Any]
+) -> list[BindingUsage]:
+    missing = []
     for usage in iter_references(value):
         reference = usage.reference
         scope = reference.get("scope")
         if scope in ("trigger", "trigger_config"):
             if reference.get("node") not in context.get("triggers", {}):
-                return False
+                missing.append(usage)
         elif scope == "step":
             step = context.get("steps", {}).get(reference.get("node"))
             if not isinstance(step, dict) or step.get("status") != "ok":
-                return False
-    return True
+                missing.append(usage)
+    return missing
+
+
+def references_available(value: Any, context: Dict[str, Any]) -> bool:
+    return not unavailable_references(value, context)
 
 
 def iter_legacy_event_payload_paths(value: Any) -> Iterable[Tuple[str, ...]]:

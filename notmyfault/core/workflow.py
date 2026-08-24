@@ -117,6 +117,8 @@ def invoke_action(
     if action_meta.get("execution_api") == "context-v1":
         context_runner = getattr(module, "run_with_context", None)
         if not callable(context_runner):
+            context_runner = getattr(action_func, "run_with_context", None)
+        if not callable(context_runner):
             raise TypeError("execution_api=context-v1 的插件必须定义 run_with_context()")
         return context_runner(action_meta, params, context)
     return action_func(action_meta, params)

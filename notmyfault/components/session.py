@@ -86,6 +86,10 @@ class ComponentSessionManager:
                 self._sessions.values(), key=lambda session: session.created_at
             )
 
+    def drop_all(self) -> None:
+        with self._lock:
+            self._sessions.clear()
+
     def _cleanup(self) -> None:
         now = time.time()
         with self._lock:

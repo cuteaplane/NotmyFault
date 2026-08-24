@@ -1,4 +1,5 @@
-import sys, copy
+import sys, copy, tempfile
+from pathlib import Path
 from unittest.mock import MagicMock
 from notmyfault.simulator.environment import SimulatedEnvironment
 
@@ -27,6 +28,17 @@ _SIM_DEMO_RULES = [
         ],
     },
 ]
+
+
+class _SimulationRulesStore:
+    def __init__(self, rules):
+        self._rules = rules
+        directory = Path(tempfile.mkdtemp(prefix="notmyfault-simulator-"))
+        self.rules_path = str(directory / "rules.json")
+        self.plugin_manifest_path = str(directory / "plugin_manifest.json")
+
+    def load_verified_rules(self):
+        return copy.deepcopy(self._rules)
 
 
 class SimulatedRunner:
@@ -82,7 +94,11 @@ class SimulatedRunner:
             config = copy.deepcopy(DEFAULT_CONFIG)
             # 默认配置不再携带示例规则，模拟器自带微信音量演示规则
             config["rules"] = copy.deepcopy(_SIM_DEMO_RULES)
-        self.engine = AutomationEngine(config, on_event=self._on)
+        self.engine = AutomationEngine(
+            config,
+            on_event=self._on,
+            rules_store=_SimulationRulesStore(config.get("rules", [])),
+        )
         self.engine._alert_user = lambda *a, **kw: None
         for t in ["process_state","usb_insert","time_schedule","window_title","idle_detect"]:
             self.engine.triggers_funcs[t] = lambda m,c,e,se=None: None
@@ -97,6 +113,7 @@ class SimulatedRunner:
     def emit(self, tid, payload=None):
         if self.engine:
             self.engine.emit_event(tid, payload or {})
+            self.engine._rule_scheduler.wait_for_idle(timeout=5)
 
     def step(self, seconds=1.0):
         self.env.time.advance(seconds)

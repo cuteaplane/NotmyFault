@@ -14,6 +14,7 @@ from notmyfault.core.bindings import (
     is_reference,
     references_available,
     resolve_value,
+    unavailable_references,
 )
 from notmyfault.core.diagnostics import Diagnostics
 from notmyfault.core.logging import engine_error
@@ -217,6 +218,9 @@ class WorkflowExecutor:
             with self._run_cancel_lock:
                 self._run_cancel_events[run_id] = event
         return event
+
+    def prepare_run(self, context: Dict[str, Any]) -> None:
+        self._ensure_run_cancel_event(context)
 
     def _finish_run(self, context: Dict[str, Any]) -> bool:
         run_id = _run_id(context)
@@ -589,6 +593,16 @@ class WorkflowExecutor:
             )
             step_id = action.get("binding_id") or legacy_step_id
             if not references_available(action.get("params", {}), context):
+                missing_sources = unavailable_references(
+                    action.get("params", {}), context
+                )
+                source_labels = [
+                    f"{usage.location} ← {usage.reference.get('scope')}:{usage.reference.get('node', '')}"
+                    for usage in missing_sources
+                ]
+                skip_reason = "数据来源未参与本次运行"
+                if source_labels:
+                    skip_reason += "：" + "；".join(source_labels)
                 result = None
                 record = {
                     "type": action.get("type", "action"),
@@ -604,7 +618,7 @@ class WorkflowExecutor:
                         "run_id": _run_id(context),
                         "rule_name": rule_name,
                         "step_id": step_id,
-                        "reason": "数据来源未参与本次运行",
+                        "reason": skip_reason,
                         "duration_ms": 0,
                     },
                 )
