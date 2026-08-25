@@ -10,6 +10,7 @@ from notmyfault.extensions.protocol import (
     OwnedValueError,
     owned_value_identity,
     unpack_owned_value,
+    value_matches_type,
 )
 from notmyfault.extensions.session import ExtensionContext, ExtensionSessionManager
 from notmyfault.host.api.ports import EngineControlPort
@@ -90,15 +91,16 @@ class PluginInteractionService:
                 source_kind,
                 source_id,
             )
-            data_type = engine.extensions.data_type(
-                plugin_id,
-                source.get("data_type", "") if source else "",
-            )
+            data_type_id = source.get("data_type", "") if source else ""
+            data_type = engine.extensions.data_type(plugin_id, data_type_id)
             plugin = engine.extensions.plugin(plugin_id)
-            if source is None or data_type is None or plugin is None:
+            value_type = source.get("value_type") if source else None
+            if source is None or plugin is None:
+                self._fail(400, "扩展入口的数据类型不可用")
+            if data_type is None and not isinstance(value_type, str):
                 self._fail(400, "扩展入口的数据类型不可用")
             current_value = body.get("current_value")
-            if current_value is not None:
+            if current_value is not None and data_type is not None:
                 try:
                     if owned_value_identity(current_value) is not None:
                         current_value = unpack_owned_value(
@@ -113,6 +115,10 @@ class PluginInteractionService:
                         raise OwnedValueError("当前值不是该插件声明的数据")
                 except OwnedValueError as error:
                     self._fail(400, str(error))
+            elif current_value is not None and not value_matches_type(
+                current_value, value_type
+            ):
+                self._fail(400, f"当前值不是 {value_type}")
             session = self._extension_sessions.create(
                 plugin_id=plugin_id,
                 command_id=command_id,
@@ -122,6 +128,7 @@ class PluginInteractionService:
                 allowed_commands=allowed_commands,
                 data_type=data_type,
                 current_value=current_value,
+                value_type=value_type if data_type is None else None,
             )
 
         handler = engine.extension_handler(plugin_id, command_id)
@@ -150,6 +157,8 @@ class PluginInteractionService:
         if not isinstance(result, dict):
             result = {"ok": True, "data": result}
         if result.get("ok") is False:
+            if result.get("close") is True:
+                self._extension_sessions.drop(session.session_id)
             raise PluginInteractionError(
                 400,
                 {
@@ -158,6 +167,24 @@ class PluginInteractionService:
                     "session_id": session.session_id,
                 },
             )
+        if "value" in result:
+            if session.data_type is None:
+                if not value_matches_type(
+                    result["value"], session.value_type or ""
+                ):
+                    self._extension_sessions.drop(session.session_id)
+                    self._fail(400, f"插件命令返回值不是 {session.value_type}")
+            else:
+                try:
+                    unpack_owned_value(
+                        result["value"],
+                        session.plugin_meta["package_name"],
+                        session.data_type["id"],
+                        session.data_type["version"],
+                    )
+                except OwnedValueError as error:
+                    self._extension_sessions.drop(session.session_id)
+                    self._fail(400, str(error))
         response = {
             "ok": True,
             "session_id": session.session_id,
