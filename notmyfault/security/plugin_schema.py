@@ -42,10 +42,11 @@ _VIEW_FIELDS = {
 }
 _DATA_TYPE_FIELDS = {"id", "version", "binding"}
 _PARAMETER_EDITOR_FIELDS = {
-    "id", "parameter", "data_type", "command", "view", "ui", "accepts_legacy",
+    "id", "parameter", "data_type", "value_type", "command", "view", "ui",
+    "accepts_legacy",
 }
 _PARAMETER_EDITOR_UI_FIELDS = {
-    "control", "icon", "empty_label", "description",
+    "control", "icon", "label", "busy_label", "empty_label", "description",
 }
 _DATA_BINDING_POLICIES = {"private"}
 _EDITOR_CONTROLS = {"button"}
@@ -486,7 +487,7 @@ def _validate_contributes_field(
         contributes,
         "parameter_editors",
         _PARAMETER_EDITOR_FIELDS,
-        {"id", "parameter", "data_type", "command", "ui"},
+        {"id", "parameter", "command", "ui"},
         errors,
     )
 
@@ -560,16 +561,46 @@ def _validate_contributes_field(
     for index, editor in enumerate(editors):
         prefix = f"contributes.parameter_editors[{index}]"
         parameter = editor.get("parameter")
+        param = next(
+            (
+                item for item in params
+                if isinstance(item, dict) and item.get("name") == parameter
+            ),
+            None,
+        ) if isinstance(params, list) else None
         if parameter not in param_names:
             errors.append(f"{prefix}.parameter 引用了未声明参数: {parameter!r}")
         elif parameter in editor_params:
             errors.append(f"参数 {parameter!r} 声明了多个 parameter_editor")
         else:
             editor_params.add(parameter)
-        if editor.get("data_type") not in data_type_ids:
-            errors.append(
-                f"{prefix}.data_type 引用了未声明数据类型: {editor.get('data_type')!r}"
-            )
+        is_plugin_data = isinstance(param, dict) and param.get("type") == "plugin_data"
+        has_data_type = "data_type" in editor
+        has_value_type = "value_type" in editor
+        if is_plugin_data:
+            if not has_data_type:
+                errors.append(f"{prefix}.data_type 是 plugin_data 参数的必填字段")
+            elif editor.get("data_type") not in data_type_ids:
+                errors.append(
+                    f"{prefix}.data_type 引用了未声明数据类型: {editor.get('data_type')!r}"
+                )
+            if has_value_type:
+                errors.append(f"{prefix}.value_type 不能用于 plugin_data 参数")
+        elif isinstance(param, dict):
+            if has_data_type:
+                errors.append(f"{prefix}.data_type 只能用于 plugin_data 参数")
+            if not has_value_type:
+                errors.append(f"{prefix}.value_type 是普通参数编辑器的必填字段")
+            elif editor.get("value_type") not in _ALLOWED_OUTPUT_TYPES:
+                errors.append(f"{prefix}.value_type 无效: {editor.get('value_type')!r}")
+            elif editor.get("value_type") != param.get("value_type"):
+                errors.append(
+                    f"{prefix}.value_type 必须与参数 {parameter!r} 的 value_type 一致"
+                )
+            if "accepts_legacy" in editor:
+                errors.append(f"{prefix}.accepts_legacy 只能用于 plugin_data 参数")
+            if "accepts_legacy" in editor:
+                errors.append(f"{prefix}.accepts_legacy 只能用于 plugin_data 参数")
         if editor.get("command") not in command_ids:
             errors.append(
                 f"{prefix}.command 引用了未声明命令: {editor.get('command')!r}"
@@ -589,7 +620,7 @@ def _validate_contributes_field(
                     errors.append(f"{prefix}.ui 包含未知字段: '{key}'")
             if ui.get("control", "button") not in _EDITOR_CONTROLS:
                 errors.append(f"{prefix}.ui.control 目前仅支持 button")
-            for key in ("icon", "empty_label", "description"):
+            for key in ("icon", "label", "busy_label", "empty_label", "description"):
                 if key in ui and not isinstance(ui[key], str):
                     errors.append(f"{prefix}.ui.{key} 必须是字符串")
 
