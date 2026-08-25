@@ -329,17 +329,23 @@ window.pywebview = { api: {
     if (path === '/api/plugins/key-status') return { exists:true, encrypted:true }
     if (path === '/api/plugins/components') return {
       components: [
-        { plugin_id:'hotkey', kind:'triggers', id:'record', name:'录制热键', api:'component-v1', param_types:['hotkey'], ui:{ button_label:'录制', icon:'keyboard' }, vue:'', available:true },
         { plugin_id:'uia_control', kind:'actions', id:'record', name:'录制屏幕控件', api:'component-v1', param_types:['uia_selector'], ui:{ button_label:'录制桌面步骤', icon:'screen_record' }, vue:'', available:true },
       ],
     }
     if (path === '/api/plugins/extensions') return {
       commands: [],
-      parameter_editors: [{
-        plugin_id:'macro_run', id:'macro_editor', parameter:'macro', data_type:'mouse_macro',
-        command:'open_macro', view:'macro_workbench',
-        ui:{ control:'button', empty_label:'录制操作宏', icon:'movie', description:'由插件管理' },
-      }],
+      parameter_editors: [
+        {
+          plugin_id:'hotkey', id:'hotkey_recorder', parameter:'hotkey', value_type:'string',
+          command:'capture_hotkey',
+          ui:{ control:'button', label:'录制', busy_label:'请按快捷键…', icon:'keyboard' },
+        },
+        {
+          plugin_id:'macro_run', id:'macro_editor', parameter:'macro', data_type:'mouse_macro',
+          command:'open_macro', view:'macro_workbench',
+          ui:{ control:'button', empty_label:'录制操作宏', icon:'movie', description:'由插件管理' },
+        },
+      ],
       views: [{ plugin_id:'macro_run', id:'macro_workbench', title:'操作宏编辑器', window_controls:['minimize','restore'] }],
       data_types: [{ plugin_id:'macro_run', id:'mouse_macro', version:1, binding:'private' }],
     }
@@ -409,8 +415,8 @@ window.pywebview = { api: {
         display:{ control:'保存', control_type:'按钮', window:'无标题 - 记事本', app:'notepad.exe' },
       } } } }
     }
-    if (path === '/api/plugins/hotkey/components/record/invoke' && method === 'POST') {
-      return { ok:true, session_id:'s_hot', data:{ ok:true, data:{ hotkey:'Ctrl+Shift+M' } } }
+    if (path === '/api/plugins/hotkey/extensions/commands/capture_hotkey/invoke' && method === 'POST') {
+      return { ok:true, session_id:'s_hot', value:'Ctrl+Shift+M', close:true }
     }
     if (path === '/api/plugins/install-source' && method === 'POST') {
       return { ok:true, id:data?.plugin_id, type:'actions', signed:false, restart_required:true }

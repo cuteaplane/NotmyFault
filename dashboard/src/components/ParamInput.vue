@@ -6,6 +6,7 @@ import { store } from '../lib/store'
 import { isReference, referenceLabel, typesCompatible } from '../lib/bindings'
 import BindingPicker from './BindingPicker.vue'
 import PluginDataField from './PluginDataField.vue'
+import ParameterEditorButton from './ParameterEditorButton.vue'
 
 const props = defineProps({
   def: Object,
@@ -21,7 +22,6 @@ const value = computed({
 })
 const type = computed(() => props.def.type || 'string')
 const bindingType = computed(() => props.def.value_type || type.value)
-const recording = ref(false)
 const bindingOpen = ref(false)
 const selectingElement = ref(false)
 const checkingElement = ref(false)
@@ -41,7 +41,7 @@ const captureComponent = computed(() => {
     && (component.param_types || []).includes(type.value)
   )) || null
 })
-const dataEditor = computed(() => store.extensions.parameter_editors.find(editor => (
+const parameterEditor = computed(() => store.extensions.parameter_editors.find(editor => (
   editor.plugin_id === props.pluginId
   && editor.parameter === props.def.name
   && editor.data_type === props.def.data_type
@@ -75,31 +75,6 @@ const elementDisplay = computed(() => {
     app: display.app || windowInfo.process || '未知程序',
   }
 })
-
-async function recordHotkey() {
-  const component = captureComponent.value
-  if (!component || recording.value) return
-  recording.value = true
-  try {
-    const result = await invokeComponent(
-      component.plugin_id, component.id, 'capture', { timeout_seconds: 15 },
-    )
-    const data = result?.data?.data || {}
-    if (result?.ok && data.hotkey) {
-      value.value = data.hotkey
-    } else if (result?.ok && data.cancelled) {
-      elementStatus.value = '已取消录制。'
-    } else if (result?.ok && data.timed_out) {
-      elementStatus.value = '没有等到按键，请再试一次。'
-    } else {
-      elementStatus.value = result?.error || '录制热键失败。'
-    }
-  } catch (error) {
-    elementStatus.value = error.message || '录制热键失败。'
-  } finally {
-    recording.value = false
-  }
-}
 
 async function pickFolder() {
   if (!hasBridge()) return
@@ -186,7 +161,7 @@ function clearDesktopElement() {
     </div>
     <BindingPicker v-if="bindingOpen" :sources="bindingSources" :target-type="bindingType"
       @select="useBinding" @cancel="bindingOpen = false" />
-    <PluginDataField v-else-if="!bound && dataEditor" :editor="dataEditor"
+    <PluginDataField v-else-if="!bound && type === 'plugin_data' && parameterEditor" :editor="parameterEditor"
       :model-value="props.modelValue" :sensitive="props.def.sensitive === true"
       @update:model-value="emit('update:modelValue', $event)" />
     <p v-else-if="!bound && type === 'plugin_data'" class="plugin-data-error">
@@ -198,10 +173,8 @@ function clearDesktopElement() {
     <input v-else-if="!bound && type === 'time'" v-model="value" type="time" class="text-field">
     <div v-else-if="!bound && type === 'hotkey'" class="hotkey-input">
       <input v-model="value" class="text-field" :placeholder="def.placeholder || '如 Ctrl+Shift+A'">
-      <button v-if="captureComponent" type="button" class="btn btn-tonal btn-sm"
-        :disabled="recording" @click="recordHotkey">
-        <span class="material-symbols-outlined">keyboard</span>{{ recording ? '请按快捷键…' : '录制' }}
-      </button>
+      <ParameterEditorButton v-if="parameterEditor" :editor="parameterEditor" :model-value="props.modelValue"
+        @update:model-value="emit('update:modelValue', $event)" />
     </div>
     <div v-else-if="!bound && type === 'path'" class="path-input">
       <input v-model="value" type="text" class="text-field" :placeholder="def.placeholder || '选择或输入文件夹路径'">
@@ -242,5 +215,8 @@ function clearDesktopElement() {
     <input v-else-if="!bound && type === 'number'" v-model.number="value" type="number" class="text-field" :placeholder="def.placeholder" :min="def.min" :max="def.max" :step="def.step">
     <input v-else-if="!bound && type === 'bool'" type="checkbox" v-model="value">
     <input v-else-if="!bound" v-model="value" type="text" class="text-field" :placeholder="def.placeholder">
+    <ParameterEditorButton v-if="!bound && parameterEditor && !['plugin_data', 'hotkey'].includes(type)"
+      :editor="parameterEditor" :model-value="props.modelValue"
+      @update:model-value="emit('update:modelValue', $event)" />
   </div>
 </template>
