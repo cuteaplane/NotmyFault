@@ -64,6 +64,38 @@ def extension_meta():
     }
 
 
+def native_editor_meta():
+    return {
+        "id": "native_sample",
+        "name": "普通值编辑器",
+        "description": "测试普通参数编辑器",
+        "enabled": True,
+        "version_code": 1,
+        "version": "1.0",
+        "package_name": "com.example.native_sample",
+        "params": [{
+            "name": "hotkey",
+            "label": "快捷键",
+            "type": "hotkey",
+            "value_type": "string",
+        }],
+        "contributes": {
+            "commands": [{
+                "id": "capture",
+                "title": "录制",
+                "handler": "extension.py:capture",
+            }],
+            "parameter_editors": [{
+                "id": "recorder",
+                "parameter": "hotkey",
+                "value_type": "string",
+                "command": "capture",
+                "ui": {"control": "button", "label": "录制"},
+            }],
+        },
+    }
+
+
 class ExtensionEngine:
     def __init__(self, root):
         self.extensions = ExtensionRegistry()
@@ -87,6 +119,24 @@ class ExtensionEngine:
     @staticmethod
     def hidden(context, payload):
         return context.result({"secret": True})
+
+
+class NativeEditorEngine:
+    def __init__(self, root):
+        self.extensions = ExtensionRegistry()
+        self.extensions.register_manifest(
+            "native_sample", "trigger", native_editor_meta(), str(root)
+        )
+        self.extensions.register_command(
+            "native_sample", "capture", self.capture, self
+        )
+
+    def extension_handler(self, plugin_id, command_id):
+        return self.extensions.handler(plugin_id, command_id)
+
+    @staticmethod
+    def capture(context, payload):
+        return context.commit_value("Ctrl+Shift+K")
 
 
 def make_client(tmp_path, engine=None):
@@ -150,6 +200,18 @@ def test_contribution_schema_checks_references():
     ok, errors = validate_plugin_meta(broken, "action")
     assert ok is False
     assert any("未声明命令" in error for error in errors)
+
+
+def test_native_parameter_editor_schema_checks_value_type():
+    ok, errors = validate_plugin_meta(native_editor_meta(), "trigger")
+    assert ok is True
+    assert errors == []
+
+    broken = json.loads(json.dumps(native_editor_meta()))
+    broken["contributes"]["parameter_editors"][0]["value_type"] = "number"
+    ok, errors = validate_plugin_meta(broken, "trigger")
+    assert ok is False
+    assert any("必须与参数 'hotkey' 的 value_type 一致" in error for error in errors)
 
 
 def test_public_registry_does_not_expose_handler_path(tmp_path):
@@ -252,6 +314,37 @@ def test_extension_command_session_and_private_value(tmp_path):
         json={"session_id": session_id, "payload": {"text": "again"}},
     )
     assert expired.status_code == 404
+
+
+def test_extension_command_commits_native_value(tmp_path):
+    client, headers = make_client(tmp_path, NativeEditorEngine(tmp_path))
+    response = client.post(
+        "/api/plugins/native_sample/extensions/commands/capture/invoke",
+        headers=headers,
+        json={
+            "source_kind": "parameter_editors",
+            "source_id": "recorder",
+            "current_value": "Ctrl+A",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["value"] == "Ctrl+Shift+K"
+    assert response.json()["close"] is True
+
+
+def test_extension_rejects_wrong_native_current_value_type(tmp_path):
+    client, headers = make_client(tmp_path, NativeEditorEngine(tmp_path))
+    response = client.post(
+        "/api/plugins/native_sample/extensions/commands/capture/invoke",
+        headers=headers,
+        json={
+            "source_kind": "parameter_editors",
+            "source_id": "recorder",
+            "current_value": 3,
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["error"] == "当前值不是 string"
 
 
 def test_extension_rejects_owned_value_from_other_plugin(tmp_path):
