@@ -1,11 +1,12 @@
 """插件扩展命令使用的会话和受限上下文。"""
 
+import copy
 import threading
 import time
 import uuid
 from typing import Any, Callable, Dict, Iterable, Optional
 
-from notmyfault.extensions.protocol import make_owned_value
+from notmyfault.extensions.protocol import make_owned_value, value_matches_type
 
 
 SESSION_TTL_SECONDS = 30 * 60
@@ -22,8 +23,9 @@ class ExtensionSession:
         source_kind: str,
         source_id: str,
         allowed_commands: Iterable[str],
-        data_type: Dict[str, Any],
+        data_type: Dict[str, Any] | None,
         current_value: Any,
+        value_type: str | None = None,
     ) -> None:
         self.plugin_id = plugin_id
         self.command_id = command_id
@@ -32,6 +34,7 @@ class ExtensionSession:
         self.source_id = source_id
         self.allowed_commands = frozenset(allowed_commands)
         self.data_type = data_type
+        self.value_type = value_type
         self.current_value = current_value
         self.session_id = uuid.uuid4().hex
         self.created_at = time.time()
@@ -178,6 +181,8 @@ class ExtensionContext:
     ) -> Dict[str, Any]:
         package_name = self.session.plugin_meta["package_name"]
         data_type = self.session.data_type
+        if data_type is None:
+            raise ValueError("当前参数不使用插件私有数据")
         value = make_owned_value(
             package_name,
             data_type["id"],
@@ -193,8 +198,28 @@ class ExtensionContext:
             "close": close,
         }
 
+    def commit_value(
+        self,
+        value: Any,
+        *,
+        close: bool = True,
+        response: Any = None,
+    ) -> Dict[str, Any]:
+        value_type = self.session.value_type
+        if value_type is None:
+            raise ValueError("当前参数需要插件私有数据")
+        if not value_matches_type(value, value_type):
+            raise ValueError(f"提交值不是 {value_type}")
+        self.session.current_value = copy.deepcopy(value)
+        return {
+            "ok": True,
+            "value": value,
+            "data": response,
+            "close": close,
+        }
+
     def result(self, data: Any = None, *, close: bool = False) -> Dict[str, Any]:
         return {"ok": True, "data": data, "close": close}
 
-    def error(self, message: str) -> Dict[str, Any]:
-        return {"ok": False, "error": str(message)}
+    def error(self, message: str, *, close: bool = False) -> Dict[str, Any]:
+        return {"ok": False, "error": str(message), "close": close}

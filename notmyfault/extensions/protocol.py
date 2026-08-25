@@ -87,3 +87,19 @@ def owned_value_summary(value: Any) -> str:
         return ""
     summary = value.get("summary")
     return summary if isinstance(summary, str) else ""
+
+
+def value_matches_type(value: Any, value_type: str) -> bool:
+    if value_type == "any":
+        return True
+    if value_type == "string":
+        return isinstance(value, str)
+    if value_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if value_type == "bool":
+        return isinstance(value, bool)
+    if value_type == "array":
+        return isinstance(value, list)
+    if value_type == "object":
+        return isinstance(value, dict)
+    return False
