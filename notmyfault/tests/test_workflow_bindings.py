@@ -1,5 +1,8 @@
 """结构化绑定的静态校验、上下文构建与 guaranteed 来源推导"""
 
+import json
+from pathlib import Path
+
 import pytest
 
 from notmyfault.core.bindings import (
@@ -218,6 +221,36 @@ def test_event_reference_and_legacy_template_remain_supported():
     )
     # event scope 与旧模板都不应产生静态问题
     assert validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META) == []
+
+
+def test_file_operation_allows_dynamic_source_but_not_destination():
+    manifest_path = Path(__file__).parents[1] / "actions" / "file_operation" / "action.json"
+    action_meta = json.loads(manifest_path.read_text(encoding="utf-8"))
+    triggers_meta = {
+        "usb_insert": {"outputs": [{"name": "actual_drive", "type": "string"}]},
+    }
+    actions_meta = {"file_operation": action_meta}
+    rule = _rule(
+        _leaf("usb_insert", "t_usb001"),
+        [{
+            "type": "file_operation",
+            "binding_id": "a_copy001",
+            "params": {
+                "operation": "copy",
+                "source": _ref("trigger", "t_usb001", ["actual_drive"]),
+                "destination": "D:/backup",
+            },
+        }],
+    )
+
+    assert validate_rule_bindings(rule, triggers_meta, actions_meta) == []
+
+    rule["actions"][0]["params"]["source"] = "C:/source"
+    rule["actions"][0]["params"]["destination"] = _ref(
+        "trigger", "t_usb001", ["actual_drive"]
+    )
+    issues = validate_rule_bindings(rule, triggers_meta, actions_meta)
+    assert [issue["code"] for issue in issues] == ["unsafe_dynamic_parameter"]
 
 
 @pytest.mark.parametrize(

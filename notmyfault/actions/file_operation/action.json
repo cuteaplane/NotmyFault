@@ -9,7 +9,7 @@
     "permissions": ["filesystem"],
     "security": {
         "rule_approval": "admin_key",
-        "literal_only_params": ["operation", "source", "destination"]
+        "literal_only_params": ["operation", "destination"]
     },
     "params": [
         {
