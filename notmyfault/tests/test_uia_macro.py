@@ -194,6 +194,15 @@ class TestExecuteMacro:
         with pytest.raises(ValueError):
             macro_action.execute_macro([{"operation": "invoke"}])
 
+    def test_execution_rejects_keyboard_event_limit_bypass(self):
+        events = [
+            {"event": "down", "vk": 65, "scan_code": 30}
+            for _ in range(1001)
+        ]
+
+        with pytest.raises(ValueError, match="过多键盘事件"):
+            macro_action.execute_macro([{"kind": "keyboard", "events": events}])
+
     def test_run_with_context_passes_cancellation(self, monkeypatch):
         captured = {}
 

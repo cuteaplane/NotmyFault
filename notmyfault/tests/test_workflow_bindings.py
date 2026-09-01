@@ -220,6 +220,23 @@ def test_event_reference_and_legacy_template_remain_supported():
     assert validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META) == []
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "{{ _run_cancel_event }}",
+        {"$ref": {"scope": "event", "path": ["_private"]}},
+    ],
+)
+def test_bindings_cannot_read_internal_context_keys(value):
+    context = {
+        "_run_cancel_event": "private",
+        "event": {"payload": {"_private": "private"}},
+    }
+
+    with pytest.raises(BindingResolutionError, match="非法的数据路径段|运行数据不存在"):
+        resolve_value(value, context)
+
+
 def test_failure_actions_can_use_earlier_main_and_recovery_outputs():
     rule = _rule(
         _leaf("usb_insert", "t_usb001"),

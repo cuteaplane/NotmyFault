@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 
 import pytest
 
-from notmyfault.host.ai_provider import AIProviderIdleTimeoutError
+from notmyfault.host import ai_provider
+from notmyfault.host.ai_provider import (
+    AIProviderIdleTimeoutError,
+    OpenAICompatibleDraftProvider,
+)
 from notmyfault.host.api.services.ai_drafting import (
     AIDraftingError,
     AIDraftingService,
@@ -43,16 +48,16 @@ class RecordingProvider:
         self.error = error
         self.calls = []
 
-    def __call__(self, messages, schema, allow_plugin_source=False):
-        self.calls.append((messages, schema, allow_plugin_source))
+    def __call__(self, messages, schema):
+        self.calls.append((messages, schema))
         if self.error is not None:
             raise self.error
         return self.result
 
 
 class StreamingProvider(RecordingProvider):
-    def stream(self, messages, schema, allow_plugin_source=False):
-        self.calls.append((messages, schema, allow_plugin_source))
+    def stream(self, messages, schema):
+        self.calls.append((messages, schema))
         yield "reasoning", "分析"
         yield "text", "草稿"
         yield "result", self.result
@@ -66,7 +71,6 @@ class IdleTimeoutProvider:
         self,
         messages,
         schema,
-        allow_plugin_source=False,
         should_stop=None,
         idle_timeout=None,
     ):
@@ -87,6 +91,11 @@ class IdleTimeoutService(AIDraftingService):
 class FailingKeyStore(FakeKeyStore):
     def save_api_key(self, value: str) -> None:
         raise KeyStoreError("secret-value")
+
+
+class TimeoutOpener:
+    def open(self, _request, timeout):
+        raise socket.timeout(f"timeout after {timeout}")
 
 
 def build_service(tmp_path, provider=None, key_store=None):
@@ -129,6 +138,17 @@ def test_provider_failure_is_generic_and_does_not_leak_secret(tmp_path):
         )
     assert caught.value.status_code == 502
     assert "secret-value" not in caught.value.body["error"]
+
+
+def test_consent_field_is_rejected(tmp_path):
+    service, _store = build_service(tmp_path, RecordingProvider())
+    with pytest.raises(AIDraftingError) as caught:
+        asyncio.run(service.draft({
+            "messages": [{"role": "user", "content": "提醒"}],
+            "consent": {"plugin_id": "example", "permissions": []},
+        }))
+    assert caught.value.status_code == 400
+    assert caught.value.body["error"] == "consent 已停用"
 
 
 def test_stream_emits_final_result_and_done(tmp_path):
@@ -201,6 +221,26 @@ def test_stream_reports_120_second_idle_timeout(tmp_path):
         ),
         ("done", {"status": "done"}),
     ]
+
+
+def test_provider_stream_translates_socket_timeout(monkeypatch):
+    provider = object.__new__(OpenAICompatibleDraftProvider)
+    provider._model = "test-model"
+    provider._api_format = "chat_completions"
+    provider._api_key = "test-key"
+    provider._request_host = "example.test"
+    provider._request_url = "https://example.test/v1/chat/completions"
+    provider._opener = TimeoutOpener()
+    monkeypatch.setattr(ai_provider, "_is_private_host", lambda _host: False)
+
+    with pytest.raises(AIProviderIdleTimeoutError):
+        next(
+            provider.stream(
+                [{"role": "user", "content": "提醒"}],
+                {"triggers": {}, "actions": {}},
+                idle_timeout=1,
+            )
+        )
 
 
 def test_api_key_endpoints_use_injected_store(tmp_path):

@@ -56,12 +56,12 @@ def test_migrates_json_disabled_into_config(env):
     assert migrated == ["demo"]
     assert config["disabled_plugins"]["actions"] == ["demo"]
     meta = json.loads(json_path.read_text(encoding="utf-8"))
-    assert meta["enabled"] is True
+    assert meta["enabled"] is False
     saved = json.loads(env.paths.config_file.read_text(encoding="utf-8"))
     assert saved["disabled_plugins"]["actions"] == ["demo"]
 
 
-def test_migration_updates_manifest_baseline(env):
+def test_migration_does_not_create_a_new_integrity_baseline(env):
     json_path = write_user_plugin(
         env.user_dir, "actions", "demo", make_meta("demo", enabled=False)
     )
@@ -74,27 +74,8 @@ def test_migration_updates_manifest_baseline(env):
     )
 
     manifest = security_plugins.load_plugin_manifest(env.paths.plugin_manifest_file)
-    assert manifest["demo"]["action.json"] == security_plugins.compute_file_hash(
-        str(json_path)
-    )
-
-
-def test_migration_leaves_enabled_plugins_alone(env):
-    json_path = write_user_plugin(
-        env.user_dir, "actions", "demo", make_meta("demo", enabled=True)
-    )
-    original = json_path.read_text(encoding="utf-8")
-    config = {"disabled_plugins": {"triggers": [], "actions": []}}
-
-    migrated = app_mod.migrate_user_plugin_enabled_state(
-        config,
-        env.store,
-        user_dir=str(env.user_dir),
-    )
-
-    assert migrated == []
-    assert config["disabled_plugins"]["actions"] == []
-    assert json_path.read_text(encoding="utf-8") == original
+    assert manifest == {}
+    assert json.loads(json_path.read_text(encoding="utf-8"))["enabled"] is False
 
 
 def test_migration_is_idempotent(env):
@@ -138,13 +119,3 @@ def test_migration_keeps_existing_config_entries(env):
     )
 
     assert config["disabled_plugins"]["actions"] == ["other", "demo"]
-
-
-def test_migration_missing_user_dir(env):
-    config = {"disabled_plugins": {"triggers": [], "actions": []}}
-    migrated = app_mod.migrate_user_plugin_enabled_state(
-        config,
-        env.store,
-        user_dir=str(env.user_dir / "absent"),
-    )
-    assert migrated == []

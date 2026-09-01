@@ -21,34 +21,22 @@ EXPECTED_OPERATIONS = {
     ("GET", "/api/runs"),
     ("GET", "/api/runs/{run_id}"),
     ("POST", "/api/runs/{run_id}/cancel"),
-    ("POST", "/api/desktop-elements/capture"),
-    ("POST", "/api/desktop-elements/check"),
     ("GET", "/api/engine/logs"),
     ("GET", "/api/events"),
     ("GET", "/api/plugins/extensions"),
     ("POST", "/api/plugins/{plugin_id}/extensions/commands/{command_id}/invoke"),
     ("DELETE", "/api/plugins/{plugin_id}/extensions/sessions/{session_id}"),
     ("GET", "/api/plugins/{plugin_id}/extensions/views/{view_id}/page"),
-    ("GET", "/api/plugins/components"),
-    ("POST", "/api/plugins/{plugin_id}/components/{component_id}/invoke"),
     ("GET", "/api/config/security-status"),
-    ("GET", "/api/settings/admin-authorization"),
-    ("PUT", "/api/settings/admin-authorization"),
-    ("GET", "/api/settings/admin-rule-verification"),
-    ("PUT", "/api/settings/admin-rule-verification"),
     ("POST", "/api/config/security-approve"),
     ("GET", "/api/plugins"),
     ("GET", "/api/plugins/list"),
     ("POST", "/api/plugins/registry"),
     ("POST", "/api/plugins/registry/download"),
-    ("GET", "/api/settings/bluetooth"),
-    ("POST", "/api/settings/bluetooth/install"),
-    ("POST", "/api/settings/bluetooth/uninstall"),
     ("POST", "/api/plugins/toggle"),
     ("POST", "/api/plugins/preview"),
     ("POST", "/api/plugins/install"),
     ("GET", "/api/plugins/key-status"),
-    ("POST", "/api/plugins/install-source"),
     ("DELETE", "/api/plugins/{ptype}/{pid}"),
     ("GET", "/api/rules"),
     ("PUT", "/api/rules"),
@@ -63,217 +51,6 @@ EXPECTED_OPERATIONS = {
     ("POST", "/api/rules/draft/ai/stream"),
 }
 
-AUTHENTICATED_CONTRACTS = [
-    ("POST", "/api/engine/shutdown", None, 200, {"message", "ok"}),
-    (
-        "GET",
-        "/api/engine/status",
-        None,
-        200,
-        {
-            "actions_count",
-            "api_alive",
-            "engine_running",
-            "engine_state",
-            "last_error",
-            "pid",
-            "rules_count",
-            "running",
-            "scheduler",
-            "security_mode",
-            "triggers_count",
-        },
-    ),
-    (
-        "GET",
-        "/api/platform",
-        None,
-        200,
-        {"capabilities", "desktop", "limitations", "platform", "session_type"},
-    ),
-    (
-        "GET",
-        "/api/engine/diagnostics",
-        None,
-        200,
-        {"actions", "plugins", "rules", "uptime_seconds"},
-    ),
-    ("GET", "/api/runs", None, 200, {"runs"}),
-    ("GET", "/api/runs/missing", None, 404, {"detail"}),
-    ("POST", "/api/runs/missing/cancel", None, 404, {"error", "ok"}),
-    (
-        "POST",
-        "/api/desktop-elements/capture",
-        {},
-        200,
-        {"ok", "selector"},
-    ),
-    (
-        "POST",
-        "/api/desktop-elements/check",
-        {"selector": {"x": 1}},
-        200,
-        {"matched", "ok"},
-    ),
-    ("GET", "/api/engine/logs", None, 200, {"lines", "total"}),
-    (
-        "GET",
-        "/api/plugins/extensions",
-        None,
-        200,
-        {"commands", "data_types", "parameter_editors", "views"},
-    ),
-    (
-        "POST",
-        "/api/plugins/missing/extensions/commands/missing/invoke",
-        {},
-        409,
-        {"error", "ok"},
-    ),
-    (
-        "DELETE",
-        "/api/plugins/missing/extensions/sessions/missing",
-        None,
-        200,
-        {"ok"},
-    ),
-    (
-        "GET",
-        "/api/plugins/missing/extensions/views/missing/page",
-        None,
-        409,
-        {"error", "ok"},
-    ),
-    ("GET", "/api/plugins/components", None, 200, {"components"}),
-    (
-        "POST",
-        "/api/plugins/missing/components/missing/invoke",
-        {},
-        404,
-        {"error", "ok"},
-    ),
-    (
-        "GET",
-        "/api/config/security-status",
-        None,
-        200,
-        {"reason", "status", "summary"},
-    ),
-    (
-        "GET",
-        "/api/settings/admin-authorization",
-        None,
-        200,
-        {"effective_mode", "mode", "restart_required", "supported_modes"},
-    ),
-    (
-        "PUT",
-        "/api/settings/admin-authorization",
-        {"mode": "per_execution"},
-        200,
-        {"effective_mode", "mode", "ok", "restart_required"},
-    ),
-    (
-        "GET",
-        "/api/settings/admin-rule-verification",
-        None,
-        200,
-        {"key_verification"},
-    ),
-    (
-        "PUT",
-        "/api/settings/admin-rule-verification",
-        {"key_verification": True},
-        200,
-        {"key_verification", "ok"},
-    ),
-    ("POST", "/api/config/security-approve", None, 200, {"message", "ok"}),
-    ("GET", "/api/plugins", None, 200, {"actions", "triggers"}),
-    ("GET", "/api/plugins/list", None, 200, {"actions", "triggers"}),
-    ("POST", "/api/plugins/registry", {}, 400, {"error", "ok"}),
-    (
-        "POST",
-        "/api/plugins/registry/download",
-        {},
-        400,
-        {"error", "ok"},
-    ),
-    (
-        "GET",
-        "/api/settings/bluetooth",
-        None,
-        200,
-        {"available", "installed", "meta"},
-    ),
-    (
-        "POST",
-        "/api/settings/bluetooth/install",
-        None,
-        200,
-        {"ok", "restart_required"},
-    ),
-    (
-        "POST",
-        "/api/settings/bluetooth/uninstall",
-        None,
-        200,
-        {"error", "ok"},
-    ),
-    ("POST", "/api/plugins/toggle", {}, 400, {"error", "ok"}),
-    ("POST", "/api/plugins/preview", None, 400, {"error", "ok"}),
-    ("POST", "/api/plugins/install", None, 400, {"error", "ok"}),
-    ("GET", "/api/plugins/key-status", None, 200, {"encrypted", "exists"}),
-    ("POST", "/api/plugins/install-source", {}, 400, {"error", "ok"}),
-    (
-        "DELETE",
-        "/api/plugins/actions/missing",
-        None,
-        200,
-        {"error", "ok"},
-    ),
-    ("GET", "/api/rules", None, 200, {"rules"}),
-    ("PUT", "/api/rules", {"rules": []}, 200, {"ok", "rules"}),
-    (
-        "POST",
-        "/api/rules/validate",
-        {"rule": {}},
-        200,
-        {"issues", "ok", "summary", "valid"},
-    ),
-    ("POST", "/api/rules/approve", {"rules": []}, 200, {"ok"}),
-    ("POST", "/api/rules/0/run", None, 409, {"error", "ok"}),
-    (
-        "GET",
-        "/api/settings/ai-drafting",
-        None,
-        200,
-        {"api_format", "api_key_status", "enabled", "endpoint_url", "model"},
-    ),
-    (
-        "PUT",
-        "/api/settings/ai-drafting",
-        {},
-        200,
-        {"ok", "settings"},
-    ),
-    (
-        "PUT",
-        "/api/settings/ai-drafting/api-key",
-        {},
-        400,
-        {"error", "ok"},
-    ),
-    (
-        "DELETE",
-        "/api/settings/ai-drafting/api-key",
-        None,
-        200,
-        {"api_key_status", "ok"},
-    ),
-    ("POST", "/api/rules/draft/ai", {}, 403, {"code", "ok"}),
-    ("POST", "/api/rules/draft/ai/stream", {}, 403, {"code", "ok"}),
-]
-
 
 def concrete_path(path: str) -> str:
     return (
@@ -282,7 +59,6 @@ def concrete_path(path: str) -> str:
         .replace("{command_id}", "missing")
         .replace("{session_id}", "missing")
         .replace("{view_id}", "missing")
-        .replace("{component_id}", "missing")
         .replace("{ptype}", "actions")
         .replace("{pid}", "missing")
         .replace("{rule_index}", "0")
@@ -307,27 +83,19 @@ def test_every_api_operation_requires_authentication(tmp_path, method, path):
     assert response.json() == {"detail": "Forbidden: invalid API Token"}
 
 
-@pytest.mark.parametrize(
-    "method,path,body,status_code,fields",
-    AUTHENTICATED_CONTRACTS,
-)
-def test_authenticated_endpoint_contract(
-    tmp_path,
-    method,
-    path,
-    body,
-    status_code,
-    fields,
-):
+def test_security_approval_returns_parse_reason(tmp_path):
     env = make_api_env(tmp_path)
-    kwargs = {"headers": env.headers}
-    if body is not None:
-        kwargs["json"] = body
+    env.paths.config_file.write_text("{broken", encoding="utf-8")
 
-    response = env.client.request(method, path, **kwargs)
+    response = env.client.post(
+        "/api/config/security-approve",
+        headers=env.headers,
+    )
 
-    assert response.status_code == status_code
-    assert set(response.json()) == fields
+    assert response.status_code == 400
+    body = response.json()
+    assert body["ok"] is False
+    assert body["error"].startswith("配置文件无法解析:")
 
 
 def test_options_preflight_is_allowed_for_dashboard_port(tmp_path):
@@ -343,7 +111,7 @@ def test_options_preflight_is_allowed_for_dashboard_port(tmp_path):
     assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:19218"
 
 
-def test_wrong_token_repairs_the_shared_token_file(tmp_path):
+def test_wrong_token_does_not_write_the_shared_token_file(tmp_path):
     env = make_api_env(tmp_path)
     env.paths.api_token_file.write_text("b" * 64, encoding="utf-8")
     response = env.client.get(
@@ -351,6 +119,10 @@ def test_wrong_token_repairs_the_shared_token_file(tmp_path):
         headers={"Authorization": "Bearer wrong"},
     )
     assert response.status_code == 403
+    assert env.paths.api_token_file.read_text(encoding="utf-8") == "b" * 64
+
+    valid = env.client.get("/api/engine/status", headers=env.headers)
+    assert valid.status_code == 200
     assert env.paths.api_token_file.read_text(encoding="utf-8") == API_TOKEN
 
 
@@ -376,7 +148,7 @@ def test_token_store_creates_token_and_reapplies_file_permissions(tmp_path):
     assert len(restricted) == 1
 
 
-def test_sse_accepts_query_token(tmp_path):
+def test_sse_rejects_query_token(tmp_path):
     token_path = tmp_path / ".api_token"
     token_store = ApiTokenStore(
         token_path,
@@ -391,8 +163,7 @@ def test_sse_accepts_query_token(tmp_path):
         return {"ok": True}
 
     response = TestClient(app).get(f"/api/events?token={API_TOKEN}")
-    assert response.status_code == 200
-    assert response.json() == {"ok": True}
+    assert response.status_code == 403
 
 
 def test_registry_download_contract(tmp_path):

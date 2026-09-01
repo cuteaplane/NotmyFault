@@ -151,6 +151,50 @@ def test_preview_token_installs_the_exact_previewed_directory(tmp_path):
     assert reused.status_code == 400
 
 
+def test_build_hook_requires_matching_server_confirmation(tmp_path):
+    env = make_api_env(tmp_path)
+    archive = build_nmfp(
+        tmp_path,
+        make_meta("actions", build={"outputs": ["action.py"]}),
+        "actions",
+        "build-confirmation",
+    )
+
+    def preview_token():
+        response = post_archive(env, "/api/plugins/preview", archive)
+        assert response.status_code == 200
+        return response.json()["preview_token"]
+
+    missing = env.client.post(
+        "/api/plugins/install",
+        headers=env.headers,
+        data={"preview_token": preview_token()},
+    )
+    assert missing.status_code == 400
+    assert missing.json()["code"] == "build_hook_confirmation_required"
+
+    wrong = env.client.post(
+        "/api/plugins/install",
+        headers=env.headers,
+        data={
+            "preview_token": preview_token(),
+            "confirmed_risk_ids": '["borrowed_privilege"]',
+        },
+    )
+    assert wrong.status_code == 400
+    assert "不一致" in wrong.json()["error"]
+
+    confirmed = env.client.post(
+        "/api/plugins/install",
+        headers=env.headers,
+        data={
+            "preview_token": preview_token(),
+            "confirmed_risk_ids": '["build_hook"]',
+        },
+    )
+    assert confirmed.status_code == 200
+
+
 def test_downgrade_requires_force_and_keeps_backup(tmp_path):
     env = make_api_env(tmp_path)
     high = build_nmfp(
@@ -244,30 +288,26 @@ def test_uninstall_reports_strict_delete_failure(tmp_path):
     assert plugin_dir.is_dir()
 
 
-def test_install_source_writes_reviewed_plugin_only(tmp_path):
-    env = make_api_env(tmp_path)
-    body = {
-        "kind": "action",
-        "plugin_id": "generated_action",
-        "manifest": make_meta(
-            "actions",
-            id="generated_action",
-            package_name="com.test.generated_action",
-        ),
-        "source": "def run(meta, params):\n    return {'ok': True}\n",
-    }
-    response = env.client.post(
-        "/api/plugins/install-source", json=body, headers=env.headers
-    )
-    assert response.status_code == 200
-    assert response.json()["signed"] is False
-    target = env.paths.user_plugins_dir / "actions" / "generated_action"
-    assert (target / "action.json").is_file()
-    assert (target / "test_plugin.py").is_file()
-
-
 def test_plugin_list_contract_has_both_kinds(tmp_path):
     env = make_api_env(tmp_path)
     response = env.client.get("/api/plugins/list", headers=env.headers)
     assert response.status_code == 200
     assert set(response.json()) == {"triggers", "actions"}
+
+
+def test_plugin_list_probes_capabilities_once(monkeypatch, tmp_path):
+    calls = []
+
+    def probe():
+        calls.append(True)
+        return {}
+
+    monkeypatch.setattr(
+        "notmyfault.host.api.services.plugin_catalog.probe_capabilities",
+        probe,
+    )
+    env = make_api_env(tmp_path)
+    response = env.client.get("/api/plugins/list", headers=env.headers)
+
+    assert response.status_code == 200
+    assert calls == [True]

@@ -1,135 +1,200 @@
-"""bluetooth_toggle 动作插件的 WinRT 查询、PnP 回退与脚本生成测试。"""
+"""bluetooth_toggle 动作的参数、系统调用和状态确认测试。"""
 
 import importlib.util
 import json
 import os
+import subprocess
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
+from notmyfault.security.plugin_schema import validate_plugin_meta
+
+
 PKG_ROOT = Path(__file__).resolve().parents[1]
-WINDOWS_ONLY = pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 WinRT/PnP")
+PLUGIN_ROOT = PKG_ROOT / "actions" / "bluetooth_toggle"
 
 
 def load_module():
-    path = PKG_ROOT / "bundled" / "actions" / "bluetooth_toggle" / "action.py"
+    path = PLUGIN_ROOT / "action.py"
     spec = importlib.util.spec_from_file_location("bluetooth_toggle_under_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-@WINDOWS_ONLY
-def test_query_uses_winrt_when_available(monkeypatch):
+def completed(*, returncode=0, stdout="", stderr=""):
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+def test_manifest_is_a_non_admin_optional_action():
+    meta = json.loads((PLUGIN_ROOT / "action.json").read_text(encoding="utf-8"))
+
+    valid, errors = validate_plugin_meta(meta, "action")
+
+    assert valid, errors
+    assert meta["permissions"] == ["external_binary", "native_api"]
+    assert meta["platforms"] == ["windows", "linux"]
+    assert meta["requires_capabilities"] == ["bluetooth.control"]
+    assert "security" not in meta
+
+
+def test_unknown_action_is_rejected_before_platform_dispatch(monkeypatch):
     module = load_module()
-    payload = {
-        "method": "winrt_radio",
-        "radios": [{"name": "Intel Bluetooth", "state": "On"}],
-    }
-    monkeypatch.setattr(
-        module, "_run_powershell", lambda script: (0, json.dumps(payload), "")
-    )
+    monkeypatch.setattr(module, "_run_windows", lambda action: pytest.fail(action))
+
+    with pytest.raises(ValueError, match="不支持的蓝牙操作"):
+        module.run({}, {"action": "reset-adapter"})
+
+
+def test_windows_query_uses_packaged_helper_and_returns_payload(monkeypatch):
+    module = load_module()
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return completed(
+            stdout=(
+                '{"ok":true,"action":"query","state":"on",'
+                '"changed":false,"method":"winrt","radios":[]}'
+            )
+        )
+
+    monkeypatch.setattr(module.sys, "platform", "win32")
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
 
     result = module.run({}, {"action": "query"})
 
     assert result == {
-        "ok": True,
-        "method": "winrt_radio",
+        "action": "query",
         "state": "on",
-        "radios": payload["radios"],
+        "changed": False,
+        "method": "winrt",
+        "radios": [],
+    }
+    command, kwargs = calls[0]
+    assert command[0].replace("/", "\\").endswith(
+        r"System32\WindowsPowerShell\v1.0\powershell.exe"
+    )
+    assert command[-2:] == ["-Action", "query"]
+    assert Path(command[command.index("-File") + 1]).name == "radio.ps1"
+    assert kwargs["timeout"] == 30
+
+
+def test_windows_structured_failure_has_user_facing_message(monkeypatch):
+    module = load_module()
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: completed(
+            returncode=4,
+            stdout='{"ok":false,"code":"access_denied","detail":"DeniedBySystem"}',
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Windows 拒绝蓝牙控制权限：DeniedBySystem"):
+        module._run_windows("on")
+
+
+def test_windows_rejects_success_exit_without_json(monkeypatch):
+    module = load_module()
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: completed(stdout="unexpected output"),
+    )
+
+    with pytest.raises(RuntimeError, match="蓝牙辅助程序执行失败"):
+        module._run_windows("query")
+
+
+def test_linux_query_reads_powered_state(monkeypatch):
+    module = load_module()
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(module.shutil, "which", lambda name: "/usr/bin/bluetoothctl")
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda command, **kwargs: completed(stdout="Controller AA:BB\n\tPowered: yes\n"),
+    )
+
+    assert module.run({}, {"action": "query"}) == {
+        "action": "query",
+        "state": "on",
+        "changed": False,
+        "method": "bluetoothctl",
     }
 
 
-@WINDOWS_ONLY
-def test_falls_back_to_elevated_pnp_and_verifies_state(monkeypatch, tmp_path):
-    module = load_module()
-    # WinRT 查询被策略拒绝，触发提权 PnP 回退
-    monkeypatch.setattr(
-        module, "_run_powershell", lambda script: (1, "", "WinRT Radio API access denied")
-    )
-
-    result_path = str(tmp_path / "bluetooth-result.json")
-
-    def fake_mkstemp(prefix="", suffix=""):
-        fd = os.open(result_path, os.O_CREAT | os.O_RDWR)
-        return fd, result_path
-
-    def fake_run_as_admin(command, timeout=None):
-        pnp_result = {
-            "method": "pnp_adapter",
-            "state": "off",
-            "before": [{"instance_id": "USB\\VID_8087", "name": "适配器", "status": "OK", "problem": 0}],
-            "adapters": [{"instance_id": "USB\\VID_8087", "name": "适配器", "status": "Error", "problem": 22}],
-        }
-        with open(result_path, "w", encoding="utf-8") as result_file:
-            json.dump(pnp_result, result_file)
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(module.tempfile, "mkstemp", fake_mkstemp)
-    monkeypatch.setattr(module, "run_as_admin", fake_run_as_admin)
-
-    result = module.run({}, {"action": "toggle"})
-
-    assert result["ok"] is True
-    assert result["method"] == "pnp_adapter"
-    assert result["state"] == "off"
-    assert result["winrt_error"] == "WinRT Radio API access denied"
-    assert not os.path.exists(result_path)
-
-
-# Windows 上 run() 走 WinRT/PnP，会真的碰蓝牙适配器
-@pytest.mark.skipif(os.name != "posix", reason="仅 Linux 调用 bluetoothctl")
-def test_linux_query_and_toggle_use_bluetoothctl(monkeypatch):
+def test_linux_toggle_changes_and_confirms_state(monkeypatch):
     module = load_module()
     commands = []
-    responses = iter(["Powered: yes", "Powered: yes", "Powered: yes", "Powered: no"])
+    shows = iter(("\tPowered: yes\n", "\tPowered: no\n"))
 
     def fake_run(command, **kwargs):
         commands.append(command)
-        if command[1] == "show":
-            output = next(responses)
-        else:
-            output = ""
-        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+        if command[-1] == "show":
+            return completed(stdout=next(shows))
+        return completed(stdout="Changing power off succeeded\n")
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(module.shutil, "which", lambda name: "/usr/bin/bluetoothctl")
     monkeypatch.setattr(module.subprocess, "run", fake_run)
-    assert module.run({}, {"action": "query"}) == {
-        "ok": True,
-        "method": "bluetoothctl",
-        "state": "on",
-    }
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+
     assert module.run({}, {"action": "toggle"}) == {
-        "ok": True,
-        "method": "bluetoothctl",
+        "action": "toggle",
         "state": "off",
+        "changed": True,
+        "method": "bluetoothctl",
     }
     assert commands == [
-        ["bluetoothctl", "show"],
-        ["bluetoothctl", "show"],
-        ["bluetoothctl", "show"],
-        ["bluetoothctl", "power", "off"],
-        ["bluetoothctl", "show"],
+        ["/usr/bin/bluetoothctl", "show"],
+        ["/usr/bin/bluetoothctl", "power", "off"],
+        ["/usr/bin/bluetoothctl", "show"],
     ]
 
 
-def test_pnp_script_filters_physical_adapters_and_writes_result_file():
+def test_linux_missing_controller_is_not_reported_as_off(monkeypatch):
     module = load_module()
+    monkeypatch.setattr(module.shutil, "which", lambda name: "/usr/bin/bluetoothctl")
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda command, **kwargs: completed(stdout="No default controller available\n"),
+    )
 
-    script = module._pnp_control_script("toggle", "C:/temp/result.json")
-    assert "-match '^(USB|PCI|BTH)\\\\'" in script
-    assert "-notmatch '^BTHENUM\\\\'" in script
-    assert "Set-Content -LiteralPath 'C:/temp/result.json'" in script
-    assert "'toggle'" in script
+    with pytest.raises(RuntimeError, match="没有返回默认蓝牙控制器"):
+        module._run_linux("query")
 
-    # 路径中的单引号按 PowerShell 规则加倍转义
-    quoted = module._pnp_control_script("on", "C:/it's/result.json")
-    assert "'C:/it''s/result.json'" in quoted
-    responses = iter(["Powered: yes", "Powered: yes", "Powered: yes", "Powered: no"])
 
-    def fake_run(command, **kwargs):
-        commands.append(command)
-        if command[1] == "show":
-            output = next(responses)
-        else:
-            output = ""
-        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 自带 Windows PowerShell")
+def test_windows_helper_returns_structured_query_result():
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(PLUGIN_ROOT / "radio.ps1"),
+            "-Action",
+            "query",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=20,
+        check=False,
+    )
+
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["ok"] is (result.returncode == 0)
+    if result.returncode == 0:
+        assert payload["method"] == "winrt"
+        assert payload["state"] in {"on", "off", "disabled", "mixed"}
+    else:
+        assert payload["code"] in {"no_radio", "winrt_unavailable"}

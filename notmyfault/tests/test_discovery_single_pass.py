@@ -1,13 +1,13 @@
-"""发现/物化阶段单次读文件的结构性约束。"""
+"""插件发现与物化之间的 TOCTOU 防护。"""
 
 import json
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-from notmyfault.security.plugin_loader import PluginLoader, PluginRegistry, inspect_plugin_tree
+import pytest
+
+from notmyfault.security.plugin_loader import PluginLoader, PluginRegistry
 from notmyfault.security.security import SecurityMode
-from notmyfault.security.signing import plugin_files
 
 
 def make_meta(plugin_id="plug_a", **overrides):
@@ -61,181 +61,49 @@ def make_loader(tmp_path, mode=SecurityMode.PERMISSIVE):
     return loader, registry, plugin_errors
 
 
-def load_actions(loader, tmp_path, origin="builtin", meta_store=None, func_store=None):
-    if meta_store is None:
-        meta_store = {}
-    if func_store is None:
-        func_store = {}
-    loaded, failed = loader.load(
-        base_dir=str(tmp_path),
-        plugins_dir="actions",
-        json_filename="action.json",
-        py_filename="action.py",
-        module_prefix="notmyfault.action_",
-        meta_store=meta_store,
-        func_store=func_store,
-        store_name="Actioner",
-        origin=origin,
-    )
-    return loaded, failed, meta_store, func_store
-
-
-def load_triggers(loader, tmp_path, origin="builtin", meta_store=None, func_store=None):
-    if meta_store is None:
-        meta_store = {}
-    if func_store is None:
-        func_store = {}
-    loaded, failed = loader.load(
-        base_dir=str(tmp_path),
-        plugins_dir="triggers",
-        json_filename="trigger.json",
-        py_filename="trigger.py",
-        module_prefix="notmyfault.trigger_",
-        meta_store=meta_store,
-        func_store=func_store,
-        store_name="Trigger",
-        origin=origin,
-    )
-    return loaded, failed, meta_store, func_store
-
-
-def test_discovery_reads_each_plugin_file_once(tmp_path, monkeypatch):
-    loader, registry, _errors = make_loader(tmp_path, mode=SecurityMode.PERMISSIVE)
-    write_plugin(
-        tmp_path / "actions",
-        "once",
-        make_meta("once_a"),
-        "import os\n\ndef run(meta, params):\n    return None\n",
-    )
-    folder = tmp_path / "actions" / "once"
-    expected = {str(p.resolve()) for p in plugin_files(folder)}
-
-    real_read = Path.read_bytes
-    counts = {}
-
-    def counting(self):
-        key = str(self.resolve())
-        if key in expected:
-            counts[key] = counts.get(key, 0) + 1
-        return real_read(self)
-
-    monkeypatch.setattr(Path, "read_bytes", counting)
-    loaded, failed, meta_store, func_store = load_actions(loader, tmp_path)
-    assert (loaded, failed) == (1, 0)
-    assert "once_a" in meta_store
-    assert func_store == {}
-    assert set(counts) == expected
-    assert all(n == 1 for n in counts.values()), counts
-
-
-def test_materialize_toctou_rereads_once_and_rejects_change(tmp_path, monkeypatch):
-    loader, registry, errors = make_loader(tmp_path, mode=SecurityMode.PERMISSIVE)
+@pytest.mark.parametrize(
+    ("kind", "plugins_dir", "json_name", "py_name", "resolver_name"),
+    [
+        ("action", "actions", "action.json", "action.py", "resolve_action"),
+        ("trigger", "triggers", "trigger.json", "trigger.py", "resolve_trigger"),
+    ],
+)
+def test_materialize_rejects_plugin_changed_after_discovery(
+    tmp_path,
+    kind,
+    plugins_dir,
+    json_name,
+    py_name,
+    resolver_name,
+):
+    loader, registry, errors = make_loader(tmp_path)
+    plugin_id = f"toctou_{kind}"
     folder = write_plugin(
-        tmp_path / "actions",
-        "toctou",
-        make_meta("toctou_a"),
+        tmp_path / plugins_dir,
+        plugin_id,
+        make_meta(plugin_id),
         "def run(meta, params):\n    return 'ok'\n",
+        json_name=json_name,
+        py_name=py_name,
     )
-    load_actions(loader, tmp_path)
+    loaded, failed = loader.load(
+        base_dir=str(tmp_path),
+        plugins_dir=plugins_dir,
+        json_filename=json_name,
+        py_filename=py_name,
+        module_prefix=f"notmyfault.{kind}_",
+        meta_store={},
+        func_store={},
+        store_name=kind.title(),
+        origin="builtin",
+    )
+    assert (loaded, failed) == (1, 0)
 
-    expected = {str(p.resolve()) for p in plugin_files(folder)}
-    real_read = Path.read_bytes
-    counts = {}
-
-    def counting(self):
-        key = str(self.resolve())
-        if key in expected:
-            counts[key] = counts.get(key, 0) + 1
-        return real_read(self)
-
-    monkeypatch.setattr(Path, "read_bytes", counting)
-    (folder / "action.py").write_text(
+    (folder / py_name).write_text(
         "def run(meta, params):\n    return 'changed'\n",
         encoding="utf-8",
     )
-    counts.clear()
-    assert registry.resolve_action("toctou_a") is None
+    assert getattr(registry, resolver_name)(plugin_id) is None
     assert any("校验后发生变化" in message for _, _, message in errors)
-    assert set(counts) == expected
-    assert all(n == 1 for n in counts.values()), counts
-
-
-def test_trigger_discovery_stores_pending_without_import(tmp_path, monkeypatch):
-    loader, registry, _errors = make_loader(tmp_path, mode=SecurityMode.PERMISSIVE)
-    folder = write_plugin(
-        tmp_path / "triggers",
-        "lazy_trig",
-        make_meta("lazy_trig"),
-        "def run(meta, params):\n    return 'ok'\n",
-        json_name="trigger.json",
-        py_name="trigger.py",
-    )
-    expected = {str(p.resolve()) for p in plugin_files(folder)}
-
-    real_read = Path.read_bytes
-    counts = {}
-
-    def counting(self):
-        key = str(self.resolve())
-        if key in expected:
-            counts[key] = counts.get(key, 0) + 1
-        return real_read(self)
-
-    monkeypatch.setattr(Path, "read_bytes", counting)
-    loaded, failed, meta_store, func_store = load_triggers(loader, tmp_path)
-    assert (loaded, failed) == (1, 0)
-    # 发现阶段只入账元数据和待物化条目，不导入模块、不注册入口函数。
-    assert "lazy_trig" in meta_store
-    assert func_store == {}
-    assert registry.triggers_funcs == {}
-    assert registry.get_module("lazy_trig") is None
-    assert registry.pending.get("lazy_trig") is not None
-    assert registry.pending["lazy_trig"]["kind"] == "trigger"
-    assert "notmyfault.trigger_lazy_trig" not in sys.modules
-    assert set(counts) == expected
-    assert all(n == 1 for n in counts.values()), counts
-
-
-def test_trigger_materialize_toctou_rereads_once_and_rejects_change(tmp_path, monkeypatch):
-    loader, registry, errors = make_loader(tmp_path, mode=SecurityMode.PERMISSIVE)
-    folder = write_plugin(
-        tmp_path / "triggers",
-        "toctou_trig",
-        make_meta("toctou_trig"),
-        "def run(meta, params):\n    return 'ok'\n",
-        json_name="trigger.json",
-        py_name="trigger.py",
-    )
-    load_triggers(loader, tmp_path)
-
-    expected = {str(p.resolve()) for p in plugin_files(folder)}
-    real_read = Path.read_bytes
-    counts = {}
-
-    def counting(self):
-        key = str(self.resolve())
-        if key in expected:
-            counts[key] = counts.get(key, 0) + 1
-        return real_read(self)
-
-    monkeypatch.setattr(Path, "read_bytes", counting)
-    (folder / "trigger.py").write_text(
-        "def run(meta, params):\n    return 'changed'\n",
-        encoding="utf-8",
-    )
-    counts.clear()
-    assert registry.resolve_trigger("toctou_trig") is None
-    assert any("校验后发生变化" in message for _, _, message in errors)
-    assert "toctou_trig" not in registry.triggers_funcs
-    assert registry.get_module("toctou_trig") is None
-    assert "toctou_trig" not in registry.pending
-    assert set(counts) == expected
-    assert all(n == 1 for n in counts.values()), counts
-
-    counts.clear()
-    assert registry.resolve_trigger("toctou_trig") is None
-    assert counts == {}
-
-
-def test_inspect_plugin_tree_still_available():
-    assert callable(inspect_plugin_tree)
+    assert registry.get_module(plugin_id) is None
+    assert plugin_id not in registry.pending

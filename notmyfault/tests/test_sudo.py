@@ -21,9 +21,8 @@ def clean_sudo_state(monkeypatch):
     yield
     sudo._engine_token = None
     sudo._admin_plugins.clear()
+    sudo._admin_executables.clear()
     sudo._admin_by_module.clear()
-    sudo._authorization_mode = "direct"
-    sudo._admin_broker = None
 
 
 def make_plugin_module(name="notmyfault.action_testplug"):
@@ -41,9 +40,14 @@ def call_from(module, func, *args, **kwargs):
 @pytest.fixture
 def authorized_plugin(monkeypatch):
     """返回 (module, captured)：插件已授权，subprocess.run 被替换为记录器"""
-    sudo.begin_engine_session(TOKEN, authorization_mode="per_execution")
+    sudo.begin_engine_session(TOKEN)
     module = make_plugin_module()
-    sudo.authorize_plugin("testplug", TOKEN, module=module)
+    sudo.authorize_plugin(
+        "testplug",
+        TOKEN,
+        module=module,
+        allowed_executables={"cmd.exe", "notepad.exe", "tool.exe"},
+    )
     captured = {}
 
     def fake_run(cmd, **kwargs):
@@ -54,6 +58,12 @@ def authorized_plugin(monkeypatch):
         )
 
     monkeypatch.setattr(sudo.subprocess, "run", fake_run)
+    if os.name != "nt":
+        monkeypatch.setattr(
+            sudo.shutil,
+            "which",
+            lambda name, path=None: f"/usr/bin/{name}",
+        )
     return module, captured
 
 
@@ -62,15 +72,42 @@ class TestRunAsAdmin:
         with pytest.raises(ValueError):
             sudo.run_as_admin([])
 
+    def test_linux_uses_pkexec_without_joining_arguments(
+        self, authorized_plugin, monkeypatch
+    ):
+        module, captured = authorized_plugin
+        monkeypatch.setattr(sudo.os, "name", "posix")
+        monkeypatch.setattr(sudo.os.path, "realpath", lambda path: path)
+        monkeypatch.setattr(
+            sudo.shutil, "which", lambda name, path=None: f"/usr/bin/{name}"
+        )
+
+        call_from(module, sudo.run_as_admin, ["tool.exe", "argument with spaces"])
+
+        assert captured["cmd"] == [
+            "/usr/bin/pkexec",
+            "--",
+            "/usr/bin/tool.exe",
+            "argument with spaces",
+        ]
+
     @WINDOWS_ONLY
     def test_basic_command_generates_correct_ps(self, authorized_plugin):
         module, captured = authorized_plugin
         call_from(module, sudo.run_as_admin, ["cmd.exe", "/c", "dir"])
-        assert captured["cmd"] == [
-            "powershell",
+        assert captured["cmd"][0].endswith(
+            r"System32\WindowsPowerShell\v1.0\powershell.exe"
+        )
+        assert captured["cmd"][1:] == [
             "-NoProfile",
             "-Command",
-            "$process = Start-Process -FilePath 'cmd.exe'"
+            "$process = Start-Process -FilePath '"
+            + os.path.join(
+                os.environ.get("SystemRoot", r"C:\Windows"),
+                "System32",
+                "cmd.exe",
+            ).replace("'", "''")
+            + "'"
             " -ArgumentList '/c', 'dir' -Verb RunAs -Wait -PassThru; "
             "exit $process.ExitCode",
         ]
@@ -100,8 +137,13 @@ class TestRunAsAdmin:
         call_from(module, sudo.run_as_admin, ["notepad.exe"])
         script = captured["cmd"][3]
         assert "-ArgumentList" not in script
+        executable = os.path.join(
+            os.environ.get("SystemRoot", r"C:\Windows"),
+            "System32",
+            "notepad.exe",
+        )
         assert script == (
-            "$process = Start-Process -FilePath 'notepad.exe'"
+            f"$process = Start-Process -FilePath '{executable}'"
             " -Verb RunAs -Wait -PassThru; exit $process.ExitCode"
         )
 
@@ -146,8 +188,8 @@ class TestRunAsAdmin:
         result = call_from(module, sudo.run_as_admin, ["cmd.exe"])
         assert result.returncode == 1
         err = capsys.readouterr().err
-        assert "命令执行可能失败" in err
-        assert "boom" in err
+        assert "管理员命令执行失败" in err
+        assert "boom" not in err
 
     def test_timeout_expired_raises(self, authorized_plugin, monkeypatch, capsys):
         module, captured = authorized_plugin
@@ -158,7 +200,7 @@ class TestRunAsAdmin:
         monkeypatch.setattr(sudo.subprocess, "run", timeout_run)
         with pytest.raises(subprocess.TimeoutExpired):
             call_from(module, sudo.run_as_admin, ["cmd.exe"], timeout=5)
-        assert "命令超时" in capsys.readouterr().err
+        assert "管理员命令超时" in capsys.readouterr().err
 
     def test_os_error_propagates(self, authorized_plugin, monkeypatch, capsys):
         module, captured = authorized_plugin
@@ -169,7 +211,21 @@ class TestRunAsAdmin:
         monkeypatch.setattr(sudo.subprocess, "run", broken_run)
         with pytest.raises(OSError):
             call_from(module, sudo.run_as_admin, ["cmd.exe"])
-        assert "命令执行异常" in capsys.readouterr().err
+        assert "管理员命令执行异常" in capsys.readouterr().err
+
+    def test_rejects_executable_outside_manifest_allowlist(self, authorized_plugin):
+        module, _captured = authorized_plugin
+        with pytest.raises(PermissionError, match="calc.exe"):
+            call_from(module, sudo.run_as_admin, ["calc.exe"])
+
+    def test_rejects_path_even_when_basename_is_allowed(self, authorized_plugin):
+        module, _captured = authorized_plugin
+        with pytest.raises(PermissionError, match="未获准"):
+            call_from(
+                module,
+                sudo.run_as_admin,
+                [r"C:\Users\Public\cmd.exe"],
+            )
 
 
 def test_authorize_binds_to_module_identity(monkeypatch):
@@ -213,7 +269,12 @@ def test_module_mapping_is_removed_after_module_is_collected():
     module = make_plugin_module()
     module_key = id(module.__dict__)
     module_ref = weakref.ref(module)
-    sudo.authorize_plugin("testplug", TOKEN, module=module)
+    sudo.authorize_plugin(
+        "testplug",
+        TOKEN,
+        module=module,
+        allowed_executables={"cmd.exe", "notepad.exe", "tool.exe"},
+    )
 
     del module
     gc.collect()
@@ -289,79 +350,6 @@ def test_per_execution_rejects_when_notification_not_approved(
     with pytest.raises(PermissionError, match="未确认"):
         call_from(module, sudo.run_as_admin, ["cmd.exe"])
     assert "cmd" not in captured
-
-
-def test_engine_start_mode_uses_existing_broker(monkeypatch):
-    calls = []
-
-    class FakeBroker:
-        def execute(self, command, wait, timeout):
-            calls.append((command, wait, timeout))
-            return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
-
-    sudo.begin_engine_session(TOKEN, authorization_mode="engine_start")
-    module = make_plugin_module()
-    sudo.authorize_plugin("testplug", TOKEN, module=module)
-    sudo._admin_broker = FakeBroker()
-
-    result = call_from(module, sudo.run_as_admin, ["cmd.exe", "/c", "whoami"], timeout=9)
-    assert result.stdout == "ok"
-    assert calls == [(["cmd.exe", "/c", "whoami"], True, 9)]
-
-
-@WINDOWS_ONLY
-def test_engine_start_mode_falls_back_to_per_execution(monkeypatch, capsys):
-    """engine_start 没有 broker 时降级为单次确认提权，不直接报未授权"""
-    sudo.begin_engine_session(TOKEN, authorization_mode="engine_start")
-    module = make_plugin_module()
-    sudo.authorize_plugin("testplug", TOKEN, module=module)
-    captured = {}
-
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(sudo.subprocess, "run", fake_run)
-
-    result = call_from(module, sudo.run_as_admin, ["cmd.exe"])
-    assert result.returncode == 0
-    # 降级走的是 UAC 单次提权通道
-    assert captured["cmd"][0] == "powershell"
-    assert "降级为单次确认提权" in capsys.readouterr().err
-
-
-@WINDOWS_ONLY
-def test_engine_start_fallback_respects_user_decline(monkeypatch):
-    sudo.begin_engine_session(TOKEN, authorization_mode="engine_start")
-    module = make_plugin_module()
-    sudo.authorize_plugin("testplug", TOKEN, module=module)
-    monkeypatch.setattr(admin_prompt, "confirm_admin_request", lambda *a, **k: False)
-
-    with pytest.raises(PermissionError, match="未确认"):
-        call_from(module, sudo.run_as_admin, ["cmd.exe"])
-
-
-def test_start_admin_session_is_closed_with_engine_session(monkeypatch):
-    closed = []
-
-    class FakeBroker:
-        def close(self):
-            closed.append(True)
-
-    monkeypatch.setattr(
-        sudo._AdminBrokerClient,
-        "start",
-        classmethod(lambda cls, timeout=60: FakeBroker()),
-    )
-    sudo.begin_engine_session(TOKEN, authorization_mode="engine_start")
-
-    assert sudo.start_admin_session(TOKEN) is True
-    assert sudo.get_authorization_status() == {
-        "mode": "engine_start",
-        "session_active": True,
-    }
-    assert sudo.end_engine_session(TOKEN) is True
-    assert closed == [True]
 
 
 def test_override_does_not_inherit_admin(monkeypatch):

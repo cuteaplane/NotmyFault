@@ -3,7 +3,6 @@
 import base64
 import binascii
 from contextlib import contextmanager
-import os
 
 import pytest
 
@@ -158,54 +157,6 @@ class TestInvalidKey:
         key = "x" * store._MAX_KEY_LENGTH
         key_store.save_api_key(key)
         assert key_store.load_api_key() == key
-
-
-class TestUnsupportedPlatform:
-    def test_save_raises_unsupported(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(store, "_is_windows", lambda: False)
-        self._disable_secret_service(monkeypatch)
-        key_store = store.AIKeyStore(tmp_path / ".ai_api_key")
-        with pytest.raises(store.KeyStoreUnsupportedError):
-            key_store.save_api_key("secret")
-
-    def test_load_returns_none_on_unsupported(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(store, "_is_windows", lambda: False)
-        self._disable_secret_service(monkeypatch)
-        key_store = store.AIKeyStore(tmp_path / ".ai_api_key")
-        assert key_store.load_api_key() is None
-
-    def test_status_unsupported(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(store, "_is_windows", lambda: False)
-        self._disable_secret_service(monkeypatch)
-        key_store = store.AIKeyStore(tmp_path / ".ai_api_key")
-        assert key_store.api_key_status() is store.KeyStoreStatus.UNSUPPORTED
-
-    def test_delete_noop_on_unsupported(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(store, "_is_windows", lambda: False)
-        self._disable_secret_service(monkeypatch)
-        store.AIKeyStore(tmp_path / ".ai_api_key").delete_api_key()
-
-    @staticmethod
-    def _disable_secret_service(monkeypatch):
-        @contextmanager
-        def unavailable():
-            raise store.KeyStoreUnsupportedError("Secret Service 不可用")
-            yield
-
-        monkeypatch.setattr(store, "_secret_service_collection", unavailable)
-
-
-class TestRealDpapi:
-    @pytest.mark.skipif(os.name != "nt", reason="需要 Windows")
-    def test_real_dpapi_round_trip(self, tmp_path, monkeypatch):
-        path = tmp_path / ".ai_api_key"
-        key_store = store.AIKeyStore(path)
-        key = "sk-real-dpapi-round-trip"
-        key_store.save_api_key(key)
-        assert key_store.load_api_key() == key
-        assert key.encode("utf-8") not in path.read_bytes()
-        key_store.delete_api_key()
-        assert not path.exists()
 
 
 class TestSecretService:

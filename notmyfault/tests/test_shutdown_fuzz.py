@@ -88,13 +88,17 @@ class TestShutdownFuzz:
     def test_shutdown_cancels_deferred_workflow(self):
         engine = make_engine()
         shorten_timeouts(engine)
-        rule = {"name": "延迟规则", "actions": []}
-        context = build_context(rule["name"], "fuzz", {}, [])
-        engine._defer_workflow("fuzz_key", rule, rule["name"], context, 60)
-        assert "fuzz_key" in engine._deferred_workflows
+        executed = threading.Event()
+        engine.actions_funcs["fuzz_deferred"] = lambda meta, params: executed.set()
+        engine.actions_meta["fuzz_deferred"] = {}
+        rule = {
+            "name": "延迟规则",
+            "actions": [{"type": "fuzz_deferred", "params": {}}],
+        }
+        context = build_context(rule["name"], "fuzz", {}, [], run_id="fuzz-run")
+        engine._defer_workflow("fuzz_key", rule, rule["name"], context, 0.1)
         engine.shutdown()
-        assert "fuzz_key" not in engine._deferred_workflows
-        assert not engine._deferred_workflows
+        assert executed.wait(timeout=0.2) is False
 
     def test_repeated_shutdown_calls_are_safe(self):
         engine = make_engine()

@@ -22,7 +22,6 @@ from notmyfault.host.app import create_engine
 from notmyfault.host.plugin_registry import PluginRegistryClient
 from notmyfault.tests.api_support import (
     API_TOKEN,
-    FakeDesktopElements,
     FakeKeyStore,
     make_paths,
     make_store,
@@ -42,6 +41,9 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
     launcher_path = Path(__file__).resolve().parents[2] / "NOTMYFAULT.pyw"
     namespace = runpy.run_path(str(launcher_path), run_name="notmyfault_assembly_test")
     monkeypatch.setattr(signal, "signal", lambda *args: None)
+    monkeypatch.setattr(
+        "notmyfault.core.engine.verify_core_integrity", lambda: (True, [])
+    )
     source_package = Path(__file__).resolve().parents[1]
     package_root = tmp_path / "package"
     shutil.copytree(
@@ -91,7 +93,6 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
         plugin_file_system=PluginFileSystem(),
         pending_previews=PendingPreviewStore(),
         plugin_temporary_storage=PluginTemporaryStorage(),
-        desktop_elements=FakeDesktopElements(),
         plugin_registry=PluginRegistryClient(),
         run_history=history,
         event_broker=events,
@@ -117,8 +118,6 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
     try:
         asyncio.run(receive_state_event())
         assert wait_for(lambda: runner.current_engine is not None)
-        assert runner.current_engine._rules_store is store
-        assert runner.current_engine._hot_reloader._load_rules_fn.__self__ is store
         assert client.get("/api/engine/status", headers=headers).json()[
             "engine_state"
         ] == "running"

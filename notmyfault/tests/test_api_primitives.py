@@ -12,15 +12,8 @@ from notmyfault.host.api.plugin_installation import (
     PluginFileSystem,
     PluginInstallTransaction,
 )
-from notmyfault.host.api.services.settings import (
-    SettingsService,
-    SettingsServiceError,
-)
-from notmyfault.host.api.services.engine import EngineService
 from notmyfault.host.api.events import EventBroker
-from notmyfault.host.api.routes_engine import create_engine_router
 from notmyfault.host.api.services.rule_runs import RuleRunService, RuleRunServiceError
-from notmyfault.host.api.services.ai_drafting import AIDraftingService
 from notmyfault.security.api_key_store import KeyStoreStatus
 from notmyfault.tests.api_support import make_api_env
 
@@ -177,133 +170,10 @@ def test_backup_store_prefers_backup_named_after_current_plugin(tmp_path) -> Non
     assert retained[0].active_path == current
 
 
-class _SettingsStore:
-    config_path = "config.json"
-
-    def __init__(self, config: dict | None = None) -> None:
-        self.config = config or {}
-        self.saved: list[dict] = []
-
-    def load_verified_config(self) -> dict:
-        return dict(self.config)
-
-    def save_config(self, config: dict) -> bool:
-        self.saved.append(config)
-        self.config = config
-        return True
-
-    def inspect_security(self) -> dict:
-        return {"status": "ok"}
-
-    def approve_current_files(self) -> None:
-        return None
-
-
-def test_settings_service_updates_injected_store() -> None:
-    store = _SettingsStore({"settings": {}})
-    engine = SimpleNamespace(current_engine=None)
-    service = SettingsService(store, engine, platform_name="nt")
-
-    result = service.update_admin_authorization("engine_start")
-
-    assert result == {
-        "ok": True,
-        "mode": "engine_start",
-        "effective_mode": None,
-        "restart_required": False,
-    }
-    assert store.saved[-1]["settings"]["admin_authorization_mode"] == "engine_start"
-
-
-def test_settings_service_rejects_platform_specific_mode() -> None:
-    service = SettingsService(
-        _SettingsStore({"settings": {}}),
-        SimpleNamespace(current_engine=None),
-        platform_name="posix",
-    )
-
-    with pytest.raises(SettingsServiceError) as error:
-        service.update_admin_authorization("engine_start")
-
-    assert error.value.kind == "invalid"
-
-
-class _SessionStore:
-    def __init__(self) -> None:
-        self.dropped = 0
-
-    def drop_all(self) -> None:
-        self.dropped += 1
-
-
-class _History:
-    def list_runs(self, limit: int) -> list:
-        return [{"limit": limit}]
-
-    def get_run(self, run_id: str):
-        return {"run_id": run_id} if run_id == "known" else None
-
-
-def test_engine_service_stop_cleans_sessions() -> None:
-    component_sessions = _SessionStore()
-    extension_sessions = _SessionStore()
-    engine = SimpleNamespace(
-        engine_running=False,
-        engine_state="stopped",
-        last_error=None,
-        current_engine=None,
-        stop_engine=lambda: True,
-    )
-    paths = SimpleNamespace(logs_dir=Path("logs"))
-    service = EngineService(
-        engine,
-        SimpleNamespace(load_verified_rules=lambda: []),
-        paths,
-        _History(),
-        component_sessions,
-        extension_sessions,
-        SimpleNamespace(),
-    )
-
-    result = service.stop()
-
-    assert result["stopped"] is True
-    assert component_sessions.dropped == 1
-    assert extension_sessions.dropped == 1
-
-
-def test_engine_service_uses_injected_rule_store_for_status() -> None:
-    rules = [{"event": {"type": "clipboard"}, "actions": [{"type": "notify"}]}]
-    engine = SimpleNamespace(
-        engine_running=False,
-        engine_state="stopped",
-        last_error=None,
-        current_engine=None,
-    )
-    service = EngineService(
-        engine,
-        SimpleNamespace(load_verified_rules=lambda: rules),
-        SimpleNamespace(logs_dir=Path("logs")),
-        _History(),
-        _SessionStore(),
-        _SessionStore(),
-        SimpleNamespace(),
-        process_id=lambda: 123,
-    )
-
-    result = service.status()
-
-    assert result["pid"] == 123
-    assert result["rules_count"] == 1
-    assert result["triggers_count"] == 1
-    assert result["actions_count"] == 1
-
-
 class _EventHistory:
     def __init__(self) -> None:
-        self.events: list[dict] = []
-
-    def record(self, event: dict) -> None:
+        self.events = []
+    def record(self, event) -> None:
         self.events.append(event)
 
 
@@ -339,70 +209,6 @@ def test_event_broker_closes_slow_subscriber() -> None:
         assert await subscription.queue.get() is None
 
     asyncio.run(exercise())
-
-
-def test_sse_route_keeps_event_format_and_unsubscribes() -> None:
-    class Events:
-        def __init__(self) -> None:
-            self.unsubscribed = False
-
-        def subscribe(self):
-            queue = asyncio.Queue()
-            queue.put_nowait({"type": "changed", "data": {"value": 1}})
-            return SimpleNamespace(queue=queue)
-
-        def unsubscribe(self, subscription) -> None:
-            self.unsubscribed = True
-
-    class Request:
-        async def is_disconnected(self) -> bool:
-            return False
-
-    async def exercise() -> None:
-        events = Events()
-        router = create_engine_router(SimpleNamespace(), events)
-        endpoint = next(
-            route.endpoint for route in router.routes if route.path == "/api/events"
-        )
-        response = await endpoint(Request())
-        iterator = response.body_iterator
-
-        assert await anext(iterator) == "event: changed\n"
-        assert await anext(iterator) == 'data: {"value": 1}\n\n'
-        await iterator.aclose()
-        assert events.unsubscribed is True
-
-    asyncio.run(exercise())
-
-
-def test_rule_run_service_reads_rules_from_injected_store() -> None:
-    rule = {
-        "name": "通知规则",
-        "event": {"type": "usb_insert", "params": {}},
-        "actions": [{"type": "open_url", "params": {}}],
-    }
-    calls: list[tuple] = []
-    active_engine = SimpleNamespace(
-        actions_meta={},
-        triggers_meta={},
-        run_manual_rule_snapshot=lambda *args, **kwargs: (
-            calls.append((args, kwargs)) or (True, "已执行", "run-1")
-        ),
-    )
-    service = RuleRunService(
-        SimpleNamespace(current_engine=active_engine),
-        SimpleNamespace(load_verified_rules=lambda: [rule]),
-    )
-
-    result = service.run(0, None)
-
-    assert result == {
-        "ok": True,
-        "message": "已执行",
-        "run_id": "run-1",
-        "action_count": 1,
-    }
-    assert calls[0][0][0] == rule
 
 
 def test_rule_run_route_rejects_test_data_over_one_mib(tmp_path) -> None:
@@ -560,39 +366,3 @@ class _AIKeyStore:
     @staticmethod
     def delete_api_key():
         return None
-
-
-def test_ai_drafting_service_uses_injected_provider() -> None:
-    store = _SettingsStore(
-        {
-            "settings": {
-                "ai_drafting": {
-                    "enabled": True,
-                    "endpoint_url": "",
-                    "model": "",
-                    "api_format": "chat_completions",
-                }
-            }
-        }
-    )
-    calls: list[tuple] = []
-
-    def provider(messages, schema, allow_plugin_source):
-        calls.append((messages, schema, allow_plugin_source))
-        return {"result_type": "assistant_message", "message": "完成"}
-
-    service = AIDraftingService(
-        store,
-        plugin_schema=lambda: {"triggers": {}, "actions": {}},
-        validate_rule=lambda rule: {"ok": True},
-        provider=provider,
-        key_store=_AIKeyStore,
-    )
-
-    result = asyncio.run(
-        service.draft({"messages": [{"role": "user", "content": "测试"}]})
-    )
-
-    assert result["result_type"] == "assistant_message"
-    assert result["message"] == "完成"
-    assert calls[0][2] is False

@@ -82,16 +82,16 @@ class TriggerV2Tests:
             "demo_trigger", {"value": 42}, instance={"config": {"watch": "folder_a"}}
         )
 
-        matches = engine._condition_runtime.last_match("v2 绑定规则")
-        assert len(matches) == 1
-        assert matches[0]["binding_id"] == "t_demo001"
-        assert matches[0]["payload"] == {"value": 42}
+        assert engine._condition_runtime.last_match("v2 绑定规则") == []
 
     def test_supervisor_starts_one_v2_instance_per_config(self):
         started = []
+        all_started = threading.Event()
 
         def run_cb(instance_id, event_type, func, meta, config, stop_event):
             started.append((instance_id, config))
+            if len(started) == 2:
+                all_started.set()
 
         supervisor = TriggerSupervisor()
         configs = [{"n": 1}, {"n": 2}]
@@ -103,9 +103,9 @@ class TriggerV2Tests:
         )
 
         assert count == 2
-        for thread in supervisor.threads.values():
-            thread.join(timeout=2)
+        assert all_started.wait(timeout=2)
         assert sorted(started) == [("demo:1", {"n": 1}), ("demo:2", {"n": 2})]
+        assert set(supervisor.health()) == {"demo:1", "demo:2"}
         supervisor.stop(timeout=2)
 
 
@@ -269,6 +269,29 @@ class V2ContractTests:
         assert any(event_type == "trigger_payload_invalid" for event_type, _ in events)
         assert engine._condition_runtime.last_match("契约规则") == []
 
+    def test_engine_blocks_event_v1_contract_violation(self):
+        engine = make_engine(None)
+        events = []
+        engine.on_event = lambda event_type, data: events.append((event_type, data))
+        meta = {
+            "trigger_api": "event-v1",
+            "outputs": [{"name": "value", "type": "number"}],
+        }
+
+        def bad_trigger(plugin_meta, configs, emit_event, shutdown_event):
+            emit_event("demo_trigger", {"value": "not a number"})
+
+        engine._run_trigger(
+            "demo_trigger",
+            "demo_trigger",
+            bad_trigger,
+            meta,
+            [],
+            threading.Event(),
+        )
+
+        assert [name for name, _data in events] == ["trigger_payload_invalid"]
+
 
 class V2MatchingTests:
     def _v2_rule(self):
@@ -359,9 +382,11 @@ class V2OptimizationTests:
 
     def test_supervisor_dedupes_normalized_identical_configs(self):
         started = []
+        did_start = threading.Event()
 
         def run_cb(instance_id, event_type, func, meta, config, stop_event):
             started.append(instance_id)
+            did_start.set()
 
         supervisor = TriggerSupervisor()
         count = supervisor.start(
@@ -372,9 +397,8 @@ class V2OptimizationTests:
         )
 
         assert count == 1
-        assert list(supervisor.threads) == ["demo"]
-        for thread in supervisor.threads.values():
-            thread.join(timeout=2)
+        assert did_start.wait(timeout=2)
+        assert list(supervisor.health()) == ["demo"]
         assert started == ["demo"]
         supervisor.stop(timeout=2)
 

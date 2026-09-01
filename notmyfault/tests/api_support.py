@@ -94,14 +94,6 @@ class FakeKeyStore:
         return self.status
 
 
-class FakeDesktopElements:
-    async def capture(self, delay_value: Any) -> dict[str, Any]:
-        return {"ok": True, "selector": {"control_type": "Button"}}
-
-    async def check(self, selector: Any) -> dict[str, Any]:
-        return {"ok": True, "matched": bool(selector)}
-
-
 def make_paths(
     tmp_path: Path,
     package_root: Path | None = None,
@@ -141,7 +133,6 @@ def make_api_env(
     plugin_file_system = dependencies.pop("plugin_file_system", None)
     pending_previews = dependencies.pop("pending_previews", None)
     plugin_temporary_storage = dependencies.pop("plugin_temporary_storage", None)
-    desktop_elements = dependencies.pop("desktop_elements", FakeDesktopElements())
     plugin_registry = dependencies.pop("plugin_registry", PluginRegistryClient())
     run_history = dependencies.pop(
         "run_history", RunHistory(str(paths.run_history_file))
@@ -168,7 +159,6 @@ def make_api_env(
             if plugin_temporary_storage is not None
             else PluginTemporaryStorage()
         ),
-        desktop_elements=desktop_elements,
         plugin_registry=plugin_registry,
         run_history=run_history,
         event_broker=event_broker,

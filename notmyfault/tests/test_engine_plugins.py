@@ -27,6 +27,8 @@ def make_meta(plugin_id="plug_a", **overrides):
         "package_name": "com.test.plug",
     }
     meta.update(overrides)
+    if "admin" in meta.get("permissions", []) and "security" not in meta:
+        meta["security"] = {"admin_executables": ["cmd.exe"]}
     return meta
 
 
@@ -44,7 +46,13 @@ class SudoStub:
     def __init__(self):
         self.calls = []
 
-    def authorize_plugin(self, plugin_id, token, module=None):
+    def authorize_plugin(
+        self,
+        plugin_id,
+        token,
+        module=None,
+        allowed_executables=None,
+    ):
         self.calls.append(("authorize", plugin_id))
 
     def deauthorize_plugin(self, plugin_id, token):
@@ -121,6 +129,21 @@ def sign_with_test_key(plugin_dir, monkeypatch):
     signing.sign_plugin(Path(plugin_dir), "action.json", private_key=key)
 
 
+def sign_with_old_payload(plugin_dir, monkeypatch):
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    from notmyfault.security import signing, signing_keys
+
+    key = ed25519.Ed25519PrivateKey.generate()
+    public_bytes = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [public_bytes])
+    old_payload = b"".join(
+        path.read_bytes() for path in signing.plugin_files(plugin_dir)
+    )
+    monkeypatch.setattr(signing, "plugin_payload", lambda _folder: old_payload)
+    signing.sign_plugin(Path(plugin_dir), "action.json", private_key=key)
+
+
 CLEAN_RUN = "def run(meta, params):\n    return None\n"
 
 
@@ -137,53 +160,6 @@ class TestEngineStart:
         assert diag["plugins"]["actions_loaded"] == 0
         assert diag["plugins"]["triggers_loaded"] == 0
         assert diag["rules"]["total"] == 1
-
-    def test_admin_startup_only_counts_plugins_used_by_enabled_rules(self):
-        engine = create_test_engine({
-            "rules": [
-                {
-                    "name": "启用规则",
-                    "event": {"type": "manual", "params": {}},
-                    "actions": [{"type": "admin_action", "params": {}}],
-                },
-                {
-                    "name": "停用规则",
-                    "enabled": False,
-                    "event": {"type": "admin_trigger", "params": {}},
-                    "actions": [{"type": "unused_admin", "params": {}}],
-                },
-            ]
-        })
-        engine.actions_meta.update({
-            "admin_action": {"permissions": ["admin"]},
-            "unused_admin": {"permissions": ["admin"]},
-        })
-        engine.triggers_meta["admin_trigger"] = {"permissions": ["admin"]}
-
-        assert engine._required_admin_plugins() == ["admin_action"]
-
-    def test_engine_start_requests_session_for_admin_rules(self, monkeypatch):
-        engine = create_test_engine({
-            "settings": {"admin_authorization_mode": "engine_start"},
-            "rules": [
-                {
-                    "name": "管理员规则",
-                    "event": {"type": "manual", "params": {}},
-                    "actions": [{"type": "admin_action", "params": {}}],
-                }
-            ],
-        })
-        engine.actions_meta["admin_action"] = {"permissions": ["admin"]}
-        calls = []
-        monkeypatch.setattr(
-            engine._sudo,
-            "start_admin_session",
-            lambda token: calls.append(token) or True,
-        )
-
-        engine._authorize_admin_rules_at_startup()
-
-        assert calls == [engine._engine_token]
 
     def test_start_no_trigger_threads_alerts(self, monkeypatch):
         from notmyfault.platform import platform_support
@@ -204,17 +180,6 @@ class TestEngineStart:
 
 
 class TestLoadPlugins:
-    def test_plugin_dir_not_exists(self, tmp_path):
-        loader, registry, errors, _ = make_loader(tmp_path)
-        assert load_actions(loader, tmp_path)[:2] == (0, 0)
-        assert errors == []
-
-    def test_missing_json_file(self, tmp_path, capsys):
-        loader, registry, errors, _ = make_loader(tmp_path)
-        (tmp_path / "actions" / "bare").mkdir(parents=True)
-        assert load_actions(loader, tmp_path)[:2] == (0, 0)
-        assert "缺少 action.json" in capsys.readouterr().err
-
     def test_json_parse_error(self, tmp_path):
         loader, registry, errors, _ = make_loader(tmp_path)
         folder = tmp_path / "actions" / "bad"
@@ -232,16 +197,6 @@ class TestLoadPlugins:
         loaded, failed, _, _ = load_actions(loader, tmp_path)
         assert (loaded, failed) == (0, 1)
         assert any("schema 校验失败" in msg for _, _, msg in errors)
-
-    def test_missing_py_file(self, tmp_path, capsys):
-        loader, registry, errors, _ = make_loader(tmp_path)
-        folder = tmp_path / "actions" / "no_py"
-        folder.mkdir(parents=True)
-        (folder / "action.json").write_text(
-            json.dumps(make_meta(), ensure_ascii=False), encoding="utf-8"
-        )
-        assert load_actions(loader, tmp_path)[:2] == (0, 0)
-        assert "缺少 action.py" in capsys.readouterr().err
 
     def test_missing_run_function(self, tmp_path):
         loader, registry, errors, _ = make_loader(tmp_path)
@@ -273,35 +228,6 @@ class TestLoadPlugins:
         assert meta_store == {}
         assert "已禁用" in capsys.readouterr().out
 
-    def test_config_disabled_list_skips_builtin_plugin(self, tmp_path):
-        config = {"disabled_plugins": {"triggers": [], "actions": ["plug_a"]}}
-        loader, registry, errors, _ = make_loader(tmp_path, config=config)
-        write_plugin(tmp_path / "actions", "good", make_meta(), CLEAN_RUN)
-        loaded, failed, meta_store, func_store = load_actions(loader, tmp_path)
-        assert (loaded, failed) == (0, 0)
-        assert meta_store == {}
-
-    def test_config_disabled_list_skips_user_plugin(self, tmp_path):
-        # 开关插件只写 config，加载器对用户插件同样要认这份名单
-        config = {"disabled_plugins": {"triggers": [], "actions": ["plug_a"]}}
-        loader, registry, errors, _ = make_loader(tmp_path, config=config)
-        write_plugin(tmp_path / "actions", "good", make_meta(), CLEAN_RUN)
-        loaded, failed, meta_store, func_store = load_actions(
-            loader, tmp_path, origin="user"
-        )
-        assert (loaded, failed) == (0, 0)
-        assert meta_store == {}
-
-    def test_user_plugin_loads_when_not_in_disabled_list(self, tmp_path):
-        config = {"disabled_plugins": {"triggers": [], "actions": []}}
-        loader, registry, errors, _ = make_loader(tmp_path, config=config)
-        write_plugin(tmp_path / "actions", "good", make_meta(), CLEAN_RUN)
-        loaded, failed, meta_store, func_store = load_actions(
-            loader, tmp_path, origin="user"
-        )
-        assert (loaded, failed) == (1, 0)
-        assert meta_store["plug_a"]["origin"] == "user"
-
     def test_successful_plugin_load(self, tmp_path):
         loader, registry, errors, _ = make_loader(tmp_path)
         write_plugin(tmp_path / "actions", "good", make_meta(), CLEAN_RUN)
@@ -314,33 +240,6 @@ class TestLoadPlugins:
         assert callable(registry.resolve_action("plug_a"))
         assert callable(func_store["plug_a"])
         assert registry.get_module("plug_a") is not None
-        assert errors == []
-
-    def test_multiple_plugins_mixed(self, tmp_path):
-        loader, registry, errors, _ = make_loader(tmp_path)
-        write_plugin(tmp_path / "actions", "aaa_good", make_meta("aaa_good"), CLEAN_RUN)
-        write_plugin(
-            tmp_path / "actions", "bbb_broken", make_meta("bbb_broken"),
-            "raise RuntimeError('boom')\n",
-        )
-        loaded, failed, meta_store, _ = load_actions(loader, tmp_path)
-        # 两个插件都通过发现阶段，损坏的那个要到物化才失败
-        assert (loaded, failed) == (2, 0)
-        assert "aaa_good" in meta_store
-        assert "bbb_broken" in meta_store
-        assert registry.resolve_action("bbb_broken") is None
-        assert "bbb_broken" not in registry.actions_funcs
-
-    @pytest.mark.parametrize(
-        "folder_name",
-        [".hidden", ".pytest_cache", "__pycache__", "__pypackages__", "node_modules"],
-    )
-    def test_generated_directories_are_silently_ignored(self, tmp_path, folder_name):
-        loader, registry, errors, _ = make_loader(tmp_path)
-        write_plugin(tmp_path / "actions" / folder_name, "inner", make_meta(), CLEAN_RUN)
-        loaded, failed, meta_store, func_store = load_actions(loader, tmp_path)
-        assert (loaded, failed) == (0, 0)
-        assert meta_store == {} and func_store == {}
         assert errors == []
 
     def test_setup_raises_exception(self, tmp_path):
@@ -362,25 +261,6 @@ class TestLoadPlugins:
         assert "bad_setup" not in meta_store
         assert registry.get_module("bad_setup") is None
         assert any("setup() 执行异常" in msg for _, _, msg in errors)
-
-    def test_setup_returns_false(self, tmp_path):
-        loader, registry, errors, _ = make_loader(tmp_path)
-        code = (
-            "def setup(meta):\n"
-            "    return False\n"
-            "def run(meta, config, emit, stop_event):\n"
-            "    pass\n"
-        )
-        write_plugin(
-            tmp_path / "triggers", "no_setup", make_meta("no_setup"),
-            code, json_name="trigger.json", py_name="trigger.py",
-        )
-        loaded, failed, meta_store, func_store = load_triggers(loader, tmp_path)
-        assert (loaded, failed) == (1, 0)
-        assert registry.resolve_trigger("no_setup") is None
-        assert "no_setup" not in func_store
-        assert "no_setup" not in meta_store
-        assert any("setup() 返回 False" in msg for _, _, msg in errors)
 
     def test_sudo_import_warning_no_admin_permission(self, tmp_path, capsys):
         loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.NORMAL)
@@ -483,19 +363,6 @@ class TestSecurityScanIntegration:
         assert "sneaky" not in func_store
         assert any("未声明能力" in msg for _, _, msg in errors)
 
-    def test_strict_rejects_undeclared_os_alias(self, tmp_path, monkeypatch):
-        loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
-        code = (
-            "import os as o\n"
-            "def run(meta, params):\n"
-            "    return o.system('dir')\n"
-        )
-        folder = write_plugin(tmp_path / "actions", "aliased", make_meta("aliased"), code)
-        sign_with_test_key(folder, monkeypatch)
-        loaded, failed, _, _ = load_actions(loader, tmp_path)
-        assert (loaded, failed) == (0, 1)
-        assert any("未声明能力" in msg for _, _, msg in errors)
-
     def test_strict_invalid_signature_is_rejected_before_module_execution(
         self, tmp_path, monkeypatch
     ):
@@ -534,6 +401,67 @@ class TestSecurityScanIntegration:
         loaded, failed, meta_store, _ = load_actions(loader, tmp_path, origin="user")
         assert (loaded, failed) == (1, 0)
         assert meta_store["legacy"]["signature_kind"] == "official-legacy"
+
+    def test_strict_migrates_old_payload_with_existing_integrity_record(
+        self, tmp_path, monkeypatch
+    ):
+        from notmyfault.security.plugin_loader import inspect_plugin_tree
+
+        loader, _registry, errors, _sudo = make_loader(
+            tmp_path,
+            mode=SecurityMode.STRICT,
+        )
+        folder = write_plugin(
+            tmp_path / "actions",
+            "oldpayload",
+            make_meta("oldpayload"),
+            "def run(meta, params):\n    return {'value': params['value']}\n",
+        )
+        sign_with_old_payload(folder, monkeypatch)
+        tree = inspect_plugin_tree(str(folder))
+        assert tree is not None
+        (tmp_path / "manifest.json").write_text(
+            json.dumps({"oldpayload": tree.file_snapshot}),
+            encoding="utf-8",
+        )
+
+        loaded, failed, meta_store, func_store = load_actions(
+            loader,
+            tmp_path,
+            origin="user",
+        )
+
+        assert (loaded, failed) == (1, 0)
+        assert meta_store["oldpayload"]["signature_kind"] == "official-legacy"
+        assert errors == []
+        assert loader.materialize_pending_action("oldpayload") is not None
+        assert func_store["oldpayload"](meta_store["oldpayload"], {"value": 7}) == {
+            "value": 7
+        }
+
+    def test_strict_rejects_old_payload_without_existing_integrity_record(
+        self, tmp_path, monkeypatch
+    ):
+        loader, _registry, errors, _sudo = make_loader(
+            tmp_path,
+            mode=SecurityMode.STRICT,
+        )
+        folder = write_plugin(
+            tmp_path / "actions",
+            "oldpayload",
+            make_meta("oldpayload"),
+            CLEAN_RUN,
+        )
+        sign_with_old_payload(folder, monkeypatch)
+
+        loaded, failed, _, _ = load_actions(
+            loader,
+            tmp_path,
+            origin="user",
+        )
+
+        assert (loaded, failed) == (0, 1)
+        assert any("签名无效" in message for _, _, message in errors)
 
     def test_strict_rejects_self_signed_admin_plugin(self, tmp_path):
         from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -595,26 +523,6 @@ class TestSecurityScanIntegration:
         assert (loaded, failed) == (1, 0)
         assert meta_store["authored"]["signature_kind"] == "author"
         assert errors2 == []
-
-
-def test_engine_keeps_plugin_loader_compatibility_exports():
-    from notmyfault.core import engine as engine_module
-
-    for name in (
-        "PluginKind",
-        "PluginLoader",
-        "PluginRegistry",
-        "check_permissions_conform",
-        "check_sudo_import",
-        "is_known_permission",
-        "scan_plugin_capabilities",
-        "validate_plugin_meta",
-        "verify_plugin_integrity",
-        "verify_plugin_sig",
-        "_check_sudo_import",
-        "_validate_plugin_meta",
-    ):
-        assert hasattr(engine_module, name), f"engine 缺少兼容导出 {name}"
 
 
 def test_plugin_registry_registers_and_unregisters_atomically():

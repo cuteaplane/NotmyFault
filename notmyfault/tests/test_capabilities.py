@@ -38,11 +38,21 @@ class ProbeStructureTests(unittest.TestCase):
 
     def test_linux_missing_backend_reports_reason(self):
         with patch("notmyfault.platform.capabilities.os.name", "posix"), \
+                patch("notmyfault.platform.capabilities.sys.platform", "linux"), \
                 patch("notmyfault.platform.linux_support.shutil.which", return_value=None):
             report = capabilities.probe_capabilities()
         brightness = report[capabilities.DISPLAY_BRIGHTNESS]
         self.assertFalse(brightness["available"])
         self.assertIn("brightnessctl", brightness["reason"])
+
+    def test_macos_does_not_use_linux_probe(self):
+        with patch("notmyfault.platform.capabilities.os.name", "posix"), \
+                patch("notmyfault.platform.capabilities.sys.platform", "darwin"), \
+                patch("notmyfault.platform.capabilities._probe_linux") as linux_probe:
+            result = capabilities.probe_capability(capabilities.CLIPBOARD_READ)
+        linux_probe.assert_not_called()
+        self.assertFalse(result["available"])
+        self.assertIn("暂未提供", result["reason"])
 
     def test_linux_clipboard_probe_matches_wayland_backend(self):
         def only_xclip(name):

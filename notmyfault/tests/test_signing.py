@@ -98,16 +98,32 @@ class TestSignPlugin:
         key = make_key()
         signing.sign_plugin(tmp_path, "action.json", private_key=key)
 
-        payload = b"".join(f.read_bytes() for f in signing.plugin_files(tmp_path))
+        payload = signing.plugin_payload(tmp_path)
         digest = hashlib.sha256(payload).digest()
         sig = (tmp_path / "signature.sig").read_bytes()
         key.public_key().verify(sig, digest)
 
         # 篡改任意文件后原签名必须失效
         (tmp_path / "action.py").write_text("VALUE = 2\n")
-        payload = b"".join(f.read_bytes() for f in signing.plugin_files(tmp_path))
+        payload = signing.plugin_payload(tmp_path)
         with pytest.raises(InvalidSignature):
             key.public_key().verify(sig, hashlib.sha256(payload).digest())
+
+    def test_payload_binds_file_names_and_boundaries(self, tmp_path):
+        first = tmp_path / "first.txt"
+        second = tmp_path / "second.txt"
+        first.write_bytes(b"ab")
+        second.write_bytes(b"c")
+        original = signing.plugin_payload(tmp_path)
+
+        first.write_bytes(b"a")
+        second.write_bytes(b"bc")
+        moved_boundary = signing.plugin_payload(tmp_path)
+        assert moved_boundary != original
+
+        second.rename(tmp_path / "renamed.txt")
+        renamed = signing.plugin_payload(tmp_path)
+        assert renamed != moved_boundary
 
 
 class TestCounterSignAuthorKey:

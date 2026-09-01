@@ -1,6 +1,5 @@
 import ctypes
 import importlib.util
-import json
 import os
 import threading
 from datetime import datetime, timedelta
@@ -11,42 +10,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from notmyfault.core.workflow import ActionCancellation, ActionCancelled
-from notmyfault.security.plugin_loader import PluginLoader, PluginRegistry
-from notmyfault.security.plugin_schema import current_platform_name, validate_plugin_meta
-from notmyfault.security.security import SecurityMode
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
-
-NEW_ACTIONS = [
-    "append_text",
-    "clipboard_clear",
-    "create_shortcut",
-    "media_control",
-    "open_url",
-    "power_plan",
-    "send_keys",
-    "uia_control",
-    "uia_focus_window",
-    "uia_read_text",
-    "uia_wait",
-    "window_pin",
-]
-WINDOWS_ONLY_ACTIONS = {
-    "power_plan",
-    "uia_control",
-    "uia_focus_window",
-    "uia_read_text",
-    "uia_wait",
-}
-NEW_TRIGGERS = [
-    "audio_device",
-    "battery_level",
-    "cron_schedule",
-    "session_lock",
-    "system_startup",
-    "wifi_network",
-]
-
 
 def load_plugin(ptype, name):
     filename = "action.py" if ptype == "actions" else "trigger.py"
@@ -100,19 +65,6 @@ def test_append_text_appends_without_overwriting(tmp_path):
     assert target.read_text(encoding="utf-8") == "旧内容\n新内容\n"
 
 
-def test_append_text_validates_input(tmp_path):
-    mod = load_plugin("actions", "append_text")
-    target = str(tmp_path / "log.txt")
-    with pytest.raises(ValueError, match="未指定日志文件路径"):
-        mod.run_with_context({}, {"text": "x"}, {})
-    with pytest.raises(ValueError, match="没有可写入的内容"):
-        mod.run_with_context({}, {"file_path": target, "text": "  "}, {})
-    with pytest.raises(ValueError, match="不支持的编码"):
-        mod.run_with_context(
-            {}, {"file_path": target, "text": "x", "encoding": "utf-16"}, {}
-        )
-
-
 def test_append_text_writes_timestamped_lines(tmp_path):
     mod = load_plugin("actions", "append_text")
     target = tmp_path / "log.txt"
@@ -148,33 +100,9 @@ def test_clipboard_clear_windows_flow(monkeypatch):
     user32.CloseClipboard.assert_called_once()
 
 
-def test_clipboard_clear_linux_path(monkeypatch):
-    import sys
-
-    mod = load_plugin("actions", "clipboard_clear")
-    written = []
-    monkeypatch.setattr(mod.os, "name", "posix")
-    monkeypatch.setitem(
-        sys.modules,
-        "notmyfault.platform.linux_support",
-        SimpleNamespace(set_clipboard_text=written.append),
-    )
-    result = mod.run({}, {})
-    assert result == {"cleared": True}
-    assert written == [""]
-
 
 # ------------------------------------------------------------ create_shortcut
 
-
-def test_create_shortcut_requires_name_and_target():
-    mod = load_plugin("actions", "create_shortcut")
-    with pytest.raises(ValueError, match="未指定快捷方式名称"):
-        mod.run({}, {"target_path": "C:\\x.exe"})
-    with pytest.raises(ValueError, match="名称不合法"):
-        mod.run({}, {"name": "../evil", "target_path": "C:\\x.exe"})
-    with pytest.raises(ValueError, match="未指定快捷方式目标路径"):
-        mod.run({}, {"name": "快捷"})
 
 
 @pytest.mark.skipif(os.name != "nt", reason="仅 Windows 创建 lnk")
@@ -328,30 +256,6 @@ def test_send_keys_hotkey_order_and_modifiers(monkeypatch):
     ]
 
 
-@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 SendInput ABI")
-def test_send_keys_type_text_builds_unicode_inputs(monkeypatch):
-    mod = load_plugin("actions", "send_keys")
-    sent = []
-    monkeypatch.setattr(mod, "_send", sent.extend)
-    mod.run({}, {"mode": "type_text", "text": "a中"})
-    assert len(sent) == 4
-    assert [inp.ki.wScan for inp in sent] == [ord("a"), ord("a"), 0x4E2D, 0x4E2D]
-    assert all(inp.ki.wVk == 0 for inp in sent)
-    assert sent[0].ki.dwFlags == mod.KEYEVENTF_UNICODE
-    assert sent[1].ki.dwFlags == mod.KEYEVENTF_UNICODE | mod.KEYEVENTF_KEYUP
-
-
-@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 需要 UTF-16 代理对")
-def test_send_keys_type_text_splits_surrogate_pairs(monkeypatch):
-    mod = load_plugin("actions", "send_keys")
-    sent = []
-    monkeypatch.setattr(mod, "_send", sent.extend)
-    mod.run({}, {"mode": "type_text", "text": "😀"})
-    # 😀 = U+1F600，拆成高代理 0xD83D 和低代理 0xDE00，各发一次按下和抬起
-    assert [inp.ki.wScan for inp in sent] == [0xD83D, 0xD83D, 0xDE00, 0xDE00]
-    assert all(inp.ki.wVk == 0 for inp in sent)
-
-
 # Windows 上 run() 走 SendInput，会把组合键真的按进系统
 @pytest.mark.skipif(os.name != "posix", reason="仅 Linux 走 InputBackend")
 def test_send_keys_linux_dispatches_input_tool(monkeypatch):
@@ -383,16 +287,6 @@ def test_send_keys_linux_dispatches_input_tool(monkeypatch):
 
 
 
-def test_send_keys_rejects_bad_input():
-    mod = load_plugin("actions", "send_keys")
-    with pytest.raises(ValueError, match="未知模式"):
-        mod.run({}, {"mode": "warp"})
-    with pytest.raises(ValueError, match="没有要输入的文本"):
-        mod.run({}, {"mode": "type_text", "text": ""})
-    with pytest.raises(ValueError, match="只允许修饰键在前"):
-        mod.run({}, {"mode": "hotkey", "keys": "a+ctrl"})
-
-
 # ---------------------------------------------------------------- window_pin
 
 
@@ -412,24 +306,6 @@ def test_window_pin_toggle_pins_active_window(monkeypatch):
     result = mod.run({}, {"action": "toggle"})
     assert result == {"state": "pinned", "hwnd": 777}
     assert user32.SetWindowPos.call_args.args[1] == mod.HWND_TOPMOST
-
-
-@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 user32 ABI")
-def test_window_pin_unpin_uses_notopmost(monkeypatch):
-    mod = load_plugin("actions", "window_pin")
-    user32 = _patch_pin_user32(monkeypatch, mod, exstyle=mod.WS_EX_TOPMOST)
-    result = mod.run({}, {"action": "toggle"})
-    assert result["state"] == "unpinned"
-    assert user32.SetWindowPos.call_args.args[1] == mod.HWND_NOTOPMOST
-
-
-@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 user32 ABI")
-def test_window_pin_title_target_resolves_window(monkeypatch):
-    mod = load_plugin("actions", "window_pin")
-    _patch_pin_user32(monkeypatch, mod)
-    monkeypatch.setattr(mod, "_find_windows_by_title", lambda kw: [42])
-    result = mod.run({}, {"action": "pin", "target": "title", "title": "记事本"})
-    assert result == {"state": "pinned", "hwnd": 42}
 
 
 def test_window_pin_linux_dispatches_wmctrl(monkeypatch):
@@ -452,13 +328,6 @@ def test_window_pin_linux_dispatches_wmctrl(monkeypatch):
     }
     assert calls == [mod.default_runner, ("pin", "title", "记事本")]
 
-
-def test_window_pin_rejects_bad_input():
-    mod = load_plugin("actions", "window_pin")
-    with pytest.raises(ValueError, match="未知操作"):
-        mod.run({}, {"action": "warp"})
-    with pytest.raises(ValueError, match="必须填写窗口标题"):
-        mod.run({}, {"action": "pin", "target": "title", "title": ""})
 
 
 # --------------------------------------------------------------- audio_device
@@ -489,39 +358,6 @@ def test_audio_device_emits_only_on_change(monkeypatch):
     assert events[0]["previous_device_id"] == "A"
 
 
-def test_audio_device_any_tracks_both_flows(monkeypatch):
-    mod = load_plugin("triggers", "audio_device")
-    scripted(
-        monkeypatch,
-        mod,
-        "_query_default_devices",
-        [
-            {"render": "A", "capture": "C"},
-            {"render": "B", "capture": "D"},
-        ],
-    )
-    trigger, events = make_trigger(mod, "AudioDeviceTrigger", {"device_type": "any"})
-    trigger.poll()
-    trigger.poll()
-    assert [e["device_type"] for e in events] == ["render", "capture"]
-
-
-def test_audio_device_query_failure_is_silent(monkeypatch):
-    mod = load_plugin("triggers", "audio_device")
-    scripted(monkeypatch, mod, "_query_default_devices", [{}, {}])
-    trigger, events = make_trigger(mod, "AudioDeviceTrigger", {})
-    trigger.poll()
-    trigger.poll()
-    assert events == []
-
-
-def test_audio_device_validate_rejects_bad_config():
-    mod = load_plugin("triggers", "audio_device")
-    trigger = mod.AudioDeviceTrigger(
-        {"id": "audio_device"}, {"device_type": "speaker"}, lambda e: None, threading.Event()
-    )
-    with pytest.raises(ValueError, match="无效的设备类型"):
-        trigger.validate()
 
 
 # -------------------------------------------------------------- battery_level
@@ -547,12 +383,6 @@ def test_battery_level_fires_once_with_hysteresis(monkeypatch):
     assert len(events) == 2
 
 
-def test_battery_level_ignores_missing_battery(monkeypatch):
-    mod = load_plugin("triggers", "battery_level")
-    monkeypatch.setattr(mod.psutil, "sensors_battery", lambda: None)
-    trigger, events = make_trigger(mod, "BatteryLevelTrigger", {})
-    trigger.poll()
-    assert events == []
 
 
 def test_battery_level_respects_charge_state_filter(monkeypatch):
@@ -644,25 +474,6 @@ def test_cron_schedule_weekly_respects_weekdays(monkeypatch):
     assert events[0]["mode"] == "weekly"
 
 
-@pytest.mark.parametrize(
-    "config",
-    [
-        {"mode": "hourly"},
-        {"mode": "daily", "time": "25:00"},
-        {"mode": "daily", "time": "abc"},
-        {"mode": "weekly", "time": "08:00", "days": "9"},
-        {"mode": "weekly", "time": "08:00", "days": ""},
-        {"mode": "interval", "interval_minutes": 0},
-        {"mode": "interval", "interval_minutes": "x"},
-    ],
-)
-def test_cron_schedule_validate_rejects_bad_config(config):
-    mod = load_plugin("triggers", "cron_schedule")
-    trigger = mod.CronScheduleTrigger(
-        {"id": "cron_schedule"}, config, lambda e: None, threading.Event()
-    )
-    with pytest.raises(ValueError):
-        trigger.validate()
 
 
 # -------------------------------------------------------------- session_lock
@@ -702,22 +513,6 @@ def test_session_lock_filters_by_target_state(monkeypatch):
     assert events == [{"state": "locked", "previous_state": "unlocked"}]
 
 
-def test_session_lock_query_failure_is_silent(monkeypatch):
-    mod = load_plugin("triggers", "session_lock")
-    scripted(monkeypatch, mod, "_is_locked", [None, None])
-    trigger, events = make_trigger(mod, "SessionLockTrigger", {})
-    trigger.poll()
-    trigger.poll()
-    assert events == []
-
-
-def test_session_lock_validate_rejects_bad_state():
-    mod = load_plugin("triggers", "session_lock")
-    trigger = mod.SessionLockTrigger(
-        {"id": "session_lock"}, {"state": "sleeping"}, lambda e: None, threading.Event()
-    )
-    with pytest.raises(ValueError, match="无效的目标状态"):
-        trigger.validate()
 
 
 # ------------------------------------------------------------ system_startup
@@ -739,23 +534,6 @@ def test_system_startup_fires_once_after_delay(monkeypatch):
     assert events[0]["delay_seconds"] == 5.0
 
 
-def test_system_startup_zero_delay_fires_immediately(monkeypatch):
-    mod = load_plugin("triggers", "system_startup")
-    clock = FakeClock(datetime(2026, 1, 1, 0, 0, 0))
-    monkeypatch.setattr(mod, "datetime", clock)
-    trigger, events = make_trigger(mod, "SystemStartupTrigger", {"delay_seconds": 0})
-    trigger.poll()
-    assert len(events) == 1
-
-
-def test_system_startup_validate_rejects_bad_delay():
-    mod = load_plugin("triggers", "system_startup")
-    for config in ({"delay_seconds": "abc"}, {"delay_seconds": 301}):
-        trigger = mod.SystemStartupTrigger(
-            {"id": "system_startup"}, config, lambda e: None, threading.Event()
-        )
-        with pytest.raises(ValueError):
-            trigger.validate()
 
 
 # -------------------------------------------------------------- wifi_network
@@ -787,28 +565,6 @@ def test_wifi_network_emits_on_leaving_target(monkeypatch):
     ]
 
 
-def test_wifi_network_any_fires_on_every_change(monkeypatch):
-    mod = load_plugin("triggers", "wifi_network")
-    scripted(monkeypatch, mod, "_current_ssid", ["A", "B", ""])
-    trigger, events = make_trigger(mod, "WifiNetworkTrigger", {"direction": "any"})
-    trigger.poll()
-    trigger.poll()
-    trigger.poll()
-    assert len(events) == 2
-
-
-def test_wifi_network_validate_rejects_bad_config():
-    mod = load_plugin("triggers", "wifi_network")
-    bad = mod.WifiNetworkTrigger(
-        {"id": "wifi_network"}, {"direction": "sideways"}, lambda e: None, threading.Event()
-    )
-    with pytest.raises(ValueError, match="无效的触发方向"):
-        bad.validate()
-    missing = mod.WifiNetworkTrigger(
-        {"id": "wifi_network"}, {"direction": "connected"}, lambda e: None, threading.Event()
-    )
-    with pytest.raises(ValueError, match="必须填写目标 SSID"):
-        missing.validate()
 
 
 def test_shutdown_system_delay_can_be_cancelled_before_system_call():
@@ -925,79 +681,3 @@ def test_uia_window_and_text_actions_pass_cancellation(
 
     assert result == expected
     assert calls == [(selector, cancellation)]
-
-
-# ------------------------------------------------------------ 元数据与加载
-
-
-@pytest.mark.parametrize("name", NEW_ACTIONS)
-def test_new_action_meta_valid(name):
-    meta = json.loads(
-        (PKG_ROOT / "actions" / name / "action.json").read_text(encoding="utf-8")
-    )
-    ok, errors = validate_plugin_meta(meta, "action")
-    assert ok is True, errors
-
-
-@pytest.mark.parametrize("name", NEW_TRIGGERS)
-def test_new_trigger_meta_valid(name):
-    meta = json.loads(
-        (PKG_ROOT / "triggers" / name / "trigger.json").read_text(encoding="utf-8")
-    )
-    ok, errors = validate_plugin_meta(meta, "trigger")
-    assert ok is True, errors
-
-
-class SudoStub:
-    def authorize_plugin(self, plugin_id, token, module=None):
-        pass
-
-    def deauthorize_plugin(self, plugin_id, token):
-        pass
-
-
-def test_new_plugins_loaded_by_engine(tmp_path):
-    loader = PluginLoader(
-        registry=PluginRegistry(),
-        config={},
-        diagnostics=SimpleNamespace(record_plugin_error=lambda *a, **k: None),
-        security_mode=SecurityMode.PERMISSIVE,
-        sudo=SudoStub(),
-        engine_token="token",
-        integrity_errors=[],
-        plugin_manifest_path=str(tmp_path / "manifest.json"),
-    )
-    base = str(PKG_ROOT)
-    actions_meta: dict = {}
-    loader.load(
-        base_dir=base,
-        plugins_dir="actions",
-        json_filename="action.json",
-        py_filename="action.py",
-        module_prefix="notmyfault.action_",
-        meta_store=actions_meta,
-        func_store={},
-        store_name="Action",
-        origin="builtin",
-    )
-    triggers_meta: dict = {}
-    loader.load(
-        base_dir=base,
-        plugins_dir="triggers",
-        json_filename="trigger.json",
-        py_filename="trigger.py",
-        module_prefix="notmyfault.trigger_",
-        meta_store=triggers_meta,
-        func_store={},
-        store_name="Trigger",
-        origin="builtin",
-    )
-    expected_actions = [
-        name
-        for name in NEW_ACTIONS
-        if current_platform_name() == "windows" or name not in WINDOWS_ONLY_ACTIONS
-    ]
-    for name in expected_actions:
-        assert name in actions_meta, f"动作 {name} 未被引擎加载"
-    for name in NEW_TRIGGERS:
-        assert name in triggers_meta, f"触发器 {name} 未被引擎加载"

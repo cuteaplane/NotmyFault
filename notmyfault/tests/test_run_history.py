@@ -120,6 +120,34 @@ def test_run_history_recovers_from_broken_lines(tmp_path):
     assert runs[0]["status"] == "running"
 
 
+def test_run_history_rejects_malformed_counts_and_timestamps(tmp_path):
+    history = RunHistory(str(tmp_path / "runs.jsonl"))
+    history.record(packet(
+        "rule_triggered",
+        float("inf"),
+        run_id="run_malformed",
+        action_count={"bad": 1},
+        precondition_count="NaN",
+        assertion_count="1000001",
+    ))
+    history.record(packet(
+        "workflow_completed",
+        float("-inf"),
+        run_id="run_malformed",
+        status="succeeded",
+        assertions_passed=[],
+        assertions_total="not-a-number",
+    ))
+
+    run = history.get_run("run_malformed")
+
+    assert run["action_count"] == 0
+    assert run["precondition_count"] == 0
+    assert run["assertions_passed"] == 0
+    assert run["assertions_total"] == 0
+    assert run["duration_ms"] is None
+
+
 def test_run_history_keeps_partial_scope_and_safe_assertion_summary(tmp_path):
     path = tmp_path / "runs.jsonl"
     history = RunHistory(str(path))

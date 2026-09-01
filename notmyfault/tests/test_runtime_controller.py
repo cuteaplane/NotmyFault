@@ -7,6 +7,8 @@ import signal
 from pathlib import Path
 
 from notmyfault.core.runtime_controller import RuntimeController
+from notmyfault.security.security import SecurityMode
+from notmyfault.tests.api_support import create_test_engine
 
 
 class FakeEngine:
@@ -115,6 +117,36 @@ def test_runtime_controller_reports_factory_failure():
     assert str(failures[0]) == "factory exploded"
     assert controller.status().last_error == "factory exploded"
     assert ("error", {"error": "factory exploded"}) in events
+
+
+def test_runtime_controller_reports_integrity_start_failure(monkeypatch):
+    from notmyfault.core import engine as engine_module
+
+    alerts = []
+    events = []
+
+    def factory(on_event=None):
+        engine = create_test_engine({"rules": []}, on_event=on_event)
+        engine._security_mode = SecurityMode.STRICT
+        engine._alert_user = lambda *args, **kwargs: alerts.append((args, kwargs))
+        return engine
+
+    monkeypatch.setattr(
+        engine_module,
+        "verify_core_integrity",
+        lambda: (False, ["notmyfault/core/engine.py"]),
+    )
+    controller = RuntimeController(
+        factory,
+        event_sink=lambda event_type, data: events.append((event_type, data)),
+    )
+
+    assert controller.start() is True
+    assert _wait(lambda: controller.state == "stopped")
+    assert controller.current_engine is None
+    assert controller.status().last_error == "核心文件完整性校验失败"
+    assert ("error", {"error": "核心文件完整性校验失败"}) in events
+    assert alerts[0][0][0] == "NotmyFault 完整性校验失败"
 
 
 def test_runtime_controller_serializes_concurrent_start_requests():

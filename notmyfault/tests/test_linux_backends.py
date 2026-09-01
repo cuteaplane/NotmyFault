@@ -214,6 +214,9 @@ class ClipboardBackendTests(LinuxPathTest):
     def _wayland(self):
         return patch("notmyfault.platform.linux_support.session_type", return_value="wayland")
 
+    def _x11(self):
+        return patch("notmyfault.platform.linux_support.session_type", return_value="x11")
+
     def test_read_prefers_wayland_paste_on_wayland(self):
         runner = FakeRunner(
             paths={"wl-paste": "/usr/bin/wl-paste", "xclip": "/usr/bin/xclip"},
@@ -231,9 +234,7 @@ class ClipboardBackendTests(LinuxPathTest):
             paths={"wl-paste": "/usr/bin/wl-paste", "xclip": "/usr/bin/xclip"},
             results=[ok(stdout="text")],
         )
-        with patch(
-            "notmyfault.platform.linux_support.session_type", return_value="x11"
-        ):
+        with self._x11():
             self.assertEqual(ClipboardBackend(runner).read_text(), "text")
         self.assertEqual(
             runner.calls[0]["args"],
@@ -244,7 +245,8 @@ class ClipboardBackendTests(LinuxPathTest):
         runner = FakeRunner(
             paths={"xclip": "/usr/bin/xclip"}, results=[ok(stdout="text")]
         )
-        self.assertEqual(ClipboardBackend(runner).read_text(), "text")
+        with self._x11():
+            self.assertEqual(ClipboardBackend(runner).read_text(), "text")
         self.assertEqual(
             runner.calls[0]["args"],
             ["/usr/bin/xclip", "-selection", "clipboard", "-o"],
@@ -274,7 +276,7 @@ class ClipboardBackendTests(LinuxPathTest):
             paths={"xsel": "/usr/bin/xsel"},
             results=[ok(stderr="no display", returncode=1)],
         )
-        with self.assertRaises(BackendFailedError):
+        with self._x11(), self.assertRaises(BackendFailedError):
             ClipboardBackend(runner).write_text("x")
 
 

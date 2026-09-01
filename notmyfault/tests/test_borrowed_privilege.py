@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from notmyfault.security.plugins import (
     scan_borrowed_privilege,
     scan_plugin_capabilities,
@@ -130,7 +132,10 @@ class SudoStub:
         pass
 
 
-def test_loader_warns_on_borrowed_privilege(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("origin", ["builtin", "user", "third_party"])
+def test_loader_warns_on_borrowed_privilege_for_every_origin(
+    tmp_path, monkeypatch, capsys, origin
+):
     folder = tmp_path / "actions" / "borrow"
     folder.mkdir(parents=True)
     (folder / "action.json").write_text(
@@ -180,10 +185,10 @@ def test_loader_warns_on_borrowed_privilege(tmp_path, monkeypatch, capsys):
         meta_store={},
         func_store={},
         store_name="Action",
-        origin="user",
+        origin=origin,
     )
 
-    # 用户插件命中借壳扫描：告警并记录，但宽松模式下不拒载
+    # 所有来源执行相同的借用权限检查；宽松模式记录告警但不拒载。
     assert loaded == 1
     assert failed == 0
     err = capsys.readouterr().err

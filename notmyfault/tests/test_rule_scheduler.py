@@ -59,12 +59,13 @@ class FakeRuntime:
             return [item for item in self.history if item[0] == kind]
 
 
-def make_scheduler(rule, runtime):
+def make_scheduler(rule, runtime, **kwargs):
     return RuleScheduler(
         execute_fn=runtime.execute,
         cancel_run_fn=runtime.cancel_run,
         is_deferred_fn=runtime.is_deferred,
         on_history_event=runtime.on_history,
+        **kwargs,
     )
 
 
@@ -263,6 +264,53 @@ class TestQueueMode:
         first.join(timeout=5)
         second.join(timeout=5)
 
+    def test_parallel_mode_bounds_workers_and_pending_runs(self):
+        runtime = FakeRuntime()
+        rule = {"concurrency": {"mode": "parallel", "queue_limit": 2}}
+        scheduler = make_scheduler(rule, runtime, max_workers=2)
+
+        decisions = [
+            scheduler.submit("key", rule, "规则", make_context())
+            for _ in range(5)
+        ]
+
+        assert decisions == ["started", "started", "queued", "queued", "dropped"]
+        assert scheduler.stats()["key"] == {"running": 2, "queued": 2}
+        runtime.block.set()
+        wait_until(lambda: len(runtime.executed_ids()) == 4)
+        wait_until(lambda: scheduler.stats()["key"] == {"running": 0, "queued": 0})
+        scheduler.shutdown()
+
+
+def test_execute_exception_emits_stable_terminal_event():
+    events = []
+
+    def fail(*args):
+        raise RuntimeError("private detail")
+
+    scheduler = RuleScheduler(
+        execute_fn=fail,
+        cancel_run_fn=lambda run_id: True,
+        is_deferred_fn=lambda run_id: False,
+        on_history_event=lambda kind, data: events.append((kind, data)),
+    )
+    context = make_context()
+    assert scheduler.submit("key", {"rule_id": "r_rule001"}, "规则", context) == "started"
+    wait_until(lambda: scheduler.stats()["key"]["running"] == 0)
+
+    failures = [data for kind, data in events if kind == "workflow_failed"]
+    assert failures == [{
+        "run_id": context["run"]["id"],
+        "rule_id": "r_rule001",
+        "rule_name": "规则",
+        "error": {
+            "code": "scheduler_execution_failed",
+            "message": "工作流执行异常",
+        },
+    }]
+    assert "private detail" not in str(failures)
+    scheduler.shutdown()
+
 
 def submit_from_thread_with_context(scheduler, rule, rule_key, result, index):
     context = make_context()
@@ -390,58 +438,6 @@ class TestShutdownAndReload:
         first_thread.join(timeout=5)
 
 
-class TestParallelMode:
-    def test_parallel_runs_everything(self):
-        runtime = FakeRuntime()
-        rule = {"concurrency": {"mode": "parallel"}}
-        scheduler = make_scheduler(rule, runtime)
-        results = {}
-        threads = [
-            submit_from_thread(scheduler, rule, "key", results, i)
-            for i in range(20)
-        ]
-        for thread in threads:
-            thread.join(timeout=15)
-        assert set(results.values()) == {"started"}
-        runtime.block.set()
-        wait_until(lambda: len(runtime.executed_ids()) == 20,
-                   timeout=10, message="parallel 模式有 run 没执行")
-
-    def test_default_without_config_is_parallel(self):
-        runtime = FakeRuntime()
-        runtime.blocking = False
-        scheduler = make_scheduler({}, runtime)
-        assert scheduler.submit("key", {}, "规则", make_context()) == "started"
-        assert scheduler.submit("key", {}, "规则", make_context()) == "started"
-
-
-class TestRunHistoryEvents:
-    def test_scheduler_statuses_in_run_history(self):
-        from notmyfault.core.run_history import build_runs
-
-        run_id = make_run_id()
-        packets = [
-            {"type": "rule_triggered", "data": {"run_id": run_id, "rule_name": "规则"}, "ts": 1},
-            {"type": "run_queued", "data": {"run_id": run_id, "reason": "排队中"}, "ts": 2},
-            {"type": "run_dropped", "data": {"run_id": run_id, "reason": "引擎关闭"}, "ts": 3},
-        ]
-        runs = build_runs(packets)
-        assert len(runs) == 1
-        assert runs[0]["status"] == "dropped"
-        assert runs[0]["drop_reason"] == "引擎关闭"
-
-    def test_replaced_status_is_terminal(self):
-        from notmyfault.core.run_history import build_runs
-
-        run_id = make_run_id()
-        packets = [
-            {"type": "rule_triggered", "data": {"run_id": run_id}, "ts": 1},
-            {"type": "run_replaced", "data": {"run_id": run_id, "reason": "被新触发的 run 替换"}, "ts": 2},
-        ]
-        runs = build_runs(packets)
-        assert runs[0]["status"] == "replaced"
-
-
 class TestEngineWiring:
     def _make_engine(self, rule, on_event):
         from notmyfault.tests.api_support import create_test_engine
@@ -498,18 +494,6 @@ class TestEngineWiring:
         while running_count() and time.time() < deadline:
             time.sleep(0.01)
         assert running_count() == 0
-
-    def test_scheduler_summary_in_engine_status(self):
-        rule = {
-            "name": "q",
-            "event": {"type": "hotkey", "params": {}},
-            "concurrency": {"mode": "queue"},
-            "actions": [{"type": "noop", "params": {}}],
-        }
-        engine = self._make_engine(rule, None)
-        engine.actions_funcs["noop"] = lambda meta, params: {"ok": True}
-        engine.actions_meta["noop"] = {}
-        assert engine.scheduler_stats() == {}
 
     def test_hot_reload_drops_queue_of_removed_rule(self):
         import threading

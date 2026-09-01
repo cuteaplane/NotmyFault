@@ -32,16 +32,18 @@ def write_action(root: Path, **overrides) -> Path:
 def test_check_reports_all_plugin_surfaces(tmp_path):
     root = write_action(
         tmp_path / "sample_action",
-        components=[{
-            "id": "capture",
-            "name": "采集",
-            "description": "读取示例值",
-            "entrypoint": "component.py",
-            "param_types": ["string"],
-            "ui": {},
-        }],
+        contributes={
+            "commands": [{
+                "id": "capture",
+                "title": "采集",
+                "handler": "extension.py:capture",
+            }],
+        },
     )
-    (root / "component.py").write_text("def invoke(*args): return {}\n", encoding="utf-8")
+    (root / "extension.py").write_text(
+        "def capture(context, payload): return context.result()\n",
+        encoding="utf-8",
+    )
 
     report = plugin_cli.check_plugin(root)
 
@@ -53,7 +55,6 @@ def test_check_reports_all_plugin_surfaces(tmp_path):
     assert report["risks"] == []
     assert report["signature"] == "none"
     assert report["entrypoints"]["selected"] == "action.py"
-    assert report["components"] == ["capture"]
     assert set(report["contributions"]) == {
         "commands", "views", "parameter_editors", "data_types"
     }

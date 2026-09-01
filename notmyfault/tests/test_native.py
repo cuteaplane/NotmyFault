@@ -149,6 +149,16 @@ def test_uia_wait_retries_missing_control_until_it_appears(monkeypatch):
     assert len(attempts) == 3
 
 
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), float("-inf")])
+def test_uia_wait_rejects_nonfinite_timeout(timeout):
+    from notmyfault.native import uia
+
+    with pytest.raises(uia.DesktopElementError) as excinfo:
+        uia.wait_for_selector(_selector(), timeout)
+
+    assert excinfo.value.code == "invalid_timeout"
+
+
 def test_uia_text_read_rejects_password_control(monkeypatch):
     from notmyfault.native import uia
 

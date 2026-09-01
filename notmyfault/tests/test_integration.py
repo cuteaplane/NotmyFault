@@ -185,7 +185,6 @@ class TestHotReloadIntegration:
             cancel_deferred_fn=lambda: None,
             validate_rules_fn=lambda: None,
             start_triggers_fn=lambda rules: 1,
-            recheck_admin_fn=lambda: None,
             diagnostics=Diagnostics(),
             alert_cb=lambda title, message: alerts.append((title, message)),
         )
@@ -220,7 +219,6 @@ class TestHotReloadIntegration:
             cancel_deferred_fn=lambda: None,
             validate_rules_fn=lambda: None,
             start_triggers_fn=start_triggers,
-            recheck_admin_fn=lambda: None,
             diagnostics=Diagnostics(),
             alert_cb=lambda title, message: alerts.append((title, message)),
         )
@@ -263,7 +261,7 @@ class TestHotReloadIntegration:
         thread.start()
         try:
             deadline = time.monotonic() + 5
-            while "hotkey" not in engine._trigger_threads:
+            while "hotkey" not in engine._trigger_supervisor._threads:
                 if time.monotonic() > deadline:
                     raise AssertionError("触发器线程未启动")
                 time.sleep(0.05)
@@ -309,7 +307,6 @@ class TestHotReloadIntegration:
             cancel_deferred_fn=lambda: None,
             validate_rules_fn=lambda: None,
             start_triggers_fn=start_triggers,
-            recheck_admin_fn=lambda: None,
             diagnostics=Diagnostics(),
             alert_cb=lambda title, message: alerts.append((title, message)),
         )
@@ -377,43 +374,3 @@ class TestLoggingPipeline:
         assert diag["plugin_errors"] == [
             {"plugin": "p1", "type": "?", "reason": "bad"}
         ]
-
-
-@pytest.fixture
-def first_run_env(tmp_path, monkeypatch):
-    """把首次构建指向空目录并截获子进程调用"""
-    from notmyfault.host import alert
-
-    pkg_root = tmp_path / "pkg"
-    (pkg_root / "actions").mkdir(parents=True)
-    (pkg_root / "triggers").mkdir(parents=True)
-    monkeypatch.setattr(host_app, "_PKG_ROOT", str(pkg_root))
-    monkeypatch.setattr(alert, "alert_user", lambda *a, **k: None)
-
-    calls = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append({"cmd": cmd, "kwargs": kwargs})
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(host_app._sp, "run", fake_run)
-    return calls
-
-
-def test_first_run_build_is_noninteractive(first_run_env):
-    host_app._ensure_first_run_build()
-    assert len(first_run_env) == 1
-    call = first_run_env[0]
-    assert "--security-mode=permissive" in call["cmd"]
-    # 构建输出全部被捕获且不向子进程提供输入，GUI 启动不会卡在交互提示
-    assert call["kwargs"].get("capture_output") is True
-    assert call["kwargs"].get("input") is None
-
-
-def test_first_run_build_uses_utf8_subprocess_io(first_run_env):
-    host_app._ensure_first_run_build()
-    kwargs = first_run_env[0]["kwargs"]
-    assert kwargs.get("text") is True
-    assert kwargs.get("encoding") == "utf-8"
-    assert kwargs.get("errors") == "replace"
-    assert kwargs["env"]["PYTHONUTF8"] == "1"

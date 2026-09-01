@@ -11,6 +11,14 @@ SCHEMA = {
     "actions": {
         "plain_action": {"permissions": []},
         "admin_action": {"permissions": ["admin"]},
+        "run_powershell": {
+            "permissions": ["external_binary"],
+            "security": {"rule_approval": "admin_key"},
+        },
+        "kill_process": {
+            "permissions": ["process"],
+            "security": {"rule_approval": "admin_key"},
+        },
     },
 }
 
@@ -65,18 +73,18 @@ def test_changed_admin_plugins_finds_failure_action():
     assert rule_approval.changed_admin_plugins([], [rule], SCHEMA) == ["admin_action"]
 
 
-def test_changed_high_risk_actions_finds_run_powershell():
-    assert rule_approval.changed_high_risk_actions(
-        [], [high_risk_rule()],
+def test_changed_admin_plugins_finds_manifest_restricted_action():
+    assert rule_approval.changed_admin_plugins(
+        [], [high_risk_rule()], SCHEMA,
     ) == ["run_powershell"]
 
 
-def test_changed_high_risk_actions_finds_failure_action():
+def test_changed_admin_plugins_finds_restricted_failure_action():
     rule = plain_rule()
     rule["actions"][0]["failure_actions"] = [
         {"type": "kill_process", "params": {}},
     ]
-    assert rule_approval.changed_high_risk_actions([], [rule]) == ["kill_process"]
+    assert rule_approval.changed_admin_plugins([], [rule], SCHEMA) == ["kill_process"]
 
 
 def test_normal_mode_does_not_request_private_key(monkeypatch):
@@ -106,27 +114,18 @@ def test_strict_mode_requests_private_key_password(monkeypatch):
     assert caught.value.plugins == ["admin_action"]
 
 
-def test_key_verification_off_skips_strict_mode_check(monkeypatch):
-    monkeypatch.setattr(
-        rule_approval, "detect_security_mode", lambda: SecurityMode.STRICT,
-    )
-    monkeypatch.setattr(
-        rule_approval, "key_status", lambda: {"exists": True, "encrypted": True},
-    )
+def test_private_key_read_error_does_not_expose_system_details(monkeypatch):
+    def fail_key_status():
+        raise OSError("secret-key-path")
 
-    assert rule_approval.require_admin_rule_approval(
-        [], [admin_rule()], SCHEMA, None, key_verification=False,
-    ) == []
+    monkeypatch.setattr(rule_approval, "key_status", fail_key_status)
 
+    with pytest.raises(rule_approval.AdminRuleApprovalError) as caught:
+        rule_approval.verify_admin_key_password("password", ["admin_action"])
 
-def test_key_verification_off_skips_high_risk_check(monkeypatch):
-    monkeypatch.setattr(
-        rule_approval, "detect_security_mode", lambda: SecurityMode.STRICT,
-    )
-
-    assert rule_approval.require_admin_rule_approval(
-        [], [high_risk_rule()], SCHEMA, None, key_verification=False,
-    ) == []
+    assert caught.value.code == "admin_key_unreadable"
+    assert str(caught.value) == "无法读取签名私钥"
+    assert "secret-key-path" not in str(caught.value)
 
 
 def test_strict_mode_requires_password_for_high_risk_action(monkeypatch):
@@ -225,12 +224,16 @@ def test_verify_admin_key_password_accepts_matching_encrypted_private_key(
 def test_verify_admin_key_password_reuses_existing_approval_errors(
     password, expected_code, monkeypatch,
 ):
+    def reject_password(*args, **kwargs):
+        raise ValueError("bad password")
+
     monkeypatch.setattr(
         rule_approval, "detect_security_mode", lambda: SecurityMode.STRICT,
     )
     monkeypatch.setattr(
         rule_approval, "key_status", lambda: {"exists": True, "encrypted": True},
     )
+    monkeypatch.setattr(rule_approval, "load_private_key", reject_password)
 
     with pytest.raises(rule_approval.AdminRuleApprovalError) as caught:
         rule_approval.verify_admin_key_password(

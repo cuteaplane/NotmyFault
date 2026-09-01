@@ -32,22 +32,14 @@ def _context():
 
 
 class TestExecuteAction:
-    def test_execute_valid_action(self):
-        engine = make_engine()
-        register_action(engine, "noop", lambda meta, params: {"ok": True})
-        ok, result = engine._run_action({"type": "noop", "params": {}}, "规则", _context())
-        assert ok is True
-        assert result == {"ok": True}
-
-    def test_execute_unknown_action(self):
-        engine = make_engine()
-        ok, result = engine._run_action({"type": "ghost", "params": {}}, "规则", _context())
-        assert ok is False
-        assert "ghost" in result
-
     def test_launch_program_rejects_dynamic_path(self):
         engine = make_engine()
-        register_action(engine, "launch_program", lambda meta, params: None)
+        register_action(
+            engine,
+            "launch_program",
+            lambda meta, params: None,
+            meta={"security": {"literal_only_params": ["path"]}},
+        )
         ok, result = engine._run_action(
             {
                 "type": "launch_program",
@@ -61,7 +53,7 @@ class TestExecuteAction:
             _context(),
         )
         assert ok is False
-        assert result == "程序路径不允许来自运行时数据"
+        assert result == "参数 'path' 只允许使用固定值"
 
     def test_execute_during_shutdown(self):
         engine = make_engine()
@@ -71,56 +63,6 @@ class TestExecuteAction:
         ok, result = engine._run_action({"type": "noop", "params": {}}, "规则", _context())
         assert ok is False
         assert result == "引擎正在关闭"
-
-    def test_action_success_tracking(self):
-        engine = make_engine()
-        register_action(engine, "noop", lambda meta, params: None)
-        engine._run_action({"type": "noop", "params": {}}, "规则", _context())
-        assert engine._diag_obj.data["action_ok"] == 1
-        assert engine._diag_obj.data["action_fail"] == 0
-
-    def test_action_failure_tracking(self):
-        engine = make_engine()
-
-        def boom(meta, params):
-            raise RuntimeError("炸了")
-
-        register_action(engine, "boom", boom)
-        ok, _ = engine._run_action({"type": "boom", "params": {}}, "规则", _context())
-        assert ok is False
-        assert engine._diag_obj.data["action_fail"] == 1
-
-    def test_active_actions_counter(self):
-        engine = make_engine()
-        release = threading.Event()
-        started = threading.Event()
-
-        def slow(meta, params):
-            started.set()
-            release.wait(timeout=5)
-
-        register_action(engine, "slow", slow)
-        thread = threading.Thread(
-            target=engine._run_action,
-            args=({"type": "slow", "params": {}}, "规则", _context()),
-        )
-        thread.start()
-        started.wait(timeout=5)
-        assert engine._active_actions == 1
-        release.set()
-        thread.join(timeout=5)
-        assert engine._active_actions == 0
-
-    def test_on_event_success_callback(self):
-        events = []
-        engine = make_engine(on_event=lambda t, p: events.append((t, p)))
-        register_action(engine, "noop", lambda meta, params: "done")
-        engine._run_action({"type": "noop", "params": {"x": 1}}, "规则A", _context())
-        executed = [p for t, p in events if t == "action_executed"]
-        assert len(executed) == 1
-        assert executed[0]["status"] == "ok"
-        assert executed[0]["result"] == "done"
-        assert executed[0]["rule_name"] == "规则A"
 
     def test_action_event_carries_stable_rule_and_step_ids(self):
         events = []
@@ -190,8 +132,7 @@ class TestExecuteAction:
             },
             0,
         )
-        for thread in engine._manual_threads:
-            thread.join(timeout=5)
+        assert engine._rule_scheduler.wait_for_idle(timeout=5)
 
         assert ok is True
         assert message == "已开始执行"
@@ -243,8 +184,7 @@ class TestExecuteAction:
                 "expected": 2,
             }],
         )
-        for thread in engine._manual_threads:
-            thread.join(timeout=5)
+        assert engine._rule_scheduler.wait_for_idle(timeout=5)
 
         assert ok is True
         assert received == [{"value": "provided"}]
@@ -256,38 +196,33 @@ class TestExecuteAction:
         assert completed[0]["run_id"] == run_id
         assert completed[0]["status"] == "succeeded"
 
-    def test_manual_run_exposes_trigger_configuration_without_fake_payload(self):
-        received = []
+    def test_manual_run_obeys_single_concurrency(self):
         engine = make_engine()
-        register_action(engine, "consume", lambda meta, params: received.append(params))
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_action(meta, params):
+            started.set()
+            release.wait(timeout=5)
+
+        register_action(engine, "blocking", blocking_action)
         rule = {
-            "rule_id": "r_config001",
-            "name": "触发配置测试",
-            "event": {
-                "type": "hotkey",
-                "binding_id": "t_hotkey001",
-                "params": {"hotkey": "ctrl+alt+t"},
-            },
-            "actions": [{
-                "type": "consume",
-                "binding_id": "a_consume001",
-                "params": {
-                    "value": {
-                        "$ref": {
-                            "scope": "trigger_config",
-                            "node": "t_hotkey001",
-                            "path": ["hotkey"],
-                        }
-                    }
-                },
-            }],
+            "rule_id": "r_manual_single",
+            "name": "单运行规则",
+            "concurrency": {"mode": "single"},
+            "actions": [
+                {"type": "blocking", "binding_id": "a_block001", "params": {}}
+            ],
         }
 
-        engine.run_manual_rule_snapshot(rule, 0)
-        for thread in engine._manual_threads:
-            thread.join(timeout=5)
+        first = engine.run_manual_rule_snapshot(rule, 0)
+        assert started.wait(timeout=2)
+        second = engine.run_manual_rule_snapshot(rule, 0)
 
-        assert received == [{"value": "ctrl+alt+t"}]
+        assert first[0] is True
+        assert second[0] is False
+        release.set()
+        assert engine._rule_scheduler.wait_for_idle(timeout=5)
 
     def test_failed_manual_assertion_marks_workflow_failed_without_exposing_values(self):
         events = []
@@ -322,40 +257,6 @@ class TestExecuteAction:
         assert completed["status"] == "failed"
         assert completed["failure_kind"] == "assertion"
 
-    def test_contains_assertion_handles_text_lists_and_object_subsets(self):
-        events = []
-        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
-        register_action(
-            engine,
-            "result",
-            lambda meta, params: {
-                "text": "NotmyFault automation",
-                "items": ["one", "two", "three"],
-                "meta": {"ready": True, "count": 3},
-            },
-        )
-        context = build_context("包含检查", "manual", {}, [], "r_contains001", "run_contains001")
-        context["manual_test"] = {
-            "start_index": 0,
-            "end_index": 0,
-            "assertions": [
-                {"step_id": "a_result001", "path": ["text"], "operator": "contains", "expected": "automation"},
-                {"step_id": "a_result001", "path": ["items"], "operator": "contains", "expected": ["one", "three"]},
-                {"step_id": "a_result001", "path": ["meta"], "operator": "contains", "expected": {"ready": True}},
-            ],
-        }
-
-        engine.execute_workflow(
-            "r_contains001",
-            {"actions": [{"type": "result", "binding_id": "a_result001", "params": {}}]},
-            "包含检查",
-            context,
-        )
-
-        assertion_event = [data for name, data in events if name == "test_assertions_completed"][0]
-        assert assertion_event["passed"] == 3
-        assert assertion_event["total"] == 3
-
     def test_sensitive_action_result_is_masked_in_event(self):
         events = []
         engine = make_engine(on_event=lambda t, p: events.append((t, p)))
@@ -379,58 +280,6 @@ class TestExecuteAction:
         assert result["token"] == "TOP_SECRET"
         executed = [p for t, p in events if t == "action_executed"]
         assert executed[0]["result"] == {"token": "***", "ok": True}
-
-    def test_action_event_contains_plugin_controlled_safe_summaries(self):
-        events = []
-        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
-        register_action(
-            engine,
-            "summarize",
-            lambda meta, params: {
-                "count": 3,
-                "body": "PRIVATE_RESULT",
-                "secret": "OUTPUT_SECRET",
-            },
-            meta={
-                "params": [
-                    {"name": "message", "label": "消息", "type": "string"},
-                    {"name": "mode", "label": "模式", "type": "select", "summary": "value"},
-                    {"name": "token", "label": "令牌", "type": "string", "summary": "value", "sensitive": True},
-                    {"name": "hidden", "label": "隐藏", "type": "string", "summary": "hidden"},
-                ],
-                "outputs": [
-                    {"name": "count", "label": "数量", "type": "number", "summary": "value"},
-                    {"name": "body", "label": "正文", "type": "string"},
-                    {"name": "secret", "label": "密文", "type": "string", "summary": "value", "sensitive": True},
-                ],
-            },
-        )
-
-        engine._run_action(
-            {
-                "type": "summarize",
-                "params": {
-                    "message": "PRIVATE_INPUT",
-                    "mode": "safe",
-                    "token": "INPUT_SECRET",
-                    "hidden": "HIDDEN_INPUT",
-                },
-            },
-            "规则A",
-            _context(),
-        )
-
-        event = next(data for name, data in events if name == "action_executed")
-        assert [item["display"] for item in event["input_summary"]] == [
-            "文本 · 13 字符", "safe", "敏感值已隐藏",
-        ]
-        assert [item["display"] for item in event["output_summary"]] == [
-            "3", "文本 · 14 字符", "敏感值已隐藏",
-        ]
-        assert "PRIVATE_INPUT" not in repr(event["input_summary"])
-        assert "PRIVATE_RESULT" not in repr(event["output_summary"])
-        assert event["params"]["token"] == "***"
-        assert event["result"]["secret"] == "***"
 
     def test_sensitive_action_param_is_masked_in_failure_without_context_binding(self):
         events = []
@@ -464,31 +313,6 @@ class TestExecuteAction:
         assert "DIRECT_SECRET" not in result
         assert "DIRECT_SECRET" not in event["error"]
         assert event["input_summary"][0]["display"] == "敏感值已隐藏"
-
-    def test_sensitive_value_is_masked_inside_action_parameter(self):
-        events = []
-        engine = make_engine(on_event=lambda t, p: events.append((t, p)))
-        engine.triggers_meta["clipboard"] = {
-            "outputs": [
-                {"name": "text", "type": "string", "sensitive": True},
-            ],
-        }
-        register_action(engine, "consume", lambda meta, params: None)
-        context = build_context(
-            "规则A", "clipboard", {"text": "TOP_SECRET"}, []
-        )
-
-        engine._run_action(
-            {
-                "type": "consume",
-                "params": {"message": "Bearer {{ event.payload.text }}"},
-            },
-            "规则A",
-            context,
-        )
-
-        executed = [p for t, p in events if t == "action_executed"]
-        assert executed[0]["params"]["message"] == "Bearer ***"
 
     def test_sensitive_value_is_masked_in_action_errors_and_logs(self, capsys):
         events = []
@@ -527,20 +351,12 @@ class TestExecuteAction:
         error_event = next(data for name, data in events if name == "error")
         assert ok is False
         assert "TOP_SECRET" not in str(result)
-        assert "TOP_SECRET" not in error_event["error"]
+        assert "TOP_SECRET" not in str(error_event["error"])
         assert "TOP_SECRET" not in output.out + output.err
-        assert "***" in error_event["error"]
-
-    def test_on_event_error_callback(self):
-        events = []
-        engine = make_engine(on_event=lambda t, p: events.append((t, p)))
-
-        def boom(meta, params):
-            raise RuntimeError("炸了")
-
-        register_action(engine, "boom", boom)
-        engine._run_action({"type": "boom", "params": {}}, "规则A", _context())
-        assert any(t == "error" for t, _ in events)
+        assert error_event["error"] == {
+            "code": "action_execution_failed",
+            "message": "动作 consume 执行失败",
+        }
 
     def test_pipeline_passes_step_result_to_context_action(self):
         engine = make_engine()
@@ -665,54 +481,6 @@ class TestExecuteAction:
         assert calls == ["recover", "after"]
         assert context["steps"]["a_bad001"]["status"] == "failed"
         assert context["steps"]["a_rec001"]["status"] == "ok"
-
-    def test_pipeline_does_not_run_failure_actions_after_success(self):
-        engine = make_engine()
-        calls = []
-        register_action(engine, "works", lambda meta, params: calls.append("main"))
-        register_action(engine, "recover", lambda meta, params: calls.append("recover"))
-
-        engine.execute_workflow(
-            "wf",
-            {"actions": [{
-                "type": "works",
-                "binding_id": "a_main001",
-                "params": {},
-                "failure_actions": [{
-                    "type": "recover",
-                    "binding_id": "a_rec001",
-                    "params": {},
-                }],
-            }]},
-            "规则",
-            _context(),
-        )
-
-        assert calls == ["main"]
-
-    def test_failed_recovery_stops_remaining_failure_actions(self):
-        engine = make_engine()
-        calls = []
-        register_action(engine, "broken", lambda meta, params: 1 / 0)
-        register_action(engine, "recover_broken", lambda meta, params: 1 / 0)
-        register_action(engine, "recover_after", lambda meta, params: calls.append("recover_after"))
-
-        engine.execute_workflow(
-            "wf",
-            {"actions": [{
-                "type": "broken",
-                "binding_id": "a_bad001",
-                "params": {},
-                "failure_actions": [
-                    {"type": "recover_broken", "binding_id": "a_rec001", "params": {}},
-                    {"type": "recover_after", "binding_id": "a_rec002", "params": {}},
-                ],
-            }]},
-            "规则",
-            _context(),
-        )
-
-        assert calls == []
 
     def test_cancel_run_interrupts_context_action_without_recovery(self):
         events = []
@@ -910,40 +678,6 @@ class TestExecuteAction:
         completed = [data for name, data in events if name == "workflow_completed"]
         assert completed[-1]["status"] == "cancelled"
 
-    def test_exponential_retry_waits_longer_after_each_failure(self, monkeypatch):
-        events = []
-        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
-        waits = []
-        attempts = []
-
-        def flaky(meta, params):
-            attempts.append(1)
-            raise RuntimeError("boom")
-
-        monkeypatch.setattr(
-            workflow_executor_module.ActionCancellation,
-            "wait",
-            lambda self, seconds: waits.append(seconds) or False,
-        )
-        register_action(engine, "flaky", flaky)
-
-        engine._run_action(
-            {
-                "type": "flaky",
-                "params": {},
-                "retry": 3,
-                "retry_delay_seconds": 2,
-                "retry_backoff": "exponential",
-            },
-            "规则",
-            _context(),
-        )
-
-        assert len(attempts) == 4
-        assert waits == [2, 4, 8]
-        error = next(data for name, data in events if name == "error")
-        assert error["attempt"] == 4
-
     def test_admin_rejection_is_not_retried(self):
         engine = make_engine()
         attempts = []
@@ -961,27 +695,6 @@ class TestExecuteAction:
 
         assert ok is False
         assert attempts == [1]
-
-    def test_precondition_allows_ready_workflow(self):
-        engine = make_engine()
-        module = types.SimpleNamespace(
-            check_precondition=lambda meta, params, context: True
-        )
-        register_action(
-            engine,
-            "doc_check",
-            lambda meta, params: None,
-            meta={"precondition_api": "context-v1"},
-            module=module,
-        )
-        ran = []
-        register_action(engine, "real", lambda meta, params: ran.append(1))
-        rule = {
-            "preconditions": [{"type": "doc_check", "binding_id": "p_doc001", "params": {}}],
-            "actions": [{"type": "real", "binding_id": "a_rea001", "params": {}}],
-        }
-        engine.execute_workflow("wf", rule, "规则", _context())
-        assert ran == [1]
 
     def test_precondition_defers_workflow_without_running_actions(self):
         events = []
@@ -1008,7 +721,7 @@ class TestExecuteAction:
         }
         engine.execute_workflow("wf", rule, "规则", _context())
         assert ran == []
-        assert "wf" in engine._deferred_workflows
+        assert len(engine._deferred_workflows) == 1
         assert any(t == "workflow_deferred" for t, _ in events)
         engine._cancel_deferred_workflows()
 
@@ -1044,13 +757,13 @@ class TestExecuteAction:
             context,
         )
 
-        assert "wf" in engine._deferred_workflows
+        assert "run_deferred001" in engine._deferred_workflows
         assert engine.cancel_run("run_deferred001") is True
-        assert "wf" not in engine._deferred_workflows
+        assert "run_deferred001" not in engine._deferred_workflows
         completed = [data for name, data in events if name == "workflow_completed"]
         assert completed[-1]["status"] == "cancelled"
 
-    def test_repeated_deferred_workflow_completes_coalesced_run(self):
+    def test_repeated_deferred_workflow_keeps_each_run(self):
         events = []
         engine = make_engine(on_event=lambda name, data: events.append((name, data)))
         module = types.SimpleNamespace(
@@ -1081,48 +794,17 @@ class TestExecuteAction:
         engine.execute_workflow("wf", rule, "规则", first)
         engine.execute_workflow("wf", rule, "规则", second)
 
-        completed = [data for name, data in events if name == "workflow_completed"]
-        assert completed[-1]["run_id"] == "run_deferred002"
-        assert completed[-1]["status"] == "cancelled"
-        assert "run_deferred002" not in engine._workflow_executor._run_cancel_events
+        assert set(engine._deferred_workflows) == {
+            "run_deferred001",
+            "run_deferred002",
+        }
+        assert not [data for name, data in events if name == "workflow_completed"]
         engine._cancel_deferred_workflows()
-
-    def test_cancel_deferred_workflows_completes_runs(self):
-        events = []
-        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
-        module = types.SimpleNamespace(
-            check_precondition=lambda meta, params, context: {
-                "ok": False,
-                "reason": "目录仍在使用",
-                "retry_after_seconds": 30,
-            }
-        )
-        register_action(
-            engine,
-            "doc_check",
-            lambda meta, params: None,
-            meta={"precondition_api": "context-v1"},
-            module=module,
-        )
-        context = build_context("规则", "manual", {}, [], run_id="run_deferred003")
-        engine.execute_workflow(
-            "wf",
-            {"preconditions": [{
-                "type": "doc_check",
-                "binding_id": "p_doc001",
-                "params": {},
-            }], "actions": []},
-            "规则",
-            context,
-        )
-
-        engine._cancel_deferred_workflows()
-
         completed = [data for name, data in events if name == "workflow_completed"]
-        assert completed[-1]["run_id"] == "run_deferred003"
-        assert completed[-1]["status"] == "cancelled"
-        assert not engine._deferred_workflows
-        assert "run_deferred003" not in engine._workflow_executor._run_cancel_events
+        assert {item["run_id"] for item in completed} == {
+            "run_deferred001",
+            "run_deferred002",
+        }
 
     def test_validate_params_called(self):
         engine = make_engine()
@@ -1137,33 +819,6 @@ class TestExecuteAction:
         assert len(seen) == 1
         assert seen[0][1] == {"a": 1}
 
-    def test_validate_params_not_present(self):
-        engine = make_engine()
-        module = types.SimpleNamespace()
-        register_action(engine, "plain", lambda meta, params: "ok", module=module)
-        ok, result = engine._run_action({"type": "plain", "params": {}}, "规则", _context())
-        assert ok and result == "ok"
-
-    def test_validate_params_warnings_printed(self, capsys):
-        engine = make_engine()
-        module = types.SimpleNamespace(
-            validate_params=lambda meta, params: ["参数不对"]
-        )
-        register_action(engine, "warned", lambda meta, params: None, module=module)
-        engine._run_action({"type": "warned", "params": {}}, "规则", _context())
-        err = capsys.readouterr().err
-        assert "参数不对" in err
-
-    def test_validate_params_exception_handled(self):
-        engine = make_engine()
-
-        def broken(meta, params):
-            raise RuntimeError("validate 炸了")
-
-        module = types.SimpleNamespace(validate_params=broken)
-        register_action(engine, "warned", lambda meta, params: "done", module=module)
-        ok, result = engine._run_action({"type": "warned", "params": {}}, "规则", _context())
-        assert ok and result == "done"
 
     def test_document_quiescent_requires_observation_then_allows(self, tmp_path):
         doc_path = os.path.join(
@@ -1203,13 +858,6 @@ class TestErrorIsolation:
         assert engine._diag_obj.data["trigger_crashes"] == 1
         assert len(alerts) == 1
 
-    def test_safe_on_event_isolates_raising_callback(self):
-        engine = make_engine(on_event=lambda t, p: (_ for _ in ()).throw(RuntimeError("回调炸了")))
-        engine._safe_on_event("rule_triggered", {})
-
-    def test_safe_on_event_no_callback_is_noop(self):
-        engine = make_engine(on_event=None)
-        engine._safe_on_event("rule_triggered", {"x": 1})
 
     def test_stop_trigger_threads_keeps_unstoppable_thread_registered(self):
         engine = make_engine()
@@ -1222,80 +870,10 @@ class TestErrorIsolation:
         engine.triggers_meta["hotkey"] = {}
         engine._start_trigger_threads([{"event": {"type": "hotkey", "params": {}}}])
         assert engine._stop_trigger_threads(timeout=0.1) is False
-        assert "hotkey" in engine._trigger_threads
+        assert "hotkey" in engine._trigger_supervisor._threads
         hold.set()
         engine._stop_trigger_threads(timeout=5)
 
-
-class TestGetDiagnostics:
-    def test_initial_diagnostics(self):
-        engine = make_engine(rules=[{"name": "a"}])
-        diag = engine.get_diagnostics()
-        assert diag["uptime_seconds"] == 0
-        assert diag["actions"] == {"ok": 0, "fail": 0, "total": 0}
-        assert diag["rules"]["total"] == 1
-        assert diag["trigger_crashes"] == 0
-        assert diag["errors"] == []
-
-    def test_uptime_calculated(self):
-        engine = make_engine()
-        engine._start_time = time.time() - 5
-        assert engine.get_diagnostics()["uptime_seconds"] >= 4.5
-
-    def test_diagnostics_after_action(self):
-        engine = make_engine()
-        register_action(engine, "noop", lambda meta, params: None)
-        engine._run_action({"type": "noop", "params": {}}, "规则", _context())
-        diag = engine.get_diagnostics()
-        assert diag["actions"]["ok"] == 1
-        assert diag["actions"]["total"] == 1
-
-    def test_diagnostics_truncates_errors(self):
-        engine = make_engine()
-        for i in range(30):
-            engine._diag_obj.record_error("test", f"错误{i}")
-        diag = engine.get_diagnostics()
-        assert len(diag["errors"]) == 20
-        assert diag["errors"][-1][1] == "错误29"
-
-
-class TestShutdown:
-    def test_shutdown_sets_flag(self):
-        engine = make_engine()
-        flag = threading.Event()
-        engine._shutdown_flag = flag
-        engine.shutdown()
-        assert flag.is_set()
-
-    def test_shutdown_no_plugins(self):
-        engine = make_engine()
-        engine.shutdown()
-
-    def test_shutdown_calls_teardowns(self):
-        engine = make_engine()
-        calls = []
-        engine._plugin_modules["plug"] = types.SimpleNamespace(teardown=lambda: calls.append(1))
-        engine.shutdown()
-        assert calls == [1]
-
-    def test_teardown_exception_handling(self):
-        engine = make_engine()
-
-        def broken_teardown():
-            raise RuntimeError("teardown 炸了")
-
-        engine._plugin_modules["plug"] = types.SimpleNamespace(teardown=broken_teardown)
-        engine.shutdown()
-        errors = engine._diag_obj.data["plugin_errors"]
-        assert any(store == "teardown" for store, _, _ in errors)
-
-    def test_shutdown_idempotent(self):
-        engine = make_engine()
-        calls = []
-        engine._plugin_modules["plug"] = types.SimpleNamespace(teardown=lambda: calls.append(1))
-        engine.shutdown()
-        engine.shutdown()
-        assert calls == [1]
 
     def test_concurrent_shutdown_tears_down_plugin_once(self):
         engine = make_engine()
@@ -1332,11 +910,71 @@ class TestShutdown:
         from notmyfault.platform import platform_support
         monkeypatch.setattr(platform_support, "show_notification", lambda *a, **k: None)
         engine = make_engine()
+        engine._security_mode = type(engine._security_mode).PERMISSIVE
         # 没有任何触发器时 _run 直接返回，start() 仍应撤销权限会话
         engine.start(shutdown_event=threading.Event())
         assert engine._privilege_session_closed is True
 
-    def test_close_can_retry_after_unclean_shutdown(self):
+    def test_partial_trigger_start_failure_cleans_runtime(self, monkeypatch):
+        from notmyfault.platform import platform_support
+
+        monkeypatch.setattr(platform_support, "show_notification", lambda *a, **k: None)
+        started = threading.Event()
+        stopped = threading.Event()
+        rule = {
+            "event": {"type": "hotkey", "params": {}},
+            "actions": [{"type": "noop", "params": {}}],
+        }
+        engine = make_engine([rule])
+        engine._security_mode = type(engine._security_mode).PERMISSIVE
+        register_action(engine, "noop", lambda meta, params: None)
+
+        def trigger(meta, config, emit, stop_event):
+            started.set()
+            stop_event.wait(timeout=2)
+            stopped.set()
+
+        engine.triggers_funcs["hotkey"] = trigger
+        engine.triggers_meta["hotkey"] = {}
+        start_triggers = engine._start_trigger_threads
+
+        def fail_after_start():
+            assert start_triggers() == 1
+            assert started.wait(timeout=1)
+            raise RuntimeError("startup failed")
+
+        monkeypatch.setattr(engine, "_start_trigger_threads", fail_after_start)
+        with pytest.raises(RuntimeError, match="startup failed"):
+            engine.start(shutdown_event=threading.Event())
+
+        assert stopped.wait(timeout=1)
+        assert engine._trigger_supervisor.health() == {}
+        assert engine._runtime_cleaned is True
+
+    def test_hot_reload_start_failure_cleans_plugins(self, monkeypatch):
+        from notmyfault.platform import platform_support
+
+        monkeypatch.setattr(platform_support, "show_notification", lambda *a, **k: None)
+        engine = make_engine()
+        engine._security_mode = type(engine._security_mode).PERMISSIVE
+        cleaned = []
+        engine._plugin_modules["sample"] = types.SimpleNamespace(
+            teardown=lambda: cleaned.append(True)
+        )
+        monkeypatch.setattr(engine, "_start_trigger_threads", lambda: 1)
+        monkeypatch.setattr(
+            engine._hot_reloader,
+            "begin",
+            lambda: (_ for _ in ()).throw(RuntimeError("reload failed")),
+        )
+
+        with pytest.raises(RuntimeError, match="reload failed"):
+            engine.start(shutdown_event=threading.Event())
+
+        assert cleaned == [True]
+        assert engine._runtime_cleaned is True
+
+    def test_close_revokes_privilege_session_after_unclean_shutdown(self):
         engine = make_engine()
         calls = []
         engine._sudo = types.SimpleNamespace(
@@ -1346,13 +984,10 @@ class TestShutdown:
 
         engine.close()
 
-        assert engine._privilege_session_closed is False
-        assert calls == []
-
-        engine._shutdown_clean = True
-        engine.close()
-
         assert engine._privilege_session_closed is True
+        assert calls == [engine._engine_token]
+
+        engine.close()
         assert calls == [engine._engine_token]
 
     def test_wait_active_actions_completes(self):

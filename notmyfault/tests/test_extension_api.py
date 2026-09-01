@@ -1,6 +1,7 @@
 """插件扩展注册表、私有数据和 HTTP 会话。"""
 
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -459,3 +460,60 @@ def test_extension_session_manager_drop_all_runs_cleanup():
 
     assert manager.get(session.session_id) is None
     assert cleaned == [True]
+
+
+def test_extension_session_manager_expires_without_new_lookup():
+    manager = ExtensionSessionManager(ttl_seconds=10)
+    session = manager.create(
+        plugin_id="sample",
+        command_id="open",
+        plugin_meta=extension_meta(),
+        source_kind="parameter_editors",
+        source_id="document_editor",
+        allowed_commands={"open"},
+        data_type={"id": "document", "version": 2},
+        current_value=None,
+    )
+    cleaned = []
+    session.add_cleanup(lambda: cleaned.append(True))
+    session.updated_at -= 20
+
+    assert manager.cleanup_expired() == 1
+    assert cleaned == [True]
+
+
+def test_extension_session_can_close_while_handler_is_running():
+    manager = ExtensionSessionManager()
+    session = manager.create(
+        plugin_id="sample",
+        command_id="open",
+        plugin_meta=extension_meta(),
+        source_kind="parameter_editors",
+        source_id="document_editor",
+        allowed_commands={"open"},
+        data_type={"id": "document", "version": 2},
+        current_value=None,
+    )
+    started = threading.Event()
+    cancelled = threading.Event()
+    session.add_cleanup(cancelled.set)
+
+    def handler(context, payload):
+        started.set()
+        cancelled.wait(timeout=2)
+
+    invoke_thread = threading.Thread(
+        target=session.invoke,
+        args=(handler, object(), None),
+    )
+    invoke_thread.start()
+    assert started.wait(timeout=1)
+
+    drop_thread = threading.Thread(target=manager.drop, args=(session.session_id,))
+    drop_thread.start()
+    drop_thread.join(timeout=1)
+    invoke_thread.join(timeout=1)
+
+    assert not drop_thread.is_alive()
+    assert not invoke_thread.is_alive()
+    assert cancelled.is_set()

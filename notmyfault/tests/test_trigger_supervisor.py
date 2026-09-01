@@ -32,7 +32,7 @@ class TestRegistration:
             _body_waits_on_stop,
         )
         assert count == 2
-        assert set(sup.threads) == {"hotkey", "usb_insert"}
+        assert set(sup._threads) == {"hotkey", "usb_insert"}
         sup.stop(timeout=5)
 
     def test_start_registers_before_thread_starts(self):
@@ -40,7 +40,7 @@ class TestRegistration:
         observed = {}
 
         def cb(instance_id, event_type, func, meta, config, stop_event):
-            observed["registered"] = instance_id in sup.threads
+            observed["registered"] = instance_id in sup._threads
             stop_event.wait(timeout=5)
 
         sup.start({"hotkey": [{}]}, {"hotkey": lambda *a: None}, {"hotkey": {}}, cb)
@@ -57,7 +57,7 @@ class TestRegistration:
             _body_waits_on_stop,
         )
         assert count == 1
-        assert set(sup.threads) == {"hotkey"}
+        assert set(sup._threads) == {"hotkey"}
         sup.stop(timeout=5)
 
     def test_stop_cannot_join_thread_before_start_finishes(self):
@@ -73,7 +73,7 @@ class TestRegistration:
         assert sup.stop(timeout=5) is True
         t.join(timeout=5)
         assert started.is_set()
-        assert sup.threads == {}
+        assert sup._threads == {}
 
     def test_thread_start_failure_rolls_back_registration(self, monkeypatch):
         sup = TriggerSupervisor()
@@ -84,8 +84,8 @@ class TestRegistration:
         monkeypatch.setattr(threading.Thread, "start", boom)
         with pytest.raises(RuntimeError):
             sup.start({"hotkey": [{}]}, {"hotkey": lambda *a: None}, {"hotkey": {}}, _body_waits_on_stop)
-        assert sup.threads == {}
-        assert sup.events == {}
+        assert sup._threads == {}
+        assert sup._events == {}
 
 
 class TestRequestStopAll:
@@ -98,7 +98,7 @@ class TestRequestStopAll:
             _body_waits_on_stop,
         )
         sup.request_stop_all()
-        assert all(evt.is_set() for evt in sup.events.values())
+        assert all(evt.is_set() for evt in sup._events.values())
         sup.stop(timeout=5)
 
     def test_idempotent_empty(self):
@@ -118,7 +118,7 @@ class TestRequestStopAll:
         sup.start({"hotkey": [{}]}, {"hotkey": lambda *a: None}, {"hotkey": {}}, _body_waits_on_stop)
         sup.request_stop_all()
         assert sup.stop(timeout=5) is True
-        assert sup.threads == {}
+        assert sup._threads == {}
 
 
 class TestStopRetention:
@@ -129,8 +129,8 @@ class TestStopRetention:
         sup = TriggerSupervisor()
         sup.start({"hotkey": [{}]}, {"hotkey": lambda *a: None}, {"hotkey": {}}, _body_waits_on_stop)
         assert sup.stop(timeout=5) is True
-        assert sup.threads == {}
-        assert sup.events == {}
+        assert sup._threads == {}
+        assert sup._events == {}
 
     def _start_stuck(self, sup, hold):
         def stubborn(*args):
@@ -144,7 +144,7 @@ class TestStopRetention:
         hold = threading.Event()
         self._start_stuck(sup, hold)
         assert sup.stop(timeout=0.05) is False
-        assert "hotkey" in sup.threads
+        assert "hotkey" in sup._threads
         hold.set()
         sup.stop(timeout=5)
 
@@ -164,14 +164,14 @@ class TestStopRetention:
             ),
         )
         assert sup.stop(timeout=0.2) is False
-        assert set(sup.threads) == {"hotkey"}
+        assert set(sup._threads) == {"hotkey"}
         hold.set()
         assert sup.stop(timeout=5) is True
 
     def test_stop_real_thread_joins(self):
         sup = TriggerSupervisor()
         sup.start({"hotkey": [{}]}, {"hotkey": lambda *a: None}, {"hotkey": {}}, _body_waits_on_stop)
-        thread = sup.threads["hotkey"]
+        thread = sup._threads["hotkey"]
         assert sup.stop(timeout=5) is True
         assert not thread.is_alive()
 
@@ -181,7 +181,7 @@ class TestStopRetention:
         self._start_stuck(sup, hold)
         assert sup.stop(timeout=0.05) is False
         assert sup.stop(timeout=0.05) is False
-        assert "hotkey" in sup.threads
+        assert "hotkey" in sup._threads
         hold.set()
         assert sup.stop(timeout=5) is True
 
@@ -218,7 +218,7 @@ class TestHealth:
     def test_crashed_thread(self):
         sup = TriggerSupervisor()
         sup.start({"hotkey": [{}]}, {"hotkey": lambda *a: None}, {"hotkey": {}}, lambda *a: None)
-        assert _wait(lambda: not sup.threads["hotkey"].is_alive())
+        assert _wait(lambda: not sup._threads["hotkey"].is_alive())
         sup.mark_crashed("hotkey", "boom")
         entry = sup.health()["hotkey"]
         assert entry["alive"] is False
@@ -228,7 +228,7 @@ class TestHealth:
     def test_dead_no_crash_not_flagged(self):
         sup = TriggerSupervisor()
         sup.start({"hotkey": [{}]}, {"hotkey": lambda *a: None}, {"hotkey": {}}, lambda *a: None)
-        assert _wait(lambda: not sup.threads["hotkey"].is_alive())
+        assert _wait(lambda: not sup._threads["hotkey"].is_alive())
         entry = sup.health()["hotkey"]
         assert entry["alive"] is False
         assert entry["crashed"] is False
@@ -236,7 +236,7 @@ class TestHealth:
     def test_last_crash_takes_latest(self):
         sup = TriggerSupervisor()
         sup.start({"hotkey": [{}]}, {"hotkey": lambda *a: None}, {"hotkey": {}}, lambda *a: None)
-        assert _wait(lambda: not sup.threads["hotkey"].is_alive())
+        assert _wait(lambda: not sup._threads["hotkey"].is_alive())
         sup.mark_crashed("hotkey", "first")
         sup.mark_crashed("hotkey", "second")
         assert sup.health()["hotkey"]["last_error"] == "second"
@@ -244,7 +244,7 @@ class TestHealth:
     def test_new_generation_clears_previous_crash(self):
         sup = TriggerSupervisor()
         sup.start({"hotkey": [{}]}, {"hotkey": lambda *a: None}, {"hotkey": {}}, lambda *a: None)
-        assert _wait(lambda: not sup.threads["hotkey"].is_alive())
+        assert _wait(lambda: not sup._threads["hotkey"].is_alive())
         sup.mark_crashed("hotkey", "boom")
         sup.start({"hotkey": [{}]}, {"hotkey": lambda *a: None}, {"hotkey": {}}, _body_waits_on_stop)
         entry = sup.health()["hotkey"]
@@ -289,25 +289,10 @@ class TestMissingAlert:
         assert sup.start({"ghost": [{}]}, {}, {}, _body_waits_on_stop) == 0
 
 
-class TestEngineCompat:
+class TestEngineIntegration:
     def _engine(self):
         from notmyfault.tests.api_support import create_test_engine
         return create_test_engine({"rules": []})
-
-    def test_property_proxy_same_object(self):
-        engine = self._engine()
-        assert engine._trigger_threads is engine._trigger_supervisor.threads
-        assert engine._trigger_events is engine._trigger_supervisor.events
-        assert engine._trigger_lock is engine._trigger_supervisor.lock
-
-    def test_direct_assignment_propagates(self):
-        engine = self._engine()
-        new_threads = {"manual": object()}
-        engine._trigger_threads = new_threads
-        assert engine._trigger_supervisor.threads is new_threads
-        new_events = {"manual": threading.Event()}
-        engine._trigger_events = new_events
-        assert engine._trigger_supervisor.events is new_events
 
     def test_get_diagnostics_has_triggers_health(self):
         engine = self._engine()
@@ -320,7 +305,9 @@ class TestEngineCompat:
         engine.triggers_funcs["hotkey"] = lambda meta, config, emit, stop_event: None
         engine.triggers_meta["hotkey"] = {}
         engine._start_trigger_threads([{"event": {"type": "hotkey", "params": {}}}])
-        assert _wait(lambda: not engine._trigger_threads["hotkey"].is_alive())
+        assert _wait(
+            lambda: not engine._trigger_supervisor._threads["hotkey"].is_alive()
+        )
         engine._trigger_supervisor.mark_crashed("hotkey", "boom")
         health = engine.get_diagnostics()["triggers"]["health"]
         assert health["hotkey"]["crashed"] is True
@@ -362,6 +349,6 @@ class TestEngineCompat:
         engine.triggers_funcs["hotkey"] = lambda meta, config, emit, stop_event: stop_event.wait(timeout=5)
         engine.triggers_meta["hotkey"] = {}
         engine._start_trigger_threads([{"event": {"type": "hotkey", "params": {}}}])
-        assert "hotkey" in engine._trigger_threads
+        assert "hotkey" in engine._trigger_supervisor._threads
         assert engine._stop_trigger_threads(timeout=5) is True
-        assert engine._trigger_threads == {}
+        assert engine._trigger_supervisor._threads == {}
