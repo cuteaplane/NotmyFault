@@ -9,6 +9,34 @@ import { aiProviderIdFor } from '../src/lib/providers.js'
 import { streamRuleDraftWithAI } from '../src/lib/api.js'
 import { computeChangeSet, summarizeRuleChanges } from '../src/lib/ruleDiff.js'
 import { ensureParams } from '../src/lib/utils.js'
+import { buildNodeDataPorts, parameterAllowsBinding } from '../src/lib/bindings.js'
+
+const bindingPolicyMeta = {
+  params:[
+    { name:'operation', type:'select' },
+    { name:'source', type:'string' },
+    { name:'destination', type:'string' },
+  ],
+  security:{ literal_only_params:['operation', 'destination'] },
+}
+const bindingPolicyNode = buildNodeDataPorts(
+  { kind:'action', source:{ type:'file_operation' } },
+  { triggers:{}, actions:{ file_operation:bindingPolicyMeta } },
+)
+const bindingPolicyOk = parameterAllowsBinding(bindingPolicyMeta, 'source')
+  && !parameterAllowsBinding(bindingPolicyMeta, 'destination')
+  && bindingPolicyNode.dataInputs.map(port => port.name).join('|') === 'source'
+console.log((bindingPolicyOk?'PASS':'FAIL')+' - literal-only parameters stay out of graph binding ports')
+if (!bindingPolicyOk) process.exit(1)
+
+const dashboardStyles = fs.readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8')
+const settingsStageStyles = dashboardStyles.match(/\.settings-stage\{([^}]*)\}/)?.[1] || ''
+const settingsTransitionStyles = dashboardStyles.match(/\.settings-forward-enter-active,[^{]+\{([^}]*)\}/)?.[1] || ''
+const settingsTransitionLayerOk = !settingsStageStyles.includes('will-change')
+  && settingsStageStyles.includes('transform:none')
+  && settingsTransitionStyles.includes('will-change:transform,opacity')
+console.log((settingsTransitionLayerOk?'PASS':'FAIL')+' - settings transition releases its compositor layer after animation')
+if (!settingsTransitionLayerOk) process.exit(1)
 
 const distDir = process.env.DASHBOARD_DIST_DIR || 'dist'
 const dom = new JSDOM('<!DOCTYPE html><html><head></head><body><div id="app"></div></body></html>', {
@@ -189,7 +217,7 @@ window.pywebview = { api: {
       else mockEngineState = 'stopped'
     }
     mockEngineRunning = mockEngineState === 'running'
-    return { api_alive:true, engine_running:mockEngineRunning, engine_state:mockEngineState, security_mode:'permissive', rules_count:1, triggers_count:1, actions_count:1, pid:1234 }
+    return { api_alive:true, engine_running:mockEngineRunning, engine_state:mockEngineState, security_mode:'permissive', last_error:'核心文件完整性校验失败', rules_count:1, triggers_count:1, actions_count:1, pid:1234 }
   },
   stop_engine: async () => {
     mockEngineRunning = false
@@ -216,6 +244,12 @@ window.pywebview = { api: {
   request_api: async (path, method, data) => {
     bridgeCalls.push({ path, method, data })
     if (path === '/api/config/security-status') return { status:'ok', reason:'', summary:null }
+    if (path === '/api/platform') return {
+      platform:'windows', session_type:'desktop', capabilities:{
+        'audio.control':{ available:true, degraded:false, backend:'pycaw', reason:'' },
+        'bluetooth.control':{ available:false, degraded:false, backend:'', reason:'未安装后端' },
+      },
+    }
     if (path === '/api/settings/ai-drafting' && method === 'GET') {
       return { ...mockAiDrafting, api_key_status: mockAiApiKeyStatus }
     }
@@ -569,7 +603,9 @@ const checks = [
 const startupRetryOk = engineStatusReads >= 2 && configReads >= 2
   && document.querySelector('.dashboard-metrics')?.textContent.includes('1')
   && !document.querySelector('.dashboard-first-run')
+const homeKeepsCapabilitiesOutOfDiagnostics = !document.querySelector('.dashboard-capability-report')
 checks.push(['status polling restores engine state and startup config retries', startupRetryOk])
+checks.push(['home diagnostics omit the full platform capability list', homeKeepsCapabilitiesOutOfDiagnostics])
 let ok = true
 for (const [name, pass] of checks) { console.log((pass?'PASS':'FAIL')+' - '+name); if(!pass) ok=false }
 if (!ok) { console.error(html.substring(0, 600)); process.exit(1) }
@@ -586,8 +622,10 @@ const pausedControls = [...document.querySelectorAll('.apatch-hero .hero-control
 const pausedControlsOk = pausedControls.length === 2
   && pausedControls.some(button => button.textContent.includes('启动自动化'))
   && pausedControls.some(button => button.textContent.includes('彻底停止引擎'))
-console.log((pausedControlsOk?'PASS':'FAIL')+' - paused automation reveals two unified engine controls')
-if (!pausedControlsOk) process.exit(1)
+const startupAlertOk = document.querySelector('.engine-startup-alert')?.textContent.includes('核心文件完整性校验失败')
+  && document.querySelector('.engine-startup-alert .btn')?.textContent.includes('前往安全页处理')
+console.log((pausedControlsOk && startupAlertOk?'PASS':'FAIL')+' - paused automation keeps controls and startup failure in separate layouts')
+if (!pausedControlsOk || !startupAlertOk) process.exit(1)
 
 const rulesNav = [...document.querySelectorAll('.nav-item')].find(
   button => button.textContent.includes('自动化'),
@@ -602,8 +640,17 @@ const disabledAiCreateOk = document.querySelector('.rule-title-capsule')?.textCo
   && !document.querySelector('.automation-create-panel')
   && !document.querySelector('#natural-draft-description')
   && !document.querySelector('.automation-template')
+const compactValidation = document.querySelector('.flow-validation')
+const compactValidationOk = compactValidation
+  && !compactValidation.classList.contains('expanded')
+  && !compactValidation.querySelector('.flow-validation-list')
+  && !!compactValidation.querySelector('.flow-validation-preview')
+compactValidation?.querySelector('.flow-validation-toggle')?.click()
+await new Promise(r => setTimeout(r, 20))
+const validationExpandsOnDemand = document.querySelector('.flow-validation.expanded .flow-validation-list')
 console.log((automationPageOk && disabledAiCreateOk?'PASS':'FAIL')+' - AI-off creation opens a blank editor without draft surfaces')
-if (!automationPageOk || !disabledAiCreateOk) process.exit(1)
+console.log((compactValidationOk && validationExpandsOnDemand?'PASS':'FAIL')+' - rule validation stays compact until expanded')
+if (!automationPageOk || !disabledAiCreateOk || !compactValidationOk || !validationExpandsOnDemand) process.exit(1)
 document.querySelector('.rule-back-btn')?.click()
 await new Promise(r => setTimeout(r, 50))
 const earlySettingsNav = [...document.querySelectorAll('.nav-item')].find(
@@ -880,6 +927,16 @@ const settingsNav = [...document.querySelectorAll('.nav-item')].find(
 )
 settingsNav?.click()
 await new Promise(r => setTimeout(r, 50))
+;[...document.querySelectorAll('.settings-root-list button')].find(
+  button => button.textContent.includes('关于 NotmyFault'),
+)?.click()
+await new Promise(r => setTimeout(r, 20))
+const capabilitiesMovedToSettings = document.querySelector('.settings-capability-report')?.textContent.includes('audio.control')
+  && document.querySelector('.settings-capability-report')?.textContent.includes('1 / 2 可用')
+console.log((capabilitiesMovedToSettings?'PASS':'FAIL')+' - platform capability details live under settings about')
+if (!capabilitiesMovedToSettings) process.exit(1)
+document.querySelector('.settings-back')?.click()
+await new Promise(r => setTimeout(r, 20))
 ;[...document.querySelectorAll('.settings-root-list button')].find(
   button => button.textContent.includes('AI 功能'),
 )?.click()

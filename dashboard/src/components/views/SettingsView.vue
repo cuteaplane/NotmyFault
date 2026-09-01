@@ -4,6 +4,7 @@ import { store } from '../../lib/store'
 import {
   getAIDraftingSetting,
   deleteAIApiKey,
+  readPlatformCapabilities,
   saveAIApiKey,
   updateAIDraftingSetting,
 } from '../../lib/api'
@@ -23,6 +24,7 @@ const aiApiKeyDraft = ref('')
 const currentPage = ref('root')
 const settingsTransition = ref('settings-forward')
 const q = ref('')
+const platformReport = ref(null)
 
 const pageTitles = {
   root: '设置',
@@ -70,6 +72,15 @@ const aiProviderLabel = computed(() => {
   const provider = aiProviderPresets.find(item => item.id === aiProviderIdFor(aiSavedSnapshot.value || store.aiDrafting))
   return provider?.label || (store.aiDrafting.endpoint_url ? '自定义' : '未设置')
 })
+const capabilityRows = computed(() => Object.entries(platformReport.value?.capabilities || {}).map(([id, entry]) => ({
+  id,
+  available: entry.available === true,
+  backend: entry.backend || '',
+  state: entry.available ? (entry.degraded ? '部分可用' : '可用') : '不可用',
+  reason: entry.reason || '',
+  cls: entry.available ? (entry.degraded ? 'text-warn' : 'text-success') : 'text-error',
+})))
+const availableCapabilityCount = computed(() => capabilityRows.value.filter(row => row.available).length)
 
 const rootItems = computed(() => [
   { page: 'auth', icon: 'shield_lock', title: '安全与授权', value: '每次执行时确认', terms: '管理员 授权 签名 验证' },
@@ -209,8 +220,9 @@ function onKonamiKey(event) {
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
   load()
+  platformReport.value = await readPlatformCapabilities()
   window.addEventListener('keydown', onKonamiKey)
 })
 onUnmounted(() => {
@@ -324,6 +336,20 @@ onUnmounted(() => {
         <div class="a16-card settings-about-card">
           <header class="a16-brand"><img class="a16-brand-logo" :src="appLogoUrl" alt=""><span class="a16-brand-body"><b>NotmyFault</b><small>{{ appVersion }}</small></span><span class="a16-badges"><span class="chip">Alpha</span><span class="chip">GPL-3.0</span></span></header>
           <div v-for="item in runtimeInfo" :key="item.key" class="a16-row"><span class="material-symbols-outlined a16-row-ico">{{ item.icon }}</span><span class="a16-row-body"><span class="a16-row-title">{{ item.key }}</span></span><span class="a16-row-val">{{ item.val }}</span></div>
+          <details v-if="capabilityRows.length" class="settings-capability-report">
+            <summary>
+              <span class="material-symbols-outlined a16-row-ico">memory</span>
+              <span class="a16-row-body"><span class="a16-row-title">系统能力</span><span class="a16-row-sub">{{ platformReport.platform }}{{ platformReport.session_type ? ' · ' + platformReport.session_type : '' }}</span></span>
+              <span class="a16-row-val">{{ availableCapabilityCount }} / {{ capabilityRows.length }} 可用</span>
+              <span class="material-symbols-outlined settings-chevron">expand_more</span>
+            </summary>
+            <div class="settings-capability-list">
+              <div v-for="row in capabilityRows" :key="row.id" class="a16-row a16-row-sm" :title="row.reason || row.backend">
+                <span class="a16-row-body"><span class="a16-row-title">{{ row.id }}</span></span>
+                <span class="a16-row-val" :class="row.cls">{{ row.state }}{{ row.backend ? ' · ' + row.backend : '' }}</span>
+              </div>
+            </div>
+          </details>
           <p class="a16-sub-label">平台支持</p>
           <div v-for="platform in platforms" :key="platform.name" class="a16-row a16-row-sm"><span class="material-symbols-outlined a16-row-ico">{{ platform.icon }}</span><span class="a16-row-body"><span class="a16-row-title">{{ platform.name }}</span></span><span class="a16-row-val" :class="platform.cls">{{ platform.state }}</span></div>
           <p class="a16-sub-label">配置目录</p>

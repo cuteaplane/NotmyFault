@@ -219,12 +219,19 @@ export function buildFailureBindingSources(rule, actionIndex, failureIndex, sche
   return result
 }
 
+export function parameterAllowsBinding(meta, paramName) {
+  const fixedParams = meta?.security?.literal_only_params
+  return !Array.isArray(fixedParams) || !fixedParams.includes(paramName)
+}
+
 export function buildNodeDataPorts(node, schema) {
   const meta = node.kind === 'trigger'
     ? schema.triggers[node.source?.type]
     : schema.actions[node.source?.type]
   const dataInputs = ['action', 'failure-action', 'precondition'].includes(node.kind)
-    ? (meta?.params || []).map((param, index) => ({
+    ? (meta?.params || [])
+      .filter(param => parameterAllowsBinding(meta, param.name))
+      .map((param, index) => ({
         id: `input:${param.name}`,
         index,
         name: param.name,

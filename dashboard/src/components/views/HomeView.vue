@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { store } from '../../lib/store'
-import { getEngineStatus, readDiagnostics, readPlatformCapabilities, hasBridge } from '../../lib/api'
+import { getEngineStatus, readDiagnostics, hasBridge } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
 import { useEngineControl } from '../../composables/useEngineControl'
 
@@ -60,20 +60,6 @@ async function loadDiag() {
   if (!isRunning.value) { diag.value = null; return }
   diag.value = await readDiagnostics()
 }
-
-// 系统能力报告不依赖引擎运行状态，加载一次就够
-const platformReport = ref(null)
-onMounted(async () => { platformReport.value = await readPlatformCapabilities() })
-const capabilityRows = computed(() => {
-  const caps = platformReport.value?.capabilities || {}
-  return Object.entries(caps).map(([id, entry]) => ({
-    id,
-    backend: entry.backend || '',
-    state: entry.available ? (entry.degraded ? '部分可用' : '可用') : '不可用',
-    reason: entry.reason || '',
-    cls: entry.available ? (entry.degraded ? 'diag-warn' : 'diag-ok') : 'diag-err',
-  }))
-})
 
 const diagPlugins = computed(() => {
   const d = diag.value
@@ -207,17 +193,16 @@ watch(isRunning, (running) => {
       </div>
     </div>
 
-    <!-- 启动被拒绝时显示后台返回的配置错误。 -->
-    <div v-if="isControllerOnline && !isRunning && !isStarting && pausedError" class="mt-3 flex items-start gap-3 rounded-lg border border-error/40 bg-error/10 p-4">
-      <span class="material-symbols-outlined text-error">shield_person</span>
-      <div class="min-w-0 flex-1">
-        <b class="text-error">引擎启动被拒绝</b>
-        <p class="mt-0.5 break-all text-body-s text-on-surface-variant">{{ pausedError }}</p>
-        <button class="btn btn-outlined mt-2" @click="goSecurity">
-          <span class="material-symbols-outlined">security</span>前往安全页查看配置并处理
-        </button>
+    <section v-if="isControllerOnline && !isRunning && !isStarting && pausedError" class="engine-startup-alert">
+      <span class="material-symbols-outlined engine-startup-alert-icon">shield_person</span>
+      <div class="engine-startup-alert-copy">
+        <b>引擎启动被拒绝</b>
+        <p>{{ pausedError }}</p>
       </div>
-    </div>
+      <button class="btn btn-outlined" @click="goSecurity">
+        <span class="material-symbols-outlined">security</span>前往安全页处理
+      </button>
+    </section>
 
     <!-- 引擎运行时显示统计、诊断和操作区。 -->
     <template v-if="isControllerOnline">
@@ -273,13 +258,6 @@ watch(isRunning, (running) => {
         <div v-else class="dashboard-diagnostic-empty diag-ok">
           <span class="material-symbols-outlined">check_circle</span>暂无异常记录
         </div>
-        <details v-if="capabilityRows.length" class="dashboard-capability-report">
-          <summary>系统能力（{{ platformReport.platform }}{{ platformReport.session_type ? ' · ' + platformReport.session_type : '' }}）</summary>
-          <div v-for="row in capabilityRows" :key="row.id" class="dashboard-diagnostic-row">
-            <span>{{ row.id }}</span>
-            <span class="dashboard-diagnostic-value" :class="row.cls" :title="row.reason || row.backend">{{ row.state }}{{ row.backend ? ' · ' + row.backend : '' }}</span>
-          </div>
-        </details>
       </section>
     </template>
 

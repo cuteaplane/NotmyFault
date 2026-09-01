@@ -33,6 +33,7 @@ import {
   guaranteedTriggerIds,
   isReference,
   outputDefs,
+  parameterAllowsBinding,
   regenerateBindingIds,
   typesCompatible,
 } from '../lib/bindings'
@@ -226,6 +227,10 @@ const conditionNode = computed(() => props.rule.condition ? normalizeConditionTr
 const isAdmin = (meta) => !!(meta?.permissions || []).includes('admin')
 const eventParams = (event) => getVisibleParamDefs(store.schema.triggers[event.type], ensureParams(event))
 const actionParams = (action) => getVisibleParamDefs(store.schema.actions[action.type], ensureParams(action))
+const actionParamAllowsBinding = (action, param) => parameterAllowsBinding(
+  store.schema.actions[action?.type],
+  param.name,
+)
 const eventName = (event) => store.schema.triggers[event?.type]?.name || event?.type || '未选择触发器'
 const actionName = (action) => store.schema.actions[action?.type]?.name || action?.type || '未选择动作'
 function actionFailureSummary(action) {
@@ -514,6 +519,7 @@ const clientValidationIssues = computed(() => {
 const serverValidationIssues = ref([])
 const checkingRule = ref(false)
 const checkerError = ref('')
+const validationExpanded = ref(false)
 let checkerTimer = null
 let checkerSequence = 0
 
@@ -1618,7 +1624,7 @@ function onEditorKeydown(event) {
             <summary><span class="material-symbols-outlined flow-kind-icon">verified</span><span class="flow-card-copy"><b>{{ actionName(item) }}</b><small>开始前确认</small></span><button class="icon-btn icon-btn-danger" title="移除确认" @click.prevent.stop="removePrecondition(index)"><span class="material-symbols-outlined">delete</span></button><span class="material-symbols-outlined flow-expand">expand_more</span></summary>
             <div class="flow-card-body">
               <label class="field field-wide"><span class="field-label">确认方式</span><select class="select" :value="item.type" @change="changePrecondition(item, $event.target.value)"><option v-for="key in preconditionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option></select></label>
-              <div class="param-grid"><ParamInput v-for="param in actionParams(item)" :key="param.name" :def="param" :plugin-id="item.type" v-model="item.params[param.name]" allow-binding :binding-sources="preconditionBindingSources()" /></div>
+              <div class="param-grid"><ParamInput v-for="param in actionParams(item)" :key="param.name" :def="param" :plugin-id="item.type" v-model="item.params[param.name]" :allow-binding="actionParamAllowsBinding(item, param)" :binding-sources="preconditionBindingSources()" /></div>
             </div>
           </details>
           <div class="flow-add-control"><button class="btn btn-tonal" @click="openPluginPicker('precondition', { mode: 'precondition', title: '添加开始前确认' })"><span class="material-symbols-outlined">add</span>添加确认</button></div>
@@ -1645,7 +1651,7 @@ function onEditorKeydown(event) {
                   <span class="material-symbols-outlined">arrow_forward</span>
                 </button>
               </div>
-              <div class="param-grid"><ParamInput v-for="param in actionParams(action)" :key="param.name" :def="param" :plugin-id="action.type" v-model="action.params[param.name]" allow-binding :binding-sources="actionBindingSources(index)" /></div>
+              <div class="param-grid"><ParamInput v-for="param in actionParams(action)" :key="param.name" :def="param" :plugin-id="action.type" v-model="action.params[param.name]" :allow-binding="actionParamAllowsBinding(action, param)" :binding-sources="actionBindingSources(index)" /></div>
               <div v-if="actionOutputHint(action, index)" class="workflow-output-hint">后续步骤可引用：<code>{{ actionOutputHint(action, index) }}</code></div>
               <ActionFailureSettings :action="action" :meta="store.schema.actions[action.type]" :schema="store.schema.actions"
                 :binding-sources="failureIndex => failureActionBindingSources(index, failureIndex)"
@@ -1661,13 +1667,24 @@ function onEditorKeydown(event) {
       </section>
     </main>
 
-    <footer class="flow-validation" :class="{ valid: !validationErrorCount, warning: !validationErrorCount && validationWarningCount }">
+    <footer class="flow-validation" :class="{ valid: !validationErrorCount, warning: !validationErrorCount && validationWarningCount, expanded: validationExpanded }">
       <span class="material-symbols-outlined">{{ validationErrorCount ? 'error' : validationWarningCount ? 'warning' : 'check_circle' }}</span>
       <div class="flow-validation-body">
-        <b v-if="validationErrorCount">{{ validationErrorCount }} 项需要处理</b>
-        <b v-else-if="validationWarningCount">可以保存，另有 {{ validationWarningCount }} 项提醒</b>
-        <b v-else>{{ checkingRule ? '正在检查当前草稿…' : '规则可以保存' }}</b>
-        <div v-if="validationIssues.length" class="flow-validation-list">
+        <div class="flow-validation-summary">
+          <b v-if="validationErrorCount">{{ validationErrorCount }} 项需要处理</b>
+          <b v-else-if="validationWarningCount">可以保存，另有 {{ validationWarningCount }} 项提醒</b>
+          <b v-else>{{ checkingRule ? '正在检查当前草稿…' : '规则可以保存' }}</b>
+          <button v-if="validationIssues.length && !validationExpanded" type="button" class="flow-validation-preview"
+            :disabled="!validationIssues[0].target" @click="focusValidationIssue(validationIssues[0])">
+            <span>{{ validationIssues[0].message }}</span>
+            <span v-if="validationIssues[0].target" class="material-symbols-outlined">arrow_forward</span>
+          </button>
+          <button v-if="validationIssues.length" type="button" class="icon-btn flow-validation-toggle"
+            :title="validationExpanded ? '收起检查结果' : '展开全部检查结果'" @click="validationExpanded = !validationExpanded">
+            <span class="material-symbols-outlined">{{ validationExpanded ? 'expand_less' : 'expand_more' }}</span>
+          </button>
+        </div>
+        <div v-if="validationExpanded && validationIssues.length" class="flow-validation-list">
           <button v-for="(issue, index) in validationIssues" :key="`${issue.message}-${index}`" type="button"
             :class="`flow-validation-item ${issue.severity === 'warning' ? 'warning' : ''}`"
             :disabled="!issue.target" @click="focusValidationIssue(issue)">
@@ -1676,8 +1693,8 @@ function onEditorKeydown(event) {
             <span v-if="issue.target" class="material-symbols-outlined">arrow_forward</span>
           </button>
         </div>
-        <p v-else-if="checkerError" class="flow-validation-service-error">在线检查暂不可用：{{ checkerError }}。保存时仍会由后台校验。</p>
-        <p v-else-if="!checkingRule">修改只会在保存后应用到引擎。</p>
+        <p v-else-if="!validationIssues.length && checkerError" class="flow-validation-service-error">在线检查暂不可用：{{ checkerError }}。保存时仍会由后台校验。</p>
+        <p v-else-if="!validationIssues.length && !checkingRule">修改只会在保存后应用到引擎。</p>
       </div>
     </footer>
     </div>
@@ -1770,7 +1787,7 @@ function onEditorKeydown(event) {
                   <option v-for="key in preconditionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option>
                 </select>
               </label>
-              <div class="param-grid"><ParamInput v-for="param in actionParams(selectedPrecondition)" :key="param.name" :def="param" :plugin-id="selectedPrecondition.type" v-model="selectedPrecondition.params[param.name]" allow-binding :binding-sources="preconditionBindingSources()" /></div>
+              <div class="param-grid"><ParamInput v-for="param in actionParams(selectedPrecondition)" :key="param.name" :def="param" :plugin-id="selectedPrecondition.type" v-model="selectedPrecondition.params[param.name]" :allow-binding="actionParamAllowsBinding(selectedPrecondition, param)" :binding-sources="preconditionBindingSources()" /></div>
               <button class="btn btn-text btn-sm danger-text inspector-switch" @click="removePrecondition(selectedIndex)"><span class="material-symbols-outlined">delete</span>删除确认</button>
             </template>
 
@@ -1783,7 +1800,7 @@ function onEditorKeydown(event) {
                   <span class="material-symbols-outlined">arrow_forward</span>
                 </button>
               </div>
-              <div class="param-grid"><ParamInput v-for="param in actionParams(selectedAction)" :key="param.name" :def="param" :plugin-id="selectedAction.type" v-model="selectedAction.params[param.name]" allow-binding :binding-sources="actionBindingSources(selectedIndex)" /></div>
+              <div class="param-grid"><ParamInput v-for="param in actionParams(selectedAction)" :key="param.name" :def="param" :plugin-id="selectedAction.type" v-model="selectedAction.params[param.name]" :allow-binding="actionParamAllowsBinding(selectedAction, param)" :binding-sources="actionBindingSources(selectedIndex)" /></div>
               <div v-if="actionOutputHint(selectedAction, selectedIndex)" class="workflow-output-hint">后续步骤可引用：<code>{{ actionOutputHint(selectedAction, selectedIndex) }}</code></div>
               <ActionFailureSettings :action="selectedAction" :meta="store.schema.actions[selectedAction.type]" :schema="store.schema.actions"
                 :binding-sources="failureIndex => failureActionBindingSources(selectedIndex, failureIndex)"
@@ -1809,7 +1826,7 @@ function onEditorKeydown(event) {
                   <span class="material-symbols-outlined">arrow_forward</span>
                 </button>
               </div>
-              <div class="param-grid"><ParamInput v-for="param in actionParams(selectedFailureAction)" :key="param.name" :def="param" :plugin-id="selectedFailureAction.type" v-model="selectedFailureAction.params[param.name]" allow-binding :binding-sources="failureActionBindingSources(selectedGraphNode.parentIndex, selectedIndex)" /></div>
+              <div class="param-grid"><ParamInput v-for="param in actionParams(selectedFailureAction)" :key="param.name" :def="param" :plugin-id="selectedFailureAction.type" v-model="selectedFailureAction.params[param.name]" :allow-binding="actionParamAllowsBinding(selectedFailureAction, param)" :binding-sources="failureActionBindingSources(selectedGraphNode.parentIndex, selectedIndex)" /></div>
               <p class="failure-action-note">{{ selectedFailureAction.on_error === 'continue' ? '如果它也失败，会继续执行剩余补救动作。' : '如果它也失败，会停止剩余补救动作。' }}</p>
               <button class="btn btn-tonal btn-sm" @click="selectedNodeId = `action-${rule.actions[selectedGraphNode.parentIndex].binding_id}`"><span class="material-symbols-outlined">tune</span>设置重试和失败处理</button>
               <div class="inspector-action-row">

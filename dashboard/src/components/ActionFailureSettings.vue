@@ -1,6 +1,7 @@
 <script setup>
 import { computed } from 'vue'
 import { ensureParams, getVisibleParamDefs } from '../lib/utils'
+import { parameterAllowsBinding } from '../lib/bindings'
 import ParamInput from './ParamInput.vue'
 
 const props = defineProps({
@@ -71,6 +72,10 @@ function actionName(action) {
 
 function actionParams(action) {
   return getVisibleParamDefs(props.schema[action?.type], ensureParams(action))
+}
+
+function actionParamAllowsBinding(action, param) {
+  return parameterAllowsBinding(props.schema[action?.type], param.name)
 }
 </script>
 
@@ -155,7 +160,8 @@ function actionParams(action) {
           </button>
           <div class="param-grid">
             <ParamInput v-for="param in actionParams(failureAction)" :key="param.name" :def="param"
-              :plugin-id="failureAction.type" v-model="failureAction.params[param.name]" allow-binding :binding-sources="bindingSources(index)" />
+              :plugin-id="failureAction.type" v-model="failureAction.params[param.name]"
+              :allow-binding="actionParamAllowsBinding(failureAction, param)" :binding-sources="bindingSources(index)" />
           </div>
           <div class="failure-action-policy-grid">
             <label class="field"><span class="field-label">这个补救动作也失败时</span>

@@ -153,7 +153,12 @@ function clearDesktopElement() {
         <span class="material-symbols-outlined">data_object</span>使用运行数据
       </button>
     </span>
-    <div v-if="bound && type === 'plugin_data'" class="plugin-data-error">
+    <div v-if="bound && !allowBinding" class="plugin-data-error">
+      <span class="material-symbols-outlined">link_off</span>
+      <span>这项参数只允许使用固定值。</span>
+      <button type="button" class="btn btn-text btn-sm" @click="useFixedValue">改为固定值</button>
+    </div>
+    <div v-else-if="bound && type === 'plugin_data'" class="plugin-data-error">
       <span class="material-symbols-outlined">link_off</span>
       <span>这项数据由插件自己管理，不能使用运行数据。</span>
       <button type="button" class="btn btn-text btn-sm" @click="useFixedValue">移除绑定</button>
