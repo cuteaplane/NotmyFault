@@ -12,19 +12,29 @@
         "windows": "action.py"
     },
     "permissions": ["native_api", "screen_reader"],
-    "components": [
-        {
-            "id": "record",
-            "name": "录制屏幕控件",
-            "description": "依次选择要操作的屏幕控件，生成可重复执行的步骤",
-            "entrypoint": "component.py",
-            "ui": {
-                "button_label": "录制桌面步骤",
-                "icon": "screen_record",
-                "description": "依次选择要操作的屏幕控件"
+    "contributes": {
+        "commands": [
+            {
+                "id": "edit_selector",
+                "title": "选择屏幕控件",
+                "handler": "extension.py:edit_selector"
             }
-        }
-    ],
+        ],
+        "parameter_editors": [
+            {
+                "id": "selector_editor",
+                "parameter": "target",
+                "value_type": "object",
+                "command": "edit_selector",
+                "ui": {
+                    "control": "button",
+                    "empty_label": "选择屏幕控件",
+                    "icon": "center_focus_strong",
+                    "description": "把鼠标停在目标控件上，等待识别"
+                }
+            }
+        ]
+    },
     "params": [
         {
             "name": "target",

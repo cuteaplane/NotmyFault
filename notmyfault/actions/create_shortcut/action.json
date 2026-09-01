@@ -8,6 +8,17 @@
     "enabled": true,
     "platforms": ["windows", "linux"],
     "permissions": ["external_binary"],
+    "security": {
+        "rule_approval": "admin_key",
+        "literal_only_params": [
+            "name",
+            "target_path",
+            "location",
+            "arguments",
+            "working_directory",
+            "icon_path"
+        ]
+    },
     "outputs": [
         {"name": "shortcut_path", "label": "快捷方式路径", "type": "string"}
     ],

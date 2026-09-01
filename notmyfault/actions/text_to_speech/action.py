@@ -75,7 +75,7 @@ def run(action_info, params):
     if not text:
         raise ValueError("没有文本可播报")
 
-    print(f"[Action:text_to_speech] 播报: {text[:60]}...")
+    print(f"[Action:text_to_speech] 准备播报 ({len(text)} 字符)")
 
     if os.name != "nt":
         from notmyfault.platform.linux_support import require_command

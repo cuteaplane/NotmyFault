@@ -1,6 +1,8 @@
 """通过 Windows UI Automation 重新定位并操作录制控件"""
 
-from notmyfault.native.uia import perform_selector
+from notmyfault.plugin_api import native_uia_api
+
+perform_selector = native_uia_api().perform_selector
 
 
 def run_with_context(action_info, params, context):

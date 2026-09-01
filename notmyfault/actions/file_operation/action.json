@@ -7,6 +7,10 @@
     "package_name": "io.github.notmyfault.file_operation",
     "enabled": true,
     "permissions": ["filesystem"],
+    "security": {
+        "rule_approval": "admin_key",
+        "literal_only_params": ["operation", "source", "destination"]
+    },
     "params": [
         {
             "name": "operation",

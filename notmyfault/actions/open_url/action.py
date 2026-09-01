@@ -23,7 +23,7 @@ def run(action_info, params):
         elif not url.lower().startswith(("http://", "https://")):
             # 自定义协议头会拉起任意注册程序，只放行 http/https
             raise ValueError(f"只支持 http/https 链接: {url}")
-        print(f"[Action:open_url] 打开: {url}")
+        print("[Action:open_url] 打开 HTTP(S) 链接")
         if webbrowser.open(url, new=1 if new_window else 0):
             opened.append(url)
 

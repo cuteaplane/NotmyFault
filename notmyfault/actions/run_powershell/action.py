@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 
@@ -17,12 +18,17 @@ def run(action_info, params):
         raise ValueError("未指定命令")
 
     command = command.strip()
-    print(f"[Action:run_powershell] 执行: {command}")
-
     try:
         if sys.platform == "win32":
+            powershell = os.path.join(
+                os.environ.get("SystemRoot", r"C:\Windows"),
+                "System32",
+                "WindowsPowerShell",
+                "v1.0",
+                "powershell.exe",
+            )
             result = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+                [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
                 capture_output=True,
                 text=True,
                 errors="replace",
@@ -45,9 +51,7 @@ def run(action_info, params):
         raise RuntimeError(f"命令执行异常: {e}") from e
 
     if result.returncode != 0:
-        raise RuntimeError(
-            f"命令执行失败 (code={result.returncode}): {_truncate(result.stderr.strip())}"
-        )
+        raise RuntimeError(f"命令执行失败 (code={result.returncode})")
     print(f"[Action:run_powershell] 执行成功")
     return {
         "returncode": 0,

@@ -5,7 +5,9 @@ Windows 为 ctypes 函数声明参数类型并持有 NATIVE_LOCK，Linux 使用 
 import ctypes
 import os
 
-from notmyfault.native import NATIVE_LOCK
+from notmyfault.plugin_api import native_lock
+
+NATIVE_LOCK = native_lock()
 
 
 def run(action_info, params):

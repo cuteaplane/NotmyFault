@@ -1,4 +1,3 @@
-import os
 import shlex
 import subprocess
 import sys
@@ -8,8 +7,8 @@ def _split_args(raw: str) -> list:
     """将命令行参数字符串拆分为列表，支持双引号包裹"""
     try:
         return shlex.split(raw)
-    except ValueError:
-        return raw.split()
+    except ValueError as error:
+        raise ValueError("程序参数引号不完整") from error
 
 
 def run(action_info, params):
@@ -19,7 +18,7 @@ def run(action_info, params):
 
     raw_args = params.get("args", "").strip()
     working_directory = params.get("working_directory", "").strip() or None
-    print(f"[Action:launch_program] 启动: {path} {raw_args}")
+    print(f"[Action:launch_program] 启动: {path} (参数 {len(raw_args)} 字符)")
 
     args = [path] + _split_args(raw_args) if raw_args else [path]
 
@@ -35,15 +34,7 @@ def run(action_info, params):
     try:
         subprocess.Popen(args, cwd=working_directory, **popen_kwargs)
         print(f"[Action:launch_program] 已启动: {path}")
-    except FileNotFoundError:
-        # Windows 的 os.startfile() 使用文件关联，其他系统再次调用 subprocess.Popen()，两个启动调用都失败时向引擎抛异常
-        try:
-            if sys.platform == "win32":
-                os.startfile(path)
-            else:
-                subprocess.Popen([path])
-            print(f"[Action:launch_program] (回退方式) 已启动: {path}")
-        except Exception as e2:
-            raise RuntimeError(f"启动失败: {e2}") from e2
+    except FileNotFoundError as error:
+        raise RuntimeError("程序不存在或不可执行") from error
     except OSError as e:
-        raise RuntimeError(f"启动失败: {e}") from e
+        raise RuntimeError("启动失败") from e

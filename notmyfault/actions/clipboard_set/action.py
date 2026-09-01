@@ -1,7 +1,9 @@
 import ctypes
 import os
 
-from notmyfault.native import NATIVE_LOCK
+from notmyfault.plugin_api import native_lock
+
+NATIVE_LOCK = native_lock()
 
 GMEM_MOVEABLE = 0x0002
 CF_UNICODETEXT = 13
@@ -25,7 +27,7 @@ def run(action_info, params):
     if not text:
         raise ValueError("没有文本可写入")
 
-    print(f"[Action:clipboard_set] 写入剪贴板: {text[:50]}...")
+    print(f"[Action:clipboard_set] 准备写入剪贴板 ({len(text)} 字符)")
 
     if os.name != "nt":
         from notmyfault.platform.linux_support import set_clipboard_text

@@ -1,19 +1,13 @@
-"""uia_control 插件的录制组件：采集屏幕控件、校验选择器并转成动作"""
+"""uia_control 插件的屏幕控件选择和录制命令。"""
 
 import time
 
-from notmyfault.native.uia import (
-    DesktopElementError,
-    capture_element_under_cursor,
-    check_selector,
-)
+from notmyfault.plugin_api import native_uia_api
 
-
-def describe() -> dict:
-    """组件支持的调用方法，Dashboard 可以按这份清单渲染入口"""
-    return {
-        "methods": ["capture", "check", "to_actions"],
-    }
+_uia = native_uia_api()
+DesktopElementError = _uia.DesktopElementError
+capture_element_under_cursor = _uia.capture_element_under_cursor
+check_selector = _uia.check_selector
 
 
 def _clamp_delay(value) -> float:
@@ -64,24 +58,28 @@ def _convert_step(step) -> dict:
 
 
 def to_actions(steps) -> list:
-    """把录制会话的步骤列表转成普通动作，动作类型都是本插件族的"""
     if not isinstance(steps, list):
         raise ValueError("步骤必须是数组")
     return [_convert_step(step) for step in steps]
 
 
-def invoke(session, method, payload):
+def edit_selector(context, payload):
     options = payload if isinstance(payload, dict) else {}
-    if method == "capture":
-        delay = _clamp_delay(options.get("delay_seconds", 3))
-        time.sleep(delay)
-        selector = capture_element_under_cursor()
-        session.set_status("已采集屏幕控件")
-        return {"ok": True, "data": {"selector": selector}}
-    if method == "check":
-        result = check_selector(options.get("selector"))
-        return {"ok": True, "data": result}
-    if method == "to_actions":
-        actions = to_actions(options.get("steps"))
-        return {"ok": True, "data": {"actions": actions}}
-    return {"ok": False, "error": f"未知方法: {method}"}
+    operation = options.get("operation", "capture")
+    try:
+        if operation == "capture":
+            time.sleep(_clamp_delay(options.get("delay_seconds", 3)))
+            selector = capture_element_under_cursor()
+            context.session.set_status("已采集屏幕控件")
+            return context.commit_value(selector)
+        if operation == "check":
+            selector = options.get("selector", context.current_value)
+            return context.result(check_selector(selector), close=True)
+        if operation == "to_actions":
+            return context.result(
+                {"actions": to_actions(options.get("steps"))},
+                close=True,
+            )
+    except (DesktopElementError, ValueError) as error:
+        return context.error(str(error), close=True)
+    return context.error(f"未知操作: {operation}", close=True)

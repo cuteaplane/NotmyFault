@@ -3,6 +3,20 @@ import time
 import psutil
 
 
+_PROTECTED_WINDOWS_PROCESSES = frozenset(
+    {
+        "csrss.exe",
+        "dwm.exe",
+        "lsass.exe",
+        "services.exe",
+        "smss.exe",
+        "system",
+        "wininit.exe",
+        "winlogon.exe",
+    }
+)
+
+
 def _target_name(process_name: str) -> str:
     target = process_name.lower()
     if os.name == "nt" and not target.endswith(".exe"):
@@ -19,13 +33,16 @@ def run(action_info, params):
 
     self_pid = os.getpid()
     target = _target_name(process_name)
+    if os.name == "nt" and target in _PROTECTED_WINDOWS_PROCESSES:
+        raise ValueError("不允许终止 Windows 关键系统进程")
     killed = 0
     denied = 0
 
     for proc in psutil.process_iter(["pid", "name"]):
         try:
             if proc.info["name"] and proc.info["name"].lower() == target:
-                if proc.info["pid"] == self_pid:
+                pid = proc.info.get("pid")
+                if pid == self_pid:
                     print("[Action:kill_process] 跳过引擎自身进程")
                     continue
                 proc.terminate()
@@ -34,17 +51,18 @@ def run(action_info, params):
                     proc.wait(timeout=5)
                 except psutil.TimeoutExpired:
                     print(
-                        f"[Action:kill_process] PID={proc.info['pid']} "
+                        f"[Action:kill_process] PID={pid or '?'} "
                         "5 秒内未退出，发送强杀信号"
                     )
                     proc.kill()
                     proc.wait(timeout=5)
                 killed += 1
-                print(f"[Action:kill_process] 已终止 PID={proc.info['pid']}")
+                print(f"[Action:kill_process] 已终止 PID={pid or '?'}")
         except psutil.AccessDenied:
             denied += 1
+            pid = proc.info.get("pid", "?")
             print(
-                f"[Action:kill_process] PID={proc.info['pid']} 权限不足，"
+                f"[Action:kill_process] PID={pid} 权限不足，"
                 "未终止（可能需管理员权限）"
             )
         except psutil.NoSuchProcess:

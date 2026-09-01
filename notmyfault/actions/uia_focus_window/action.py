@@ -1,6 +1,8 @@
 """切换到录制控件所属的窗口"""
 
-from notmyfault.native.uia import focus_selector_window
+from notmyfault.plugin_api import native_uia_api
+
+focus_selector_window = native_uia_api().focus_selector_window
 
 
 def run_with_context(action_info, params, context):

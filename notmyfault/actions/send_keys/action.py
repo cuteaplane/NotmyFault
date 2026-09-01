@@ -5,7 +5,9 @@ Windows 用 SendInput；Linux 走 InputBackend（xdotool 或 ydotool）
 import os
 import subprocess
 
-from notmyfault.native import NATIVE_LOCK
+from notmyfault.plugin_api import native_lock
+
+NATIVE_LOCK = native_lock()
 
 _LINUX_MODIFIERS = {"ctrl", "shift", "alt", "super", "win"}
 

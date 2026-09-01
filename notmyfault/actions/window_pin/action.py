@@ -4,7 +4,11 @@ Windows 用 SetWindowPos；Linux 用 wmctrl（仅 X11）
 
 import os
 
-from notmyfault.platform.backends import WindowBackend, default_runner
+from notmyfault.plugin_api import platform_backend_api
+
+_platform_backend = platform_backend_api()
+WindowBackend = _platform_backend.WindowBackend
+default_runner = _platform_backend.default_runner
 
 
 def _run_linux(action: str, target: str, title: str) -> dict:
@@ -51,7 +55,9 @@ if os.name == "nt":
             if not hwnds:
                 raise RuntimeError(f"未找到标题包含 \"{title}\" 的可见窗口")
             if len(hwnds) > 1:
-                print(f"[Action:window_pin] 匹配到 {len(hwnds)} 个窗口，操作第一个")
+                raise RuntimeError(
+                    f"标题匹配到 {len(hwnds)} 个窗口，请使用更精确的标题"
+                )
             return hwnds[0]
         hwnd = user32.GetForegroundWindow()
         if not hwnd:

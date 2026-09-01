@@ -96,6 +96,13 @@
             "label": "已执行步骤",
             "type": "number",
             "summary": "value"
+        },
+        {
+            "name": "steps",
+            "label": "执行步骤详情",
+            "type": "array",
+            "sensitive": true,
+            "summary": "hidden"
         }
     ],
     "idempotent": false

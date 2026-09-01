@@ -10,7 +10,7 @@ def run(action_info, params):
     # 系统 Toast 处理超长文本不可靠，标题截断为 100 字符，正文截断为 500 字符
     title = title[:100]
     message = message[:500]
-    print(f"[Action:notify] 显示通知: {title} / {message}")
+    print(f"[Action:notify] 显示通知 (标题 {len(title)} 字符，正文 {len(message)} 字符)")
     ok = show_notification(title, message)
     if not ok:
         raise RuntimeError("系统通知发送失败（通知服务不可用）")

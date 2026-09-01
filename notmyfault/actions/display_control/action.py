@@ -4,7 +4,11 @@ import os
 import subprocess
 import time
 
-from notmyfault.platform.backends import DisplayBackend, default_runner
+from notmyfault.plugin_api import platform_backend_api
+
+_platform_backend = platform_backend_api()
+DisplayBackend = _platform_backend.DisplayBackend
+default_runner = _platform_backend.default_runner
 
 HWND_BROADCAST = 0xFFFF
 WM_SYSCOMMAND = 0x0112

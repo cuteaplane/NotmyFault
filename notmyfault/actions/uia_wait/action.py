@@ -1,6 +1,8 @@
 """等待录制的 Windows UI Automation 控件出现"""
 
-from notmyfault.native.uia import wait_for_selector
+from notmyfault.plugin_api import native_uia_api
+
+wait_for_selector = native_uia_api().wait_for_selector
 
 
 def run_with_context(action_info, params, context):

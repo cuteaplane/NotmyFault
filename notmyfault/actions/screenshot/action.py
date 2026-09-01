@@ -2,7 +2,11 @@ import os
 import ctypes
 from datetime import datetime
 
-from notmyfault.platform.backends import ScreenshotBackend, default_runner
+from notmyfault.plugin_api import platform_backend_api
+
+_platform_backend = platform_backend_api()
+ScreenshotBackend = _platform_backend.ScreenshotBackend
+default_runner = _platform_backend.default_runner
 
 if os.name == "nt":
     user32 = ctypes.windll.user32

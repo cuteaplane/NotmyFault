@@ -1,6 +1,8 @@
 """读取录制的 Windows UI Automation 控件文本"""
 
-from notmyfault.native.uia import read_selector_text
+from notmyfault.plugin_api import native_uia_api
+
+read_selector_text = native_uia_api().read_selector_text
 
 
 def run_with_context(action_info, params, context):

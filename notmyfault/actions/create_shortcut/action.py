@@ -3,6 +3,7 @@ Windows 用 PowerShell WScript.Shell 创建 .lnk；Linux 创建 .desktop 文件
 """
 
 import os
+import shlex
 import subprocess
 import sys
 
@@ -39,10 +40,16 @@ def _validate_common(params) -> tuple[str, str, str]:
     target = str(params.get("target_path", "") or "").strip()
     if not name:
         raise ValueError("未指定快捷方式名称")
-    if any(ch in name for ch in ("\\", "/", ":")) or ".." in name:
+    if (
+        any(ch in name for ch in ("\\", "/", ":"))
+        or ".." in name
+        or any(ord(ch) < 32 for ch in name)
+    ):
         raise ValueError(f"快捷方式名称不合法: {name!r}")
     if not target:
         raise ValueError("未指定快捷方式目标路径")
+    if any(ch in target for ch in ("\r", "\n")):
+        raise ValueError("快捷方式目标路径不能换行")
     location = str(params.get("location", "desktop") or "desktop")
     return name, target, location
 
@@ -54,18 +61,29 @@ def _run_linux(action_info, params):
     if location not in ("desktop", "applications"):
         raise ValueError(f"无效的创建位置: {location!r}（可选: desktop/applications）")
 
+    arguments = str(params.get("arguments", "") or "").strip()
+    if any(ch in arguments for ch in ("\r", "\n")):
+        raise ValueError("快捷方式参数不能换行")
+    try:
+        argument_parts = shlex.split(arguments) if arguments else []
+    except ValueError as error:
+        raise ValueError("快捷方式参数引号不完整") from error
+
+    def desktop_token(value: str) -> str:
+        escaped = value.replace("\\", "\\\\")
+        for char in ('"', "`", "$"):
+            escaped = escaped.replace(char, "\\" + char)
+        escaped = escaped.replace("%", "%%")
+        return f'"{escaped}"'
+
+    exec_line = " ".join(desktop_token(item) for item in (target, *argument_parts))
     desktop_entry = (
         "[Desktop Entry]\n"
         "Type=Application\n"
         f"Name={name}\n"
-        f"Exec={target}\n"
+        f"Exec={exec_line}\n"
         "Terminal=false\n"
     )
-    arguments = str(params.get("arguments", "") or "").strip()
-    if arguments:
-        desktop_entry = desktop_entry.replace(
-            f"Exec={target}", f"Exec={target} {arguments}"
-        )
 
     if location == "desktop":
         base_dir = Path.home() / "Desktop"
@@ -101,13 +119,18 @@ def _run_windows(action_info, params):
 
     print(f"[Action:create_shortcut] 创建快捷方式: {name}.lnk -> {target}")
     try:
+        powershell = os.path.join(
+            os.environ.get("SystemRoot", r"C:\Windows"),
+            "System32",
+            "WindowsPowerShell",
+            "v1.0",
+            "powershell.exe",
+        )
         result = subprocess.run(
             [
-                "powershell",
+                powershell,
                 "-NoProfile",
                 "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
                 "-Command",
                 _POWERSHELL_SCRIPT,
             ],
@@ -120,13 +143,10 @@ def _run_windows(action_info, params):
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError(f"执行 PowerShell 失败: {exc}") from exc
+        raise RuntimeError("执行 PowerShell 失败") from exc
 
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()[-300:]
-        raise RuntimeError(
-            f"创建快捷方式失败 (code={result.returncode}): {detail}"
-        )
+        raise RuntimeError(f"创建快捷方式失败 (code={result.returncode})")
 
     shortcut_path = (result.stdout or "").strip()
     print(f"[Action:create_shortcut] 已创建: {shortcut_path}")

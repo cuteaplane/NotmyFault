@@ -2,16 +2,28 @@
 
 import time
 
-from notmyfault.extensions.protocol import OwnedValueError, unpack_owned_value
-from notmyfault.native.keyboard import perform_key_event
-from notmyfault.native.mouse import perform_coordinate
-from notmyfault.native.uia import (
-    focus_selector_window,
-    focus_window_signature,
-    perform_selector,
-    read_selector_text,
-    wait_for_selector,
+from notmyfault.plugin_api import (
+    native_keyboard_api,
+    native_mouse_api,
+    native_uia_api,
+    owned_value_api,
 )
+try:
+    from .macro_validation import validate_steps
+except ImportError:
+    from macro_validation import validate_steps
+
+_owned_values = owned_value_api()
+OwnedValueError = _owned_values.OwnedValueError
+unpack_owned_value = _owned_values.unpack_owned_value
+perform_key_event = native_keyboard_api().perform_key_event
+perform_coordinate = native_mouse_api().perform_coordinate
+_uia = native_uia_api()
+focus_selector_window = _uia.focus_selector_window
+focus_window_signature = _uia.focus_window_signature
+perform_selector = _uia.perform_selector
+read_selector_text = _uia.read_selector_text
+wait_for_selector = _uia.wait_for_selector
 
 
 _PACKAGE_NAME = "io.github.notmyfault.uia_macro"
@@ -34,8 +46,7 @@ def _wait(seconds, cancellation=None):
 
 
 def execute_macro(steps, cancellation=None):
-    if not isinstance(steps, list) or not steps:
-        raise ValueError("操作宏没有可执行的步骤，请重新录制")
+    steps = validate_steps(steps)
     results = []
     pressed_keys = {}
     pressed_buttons = {}
