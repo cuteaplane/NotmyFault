@@ -44,6 +44,7 @@ class ExtensionSession:
         self._cleanup_callbacks: list[Callable[[], Any]] = []
         self._closed = False
         self._lock = threading.RLock()
+        self._invoke_lock = threading.Lock()
 
     def set_status(self, text: str) -> None:
         with self._lock:
@@ -86,8 +87,15 @@ class ExtensionSession:
         payload: Any,
     ) -> Any:
         with self._lock:
+            if self._closed:
+                raise RuntimeError("扩展会话已经关闭")
             self.updated_at = time.time()
+        if not self._invoke_lock.acquire(blocking=False):
+            raise RuntimeError("扩展会话正在处理另一个命令")
+        try:
             return handler(context, payload)
+        finally:
+            self._invoke_lock.release()
 
 
 class ExtensionSessionManager:
@@ -102,11 +110,11 @@ class ExtensionSessionManager:
         session = ExtensionSession(**kwargs)
         with self._lock:
             self._sessions[session.session_id] = session
-        self._cleanup()
+        self.cleanup_expired()
         return session
 
     def get(self, session_id: str) -> Optional[ExtensionSession]:
-        self._cleanup()
+        self.cleanup_expired()
         with self._lock:
             session = self._sessions.get(session_id)
         if session is not None:
@@ -138,7 +146,7 @@ class ExtensionSessionManager:
         for session in sessions:
             session.close()
 
-    def _cleanup(self) -> None:
+    def cleanup_expired(self) -> int:
         now = time.time()
         with self._lock:
             expired = [
@@ -149,6 +157,7 @@ class ExtensionSessionManager:
             sessions = [self._sessions.pop(session_id) for session_id in expired]
         for session in sessions:
             session.close()
+        return len(sessions)
 
 
 class ExtensionContext:

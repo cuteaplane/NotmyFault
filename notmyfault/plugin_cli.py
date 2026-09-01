@@ -109,9 +109,6 @@ def check_plugin(plugin_dir: str | Path) -> dict[str, Any]:
     contributes = meta.get("contributes") or {}
     if not isinstance(contributes, dict):
         contributes = {}
-    components = meta.get("components") or []
-    if not isinstance(components, list):
-        components = []
     contribution_ids = {}
     for kind in ("commands", "views", "parameter_editors", "data_types"):
         items = contributes.get(kind) or []
@@ -136,7 +133,6 @@ def check_plugin(plugin_dir: str | Path) -> dict[str, Any]:
         "borrowed_privilege": sorted(set(borrowed)),
         "signature": plugin_signature_kind(str(root), "user"),
         "entrypoints": entrypoint,
-        "components": [item.get("id") for item in components if isinstance(item, dict)],
         "contributions": contribution_ids,
     })
     report["ok"] = bool(
@@ -176,7 +172,6 @@ def _print_report(report: dict[str, Any]) -> None:
     print(f"signature: {report['signature']}")
     selected = report["entrypoints"].get("selected") or "none"
     print(f"entrypoint: {selected} {'ok' if report['entrypoints']['exists'] else 'missing'}")
-    print(f"components: {', '.join(report['components']) or 'none'}")
     for kind, identifiers in report["contributions"].items():
         print(f"contributions.{kind}: {', '.join(identifiers) or 'none'}")
     for risk in report["risks"]:

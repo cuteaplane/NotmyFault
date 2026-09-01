@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import math
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -172,7 +173,7 @@ def _load_uia():
         return comtypes.client, UIAutomationClient
     except Exception as exc:
         raise DesktopElementError(
-            "uia_unavailable", f"Windows UI Automation 不可用: {exc}"
+            "uia_unavailable", "Windows UI Automation 不可用"
         ) from exc
 
 
@@ -693,7 +694,7 @@ def wait_for_selector(
         raise DesktopElementError(
             "invalid_timeout", "等待时间必须是 1 到 600 秒"
         ) from exc
-    if timeout < 1 or timeout > 600:
+    if not math.isfinite(timeout) or timeout < 1 or timeout > 600:
         raise DesktopElementError(
             "invalid_timeout", "等待时间必须是 1 到 600 秒"
         )

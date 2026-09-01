@@ -172,14 +172,36 @@ def _probe_linux(capability: str) -> dict:
     raise ValueError(f"未知能力 id: {capability!r}")
 
 
+def _probe_unsupported_platform(_capability: str) -> dict:
+    return _entry(False, None, "当前平台暂未提供此能力")
+
+
+def probe_capability(capability: str) -> dict:
+    if capability not in CAPABILITY_IDS:
+        raise ValueError(f"未知能力 id: {capability!r}")
+    if os.name == "nt":
+        probe = _probe_windows
+    elif sys.platform.startswith("linux"):
+        probe = _probe_linux
+    else:
+        probe = _probe_unsupported_platform
+    return probe(capability)
+
+
 def probe_capabilities() -> dict[str, dict]:
     """返回全部能力的当前状态，platform 与 capability 分开判断"""
-    probe = _probe_windows if os.name == "nt" else _probe_linux
-    return {capability: probe(capability) for capability in sorted(CAPABILITY_IDS)}
+    return {
+        capability: probe_capability(capability)
+        for capability in sorted(CAPABILITY_IDS)
+    }
 
 
-def missing_capabilities(required: list[str]) -> list[dict]:
-    report = probe_capabilities()
+def missing_capabilities(
+    required: list[str],
+    report: dict[str, dict] | None = None,
+) -> list[dict]:
+    if report is None:
+        report = probe_capabilities()
     problems = []
     for capability in required:
         entry = report.get(capability)
@@ -196,10 +218,13 @@ def missing_capabilities(required: list[str]) -> list[dict]:
     return problems
 
 
-def is_capability_compatible(meta: dict) -> tuple[bool, list[dict]]:
+def is_capability_compatible(
+    meta: dict,
+    report: dict[str, dict] | None = None,
+) -> tuple[bool, list[dict]]:
     """清单没有 requires_capabilities 时视为兼容"""
     required = meta.get("requires_capabilities")
     if not required:
         return True, []
-    problems = missing_capabilities(list(required))
+    problems = missing_capabilities(list(required), report)
     return not problems, problems

@@ -289,10 +289,14 @@ class WindowBackend:
 
         lines = result.stdout.strip().splitlines()
         if target == "title":
-            for line in lines:
-                if title.lower() in line.lower():
-                    return line.split()[0]
-            raise BackendFailedError(f'未找到标题包含 "{title}" 的窗口')
+            matches = [line for line in lines if title.lower() in line.lower()]
+            if not matches:
+                raise BackendFailedError(f'未找到标题包含 "{title}" 的窗口')
+            if len(matches) > 1:
+                raise BackendFailedError(
+                    f"标题匹配到 {len(matches)} 个窗口，请使用更精确的标题"
+                )
+            return matches[0].split()[0]
         if not lines:
             raise BackendFailedError("没有可见窗口")
         return lines[0].split()[0]
