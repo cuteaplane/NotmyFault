@@ -7,28 +7,14 @@ import traceback
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
-from notmyfault.config import (
-    get_admin_authorization_mode,
-)
-from notmyfault.core.admin_session import AdminSessionManager
 from notmyfault.core.diagnostics import Diagnostics
 from notmyfault.core.event_bus import EventBus
 from notmyfault.core.hot_reloader import RulesHotReloader
 from notmyfault.core.logging import engine_error, engine_info, engine_warn
 from notmyfault.core import plugin_worker
 from notmyfault.security.plugin_loader import (
-    PluginKind,
     PluginLoader,
     PluginRegistry,
-    _check_sudo_import,
-    _validate_plugin_meta,
-    check_permissions_conform,
-    check_sudo_import,
-    is_known_permission,
-    scan_plugin_capabilities,
-    validate_plugin_meta,
-    verify_plugin_integrity,
-    verify_plugin_sig,
 )
 from notmyfault.core.rule_scheduler import RuleScheduler
 from notmyfault.core.rules import (
@@ -86,16 +72,12 @@ class AutomationEngine:
 
         from notmyfault.security import sudo as _sudo
         self._sudo = _sudo
-        self._admin_authorization_mode = get_admin_authorization_mode(config)
-        self._engine_token: str = _sudo.begin_engine_session(
-            authorization_mode=self._admin_authorization_mode,
-        )
+        self._engine_token: str = _sudo.begin_engine_session()
         self._privilege_session_closed = False
         self._close_lock = threading.Lock()
-        # 关闭时还有线程运行就保留授权，动作结束前可能继续请求提权
         self._shutdown_clean = True
-        self._manual_threads: List[threading.Thread] = []
-        self._manual_threads_lock = threading.Lock()
+        self._runtime_cleanup_lock = threading.RLock()
+        self._runtime_cleaned = False
         self._security_mode = _detect_security_mode()
         engine_info(f"Security mode: {self._security_mode.value}")
         self._plugin_integrity_errors: list[str] = []
@@ -111,7 +93,6 @@ class AutomationEngine:
         # 热重载时整体替换条件运行时，保留 AND 分支的最近命中
         self._condition_runtime = ConditionRuntime()
 
-        # TriggerSupervisor 管理线程、停止事件和锁，engine 属性通过 property 转发
         self._trigger_supervisor = TriggerSupervisor(
             # 运行时查找 _alert_user，构造后替换的告警回调仍然生效
             alert_cb=lambda title, message: self._alert_user(title, message),
@@ -175,18 +156,6 @@ class AutomationEngine:
         self._deferred_workflows_lock = (
             self._workflow_executor.deferred_workflows_lock
         )
-        # 告警回调运行时才找 _alert_user，构造后替换告警回调仍然生效
-        self._admin_session = AdminSessionManager(
-            sudo=self._sudo,
-            engine_token=self._engine_token,
-            authorization_mode=self._admin_authorization_mode,
-            rules_fn=lambda: self.rules,
-            triggers_meta_fn=lambda: self.triggers_meta,
-            actions_meta_fn=lambda: self.actions_meta,
-            alert_cb=lambda title, message, open_dashboard=False: self._alert_user(
-                title, message, open_dashboard=open_dashboard
-            ),
-        )
         self._hot_reloader = RulesHotReloader(
             rules_path_fn=lambda: self._rules_store.rules_path,
             load_rules_fn=self._rules_store.load_verified_rules,
@@ -195,7 +164,6 @@ class AutomationEngine:
             cancel_deferred_fn=self._cancel_deferred_workflows,
             validate_rules_fn=self._validate_all_rules,
             start_triggers_fn=self._start_trigger_threads,
-            recheck_admin_fn=self._admin_session.recheck_after_reload,
             diagnostics=self._diag_obj,
             alert_cb=lambda title, message: self._alert_user(title, message),
         )
@@ -203,35 +171,6 @@ class AutomationEngine:
     @property
     def _active_actions(self) -> int:
         return self._workflow_executor.active_actions
-
-    @property
-    def admin_authorization_mode(self) -> str:
-        return self._admin_authorization_mode
-
-    # 这些属性转发到 TriggerSupervisor，旧调用方仍可直接访问
-    @property
-    def _trigger_threads(self) -> Dict[str, threading.Thread]:
-        return self._trigger_supervisor.threads
-
-    @_trigger_threads.setter
-    def _trigger_threads(self, value: Dict[str, threading.Thread]) -> None:
-        self._trigger_supervisor.threads = value
-
-    @property
-    def _trigger_events(self) -> Dict[str, threading.Event]:
-        return self._trigger_supervisor.events
-
-    @_trigger_events.setter
-    def _trigger_events(self, value: Dict[str, threading.Event]) -> None:
-        self._trigger_supervisor.events = value
-
-    @property
-    def _trigger_lock(self) -> threading.RLock:
-        return self._trigger_supervisor.lock
-
-    @_trigger_lock.setter
-    def _trigger_lock(self, value: threading.RLock) -> None:
-        self._trigger_supervisor.lock = value
 
     @staticmethod
     def _alert_user(title: str, message: str, open_dashboard: bool = False) -> None:
@@ -273,60 +212,79 @@ class AutomationEngine:
         """触发器线程入口，隔离插件异常并上报崩溃"""
         # 触发器代码来自插件，异常由这里捕获并上报
         try:
+            def emit_checked(event_name: str, payload: Dict[str, Any]) -> None:
+                if not isinstance(payload, dict):
+                    raise TypeError("emit_event 的 payload 必须是对象")
+                problems = check_payload_contract(
+                    trigger_meta.get("outputs"), payload
+                )
+                if problems:
+                    print(
+                        f"[Engine] [!!] 触发器 {instance_id} 事件 payload "
+                        "违反输出契约，已拦截:",
+                        file=sys.stderr,
+                    )
+                    for problem in problems:
+                        print(f"         - {problem}", file=sys.stderr)
+                    engine_error(
+                        "trigger_payload_invalid",
+                        trigger=instance_id,
+                        error="; ".join(problems),
+                    )
+                    self._safe_on_event(
+                        "trigger_payload_invalid",
+                        {
+                            "trigger_id": trigger_id,
+                            "instance_id": instance_id,
+                            "problems": problems,
+                        },
+                    )
+                    return
+                self.emit_event(
+                    event_name,
+                    payload,
+                    instance={"config": config},
+                )
+
             if trigger_meta.get("trigger_api") == "event-v2":
 
                 def emit_event(payload: Dict[str, Any]) -> None:
-                    if not isinstance(payload, dict):
-                        raise TypeError("event-v2 emit_event(payload) 的 payload 必须是对象")
-                    problems = check_payload_contract(
-                        trigger_meta.get("outputs"), payload
-                    )
-                    if problems:
-                        print(
-                            f"[Engine] [!!] 触发器 {instance_id} 事件 payload "
-                            "违反输出契约，已拦截:",
-                            file=sys.stderr,
-                        )
-                        for problem in problems:
-                            print(f"         - {problem}", file=sys.stderr)
-                        engine_error(
-                            "trigger_payload_invalid",
-                            trigger=instance_id,
-                            error="; ".join(problems),
-                        )
-                        self._safe_on_event(
-                            "trigger_payload_invalid",
-                            {
-                                "trigger_id": trigger_id,
-                                "instance_id": instance_id,
-                                "problems": problems,
-                            },
-                        )
-                        return
-                    self.emit_event(
-                        trigger_id,
-                        payload,
-                        instance={"config": config},
-                    )
+                    emit_checked(trigger_id, payload)
 
                 trigger_func(trigger_meta, config, emit_event, stop_event)
             else:
-                trigger_func(trigger_meta, config, self.emit_event, stop_event)
-        except Exception:
-            err = traceback.format_exc()
-            print(f"[Engine] [!!] 触发器线程 {instance_id} 崩溃:", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-            engine_error("trigger_crashed", trigger=instance_id, error=err[-500:])
-            self._diag_obj.record_trigger_crash(instance_id, err[-300:])
-            self._trigger_supervisor.mark_crashed(instance_id, err[-300:])
+                def emit_legacy(event_name: str, payload: Dict[str, Any]) -> None:
+                    emit_checked(event_name, payload)
+
+                trigger_func(trigger_meta, config, emit_legacy, stop_event)
+        except Exception as error:
+            error_type = type(error).__name__
+            print(
+                f"[Engine] [!!] 触发器线程 {instance_id} 崩溃 "
+                f"({error_type})",
+                file=sys.stderr,
+            )
+            engine_error(
+                "trigger_crashed",
+                trigger=instance_id,
+                error_type=error_type,
+            )
+            self._diag_obj.record_trigger_crash(instance_id, error_type)
+            self._trigger_supervisor.mark_crashed(instance_id, error_type)
             self._safe_on_event(
                 "trigger_crashed",
-                {"trigger_id": trigger_id, "instance_id": instance_id, "error": err[-500:]},
+                {
+                    "trigger_id": trigger_id,
+                    "instance_id": instance_id,
+                    "error": {
+                        "code": "trigger_crashed",
+                        "message": "触发器异常退出",
+                    },
+                },
             )
-            # _alert_user 自己会记录告警失败，不再静默吞掉
             self._alert_user(
                 f"触发器 {instance_id} 崩溃",
-                err[-200:],
+                "触发器异常退出，请查看诊断状态",
                 open_dashboard=False,
             )
 
@@ -347,7 +305,6 @@ class AutomationEngine:
                 "errors": snap["plugin_errors"][-20:],
                 "error_count": len(snap["plugin_errors"]),
                 "admin_plugins": self._sudo.get_authorized_plugins(),
-                "admin_authorization": self._sudo.get_authorization_status(),
                 "integrity_errors": self._plugin_integrity_errors[-10:],
             },
             "rules": {
@@ -428,16 +385,6 @@ class AutomationEngine:
             )
         print()
 
-    # 管理员授权逻辑在 AdminSessionManager 里，保留老名字，测试直接调用
-    def _required_admin_plugins(self) -> list[str]:
-        return self._admin_session.required_admin_plugins()
-
-    def _authorize_admin_rules_at_startup(self) -> None:
-        self._admin_session.authorize_at_startup()
-
-    def _recheck_admin_session(self) -> None:
-        self._admin_session.recheck_after_reload()
-
     def _load_plugins(
         self,
         base_dir: str,
@@ -462,13 +409,6 @@ class AutomationEngine:
             store_name=store_name,
             origin=origin,
         )
-
-    def component(self, plugin_id: str, component_id: str) -> Optional[Any]:
-        """返回插件声明的组件模块，没有声明或加载失败时为 None"""
-        components = self._plugin_registry.components.get(plugin_id)
-        if not components:
-            return None
-        return components.get(component_id)
 
     @property
     def extensions(self):
@@ -640,7 +580,6 @@ class AutomationEngine:
                     "provided": True,
                 }
                 context["steps"][step_id] = record
-                context["steps"][f"{action.get('type', 'action')}_{action_index + 1}"] = record
         supplied_trigger_payloads = trigger_payloads if isinstance(trigger_payloads, dict) else {}
         context["triggers"] = {
             event.get("binding_id"): {
@@ -665,18 +604,16 @@ class AutomationEngine:
             "assertion_count": len(test_assertions or []),
             "event_payload": manual_payload,
         })
-        thread = threading.Thread(
-            target=self.execute_workflow,
-            args=(f"manual:{rule_id or rule_index}", rule, rule_name, context),
-            name=f"ManualRule-{rule_index}",
-            daemon=True,
+        decision = self._rule_scheduler.submit(
+            rule_id or rule_name,
+            rule,
+            rule_name,
+            context,
         )
-        with self._manual_threads_lock:
-            self._manual_threads = [
-                item for item in self._manual_threads if item.is_alive()
-            ]
-            self._manual_threads.append(thread)
-        thread.start()
+        if decision == "queued":
+            return True, "已加入队列", run_id
+        if decision == "dropped":
+            return False, "当前规则不允许新的运行", run_id
         return True, "已开始执行", run_id
 
     def execute_workflow(
@@ -787,9 +724,6 @@ class AutomationEngine:
         with self._close_lock:
             if self._privilege_session_closed:
                 return
-            if not self._shutdown_clean:
-                engine_warn("关闭时仍有线程未完全退出，保留本代权限会话不撤销")
-                return
             self._sudo.end_engine_session(self._engine_token)
             self._privilege_session_closed = True
 
@@ -824,91 +758,75 @@ class AutomationEngine:
     ) -> None:
         self._start_time = time.time()
         self._shutdown_flag = shutdown_event or threading.Event()
+        try:
+            if self._security_mode == SecurityMode.STRICT and not getattr(sys, "frozen", False):
+                ok, bad = verify_core_integrity()
+                if not ok:
+                    detail = "；".join(bad[:5])
+                    print(f"[Engine] [!!] 核心文件完整性校验失败：{detail}", file=sys.stderr)
+                    engine_error("integrity_check_failed", files=",".join(bad))
+                    self._alert_user(
+                        "NotmyFault 完整性校验失败",
+                        f"核心文件可能被篡改（{detail}）请重新运行 python build.py 生成完整性清单",
+                        open_dashboard=True,
+                    )
+                    raise RuntimeError("核心文件完整性校验失败")
 
-        # strict 源码运行时校验引擎核心文件完整性
-        # build.json 签名用于保护安全模式
-        if self._security_mode == SecurityMode.STRICT and not getattr(sys, "frozen", False):
-            ok, bad = verify_core_integrity()
-            if not ok:
-                detail = "；".join(bad[:5])
-                print(f"[Engine] [!!] 核心文件完整性校验失败：{detail}", file=sys.stderr)
-                engine_error("integrity_check_failed", files=",".join(bad))
+            self._validate_all_rules()
+
+            from notmyfault.platform.platform_support import show_notification
+
+            if os.name == "nt":
+                from Win_toaster.AUMID_Register import register_toaster
+                register_toaster()
+
+            show_notification("NotmyFault 已加载", "")
+
+            thread_count = self._start_trigger_threads()
+
+            if thread_count == 0:
+                print("[Engine] 没有找到可用触发器，程序将退出")
+                hint = "没有可用的触发器，请检查规则配置"
+                if self._security_mode == SecurityMode.STRICT:
+                    hint += (
+                        "Tips: 当前安全模式为 strict 严格模式：若是源码运行，内置插件因缺少签名被拒载，"
+                        "请先运行 `python build.py` 生成插件签名与 build.json"
+                    )
                 self._alert_user(
-                    "NotmyFault 完整性校验失败",
-                    f"核心文件可能被篡改（{detail}）请重新运行 python build.py 生成完整性清单",
+                    "NotmyFault 启动失败 😥",
+                    hint,
                     open_dashboard=True,
                 )
                 return
 
-        # 启动前校验规则并记录问题，坏规则与其他规则分别处理
-        self._validate_all_rules()
+            se = self._shutdown_flag
+            self._hot_reloader.begin()
 
-        from notmyfault.platform.platform_support import show_notification
+            try:
+                while not se.is_set():
+                    se.wait(1)
+                    self._hot_reloader.check_once()
+            except KeyboardInterrupt:
+                print("[Engine] 主程序收到中断，退出中...")
+        finally:
+            self._cleanup_runtime()
 
-        if os.name == "nt":
-            from Win_toaster.AUMID_Register import register_toaster
-            register_toaster()
+    def _cleanup_runtime(self) -> None:
+        with self._runtime_cleanup_lock:
+            if self._runtime_cleaned:
+                return
+            from notmyfault.security.admin_prompt import cancel_pending_admin_requests
 
-        self._authorize_admin_rules_at_startup()
-        show_notification("NotmyFault 已加载", "")
-
-        thread_count = self._start_trigger_threads()
-
-        if thread_count == 0:
-            print("[Engine] 没有找到可用触发器，程序将退出")
-            hint = "没有可用的触发器，请检查规则配置"
-            if self._security_mode == SecurityMode.STRICT:
-                # strict 源码运行需要插件签名文件
-                hint += (
-                    "Tips: 当前安全模式为 strict 严格模式：若是源码运行，内置插件因缺少签名被拒载，"
-                    "请先运行 `python build.py` 生成插件签名与 build.json"
-                )
-            self._alert_user(
-                "NotmyFault 启动失败 😥",
-                hint,
-                open_dashboard=True,
-            )
-            return
-
-        se = self._shutdown_flag
-        self._hot_reloader.begin()
-
-        try:
-            while not se.is_set():
-                se.wait(1)
-                self._hot_reloader.check_once()
-        except KeyboardInterrupt:
-            print("[Engine] 主程序收到中断，退出中...")
-
-        from notmyfault.security.admin_prompt import cancel_pending_admin_requests
-
-        cancel_pending_admin_requests()
-        # 停止链路两条：shutdown() 和这里的循环退出，调度队列两边都要丢并写 history
-        self._rule_scheduler.shutdown()
-        self._cancel_deferred_workflows()
-        stopped = self._stop_trigger_threads(timeout=30)
-        manual_stopped = self._join_manual_threads()
-        scheduled_stopped, drained = self._wait_runtime_work()
-        plugin_worker.shutdown_all()
-        self._shutdown_plugins()
-        self._shutdown_clean = bool(
-            stopped and manual_stopped and scheduled_stopped and drained
-        )
-
-    def _join_manual_threads(self, timeout: float = 10.0) -> bool:
-        """等待手工规则线程退出，返回是否全部退出"""
-        with self._manual_threads_lock:
-            threads = list(self._manual_threads)
-        deadline = time.time() + timeout
-        for thread in threads:
-            remaining = deadline - time.time()
-            if remaining > 0:
-                thread.join(timeout=remaining)
-        with self._manual_threads_lock:
-            self._manual_threads = [
-                thread for thread in self._manual_threads if thread.is_alive()
-            ]
-            return not self._manual_threads
+            cancel_pending_admin_requests()
+            self._rule_scheduler.shutdown()
+            self._trigger_supervisor.request_stop_all()
+            self._cancel_deferred_workflows()
+            stopped = self._stop_trigger_threads(timeout=30)
+            scheduled_stopped, drained = self._wait_runtime_work()
+            plugin_worker.shutdown_all()
+            self._shutdown_plugins()
+            self._shutdown_clean = bool(stopped and scheduled_stopped and drained)
+            self._runtime_cleaned = True
 
     def _shutdown_plugins(self) -> None:
         # 先在锁内认领清理权，再在锁外调用插件 teardown()
@@ -951,19 +869,5 @@ class AutomationEngine:
         # API、信号和 finally 可能同时调用 shutdown()，每个清理步骤都支持重复执行
         if self._shutdown_flag is not None:
             self._shutdown_flag.set()
-        from notmyfault.security.admin_prompt import cancel_pending_admin_requests
-
-        cancel_pending_admin_requests()
-        self._rule_scheduler.shutdown()
-        self._trigger_supervisor.request_stop_all()
-        self._cancel_deferred_workflows()
-        stopped = self._stop_trigger_threads(timeout=30)
-        manual_stopped = self._join_manual_threads()
-        scheduled_stopped, drained = self._wait_runtime_work()
-        plugin_worker.shutdown_all()
-        self._shutdown_plugins()
-        self._shutdown_clean = bool(
-            stopped and manual_stopped and scheduled_stopped and drained
-        )
-        if self._shutdown_clean:
-            self.close()
+        self._cleanup_runtime()
+        self.close()

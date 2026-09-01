@@ -1,10 +1,20 @@
+import json
+import queue
 import subprocess
 import sys
 import threading
+import time
+from pathlib import Path
 
-# 动作执行和退出的等待上限，解释器启动时间算在动作超时内
+
+STARTUP_TIMEOUT = 10.0
 EXECUTE_TIMEOUT = 120.0
 EXIT_TIMEOUT = 5.0
+PROTOCOL_VERSION = 1
+MAX_PROTOCOL_LINE = 1024 * 1024
+MAX_STDERR_CHUNK = 64 * 1024
+_WORKER_MAIN = Path(__file__).resolve().with_name("plugin_worker_main.py")
+_PROJECT_ROOT = _WORKER_MAIN.parents[2]
 
 
 class PluginWorkerCrashed(RuntimeError):
@@ -12,22 +22,28 @@ class PluginWorkerCrashed(RuntimeError):
 
 
 class PluginWorkerTimeout(RuntimeError):
-    """worker 在执行超时内没有返回结果"""
+    """worker 没在给定时间内返回"""
+
+
+class PluginWorkerStartupTimeout(PluginWorkerTimeout):
+    """worker 没在启动时间内发回 ready"""
 
 
 _lock = threading.Lock()
 _live_processes: set[subprocess.Popen] = set()
 _on_crash = None
+_PROTOCOL_EOF = object()
+_PROTOCOL_OVERSIZE = object()
 
 
 def set_crash_callback(callback) -> None:
-    """引擎把 _safe_on_event 挂进来，崩溃时推送 plugin_worker_crashed 事件"""
+    """引擎把 _safe_on_event 传进来，worker 崩溃时发送事件"""
     global _on_crash
     _on_crash = callback
 
 
 def _sanitize_context(context):
-    """把 context 削成能过 JSON 的形状：下划线开头的内部键和不可序列化对象都去掉"""
+    """去掉 context 中的内部键，把其他值转成 JSON 能保存的类型"""
     def clean(value):
         if isinstance(value, dict):
             return {
@@ -58,10 +74,22 @@ def _stop_process(process: subprocess.Popen) -> None:
             pass
 
 
+def _wait_for_exit(process: subprocess.Popen) -> None:
+    try:
+        process.wait(timeout=EXIT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _stop_process(process)
+
+
 def _drain_stderr(stream) -> None:
     target = sys.stderr
     try:
-        for line in stream:
+        while True:
+            line = stream.readline(MAX_STDERR_CHUNK + 1)
+            if not line:
+                break
+            if len(line) > MAX_STDERR_CHUNK:
+                line = line[:MAX_STDERR_CHUNK] + "\n"
             if target is None:
                 continue
             try:
@@ -73,96 +101,159 @@ def _drain_stderr(stream) -> None:
         stream.close()
 
 
+def _read_protocol(stream, messages: queue.Queue) -> None:
+    try:
+        while True:
+            line = stream.readline(MAX_PROTOCOL_LINE + 1)
+            if not line:
+                break
+            if len(line) > MAX_PROTOCOL_LINE:
+                messages.put(_PROTOCOL_OVERSIZE)
+                return
+            messages.put(line)
+    finally:
+        stream.close()
+        messages.put(_PROTOCOL_EOF)
+
+
 def run_isolated_action(
     entry: str,
+    entry_sha256: str,
     action_info: dict,
     params: dict,
     context: dict,
+    startup_timeout: float = STARTUP_TIMEOUT,
     execute_timeout: float = EXECUTE_TIMEOUT,
 ):
     request = {
         "entry": entry,
+        "entry_sha256": entry_sha256,
         "action_info": action_info,
         "params": params,
         "context": _sanitize_context(context),
     }
     process = subprocess.Popen(
-        [sys.executable, "-X", "utf8", "-m", "notmyfault.core.plugin_worker_main"],
+        [sys.executable, "-X", "utf8", str(_WORKER_MAIN)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
+        cwd=str(_PROJECT_ROOT),
     )
     with _lock:
         _live_processes.add(process)
-    assert process.stderr is not None
+    if process.stderr is None or process.stdout is None:
+        _stop_process(process)
+        raise PluginWorkerCrashed("无法连接 worker 输出")
     stderr_thread = threading.Thread(
         target=_drain_stderr,
         args=(process.stderr,),
         daemon=True,
     )
+    messages: queue.Queue = queue.Queue(maxsize=4)
+    stdout_thread = threading.Thread(
+        target=_read_protocol,
+        args=(process.stdout, messages),
+        daemon=True,
+    )
     stderr_thread.start()
-    timed_out = threading.Event()
-
-    def watchdog():
-        timed_out.set()
-        _stop_process(process)
-
-    timer = threading.Timer(execute_timeout, watchdog)
-    timer.daemon = True
-    timer.start()
+    stdout_thread.start()
+    completed = False
+    started = time.monotonic()
     try:
-        return _drive(process, request, execute_timeout, timed_out)
+        startup_budget = min(max(float(startup_timeout), 0.0), execute_timeout)
+        _wait_until_ready(process, messages, startup_budget)
+        remaining = max(float(execute_timeout) - (time.monotonic() - started), 0.0)
+        result = _drive(process, messages, request, remaining)
+        completed = True
+        return result
     finally:
-        timer.cancel()
         with _lock:
             _live_processes.discard(process)
-        _stop_process(process)
+        if completed:
+            _wait_for_exit(process)
+        else:
+            _stop_process(process)
+        stdout_thread.join(timeout=EXIT_TIMEOUT)
         stderr_thread.join(timeout=EXIT_TIMEOUT)
 
 
-def _drive(process, request, execute_timeout, timed_out):
-    import json
+def _wait_until_ready(process, messages, startup_timeout):
+    payload = _receive_payload(
+        process,
+        messages,
+        startup_timeout,
+        PluginWorkerStartupTimeout(
+            f"worker 启动超过 {startup_timeout}s，已终止"
+        ),
+        "worker 没有发回启动结果就退出了",
+    )
+    if (
+        payload.get("type") != "ready"
+        or payload.get("protocol") != PROTOCOL_VERSION
+    ):
+        _fail_protocol(process, "worker 启动结果不符合协议")
 
+
+def _drive(process, messages, request, execute_timeout):
     try:
-        assert process.stdin is not None and process.stdout is not None
+        if process.stdin is None:
+            raise OSError("stdin unavailable")
         process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
         process.stdin.flush()
+        process.stdin.close()
     except (OSError, ValueError):
-        _report_crash(process, "无法向 worker 写入请求")
-        raise PluginWorkerCrashed("无法向 worker 写入请求")
+        _fail_protocol(process, "无法向 worker 写入请求")
 
-    try:
-        line = process.stdout.readline()
-    except OSError:
-        line = ""
-    if timed_out.is_set():
-        raise PluginWorkerTimeout(
-            f"worker 执行超过 {execute_timeout}s，已终止"
-        )
-    if not line:
-        _report_crash(process, "worker 没有返回结果就退出了")
-        raise PluginWorkerCrashed(
-            f"worker 异常退出，退出码 {process.poll()}"
-        )
-    try:
-        payload = json.loads(line)
-    except json.JSONDecodeError:
-        _report_crash(process, "worker 输出不是 JSON 协议")
-        raise PluginWorkerCrashed("worker 输出不是 JSON 协议")
-
+    payload = _receive_payload(
+        process,
+        messages,
+        execute_timeout,
+        PluginWorkerTimeout(f"worker 执行超过 {execute_timeout}s，已终止"),
+        "worker 没有返回结果就退出了",
+    )
+    if payload.get("type") != "result":
+        _fail_protocol(process, "worker 执行结果不符合协议")
     if payload.get("ok") is True:
         return True, payload.get("result")
     return False, payload.get("error") or "worker 执行失败"
+
+
+def _receive_payload(process, messages, timeout, timeout_error, eof_reason):
+    try:
+        line = messages.get(timeout=max(0.0, timeout))
+    except queue.Empty:
+        _stop_process(process)
+        _report_crash(process, str(timeout_error))
+        raise timeout_error
+    if line is _PROTOCOL_EOF:
+        _report_crash(process, eof_reason)
+        raise PluginWorkerCrashed(
+            f"worker 异常退出，退出码 {process.poll()}"
+        )
+    if line is _PROTOCOL_OVERSIZE:
+        _fail_protocol(process, "worker 协议消息超过大小限制")
+    try:
+        payload = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        _fail_protocol(process, "worker 输出不是 JSON 协议")
+    if not isinstance(payload, dict):
+        _fail_protocol(process, "worker 输出不是 JSON 对象")
+    return payload
+
+
+def _fail_protocol(process, reason):
+    _stop_process(process)
+    _report_crash(process, reason)
+    raise PluginWorkerCrashed(reason)
 
 
 def _report_crash(process, reason: str) -> None:
     callback = _on_crash
     if callback is None:
         return
-    # 先等进程收尸拿到退出码，poll() 这时才不是 None
     try:
         returncode = process.wait(timeout=EXIT_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -177,7 +268,7 @@ def _report_crash(process, reason: str) -> None:
 
 
 def shutdown_all() -> None:
-    """引擎关闭时回收所有还活着的 worker 子进程"""
+    """引擎关闭时结束所有还活着的 worker 子进程"""
     with _lock:
         processes = list(_live_processes)
     for process in processes:

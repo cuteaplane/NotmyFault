@@ -1,7 +1,7 @@
 """
 引擎结构化日志模块
 ------------------
-每个引擎 session 写独立日志文件: logs/engine-YYYYMMDD-HHMMSS.log
+每个引擎 session 写独立日志文件: logs/engine-YYYYMMDD-HHMMSS-ffffff-PID.log
 自动保留最近 7 个，旧文件自动删除
 
 格式约定：
@@ -36,13 +36,27 @@ def init_session_log(log_dir: str) -> str:
 
     os.makedirs(log_dir, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    filename = f"engine-{timestamp}.log"
-    _current_log_path = os.path.join(log_dir, filename)
-
-    _rotate_logs(log_dir)
-
-    return _current_log_path
+    with _log_lock:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        base = f"engine-{timestamp}-{os.getpid()}"
+        for suffix in range(1000):
+            filename = f"{base}{f'-{suffix}' if suffix else ''}.log"
+            candidate = os.path.join(log_dir, filename)
+            try:
+                descriptor = os.open(
+                    candidate,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                os.close(descriptor)
+                _current_log_path = candidate
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise OSError("无法创建唯一的会话日志文件")
+        _rotate_logs(log_dir)
+        return _current_log_path
 
 
 def _rotate_logs(log_dir: str, keep: int = 7) -> None:

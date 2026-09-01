@@ -58,13 +58,14 @@ class EventBus:
             rule_id = rule.get("rule_id", "")
             # 调度 key 用 rule_id，没有就用规则名；带数组下标会在规则重排后串到别的规则
             rule_key = rule_id or str(rule.get("name", ""))
-            if not self._condition_runtime.match(
+            matched_events = self._condition_runtime.match_and_take(
                 rule_key,
                 rule,
                 event_type,
                 event_payload,
                 instance=instance,
-            ):
+            )
+            if matched_events is None:
                 continue
 
             rule_name = rule.get("name", "未命名规则")
@@ -86,7 +87,7 @@ class EventBus:
                 rule_name,
                 event_type,
                 event_payload,
-                self._condition_runtime.last_match(rule_key),
+                matched_events,
                 rule_id,
                 run_id,
             )

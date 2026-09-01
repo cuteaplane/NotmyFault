@@ -1,8 +1,7 @@
 """rules.json 热重载，从 engine.py 的 _run 主循环拆出。
 
 每秒看一眼 rules.json 的修改时间，变了就重载：先停旧触发器，
-停了才换规则；换完取消延迟工作流、校验、重启触发器、复查管理员
-授权。
+停了才换规则；换完取消延迟工作流、校验并重启触发器。
 """
 import os
 import sys
@@ -25,7 +24,6 @@ class RulesHotReloader:
         cancel_deferred_fn: Callable[[], None],
         validate_rules_fn: Callable[[], Any],
         start_triggers_fn: Callable[[List[Any]], int],
-        recheck_admin_fn: Callable[[], None],
         diagnostics: Any,
         alert_cb: Callable[..., None],
     ) -> None:
@@ -36,7 +34,6 @@ class RulesHotReloader:
         self._cancel_deferred_fn = cancel_deferred_fn
         self._validate_rules_fn = validate_rules_fn
         self._start_triggers_fn = start_triggers_fn
-        self._recheck_admin_fn = recheck_admin_fn
         self._diagnostics = diagnostics
         self._alert_cb = alert_cb
         self._rules_mtime = 0.0
@@ -103,7 +100,6 @@ class RulesHotReloader:
                 started = self._start_triggers_fn(new_rules)
                 if started == 0:
                     print("[Engine] 热加载后无可用触发器，保持Engine运行")
-                self._recheck_admin_fn()
                 self._rules_mtime = new_mtime
         except ConfigValidationError as e:
             restored = True

@@ -1,8 +1,4 @@
-"""触发器管理，用于管线程/停止事件/锁，
-engine.py 里的 _trigger_threads / _trigger_events / _trigger_lock 原本是引擎
-自己的属性，现在收进这个组件统一管理启动、停止、崩溃和健康状态数据；
-对外仍用 property 代理回引擎的老名字用于测试
-"""
+"""统一管理触发器线程、停止事件、崩溃和健康状态。"""
 import sys
 import threading
 import time
@@ -14,11 +10,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 
 class TriggerSupervisor:
-    """触发器线程管理：启动、停止、记崩溃、报健康
-
-    threads / events / lock 通过 property 暴露且支持赋值，
-    使 ``AutomationEngine._trigger_threads`` 等属性仍可被外部直接读写
-    """
+    """触发器线程管理：启动、停止、记录崩溃并报告健康状态。"""
 
     def __init__(
         self,
@@ -33,34 +25,6 @@ class TriggerSupervisor:
         self._lock = threading.RLock()
         # 启停锁覆盖 thread.start() 到 join() 的完整过程，stop() 只能处理已经挂载的线程
         self._lifecycle_lock = threading.RLock()
-
-    # engine 仍通过这三个属性访问同一个线程管理对象
-
-    @property
-    def threads(self) -> Dict[str, threading.Thread]:
-        return self._threads
-
-    @threads.setter
-    def threads(self, value: Dict[str, threading.Thread]) -> None:
-        with self._lock:
-            self._threads = value
-
-    @property
-    def events(self) -> Dict[str, threading.Event]:
-        return self._events
-
-    @events.setter
-    def events(self, value: Dict[str, threading.Event]) -> None:
-        with self._lock:
-            self._events = value
-
-    @property
-    def lock(self) -> threading.RLock:
-        return self._lock
-
-    @lock.setter
-    def lock(self, value: threading.RLock) -> None:
-        self._lock = value
 
     def start(
         self,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import threading
 from typing import Any, Dict, Iterable
@@ -32,9 +33,23 @@ _RUN_EVENT_TYPES = frozenset(
 
 def _duration_ms(started_at: Any, finished_at: Any) -> int | None:
     try:
-        return max(0, round((float(finished_at) - float(started_at)) * 1000))
-    except (TypeError, ValueError):
+        duration = (float(finished_at) - float(started_at)) * 1000
+        return max(0, round(duration)) if math.isfinite(duration) else None
+    except (OverflowError, TypeError, ValueError):
         return None
+
+
+def _safe_count(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return default
+    if not math.isfinite(number) or not number.is_integer():
+        return default
+    parsed = int(number)
+    return parsed if 0 <= parsed <= 1_000_000 else default
 
 
 def _safe_summary(value: Any) -> list[Dict[str, Any]]:
@@ -100,20 +115,23 @@ def _safe_event(packet: Dict[str, Any]) -> Dict[str, Any] | None:
     error = data.get("error")
     if isinstance(error, dict):
         kept["error"] = {
-            key: copy.deepcopy(error[key])
+            key: str(error[key])[:240]
             for key in ("code", "location", "message")
             if key in error
         }
     elif error is not None:
-        kept["error"] = str(error)[-1000:]
+        kept["error"] = {
+            "code": "run_error",
+            "message": "运行失败",
+        }
     if event_type in {
         "action_executed", "action_cancelled", "action_timed_out", "error"
     }:
         kept["input_summary"] = _safe_summary(data.get("input_summary"))
         kept["output_summary"] = _safe_summary(data.get("output_summary"))
     if event_type == "test_assertions_completed":
-        kept["passed"] = int(data.get("passed", 0) or 0)
-        kept["total"] = int(data.get("total", 0) or 0)
+        kept["passed"] = _safe_count(data.get("passed"))
+        kept["total"] = _safe_count(data.get("total"))
         raw_results = data.get("results", [])
         if not isinstance(raw_results, list):
             raw_results = []
@@ -146,12 +164,12 @@ def _new_run(data: Dict[str, Any], timestamp: Any) -> Dict[str, Any]:
         "started_at": timestamp,
         "finished_at": None,
         "duration_ms": None,
-        "action_count": int(data.get("action_count", 0) or 0),
-        "precondition_count": int(data.get("precondition_count", 0) or 0),
+        "action_count": _safe_count(data.get("action_count")),
+        "precondition_count": _safe_count(data.get("precondition_count")),
         "start_step_id": data.get("start_step_id", ""),
         "end_step_id": data.get("end_step_id", ""),
         "assertions_passed": 0,
-        "assertions_total": int(data.get("assertion_count", 0) or 0),
+        "assertions_total": _safe_count(data.get("assertion_count")),
         "assertion_results": [],
         "failure_kind": "",
         "steps": [],
@@ -182,19 +200,23 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
             rule_id=data.get("rule_id", run["rule_id"]),
             rule_name=data.get("rule_name", run["rule_name"]),
             event_type=data.get("event_type", run["event_type"]),
-            action_count=int(data.get("action_count", run["action_count"]) or 0),
-            precondition_count=int(
-                data.get("precondition_count", run["precondition_count"]) or 0
+            action_count=_safe_count(
+                data.get("action_count"), run["action_count"]
+            ),
+            precondition_count=_safe_count(
+                data.get("precondition_count"), run["precondition_count"]
             ),
             start_step_id=data.get("start_step_id", run["start_step_id"]),
             end_step_id=data.get("end_step_id", run["end_step_id"]),
-            assertions_total=int(data.get("assertion_count", run["assertions_total"]) or 0),
+            assertions_total=_safe_count(
+                data.get("assertion_count"), run["assertions_total"]
+            ),
         )
         return
 
     if event_type == "test_assertions_completed":
-        run["assertions_passed"] = int(data.get("passed", 0) or 0)
-        run["assertions_total"] = int(data.get("total", 0) or 0)
+        run["assertions_passed"] = _safe_count(data.get("passed"))
+        run["assertions_total"] = _safe_count(data.get("total"))
         run["assertion_results"] = data.get("results", [])
         return
 
@@ -263,11 +285,11 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
         run["duration_ms"] = _duration_ms(run["started_at"], timestamp)
     elif event_type == "workflow_completed":
         run["status"] = new_status or run["status"]
-        run["assertions_passed"] = int(
-            data.get("assertions_passed", run["assertions_passed"]) or 0
+        run["assertions_passed"] = _safe_count(
+            data.get("assertions_passed"), run["assertions_passed"]
         )
-        run["assertions_total"] = int(
-            data.get("assertions_total", run["assertions_total"]) or 0
+        run["assertions_total"] = _safe_count(
+            data.get("assertions_total"), run["assertions_total"]
         )
         run["failure_kind"] = data.get("failure_kind", "")
         run["finished_at"] = timestamp

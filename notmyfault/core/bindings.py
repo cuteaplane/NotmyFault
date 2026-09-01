@@ -63,7 +63,7 @@ def _validate_path(path: Any, location: str, reference: Any) -> Tuple[str, ...]:
         if (
             not isinstance(segment, str)
             or not _SEGMENT_RE.fullmatch(segment)
-            or segment.startswith("__")
+            or segment.startswith("_")
         ):
             raise BindingResolutionError(
                 "invalid_reference",
@@ -140,7 +140,7 @@ def _lookup_legacy(context: Dict[str, Any], dotted_path: str) -> Any:
     for segment in dotted_path.split("."):
         if (
             not _SEGMENT_RE.fullmatch(segment)
-            or segment.startswith("__")
+            or segment.startswith("_")
             or not isinstance(current, dict)
             or segment not in current
         ):

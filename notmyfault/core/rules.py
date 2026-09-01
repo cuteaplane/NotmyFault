@@ -13,6 +13,7 @@ from notmyfault.core.bindings import (
     iter_references,
 )
 from notmyfault.extensions.protocol import owned_value_identity
+from notmyfault.security.plugin_schema import literal_only_params
 
 
 _BINDING_ID_RE = re.compile(r"^[tap]_[a-z0-9_]{6,64}$")
@@ -454,6 +455,39 @@ class ConditionRuntime:
                 for item in self._last_matches.get(rule_key, [])
             ]
 
+    def take_last_match(self, rule_key: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            result = self.last_match(rule_key)
+            signature = self._fired.pop(rule_key, ())
+            seen = self._seen.get(rule_key, {})
+            for key, _timestamp in signature:
+                seen.pop(key, None)
+            if not seen:
+                self._seen.pop(rule_key, None)
+            self._last_matches.pop(rule_key, None)
+            return result
+
+    def match_and_take(
+        self,
+        rule_key: str,
+        rule: Dict[str, Any],
+        event_type: str,
+        event_payload: Dict[str, Any],
+        now: float | None = None,
+        instance: Dict[str, Any] | None = None,
+    ) -> List[Dict[str, Any]] | None:
+        with self._lock:
+            if not self.match(
+                rule_key,
+                rule,
+                event_type,
+                event_payload,
+                now=now,
+                instance=instance,
+            ):
+                return None
+            return self.take_last_match(rule_key)
+
     def match(
         self,
         rule_key: str,
@@ -485,6 +519,13 @@ class ConditionRuntime:
 
         with self._lock:
             seen = self._seen.setdefault(rule_key, {})
+            oldest_allowed = timestamp - 3600.0
+            for key, entry in list(seen.items()):
+                if float(entry.get("timestamp", 0.0)) < oldest_allowed:
+                    seen.pop(key, None)
+            fired = self._fired.get(rule_key, ())
+            if any(key not in seen for key, _fired_at in fired):
+                self._fired.pop(rule_key, None)
             for leaf in matching_leaves:
                 seen[_event_key(leaf)] = {
                     "binding_id": leaf.get("binding_id"),
@@ -737,6 +778,7 @@ def validate_rule_bindings(
         allow_conditional_sources: bool,
     ) -> None:
         action_meta = actions_meta.get(item.get("type", ""), {})
+        fixed_params = literal_only_params(action_meta)
         target_params = {
             param.get("name"): param
             for param in action_meta.get("params", [])
@@ -747,25 +789,24 @@ def validate_rule_bindings(
             return
         for param_name, value in params.items():
             if (
-                item.get("type") == "run_powershell"
-                and param_name == "command"
+                param_name in fixed_params
                 and contains_legacy_template(value)
             ):
                 issues.append({
                     "code": "unsafe_dynamic_parameter",
                     "location": f"{location}.params.{param_name}",
                     "reference": None,
-                    "message": "PowerShell 命令不允许来自运行时数据",
+                    "message": f"参数 {param_name!r} 只允许使用固定值",
                 })
             for usage in iter_references(
                 value,
                 location=f"{location}.params.{param_name}",
             ):
-                if item.get("type") == "run_powershell" and param_name == "command":
+                if param_name in fixed_params:
                     add(
                         "unsafe_dynamic_parameter",
                         usage,
-                        "PowerShell 命令不允许来自运行时数据",
+                        f"参数 {param_name!r} 只允许使用固定值",
                     )
                     continue
                 reference = usage.reference
@@ -1062,19 +1103,24 @@ def validate_rules(
                     continue
 
                 if expected_type == "number":
-                    if not isinstance(param_value, (int, float)):
-                        warnings.append((
+                    if (
+                        isinstance(param_value, bool)
+                        or not isinstance(param_value, (int, float))
+                    ):
+                        issues.append((
                             rule_name,
                             f'action "{action_type}" 参数 \'{param_name}\' '
                             f'应为数字，实际: {type(param_value).__name__}',
                         ))
+                        rule_ok = False
                 elif expected_type == "bool":
                     if not isinstance(param_value, bool):
-                        warnings.append((
+                        issues.append((
                             rule_name,
                             f'action "{action_type}" 参数 \'{param_name}\' '
                             f'应为布尔值，实际: {type(param_value).__name__}',
                         ))
+                        rule_ok = False
                 elif expected_type == "select":
                     raw_options = schema.get("options", [])
                     # 同时接受包含 value 和 label 的对象以及旧版字符串
@@ -1083,12 +1129,22 @@ def validate_rules(
                         for o in raw_options
                     ]
                     if opt_values and param_value not in opt_values:
-                        warnings.append((
+                        issues.append((
                             rule_name,
                             f'action "{action_type}" 参数 \'{param_name}\' '
                             f'值 \'{param_value}\' 不在可选项中 '
                             f"({', '.join(map(str, opt_values))})",
                         ))
+                        rule_ok = False
+                elif expected_type in {
+                    "string", "textarea", "time", "hotkey", "path"
+                } and not isinstance(param_value, str):
+                    issues.append((
+                        rule_name,
+                        f'action "{action_type}" 参数 \'{param_name}\' '
+                        f'应为字符串，实际: {type(param_value).__name__}',
+                    ))
+                    rule_ok = False
                 elif expected_type == "uia_selector":
                     if not _valid_uia_selector(param_value):
                         issues.append((
@@ -1106,6 +1162,18 @@ def validate_rules(
                         ))
                         rule_ok = False
                 # string 参数保留原值，不做严格类型检查
+
+        binding_issues = validate_rule_bindings(
+            rule,
+            triggers_meta,
+            actions_meta,
+        )
+        if binding_issues:
+            issues.extend(
+                (rule_name, issue.get("message", "规则数据绑定无效"))
+                for issue in binding_issues
+            )
+            rule_ok = False
 
         if rule_ok:
             valid_count += 1

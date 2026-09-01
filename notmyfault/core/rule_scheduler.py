@@ -19,15 +19,23 @@ def _concurrency_config(rule: Dict[str, Any]) -> Dict[str, Any]:
     if mode not in MODES:
         return {"mode": DEFAULT_MODE}
     config = {"mode": mode}
-    for key, default in (
-        ("max_concurrency", DEFAULT_MAX_CONCURRENCY),
-        ("queue_limit", DEFAULT_QUEUE_LIMIT),
+    max_concurrency = raw.get("max_concurrency")
+    if (
+        isinstance(max_concurrency, int)
+        and not isinstance(max_concurrency, bool)
+        and max_concurrency >= 1
     ):
-        value = raw.get(key)
-        if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
-            config[key] = value
-        else:
-            config[key] = default
+        config["max_concurrency"] = max_concurrency
+    elif mode != "parallel":
+        config["max_concurrency"] = DEFAULT_MAX_CONCURRENCY
+    queue_limit = raw.get("queue_limit")
+    config["queue_limit"] = (
+        queue_limit
+        if isinstance(queue_limit, int)
+        and not isinstance(queue_limit, bool)
+        and queue_limit >= 1
+        else DEFAULT_QUEUE_LIMIT
+    )
     return config
 
 
@@ -43,12 +51,17 @@ class RuleScheduler:
         spawn_thread_fn: Callable[[Callable[[], None]], None] | None = None,
         prepare_run_fn: Callable[[Dict[str, Any]], None] | None = None,
         max_workers: int = DEFAULT_WORKERS,
+        max_pending_runs: int | None = None,
     ) -> None:
         self._execute_fn = execute_fn
         self._cancel_run_fn = cancel_run_fn
         self._is_deferred_fn = is_deferred_fn
         self._on_history_event = on_history_event or (lambda kind, data: None)
         self._prepare_run = prepare_run_fn or (lambda context: None)
+        self._max_workers = max_workers
+        self._max_pending_runs = max_pending_runs or max(
+            DEFAULT_QUEUE_LIMIT, max_workers * 4
+        )
         self._executor: ThreadPoolExecutor | None = None
         if spawn_thread_fn is None:
             self._executor = ThreadPoolExecutor(
@@ -98,13 +111,7 @@ class RuleScheduler:
                 return "dropped"
             active = self._active_runs.setdefault(rule_key, set())
 
-            if mode == "parallel":
-                self._prepare_run(context)
-                active.add(run_id)
-                run_now = True
-                decision = "started"
-
-            elif mode == "single":
+            if mode == "single":
                 if active:
                     self._emit_history("run_dropped", rule, run_id, rule_name, "已有运行中的 run")
                     return "dropped"
@@ -126,14 +133,23 @@ class RuleScheduler:
 
             else:
                 queue = self._queues.setdefault(rule_key, deque())
-                max_concurrency = config.get("max_concurrency", DEFAULT_MAX_CONCURRENCY)
-                if len(active) < max_concurrency:
+                max_concurrency = config.get(
+                    "max_concurrency",
+                    self._max_workers if mode == "parallel" else DEFAULT_MAX_CONCURRENCY,
+                )
+                if (
+                    len(active) < max_concurrency
+                    and self._worker_count < self._max_workers
+                ):
                     self._prepare_run(context)
                     active.add(run_id)
                     run_now = True
                     decision = "started"
                 elif len(queue) >= config.get("queue_limit", DEFAULT_QUEUE_LIMIT):
                     self._emit_history("run_dropped", rule, run_id, rule_name, "排队已满")
+                    return "dropped"
+                elif sum(len(items) for items in self._queues.values()) >= self._max_pending_runs:
+                    self._emit_history("run_dropped", rule, run_id, rule_name, "调度队列已满")
                     return "dropped"
                 else:
                     # 规则快照入队时冻结，热重载改规则不影响这条
@@ -238,7 +254,13 @@ class RuleScheduler:
             return
         config = self._queue_configs.get(rule_key) or {}
         max_concurrency = config.get("max_concurrency", DEFAULT_MAX_CONCURRENCY)
-        while queue and len(active) < max_concurrency:
+        if config.get("mode") == "parallel" and "max_concurrency" not in config:
+            max_concurrency = self._max_workers
+        while (
+            queue
+            and len(active) < max_concurrency
+            and self._worker_count < self._max_workers
+        ):
             rule, rule_name, context, run_id = queue.popleft()
             self._prepare_run(context)
             active.add(run_id)
@@ -261,6 +283,7 @@ class RuleScheduler:
             finally:
                 with self._workers_done:
                     self._worker_count -= 1
+                    self._dispatch_available_locked()
                     self._workers_done.notify_all()
 
         try:
@@ -289,11 +312,33 @@ class RuleScheduler:
         try:
             self._execute_fn(rule_key, rule, rule_name, context)
         except Exception:
-            import traceback
-
-            traceback.print_exc()
+            try:
+                self._on_history_event(
+                    "workflow_failed",
+                    {
+                        "run_id": run_id,
+                        "rule_id": rule.get("rule_id", ""),
+                        "rule_name": rule_name,
+                        "error": {
+                            "code": "scheduler_execution_failed",
+                            "message": "工作流执行异常",
+                        },
+                    },
+                )
+            except Exception:
+                pass
         finally:
             self._retire_if_done(rule_key, run_id)
+
+    def _dispatch_available_locked(self) -> None:
+        while self._worker_count < self._max_workers:
+            before = self._worker_count
+            for rule_key in list(self._queues):
+                self._dispatch_queued_locked(rule_key)
+                if self._worker_count >= self._max_workers:
+                    break
+            if self._worker_count == before:
+                return
 
     def _retire_if_done(self, rule_key: str, run_id: str) -> None:
         """execute_fn 返回后：deferred 的继续留在活跃集合等终态事件，其余直接退场"""
