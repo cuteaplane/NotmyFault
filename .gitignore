@@ -64,6 +64,7 @@ _patch_dash.py
 .qoder-cn/
 DECOUPLING.md
 .playwright-mcp/
+.codex/
 # 测试沙箱残留（含敏感凭据）
 sandbox_appdata/
 
