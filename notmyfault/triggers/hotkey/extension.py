@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 
 
@@ -9,10 +10,12 @@ def capture_hotkey(context, payload):
     except (TypeError, ValueError):
         timeout = 15.0
     timeout = min(max(timeout, 3.0), 60.0)
+    cancelled = threading.Event()
+    context.register_cleanup(cancelled.set)
     if os.name == "nt":
-        result = _wait_for_hotkey_windows(context, timeout)
+        result = _wait_for_hotkey_windows(context, timeout, cancelled=cancelled)
     else:
-        result = _wait_for_hotkey_linux(context, timeout)
+        result = _wait_for_hotkey_linux(context, timeout, cancelled=cancelled)
     if "hotkey" in result:
         return context.commit_value(result["hotkey"])
     if result.get("error"):
@@ -28,7 +31,12 @@ def _key_down(vk: int) -> bool:
     return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
 
 
-def _wait_for_hotkey_windows(context, timeout: float, key_down=None) -> dict:
+def _wait_for_hotkey_windows(
+    context,
+    timeout: float,
+    key_down=None,
+    cancelled=None,
+) -> dict:
     from notmyfault.triggers.hotkey.trigger import _VK_MAP
 
     if key_down is None:
@@ -41,6 +49,8 @@ def _wait_for_hotkey_windows(context, timeout: float, key_down=None) -> dict:
     deadline = time.monotonic() + timeout
     context.session.set_status("请按下要录制的快捷键，按 Esc 取消…")
     while time.monotonic() < deadline:
+        if cancelled is not None and cancelled.is_set():
+            return {"cancelled": True}
         if key_down(vk_escape):
             return {"cancelled": True}
         modifiers = [name for name, vk in vk_modifiers if key_down(vk)]
@@ -51,7 +61,7 @@ def _wait_for_hotkey_windows(context, timeout: float, key_down=None) -> dict:
     return {"timed_out": True}
 
 
-def _wait_for_hotkey_linux(context, timeout: float) -> dict:
+def _wait_for_hotkey_linux(context, timeout: float, cancelled=None) -> dict:
     try:
         from Xlib import X, XK
         from Xlib.display import Display
@@ -69,6 +79,9 @@ def _wait_for_hotkey_linux(context, timeout: float) -> dict:
 
     try:
         while time.monotonic() < deadline:
+            if cancelled is not None and cancelled.is_set():
+                result["cancelled"] = True
+                break
             if display.pending_events() == 0:
                 time.sleep(0.02)
                 continue

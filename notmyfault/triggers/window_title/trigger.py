@@ -7,8 +7,10 @@ import shutil
 import subprocess
 import sys
 
-from notmyfault.platform.linux_support import BackendMissingError
+from notmyfault.plugin_api import platform_backend_api
 from notmyfault.triggers.base import PollingTrigger
+
+BackendMissingError = platform_backend_api().BackendMissingError
 
 
 def _get_window_titles() -> dict:

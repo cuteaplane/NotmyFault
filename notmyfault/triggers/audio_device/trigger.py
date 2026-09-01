@@ -5,8 +5,10 @@ Windows 用 PowerShell MediaDevice API；Linux 用 wpctl 或 pactl
 import os
 import subprocess
 
-from notmyfault.platform.backends import BackendError
+from notmyfault.plugin_api import platform_backend_api
 from notmyfault.triggers.base import PollingTrigger
+
+BackendError = platform_backend_api().BackendError
 
 _POWERSHELL_QUERY = r"""
 [Windows.Media.Devices.MediaDevice, Windows.Media.Devices, ContentType = WindowsRuntime] | Out-Null
