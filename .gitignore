@@ -11,6 +11,7 @@ __pycache__/
 # Distribution / packaging
 dist/
 build/
+node_modules/
 *.egg-info/
 *.egg
 .gitignore
@@ -47,6 +48,9 @@ Desktop.ini
 # OpenCode 无头任务的临时描述与输出；任务结束后仍会主动清理，
 # 忽略规则用于避免运行期间污染 VS Code Source Control。
 .opencode-*.job.json
+
+# Website is a separate git repository
+website/
 .opencode-*.stdout.log
 .opencode-*.stderr.log
 *.sig
