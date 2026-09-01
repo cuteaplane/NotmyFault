@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, Literal, Optional, Tuple
 from notmyfault.core.logging import engine_error, engine_info, engine_warn
 from notmyfault.extensions.registry import ExtensionRegistry
 from notmyfault.security.plugin_schema import (
+    admin_executables,
     check_permissions_conform,
     is_known_permission,
     validate_plugin_meta,
@@ -23,6 +24,7 @@ from notmyfault.security.plugin_schema import (
 from notmyfault.security.plugins import (
     analyze_plugin_source,
     check_sudo_import,
+    load_plugin_manifest,
     plugin_signature_kind,
     plugin_signature_kind_from_payload,
     scan_borrowed_privilege,
@@ -34,10 +36,6 @@ from notmyfault.security.plugins import (
 from notmyfault.security.security import SecurityMode
 from notmyfault.security.signing import plugin_files
 from notmyfault.security import plugin_resources
-
-# 旧调用仍通过这两个别名访问校验函数。
-_validate_plugin_meta = validate_plugin_meta
-_check_sudo_import = check_sudo_import
 
 PluginKind = Literal["trigger", "action"]
 
@@ -88,6 +86,7 @@ class PluginTree:
     file_snapshot: dict[str, str]
     py_sources: dict[str, str]
     payload: bytes
+    legacy_payload: bytes
 
 
 def inspect_plugin_tree(folder_path: str) -> Optional[PluginTree]:
@@ -96,21 +95,24 @@ def inspect_plugin_tree(folder_path: str) -> Optional[PluginTree]:
         files = plugin_files(folder_path)
         snapshot: dict[str, str] = {}
         py_sources: dict[str, str] = {}
-        parts: list[bytes] = []
+        payload_entries: list[tuple[str, bytes]] = []
         for path in files:
             data = path.read_bytes()
             relative = os.path.relpath(str(path), folder_path).replace(os.sep, "/")
             snapshot[relative] = hashlib.sha256(data).hexdigest()
-            parts.append(data)
+            payload_entries.append((relative, data))
             if path.suffix == ".py":
                 py_sources[str(path)] = data.decode("utf-8", errors="replace")
     except (OSError, ValueError):
         return None
+    from notmyfault.security.signing import plugin_payload_from_entries
+
     return PluginTree(
         files=files,
         file_snapshot=snapshot,
         py_sources=py_sources,
-        payload=b"".join(parts),
+        payload=plugin_payload_from_entries(payload_entries),
+        legacy_payload=b"".join(content for _relative, content in payload_entries),
     )
 
 
@@ -165,8 +167,6 @@ class PluginRegistry:
         # 插件根目录，plugin_resource 靠它定位插件自带的二进制和资源。
         self.plugin_roots: Dict[str, str] = {}
         self.plugin_kinds: Dict[str, PluginKind] = {}
-        # 插件声明的组件模块，按插件 id 再按组件 id 索引。
-        self.components: Dict[str, Dict[str, Any]] = {}
         self.extensions = ExtensionRegistry()
         # 每个插件插进 sys.path 的目录，卸载时按这份清单移除。
         self.sys_path_entries: Dict[str, str] = {}
@@ -237,10 +237,6 @@ class PluginRegistry:
         self.pending.pop(plugin_id, None)
         self.plugin_roots.pop(plugin_id, None)
         self.plugin_kinds.pop(plugin_id, None)
-        components = self.components.pop(plugin_id, None)
-        if components:
-            for component in components.values():
-                sys.modules.pop(getattr(component, "__name__", ""), None)
         self.extensions.unregister_plugin(plugin_id)
         self._cleanup_plugin_path(plugin_id)
 
@@ -250,9 +246,6 @@ class PluginRegistry:
             self._cleanup_plugin_path(plugin_id)
         for module in tuple(self.modules.values()):
             sys.modules.pop(getattr(module, "__name__", ""), None)
-        for components in tuple(self.components.values()):
-            for component in components.values():
-                sys.modules.pop(getattr(component, "__name__", ""), None)
         self.triggers_meta.clear()
         self.triggers_funcs.clear()
         self.actions_meta.clear()
@@ -261,7 +254,6 @@ class PluginRegistry:
         self.pending.clear()
         self.plugin_roots.clear()
         self.plugin_kinds.clear()
-        self.components.clear()
         self.extensions.clear()
 
     def _cleanup_plugin_path(self, plugin_id: str) -> None:
@@ -419,7 +411,7 @@ class PluginLoader:
                 )
                 engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason=f"schema 校验失败: {'; '.join(errors[:3])}")
                 continue
-            if not meta["enabled"]:
+            if origin == "builtin" and not meta["enabled"]:
                 print(
                     f"[Engine] 插件 \"{plugin_id}\" ({meta['name']}) 已禁用，跳过"
                 )
@@ -473,7 +465,7 @@ class PluginLoader:
                 )
                 continue
 
-            from notmyfault.core.plugin_api import engines_compatibility
+            from notmyfault.plugin_api import engines_compatibility
 
             engines_ok, engines_reason = engines_compatibility(meta)
             if not engines_ok:
@@ -572,6 +564,20 @@ class PluginLoader:
                 folder_path, origin, tree.payload
             )
             if (
+                signature_kind == "none"
+                and self._security_mode == SecurityMode.STRICT
+                and origin == "user"
+            ):
+                installed_hashes = load_plugin_manifest(
+                    self._plugin_manifest_path
+                ).get(plugin_id)
+                if installed_hashes == tree.file_snapshot:
+                    signature_kind = plugin_signature_kind_from_payload(
+                        folder_path,
+                        origin,
+                        tree.legacy_payload,
+                    )
+            if (
                 self._security_mode == SecurityMode.STRICT
                 and origin == "user"
                 and signature_kind == "author"
@@ -631,19 +637,15 @@ class PluginLoader:
                     )
                     continue
 
-            # 每个 .py 只 parse 一次；内置插件不做借壳扫描。
+            # 每个 .py 只解析一次，所有来源执行相同的能力与借用权限检查。
             caps: set[str] = set()
             uses_sudo = False
             borrowed_findings: list[str] = []
-            include_borrowed = origin != "builtin"
             for _py_path, source in tree.py_sources.items():
-                file_caps, file_uses_sudo, file_borrowed = analyze_plugin_source(
-                    source, include_borrowed=include_borrowed
-                )
+                file_caps, file_uses_sudo, file_borrowed = analyze_plugin_source(source)
                 caps |= file_caps
                 uses_sudo = uses_sudo or file_uses_sudo
-                if include_borrowed:
-                    borrowed_findings.extend(file_borrowed)
+                borrowed_findings.extend(file_borrowed)
 
             # self_elevation 始终拒绝，插件只能通过 sudo.run_as_admin 提权并声明 admin。
             if "self_elevation" in caps:
@@ -740,14 +742,14 @@ class PluginLoader:
                     engine_warn(f"integrity_check: {integrity_msg}")
                     self._integrity_errors.append(warning)
 
-                if borrowed_findings:
-                    warning = (
-                        f"[Engine] [安全] 插件 \"{plugin_id}\" 存在借壳提权嫌疑: "
-                        + "；".join(sorted(set(borrowed_findings))[:3])
-                    )
-                    print(warning, file=sys.stderr)
-                    engine_warn(f"borrowed_privilege: {plugin_id} {'; '.join(borrowed_findings)}")
-                    self._integrity_errors.append(warning)
+            if borrowed_findings:
+                warning = (
+                    f"[Engine] [安全] 插件 \"{plugin_id}\" 存在借壳提权嫌疑: "
+                    + "；".join(sorted(set(borrowed_findings))[:3])
+                )
+                print(warning, file=sys.stderr)
+                engine_warn(f"borrowed_privilege: {plugin_id} {'; '.join(borrowed_findings)}")
+                self._integrity_errors.append(warning)
 
             existing_kind = self._registry.plugin_kinds.get(plugin_id)
             if existing_kind is not None and existing_kind != plugin_type:
@@ -948,8 +950,16 @@ class PluginLoader:
             if tree is None:
                 fail("无法读取插件文件，拒绝导入")
                 return None
+            # 物化阶段必须使用与发现阶段相同的 payload 格式
+            signature_payload = (
+                tree.legacy_payload
+                if expected_signature == "official-legacy"
+                else tree.payload
+            )
             if (
-                plugin_signature_kind_from_payload(folder_path, origin, tree.payload)
+                plugin_signature_kind_from_payload(
+                    folder_path, origin, signature_payload
+                )
                 != expected_signature
             ):
                 fail("插件签名在物化前发生变化，拒绝导入")
@@ -964,16 +974,39 @@ class PluginLoader:
             ):
                 from notmyfault.core.plugin_worker import run_isolated_action
 
-                def isolated_run(_meta, params, _entry=py_file, _info=meta):
-                    ok, result = run_isolated_action(_entry, _info, params, {})
+                entry_relative = os.path.relpath(py_file, folder_path).replace(
+                    os.sep, "/"
+                )
+                entry_hash = tree.file_snapshot.get(entry_relative)
+                if not entry_hash:
+                    fail("隔离动作入口没有完整性记录")
+                    return None
+
+                def isolated_run(
+                    _meta,
+                    params,
+                    _entry=py_file,
+                    _entry_hash=entry_hash,
+                    _info=meta,
+                ):
+                    ok, result = run_isolated_action(
+                        _entry, _entry_hash, _info, params, {}
+                    )
                     if not ok:
                         raise RuntimeError(f"isolated worker 执行失败: {result}")
                     return result
 
                 def isolated_run_with_context(
-                    _meta, params, context, _entry=py_file, _info=meta
+                    _meta,
+                    params,
+                    context,
+                    _entry=py_file,
+                    _entry_hash=entry_hash,
+                    _info=meta,
                 ):
-                    ok, result = run_isolated_action(_entry, _info, params, context)
+                    ok, result = run_isolated_action(
+                        _entry, _entry_hash, _info, params, context
+                    )
                     if not ok:
                         raise RuntimeError(f"isolated worker 执行失败: {result}")
                     return result
@@ -1077,18 +1110,16 @@ class PluginLoader:
             if "admin" in (meta.get("permissions") or []):
                 try:
                     self._sudo.authorize_plugin(
-                        plugin_id, self._engine_token, module=module
+                        plugin_id,
+                        self._engine_token,
+                        module=module,
+                        allowed_executables=admin_executables(meta),
                     )
                     print(f"[Engine] [安全] 插件 \"{plugin_id}\" 已注册管理员权限")
                 except PermissionError as e:
                     print(f"[Engine] [!!] 插件 \"{plugin_id}\" 管理员权限注册失败: {e}", file=sys.stderr)
                     engine_error("admin_registration_failed", plugin=plugin_id, error=str(e))
 
-            # 组件是附加协议：只有声明了 components 的插件才进入组件加载。
-            if isinstance(meta.get("components"), list) and meta["components"]:
-                self._load_components(
-                    plugin_id, folder_path, meta, module_prefix
-                )
             if isinstance(meta.get("contributes"), dict):
                 self._load_extensions(
                     plugin_id, folder_path, meta, module_prefix, module, py_file
@@ -1100,73 +1131,6 @@ class PluginLoader:
                     f"{_version_info(meta)}{_perm_info(meta)}"
                 )
             return module
-
-    def _load_components(
-        self,
-        plugin_id: str,
-        folder_path: str,
-        meta: Dict[str, Any],
-        module_prefix: str,
-    ) -> Optional[Any]:
-        """导入插件声明的组件，入口缺 invoke 或导入失败时不注册"""
-        components = meta.get("components")
-        if not isinstance(components, list) or not components:
-            return None
-        root = os.path.realpath(folder_path)
-        loaded: Dict[str, Any] = {}
-        for component in components:
-            if not isinstance(component, dict):
-                continue
-            component_id = component.get("id")
-            if not isinstance(component_id, str):
-                continue
-            entrypoint = str(component.get("entrypoint", "component.py"))
-            component_path = os.path.realpath(os.path.join(root, entrypoint))
-            try:
-                inside = os.path.commonpath((component_path, root)) == root
-            except ValueError:
-                inside = False
-            if not inside or not os.path.isfile(component_path):
-                self._diagnostics.record_plugin_error(
-                    "plugin", plugin_id, f"组件 {component_id} 入口缺失: {entrypoint}"
-                )
-                continue
-
-            module_name = f"{module_prefix}{plugin_id}__component_{component_id}"
-            sys.modules.pop(module_name, None)
-            spec = importlib.util.spec_from_file_location(
-                module_name, component_path
-            )
-            if spec is None or spec.loader is None:
-                self._diagnostics.record_plugin_error(
-                    "plugin", plugin_id, f"组件 {component_id} 无法创建模块规格"
-                )
-                continue
-            try:
-                component_module = importlib.util.module_from_spec(spec)
-                sys.modules[module_name] = component_module
-                spec.loader.exec_module(component_module)
-            except Exception:
-                print(
-                    f"[Engine] 插件 \"{plugin_id}\" 组件 {component_id} "
-                    f"导入异常 ({component_path}):",
-                    file=sys.stderr,
-                )
-                traceback.print_exc(file=sys.stderr)
-                self._diagnostics.record_plugin_error(
-                    "plugin", plugin_id, f"组件 {component_id} 导入异常"
-                )
-                continue
-
-            if not hasattr(component_module, "invoke"):
-                self._diagnostics.record_plugin_error(
-                    "plugin", plugin_id, f"组件 {component_id} 缺少 invoke 函数"
-                )
-                continue
-            loaded[component_id] = component_module
-        if loaded:
-            self._registry.components[plugin_id] = loaded
-        return loaded or None
 
     def _load_extensions(
         self,

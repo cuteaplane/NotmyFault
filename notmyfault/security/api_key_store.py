@@ -202,6 +202,8 @@ def _restrict_key_file(path: str) -> None:
         advapi32.GetTokenInformation(
             process_token, token_user_class, None, 0, ctypes.byref(required)
         )
+        if not required.value:
+            raise ctypes.WinError(ctypes.get_last_error())
         token_buffer = ctypes.create_string_buffer(required.value)
         if not advapi32.GetTokenInformation(
             process_token, token_user_class, token_buffer, required, ctypes.byref(required)

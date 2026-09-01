@@ -1,4 +1,6 @@
 import hashlib
+import os
+import struct
 from pathlib import Path
 from typing import Optional
 
@@ -46,6 +48,29 @@ def _plugin_files(plugin_dir: Path, json_name: str) -> list[Path]:
     return plugin_files(plugin_dir)
 
 
+def plugin_payload_from_entries(entries) -> bytes:
+    payload = bytearray(b"NotmyFault-plugin-signature\x00\x01")
+    for relative_path, content in entries:
+        path_bytes = relative_path.replace("\\", "/").encode("utf-8")
+        data = bytes(content)
+        payload.extend(struct.pack(">Q", len(path_bytes)))
+        payload.extend(path_bytes)
+        payload.extend(struct.pack(">Q", len(data)))
+        payload.extend(data)
+    return bytes(payload)
+
+
+def plugin_payload(plugin_dir) -> bytes:
+    root = Path(plugin_dir)
+    return plugin_payload_from_entries(
+        (
+            path.relative_to(root).as_posix(),
+            path.read_bytes(),
+        )
+        for path in plugin_files(root)
+    )
+
+
 def load_private_key(path: Path, password: Optional[str] = None):
     _, _, _, _, _, _, load_pem_private_key, Ed25519PrivateKey = _get_crypto()
     data = path.read_bytes()
@@ -55,6 +80,8 @@ def load_private_key(path: Path, password: Optional[str] = None):
             return load_pem_private_key(data, password=None)
         except (TypeError, ValueError):
             # 密钥有加密，需要提供密码
+            if password is None:
+                password = os.environ.get("NOTMYFAULT_SIGNING_PASSPHRASE") or None
             if password is not None:
                 return load_pem_private_key(data, password=password.encode())
             import getpass
@@ -69,8 +96,7 @@ def load_private_key(path: Path, password: Optional[str] = None):
 def sign_plugin(plugin_dir: Path, json_name: str, private_key=None) -> bool:
     if private_key is None:
         private_key = load_private_key(PRIVATE_KEY_FILE)
-    files = plugin_files(plugin_dir)
-    payload = b"".join(f.read_bytes() for f in files)
+    payload = plugin_payload(plugin_dir)
     sig = private_key.sign(hashlib.sha256(payload).digest())
     (plugin_dir / "signature.sig").write_bytes(sig)
     return True

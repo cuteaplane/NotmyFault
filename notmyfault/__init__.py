@@ -60,7 +60,7 @@ def _guard_package_import() -> None:
         )
         return
     raise ImportError(
-        f"NotmyFault 安全限制（strict）：拒绝 pytest 之外的外部导入"
+        f"NMF_STRICT_IMPORT_DENIED: NotmyFault 安全限制（strict）：拒绝 pytest 之外的外部导入"
         f"（调用者 {caller_name} @ {caller_file}）。notmyfault 组件仅供引擎自身、"
         f"官方入口脚本与插件使用，请通过 NOTMYFAULT.pyw 启动。"
     )

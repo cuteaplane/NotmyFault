@@ -19,7 +19,11 @@ def cancel_pending_admin_requests() -> None:
         decision.set()
 
 
-def confirm_admin_request(plugin_id: str, timeout: float = 120.0) -> bool:
+def confirm_admin_request(
+    plugin_id: str,
+    executable: str,
+    timeout: float = 120.0,
+) -> bool:
     """等待用户点击通知中的允许按钮，超时或关闭时返回 False。"""
     if os.name != "nt":
         return True
@@ -40,7 +44,8 @@ def confirm_admin_request(plugin_id: str, timeout: float = 120.0) -> bool:
     toast = Toast(
         [
             "NotmyFault 请求管理员权限",
-            f"插件“{plugin_id}”准备执行管理员命令。点击允许后将显示 UAC。",
+            f"插件“{plugin_id}”准备以管理员权限运行 {executable}。"
+            "点击允许后将显示 UAC。",
         ],
         duration=ToastDuration.Long,
         expiration_time=datetime.now() + timedelta(seconds=max(float(timeout), 0.0)),

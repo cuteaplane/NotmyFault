@@ -3,6 +3,7 @@
 from typing import Any, Dict, List
 
 from notmyfault.core.rules import get_rule_admin_plugins
+from notmyfault.security.plugin_schema import requires_admin_rule_approval
 from notmyfault.security.security import SecurityMode, detect_security_mode
 from notmyfault.security.signing import (
     PRIVATE_KEY_FILE,
@@ -18,12 +19,13 @@ class AdminRuleApprovalError(ValueError):
         self.plugins = plugins
 
 
-_HIGH_RISK_ACTIONS = frozenset({"run_powershell", "shutdown_system", "kill_process"})
-
-
-def _rule_high_risk_actions(rule: Dict[str, Any]) -> List[str]:
-    """返回规则里命中的高危动作，包含失败后的补救动作。"""
-    found = set()
+def _rule_approval_plugins(
+    rule: Dict[str, Any],
+    schema: Dict[str, Dict[str, Dict[str, Any]]],
+) -> List[str]:
+    triggers_meta = schema.get("triggers", {})
+    actions_meta = schema.get("actions", {})
+    required = set(get_rule_admin_plugins(rule, triggers_meta, actions_meta))
     for field in ("preconditions", "actions"):
         items = rule.get(field, [])
         if not isinstance(items, list):
@@ -33,34 +35,12 @@ def _rule_high_risk_actions(rule: Dict[str, Any]) -> List[str]:
             item = pending.pop()
             if not isinstance(item, dict):
                 continue
-            if item.get("type") in _HIGH_RISK_ACTIONS:
-                found.add(item["type"])
+            plugin_id = item.get("type")
+            if requires_admin_rule_approval(actions_meta.get(plugin_id, {})):
+                required.add(plugin_id)
             failure_actions = item.get("failure_actions", [])
             if isinstance(failure_actions, list):
                 pending.extend(failure_actions)
-    return sorted(found)
-
-
-def changed_high_risk_actions(
-    previous_rules: List[Dict[str, Any]],
-    next_rules: List[Dict[str, Any]],
-) -> List[str]:
-    """返回新增或内容有变化的规则引用的高危动作。"""
-    previous_by_id = {
-        rule.get("rule_id"): rule
-        for rule in previous_rules
-        if isinstance(rule, dict) and isinstance(rule.get("rule_id"), str)
-    }
-    required = set()
-    for rule in next_rules:
-        if not isinstance(rule, dict):
-            continue
-        actions = _rule_high_risk_actions(rule)
-        if not actions:
-            continue
-        previous = previous_by_id.get(rule.get("rule_id"))
-        if previous != rule:
-            required.update(actions)
     return sorted(required)
 
 
@@ -76,12 +56,10 @@ def changed_admin_plugins(
         if isinstance(rule, dict) and isinstance(rule.get("rule_id"), str)
     }
     required = set()
-    triggers_meta = schema.get("triggers", {})
-    actions_meta = schema.get("actions", {})
     for rule in next_rules:
         if not isinstance(rule, dict):
             continue
-        plugins = get_rule_admin_plugins(rule, triggers_meta, actions_meta)
+        plugins = _rule_approval_plugins(rule, schema)
         if not plugins:
             continue
         previous = previous_by_id.get(rule.get("rule_id"))
@@ -97,7 +75,7 @@ def verify_admin_key_password(password: str | None, required: List[str]) -> None
     except OSError as error:
         raise AdminRuleApprovalError(
             "admin_key_unreadable",
-            f"无法读取签名私钥: {error}",
+            "无法读取签名私钥",
             required,
         ) from error
     if not status["exists"]:
@@ -141,20 +119,11 @@ def require_admin_rule_approval(
     next_rules: List[Dict[str, Any]],
     schema: Dict[str, Dict[str, Dict[str, Any]]],
     password: str | None,
-    key_verification: bool = True,
 ) -> List[str]:
-    """检查管理员插件和高危动作的改动，成功时返回涉及的插件与动作。
-
-    key_verification 为 False 时直接放行；设置页的“创建管理员规则时
-    是否要求验证密钥”会把这个开关传进来。
-    """
-    if not key_verification:
-        return []
+    """检查受限插件的规则改动，成功时返回涉及的插件。"""
     if detect_security_mode() != SecurityMode.STRICT:
         return []
-    plugins = changed_admin_plugins(previous_rules, next_rules, schema)
-    actions = changed_high_risk_actions(previous_rules, next_rules)
-    required = sorted(set(plugins) | set(actions))
+    required = changed_admin_plugins(previous_rules, next_rules, schema)
     if not required:
         return []
 

@@ -73,6 +73,17 @@ _DYNAMIC_EXEC_FUNCS = {"exec", "eval", "compile"}
 _BUILTIN_OWNERS = {"builtins", "__builtins__"}
 
 
+def _constant_string(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _constant_string(node.left)
+        right = _constant_string(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
 def _scan_capabilities_from_tree(tree: ast.Module) -> Set[str]:
     """记录模块树里的 native_api、external_binary、self_elevation 和 dynamic_exec"""
     caps: Set[str] = set()
@@ -167,8 +178,9 @@ def _scan_capabilities_from_tree(tree: ast.Module) -> Set[str]:
                   and isinstance(func.value, ast.Name)
                   and module_aliases.get(func.value.id, func.value.id) == "importlib"):
                 mod_arg = node.args[0] if node.args else None
-            if isinstance(mod_arg, ast.Constant) and isinstance(mod_arg.value, str):
-                top = mod_arg.value.split(".")[0]
+            module_name = _constant_string(mod_arg) if mod_arg is not None else None
+            if module_name is not None:
+                top = module_name.split(".")[0]
                 if top in _NATIVE_MODULES:
                     caps.add("native_api")
                 if top in _EXTERNAL_MODULES:
@@ -177,9 +189,8 @@ def _scan_capabilities_from_tree(tree: ast.Module) -> Set[str]:
             if (isinstance(func, ast.Name) and func.id == "getattr"
                     and len(node.args) >= 2):
                 target, name_arg = node.args[0], node.args[1]
-                if isinstance(name_arg, ast.Constant) \
-                        and isinstance(name_arg.value, str):
-                    attr = name_arg.value
+                attr = _constant_string(name_arg)
+                if attr is not None:
                     if isinstance(target, ast.Name):
                         owner = module_aliases.get(target.id, target.id)
                         if owner == "os" and attr in _OS_DANGEROUS:
@@ -198,10 +209,9 @@ def _scan_capabilities_from_tree(tree: ast.Module) -> Set[str]:
                             and tv.attr == "modules"
                             and isinstance(tv.value, ast.Name)
                             and tv.value.id == "sys"
-                            and isinstance(target.slice, ast.Constant)
-                            and isinstance(target.slice.value, str)
+                            and _constant_string(target.slice) is not None
                         ):
-                            mod = target.slice.value.split(".")[0]
+                            mod = _constant_string(target.slice).split(".")[0]
                             if mod == "os" and attr in _OS_DANGEROUS:
                                 caps.add("external_binary")
                             elif mod == "subprocess" and attr in _SUBPROCESS_CALLS:
@@ -216,9 +226,7 @@ def _scan_capabilities_from_tree(tree: ast.Module) -> Set[str]:
             if (
                 isinstance(tv, ast.Name)
                 and tv.id in _BUILTIN_OWNERS
-                and isinstance(node.slice, ast.Constant)
-                and isinstance(node.slice.value, str)
-                and node.slice.value in _DYNAMIC_EXEC_BYPASS
+                and _constant_string(node.slice) in _DYNAMIC_EXEC_BYPASS
             ):
                 caps.add("dynamic_exec")
         elif isinstance(node, ast.keyword):
@@ -414,8 +422,8 @@ def _verify_sig_with_keys(plugin_dir: str, pubs) -> bool:
     try:
         with open(sig_file, "rb") as f:
             sig = f.read()
-        from notmyfault.security.signing import plugin_files
-        payload = b"".join(f.read_bytes() for f in plugin_files(plugin_dir))
+        from notmyfault.security.signing import plugin_payload
+        payload = plugin_payload(plugin_dir)
     except OSError:
         return False
     return _verify_sig_with_payload(sig, payload, pubs)
@@ -479,8 +487,8 @@ def plugin_signature_kind_from_payload(
 def plugin_signature_kind(plugin_dir: str, origin: str = "builtin") -> str:
     """返回签名来源：official、author、official-legacy 或 none，验签失败一律算 none"""
     try:
-        from notmyfault.security.signing import plugin_files
-        payload = b"".join(f.read_bytes() for f in plugin_files(plugin_dir))
+        from notmyfault.security.signing import plugin_payload
+        payload = plugin_payload(plugin_dir)
     except OSError:
         return "none"
     return plugin_signature_kind_from_payload(plugin_dir, origin, payload)

@@ -9,16 +9,20 @@ from typing import Any, Dict, List, Tuple
 _REQUIRED_META_FIELDS = {"id", "name", "description", "enabled", "version_code", "version", "package_name"}
 _TRIGGER_OPTIONAL_FIELDS = {
     "semantic", "params", "permissions", "origin", "trigger_api", "platforms",
-    "entrypoints", "outputs", "build", "components", "contributes",
-    "requires_capabilities", "engines",
+    "entrypoints", "outputs", "build", "contributes",
+    "requires_capabilities", "engines", "security",
 }
 _ACTION_OPTIONAL_FIELDS = {
     "params", "permissions", "origin", "execution_api", "precondition_api",
     "outputs", "platforms", "entrypoints", "build", "idempotent",
-    "cancellation_api", "components", "contributes", "requires_capabilities",
-    "execution_mode", "engines",
+    "cancellation_api", "contributes", "requires_capabilities",
+    "execution_mode", "engines", "security",
 }
 _ALLOWED_EXECUTION_MODES = {"in-process", "isolated"}
+_ACTION_SECURITY_FIELDS = {
+    "rule_approval", "literal_only_params", "admin_executables",
+}
+_RULE_APPROVAL_MODES = {"admin_key"}
 _ALLOWED_SEMANTICS = {"state", "oneshot"}
 _ALLOWED_PARAM_TYPES = {
     "string", "number", "select", "bool", "time", "hotkey", "path",
@@ -31,10 +35,6 @@ _REQUIRED_OUTPUT_FIELDS = {"name", "type", "label"}
 _ALLOWED_ORIGINS = {"builtin", "user", "third_party"}
 _ALLOWED_PLATFORMS = {"windows", "linux", "macos"}
 _PACKAGE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$")
-_COMPONENT_REQUIRED_FIELDS = {"id", "name", "entrypoint"}
-_COMPONENT_OPTIONAL_FIELDS = {"description", "api", "ui", "param_types"}
-_COMPONENT_APIS = {"component-v1"}
-_COMPONENT_UI_FIELDS = {"button_label", "icon", "description"}
 _CONTRIBUTION_FIELDS = {"commands", "parameter_editors", "views", "data_types"}
 _COMMAND_FIELDS = {"id", "title", "description", "handler"}
 _VIEW_FIELDS = {
@@ -53,10 +53,48 @@ _EDITOR_CONTROLS = {"button"}
 # plugin id 只允许字母、数字、下划线和连字符，路径分隔符会把 id 变成路径。
 _PLUGIN_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 _COMPONENT_ID_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]*$")
+_PARAM_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]*$")
+_UNSAFE_PARAM_NAMES = {"__proto__", "constructor", "prototype"}
 
 
 def is_valid_plugin_id(plugin_id: str) -> bool:
     return bool(_PLUGIN_ID_RE.match(plugin_id))
+
+
+def requires_admin_rule_approval(meta: Any) -> bool:
+    security = meta.get("security") if isinstance(meta, dict) else None
+    return (
+        isinstance(security, dict)
+        and security.get("rule_approval") == "admin_key"
+    )
+
+
+def literal_only_params(meta: Any) -> set[str]:
+    security = meta.get("security") if isinstance(meta, dict) else None
+    declared = (
+        security.get("literal_only_params")
+        if isinstance(security, dict)
+        else None
+    )
+    if not isinstance(declared, list):
+        return set()
+    return {name for name in declared if isinstance(name, str)}
+
+
+def admin_executables(meta: Any) -> set[str]:
+    security = meta.get("security") if isinstance(meta, dict) else None
+    declared = (
+        security.get("admin_executables")
+        if isinstance(security, dict)
+        else None
+    )
+    if not isinstance(declared, list):
+        return set()
+    return {
+        name.lower()
+        for name in declared
+        if isinstance(name, str) and name
+    }
 
 
 def current_platform_name() -> str:
@@ -341,74 +379,6 @@ def _relative_plugin_path_ok(value: Any) -> bool:
     return True
 
 
-def _validate_components_field(components: Any) -> List[str]:
-    """校验插件声明的组件数组，触发器和动作插件共用同一份结构"""
-    errors: List[str] = []
-    if not isinstance(components, list):
-        return ["字段 'components' 必须是数组"]
-    if not components:
-        return ["字段 'components' 不能为空数组"]
-    seen: set[str] = set()
-    for index, component in enumerate(components):
-        prefix = f"components[{index}]"
-        if not isinstance(component, dict):
-            errors.append(f"{prefix} 必须是对象")
-            continue
-        for field in sorted(_COMPONENT_REQUIRED_FIELDS):
-            if field not in component:
-                errors.append(f"{prefix} 缺少必填字段: {field}")
-        for key in component:
-            if key not in _COMPONENT_REQUIRED_FIELDS | _COMPONENT_OPTIONAL_FIELDS:
-                errors.append(f"{prefix} 包含未知字段: '{key}'")
-        component_id = component.get("id")
-        if not isinstance(component_id, str) or not _COMPONENT_ID_RE.match(component_id):
-            errors.append(
-                f"{prefix}.id 必须是以字母开头的 id（字母/数字/下划线/连字符）"
-            )
-        elif component_id in seen:
-            errors.append(f"components 包含重复 id: '{component_id}'")
-        else:
-            seen.add(component_id)
-        if "name" in component and not isinstance(component["name"], str):
-            errors.append(f"{prefix}.name 必须是字符串")
-        if "description" in component and not isinstance(component["description"], str):
-            errors.append(f"{prefix}.description 必须是字符串")
-        if "api" in component and component["api"] not in _COMPONENT_APIS:
-            errors.append(
-                f"{prefix}.api 目前仅支持 {', '.join(sorted(_COMPONENT_APIS))}"
-            )
-        if "param_types" in component:
-            param_types = component["param_types"]
-            if not isinstance(param_types, list) or not param_types:
-                errors.append(f"{prefix}.param_types 必须是非空字符串数组")
-            else:
-                for ptype in param_types:
-                    if not isinstance(ptype, str) or ptype not in _ALLOWED_PARAM_TYPES:
-                        errors.append(
-                            f"{prefix}.param_types 包含无效参数类型: {ptype!r}"
-                        )
-        if "entrypoint" in component:
-            entrypoint = component["entrypoint"]
-            if not isinstance(entrypoint, str) or not entrypoint.endswith(".py"):
-                errors.append(f"{prefix}.entrypoint 必须是相对 .py 文件路径")
-            elif not _relative_plugin_path_ok(entrypoint):
-                errors.append(
-                    f"{prefix}.entrypoint 必须位于插件目录内: {entrypoint!r}"
-                )
-        if "ui" in component:
-            ui = component["ui"]
-            if not isinstance(ui, dict):
-                errors.append(f"{prefix}.ui 必须是对象")
-            else:
-                for key in ui:
-                    if key not in _COMPONENT_UI_FIELDS:
-                        errors.append(f"{prefix}.ui 包含未知字段: '{key}'")
-                for key in ("button_label", "icon", "description"):
-                    if key in ui and not isinstance(ui[key], str):
-                        errors.append(f"{prefix}.ui.{key} 必须是字符串")
-    return errors
-
-
 def _validate_string_id(value: Any, path: str, errors: List[str]) -> bool:
     if not isinstance(value, str) or not _COMPONENT_ID_RE.match(value):
         errors.append(
@@ -599,8 +569,6 @@ def _validate_contributes_field(
                 )
             if "accepts_legacy" in editor:
                 errors.append(f"{prefix}.accepts_legacy 只能用于 plugin_data 参数")
-            if "accepts_legacy" in editor:
-                errors.append(f"{prefix}.accepts_legacy 只能用于 plugin_data 参数")
         if editor.get("command") not in command_ids:
             errors.append(
                 f"{prefix}.command 引用了未声明命令: {editor.get('command')!r}"
@@ -709,14 +677,86 @@ def validate_plugin_meta(
             errors.append("origin invalid: " + meta["origin"])
 
     if "execution_mode" in meta:
-        # isolated 是给第三方动作做故障隔离的实验字段，内置插件必须走进程内
         if meta.get("execution_mode") not in _ALLOWED_EXECUTION_MODES:
             errors.append(
                 "execution_mode 必须是 in-process 或 isolated，实际: "
                 f"{meta.get('execution_mode')!r}"
             )
-        elif meta.get("origin") == "builtin" and meta["execution_mode"] == "isolated":
-            errors.append("内置插件不允许 execution_mode: isolated")
+    if "security" in meta:
+        security = meta["security"]
+        if not isinstance(security, dict) or not security:
+            errors.append("security 必须是非空对象")
+        else:
+            for key in security:
+                if key not in _ACTION_SECURITY_FIELDS:
+                    errors.append(f"security 包含未知字段: {key!r}")
+            approval = security.get("rule_approval")
+            if approval is not None and approval not in _RULE_APPROVAL_MODES:
+                errors.append("security.rule_approval 目前仅支持 admin_key")
+            literal_params = security.get("literal_only_params")
+            if literal_params is not None:
+                if plugin_type in ("trigger", "triggers"):
+                    errors.append(
+                        "trigger 不支持 security.literal_only_params"
+                    )
+                if not isinstance(literal_params, list) or not literal_params:
+                    errors.append("security.literal_only_params 必须是非空字符串数组")
+                else:
+                    seen_literal_params: set[str] = set()
+                    declared_params = {
+                        param.get("name")
+                        for param in meta.get("params", [])
+                        if isinstance(param, dict)
+                    }
+                    for name in literal_params:
+                        if not isinstance(name, str) or not name:
+                            errors.append(
+                                "security.literal_only_params 中的值必须是非空字符串"
+                            )
+                        elif name in seen_literal_params:
+                            errors.append(
+                                f"security.literal_only_params 包含重复参数: {name!r}"
+                            )
+                        elif name not in declared_params:
+                            errors.append(
+                                f"security.literal_only_params 引用了未声明参数: {name!r}"
+                            )
+                        seen_literal_params.add(name)
+            allowed_executables = security.get("admin_executables")
+            if allowed_executables is not None:
+                if not isinstance(allowed_executables, list) or not allowed_executables:
+                    errors.append("security.admin_executables 必须是非空字符串数组")
+                else:
+                    seen_executables: set[str] = set()
+                    for executable in allowed_executables:
+                        normalized = (
+                            executable.lower()
+                            if isinstance(executable, str)
+                            else ""
+                        )
+                        if (
+                            not normalized
+                            or os.path.basename(normalized) != normalized
+                            or not re.fullmatch(r"[a-z0-9_.-]+", normalized)
+                        ):
+                            errors.append(
+                                "security.admin_executables 只能包含可执行文件名"
+                            )
+                        elif normalized in seen_executables:
+                            errors.append(
+                                f"security.admin_executables 包含重复项: {executable!r}"
+                            )
+                        seen_executables.add(normalized)
+                if "admin" not in (meta.get("permissions") or []):
+                    errors.append(
+                        "security.admin_executables 需要 permissions 包含 admin"
+                    )
+
+    if "admin" in (meta.get("permissions") or []):
+        if not admin_executables(meta):
+            errors.append("admin 权限插件必须声明 security.admin_executables")
+        if meta.get("execution_mode") == "isolated":
+            errors.append("isolated 动作暂不支持 admin 权限")
 
     if "engines" in meta:
         engines = meta["engines"]
@@ -803,8 +843,6 @@ def validate_plugin_meta(
             errors.append("isolated 动作暂不支持 cancellation_api")
     if "build" in meta:
         errors.extend(_validate_build_field(meta["build"]))
-    if "components" in meta:
-        errors.extend(_validate_components_field(meta["components"]))
     if "contributes" in meta:
         errors.extend(
             _validate_contributes_field(meta["contributes"], meta.get("params", []))
@@ -874,6 +912,13 @@ def validate_plugin_meta(
                 for field in sorted(_REQUIRED_PARAM_FIELDS):
                     if field not in param:
                         errors.append(f"params[{i}] 缺少必填字段: {field}")
+                param_name = param.get("name")
+                if (
+                    not isinstance(param_name, str)
+                    or not _PARAM_NAME_RE.fullmatch(param_name)
+                    or param_name in _UNSAFE_PARAM_NAMES
+                ):
+                    errors.append(f"params[{i}].name 不是安全字段名")
                 ptype = param.get("type", "")
                 if ptype and ptype not in _ALLOWED_PARAM_TYPES:
                     errors.append(
@@ -971,7 +1016,13 @@ def check_payload_contract(
     return problems
 
 
-def scan_plugins(base_dir: str, plugins_dir: str, json_filename: str) -> Dict[str, Dict]:
+def scan_plugins(
+    base_dir: str,
+    plugins_dir: str,
+    json_filename: str,
+    *,
+    include_disabled: bool = False,
+) -> Dict[str, Dict]:
     result: Dict[str, Dict] = {}
     root = os.path.join(base_dir, plugins_dir)
     if not os.path.isdir(root):
@@ -997,11 +1048,13 @@ def scan_plugins(base_dir: str, plugins_dir: str, json_filename: str) -> Dict[st
         except Exception:
             continue
 
+        if not isinstance(meta, dict):
+            continue
         plugin_id = meta.get("id")
         if not plugin_id:
             continue
 
-        if meta.get("enabled") is False:
+        if meta.get("enabled") is False and not include_disabled:
             continue
 
         plugin_type = "trigger" if json_filename == "trigger.json" else "action"

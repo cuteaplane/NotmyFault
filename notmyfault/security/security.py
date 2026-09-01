@@ -1,4 +1,4 @@
-"""读取 NOTMYFAULT_MODE 和签名 build.json，选择引擎安全模式。"""
+"""读取签名 build.json，并允许环境变量提高安全等级。"""
 import json as _json
 import os
 import sys
@@ -55,15 +55,8 @@ class SecurityMode(Enum):
 
 
 def detect_security_mode() -> SecurityMode:
-    """按环境变量、签名 build.json、默认 STRICT 的顺序选择安全模式。"""
-    env_mode = os.environ.get("NOTMYFAULT_MODE", "").lower().strip()
-    if env_mode == "alpha":
-        return SecurityMode.PERMISSIVE
-    if env_mode in ("develop", "dev"):
-        return SecurityMode.NORMAL
-    if env_mode in ("stable", "master"):
-        return SecurityMode.STRICT
-
+    """返回已签名模式；环境变量只能选择更严格的等级。"""
+    signed_mode = SecurityMode.STRICT
     paths = []
     if getattr(sys, "frozen", False):
         paths.append(os.path.join(sys._MEIPASS, "build.json"))
@@ -80,16 +73,32 @@ def detect_security_mode() -> SecurityMode:
                 _bj = _json.load(_bf)
             _m = _bj.get("security_mode", "").lower().strip()
             if _m == "permissive":
-                return SecurityMode.PERMISSIVE
+                signed_mode = SecurityMode.PERMISSIVE
+                break
             if _m == "normal":
-                return SecurityMode.NORMAL
+                signed_mode = SecurityMode.NORMAL
+                break
             if _m == "strict":
-                return SecurityMode.STRICT
+                signed_mode = SecurityMode.STRICT
+                break
         except Exception:
             continue
 
-    # 没有有效配置时使用 STRICT。
-    return SecurityMode.STRICT
+    env_name = os.environ.get("NOTMYFAULT_MODE", "").lower().strip()
+    env_modes = {
+        "alpha": SecurityMode.PERMISSIVE,
+        "develop": SecurityMode.NORMAL,
+        "dev": SecurityMode.NORMAL,
+        "stable": SecurityMode.STRICT,
+        "master": SecurityMode.STRICT,
+    }
+    requested = env_modes.get(env_name, signed_mode)
+    rank = {
+        SecurityMode.PERMISSIVE: 0,
+        SecurityMode.NORMAL: 1,
+        SecurityMode.STRICT: 2,
+    }
+    return requested if rank[requested] > rank[signed_mode] else signed_mode
 
 
 def verify_core_integrity() -> Tuple[bool, List[str]]:
@@ -110,12 +119,33 @@ def verify_core_integrity() -> Tuple[bool, List[str]]:
 
     bad: List[str] = []
     for name, expected in listed.items():
-        fp = os.path.join(pkg_dir, name)
+        fp = Path(pkg_dir, name)
         try:
-            actual = hashlib.sha256(open(fp, "rb").read()).hexdigest()
+            actual = hashlib.sha256(fp.read_bytes()).hexdigest()
         except OSError:
             bad.append(f"{name} (missing)")
             continue
         if actual != expected:
             bad.append(name)
+    current: set[str] = set()
+    for path in _PKG_ROOT.rglob("*.py"):
+        relative = path.relative_to(_PKG_ROOT).as_posix()
+        parts = relative.split("/")
+        if (
+            parts[0] in (
+                "tests",
+                "simulator",
+                "actions",
+                "__pycache__",
+            )
+            or "__pycache__" in parts
+        ):
+            continue
+        if parts[0] == "triggers" and relative not in (
+            "triggers/__init__.py",
+            "triggers/base.py",
+        ):
+            continue
+        current.add(relative)
+    bad.extend(f"{name} (unlisted)" for name in sorted(current - set(listed)))
     return (len(bad) == 0), bad

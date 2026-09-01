@@ -5,7 +5,9 @@ import json
 import os
 import re
 import secrets
+import stat
 import sys
+import tempfile
 from typing import Any, Dict, List
 
 from notmyfault.application_paths import ApplicationPaths
@@ -122,27 +124,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "triggers": [],
         "actions": []
     },
-    "settings": {
-        "admin_authorization_mode": "per_execution",
-        "admin_rule_key_verification": True
-    }
+    "settings": {}
 }
-
-ADMIN_AUTHORIZATION_MODES = {"per_execution", "engine_start"}
-
-
-def get_admin_authorization_mode(config: Dict[str, Any]) -> str:
-    """读取管理员授权方式，无效或缺失时使用逐次确认。"""
-    settings = config.get("settings") if isinstance(config, dict) else None
-    mode = settings.get("admin_authorization_mode") if isinstance(settings, dict) else None
-    return mode if mode in ADMIN_AUTHORIZATION_MODES else "per_execution"
-
-
-def get_admin_rule_key_verification(config: Dict[str, Any]) -> bool:
-    """读取创建管理员规则时是否验证签名私钥，缺失时默认验证。"""
-    settings = config.get("settings") if isinstance(config, dict) else None
-    value = settings.get("admin_rule_key_verification") if isinstance(settings, dict) else None
-    return value if isinstance(value, bool) else True
 
 
 def get_ai_drafting_settings(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -171,127 +154,119 @@ _SIGNATURE_KEY = "_signature"
 
 def _secure_write_secret(path: str, data: bytes) -> None:
     """写入配置密钥并把文件权限限制为当前用户"""
+    fd = -1
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as f:
+            fd = -1
             f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
         if os.name == "nt":
-            try:
-                import subprocess as _sp
-                # icacls 需要 domain\\user 格式，USERDOMAIN 和 USERNAME 能组成可识别的账户名
-                userdomain = os.environ.get("USERDOMAIN", "")
-                username = os.environ.get("USERNAME") or os.getlogin()
-                full_user = f"{userdomain}\\{username}" if userdomain else username
-                # 先确认授权成功再移除继承权限，授权失败时保留默认权限
-                r1 = _sp.run(
-                    ["icacls", path, "/grant:r", f"{full_user}:F"],
-                    capture_output=True, timeout=5,
-                )
-                if r1.returncode == 0:
-                    _sp.run(
-                        ["icacls", path, "/inheritance:r"],
-                        capture_output=True, timeout=5,
-                    )
-            except Exception:
-                pass
-    except OSError:
-        pass
+            import subprocess as _sp
+
+            userdomain = os.environ.get("USERDOMAIN", "")
+            username = os.environ.get("USERNAME") or os.getlogin()
+            full_user = f"{userdomain}\\{username}" if userdomain else username
+            grant = _sp.run(
+                ["icacls", path, "/grant:r", f"{full_user}:F"],
+                capture_output=True,
+                timeout=5,
+            )
+            if grant.returncode != 0:
+                raise OSError("icacls 无法授予密钥文件权限")
+            inheritance = _sp.run(
+                ["icacls", path, "/inheritance:r"],
+                capture_output=True,
+                timeout=5,
+            )
+            if inheritance.returncode != 0:
+                raise OSError("icacls 无法移除密钥文件继承权限")
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
-_DANGEROUS_PATTERNS = [
-    # 高危：下载执行
-    "Invoke-WebRequest", "Invoke-Expression", "IEX", "Invoke-Command",
-    "Start-Process", "Start-Job", "Register-ScheduledJob",
-    # 高危：绕过
-    "-Bypass", "-EncodedCommand", "-Enc", "FromBase64String",
-    # 高危：SMB 协议
-    "\\\\\\\\(", "New-PSDrive",
-    # 高危：破坏性
-    "Remove-Item", "rm -rf", "Format-Volume", "Clear-Disk",
-    "Stop-Computer", "Restart-Computer", "Shutdown",
-    # 高危：系统配置
-    "Set-MpPreference", "Add-MpPreference", "New-Service",
-    "Set-ItemProperty", "New-ItemProperty",
-    "reg add", "sc config", "bcdedit",
-    # 高危：提权
-    "runas", "processstartinfo", "system.diagnostics.process",
-    # 高危：脚本块/间接调用绕过
-    "[scriptblock]::create", "[scriptblock]::",
-    "get-command", "get-alias",
-    ".invoke()",
-    "icm",  # Invoke-Command 别名
-    "iex ",  # 带空格的 Invoke-Expression 别名
-]
+def _validate_secret_permissions(path: str) -> None:
+    if os.name != "nt":
+        file_stat = os.stat(path)
+        if hasattr(os, "getuid") and file_stat.st_uid != os.getuid():
+            raise ConfigValidationError("配置签名密钥所有者无效")
+        if stat.S_IMODE(file_stat.st_mode) & 0o077:
+            raise ConfigValidationError("配置签名密钥权限过宽")
+        return
 
-# launch_program 命中这些路径时加入 errors 并拒绝执行
-_DANGEROUS_LAUNCH_PATHS = [
-    "\\\\", "temp\\", "%tmp%\\", "%temp%\\",
-    "powershell.exe", "cmd.exe", "wscript.exe", "cscript.exe",
-    "powers~",   # 8.3 短名绕过
-    "rundll32", "regsvr32", "wmic", "mshta", "certutil", "bitsadmin",
-]
+    import subprocess as _sp
 
-# 正则覆盖空格、变量拼接和调用运算符等子串黑名单漏掉的写法
-_DANGEROUS_RE_PATTERNS = [
-    (r"\bpowershell(\.exe)?\b", "嵌套 PowerShell"),
-    (r"\bpwsh\b", "嵌套 PowerShell"),
-    (r"\biex\b", "Invoke-Expression 别名"),
-    (r"\bGet-Command\b", "动态获取命令"),
-    (r"&\s*[\$\(]", "间接调用运算符 &"),
-    (r"\$PSHOME", "路径变量拼接"),
-    (r"\$env:\w+\s*[+)]", "环境变量拼接"),
-    (r"\.\s*invoke\s*\(", "脚本块 Invoke"),
-]
+    script = """
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$acl = [System.IO.File]::GetAccessControl($env:NMF_CONFIG_SECRET_PATH)
+$access = @($acl.GetAccessRules(
+    $true,
+    $true,
+    [System.Security.Principal.SecurityIdentifier]
+) | ForEach-Object {
+    [pscustomobject]@{
+        Sid = $_.IdentityReference.Value
+        Type = $_.AccessControlType.ToString()
+    }
+})
+[pscustomobject]@{
+    Current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    Owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    Access = $access
+} | ConvertTo-Json -Compress -Depth 4
+"""
+    command_env = os.environ.copy()
+    command_env["NMF_CONFIG_SECRET_PATH"] = path
+    import base64
 
-def _has_dangerous_command(command: str) -> str | None:
-    """检查命令是否命中字符串或正则危险模式"""
-    cmd_lower = command.lower()
-    for pattern in _DANGEROUS_PATTERNS:
-        if pattern.lower() in cmd_lower:
-            return pattern
-    for regex, label in _DANGEROUS_RE_PATTERNS:
-        if re.search(regex, command, re.IGNORECASE):
-            return label
-    return None
+    encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    try:
+        result = _sp.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                encoded_script,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            env=command_env,
+        )
+        if result.returncode != 0:
+            raise OSError("PowerShell ACL 检查失败")
+        acl = json.loads(result.stdout)
+    except (json.JSONDecodeError, OSError, _sp.SubprocessError) as error:
+        raise ConfigValidationError("配置签名密钥权限无法验证") from error
+    current_sid = acl.get("Current") if isinstance(acl, dict) else None
+    allowed = {current_sid, "S-1-5-18", "S-1-5-32-544"}
+    if not current_sid or acl.get("Owner") not in allowed:
+        raise ConfigValidationError("配置签名密钥所有者无效")
+    access = acl.get("Access", [])
+    if isinstance(access, dict):
+        access = [access]
+    if not isinstance(access, list) or any(
+        isinstance(entry, dict)
+        and entry.get("Type") == "Allow"
+        and entry.get("Sid") not in allowed
+        for entry in access
+    ):
+        raise ConfigValidationError("配置签名密钥权限过宽")
 
 
 def _validate_rules_safety(rules: list) -> tuple[list[str], list[str]]:
-    """检查规则动作参数并返回警告和错误列表"""
-    warnings: list[str] = []
-    errors: list[str] = []
-    for i, rule in enumerate(rules):
-        rule_name = rule.get("name", f"规则 #{i+1}")
-        actions = []
-        for action in rule.get("actions", []):
-            actions.append(action)
-            if isinstance(action, dict) and isinstance(action.get("failure_actions"), list):
-                actions.extend(action["failure_actions"])
-        for action in actions:
-            if not isinstance(action, dict):
-                continue
-            action_type = action.get("type", "")
-
-            if action_type in ("run_powershell",):
-                cmd = action.get("params", {}).get("command", "")
-                if isinstance(cmd, str) and cmd:
-                    danger = _has_dangerous_command(cmd)
-                    if danger:
-                        errors.append(
-                            f"规则 \"{rule_name}\" 的 PowerShell 命令包含危险模式: '{danger}'"
-                        )
-
-            if action_type == "launch_program":
-                path = action.get("params", {}).get("path", "")
-                if isinstance(path, str) and path:
-                    path_lower = path.lower()
-                    for dl in _DANGEROUS_LAUNCH_PATHS:
-                        if dl in path_lower:
-                            errors.append(
-                                f"规则 \"{rule_name}\" 的启动路径包含危险位置: '{path}'"
-                            )
-                            break
-
-    return warnings, errors
+    return [], []
 
 
 def validate_rules_safety(rules: list) -> tuple[list[str], list[str]]:
@@ -308,6 +283,13 @@ class ConfigValidationError(ValueError):
 
 def _validate_rules_for_runtime(rules: List[Dict[str, Any]]) -> None:
     """打印安全提醒，并拒绝会在运行时执行的危险规则。"""
+    from notmyfault.core.rules import validate_rules_structure
+
+    structure_errors = validate_rules_structure(rules)
+    if structure_errors:
+        raise ConfigValidationError(
+            "规则结构校验失败: " + "; ".join(structure_errors[:3])
+        )
     safety_warnings, safety_errors = _validate_rules_safety(rules)
     for warning in safety_warnings:
         print(f"[Config] [安全] {warning}", file=sys.stderr)
@@ -357,12 +339,24 @@ def _unwrap_single_condition(condition: Any) -> Dict[str, Any] | None:
 
 def _replace_step_references(value: Any, replacements: Dict[str, str]) -> Any:
     if isinstance(value, str):
-        for old, new in replacements.items():
-            value = value.replace(f"steps.{old}.", f"steps.{new}.")
-        return value
+        def replace(match: re.Match[str]) -> str:
+            parts = match.group(1).split(".")
+            if len(parts) >= 3 and parts[0] == "steps" and parts[1] in replacements:
+                parts[1] = replacements[parts[1]]
+                return match.group(0).replace(match.group(1), ".".join(parts), 1)
+            return match.group(0)
+
+        return _LEGACY_TEMPLATE_RE.sub(replace, value)
     if isinstance(value, list):
         return [_replace_step_references(item, replacements) for item in value]
     if isinstance(value, dict):
+        if is_reference(value):
+            reference = dict(value["$ref"])
+            if reference.get("scope") == "step":
+                node = reference.get("node")
+                if node in replacements:
+                    reference["node"] = replacements[node]
+            return {"$ref": reference}
         return {key: _replace_step_references(item, replacements) for key, item in value.items()}
     return value
 
@@ -430,19 +424,20 @@ def _upgrade_legacy_templates(
     value: Any,
     step_refs: Dict[str, str],
 ) -> Any:
-    """把纯模板字符串转换为结构化 $ref，并保留混合模板"""
+    """把纯模板字符串转换为结构化 $ref，并更新混合模板中的步骤 ID"""
     if isinstance(value, str):
         full = _LEGACY_TEMPLATE_RE.fullmatch(value)
         if full:
             reference = _legacy_template_ref(full.group(1), step_refs)
             if reference is not None:
                 return {"$ref": reference}
-        return value
+        # 混合模板需要更新旧步骤 ID 引用
+        return _replace_step_references(value, step_refs)
     if isinstance(value, list):
         return [_upgrade_legacy_templates(item, step_refs) for item in value]
     if isinstance(value, dict):
         if is_reference(value):
-            return value
+            return _replace_step_references(value, step_refs)
         return {
             key: _upgrade_legacy_templates(item, step_refs)
             for key, item in value.items()
@@ -570,8 +565,8 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         settings = {}
     else:
         settings = dict(settings)
-    settings["admin_authorization_mode"] = get_admin_authorization_mode(result)
-    settings["admin_rule_key_verification"] = get_admin_rule_key_verification(result)
+    settings.pop("admin_authorization_mode", None)
+    settings.pop("admin_rule_key_verification", None)
     if "ai_drafting" in settings:
         settings["ai_drafting"] = get_ai_drafting_settings(result)
     result["settings"] = settings
@@ -587,6 +582,7 @@ def _default_v2_config() -> Dict[str, Any]:
 class SignedConfigStore:
     def __init__(self, paths: ApplicationPaths) -> None:
         self.paths = paths
+        self._secret_cache: bytes | None = None
 
     @property
     def config_path(self) -> str:
@@ -605,13 +601,27 @@ class SignedConfigStore:
         return str(self.paths.config_secret_file)
 
     def _get_or_create_secret(self) -> bytes:
+        if self._secret_cache is not None:
+            return self._secret_cache
         self.paths.config_dir.mkdir(parents=True, exist_ok=True)
+        created = False
         try:
-            return self.paths.config_secret_file.read_bytes()
-        except OSError:
+            secret = self.paths.config_secret_file.read_bytes()
+        except FileNotFoundError:
             secret = secrets.token_bytes(32)
-            _secure_write_secret(self._secret_path, secret)
-            return secret
+            try:
+                _secure_write_secret(self._secret_path, secret)
+                created = True
+            except FileExistsError:
+                secret = self.paths.config_secret_file.read_bytes()
+        except OSError as error:
+            raise ConfigValidationError("配置签名密钥无法读取") from error
+        if len(secret) < 32:
+            raise ConfigValidationError("配置签名密钥格式无效")
+        if not created:
+            _validate_secret_permissions(self._secret_path)
+        self._secret_cache = secret
+        return self._secret_cache
 
     def _sign(self, data: Dict[str, Any]) -> str:
         content = json.dumps(data, sort_keys=True, ensure_ascii=False, default=str)
@@ -634,43 +644,37 @@ class SignedConfigStore:
             target_dir = os.path.dirname(path)
             if target_dir:
                 os.makedirs(target_dir, exist_ok=True)
-            if os.path.exists(path):
-                try:
-                    with open(path, "r", encoding="utf-8") as src:
-                        with open(backup_path, "w", encoding="utf-8") as dst:
-                            dst.write(src.read())
-                except OSError:
-                    pass
-
             to_save = dict(data)
             to_save[_SIGNATURE_KEY] = self._sign(to_save)
-            tmp_path = path + ".tmp"
-            try:
-                with open(tmp_path, "w", encoding="utf-8") as file:
-                    json.dump(to_save, file, ensure_ascii=False, indent=4)
-                os.replace(tmp_path, path)
-            except OSError:
+            content = json.dumps(
+                to_save,
+                ensure_ascii=False,
+                indent=4,
+            ).encode("utf-8")
+
+            def atomic_write(target: str, payload: bytes) -> None:
+                descriptor, tmp_path = tempfile.mkstemp(
+                    prefix=f".{os.path.basename(target)}.",
+                    suffix=".tmp",
+                    dir=target_dir or None,
+                )
                 try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
-                old_content = None
-                try:
-                    with open(path, "r", encoding="utf-8") as file:
-                        old_content = file.read()
-                except OSError:
-                    pass
-                try:
-                    with open(path, "w", encoding="utf-8") as file:
-                        json.dump(to_save, file, ensure_ascii=False, indent=4)
-                except OSError:
-                    if old_content is not None:
-                        try:
-                            with open(path, "w", encoding="utf-8") as file:
-                                file.write(old_content)
-                        except OSError:
-                            pass
-                    raise
+                    with os.fdopen(descriptor, "wb") as file:
+                        file.write(payload)
+                        file.flush()
+                        os.fsync(file.fileno())
+                    os.replace(tmp_path, target)
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except FileNotFoundError:
+                        pass
+
+            if os.path.exists(path):
+                with open(path, "rb") as source:
+                    previous = source.read()
+                atomic_write(backup_path, previous)
+            atomic_write(path, content)
             return True
         except OSError as error:
             print(
@@ -729,6 +733,7 @@ class SignedConfigStore:
         rules = raw.get("rules")
         if not isinstance(rules, list):
             raise ConfigValidationError("rules 必须是列表")
+        _validate_rules_for_runtime(rules)
         normalized = _normalize_rules(rules)
         _validate_rules_for_runtime(normalized)
         return normalized
@@ -850,7 +855,6 @@ class SignedConfigStore:
             self.save_config(default)
             return default
         self._migrate_rules_file()
-        self.save_config(config)
         return config
 
     def load_rules(self) -> List[Dict[str, Any]]:
@@ -871,10 +875,12 @@ class SignedConfigStore:
                 return recovered
             self.save_rules([])
             return []
-        self.save_rules(rules)
         return rules
 
-    def inspect_security(self) -> Dict[str, Any]:
+    def inspect_security(
+        self,
+        actions_meta: Dict[str, Dict[str, Any]] | None = None,
+    ) -> Dict[str, Any]:
         status: Dict[str, Any] = {"status": "ok", "reason": "", "summary": None}
         has_secret = self.paths.config_secret_file.is_file()
         if not has_secret:
@@ -920,7 +926,36 @@ class SignedConfigStore:
             if isinstance(loaded, list):
                 rules = loaded
 
-        high_risk_actions = {"run_powershell", "shutdown_system", "kill_process"}
+        from notmyfault.security.plugin_schema import requires_admin_rule_approval
+
+        action_schema = actions_meta or {}
+
+        def summarize_params(params: Any) -> Dict[str, Any]:
+            if not isinstance(params, dict):
+                return {}
+            return {
+                str(key): "***" if value not in (None, "") else ""
+                for key, value in params.items()
+            }
+
+        def summarize_item(item: Any) -> Dict[str, Any]:
+            if not isinstance(item, dict):
+                return {"type": "?", "high_risk": False, "params": {}}
+            action_type = item.get("type", "?")
+            summary = {
+                "type": action_type,
+                "high_risk": requires_admin_rule_approval(
+                    action_schema.get(action_type, {})
+                ),
+                "params": summarize_params(item.get("params")),
+            }
+            failures = item.get("failure_actions", [])
+            if isinstance(failures, list) and failures:
+                summary["failure_actions"] = [
+                    summarize_item(failure) for failure in failures
+                ]
+            return summary
+
         status["summary"] = {
             "rule_count": len(rules),
             "rules": [
@@ -930,21 +965,32 @@ class SignedConfigStore:
                         if isinstance(rule, dict)
                         else f"规则 #{index + 1}"
                     ),
-                    "actions": [
-                        {
-                            "type": action.get("type", "?"),
-                            "high_risk": action.get("type") in high_risk_actions,
-                        }
-                        for action in rule.get("actions", [])
-                        if isinstance(rule, dict) and isinstance(action, dict)
-                    ],
+                    "preconditions": (
+                        [
+                            summarize_item(item)
+                            for item in rule.get("preconditions", [])
+                        ]
+                        if isinstance(rule, dict)
+                        and isinstance(rule.get("preconditions", []), list)
+                        else []
+                    ),
+                    "actions": (
+                        [summarize_item(action) for action in rule.get("actions", [])]
+                        if isinstance(rule, dict)
+                        and isinstance(rule.get("actions", []), list)
+                        else []
+                    ),
                 }
                 for index, rule in enumerate(rules)
             ],
         }
         return status
 
-    def approve_current_files(self) -> None:
+    def approve_current_files(
+        self,
+        schema: Dict[str, Dict[str, Dict[str, Any]]],
+        admin_key_password: str | None,
+    ) -> None:
         try:
             with open(self.config_path, "r", encoding="utf-8") as file:
                 config = json.load(file)
@@ -972,7 +1018,10 @@ class SignedConfigStore:
                 rules = []
             normalized_rules = _normalize_rules(rules)
             _validate_rules_for_runtime(normalized_rules)
-            from notmyfault.core.rules import validate_rules_structure
+            from notmyfault.core.rules import (
+                validate_rule_bindings,
+                validate_rules_structure,
+            )
 
             structure_errors = validate_rules_structure(normalized_rules)
             if structure_errors:
@@ -980,6 +1029,32 @@ class SignedConfigStore:
                     "规则包含结构无效的规则，拒绝重新签名: "
                     + "; ".join(structure_errors[:3])
                 )
+            binding_errors = []
+            for index, rule in enumerate(normalized_rules):
+                for issue in validate_rule_bindings(
+                    rule,
+                    schema.get("triggers", {}),
+                    schema.get("actions", {}),
+                ):
+                    binding_errors.append(
+                        f"规则 #{index + 1} {issue.get('message', '数据绑定无效')}"
+                    )
+            if binding_errors:
+                raise ConfigValidationError(
+                    "规则数据绑定无效，拒绝重新签名: "
+                    + "; ".join(binding_errors[:3])
+                )
+
+            from notmyfault.security.rule_approval import (
+                require_admin_rule_approval,
+            )
+
+            require_admin_rule_approval(
+                [],
+                normalized_rules,
+                schema,
+                admin_key_password,
+            )
 
         if not self.save_config(normalized_config):
             raise ConfigValidationError("重新签名失败")
