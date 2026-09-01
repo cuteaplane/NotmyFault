@@ -7,7 +7,7 @@ import {
   approveConfigSecurity,
 } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
-import { alertDialog, confirmDialog } from '../../lib/dialog'
+import { alertDialog, confirmDialog, passwordDialog } from '../../lib/dialog'
 
 const mode = ref('unknown')
 const modeMap = {
@@ -37,8 +37,6 @@ const oL = { builtin: '内置', user: '用户', third_party: '第三方' }
 
 const configSec = ref({ status: 'loading', reason: '', summary: null })
 const approving = ref(false)
-const HIGH_RISK = ['run_powershell', 'shutdown_system', 'kill_process']
-
 async function loadConfigSecurity() {
   const data = await getConfigSecurityStatus()
   configSec.value = data
@@ -48,7 +46,15 @@ async function approveConfig() {
   if (!await confirmDialog('重新签名配置？', '请再次确认上方摘要中的规则均为你本人配置。确认无误后，当前配置将被原样重新签名，引擎恢复运行。', '重新签名')) return
   approving.value = true
   try {
-    const r = await approveConfigSecurity()
+    let r = await approveConfigSecurity()
+    if (!r.ok && r.code === 'admin_key_required') {
+      const password = await passwordDialog(
+        '需要签名私钥密码',
+        '当前文件包含需要审批的动作。验证通过后才会重新签名。',
+      )
+      if (typeof password !== 'string') return
+      r = await approveConfigSecurity(password)
+    }
     if (r.ok) {
       snackbar(r.message || '配置已重新签名')
       await loadConfigSecurity()
@@ -130,12 +136,19 @@ onMounted(() => { load(); loadConfigSecurity() })
               <span v-for="(a, j) in rule.actions" :key="j" class="chip"
                     :class="a.high_risk ? 'chip-admin' : 'chip-clean'">{{ a.type }}</span>
             </span>
+            <code v-for="(a, j) in [...(rule.preconditions || []), ...(rule.actions || [])]"
+                  :key="`params-${j}`" class="config-security-rule-params">
+              {{ a.type }} {{ JSON.stringify(a.params || {}) }}
+              <template v-for="(failure, k) in (a.failure_actions || [])" :key="k">
+                | failure: {{ failure.type }} {{ JSON.stringify(failure.params || {}) }}
+              </template>
+            </code>
           </div>
           <div v-if="!configSec.summary.rules.length" class="config-security-rule-empty">当前没有规则</div>
         </div>
         <p class="config-security-risk">
           <span class="material-symbols-outlined">warning</span>
-          <span>红色标记为高风险动作（PowerShell 执行 / 系统控制 / 进程终止），请确认它们由你本人配置。</span>
+          <span>红色标记为需要签名私钥审批的动作。请逐项核对动作参数、前置检查和失败动作。</span>
         </p>
       </div>
       <footer class="config-security-actions">

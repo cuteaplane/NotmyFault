@@ -1,10 +1,9 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import MarkdownIt from 'markdown-it'
-import { apiWrite, getSchema, loadPlugins, streamRuleDraftWithAI } from '../lib/api'
+import { streamRuleDraftWithAI } from '../lib/api'
 import { computeChangeSet } from '../lib/ruleDiff'
-import { confirmDialog, passwordDialog } from '../lib/dialog'
-import { snackbar } from '../lib/notify'
+import { confirmDialog } from '../lib/dialog'
 import { store } from '../lib/store'
 
 const STORAGE_KEY = 'nmf_ai_conversation'
@@ -22,7 +21,6 @@ const props = defineProps({
 const emit = defineEmits(['create', 'highlight-node'])
 const composer = ref('')
 const drafting = ref(false)
-const installingPlugin = ref(false)
 const messages = ref([])
 const conversationRef = ref(null)
 const composerRef = ref(null)
@@ -70,20 +68,6 @@ function renderMarkdown(content) {
   return markdown.render(String(content ?? ''))
 }
 
-function proposalId(result) {
-  return clipContent(result?.proposal?.id || result?.plugin_id || result?.plugin?.id || result?.id)
-}
-
-function pluginKind(result) {
-  const manifest = result?.manifest ?? result?.plugin?.manifest ?? result?.plugin_source?.manifest
-  const kind = result?.plugin?.kind ?? manifest?.kind ?? result?.proposal?.kind ?? result?.kind
-  return kind === 'trigger' ? 'trigger' : 'action'
-}
-
-function pluginFileId(result) {
-  return (proposalId(result) || 'plugin').replace(/[^a-zA-Z0-9_-]/g, '_')
-}
-
 function assistantMessage(result) {
   return clipContent(result?.message || result?.content || result?.error)
     || '我还需要一点信息，才能继续起草。'
@@ -97,10 +81,6 @@ function formatErrorMessage(rawError) {
 
   if (code === 'idle_timeout') {
     return 'AI 服务超过 120 秒未返回内容。\n请检查网络连接，或稍后重试。'
-  }
-
-  if (code === 'consent_required') {
-    return '生成插件源码需要你的明确同意。\n点击提案里的同意按钮后继续。'
   }
 
   if (code === 'ai_provider_failed') {
@@ -127,13 +107,6 @@ function providerErrorCause(text, httpStatus) {
   if (httpStatus === '408') return '等待请求超时，请检查网络后重试。'
   if (httpStatus === '429') return '请求太频繁或额度不足，请稍后重试或检查账户额度。'
   if (httpStatus && Number(httpStatus) >= 500) return '服务端暂时不可用，请稍后重试。'
-  const paramMatch = text.match(/proposal\.parameters\[(\d+)\]\.(\w+)\s*必须是非空字符串/)
-  if (paramMatch) {
-    const index = parseInt(paramMatch[1], 10) + 1
-    const field = paramMatch[2]
-    const fieldMap = { name: '参数名', type: '参数类型', label: '参数标签' }
-    return `AI 生成的插件提案缺少第 ${index} 个参数的${fieldMap[field] || field}，请换一种说法重试。`
-  }
   if (text.includes('草稿请求失败') || text.includes('网络') || text.includes('连接')) {
     return '无法连接 AI 服务，请检查网络、endpoint 地址和防火墙设置。'
   }
@@ -181,41 +154,27 @@ function ruleParamRows(result) {
   const draft = result?.draft
   if (!draft) return []
   const rows = []
-  const push = (nodeLabel, params) => {
-    Object.entries(params || {}).forEach(([key, value]) => {
-      rows.push({ node: nodeLabel, key, value: typeof value === 'string' ? value : JSON.stringify(value) })
+  const push = (nodeLabel, node, catalog) => {
+    const definitions = new Map((catalog?.[node?.type]?.params || []).map(param => [param.name, param]))
+    Object.entries(node?.params || {}).forEach(([key, value]) => {
+      const display = definitions.get(key)?.sensitive
+        ? '***'
+        : (typeof value === 'string' ? value : JSON.stringify(value))
+      rows.push({ node: nodeLabel, key, value: display })
     })
   }
-  push(triggerName(result), draft.event?.params)
+  push(triggerName(result), draft.event, store.schema.triggers)
   ;(draft.preconditions || []).forEach((node, index) => {
-    push(`检查 ${index + 1}`, node.params)
+    push(`检查 ${index + 1}`, node, store.schema.actions)
   })
   ;(draft.actions || []).forEach((node, index) => {
-    push(`动作 ${index + 1}`, node.params)
+    push(`动作 ${index + 1}`, node, store.schema.actions)
   })
   return rows
 }
 
 function validationIssues(result) {
   return result?.validation?.issues?.slice(0, 5) || []
-}
-
-function pluginManifest(result) {
-  const manifest = result?.manifest ?? result?.plugin?.manifest ?? result?.plugin_source?.manifest
-  if (typeof manifest === 'string') return manifest
-  if (manifest && typeof manifest === 'object') return JSON.stringify(manifest, null, 2)
-  return '{}'
-}
-
-function pluginSource(result) {
-  const source = result?.source_code
-    ?? result?.plugin?.source_code
-    ?? result?.plugin?.source
-    ?? result?.plugin_source?.source_code
-    ?? result?.plugin_source?.source
-    ?? result?.code
-    ?? (result?.source === 'ai' ? '' : result?.source)
-  return typeof source === 'string' ? source : ''
 }
 
 function assistantSummary(result) {
@@ -226,15 +185,6 @@ function assistantSummary(result) {
     if (checks.length) parts.push(`检查 ${checks.join('、')}`)
     parts.push(`然后 ${actionNames(result).join('、') || '待补充动作'}`)
     return clipContent(`已生成规则草稿：${parts.join('，')}。`)
-  }
-  if (result?.result_type === 'plugin_proposal') {
-    const id = proposalId(result) || '未命名插件'
-    const name = clipContent(result?.proposal?.name) || id
-    return clipContent(`已提出插件能力提案：${name}（${id}）。`)
-  }
-  if (result?.result_type === 'plugin_source') {
-    const id = proposalId(result) || '未命名插件'
-    return `插件 ${id} 已生成，可直接安装。`
   }
   return assistantMessage(result)
 }
@@ -284,18 +234,29 @@ function hasHighImpactActions(draft) {
       issues.push(label + ' 需要管理员权限')
     }
   }
-  ;(draft.actions || []).forEach((a, i) => checkAction(a, '动作 ' + (i + 1)))
+  ;(draft.actions || []).forEach((a, i) => {
+    checkAction(a, '动作 ' + (i + 1))
+    ;(a.failure_actions || []).forEach((failureAction, failureIndex) => {
+      checkAction(failureAction, `动作 ${i + 1} 的补救动作 ${failureIndex + 1}`)
+    })
+  })
   return issues
 }
 
-function highlightNode(nodeLabel, target, index) {
+function highlightNode(item) {
   if (!props.fullRule) return
   let nodeId = null
-  if (target === 'action' && props.fullRule.actions?.[index]?.binding_id) {
-    nodeId = 'action-' + props.fullRule.actions[index].binding_id
-  } else if (target === 'precondition' && props.fullRule.preconditions?.[index]?.binding_id) {
-    nodeId = 'precondition-' + props.fullRule.preconditions[index].binding_id
-  } else if (target === 'trigger') {
+  if (item.target === 'action' && props.fullRule.actions?.[item.index]?.binding_id) {
+    nodeId = 'action-' + props.fullRule.actions[item.index].binding_id
+  } else if (item.target === 'failure-action') {
+    const parent = props.fullRule.actions?.[item.parentIndex]
+    const failureAction = parent?.failure_actions?.[item.index]
+    nodeId = failureAction?.binding_id
+      ? 'failure-action-' + failureAction.binding_id
+      : parent?.binding_id ? 'action-' + parent.binding_id : null
+  } else if (item.target === 'precondition' && props.fullRule.preconditions?.[item.index]?.binding_id) {
+    nodeId = 'precondition-' + props.fullRule.preconditions[item.index].binding_id
+  } else if (item.target === 'trigger') {
     nodeId = 'trigger'
   }
   if (nodeId) emit('highlight-node', nodeId)
@@ -374,7 +335,6 @@ async function appendMessage(role, content, result = null, state = {}) {
     activity: null,
     requestMessageId: state.requestMessageId || null,
     retryPrompt: '',
-    retryConsent: null,
     transient: state.transient === true,
     streaming: state.streaming === true,
     stopped: false,
@@ -404,18 +364,16 @@ function finishResult(message, result) {
   message.transient = false
   message.streaming = false
   message.retryPrompt = ''
-  message.retryConsent = null
   finishActivity(message)
 }
 
-function finishError(message, text, retryPrompt = '', retryConsent = null) {
+function finishError(message, text, retryPrompt = '') {
   message.content = text
   message.result = null
   message.error = true
   message.transient = false
   message.streaming = false
   message.retryPrompt = retryPrompt
-  message.retryConsent = retryConsent
   finishActivity(message, true)
 }
 
@@ -433,7 +391,8 @@ function requestMessages() {
 }
 function loadConversation() {
   try {
-    const saved = localStorage.getItem(STORAGE_KEY)
+    localStorage.removeItem(STORAGE_KEY)
+    const saved = sessionStorage.getItem(STORAGE_KEY)
     if (!saved) return
     const parsed = JSON.parse(saved)
     if (Array.isArray(parsed) && parsed.length > 0) {
@@ -458,7 +417,6 @@ function loadConversation() {
           activity,
           requestMessageId: msg.requestMessageId || null,
           retryPrompt: typeof msg.retryPrompt === 'string' ? msg.retryPrompt : '',
-          retryConsent: msg.error === true ? msg.retryConsent || null : null,
           ruleDetailsOpen: false,
           reasoningOpen: false,
         }
@@ -475,7 +433,10 @@ function saveConversation() {
     const toSave = messages.value
       .filter(m => !m.transient)
       .slice(-MAX_HISTORY_ITEMS)
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave))
+      .map(({ id, role, timestamp, content, stopped, error, requestMessageId, retryPrompt }) => ({
+        id, role, timestamp, content, stopped, error, requestMessageId, retryPrompt,
+      }))
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(toSave))
   } catch (err) {
     console.warn('保存对话失败:', err)
   }
@@ -492,7 +453,7 @@ function flushSaveConversation() {
   saveConversation()
 }
 
-function handleStreamEvent(message, event, markDone, retryPrompt = '', retryConsent = null) {
+function handleStreamEvent(message, event, markDone, retryPrompt = '') {
   if (event.type === 'status') {
     ensureActivity(message)
     addActivityStep(message, '连接 AI 服务', 'done')
@@ -540,7 +501,7 @@ function handleStreamEvent(message, event, markDone, retryPrompt = '', retryCons
     return
   }
   if (event.type === 'error') {
-    finishError(message, formatErrorMessage(event.data), retryPrompt, retryConsent)
+    finishError(message, formatErrorMessage(event.data), retryPrompt)
     void scrollConversation()
     markDone()
     return
@@ -548,7 +509,7 @@ function handleStreamEvent(message, event, markDone, retryPrompt = '', retryCons
   if (event.type === 'done') markDone()
 }
 
-async function sendTurn(content, consent = null) {
+async function sendTurn(content) {
   const text = clipContent(content)
   if (!text || drafting.value) return
 
@@ -567,23 +528,21 @@ async function sendTurn(content, consent = null) {
   activeMessageId = message.id
   try {
     await streamRuleDraftWithAI(requestMessages(), {
-      consent,
-      apiKey: store.aiApiKey,
       signal: controller.signal,
       onEvent: event => {
         if (!controller.signal.aborted) {
-          handleStreamEvent(message, event, () => { receivedDone = true }, text, consent)
+          handleStreamEvent(message, event, () => { receivedDone = true }, text)
         }
       },
     })
     if (!controller.signal.aborted && !receivedDone) {
-      finishError(message, '连接已中断，请检查网络后重试。', text, consent)
+      finishError(message, '连接已中断，请检查网络后重试。', text)
     } else if (!controller.signal.aborted && message.transient) {
-      finishError(message, '草稿服务没有返回结果，请重试。', text, consent)
+      finishError(message, '草稿服务没有返回结果，请重试。', text)
     }
   } catch (reason) {
     if (!controller.signal.aborted) {
-      finishError(message, formatClientError(reason), text, consent)
+      finishError(message, formatClientError(reason), text)
     }
   } finally {
     if (activeController === controller) {
@@ -631,16 +590,17 @@ async function retryFailedMessage(message) {
   } else {
     messages.value.splice(failedIndex, 1)
   }
-  await sendTurn(message.retryPrompt, message.retryConsent)
+  await sendTurn(message.retryPrompt)
 }
 
 // 结束一轮探索后清空重来，避免历史干扰后续起草。
 async function clearConversation() {
   if (drafting.value) return
   if (!messages.value.length) return
-  if (!await confirmDialog('清空当前对话？', '已生成的草稿和插件提案都会消失。', '清空')) return
+  if (!await confirmDialog('清空当前对话？', '已生成的对话和规则草稿都会消失。', '清空')) return
   messages.value = []
-  localStorage.removeItem(STORAGE_KEY)
+  try { sessionStorage.removeItem(STORAGE_KEY) } catch {}
+  try { localStorage.removeItem(STORAGE_KEY) } catch {}
   userScrolledUp.value = false
   void nextTick(() => composerRef.value?.focus({ preventScroll: true }))
 }
@@ -691,87 +651,8 @@ function onComposerKeydown(e) {
   }
 }
 
-async function approvePluginProposal(result) {
-  const id = proposalId(result)
-  if (!id || drafting.value) return
-  await sendTurn(`我同意生成插件草稿：${id}`, {
-    plugin_id: id,
-    permissions: result?.proposal?.permissions || [],
-  })
-}
-
-async function requestPluginRepair(result) {
-  const plugin = result?.plugin || {}
-  const id = plugin.id || proposalId(result)
-  const findings = plugin?.check?.scanner_findings || []
-  if (!id || !findings.length || drafting.value) return
-  const detail = findings.map(item => `${item.id}: ${item.detail}`).join('；')
-  await sendTurn(`插件草稿 ${id} 的静态扫描发现：${detail}。请移除这些风险并重新生成完整插件草稿。`, {
-    plugin_id: id,
-    permissions: plugin?.manifest?.permissions || [],
-  })
-}
-
 function openDraft(result) {
   if (result?.draft) emit('create', result.draft)
-}
-
-function _downloadBlob(filename, content, mime = 'text/plain') {
-  const blob = new Blob([content], { type: mime })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  a.click()
-  URL.revokeObjectURL(url)
-}
-
-function downloadPluginDraft(result) {
-  const manifest = result?.manifest ?? result?.plugin?.manifest ?? result?.plugin_source?.manifest
-  const source = result?.source_code ?? result?.plugin?.source_code ?? result?.plugin?.source
-    ?? result?.plugin_source?.source_code ?? result?.plugin_source?.source
-    ?? result?.code ?? (result?.source === 'ai' ? '' : result?.source)
-  const id = pluginFileId(result)
-  const kind = pluginKind(result)
-  if (manifest) _downloadBlob(`${id}.${kind}.json`, JSON.stringify(manifest, null, 2))
-  if (source) _downloadBlob(`${id}.${kind}.py`, String(source))
-  if (result?.plugin?.tests) _downloadBlob(`${id}.test_plugin.py`, result.plugin.tests)
-}
-
-async function requestPluginInstall(payload) {
-  const r = await apiWrite('/api/plugins/install-source', 'POST', payload)
-  return await r.json()
-}
-
-async function installPluginDraft(result) {
-  if (installingPlugin.value) return
-  const plugin = result?.plugin || {}
-  const manifest = plugin.manifest ?? result?.manifest
-  const source = plugin.source ?? pluginSource(result)
-  const kind = pluginKind(result)
-  const id = plugin.id || proposalId(result)
-  if (!manifest || !source || !id) return
-  installingPlugin.value = true
-  try {
-    let data = await requestPluginInstall({ kind, manifest, source, plugin_id: id })
-    if (!data.ok && data.code === 'key_password_required') {
-      const password = await passwordDialog('需要签名私钥密码', '安装 AI 插件需要用你的签名私钥签名。')
-      if (typeof password !== 'string') return
-      data = await requestPluginInstall({ kind, manifest, source, plugin_id: id, password })
-    }
-    if (!data.ok) {
-      snackbar(data.error || '插件安装失败')
-      return
-    }
-    snackbar(`插件 ${id} 已安装，重启引擎后生效`)
-    const [plugins, schema] = await Promise.all([loadPlugins(), getSchema()])
-    store.pluginsData = plugins
-    store.schema = schema
-  } catch (error) {
-    snackbar(error?.message || '插件安装失败')
-  } finally {
-    installingPlugin.value = false
-  }
 }
 
 watch(messages, scheduleSaveConversation, { deep: true })
@@ -877,8 +758,8 @@ onUnmounted(() => {
                     <div class="ai-changeset-list">
                       <div v-for="(item, ci) in computeMessageChangeSet(message)" :key="ci"
                         class="ai-changeset-item" :class="'ai-changeset-' + item.op"
-                        :clickable="item.target === 'action' || item.target === 'precondition' || item.target === 'trigger'"
-                        @click="highlightNode(item.label, item.target, item.index)">
+                        :clickable="['action', 'failure-action', 'precondition', 'trigger'].includes(item.target)"
+                        @click="highlightNode(item)">
                         <span class="ai-changeset-op">{{ item.op === 'add' ? 'A' : item.op === 'delete' ? 'D' : 'M' }}</span>
                         <span class="ai-changeset-label">{{ item.label }}</span>
                         <span v-if="item.detail" class="ai-changeset-detail">{{ item.detail }}</span>
@@ -939,83 +820,6 @@ onUnmounted(() => {
                       <span>{{ row.node }}</span>
                       <code>{{ row.key }} = {{ row.value }}</code>
                     </div>
-                  </div>
-                </div>
-
-                <div v-else-if="message.result?.result_type === 'plugin_proposal' && message.result.proposal" class="ai-card">
-                  <div class="ai-card-head">
-                    <span class="material-symbols-outlined">extension</span>
-                    <div class="min-w-0 flex-1">
-                      <b class="ai-card-title">{{ message.result.proposal.name }}</b>
-                      <small class="ai-card-kicker">缺少能力提案 · {{ message.result.proposal.kind === 'trigger' ? '触发器' : '动作' }}</small>
-                    </div>
-                  </div>
-                  <p v-if="message.result.proposal.description" class="ai-card-desc">{{ message.result.proposal.description }}</p>
-                  <div class="ai-card-rows">
-                    <div class="ai-row"><span><span class="material-symbols-outlined">code</span>ID</span><code>{{ proposalId(message.result) }}</code></div>
-                    <div v-if="message.result.proposal.parameters?.length" class="ai-row">
-                      <span><span class="material-symbols-outlined">settings</span>参数</span>
-                      <div class="ai-list">{{ message.result.proposal.parameters.map(p => `${p.label || p.name}（${p.type}）`).join('、') }}</div>
-                    </div>
-                    <div v-if="message.result.proposal.outputs?.length" class="ai-row">
-                      <span><span class="material-symbols-outlined">output</span>输出</span>
-                      <div class="ai-list">{{ message.result.proposal.outputs.map(o => `${o.label || o.name}（${o.type}）`).join('、') }}</div>
-                    </div>
-                    <div v-if="message.result.proposal.permissions?.length" class="ai-row">
-                      <span><span class="material-symbols-outlined">shield</span>权限</span>
-                      <div class="ai-list">{{ message.result.proposal.permissions.join('、') }}</div>
-                    </div>
-                    <div v-if="message.result.proposal.rationale" class="ai-row">
-                      <span><span class="material-symbols-outlined">lightbulb</span>理由</span>
-                      <div class="ai-list">{{ message.result.proposal.rationale }}</div>
-                    </div>
-                    <div v-if="message.result.proposal.acceptance_criteria?.length" class="ai-row">
-                      <span><span class="material-symbols-outlined">check_circle</span>验收</span>
-                      <div class="ai-list">{{ message.result.proposal.acceptance_criteria.join('；') }}</div>
-                    </div>
-                  </div>
-                  <div class="ai-card-foot">
-                    <button class="btn btn-tonal btn-sm" type="button" :disabled="drafting || !proposalId(message.result)"
-                      @click="approvePluginProposal(message.result)">
-                      同意生成插件草稿<span class="material-symbols-outlined">arrow_forward</span>
-                    </button>
-                  </div>
-                </div>
-
-                <div v-else-if="message.result?.result_type === 'plugin_source'" class="ai-card natural-draft-source">
-                  <div class="ai-card-head">
-                    <span class="material-symbols-outlined">extension</span>
-                    <div class="min-w-0 flex-1">
-                      <b class="ai-card-title">{{ proposalId(message.result) || '未命名插件' }}</b>
-                      <small class="ai-card-kicker">{{ message.result.plugin?.check?.revision_required ? '插件已生成 · 静态扫描待修正' : '插件已生成 · 可审阅安装' }}</small>
-                    </div>
-                  </div>
-                  <div class="ai-card-rows">
-                    <div class="ai-row"><span>清单</span><pre tabindex="0" class="ai-pre">{{ pluginManifest(message.result) }}</pre></div>
-                    <div class="ai-row"><span>源码</span><pre tabindex="0" class="ai-pre">{{ pluginSource(message.result) }}</pre></div>
-                    <div v-if="message.result.plugin?.compatibility_notes?.length" class="ai-row">
-                      <span>兼容性</span><div class="ai-list">{{ message.result.plugin.compatibility_notes.join('；') }}</div>
-                    </div>
-                    <div v-if="message.result.plugin?.permissions_explanation?.length" class="ai-row">
-                      <span>权限说明</span><div class="ai-list">{{ message.result.plugin.permissions_explanation.map(item => `${item.label}（${item.risk}）：${item.description}`).join('；') }}</div>
-                    </div>
-                    <div class="ai-row">
-                      <span>plugin check</span><div class="ai-list">schema {{ message.result.plugin?.check?.schema }} · entrypoint {{ message.result.plugin?.check?.entrypoint }} · {{ message.result.plugin?.check?.platform }}</div>
-                    </div>
-                    <div v-if="message.result.plugin?.check?.scanner_findings?.length" class="ai-row">
-                      <span>扫描结果</span><div class="ai-list">{{ message.result.plugin.check.scanner_findings.map(item => `${item.label}：${item.detail}`).join('；') }}</div>
-                    </div>
-                  </div>
-                  <div class="ai-card-foot">
-                    <button class="btn btn-text btn-sm" type="button" @click="downloadPluginDraft(message.result)">
-                      <span class="material-symbols-outlined">download</span>下载文件
-                    </button>
-                    <button v-if="message.result.plugin?.check?.revision_required" class="btn btn-tonal btn-sm" type="button" :disabled="drafting" @click="requestPluginRepair(message.result)">
-                      <span class="material-symbols-outlined">auto_fix_high</span>让 AI 修正
-                    </button>
-                    <button v-else class="btn btn-filled btn-sm" type="button" :disabled="installingPlugin" @click="installPluginDraft(message.result)">
-                      <span class="material-symbols-outlined" :class="{ 'animate-spin': installingPlugin }">{{ installingPlugin ? 'progress_activity' : 'check_circle' }}</span>{{ installingPlugin ? '正在安装…' : '安装插件' }}
-                    </button>
                   </div>
                 </div>
 
@@ -1155,20 +959,6 @@ onUnmounted(() => {
 .ai-rule-param-row>span:first-child{white-space:nowrap}
 .ai-rule-param-row code{font-family:ui-monospace,Consolas,monospace;font-size:12px;word-break:break-all;color:var(--md-on-surface);overflow-wrap:anywhere}
 
-
-.ai-card{display:flex;flex-direction:column;gap:12px;width:100%;min-width:0;max-width:100%;padding:14px;border:1px solid var(--md-outline-variant);border-radius:var(--r-md);background:var(--md-surface-c-low)}
-.ai-card-head{display:flex;align-items:center;gap:8px;min-width:0}
-.ai-card-head>.material-symbols-outlined{flex:none;font-size:18px;color:var(--md-primary)}
-.ai-card-title{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:var(--ts-title-s);color:var(--md-on-surface)}
-.ai-card-desc{margin:0;font-size:13px;line-height:19px;color:var(--md-on-surface-variant);overflow-wrap:anywhere}
-.ai-card-rows{display:flex;flex-direction:column;gap:8px}
-.ai-row{display:grid;grid-template-columns:auto minmax(0,1fr);gap:10px;font-size:13px;line-height:19px;color:var(--md-on-surface)}
-.ai-row>span:first-child{display:inline-flex;align-items:center;gap:6px;color:var(--md-on-surface-variant);font-weight:500;white-space:nowrap}
-.ai-row>span:first-child .material-symbols-outlined{font-size:18px}
-.ai-row code{font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:17px;word-break:break-all;color:var(--md-on-surface);overflow-wrap:anywhere}
-.ai-list{min-width:0;overflow-wrap:anywhere}
-.ai-card-foot{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}
-.ai-pre{max-height:160px;overflow:auto;margin:0;padding:8px 10px;border-radius:var(--r-sm);background:var(--md-surface-c-lowest);font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:17px;white-space:pre-wrap;word-break:break-all}
 
 
 .ai-issues{display:flex;flex-direction:column;gap:4px;padding:8px 10px;border-radius:var(--r-sm);background:color-mix(in srgb,var(--md-warn) 9%,transparent)}

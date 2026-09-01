@@ -1,7 +1,7 @@
 <script setup>
 import { computed, ref } from 'vue'
 import { store } from '../lib/store'
-import { buildDefaultParams, getVisibleParamDefs, groupTriggerKeys } from '../lib/utils'
+import { buildDefaultParams, ensureParams, getVisibleParamDefs, groupTriggerKeys, pluginUnavailableReason } from '../lib/utils'
 import { createBindingId } from '../lib/bindings'
 import ParamInput from './ParamInput.vue'
 import PluginPicker from './PluginPicker.vue'
@@ -15,7 +15,7 @@ const emit = defineEmits(['remove'])
 if (!Array.isArray(props.node.children)) props.node.children = []
 
 const triggerKeys = computed(() => Object.keys(store.schema.triggers).filter(
-  key => store.schema.triggers[key]?.platform_compatible !== false
+  key => !pluginUnavailableReason(store.schema.triggers[key])
 ))
 const triggerGroups = computed(() => groupTriggerKeys(triggerKeys.value))
 const pickerOpen = ref(false)
@@ -28,7 +28,7 @@ const pickerTitle = computed(() => ({
 const isLeaf = (node) => !!node?.type && !node.children && !node.events
 const isObjectNode = (node) => !!node && typeof node === 'object' && !Array.isArray(node)
 const eventName = (event) => store.schema.triggers[event?.type]?.name || event?.type || '未选择触发器'
-const eventParams = (event) => getVisibleParamDefs(store.schema.triggers[event.type], event.params)
+const eventParams = (event) => getVisibleParamDefs(store.schema.triggers[event.type], ensureParams(event))
 
 function defaultEvent(type = triggerKeys.value[0] || '') {
   // 新条件带有 binding_id，绑定选择器用它定位运行数据。

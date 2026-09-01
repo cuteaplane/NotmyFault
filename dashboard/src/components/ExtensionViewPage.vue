@@ -1,5 +1,5 @@
 <script setup>
-import { nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { nextTick, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import { closeExtensionSession, getExtensionViewPage, invokeExtensionCommand } from '../lib/api'
 
 const props = defineProps({
@@ -18,6 +18,9 @@ const closing = ref(false)
 const error = ref('')
 const frameRef = ref(null)
 const pageRef = ref(null)
+const activeSession = shallowRef(null)
+const closingSessions = new Set()
+let pageGeneration = 0
 
 function scriptSafeJson(value) {
   return JSON.stringify(value ?? null).replace(/[<>&\u2028\u2029]/g, character => ({
@@ -53,28 +56,60 @@ function isolatePage(source, initialState) {
   return `<!DOCTYPE html>\n${documentNode.documentElement.outerHTML}`
 }
 
-watch(() => props.open, async (open) => {
+function sessionKey(session) {
+  return session ? `${session.pluginId}:${session.sessionId}` : ''
+}
+
+async function closeSession(session) {
+  if (!session?.pluginId || !session?.sessionId) return
+  const key = sessionKey(session)
+  if (closingSessions.has(key)) return
+  closingSessions.add(key)
+  try {
+    await closeExtensionSession(session.pluginId, session.sessionId)
+  } catch (reason) {
+    void reason
+  }
+}
+
+watch(() => [props.open, props.pluginId, props.viewId, props.sessionId], async ([open]) => {
+  const generation = ++pageGeneration
+  const previous = activeSession.value
   if (!open) {
+    activeSession.value = null
     html.value = ''
     error.value = ''
+    await closeSession(previous)
     return
   }
+  const session = {
+    pluginId: props.pluginId,
+    sessionId: props.sessionId,
+    generation,
+  }
+  activeSession.value = session
+  if (previous && sessionKey(previous) !== sessionKey(session)) void closeSession(previous)
   loading.value = true
   closing.value = false
   error.value = ''
   try {
-    html.value = isolatePage(
+    const page = isolatePage(
       await getExtensionViewPage(props.pluginId, props.viewId),
       props.initialState,
     )
+    if (pageGeneration === generation && activeSession.value === session) html.value = page
   } catch (reason) {
-    error.value = reason.message || '插件编辑器加载失败。'
+    if (pageGeneration === generation && activeSession.value === session) {
+      error.value = reason.message || '插件编辑器加载失败。'
+    }
   } finally {
-    loading.value = false
-    await nextTick()
-    pageRef.value?.focus()
+    if (pageGeneration === generation && activeSession.value === session) {
+      loading.value = false
+      await nextTick()
+      pageRef.value?.focus()
+    }
   }
-})
+}, { immediate: true })
 
 function sendToView(message) {
   frameRef.value?.contentWindow?.postMessage({
@@ -90,10 +125,11 @@ function initializeView() {
 async function requestClose() {
   if (closing.value) return
   closing.value = true
+  pageGeneration += 1
+  const session = activeSession.value
+  activeSession.value = null
   try {
-    await closeExtensionSession(props.pluginId, props.sessionId)
-  } catch (reason) {
-    void reason
+    await closeSession(session)
   } finally {
     emit('close')
   }
@@ -117,6 +153,10 @@ async function applyWindowAction(action) {
 
 async function receiveFromView(event) {
   if (!props.open || event.source !== frameRef.value?.contentWindow) return
+  const generation = pageGeneration
+  const session = activeSession.value
+  const sourceWindow = event.source
+  if (!session) return
   const message = event.data
   if (!message || message.source !== 'notmyfault:extension-view') return
   if (message.type === 'ready') {
@@ -135,13 +175,19 @@ async function receiveFromView(event) {
   const requestId = typeof message.request_id === 'string' ? message.request_id : ''
   let response
   try {
-    response = await invokeExtensionCommand(props.pluginId, message.command, {
+    response = await invokeExtensionCommand(session.pluginId, message.command, {
       payload: message.payload,
-      sessionId: props.sessionId,
+      sessionId: session.sessionId,
     })
   } catch (reason) {
     response = { ok: false, error: reason.message || '插件命令调用失败。' }
   }
+  if (
+    !props.open
+    || pageGeneration !== generation
+    || activeSession.value !== session
+    || frameRef.value?.contentWindow !== sourceWindow
+  ) return
   sendToView({ type: 'result', request_id: requestId, response })
   if (response?.ok && response?.data?.window_action) {
     applyWindowAction(response.data.window_action)
@@ -151,7 +197,13 @@ async function receiveFromView(event) {
 }
 
 window.addEventListener('message', receiveFromView)
-onBeforeUnmount(() => window.removeEventListener('message', receiveFromView))
+onBeforeUnmount(() => {
+  window.removeEventListener('message', receiveFromView)
+  pageGeneration += 1
+  const session = activeSession.value
+  activeSession.value = null
+  void closeSession(session)
+})
 </script>
 
 <template>

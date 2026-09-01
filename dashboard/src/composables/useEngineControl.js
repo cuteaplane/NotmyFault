@@ -62,14 +62,28 @@ export function useEngineControl() {
     shuttingDown.value = true
     try {
       if (!hasBridge()) throw new Error('Dashboard 桌面桥接尚未就绪')
-      await window.pywebview.api.shutdown_engine()
+      const result = await window.pywebview.api.shutdown_engine()
+      if (!result?.ok) {
+        const error = new Error(result?.error || '后台服务拒绝关闭')
+        error.explicitFailure = true
+        throw error
+      }
+      syncStatus({ api_alive: false, engine_running: false, engine_state: 'offline' })
       snackbar('引擎进程正在退出…')
     } catch (e) {
-      // 响应返回前进程就断开时，界面直接显示已退出。
-      snackbar('引擎进程已退出')
+      if (e.explicitFailure) {
+        try { syncStatus(await getEngineStatus()) } catch {}
+        alertDialog('退出失败', e.message)
+      } else {
+        try {
+          syncStatus(await getEngineStatus())
+          alertDialog('退出失败', e.message)
+        } catch {
+          syncStatus({ api_alive: false, engine_running: false, engine_state: 'offline' })
+          snackbar('引擎进程已退出')
+        }
+      }
     } finally {
-      syncStatus({ api_alive: false, engine_running: false, engine_state: 'offline' })
-      if (window.__nmf) await window.__nmf.refreshAll()
       shuttingDown.value = false
     }
   }

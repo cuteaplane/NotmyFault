@@ -1,7 +1,7 @@
 <script setup>
 import { computed, ref } from 'vue'
 import { optValue, optLabel } from '../lib/utils'
-import { hasBridge, invokeComponent } from '../lib/api'
+import { hasBridge, invokeExtensionCommand } from '../lib/api'
 import { store } from '../lib/store'
 import { isReference, referenceLabel, typesCompatible } from '../lib/bindings'
 import BindingPicker from './BindingPicker.vue'
@@ -32,15 +32,6 @@ const boundLabel = computed(() => referenceLabel(props.modelValue, props.binding
 const compatibleSources = computed(() => props.bindingSources.filter(
   source => typesCompatible(source.type, bindingType.value),
 ))
-// 参数类型 → 采集组件，由插件声明 param_types 驱动，不写死任何插件。
-const captureComponent = computed(() => {
-  if (!type.value) return null
-  return store.components.find(component => (
-    component.available
-    && component.plugin_id === props.pluginId
-    && (component.param_types || []).includes(type.value)
-  )) || null
-})
 const parameterEditor = computed(() => store.extensions.parameter_editors.find(editor => (
   editor.plugin_id === props.pluginId
   && editor.parameter === props.def.name
@@ -85,8 +76,8 @@ async function pickFolder() {
 }
 
 async function pickDesktopElement() {
-  const component = captureComponent.value
-  if (!component || selectingElement.value) return
+  const editor = parameterEditor.value
+  if (!editor || selectingElement.value) return
   selectingElement.value = true
   elementCountdown.value = 3
   elementStatus.value = '把鼠标移到目标控件上，不需要点击。'
@@ -94,10 +85,17 @@ async function pickDesktopElement() {
     elementCountdown.value = Math.max(0, elementCountdown.value - 1)
   }, 1000)
   try {
-    const result = await invokeComponent(
-      component.plugin_id, component.id, 'capture', { delay_seconds: 3 },
+    const result = await invokeExtensionCommand(
+      editor.plugin_id,
+      editor.command,
+      {
+        sourceKind: 'parameter_editors',
+        sourceId: editor.id,
+        currentValue: props.modelValue,
+        payload: { operation: 'capture', delay_seconds: 3 },
+      },
     )
-    const selector = result?.data?.data?.selector
+    const selector = result?.value
     if (!result?.ok || !selector) {
       elementStatus.value = result?.error || '没有读到屏幕控件，请再试一次。'
       return
@@ -114,15 +112,22 @@ async function pickDesktopElement() {
 }
 
 async function verifyDesktopElement() {
-  const component = captureComponent.value
-  if (!component || !elementSelected.value || checkingElement.value) return
+  const editor = parameterEditor.value
+  if (!editor || !elementSelected.value || checkingElement.value) return
   checkingElement.value = true
   elementStatus.value = '正在重新查找这个控件…'
   try {
-    const result = await invokeComponent(
-      component.plugin_id, component.id, 'check', { selector: props.modelValue },
+    const result = await invokeExtensionCommand(
+      editor.plugin_id,
+      editor.command,
+      {
+        sourceKind: 'parameter_editors',
+        sourceId: editor.id,
+        currentValue: props.modelValue,
+        payload: { operation: 'check', selector: props.modelValue },
+      },
     )
-    const data = result?.data?.data || {}
+    const data = result?.data || {}
     elementStatus.value = result?.ok && data.ok
       ? '检查通过，现在仍能找到这个控件。'
       : (result?.error || data.error || '现在找不到这个控件，请重新选择。')
@@ -190,10 +195,7 @@ function clearDesktopElement() {
           <small>{{ elementDisplay.controlType }} · {{ elementDisplay.app }}</small>
           <small>{{ elementDisplay.window }}</small>
         </span>
-        <button v-if="captureComponent?.vue" type="button" class="btn btn-text btn-sm" @click="componentPageOpen = true">
-          <span class="material-symbols-outlined">open_in_new</span>查看录制详情
-        </button>
-        <button v-if="captureComponent" type="button" class="btn btn-text btn-sm" :disabled="checkingElement" @click="verifyDesktopElement">
+        <button v-if="parameterEditor" type="button" class="btn btn-text btn-sm" :disabled="checkingElement" @click="verifyDesktopElement">
           {{ checkingElement ? '检查中' : '检查' }}
         </button>
       </div>
@@ -202,14 +204,14 @@ function clearDesktopElement() {
         <span><b>还没选择控件</b><small>NotmyFault 会保存控件和窗口特征，不会保存鼠标坐标。</small></span>
       </div>
       <div class="uia-selector-actions">
-        <button v-if="captureComponent" type="button" class="btn btn-tonal btn-sm" :disabled="selectingElement" @click="pickDesktopElement">
+        <button v-if="parameterEditor" type="button" class="btn btn-tonal btn-sm" :disabled="selectingElement" @click="pickDesktopElement">
           <span class="material-symbols-outlined">center_focus_strong</span>
           {{ selectingElement ? `${elementCountdown || '正在'} 秒后读取` : (elementSelected ? '重新选择' : '选择屏幕上的控件') }}
         </button>
         <button v-if="elementSelected" type="button" class="btn btn-text btn-sm danger-text" @click="clearDesktopElement">清除</button>
       </div>
       <p v-if="elementStatus" class="uia-selector-status">{{ elementStatus }}</p>
-      <p v-else-if="!captureComponent" class="uia-selector-status">自动化引擎运行后可以选择屏幕控件。</p>
+      <p v-else-if="!parameterEditor" class="uia-selector-status">自动化引擎运行后可以选择屏幕控件。</p>
     </div>
     <textarea v-else-if="!bound && type === 'textarea'" v-model="value" class="text-field textarea-field" :placeholder="def.placeholder" :rows="def.rows || 5" />
     <input v-else-if="!bound && type === 'number'" v-model.number="value" type="number" class="text-field" :placeholder="def.placeholder" :min="def.min" :max="def.max" :step="def.step">

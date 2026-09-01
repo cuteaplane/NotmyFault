@@ -17,7 +17,10 @@ import BaseDialog from '../BaseDialog.vue'
 const activeRuleIndex = ref(null)
 const draftRule = ref(null)
 const baseline = ref('')
-const runningRuleIndex = ref(null)
+const pendingRuleIndex = ref(null)
+const activeManualRun = ref(store.activeManualRun)
+const runningRuleIndex = computed(() => pendingRuleIndex.value ?? activeManualRun.value?.index ?? null)
+watch(() => store.activeManualRun, run => { activeManualRun.value = run })
 const testPreparation = ref(null)
 const pendingEditorNodeId = ref('')
 const activeRule = computed(() => draftRule.value)
@@ -28,10 +31,7 @@ const baselineRule = computed(() => {
 })
 const draftChangeSummary = computed(() => summarizeRuleChanges(baselineRule.value, draftRule.value))
 const draftChangeText = computed(() => draftChangeSummary.value.join('、') || '规则内容已修改')
-const isTestingActiveRule = computed(() => (
-  activeRuleIndex.value !== null
-  && runningRuleIndex.value === activeRuleIndex.value
-))
+const isTestingActiveRule = computed(() => runningRuleIndex.value !== null)
 const draftHistory = ref([])
 const draftHistoryIndex = ref(-1)
 const draftHistoryPending = ref(false)
@@ -40,6 +40,7 @@ const canRedoDraft = computed(() => !draftHistoryPending.value && draftHistoryIn
 let draftHistoryTimer = null
 let applyingDraftHistory = false
 const DRAFT_RECOVERY_KEY = 'notmyfault.ruleDraft.v1'
+const DRAFT_RECOVERY_VERSION = 2
 const TEST_DATA_KEY = 'notmyfault.ruleTestData.v1'
 
 const showCreatePanel = ref(false)
@@ -65,6 +66,55 @@ const availableFolders = computed(() => [...new Set(
 )].sort((a, b) => a.localeCompare(b, 'zh-CN')))
 
 function clone(value) { return JSON.parse(JSON.stringify(value)) }
+function visitRuleNodes(rule, visitor) {
+  const visitAction = node => {
+    if (!node || typeof node !== 'object') return
+    visitor(node, 'action')
+    ;(node.failure_actions || []).forEach(visitAction)
+  }
+  const visitCondition = node => {
+    if (!node || typeof node !== 'object') return
+    if (node.type) visitor(node, 'trigger')
+    ;(node.children || []).forEach(visitCondition)
+  }
+  if (rule?.event) visitor(rule.event, 'trigger')
+  visitCondition(rule?.condition)
+  ;(rule?.preconditions || []).forEach(visitAction)
+  ;(rule?.actions || []).forEach(visitAction)
+}
+function sensitiveParamNames(node, kind) {
+  const catalog = kind === 'trigger' ? store.schema.triggers : store.schema.actions
+  return (catalog?.[node?.type]?.params || [])
+    .filter(param => param.sensitive)
+    .map(param => param.name)
+}
+function sanitizedRuleForRecovery(rule) {
+  const sanitized = clone(rule)
+  visitRuleNodes(sanitized, (node, kind) => {
+    if (!node.params || typeof node.params !== 'object') return
+    for (const name of sensitiveParamNames(node, kind)) delete node.params[name]
+  })
+  return sanitized
+}
+function restoreSensitiveParams(targetRule, currentRule) {
+  const currentNodes = new Map()
+  visitRuleNodes(currentRule, (node, kind) => {
+    if (node.binding_id) currentNodes.set(`${kind}:${node.binding_id}`, node)
+  })
+  visitRuleNodes(targetRule, (node, kind) => {
+    const current = node.binding_id ? currentNodes.get(`${kind}:${node.binding_id}`) : null
+    if (!current || current.type !== node.type) return
+    for (const name of sensitiveParamNames(node, kind)) {
+      if (!Object.prototype.hasOwnProperty.call(current.params || {}, name)) continue
+      if (!node.params || typeof node.params !== 'object') node.params = {}
+      node.params[name] = clone(current.params[name])
+    }
+  })
+}
+function recoveryBaseline() {
+  const rule = baselineRule.value
+  return rule ? JSON.stringify(sanitizedRuleForRecovery(rule)) : ''
+}
 function readSavedTestData() {
   try {
     const value = JSON.parse(localStorage.getItem(TEST_DATA_KEY) || '{}')
@@ -108,7 +158,12 @@ function updateSavedTestData(rule, fields, values, remember) {
 function readDraftRecovery() {
   try {
     const value = JSON.parse(localStorage.getItem(DRAFT_RECOVERY_KEY) || 'null')
-    return value && typeof value === 'object' ? value : null
+    if (!value || typeof value !== 'object') return null
+    if (value.version !== DRAFT_RECOVERY_VERSION) {
+      clearDraftRecovery()
+      return null
+    }
+    return value
   } catch { return null }
 }
 function clearDraftRecovery() {
@@ -121,10 +176,11 @@ function persistDraftRecovery() {
   }
   try {
     localStorage.setItem(DRAFT_RECOVERY_KEY, JSON.stringify({
+      version: DRAFT_RECOVERY_VERSION,
       ruleId: draftRule.value.rule_id,
       isNew: activeRuleIndex.value === -1,
-      baseline: baseline.value,
-      draft: draftRule.value,
+      baseline: recoveryBaseline(),
+      draft: sanitizedRuleForRecovery(draftRule.value),
       savedAt: Date.now(),
     }))
   } catch {}
@@ -136,11 +192,12 @@ async function restoreDraftRecovery(index) {
     ? recovery.isNew === true
     : recovery.ruleId === draftRule.value?.rule_id
   if (!matches) return
-  if (index !== -1 && recovery.baseline !== baseline.value) {
+  const currentRecoveryBaseline = recoveryBaseline()
+  if (index !== -1 && recovery.baseline !== currentRecoveryBaseline) {
     clearDraftRecovery()
     return
   }
-  if (index !== -1 && JSON.stringify(recovery.draft) === baseline.value) {
+  if (index !== -1 && JSON.stringify(recovery.draft) === currentRecoveryBaseline) {
     clearDraftRecovery()
     return
   }
@@ -149,8 +206,11 @@ async function restoreDraftRecovery(index) {
     'NotmyFault 找到了这条规则上次关闭前的修改。',
     '恢复草稿',
   )
-  if (restore) draftRule.value = ensureRuleBindingIds(normalizeRuleDraft(clone(recovery.draft)))
-  else clearDraftRecovery()
+  if (restore) {
+    const restored = ensureRuleBindingIds(normalizeRuleDraft(clone(recovery.draft)))
+    restoreSensitiveParams(restored, draftRule.value)
+    draftRule.value = restored
+  } else clearDraftRecovery()
 }
 function resetDraftHistory() {
   if (draftHistoryTimer) { clearTimeout(draftHistoryTimer); draftHistoryTimer = null }
@@ -324,7 +384,7 @@ async function runManualRule(index, ruleSnapshot = null) {
   }
 }
 async function executeManualRule(index, snapshot, testContext) {
-  runningRuleIndex.value = index
+  pendingRuleIndex.value = index
   try {
     let watchFromSeq = latestEngineEventSeq()
     const result = await runRule(index, snapshot, testContext)
@@ -341,6 +401,8 @@ async function executeManualRule(index, snapshot, testContext) {
       }
     }
     if (result.ok) {
+      activeManualRun.value = { index, runId: result.run_id || '', ruleName: snapshot?.name || '' }
+      store.activeManualRun = activeManualRun.value
       snackbar(result.message ? `测试已启动：${result.message}` : '规则测试已启动')
       startTestWatch(
         snapshot,
@@ -354,7 +416,7 @@ async function executeManualRule(index, snapshot, testContext) {
   } catch (error) {
     alertDialog('规则测试失败', error.message)
   } finally {
-    runningRuleIndex.value = null
+    pendingRuleIndex.value = null
   }
 }
 function cancelTestPreparation() {
@@ -433,7 +495,7 @@ function processTestEvents() {
       finishTestWatch()
     } else if (ev.name === 'workflow_deferred') {
       t.steps.push({ status: 'deferred', type: '', detail: ev.data.reason || '前置条件未满足' })
-      finishTestWatch()
+      t.note = '前置条件暂未满足，测试会在条件满足后继续。'
     } else if (ev.name === 'test_assertions_completed') {
       t.assertions = ev.data
     } else if (ev.name === 'workflow_completed') {

@@ -18,13 +18,15 @@ async function authHeaders() {
 async function fetchAuthenticated(path, options = {}) {
   const request = async () => {
     const headers = { ...(options.headers || {}), ...await authHeaders() }
-    return await fetch(API + path, { ...options, headers })
+    return await fetch((hasBridge() ? API : '') + path, { ...options, headers })
   }
   let res = await request()
   // 认证返回 403 时重新从 bridge 读取内存 token 再重试一次，运行中的 engine 会在这里重新发布 token。
   if (res.status === 403 && hasBridge()) res = await request()
   return res
 }
+
+export { fetchAuthenticated }
 
 function bridgeResponse(data) {
   const status = Number(data?.status || (data?.ok === false ? 400 : 200))
@@ -43,13 +45,22 @@ async function bridgeRequest(path, method = 'GET', data = null) {
 }
 
 export async function apiRead(path) {
-  return await bridgeRequest(path, 'GET')
+  return hasBridge()
+    ? await bridgeRequest(path, 'GET')
+    : await fetchAuthenticated(path)
 }
 
 // 含文件的 FormData 无法通过 pywebview JSON bridge，这里直接发 HTTP 请求。
 export async function apiWrite(path, method, body, isForm) {
-  if (!isForm) return await bridgeRequest(path, method, body || null)
-  const res = await fetchAuthenticated(path, { method, body })
+  if (!isForm && hasBridge()) return await bridgeRequest(path, method, body || null)
+  const options = isForm
+    ? { method, body }
+    : {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: body == null ? null : JSON.stringify(body),
+    }
+  const res = await fetchAuthenticated(path, options)
   if (res.status === 403) throw new Error('Dashboard 与后台服务认证不同步')
   return res
 }
@@ -65,13 +76,17 @@ export async function apiDownload(path, body) {
 }
 
 export async function loadConfig() {
-  if (!hasBridge()) throw new Error('Dashboard 桌面桥接尚未就绪')
-  return await window.pywebview.api.get_config()
+  if (hasBridge()) return await window.pywebview.api.get_config()
+  return await (await apiRead('/api/rules')).json()
 }
 
 export async function saveConfig(rules, adminKeyPassword = '') {
-  if (!hasBridge()) throw new Error('Dashboard 桌面桥接尚未就绪')
-  return await window.pywebview.api.save_config(rules, adminKeyPassword)
+  if (hasBridge()) return await window.pywebview.api.save_config(rules, adminKeyPassword)
+  const response = await apiWrite('/api/rules', 'PUT', {
+    rules,
+    admin_key_password: adminKeyPassword,
+  })
+  return await response.json()
 }
 
 export async function runRule(ruleIndex, rule = null, testContext = null) {
@@ -93,21 +108,6 @@ export async function cancelRun(runId) {
     'POST',
   )
   return await res.json()
-}
-
-export async function captureDesktopElement(delaySeconds = 3) {
-  const res = await apiWrite(
-    '/api/desktop-elements/capture',
-    'POST',
-    { delay_seconds: delaySeconds },
-  )
-  return await res.json()
-}
-
-export async function getPluginComponents() {
-  const res = await apiRead('/api/plugins/components')
-  const data = await res.json()
-  return Array.isArray(data?.components) ? data.components : []
 }
 
 export async function getPluginExtensions() {
@@ -167,26 +167,6 @@ export async function closeExtensionSession(pluginId, sessionId) {
   return await res.json()
 }
 
-export async function invokeComponent(pluginId, componentId, method, payload = null, sessionId = '') {
-  const body = { method, payload }
-  if (sessionId) body.session_id = sessionId
-  const res = await apiWrite(
-    `/api/plugins/${encodeURIComponent(pluginId)}/components/${encodeURIComponent(componentId)}/invoke`,
-    'POST',
-    body,
-  )
-  return await res.json()
-}
-
-export async function checkDesktopElement(selector) {
-  const res = await apiWrite(
-    '/api/desktop-elements/check',
-    'POST',
-    { selector },
-  )
-  return await res.json()
-}
-
 export async function validateRuleDraft(rule) {
   const res = await apiWrite('/api/rules/validate', 'POST', { rule })
   return await res.json()
@@ -196,7 +176,7 @@ const AI_DRAFT_EVENT_TYPES = new Set(['status', 'reasoning', 'text', 'progress',
 const AI_DRAFT_HISTORY_LIMIT = 40
 const AI_DRAFT_MESSAGE_LIMIT = 4000
 
-function aiDraftRequestBody(messages, consent = null, apiKey = '') {
+function aiDraftRequestBody(messages, apiKey = '') {
   const body = {
     messages: (Array.isArray(messages) ? messages : [])
       .filter(message => message?.role === 'user' || message?.role === 'assistant')
@@ -207,15 +187,7 @@ function aiDraftRequestBody(messages, consent = null, apiKey = '') {
       .filter(message => message.content)
       .slice(-AI_DRAFT_HISTORY_LIMIT),
   }
-  const pluginId = typeof consent?.plugin_id === 'string' ? consent.plugin_id.trim() : ''
-  const permissions = Array.isArray(consent?.permissions)
-    ? [...new Set(consent.permissions
-      .filter(permission => typeof permission === 'string')
-      .map(permission => permission.trim())
-      .filter(Boolean))]
-    : []
   const key = typeof apiKey === 'string' ? apiKey.trim() : ''
-  if (pluginId) body.consent = { plugin_id: pluginId, permissions }
   if (key) body.api_key = key
   return body
 }
@@ -277,7 +249,6 @@ export async function consumeAIDraftSSE(body, onEvent, signal) {
 }
 
 export async function streamRuleDraftWithAI(messages, {
-  consent = null,
   apiKey = '',
   signal,
   onEvent = () => {},
@@ -285,7 +256,7 @@ export async function streamRuleDraftWithAI(messages, {
   const response = await fetchAuthenticated('/api/rules/draft/ai/stream', {
     method: 'POST',
     headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
-    body: JSON.stringify(aiDraftRequestBody(messages, consent, apiKey)),
+    body: JSON.stringify(aiDraftRequestBody(messages, apiKey)),
     signal,
   })
   if (!response.ok || !response.body) {
@@ -312,10 +283,8 @@ export async function getSchema() {
 }
 
 export async function getEngineStatus() {
-  if (!hasBridge()) {
-    return { api_alive: false, engine_running: false, engine_state: 'offline' }
-  }
-  return await window.pywebview.api.get_engine_status()
+  if (hasBridge()) return await window.pywebview.api.get_engine_status()
+  return await (await apiRead('/api/engine/status')).json()
 }
 
 export async function getConfigSecurityStatus() {
@@ -327,30 +296,12 @@ export async function getConfigSecurityStatus() {
   }
 }
 
-export async function approveConfigSecurity() {
-  const r = await apiWrite('/api/config/security-approve', 'POST')
-  return await r.json()
-}
-
-export async function getAdminAuthorizationSetting() {
-  const r = await apiRead('/api/settings/admin-authorization')
-  return await r.json()
-}
-
-export async function updateAdminAuthorizationSetting(mode) {
-  const r = await apiWrite('/api/settings/admin-authorization', 'PUT', { mode })
-  return await r.json()
-}
-
-export async function getAdminRuleVerificationSetting() {
-  const r = await apiRead('/api/settings/admin-rule-verification')
-  return await r.json()
-}
-
-export async function updateAdminRuleVerificationSetting(keyVerification) {
-  const r = await apiWrite('/api/settings/admin-rule-verification', 'PUT', {
-    key_verification: keyVerification,
-  })
+export async function approveConfigSecurity(adminKeyPassword = '') {
+  const r = await apiWrite(
+    '/api/config/security-approve',
+    'POST',
+    adminKeyPassword ? { admin_key_password: adminKeyPassword } : null,
+  )
   return await r.json()
 }
 
@@ -371,21 +322,6 @@ export async function saveAIApiKey(apiKey) {
 
 export async function deleteAIApiKey() {
   const r = await apiWrite('/api/settings/ai-drafting/api-key', 'DELETE')
-  return await r.json()
-}
-
-export async function getBluetoothSetting() {
-  const r = await apiRead('/api/settings/bluetooth')
-  return await r.json()
-}
-
-export async function installBluetoothPlugin() {
-  const r = await apiWrite('/api/settings/bluetooth/install', 'POST')
-  return await r.json()
-}
-
-export async function uninstallBluetoothPlugin() {
-  const r = await apiWrite('/api/settings/bluetooth/uninstall', 'POST')
   return await r.json()
 }
 

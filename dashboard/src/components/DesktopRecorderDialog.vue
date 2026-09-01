@@ -1,12 +1,11 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
-import { hasBridge, invokeComponent } from '../lib/api'
+import { hasBridge, invokeExtensionCommand } from '../lib/api'
 import BaseDialog from './BaseDialog.vue'
 
 const props = defineProps({
   open: Boolean,
-  pluginId: { type: String, default: '' },
-  componentId: { type: String, default: 'record' },
+  editor: { type: Object, default: null },
   mode: { type: String, default: 'actions' },
   commitLabel: { type: String, default: '保存' },
 })
@@ -17,7 +16,10 @@ const countdown = ref(0)
 const status = ref('')
 let nextStepId = 1
 
-const canRecord = computed(() => hasBridge() && !selecting.value && steps.value.length < 50)
+const editorAvailable = computed(() => Boolean(
+  props.editor?.plugin_id && props.editor?.command && props.editor?.id,
+))
+const canRecord = computed(() => hasBridge() && editorAvailable.value && !selecting.value && steps.value.length < 50)
 
 function reset() {
   steps.value = []
@@ -48,6 +50,10 @@ function stepDisplay(step) {
 }
 
 async function recordStep() {
+  if (!editorAvailable.value) {
+    status.value = '录制扩展已不可用，请关闭后重新打开。'
+    return
+  }
   if (!canRecord.value) return
   selecting.value = true
   countdown.value = 3
@@ -56,10 +62,16 @@ async function recordStep() {
     countdown.value = Math.max(0, countdown.value - 1)
   }, 1000)
   try {
-    const result = await invokeComponent(
-      props.pluginId, props.componentId, 'capture', { delay_seconds: 3 },
+    const result = await invokeExtensionCommand(
+      props.editor.plugin_id,
+      props.editor.command,
+      {
+        sourceKind: 'parameter_editors',
+        sourceId: props.editor.id,
+        payload: { operation: 'capture', delay_seconds: 3 },
+      },
     )
-    const selector = result?.data?.data?.selector
+    const selector = result?.value
     if (!result?.ok || !selector) {
       status.value = result?.error || '没有读到屏幕控件，请再试一次。'
       return
@@ -102,11 +114,21 @@ async function insertSteps() {
     emit('close')
     return
   }
+  if (!editorAvailable.value) {
+    status.value = '录制扩展已不可用，请关闭后重新打开。'
+    return
+  }
   try {
-    const result = await invokeComponent(
-      props.pluginId, props.componentId, 'to_actions', { steps: payload },
+    const result = await invokeExtensionCommand(
+      props.editor.plugin_id,
+      props.editor.command,
+      {
+        sourceKind: 'parameter_editors',
+        sourceId: props.editor.id,
+        payload: { operation: 'to_actions', steps: payload },
+      },
     )
-    const actions = result?.data?.data?.actions
+    const actions = result?.data?.actions
     if (!result?.ok || !Array.isArray(actions) || !actions.length) {
       status.value = result?.error || '录制组件没有生成动作。'
       return
@@ -145,6 +167,9 @@ watch(() => props.open, open => {
 
         <p v-if="!hasBridge()" class="desktop-recorder-message error">
           <span class="material-symbols-outlined">desktop_windows</span>只有 NotmyFault 桌面应用可以录制屏幕控件。
+        </p>
+        <p v-else-if="!editorAvailable" class="desktop-recorder-message error">
+          <span class="material-symbols-outlined">extension_off</span>录制扩展已不可用，请关闭后重新打开。
         </p>
         <p v-else-if="status" class="desktop-recorder-message" aria-live="polite">
           <span class="material-symbols-outlined">info</span>{{ status }}
@@ -188,7 +213,7 @@ watch(() => props.open, open => {
           <small>加入后，每一步仍是普通动作，可以单独修改、移动或删除。</small>
           <div>
             <button class="btn btn-text" :disabled="selecting" @click="emit('close')">取消</button>
-            <button class="btn btn-filled" :disabled="!steps.length || selecting" @click="insertSteps">
+            <button class="btn btn-filled" :disabled="!steps.length || selecting || (mode !== 'value' && !editorAvailable)" @click="insertSteps">
               {{ mode === 'value' ? `${commitLabel}（${steps.length} 步）` : `加入 ${steps.length} 个步骤` }}<span class="material-symbols-outlined">arrow_forward</span>
             </button>
           </div>

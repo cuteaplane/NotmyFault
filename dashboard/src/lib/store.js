@@ -3,7 +3,6 @@ import { reactive } from 'vue'
 // 各视图共享这份响应式状态，字段变化时 Vue 会重新渲染。
 export const store = reactive({
   schema: { triggers: {}, actions: {} },
-  components: [],
   extensions: { commands: [], parameter_editors: [], views: [], data_types: [] },
   configData: { rules: [] },
   configLoaded: false,
@@ -17,11 +16,11 @@ export const store = reactive({
   pendingRuleName: '', // 旧调用仍可按名称跳转，规则页优先使用 rule_id。
   pendingStepId: '',
   pendingRunId: '',
+  activeManualRun: null,
   pendingRuleDraft: null,
   pendingPluginFocus: null,
   pendingAutomationCreate: false,
   pendingAiPanel: false,
   aiDrafting: { enabled: false, endpoint_url: '', model: '', api_format: 'chat_completions' },
-  aiApiKey: '',
   aiApiKeyStatus: 'none',
 })

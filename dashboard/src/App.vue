@@ -10,7 +10,7 @@ import LogsView from './components/views/LogsView.vue'
 import AppDialog from './components/AppDialog.vue'
 import { store } from './lib/store'
 import { snack } from './lib/notify'
-import { loadConfig, loadPlugins, getSchema, getEngineStatus, getPluginComponents, getPluginExtensions, getAIDraftingSetting } from './lib/api'
+import { fetchAuthenticated, hasBridge, loadConfig, loadPlugins, getSchema, getEngineStatus, getPluginExtensions, getAIDraftingSetting } from './lib/api'
 import { ensureRuleIds } from './lib/bindings'
 import { useTheme } from './composables/useTheme'
 
@@ -29,7 +29,7 @@ const SSE_MAX = 10
 let sseReconnectTimer = null
 let sseEventSeq = 0
 // 规则测试回显只关心这几类执行事件。
-const RULE_EVENTS = ['action_executed', 'action_skipped', 'workflow_failed', 'workflow_deferred', 'workflow_completed', 'test_assertions_completed', 'error']
+const RULE_EVENTS = ['action_executed', 'action_skipped', 'action_cancelled', 'action_timed_out', 'workflow_failed', 'workflow_deferred', 'workflow_completed', 'test_assertions_completed', 'error', 'run_dropped', 'run_replaced']
 const timers = []
 function setTracked(fn, ms) { const id = setInterval(fn, ms); timers.push(id); return id }
 
@@ -78,12 +78,11 @@ async function refreshAll(status = null) {
   await loadConfigData().catch(() => {})
   void loadAISettingsOnce()
   try {
-    const [sch, plugins, components, extensions] = await Promise.all([
-      getSchema(), loadPlugins(), getPluginComponents(), getPluginExtensions(),
+    const [sch, plugins, extensions] = await Promise.all([
+      getSchema(), loadPlugins(), getPluginExtensions(),
     ])
     store.schema = sch
     store.pluginsData = plugins
-    store.components = components
     store.extensions = extensions
   } catch (e) { /* 后台短暂不可用时保留已加载的数据。 */ }
 }
@@ -116,7 +115,7 @@ async function connectSSE() {
   if (sseAbort) { sseAbort.abort(); sseAbort = null }
   let token = ''
   try { token = await window.pywebview?.api?.get_api_token() || '' } catch (e) { /* bridge 暂时不可用时按无 token 处理。 */ }
-  if (!token) {
+  if (hasBridge() && !token) {
     // 后台服务重启时 token 文件可能尚未发布，这里按退避重连直到 token 出现。
     updateStatus({ engine_running: false })
     sseRetry++
@@ -128,10 +127,7 @@ async function connectSSE() {
   const abort = new AbortController()
   sseAbort = abort
   try {
-    const res = await fetch('http://127.0.0.1:19198/api/events', {
-      headers: { Authorization: 'Bearer ' + token },
-      signal: abort.signal,
-    })
+    const res = await fetchAuthenticated('/api/events', { signal: abort.signal })
     if (!res.ok || !res.body) throw new Error('SSE HTTP ' + res.status)
     sseRetry = 0
     consumeSSE(res, abort)
@@ -168,6 +164,10 @@ function dispatchSSEEvent(eventName, dataText) {
     try { d = JSON.parse(dataText) } catch (err) { return }
     store.engineEvents.push({ name: eventName, data: d, seq: ++sseEventSeq })
     if (store.engineEvents.length > 40) store.engineEvents.splice(0, store.engineEvents.length - 40)
+    if (
+      ['workflow_failed', 'workflow_completed', 'run_dropped', 'run_replaced'].includes(eventName)
+      && store.activeManualRun?.runId === d.run_id
+    ) store.activeManualRun = null
   }
 }
 

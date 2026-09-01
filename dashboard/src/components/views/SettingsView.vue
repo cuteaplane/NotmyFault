@@ -2,17 +2,10 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { store } from '../../lib/store'
 import {
-  getAdminAuthorizationSetting,
-  getAdminRuleVerificationSetting,
   getAIDraftingSetting,
-  getBluetoothSetting,
-  installBluetoothPlugin,
   deleteAIApiKey,
   saveAIApiKey,
-  updateAdminAuthorizationSetting,
-  updateAdminRuleVerificationSetting,
   updateAIDraftingSetting,
-  uninstallBluetoothPlugin,
 } from '../../lib/api'
 import { alertDialog } from '../../lib/dialog'
 import { snackbar } from '../../lib/notify'
@@ -20,26 +13,16 @@ import { appLogoUrl } from '../../lib/branding'
 import { aiProviderIdFor, aiProviderPresets } from '../../lib/providers'
 import OriginDialog from '../OriginDialog.vue'
 
-const adminAuth = ref({ mode: 'per_execution', supported_modes: ['per_execution'], restart_required: false })
-const adminRuleVerification = ref(true)
-const savingAdminAuth = ref(false)
 const savingAIFeature = ref(false)
 const savingAIService = ref(false)
 const savingAIKey = ref(false)
-const savingVerification = ref(false)
-const bluetooth = ref({ available: false, installed: false, meta: null })
-const savingBluetooth = ref(false)
 const aiSavedSnapshot = ref(null)
 const aiServiceDraft = ref({ endpoint_url: '', model: '', api_format: 'chat_completions' })
 const aiKeyEditorOpen = ref(false)
+const aiApiKeyDraft = ref('')
 const currentPage = ref('root')
 const settingsTransition = ref('settings-forward')
 const q = ref('')
-
-const authOptions = [
-  { mode: 'engine_start', icon: 'verified_user', title: '引擎启动时授权一次', sub: '本次引擎运行期间复用管理员授权。' },
-  { mode: 'per_execution', icon: 'touch_app', title: '每次执行时确认', sub: '每次管理员命令都需要单独确认。' },
-]
 
 const pageTitles = {
   root: '设置',
@@ -47,7 +30,6 @@ const pageTitles = {
   ai: 'AI 功能',
   'ai-service': '服务配置',
   'ai-key': 'API 密钥',
-  plugins: '可选插件',
   about: '关于 NotmyFault',
 }
 
@@ -84,16 +66,14 @@ const ruleCount = computed(() => store.configData?.rules?.length || 0)
 const triggerCount = computed(() => Object.keys(store.pluginsData?.triggers || {}).length)
 const actionCount = computed(() => Object.keys(store.pluginsData?.actions || {}).length)
 const modeLabel = computed(() => ({ strict: '严格', normal: '标准', permissive: '宽松' })[store.engineStatus?.security_mode] || '未知')
-const adminAuthLabel = computed(() => authOptions.find(option => option.mode === adminAuth.value.mode)?.title || '未设置')
 const aiProviderLabel = computed(() => {
   const provider = aiProviderPresets.find(item => item.id === aiProviderIdFor(aiSavedSnapshot.value || store.aiDrafting))
   return provider?.label || (store.aiDrafting.endpoint_url ? '自定义' : '未设置')
 })
 
 const rootItems = computed(() => [
-  { page: 'auth', icon: 'shield_lock', title: '安全与授权', value: adminAuthLabel.value, terms: '管理员 授权 签名 验证' },
+  { page: 'auth', icon: 'shield_lock', title: '安全与授权', value: '每次执行时确认', terms: '管理员 授权 签名 验证' },
   { page: 'ai', icon: 'auto_awesome', title: 'AI 功能', value: store.aiDrafting.enabled ? '已开启' : '已关闭', terms: '规则 草稿 服务商 api 密钥 模型' },
-  { page: 'plugins', icon: 'extension', title: '可选插件', value: bluetooth.value.installed ? '已安装 1 个' : '未安装', terms: '蓝牙 安装 插件' },
   { page: 'about', icon: 'info', title: '关于 NotmyFault', value: appVersion, terms: '版本 环境 平台 技术栈' },
 ])
 const filteredRootItems = computed(() => {
@@ -129,35 +109,10 @@ function applyAISavedSettings(settings) {
 
 async function load() {
   try {
-    adminAuth.value = { ...adminAuth.value, ...await getAdminAuthorizationSetting() }
-    adminRuleVerification.value = (await getAdminRuleVerificationSetting()).key_verification === true
     const { api_key_status: aiApiKeyStatus, ...aiDrafting } = await getAIDraftingSetting()
     applyAISavedSettings(aiDrafting)
     store.aiApiKeyStatus = aiApiKeyStatus || 'none'
-    bluetooth.value = await getBluetoothSetting()
   } catch { snackbar('无法读取设置') }
-}
-
-async function selectAdminAuthorization(mode) {
-  if (savingAdminAuth.value || mode === adminAuth.value.mode) return
-  savingAdminAuth.value = true
-  try {
-    const result = await updateAdminAuthorizationSetting(mode)
-    if (!result.ok) return alertDialog('保存失败', result.error || '无法保存管理员授权方式')
-    adminAuth.value = { ...adminAuth.value, ...result }
-    snackbar(result.restart_required ? '已保存，重启引擎后生效' : '管理员授权方式已保存')
-  } catch (error) { alertDialog('保存失败', error.message) } finally { savingAdminAuth.value = false }
-}
-
-async function toggleAdminRuleVerification() {
-  if (savingVerification.value) return
-  savingVerification.value = true
-  try {
-    const result = await updateAdminRuleVerificationSetting(!adminRuleVerification.value)
-    if (!result.ok) return alertDialog('保存失败', result.error || '无法保存验证设置')
-    adminRuleVerification.value = result.key_verification === true
-    snackbar(adminRuleVerification.value ? '管理员规则验证已开启' : '管理员规则验证已关闭')
-  } catch (error) { alertDialog('保存失败', error.message) } finally { savingVerification.value = false }
 }
 
 async function toggleAIDrafting() {
@@ -189,23 +144,23 @@ async function saveAIService() {
 }
 
 function editAIKey() {
-  store.aiApiKey = ''
+  aiApiKeyDraft.value = ''
   aiKeyEditorOpen.value = true
 }
 
 function cancelAIKeyEdit() {
-  store.aiApiKey = ''
+  aiApiKeyDraft.value = ''
   aiKeyEditorOpen.value = false
 }
 
 async function saveAIKey() {
-  if (savingAIKey.value || aiApiKeyPersistenceUnsupported.value || !store.aiApiKey) return
+  if (savingAIKey.value || aiApiKeyPersistenceUnsupported.value || !aiApiKeyDraft.value) return
   savingAIKey.value = true
   try {
-    const result = await saveAIApiKey(store.aiApiKey)
+    const result = await saveAIApiKey(aiApiKeyDraft.value)
     if (!result.ok) return alertDialog('保存失败', result.error || '无法保存 AI API 密钥')
     store.aiApiKeyStatus = result.api_key_status || 'saved'
-    store.aiApiKey = ''
+    aiApiKeyDraft.value = ''
     aiKeyEditorOpen.value = false
     snackbar('API 密钥已保存')
   } catch (error) { alertDialog('保存失败', error.message) } finally { savingAIKey.value = false }
@@ -218,23 +173,10 @@ async function deleteAIKey() {
     const result = await deleteAIApiKey()
     if (!result.ok) return alertDialog('删除失败', result.error || '无法删除 AI API 密钥')
     store.aiApiKeyStatus = result.api_key_status || 'none'
-    store.aiApiKey = ''
+    aiApiKeyDraft.value = ''
     aiKeyEditorOpen.value = false
     snackbar('API 密钥已删除')
   } catch (error) { alertDialog('删除失败', error.message) } finally { savingAIKey.value = false }
-}
-
-async function changeBluetoothInstallation() {
-  if (savingBluetooth.value || !bluetooth.value.available) return
-  savingBluetooth.value = true
-  try {
-    const result = bluetooth.value.installed
-      ? await uninstallBluetoothPlugin()
-      : await installBluetoothPlugin()
-    if (!result.ok) return alertDialog('操作失败', result.error || '无法更改蓝牙插件')
-    bluetooth.value = await getBluetoothSetting()
-    snackbar(bluetooth.value.installed ? '蓝牙开关已安装，重启引擎后生效' : '蓝牙开关已移除，重启引擎后生效')
-  } catch (error) { alertDialog('操作失败', error.message) } finally { savingBluetooth.value = false }
 }
 
 function openSettingsPage(page) {
@@ -271,7 +213,10 @@ onMounted(() => {
   load()
   window.addEventListener('keydown', onKonamiKey)
 })
-onUnmounted(() => window.removeEventListener('keydown', onKonamiKey))
+onUnmounted(() => {
+  aiApiKeyDraft.value = ''
+  window.removeEventListener('keydown', onKonamiKey)
+})
 </script>
 
 <template>
@@ -305,21 +250,17 @@ onUnmounted(() => window.removeEventListener('keydown', onKonamiKey))
 
       <section v-else-if="currentPage === 'auth'" class="settings-subpage">
         <div class="a16-card">
-          <button v-for="option in authOptions" :key="option.mode" type="button"
-            class="a16-row admin-auth-option" :class="{ selected: adminAuth.mode === option.mode }"
-            :disabled="savingAdminAuth || (option.mode === 'engine_start' && !adminAuth.supported_modes.includes('engine_start'))"
-            @click="selectAdminAuthorization(option.mode)">
-            <span class="material-symbols-outlined a16-row-ico">{{ option.icon }}</span>
-            <span class="a16-row-body"><span class="a16-row-title">{{ option.title }}</span><span class="a16-row-sub">{{ option.sub }}</span></span>
-            <span class="material-symbols-outlined a16-radio" :aria-label="adminAuth.mode === option.mode ? '已选择' : '未选择'">{{ adminAuth.mode === option.mode ? 'radio_button_checked' : 'radio_button_unchecked' }}</span>
-          </button>
+          <div class="a16-row admin-auth-option selected">
+            <span class="material-symbols-outlined a16-row-ico">touch_app</span>
+            <span class="a16-row-body"><span class="a16-row-title">每次执行时确认</span><span class="a16-row-sub">每次管理员命令都需要单独确认</span></span>
+            <span class="material-symbols-outlined a16-radio" aria-label="已启用">check_circle</span>
+          </div>
           <div class="a16-row admin-rule-verification-settings">
             <span class="material-symbols-outlined a16-row-ico">key</span>
-            <span class="a16-row-body"><span class="a16-row-title">管理员规则验证</span><span class="a16-row-sub">创建管理员规则时验证签名私钥</span></span>
-            <label class="switch"><input type="checkbox" :checked="adminRuleVerification" :disabled="savingVerification" @change="toggleAdminRuleVerification"><span class="switch-track"><span class="switch-thumb"></span></span></label>
+            <span class="a16-row-body"><span class="a16-row-title">管理员规则验证</span><span class="a16-row-sub">需要审批的规则始终验证签名私钥</span></span>
+            <span class="material-symbols-outlined a16-radio" aria-label="已启用">check_circle</span>
           </div>
         </div>
-        <p v-if="adminAuth.restart_required" class="settings-inline-note">重启引擎后生效</p>
       </section>
 
       <section v-else-if="currentPage === 'ai'" class="settings-subpage ai-drafting-settings">
@@ -366,28 +307,15 @@ onUnmounted(() => window.removeEventListener('keydown', onKonamiKey))
             <strong>{{ aiApiKeyStatusInfo.label }}</strong>
           </div>
           <template v-if="aiKeyEditorOpen">
-            <label class="a16-field settings-key-input">API 密钥<input v-model="store.aiApiKey" class="text-field" type="password" autocomplete="off"></label>
+            <label class="a16-field settings-key-input">API 密钥<input v-model="aiApiKeyDraft" class="text-field" type="password" autocomplete="off"></label>
             <div class="settings-key-actions">
               <button class="btn btn-text" :disabled="savingAIKey" @click="cancelAIKeyEdit">取消</button>
-              <button v-if="!aiApiKeyPersistenceUnsupported" class="btn btn-filled" :disabled="savingAIKey || !store.aiApiKey" @click="saveAIKey">{{ savingAIKey ? '保存中…' : '保存 API 密钥' }}</button>
+              <button v-if="!aiApiKeyPersistenceUnsupported" class="btn btn-filled" :disabled="savingAIKey || !aiApiKeyDraft" @click="saveAIKey">{{ savingAIKey ? '保存中…' : '保存 API 密钥' }}</button>
             </div>
           </template>
           <div v-else class="settings-key-actions">
             <button class="btn btn-filled" :disabled="aiApiKeyPersistenceUnsupported" @click="editAIKey">{{ canDeleteSavedAIKey ? '更改 API 密钥' : '添加 API 密钥' }}</button>
             <button v-if="canDeleteSavedAIKey" class="btn btn-outlined" :disabled="savingAIKey" @click="deleteAIKey">删除 API 密钥</button>
-          </div>
-        </div>
-      </section>
-
-      <section v-else-if="currentPage === 'plugins'" class="settings-subpage">
-        <div class="a16-card bluetooth-settings">
-          <div class="a16-row">
-            <span class="material-symbols-outlined a16-row-ico">bluetooth</span>
-            <span class="a16-row-body"><span class="a16-row-title">蓝牙开关</span></span>
-            <span class="a16-row-val" :class="{ 'settings-state-success': bluetooth.installed }">{{ bluetooth.installed ? '已安装' : '未安装' }}</span>
-          </div>
-          <div class="settings-plugin-actions">
-            <button class="btn btn-filled" :disabled="savingBluetooth || !bluetooth.available" @click="changeBluetoothInstallation">{{ savingBluetooth ? '处理中…' : bluetooth.installed ? '移除' : '安装' }}</button>
           </div>
         </div>
       </section>

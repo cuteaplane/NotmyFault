@@ -6,10 +6,32 @@ export function getParamDefs(m) {
   return []
 }
 
+const unsafeParamNames = new Set(['__proto__', 'constructor', 'prototype'])
+
+export function isSafeParamName(name) {
+  return typeof name === 'string'
+    && /^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(name)
+    && !unsafeParamNames.has(name)
+}
+
 export function buildDefaultParams(m) {
-  const o = {}
-  getParamDefs(m).forEach(p => { o[p.name] = p.default ?? '' })
+  const o = Object.create(null)
+  getParamDefs(m).forEach(p => {
+    if (isSafeParamName(p.name)) o[p.name] = p.default ?? ''
+  })
   return o
+}
+
+export function ensureParams(node) {
+  if (!node || typeof node !== 'object') return {}
+  if (!node.params || typeof node.params !== 'object' || Array.isArray(node.params)) {
+    node.params = Object.create(null)
+  } else {
+    for (const key of Object.keys(node.params)) {
+      if (!isSafeParamName(key)) delete node.params[key]
+    }
+  }
+  return node.params
 }
 
 // options 可能是字符串或带 value 字段的对象，这里统一取 value。
@@ -54,6 +76,16 @@ export function isVisible(paramDef, currentParams) {
 
 export function getVisibleParamDefs(meta, currentParams) {
   return getParamDefs(meta).filter(p => isVisible(p, currentParams))
+}
+
+export function pluginUnavailableReason(meta) {
+  if (!meta) return '未安装'
+  if (meta.enabled === false) return '插件已禁用'
+  if (meta.platform_compatible === false || meta.availability === 'unavailable') {
+    const reasons = Array.isArray(meta.unavailable_reasons) ? meta.unavailable_reasons : []
+    return reasons.join('；') || '当前系统不可用'
+  }
+  return meta._error ? String(meta._error) : ''
 }
 
 const triggerCategoryMap = {

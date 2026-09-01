@@ -1,4 +1,4 @@
-import { getParamDefs } from './utils'
+import { getParamDefs } from './utils.js'
 
 function comparable(value) {
   if (Array.isArray(value)) return value.map(comparable)
@@ -14,14 +14,21 @@ function equal(left, right) {
   return JSON.stringify(comparable(left)) === JSON.stringify(comparable(right))
 }
 
-function describeList(before, after, noun) {
+function withoutFailureActions(item) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return item
+  const { failure_actions, ...rest } = item
+  return rest
+}
+
+function describeList(before, after, noun, transform = value => value) {
   const previous = Array.isArray(before) ? before : []
   const current = Array.isArray(after) ? after : []
   const previousById = new Map(previous.map((item, index) => [item?.binding_id || `index:${index}`, item]))
   const currentById = new Map(current.map((item, index) => [item?.binding_id || `index:${index}`, item]))
   const added = [...currentById.keys()].filter(id => !previousById.has(id)).length
   const removed = [...previousById.keys()].filter(id => !currentById.has(id)).length
-  const changed = [...currentById].filter(([id, item]) => previousById.has(id) && !equal(previousById.get(id), item)).length
+  const changed = [...currentById].filter(([id, item]) => previousById.has(id)
+    && !equal(transform(previousById.get(id)), transform(item))).length
   const sameIds = previous.length === current.length
     && [...previousById.keys()].every(id => currentById.has(id))
   const reordered = sameIds
@@ -41,7 +48,14 @@ export function summarizeRuleChanges(before, after) {
   if (String(before.folder || '') !== String(after.folder || '')) changes.push('文件夹已改')
   if (!equal(before.event || before.condition, after.event || after.condition)) changes.push('触发条件已改')
   changes.push(...describeList(before.preconditions, after.preconditions, '确认'))
-  changes.push(...describeList(before.actions, after.actions, '动作'))
+  changes.push(...describeList(before.actions, after.actions, '动作', withoutFailureActions))
+  const previousActions = new Map((before.actions || []).map((item, index) => [item?.binding_id || `index:${index}`, item]))
+  ;(after.actions || []).forEach((action, index) => {
+    const previous = previousActions.get(action?.binding_id || `index:${index}`)
+    if (!previous) return
+    const name = action?.type || `动作 ${index + 1}`
+    changes.push(...describeList(previous.failure_actions, action.failure_actions, `${name} 的补救动作`))
+  })
   if (!changes.length && !equal(before, after)) changes.push('规则设置已改')
   return changes
 }
@@ -79,7 +93,7 @@ export function computeChangeSet(before, after, schema) {
   if (before && !equal(before.event || before.condition, after.event || after.condition)) {
     items.push({ op: 'modify', target: 'trigger', label: '触发条件', detail: '已变更' })
   }
-  const diffList = (beforeArr, afterArr, noun, kind) => {
+  const diffList = (beforeArr, afterArr, noun, kind, options = {}) => {
     const prev = Array.isArray(beforeArr) ? beforeArr : []
     const curr = Array.isArray(afterArr) ? afterArr : []
     const prevMap = new Map(prev.map((item, i) => [item?.binding_id || 'idx:' + i, { item, index: i }]))
@@ -87,34 +101,40 @@ export function computeChangeSet(before, after, schema) {
     for (const [id, { item, index }] of currMap) {
       if (!prevMap.has(id)) {
         const name = schema?.actions?.[item.type]?.name || item.type || noun
-        items.push({ op: 'add', target: kind, label: name, index })
+        items.push({ op: 'add', target: kind, label: name, index, parentIndex: options.parentIndex })
       }
     }
     for (const [id, { item, index }] of prevMap) {
       if (!currMap.has(id)) {
         const name = schema?.actions?.[item.type]?.name || item.type || noun
-        items.push({ op: 'delete', target: kind, label: name, index })
+        items.push({ op: 'delete', target: kind, label: name, index, parentIndex: options.parentIndex })
       }
     }
     for (const [id, { item: afterItem }] of currMap) {
       const prevEntry = prevMap.get(id)
       if (!prevEntry) continue
       const beforeItem = prevEntry.item
-      if (equal(beforeItem, afterItem)) continue
+      const transform = options.transform || (value => value)
+      if (equal(transform(beforeItem), transform(afterItem))) continue
       const name = schema?.actions?.[afterItem.type]?.name || afterItem.type || noun
       const paramDefs = getParamDefs(schema?.actions?.[afterItem.type])
       const paramChanges = describeParamChanges(beforeItem.params, afterItem.params, paramDefs)
       if (paramChanges.length) {
         for (const pc of paramChanges) {
-          items.push({ op: 'modify', target: kind, label: name, detail: pc.label + ': ' + pc.before + ' → ' + pc.after, index: prevEntry.index })
+          items.push({ op: 'modify', target: kind, label: name, detail: pc.label + ': ' + pc.before + ' → ' + pc.after, index: prevEntry.index, parentIndex: options.parentIndex })
         }
       } else {
-        items.push({ op: 'modify', target: kind, label: name, index: prevEntry.index })
+        items.push({ op: 'modify', target: kind, label: name, index: prevEntry.index, parentIndex: options.parentIndex })
       }
     }
   }
   diffList(before?.preconditions, after.preconditions, '确认', 'precondition')
-  diffList(before?.actions, after.actions, '动作', 'action')
+  diffList(before?.actions, after.actions, '动作', 'action', { transform: withoutFailureActions })
+  const previousActions = new Map((before?.actions || []).map((item, index) => [item?.binding_id || `idx:${index}`, item]))
+  ;(after.actions || []).forEach((action, parentIndex) => {
+    const previous = previousActions.get(action?.binding_id || `idx:${parentIndex}`)
+    if (previous) diffList(previous.failure_actions, action.failure_actions, '补救动作', 'failure-action', { parentIndex })
+  })
   if (!items.length && !equal(before, after)) {
     items.push({ op: 'modify', target: 'rule', label: '规则设置', detail: '已变更' })
   }

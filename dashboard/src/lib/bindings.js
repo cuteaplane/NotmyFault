@@ -332,11 +332,50 @@ export function collectLegacyEventPayloadPaths(value, result = []) {
   return result
 }
 
+const UNSAFE_CONTEXT_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+
+function assertSafeContextKey(key) {
+  if (typeof key !== 'string' || !key || UNSAFE_CONTEXT_KEYS.has(key)) {
+    throw new Error('规则引用包含不安全的字段名')
+  }
+}
+
+function contextRecord() { return Object.create(null) }
+
+function safeContextValue(value) {
+  if (Array.isArray(value)) return value.map(safeContextValue)
+  if (!value || typeof value !== 'object') return value
+  const result = contextRecord()
+  for (const [key, item] of Object.entries(value)) {
+    assertSafeContextKey(key)
+    result[key] = safeContextValue(item)
+  }
+  return result
+}
+
+function assignContextRecord(target, value) {
+  for (const [key, item] of Object.entries(value)) {
+    assertSafeContextKey(key)
+    target[key] = safeContextValue(item)
+  }
+}
+
+function contextBucket(target, key) {
+  assertSafeContextKey(key)
+  if (!Object.prototype.hasOwnProperty.call(target, key)) target[key] = contextRecord()
+  return target[key]
+}
+
 function setPath(target, path, value) {
+  if (!Array.isArray(path) || !path.length) throw new Error('规则引用路径无效')
   let current = target
   path.forEach((segment, index) => {
-    if (index === path.length - 1) current[segment] = value
-    else current = current[segment] ||= {}
+    assertSafeContextKey(segment)
+    if (index === path.length - 1) current[segment] = safeContextValue(value)
+    else {
+      if (!Object.prototype.hasOwnProperty.call(current, segment)) current[segment] = contextRecord()
+      current = current[segment]
+    }
   })
 }
 
@@ -524,7 +563,11 @@ function parsePreparedTestValue(raw, field) {
 }
 
 export function buildPreparedTestContext(fields, values) {
-  const context = { trigger_payloads: {}, event_payload: {}, step_outputs: {} }
+  const context = {
+    trigger_payloads: contextRecord(),
+    event_payload: contextRecord(),
+    step_outputs: contextRecord(),
+  }
   let hasEvent = false
   for (const field of fields) {
     let value
@@ -537,9 +580,9 @@ export function buildPreparedTestContext(fields, values) {
     const target = field.scope === 'event'
       ? context.event_payload
       : field.scope === 'step'
-        ? (context.step_outputs[field.node] ||= {})
-        : (context.trigger_payloads[field.node] ||= {})
-    if (field.fullPayload) Object.assign(target, value)
+        ? contextBucket(context.step_outputs, field.node)
+        : contextBucket(context.trigger_payloads, field.node)
+    if (field.fullPayload) assignContextRecord(target, value)
     else setPath(target, field.path, value)
     if (field.scope === 'event') hasEvent = true
   }
@@ -559,7 +602,10 @@ export function requestTestContext(rule, schema, promptValue = globalThis.prompt
     collectLegacyEventPayloadPaths(rule).map(path => [JSON.stringify(path), path]),
   ).values()]
   if (!references.length && !legacyEventPaths.length) return {}
-  const context = { trigger_payloads: {}, event_payload: {} }
+  const context = {
+    trigger_payloads: contextRecord(),
+    event_payload: contextRecord(),
+  }
   const promptedEventPaths = new Set()
 
   for (const reference of references) {
@@ -593,10 +639,11 @@ export function requestTestContext(rule, schema, promptValue = globalThis.prompt
         throw new Error(`${sourceName} · ${label}：请输入 JSON 对象`)
       }
       if (reference.scope === 'event') {
-        Object.assign(context.event_payload, payloadObject)
+        assignContextRecord(context.event_payload, payloadObject)
         promptedEventPaths.add(JSON.stringify(path))
       } else {
-        context.trigger_payloads[reference.node] = payloadObject
+        const payload = contextBucket(context.trigger_payloads, reference.node)
+        assignContextRecord(payload, payloadObject)
       }
       continue
     }
@@ -611,7 +658,7 @@ export function requestTestContext(rule, schema, promptValue = globalThis.prompt
       promptedEventPaths.add(JSON.stringify(path))
     }
     else {
-      const payload = context.trigger_payloads[reference.node] ||= {}
+      const payload = contextBucket(context.trigger_payloads, reference.node)
       setPath(payload, path, parsed)
     }
   }
@@ -631,7 +678,7 @@ export function requestTestContext(rule, schema, promptValue = globalThis.prompt
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
         throw new Error(`本次触发 · ${label}：请输入 JSON 对象`)
       }
-      Object.assign(context.event_payload, parsed)
+      assignContextRecord(context.event_payload, parsed)
     } else {
       setPath(context.event_payload, path, parsed)
     }

@@ -41,8 +41,11 @@ const previewLoading = ref(false)
 const previewError = ref('')
 const fileForUpload = ref(null)
 const installError = ref('')
+// 页面暂时没有修改 showRegistry 的入口，索引面板和下载代码留给后续继续用。
 const showRegistry = ref(false)
-const registryUrl = ref(localStorage.getItem('nmf-plugin-registry-url') || '')
+let savedRegistryUrl = ''
+try { savedRegistryUrl = localStorage.getItem('nmf-plugin-registry-url') || '' } catch {}
+const registryUrl = ref(savedRegistryUrl)
 const registryPlugins = ref([])
 const registryLoading = ref(false)
 const registryError = ref('')
@@ -68,7 +71,7 @@ async function loadRegistry() {
       registryError.value = data.error || '读取插件索引失败'
       return
     }
-    localStorage.setItem('nmf-plugin-registry-url', url)
+    try { localStorage.setItem('nmf-plugin-registry-url', url) } catch {}
     registryPlugins.value = data.plugins || []
   } catch (error) {
     registryError.value = error.message || '读取插件索引失败'
@@ -236,6 +239,9 @@ async function doInstall() {
 
   const fd = new FormData()
   fd.append('preview_token', p.preview_token)
+  if (hasBuildHookRisk.value && buildHookConfirmed.value) {
+    fd.append('confirmed_risk_ids', JSON.stringify(['build_hook']))
+  }
   if (signingPassword.value) fd.append('signing_password', signingPassword.value)
   if (forceInstall.value) fd.append('force', 'true')
   try {
@@ -284,7 +290,6 @@ onMounted(async () => {
 <template>
   <section class="page active">
     <div class="page-head"><h2>插件管理</h2><div class="actions">
-      <button class="btn btn-tonal" @click="showRegistry = !showRegistry"><span class="material-symbols-outlined">deployed_code</span>插件索引</button>
       <button class="btn btn-filled" @click="openInstall"><span class="material-symbols-outlined">install_desktop</span>安装插件</button>
     </div></div>
     <section v-if="showRegistry" class="plugin-registry-panel">

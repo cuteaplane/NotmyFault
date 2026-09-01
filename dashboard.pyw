@@ -10,12 +10,13 @@ import http.server
 import socketserver
 import socket
 import threading
+import secrets
 
 DASHBOARD_PORT = 19199
 DASHBOARD_CONTROL_PORT = 19197
-_CONTROL_SHOW = b"NMF_DASHBOARD_SHOW_V1"
+_CONTROL_SHOW = b"NMF_DASHBOARD_SHOW_V2"
 _CONTROL_OK = b"NMF_DASHBOARD_OK_V1"
-_CONTROL_QUIT = b"NMF_DASHBOARD_QUIT_V1"
+_CONTROL_QUIT = b"NMF_DASHBOARD_QUIT_V2"
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
@@ -24,6 +25,7 @@ if PROJECT_ROOT not in sys.path:
 import webview
 from notmyfault.application_paths import ApplicationPaths
 from notmyfault.config import SignedConfigStore
+from notmyfault.host.api.auth import ApiTokenStore
 from notmyfault.platform.platform_support import launch_python_entry
 from notmyfault.security.plugin_schema import scan_plugins
 
@@ -73,23 +75,62 @@ def _get_plugins_schema(paths: ApplicationPaths) -> dict:
     return result
 
 
-def _claim_dashboard_instance(port: int = DASHBOARD_CONTROL_PORT):
+def _read_control_secret(path) -> bytes:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+        if len(value) != 64:
+            return b""
+        int(value, 16)
+        return value.encode("ascii")
+    except (OSError, UnicodeError, ValueError):
+        return b""
+
+
+def _send_control_command(path, command: bytes, port: int) -> bool:
+    secret = _read_control_secret(path)
+    if not secret:
+        return False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1) as client:
+            client.settimeout(1)
+            client.sendall(secret + b" " + command + b"\n")
+            response = client.makefile("rb").readline(64).rstrip(b"\r\n")
+            return response == _CONTROL_OK
+    except OSError:
+        return False
+
+
+def _remove_control_secret(path, expected: str) -> None:
+    try:
+        if secrets.compare_digest(path.read_text(encoding="utf-8").strip(), expected):
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _claim_dashboard_instance(control_token_path, port: int = DASHBOARD_CONTROL_PORT):
     """占用 Dashboard 控制端口，已有实例时通知它恢复到前台"""
     show_requested = threading.Event()
     quit_requested = threading.Event()
+    control_secret = secrets.token_hex(32)
 
     class ControlHandler(socketserver.BaseRequestHandler):
         def handle(self):
             try:
-                message = self.request.makefile("rb").readline(64).rstrip(b"\r\n")
-                if message == _CONTROL_SHOW:
+                self.request.settimeout(1)
+                message = self.request.makefile("rb").readline(128).rstrip(b"\r\n")
+                candidate, separator, command = message.partition(b" ")
+                authenticated = separator and secrets.compare_digest(
+                    candidate.decode("ascii"), control_secret,
+                )
+                if authenticated and command == _CONTROL_SHOW:
                     show_requested.set()
                     self.request.sendall(_CONTROL_OK + b"\n")
-                elif message == _CONTROL_QUIT:
+                elif authenticated and command == _CONTROL_QUIT:
                     # 引擎或托盘退出时让 Dashboard 一起退出
                     quit_requested.set()
                     self.request.sendall(_CONTROL_OK + b"\n")
-            except OSError:
+            except (OSError, UnicodeDecodeError):
                 pass
 
     class ControlServer(socketserver.ThreadingTCPServer):
@@ -117,16 +158,8 @@ def _claim_dashboard_instance(port: int = DASHBOARD_CONTROL_PORT):
             break
         except OSError as error:
             last_error = error
-            try:
-                with socket.create_connection(
-                    ("127.0.0.1", port), timeout=1
-                ) as client:
-                    client.sendall(_CONTROL_SHOW + b"\n")
-                    response = client.makefile("rb").readline(64).rstrip(b"\r\n")
-                    if response == _CONTROL_OK:
-                        return None, None, None
-            except OSError:
-                pass
+            if _send_control_command(control_token_path, _CONTROL_SHOW, port):
+                return None, None, None, None
             if attempt < 4:
                 time.sleep(0.1)
     else:
@@ -134,8 +167,14 @@ def _claim_dashboard_instance(port: int = DASHBOARD_CONTROL_PORT):
             f"Dashboard 控制端口 {port} 被其他程序占用"
         ) from last_error
 
+    try:
+        token_store = ApiTokenStore(control_token_path, token=control_secret)
+        token_store.repair_file()
+    except Exception as error:
+        server.server_close()
+        raise RuntimeError("Dashboard 控制令牌无法安全写入") from error
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server, show_requested, quit_requested
+    return server, show_requested, quit_requested, control_secret
 
 
 class DashboardAPI:
@@ -562,8 +601,11 @@ def main():
     if sys.platform.startswith("linux"):
         _patch_qt_permission_policy()
 
+    paths = ApplicationPaths.default()
     try:
-        control_server, show_requested, quit_requested = _claim_dashboard_instance()
+        control_server, show_requested, quit_requested, control_secret = (
+            _claim_dashboard_instance(paths.dashboard_control_token_file)
+        )
     except RuntimeError as error:
         print(f"[Dashboard] {error}", file=sys.stderr)
         if os.name == "nt":
@@ -591,10 +633,12 @@ def main():
     dashboard_url, _static_httpd = _resolve_dashboard_url()
     if not dashboard_url:
         print("[Dashboard] 找不到 dashboard/dist 构建产物", file=sys.stderr)
+        control_server.shutdown()
+        control_server.server_close()
+        _remove_control_secret(paths.dashboard_control_token_file, control_secret)
         return
     icon_path = os.path.join(PROJECT_ROOT, "logo.ico")
 
-    paths = ApplicationPaths.default()
     api = DashboardAPI(SignedConfigStore(paths), paths)
 
     window = webview.create_window(
@@ -655,6 +699,7 @@ def main():
         pass
     control_server.shutdown()
     control_server.server_close()
+    _remove_control_secret(paths.dashboard_control_token_file, control_secret)
     print("[Dashboard] 已退出")
 
 

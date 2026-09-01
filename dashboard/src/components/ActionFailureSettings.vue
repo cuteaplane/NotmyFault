@@ -1,6 +1,6 @@
 <script setup>
 import { computed } from 'vue'
-import { getVisibleParamDefs } from '../lib/utils'
+import { ensureParams, getVisibleParamDefs } from '../lib/utils'
 import ParamInput from './ParamInput.vue'
 
 const props = defineProps({
@@ -61,12 +61,16 @@ function setTimeout(event, action = props.action) {
   action.timeout_seconds = Math.min(Math.max(value, 1), 86400)
 }
 
+function clearTimeout(action = props.action) {
+  delete action.timeout_seconds
+}
+
 function actionName(action) {
   return props.schema[action?.type]?.name || action?.type || '未选择动作'
 }
 
 function actionParams(action) {
-  return getVisibleParamDefs(props.schema[action?.type], action?.params)
+  return getVisibleParamDefs(props.schema[action?.type], ensureParams(action))
 }
 </script>
 
@@ -124,7 +128,7 @@ function actionParams(action) {
           <span class="field-label">超过多少秒就停止</span>
           <span class="action-delay-field"><input class="text-field" type="number" min="1" max="86400" step="1" placeholder="不限制" :value="action.timeout_seconds ?? ''" @input="setTimeout"><small>秒</small></span>
         </label>
-        <p v-else class="action-timeout-unavailable"><span class="material-symbols-outlined">info</span>插件没有提供安全停止能力，所以这里不能设置一个假的超时。动作自身仍可能有网络或子进程超时。</p>
+        <p v-else class="action-timeout-unavailable"><span class="material-symbols-outlined">info</span>插件没有提供安全停止能力，所以这里不能设置一个假的超时。动作自身仍可能有网络或子进程超时。<button v-if="action.timeout_seconds != null" class="btn btn-text btn-sm" type="button" @click="clearTimeout()">清除旧设置</button></p>
       </div>
     </details>
     <details class="failure-actions-settings" :open="action.failure_actions?.length > 0">
@@ -176,6 +180,7 @@ function actionParams(action) {
             <label v-if="schema[failureAction.type]?.cancellation_api === 'runtime-v1'" class="field"><span class="field-label">超过多少秒就停止</span>
               <span class="action-delay-field"><input class="text-field" type="number" min="1" max="86400" step="1" placeholder="不限制" :value="failureAction.timeout_seconds ?? ''" @input="setTimeout($event, failureAction)"><small>秒</small></span>
             </label>
+            <p v-else-if="failureAction.timeout_seconds != null" class="action-timeout-unavailable">当前补救动作不能安全停止。<button class="btn btn-text btn-sm" type="button" @click="clearTimeout(failureAction)">清除旧设置</button></p>
           </div>
           <p v-if="retryCountFor(failureAction) && schema[failureAction.type]?.idempotent !== true" class="action-retry-warning"><span class="material-symbols-outlined">warning</span>这个补救动作没有声明可安全重复执行。重试可能重复产生结果。</p>
         </article>

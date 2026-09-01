@@ -2,12 +2,14 @@
 import { computed, nextTick, ref, watch, onMounted, onUnmounted } from 'vue'
 import { store } from '../lib/store'
 import {
+  ensureParams,
   getVisibleParamDefs,
   buildDefaultParams,
   groupActionKeys,
   groupTriggerKeys,
   normalizeConditionTree,
   normalizeRuleDraft,
+  pluginUnavailableReason as getPluginUnavailableReason,
   optLabel,
   optValue,
 } from '../lib/utils'
@@ -194,15 +196,7 @@ function setConcurrencyMode(mode) {
 }
 // 平台不匹配、缺能力或被用户禁用都算不可选，原因展示给已引用它的规则
 function pluginUnavailableReason(kind, type) {
-  const meta = store.schema[kind]?.[type]
-  if (!meta) return '未安装'
-  if (meta.enabled === false) return '插件已禁用'
-  if (meta.platform_compatible === false || meta.availability === 'unavailable') {
-    const reasons = Array.isArray(meta.unavailable_reasons) ? meta.unavailable_reasons : []
-    return reasons.join('；') || '当前系统不可用'
-  }
-  if (meta._error) return String(meta._error)
-  return ''
+  return getPluginUnavailableReason(store.schema[kind]?.[type])
 }
 const triggerKeys = computed(() => Object.keys(store.schema.triggers).filter(
   key => !pluginUnavailableReason('triggers', key)
@@ -211,10 +205,9 @@ const triggerGroups = computed(() => groupTriggerKeys(triggerKeys.value))
 const actionKeys = computed(() => Object.keys(store.schema.actions).filter(
   key => !pluginUnavailableReason('actions', key)
 ))
-// 录制入口由插件的 uia_selector 采集组件声明驱动，不写死具体插件。
-const desktopRecorder = computed(() => store.components.find(component => (
-  component.available
-  && (component.param_types || []).includes('uia_selector')
+const desktopRecorder = computed(() => store.extensions.parameter_editors.find(editor => (
+  editor.plugin_id === 'uia_control'
+  && editor.parameter === 'target'
 )) || null)
 const desktopRecorderAvailable = computed(() => !!desktopRecorder.value)
 const preconditionKeys = computed(() => actionKeys.value.filter(
@@ -231,8 +224,8 @@ normalizeRuleDraft(props.rule)
 ensureRuleBindingIds(props.rule)
 const conditionNode = computed(() => props.rule.condition ? normalizeConditionTree(props.rule.condition) : null)
 const isAdmin = (meta) => !!(meta?.permissions || []).includes('admin')
-const eventParams = (event) => getVisibleParamDefs(store.schema.triggers[event.type], event.params)
-const actionParams = (action) => getVisibleParamDefs(store.schema.actions[action.type], action.params)
+const eventParams = (event) => getVisibleParamDefs(store.schema.triggers[event.type], ensureParams(event))
+const actionParams = (action) => getVisibleParamDefs(store.schema.actions[action.type], ensureParams(action))
 const eventName = (event) => store.schema.triggers[event?.type]?.name || event?.type || '未选择触发器'
 const actionName = (action) => store.schema.actions[action?.type]?.name || action?.type || '未选择动作'
 function actionFailureSummary(action) {
@@ -702,6 +695,7 @@ function insertRecordedSteps(actions) {
 function changeAction(action, type) {
   action.type = type
   action.params = buildDefaultParams(store.schema.actions[type])
+  if (store.schema.actions[type]?.cancellation_api !== 'runtime-v1') delete action.timeout_seconds
 }
 function removeAction(index) {
   props.rule.actions.splice(index, 1)
@@ -1325,7 +1319,9 @@ onMounted(() => {
   window.addEventListener('keydown', onEditorKeydown)
   aiPanelOpen.value = store.pendingAiPanel === true
   store.pendingAiPanel = false
-  const savedWidth = Number(localStorage.getItem('notmyfault.aiPanelWidth'))
+  let savedWidth = 0
+  try { savedWidth = Number(localStorage.getItem('notmyfault.aiPanelWidth')) }
+  catch { savedWidth = 0 }
   if (savedWidth >= AI_PANEL_MIN_WIDTH && savedWidth <= AI_PANEL_MAX_WIDTH) {
     aiPanelWidth.value = savedWidth
   }
@@ -1876,7 +1872,7 @@ function onEditorKeydown(event) {
     <FolderPicker :open="folderPickerOpen" :folders="folders" :current="currentFolderName"
       @close="folderPickerOpen = false" @select="chooseFolder" />
     <DesktopRecorderDialog :open="desktopRecorderOpen"
-      :plugin-id="desktopRecorder?.plugin_id" :component-id="desktopRecorder?.id || 'record'"
+      :editor="desktopRecorder"
       @close="desktopRecorderOpen = false" @insert="insertRecordedSteps" />
   </section>
 </template>
