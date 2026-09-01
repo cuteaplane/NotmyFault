@@ -42,12 +42,13 @@ cd ..
 ```
 
 ```powershell
+python build.py
 .\.venv\Scripts\python dashboard.pyw
 ```
 
 Dashboard用于操作引擎，用于日常管理和插件的安装。
-第一次启动时如果缺少签名或 build.json，引擎会自动以宽松方式
-构建；后续会改为通过严格方式构建，或许等我再过上十年做个安装脚本出来（啥）
+首次使用需要先运行 `python build.py` 生成签名的 `build.json`；
+缺少签名时引擎启动会失败并提示运行构建脚本。
 
 ### Linux
 
@@ -159,7 +160,9 @@ Dashboard 负责编辑和校验规则。
 - `plugins/`：用户安装的插件。
 - `.api_token`：Dashboard 与本地 API 之间共享的认证令牌。
 
-本地 API 监听 `127.0.0.1:19198`，只接受本机请求和上述令牌认证。
+本地 API 监听 `127.0.0.1:19198`。除 `OPTIONS` 外，`/api/` 请求需要发送
+`Authorization: Bearer <token>`；令牌保存在配置目录的 `.api_token` 中。
+令牌缺失或不匹配时返回 403。
 Dashboard 是 pywebview 桌面客户端，只能在本机使用。
 
 ## 开发与验证
@@ -190,8 +193,18 @@ python build.py verify
 `notmyfault/simulator/` 提供模拟环境，可以在不接触真实系统的情况下跑规则；
 对应测试见 `notmyfault/tests/test_simulator.py`。
 
-插件格式、条件树、动作上下文和目录说明见 [开发文档](docs/DEVELOPMENT.md)；
-Windows 原生调用边界见 [docs/native-safety.md](docs/native-safety.md)。
+开发文档：
+
+- [项目开发与验证](docs/DEVELOPMENT.md)
+- [插件 API v1](docs/plugin-api-v1.md)
+- [插件扩展 API](docs/plugin-extension-api.md)
+- [插件开发命令](docs/plugin-cli.md)
+- [插件多文件、二进制与签名](docs/plugin-author-guide-extensions.md)
+- [插件索引](docs/plugin-registry.md)
+- [动作运行摘要](docs/run-summary-policy.md)
+- [API 后端结构](docs/api-backend-architecture.md)
+- [规则格式 v2](docs/rule-schema-v2.md)
+- [Windows 原生调用安全](docs/native-safety.md)
 
 ## 已知限制
 

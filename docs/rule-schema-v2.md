@@ -130,8 +130,8 @@
 }
 ```
 
-步骤状态包括 `ok`、`failed` 和 `skipped`。`config` 是该触发器实例的配置
-快照，供 `scope: "trigger_config"` 引用。
+步骤状态包括 `ok`、`failed`、`skipped`、`timed_out` 和 `cancelled`。
+`config` 是该触发器实例的配置快照，供 `scope: "trigger_config"` 引用。
 
 ## 事件匹配语义（event-v2）
 

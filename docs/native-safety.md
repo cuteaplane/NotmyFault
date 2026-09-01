@@ -1,13 +1,14 @@
 # 原生调用安全（Native Call Safety）
 
-本文记录引擎与 Windows 原生 API（ctypes / COM / 子进程）打交道要注意的事。
-违反这些规则会在**没有任何 Python traceback** 的情况下把整个进程带崩——
-引擎、API、托盘、日志一起消失，只剩 Windows 事件日志里的
+原生调用错误可能在**没有任何 Python traceback** 的情况下结束整个进程。
+引擎、API、托盘和日志会一起停止，只剩 Windows 事件日志里的
 `0xc0000374`（堆损坏）或 `0xc0000005`（访问冲突）。
 
-## 我已急哭（2026-07）
+## 问题现象与原因（2026-07）
 
-引擎启动后 2~60 秒内静默Boom，日志最后一行往往是某个动作正常完成（如 text_to_speech "播报完成"）。WER 显示 `pythonw.exe` + `ntdll.dll` + `0xc0000374`（STATUS_HEAP_CORRUPTION），且拿不到堆栈。
+引擎启动后 2~60 秒内无日志退出。日志最后一行往往是某个动作正常完成，
+例如 text_to_speech 显示“播报完成”。WER 显示 `pythonw.exe`、`ntdll.dll`
+和 `0xc0000374`（STATUS_HEAP_CORRUPTION），没有可用堆栈。
 
 定位：单线程探针（SAPI 播报、Toast、剪贴板、窗口枚举单独跑）全部正常；
 用引擎的并发模式做多线程压测才复现：
@@ -67,7 +68,7 @@ user32.GetClipboardData.restype = ctypes.c_void_p
 的代码段，必须包在共享锁里：
 
 ```python
-from notmyfault._native_guard import NATIVE_LOCK
+from notmyfault.native import NATIVE_LOCK
 
 def _poll():
     with NATIVE_LOCK:
