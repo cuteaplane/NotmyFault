@@ -2,13 +2,19 @@
     "id": "system_resource",
     "name": "系统资源阈值",
     "semantic": "state",
-    "trigger_api": "event-v1",
+    "trigger_api": "event-v2",
     "description": "当 CPU/内存/磁盘/网络 达到指定阈值时触发",
     "version_code": 2,
     "version": "1.1",
     "package_name": "io.github.notmyfault.system_resource",
     "enabled": true,
-    "permissions": ["native_api"],
+    "permissions": [],
+    "outputs": [
+        {"name": "resource", "label": "资源类型", "type": "string"},
+        {"name": "value", "label": "当前数值", "type": "number"},
+        {"name": "threshold", "label": "配置阈值", "type": "number"},
+        {"name": "direction", "label": "触发方向", "type": "string"}
+    ],
     "params": [
         {
             "name": "resource",

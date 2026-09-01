@@ -2,13 +2,17 @@
     "id": "bluetooth_toggle",
     "name": "开关蓝牙",
     "description": "打开或关闭蓝牙适配器",
-    "version_code": 3,
-    "version": "1.2",
+    "version_code": 4,
+    "version": "2.0",
     "package_name": "io.github.notmyfault.bluetooth_toggle",
+    "requires_capabilities": ["bluetooth.control"],
+    "platforms": ["windows", "linux"],
     "enabled": true,
-    "permissions": [
-        "admin",
-        "external_binary"
+    "permissions": ["external_binary", "native_api"],
+    "outputs": [
+        {"name": "state", "label": "蓝牙状态", "type": "string"},
+        {"name": "changed", "label": "状态是否改变", "type": "bool"},
+        {"name": "method", "label": "控制方式", "type": "string"}
     ],
     "params": [
         {

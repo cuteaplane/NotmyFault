@@ -1,5 +1,4 @@
-// pywebview 桌面客户端。普通 JSON 请求统一经 Python bridge 代理；
-// 只有包含 File 的 FormData 上传需要由 WebView 直接发送。
+// pywebview 桌面客户端，普通 JSON 请求经 Python bridge 代理，包含 File 的 FormData 上传直接由 WebView 发送。
 export const API = 'http://127.0.0.1:19198'
 
 export function hasBridge() {
@@ -19,14 +18,15 @@ async function authHeaders() {
 async function fetchAuthenticated(path, options = {}) {
   const request = async () => {
     const headers = { ...(options.headers || {}), ...await authHeaders() }
-    return await fetch(API + path, { ...options, headers })
+    return await fetch((hasBridge() ? API : '') + path, { ...options, headers })
   }
   let res = await request()
-  // 运行中的 engine 会在认证失败时重新发布其内存 token。重新从 bridge
-  // 读取并重试一次，可从 token 文件被清理/覆盖的状态中立即自愈。
+  // 认证返回 403 时重新从 bridge 读取内存 token 再重试一次，运行中的 engine 会在这里重新发布 token。
   if (res.status === 403 && hasBridge()) res = await request()
   return res
 }
+
+export { fetchAuthenticated }
 
 function bridgeResponse(data) {
   const status = Number(data?.status || (data?.ok === false ? 400 : 200))
@@ -45,34 +45,227 @@ async function bridgeRequest(path, method = 'GET', data = null) {
 }
 
 export async function apiRead(path) {
-  return await bridgeRequest(path, 'GET')
+  return hasBridge()
+    ? await bridgeRequest(path, 'GET')
+    : await fetchAuthenticated(path)
 }
 
-// 带文件的上传无法穿过 pywebview JSON bridge，保留唯一一条直连路径。
+// 含文件的 FormData 无法通过 pywebview JSON bridge，这里直接发 HTTP 请求。
 export async function apiWrite(path, method, body, isForm) {
-  if (!isForm) return await bridgeRequest(path, method, body || null)
-  const res = await fetchAuthenticated(path, { method, body })
+  if (!isForm && hasBridge()) return await bridgeRequest(path, method, body || null)
+  const options = isForm
+    ? { method, body }
+    : {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: body == null ? null : JSON.stringify(body),
+    }
+  const res = await fetchAuthenticated(path, options)
+  if (res.status === 403) throw new Error('Dashboard 与后台服务认证不同步')
+  return res
+}
+
+export async function apiDownload(path, body) {
+  const res = await fetchAuthenticated(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  })
   if (res.status === 403) throw new Error('Dashboard 与后台服务认证不同步')
   return res
 }
 
 export async function loadConfig() {
-  if (!hasBridge()) throw new Error('Dashboard 桌面桥接尚未就绪')
-  return await window.pywebview.api.get_config()
+  if (hasBridge()) return await window.pywebview.api.get_config()
+  return await (await apiRead('/api/rules')).json()
 }
 
-export async function saveConfig(rules) {
-  if (!hasBridge()) throw new Error('Dashboard 桌面桥接尚未就绪')
-  return await window.pywebview.api.save_config(rules)
+export async function saveConfig(rules, adminKeyPassword = '') {
+  if (hasBridge()) return await window.pywebview.api.save_config(rules, adminKeyPassword)
+  const response = await apiWrite('/api/rules', 'PUT', {
+    rules,
+    admin_key_password: adminKeyPassword,
+  })
+  return await response.json()
 }
 
-export async function runRule(ruleIndex, rule = null) {
+export async function runRule(ruleIndex, rule = null, testContext = null) {
+  const body = {
+    ...(rule ? { rule } : {}),
+    ...(testContext || {}),
+  }
   const res = await apiWrite(
     `/api/rules/${ruleIndex}/run`,
     'POST',
-    rule ? { rule } : null,
+    Object.keys(body).length ? body : null,
   )
   return await res.json()
+}
+
+export async function cancelRun(runId) {
+  const res = await apiWrite(
+    `/api/runs/${encodeURIComponent(runId)}/cancel`,
+    'POST',
+  )
+  return await res.json()
+}
+
+export async function getPluginExtensions() {
+  const res = await apiRead('/api/plugins/extensions')
+  const data = await res.json()
+  return {
+    commands: Array.isArray(data?.commands) ? data.commands : [],
+    parameter_editors: Array.isArray(data?.parameter_editors) ? data.parameter_editors : [],
+    views: Array.isArray(data?.views) ? data.views : [],
+    data_types: Array.isArray(data?.data_types) ? data.data_types : [],
+  }
+}
+
+export async function invokeExtensionCommand(
+  pluginId,
+  commandId,
+  {
+    payload = null,
+    sessionId = '',
+    sourceKind = '',
+    sourceId = '',
+    currentValue = null,
+  } = {},
+) {
+  const body = { payload }
+  if (sessionId) body.session_id = sessionId
+  else {
+    body.source_kind = sourceKind
+    body.source_id = sourceId
+    body.current_value = currentValue
+  }
+  const res = await apiWrite(
+    `/api/plugins/${encodeURIComponent(pluginId)}/extensions/commands/${encodeURIComponent(commandId)}/invoke`,
+    'POST',
+    body,
+  )
+  return await res.json()
+}
+
+export async function getExtensionViewPage(pluginId, viewId) {
+  const res = await apiRead(
+    `/api/plugins/${encodeURIComponent(pluginId)}/extensions/views/${encodeURIComponent(viewId)}/page`,
+  )
+  const data = await res.json()
+  if (!res.ok || data?.ok === false || typeof data?.html !== 'string') {
+    throw new Error(data?.error || '无法加载插件视图')
+  }
+  return data.html
+}
+
+export async function closeExtensionSession(pluginId, sessionId) {
+  if (!sessionId) return { ok: true }
+  const res = await apiWrite(
+    `/api/plugins/${encodeURIComponent(pluginId)}/extensions/sessions/${encodeURIComponent(sessionId)}`,
+    'DELETE',
+  )
+  return await res.json()
+}
+
+export async function validateRuleDraft(rule) {
+  const res = await apiWrite('/api/rules/validate', 'POST', { rule })
+  return await res.json()
+}
+
+const AI_DRAFT_EVENT_TYPES = new Set(['status', 'reasoning', 'text', 'progress', 'result', 'error', 'done'])
+const AI_DRAFT_HISTORY_LIMIT = 40
+const AI_DRAFT_MESSAGE_LIMIT = 4000
+
+function aiDraftRequestBody(messages, apiKey = '') {
+  const body = {
+    messages: (Array.isArray(messages) ? messages : [])
+      .filter(message => message?.role === 'user' || message?.role === 'assistant')
+      .map(message => ({
+        role: message.role,
+        content: String(message.content ?? '').trim().slice(0, AI_DRAFT_MESSAGE_LIMIT),
+      }))
+      .filter(message => message.content)
+      .slice(-AI_DRAFT_HISTORY_LIMIT),
+  }
+  const key = typeof apiKey === 'string' ? apiKey.trim() : ''
+  if (key) body.api_key = key
+  return body
+}
+
+function dispatchAIDraftEvent(eventName, dataText, onEvent) {
+  if (!AI_DRAFT_EVENT_TYPES.has(eventName) || !dataText) return
+  onEvent({ type: eventName, data: JSON.parse(dataText) })
+}
+
+export async function consumeAIDraftSSE(body, onEvent, signal) {
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let eventName = ''
+  let dataLines = []
+  const flushEvent = () => {
+    if (dataLines.length) dispatchAIDraftEvent(eventName, dataLines.join('\n'), onEvent)
+    eventName = ''
+    dataLines = []
+  }
+  const consumeLine = (line) => {
+    if (line === '') {
+      flushEvent()
+      return
+    }
+    if (line.startsWith(':')) return
+    if (line.startsWith('event:')) {
+      eventName = line.slice(6).trim()
+      return
+    }
+    if (line.startsWith('data:')) {
+      dataLines.push(line.startsWith('data: ') ? line.slice(6) : line.slice(5))
+    }
+  }
+  const consumeBuffer = () => {
+    let lineEnd
+    while ((lineEnd = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, lineEnd).replace(/\r$/, '')
+      buffer = buffer.slice(lineEnd + 1)
+      consumeLine(line)
+    }
+  }
+  const cancelReader = () => { void reader.cancel().catch(() => {}) }
+  signal?.addEventListener('abort', cancelReader, { once: true })
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      consumeBuffer()
+    }
+    buffer += decoder.decode()
+    consumeBuffer()
+    if (buffer) consumeLine(buffer.replace(/\r$/, ''))
+    flushEvent()
+  } finally {
+    signal?.removeEventListener('abort', cancelReader)
+  }
+}
+
+export async function streamRuleDraftWithAI(messages, {
+  apiKey = '',
+  signal,
+  onEvent = () => {},
+} = {}) {
+  const response = await fetchAuthenticated('/api/rules/draft/ai/stream', {
+    method: 'POST',
+    headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
+    body: JSON.stringify(aiDraftRequestBody(messages, apiKey)),
+    signal,
+  })
+  if (!response.ok || !response.body) {
+    let message = `AI 草稿服务请求失败（${response.status}）`
+    const data = await response.json().catch(() => null)
+    if (typeof data?.error === 'string' && data.error) message = data.error
+    throw new Error(message)
+  }
+  await consumeAIDraftSSE(response.body, onEvent, signal)
 }
 
 export async function loadPlugins() {
@@ -90,10 +283,53 @@ export async function getSchema() {
 }
 
 export async function getEngineStatus() {
-  if (!hasBridge()) {
-    return { api_alive: false, engine_running: false, engine_state: 'offline' }
+  if (hasBridge()) return await window.pywebview.api.get_engine_status()
+  return await (await apiRead('/api/engine/status')).json()
+}
+
+export async function getConfigSecurityStatus() {
+  try {
+    const r = await apiRead('/api/config/security-status')
+    return await r.json()
+  } catch (e) {
+    return { status: 'unavailable', reason: '无法获取配置安全状态', summary: null }
   }
-  return await window.pywebview.api.get_engine_status()
+}
+
+export async function approveConfigSecurity(adminKeyPassword = '') {
+  const r = await apiWrite(
+    '/api/config/security-approve',
+    'POST',
+    adminKeyPassword ? { admin_key_password: adminKeyPassword } : null,
+  )
+  return await r.json()
+}
+
+export async function getAIDraftingSetting() {
+  const r = await apiRead('/api/settings/ai-drafting')
+  return await r.json()
+}
+
+export async function updateAIDraftingSetting(settings) {
+  const r = await apiWrite('/api/settings/ai-drafting', 'PUT', settings)
+  return await r.json()
+}
+
+export async function saveAIApiKey(apiKey) {
+  const r = await apiWrite('/api/settings/ai-drafting/api-key', 'PUT', { api_key: apiKey })
+  return await r.json()
+}
+
+export async function deleteAIApiKey() {
+  const r = await apiWrite('/api/settings/ai-drafting/api-key', 'DELETE')
+  return await r.json()
+}
+
+export async function approveRuleDraft(rule, adminKeyPassword = '') {
+  const r = await apiWrite('/api/rules/approve', 'POST', {
+    rules: [rule], admin_key_password: adminKeyPassword,
+  })
+  return await r.json()
 }
 
 export async function readLogRaw(lines = 300) {
@@ -101,15 +337,28 @@ export async function readLogRaw(lines = 300) {
   catch (e) { return '读取日志失败: ' + e.message }
 }
 
-// 诊断：优先经认证 HTTP 直读引擎实时诊断（含 action_ok），
-// 引擎离线时回退 bridge 直读日志。日志里只有 action_failed 没有“成功”条目，
-// bridge 的 build_diagnostics 凑不出 action_ok，桌面端会永远显示“正常”而非执行次数。
+export async function readLogEntries(lines = 600) {
+  try { return await window.pywebview.api.read_log_entries(lines) }
+  catch (e) { return [{ ts: '', level: 'ERROR', text: '读取日志失败: ' + e.message, data: null }] }
+}
+
+export async function listLogFiles() {
+  try { return await window.pywebview.api.list_log_files() }
+  catch (e) { return [] }
+}
+
+export async function readLogFileEntries(name, lines = 600) {
+  try { return await window.pywebview.api.read_log_file_entries(name, lines) }
+  catch (e) { return [] }
+}
+
+// 诊断优先从认证 HTTP 读取引擎实时数据，离线时读取 bridge 日志，因为日志只有 action_failed，无法统计成功次数。
 export async function readDiagnostics() {
   try {
     const r = await apiRead('/api/engine/diagnostics')
     if (!r.ok) return null
     const d = await r.json()
-    // get_diagnostics 返回嵌套结构，展平成 build_diagnostics 格式
+    // get_diagnostics 返回嵌套结构，展平成 build_diagnostics 格式。
     const errs = d.errors || []
     return {
       error_count: errs.length,
@@ -127,4 +376,29 @@ export async function readDiagnostics() {
   } catch (e) {
     return null
   }
+}
+
+export async function listRuns(limit = 100) {
+  try {
+    const response = await apiRead(`/api/runs?limit=${limit}`)
+    const data = await response.json()
+    return Array.isArray(data?.runs) ? data.runs : []
+  } catch (e) {
+    return []
+  }
+}
+
+export async function getRun(runId) {
+  const response = await apiRead(`/api/runs/${encodeURIComponent(runId)}`)
+  if (!response.ok) return null
+  return await response.json()
+}
+
+// 平台能力报告：每个能力带 available / backend / reason / degraded
+export async function readPlatformCapabilities() {
+  try {
+    const r = await apiRead('/api/platform')
+    if (!r.ok) return null
+    return await r.json()
+  } catch (e) { return null }
 }

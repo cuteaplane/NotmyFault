@@ -1,23 +1,39 @@
+import os
 import subprocess
 import sys
 
+# 命令输出会进规则上下文和日志，全量保留大输出会撑爆内存
+_MAX_OUTPUT = 100 * 1024
+
+
+def _truncate(text: str) -> str:
+    if len(text) <= _MAX_OUTPUT:
+        return text
+    return text[:_MAX_OUTPUT] + f"...（已截断，共 {len(text)} 字符）"
+
 
 def run(action_info, params):
-    command = params.get("command", "").strip()
-    if not command:
-        print("[Action:run_powershell] 未指定命令，跳过")
-        return
+    command = params.get("command", "")
+    if not isinstance(command, str) or not command.strip():
+        raise ValueError("未指定命令")
 
-    print(f"[Action:run_powershell] 执行: {command}")
-
+    command = command.strip()
     try:
         if sys.platform == "win32":
+            powershell = os.path.join(
+                os.environ.get("SystemRoot", r"C:\Windows"),
+                "System32",
+                "WindowsPowerShell",
+                "v1.0",
+                "powershell.exe",
+            )
             result = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+                [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
                 capture_output=True,
                 text=True,
                 errors="replace",
-                timeout=60
+                timeout=60,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
         else:
             result = subprocess.run(
@@ -25,16 +41,20 @@ def run(action_info, params):
                 capture_output=True,
                 text=True,
                 errors="replace",
-                timeout=60
+                timeout=60,
             )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError("命令执行超时（60s）") from e
+    except FileNotFoundError as e:
+        raise RuntimeError("未找到 PowerShell，请确认已安装") from e
+    except OSError as e:
+        raise RuntimeError(f"命令执行异常: {e}") from e
 
-        if result.returncode == 0:
-            print(f"[Action:run_powershell] 执行成功")
-        else:
-            print(f"[Action:run_powershell] 执行失败 (code={result.returncode}): {result.stderr.strip()}")
-    except subprocess.TimeoutExpired:
-        print("[Action:run_powershell] 命令执行超时（60s）")
-    except FileNotFoundError:
-        print("[Action:run_powershell] 未找到 PowerShell，请确认已安装")
-    except Exception as e:
-        print(f"[Action:run_powershell] 执行异常: {e}")
+    if result.returncode != 0:
+        raise RuntimeError(f"命令执行失败 (code={result.returncode})")
+    print(f"[Action:run_powershell] 执行成功")
+    return {
+        "returncode": 0,
+        "stdout": _truncate(result.stdout),
+        "stderr": _truncate(result.stderr),
+    }

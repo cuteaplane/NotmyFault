@@ -1,5 +1,3 @@
-// 插件参数定义工具（规则编辑器使用）
-
 export function getParamDefs(m) {
   if (!m) return []
   if (Array.isArray(m.params)) return m.params
@@ -8,18 +6,40 @@ export function getParamDefs(m) {
   return []
 }
 
+const unsafeParamNames = new Set(['__proto__', 'constructor', 'prototype'])
+
+export function isSafeParamName(name) {
+  return typeof name === 'string'
+    && /^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(name)
+    && !unsafeParamNames.has(name)
+}
+
 export function buildDefaultParams(m) {
-  const o = {}
-  getParamDefs(m).forEach(p => { o[p.name] = p.default ?? '' })
+  const o = Object.create(null)
+  getParamDefs(m).forEach(p => {
+    if (isSafeParamName(p.name)) o[p.name] = p.default ?? ''
+  })
   return o
 }
 
-// options 统一提取 value（兼容字符串和 {value,label} 对象）
+export function ensureParams(node) {
+  if (!node || typeof node !== 'object') return {}
+  if (!node.params || typeof node.params !== 'object' || Array.isArray(node.params)) {
+    node.params = Object.create(null)
+  } else {
+    for (const key of Object.keys(node.params)) {
+      if (!isSafeParamName(key)) delete node.params[key]
+    }
+  }
+  return node.params
+}
+
+// options 可能是字符串或带 value 字段的对象，这里统一取 value。
 export function optValue(o) {
   return typeof o === 'object' && o !== null ? o.value : o
 }
 
-// options 统一提取 label（兼容字符串和 {value,label} 对象）
+// options 可能是字符串或带 label 字段的对象，这里统一取显示文字。
 export function optLabel(o) {
   if (typeof o === 'object' && o !== null) return o.label || friendlyOptionLabel(o.value)
   return friendlyOptionLabel(o)
@@ -40,27 +60,38 @@ function friendlyOptionLabel(value) {
   return commonOptionLabels[text] || text.replace(/[_-]+/g, ' ')
 }
 
-// 判断参数是否应该显示（基于 visible_when 条件）
-// visible_when 格式: {"param_name": ["value1", "value2"]}，多条件为 AND
+// visible_when 用参数名映射允许值列表，多个参数必须同时满足。
 export function isVisible(paramDef, currentParams) {
   const vw = paramDef.visible_when
   if (!vw) return true
   for (const [key, vals] of Object.entries(vw)) {
-    const cur = String(currentParams?.[key] ?? '')
+    const raw = currentParams?.[key]
+    // 参数值来自运行数据时，编辑期无法判断条件，这里保留显示。
+    if (raw && typeof raw === 'object' && raw.$ref) continue
+    const cur = String(raw ?? '')
     if (!vals.map(String).includes(cur)) return false
   }
   return true
 }
 
-// 返回当前应该显示的参数定义（过滤掉 visible_when 不满足的）
 export function getVisibleParamDefs(meta, currentParams) {
   return getParamDefs(meta).filter(p => isVisible(p, currentParams))
+}
+
+export function pluginUnavailableReason(meta) {
+  if (!meta) return '未安装'
+  if (meta.enabled === false) return '插件已禁用'
+  if (meta.platform_compatible === false || meta.availability === 'unavailable') {
+    const reasons = Array.isArray(meta.unavailable_reasons) ? meta.unavailable_reasons : []
+    return reasons.join('；') || '当前系统不可用'
+  }
+  return meta._error ? String(meta._error) : ''
 }
 
 const triggerCategoryMap = {
   manual: '手动', hotkey: '手动', time_schedule: '时间', idle_detect: '时间',
   window_title: '程序', process_state: '程序',
-  folder_monitor: '文件与内容', clipboard: '文件与内容', usb_insert: '设备', bluetooth_device: '设备',
+  folder_monitor: '文件与内容', clipboard: '文件与内容', usb_insert: '设备',
   network_status: '网络', power_state: '系统', system_resource: '系统',
 }
 const triggerCategoryOrder = ['手动', '时间', '程序', '文件与内容', '设备', '网络', '系统', '其他']
@@ -68,6 +99,22 @@ const triggerCategoryOrder = ['手动', '时间', '程序', '文件与内容', '
 export function groupTriggerKeys(keys) {
   const groups = new Map(triggerCategoryOrder.map(name => [name, []]))
   keys.forEach(key => groups.get(triggerCategoryMap[key] || '其他').push(key))
+  return [...groups].filter(([, items]) => items.length)
+}
+
+const actionCategoryMap = {
+  launch_program: '程序', kill_process: '程序', run_powershell: '程序',
+  file_operation: '文件与内容', document_quiescent: '文件与内容', clipboard_set: '文件与内容',
+  http_request: '网络', bluetooth_toggle: '设备',
+  display_control: '桌面', screenshot: '桌面', wallpaper: '桌面', lock_screen: '桌面',
+  notify: '通知与声音', text_to_speech: '通知与声音', set_volume: '通知与声音',
+  shutdown_system: '系统',
+}
+const actionCategoryOrder = ['程序', '文件与内容', '网络', '设备', '桌面', '通知与声音', '系统', '其他']
+
+export function groupActionKeys(keys) {
+  const groups = new Map(actionCategoryOrder.map(name => [name, []]))
+  keys.forEach(key => groups.get(actionCategoryMap[key] || '其他').push(key))
   return [...groups].filter(([, items]) => items.length)
 }
 

@@ -6,18 +6,29 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.pyc
-.pytest-review-tmp/
-
+.pytest-review-*/
+.omo/
 # Distribution / packaging
 dist/
 build/
+node_modules/
 *.egg-info/
 *.egg
-
+.gitignore
 # Virtual environments
 venv/
 .venv/
 env/
+
+# AI agent 配置与产物（一切与 AI agent 有关的内容）
+.agents/
+.claude/
+.opencode/
+.qoder/
+.cursor/
+agent_docs/
+agent_files/
+AGENTS.md
 
 # IDE
 .vscode/
@@ -25,7 +36,6 @@ env/
 *.swp
 *.swo
 *~
-.agents/
 .pytest_cache/
 
 # OS
@@ -38,20 +48,25 @@ Desktop.ini
 # OpenCode 无头任务的临时描述与输出；任务结束后仍会主动清理，
 # 忽略规则用于避免运行期间污染 VS Code Source Control。
 .opencode-*.job.json
+
+# Website is a separate git repository
+website/
 .opencode-*.stdout.log
 .opencode-*.stderr.log
 *.sig
-tests/
-.claude/
+# 带前导斜杠只匹配根目录的 tests，不带斜杠会连 notmyfault/tests 一起忽略
+/tests/
 .coverage
 .private/
 build.json
 notmyfault/integrity.json
 _patch_dash.py
-
+.qoder-cn/
 DECOUPLING.md
-
+.playwright-mcp/
+.codex/
 # 测试沙箱残留（含敏感凭据）
 sandbox_appdata/
 
 .git_commit_msg.txt
+/agent_files/mtkclient/

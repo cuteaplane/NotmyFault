@@ -3,62 +3,48 @@ import os
 import psutil
 
 
-def run(trigger_info, config_list, emit_event, shutdown_event):
-    trigger_id = trigger_info.get("id")
+def run(meta, config, emit_event, shutdown_event):
+    trigger_id = meta.get("id", "process_state")
     poll_interval = 2.0
+    raw_name = config.get("process_name", "").strip()
+    if not raw_name:
+        raise ValueError("未配置监听的进程名（process_name 为空）")
+    normalized_name = raw_name + ".exe" if os.name == "nt" and not raw_name.lower().endswith(".exe") else raw_name
+    target_process = normalized_name.lower()
 
-    target_processes = set()
-    original_names = {}
-    for cfg in config_list:
-        raw_name = cfg.get("process_name", "").strip()
-        if not raw_name:
-            continue
-
-        if os.name == "nt" and not raw_name.lower().endswith(".exe"):
-            normalized_name = raw_name + ".exe"
-        else:
-            normalized_name = raw_name
-
-        normalized_key = normalized_name.lower()
-        target_processes.add(normalized_key)
-        original_names[normalized_key] = raw_name
-
-    if not target_processes:
-        print(f"[Trigger:{trigger_id}] 没有需要监听的进程，触发器退出")
-        return
-
-    print(f"[Trigger:{trigger_id}] 开始监听进程: {sorted(original_names[process_name] for process_name in target_processes)}")
-
-    last_states = {process_name: "stopped" for process_name in target_processes}
+    print(f"[Trigger:{trigger_id}] 开始监听进程: {raw_name}")
+    target_state = config.get("state", "running")
+    if target_state not in ("running", "stopped"):
+        raise ValueError(
+            f"无效的进程状态: {target_state!r}（可选: running/stopped）"
+        )
+    last_state = "stopped"
 
     for proc in psutil.process_iter(["name"]):
         try:
             name = proc.info["name"]
-            if name and name.lower() in target_processes:
-                normalized_name = name.lower()
-                last_states[normalized_name] = "running"
+            if name and name.lower() == target_process:
+                last_state = "running"
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
 
     while not shutdown_event.is_set():
-        currently_running = set()
+        currently_running = False
         for proc in psutil.process_iter(["name"]):
             try:
                 name = proc.info["name"]
-                if name and name.lower() in target_processes:
-                    currently_running.add(name.lower())
+                if name and name.lower() == target_process:
+                    currently_running = True
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
-        for process_name in target_processes:
-            current_state = "running" if process_name in currently_running else "stopped"
-            if current_state != last_states[process_name]:
-                last_states[process_name] = current_state
-                raw_name = original_names.get(process_name, process_name)
-                print(f"[Trigger:{trigger_id}] {raw_name} 状态变化: {current_state}")
-                emit_event(trigger_id, {
-                    "process_name": raw_name,
-                    "state": current_state,
-                })
+        current_state = "running" if currently_running else "stopped"
+        if current_state != last_state:
+            last_state = current_state
+            # 仅在 current_state 等于 target_state 时发送事件
+            if current_state != target_state:
+                continue
+            print(f"[Trigger:{trigger_id}] {raw_name} 状态变化: {current_state}")
+            emit_event({"process_name": raw_name, "state": current_state})
 
         shutdown_event.wait(poll_interval)

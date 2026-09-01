@@ -1,0 +1,27 @@
+{
+    "id": "system_startup",
+    "name": "引擎启动",
+    "semantic": "oneshot",
+    "trigger_api": "event-v2",
+    "description": "引擎启动后延迟指定秒数触发一次（开机自动化）",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.system_startup",
+    "enabled": true,
+    "outputs": [
+        {"name": "started_at", "label": "引擎启动时间", "type": "string"},
+        {"name": "delay_seconds", "label": "延迟秒数", "type": "number"}
+    ],
+    "params": [
+        {
+            "name": "delay_seconds",
+            "label": "延迟（秒）",
+            "type": "number",
+            "default": 5,
+            "min": 0,
+            "max": 300,
+            "step": 1,
+            "placeholder": "等系统/网络就绪后再触发"
+        }
+    ]
+}

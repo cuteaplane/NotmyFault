@@ -1,4 +1,3 @@
-# Experimental feature !
 import os
 import sys
 from pathlib import Path
@@ -60,7 +59,6 @@ def create_shortcut():
     args = f'"{root / "NOTMYFAULT.pyw"}"'
     icon = root / "logo.ico"
     try:
-        # 创建 .lnk
         shell_link = comtypes.client.CreateObject(ShellLink, interface=IShellLinkW)
         shell_link.SetPath(str(target))
         if args:
@@ -72,7 +70,7 @@ def create_shortcut():
         persist_file = shell_link.QueryInterface(IPersistFile)
         persist_file.Save(str(lnk_path), 0)
 
-        # 打开快捷方式并设置 PKEY_AppUserModel_ID
+        # 获取属性存储并写入 PKEY_AppUserModel_ID
         property_store = shell_link.QueryInterface(IPropertyStore)
         pkey = PROPERTYKEY(
             fmtid=GUID("{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}"),

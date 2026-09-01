@@ -1,4 +1,3 @@
-def run(meta, config_list, emit_event, shutdown_event):
-    """手动触发由 Dashboard API 精确分发，后台不需要轮询。"""
-    if config_list:
-        shutdown_event.wait()
+def run(meta, config, emit_event, shutdown_event):
+    """手动触发由 Dashboard API 分发，run 只等待 shutdown_event"""
+    shutdown_event.wait()

@@ -1,0 +1,56 @@
+{
+    "id": "append_text",
+    "name": "追加文本到文件",
+    "description": "把带时间戳的内容追加到本地文件末尾（日志/台账）",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.append_text",
+    "enabled": true,
+    "permissions": ["filesystem"],
+    "security": {
+        "rule_approval": "admin_key",
+        "literal_only_params": ["file_path"]
+    },
+    "execution_api": "context-v1",
+    "outputs": [
+        {"name": "file", "label": "文件路径", "type": "string"},
+        {"name": "lines", "label": "写入行数", "type": "number"},
+        {"name": "written", "label": "写入内容", "type": "string", "sensitive": true, "summary": "hidden"}
+    ],
+    "params": [
+        {
+            "name": "file_path",
+            "label": "文件路径",
+            "type": "path",
+            "default": "",
+            "placeholder": "要追加的 txt/csv/日志文件路径"
+        },
+        {
+            "name": "text",
+            "label": "内容",
+            "type": "textarea",
+            "default": "",
+            "sensitive": true,
+            "summary": "hidden",
+            "placeholder": "要追加的文字，可多行；支持引用上一步结果",
+            "rows": 4
+        },
+        {
+            "name": "add_timestamp",
+            "label": "自动加时间戳",
+            "type": "bool",
+            "default": true
+        },
+        {
+            "name": "encoding",
+            "label": "编码",
+            "type": "select",
+            "default": "utf-8",
+            "options": [
+                {"value": "utf-8", "label": "UTF-8"},
+                {"value": "utf-8-sig", "label": "UTF-8 带 BOM"},
+                {"value": "gbk", "label": "GBK（兼容旧系统日志）"}
+            ]
+        }
+    ]
+}

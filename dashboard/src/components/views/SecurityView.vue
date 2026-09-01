@@ -1,7 +1,13 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
 import { store } from '../../lib/store'
-import { getEngineStatus } from '../../lib/api'
+import {
+  getEngineStatus,
+  getConfigSecurityStatus,
+  approveConfigSecurity,
+} from '../../lib/api'
+import { snackbar } from '../../lib/notify'
+import { alertDialog, confirmDialog, passwordDialog } from '../../lib/dialog'
 
 const mode = ref('unknown')
 const modeMap = {
@@ -10,10 +16,58 @@ const modeMap = {
   permissive: { l: '宽松', d: '开发模式：所有插件均可加载，未声明能力仅告警', c: 'sec-mode-permissive' },
   unknown: { l: '未知', d: '无法获取安全模式（引擎可能未运行）', c: 'sec-mode-permissive' },
 }
-const pL = { admin: '管理员', native_api: '原生API', external_binary: '外部程序' }
-const pC = { admin: 'chip-admin', native_api: 'chip-native', external_binary: 'chip-external' }
-const pI = { admin: 'admin_panel_settings', native_api: 'code', external_binary: 'terminal' }
+// pL 按后端 PERMISSION_REGISTRY 列出全部权限，clipboard 等新增项也会显示图标和文字。
+const pL = {
+  notification: '发送通知', audio: '音频', clipboard: '剪贴板', network: '网络访问',
+  external_binary: '外部程序', native_api: '原生 API', filesystem: '文件系统',
+  process: '进程管理', registry: '注册表', screen_reader: '屏幕读取', admin: '管理员权限',
+}
+const pC = {
+  notification: 'chip-clean', audio: 'chip-permission-low', clipboard: 'chip-permission-medium',
+  network: 'chip-permission-medium', external_binary: 'chip-external', native_api: 'chip-native',
+  filesystem: 'chip-permission-high', process: 'chip-permission-high', registry: 'chip-permission-high',
+  screen_reader: 'chip-permission-high', admin: 'chip-admin',
+}
+const pI = {
+  notification: 'notifications', audio: 'volume_up', clipboard: 'content_paste', network: 'language',
+  external_binary: 'terminal', native_api: 'code', filesystem: 'folder_open', process: 'memory',
+  registry: 'account_tree', screen_reader: 'screenshot_monitor', admin: 'admin_panel_settings',
+}
 const oL = { builtin: '内置', user: '用户', third_party: '第三方' }
+
+const configSec = ref({ status: 'loading', reason: '', summary: null })
+const approving = ref(false)
+async function loadConfigSecurity() {
+  const data = await getConfigSecurityStatus()
+  configSec.value = data
+}
+
+async function approveConfig() {
+  if (!await confirmDialog('重新签名配置？', '请再次确认上方摘要中的规则均为你本人配置。确认无误后，当前配置将被原样重新签名，引擎恢复运行。', '重新签名')) return
+  approving.value = true
+  try {
+    let r = await approveConfigSecurity()
+    if (!r.ok && r.code === 'admin_key_required') {
+      const password = await passwordDialog(
+        '需要签名私钥密码',
+        '当前文件包含需要审批的动作。验证通过后才会重新签名。',
+      )
+      if (typeof password !== 'string') return
+      r = await approveConfigSecurity(password)
+    }
+    if (r.ok) {
+      snackbar(r.message || '配置已重新签名')
+      await loadConfigSecurity()
+      await load()
+    } else {
+      alertDialog('重新签名失败', r.error || '未知错误')
+    }
+  } catch (e) {
+    alertDialog('重新签名失败', e.message)
+  } finally {
+    approving.value = false
+  }
+}
 
 const all = computed(() => {
   const arr = []
@@ -44,39 +98,111 @@ const modeInfo = computed(() => modeMap[mode.value] || modeMap.unknown)
 async function load() {
   try {
     const s = await getEngineStatus()
-    // 合并而非整体覆盖：与 App.vue.updateStatus / useEngineControl.syncStatus 对齐。
-    // 整体替换会把 engine_running 等部分状态字段冲掉，导致引擎状态不一致。
+    // 状态更新采用合并，保留已有的 engine_running 等字段。
     store.engineStatus = { ...store.engineStatus, ...s }
     store.engineOnline = s.engine_running === true
     document.body.classList.toggle('engine-online', store.engineOnline)
     mode.value = s.security_mode || 'unknown'
   } catch (e) { mode.value = 'unknown' }
 }
-onMounted(load)
+onMounted(() => { load(); loadConfigSecurity() })
 </script>
 
 <template>
   <section class="page active">
     <div class="page-head"><h2>安全与权限</h2><div class="actions">
-      <button class="btn btn-outlined" @click="load"><span class="material-symbols-outlined">refresh</span>刷新</button>
+      <button class="btn btn-outlined" @click="load(); loadConfigSecurity()"><span class="material-symbols-outlined">refresh</span>刷新</button>
     </div></div>
+
+    <Transition name="status-strip" mode="out-in">
+    <div v-if="configSec.status === 'tampered'" key="tampered"
+      class="config-security-status config-security-panel config-security-panel-danger">
+      <header class="config-security-head">
+        <span class="material-symbols-outlined config-security-icon">shield_person</span>
+        <div>
+          <h3>配置可能被篡改，引擎已暂停</h3>
+          <p>{{ configSec.reason }}</p>
+        </div>
+      </header>
+      <div v-if="configSec.summary" class="config-security-summary">
+        <div class="config-security-summary-title">
+          <span>当前规则摘要</span>
+          <strong>{{ configSec.summary.rule_count }} 条</strong>
+        </div>
+        <div class="config-security-rule-list">
+          <div v-for="(rule, i) in configSec.summary.rules" :key="i" class="config-security-rule">
+            <span>{{ i + 1 }}. {{ rule.name }}</span>
+            <span class="config-security-rule-actions">
+              <span v-for="(a, j) in rule.actions" :key="j" class="chip"
+                    :class="a.high_risk ? 'chip-admin' : 'chip-clean'">{{ a.type }}</span>
+            </span>
+            <code v-for="(a, j) in [...(rule.preconditions || []), ...(rule.actions || [])]"
+                  :key="`params-${j}`" class="config-security-rule-params">
+              {{ a.type }} {{ JSON.stringify(a.params || {}) }}
+              <template v-for="(failure, k) in (a.failure_actions || [])" :key="k">
+                | failure: {{ failure.type }} {{ JSON.stringify(failure.params || {}) }}
+              </template>
+            </code>
+          </div>
+          <div v-if="!configSec.summary.rules.length" class="config-security-rule-empty">当前没有规则</div>
+        </div>
+        <p class="config-security-risk">
+          <span class="material-symbols-outlined">warning</span>
+          <span>红色标记为需要签名私钥审批的动作。请逐项核对动作参数、前置检查和失败动作。</span>
+        </p>
+      </div>
+      <footer class="config-security-actions">
+        <p>
+          <span class="material-symbols-outlined">backup</span>
+          <span>重新签名前，设置与规则会分别备份到 config.json.bak 和 rules.json.bak。</span>
+        </p>
+        <button class="btn btn-filled" :disabled="approving" @click="approveConfig">
+          <span class="material-symbols-outlined">verified</span>{{ approving ? '重新签名中…' : '我已确认，重新签名' }}
+        </button>
+      </footer>
+    </div>
+    <div v-else-if="configSec.status === 'ok'" key="ok"
+      class="config-security-status config-security-panel config-security-panel-ok config-security-panel-compact">
+      <span class="material-symbols-outlined config-security-icon">verified</span>
+      <div>
+        <strong>完整性正常</strong>
+        <p>设置与规则的签名均有效。</p>
+      </div>
+    </div>
+    <div v-else-if="configSec.status === 'unreadable'" key="unreadable"
+      class="config-security-status config-security-panel config-security-panel-warn config-security-panel-compact">
+      <span class="material-symbols-outlined config-security-icon">warning</span>
+      <div>
+        <strong>配置无法读取</strong>
+        <p>{{ configSec.reason }}</p>
+      </div>
+    </div>
+    </Transition>
+
     <div class="sec-banner" :class="modeInfo.c"><span class="material-symbols-outlined sec-banner-ico">shield</span>
       <div><div class="sec-banner-title">安全模式：{{ modeInfo.l }}</div><p class="sec-banner-desc">{{ modeInfo.d }}</p></div></div>
+
     <div class="stat-grid">
-      <div class="stat-card"><div class="material-symbols-outlined stat-ico" style="color:var(--md-error)">admin_panel_settings</div><div class="stat-val">{{ counts.admin }}</div><div class="stat-lbl">管理员权限</div></div>
-      <div class="stat-card"><div class="material-symbols-outlined stat-ico" style="color:var(--md-warn)">code</div><div class="stat-val">{{ counts.native }}</div><div class="stat-lbl">原生 API</div></div>
-      <div class="stat-card"><div class="material-symbols-outlined stat-ico" style="color:var(--md-tertiary)">terminal</div><div class="stat-val">{{ counts.external }}</div><div class="stat-lbl">外部程序</div></div>
-      <div class="stat-card"><div class="material-symbols-outlined stat-ico" style="color:var(--md-success)">verified</div><div class="stat-val">{{ counts.clean }}</div><div class="stat-lbl">无特殊权限</div></div>
+      <div class="stat-card"><div class="material-symbols-outlined stat-ico text-error">admin_panel_settings</div><div class="stat-val">{{ counts.admin }}</div><div class="stat-lbl">管理员权限</div></div>
+      <div class="stat-card"><div class="material-symbols-outlined stat-ico text-warn">code</div><div class="stat-val">{{ counts.native }}</div><div class="stat-lbl">原生 API</div></div>
+      <div class="stat-card"><div class="material-symbols-outlined stat-ico text-tertiary">terminal</div><div class="stat-val">{{ counts.external }}</div><div class="stat-lbl">外部程序</div></div>
+      <div class="stat-card"><div class="material-symbols-outlined stat-ico text-success">verified</div><div class="stat-val">{{ counts.clean }}</div><div class="stat-lbl">无特殊权限</div></div>
     </div>
     <h4 class="sec-h">权限说明</h4>
-    <div class="sec-legend">
-      <div class="sec-legend-item"><span class="chip chip-admin">管理员</span><span>导入 notmyfault.sudo 模块，可请求管理员提权执行</span></div>
-      <div class="sec-legend-item"><span class="chip chip-native">原生 API</span><span>直接调用 ctypes / win32api 等系统底层接口，可绕过内置工具</span></div>
-      <div class="sec-legend-item"><span class="chip chip-external">外部程序</span><span>通过 subprocess / os.system 执行外部命令或进程</span></div>
+    <div class="mb-5 grid grid-cols-1 gap-3 md:grid-cols-3">
+      <div v-for="leg in [
+          { chip: 'chip-admin', label: '管理员', icon: 'admin_panel_settings', desc: '导入 notmyfault.sudo 模块，可请求管理员提权执行' },
+          { chip: 'chip-native', label: '原生 API', icon: 'code', desc: '直接调用 ctypes / win32api 等系统底层接口，可绕过内置工具' },
+          { chip: 'chip-external', label: '外部程序', icon: 'terminal', desc: '通过 subprocess / os.system 执行外部命令或进程' },
+        ]" :key="leg.label"
+        class="flex items-start gap-3 rounded-md bg-surface-c-low p-4 shadow-elev1">
+        <span class="chip shrink-0" :class="leg.chip">{{ leg.label }}</span>
+        <p class="text-body-s text-on-surface-variant">{{ leg.desc }}</p>
+      </div>
     </div>
     <h4 class="sec-h">插件权限清单</h4>
     <div v-if="!all.length" class="empty-state"><div class="material-symbols-outlined">extension_off</div><h3>暂无插件</h3><p>启动引擎或安装插件后查看</p></div>
-    <div v-else class="perm-table">
+    <div v-else class="overflow-x-auto"><div class="perm-table min-w-[680px]">
       <div class="perm-row perm-row-head"><span class="perm-name">插件</span><span class="perm-type">类型</span><span class="perm-origin">来源</span><span class="perm-chips">声明权限</span></div>
       <div v-for="p in all" :key="p.pid" class="perm-row" :class="{ disabled: !p.enabled }">
         <span class="perm-name"><b>{{ p.name }}</b><small>{{ p.pid }}</small></span>
@@ -84,11 +210,12 @@ onMounted(load)
         <span class="perm-origin">{{ oL[p.origin] || p.origin || '未知' }}</span>
         <span class="perm-chips">
           <span v-if="!p.perms.length" class="chip chip-clean">无特殊权限</span>
-          <span v-for="perm in p.perms" :key="perm" class="chip" :class="pC[perm]">
-            <span class="material-symbols-outlined" style="font-size:14px">{{ pI[perm] }}</span>{{ pL[perm] }}
+          <span v-for="perm in p.perms" :key="perm" class="chip" :class="pC[perm] || 'chip-unknown'"
+            :title="pL[perm] ? perm : `未识别的权限：${perm || '空值'}`">
+            <span class="material-symbols-outlined" style="font-size:14px">{{ pI[perm] || 'help' }}</span>{{ pL[perm] || perm || '未命名权限' }}
           </span>
         </span>
       </div>
-    </div>
+    </div></div>
   </section>
 </template>

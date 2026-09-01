@@ -1,0 +1,109 @@
+{
+    "id": "uia_macro",
+    "name": "执行操作宏",
+    "description": "录制并按原时间顺序重放鼠标、键盘和 UIA 控件操作",
+    "version_code": 2,
+    "version": "1.1",
+    "package_name": "io.github.notmyfault.uia_macro",
+    "enabled": true,
+    "execution_api": "context-v1",
+    "cancellation_api": "runtime-v1",
+    "platforms": ["windows"],
+    "entrypoints": {"windows": "action.py"},
+    "permissions": ["native_api", "screen_reader", "input_monitor"],
+    "contributes": {
+        "commands": [
+            {
+                "id": "open_macro",
+                "title": "打开操作宏编辑器",
+                "handler": "component.py:open_macro"
+            },
+            {
+                "id": "start_recording",
+                "title": "开始录制操作",
+                "handler": "component.py:start_recording"
+            },
+            {
+                "id": "recording_status",
+                "title": "读取录制状态",
+                "handler": "component.py:recording_status"
+            },
+            {
+                "id": "stop_recording",
+                "title": "停止录制操作",
+                "handler": "component.py:stop_recording"
+            },
+            {
+                "id": "commit_macro",
+                "title": "保存操作宏",
+                "handler": "component.py:commit_macro"
+            },
+            {
+                "id": "cancel_macro",
+                "title": "取消编辑操作宏",
+                "handler": "component.py:cancel_macro"
+            }
+        ],
+        "views": [
+            {
+                "id": "macro_workbench",
+                "title": "操作宏编辑器",
+                "description": "录制鼠标、键盘和操作间隔，鼠标点击优先识别 UIA 控件",
+                "page": "pages/macro.html",
+                "commands": ["start_recording", "recording_status", "stop_recording", "commit_macro", "cancel_macro"],
+                "window_controls": ["minimize", "restore"]
+            }
+        ],
+        "data_types": [
+            {
+                "id": "mouse_macro",
+                "version": 1,
+                "binding": "private"
+            }
+        ],
+        "parameter_editors": [
+            {
+                "id": "macro_editor",
+                "parameter": "macro",
+                "data_type": "mouse_macro",
+                "command": "open_macro",
+                "view": "macro_workbench",
+                "accepts_legacy": true,
+                "ui": {
+                    "control": "button",
+                    "empty_label": "录制操作宏",
+                    "icon": "movie",
+                    "description": "走一遍操作即可记录鼠标、键盘和时间间隔；数据由插件自己管理"
+                }
+            }
+        ]
+    },
+    "params": [
+        {
+            "name": "macro",
+            "label": "操作宏",
+            "type": "plugin_data",
+            "data_type": "mouse_macro",
+            "value_type": "object",
+            "required": true,
+            "sensitive": true,
+            "summary": "hidden"
+        }
+    ],
+    "outputs": [
+        {
+            "name": "executed",
+            "label": "已执行步骤",
+            "type": "number",
+            "summary": "value"
+        },
+        {
+            "name": "steps",
+            "label": "执行步骤详情",
+            "type": "array",
+            "sensitive": true,
+            "summary": "hidden"
+        }
+    ],
+    "idempotent": false
+}

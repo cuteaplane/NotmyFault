@@ -7,11 +7,14 @@ openpyxl
 python-multipart
 pillow
 dbus-next
+secretstorage; sys_platform == "linux"
 
 pywebview[qt]; sys_platform == "linux"
 pystray; sys_platform == "linux"
+python-xlib; sys_platform == "linux"
 
 pywebview; sys_platform == "win32"
 pywin32; sys_platform == "win32"
+comtypes; sys_platform == "win32"
 windows-toasts; sys_platform == "win32"
 pycaw; sys_platform == "win32"

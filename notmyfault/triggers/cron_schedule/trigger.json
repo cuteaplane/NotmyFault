@@ -1,0 +1,54 @@
+{
+    "id": "cron_schedule",
+    "name": "计划任务",
+    "semantic": "state",
+    "trigger_api": "event-v2",
+    "description": "每天/每周定时触发，或每隔 N 分钟触发一次",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.cron_schedule",
+    "enabled": true,
+    "outputs": [
+        {"name": "triggered_at", "label": "触发时间", "type": "string"},
+        {"name": "mode", "label": "计划模式", "type": "string"}
+    ],
+    "params": [
+        {
+            "name": "mode",
+            "label": "计划模式",
+            "type": "select",
+            "default": "daily",
+            "options": [
+                {"value": "daily", "label": "每天固定时间"},
+                {"value": "weekly", "label": "每周指定星期"},
+                {"value": "interval", "label": "每隔 N 分钟"}
+            ]
+        },
+        {
+            "name": "time",
+            "label": "触发时间",
+            "type": "time",
+            "default": "09:00",
+            "placeholder": "HH:MM 格式，如 08:30、22:00",
+            "visible_when": {"mode": ["daily", "weekly"]}
+        },
+        {
+            "name": "days",
+            "label": "星期（0=周日）",
+            "type": "string",
+            "default": "1,2,3,4,5",
+            "placeholder": "逗号分隔，如 1,2,3,4,5（工作日）",
+            "visible_when": {"mode": ["weekly"]}
+        },
+        {
+            "name": "interval_minutes",
+            "label": "间隔（分钟）",
+            "type": "number",
+            "default": 30,
+            "min": 1,
+            "max": 1440,
+            "step": 1,
+            "visible_when": {"mode": ["interval"]}
+        }
+    ]
+}

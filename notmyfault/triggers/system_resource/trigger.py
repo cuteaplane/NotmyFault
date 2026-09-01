@@ -15,57 +15,71 @@ def _get_usage(resource: str) -> float:
     return 0.0
 
 
-def run(meta, config_list, emit_event, shutdown_event):
+def run(meta, config, emit_event, shutdown_event):
     trigger_id = meta.get("id", "system_resource")
-
-    if not config_list:
-        print(f"[Trigger:{trigger_id}] 没有配置规则，退出")
-        return
-
-    resources = {}
-    for cfg in config_list:
-        key = (cfg.get("resource", "cpu"), cfg.get("direction", "above"))
-        resources[key] = cfg.get("threshold", 90)
-
-    print(f"[Trigger:{trigger_id}] 开始监控系统资源: {list(resources.keys())}")
-    last_triggered = {}
-    # network 采样基线，用于计算速率而非累计字节
-    net_prev = None  # (timestamp, total_bytes)
+    resource = config.get("resource", "cpu")
+    direction = config.get("direction", "above")
+    if resource not in ("cpu", "memory", "disk", "network"):
+        raise ValueError(
+            f"无效的资源类型: {resource!r}（可选: cpu/memory/disk/network）"
+        )
+    if direction not in ("above", "below"):
+        raise ValueError(
+            f"无效的阈值方向: {direction!r}（可选: above/below）"
+        )
+    try:
+        threshold = float(config.get("threshold", 90))
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"threshold 必须是数字，实际: {config.get('threshold')!r}"
+        ) from None
+    print(f"[Trigger:{trigger_id}] 开始监控系统资源: {resource} {direction}")
+    last_triggered = False
+    # network 采样基线，用于计算 MB/s 速率
+    net_prev = None  # 上一次采样的时间戳和总字节数
     net_rate = 0.0
+    first_sample = True  # 首轮只建基线，不做判定
 
     while not shutdown_event.is_set():
-        net_sampled = False
-        for (resource, direction), threshold in resources.items():
-            try:
-                if resource == "network":
-                    # 每轮只采样一次，计算 MB/s 速率（阈值语义为 MB/s）
-                    if not net_sampled:
-                        net = psutil.net_io_counters()
-                        total = net.bytes_sent + net.bytes_recv
-                        now = time.time()
-                        if net_prev is not None:
-                            elapsed = now - net_prev[0]
-                            if elapsed > 0:
-                                net_rate = (total - net_prev[1]) / elapsed / (1024 * 1024)
-                        net_prev = (now, total)
-                        net_sampled = True
-                    value = net_rate
-                else:
-                    value = _get_usage(resource)
-                triggered = (direction == "above" and value >= threshold) or \
-                            (direction == "below" and value <= threshold)
-                prev = last_triggered.get((resource, direction), False)
-                if triggered and not prev:
-                    unit = "MB/s" if resource == "network" else "%"
-                    print(f"[Trigger:{trigger_id}] {resource} {direction} {threshold}{unit} (当前: {value:.1f})")
-                    emit_event(trigger_id, {
-                        "resource": resource,
-                        "value": round(value, 1),
-                        "threshold": threshold,
-                        "direction": direction,
-                    })
-                last_triggered[(resource, direction)] = triggered
-            except Exception as e:
-                print(f"[Trigger:{trigger_id}] 检查 {resource} 出错: {e}")
+        try:
+            if resource == "network":
+                net = psutil.net_io_counters()
+                total = net.bytes_sent + net.bytes_recv
+                now = time.time()
+                if net_prev is not None:
+                    elapsed = now - net_prev[0]
+                    if elapsed > 0:
+                        net_rate = (total - net_prev[1]) / elapsed / (1024 * 1024)
+                net_prev = (now, total)
+                value = net_rate
+            else:
+                value = _get_usage(resource)
+
+            if first_sample:
+                # cpu_percent 首次调用返回 0，network 首轮还没有速率值，首轮只记录状态
+                first_sample = False
+                last_triggered = False
+                continue
+
+            triggered = (direction == "above" and value >= threshold) or (
+                direction == "below" and value <= threshold
+            )
+            if triggered and not last_triggered:
+                unit = "MB/s" if resource == "network" else "%"
+                print(
+                    f"[Trigger:{trigger_id}] {resource} {direction} "
+                    f"{threshold}{unit} (当前: {value:.1f})"
+                )
+                emit_event({
+                    "resource": resource,
+                    "value": round(value, 1),
+                    "threshold": threshold,
+                    "direction": direction,
+                })
+            last_triggered = triggered
+        except Exception as e:
+            print(f"[Trigger:{trigger_id}] 检查 {resource} 出错: {e}")
+            # 异常时清空触发标志，下一次成功采样重新判断越界
+            last_triggered = False
 
         shutdown_event.wait(5)

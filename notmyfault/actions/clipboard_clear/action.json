@@ -1,0 +1,14 @@
+{
+    "id": "clipboard_clear",
+    "name": "清空剪贴板",
+    "description": "清空系统剪贴板中的内容",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.clipboard_clear",
+    "requires_capabilities": ["clipboard.write"],
+    "enabled": true,
+    "permissions": ["clipboard", "native_api"],
+    "outputs": [
+        {"name": "cleared", "label": "是否清空成功", "type": "bool"}
+    ]
+}

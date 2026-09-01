@@ -5,8 +5,9 @@
     "version_code": 2,
     "version": "1.1",
     "package_name": "io.github.notmyfault.set_volume",
+    "requires_capabilities": ["audio.control"],
     "enabled": true,
-    "permissions": ["audio", "external_binary"],
+    "permissions": ["audio", "external_binary", "native_api"],
     "params": [
         {
             "name": "action",

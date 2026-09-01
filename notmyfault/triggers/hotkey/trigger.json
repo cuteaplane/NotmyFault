@@ -2,19 +2,48 @@
     "id": "hotkey",
     "name": "全局热键",
     "semantic": "oneshot",
-    "trigger_api": "event-v1",
+    "trigger_api": "event-v2",
     "description": "按下指定全局热键时触发动作",
-    "version_code": 1,
-    "version": "1.0",
+    "version_code": 2,
+    "version": "1.1",
     "package_name": "io.github.notmyfault.hotkey",
-    "platforms": ["windows"],
+    "requires_capabilities": ["input.global_hotkey"],
+    "platforms": ["windows", "linux"],
     "enabled": true,
-    "permissions": ["native_api"],
+    "permissions": ["native_api", "input_monitor"],
+    "contributes": {
+        "commands": [
+            {
+                "id": "capture_hotkey",
+                "title": "录制热键",
+                "handler": "extension.py:capture_hotkey"
+            }
+        ],
+        "parameter_editors": [
+            {
+                "id": "hotkey_recorder",
+                "parameter": "hotkey",
+                "value_type": "string",
+                "command": "capture_hotkey",
+                "ui": {
+                    "control": "button",
+                    "label": "录制",
+                    "busy_label": "请按快捷键…",
+                    "icon": "keyboard",
+                    "description": "按下组合键后写入快捷键"
+                }
+            }
+        ]
+    },
+    "outputs": [
+        {"name": "hotkey", "label": "触发热键", "type": "string"}
+    ],
     "params": [
         {
             "name": "hotkey",
             "label": "快捷键",
             "type": "hotkey",
+            "value_type": "string",
             "default": "Ctrl+Alt+Shift+X",
             "placeholder": "如 Ctrl+Shift+A、Alt+F1"
         }

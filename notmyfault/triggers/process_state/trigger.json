@@ -2,12 +2,16 @@
     "id": "process_state",
     "name": "进程状态扫描器",
     "semantic": "state",
-    "trigger_api": "event-v1",
+    "trigger_api": "event-v2",
     "description": "持续扫描进程状态并在目标状态到达时通知主程序",
     "version_code": 2,
     "version": "1.1",
     "package_name": "io.github.notmyfault.process_state",
     "enabled": true,
+    "outputs": [
+        {"name": "process_name", "label": "进程名称", "type": "string"},
+        {"name": "state", "label": "进程状态", "type": "string"}
+    ],
     "params": [
         {
             "name": "process_name",

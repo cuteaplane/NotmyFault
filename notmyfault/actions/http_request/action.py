@@ -1,11 +1,95 @@
-import urllib.request
-import urllib.error
-import json as json_lib
+"""HTTP 请求动作，仅接受 http 和 https URL"""
+
+import http.client
+import socket
+import ssl
+from urllib.parse import urlparse
+
+from notmyfault.plugin_api import network_security_api
+
+resolve_public_http_url = network_security_api().resolve_public_http_url
+
+
+_ALLOWED_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD")
+_MAX_RESPONSE_BYTES = 1024 * 1024
+_BLOCKED_HEADERS = frozenset(
+    {
+        "connection",
+        "content-length",
+        "host",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+
+
+def _open_pinned_socket(
+    addresses: tuple[str, ...],
+    port: int,
+    timeout: float,
+    source_address=None,
+):
+    last_error = None
+    for address in addresses:
+        try:
+            return socket.create_connection(
+                (address, port),
+                timeout,
+                source_address,
+            )
+        except OSError as error:
+            last_error = error
+    if last_error is None:
+        raise OSError("没有可连接的公网地址")
+    raise last_error
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host: str, addresses: tuple[str, ...], **kwargs):
+        self._addresses = addresses
+        super().__init__(host, **kwargs)
+
+    def connect(self):
+        self.sock = _open_pinned_socket(
+            self._addresses,
+            self.port,
+            self.timeout,
+            self.source_address,
+        )
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host: str, addresses: tuple[str, ...], **kwargs):
+        self._addresses = addresses
+        super().__init__(host, **kwargs)
+
+    def connect(self):
+        raw_socket = _open_pinned_socket(
+            self._addresses,
+            self.port,
+            self.timeout,
+            self.source_address,
+        )
+        self.sock = self._context.wrap_socket(
+            raw_socket,
+            server_hostname=self.host,
+        )
+
+
+def _redact_url(url: str) -> str:
+    """查询参数可能包含 token 等凭据，日志只保留 URL 路径"""
+    parsed = urlparse(url)
+    if not parsed.query:
+        return url
+    return parsed._replace(query="***").geturl()
 
 
 def run(action_info, params):
-    method = params.get("method", "GET")
-    url = params.get("url", "").strip()
+    method = str(params.get("method", "GET")).upper()
+    url = str(params.get("url", "")).strip()
     body = params.get("body", "")
     headers_raw = params.get("headers", "")
     try:
@@ -14,37 +98,79 @@ def run(action_info, params):
         timeout = 30
 
     if not url:
-        print("[Action:http_request] 未指定 URL")
-        return
+        raise ValueError("未指定 URL")
+    if method not in _ALLOWED_METHODS:
+        raise ValueError(f"不支持的 HTTP 方法: {method}")
+    parsed, addresses = resolve_public_http_url(url)
 
-    print(f"[Action:http_request] {method} {url}")
+    print(f"[Action:http_request] {method} {_redact_url(url)}")
 
+    headers = {}
+
+    if headers_raw:
+        for line in str(headers_raw).strip().split("\n"):
+            line = line.strip()
+            if ":" in line:
+                key, val = line.split(":", 1)
+                key = key.strip()
+                val = val.strip()
+                if (
+                    not key
+                    or key.lower() in _BLOCKED_HEADERS
+                    or key.lower().startswith("proxy-")
+                    or "\r" in key
+                    or "\n" in key
+                    or "\r" in val
+                    or "\n" in val
+                ):
+                    raise ValueError(f"不允许的 HTTP 请求头: {key or '(空)'}")
+                headers[key] = val
+
+    data = None
+    if method in ("POST", "PUT", "PATCH") and body:
+        data = str(body).encode("utf-8")
+        if not any(k.lower() == "content-type" for k in headers):
+            headers["Content-Type"] = "application/json"
+
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    target = parsed.path or "/"
+    if parsed.query:
+        target += "?" + parsed.query
+    if parsed.scheme.lower() == "https":
+        connection = _PinnedHTTPSConnection(
+            parsed.hostname,
+            addresses,
+            port=port,
+            timeout=timeout,
+            context=ssl.create_default_context(),
+        )
+    else:
+        connection = _PinnedHTTPConnection(
+            parsed.hostname,
+            addresses,
+            port=port,
+            timeout=timeout,
+        )
     try:
-        req = urllib.request.Request(url, method=method)
-
-        if headers_raw:
-            for line in headers_raw.strip().split("\n"):
-                line = line.strip()
-                if ":" in line:
-                    key, val = line.split(":", 1)
-                    req.add_header(key.strip(), val.strip())
-
-        data = None
-        if method in ("POST", "PUT") and body:
-            data = body.encode("utf-8")
-            if not any(k.lower() == "content-type" for k in req.headers):
-                req.add_header("Content-Type", "application/json")
-
-        with urllib.request.urlopen(req, data=data, timeout=timeout) as resp:
-            status = resp.status
-            resp_body = resp.read().decode("utf-8", errors="replace")[:500]
-            print(f"[Action:http_request] {method} {url} -> {status}")
-            if resp_body:
-                print(f"[Action:http_request] 响应: {resp_body[:200]}")
-
-    except urllib.error.HTTPError as e:
-        print(f"[Action:http_request] HTTP {e.code}: {e.reason}")
-    except urllib.error.URLError as e:
-        print(f"[Action:http_request] 请求失败: {e.reason}")
-    except Exception as e:
-        print(f"[Action:http_request] 异常: {e}")
+        connection.request(method, target, body=data, headers=headers)
+        response = connection.getresponse()
+        status = response.status
+        if status >= 300:
+            raise RuntimeError(f"HTTP {status}: {response.reason}")
+        raw_body = response.read(_MAX_RESPONSE_BYTES + 1)
+        truncated = len(raw_body) > _MAX_RESPONSE_BYTES
+        resp_body = raw_body[:_MAX_RESPONSE_BYTES].decode(
+            "utf-8", errors="replace"
+        )
+        print(f"[Action:http_request] {method} {_redact_url(url)} -> {status}")
+        return {
+            "status": status,
+            "body": resp_body,
+            "truncated": truncated,
+        }
+    except OSError as e:
+        raise RuntimeError("请求失败") from e
+    except http.client.HTTPException as e:
+        raise RuntimeError("请求异常") from e
+    finally:
+        connection.close()

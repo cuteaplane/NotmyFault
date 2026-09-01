@@ -9,12 +9,23 @@
     "permissions": [
         "external_binary"
     ],
+    "security": {
+        "rule_approval": "admin_key",
+        "literal_only_params": ["command"]
+    },
+    "outputs": [
+        {"name": "returncode", "label": "退出状态", "type": "number"},
+        {"name": "stdout", "label": "标准输出", "type": "string", "sensitive": true, "summary": "hidden"},
+        {"name": "stderr", "label": "标准错误", "type": "string", "sensitive": true, "summary": "hidden"}
+    ],
     "params": [
         {
             "name": "command",
             "label": "PowerShell 命令",
             "type": "textarea",
             "default": "",
+            "sensitive": true,
+            "summary": "hidden",
             "placeholder": "要执行的 PowerShell 命令",
             "rows": 8
         }

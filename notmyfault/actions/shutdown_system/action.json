@@ -1,12 +1,18 @@
 {
     "id": "shutdown_system",
     "name": "系统控制",
-    "description": "关机、重启、注销、休眠、睡眠",
-    "version_code": 2,
-    "version": "1.1",
+    "description": "关机、重启、注销、休眠、睡眠（需显式确认，默认不强制）",
+    "version_code": 4,
+    "version": "1.3",
     "package_name": "io.github.notmyfault.shutdown_system",
     "enabled": true,
-    "permissions": ["admin", "native_api", "external_binary"],
+    "execution_api": "context-v1",
+    "cancellation_api": "runtime-v1",
+    "permissions": ["native_api", "external_binary"],
+    "security": {
+        "rule_approval": "admin_key",
+        "literal_only_params": ["action", "confirm", "force", "delay_seconds"]
+    },
     "params": [
         {
             "name": "action",
@@ -22,10 +28,16 @@
             ]
         },
         {
+            "name": "confirm",
+            "label": "我已确认，执行该操作",
+            "type": "bool",
+            "default": false
+        },
+        {
             "name": "force",
             "label": "强制（不等待应用响应）",
             "type": "bool",
-            "default": true
+            "default": false
         },
         {
             "name": "delay_seconds",

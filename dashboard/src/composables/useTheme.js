@@ -1,6 +1,6 @@
 import { ref } from 'vue'
 
-// 模块级共享状态，App 与 NavRail 共用同一份 isDark
+// App 和 NavRail 共享模块里的 isDark 状态。
 const isDark = ref(false)
 let initialized = false
 

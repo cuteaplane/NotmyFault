@@ -1,0 +1,31 @@
+{
+    "id": "media_control",
+    "name": "媒体控制",
+    "description": "播放/暂停/切歌/调节音量等媒体命令",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.media_control",
+    "enabled": true,
+    "platforms": ["windows", "linux"],
+    "permissions": ["native_api","external_binary"],
+    "outputs": [
+        {"name": "command", "label": "媒体命令", "type": "string"}
+    ],
+    "params": [
+        {
+            "name": "command",
+            "label": "媒体命令",
+            "type": "select",
+            "default": "play_pause",
+            "options": [
+                {"value": "play_pause", "label": "播放/暂停"},
+                {"value": "stop", "label": "停止"},
+                {"value": "next", "label": "下一首"},
+                {"value": "previous", "label": "上一首"},
+                {"value": "volume_up", "label": "音量 +"},
+                {"value": "volume_down", "label": "音量 -"},
+                {"value": "mute", "label": "静音"}
+            ]
+        }
+    ]
+}

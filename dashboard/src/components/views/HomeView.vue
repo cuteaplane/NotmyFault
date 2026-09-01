@@ -5,27 +5,39 @@ import { getEngineStatus, readDiagnostics, hasBridge } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
 import { useEngineControl } from '../../composables/useEngineControl'
 
-// 引擎启动/暂停/重启逻辑与 NavRail 快捷按钮共享（含 busy 状态）
-const { starting, stopping, syncStatus, startEngine, stopEngine } = useEngineControl()
+// 引擎启停逻辑与 NavRail 快捷按钮共享 starting、stopping 等状态。
+const { starting, stopping, shuttingDown, syncStatus, startEngine, stopEngine, shutdownEngine } = useEngineControl()
 const stats = ref({ rules: '-', triggers: '-', actions: '-', pid: '-' })
+const schedulerText = ref('0 / 0')
 const diag = ref(null)
 let diagTimer = null
-const appVersion = __APP_VERSION__
 
 const isRunning = computed(() => store.engineStatus.engine_running === true)
 const isControllerOnline = computed(() => store.engineStatus.api_alive === true)
 const engineState = computed(() => store.engineStatus.engine_state || (isRunning.value ? 'running' : 'offline'))
 const isStarting = computed(() => starting.value || engineState.value === 'starting')
 const isStopping = computed(() => stopping.value || engineState.value === 'stopping')
-const modeLabel = computed(() => {
-  const m = store.engineStatus.security_mode
-  return ({ strict: '严格', normal: '标准', permissive: '宽松' })[m] || '-'
-})
+// 引擎启动失败或被拒绝时，pausedError 保存后台返回的原因。
+const pausedError = computed(() => store.engineStatus.last_error || '')
+const showFirstAutomationGuide = computed(() => store.configLoaded
+  && isControllerOnline.value
+  && !store.configData.rules?.length)
+
+function goSecurity() {
+  if (window.__nmf && window.__nmf.switchPage) window.__nmf.switchPage('security')
+}
+
+function goAutomations() {
+  store.pendingAutomationCreate = true
+  window.__nmf?.switchPage?.('rules')
+}
 
 async function loadStats() {
   try {
     const s = await getEngineStatus()
     await syncStatus(s)
+    const scheduler = s.scheduler || {}
+    schedulerText.value = `${scheduler.running ?? 0} / ${scheduler.queued ?? 0}`
     if (s.api_alive === true) {
       stats.value = {
         rules: s.rules_count != null ? s.rules_count : '-',
@@ -34,7 +46,7 @@ async function loadStats() {
         pid: s.pid || '-',
       }
     } else {
-      // 引擎未运行：清空数据，避免把配置文件的 rules_count 误报为运行态数据
+      // 引擎未运行时清空统计，运行态数字只来自当前引擎。
       stats.value = { rules: '-', triggers: '-', actions: '-', pid: '-' }
     }
   } catch (e) {
@@ -44,7 +56,7 @@ async function loadStats() {
 }
 
 async function loadDiag() {
-  // 引擎未运行时不请求诊断，避免误报
+  // 引擎未运行时清空诊断结果，后台请求只在运行状态下进行。
   if (!isRunning.value) { diag.value = null; return }
   diag.value = await readDiagnostics()
 }
@@ -100,14 +112,30 @@ function refreshHome() {
   snackbar('已刷新')
 }
 
+function syncStats(status) {
+  stats.value = status.api_alive === true
+    ? {
+        rules: status.rules_count != null ? status.rules_count : '-',
+        triggers: status.triggers_count != null ? status.triggers_count : '-',
+        actions: status.actions_count != null ? status.actions_count : '-',
+        pid: status.pid || '-',
+      }
+    : { rules: '-', triggers: '-', actions: '-', pid: '-' }
+}
+
+watch(() => store.engineStatus, (status) => {
+  syncStats(status)
+  loadDiag()
+}, { immediate: true, deep: true })
+
 onMounted(() => {
-  loadStats()
-  if (hasBridge()) diagTimer = setInterval(loadDiag, 30000)
+  // 引擎空闲没有 SSE 时靠这个定时器兜着，排队数字和诊断一起刷新
+  if (hasBridge()) diagTimer = setInterval(() => { loadDiag(); loadStats() }, 30000)
 })
 onUnmounted(() => { if (diagTimer) clearInterval(diagTimer) })
-// SSE 事件到达时统一刷新统计 + 诊断
+// SSE 事件到达时重新读取统计，并由 loadStats 更新诊断。
 watch(() => store.refreshSignal, () => loadStats())
-// 引擎状态切换：关闭时清空数据，启动时立即刷新
+// 引擎停止时清空诊断，启动后立即读取统计。
 watch(isRunning, (running) => {
   if (!running) {
     diag.value = null
@@ -118,12 +146,23 @@ watch(isRunning, (running) => {
 </script>
 
 <template>
-  <section class="page active">
-    <div class="page-head"><h2>引擎状态</h2><div class="actions">
+  <section class="page active dashboard-home">
+    <div class="page-head"><h2>首页</h2><div class="actions">
       <button class="btn btn-outlined" @click="refreshHome"><span class="material-symbols-outlined">refresh</span>刷新</button>
     </div></div>
 
-    <!-- APatch 风格状态卡片 -->
+    <section v-if="showFirstAutomationGuide" class="dashboard-first-run">
+      <span class="material-symbols-outlined">account_tree</span>
+      <div>
+        <small>第一次使用</small>
+        <h3>创建第一条自动化</h3>
+        <p>前往“自动化”页，从常见用途开始，或者自己指定什么时候开始、接着做什么。</p>
+      </div>
+      <button class="btn btn-filled" @click="goAutomations">前往自动化<span class="material-symbols-outlined">arrow_forward</span></button>
+    </section>
+
+    <h2 class="dashboard-section-title">引擎状态</h2>
+
     <div class="apatch-hero" :class="isStarting ? 'starting' : isStopping ? 'stopping' : isRunning ? 'running' : isControllerOnline ? 'stopped' : 'offline'">
       <div class="hero-left">
         <div class="hero-icon">
@@ -131,76 +170,96 @@ watch(isRunning, (running) => {
           <span v-else class="material-symbols-outlined">{{ isRunning ? 'task_alt' : isControllerOnline ? 'pause_circle' : 'cloud_off' }}</span>
         </div>
         <div>
-          <h3>{{ isStarting ? '启动中…' : isStopping ? '暂停中…' : isRunning ? '自动化运行中' : isControllerOnline ? '自动化已暂停' : '后台服务未启动' }}</h3>
-          <p v-if="isStarting">正在连接后台服务并加载规则…</p>
-          <p v-else-if="isStopping">触发器正在安全退出，托盘与配置服务会保持在线。</p>
-          <p v-else-if="isRunning">PID {{ stats.pid }} · {{ modeLabel }} · 127.0.0.1:19198</p>
-          <p v-else-if="isControllerOnline">PID {{ stats.pid }} · 可继续编辑规则或重新启动自动化</p>
-          <p v-else>Dashboard 会为你启动后台服务、托盘与自动化核心</p>
+          <h3>{{ isStarting ? '启动中…' : isStopping ? '暂停中…' : isRunning ? '运行中' : isControllerOnline ? '已暂停' : '引擎未运行' }}</h3>
         </div>
       </div>
-      <!-- 填充按钮 + 假加载 spinner，4 态互斥 -->
+      <!-- 按钮区域在启动、运行、停止和关闭中只显示一个状态。 -->
       <div class="actions">
-        <button v-if="!isRunning && !isStarting && !isStopping" class="btn" @click="startEngine" style="min-width:148px">
-          <span class="material-symbols-outlined">play_arrow</span>{{ isControllerOnline ? '启动自动化' : '启动后台服务' }}</button>
-        <button v-if="isStarting" class="btn" disabled style="min-width:148px">
+        <button v-if="!isRunning && !isStarting && !isStopping" class="btn hero-control hero-control-primary" @click="startEngine">
+          <span class="material-symbols-outlined">play_arrow</span>{{ isControllerOnline ? '启动自动化' : '启动引擎' }}</button>
+        <button v-if="isStarting" class="btn hero-control hero-control-primary" disabled>
           <span class="spinner"></span>启动中...</button>
-        <button v-if="isRunning && !isStopping" class="btn" @click="stopEngine" style="min-width:148px">
+        <button v-if="isRunning && !isStopping" class="btn hero-control hero-control-primary" @click="stopEngine">
           <span class="material-symbols-outlined">pause</span>暂停自动化</button>
-        <button v-if="isStopping" class="btn" disabled style="min-width:148px">
+        <button v-if="isStopping" class="btn hero-control hero-control-primary" disabled>
           <span class="spinner"></span>暂停中...</button>
+        <!-- 彻底停止按钮只在暂停状态出现，运行时先显示暂停按钮。 -->
+        <button v-if="isControllerOnline && !isRunning && !isStarting && !isStopping && !shuttingDown"
+          class="btn hero-control hero-control-danger" @click="shutdownEngine">
+          <span class="material-symbols-outlined">power_settings_new</span>彻底停止引擎</button>
+        <button v-if="isControllerOnline && !isRunning && !isStarting && !isStopping && shuttingDown"
+          class="btn hero-control hero-control-danger" disabled>
+          <span class="spinner"></span>停止中...</button>
       </div>
     </div>
 
-    <!-- 引擎运行中：显示概览 + 诊断 -->
+    <section v-if="isControllerOnline && !isRunning && !isStarting && pausedError" class="engine-startup-alert">
+      <span class="material-symbols-outlined engine-startup-alert-icon">shield_person</span>
+      <div class="engine-startup-alert-copy">
+        <b>引擎启动被拒绝</b>
+        <p>{{ pausedError }}</p>
+      </div>
+      <button class="btn btn-outlined" @click="goSecurity">
+        <span class="material-symbols-outlined">security</span>前往安全页处理
+      </button>
+    </section>
+
+    <!-- 引擎运行时显示统计、诊断和操作区。 -->
     <template v-if="isControllerOnline">
-    <div v-if="isRunning" class="card" style="margin-bottom:16px">
-      <h4 class="card-section-title">引擎概览</h4>
-      <div class="kv-list">
-        <div class="kv-item"><span class="kv-key">规则数量</span><span class="kv-val">{{ stats.rules }}</span></div>
-        <div class="kv-item"><span class="kv-key">活跃触发器</span><span class="kv-val">{{ stats.triggers }}</span></div>
-        <div class="kv-item"><span class="kv-key">动作类型</span><span class="kv-val">{{ stats.actions }}</span></div>
-        <div class="kv-item"><span class="kv-key">进程 PID</span><span class="kv-val">{{ stats.pid }}</span></div>
-      </div>
-    </div>
-
-    <div class="card" style="margin-bottom:16px">
-      <h4 class="card-section-title">引擎诊断</h4>
-      <div class="kv-list">
-        <div class="kv-item"><span class="kv-key">插件状态</span><span class="kv-val" :class="diagPlugins.cls"><span v-if="diagPlugins.icon" class="material-symbols-outlined">{{ diagPlugins.icon }}</span>{{ diagPlugins.txt }}</span></div>
-        <div class="kv-item"><span class="kv-key">规则状态</span><span class="kv-val" :class="diagRules.cls"><span v-if="diagRules.icon" class="material-symbols-outlined">{{ diagRules.icon }}</span>{{ diagRules.txt }}</span></div>
-        <div class="kv-item"><span class="kv-key">动作执行</span><span class="kv-val" :class="diagActions.cls"><span v-if="diagActions.icon" class="material-symbols-outlined">{{ diagActions.icon }}</span>{{ diagActions.txt }}</span></div>
-        <div class="kv-item"><span class="kv-key">错误 / 警告</span><span class="kv-val"><span class="material-symbols-outlined">{{ diagErrors.ec > 0 ? 'error' : 'check_circle' }}</span>{{ diagErrors.txt }}</span></div>
-        <!-- 诊断详情整合到卡片内，kv-item 风格统一 -->
-        <template v-if="diagLines.length">
-          <div class="kv-item" v-for="(l, i) in diagLines" :key="i">
-            <span class="kv-key" :class="l.cls"><span class="material-symbols-outlined">{{ l.icon }}</span>{{ l.text }}</span>
+      <section v-if="isRunning" class="dashboard-card dashboard-overview">
+        <header class="dashboard-card-head">
+          <div>
+            <h3>运行概览</h3>
           </div>
-        </template>
-        <div v-else class="kv-item">
-          <span class="kv-key">异常详情</span>
-          <span class="kv-val diag-ok"><span class="material-symbols-outlined">check_circle</span>无异常</span>
+          <span class="dashboard-live"><i></i>运行中</span>
+        </header>
+        <div class="dashboard-metrics">
+          <div v-for="s in [
+              { icon: 'rule', val: stats.rules, lbl: '规则数量' },
+              { icon: 'memory', val: stats.triggers, lbl: '活跃触发器' },
+              { icon: 'bolt', val: stats.actions, lbl: '动作类型' },
+              { icon: 'dns', val: stats.pid, lbl: '进程 PID' },
+              { icon: 'stacks', val: schedulerText, lbl: '正在运行 / 排队' },
+            ]" :key="s.lbl" class="dashboard-metric">
+            <span class="material-symbols-outlined dashboard-metric-icon">{{ s.icon }}</span>
+            <div>
+              <strong>{{ s.val }}</strong>
+              <span>{{ s.lbl }}</span>
+            </div>
+          </div>
         </div>
-      </div>
-    </div>
+      </section>
+
+      <section class="dashboard-card dashboard-diagnostics">
+        <header class="dashboard-card-head">
+          <div>
+            <h3>引擎诊断</h3>
+          </div>
+        </header>
+        <div class="dashboard-diagnostic-grid">
+          <div v-for="row in [
+              { key: '插件状态', d: diagPlugins },
+              { key: '规则状态', d: diagRules },
+              { key: '动作执行', d: diagActions },
+              { key: '错误 / 警告', d: { txt: diagErrors.txt, cls: diagErrors.ec > 0 ? 'diag-err' : 'diag-ok', icon: diagErrors.ec > 0 ? 'error' : 'check_circle' } },
+            ]" :key="row.key" class="dashboard-diagnostic-row">
+            <span>{{ row.key }}</span>
+            <span class="dashboard-diagnostic-value" :class="row.d.cls">
+              <span v-if="row.d.icon" class="material-symbols-outlined">{{ row.d.icon }}</span>{{ row.d.txt }}
+            </span>
+          </div>
+        </div>
+        <div v-if="diagLines.length" class="dashboard-diagnostic-detail">
+          <div v-for="(l, i) in diagLines" :key="i" :class="l.cls">
+            <span class="material-symbols-outlined">{{ l.icon }}</span>
+            <span>{{ l.text }}</span>
+          </div>
+        </div>
+        <div v-else class="dashboard-diagnostic-empty diag-ok">
+          <span class="material-symbols-outlined">check_circle</span>暂无异常记录
+        </div>
+      </section>
     </template>
 
-    <!-- 引擎未运行：显示系统信息 -->
-    <template v-else>
-    <div class="card" style="margin-bottom:16px">
-      <h4 class="card-section-title">系统信息</h4>
-      <div class="kv-list">
-        <div class="kv-item"><span class="kv-key">版本</span><span class="kv-val">NotmyFault v{{ appVersion }}</span></div>
-        <div class="kv-item"><span class="kv-key">安全模式</span><span class="kv-val">{{ modeLabel }}</span></div>
-        <div class="kv-item"><span class="kv-key">配置目录</span><span class="kv-val">%APPDATA%/NotmyFault/</span></div>
-        <div class="kv-item"><span class="kv-key">已配置规则</span><span class="kv-val">{{ store.configData?.rules?.length || 0 }} 条</span></div>
-      </div>
-    </div>
-    <div class="empty-state" style="padding:32px 20px">
-      <div class="material-symbols-outlined">power_off</div>
-      <h3>后台服务未启动</h3>
-      <p>点击上方按钮，同时启动托盘、配置服务和自动化核心</p>
-    </div>
-    </template>
   </section>
 </template>

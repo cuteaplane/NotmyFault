@@ -2,13 +2,19 @@
     "id": "clipboard",
     "name": "剪贴板监控",
     "semantic": "oneshot",
-    "trigger_api": "event-v1",
+    "trigger_api": "event-v2",
     "description": "剪贴板内容发生变化时触发",
     "version_code": 1,
     "version": "1.0",
     "package_name": "io.github.notmyfault.clipboard",
+    "requires_capabilities": ["clipboard.read"],
     "enabled": true,
     "permissions": ["clipboard", "native_api"],
+    "outputs": [
+        {"name": "text", "label": "剪贴板内容", "type": "string", "sensitive": true},
+        {"name": "match_text", "label": "匹配配置", "type": "string"},
+        {"name": "matched", "label": "实际匹配文本", "type": "string", "required": false}
+    ],
     "params": [
         {
             "name": "match_text",

@@ -1,5 +1,69 @@
+import json
 import os
+import re
 import subprocess
+import sys
+
+_SPEAK_TIMEOUT = 60
+
+
+# SAPI 和音频驱动曾在播报完成后让引擎进程因堆损坏静默崩溃，错误码 0xc0000374，
+# Windows TTS 放进独立子进程，SAPI 崩溃时父进程仍可继续运行
+_TTS_HELPER = r"""
+import json
+import sys
+import pythoncom
+import win32com.client
+
+# 父进程以 UTF-8 写入二进制 stdin，Windows 中文环境的文本模式默认使用 GBK
+payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+pythoncom.CoInitialize()
+try:
+    speaker = win32com.client.Dispatch("SAPI.SpVoice")
+    voice_name = payload.get("voice") or ""
+    if voice_name:
+        for voice in speaker.GetVoices():
+            try:
+                name = str(voice.GetAttribute("Name"))
+            except Exception:
+                name = ""
+            if voice_name.casefold() in name.casefold():
+                speaker.Voice = voice
+                break
+    rate = int(payload.get("rate", 0) or 0)
+    volume = int(payload.get("volume", 100) or 100)
+    if rate != 0:
+        speaker.Rate = max(-10, min(10, rate))
+    if volume != 100:
+        speaker.Volume = max(0, min(100, volume))
+    # 子进程只处理本次播报，父进程超时后终止等待中的子进程
+    speaker.Speak(payload.get("text", ""))
+    speaker = None
+finally:
+    pythoncom.CoUninitialize()
+"""
+
+
+def _speak_windows(text: str, rate, volume, voice_name: str) -> None:
+    payload = json.dumps({
+        "text": text,
+        "rate": rate,
+        "volume": volume,
+        "voice": voice_name,
+    }, ensure_ascii=False).encode("utf-8")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _TTS_HELPER],
+            input=payload,
+            capture_output=True,
+            timeout=_SPEAK_TIMEOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"语音播报超时（{_SPEAK_TIMEOUT}s）") from None
+    if result.returncode != 0:
+        stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"语音播报失败: {stderr[:200] or 'SAPI 错误'}")
 
 
 def run(action_info, params):
@@ -9,60 +73,43 @@ def run(action_info, params):
     voice_name = str(params.get("voice", "")).strip()
 
     if not text:
-        print("[Action:text_to_speech] 没有文本可播报")
-        return
+        raise ValueError("没有文本可播报")
 
-    print(f"[Action:text_to_speech] 播报: {text[:60]}...")
+    print(f"[Action:text_to_speech] 准备播报 ({len(text)} 字符)")
 
-    try:
-        if os.name != "nt":
-            command = ["spd-say", "--wait"]
+    if os.name != "nt":
+        from notmyfault.platform.linux_support import require_command
+
+        speaker = require_command("语音播报", "spd-say")
+        command = [speaker, "--wait"]
+        try:
             if rate:
                 command.extend(["--rate", str(max(-100, min(100, int(rate) * 10)))])
             if volume != 100:
                 command.extend(["--volume", str(max(-100, min(100, int(volume) - 100)))])
-            if voice_name:
-                command.extend(["--language", voice_name])
-            command.append(text)
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=120,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(result.stderr.strip() or "spd-say 播报失败")
-            print("[Action:text_to_speech] 播报完成")
-            return
+        except (TypeError, ValueError):
+            raise ValueError(f"rate/volume 必须是数字，实际: rate={rate!r} volume={volume!r}") from None
+        # spd-say 的 --language 只认 BCP 47 语言代码；Windows 声音名传过去只会报错
+        if voice_name and re.fullmatch(r"[a-z]{2,3}(-[A-Za-z0-9]{2,8})*", str(voice_name)):
+            command.extend(["--language", str(voice_name)])
+        command.append(text)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=120,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "spd-say 播报失败")
+        print("[Action:text_to_speech] 播报完成")
+        return
 
-        import win32com.client
-        speaker = win32com.client.Dispatch("SAPI.SpVoice")
+    try:
+        rate = int(rate)
+        volume = int(volume)
+    except (TypeError, ValueError):
+        raise ValueError(f"rate/volume 必须是数字，实际: rate={rate!r} volume={volume!r}") from None
 
-        if voice_name:
-            matched_voice = None
-            for voice in speaker.GetVoices():
-                try:
-                    name = str(voice.GetAttribute("Name"))
-                except Exception:
-                    name = ""
-                if voice_name.casefold() in name.casefold():
-                    matched_voice = voice
-                    break
-            if matched_voice is None:
-                print(f"[Action:text_to_speech] 未找到声音: {voice_name}，使用系统默认声音")
-            else:
-                speaker.Voice = matched_voice
-
-        if rate != 0:
-            speaker.Rate = max(-10, min(10, int(rate)))
-        if volume != 100:
-            speaker.Volume = max(0, min(100, int(volume)))
-
-        speaker.Speak(text)
-        print(f"[Action:text_to_speech] 播报完成")
-
-    except ImportError:
-        print("[Action:text_to_speech] 需要 pywin32 库")
-    except Exception as e:
-        print(f"[Action:text_to_speech] 播报失败: {e}")
+    _speak_windows(text, rate, volume, voice_name)
+    print("[Action:text_to_speech] 播报完成")

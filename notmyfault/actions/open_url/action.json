@@ -1,0 +1,35 @@
+{
+    "id": "open_url",
+    "name": "打开链接",
+    "description": "用系统默认浏览器打开一个或多个网址",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.open_url",
+    "enabled": true,
+    "permissions": ["external_binary", "network"],
+    "security": {
+        "rule_approval": "admin_key",
+        "literal_only_params": ["urls"]
+    },
+    "outputs": [
+        {"name": "opened", "label": "成功打开数量", "type": "number"}
+    ],
+    "params": [
+        {
+            "name": "urls",
+            "label": "网址（每行一个）",
+            "type": "textarea",
+            "default": "",
+            "sensitive": true,
+            "summary": "hidden",
+            "placeholder": "如 https://example.com，可写多行",
+            "rows": 5
+        },
+        {
+            "name": "new_window",
+            "label": "新窗口打开",
+            "type": "bool",
+            "default": false
+        }
+    ]
+}

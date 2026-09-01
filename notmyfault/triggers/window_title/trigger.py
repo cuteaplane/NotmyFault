@@ -1,75 +1,113 @@
-import time
-import ctypes
-from ctypes import wintypes
+"""窗口标题状态检测：目标窗口出现 / 关闭时触发
+Windows 用 EnumWindows；Linux 用 xdotool（仅 X11，Wayland 不可用）
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+
+from notmyfault.plugin_api import platform_backend_api
+from notmyfault.triggers.base import PollingTrigger
+
+BackendMissingError = platform_backend_api().BackendMissingError
 
 
 def _get_window_titles() -> dict:
-    """枚举所有可见窗口，返回 {hwnd: title} 字典"""
-    result = {}
-    user32 = ctypes.windll.user32
+    if os.name == "nt":
+        return _get_window_titles_windows()
+    return _get_window_titles_linux()
+
+
+def _get_window_titles_windows() -> dict:
+    import ctypes
+    from notmyfault.native import NATIVE_LOCK, typed_user32, WNDENUMPROC
+    user32 = typed_user32()
     titles = {}
-
-    def enum_callback(hwnd, _):
-        if user32.IsWindowVisible(hwnd):
-            length = user32.GetWindowTextLengthW(hwnd)
-            if length > 0:
-                buf = ctypes.create_unicode_buffer(length + 1)
-                user32.GetWindowTextW(hwnd, buf, length + 1)
-                title = buf.value
-                if title.strip():
-                    titles[hwnd] = title
-        return True  # 继续枚举
-
-    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    user32.EnumWindows(WNDENUMPROC(enum_callback), 0)
+    with NATIVE_LOCK:
+        def enum_callback(hwnd, _):
+            if user32.IsWindowVisible(hwnd):
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buf, length + 1)
+                    title = buf.value
+                    if title.strip():
+                        titles[hwnd] = title
+            return True
+        user32.EnumWindows(WNDENUMPROC(enum_callback), 0)
     return titles
 
 
-def run(meta, config_list, emit_event, shutdown_event):
-    trigger_id = meta.get("id", "window_title")
+def _get_window_titles_linux() -> dict:
+    xdotool = shutil.which("xdotool")
+    if not xdotool:
+        return {}
+    try:
+        result = subprocess.run(
+            [xdotool, "search", "--name", "", "getwindowname"],
+            capture_output=True, text=True, errors="replace", timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if result.returncode != 0:
+        return {}
+    titles = {}
+    lines = result.stdout.strip().splitlines()
+    i = 0
+    while i < len(lines) - 1:
+        wid = lines[i].strip()
+        title = lines[i + 1].strip()
+        if wid.isdigit() and title:
+            titles[wid] = title
+        i += 2
+    return titles
 
-    patterns = {}
-    for cfg in config_list:
-        pattern = cfg.get("title_pattern", "").strip().lower()
-        expected_state = cfg.get("state", "opened")
-        if pattern:
-            patterns[pattern] = expected_state
 
-    if not patterns:
-        print(f"[Trigger:{trigger_id}] 未配置标题关键词，退出")
-        return
+class WindowTitleTrigger(PollingTrigger):
+    interval = 3.0
+    native = True
 
-    print(f"[Trigger:{trigger_id}] 开始监视窗口标题: {list(patterns.keys())}")
+    def validate(self):
+        if not str(self.config.get("title_pattern", "")).strip():
+            raise ValueError("未配置标题关键词（title_pattern 为空）")
+        state = self.config.get("state", "opened")
+        if state not in ("opened", "closed"):
+            raise ValueError(f"无效的窗口状态: {state!r}（可选: opened/closed）")
+        if sys.platform != "win32" and not shutil.which("xdotool"):
+            raise BackendMissingError("依赖缺失：窗口标题监视需要 xdotool")
 
-    # 记录每个模式当前是否已匹配到
-    was_matched = {p: False for p in patterns}
+    def setup(self):
+        self.pattern = str(self.config.get("title_pattern", "")).strip().lower()
+        self.target_state = self.config.get("state", "opened")
+        self._was_matched = False
+        self.log(f"开始监视窗口标题: {self.pattern}")
 
-    while not shutdown_event.is_set():
-        try:
-            titles = _get_window_titles()
-            all_text = " ".join(titles.values()).lower()
+    def poll(self):
+        titles = _get_window_titles()
+        matched_titles = [t for t in titles.values() if self.pattern in t.lower()]
+        matched = bool(matched_titles)
 
-            for pattern, expected_state in patterns.items():
-                matched = pattern in all_text
+        if matched and not self._was_matched:
+            if self.target_state == "opened":
+                actual_title = max(matched_titles, key=len)
+                self.log(f"窗口出现: '{self.pattern}'")
+                self.emit({
+                    "title_pattern": self.pattern,
+                    "state": "opened",
+                    "matched_title": actual_title,
+                })
+            self._was_matched = True
+        elif not matched and self._was_matched:
+            if self.target_state == "closed":
+                self.log(f"窗口关闭: '{self.pattern}'")
+                self.emit({
+                    "title_pattern": self.pattern,
+                    "state": "closed",
+                    "matched_title": "",
+                })
+            self._was_matched = False
 
-                if matched and not was_matched[pattern]:
-                    print(f"[Trigger:{trigger_id}] 窗口出现: '{pattern}'")
-                    emit_event(trigger_id, {
-                        "title_pattern": pattern,
-                        "state": "opened",
-                        "matched_title": pattern
-                    })
-                    was_matched[pattern] = True
-                elif not matched and was_matched[pattern]:
-                    print(f"[Trigger:{trigger_id}] 窗口关闭: '{pattern}'")
-                    emit_event(trigger_id, {
-                        "title_pattern": pattern,
-                        "state": "closed",
-                        "matched_title": pattern
-                    })
-                    was_matched[pattern] = False
 
-        except Exception as e:
-            print(f"[Trigger:{trigger_id}] 扫描出错: {e}")
-
-        shutdown_event.wait(3)
+def run(meta, config, emit_event, shutdown_event):
+    WindowTitleTrigger(meta, config, emit_event, shutdown_event).run()

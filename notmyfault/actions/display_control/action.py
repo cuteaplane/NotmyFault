@@ -4,6 +4,12 @@ import os
 import subprocess
 import time
 
+from notmyfault.plugin_api import platform_backend_api
+
+_platform_backend = platform_backend_api()
+DisplayBackend = _platform_backend.DisplayBackend
+default_runner = _platform_backend.default_runner
+
 HWND_BROADCAST = 0xFFFF
 WM_SYSCOMMAND = 0x0112
 SC_MONITORPOWER = 0xF170
@@ -12,7 +18,7 @@ MONITOR_OFF = 2
 
 
 def _brightness_level(params) -> int:
-    """Return a validated integer brightness, including legacy action aliases."""
+    """返回经过校验的整数亮度，也处理旧动作别名"""
     action = params.get("action", "off")
     if action == "low_brightness":
         return 10
@@ -48,7 +54,7 @@ def validate_params(_action_info, params):
 
 
 def _set_wmi_brightness(level: int) -> int:
-    """Set and verify brightness for panels exposed through root/WMI."""
+    """设置并回读 root/WMI 提供的显示器亮度"""
     script = (
         "$ErrorActionPreference='Stop';"
         "$methods=@(Get-CimInstance -Namespace root/WMI "
@@ -87,7 +93,7 @@ def _set_wmi_brightness(level: int) -> int:
 
 
 def _set_ddc_brightness(level: int) -> int:
-    """Set and verify brightness for DDC/CI-capable physical monitors."""
+    """设置并回读支持 DDC/CI 的物理显示器亮度"""
     from ctypes import wintypes
 
     class PhysicalMonitor(ctypes.Structure):
@@ -178,9 +184,7 @@ def _set_ddc_brightness(level: int) -> int:
                     errors.append(f"{monitor.description or '显示器'} 拒绝 DDC/CI 亮度设置")
                     continue
 
-                # Some monitors apply DDC commands asynchronously. Read twice before
-                # declaring success so a successful API return cannot become a false
-                # positive in the rule log.
+                # 部分显示器异步应用 DDC 命令，回读确认规则日志中的结果
                 verified = False
                 for delay in (0.08, 0.2):
                     time.sleep(delay)
@@ -232,48 +236,14 @@ def run(action_info, params):
 
     try:
         if os.name != "nt":
-            from notmyfault.linux_support import desktop_environment
-
+            backend = DisplayBackend(default_runner)
             if action in ("set_brightness", "low_brightness", "high_brightness"):
                 brightness = _brightness_level(params)
-                result = subprocess.run(
-                    ["brightnessctl", "set", f"{brightness}%"],
-                    capture_output=True,
-                    text=True,
-                    errors="replace",
-                    timeout=5,
-                )
-            elif action in ("off", "on") and desktop_environment() == "gnome":
-                result = subprocess.run(
-                    [
-                        "gdbus",
-                        "call",
-                        "--session",
-                        "--dest",
-                        "org.gnome.ScreenSaver",
-                        "--object-path",
-                        "/org/gnome/ScreenSaver",
-                        "--method",
-                        "org.gnome.ScreenSaver.SetActive",
-                        "true" if action == "off" else "false",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    errors="replace",
-                    timeout=5,
-                )
+                backend.set_brightness(brightness)
             elif action in ("off", "on"):
-                result = subprocess.run(
-                    ["xset", "dpms", "force", action],
-                    capture_output=True,
-                    text=True,
-                    errors="replace",
-                    timeout=5,
-                )
+                backend.set_power(action)
             else:
                 raise ValueError(f"不支持的显示器操作: {action}")
-            if result.returncode != 0:
-                raise RuntimeError(result.stderr.strip() or "Linux 显示器命令失败")
             print(f"[Action:display_control] 操作完成: {action}")
             return {"action": action}
 

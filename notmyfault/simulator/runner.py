@@ -1,6 +1,44 @@
-import sys, copy
+import sys, copy, tempfile
+from pathlib import Path
 from unittest.mock import MagicMock
 from notmyfault.simulator.environment import SimulatedEnvironment
+
+
+_SIM_DEMO_RULES = [
+    {
+        "name": "微信音量规则",
+        "event": {
+            "type": "process_state",
+            "params": {"process_name": "WeChat.exe", "state": "running"},
+        },
+        "actions": [
+            {"type": "set_volume", "params": {"action": "max"}},
+            {"type": "notify", "params": {"title": "微信正在运行", "message": "音量已设置为100%"}},
+        ],
+    },
+    {
+        "name": "微信退出-恢复音量",
+        "event": {
+            "type": "process_state",
+            "params": {"process_name": "WeChat.exe", "state": "stopped"},
+        },
+        "actions": [
+            {"type": "set_volume", "params": {"action": "half"}},
+            {"type": "notify", "params": {"title": "微信已退出", "message": "音量已恢复至50%"}},
+        ],
+    },
+]
+
+
+class _SimulationRulesStore:
+    def __init__(self, rules):
+        self._rules = rules
+        directory = Path(tempfile.mkdtemp(prefix="notmyfault-simulator-"))
+        self.rules_path = str(directory / "rules.json")
+        self.plugin_manifest_path = str(directory / "plugin_manifest.json")
+
+    def load_verified_rules(self):
+        return copy.deepcopy(self._rules)
 
 
 class SimulatedRunner:
@@ -50,16 +88,22 @@ class SimulatedRunner:
         self._originals.clear()
 
     def start(self, config=None):
-        from notmyfault.engine import AutomationEngine
+        from notmyfault.core.engine import AutomationEngine
         if config is None:
             from notmyfault.config import DEFAULT_CONFIG
             config = copy.deepcopy(DEFAULT_CONFIG)
-        self.engine = AutomationEngine(config, on_event=self._on)
+            # 默认配置不再携带示例规则，模拟器自带微信音量演示规则
+            config["rules"] = copy.deepcopy(_SIM_DEMO_RULES)
+        self.engine = AutomationEngine(
+            config,
+            on_event=self._on,
+            rules_store=_SimulationRulesStore(config.get("rules", [])),
+        )
         self.engine._alert_user = lambda *a, **kw: None
-        for t in ["process_state","usb_insert","time_schedule","window_title","idle_detect","bluetooth_device"]:
+        for t in ["process_state","usb_insert","time_schedule","window_title","idle_detect"]:
             self.engine.triggers_funcs[t] = lambda m,c,e,se=None: None
             self.engine.triggers_meta[t] = {"semantic": "state"}
-        for a in ["set_volume","notify","launch_program","kill_process","lock_screen","run_powershell","bluetooth_toggle"]:
+        for a in ["set_volume","notify","launch_program","kill_process","lock_screen","run_powershell"]:
             self.engine.actions_funcs[a] = lambda m,p: None
             self.engine.actions_meta[a] = {}
 
@@ -69,6 +113,7 @@ class SimulatedRunner:
     def emit(self, tid, payload=None):
         if self.engine:
             self.engine.emit_event(tid, payload or {})
+            self.engine._rule_scheduler.wait_for_idle(timeout=5)
 
     def step(self, seconds=1.0):
         self.env.time.advance(seconds)

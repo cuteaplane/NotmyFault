@@ -1,7 +1,4 @@
-"""
-NotmyFault Dashboard — 独立 UI 进程
-pywebview 窗口 + dashboard.html，通过 HTTP API 与引擎通信。
-"""
+"""NotmyFault 的独立 Dashboard 进程，通过 HTTP API 与引擎通信"""
 import json
 import os
 import sys
@@ -13,46 +10,131 @@ import http.server
 import socketserver
 import socket
 import threading
+import secrets
 
 DASHBOARD_PORT = 19199
 DASHBOARD_CONTROL_PORT = 19197
-_CONTROL_SHOW = b"NMF_DASHBOARD_SHOW_V1"
+_CONTROL_SHOW = b"NMF_DASHBOARD_SHOW_V2"
 _CONTROL_OK = b"NMF_DASHBOARD_OK_V1"
+_CONTROL_QUIT = b"NMF_DASHBOARD_QUIT_V2"
 
-# 确保能导入 notmyfault 包
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import webview
-from notmyfault.config import CONFIG_FILE
-from notmyfault.platform_support import launch_python_entry
+from notmyfault.application_paths import ApplicationPaths
+from notmyfault.config import SignedConfigStore
+from notmyfault.host.api.auth import ApiTokenStore
+from notmyfault.platform.platform_support import launch_python_entry
+from notmyfault.security.plugin_schema import scan_plugins
+
+def _patch_qt_permission_policy():
+    try:
+        from webview.platforms import qt
+    except ImportError:
+        return
+
+    page = qt.BrowserView.WebPage
+    policy = page.PermissionPolicy
+    feature = page.Feature
+    media_features = (
+        feature.MediaAudioCapture,
+        feature.MediaVideoCapture,
+        feature.MediaAudioVideoCapture,
+    )
+
+    def handle_permission(self, url, requested_feature):
+        local_page = url.scheme() == "http" and url.host() in {"127.0.0.1", "localhost"}
+        allowed = requested_feature in media_features or (
+            requested_feature == feature.ClipboardReadWrite and local_page
+        )
+        permission = (
+            policy.PermissionGrantedByUser if allowed else policy.PermissionDeniedByUser
+        )
+        self.setFeaturePermission(url, requested_feature, permission)
+
+    page.onFeaturePermissionRequested = handle_permission
+
 
 API = "http://127.0.0.1:19198"
-# 必须与 notmyfault/api_server.py 的 API_TOKEN_FILE 保持一致：
-# token 写在 config.json 同目录下（%APPDATA%/NotmyFault/.api_token），
-# 不再用 %TEMP%/notmyfault_api_token（旧路径，Authenticated Users 可读，已废弃）。
-API_TOKEN_FILE = os.path.join(os.path.dirname(CONFIG_FILE), ".api_token")
+def _get_plugins_schema(paths: ApplicationPaths) -> dict:
+    base = str(paths.package_root)
+    result = {
+        "triggers": scan_plugins(base, "triggers", "trigger.json"),
+        "actions": scan_plugins(base, "actions", "action.json"),
+    }
+    user_dir = str(paths.user_plugins_dir)
+    if os.path.isdir(user_dir):
+        for plugin_type in ("triggers", "actions"):
+            filename = "trigger.json" if plugin_type == "triggers" else "action.json"
+            for plugin_id, meta in scan_plugins(
+                user_dir, plugin_type, filename,
+            ).items():
+                result[plugin_type].setdefault(plugin_id, meta)
+    return result
 
 
-def _claim_dashboard_instance(port: int = DASHBOARD_CONTROL_PORT):
-    """占用 Dashboard 控制端口；已有窗口时通知它恢复到前台。"""
+def _read_control_secret(path) -> bytes:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+        if len(value) != 64:
+            return b""
+        int(value, 16)
+        return value.encode("ascii")
+    except (OSError, UnicodeError, ValueError):
+        return b""
+
+
+def _send_control_command(path, command: bytes, port: int) -> bool:
+    secret = _read_control_secret(path)
+    if not secret:
+        return False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1) as client:
+            client.settimeout(1)
+            client.sendall(secret + b" " + command + b"\n")
+            response = client.makefile("rb").readline(64).rstrip(b"\r\n")
+            return response == _CONTROL_OK
+    except OSError:
+        return False
+
+
+def _remove_control_secret(path, expected: str) -> None:
+    try:
+        if secrets.compare_digest(path.read_text(encoding="utf-8").strip(), expected):
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _claim_dashboard_instance(control_token_path, port: int = DASHBOARD_CONTROL_PORT):
+    """占用 Dashboard 控制端口，已有实例时通知它恢复到前台"""
     show_requested = threading.Event()
+    quit_requested = threading.Event()
+    control_secret = secrets.token_hex(32)
 
     class ControlHandler(socketserver.BaseRequestHandler):
         def handle(self):
             try:
-                message = self.request.makefile("rb").readline(64).rstrip(b"\r\n")
-                if message != _CONTROL_SHOW:
-                    return
-                show_requested.set()
-                self.request.sendall(_CONTROL_OK + b"\n")
-            except OSError:
+                self.request.settimeout(1)
+                message = self.request.makefile("rb").readline(128).rstrip(b"\r\n")
+                candidate, separator, command = message.partition(b" ")
+                authenticated = separator and secrets.compare_digest(
+                    candidate.decode("ascii"), control_secret,
+                )
+                if authenticated and command == _CONTROL_SHOW:
+                    show_requested.set()
+                    self.request.sendall(_CONTROL_OK + b"\n")
+                elif authenticated and command == _CONTROL_QUIT:
+                    # 引擎或托盘退出时让 Dashboard 一起退出
+                    quit_requested.set()
+                    self.request.sendall(_CONTROL_OK + b"\n")
+            except (OSError, UnicodeDecodeError):
                 pass
 
     class ControlServer(socketserver.ThreadingTCPServer):
-        # Windows 上 SO_REUSEADDR 允许多个进程同时绑定同一端口，恰好违背
-        # 单实例目标；必须使用独占绑定。
+        # Windows 的 SO_REUSEADDR 会允许多个进程绑定同一端口，监听 socket 需保持独占
         allow_reuse_address = False
         allow_reuse_port = False
         daemon_threads = True
@@ -76,16 +158,8 @@ def _claim_dashboard_instance(port: int = DASHBOARD_CONTROL_PORT):
             break
         except OSError as error:
             last_error = error
-            try:
-                with socket.create_connection(
-                    ("127.0.0.1", port), timeout=1
-                ) as client:
-                    client.sendall(_CONTROL_SHOW + b"\n")
-                    response = client.makefile("rb").readline(64).rstrip(b"\r\n")
-                    if response == _CONTROL_OK:
-                        return None, None
-            except OSError:
-                pass
+            if _send_control_command(control_token_path, _CONTROL_SHOW, port):
+                return None, None, None, None
             if attempt < 4:
                 time.sleep(0.1)
     else:
@@ -93,20 +167,45 @@ def _claim_dashboard_instance(port: int = DASHBOARD_CONTROL_PORT):
             f"Dashboard 控制端口 {port} 被其他程序占用"
         ) from last_error
 
+    try:
+        token_store = ApiTokenStore(control_token_path, token=control_secret)
+        token_store.repair_file()
+    except Exception as error:
+        server.server_close()
+        raise RuntimeError("Dashboard 控制令牌无法安全写入") from error
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server, show_requested
+    return server, show_requested, quit_requested, control_secret
 
 
 class DashboardAPI:
-    """暴露给前端 JS 的 Python 接口"""
+    """提供给前端 JavaScript 调用的 Python 接口"""
 
-    def __init__(self):
-        # pywebview 会检查 bridge API 的公开属性；不能把原生 Window 放在
-        # self.window 上，否则它会递归枚举 AccessibilityObject 并卡死。
+    def __init__(
+        self,
+        store: SignedConfigStore | None = None,
+        paths: ApplicationPaths | None = None,
+    ) -> None:
+        self._paths = paths or ApplicationPaths.default()
+        self._store = store or SignedConfigStore(self._paths)
         self._window = None
 
+    def set_window_state(self, action: str) -> dict:
+        if action not in ("minimize", "restore"):
+            return {"ok": False, "error": "不支持的窗口操作"}
+        if self._window is None:
+            return {"ok": False, "error": "Dashboard 窗口尚未就绪"}
+        try:
+            if action == "minimize":
+                self._window.minimize()
+            else:
+                self._window.restore()
+                self._window.show()
+            return {"ok": True, "action": action}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
     def launch_engine(self) -> dict:
-        """确保后台服务在线，并启动自动化核心。"""
+        """保证后台服务在线，并启动自动化核心"""
         status = self.get_engine_status()
         if status.get("api_alive"):
             if status.get("engine_state") in ("running", "starting"):
@@ -159,8 +258,7 @@ class DashboardAPI:
             except Exception as e:
                 return {"ok": False, "error": str(e)}
 
-        # 启动与 token 文件发布均为异步；bridge 在这里统一等待，不让 Vue
-        # 同时维护另一套轮询状态机。
+        # 启动与令牌文件发布均为异步，bridge 在这里统一等待让 Vue 只维护一套状态
         deadline = time.monotonic() + 15
         last_error = ""
         while time.monotonic() < deadline:
@@ -172,30 +270,36 @@ class DashboardAPI:
         return {"ok": False, "error": last_error or "后台服务启动超时"}
 
     def get_config(self) -> dict:
-        """直接读取 JSON 配置文件，文件不存在则返回默认规则"""
+        """有效规则先补齐身份，验签失败时保留原文供安全页核对"""
         try:
-            if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
+            if self._paths.rules_file.exists():
+                with open(self._paths.rules_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                rules = data.get("rules", []) if isinstance(data, dict) else []
+                rules = rules if isinstance(rules, list) else []
+                try:
+                    normalized = self._store.load_verified_rules()
+                    if normalized != rules:
+                        self._store.save_rules(normalized)
+                    return {"rules": normalized}
+                except Exception:
+                    return {"rules": rules}
         except Exception as e:
             return {"_error": str(e), "rules": []}
         return {"rules": []}
 
-    def save_config(self, rules: list) -> dict:
+    def save_config(self, rules: list, admin_key_password: str = "") -> dict:
         try:
             from notmyfault.config import (
-                save_config as _save,
-                _normalize_config,
-                _validate_rules_safety,
+                ConfigValidationError,
+                normalize_rules,
+                validate_rules_safety,
             )
-            from notmyfault.rules import validate_rules_structure
-            config = self.get_config()
-            if not isinstance(config, dict) or config.get("_error"):
-                config = {}
-            config.pop("_signature", None)
-            config["rules"] = rules
-            config = _normalize_config(config)
-            normalized_rules = config.get("rules", [])
+            from notmyfault.core.rules import (
+                validate_rule_bindings,
+                validate_rules_structure,
+            )
+            normalized_rules = normalize_rules(rules)
             structure_errors = validate_rules_structure(normalized_rules)
             if structure_errors:
                 return {
@@ -203,28 +307,76 @@ class DashboardAPI:
                     "error": "规则结构校验失败",
                     "details": structure_errors[:10],
                 }
-            _warnings, errors = _validate_rules_safety(normalized_rules)
+            schema = _get_plugins_schema(self._paths)
+            binding_issues = []
+            for index, rule in enumerate(normalized_rules):
+                for issue in validate_rule_bindings(
+                    rule, schema["triggers"], schema["actions"],
+                ):
+                    binding_issues.append({
+                        "rule": rule.get("name", f"规则 #{index + 1}"),
+                        **issue,
+                    })
+            if binding_issues:
+                return {
+                    "ok": False,
+                    "error": "规则数据绑定无效",
+                    "details": binding_issues[:20],
+                }
+            _warnings, errors = validate_rules_safety(normalized_rules)
             if errors:
                 return {
                     "ok": False,
                     "error": "规则安全校验失败",
                     "details": errors[:10],
                 }
-            ok = _save(config)
+            previous_rules = []
+            if self._paths.rules_file.exists():
+                try:
+                    previous_rules = self._store.load_verified_rules()
+                except ConfigValidationError as error:
+                    return {
+                        "ok": False,
+                        "error": f"现有规则未通过完整性校验: {error}",
+                    }
+            from notmyfault.security.rule_approval import (
+                AdminRuleApprovalError,
+                require_admin_rule_approval,
+            )
+            try:
+                require_admin_rule_approval(
+                    previous_rules,
+                    normalized_rules,
+                    schema,
+                    admin_key_password,
+                )
+            except AdminRuleApprovalError as error:
+                return {
+                    "ok": False,
+                    "code": error.code,
+                    "error": str(error),
+                    "plugins": error.plugins,
+                }
+            ok = self._store.save_rules(normalized_rules)
             return {"ok": ok, "rules": normalized_rules if ok else None}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
     def _get_api_token(self) -> str:
-        """读取 API 认证令牌"""
         try:
-            with open(API_TOKEN_FILE, "r") as f:
+            with open(self._paths.api_token_file, "r") as f:
                 return f.read().strip()
         except (OSError, IOError):
             return ""
 
-    def _auth_request(self, path: str, method: str = "POST", data: dict = None) -> dict:
-        """发送带认证的 HTTP 请求；token 漂移时重读文件并重试一次。"""
+    def _auth_request(
+        self,
+        path: str,
+        method: str = "POST",
+        data: dict = None,
+        timeout: float = 5,
+    ) -> dict:
+        """发送带认证的 HTTP 请求，认证失败时重读令牌并重试一次"""
         last_error = ""
         for attempt in range(2):
             token = self._get_api_token()
@@ -239,14 +391,21 @@ class DashboardAPI:
                     req.add_header("Authorization", f"Bearer {token}")
                 if data is not None:
                     req.add_header("Content-Type", "application/json")
-                return json.loads(urllib.request.urlopen(req, timeout=5).read())
+                return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", errors="replace")
-                last_error = f"HTTP {e.code}: {detail}"
+                try:
+                    error_payload = json.loads(detail)
+                except (TypeError, ValueError):
+                    error_payload = {}
+                if not isinstance(error_payload, dict):
+                    error_payload = {}
+                last_error = error_payload.get("error") or f"HTTP {e.code}: {detail}"
                 if e.code == 403 and attempt == 0:
                     time.sleep(0.05)
                     continue
                 return {
+                    **error_payload,
                     "ok": False,
                     "error": last_error,
                     "status": e.code,
@@ -262,10 +421,11 @@ class DashboardAPI:
         return {"ok": False, "error": last_error, "status": 403}
 
     def request_api(self, path: str, method: str = "GET", data: dict = None) -> dict:
-        """pywebview 的统一 JSON API 代理；Dashboard 不存在浏览器降级模式。"""
+        """通过 pywebview bridge 转发 Dashboard 的 JSON API 请求"""
         if not isinstance(path, str) or not path.startswith("/api/"):
             return {"ok": False, "error": "无效的 API 路径", "status": 400}
-        return self._auth_request(path, method.upper(), data)
+        timeout = 30 if path == "/api/rules/draft/ai" else 5
+        return self._auth_request(path, method.upper(), data, timeout=timeout)
 
     def get_engine_status(self) -> dict:
         result = self._auth_request("/api/engine/status", "GET")
@@ -279,11 +439,10 @@ class DashboardAPI:
         }
 
     def get_api_token(self) -> str:
-        """暴露给 JS bridge 的 API Token 读取方法"""
         return self._get_api_token()
 
     def select_folder(self, initial_path: str = "") -> str:
-        """让 Dashboard 选择本地目录；仅通过桌面 bridge 暴露。"""
+        """通过桌面窗口选择本地目录并返回路径"""
         if self._window is None:
             return ""
         try:
@@ -301,27 +460,15 @@ class DashboardAPI:
     def shutdown_engine(self) -> dict:
         """彻底退出引擎进程"""
         return self._auth_request("/api/engine/shutdown")
-    def fetch_api(self, path: str) -> dict:
-        """代理 API 请求"""
-        try:
-            req = urllib.request.urlopen(f"{API}{path}", timeout=5)
-            return json.loads(req.read())
-        except Exception as e:
-            return {"_error": str(e)}
-
-    # ---- 日志读取 (bridge 直读文件，不依赖 API) ----
-
-    _LOG_DIR = os.path.join(os.path.dirname(CONFIG_FILE), "logs")
 
     def _get_latest_log(self):
-        """返回最新日志文件路径，没有则返回 None。"""
-        from notmyfault.logging import get_latest_log
-        return get_latest_log(self._LOG_DIR)
+        from notmyfault.core.logging import get_latest_log
+        return get_latest_log(str(self._paths.logs_dir))
 
     def read_log_entries(self, lines: int = 500) -> list:
-        """读取最新日志末尾 N 行，返回解析后的结构化条目列表。"""
+        """读取最新日志末尾 N 行，返回解析后的结构化条目列表"""
         try:
-            from notmyfault.logging import read_log_entries as _read
+            from notmyfault.core.logging import read_log_entries as _read
             log_path = self._get_latest_log()
             if not log_path:
                 return [{"ts": "", "level": "INFO", "text": "还没有日志文件，请启动引擎", "data": None}]
@@ -330,9 +477,9 @@ class DashboardAPI:
             return [{"ts": "", "level": "ERROR", "text": f"读取日志失败: {e}", "data": None}]
 
     def read_diagnostics(self) -> dict:
-        """从最新日志文件构建诊断摘要。"""
+        """从最新日志文件构建诊断摘要"""
         try:
-            from notmyfault.logging import read_log_entries as _read, build_diagnostics
+            from notmyfault.core.logging import read_log_entries as _read, build_diagnostics
             log_path = self._get_latest_log()
             if not log_path:
                 return {"error_count": 0, "warn_count": 0, "last_errors": ["还没有日志文件，请启动引擎"]}
@@ -342,7 +489,7 @@ class DashboardAPI:
             return {"error_count": 1, "last_errors": [str(e)]}
 
     def read_log_raw(self, lines: int = 300) -> str:
-        """读取最新日志文件原始文本（供日志查看器使用）。"""
+        """读取最新日志文件原始文本，供日志查看器使用"""
         try:
             log_path = self._get_latest_log()
             if not log_path:
@@ -356,35 +503,58 @@ class DashboardAPI:
             return f"读取日志失败: {e}"
 
     def list_log_files(self) -> list:
-        """列出所有日志文件信息。"""
+        """列出所有日志文件信息"""
         try:
-            from notmyfault.logging import list_logs
+            from notmyfault.core.logging import list_logs
             return list_logs(self._LOG_DIR)
         except Exception as e:
             return []
 
+    def read_log_file_entries(self, name: str, lines: int = 600) -> list:
+        """读取指定历史日志文件末尾 N 行，返回解析后的结构化条目列表"""
+        try:
+            # 文件名只认 engine-*.log，堵住 ../ 之类构造出来的路径
+            if (
+                not isinstance(name, str)
+                or os.path.basename(name) != name
+                or not (name.startswith("engine-") and name.endswith(".log"))
+            ):
+                return []
+            log_path = os.path.join(self._LOG_DIR, name)
+            if not os.path.isfile(log_path):
+                return []
+            from notmyfault.core.logging import read_log_entries as _read
+            return _read(log_path, lines=lines)
+        except Exception as e:
+            return [{"ts": "", "level": "ERROR", "text": f"读取日志失败: {e}", "data": None}]
+
+
+
+class _DashboardStaticHandler(http.server.SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        super().end_headers()
 
 
 def _start_static_server(directory, port=DASHBOARD_PORT):
-    """后台线程托管 Vue 构建产物（多文件 ES 模块）。
-
-    pywebview 从 file:// 加载 ES 模块会被浏览器 CORS 拦截，故改用本地 HTTP。
-    端口被占用时自动 +1 重试。
-    """
-    Handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=directory)
+    """pywebview 从 file:// 加载 ES 模块会被 CORS 拦截，因此用本地 HTTP 服务托管并在端口占用时递增重试"""
+    Handler = functools.partial(_DashboardStaticHandler, directory=directory)
     for p in range(port, port + 20):
         try:
             httpd = socketserver.TCPServer(("127.0.0.1", p), Handler)
             httpd.daemon_threads = True
             threading.Thread(target=httpd.serve_forever, daemon=True).start()
-            return httpd, f"http://127.0.0.1:{p}/"
+            version = int(os.path.getmtime(os.path.join(directory, "index.html")))
+            return httpd, f"http://127.0.0.1:{p}/?v={version}"
         except OSError:
             continue
     return None, None
 
 
 def _ensure_dashboard_build():
-    """如果 dashboard/dist 不存在，自动 npm run build。"""
+    """构建产物不存在时运行 npm run build 并返回是否成功"""
     dist = os.path.join(PROJECT_ROOT, "dashboard", "dist")
     if os.path.isdir(dist) and os.path.exists(os.path.join(dist, "index.html")):
         return True
@@ -417,7 +587,7 @@ def _ensure_dashboard_build():
 
 
 def _resolve_dashboard_url():
-    """使用 dashboard/dist 构建产物。"""
+    """准备构建产物和静态服务器并返回 Dashboard 地址"""
     dist = os.path.join(PROJECT_ROOT, "dashboard", "dist")
     if not (os.path.isdir(dist) and os.path.exists(os.path.join(dist, "index.html"))):
         _ensure_dashboard_build()
@@ -428,8 +598,14 @@ def _resolve_dashboard_url():
     return None, None
 
 def main():
+    if sys.platform.startswith("linux"):
+        _patch_qt_permission_policy()
+
+    paths = ApplicationPaths.default()
     try:
-        control_server, show_requested = _claim_dashboard_instance()
+        control_server, show_requested, quit_requested, control_secret = (
+            _claim_dashboard_instance(paths.dashboard_control_token_file)
+        )
     except RuntimeError as error:
         print(f"[Dashboard] {error}", file=sys.stderr)
         if os.name == "nt":
@@ -447,7 +623,7 @@ def main():
     if control_server is None:
         return
 
-    # 注册协议（幂等，每次启动都确保存在）
+    # 每次启动都调用协议注册器，注册器内部保持幂等
     try:
         from Win_toaster.AUMID_Register import register_protocol
         register_protocol()
@@ -457,10 +633,13 @@ def main():
     dashboard_url, _static_httpd = _resolve_dashboard_url()
     if not dashboard_url:
         print("[Dashboard] 找不到 dashboard/dist 构建产物", file=sys.stderr)
+        control_server.shutdown()
+        control_server.server_close()
+        _remove_control_secret(paths.dashboard_control_token_file, control_secret)
         return
     icon_path = os.path.join(PROJECT_ROOT, "logo.ico")
 
-    api = DashboardAPI()
+    api = DashboardAPI(SignedConfigStore(paths), paths)
 
     window = webview.create_window(
         title="NotmyFault",
@@ -470,9 +649,6 @@ def main():
         height=720,
         min_size=(640, 480),
         confirm_close=False,
-        # 窗口背景色：HTML 渲染前 pywebview 显示这个颜色而非默认白色。
-        # 用深色（与深色模式 --md-surface-c-low 一致），深色模式零闪烁；
-        # 浅色模式会闪一下深色但不如白色刺眼，且 HTML 加载后立即被正确背景覆盖。
         background_color='#1b1b21',
     )
     api._window = window
@@ -489,7 +665,16 @@ def main():
 
     threading.Thread(target=watch_show_requests, daemon=True).start()
 
-    # 设置窗口图标（仅 Windows）
+    def watch_quit_requests():
+        quit_requested.wait()
+        try:
+            window.destroy()
+        except Exception:
+            pass
+
+    threading.Thread(target=watch_quit_requests, daemon=True).start()
+
+    # Windows 进程需要设置应用图标
     if os.name == "nt" and os.path.exists(icon_path):
         try:
             import ctypes
@@ -499,7 +684,6 @@ def main():
         except Exception:
             pass
 
-    # 窗口关闭事件 — 确保干净退出
     def on_closing():
         print("[Dashboard] 窗口正在关闭...")
 
@@ -515,6 +699,7 @@ def main():
         pass
     control_server.shutdown()
     control_server.server_close()
+    _remove_control_secret(paths.dashboard_control_token_file, control_secret)
     print("[Dashboard] 已退出")
 
 
@@ -526,7 +711,6 @@ if __name__ == "__main__":
         import runpy
         runpy.run_path(engine_entry, run_name="__main__")
     else:
-        # 处理协议调用: notmyfault://dashboard
         if "--protocol" in sys.argv:
             print("[Dashboard] 通过协议启动")
         main()

@@ -7,6 +7,15 @@
     "package_name": "io.github.notmyfault.http_request",
     "enabled": true,
     "permissions": ["network"],
+    "security": {
+        "rule_approval": "admin_key",
+        "literal_only_params": ["method", "url", "headers"]
+    },
+    "outputs": [
+        {"name": "status", "label": "HTTP 状态码", "type": "number"},
+        {"name": "body", "label": "响应正文", "type": "string", "sensitive": true, "summary": "hidden"},
+        {"name": "truncated", "label": "响应是否截断", "type": "bool"}
+    ],
     "params": [
         {
             "name": "method",
@@ -25,6 +34,8 @@
             "label": "URL",
             "type": "string",
             "default": "",
+            "sensitive": true,
+            "summary": "hidden",
             "placeholder": "https://example.com/api"
         },
         {
@@ -32,6 +43,8 @@
             "label": "请求体 (POST/PUT)",
             "type": "textarea",
             "default": "",
+            "sensitive": true,
+            "summary": "hidden",
             "placeholder": "JSON 字符串",
             "rows": 7
         },
@@ -40,6 +53,8 @@
             "label": "自定义请求头",
             "type": "textarea",
             "default": "",
+            "sensitive": true,
+            "summary": "hidden",
             "placeholder": "每行一条，如 Content-Type: application/json",
             "rows": 5
         },
