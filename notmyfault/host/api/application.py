@@ -1,9 +1,10 @@
+import asyncio
+from contextlib import asynccontextmanager, suppress
 from typing import Any, Dict
 
 from fastapi import FastAPI
 
 from notmyfault.application_paths import ApplicationPaths
-from notmyfault.components.session import ComponentSessionManager
 from notmyfault.config import SignedConfigStore
 from notmyfault.core.run_history import RunHistory
 from notmyfault.extensions.session import ExtensionSessionManager
@@ -15,11 +16,7 @@ from notmyfault.host.api.plugin_installation import (
     PluginFileSystem,
     PluginTemporaryStorage,
 )
-from notmyfault.host.api.ports import (
-    DesktopElementPort,
-    EngineControlPort,
-    PluginRegistryPort,
-)
+from notmyfault.host.api.ports import EngineControlPort, PluginRegistryPort
 from notmyfault.host.api.routes_ai import create_ai_router
 from notmyfault.host.api.routes_engine import create_engine_router
 from notmyfault.host.api.routes_interactions import create_interactions_router
@@ -48,7 +45,6 @@ class ApiApplication:
         plugin_file_system: PluginFileSystem,
         pending_previews: PendingPreviewStore,
         plugin_temporary_storage: PluginTemporaryStorage,
-        desktop_elements: DesktopElementPort,
         plugin_registry: PluginRegistryPort,
         run_history: RunHistory,
         event_broker: EventBroker,
@@ -61,7 +57,6 @@ class ApiApplication:
         self._plugin_file_system = plugin_file_system
         self._run_history = run_history
         self._events = event_broker
-        self._component_sessions = ComponentSessionManager()
         self._extension_sessions = ExtensionSessionManager()
         self._plugin_catalog = PluginCatalogService(
             self._paths,
@@ -72,12 +67,31 @@ class ApiApplication:
         self._ai_key_store = ai_key_store
         self._pending_previews = pending_previews
         self._plugin_temporary_storage = plugin_temporary_storage
-        self._desktop_elements = desktop_elements
         self._plugin_registry = plugin_registry
 
-        self.app = FastAPI(title="NotmyFault Engine API", version=__version__)
+        self.app = FastAPI(
+            title="NotmyFault Engine API",
+            version=__version__,
+            lifespan=self._lifespan,
+        )
         install_api_middleware(self.app, self._token_store)
         self._setup_routes()
+
+    @asynccontextmanager
+    async def _lifespan(self, _app: FastAPI):
+        cleanup_task = asyncio.create_task(self._cleanup_extension_sessions())
+        try:
+            yield
+        finally:
+            cleanup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await cleanup_task
+            self._extension_sessions.drop_all()
+
+    async def _cleanup_extension_sessions(self) -> None:
+        while True:
+            await asyncio.sleep(30)
+            self._extension_sessions.cleanup_expired()
 
     def publish_event(self, event_type: str, data: Dict[str, Any]):
         self._events.publish(event_type, data)
@@ -92,9 +106,7 @@ class ApiApplication:
                     self._store,
                     self._paths,
                     self._run_history,
-                    self._component_sessions,
                     self._extension_sessions,
-                    self._desktop_elements,
                 ),
                 self._events,
             )
@@ -103,13 +115,17 @@ class ApiApplication:
             create_interactions_router(
                 PluginInteractionService(
                     self._engine,
-                    self._component_sessions,
                     self._extension_sessions,
                 )
             )
         )
         self.app.include_router(
-            create_settings_router(SettingsService(self._store, self._engine))
+            create_settings_router(
+                SettingsService(
+                    self._store,
+                    plugin_catalog.schema,
+                )
+            )
         )
         self.app.include_router(
             create_plugins_router(

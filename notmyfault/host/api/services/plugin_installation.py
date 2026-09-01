@@ -11,7 +11,6 @@ from typing import Any, Callable, Dict
 from notmyfault.application_paths import ApplicationPaths
 from notmyfault.config import ConfigValidationError, SignedConfigStore
 from notmyfault.core.logging import engine_error
-from notmyfault.host.ai_plugin_source import AIPluginSourceError, review_plugin_source
 from notmyfault.host.api.plugin_installation import (
     PendingPreviewStore,
     PluginFileSystem,
@@ -28,6 +27,7 @@ from notmyfault.security.plugin_schema import (
     check_permissions_conform,
     current_platform_name,
     get_permission_info,
+    is_valid_plugin_id,
     is_known_permission,
     scan_plugin_security,
     validate_plugin_meta,
@@ -74,6 +74,10 @@ class PluginInstallationService:
         self._package_limits = package_limits or PluginPackageLimits()
         self._build_hook = build_hook or self._run_build_hook
 
+    @property
+    def max_upload_bytes(self) -> int:
+        return self._package_limits.max_upload_bytes
+
     def registry(self, url: Any) -> Dict[str, Any]:
         try:
             registry = self._registry.load(url if isinstance(url, str) else "")
@@ -113,89 +117,6 @@ class PluginInstallationService:
             filename=f"{safe_name}-{safe_version}.nmfp",
             sha256=entry["sha256"],
         )
-
-    def bluetooth_status(self) -> Dict[str, Any]:
-        plugin_dir = (
-            self._paths.package_root
-            / "bundled"
-            / "actions"
-            / "bluetooth_toggle"
-        )
-        meta_path = plugin_dir / "action.json"
-        destination = (
-            self._paths.user_plugins_dir / "actions" / "bluetooth_toggle"
-        )
-        if not meta_path.is_file():
-            return {
-                "available": False,
-                "installed": destination.is_dir(),
-                "meta": None,
-            }
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {
-                "available": False,
-                "installed": destination.is_dir(),
-                "meta": None,
-            }
-        valid, _errors = validate_plugin_meta(meta, "action")
-        signature_path = plugin_dir / "signature.sig"
-        signature_ok = (
-            plugin_signature_kind(str(plugin_dir), "builtin") == "official"
-            if signature_path.is_file()
-            else detect_security_mode() == SecurityMode.PERMISSIVE
-        )
-        return {
-            "available": bool(
-                valid
-                and meta.get("id") == "bluetooth_toggle"
-                and signature_ok
-            ),
-            "installed": (destination / "action.json").is_file(),
-            "meta": meta,
-        }
-
-    def install_bluetooth(self) -> Dict[str, Any]:
-        status = self.bluetooth_status()
-        if not status["available"]:
-            self._fail(400, "蓝牙开关插件缺失或签名无效")
-        source = (
-            self._paths.package_root
-            / "bundled"
-            / "actions"
-            / "bluetooth_toggle"
-        )
-        destination = (
-            self._paths.user_plugins_dir / "actions" / "bluetooth_toggle"
-        )
-        if destination.exists():
-            return {"ok": True, "restart_required": True}
-
-        def validate(staging: Path) -> None:
-            copied_signature = staging / "signature.sig"
-            if (
-                copied_signature.is_file()
-                and plugin_signature_kind(str(staging), "user")
-                != "official-legacy"
-            ):
-                raise ValueError("复制后的蓝牙开关插件签名无效")
-
-        try:
-            self._transaction.install_tree(
-                source,
-                destination,
-                validate=validate,
-                keep_backup=False,
-            )
-        except ValueError as error:
-            self._fail(400, str(error))
-        except OSError as error:
-            raise PluginInstallationError(
-                400,
-                {"ok": False, "error": "复制蓝牙开关插件失败"},
-            ) from error
-        return {"ok": True, "restart_required": True}
 
     def toggle(self, plugin_kind: Any, plugin_id: Any) -> Dict[str, Any]:
         if plugin_kind not in ("triggers", "actions") or not plugin_id:
@@ -451,6 +372,7 @@ class PluginInstallationService:
         password: str = "",
         signing_password: str = "",
         force: bool = False,
+        confirmed_risk_ids: Any = None,
     ) -> Dict[str, Any]:
         self._previews.purge_expired()
         extract_dir: Path | None = None
@@ -492,6 +414,24 @@ class PluginInstallationService:
                     self._previews.discard(preview_token)
                     extract_dir = None
                     self._fail(409, "插件安全检查结果已经变化，请重新预览")
+                confirmed = self._parse_confirmed_risk_ids(confirmed_risk_ids)
+                current_risk_ids = {
+                    str(risk.get("id"))
+                    for risk in current_risks
+                    if isinstance(risk.get("id"), str)
+                }
+                if not confirmed.issubset(current_risk_ids):
+                    self._fail(400, "确认的风险项与当前预览不一致")
+                if "build_hook" in current_risk_ids and "build_hook" not in confirmed:
+                    raise PluginInstallationError(
+                        400,
+                        {
+                            "ok": False,
+                            "error": "执行插件构建命令前需要明确确认",
+                            "code": "build_hook_confirmation_required",
+                            "required_risk_ids": ["build_hook"],
+                        },
+                    )
                 self._previews.pop(preview_token)
                 preview_owned = True
             else:
@@ -537,17 +477,6 @@ class PluginInstallationService:
                         },
                     )
 
-            collision = self._catalog.plugin_id_collision(plugin_kind, meta)
-            if collision is not None:
-                self._fail(409, "插件 id 已被其他包使用")
-            self._build_hook(root_path, meta)
-            if (root_path / "public_key.pem").exists():
-                counter_error = self._counter_sign_author_key(
-                    root_path, signing_password
-                )
-                if counter_error:
-                    self._fail(400, counter_error)
-
             package_name = meta.get("package_name", "")
             version_code = meta.get("version_code", 0)
             plugin_id = meta.get("id", root_path.name)
@@ -570,6 +499,10 @@ class PluginInstallationService:
                     + ", ".join(unknown),
                 )
 
+            collision = self._catalog.plugin_id_collision(plugin_kind, meta)
+            if collision is not None:
+                self._fail(409, "插件 id 已被其他包使用")
+
             existing = self._catalog.find_user_plugin_by_package(package_name)
             obsolete: tuple[Path, ...] = ()
             if existing:
@@ -585,6 +518,33 @@ class PluginInstallationService:
                 )
                 if old_destination != destination:
                     obsolete = (old_destination,)
+
+            self._build_hook(root_path, meta)
+            built_meta = self._read_manifest(root_path / json_name)
+            if built_meta != meta:
+                self._fail(400, "插件构建命令不得修改 manifest")
+            post_build_risks = [
+                risk
+                for risk in self.scan_install_risks(
+                    str(root_path), json_name, built_meta
+                )
+                if risk.get("id") not in accepted_risk_ids
+            ]
+            if post_build_risks:
+                raise PluginInstallationError(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "构建产物引入了新的风险",
+                        "risks": post_build_risks,
+                    },
+                )
+            if (root_path / "public_key.pem").exists():
+                counter_error = self._counter_sign_author_key(
+                    root_path, signing_password
+                )
+                if counter_error:
+                    self._fail(400, counter_error)
 
             def validate_staging(staging: Path) -> None:
                 written_meta = self._read_manifest(staging / json_name)
@@ -654,177 +614,26 @@ class PluginInstallationService:
             if preview_token and not preview_owned and preview_token in self._previews:
                 self._previews.discard(preview_token)
 
-    def install_source(self, body: Any) -> Dict[str, Any]:
-        if not isinstance(body, dict):
-            self._fail(400, "请求体必须是 JSON 对象")
-        kind = body.get("kind")
-        manifest = body.get("manifest")
-        source = body.get("source")
-        plugin_id = body.get("plugin_id")
-        password = body.get("password") if isinstance(body.get("password"), str) else ""
-        if (
-            not isinstance(kind, str)
-            or not isinstance(manifest, dict)
-            or not isinstance(source, str)
-            or not isinstance(plugin_id, str)
-        ):
-            self._fail(400, "kind、manifest、source、plugin_id 都是必填")
-        try:
-            review = review_plugin_source(kind, manifest, source, plugin_id)
-        except AIPluginSourceError as error:
-            raise PluginInstallationError(
-                400,
-                {"ok": False, "error": error.message, "code": error.code},
-            ) from error
-        if review["check"]["revision_required"]:
-            raise PluginInstallationError(
-                400,
-                {
-                    "ok": False,
-                    "error": "插件源码仍有静态扫描发现，请先让 AI 修正",
-                    "code": "scanner_findings",
-                    "check": review["check"],
-                },
-            )
-        if not self._safe_plugin_id(plugin_id):
-            self._fail(400, "插件 id 含非法字符（禁止路径分隔符）")
-        plugin_kind = "triggers" if kind == "trigger" else "actions"
-        if (
-            self._catalog.plugin_id_collision(plugin_kind, review["manifest"])
-            is not None
-        ):
-            self._fail(409, "插件 id 已被其他包使用")
-
-        permissions = manifest.get("permissions", [])
-        security_mode = detect_security_mode()
-        permission_conform, _ = check_permissions_conform(permissions)
-        if security_mode == SecurityMode.STRICT and not permission_conform:
-            unknown = [item for item in permissions if not is_known_permission(item)]
-            self._fail(
-                400,
-                "严格模式下拒绝安装：插件请求了未知权限: "
-                + ", ".join(unknown),
-            )
-
-        json_name = "trigger.json" if kind == "trigger" else "action.json"
-        source_name = "trigger.py" if kind == "trigger" else "action.py"
-        destination = self._paths.user_plugins_dir / plugin_kind / plugin_id
-        if destination.exists():
-            raise PluginInstallationError(
-                409,
-                {
-                    "ok": False,
-                    "error": "AI 不能直接修改已安装插件，请先另存审阅或手动卸载旧插件",
-                    "code": "ai_plugin_exists",
-                },
-            )
-
-        private_key = None
-        key_error: str | None = None
-        private_key_path = self._paths.plugin_private_key_file
-        if private_key_path.exists():
-            encrypted = private_key_path.read_bytes()[:20].startswith(
-                b"-----BEGIN ENCRYPTED"
-            )
-            if encrypted and not password:
-                key_error = "key_password_required"
-            else:
-                try:
-                    from notmyfault.security.signing import load_private_key
-
-                    private_key = load_private_key(
-                        private_key_path, password=password or None
-                    )
-                except Exception as error:
-                    self._log_exception("load_plugin_signing_key", error)
-                    key_error = "签名私钥密码错误或无法加载"
-        else:
-            key_error = "缺少签名私钥，先运行 python build.py init-keys 生成"
-        if key_error is not None and security_mode == SecurityMode.STRICT:
-            raise PluginInstallationError(
-                400,
-                {
-                    "ok": False,
-                    "error": f"{key_error}；严格模式没有签名无法加载插件",
-                    "code": (
-                        "key_password_required"
-                        if key_error == "key_password_required"
-                        else "signing_unavailable"
-                    ),
-                },
-            )
-
-        staging = self._temporary_storage.create_directory()
-        signed = False
-        try:
-            (staging / json_name).write_text(
-                json.dumps(review["manifest"], ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            (staging / source_name).write_text(review["source"], encoding="utf-8")
-            (staging / "test_plugin.py").write_text(
-                review["tests"], encoding="utf-8"
-            )
-            from notmyfault.plugin_cli import check_plugin
-
-            check_report = check_plugin(staging)
-            if not check_report["ok"]:
+    @staticmethod
+    def _parse_confirmed_risk_ids(value: Any) -> set[str]:
+        if value in (None, ""):
+            return set()
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError) as error:
                 raise PluginInstallationError(
                     400,
-                    {
-                        "ok": False,
-                        "error": "生成插件未通过 plugin check",
-                        "code": "plugin_check_failed",
-                        "check": check_report,
-                    },
-                )
-            if private_key is not None:
-                from notmyfault.security.signing import sign_plugin
-
-                try:
-                    sign_plugin(staging, json_name, private_key)
-                    signed = True
-                except Exception as error:
-                    if security_mode == SecurityMode.STRICT:
-                        raise PluginInstallationError(
-                            500, {"ok": False, "error": "插件签名失败"}
-                        ) from error
-            try:
-                self._transaction.install_tree(
-                    staging,
-                    destination,
-                    validate=lambda candidate: self._validate_generated_plugin(
-                        candidate, json_name
-                    ),
-                    keep_backup=False,
-                )
-            except OSError as error:
-                raise PluginInstallationError(
-                    500, {"ok": False, "error": "写入插件文件失败"}
+                    {"ok": False, "error": "风险确认字段格式无效"},
                 ) from error
-        finally:
-            self._file_system.discard_tree(staging)
-
-        try:
-            from notmyfault.security.plugins import (
-                load_plugin_manifest,
-                save_plugin_manifest,
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) for item in value
+        ):
+            raise PluginInstallationError(
+                400,
+                {"ok": False, "error": "风险确认字段格式无效"},
             )
-
-            manifest_path = self._paths.plugin_manifest_file
-            manifest_hashes = load_plugin_manifest(manifest_path)
-            if plugin_id in manifest_hashes:
-                del manifest_hashes[plugin_id]
-                save_plugin_manifest(manifest_hashes, manifest_path)
-        except Exception:
-            pass
-        return {
-            "ok": True,
-            "id": plugin_id,
-            "type": plugin_kind,
-            "signed": signed,
-            "restart_required": True,
-        }
+        return set(value)
 
     def _read_manifest(
         self, manifest_path: Path, preview: bool = False
@@ -1019,12 +828,15 @@ class PluginInstallationService:
     def _signature_identity(root_path: str) -> str:
         import hashlib
 
+        kind = plugin_signature_kind(root_path, "user")
+        if kind == "none":
+            return "none"
         key_file = os.path.join(root_path, "public_key.pem")
         try:
             with open(key_file, "rb") as file:
                 return "author:" + hashlib.sha256(file.read()).hexdigest()[:16]
         except OSError:
-            return "official"
+            return "trusted-local"
 
     def _load_config_for_update(self) -> Dict[str, Any]:
         if not os.path.exists(self._store.config_path):
@@ -1058,13 +870,7 @@ class PluginInstallationService:
 
     @staticmethod
     def _safe_plugin_id(plugin_id: Any) -> bool:
-        return bool(
-            isinstance(plugin_id, str)
-            and plugin_id
-            and "/" not in plugin_id
-            and "\\" not in plugin_id
-            and ".." not in plugin_id
-        )
+        return isinstance(plugin_id, str) and is_valid_plugin_id(plugin_id)
 
     @staticmethod
     def _fail(status_code: int, message: str) -> None:

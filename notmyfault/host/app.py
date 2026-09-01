@@ -1,4 +1,7 @@
 import os
+import glob
+import json
+import os
 import sys
 import threading
 from typing import Any, Callable, Dict, Optional
@@ -10,41 +13,18 @@ from notmyfault.host.api.plugin_installation import (
     PluginFileSystem,
     RetainedPluginBackup,
 )
-import glob
-import json
-import subprocess as _sp
-
-
-def _run_build_command(cmd: list[str], build_dir: str):
-    """以 UTF-8 运行 build.py，首次启动日志使用统一编码。"""
-    env = os.environ.copy()
-    # build.py 输出中文，子进程和父进程都显式使用 UTF-8。
-    env["PYTHONUTF8"] = "1"
-    return _sp.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        cwd=build_dir,
-        env=env,
-        timeout=60,
-    )
-
-
-def _notify_first_run_mode(mode: str) -> None:
-    """首次构建或降级后通知用户当前安全模式。"""
+def _notify_build_required(detail: str) -> None:
     try:
         from notmyfault.host.alert import alert_user
+
         alert_user(
-            "NotmyFault 首次运行",
-            f"检测到缺少签名，已自动完成开发构建并进入 {mode} 安全模式。"
-            "如需更严格的安全模式，请运行 `python build.py build`（strict）"
-            "并在 Dashboard「安全与权限」页确认当前配置。",
+            "NotmyFault 安装文件不完整",
+            f"{detail}。为防止安全模式被自动降低，引擎已拒绝启动。"
+            "请从可信来源恢复文件，或在确认源码完整后运行 `python build.py build`。",
             open_dashboard=False,
         )
     except Exception:
-        print("[FirstRun] 无法发送安全模式提示", file=sys.stderr)
+        print("[Startup] 无法发送安装完整性提示", file=sys.stderr)
 
 
 _PKG_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -54,8 +34,6 @@ def _shipped_plugin_directories() -> list[str]:
     plugin_specs = (
         ("actions", "action.json"),
         ("triggers", "trigger.json"),
-        (os.path.join("bundled", "actions"), "action.json"),
-        (os.path.join("bundled", "triggers"), "trigger.json"),
     )
     return [
         os.path.dirname(meta_path)
@@ -69,45 +47,25 @@ def _shipped_plugin_directories() -> list[str]:
 def _ensure_first_run_build() -> None:
     if getattr(sys, "frozen", False):
         return
-    src_dir = _PKG_ROOT
-    build_json = os.path.join(src_dir, "..", "build.json")
-    build_py = os.path.join(src_dir, "..", "build.py")
-    plugin_dirs = _shipped_plugin_directories()
-    needs_build = not os.path.exists(build_json) or any(
-        not os.path.isfile(os.path.join(plugin_dir, "signature.sig"))
-        for plugin_dir in plugin_dirs
-    )
-    if not needs_build:
-        return
-    print("[FirstRun] Detected missing signatures or build file, running first-time build...")
-    # GUI 首次启动没有终端输入私钥口令，因此使用 permissive 构建生成本机签名文件。
-    # 正式发布由开发者显式执行 strict 构建。
-    commands = [
-        ([sys.executable, build_py, "build", "--security-mode=permissive"], "build"),
+    project_root = os.path.dirname(_PKG_ROOT)
+    required_files = [
+        os.path.join(project_root, "build.json"),
+        os.path.join(project_root, "build.json.sig"),
     ]
-    for cmd, name in commands:
-        try:
-            result = _run_build_command(cmd, os.path.dirname(build_py))
-            if result.returncode != 0:
-                print(f"[FirstRun] build {name} failed (code={result.returncode}): {result.stderr.strip()[:500]}")
-                _degrade_security_mode()
-                return
-            print(f"[FirstRun] build {name} OK")
-        except Exception as e:
-            print(f"[FirstRun] build {name} exception: {e}")
-            _degrade_security_mode()
-            return
-    print("[FirstRun] First-time build complete")
-    _notify_first_run_mode("permissive")
-
-
-def _degrade_security_mode() -> None:
-    env_mode = os.environ.get("NOTMYFAULT_MODE", "")
-    if env_mode:
+    missing = [path for path in required_files if not os.path.isfile(path)]
+    missing.extend(
+        os.path.join(plugin_dir, "signature.sig")
+        for plugin_dir in _shipped_plugin_directories()
+        if not os.path.isfile(os.path.join(plugin_dir, "signature.sig"))
+    )
+    if not missing:
         return
-    os.environ["NOTMYFAULT_MODE"] = "develop"
-    print("[FirstRun] Degraded to development mode (NOTMYFAULT_MODE=develop)")
-    _notify_first_run_mode("develop（normal）")
+    relative = [os.path.relpath(path, project_root) for path in missing]
+    detail = "缺少签名文件：" + "、".join(relative[:5])
+    if len(relative) > 5:
+        detail += f" 等 {len(relative)} 个文件"
+    _notify_build_required(detail)
+    raise RuntimeError(detail)
 
 
 def _get_plugin_paths(store: SignedConfigStore):
@@ -135,7 +93,6 @@ def migrate_user_plugin_enabled_state(
         config["disabled_plugins"] = disabled
 
     migrated: list[str] = []
-    pending_rewrites: list[tuple[str, Dict[str, Any]]] = []
     for ptype, json_name in (("triggers", "trigger.json"), ("actions", "action.json")):
         ptype_root = os.path.join(user_dir, ptype)
         if not os.path.isdir(ptype_root):
@@ -158,47 +115,18 @@ def migrate_user_plugin_enabled_state(
             pid = meta.get("id") or folder_name
             if pid not in disabled_list:
                 disabled_list.append(pid)
-            meta["enabled"] = True
-            pending_rewrites.append((json_path, meta))
-            migrated.append(pid)
+                migrated.append(pid)
 
     if not migrated:
         return []
 
-    # config 先落盘再改 json，保存失败时插件保持 json 里的禁用状态。
     if not store.save_config(config):
-        print("[Plugins] 迁移开关状态后保存 config 失败，json 保持不动", file=sys.stderr)
+        print("[Plugins] 迁移开关状态后保存 config 失败", file=sys.stderr)
         return []
-
-    from notmyfault.security.plugins import (
-        compute_file_hash,
-        load_plugin_manifest,
-        save_plugin_manifest,
-    )
-
-    manifest_path = store.paths.plugin_manifest_file
-    manifest = load_plugin_manifest(manifest_path)
-    manifest_changed = False
-    for json_path, meta in pending_rewrites:
-        try:
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=2)
-        except OSError as e:
-            print(f"[Plugins] 迁移 {meta.get('id')} 失败，写回 json 出错: {e}", file=sys.stderr)
-            continue
-        # JSON 改写后，插件清单需要记录新哈希
-        pid = meta.get("id")
-        json_name = os.path.basename(json_path)
-        new_hash = compute_file_hash(json_path)
-        if pid and new_hash is not None:
-            manifest.setdefault(pid, {})[json_name] = new_hash
-            manifest_changed = True
-    if manifest_changed:
-        save_plugin_manifest(manifest, manifest_path)
 
     print(
         f"[Plugins] 已把 {len(migrated)} 个用户插件的开关状态迁到 config: "
-        f"{', '.join(migrated)}；这些插件的签名已失效，重新安装插件包可恢复"
+        f"{', '.join(migrated)}"
     )
     return migrated
 
@@ -213,8 +141,6 @@ def _plugin_check_needed(
     plugin_id = meta.get("id")
     if not isinstance(plugin_id, str) or not plugin_id:
         return True
-    if meta.get("enabled") is False:
-        return False
     disabled = config.get("disabled_plugins", {})
     disabled_key = "triggers" if backup.kind == "trigger" else "actions"
     if isinstance(disabled, dict):

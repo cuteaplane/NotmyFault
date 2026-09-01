@@ -15,11 +15,7 @@ from notmyfault.host.api.plugin_installation import (
     PluginFileSystem,
     PluginTemporaryStorage,
 )
-from notmyfault.host.api.ports import (
-    DesktopElementPort,
-    EngineControlPort,
-    PluginRegistryPort,
-)
+from notmyfault.host.api.ports import EngineControlPort, PluginRegistryPort
 
 
 class ApiServer:
@@ -74,7 +70,6 @@ def create_api_server(
     plugin_file_system: PluginFileSystem,
     pending_previews: PendingPreviewStore,
     plugin_temporary_storage: PluginTemporaryStorage,
-    desktop_elements: DesktopElementPort,
     plugin_registry: PluginRegistryPort,
     run_history: RunHistory,
     event_broker: EventBroker,
@@ -89,7 +84,6 @@ def create_api_server(
         plugin_file_system=plugin_file_system,
         pending_previews=pending_previews,
         plugin_temporary_storage=plugin_temporary_storage,
-        desktop_elements=desktop_elements,
         plugin_registry=plugin_registry,
         run_history=run_history,
         event_broker=event_broker,

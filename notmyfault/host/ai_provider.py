@@ -4,16 +4,16 @@
 """
 
 import codecs
-import ipaddress
 import json
 import socket
-from http.client import HTTPException
+import ssl
+from http.client import HTTPException, HTTPSConnection
 from typing import Any, Callable, Dict, Iterator
 from urllib import parse, request
 from urllib.error import HTTPError
 
-from notmyfault.host.ai_proposals import parse_plugin_proposal, parse_rule_draft
-from notmyfault.host.ai_skills import build_rule_drafting_skill, plugin_authoring_guidance
+from notmyfault.host.ai_rule_draft import parse_rule_draft
+from notmyfault.host.ai_skills import build_rule_drafting_skill
 from notmyfault.host.ai_tools import (
     SkillSpec,
     ToolCall,
@@ -26,13 +26,13 @@ from notmyfault.host.ai_tools import (
     extract_responses_tool_call,
     responses_tool_definitions,
 )
+from notmyfault.security.network import is_private_host, resolve_public_http_url
 
 _REQUEST_TIMEOUT_SECONDS = 120
 _MAX_RESPONSE_BYTES = 1024 * 1024
 # 流式读每次阻塞等待的上限；上游停住这么久就判超时。
 _IDLE_TIMEOUT_SECONDS = 120
 _STREAM_CHUNK_BYTES = 8192
-_PROXY_FAKE_IPV4_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 
 
 class AIProviderIdleTimeoutError(ValueError):
@@ -50,9 +50,59 @@ class _NoRedirects(request.HTTPRedirectHandler):
         return None
 
 
-def _build_request_opener() -> request.OpenerDirector:
+def _open_pinned_socket(addresses: tuple[str, ...], port: int, timeout, source_address):
+    last_error = None
+    for address in addresses:
+        try:
+            return socket.create_connection(
+                (address, port), timeout, source_address,
+            )
+        except OSError as error:
+            last_error = error
+    if last_error is None:
+        raise OSError("AI 草稿端点没有可连接的公网地址")
+    raise last_error
+
+
+class _PinnedHTTPSConnection(HTTPSConnection):
+    def __init__(self, host: str, addresses: tuple[str, ...], **kwargs):
+        self._addresses = addresses
+        super().__init__(host, **kwargs)
+
+    def connect(self):
+        raw_socket = _open_pinned_socket(
+            self._addresses,
+            self.port,
+            self.timeout,
+            self.source_address,
+        )
+        self.sock = self._context.wrap_socket(
+            raw_socket,
+            server_hostname=self.host,
+        )
+
+
+class _PinnedHTTPSHandler(request.HTTPSHandler):
+    def __init__(self, addresses: tuple[str, ...]):
+        self._addresses = addresses
+        super().__init__(context=ssl.create_default_context())
+
+    def https_open(self, req):
+        return self.do_open(
+            lambda host, **kwargs: _PinnedHTTPSConnection(
+                host, self._addresses, **kwargs,
+            ),
+            req,
+        )
+
+
+def _build_request_opener(addresses: tuple[str, ...]) -> request.OpenerDirector:
     # 单独包一层，测试会把它整个换成假网络。
-    return request.build_opener(_NoRedirects())
+    return request.build_opener(
+        request.ProxyHandler({}),
+        _NoRedirects(),
+        _PinnedHTTPSHandler(addresses),
+    )
 
 
 def _request_failure_message(error: Exception) -> str:
@@ -78,32 +128,7 @@ def _request_failure_message(error: Exception) -> str:
 
 
 def _is_private_host(host: str) -> bool:
-    host = host.lower().rstrip(".")
-    if host == "localhost" or host.endswith(".localhost"):
-        return True
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        try:
-            resolved = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-        except OSError:
-            return False
-        for item in resolved:
-            raw_address = item[4][0]
-            if not isinstance(raw_address, str):
-                continue
-            resolved_address = ipaddress.ip_address(raw_address)
-            if (
-                isinstance(resolved_address, ipaddress.IPv4Address)
-                and resolved_address in _PROXY_FAKE_IPV4_NETWORK
-            ):
-                continue
-            if not resolved_address.is_global:
-                return True
-        return False
-    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
-        address = address.ipv4_mapped
-    return not address.is_global
+    return is_private_host(host, allow_proxy_fake_ip=True)
 
 
 def _catalog_prompt(schema: Dict[str, Any]) -> str:
@@ -112,7 +137,9 @@ def _catalog_prompt(schema: Dict[str, Any]) -> str:
     lines = [
         "你是 NotmyFault 规则草稿助手。",
         "先读下面的插件目录，挑出能满足用户需求的能力。",
-        "目录里已有能满足需求的触发器和动作时调 propose_rule_draft，缺能力时调 propose_plugin。",
+        "目录里已有能满足需求的触发器和动作时调 propose_rule_draft。",
+        "目录缺少能力时直接说明缺少的触发器或动作，并提示用户检查第三方插件。",
+        "不要给出未经验证的插件名称、插件源码或安装操作。",
         "用户明确提出执行前条件时，把条件动作填进 preconditions。",
         "需要澄清、解释或追问时直接用普通文字回复，不要调工具，让用户看到流式输出。",
         "一次只调一个工具。触发器 id、动作 id 和参数名只能用目录里的。",
@@ -158,7 +185,7 @@ def _catalog_prompt(schema: Dict[str, Any]) -> str:
 
 
 def _system_prompt(schema: Dict[str, Any]) -> str:
-    return _catalog_prompt(schema) + "\n\n" + plugin_authoring_guidance()
+    return _catalog_prompt(schema)
 
 
 class _StreamDone:
@@ -380,8 +407,16 @@ class OpenAICompatibleDraftProvider:
         parsed = parse.urlparse(endpoint_url)
         if parsed.scheme != "https":
             raise AIProviderRequestError("AI 草稿端点必须是 HTTPS")
-        if _is_private_host(parsed.hostname or ""):
-            raise AIProviderRequestError("AI 草稿端点不能指向内网地址")
+        try:
+            _parsed, addresses = resolve_public_http_url(
+                endpoint_url,
+                https_only=True,
+                allow_proxy_fake_ip=True,
+            )
+        except ValueError as error:
+            if "本机、内网" in str(error):
+                raise AIProviderRequestError("AI 草稿端点不能指向内网地址") from None
+            raise AIProviderRequestError("AI 草稿端点格式无效") from None
         if api_format not in {"chat_completions", "responses"}:
             raise AIProviderRequestError("AI 草稿接口格式无效")
         endpoint_url = endpoint_url.rstrip("/")
@@ -393,18 +428,14 @@ class OpenAICompatibleDraftProvider:
         self._model = model
         self._api_key = api_key
         self._request_host = parsed.hostname or ""
-        self._opener = _build_request_opener()
+        self._opener = _build_request_opener(addresses)
 
     def __call__(
         self,
         messages: list[dict],
         schema: Dict[str, Any],
-        *,
-        allow_plugin_source: bool = False,
     ) -> Dict[str, Any]:
-        skill = build_rule_drafting_skill(
-            schema, allow_plugin_source=allow_plugin_source
-        )
+        skill = build_rule_drafting_skill(schema)
         full_messages = [
             {"role": "system", "content": _system_prompt(schema)},
             *messages,
@@ -466,14 +497,11 @@ class OpenAICompatibleDraftProvider:
         messages: list[dict],
         schema: Dict[str, Any],
         *,
-        allow_plugin_source: bool = False,
         idle_timeout: float = _IDLE_TIMEOUT_SECONDS,
         should_stop: Callable[[], bool] | None = None,
     ) -> Iterator[tuple[str, Any]]:
         """流式调用，产出 (kind, payload)；kind 是 reasoning/text/result。"""
-        skill = build_rule_drafting_skill(
-            schema, allow_plugin_source=allow_plugin_source
-        )
+        skill = build_rule_drafting_skill(schema)
         full_messages = [
             {"role": "system", "content": _system_prompt(schema)},
             *messages,
@@ -553,26 +581,11 @@ def _dispatch_tool_call(call: ToolCall, catalog: Dict[str, Any]) -> Dict[str, An
             "result_type": "rule_draft",
             "candidates": [parse_rule_draft(call.arguments, catalog)],
         }
-    if call.name == "propose_plugin":
-        return {
-            "ok": True,
-            "result_type": "plugin_proposal",
-            "proposal": parse_plugin_proposal(call.arguments),
-        }
     if call.name == "reply":
         message = _require_str(
             call.arguments.get("message"), "reply.message", "bad_arguments"
         )
         return {"ok": True, "result_type": "assistant_message", "message": message}
-    if call.name == "propose_plugin_source":
-        # 不在这里校验，端点拿到同意后交给 review_plugin_source。
-        return {
-            "ok": True,
-            "result_type": "plugin_source",
-            "kind": call.arguments.get("kind"),
-            "manifest": call.arguments.get("manifest"),
-            "source": call.arguments.get("source"),
-        }
     raise ToolCallError("unknown_tool", f"技能不允许工具 {call.name}")
 
 
@@ -597,7 +610,5 @@ def draft_from_openai_compatible(
     provider: OpenAICompatibleDraftProvider,
     messages: list[dict],
     schema: Dict[str, Any],
-    *,
-    allow_plugin_source: bool = False,
 ) -> Dict[str, Any]:
-    return provider(messages, schema, allow_plugin_source=allow_plugin_source)
+    return provider(messages, schema)

@@ -13,8 +13,6 @@ from notmyfault.config import (
     ensure_rule_binding_ids,
     get_ai_drafting_settings,
 )
-from notmyfault.host.ai_plugin_source import AIPluginSourceError, review_plugin_source
-from notmyfault.host.ai_proposals import parse_plugin_proposal
 from notmyfault.host.ai_provider import (
     AIProviderIdleTimeoutError,
     AIProviderRequestError,
@@ -50,7 +48,6 @@ class AIDraftingError(Exception):
 class AIStreamPlan:
     messages: List[Dict[str, str]]
     schema: Dict[str, Any]
-    consent: Dict[str, Any] | None
     body: Dict[str, Any]
     settings: Dict[str, Any]
 
@@ -146,14 +143,12 @@ class AIDraftingService:
 
     async def draft(self, body: Dict[str, Any]) -> Dict[str, Any]:
         plan = self._prepare(body)
-        allow_plugin_source = plan.consent is not None
         try:
             if callable(self._provider):
                 provider_result = await asyncio.to_thread(
                     self._provider,
                     plan.messages,
                     plan.schema,
-                    allow_plugin_source,
                 )
             else:
                 provider_result = await asyncio.to_thread(
@@ -161,7 +156,6 @@ class AIDraftingService:
                     self._build_configured_provider(plan.body, plan.settings),
                     plan.messages,
                     plan.schema,
-                    allow_plugin_source=allow_plugin_source,
                 )
         except Exception as error:
             raise AIDraftingError(
@@ -173,16 +167,7 @@ class AIDraftingService:
                 },
             ) from error
         try:
-            return self._finalize(provider_result, plan.consent)
-        except _ConsentRequired as error:
-            raise AIDraftingError(
-                409,
-                {
-                    "ok": False,
-                    "code": "consent_required",
-                    "error": "生成插件源码需要用户同意",
-                },
-            ) from error
+            return self._finalize(provider_result)
         except Exception as error:
             raise AIDraftingError(
                 502,
@@ -206,14 +191,12 @@ class AIDraftingService:
         cancel_event = threading.Event()
 
         def make_stream():
-            allow_plugin_source = plan.consent is not None
             if self._provider is not None:
                 provider_stream = getattr(self._provider, "stream", None)
                 if callable(provider_stream):
                     return provider_stream(
                         plan.messages,
                         plan.schema,
-                        allow_plugin_source=allow_plugin_source,
                     )
                 if callable(self._provider):
                     def fallback():
@@ -222,7 +205,6 @@ class AIDraftingService:
                             self._provider(
                                 plan.messages,
                                 plan.schema,
-                                allow_plugin_source=allow_plugin_source,
                             ),
                         )
 
@@ -234,7 +216,6 @@ class AIDraftingService:
             return configured.stream(
                 plan.messages,
                 plan.schema,
-                allow_plugin_source=allow_plugin_source,
                 should_stop=cancel_event.is_set,
                 idle_timeout=120,
             )
@@ -293,12 +274,7 @@ class AIDraftingService:
                     elif kind == "result":
                         finalized = True
                         try:
-                            result = self._finalize(payload, plan.consent)
-                        except _ConsentRequired:
-                            yield "error", {
-                                "code": "consent_required",
-                                "error": "生成插件源码需要用户同意",
-                            }
+                            result = self._finalize(payload)
                         except Exception as error:
                             yield "error", {
                                 "code": "ai_provider_failed",
@@ -345,13 +321,11 @@ class AIDraftingService:
         messages, message_error = _validate_messages(body.get("messages"))
         if message_error is not None or messages is None:
             self._fail(400, message_error or "messages 无效")
-        consent, consent_error = _validate_consent(body.get("consent"))
-        if consent_error is not None:
-            self._fail(400, consent_error)
+        if "consent" in body:
+            self._fail(400, "consent 已停用")
         return AIStreamPlan(
             messages=messages,
             schema=self._plugin_schema(),
-            consent=consent,
             body=body,
             settings=settings,
         )
@@ -378,7 +352,6 @@ class AIDraftingService:
     def _finalize(
         self,
         provider_result: Any,
-        consent: Dict[str, Any] | None,
     ) -> Dict[str, Any]:
         if not isinstance(provider_result, dict):
             raise ValueError("invalid AI draft result")
@@ -394,38 +367,6 @@ class AIDraftingService:
                 "source": "ai",
                 "result_type": "assistant_message",
                 "message": message,
-            }
-        if result_type == "plugin_proposal":
-            proposal = provider_result.get("proposal")
-            if not isinstance(proposal, dict):
-                raise ValueError("invalid AI plugin proposal")
-            return {
-                "ok": True,
-                "source": "ai",
-                "result_type": "plugin_proposal",
-                "proposal": dict(parse_plugin_proposal(proposal)),
-            }
-        if result_type == "plugin_source":
-            if consent is None:
-                raise _ConsentRequired()
-            plugin = review_plugin_source(
-                provider_result.get("kind"),
-                provider_result.get("manifest"),
-                provider_result.get("source"),
-                consent["plugin_id"],
-            )
-            requested = set(plugin["manifest"].get("permissions") or [])
-            approved = set(consent.get("permissions") or [])
-            if not requested.issubset(approved):
-                raise AIPluginSourceError(
-                    "permission_expansion",
-                    "生成插件请求了用户尚未批准的权限",
-                )
-            return {
-                "ok": True,
-                "source": "ai",
-                "result_type": "plugin_source",
-                "plugin": plugin,
             }
         if result_type != "rule_draft":
             raise ValueError("unknown AI draft result type")
@@ -486,10 +427,6 @@ class AIDraftingService:
         )
 
 
-class _ConsentRequired(Exception):
-    pass
-
-
 def _validate_messages(
     value: Any,
 ) -> tuple[List[Dict[str, str]] | None, str | None]:
@@ -515,30 +452,3 @@ def _validate_messages(
     if normalized[-1]["role"] != "user":
         return None, "最后一条消息必须是 user 角色"
     return normalized, None
-
-
-def _validate_consent(
-    value: Any,
-) -> tuple[Dict[str, Any] | None, str | None]:
-    from notmyfault.security.plugin_schema import is_known_permission, is_valid_plugin_id
-
-    if value is None:
-        return None, None
-    if not isinstance(value, dict):
-        return None, "consent 必须是对象"
-    if not set(value).issubset({"plugin_id", "permissions"}) or "plugin_id" not in value:
-        return None, "consent 只能包含 plugin_id 和 permissions"
-    plugin_id = value.get("plugin_id")
-    if not isinstance(plugin_id, str) or not is_valid_plugin_id(plugin_id):
-        return None, "consent.plugin_id 无效"
-    permissions = value.get("permissions", [])
-    if (
-        not isinstance(permissions, list)
-        or any(
-            not isinstance(item, str) or not is_known_permission(item)
-            for item in permissions
-        )
-        or len(permissions) != len(set(permissions))
-    ):
-        return None, "consent.permissions 必须是不重复的已知权限数组"
-    return {"plugin_id": plugin_id, "permissions": list(permissions)}, None

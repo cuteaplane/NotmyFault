@@ -38,6 +38,10 @@ class ApplicationPaths:
         return self.config_dir / ".api_token"
 
     @property
+    def dashboard_control_token_file(self) -> Path:
+        return self.config_dir / ".dashboard_control_token"
+
+    @property
     def ai_api_key_file(self) -> Path:
         return self.config_dir / ".ai_api_key"
 

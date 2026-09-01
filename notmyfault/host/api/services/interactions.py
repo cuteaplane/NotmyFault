@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict
 
-from notmyfault.components.session import ComponentSessionManager
 from notmyfault.extensions.protocol import (
     OwnedValueError,
     owned_value_identity,
@@ -17,6 +17,7 @@ from notmyfault.host.api.ports import EngineControlPort
 
 
 _MESSAGE_MAX_BYTES = 1024 * 1024
+_MAX_CONCURRENT_INVOCATIONS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,12 +30,13 @@ class PluginInteractionService:
     def __init__(
         self,
         engine: EngineControlPort,
-        component_sessions: ComponentSessionManager,
         extension_sessions: ExtensionSessionManager,
     ) -> None:
         self._engine = engine
-        self._component_sessions = component_sessions
         self._extension_sessions = extension_sessions
+        self._invoke_slots = threading.BoundedSemaphore(
+            _MAX_CONCURRENT_INVOCATIONS
+        )
 
     def extensions(self) -> Dict[str, Any]:
         engine = self._engine.current_engine
@@ -136,13 +138,17 @@ class PluginInteractionService:
             self._extension_sessions.drop(session.session_id)
             self._fail(404, f"插件命令不可用: {command_id}")
         context = ExtensionContext(session, engine.extensions)
+
+        def invoke_handler() -> Any:
+            if not self._invoke_slots.acquire(blocking=False):
+                raise RuntimeError("扩展命令并发数已达上限")
+            try:
+                return session.invoke(handler, context, body.get("payload"))
+            finally:
+                self._invoke_slots.release()
+
         try:
-            result = await asyncio.to_thread(
-                session.invoke,
-                handler,
-                context,
-                body.get("payload"),
-            )
+            result = await asyncio.to_thread(invoke_handler)
         except Exception as error:
             raise PluginInteractionError(
                 400,
@@ -248,105 +254,6 @@ class PluginInteractionService:
                 {"ok": False, "error": "无法读取插件视图"},
             ) from error
         return {"ok": True, "html": html}
-
-    def components(self) -> Dict[str, Any]:
-        engine = self._engine.current_engine
-        if engine is None:
-            return {"components": []}
-        items = []
-        for kind, meta_store in (
-            ("actions", engine.actions_meta),
-            ("triggers", engine.triggers_meta),
-        ):
-            for plugin_id, meta in sorted(meta_store.items()):
-                components = meta.get("components")
-                if not isinstance(components, list):
-                    continue
-                for component in components:
-                    if not isinstance(component, dict):
-                        continue
-                    component_id = component.get("id", "")
-                    items.append(
-                        {
-                            "plugin_id": plugin_id,
-                            "kind": kind,
-                            "id": component_id,
-                            "name": component.get("name", component_id),
-                            "description": component.get("description", ""),
-                            "api": component.get("api", "component-v1"),
-                            "ui": component.get("ui", {}),
-                            "available": engine.component(
-                                plugin_id,
-                                component_id,
-                            )
-                            is not None,
-                        }
-                    )
-        return {"components": items}
-
-    async def invoke_component(
-        self,
-        plugin_id: str,
-        component_id: str,
-        body: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        engine = self._engine.current_engine
-        if engine is None:
-            self._fail(404, "自动化引擎未运行，无法调用插件组件")
-        module = engine.component(plugin_id, component_id)
-        if module is None:
-            self._fail(404, f"插件组件不可用: {plugin_id}/{component_id}")
-        method = body.get("method", "")
-        if not isinstance(method, str) or not method:
-            self._fail(400, "缺少 method 字段")
-        payload = body.get("payload")
-        session_id = body.get("session_id")
-        meta = (
-            engine.actions_meta.get(plugin_id)
-            or engine.triggers_meta.get(plugin_id)
-            or {}
-        )
-        if isinstance(session_id, str) and session_id:
-            session = self._component_sessions.get(session_id)
-            if session is None:
-                self._fail(404, "组件会话不存在或已过期")
-            if (
-                session.plugin_id != plugin_id
-                or session.component_id != component_id
-            ):
-                self._fail(400, "会话不属于该组件")
-        else:
-            session = self._component_sessions.create(plugin_id, component_id, meta)
-        try:
-            result = await asyncio.to_thread(
-                module.invoke,
-                session,
-                method,
-                payload,
-            )
-        except Exception as error:
-            self._component_sessions.drop(session.session_id)
-            raise PluginInteractionError(
-                400,
-                {"ok": False, "error": "组件调用失败"},
-            ) from error
-        if result is None:
-            result = {}
-        if not isinstance(result, dict):
-            result = {"data": result}
-        if result.get("ok") is False:
-            self._component_sessions.drop(session.session_id)
-            self._fail(400, result.get("error", "组件调用失败"))
-        if result.get("close") is True:
-            self._component_sessions.drop(session.session_id)
-        response = {
-            "ok": True,
-            "session_id": session.session_id,
-            "data": result,
-        }
-        if session.status:
-            response["status"] = session.status
-        return response
 
     @staticmethod
     def _fail(status_code: int, message: str) -> None:

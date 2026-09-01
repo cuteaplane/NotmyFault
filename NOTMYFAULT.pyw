@@ -13,7 +13,6 @@ from notmyfault.application_paths import ApplicationPaths
 from notmyfault.config import SignedConfigStore
 from notmyfault.host.api_server import create_api_server
 from notmyfault.host.api.auth import ApiTokenStore
-from notmyfault.host.api.desktop_elements import NativeDesktopElements
 from notmyfault.host.api.events import EventBroker
 from notmyfault.host.api.plugin_installation import (
     PendingPreviewStore,
@@ -28,7 +27,7 @@ from notmyfault.core.runtime_controller import RuntimeController
 
 # Dashboard 控制端口和退出协议与 dashboard.pyw 共用，直接导入会拉起 webview 依赖
 _DASHBOARD_CONTROL_PORT = 19197
-_DASHBOARD_QUIT = b"NMF_DASHBOARD_QUIT_V1"
+_DASHBOARD_QUIT = b"NMF_DASHBOARD_QUIT_V2"
 
 # 托盘模块导入失败时仍可运行引擎
 try:
@@ -110,13 +109,21 @@ def setup_logging(log_dir: str) -> str:
 def _notify_dashboard_quit():
     """通知 Dashboard 控制端口关闭自身，让 UI 与引擎一起退出"""
     try:
-        import socket
+        token = (
+            ApplicationPaths.default()
+            .dashboard_control_token_file.read_text(encoding="utf-8")
+            .strip()
+        )
+        if len(token) != 64:
+            return
+        int(token, 16)
         with socket.create_connection(
             ("127.0.0.1", _DASHBOARD_CONTROL_PORT), timeout=1
         ) as client:
-            client.sendall(_DASHBOARD_QUIT + b"\n")
+            client.settimeout(1)
+            client.sendall(token.encode("ascii") + b" " + _DASHBOARD_QUIT + b"\n")
             client.makefile("rb").readline(32)
-    except OSError:
+    except (OSError, UnicodeError, ValueError):
         pass
 
 
@@ -311,7 +318,6 @@ class EngineRunner:
                 plugin_file_system=PluginFileSystem(),
                 pending_previews=PendingPreviewStore(),
                 plugin_temporary_storage=PluginTemporaryStorage(),
-                desktop_elements=NativeDesktopElements(),
                 plugin_registry=PluginRegistryClient(),
                 run_history=run_history,
                 event_broker=event_broker,
@@ -386,11 +392,7 @@ def main():
 
 
 if __name__ == "__main__":
-    if "--admin-broker" in sys.argv:
-        from notmyfault.security.admin_broker import main as admin_broker_main
-        index = sys.argv.index("--admin-broker")
-        raise SystemExit(admin_broker_main(sys.argv[index + 1:index + 2]))
-    elif "--enable-autostart" in sys.argv or "--disable-autostart" in sys.argv:
+    if "--enable-autostart" in sys.argv or "--disable-autostart" in sys.argv:
         if os.name == "nt":
             raise SystemExit("出于安全考虑，请通过 Windows 托盘菜单管理开机自启")
         from notmyfault.platform.platform_support import set_linux_autostart

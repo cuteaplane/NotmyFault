@@ -9,7 +9,6 @@ from notmyfault.config import (
     SignedConfigStore,
     ensure_rule_binding_ids,
     ensure_rule_id,
-    get_admin_rule_key_verification,
     validate_rules_safety,
 )
 from notmyfault.core.rules import (
@@ -206,9 +205,6 @@ class RuleService:
                 rules,
                 self._plugin_schema(),
                 admin_key_password,
-                key_verification=get_admin_rule_key_verification(
-                    self._load_config()
-                ),
             )
         except AdminRuleApprovalError as error:
             raise self._approval_error(error) from error
@@ -300,9 +296,6 @@ class RuleService:
                 normalized_rules,
                 schema,
                 admin_key_password,
-                key_verification=get_admin_rule_key_verification(
-                    self._load_config()
-                ),
             )
         except AdminRuleApprovalError as error:
             raise self._approval_error(error) from error

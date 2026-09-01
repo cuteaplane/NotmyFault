@@ -11,118 +11,23 @@ def restrict_token_file(path: str) -> None:
         os.chmod(path, 0o600)
         return
 
-    import ctypes
-    from ctypes import wintypes
+    import subprocess
 
-    token_query = 0x0008
-    token_user_class = 1
-    dacl_security_information = 0x00000004
-    protected_dacl_security_information = 0x80000000
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-    advapi32.OpenProcessToken.argtypes = (
-        wintypes.HANDLE,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.HANDLE),
+    userdomain = os.environ.get("USERDOMAIN", "")
+    username = os.environ.get("USERNAME") or os.getlogin()
+    account = f"{userdomain}\\{username}" if userdomain else username
+    grant = subprocess.run(
+        ["icacls", path, "/grant:r", f"{account}:F"],
+        capture_output=True,
+        timeout=5,
     )
-    advapi32.OpenProcessToken.restype = wintypes.BOOL
-    advapi32.GetTokenInformation.argtypes = (
-        wintypes.HANDLE,
-        ctypes.c_int,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
+    inheritance = subprocess.run(
+        ["icacls", path, "/inheritance:r"],
+        capture_output=True,
+        timeout=5,
     )
-    advapi32.GetTokenInformation.restype = wintypes.BOOL
-    advapi32.ConvertSidToStringSidW.argtypes = (
-        wintypes.LPVOID,
-        ctypes.POINTER(wintypes.LPWSTR),
-    )
-    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
-    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.LPVOID),
-        ctypes.POINTER(wintypes.DWORD),
-    )
-    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = (
-        wintypes.BOOL
-    )
-    advapi32.SetFileSecurityW.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-    )
-    advapi32.SetFileSecurityW.restype = wintypes.BOOL
-    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    kernel32.LocalFree.argtypes = (wintypes.HLOCAL,)
-
-    class SidAndAttributes(ctypes.Structure):
-        _fields_ = (("sid", wintypes.LPVOID), ("attributes", wintypes.DWORD))
-
-    class TokenUser(ctypes.Structure):
-        _fields_ = (("user", SidAndAttributes),)
-
-    process_token = wintypes.HANDLE()
-    sid_text = wintypes.LPWSTR()
-    security_descriptor = wintypes.LPVOID()
-    try:
-        if not advapi32.OpenProcessToken(
-            kernel32.GetCurrentProcess(), token_query, ctypes.byref(process_token)
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        required = wintypes.DWORD()
-        advapi32.GetTokenInformation(
-            process_token,
-            token_user_class,
-            None,
-            0,
-            ctypes.byref(required),
-        )
-        if not required.value:
-            raise ctypes.WinError(ctypes.get_last_error())
-        token_buffer = ctypes.create_string_buffer(required.value)
-        if not advapi32.GetTokenInformation(
-            process_token,
-            token_user_class,
-            token_buffer,
-            required,
-            ctypes.byref(required),
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        user = ctypes.cast(token_buffer, ctypes.POINTER(TokenUser)).contents
-        if not advapi32.ConvertSidToStringSidW(
-            user.user.sid, ctypes.byref(sid_text)
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        sddl = f"D:P(A;;FA;;;{sid_text.value})"
-        if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl,
-            1,
-            ctypes.byref(security_descriptor),
-            None,
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        security_information = (
-            dacl_security_information | protected_dacl_security_information
-        )
-        if not advapi32.SetFileSecurityW(
-            path,
-            security_information,
-            security_descriptor,
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-    except OSError as error:
-        raise RuntimeError("无法设置 API 令牌文件权限") from error
-    finally:
-        if security_descriptor:
-            kernel32.LocalFree(security_descriptor)
-        if sid_text:
-            kernel32.LocalFree(sid_text)
-        if process_token:
-            kernel32.CloseHandle(process_token)
+    if grant.returncode != 0 or inheritance.returncode != 0:
+        raise RuntimeError("无法设置 API 令牌文件权限")
 
 
 class ApiTokenStore:

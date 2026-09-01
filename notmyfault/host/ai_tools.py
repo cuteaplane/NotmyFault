@@ -66,53 +66,15 @@ _RULE_DRAFT_PARAMETERS: JSON = {
     "additionalProperties": False,
 }
 
-_PLUGIN_PROPOSAL_PARAMETERS: JSON = {
-    "type": "object",
-    "properties": {
-        "kind": {"type": "string", "enum": ["trigger", "action"]},
-        "id": {"type": "string"},
-        "name": {"type": "string"},
-        "description": {"type": "string"},
-        "parameters": {"type": "array"},
-        "outputs": {"type": "array"},
-        "permissions": {"type": "array", "items": {"type": "string"}},
-        "rationale": {"type": "string"},
-        "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["kind", "id", "name", "description"],
-    "additionalProperties": False,
-}
-
-_PLUGIN_SOURCE_PARAMETERS: JSON = {
-    "type": "object",
-    "properties": {
-        "kind": {"type": "string", "enum": ["trigger", "action"]},
-        "manifest": {"type": "object"},
-        "source": {"type": "string"},
-    },
-    "required": ["kind", "manifest", "source"],
-    "additionalProperties": False,
-}
-
 RULE_DRAFT_TOOL = ToolSpec(
     name="propose_rule_draft",
     description="把规则描述转成只读的规则候选，不保存也不执行。",
     parameters=_RULE_DRAFT_PARAMETERS,
 )
-PLUGIN_PROPOSAL_TOOL = ToolSpec(
-    name="propose_plugin",
-    description="为目录覆盖不到的能力生成只读的元数据提案，不含源码也不安装。",
-    parameters=_PLUGIN_PROPOSAL_PARAMETERS,
-)
-PLUGIN_SOURCE_TOOL = ToolSpec(
-    name="propose_plugin_source",
-    description="用户明确允许时生成插件 manifest 与 Python 源码，仅供审查，不保存不安装。",
-    parameters=_PLUGIN_SOURCE_PARAMETERS,
-)
 DEFAULT_SKILL = SkillSpec(
     name="rule_drafting",
-    description="规则草稿与能力提案，文字回复直接用普通文本，不落盘、不安装、不执行。",
-    tools=(RULE_DRAFT_TOOL, PLUGIN_PROPOSAL_TOOL),
+    description="规则草稿工具；说明缺少的能力、澄清和追问使用普通文本。",
+    tools=(RULE_DRAFT_TOOL,),
 )
 
 

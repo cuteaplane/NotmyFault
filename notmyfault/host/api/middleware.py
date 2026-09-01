@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import collections
+import threading
+import time
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -15,6 +19,11 @@ DASHBOARD_ORIGINS = tuple(
 
 
 def install_api_middleware(app: FastAPI, token_store: ApiTokenStore) -> None:
+    request_times: collections.deque[float] = collections.deque()
+    request_times_lock = threading.Lock()
+    rate_window_seconds = 10.0
+    rate_limit = 300
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=DASHBOARD_ORIGINS,
@@ -32,11 +41,21 @@ def install_api_middleware(app: FastAPI, token_store: ApiTokenStore) -> None:
             if authorization.startswith("Bearer ")
             else ""
         )
-        if not token and request.url.path == "/api/events":
-            token = request.query_params.get("token", "")
         if not token_store.matches(token):
-            token_store.repair_file()
             return JSONResponse(
                 {"detail": "Forbidden: invalid API Token"}, status_code=403
             )
+        token_store.repair_file()
+        now = time.monotonic()
+        with request_times_lock:
+            cutoff = now - rate_window_seconds
+            while request_times and request_times[0] <= cutoff:
+                request_times.popleft()
+            if len(request_times) >= rate_limit:
+                return JSONResponse(
+                    {"detail": "Too Many Requests"},
+                    status_code=429,
+                    headers={"Retry-After": "10"},
+                )
+            request_times.append(now)
         return await call_next(request)

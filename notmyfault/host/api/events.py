@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict
 
 from notmyfault.core.run_history import RunHistory
+
+
+_EVENT_TYPE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +26,8 @@ class EventBroker:
         self._lock = threading.Lock()
 
     def publish(self, event_type: str, data: Dict[str, Any]) -> None:
+        if not isinstance(event_type, str) or not _EVENT_TYPE_RE.fullmatch(event_type):
+            event_type = "message"
         packet = {"type": event_type, "data": data, "ts": time.time()}
         try:
             self._history.record(packet)

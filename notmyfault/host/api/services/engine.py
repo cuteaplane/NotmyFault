@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import os
 import sys
 from dataclasses import dataclass
@@ -10,8 +11,7 @@ from notmyfault.config import ConfigValidationError, SignedConfigStore
 from notmyfault.core.logging import get_latest_log
 from notmyfault.core.rules import get_rule_events
 from notmyfault.core.run_history import RunHistory
-from notmyfault.host.api.desktop_elements import DesktopElementFailure
-from notmyfault.host.api.ports import DesktopElementPort, EngineControlPort
+from notmyfault.host.api.ports import EngineControlPort
 from notmyfault.security.security import detect_security_mode
 
 
@@ -32,18 +32,14 @@ class EngineService:
         store: SignedConfigStore,
         paths: ApplicationPaths,
         history: RunHistory,
-        component_sessions: SessionCleanupPort,
         extension_sessions: SessionCleanupPort,
-        desktop_elements: DesktopElementPort,
         process_id: Callable[[], int] = os.getpid,
     ) -> None:
         self._engine = engine
         self._store = store
         self._paths = paths
         self._history = history
-        self._component_sessions = component_sessions
         self._extension_sessions = extension_sessions
-        self._desktop_elements = desktop_elements
         self._process_id = process_id
 
     def start(self) -> Dict[str, Any]:
@@ -155,7 +151,8 @@ class EngineService:
         return current_engine.get_diagnostics()
 
     def runs(self, limit: int) -> Dict[str, Any]:
-        return {"runs": self._history.list_runs(limit)}
+        safe_limit = min(max(int(limit), 1), 1000)
+        return {"runs": self._history.list_runs(safe_limit)}
 
     def run_detail(self, run_id: str) -> Dict[str, Any] | None:
         return self._history.get_run(run_id)
@@ -169,36 +166,23 @@ class EngineService:
             )
         return {"ok": True, "message": "已请求停止这次运行"}
 
-    async def capture_desktop_element(self, delay_value: Any) -> Dict[str, Any]:
-        try:
-            return await self._desktop_elements.capture(delay_value)
-        except DesktopElementFailure as error:
-            raise EngineServiceError(
-                "invalid",
-                {"ok": False, "code": error.code, "error": error.message},
-            ) from error
-
-    async def check_desktop_element(self, selector: Any) -> Dict[str, Any]:
-        try:
-            return await self._desktop_elements.check(selector)
-        except DesktopElementFailure as error:
-            raise EngineServiceError(
-                "invalid",
-                {"ok": False, "code": error.code, "error": error.message},
-            ) from error
-
     def logs(self, lines: int) -> Dict[str, Any]:
+        safe_lines = min(max(int(lines), 1), 2000)
         log_path = get_latest_log(str(self._paths.logs_dir))
         if not log_path:
             return {"lines": [], "total": 0}
         try:
             with open(log_path, "r", encoding="utf-8", errors="replace") as file:
-                all_lines = file.readlines()
+                tail: deque[str] = deque(maxlen=safe_lines)
+                total = 0
+                for line in file:
+                    total += 1
+                    tail.append(line.rstrip("\n"))
         except FileNotFoundError:
             return {"lines": [], "total": 0}
         return {
-            "lines": [line.rstrip("\n") for line in all_lines[-lines:]],
-            "total": len(all_lines),
+            "lines": list(tail),
+            "total": total,
         }
 
     def _load_rules(self) -> list[Dict[str, Any]]:
@@ -220,4 +204,3 @@ class EngineService:
 
     def _drop_sessions(self) -> None:
         self._extension_sessions.drop_all()
-        self._component_sessions.drop_all()

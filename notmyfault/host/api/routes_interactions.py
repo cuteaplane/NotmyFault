@@ -67,25 +67,4 @@ def create_interactions_router(service: PluginInteractionService) -> APIRouter:
         except PluginInteractionError as error:
             return _error_response(error)
 
-    @router.get("/api/plugins/components")
-    async def plugins_components_list():
-        return service.components()
-
-    @router.post("/api/plugins/{plugin_id}/components/{component_id}/invoke")
-    async def plugin_component_invoke(
-        plugin_id: str,
-        component_id: str,
-        request: Request,
-    ):
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        if not isinstance(body, dict):
-            body = {}
-        try:
-            return await service.invoke_component(plugin_id, component_id, body)
-        except PluginInteractionError as error:
-            return _error_response(error)
-
     return router

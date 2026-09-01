@@ -68,30 +68,6 @@ def create_engine_router(
         except EngineServiceError as error:
             return _service_error(error)
 
-    @router.post("/api/desktop-elements/capture")
-    async def desktop_element_capture(request: Request):
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        delay = body.get("delay_seconds", 3) if isinstance(body, dict) else 3
-        try:
-            return await service.capture_desktop_element(delay)
-        except EngineServiceError as error:
-            return _service_error(error)
-
-    @router.post("/api/desktop-elements/check")
-    async def desktop_element_check(request: Request):
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        selector = body.get("selector") if isinstance(body, dict) else None
-        try:
-            return await service.check_desktop_element(selector)
-        except EngineServiceError as error:
-            return _service_error(error)
-
     @router.get("/api/engine/logs")
     async def engine_logs(lines: int = 200):
         return service.logs(lines)
@@ -111,7 +87,8 @@ def create_engine_router(
                         )
                         if event is None:
                             break
-                        yield f"event: {event['type']}\n"
+                        event_type = str(event["type"]).replace("\r", "").replace("\n", "")
+                        yield f"event: {event_type}\n"
                         yield "data: " + json.dumps(
                             event["data"],
                             ensure_ascii=False,
