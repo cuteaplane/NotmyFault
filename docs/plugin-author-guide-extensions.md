@@ -108,3 +108,11 @@ python nmf.py plugin pack <插件目录路径>
 - 经过 build 的插件不继承归档里的签名，按未签名插件处理。
 - 钩子无依赖解析、无工具链检测，作者需保证目标机器能跑通命令；
   内置插件不允许携带 `build`。
+
+## 声明可传递的数据
+
+路径、网址、整数和日期时间使用对应 `value_type`，数组声明元素类型。
+具有特定业务结构的共享值在 `contributes.data_types` 中声明 `binding: shared`
+和 `schema`，消费者引用完整包名、类型 ID 与版本。插件不必提供专用编辑器。
+私有编辑数据继续使用 `plugin_data` 和 `binding: private`。升级类型版本不隐式
+迁移旧值；旧入口和规则可继续读取。示例与协议见 [data-types.md](data-types.md)。

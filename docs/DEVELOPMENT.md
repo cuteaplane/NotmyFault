@@ -88,10 +88,10 @@ npm exec vite build -- --emptyOutDir
 
 ## 3. 规则现在怎么工作
 
-一条规则分成三段：
+一条规则由触发条件和动作列表组成：
 
 ```text
-触发条件  →  执行前检查  →  动作流水线
+触发条件  →  动作列表
 ```
 
 ### 触发条件
@@ -132,36 +132,15 @@ npm exec vite build -- --emptyOutDir
 
 `all` 可以设置 `within_seconds`，表示这些事件必须在这段时间内都出现。
 
-### 执行前检查
+### 旧规则的运行前检查
 
-“Word 是否还在编辑”“文件是否还在写入”不是触发条件，而是动作开始前的安全检查。
+运行前检查已移除。非空 `preconditions` 会被规则校验拒绝，宿主不再调用
+`check_precondition()`，也不再因检查未通过而自动延后工作流。
 
-```json
-{
-  "preconditions": [
-    {
-      "binding_id": "p_quiescent01",
-      "type": "document_quiescent",
-      "params": {
-        "source_folder": "D:\\待归档",
-        "quiet_seconds": 120,
-        "check_file_locks": true,
-        "check_document_windows": true
-      }
-    }
-  ]
-}
-```
-
-检查没通过时，引擎不会继续执行动作；它会稍后再检查。前置检查插件必须声明
-`"precondition_api": "context-v1"`，并提供：
-
-```python
-def check_precondition(meta, params, context):
-    return {"ok": False, "reason": "文件仍在变化", "retry_after_seconds": 60}
-```
-
-也可以只返回 `True` 或 `False`。
+已签名的旧规则可以读取供编辑，保存和运行前必须移除旧检查。需要判断本次运行
+数据时，使用 IF / ELSE 动作分支；需要监视一段时间内没有发生某事件时，使用
+NOT 触发条件。NOT 不查询进程、窗口或文件的当前状态，旧检查也不会自动转换。
+结构与示例见 [规则格式](rule-schema-v2.md)。
 
 ### 动作流水线和上一步结果
 
@@ -338,7 +317,7 @@ FastAPI 或 Starlette。
 只改 API 后端时，可以先跑：
 
 ```powershell
-python -m pytest notmyfault/tests/test_api_server.py notmyfault/tests/test_api_plugins.py notmyfault/tests/test_api_primitives.py notmyfault/tests/test_api_architecture.py notmyfault/tests/test_api_assembly_smoke.py -q
+python -m pytest notmyfault/tests/test_api_server.py notmyfault/tests/test_api_plugins.py notmyfault/tests/test_api_primitives.py notmyfault/tests/test_api_assembly_smoke.py -q
 ```
 
 API 测试使用 `notmyfault/tests/api_support.py` 创建临时
@@ -347,3 +326,12 @@ API 测试使用 `notmyfault/tests/api_support.py` 创建临时
 桌面控件结果。文件替换失败测试传入 `PluginFileSystem` 的故障实现，预览过期
 测试给 `PendingPreviewStore` 传入固定时钟。测试不修改 `api_server` 或
 `config` 的模块属性。
+
+## 数据类型与运行变量
+
+`notmyfault/core/data_types.py` 处理类型和值，`type_registry.py` 从已验证清单建立
+类型快照，`value_codec.py` 统一保存和跨进程编码，`value_conversion.py` 处理
+显式转换。`bindings.py` 解析表达式，`binding_schema.py` 检查来源类型和可用性，
+`variables.py` 初始化常量与变量并执行赋值。
+Dashboard 的 `valueTypes.js` 保留编码值并提供端口标签、编辑和兼容提示。
+类型与规则格式见 [data-types.md](data-types.md)。

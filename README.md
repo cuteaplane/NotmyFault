@@ -8,7 +8,7 @@ NotmyFault 顾名思义是一个自动化（废话），由各种条件出发，
 
 自动化软件，能干的事还是有些少的，并且很零碎......为了解决这个问题，NotmyFault最大的亮点就是可扩展性！
 只要会Python，你随时可以编写一个属于自己的插件，让NotmyFault帮你办成任何事！
-通过插件，NotmyFault可以拓展出强大的能力，接入任何服务，构建一个更通用的自动化。
+通过插件，NotmyFault可以拓展出强大的能力，接入任何服务/接口/设备，构建一个更通用的自动化。
 
 ## 平台支持
 
@@ -47,7 +47,7 @@ python build.py
 ```
 
 Dashboard用于操作引擎，用于日常管理和插件的安装。
-第一次启动时如果缺少签名或 build.json，引擎会自动通过严格方式构建，或许等我再过上十年做个安装脚本出来（啥）
+首次运行源码前需要执行构建。缺少 build.json 或其签名时，引擎会拒绝启动；严格模式还会检查内置插件是否缺少签名。安装文件异常时，安全页面会引导重新安装 NotmyFault。
 
 ### Linux
 
@@ -92,16 +92,16 @@ Wayland 默认禁止普通应用监听全局按键或枚举其他应用的窗口
 | `python build.py version` | 查看密钥状态、公钥指纹和插件签名数量 |
 
 - 修改内置插件或核心源码后需要重新 build，否则旧签名失效。
-- 安全模式有 strict / normal / permissive 三档。引擎按环境变量
-  `NOTMYFAULT_MODE`、签名 build.json、默认 strict 的顺序决定当前模式。
+- 安全模式有 strict / normal / permissive 三档，以通过签名验证的 build.json 为准，缺少有效构建信息时默认 strict。环境变量 `NOTMYFAULT_MODE` 只能提高安全等级，不能降低。
 - normal 和 permissive 都使用不加密私钥，适合本地开发和测试。
+- normal 和 permissive 允许加载签名缺失或无效的插件；配置与规则的签名验证、插件结构检查和管理员执行确认仍然生效。
 
 ## 规则模型
 
 一条规则由三部分组成：
 
 ```text
-触发条件 → 可选的执行前检查 → 动作流水线
+触发条件（AND / OR / NOT）→ 动作流水线（支持 IF / ELSE）
 ```
 
 单一触发条件使用 `event`；复杂条件使用可嵌套的 `condition`：
@@ -141,7 +141,15 @@ Wayland 默认禁止普通应用监听全局按键或枚举其他应用的窗口
 }
 ```
 
+NOT 用于等待指定事件未发生，必须设置等待时长；收到匹配事件后重新计时，
+超时触发一次，直到再次收到事件后重新开始。它判断事件是否发生，不查询当前系统状态。
+IF 根据本次触发数据或前序动作结果选择 THEN / ELSE 分支，执行完分支后继续后续动作。
+运行前检查已移除，含非空 `preconditions` 的旧规则需要在编辑器中移除旧检查并重新配置。
+
 Dashboard 负责编辑和校验规则。
+规则支持只读常量和单次运行内的变量，参数可传递路径、时间、精确数字、结构化数据
+及插件声明的共享类型。格式与类型协议见 [docs/data-types.md](docs/data-types.md)。
+
 条件树节点和数据引用格式见 [docs/rule-schema-v2.md](docs/rule-schema-v2.md)。
 
 ## 数据位置
@@ -172,7 +180,7 @@ Dashboard 是 pywebview 桌面客户端，只能在本机使用。
 python -m pytest -q
 ```
 
-测试目录为 `notmyfault/tests/` 和 `tests/`（pytest.ini 的 testpaths）。
+测试目录为 `notmyfault/tests/`（pytest.ini 的 testpaths）。
 
 Dashboard 构建与挂载测试：
 
@@ -189,8 +197,7 @@ npm test
 python build.py verify
 ```
 
-`notmyfault/simulator/` 提供模拟环境，可以在不接触真实系统的情况下跑规则；
-对应测试见 `notmyfault/tests/test_simulator.py`。
+`notmyfault/simulator/` 提供模拟环境，可以在不接触真实系统的情况下跑规则。
 
 开发文档：
 

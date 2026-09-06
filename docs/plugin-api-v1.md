@@ -32,14 +32,17 @@ action 专属：
 | 字段 | 说明 |
 | --- | --- |
 | execution_api | 不写走 run()；写 "context-v1" 走 run_with_context() |
-| precondition_api | 写 "context-v1" 后可当开始前确认用 |
+| precondition_api | 旧清单字段，运行前检查已移除，宿主不再调用 check_precondition() |
 | cancellation_api | 写 "runtime-v1" 才允许规则配 timeout_seconds |
-| idempotent | 声明可安全重试 |
+| idempotent | true 表示可安全重试，false 表示重复执行可能产生额外结果 |
 | execution_mode | "isolated" 是实验字段，动作在子进程里跑（见下文） |
 
 trigger 专属：trigger_api（event-v1 / event-v2）、semantic（state / oneshot）。
 
 结构校验都在 `notmyfault/security/plugin_schema.py`，校验失败的原因会进诊断页。
+
+内置动作显式声明 `idempotent`。同一插件包含切换、追加等操作时，按整个插件的
+行为声明为 `false`。该字段用于重试提示，不阻止用户配置重试。触发器不使用此字段。
 
 ## 动作
 
@@ -53,6 +56,11 @@ def run(action_info, params):
 返回值会进规则上下文，供后续步骤 $ref 引用。抛异常表示失败。
 仓库例子：`notmyfault/actions/set_volume/action.py`。
 
+引擎在调用动作前解析常量、变量与其他步骤引用。两种动作入口都接收解析后的
+`params`，不需要在插件内再次解析表达式。参数和输出的 `value_type`、显式转换与
+自定义类型使用方法见 `data-types.md`；插件通过 `notmyfault.plugin_api.data_types_api()`
+访问类型校验和转换。
+
 ### execution_api=context-v1（稳定）
 
 ```python
@@ -65,24 +73,15 @@ context 是这次 run 独享的上下文，能读到 event payload、前面步�
 声明了 execution_api=context-v1 却没定义 run_with_context 会在执行时报
 TypeError，加载期不拦。仓库例子：`notmyfault/actions/append_text/action.py`。
 
-### precondition_api=context-v1（稳定）
+### 旧版 precondition_api（已移除）
 
-模块里定义 check_precondition 的动作可以被规则用作“开始前确认”：
+清单校验仍接受 `precondition_api: "context-v1"`，宿主不再调用
+`check_precondition()`，也不再根据 `retry_after_seconds` 延后工作流。
+新插件无需声明此字段或实现此入口。
 
-```python
-def check_precondition(action_info, params, context):
-    if window_is_ready():
-        return True
-    return {
-        "ok": False,
-        "reason": "窗口还没出现",
-        "retry_after_seconds": 30,
-    }
-```
-
-返回 `True` 表示可以执行。返回对象时，只有 `ok: true` 会通过；其他结果会阻止本次
-运行。`reason` 用于运行记录，`retry_after_seconds` 指定重试间隔；引擎会把间隔限制在
-5 到 3600 秒之间。仓库例子：`notmyfault/actions/document_quiescent/action.py`。
+非空 `preconditions` 会被规则校验拒绝。旧规则必须移除该字段中的检查；
+需要判断运行数据时使用 IF，需要监视事件未发生时使用 NOT 触发条件。
+两者的结构和适用条件见 [规则格式](rule-schema-v2.md)。
 
 ### cancellation_api=runtime-v1（稳定）
 
@@ -90,7 +89,7 @@ def check_precondition(action_info, params, context):
 动作里长循环要周期检查：
 
 ```python
-cancel = context.get("cancellation")
+cancel = context.get("runtime", {}).get("cancellation")
 if cancel is not None:
     cancel.raise_if_cancelled()
 ```
@@ -133,7 +132,7 @@ def run(meta, config, emit_event, shutdown_event):
 - commands：由参数编辑器或页面调用的处理函数
 - views：插件自带的 HTML 页面，路径必须位于插件目录内
 - parameter_editors：为普通参数或 `plugin_data` 参数提供编辑入口
-- data_types：插件自有数据的类型和版本
+- data_types：插件私有或共享数据的结构、类型和版本
 
 普通参数编辑器声明 `value_type`，命令用 `context.commit_value()` 提交新值。自有数据
 编辑器声明 `data_type`，命令用 `context.commit()` 提交带归属信息的值。完整协议见
@@ -186,15 +185,19 @@ def run(action_info, params):
 ## 隔离执行（execution_mode: isolated，experimental）
 
 manifest 写 `"execution_mode": "isolated"` 的动作不会在引擎进程中导入。每次执行会启动
-子进程调用 `run()` 或 `run_with_context()`；父子进程之间使用 JSON 标准输入和输出。
+子进程调用 `run()` 或 `run_with_context()`；父子进程之间使用 JSON 标准输入和输出，
+新宿主使用 `typed-v1` 编解码保留大整数、Decimal 和二进制等值。
 子进程先发 `{"type":"ready","protocol":1}`，父进程再发送 entry、action_info、
 params 和最小 context。执行结果的 `type` 是 `result`。
 这只隔离崩溃，不是安全沙箱，也不限制文件、网络、进程或系统调用权限。worker 异常退出时，引擎发布
 `plugin_worker_crashed` 事件，规则中的该步骤失败。默认启动等待为 10 秒，动作执行等待为
 120 秒，进程退出等待为 5 秒。
-实现位于 `notmyfault/core/plugin_worker.py`。内置插件不能使用 `isolated`，且隔离模式
-不能声明 `cancellation_api`。调用原生库或 `ctypes` 的第三方动作优先使用此模式，
+实现位于 `notmyfault/core/plugin_worker.py`。内置和用户动作均可声明 `isolated`；
+隔离模式不能声明 `cancellation_api` 或 `admin` 权限。调用原生库或 `ctypes` 的第三方动作优先使用此模式，
 原生代码仍拥有当前用户的文件、网络和系统调用权限。
+
+内置 `set_volume` 使用 `isolated`，Windows 的 pycaw COM 调用在子进程中执行。
+该动作不声明 `cancellation_api`，规则不能为它配置协作取消超时。
 
 ## 允许 import 的模块
 
@@ -229,3 +232,13 @@ notmyfault.core.workflow_executor、notmyfault.host.*、notmyfault.platform.linu
 - teardown：引擎停止时调用，插件在这里注销热键、关连接
 - 引擎停止：扩展会话一并关闭
 - isolated worker：引擎 shutdown 时 shutdown_all() 终止所有活着的子进程
+
+## 通用数据类型
+
+`data_types_api()` 提供类型声明、校验、转换、共享类型注册和传输编解码。
+参数通过 `value_type` 声明数据类型；输出也可使用此字段精化原有 `type`。
+`run(meta, params)`、`run_with_context(meta, params, context)` 和原触发协议继续可用。
+共享自定义类型由清单声明，宿主在执行前检查类型和依赖。运行上下文中的
+`constants` 与 `variables` 是传给插件的值副本，修改它们不会给规则变量赋值。
+隔离动作协议通过 `value_encoding: typed-v1` 保留大整数、精确小数和二进制等值。
+类型、转换和旧清单兼容规则见 [data-types.md](data-types.md)。

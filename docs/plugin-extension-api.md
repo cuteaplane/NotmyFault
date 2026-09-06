@@ -47,7 +47,7 @@
 }
 ```
 
-`notmyfault/actions/uia_macro/action.json` 是自有数据编辑器的实例。
+`notmyfault/actions/uia_automation/action.json` 是自有数据编辑器的实例。
 
 ```json
 {
@@ -130,7 +130,7 @@
 
 参数编辑器绑定本插件的一个参数和一个命令。当前 UI 控件只支持 `button`。一个参数不能声明多个编辑器。
 
-普通参数必须同时在参数和编辑器中声明相同的 `value_type`。类型可以是 `string`、`number`、`bool`、`array`、`object` 或 `any`。普通参数编辑器不能声明 `data_type` 或 `accepts_legacy`。
+普通参数必须同时在参数和编辑器中声明相同的 `value_type`。类型可使用基本类型、结构化声明和已安装的共享类型，见 [data-types.md](data-types.md)。普通参数编辑器不能声明 `data_type` 或 `accepts_legacy`。
 
 普通参数的原有输入控件仍然可用。按钮文案来自 `ui.label`，命令执行中的文案来自 `ui.busy_label`。`ui.icon` 和 `ui.description` 分别控制图标和提示文字。
 
@@ -148,7 +148,9 @@
 
 ### data_types
 
-数据类型包含 `id`、正整数 `version` 和 `binding`。当前 `binding` 只支持 `private`。
+数据类型包含 `id`、正整数 `version` 和 `binding`，可选 `label`。`binding` 默认为
+`private`；声明 `shared` 时必须提供 `schema`，值可跨插件绑定并由宿主校验。
+完整身份由包名、类型 ID 和版本组成，依赖类型必须可用且允许共享。
 
 `private` 参数不能绑定触发器输出、动作输出或测试数据。Dashboard 不显示绑定入口，后端也会拒绝手工写入的 `$ref`。
 
@@ -158,7 +160,7 @@
 
 ```json
 {
-  "$type": "io.github.notmyfault.uia_macro/mouse_macro@1",
+  "$type": "io.github.notmyfault.uia_automation/mouse_macro@1",
   "summary": "1 个操作宏 · 3 步",
   "data": {
     "version": 1,
@@ -167,13 +169,13 @@
 }
 ```
 
-`$type` 由插件的 `package_name`、数据类型 id 和版本组成。`summary` 是 Dashboard 可以显示的短文本。Dashboard 不读取 `data`。
+`$type` 由插件的 `package_name`、数据类型 id 和版本组成。`summary` 是 Dashboard 可以显示的短文本。私有类型由专用编辑器处理 `data`；共享类型可以使用标准结构化输入和字段引用。
 
 实例里的数据类型 id 仍是 `mouse_macro`，用于读取已经保存的值。它是存储标识，不是显示名称；界面统一称为“操作宏”。需要改数据类型 id 时，应先提供明确的数据迁移机制。
 
-信封和摘要由 `notmyfault/extensions/protocol.py` 检查。信封必须能编码成 JSON，总大小不能超过 1 MiB，摘要不能超过 160 个字符。
+信封和摘要由 `notmyfault/extensions/protocol.py` 检查。信封经过通用值编码后总大小不能超过 1 MiB，摘要不能超过 160 个字符。
 
-动作执行时仍应使用 `unpack_owned_value()` 检查归属。`notmyfault/actions/uia_macro/action.py` 同时演示了新信封和旧宏对象的读取方式。
+动作执行时仍应使用 `unpack_owned_value()` 检查归属。`notmyfault/actions/uia_automation/action.py` 演示了自有数据的读取方式；`mouse_macro` 和 `uia_selector` 的内部结构均由插件维护，宿主只校验通用信封。
 
 ## 普通值
 
@@ -276,3 +278,7 @@ window.parent.postMessage({
 命令请求、命令响应和单个页面文件不能超过 1 MiB。插件页面不直接调用这些 HTTP 接口，只通过前面的 `postMessage` 消息与 Dashboard 通信。
 
 Dashboard 的 JSON 请求通过 `window.pywebview.api.request_api()` 发送。文件上传、下载和 SSE 不能走 JSON bridge，需要直接发送 HTTP 请求。这些请求先用 `window.pywebview.api.get_api_token()` 读取令牌，再带上 `Authorization: Bearer <token>` 请求头。除 `OPTIONS` 外，所有 `/api/` 请求都要验证令牌。令牌不正确时返回 403。
+
+HTTP 编码值请求使用 `X-NMF-Value-Encoding: typed-v1`。返回值中的大整数、
+精确小数和二进制采用 `$nmf_value` 编码，页面与 Dashboard 之间保持该表示，
+引擎端解码后检查提交值。编码和普通对象转义格式见 [data-types.md](data-types.md)。
