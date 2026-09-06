@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, List
 
-from notmyfault.core.rules import get_rule_admin_plugins
+from notmyfault.core.rules import get_rule_admin_plugins, iter_action_nodes
 from notmyfault.security.plugin_schema import requires_admin_rule_approval
 from notmyfault.security.security import SecurityMode, detect_security_mode
 from notmyfault.security.signing import (
@@ -30,17 +30,10 @@ def _rule_approval_plugins(
         items = rule.get(field, [])
         if not isinstance(items, list):
             continue
-        pending = list(items)
-        while pending:
-            item = pending.pop()
-            if not isinstance(item, dict):
-                continue
+        for item, _location in iter_action_nodes(items, field):
             plugin_id = item.get("type")
             if requires_admin_rule_approval(actions_meta.get(plugin_id, {})):
                 required.add(plugin_id)
-            failure_actions = item.get("failure_actions", [])
-            if isinstance(failure_actions, list):
-                pending.extend(failure_actions)
     return sorted(required)
 
 

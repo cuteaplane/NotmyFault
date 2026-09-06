@@ -6,6 +6,11 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from notmyfault.core.data_types import (
+    BUILTIN_TYPES, TYPE_ALIASES, DataTypeError, field_type, normalize_type,
+    normalize_value,
+)
+
 _REQUIRED_META_FIELDS = {"id", "name", "description", "enabled", "version_code", "version", "package_name"}
 _TRIGGER_OPTIONAL_FIELDS = {
     "semantic", "params", "permissions", "origin", "trigger_api", "platforms",
@@ -26,9 +31,9 @@ _RULE_APPROVAL_MODES = {"admin_key"}
 _ALLOWED_SEMANTICS = {"state", "oneshot"}
 _ALLOWED_PARAM_TYPES = {
     "string", "number", "select", "bool", "time", "hotkey", "path",
-    "textarea", "uia_selector", "macro", "plugin_data",
+    "textarea", "macro", "plugin_data",
 }
-_ALLOWED_OUTPUT_TYPES = {"string", "number", "bool", "array", "object", "any"}
+_ALLOWED_OUTPUT_TYPES = BUILTIN_TYPES | TYPE_ALIASES.keys()
 _ALLOWED_SUMMARY_POLICIES = {"shape", "value", "hidden"}
 _REQUIRED_PARAM_FIELDS = {"name", "type", "label"}
 _REQUIRED_OUTPUT_FIELDS = {"name", "type", "label"}
@@ -40,7 +45,7 @@ _COMMAND_FIELDS = {"id", "title", "description", "handler"}
 _VIEW_FIELDS = {
     "id", "title", "description", "page", "commands", "window_controls",
 }
-_DATA_TYPE_FIELDS = {"id", "version", "binding"}
+_DATA_TYPE_FIELDS = {"id", "version", "binding", "schema", "label"}
 _PARAMETER_EDITOR_FIELDS = {
     "id", "parameter", "data_type", "value_type", "command", "view", "ui",
     "accepts_legacy",
@@ -48,13 +53,22 @@ _PARAMETER_EDITOR_FIELDS = {
 _PARAMETER_EDITOR_UI_FIELDS = {
     "control", "icon", "label", "busy_label", "empty_label", "description",
 }
-_DATA_BINDING_POLICIES = {"private"}
+_DATA_BINDING_POLICIES = {"private", "shared"}
 _EDITOR_CONTROLS = {"button"}
 # plugin id 只允许字母、数字、下划线和连字符，路径分隔符会把 id 变成路径。
 _PLUGIN_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 _COMPONENT_ID_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]*$")
 _PARAM_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]*$")
 _UNSAFE_PARAM_NAMES = {"__proto__", "constructor", "prototype"}
+
+
+def _validate_value_type(declaration, path, errors):
+    try:
+        normalize_type(declaration, location=path)
+        return True
+    except DataTypeError as error:
+        errors.append(f"{path} 无效: {error}")
+        return False
 
 
 def is_valid_plugin_id(plugin_id: str) -> bool:
@@ -526,7 +540,13 @@ def _validate_contributes_field(
             errors.append(f"{prefix}.version 必须是大于 0 的整数")
         binding = data_type.get("binding", "private")
         if binding not in _DATA_BINDING_POLICIES:
-            errors.append(f"{prefix}.binding 目前仅支持 private")
+            errors.append(f"{prefix}.binding 必须为 private 或 shared")
+        if binding == "shared" and "schema" not in data_type:
+            errors.append(f"{prefix}.schema 是共享类型的必填字段")
+        if "schema" in data_type:
+            _validate_value_type(data_type["schema"], f"{prefix}.schema", errors)
+        if "label" in data_type and not isinstance(data_type["label"], str):
+            errors.append(f"{prefix}.label 必须是字符串")
     editor_params: set[str] = set()
     for index, editor in enumerate(editors):
         prefix = f"contributes.parameter_editors[{index}]"
@@ -561,8 +581,8 @@ def _validate_contributes_field(
                 errors.append(f"{prefix}.data_type 只能用于 plugin_data 参数")
             if not has_value_type:
                 errors.append(f"{prefix}.value_type 是普通参数编辑器的必填字段")
-            elif editor.get("value_type") not in _ALLOWED_OUTPUT_TYPES:
-                errors.append(f"{prefix}.value_type 无效: {editor.get('value_type')!r}")
+            elif not _validate_value_type(editor.get("value_type"), f"{prefix}.value_type", errors):
+                pass
             elif editor.get("value_type") != param.get("value_type"):
                 errors.append(
                     f"{prefix}.value_type 必须与参数 {parameter!r} 的 value_type 一致"
@@ -866,11 +886,10 @@ def validate_plugin_meta(
                             errors.append(f"outputs[{i}] 缺少必填字段: {field}")
                     output_name = output.get("name")
                     output_type = output.get("type")
-                    if output_type and output_type not in _ALLOWED_OUTPUT_TYPES:
-                        errors.append(
-                            f"outputs[{i}].type 无效: '{output_type}'"
-                            f"（允许: {', '.join(sorted(_ALLOWED_OUTPUT_TYPES))}）"
-                        )
+                    if "type" in output:
+                        _validate_value_type(output_type, f"outputs[{i}].type", errors)
+                    if "value_type" in output:
+                        _validate_value_type(output["value_type"], f"outputs[{i}].value_type", errors)
                     for flag in ("required", "sensitive"):
                         if flag in output and not isinstance(output[flag], bool):
                             errors.append(f"outputs[{i}].{flag} 必须为布尔值")
@@ -881,12 +900,8 @@ def validate_plugin_meta(
                         errors.append(
                             f"outputs[{i}].summary 无效: {output['summary']!r}"
                         )
-                    if (
-                        output_type == "array"
-                        and "item_type" in output
-                        and output["item_type"] not in _ALLOWED_OUTPUT_TYPES - {"array"}
-                    ):
-                        errors.append(f"outputs[{i}].item_type 无效")
+                    if output_type == "array" and "item_type" in output:
+                        _validate_value_type(output["item_type"], f"outputs[{i}].item_type", errors)
                 else:
                     errors.append(f"outputs[{i}] 必须是字符串或对象")
                     continue
@@ -925,12 +940,8 @@ def validate_plugin_meta(
                         f"params[{i}].type 无效: '{ptype}'"
                         f"（允许: {', '.join(sorted(_ALLOWED_PARAM_TYPES))}）"
                     )
-                value_type = param.get("value_type")
-                if value_type is not None and value_type not in _ALLOWED_OUTPUT_TYPES:
-                    errors.append(
-                        f"params[{i}].value_type 无效: '{value_type}'"
-                        f"（允许: {', '.join(sorted(_ALLOWED_OUTPUT_TYPES))}）"
-                    )
+                if "value_type" in param:
+                    _validate_value_type(param["value_type"], f"params[{i}].value_type", errors)
                 if ptype == "plugin_data":
                     data_type = param.get("data_type")
                     if not isinstance(data_type, str) or not _COMPONENT_ID_RE.match(data_type):
@@ -978,8 +989,9 @@ def validate_plugin_meta(
 def check_payload_contract(
     outputs: Any,
     payload: Dict[str, Any],
+    registry=None,
 ) -> List[str]:
-    """按 outputs 声明检查 event-v2 payload，检查必填字段、未声明字段和 string、number、bool 的类型，旧插件未声明 outputs 时跳过检查。"""
+    """未声明 outputs 的旧插件仍跳过输出检查。"""
     declared: Dict[str, Dict[str, Any]] = {}
     if isinstance(outputs, list):
         for output in outputs:
@@ -997,7 +1009,12 @@ def check_payload_contract(
         elif name in payload:
             value = payload[name]
             output_type = spec.get("type", "any")
-            if output_type == "string" and not isinstance(value, str):
+            if "value_type" in spec or output_type not in ("string", "number", "bool", "array", "object", "any"):
+                try:
+                    normalize_value(value, field_type(spec), registry, location=f"outputs.{name}")
+                except DataTypeError as error:
+                    problems.append(str(error))
+            elif output_type == "string" and not isinstance(value, str):
                 problems.append(
                     f"输出字段 {name} 应为 string，实际为 {type(value).__name__}"
                 )

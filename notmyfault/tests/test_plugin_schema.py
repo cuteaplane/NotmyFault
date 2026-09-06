@@ -1,6 +1,12 @@
 """插件元数据 Schema。"""
 
+import json
+from pathlib import Path
+
+import pytest
+
 from notmyfault.security.plugin_schema import validate_plugin_meta
+from notmyfault.security.plugin_schema import check_payload_contract
 
 
 def make_meta(**overrides):
@@ -17,25 +23,56 @@ def make_meta(**overrides):
     return meta
 
 
+def test_builtin_action_manifests_declare_retry_safety_and_valid_contracts():
+    manifests = sorted((Path(__file__).resolve().parents[1] / "actions").glob("*/action.json"))
+    assert manifests
+    for path in manifests:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        valid, errors = validate_plugin_meta(meta, "action")
+        assert valid, f"{path.parent.name}: {errors}"
+        assert isinstance(meta.get("idempotent"), bool), path.parent.name
+
+
+def test_shared_types_and_structured_ports_validate_through_plugin_metadata():
+    meta = make_meta(
+        contributes={"data_types": [{
+            "id": "row", "version": 1, "binding": "shared", "label": "记录",
+            "schema": {"type": "object", "properties": {"name": "text"}, "required": ["name"]},
+        }]},
+        params=[{"name": "rows", "label": "记录", "type": "textarea", "value_type": {"type": "array", "items": "com.test.demo/row@1"}}],
+        outputs=[{"name": "count", "label": "数量", "type": "number", "value_type": "int"}],
+    )
+    assert validate_plugin_meta(meta, "action") == (True, [])
+    assert check_payload_contract(meta["outputs"], {"count": 2}) == []
+    assert check_payload_contract(meta["outputs"], {"count": True})
+    assert check_payload_contract(meta["outputs"], {"count": 2.5})
+    meta["contributes"]["data_types"][0].pop("schema")
+    assert validate_plugin_meta(meta, "action")[0] is False
+    meta["contributes"]["data_types"][0]["binding"] = "private"
+    meta["params"][0]["value_type"] = {"type": "array", "items": "misspelled"}
+    assert validate_plugin_meta(meta, "action")[0] is False
+
+
 class TestValidatePluginMetaPermissions:
-    def test_uia_selector_param_type_is_valid(self):
+    @pytest.mark.parametrize("editor_type", ["unknown_editor", "uia_selector"])
+    def test_param_rejects_invalid_editor_type(self, editor_type):
         ok, errors = validate_plugin_meta(
             make_meta(params=[{
                 "name": "target",
-                "type": "uia_selector",
+                "type": editor_type,
                 "label": "屏幕控件",
                 "value_type": "object",
             }]),
             "action",
         )
-        assert ok is True
-        assert errors == []
+        assert ok is False
+        assert any(f"type 无效: '{editor_type}'" in error for error in errors)
 
     def test_param_required_flag_is_boolean(self):
         ok, errors = validate_plugin_meta(
             make_meta(params=[{
                 "name": "target",
-                "type": "uia_selector",
+                "type": "string",
                 "label": "屏幕控件",
                 "required": "yes",
             }]),
