@@ -52,7 +52,7 @@ def _catalog_map(catalog: PluginCatalog, key: str) -> dict[str, JSON]:
     return value
 
 
-_RULE_FIELDS = frozenset({"name", "event", "preconditions", "actions"})
+_RULE_FIELDS = frozenset({"name", "event", "actions"})
 _NODE_FIELDS = frozenset({"type", "params"})
 
 
@@ -64,12 +64,6 @@ def parse_rule_draft(
     event = _require_object(args.get("event"), "rule.event", "rule_invalid")
     actions = _require_list(
         args.get("actions"), "rule.actions", "rule_invalid", nonempty=True
-    )
-    raw_preconditions = args.get("preconditions")
-    if raw_preconditions is None:
-        raw_preconditions = []
-    preconditions = _require_list(
-        raw_preconditions, "rule.preconditions", "rule_invalid"
     )
     triggers = _catalog_map(catalog, "triggers")
     actions_meta = _catalog_map(catalog, "actions")
@@ -84,24 +78,11 @@ def parse_rule_draft(
                 "动作",
             )
         )
-    normalized_preconditions: list[JSON] = []
-    for index, precondition in enumerate(preconditions):
-        location = f"preconditions[{index}]"
-        normalized_preconditions.append(
-            _parse_node(
-                _require_object(precondition, location, "rule_invalid"),
-                actions_meta,
-                location,
-                "检查",
-            )
-        )
     draft: dict[str, JSON] = {
         "name": name,
         "event": _parse_node(event, triggers, "event", "触发器"),
         "actions": normalized,
     }
-    if normalized_preconditions:
-        draft["preconditions"] = normalized_preconditions
     return draft
 
 

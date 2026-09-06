@@ -98,6 +98,37 @@ def test_security_approval_returns_parse_reason(tmp_path):
     assert body["error"].startswith("配置文件无法解析:")
 
 
+@pytest.mark.parametrize("mode_name", ["strict", "normal", "permissive"])
+def test_security_status_separates_installation_from_config_without_engine(
+    tmp_path, monkeypatch, mode_name
+):
+    from notmyfault.host.api.services import settings
+    from notmyfault.security.security import SecurityMode
+
+    package_root = tmp_path / "notmyfault"
+    plugin_dir = package_root / "actions" / "notify"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "action.json").write_text('{"id":"notify"}', encoding="utf-8")
+    env = make_api_env(tmp_path, package_root=package_root)
+    monkeypatch.setattr(settings, "detect_security_mode", lambda: SecurityMode(mode_name))
+    monkeypatch.setattr(settings, "verify_file", lambda path: True)
+    monkeypatch.setattr(settings, "verify_core_integrity", lambda: (True, []))
+
+    body = env.client.get("/api/config/security-status", headers=env.headers).json()
+    assert body["status"] == "ok"
+    assert body["security_mode"] == mode_name
+    assert body["installation"]["status"] == "invalid"
+    assert body["installation"]["issues"] == [
+        {"path": "actions/notify", "reason": "内置插件签名缺失或无效"}
+    ]
+
+    monkeypatch.setattr(settings, "verify_plugin_sig", lambda path, origin: True)
+    env.paths.config_file.write_text("{broken", encoding="utf-8")
+    body = env.client.get("/api/config/security-status", headers=env.headers).json()
+    assert body["installation"]["status"] == "ok"
+    assert body["status"] == "unreadable"
+
+
 def test_options_preflight_is_allowed_for_dashboard_port(tmp_path):
     env = make_api_env(tmp_path)
     response = env.client.options(
@@ -234,6 +265,31 @@ def test_rule_save_rejects_missing_binding_source(tmp_path):
     assert response.status_code == 400
     assert response.json()["error"] == "规则数据绑定无效"
     assert response.json()["details"]
+
+
+def test_rules_transport_preserves_typed_constants_and_literal_objects(tmp_path):
+    from decimal import Decimal
+    from notmyfault.core.value_codec import encode_value, decode_value
+
+    env = make_api_env(tmp_path)
+    values = {
+        "count": 9007199254740993, "amount": Decimal("0.1234567890123456789"),
+        "bytes": b"\x00\xff", "object": {"$nmf_value": {"type": "int", "data": "7"}},
+        "expression": {"$ref": {"scope": "step", "node": "a_literal", "path": ["x"]}},
+    }
+    rule = {"name": "保存精确数据", "event": {"type": "hotkey", "params": {"hotkey": "ctrl+k"}},
+            "constants": [{"id": "c_values01", "name": "数据", "value_type": "object", "value": {"$literal": values}}],
+            "variables": [{"id": "v_result01", "name": "结果", "value_type": "object"}],
+            "actions": [{"type": "set_variable", "variable": "v_result01", "value": {"$ref": {"scope": "constant", "node": "c_values01", "path": []}}}]}
+    response = env.client.put("/api/rules", headers={**env.headers, "X-NMF-Value-Encoding": "typed-v1"}, json=encode_value({"rules": [rule]}))
+    assert response.status_code == 200, response.text
+    stored = env.store.load_verified_rules()[0]
+    assert stored["constants"][0]["value"]["$literal"] == values
+    fetched = env.client.get("/api/rules", headers=env.headers)
+    assert decode_value(fetched.json())["rules"][0] == stored
+    saved_again = env.client.put("/api/rules", headers={**env.headers, "X-NMF-Value-Encoding": "typed-v1"}, json=fetched.json())
+    assert saved_again.status_code == 200, saved_again.text
+    assert env.store.load_verified_rules()[0] == stored
 
 
 def test_engine_control_and_status_contract(tmp_path):

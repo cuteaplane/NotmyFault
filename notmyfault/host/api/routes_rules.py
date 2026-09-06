@@ -8,6 +8,8 @@ from notmyfault.host.api.services.rule_runs import (
     RuleRunServiceError,
 )
 from notmyfault.host.api.services.rules import RuleService, RuleServiceError
+from notmyfault.core.data_types import DataTypeError
+from notmyfault.host.api.value_transport import decode_request, read_value_json, value_response
 
 
 _TEST_CONTEXT_MAX_BYTES = 1024 * 1024
@@ -21,12 +23,12 @@ def create_rules_router(
 
     @router.get("/api/rules")
     async def rules_list():
-        return service.list_rules()
+        return value_response(service.list_rules())
 
     @router.post("/api/rules/validate")
     async def rules_validate(request: Request):
         try:
-            body = await request.json()
+            body = await read_value_json(request)
         except Exception:
             return JSONResponse(
                 {"ok": False, "error": "无效的 JSON 请求体"},
@@ -37,12 +39,12 @@ def create_rules_router(
                 {"ok": False, "error": "请求体必须包含 rule 对象"},
                 status_code=400,
             )
-        return service.validate_draft(body["rule"])
+        return value_response(service.validate_draft(body["rule"]))
 
     @router.post("/api/rules/approve")
     async def rules_approve(request: Request):
         try:
-            body = await request.json()
+            body = await read_value_json(request)
         except Exception:
             return JSONResponse(
                 {"ok": False, "error": "无效的 JSON 请求体"},
@@ -53,14 +55,14 @@ def create_rules_router(
             body.get("admin_key_password") if isinstance(body, dict) else None
         )
         try:
-            return service.approve(rules, password)
+            return value_response(service.approve(rules, password))
         except RuleServiceError as error:
             return JSONResponse(error.body, status_code=error.status_code)
 
     @router.put("/api/rules")
     async def rules_save(request: Request):
         try:
-            body = await request.json()
+            body = await read_value_json(request)
         except Exception:
             return JSONResponse(
                 {"ok": False, "error": "无效的 JSON 请求体"},
@@ -72,10 +74,10 @@ def create_rules_router(
                 status_code=400,
             )
         try:
-            return service.save(
+            return value_response(service.save(
                 body.get("rules"),
                 body.get("admin_key_password"),
-            )
+            ))
         except RuleServiceError as error:
             return JSONResponse(error.body, status_code=error.status_code)
 
@@ -90,8 +92,8 @@ def create_rules_router(
         body = None
         if raw_body:
             try:
-                body = json.loads(raw_body)
-            except (json.JSONDecodeError, UnicodeDecodeError):
+                body = decode_request(request, json.loads(raw_body))
+            except (json.JSONDecodeError, UnicodeDecodeError, DataTypeError):
                 return JSONResponse(
                     {"ok": False, "error": "无效的 JSON 请求体"},
                     status_code=400,

@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, Optional
 
 from notmyfault.config import SignedConfigStore
 from notmyfault.core.engine import AutomationEngine
+from notmyfault.security.security import SecurityMode, detect_security_mode
 from notmyfault.host.api.plugin_installation import (
     PluginBackupStore,
     PluginFileSystem,
@@ -20,7 +21,7 @@ def _notify_build_required(detail: str) -> None:
         alert_user(
             "NotmyFault 安装文件不完整",
             f"{detail}。为防止安全模式被自动降低，引擎已拒绝启动。"
-            "请从可信来源恢复文件，或在确认源码完整后运行 `python build.py build`。",
+            "请从可信来源重新安装 NotmyFault。源码开发者可在确认文件完整后重新构建。",
             open_dashboard=False,
         )
     except Exception:
@@ -53,11 +54,12 @@ def _ensure_first_run_build() -> None:
         os.path.join(project_root, "build.json.sig"),
     ]
     missing = [path for path in required_files if not os.path.isfile(path)]
-    missing.extend(
-        os.path.join(plugin_dir, "signature.sig")
-        for plugin_dir in _shipped_plugin_directories()
-        if not os.path.isfile(os.path.join(plugin_dir, "signature.sig"))
-    )
+    if detect_security_mode() == SecurityMode.STRICT:
+        missing.extend(
+            os.path.join(plugin_dir, "signature.sig")
+            for plugin_dir in _shipped_plugin_directories()
+            if not os.path.isfile(os.path.join(plugin_dir, "signature.sig"))
+        )
     if not missing:
         return
     relative = [os.path.relpath(path, project_root) for path in missing]

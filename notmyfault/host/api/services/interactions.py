@@ -14,6 +14,9 @@ from notmyfault.extensions.protocol import (
 )
 from notmyfault.extensions.session import ExtensionContext, ExtensionSessionManager
 from notmyfault.host.api.ports import EngineControlPort
+from notmyfault.core.data_types import DataTypeError, normalize_value
+from notmyfault.core.type_registry import TypeRegistry
+from notmyfault.core.value_codec import encode_value
 
 
 _MESSAGE_MAX_BYTES = 1024 * 1024
@@ -58,6 +61,7 @@ class PluginInteractionService:
         engine = self._engine.current_engine
         if engine is None:
             self._fail(409, "自动化引擎未运行，无法调用插件扩展")
+        registry = TypeRegistry.from_plugins(engine.triggers_meta, engine.actions_meta)
         session_id = body.get("session_id")
         if isinstance(session_id, str) and session_id:
             session = self._extension_sessions.get(session_id)
@@ -99,7 +103,7 @@ class PluginInteractionService:
             value_type = source.get("value_type") if source else None
             if source is None or plugin is None:
                 self._fail(400, "扩展入口的数据类型不可用")
-            if data_type is None and not isinstance(value_type, str):
+            if data_type is None and not isinstance(value_type, (str, dict)):
                 self._fail(400, "扩展入口的数据类型不可用")
             current_value = body.get("current_value")
             if current_value is not None and data_type is not None:
@@ -118,7 +122,7 @@ class PluginInteractionService:
                 except OwnedValueError as error:
                     self._fail(400, str(error))
             elif current_value is not None and not value_matches_type(
-                current_value, value_type
+                current_value, value_type, registry
             ):
                 self._fail(400, f"当前值不是 {value_type}")
             session = self._extension_sessions.create(
@@ -132,6 +136,7 @@ class PluginInteractionService:
                 current_value=current_value,
                 value_type=value_type if data_type is None else None,
             )
+            session.type_registry = registry
 
         handler = engine.extension_handler(plugin_id, command_id)
         if handler is None:
@@ -176,19 +181,22 @@ class PluginInteractionService:
         if "value" in result:
             if session.data_type is None:
                 if not value_matches_type(
-                    result["value"], session.value_type or ""
+                    result["value"], session.value_type or "", registry
                 ):
                     self._extension_sessions.drop(session.session_id)
                     self._fail(400, f"插件命令返回值不是 {session.value_type}")
             else:
                 try:
+                    if session.data_type.get("binding") == "shared":
+                        identity = f"{session.plugin_meta['package_name']}/{session.data_type['id']}@{session.data_type['version']}"
+                        result["value"] = normalize_value(result["value"], identity, registry)
                     unpack_owned_value(
                         result["value"],
                         session.plugin_meta["package_name"],
                         session.data_type["id"],
                         session.data_type["version"],
                     )
-                except OwnedValueError as error:
+                except (OwnedValueError, DataTypeError) as error:
                     self._extension_sessions.drop(session.session_id)
                     self._fail(400, str(error))
         response = {
@@ -204,7 +212,7 @@ class PluginInteractionService:
             response["status"] = session.status
         try:
             response_size = len(
-                json.dumps(response, ensure_ascii=False).encode("utf-8")
+                json.dumps(encode_value(response), ensure_ascii=False).encode("utf-8")
             )
         except (TypeError, ValueError) as error:
             raise PluginInteractionError(

@@ -6,6 +6,8 @@ from typing import Any, Dict
 
 from notmyfault.application_paths import ApplicationPaths
 from notmyfault.config import ConfigValidationError, SignedConfigStore
+from notmyfault.core.type_registry import TypeRegistry
+from notmyfault.core.data_types import DataTypeError
 from notmyfault.host.api.ports import EngineControlPort
 from notmyfault.platform.capabilities import probe_capabilities
 from notmyfault.security.plugin_loader import is_plugin_platform_compatible
@@ -77,6 +79,10 @@ class PluginCatalogService:
                     if category == plugin_kind:
                         meta.setdefault("_error", error[2])
                 self._annotate_availability(meta, capability_report)
+        try:
+            result["data_types"] = TypeRegistry.from_plugins(result["triggers"], result["actions"], include_disabled=True).catalog()
+        except DataTypeError as error:
+            result["data_types"] = {**TypeRegistry().catalog(), "error": error.as_dict()}
         return result
 
     def list_all(self) -> Dict[str, Any]:

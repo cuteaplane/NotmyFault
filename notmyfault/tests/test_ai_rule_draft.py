@@ -36,16 +36,10 @@ def test_valid_rule_returns_normalized_draft():
     assert parse_rule_draft(rule_args(), make_catalog()) == rule_args()
 
 
-def test_preconditions_use_action_catalog():
-    args = rule_args(
-        preconditions=[{"type": "open_url", "params": {"url": "https://example.com"}}]
-    )
-    assert parse_rule_draft(args, make_catalog())["preconditions"] == args["preconditions"]
-
-
 @pytest.mark.parametrize(
     "bad_args",
     [
+        rule_args(preconditions=[{"type": "open_url", "params": {"url": "https://example.com"}}]),
         {"name": "x", "event": {"type": "time_schedule", "params": {}}, "actions": [], "extra": 1},
         {"event": {"type": "time_schedule", "params": {}}, "actions": []},
         {"name": "", "event": {"type": "time_schedule", "params": {}}, "actions": []},

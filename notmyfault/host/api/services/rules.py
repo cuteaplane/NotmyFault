@@ -13,6 +13,7 @@ from notmyfault.config import (
 )
 from notmyfault.core.rules import (
     get_rule_events,
+    iter_action_nodes,
     validate_rule_bindings,
     validate_rules,
     validate_rules_structure,
@@ -40,7 +41,7 @@ class RuleService:
 
     def list_rules(self) -> Dict[str, Any]:
         try:
-            rules = self._store.load_verified_rules()
+            rules = self._store.load_verified_rules(for_editing=True)
         except ConfigValidationError:
             rules = []
         return {"rules": rules}
@@ -84,78 +85,61 @@ class RuleService:
                     "event",
                 )
 
-            for field in ("preconditions", "actions"):
-                for index, item in enumerate(normalized.get(field, [])):
-                    label = (
-                        f"开始前确认 {index + 1}"
-                        if field == "preconditions"
-                        else f"动作 {index + 1}"
+            for action_item, location in iter_action_nodes(normalized.get("actions", [])):
+                if action_item.get("type") in ("if", "set_variable"):
+                    continue
+                item_label = f"动作 {location}"
+                plugin = schema["actions"].get(
+                    action_item.get("type", "")
+                )
+                if plugin is None:
+                    add(
+                        "error",
+                        "plugin_reference",
+                        f"{item_label}引用了未加载的动作: "
+                        f"{action_item.get('type', '')}",
+                        location,
                     )
-                    action_items = [(item, f"{field}[{index}]", label)]
-                    if field == "actions":
-                        action_items.extend(
-                            (
-                                failure_action,
-                                f"actions[{index}].failure_actions[{failure_index}]",
-                                f"动作 {index + 1} 的补救动作 {failure_index + 1}",
-                            )
-                            for failure_index, failure_action in enumerate(
-                                item.get("failure_actions", [])
-                            )
-                        )
-                    for action_item, location, item_label in action_items:
-                        plugin = schema["actions"].get(
-                            action_item.get("type", "")
-                        )
-                        if plugin is None:
-                            add(
-                                "error",
-                                "plugin_reference",
-                                f"{item_label}引用了未加载的动作: "
-                                f"{action_item.get('type', '')}",
-                                location,
-                            )
-                        elif plugin.get("platform_compatible") is False:
-                            add(
-                                "error",
-                                "platform_incompatible",
-                                f"{item_label}“{plugin.get('name') or action_item.get('type')}”"
-                                "不支持当前系统",
-                                location,
-                            )
-                        elif plugin.get("availability") == "unavailable":
-                            reasons = "；".join(
-                                plugin.get("unavailable_reasons") or []
-                            )
-                            add(
-                                "error",
-                                "capability_incompatible",
-                                f"{item_label}“{plugin.get('name') or action_item.get('type')}”"
-                                f"当前系统缺少能力（{reasons}）",
-                                location,
-                            )
-                        elif (
-                            action_item.get("timeout_seconds") is not None
-                            and plugin.get("cancellation_api") != "runtime-v1"
-                        ):
-                            add(
-                                "error",
-                                "timeout_not_supported",
-                                f"{item_label}不支持安全取消，不能设置运行超时",
-                                location,
-                            )
-                        elif (
-                            field == "actions"
-                            and int(action_item.get("retry", 0) or 0) > 0
-                            and plugin.get("idempotent") is not True
-                        ):
-                            add(
-                                "warning",
-                                "retry_may_repeat",
-                                f"{item_label}“{plugin.get('name') or action_item.get('type')}”"
-                                "没有声明可安全重复执行，重试可能重复产生结果",
-                                location,
-                            )
+                elif plugin.get("platform_compatible") is False:
+                    add(
+                        "error",
+                        "platform_incompatible",
+                        f"{item_label}“{plugin.get('name') or action_item.get('type')}”"
+                        "不支持当前系统",
+                        location,
+                    )
+                elif plugin.get("availability") == "unavailable":
+                    reasons = "；".join(
+                        plugin.get("unavailable_reasons") or []
+                    )
+                    add(
+                        "error",
+                        "capability_incompatible",
+                        f"{item_label}“{plugin.get('name') or action_item.get('type')}”"
+                        f"当前系统缺少能力（{reasons}）",
+                        location,
+                    )
+                elif (
+                    action_item.get("timeout_seconds") is not None
+                    and plugin.get("cancellation_api") != "runtime-v1"
+                ):
+                    add(
+                        "error",
+                        "timeout_not_supported",
+                        f"{item_label}不支持安全取消，不能设置运行超时",
+                        location,
+                    )
+                elif (
+                    int(action_item.get("retry", 0) or 0) > 0
+                    and plugin.get("idempotent") is not True
+                ):
+                    add(
+                        "warning",
+                        "retry_may_repeat",
+                        f"{item_label}“{plugin.get('name') or action_item.get('type')}”"
+                        "没有声明可安全重复执行，重试可能重复产生结果",
+                        location,
+                    )
 
             for issue in validate_rule_bindings(
                 normalized,
@@ -284,7 +268,7 @@ class RuleService:
         previous_rules = []
         if os.path.exists(self._store.rules_path):
             try:
-                previous_rules = self._store.load_verified_rules()
+                previous_rules = self._store.load_verified_rules(for_editing=True)
             except ConfigValidationError as error:
                 raise RuleServiceError(
                     409,

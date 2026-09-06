@@ -3,6 +3,7 @@
 import pytest
 
 from notmyfault.host import alert, app as host_app
+from notmyfault.security.security import SecurityMode
 
 
 def test_notify_build_required_calls_alert_user(monkeypatch):
@@ -44,6 +45,7 @@ def _prepare_startup_files(tmp_path, monkeypatch):
     (tmp_path / "build.json").write_text("{}", encoding="utf-8")
     (tmp_path / "build.json.sig").write_bytes(b"signed")
     monkeypatch.setattr(host_app, "_PKG_ROOT", str(pkg_root))
+    monkeypatch.setattr(host_app, "detect_security_mode", lambda: SecurityMode.STRICT)
     notices = []
     monkeypatch.setattr(host_app, "_notify_build_required", notices.append)
     return pkg_root, notices
@@ -67,8 +69,10 @@ def test_first_run_ignores_empty_removed_plugin_directories(tmp_path, monkeypatc
     assert notices == []
 
 
-def test_startup_rejects_unsigned_builtin_plugin(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode", list(SecurityMode))
+def test_startup_checks_builtin_signatures_in_strict_mode(tmp_path, monkeypatch, mode):
     pkg_root, notices = _prepare_startup_files(tmp_path, monkeypatch)
+    monkeypatch.setattr(host_app, "detect_security_mode", lambda: mode)
     _write_plugin(pkg_root, "actions/notify", "action.json", signed=True)
     _write_plugin(pkg_root, "triggers/manual", "trigger.json", signed=True)
     _write_plugin(
@@ -78,15 +82,20 @@ def test_startup_rejects_unsigned_builtin_plugin(tmp_path, monkeypatch):
         signed=False,
     )
 
-    with pytest.raises(RuntimeError, match="bluetooth_toggle"):
+    if mode == SecurityMode.STRICT:
+        with pytest.raises(RuntimeError, match="bluetooth_toggle"):
+            host_app._ensure_first_run_build()
+        assert len(notices) == 1
+        assert "bluetooth_toggle" in notices[0]
+    else:
         host_app._ensure_first_run_build()
-
-    assert len(notices) == 1
-    assert "bluetooth_toggle" in notices[0]
+        assert notices == []
 
 
-def test_startup_rejects_missing_build_signature(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode", list(SecurityMode))
+def test_startup_rejects_missing_build_signature(tmp_path, monkeypatch, mode):
     pkg_root, notices = _prepare_startup_files(tmp_path, monkeypatch)
+    monkeypatch.setattr(host_app, "detect_security_mode", lambda: mode)
     (tmp_path / "build.json.sig").unlink()
     _write_plugin(pkg_root, "actions/notify", "action.json", signed=True)
 

@@ -5,7 +5,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from notmyfault.config import ConfigValidationError, SignedConfigStore
-from notmyfault.core.bindings import iter_legacy_event_payload_paths, iter_references
+from notmyfault.core.bindings import BindingResolutionError, _validate_path, iter_legacy_event_payload_paths, iter_references, resolve_reference
+from notmyfault.core.data_types import DataTypeError
+from notmyfault.core.type_registry import TypeRegistry
+from notmyfault.core.variables import initialize_variables
 from notmyfault.core.rules import get_rule_events, validate_rules_structure
 from notmyfault.host.api.ports import EngineControlPort
 from notmyfault.security.plugin_schema import check_payload_contract
@@ -65,6 +68,7 @@ class RuleRunService:
         start_step_id = body.get("start_step_id", "")
         end_step_id = body.get("end_step_id", "")
         test_assertions = body.get("test_assertions", [])
+        variable_values = body.get("variable_values")
 
         candidate_rule = self._select_rule(
             verified_rules,
@@ -72,6 +76,11 @@ class RuleRunService:
             has_snapshot,
             rule_snapshot,
         )
+        try:
+            registry = TypeRegistry.from_plugins(engine.triggers_meta, engine.actions_meta)
+            initialize_variables(candidate_rule, {}, registry, overrides=variable_values)
+        except (DataTypeError, BindingResolutionError) as error:
+            raise RuleRunServiceError(400, {"ok": False, "code": "invalid_test_payload", "error": str(error)}) from error
         actions = candidate_rule.get("actions", [])
         if not isinstance(actions, list):
             actions = []
@@ -125,6 +134,7 @@ class RuleRunService:
                 if usage.reference.get("scope") == "step"
                 and isinstance(node := usage.reference.get("node"), str)
                 and node in skipped_upstream_ids
+                and usage.reference.get("on_missing") not in ("default", "skip")
             }
         )
         missing_upstream_ids = [
@@ -149,6 +159,7 @@ class RuleRunService:
             references,
             skipped_upstream_ids,
             step_outputs,
+            registry,
         )
         if upstream_issues:
             raise RuleRunServiceError(
@@ -171,6 +182,7 @@ class RuleRunService:
                 binding_id
                 for usage in references
                 if usage.reference.get("scope") == "trigger"
+                and usage.reference.get("on_missing") not in ("default", "skip")
                 and isinstance(
                     binding_id := usage.reference.get("node"),
                     str,
@@ -183,7 +195,7 @@ class RuleRunService:
             if not isinstance(trigger_payloads.get(binding_id), dict)
         ]
         needs_event = any(
-            usage.reference.get("scope") == "event" for usage in references
+            usage.reference.get("scope") == "event" and usage.reference.get("on_missing") not in ("default", "skip") for usage in references
         ) or bool(legacy_event_paths)
         if missing_trigger_ids or (needs_event and event_payload is None):
             raise RuleRunServiceError(
@@ -202,6 +214,7 @@ class RuleRunService:
             candidate_rule,
             references,
             trigger_payloads,
+            registry,
         )
         if trigger_issues:
             raise RuleRunServiceError(
@@ -223,6 +236,7 @@ class RuleRunService:
             start_step_id=start_step_id,
             end_step_id=end_step_id,
             test_assertions=normalized_assertions,
+            **({"variable_values": variable_values} if variable_values is not None else {}),
         )
         ok, message = result[:2]
         run_id = result[2] if len(result) > 2 else ""
@@ -278,16 +292,14 @@ class RuleRunService:
             step_id = assertion.get("step_id")
             path = assertion.get("path", [])
             operator = assertion.get("operator")
+            try:
+                _validate_path(path, f"test_assertions[{index}]", {})
+            except BindingResolutionError:
+                self._fail(400, f"检查项 #{index + 1} 的数据路径无效")
             if (
                 step_id not in selected_ids
                 or operator not in _TEST_ASSERTION_OPERATORS
                 or not isinstance(path, list)
-                or any(
-                    not isinstance(segment, str)
-                    or not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", segment)
-                    or segment.startswith("__")
-                    for segment in path
-                )
             ):
                 self._fail(400, f"检查项 #{index + 1} 无效")
             normalized = {"step_id": step_id, "path": path, "operator": operator}
@@ -305,6 +317,7 @@ class RuleRunService:
         references: list[Any],
         skipped_ids: set[str],
         step_outputs: Dict[str, Any],
+        registry=None,
     ) -> List[str]:
         issues: List[str] = []
         actions_by_id = {
@@ -318,18 +331,14 @@ class RuleRunService:
             step_id = reference.get("node")
             if reference.get("scope") != "step" or step_id not in skipped_ids:
                 continue
-            current = step_outputs.get(step_id)
             path = reference.get("path", [])
-            missing_value = False
-            for segment in path if isinstance(path, list) else []:
-                if not isinstance(current, dict) or segment not in current:
-                    issues.append(
-                        f"{step_id}: 缺少动作输出字段 {'.'.join(path)}"
-                    )
-                    missing_value = True
-                    break
-                current = current[segment]
-            if not path or missing_value:
+            try:
+                resolve_reference(reference, {"steps": {key: {"status": "ok", "result": value} for key, value in step_outputs.items()}, "_type_registry": registry}, location=usage.location)
+            except BindingResolutionError as error:
+                if reference.get("on_missing") not in ("skip", "default"):
+                    issues.append(f"{step_id}: 缺少动作输出字段 {path}")
+                continue
+            if not path or step_id not in step_outputs:
                 continue
             source_action = actions_by_id.get(step_id, {})
             source_meta = actions_meta.get(source_action.get("type", ""), {})
@@ -347,10 +356,16 @@ class RuleRunService:
                 else None
             )
             if output is not None:
-                root_value = step_outputs[step_id].get(path[0])
+                supplied_output = step_outputs[step_id]
+                root_payload = (
+                    {path[0]: supplied_output[path[0]]}
+                    if isinstance(supplied_output, dict) and path[0] in supplied_output
+                    else {}
+                )
                 for problem in check_payload_contract(
                     [output],
-                    {path[0]: root_value},
+                    root_payload,
+                    registry,
                 ):
                     issues.append(f"{step_id}: {problem}")
         return issues
@@ -361,6 +376,7 @@ class RuleRunService:
         rule: Dict[str, Any],
         references: list[Any],
         trigger_payloads: Dict[str, Dict[str, Any]],
+        registry=None,
     ) -> List[str]:
         leaves_by_id = {
             leaf.get("binding_id"): leaf
@@ -403,7 +419,7 @@ class RuleRunService:
             if leaf is None:
                 continue
             trigger_meta = triggers_meta.get(leaf.get("type", ""), {})
-            for problem in check_payload_contract(trigger_meta.get("outputs"), payload):
+            for problem in check_payload_contract(trigger_meta.get("outputs"), payload, registry):
                 issues.append(f"{binding_id}: {problem}")
         return issues
 

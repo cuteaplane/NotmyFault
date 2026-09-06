@@ -2,6 +2,7 @@ import json
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from notmyfault.host.api.value_transport import decode_request, value_response
 
 from notmyfault.host.api.services.interactions import (
     PluginInteractionError,
@@ -38,16 +39,16 @@ def create_interactions_router(service: PluginInteractionService) -> APIRouter:
                 status_code=413,
             )
         try:
-            body = json.loads(raw_body) if raw_body else {}
+            body = decode_request(request, json.loads(raw_body) if raw_body else {})
         except (TypeError, ValueError):
-            body = {}
+            return JSONResponse({"ok": False, "error": "扩展请求数据编码无效"}, status_code=400)
         if not isinstance(body, dict):
             return JSONResponse(
                 {"ok": False, "error": "扩展请求必须是 JSON 对象"},
                 status_code=400,
             )
         try:
-            return await service.invoke_extension(plugin_id, command_id, body)
+            return value_response(await service.invoke_extension(plugin_id, command_id, body))
         except PluginInteractionError as error:
             return _error_response(error)
 

@@ -223,7 +223,16 @@ def test_rule_run_route_rejects_test_data_over_one_mib(tmp_path) -> None:
     assert response.json() == {"ok": False, "error": "测试数据超过 1 MiB 上限"}
 
 
-def test_rule_run_service_forwards_scoped_test_context() -> None:
+@pytest.mark.parametrize("upstream,policy,valid", [
+    ({"value": "ready"}, None, True),
+    ({}, None, False),
+    ({}, "default", True),
+    ({}, "skip", True),
+    ({"value": None}, "default", False),
+    ({"value": 7}, "default", False),
+    ({"value": ""}, "default", True),
+])
+def test_rule_run_service_validates_and_forwards_scoped_test_context(upstream, policy, valid) -> None:
     rule = {
         "name": "局部运行",
         "event": {
@@ -260,10 +269,15 @@ def test_rule_run_service_forwards_scoped_test_context() -> None:
             },
         ],
     }
+    if policy is not None:
+        reference = rule["actions"][1]["params"]["upstream"]["$ref"]
+        reference["on_missing"] = policy
+        if policy == "default":
+            reference["default"] = "fallback"
     calls = []
     active_engine = SimpleNamespace(
         actions_meta={
-            "source": {"outputs": [{"name": "value", "type": "string"}]},
+            "source": {"outputs": [{"name": "value", "type": "string", "value_type": "text", "required": False}]},
             "target": {"outputs": []},
         },
         triggers_meta={
@@ -280,7 +294,7 @@ def test_rule_run_service_forwards_scoped_test_context() -> None:
     body = {
         "trigger_payloads": {"t_hot001": {"key": "Ctrl+K"}},
         "event_payload": {"kind": "manual"},
-        "step_outputs": {"a_source001": {"value": "ready"}},
+        "step_outputs": {"a_source001": upstream},
         "start_step_id": "a_target001",
         "end_step_id": "a_target001",
         "test_assertions": [
@@ -292,6 +306,12 @@ def test_rule_run_service_forwards_scoped_test_context() -> None:
         ],
     }
 
+    if not valid:
+        with pytest.raises(RuleRunServiceError) as invalid:
+            service.run(0, body)
+        assert invalid.value.body["code"] == "invalid_test_payload"
+        assert calls == []
+        return
     result = service.run(0, body)
 
     assert result == {

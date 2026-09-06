@@ -187,7 +187,7 @@ class EngineService:
 
     def _load_rules(self) -> list[Dict[str, Any]]:
         try:
-            return self._store.load_verified_rules()
+            return self._store.load_verified_rules(for_editing=True)
         except ConfigValidationError:
             return []
 
