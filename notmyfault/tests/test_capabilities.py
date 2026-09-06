@@ -45,6 +45,26 @@ class ProbeStructureTests(unittest.TestCase):
         self.assertFalse(brightness["available"])
         self.assertIn("brightnessctl", brightness["reason"])
 
+    def test_linux_tray_backend_failure_reports_unavailable(self):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def import_with_failed_tray(name, *args, **kwargs):
+            if name == "pystray":
+                raise RuntimeError('Bad display name ""')
+            return real_import(name, *args, **kwargs)
+
+        with patch("notmyfault.platform.capabilities.os.name", "posix"), patch(
+            "notmyfault.platform.capabilities.sys.platform", "linux"
+        ), patch(
+            "notmyfault.platform.linux_support.session_type", return_value="x11"
+        ), patch("builtins.__import__", side_effect=import_with_failed_tray):
+            result = capabilities.probe_capabilities()[capabilities.TRAY]
+        self.assertFalse(result["available"])
+        self.assertIsNone(result["backend"])
+        self.assertIn('Bad display name ""', result["reason"])
+
     def test_macos_does_not_use_linux_probe(self):
         with patch("notmyfault.platform.capabilities.os.name", "posix"), \
                 patch("notmyfault.platform.capabilities.sys.platform", "darwin"), \

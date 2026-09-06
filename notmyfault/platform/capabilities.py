@@ -169,6 +169,8 @@ def _probe_linux(capability: str) -> dict:
             return _entry(True, "pystray-xembed")
         except ImportError:
             return _entry(False, None, "未安装 pystray")
+        except Exception as error:
+            return _entry(False, None, f"pystray 后端不可用: {error}")
     raise ValueError(f"未知能力 id: {capability!r}")
 
 
