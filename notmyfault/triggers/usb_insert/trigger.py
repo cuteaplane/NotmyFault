@@ -1,19 +1,22 @@
-import time
 import psutil
 import os
 
+from notmyfault.triggers.base import PollingTrigger
 
-def run(meta, config, emit_event, shutdown_event):
-    trigger_id = meta.get("id", "usb_insert")
-    print(f"[Trigger:{trigger_id}] U盘监视雷达已启动！")
-    expected_drive = config.get("drive_letter", "").strip().upper()
-    # 用户填 "e" 或 "E:" 都归一成 E:，和扫描出来的盘符格式对齐
-    if expected_drive and expected_drive != "ANY":
-        letter = expected_drive.rstrip(":")
-        if len(letter) == 1 and letter.isalpha():
-            expected_drive = letter + ":"
 
-    def get_removable_drives():
+class UsbInsertTrigger(PollingTrigger):
+    interval = 3.0
+
+    def validate(self):
+        self.expected_drive = self.config.get("drive_letter", "").strip().upper()
+        # 用户填 e 或 E: 都归一成 E:
+        if self.expected_drive and self.expected_drive != "ANY":
+            letter = self.expected_drive.rstrip(":")
+            if len(letter) == 1 and letter.isalpha():
+                self.expected_drive = letter + ":"
+
+    @staticmethod
+    def _get_removable_drives():
         drives = set()
         for p in psutil.disk_partitions(all=False):
             if "removable" in p.opts or (
@@ -26,28 +29,20 @@ def run(meta, config, emit_event, shutdown_event):
                 )
         return drives
 
-    # 启动时记录已有可移动磁盘，首轮仅建立基线
-    last_drives = get_removable_drives()
+    def setup(self):
+        self._last_drives = self._get_removable_drives()
+        self.log("U盘监控已启动")
 
-    while not shutdown_event.is_set():
-        try:
-            current_drives = get_removable_drives()
-            
-            # 集合差 current_drives - last_drives 表示新出现的磁盘
-            new_drives = current_drives - last_drives
+    def poll(self):
+        current_drives = self._get_removable_drives()
+        for drive in sorted(current_drives - self._last_drives):
+            if self._stop_event.is_set():
+                return
+            self.log(f"检测到U盘插入: {drive}")
+            if self.expected_drive in ("ANY", "") or self.expected_drive == drive.upper():
+                self.emit({"drive_letter": self.expected_drive, "actual_drive": drive})
+        self._last_drives = current_drives
 
-            if new_drives:
-                for drive in new_drives:
-                    print(f"[Trigger:{trigger_id}] 捕捉到新U盘插入: {drive}")
-                    
-                    # expected_drive 为空或为 ANY 时匹配所有新磁盘
-                    if expected_drive in ("ANY", "") or expected_drive == drive.upper():
-                        emit_event({"drive_letter": expected_drive, "actual_drive": drive})
 
-            # 保存本轮磁盘集合供下一轮比较
-            last_drives = current_drives
-
-        except Exception as e:
-            print(f"[Trigger:{trigger_id}] 哎呀，扫描U盘的时候报错啦: {e}")
-
-        shutdown_event.wait(3)
+def run(meta, config, emit_event, shutdown_event):
+    UsbInsertTrigger(meta, config, emit_event, shutdown_event).run()

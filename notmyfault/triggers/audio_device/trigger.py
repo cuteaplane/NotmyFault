@@ -5,10 +5,8 @@ Windows 用 PowerShell MediaDevice API；Linux 用 wpctl 或 pactl
 import os
 import subprocess
 
-from notmyfault.plugin_api import platform_backend_api
+from notmyfault.plugin_api import PlatformServiceError, platform_services
 from notmyfault.triggers.base import PollingTrigger
-
-BackendError = platform_backend_api().BackendError
 
 _POWERSHELL_QUERY = r"""
 [Windows.Media.Devices.MediaDevice, Windows.Media.Devices, ContentType = WindowsRuntime] | Out-Null
@@ -58,11 +56,9 @@ def _query_default_devices_windows() -> dict[str, str]:
 
 
 def _query_default_devices_linux() -> dict[str, str]:
-    from notmyfault.platform.backends import AudioBackend
-
     try:
-        return AudioBackend().default_devices()
-    except BackendError:
+        return platform_services().default_audio_devices()
+    except PlatformServiceError:
         return {}
 
 

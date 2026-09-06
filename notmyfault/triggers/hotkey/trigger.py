@@ -4,6 +4,8 @@ Windows 用 RegisterHotKey；Linux 用 Xlib XGrabKey（仅 X11）
 
 import os
 
+from notmyfault.plugin_api import native_lock, platform_backend_api
+
 if os.name == "nt":
     import ctypes
     import time
@@ -22,7 +24,7 @@ if os.name == "nt":
     user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
     user32.TranslateMessage.restype = wintypes.BOOL
     user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
-    user32.DispatchMessageW.restype = ctypes.c_long
+    user32.DispatchMessageW.restype = ctypes.c_ssize_t
 
     MOD_ALT = 0x0001
     MOD_CONTROL = 0x0002
@@ -91,8 +93,9 @@ if os.name == "nt":
 
         def setup(self):
             self._hkid = 1
-            if not user32.RegisterHotKey(None, self._hkid, self._mod | MOD_NOREPEAT, self._vk):
-                raise RuntimeError(f"热键注册失败（可能与其他程序冲突）: {self._raw}")
+            with native_lock():
+                if not user32.RegisterHotKey(None, self._hkid, self._mod | MOD_NOREPEAT, self._vk):
+                    raise RuntimeError(f"热键注册失败（可能与其他程序冲突）: {self._raw}")
             self.log(f"已注册热键: {self._raw}")
 
         def poll(self):
@@ -106,7 +109,8 @@ if os.name == "nt":
 
         def teardown(self):
             try:
-                user32.UnregisterHotKey(None, self._hkid)
+                with native_lock():
+                    user32.UnregisterHotKey(None, self._hkid)
             except Exception:
                 pass
 
@@ -155,9 +159,7 @@ else:
                 from Xlib import X, XK
                 from Xlib.display import Display
             except ImportError:
-                from notmyfault.platform.linux_support import BackendMissingError
-
-                raise BackendMissingError(
+                raise platform_backend_api().BackendMissingError(
                     "依赖缺失：全局热键需要 python-xlib（pip install python-xlib）"
                 )
             modifiers, main_key_name = _parse_x11_hotkey(self._raw)

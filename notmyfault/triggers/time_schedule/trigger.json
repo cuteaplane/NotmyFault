@@ -9,7 +9,15 @@
     "package_name": "io.github.notmyfault.time_schedule",
     "enabled": true,
     "outputs": [
-        {"name": "triggered_time", "label": "触发时间", "type": "string"}
+        {
+            "name": "triggered_time",
+            "label": "触发时间",
+            "type": "string",
+            "value_type": {
+                "type": "time",
+                "timezone": "naive"
+            }
+        }
     ],
     "params": [
         {
@@ -17,7 +25,11 @@
             "label": "触发时间",
             "type": "time",
             "default": "22:00",
-            "placeholder": "HH:MM 格式，如 08:30、22:00"
+            "placeholder": "HH:MM 格式，如 08:30、22:00",
+            "value_type": {
+                "type": "time",
+                "timezone": "naive"
+            }
         }
     ]
 }

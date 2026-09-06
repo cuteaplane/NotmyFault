@@ -9,8 +9,18 @@
     "package_name": "io.github.notmyfault.usb_insert",
     "enabled": true,
     "outputs": [
-        {"name": "drive_letter", "label": "匹配盘符", "type": "string"},
-        {"name": "actual_drive", "label": "实际盘符", "type": "string", "format": "path"}
+        {
+            "name": "drive_letter",
+            "label": "匹配盘符",
+            "type": "string"
+        },
+        {
+            "name": "actual_drive",
+            "label": "实际盘符",
+            "type": "string",
+            "format": "path",
+            "value_type": "path"
+        }
     ],
     "params": [
         {

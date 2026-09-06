@@ -1,0 +1,129 @@
+{
+  "id": "file_content",
+  "name": "文件文本状态变化",
+  "description": "文本文件开始包含或不再包含指定文本时触发。首次成功读取只记录状态；文件缺失、不可读、编码错误或超过大小上限时跳过检查，保留上次状态。",
+  "version_code": 1,
+  "version": "1.0",
+  "package_name": "io.github.notmyfault.file_content",
+  "enabled": true,
+  "semantic": "state",
+  "trigger_api": "event-v2",
+  "permissions": [
+    "filesystem"
+  ],
+  "outputs": [
+    {
+      "name": "path",
+      "label": "文本文件路径",
+      "type": "string",
+      "format": "path",
+      "sensitive": true,
+      "value_type": "path"
+    },
+    {
+      "name": "state",
+      "label": "当前文本状态",
+      "type": "string",
+      "value_type": "text"
+    },
+    {
+      "name": "contains",
+      "label": "包含指定文本",
+      "type": "bool",
+      "value_type": "bool"
+    }
+  ],
+  "params": [
+    {
+      "name": "path",
+      "label": "文本文件路径",
+      "type": "path",
+      "default": "",
+      "required": true,
+      "sensitive": true,
+      "placeholder": "如 C:\\Logs\\status.txt",
+      "value_type": "path"
+    },
+    {
+      "name": "text",
+      "label": "待查找文本",
+      "type": "textarea",
+      "default": "",
+      "required": true,
+      "sensitive": true,
+      "placeholder": "按原文匹配，支持多行文本",
+      "value_type": "text"
+    },
+    {
+      "name": "state",
+      "label": "触发时机",
+      "type": "select",
+      "default": "contains",
+      "options": [
+        {
+          "value": "contains",
+          "label": "开始包含指定文本"
+        },
+        {
+          "value": "absent",
+          "label": "不再包含指定文本"
+        },
+        {
+          "value": "changed",
+          "label": "包含状态发生变化"
+        }
+      ]
+    },
+    {
+      "name": "case_sensitive",
+      "label": "区分大小写",
+      "type": "bool",
+      "default": true,
+      "value_type": "bool"
+    },
+    {
+      "name": "encoding",
+      "label": "文本编码",
+      "type": "string",
+      "default": "utf-8-sig",
+      "options": [
+        {
+          "value": "utf-8-sig",
+          "label": "UTF-8（兼容 BOM）"
+        },
+        {
+          "value": "utf-16",
+          "label": "UTF-16（含 BOM）"
+        },
+        {
+          "value": "gb18030",
+          "label": "GB18030 / GBK"
+        }
+      ],
+      "value_type": "text",
+      "placeholder": "utf-8、utf-8-sig、utf-16、gbk、gb18030、big5、shift_jis"
+    },
+    {
+      "name": "interval",
+      "label": "检查间隔（秒，0.2–3600）",
+      "type": "number",
+      "default": 1,
+      "min": 0.2,
+      "max": 3600,
+      "step": 0.1,
+      "value_type": {
+        "type": "duration",
+        "unit": "seconds"
+      }
+    },
+    {
+      "name": "max_kib",
+      "label": "文件大小上限（KiB，1–16384）",
+      "type": "number",
+      "default": 1024,
+      "min": 1,
+      "max": 16384,
+      "value_type": "number"
+    }
+  ]
+}

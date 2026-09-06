@@ -21,14 +21,14 @@ def _decode_netsh(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-def _current_ssid() -> str:
-    """返回当前 WiFi SSID，未连接或查询失败时返回空字符串"""
+def _current_ssid() -> str | None:
+    """返回当前 WiFi SSID，未连接返回空字符串，查询失败返回 None"""
     if os.name == "nt":
         return _current_ssid_windows()
     return _current_ssid_linux()
 
 
-def _current_ssid_windows() -> str:
+def _current_ssid_windows() -> str | None:
     try:
         result = subprocess.run(
             ["netsh", "wlan", "show", "interfaces"],
@@ -37,9 +37,9 @@ def _current_ssid_windows() -> str:
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError):
-        return ""
+        return None
     if result.returncode != 0:
-        return ""
+        return None
     text = _decode_netsh(result.stdout)
     for line in text.splitlines():
         match = _SSID_LINE_RE.match(line)
@@ -48,10 +48,10 @@ def _current_ssid_windows() -> str:
     return ""
 
 
-def _current_ssid_linux() -> str:
+def _current_ssid_linux() -> str | None:
     import shutil
     if not shutil.which("nmcli"):
-        return ""
+        return None
     try:
         result = subprocess.run(
             ["nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi"],
@@ -61,9 +61,9 @@ def _current_ssid_linux() -> str:
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
-        return ""
+        return None
     if result.returncode != 0:
-        return ""
+        return None
     for line in result.stdout.splitlines():
         if line.startswith("yes:"):
             return line[4:]
@@ -91,6 +91,8 @@ class WifiNetworkTrigger(PollingTrigger):
 
     def poll(self) -> None:
         current = _current_ssid()
+        if current is None:
+            return
         if self._last_ssid is None:
             # 第一轮只记录当前状态，不触发
             self._last_ssid = current

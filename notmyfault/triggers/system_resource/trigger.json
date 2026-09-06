@@ -25,15 +25,15 @@
                 {"value": "cpu", "label": "处理器使用率"},
                 {"value": "memory", "label": "内存使用率"},
                 {"value": "disk", "label": "磁盘使用率"},
-                {"value": "network", "label": "网络使用率"}
+                {"value": "network", "label": "网络吞吐量 (MB/s)"}
             ]
         },
         {
             "name": "threshold",
-            "label": "阈值 (%)",
+            "label": "阈值 (% 或 MB/s)",
             "type": "number",
             "default": 90,
-            "placeholder": "0-100"
+            "placeholder": "处理器/内存/磁盘用百分比，网络用 MB/s"
         },
         {
             "name": "direction",

@@ -6,6 +6,7 @@ import ctypes
 import os
 import psutil
 
+from notmyfault.plugin_api import native_lock
 from notmyfault.triggers.base import PollingTrigger
 
 if os.name == "nt":
@@ -22,7 +23,7 @@ if os.name == "nt":
     _user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
     _user32.TranslateMessage.restype = wintypes.BOOL
     _user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
-    _user32.DispatchMessageW.restype = ctypes.c_long
+    _user32.DispatchMessageW.restype = ctypes.c_ssize_t
     _user32.DestroyWindow.argtypes = [wintypes.HWND]
     _user32.DestroyWindow.restype = wintypes.BOOL
     _user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
@@ -56,6 +57,7 @@ def _is_on_battery():
 
 def _create_power_event_window():
     """创建隐藏窗口接收电源广播，失败时返回 None"""
+    callback = None
     try:
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
@@ -79,17 +81,6 @@ def _create_power_event_window():
                 ("lpszClassName", ctypes.c_wchar_p),
             ]
 
-        class MSG(ctypes.Structure):
-            _fields_ = [
-                ("hwnd", ctypes.c_void_p),
-                ("message", ctypes.c_uint),
-                ("wParam", ctypes.c_size_t),
-                ("lParam", ctypes.c_size_t),
-                ("time", ctypes.c_uint),
-                ("pt_x", ctypes.c_long),
-                ("pt_y", ctypes.c_long),
-            ]
-
         state = {"resume": False}
 
         def wnd_proc(hwnd, msg, wparam, lparam):
@@ -99,8 +90,16 @@ def _create_power_event_window():
                 return 0
             return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
-        _WND_PROC_HOLD.append(wnd_proc)
+        callback = WNDPROC(wnd_proc)
+        _WND_PROC_HOLD.append(callback)
 
+        user32.DefWindowProcW.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        user32.DefWindowProcW.restype = ctypes.c_ssize_t
         user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
         user32.RegisterClassW.restype = ctypes.c_ushort
         user32.CreateWindowExW.argtypes = [
@@ -109,13 +108,16 @@ def _create_power_event_window():
             wintypes.HWND, ctypes.c_void_p, wintypes.HINSTANCE, ctypes.c_void_p,
         ]
         user32.CreateWindowExW.restype = wintypes.HWND
+        kernel32.GetCurrentThreadId.argtypes = []
+        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
-        class_name = "NotmyFaultPowerState"
+        class_name = f"NotmyFaultPowerState_{kernel32.GetCurrentThreadId()}"
         wc = WNDCLASSW()
-        wc.lpfnWndProc = WNDPROC(wnd_proc)
+        wc.lpfnWndProc = callback
         wc.hInstance = kernel32.GetModuleHandleW(None)
         wc.lpszClassName = class_name
         if not user32.RegisterClassW(ctypes.byref(wc)):
+            _WND_PROC_HOLD.remove(callback)
             return None
 
         hwnd = user32.CreateWindowExW(
@@ -123,16 +125,21 @@ def _create_power_event_window():
             None, None, wc.hInstance, None,
         )
         if not hwnd:
+            user32.UnregisterClassW(class_name, wc.hInstance)
+            _WND_PROC_HOLD.remove(callback)
             return None
         return {
             "hwnd": hwnd,
             "state": state,
             "user32": user32,
-            "msg_cls": MSG,
+            "msg_cls": wintypes.MSG,
             "class_name": class_name,
-            "wnd_proc": wnd_proc,
+            "hinstance": wc.hInstance,
+            "wnd_proc": callback,
         }
     except Exception:
+        if callback in _WND_PROC_HOLD:
+            _WND_PROC_HOLD.remove(callback)
         return None
 
 
@@ -159,20 +166,22 @@ def _destroy_power_event_window(window) -> None:
     """销毁隐藏窗口并注销窗口类，在线程退出时调用"""
     if window is None:
         return
+    wnd_proc = None
     try:
         hwnd = window.get("hwnd")
         class_name = window.get("class_name")
         wnd_proc = window.get("wnd_proc")
-        if wnd_proc in _WND_PROC_HOLD:
-            _WND_PROC_HOLD.remove(wnd_proc)
         if hwnd:
-            ctypes.windll.user32.DestroyWindow(hwnd)
+            window["user32"].DestroyWindow(hwnd)
         if class_name:
-            ctypes.windll.user32.UnregisterClassW(
-                class_name, ctypes.windll.kernel32.GetModuleHandleW(None)
+            window["user32"].UnregisterClassW(
+                class_name, window.get("hinstance")
             )
     except Exception:
         pass
+    finally:
+        if wnd_proc in _WND_PROC_HOLD:
+            _WND_PROC_HOLD.remove(wnd_proc)
 
 class PowerStateTrigger(PollingTrigger):
     """电源状态监测：交流/电池/低电量轮询 + Windows 睡眠恢复事件监听"""
@@ -193,16 +202,16 @@ class PowerStateTrigger(PollingTrigger):
         self.log(f"开始监控电源状态，目标: {self.target_state}")
         # resume 只在 Windows 上通过电源广播消息实现；
         # 建窗口也要改共享 user32 函数对象，和 poll 一样持 NATIVE_LOCK
-        if os.name == "nt":
-            from notmyfault.native import NATIVE_LOCK
-            with NATIVE_LOCK:
+        if os.name == "nt" and self.target_state == "resume":
+            with native_lock():
                 self.power_window = _create_power_event_window()
         else:
             self.power_window = None
         if self.target_state == "resume" and self.power_window is None:
             self.log("当前平台不支持睡眠恢复事件监听，resume 规则不会触发")
         try:
-            on_battery, _ = _is_on_battery()
+            with native_lock():
+                on_battery, _ = _is_on_battery()
         except Exception as e:
             self.log(f"初始电源状态读取失败: {e}")
             on_battery = False
@@ -235,8 +244,7 @@ class PowerStateTrigger(PollingTrigger):
             self._low_battery_active = False
 
     def teardown(self):
-        from notmyfault.native import NATIVE_LOCK
-        with NATIVE_LOCK:
+        with native_lock():
             _destroy_power_event_window(self.power_window)
 
 

@@ -11,7 +11,7 @@
     "platforms": ["windows", "linux"],
     "enabled": true,
     "permissions": [
-        "native_api","external_binary"
+        "native_api", "external_binary", "screen_reader"
     ],
     "outputs": [
         {"name": "title_pattern", "label": "匹配规则", "type": "string"},

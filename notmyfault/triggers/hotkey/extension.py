@@ -2,6 +2,8 @@ import os
 import threading
 import time
 
+from notmyfault.plugin_api import native_lock
+
 
 def capture_hotkey(context, payload):
     options = payload if isinstance(payload, dict) else {}
@@ -28,7 +30,11 @@ def capture_hotkey(context, payload):
 def _key_down(vk: int) -> bool:
     import ctypes
 
-    return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+    with native_lock():
+        get_key_state = ctypes.windll.user32.GetAsyncKeyState
+        get_key_state.argtypes = [ctypes.c_int]
+        get_key_state.restype = ctypes.c_short
+        return bool(get_key_state(vk) & 0x8000)
 
 
 def _wait_for_hotkey_windows(

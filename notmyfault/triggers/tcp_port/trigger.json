@@ -1,0 +1,108 @@
+{
+  "id": "tcp_port",
+  "name": "TCP 端口状态变化",
+  "description": "通过 TCP 连接检查指定主机的服务端口，在可达状态变化时触发。支持主机名、IPv4 和 IPv6，首次检查只记录状态。每次检查重新解析主机名，依次尝试解析出的地址；仅建立连接，不发送应用数据。",
+  "version_code": 1,
+  "version": "1.0",
+  "package_name": "io.github.notmyfault.tcp_port",
+  "enabled": true,
+  "semantic": "state",
+  "trigger_api": "event-v2",
+  "permissions": [
+    "network"
+  ],
+  "outputs": [
+    {
+      "name": "host",
+      "label": "主机名或 IP 地址",
+      "type": "string",
+      "sensitive": true,
+      "value_type": "text"
+    },
+    {
+      "name": "port",
+      "label": "TCP 端口",
+      "type": "number",
+      "value_type": "int"
+    },
+    {
+      "name": "state",
+      "label": "端口状态",
+      "type": "string",
+      "value_type": "text"
+    },
+    {
+      "name": "reachable",
+      "label": "端口可达",
+      "type": "bool",
+      "value_type": "bool"
+    }
+  ],
+  "params": [
+    {
+      "name": "host",
+      "label": "主机名或 IP 地址",
+      "type": "string",
+      "default": "127.0.0.1",
+      "required": true,
+      "sensitive": true,
+      "placeholder": "如 localhost、server.example.com、192.168.1.10 或 ::1",
+      "value_type": "text"
+    },
+    {
+      "name": "port",
+      "label": "TCP 端口（1–65535）",
+      "type": "number",
+      "default": 80,
+      "min": 1,
+      "max": 65535,
+      "value_type": "int"
+    },
+    {
+      "name": "state",
+      "label": "触发时机",
+      "type": "select",
+      "default": "reachable",
+      "options": [
+        {
+          "value": "reachable",
+          "label": "端口变为可达"
+        },
+        {
+          "value": "unreachable",
+          "label": "端口变为不可达"
+        },
+        {
+          "value": "changed",
+          "label": "端口状态发生变化"
+        }
+      ]
+    },
+    {
+      "name": "interval",
+      "label": "检查间隔（秒，0.2–3600）",
+      "type": "number",
+      "default": 5,
+      "min": 0.2,
+      "max": 3600,
+      "step": 0.1,
+      "value_type": {
+        "type": "duration",
+        "unit": "seconds"
+      }
+    },
+    {
+      "name": "timeout",
+      "label": "单个地址连接超时（秒，0.1–10）",
+      "type": "number",
+      "default": 1,
+      "min": 0.1,
+      "max": 10,
+      "step": 0.1,
+      "value_type": {
+        "type": "duration",
+        "unit": "seconds"
+      }
+    }
+  ]
+}

@@ -1,5 +1,6 @@
 import socket
-import time
+
+from notmyfault.triggers.base import PollingTrigger
 
 
 def _is_connected(host="8.8.8.8", port=53, timeout=2):
@@ -14,28 +15,30 @@ def _is_connected(host="8.8.8.8", port=53, timeout=2):
         s.close()
 
 
+class NetworkStatusTrigger(PollingTrigger):
+    interval = 5.0
+
+    def validate(self):
+        self.target_state = self.config.get("state", "disconnected")
+        if self.target_state not in ("connected", "disconnected"):
+            raise ValueError(
+                f"无效的网络状态: {self.target_state!r}（可选: connected/disconnected）"
+            )
+
+    def setup(self):
+        self._last_connected = _is_connected()
+        self.log(f"开始监控网络状态，目标: {self.target_state}")
+        self.log(f"初始网络状态: {'已连接' if self._last_connected else '已断开'}")
+
+    def poll(self):
+        current = _is_connected()
+        if current != self._last_connected:
+            new_state = "connected" if current else "disconnected"
+            if new_state == self.target_state:
+                self.log(f"网络状态变化: {new_state}")
+                self.emit({"state": new_state})
+            self._last_connected = current
+
+
 def run(meta, config, emit_event, shutdown_event):
-    trigger_id = meta.get("id", "network_status")
-    target_state = config.get("state", "disconnected")
-    if target_state not in ("connected", "disconnected"):
-        raise ValueError(
-            f"无效的网络状态: {target_state!r}（可选: connected/disconnected）"
-        )
-    print(f"[Trigger:{trigger_id}] 开始监控网络状态，目标: {target_state}")
-
-    last_connected = _is_connected()
-    print(f"[Trigger:{trigger_id}] 初始网络状态: {'已连接' if last_connected else '已断开'}")
-
-    while not shutdown_event.is_set():
-        try:
-            current = _is_connected()
-            if current != last_connected:
-                new_state = "connected" if current else "disconnected"
-                if new_state == target_state:
-                    print(f"[Trigger:{trigger_id}] 网络状态变化: {new_state}")
-                    emit_event({"state": new_state})
-                last_connected = current
-        except Exception as e:
-            print(f"[Trigger:{trigger_id}] 检查网络出错: {e}")
-
-        shutdown_event.wait(5)
+    NetworkStatusTrigger(meta, config, emit_event, shutdown_event).run()

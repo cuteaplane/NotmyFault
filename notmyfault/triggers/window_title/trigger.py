@@ -45,7 +45,7 @@ def _get_window_titles_linux() -> dict:
         return {}
     try:
         result = subprocess.run(
-            [xdotool, "search", "--name", "", "getwindowname"],
+            [xdotool, "search", "--name", ""],
             capture_output=True, text=True, errors="replace", timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
@@ -53,14 +53,20 @@ def _get_window_titles_linux() -> dict:
     if result.returncode != 0:
         return {}
     titles = {}
-    lines = result.stdout.strip().splitlines()
-    i = 0
-    while i < len(lines) - 1:
-        wid = lines[i].strip()
-        title = lines[i + 1].strip()
-        if wid.isdigit() and title:
+    for line in result.stdout.splitlines():
+        wid = line.strip()
+        if not wid.isdigit():
+            continue
+        try:
+            title_result = subprocess.run(
+                [xdotool, "getwindowname", wid],
+                capture_output=True, text=True, errors="replace", timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        title = title_result.stdout.strip()
+        if title_result.returncode == 0 and title:
             titles[wid] = title
-        i += 2
     return titles
 
 

@@ -29,6 +29,8 @@ class CronScheduleTrigger(PollingTrigger):
 
         if mode in ("daily", "weekly"):
             raw_time = str(self.config.get("time", "") or "")
+            if len(raw_time) == 8 and raw_time.endswith(":00"):
+                raw_time = raw_time[:5]
             match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", raw_time)
             if not match:
                 raise ValueError(f"无效的触发时间: {raw_time!r}（应为 HH:MM）")

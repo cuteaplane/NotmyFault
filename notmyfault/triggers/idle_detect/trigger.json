@@ -8,12 +8,26 @@
     "version": "1.0",
     "package_name": "io.github.notmyfault.idle_detect",
     "enabled": true,
+    "platforms": ["windows", "linux"],
     "permissions": [
-        "native_api"
+        "native_api",
+        "external_binary"
     ],
     "outputs": [
-        {"name": "state", "label": "活动状态", "type": "string"},
-        {"name": "idle_seconds", "label": "空闲秒数", "type": "number"}
+        {
+            "name": "state",
+            "label": "活动状态",
+            "type": "string"
+        },
+        {
+            "name": "idle_seconds",
+            "label": "空闲秒数",
+            "type": "number",
+            "value_type": {
+                "type": "duration",
+                "unit": "seconds"
+            }
+        }
     ],
     "params": [
         {
@@ -21,7 +35,11 @@
             "label": "空闲秒数",
             "type": "number",
             "default": 300,
-            "placeholder": "空闲多少秒后触发（默认300秒=5分钟）"
+            "placeholder": "空闲多少秒后触发（默认300秒=5分钟）",
+            "value_type": {
+                "type": "duration",
+                "unit": "seconds"
+            }
         }
     ]
 }

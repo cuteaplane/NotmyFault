@@ -9,7 +9,7 @@
     "package_name": "io.github.notmyfault.battery_level",
     "enabled": true,
     "outputs": [
-        {"name": "battery_percent", "label": "电量百分比", "type": "number"},
+        {"name": "battery_percent", "label": "电量百分比", "type": "number", "value_type": "int"},
         {"name": "state", "label": "电源状态", "type": "string"},
         {"name": "threshold", "label": "配置阈值", "type": "number"},
         {"name": "direction", "label": "触发方向", "type": "string"}

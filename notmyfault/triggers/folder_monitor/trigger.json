@@ -8,11 +8,29 @@
     "version": "1.1",
     "package_name": "io.github.notmyfault.folder_monitor",
     "enabled": true,
-    "permissions": ["filesystem"],
+    "permissions": [
+        "filesystem"
+    ],
     "outputs": [
-        {"name": "event", "label": "变化类型", "type": "string"},
-        {"name": "path", "label": "变化文件", "type": "string", "format": "path"},
-        {"name": "folder", "label": "监控目录", "type": "string", "format": "path"}
+        {
+            "name": "event",
+            "label": "变化类型",
+            "type": "string"
+        },
+        {
+            "name": "path",
+            "label": "变化文件",
+            "type": "string",
+            "format": "path",
+            "value_type": "path"
+        },
+        {
+            "name": "folder",
+            "label": "监控目录",
+            "type": "string",
+            "format": "path",
+            "value_type": "path"
+        }
     ],
     "params": [
         {
@@ -20,7 +38,8 @@
             "label": "监控目录",
             "type": "string",
             "default": "",
-            "placeholder": "如 C:\\Users\\Me\\Downloads"
+            "placeholder": "如 C:\\Users\\Me\\Downloads",
+            "value_type": "path"
         },
         {
             "name": "event_type",
@@ -28,10 +47,22 @@
             "type": "select",
             "default": "created",
             "options": [
-                {"value": "created", "label": "新建文件"},
-                {"value": "modified", "label": "修改文件"},
-                {"value": "deleted", "label": "删除文件"},
-                {"value": "all", "label": "任意变化"}
+                {
+                    "value": "created",
+                    "label": "新建文件"
+                },
+                {
+                    "value": "modified",
+                    "label": "修改文件"
+                },
+                {
+                    "value": "deleted",
+                    "label": "删除文件"
+                },
+                {
+                    "value": "all",
+                    "label": "任意变化"
+                }
             ]
         },
         {

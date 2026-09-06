@@ -11,7 +11,7 @@
     "permissions": ["native_api"],
     "outputs": [
         {"name": "state", "label": "电源状态", "type": "string"},
-        {"name": "battery_percent", "label": "电池电量", "type": "number"}
+        {"name": "battery_percent", "label": "电池电量", "type": "number", "value_type": "int"}
     ],
     "params": [
         {

@@ -586,6 +586,80 @@ def test_battery_level_validate_rejects_bad_config(config):
         trigger.validate()
 
 
+# ---------------------------------------------------------------- power_state
+
+
+def test_power_state_creates_message_window_only_for_resume(monkeypatch):
+    mod = load_plugin("triggers", "power_state")
+    window = object()
+    created = []
+    monkeypatch.setattr(mod, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(mod, "_is_on_battery", lambda: (False, 100))
+    monkeypatch.setattr(
+        mod,
+        "_create_power_event_window",
+        lambda: created.append(True) or window,
+    )
+
+    ac_trigger = mod.PowerStateTrigger(
+        {"id": "power_state"},
+        {"state": "ac"},
+        lambda payload: None,
+        threading.Event(),
+    )
+    ac_trigger.setup()
+    resume_trigger = mod.PowerStateTrigger(
+        {"id": "power_state"},
+        {"state": "resume"},
+        lambda payload: None,
+        threading.Event(),
+    )
+    resume_trigger.setup()
+
+    assert ac_trigger.power_window is None
+    assert resume_trigger.power_window is window
+    assert created == [True]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 创建电源消息窗口")
+def test_power_state_keeps_native_callback_until_window_is_destroyed(monkeypatch):
+    mod = load_plugin("triggers", "power_state")
+    user32 = MagicMock()
+    kernel32 = MagicMock()
+    user32.RegisterClassW.return_value = 1
+    user32.CreateWindowExW.return_value = 99
+    user32.DestroyWindow.return_value = 1
+    user32.UnregisterClassW.return_value = 1
+    kernel32.GetModuleHandleW.return_value = 88
+    kernel32.GetCurrentThreadId.return_value = 123
+    monkeypatch.setattr(mod.ctypes.windll, "user32", user32)
+    monkeypatch.setattr(mod.ctypes.windll, "kernel32", kernel32)
+
+    window = mod._create_power_event_window()
+
+    def peek_message(message, *_args):
+        ctypes.POINTER(mod.wintypes.MSG).from_param(message)
+        return 0
+
+    user32.PeekMessageW.side_effect = peek_message
+    window["wnd_proc"](99, mod.WM_POWERBROADCAST, mod.PBT_APMRESUMEAUTOMATIC, 0)
+    assert mod._pump_power_messages(window) is True
+
+    def destroy_window(hwnd):
+        assert window["wnd_proc"] in mod._WND_PROC_HOLD
+        assert window["wnd_proc"](hwnd, mod.WM_POWERBROADCAST, mod.PBT_APMRESUMEAUTOMATIC, 0) == 0
+        return 1
+
+    user32.DestroyWindow.side_effect = destroy_window
+    mod._destroy_power_event_window(window)
+    assert window["state"]["resume"] is True
+    user32.DestroyWindow.assert_called_once_with(99)
+    user32.UnregisterClassW.assert_called_once_with(
+        window["class_name"], 88
+    )
+    assert window["wnd_proc"] not in mod._WND_PROC_HOLD
+
+
 # -------------------------------------------------------------- cron_schedule
 
 
