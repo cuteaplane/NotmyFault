@@ -31,7 +31,7 @@ try:
                 speaker.Voice = voice
                 break
     rate = int(payload.get("rate", 0) or 0)
-    volume = int(payload.get("volume", 100) or 100)
+    volume = int(payload["volume"])
     if rate != 0:
         speaker.Rate = max(-10, min(10, rate))
     if volume != 100:

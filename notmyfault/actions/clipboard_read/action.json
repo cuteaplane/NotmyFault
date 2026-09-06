@@ -1,0 +1,61 @@
+{
+  "id": "clipboard_read",
+  "name": "读取剪贴板",
+  "description": "读取当前剪贴板文本，供后续动作引用；不修改剪贴板内容",
+  "version_code": 1,
+  "version": "1.0",
+  "package_name": "io.github.notmyfault.clipboard_read",
+  "enabled": true,
+  "idempotent": true,
+  "platforms": [
+    "windows",
+    "linux"
+  ],
+  "requires_capabilities": [
+    "clipboard.read"
+  ],
+  "permissions": [
+    "clipboard",
+    "native_api"
+  ],
+  "execution_api": "context-v1",
+  "outputs": [
+    {
+      "name": "text",
+      "label": "文本",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": "text"
+    },
+    {
+      "name": "length",
+      "label": "返回字符数",
+      "type": "number",
+      "value_type": "int"
+    },
+    {
+      "name": "has_text",
+      "label": "剪贴板含文本",
+      "type": "bool",
+      "value_type": "bool"
+    },
+    {
+      "name": "truncated",
+      "label": "文本已截断",
+      "type": "bool",
+      "value_type": "bool"
+    }
+  ],
+  "params": [
+    {
+      "name": "max_chars",
+      "label": "最多读取字符数",
+      "type": "number",
+      "default": 1000000,
+      "min": 1,
+      "max": 1000000,
+      "value_type": "int"
+    }
+  ]
+}

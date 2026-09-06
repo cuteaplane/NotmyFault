@@ -1,0 +1,95 @@
+{
+  "id": "download_file",
+  "name": "下载文件",
+  "description": "从公网 HTTP/HTTPS 下载文件，地址和保存路径可引用前序结果；支持重定向、大小上限和取消",
+  "version_code": 1,
+  "version": "1.0",
+  "package_name": "io.github.notmyfault.download_file",
+  "enabled": true,
+  "idempotent": false,
+  "permissions": [
+    "network",
+    "filesystem"
+  ],
+  "security": {
+    "rule_approval": "admin_key",
+    "literal_only_params": [
+      "overwrite"
+    ]
+  },
+  "execution_api": "context-v1",
+  "cancellation_api": "runtime-v1",
+  "outputs": [
+    {
+      "name": "file",
+      "label": "保存文件路径",
+      "type": "string",
+      "value_type": "path"
+    },
+    {
+      "name": "bytes",
+      "label": "下载字节数",
+      "type": "number",
+      "value_type": "int"
+    },
+    {
+      "name": "status",
+      "label": "HTTP 状态码",
+      "type": "number",
+      "value_type": "int"
+    }
+  ],
+  "params": [
+    {
+      "name": "url",
+      "label": "下载地址",
+      "type": "string",
+      "default": "",
+      "placeholder": "https://example.com/report.csv",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": {
+        "type": "url",
+        "schemes": [
+          "http",
+          "https"
+        ]
+      }
+    },
+    {
+      "name": "file_path",
+      "label": "保存文件路径",
+      "type": "path",
+      "default": "",
+      "value_type": "path"
+    },
+    {
+      "name": "overwrite",
+      "label": "允许覆盖已有文件",
+      "type": "bool",
+      "default": false,
+      "value_type": "bool"
+    },
+    {
+      "name": "max_mb",
+      "label": "下载大小上限（MiB）",
+      "type": "number",
+      "default": 100,
+      "min": 0.01,
+      "max": 1024,
+      "value_type": "number"
+    },
+    {
+      "name": "timeout_seconds",
+      "label": "网络超时（秒）",
+      "type": "number",
+      "default": 15,
+      "min": 1,
+      "max": 120,
+      "value_type": {
+        "type": "duration",
+        "unit": "seconds"
+      }
+    }
+  ]
+}

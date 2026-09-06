@@ -6,6 +6,7 @@
     "version": "1.0",
     "package_name": "io.github.notmyfault.media_control",
     "enabled": true,
+    "idempotent": false,
     "platforms": ["windows", "linux"],
     "permissions": ["native_api","external_binary"],
     "outputs": [

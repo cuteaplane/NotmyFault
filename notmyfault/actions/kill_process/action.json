@@ -6,11 +6,16 @@
     "version": "1.0",
     "package_name": "io.github.notmyfault.kill_process",
     "enabled": true,
+    "idempotent": false,
     "permissions": ["process"],
     "security": {
         "rule_approval": "admin_key",
         "literal_only_params": ["process_name"]
     },
+    "outputs": [
+        {"name": "killed", "label": "已终止进程数", "type": "number", "value_type": "int"},
+        {"name": "denied", "label": "权限不足的进程数", "type": "number", "value_type": "int"}
+    ],
     "params": [
         {
             "name": "process_name",

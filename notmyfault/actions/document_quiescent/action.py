@@ -5,6 +5,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
+from notmyfault.plugin_api import native_lock
+
 
 _MAX_FILES = 5000
 _MAX_OBSERVATIONS = 64
@@ -49,28 +51,31 @@ def _can_open_exclusively(path: str) -> bool:
         except OSError:
             return False
 
-    kernel32 = ctypes.windll.kernel32
-    kernel32.CreateFileW.argtypes = [
-        ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
-        ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
-    ]
-    kernel32.CreateFileW.restype = ctypes.c_void_p
-    handle = kernel32.CreateFileW(
-        path,
-        0x80000000,  # GENERIC_READ
-        0,           # 共享参数为 0，其他进程持有句柄时 CreateFileW 会失败
-        None,
-        3,           # OPEN_EXISTING
-        0x80,        # FILE_ATTRIBUTE_NORMAL
-        None,
-    )
-    invalid = ctypes.c_void_p(-1).value
-    if handle == invalid:
-        return False
-    try:
-        return True
-    finally:
-        kernel32.CloseHandle(handle)
+    with native_lock():
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.CreateFileW(
+            path,
+            0x80000000,  # GENERIC_READ
+            0,           # 共享参数为 0，其他进程持有句柄时 CreateFileW 会失败
+            None,
+            3,           # OPEN_EXISTING
+            0x80,        # FILE_ATTRIBUTE_NORMAL
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle == invalid:
+            return False
+        try:
+            return True
+        finally:
+            kernel32.CloseHandle(handle)
 
 
 def _visible_editing_windows() -> Iterable[str]:

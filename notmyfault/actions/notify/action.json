@@ -6,6 +6,7 @@
     "version": "1.1",
     "package_name": "io.github.notmyfault.notify",
     "enabled": true,
+    "idempotent": false,
     "permissions": ["notification"],
     "params": [
         {

@@ -1,0 +1,168 @@
+{
+  "id": "text_transform",
+  "version_code": 1,
+  "version": "1.0",
+  "package_name": "io.github.notmyfault.text_transform",
+  "enabled": true,
+  "origin": "builtin",
+  "permissions": [],
+  "execution_api": "context-v1",
+  "idempotent": true,
+  "name": "文本处理",
+  "description": "去除首尾空白、转换大小写、替换固定文本，按行或分隔符拆分，以及连接文本数组。",
+  "params": [
+    {
+      "name": "operation",
+      "label": "操作",
+      "type": "select",
+      "default": "trim",
+      "options": [
+        {
+          "value": "trim",
+          "label": "去除首尾空白"
+        },
+        {
+          "value": "lower",
+          "label": "转小写"
+        },
+        {
+          "value": "upper",
+          "label": "转大写"
+        },
+        {
+          "value": "title",
+          "label": "单词首字母大写"
+        },
+        {
+          "value": "casefold",
+          "label": "折叠大小写"
+        },
+        {
+          "value": "replace",
+          "label": "替换固定文本"
+        },
+        {
+          "value": "split_lines",
+          "label": "按行拆分"
+        },
+        {
+          "value": "split",
+          "label": "按分隔符拆分"
+        },
+        {
+          "value": "join",
+          "label": "连接文本数组"
+        }
+      ]
+    },
+    {
+      "name": "text",
+      "label": "文本",
+      "type": "textarea",
+      "sensitive": true,
+      "summary": "hidden",
+      "default": "",
+      "rows": 6,
+      "value_type": "text"
+    },
+    {
+      "name": "find",
+      "label": "查找文本（替换时使用）",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "default": "",
+      "value_type": "text"
+    },
+    {
+      "name": "replacement",
+      "label": "替换为（留空表示删除）",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "default": "",
+      "value_type": "text"
+    },
+    {
+      "name": "trim_lines",
+      "label": "按行拆分时去除每行首尾空白",
+      "type": "bool",
+      "default": false,
+      "value_type": "bool"
+    },
+    {
+      "name": "skip_empty_lines",
+      "label": "按行拆分时去除空行",
+      "type": "bool",
+      "default": false,
+      "value_type": "bool"
+    },
+    {
+      "name": "delimiter",
+      "type": "string",
+      "value_type": "text",
+      "label": "拆分或连接的分隔符",
+      "default": ",",
+      "visible_when": {
+        "operation": [
+          "join",
+          "split"
+        ]
+      }
+    },
+    {
+      "name": "parts",
+      "type": "textarea",
+      "value_type": {
+        "type": "array",
+        "items": "text"
+      },
+      "label": "连接内容（文本数组）",
+      "default": [],
+      "sensitive": true,
+      "summary": "hidden",
+      "visible_when": {
+        "operation": [
+          "join"
+        ]
+      }
+    }
+  ],
+  "outputs": [
+    {
+      "name": "text",
+      "label": "处理后文本",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": "text"
+    },
+    {
+      "name": "lines",
+      "label": "行或分段数组",
+      "type": "array",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": {
+        "type": "array",
+        "items": "text"
+      }
+    },
+    {
+      "name": "length",
+      "label": "字符数",
+      "type": "number",
+      "sensitive": false,
+      "summary": "value",
+      "value_type": "int"
+    },
+    {
+      "name": "line_count",
+      "label": "行或分段数",
+      "type": "number",
+      "sensitive": false,
+      "summary": "value",
+      "value_type": "int"
+    }
+  ]
+}

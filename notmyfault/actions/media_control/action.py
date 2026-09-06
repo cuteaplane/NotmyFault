@@ -50,23 +50,28 @@ if os.name == "nt":
         user32.FindWindowW.restype = wintypes.HWND
         user32.SendMessageTimeoutW.argtypes = [
             wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
-            wintypes.UINT, wintypes.UINT, ctypes.POINTER(wintypes.DWORD),
+            wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t),
         ]
         user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
         lparam = (command << 16) | 0
-        result = ctypes.c_ulong()
+        result = ctypes.c_size_t()
         hwnd = user32.GetForegroundWindow()
         if hwnd:
-            user32.SendMessageTimeoutW(
+            sent = user32.SendMessageTimeoutW(
                 hwnd, WM_APPCOMMAND, 0, lparam,
                 SMTO_ABORTIFHUNG, 1000, ctypes.byref(result),
             )
+            if sent:
+                return
         shell = user32.FindWindowW("Shell_TrayWnd", None)
         if shell:
-            user32.SendMessageTimeoutW(
+            sent = user32.SendMessageTimeoutW(
                 shell, WM_APPCOMMAND, 0, lparam,
                 SMTO_ABORTIFHUNG, 1000, ctypes.byref(result),
             )
+            if sent:
+                return
+        raise RuntimeError("没有窗口接受媒体命令")
 
 
 def run(action_info, params):

@@ -1,0 +1,180 @@
+{
+  "id": "datetime_format",
+  "version_code": 1,
+  "version": "1.0",
+  "package_name": "io.github.notmyfault.datetime_format",
+  "enabled": true,
+  "origin": "builtin",
+  "permissions": [],
+  "execution_api": "context-v1",
+  "idempotent": false,
+  "name": "日期时间格式化",
+  "description": "格式化当前时间、ISO 日期时间或秒时间戳。毫秒时间戳可用数据转换换算为秒；无时区输入按本机时区解释，偏移的每天按 24 小时计算。",
+  "params": [
+    {
+      "name": "input_type",
+      "type": "select",
+      "label": "输入类型",
+      "default": "iso",
+      "options": [
+        {
+          "value": "iso",
+          "label": "ISO 日期时间或当前时间"
+        },
+        {
+          "value": "timestamp",
+          "label": "Unix 时间戳（秒）"
+        }
+      ]
+    },
+    {
+      "name": "timestamp",
+      "type": "number",
+      "value_type": {
+        "type": "timestamp",
+        "unit": "seconds"
+      },
+      "label": "Unix 时间戳（秒）",
+      "default": 0,
+      "sensitive": true,
+      "summary": "hidden",
+      "visible_when": {
+        "input_type": [
+          "timestamp"
+        ]
+      }
+    },
+    {
+      "name": "value",
+      "label": "ISO 日期时间（留空使用当前时间）",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "default": "",
+      "placeholder": "2026-09-05T09:30:00+08:00",
+      "value_type": {
+        "type": "union",
+        "variants": [
+          "text",
+          "date",
+          "datetime"
+        ]
+      },
+      "visible_when": {
+        "input_type": [
+          "iso"
+        ]
+      }
+    },
+    {
+      "name": "format",
+      "label": "输出格式",
+      "type": "string",
+      "default": "%Y-%m-%d %H:%M:%S",
+      "placeholder": "%Y 年 %m 月 %d 日；%H 时 %M 分 %S 秒；%f 微秒；%z 时区",
+      "value_type": "text"
+    },
+    {
+      "name": "timezone",
+      "label": "输出时区",
+      "type": "select",
+      "default": "local",
+      "options": [
+        {
+          "value": "local",
+          "label": "本机时区"
+        },
+        {
+          "value": "utc",
+          "label": "UTC"
+        },
+        {
+          "value": "preserve",
+          "label": "保留输入时区"
+        }
+      ]
+    },
+    {
+      "name": "offset",
+      "label": "时间偏移（负数向前）",
+      "type": "number",
+      "default": 0,
+      "value_type": "number"
+    },
+    {
+      "name": "offset_unit",
+      "label": "偏移单位",
+      "type": "select",
+      "default": "days",
+      "options": [
+        {
+          "value": "seconds",
+          "label": "秒"
+        },
+        {
+          "value": "minutes",
+          "label": "分钟"
+        },
+        {
+          "value": "hours",
+          "label": "小时"
+        },
+        {
+          "value": "days",
+          "label": "天（24 小时）"
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    {
+      "name": "text",
+      "label": "格式化文本",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": "text"
+    },
+    {
+      "name": "iso",
+      "label": "ISO 日期时间",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": {
+        "type": "datetime",
+        "timezone": "aware"
+      }
+    },
+    {
+      "name": "timestamp",
+      "label": "Unix 时间戳（秒）",
+      "type": "number",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": {
+        "type": "timestamp",
+        "unit": "seconds"
+      }
+    },
+    {
+      "name": "date",
+      "label": "日期",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": "date"
+    },
+    {
+      "name": "time",
+      "label": "时间及偏移",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": {
+        "type": "time",
+        "timezone": "aware"
+      }
+    }
+  ]
+}

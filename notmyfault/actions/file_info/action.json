@@ -1,0 +1,91 @@
+{
+  "id": "file_info",
+  "name": "读取文件信息",
+  "description": "检查路径是否存在，返回文件名、扩展名、类型、字节数和 UTC 修改时间；路径不存在时返回 exists=false",
+  "version_code": 1,
+  "version": "1.0",
+  "package_name": "io.github.notmyfault.file_info",
+  "enabled": true,
+  "idempotent": true,
+  "permissions": [
+    "filesystem"
+  ],
+  "execution_api": "context-v1",
+  "outputs": [
+    {
+      "name": "path",
+      "label": "路径",
+      "type": "string",
+      "value_type": "path"
+    },
+    {
+      "name": "name",
+      "label": "文件名",
+      "type": "string",
+      "value_type": "text"
+    },
+    {
+      "name": "extension",
+      "label": "扩展名",
+      "type": "string",
+      "value_type": "text"
+    },
+    {
+      "name": "exists",
+      "label": "路径存在",
+      "type": "bool",
+      "value_type": "bool"
+    },
+    {
+      "name": "is_file",
+      "label": "是普通文件",
+      "type": "bool",
+      "value_type": "bool"
+    },
+    {
+      "name": "is_directory",
+      "label": "是目录",
+      "type": "bool",
+      "value_type": "bool"
+    },
+    {
+      "name": "is_symlink",
+      "label": "是符号链接",
+      "type": "bool",
+      "value_type": "bool"
+    },
+    {
+      "name": "size_bytes",
+      "label": "文件字节数，目录或不存在时为 0",
+      "type": "number",
+      "value_type": "int"
+    },
+    {
+      "name": "modified_at",
+      "label": "UTC 修改时间，不存在时为空",
+      "type": "string",
+      "value_type": "text"
+    },
+    {
+      "name": "modified_time",
+      "type": "datetime",
+      "value_type": {
+        "type": "datetime",
+        "timezone": "aware",
+        "nullable": true
+      },
+      "label": "修改时间（不存在时为空）",
+      "summary": "value"
+    }
+  ],
+  "params": [
+    {
+      "name": "file_path",
+      "label": "文件或目录路径",
+      "type": "path",
+      "default": "",
+      "required": true,
+      "value_type": "path"
+    }
+  ]
+}

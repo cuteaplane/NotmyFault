@@ -1,0 +1,140 @@
+{
+  "id": "url_codec",
+  "version_code": 1,
+  "version": "1.0",
+  "package_name": "io.github.notmyfault.url_codec",
+  "enabled": true,
+  "origin": "builtin",
+  "permissions": [],
+  "execution_api": "context-v1",
+  "idempotent": true,
+  "name": "URL 编解码",
+  "description": "URL 百分号编解码、查询参数编码、URL 解析和组成。组成时使用 scheme、hostname、port、path、query、fragment 字段；重复查询键保留为数组。",
+  "params": [
+    {
+      "name": "operation",
+      "label": "操作",
+      "type": "select",
+      "default": "encode",
+      "options": [
+        {
+          "value": "encode",
+          "label": "URL 编码"
+        },
+        {
+          "value": "decode",
+          "label": "URL 解码"
+        },
+        {
+          "value": "parse",
+          "label": "解析 URL"
+        },
+        {
+          "value": "query_encode",
+          "label": "从对象生成查询参数"
+        },
+        {
+          "value": "compose",
+          "label": "从组成部分生成 URL"
+        }
+      ]
+    },
+    {
+      "name": "value",
+      "label": "文本、URL 或查询参数对象",
+      "type": "textarea",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": "any",
+      "default": "",
+      "rows": 5,
+      "placeholder": "生成查询参数时填写 JSON 对象或绑定对象；数组值会生成同名参数"
+    },
+    {
+      "name": "form_mode",
+      "label": "编解码时使用表单规则（空格与 + 互转）",
+      "type": "bool",
+      "default": false,
+      "value_type": "bool"
+    },
+    {
+      "name": "safe",
+      "label": "编码时保留的字符",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "default": "",
+      "placeholder": "留空编码 /；填写 / 可保留路径分隔符",
+      "value_type": "text"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "text",
+      "label": "处理后文本",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": "text"
+    },
+    {
+      "name": "scheme",
+      "label": "协议",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": "text"
+    },
+    {
+      "name": "hostname",
+      "label": "主机名",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": "text"
+    },
+    {
+      "name": "port",
+      "label": "显式端口（未指定为 null）",
+      "type": "any",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": {
+        "type": "int",
+        "nullable": true,
+        "min": 0,
+        "max": 65535
+      }
+    },
+    {
+      "name": "path",
+      "label": "路径（保持百分号编码）",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": "text"
+    },
+    {
+      "name": "query",
+      "label": "查询参数对象",
+      "type": "object",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": {
+        "type": "object",
+        "additional_properties": {
+          "type": "array",
+          "items": "text"
+        }
+      }
+    },
+    {
+      "name": "fragment",
+      "label": "片段（保持百分号编码）",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": "text"
+    }
+  ]
+}

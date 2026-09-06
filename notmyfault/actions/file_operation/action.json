@@ -6,10 +6,16 @@
     "version": "1.1",
     "package_name": "io.github.notmyfault.file_operation",
     "enabled": true,
-    "permissions": ["filesystem"],
+    "idempotent": false,
+    "permissions": [
+        "filesystem"
+    ],
     "security": {
         "rule_approval": "admin_key",
-        "literal_only_params": ["operation", "destination"]
+        "literal_only_params": [
+            "operation",
+            "destination"
+        ]
     },
     "params": [
         {
@@ -18,11 +24,26 @@
             "type": "select",
             "default": "copy",
             "options": [
-                {"value": "copy", "label": "复制"},
-                {"value": "move", "label": "移动"},
-                {"value": "delete", "label": "删除"},
-                {"value": "compress", "label": "压缩"},
-                {"value": "extract", "label": "解压"}
+                {
+                    "value": "copy",
+                    "label": "复制"
+                },
+                {
+                    "value": "move",
+                    "label": "移动"
+                },
+                {
+                    "value": "delete",
+                    "label": "删除"
+                },
+                {
+                    "value": "compress",
+                    "label": "压缩"
+                },
+                {
+                    "value": "extract",
+                    "label": "解压"
+                }
             ]
         },
         {
@@ -30,14 +51,19 @@
             "label": "源路径",
             "type": "string",
             "default": "",
-            "placeholder": "文件或文件夹路径"
+            "placeholder": "文件或文件夹路径",
+            "value_type": "path"
         },
         {
             "name": "destination",
             "label": "目标路径",
             "type": "string",
             "default": "",
-            "placeholder": "仅 copy/move/compress 需要"
+            "placeholder": "仅 copy/move/compress 需要",
+            "value_type": {
+                "type": "path",
+                "allow_empty": true
+            }
         }
     ]
 }

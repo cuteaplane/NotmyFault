@@ -6,12 +6,22 @@
     "version": "1.3",
     "package_name": "io.github.notmyfault.shutdown_system",
     "enabled": true,
+    "idempotent": false,
+    "platforms": ["windows", "linux"],
     "execution_api": "context-v1",
     "cancellation_api": "runtime-v1",
-    "permissions": ["native_api", "external_binary"],
+    "permissions": [
+        "native_api",
+        "external_binary"
+    ],
     "security": {
         "rule_approval": "admin_key",
-        "literal_only_params": ["action", "confirm", "force", "delay_seconds"]
+        "literal_only_params": [
+            "action",
+            "confirm",
+            "force",
+            "delay_seconds"
+        ]
     },
     "params": [
         {
@@ -20,11 +30,26 @@
             "type": "select",
             "default": "shutdown",
             "options": [
-                {"value": "shutdown", "label": "关机"},
-                {"value": "restart", "label": "重新启动"},
-                {"value": "logoff", "label": "注销当前用户"},
-                {"value": "hibernate", "label": "休眠"},
-                {"value": "sleep", "label": "睡眠"}
+                {
+                    "value": "shutdown",
+                    "label": "关机"
+                },
+                {
+                    "value": "restart",
+                    "label": "重新启动"
+                },
+                {
+                    "value": "logoff",
+                    "label": "注销当前用户"
+                },
+                {
+                    "value": "hibernate",
+                    "label": "休眠"
+                },
+                {
+                    "value": "sleep",
+                    "label": "睡眠"
+                }
             ]
         },
         {
@@ -43,7 +68,11 @@
             "name": "delay_seconds",
             "label": "延迟秒数",
             "type": "number",
-            "default": 0
+            "default": 0,
+            "value_type": {
+                "type": "duration",
+                "unit": "seconds"
+            }
         }
     ]
 }

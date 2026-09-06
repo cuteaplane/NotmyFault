@@ -6,17 +6,37 @@
     "version": "1.0",
     "package_name": "io.github.notmyfault.run_powershell",
     "enabled": true,
+    "idempotent": false,
     "permissions": [
         "external_binary"
     ],
     "security": {
         "rule_approval": "admin_key",
-        "literal_only_params": ["command"]
+        "literal_only_params": [
+            "command"
+        ]
     },
     "outputs": [
-        {"name": "returncode", "label": "退出状态", "type": "number"},
-        {"name": "stdout", "label": "标准输出", "type": "string", "sensitive": true, "summary": "hidden"},
-        {"name": "stderr", "label": "标准错误", "type": "string", "sensitive": true, "summary": "hidden"}
+        {
+            "name": "returncode",
+            "label": "退出状态",
+            "type": "number",
+            "value_type": "int"
+        },
+        {
+            "name": "stdout",
+            "label": "标准输出",
+            "type": "string",
+            "sensitive": true,
+            "summary": "hidden"
+        },
+        {
+            "name": "stderr",
+            "label": "标准错误",
+            "type": "string",
+            "sensitive": true,
+            "summary": "hidden"
+        }
     ],
     "params": [
         {

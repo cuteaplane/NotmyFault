@@ -1,0 +1,41 @@
+{
+  "id": "create_directory",
+  "name": "创建目录",
+  "description": "按指定路径创建目录及缺少的父目录，路径可引用触发数据或前序结果；已有目录直接成功",
+  "version_code": 1,
+  "version": "1.0",
+  "package_name": "io.github.notmyfault.create_directory",
+  "enabled": true,
+  "idempotent": true,
+  "permissions": [
+    "filesystem"
+  ],
+  "security": {
+    "rule_approval": "admin_key"
+  },
+  "execution_api": "context-v1",
+  "outputs": [
+    {
+      "name": "path",
+      "label": "目录路径",
+      "type": "string",
+      "value_type": "path"
+    },
+    {
+      "name": "created",
+      "label": "本次创建了目录",
+      "type": "bool",
+      "value_type": "bool"
+    }
+  ],
+  "params": [
+    {
+      "name": "directory",
+      "label": "目录路径",
+      "type": "path",
+      "default": "",
+      "required": true,
+      "value_type": "path"
+    }
+  ]
+}

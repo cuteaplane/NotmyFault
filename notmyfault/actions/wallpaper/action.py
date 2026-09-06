@@ -3,6 +3,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from notmyfault.plugin_api import native_lock
+
 SPI_SETDESKWALLPAPER = 0x0014
 SPIF_UPDATEINIFILE = 0x01
 SPIF_SENDCHANGE = 0x02
@@ -72,11 +74,16 @@ def run(action_info, params):
         print("[Action:wallpaper] 壁纸已更换")
         return
 
-    user32 = ctypes.windll.user32
-    result = user32.SystemParametersInfoW(
-        SPI_SETDESKWALLPAPER, 0, abspath,
-        SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
-    )
+    with native_lock():
+        user32 = ctypes.windll.user32
+        user32.SystemParametersInfoW.argtypes = [
+            ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint,
+        ]
+        user32.SystemParametersInfoW.restype = ctypes.c_int
+        result = user32.SystemParametersInfoW(
+            SPI_SETDESKWALLPAPER, 0, ctypes.c_wchar_p(abspath),
+            SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
+        )
     if not result:
         raise RuntimeError(
             f"SystemParametersInfoW 设置壁纸失败（返回 {result}）"

@@ -2,11 +2,17 @@ import ctypes
 import subprocess
 import sys
 
+from notmyfault.plugin_api import native_lock
+
 
 def run(action_info, params):
     print("[Action:lock_screen] 正在锁定屏幕...")
     if sys.platform == "win32":
-        ok = ctypes.windll.user32.LockWorkStation()
+        with native_lock():
+            user32 = ctypes.windll.user32
+            user32.LockWorkStation.argtypes = []
+            user32.LockWorkStation.restype = ctypes.c_int
+            ok = user32.LockWorkStation()
         if not ok:
             raise RuntimeError("LockWorkStation 调用失败（可能被系统拒绝）")
         print("[Action:lock_screen] 屏幕已锁定")

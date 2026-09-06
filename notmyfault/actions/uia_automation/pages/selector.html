@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>屏幕控件编辑器</title>
+<style>
+  :root {
+    color-scheme: dark;
+    font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+    background: #111116;
+    color: #f0eff7;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #111116; }
+  main { display: grid; min-height: 100vh; grid-template-rows: auto 1fr auto; }
+  header { padding: 28px 30px 18px; border-bottom: 1px solid #35353b; }
+  header small { color: #c9baff; font-size: 12px; letter-spacing: .08em; }
+  h1 { margin: 5px 0 7px; font-size: 24px; font-weight: 650; }
+  header p { max-width: 680px; margin: 0; color: #c9c6d0; line-height: 1.6; }
+  .content { display: grid; align-content: start; gap: 16px; padding: 24px 30px; }
+  .selector-card, .empty {
+    display: grid;
+    min-height: 156px;
+    align-content: center;
+    gap: 10px;
+    padding: 22px;
+    border: 1px solid #35353b;
+    border-radius: 16px;
+    background: #1b1b21;
+  }
+  .selector-card { border-left: 4px solid #c9baff; }
+  .selector-card[hidden], .empty[hidden], .status[hidden] { display: none; }
+  .selector-card small, .empty p { color: #c9c6d0; }
+  .selector-card b { overflow-wrap: anywhere; font-size: 20px; }
+  .details { display: grid; grid-template-columns: 104px minmax(0, 1fr); gap: 7px 14px; }
+  .details span:nth-child(odd) { color: #9d99a6; }
+  .details span:nth-child(even) { overflow-wrap: anywhere; }
+  .empty { justify-items: center; text-align: center; }
+  .empty b { font-size: 18px; }
+  .empty p { max-width: 520px; margin: 0; line-height: 1.6; }
+  .actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  button {
+    min-height: 40px;
+    padding: 0 16px;
+    border: 1px solid #625b71;
+    border-radius: 999px;
+    background: transparent;
+    color: #f0eff7;
+    font: inherit;
+    cursor: pointer;
+  }
+  button.primary { border-color: #c9baff; background: #c9baff; color: #241c38; font-weight: 650; }
+  button:hover:not(:disabled) { border-color: #e7deff; }
+  button:disabled { cursor: default; opacity: .55; }
+  .status { margin: 0; padding: 11px 13px; border-radius: 10px; background: #25232d; color: #d8d2e7; }
+  .status.error { background: #4b2025; color: #ffdadc; }
+  footer { display: flex; justify-content: space-between; gap: 12px; padding: 18px 30px 24px; border-top: 1px solid #35353b; }
+  footer div { display: flex; gap: 9px; }
+  @media (max-width: 620px) {
+    header, .content { padding-right: 20px; padding-left: 20px; }
+    footer { align-items: stretch; flex-direction: column; padding: 16px 20px 20px; }
+    footer div { justify-content: flex-end; }
+    .details { grid-template-columns: 82px minmax(0, 1fr); }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <small>WINDOWS UI AUTOMATION</small>
+    <h1>屏幕控件编辑器</h1>
+    <p>开始采集后，把鼠标移到 NotmyFault 以外的目标控件上并保持不动；插件只保存窗口和控件特征。</p>
+  </header>
+  <section class="content">
+    <div id="empty" class="empty">
+      <b>还没有选择屏幕控件</b>
+      <p>采集会在三秒后读取鼠标下方的控件。密码输入框不能保存为目标。</p>
+    </div>
+    <div id="selectorCard" class="selector-card" hidden>
+      <small id="controlType">屏幕控件</small>
+      <b id="controlName">未命名控件</b>
+      <div class="details">
+        <span>程序</span><span id="appName">未知程序</span>
+        <span>窗口</span><span id="windowName">未命名窗口</span>
+        <span>定位标识</span><span id="identity">未提供</span>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="captureButton" class="primary" type="button">选择屏幕上的控件</button>
+      <button id="verifyButton" type="button" disabled>检查这个控件</button>
+    </div>
+    <p id="status" class="status" hidden aria-live="polite"></p>
+  </section>
+  <footer>
+    <button id="cancelButton" type="button">取消</button>
+    <div>
+      <button id="saveButton" class="primary" type="button" disabled>保存控件</button>
+    </div>
+  </footer>
+</main>
+<script>
+  const hostSource = 'notmyfault:extension-host'
+  const viewSource = 'notmyfault:extension-view'
+  const pending = new Map()
+  let requestSequence = 0
+  let selector = null
+  let busy = false
+
+  function invoke(command, payload) {
+    const requestId = 'selector-' + (++requestSequence)
+    window.parent.postMessage({ source:viewSource, type:'invoke', request_id:requestId, command, payload:payload || {} }, '*')
+    return new Promise(function (resolve) { pending.set(requestId, resolve) })
+  }
+
+  function setStatus(message, isError) {
+    const node = document.getElementById('status')
+    node.textContent = message || ''
+    node.className = isError ? 'status error' : 'status'
+    node.hidden = !message
+  }
+
+  function render() {
+    const selected = selector && typeof selector === 'object'
+    const display = selected && selector.display && typeof selector.display === 'object' ? selector.display : {}
+    const target = selected && selector.target && typeof selector.target === 'object' ? selector.target : {}
+    const windowInfo = selected && selector.window && typeof selector.window === 'object' ? selector.window : {}
+    document.getElementById('empty').hidden = Boolean(selected)
+    document.getElementById('selectorCard').hidden = !selected
+    document.getElementById('controlType').textContent = display.control_type || '屏幕控件'
+    document.getElementById('controlName').textContent = display.control || target.name || '未命名控件'
+    document.getElementById('appName').textContent = display.app || windowInfo.process || '未知程序'
+    document.getElementById('windowName').textContent = display.window || windowInfo.name || '未命名窗口'
+    document.getElementById('identity').textContent = target.automation_id || target.name || target.class_name || '未提供'
+    document.getElementById('captureButton').textContent = busy ? '正在等待，请移动鼠标…' : (selected ? '重新选择控件' : '选择屏幕上的控件')
+    document.getElementById('captureButton').disabled = busy
+    document.getElementById('verifyButton').disabled = busy || !selected
+    document.getElementById('saveButton').disabled = busy || !selected
+    document.getElementById('cancelButton').disabled = busy
+  }
+
+  async function capture() {
+    if (busy) return
+    busy = true; setStatus('三秒后读取鼠标下方的控件。', false); render()
+    try {
+      const response = await invoke('capture_selector', { delay_seconds:3 })
+      if (!response || !response.ok) throw new Error(response && response.error || '屏幕控件采集失败')
+      selector = response.data && response.data.selector || null
+      setStatus('已读取控件；保存前可以检查当前是否仍能找到它。', false)
+    } catch (error) { setStatus(error.message || '屏幕控件采集失败', true) }
+    finally { busy = false; render() }
+  }
+
+  async function verify() {
+    if (busy || !selector) return
+    busy = true; setStatus('正在重新查找这个控件…', false); render()
+    try {
+      const response = await invoke('verify_selector', { selector })
+      if (!response || !response.ok) throw new Error(response && response.error || '屏幕控件检查失败')
+      const check = response.data && response.data.check || {}
+      if (!check.ok) throw new Error(check.error || '现在找不到这个控件，请重新选择')
+      selector = response.data.selector || selector
+      setStatus('检查通过，现在仍能找到这个控件。', false)
+    } catch (error) { setStatus(error.message || '屏幕控件检查失败', true) }
+    finally { busy = false; render() }
+  }
+
+  async function save() {
+    if (busy || !selector) return
+    busy = true; render()
+    try {
+      const response = await invoke('commit_selector', { selector })
+      if (!response || !response.ok) throw new Error(response && response.error || '屏幕控件保存失败')
+    } catch (error) { busy = false; render(); setStatus(error.message || '屏幕控件保存失败', true) }
+  }
+
+  async function cancel() {
+    if (busy) return
+    busy = true; render()
+    try {
+      const response = await invoke('cancel_selector', {})
+      if (!response || !response.ok) throw new Error(response && response.error || '取消失败')
+    } catch (error) { busy = false; render(); setStatus(error.message || '取消失败', true) }
+  }
+
+  window.addEventListener('message', function (event) {
+    const message = event.data || {}
+    if (event.source !== window.parent || message.source !== hostSource) return
+    if (message.type === 'init') {
+      selector = message.state && message.state.selector || null
+      render(); return
+    }
+    if (message.type !== 'result' || typeof message.request_id !== 'string') return
+    const resolve = pending.get(message.request_id)
+    if (!resolve) return
+    pending.delete(message.request_id)
+    resolve(message.response || { ok:false, error:'插件宿主没有返回结果' })
+  })
+
+  document.getElementById('captureButton').addEventListener('click', capture)
+  document.getElementById('verifyButton').addEventListener('click', verify)
+  document.getElementById('saveButton').addEventListener('click', save)
+  document.getElementById('cancelButton').addEventListener('click', cancel)
+  document.addEventListener('keydown', function (event) {
+    if (event.key !== 'Escape' || busy) return
+    event.preventDefault()
+    window.parent.postMessage({ source:viewSource, type:'close' }, '*')
+  })
+  render()
+  window.parent.postMessage({ source:viewSource, type:'ready' }, '*')
+</script>
+</body>
+</html>

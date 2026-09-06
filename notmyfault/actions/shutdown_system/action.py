@@ -7,6 +7,8 @@ import os
 import subprocess
 import time
 
+from notmyfault.plugin_api import native_lock
+
 EWX_LOGOFF = 0
 EWX_SHUTDOWN = 0x00000001
 EWX_REBOOT = 0x00000002
@@ -28,8 +30,6 @@ _LINUX_COMMANDS = {
 
 def _enable_shutdown_privilege():
     try:
-        ADVAPI32 = ctypes.windll.advapi32
-        KERNEL32 = ctypes.windll.kernel32
         TOKEN_ADJUST_PRIVILEGES = 0x0020
         TOKEN_QUERY = 0x0008
         SE_PRIVILEGE_ENABLED = 0x2
@@ -44,14 +44,45 @@ def _enable_shutdown_privilege():
                 ("Attributes", ctypes.c_ulong),
             ]
 
-        token = ctypes.c_void_p()
-        ADVAPI32.OpenProcessToken(KERNEL32.GetCurrentProcess(),
-                                   TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-                                   ctypes.byref(token))
-        luid = LUID()
-        ADVAPI32.LookupPrivilegeValueW(None, SE_SHUTDOWN_NAME, ctypes.byref(luid))
-        tp = TOKEN_PRIVILEGES(1, luid, SE_PRIVILEGE_ENABLED)
-        ADVAPI32.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None)
+        with native_lock():
+            advapi32 = ctypes.windll.advapi32
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetCurrentProcess.argtypes = []
+            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle.restype = ctypes.c_int
+            advapi32.OpenProcessToken.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p),
+            ]
+            advapi32.OpenProcessToken.restype = ctypes.c_int
+            advapi32.LookupPrivilegeValueW.argtypes = [
+                ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.POINTER(LUID),
+            ]
+            advapi32.LookupPrivilegeValueW.restype = ctypes.c_int
+            advapi32.AdjustTokenPrivileges.argtypes = [
+                ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(TOKEN_PRIVILEGES),
+                ctypes.c_uint32, ctypes.POINTER(TOKEN_PRIVILEGES),
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            advapi32.AdjustTokenPrivileges.restype = ctypes.c_int
+
+            token = ctypes.c_void_p()
+            if not advapi32.OpenProcessToken(
+                kernel32.GetCurrentProcess(),
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                ctypes.byref(token),
+            ):
+                return
+            try:
+                luid = LUID()
+                if not advapi32.LookupPrivilegeValueW(
+                    None, SE_SHUTDOWN_NAME, ctypes.byref(luid)
+                ):
+                    return
+                tp = TOKEN_PRIVILEGES(1, luid, SE_PRIVILEGE_ENABLED)
+                advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None)
+            finally:
+                kernel32.CloseHandle(token)
     except Exception:
         pass
 
@@ -114,19 +145,24 @@ def _execute(params, cancellation=None):
         return
 
     _enable_shutdown_privilege()
-    if action == "hibernate":
-        ok = ctypes.windll.powrprof.SetSuspendState(True, True, False)
-    elif action == "sleep":
-        ok = ctypes.windll.powrprof.SetSuspendState(False, True, False)
-    else:
-        flags = {
-            "shutdown": EWX_SHUTDOWN | EWX_POWEROFF,
-            "restart": EWX_REBOOT,
-            "logoff": EWX_LOGOFF,
-        }[action]
-        if force:
-            flags |= EWX_FORCE
-        ok = ctypes.windll.user32.ExitWindowsEx(flags, 0)
+    with native_lock():
+        if action in ("hibernate", "sleep"):
+            powrprof = ctypes.windll.powrprof
+            powrprof.SetSuspendState.argtypes = [ctypes.c_ubyte] * 3
+            powrprof.SetSuspendState.restype = ctypes.c_ubyte
+            ok = powrprof.SetSuspendState(action == "hibernate", True, False)
+        else:
+            flags = {
+                "shutdown": EWX_SHUTDOWN | EWX_POWEROFF,
+                "restart": EWX_REBOOT,
+                "logoff": EWX_LOGOFF,
+            }[action]
+            if force:
+                flags |= EWX_FORCE
+            user32 = ctypes.windll.user32
+            user32.ExitWindowsEx.argtypes = [ctypes.c_uint, ctypes.c_uint32]
+            user32.ExitWindowsEx.restype = ctypes.c_int
+            ok = user32.ExitWindowsEx(flags, 0)
     if not ok:
         raise RuntimeError(
             f"系统未能执行 {action}（可能被其他程序阻止或权限不足）"

@@ -93,7 +93,16 @@ def run(action_info, params):
             dest += ".zip"
         _ensure_copy_safe(source, dest)
         base = os.path.splitext(dest)[0]
-        shutil.make_archive(base, "zip", source)
+        if os.path.isdir(source):
+            shutil.make_archive(base, "zip", root_dir=source)
+        else:
+            source_dir = os.path.dirname(source) or "."
+            shutil.make_archive(
+                base,
+                "zip",
+                root_dir=source_dir,
+                base_dir=os.path.basename(source),
+            )
         print(f"[Action:file_operation] 压缩完成: {dest}")
 
     elif operation == "extract":

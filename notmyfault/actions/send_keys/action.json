@@ -6,6 +6,7 @@
     "version": "1.0",
     "package_name": "io.github.notmyfault.send_keys",
     "enabled": true,
+    "idempotent": false,
     "requires_capabilities": ["input.send"],
     "platforms": ["windows", "linux"],
     "permissions": ["native_api","external_binary"],

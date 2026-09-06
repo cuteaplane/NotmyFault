@@ -130,7 +130,7 @@ def test_linux_shortcut_rejects_multiline_fields():
             {
                 "name": "safe",
                 "target_path": "/usr/bin/tool\nX-GNOME-Autostart-enabled=true",
-                "location": "applications",
+                "location": "start_menu",
             },
         )
 
@@ -143,7 +143,7 @@ def test_linux_shortcut_quotes_exec_tokens(tmp_path, monkeypatch):
             "name": "safe",
             "target_path": "/opt/My Tool/tool",
             "arguments": "--label 'two words'",
-            "location": "applications",
+            "location": "start_menu",
         },
     )
     content = Path(result["shortcut_path"]).read_text(encoding="utf-8")
@@ -153,6 +153,13 @@ def test_linux_shortcut_quotes_exec_tokens(tmp_path, monkeypatch):
 def test_launch_program_rejects_unbalanced_quotes():
     with pytest.raises(ValueError, match="引号"):
         launch_program._split_args('"unfinished')
+
+
+@pytest.mark.skipif(launch_program.sys.platform != "win32", reason="仅 Windows 参数规则")
+def test_launch_program_preserves_windows_path_backslashes():
+    assert launch_program._split_args(
+        r'--config C:\Temp\a.txt --label "two words"'
+    ) == ["--config", r"C:\Temp\a.txt", "--label", "two words"]
 
 
 def test_kill_process_rejects_critical_windows_process(monkeypatch):

@@ -5,7 +5,7 @@ Windows 用 SendInput；Linux 走 InputBackend（xdotool 或 ydotool）
 import os
 import subprocess
 
-from notmyfault.plugin_api import native_lock
+from notmyfault.plugin_api import native_lock, platform_services
 
 NATIVE_LOCK = native_lock()
 
@@ -13,9 +13,7 @@ _LINUX_MODIFIERS = {"ctrl", "shift", "alt", "super", "win"}
 
 
 def _linux_type_text(text: str) -> None:
-    from notmyfault.platform.backends import InputBackend
-
-    InputBackend().type_text(text)
+    platform_services().type_text(text)
 
 
 def _linux_send_hotkey(keys: str) -> None:
@@ -31,14 +29,11 @@ def _linux_send_hotkey(keys: str) -> None:
             if main_key_seen:
                 raise ValueError(f"组合键只能包含一个主键: {keys!r}")
             main_key_seen = True
-    from notmyfault.platform.backends import InputBackend
-
-    InputBackend().send_hotkey(parts)
+    platform_services().send_hotkey(parts)
 
 
 if os.name == "nt":
     import ctypes
-    import time
     from ctypes import wintypes
 
     INPUT_KEYBOARD = 1
@@ -103,10 +98,28 @@ if os.name == "nt":
         user32.SendInput.restype = wintypes.UINT
         sent = user32.SendInput(len(array), array, ctypes.sizeof(INPUT))
         if sent != len(array):
-            time.sleep(0.05)
-            sent = user32.SendInput(len(array), array, ctypes.sizeof(INPUT))
-            if sent != len(array):
-                raise RuntimeError(f"SendInput 只发送了 {sent}/{len(array)} 个输入事件")
+            pressed = {}
+            for item in inputs[:sent]:
+                key = (
+                    item.ki.wVk,
+                    item.ki.wScan,
+                    item.ki.dwFlags & ~KEYEVENTF_KEYUP,
+                )
+                if item.ki.dwFlags & KEYEVENTF_KEYUP:
+                    pressed.pop(key, None)
+                else:
+                    pressed[key] = None
+            releases = [
+                _key_input(vk, scan, flags | KEYEVENTF_KEYUP)
+                for vk, scan, flags in reversed(pressed)
+            ]
+            message = f"SendInput 只发送了 {sent}/{len(array)} 个输入事件"
+            if releases:
+                cleanup = (INPUT * len(releases))(*releases)
+                released = user32.SendInput(len(cleanup), cleanup, ctypes.sizeof(INPUT))
+                if released != len(cleanup):
+                    message += "，部分按键未能释放"
+            raise RuntimeError(message)
 
     def _utf16_code_units(text: str) -> list[int]:
         units = []

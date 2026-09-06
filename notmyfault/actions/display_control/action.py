@@ -4,7 +4,7 @@ import os
 import subprocess
 import time
 
-from notmyfault.plugin_api import platform_backend_api
+from notmyfault.plugin_api import native_lock, platform_backend_api
 
 _platform_backend = platform_backend_api()
 DisplayBackend = _platform_backend.DisplayBackend
@@ -237,28 +237,40 @@ def run(action_info, params):
     try:
         if os.name != "nt":
             backend = DisplayBackend(default_runner)
+            result = {"action": action}
             if action in ("set_brightness", "low_brightness", "high_brightness"):
                 brightness = _brightness_level(params)
                 backend.set_brightness(brightness)
+                result["brightness"] = brightness
             elif action in ("off", "on"):
                 backend.set_power(action)
             else:
                 raise ValueError(f"不支持的显示器操作: {action}")
             print(f"[Action:display_control] 操作完成: {action}")
-            return {"action": action}
+            return result
 
-        user32 = ctypes.windll.user32
-        if action == "off":
-            user32.SendMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, MONITOR_OFF)
-            print("[Action:display_control] 显示器已关闭")
+        if action in ("off", "on"):
+            from ctypes import wintypes
 
-        elif action == "on":
-            user32.SendMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, MONITOR_ON)
-            print("[Action:display_control] 显示器已开启")
+            with native_lock():
+                user32 = ctypes.windll.user32
+                user32.SendNotifyMessageW.argtypes = [
+                    wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+                ]
+                user32.SendNotifyMessageW.restype = wintypes.BOOL
+                # 接收广播的电源触发器也需要这把锁才能处理窗口消息。
+                sent = user32.SendNotifyMessageW(
+                    HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER,
+                    MONITOR_OFF if action == "off" else MONITOR_ON,
+                )
+                if not sent:
+                    raise RuntimeError("发送显示器电源命令失败")
+            print("[Action:display_control] 已发送关闭显示器命令" if action == "off" else "[Action:display_control] 已发送开启显示器命令")
 
         elif action in ("set_brightness", "low_brightness", "high_brightness"):
             brightness = _brightness_level(params)
             result = _set_brightness(brightness)
+            result["action"] = action
             print(
                 f"[Action:display_control] 亮度已设置为 {brightness}%（"
                 + "，".join(result["methods"])
@@ -268,6 +280,8 @@ def run(action_info, params):
 
         else:
             raise ValueError(f"不支持的显示器操作: {action}")
+
+        return {"action": action}
 
     except Exception as e:
         print(f"[Action:display_control] 操作失败: {e}")

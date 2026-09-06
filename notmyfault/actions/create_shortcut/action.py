@@ -58,8 +58,8 @@ def _run_linux(action_info, params):
     from pathlib import Path
 
     name, target, location = _validate_common(params)
-    if location not in ("desktop", "applications"):
-        raise ValueError(f"无效的创建位置: {location!r}（可选: desktop/applications）")
+    if location not in ("desktop", "start_menu"):
+        raise ValueError(f"无效的创建位置: {location!r}（可选: desktop/start_menu）")
 
     arguments = str(params.get("arguments", "") or "").strip()
     if any(ch in arguments for ch in ("\r", "\n")):

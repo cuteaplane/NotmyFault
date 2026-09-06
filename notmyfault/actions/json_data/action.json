@@ -1,0 +1,88 @@
+{
+  "id": "json_data",
+  "version_code": 1,
+  "version": "1.0",
+  "package_name": "io.github.notmyfault.json_data",
+  "enabled": true,
+  "origin": "builtin",
+  "permissions": [],
+  "execution_api": "context-v1",
+  "idempotent": true,
+  "name": "JSON 数据",
+  "description": "解析 JSON 文本、按 JSON Pointer 提取已解析值或序列化数据。JSON 文本须先解析再提取；空路径保留原值和类型，序列化字符串会生成 JSON 字符串。",
+  "params": [
+    {
+      "name": "operation",
+      "label": "操作",
+      "type": "select",
+      "default": "parse",
+      "options": [
+        {
+          "value": "parse",
+          "label": "解析 JSON 文本"
+        },
+        {
+          "value": "extract",
+          "label": "提取已解析值"
+        },
+        {
+          "value": "stringify",
+          "label": "序列化绑定值"
+        }
+      ]
+    },
+    {
+      "name": "value",
+      "label": "JSON 文本（解析时）或数据值",
+      "type": "textarea",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": "any",
+      "default": "{}",
+      "rows": 7
+    },
+    {
+      "name": "pointer",
+      "label": "提取路径（留空取完整值）",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "default": "",
+      "placeholder": "/items/0/name；键中的 / 写 ~1，~ 写 ~0",
+      "value_type": "text"
+    },
+    {
+      "name": "pretty",
+      "label": "缩进输出 JSON",
+      "type": "bool",
+      "default": false,
+      "value_type": "bool"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "value",
+      "label": "数据值",
+      "type": "any",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": "any"
+    },
+    {
+      "name": "json",
+      "label": "JSON 文本",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": "text"
+    },
+    {
+      "name": "type",
+      "label": "数据类型",
+      "type": "string",
+      "sensitive": false,
+      "summary": "value",
+      "value_type": "text"
+    }
+  ]
+}

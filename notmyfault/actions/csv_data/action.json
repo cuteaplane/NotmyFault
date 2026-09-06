@@ -1,0 +1,143 @@
+{
+  "id": "csv_data",
+  "version_code": 1,
+  "version": "1.0",
+  "package_name": "io.github.notmyfault.csv_data",
+  "enabled": true,
+  "origin": "builtin",
+  "permissions": [],
+  "execution_api": "context-v1",
+  "idempotent": true,
+  "name": "CSV 数据",
+  "description": "将 CSV 文本解析为记录或将记录数组生成 CSV；有表头时返回对象数组，无表头时返回二维数组，读取的单元格保留文本类型。",
+  "params": [
+    {
+      "name": "operation",
+      "label": "操作",
+      "type": "select",
+      "default": "parse",
+      "options": [
+        {
+          "value": "parse",
+          "label": "解析 CSV 文本"
+        },
+        {
+          "value": "stringify",
+          "label": "生成 CSV 文本"
+        }
+      ]
+    },
+    {
+      "name": "value",
+      "label": "CSV 文本或记录数组",
+      "type": "textarea",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": "any",
+      "default": "",
+      "rows": 7,
+      "placeholder": "生成 CSV 时可填写 JSON 数组或绑定前序步骤的 records"
+    },
+    {
+      "name": "delimiter",
+      "label": "分隔符（一个字符）",
+      "type": "string",
+      "default": ",",
+      "value_type": "text"
+    },
+    {
+      "name": "has_header",
+      "label": "包含表头",
+      "type": "bool",
+      "default": true,
+      "value_type": "bool"
+    },
+    {
+      "name": "columns",
+      "label": "生成 CSV 的列名（JSON 数组，可绑定）",
+      "type": "textarea",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": {
+        "type": "union",
+        "variants": [
+          "text",
+          {
+            "type": "array",
+            "items": "text"
+          }
+        ]
+      },
+      "default": "",
+      "placeholder": "[\"name\",\"value\"]；对象记录留空时自动读取全部键"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "records",
+      "label": "记录数组",
+      "type": "array",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": {
+        "type": "array",
+        "items": {
+          "type": "union",
+          "variants": [
+            {
+              "type": "object",
+              "additional_properties": {
+                "type": "union",
+                "variants": [
+                  "text",
+                  "number",
+                  "bool",
+                  "null"
+                ]
+              }
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "union",
+                "variants": [
+                  "text",
+                  "number",
+                  "bool",
+                  "null"
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "columns",
+      "label": "列名",
+      "type": "array",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": {
+        "type": "array",
+        "items": "text"
+      }
+    },
+    {
+      "name": "text",
+      "label": "CSV 文本",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": "text"
+    },
+    {
+      "name": "row_count",
+      "label": "数据行数",
+      "type": "number",
+      "sensitive": false,
+      "summary": "value",
+      "value_type": "int"
+    }
+  ]
+}

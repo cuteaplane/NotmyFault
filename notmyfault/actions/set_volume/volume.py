@@ -1,6 +1,8 @@
 import os
 import subprocess
 
+from notmyfault.plugin_api import platform_services
+
 _VOLUME_LEVELS = {
     "max": 1.0,
     "half": 0.5,
@@ -22,12 +24,10 @@ def set_volume(action):
     scalar = _VOLUME_LEVELS[action_lower]
 
     if os.name != "nt":
-        from notmyfault.platform.backends import AudioBackend
-
         percent = round(scalar * 100)
-        backend = AudioBackend()
-        backend.set_volume(percent)
-        backend.set_mute(action_lower == "mute")
+        services = platform_services()
+        services.set_volume(percent)
+        services.set_mute(action_lower == "mute")
         return
 
     from pycaw.pycaw import AudioUtilities

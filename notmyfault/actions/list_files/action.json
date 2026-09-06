@@ -1,0 +1,81 @@
+{
+  "id": "list_files",
+  "name": "列出文件",
+  "description": "按相对路径通配符查找文件，可递归子目录；不进入符号链接目录，达到数量上限时返回截断标记",
+  "version_code": 1,
+  "version": "1.0",
+  "package_name": "io.github.notmyfault.list_files",
+  "enabled": true,
+  "idempotent": true,
+  "permissions": [
+    "filesystem"
+  ],
+  "execution_api": "context-v1",
+  "cancellation_api": "runtime-v1",
+  "outputs": [
+    {
+      "name": "directory",
+      "label": "目录路径",
+      "type": "string",
+      "value_type": "path"
+    },
+    {
+      "name": "files",
+      "label": "文件路径列表",
+      "type": "array",
+      "item_type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": {
+        "type": "array",
+        "items": "path"
+      }
+    },
+    {
+      "name": "count",
+      "label": "返回文件数",
+      "type": "number",
+      "value_type": "int"
+    },
+    {
+      "name": "truncated",
+      "label": "还有未返回的文件",
+      "type": "bool",
+      "value_type": "bool"
+    }
+  ],
+  "params": [
+    {
+      "name": "directory",
+      "label": "目录",
+      "type": "path",
+      "default": "",
+      "required": true,
+      "value_type": "path"
+    },
+    {
+      "name": "pattern",
+      "label": "相对路径通配符",
+      "type": "string",
+      "default": "*",
+      "placeholder": "*.txt 或 reports/*.csv；* 可匹配子目录分隔符",
+      "value_type": "text"
+    },
+    {
+      "name": "recursive",
+      "label": "包含子目录",
+      "type": "bool",
+      "default": false,
+      "value_type": "bool"
+    },
+    {
+      "name": "max_results",
+      "label": "结果数量上限",
+      "type": "number",
+      "default": 1000,
+      "min": 1,
+      "max": 100000,
+      "value_type": "int"
+    }
+  ]
+}

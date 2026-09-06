@@ -1,5 +1,5 @@
 """追加文本动作：把内容写到本地文件末尾并保留已有内容
-支持给每行加时间标记，并可选择 utf-8、utf-8-sig 或 gbk 编码
+支持给每行加时间标记，编码使用 Python 文本编码名称
 """
 
 from datetime import datetime
@@ -22,8 +22,7 @@ def run_with_context(action_info, params, context):
         raise ValueError("没有可写入的内容")
 
     encoding = str(params.get("encoding", "utf-8") or "utf-8")
-    if encoding not in ("utf-8", "utf-8-sig", "gbk"):
-        raise ValueError(f"不支持的编码: {encoding!r}（可选: utf-8/utf-8-sig/gbk）")
+    b"".decode(encoding)
 
     add_timestamp = bool(params.get("add_timestamp", True))
     timestamp = (
