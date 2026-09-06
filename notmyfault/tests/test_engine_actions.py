@@ -5,12 +5,14 @@ import os
 import threading
 import time
 import types
+from decimal import Decimal
 
 import pytest
 
 from notmyfault.tests.api_support import create_test_engine
 from notmyfault.core import workflow_executor as workflow_executor_module
 from notmyfault.core.workflow import ActionCancellation, build_context
+from notmyfault.core.run_history import RunHistory
 from notmyfault.security.errors import AdminExecutionBlocked
 
 
@@ -29,6 +31,80 @@ def register_action(engine, action_type, func, meta=None, module=None):
 
 def _context():
     return build_context("规则", "hotkey", {}, [])
+
+
+def test_run_variables_follow_executed_branches_and_survive_failed_assignment(tmp_path):
+    events, received = [], []
+    engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+
+    def consume(meta, params, context):
+        received.append(list(params["rows"]))
+        params["rows"].append(99)
+        context["variables"]["v_rows0001"].append(88)
+        context["constants"]["c_rows0001"].append(77)
+        return {"count": len(received[-1])}
+
+    register_action(engine, "consume", lambda meta, params: None, meta={
+        "execution_api": "context-v1",
+        "params": [{"name": "rows", "type": "textarea", "value_type": {"type": "array", "items": "int"}}],
+        "outputs": [{"name": "count", "type": "number", "value_type": "int"}],
+    }, module=types.SimpleNamespace(run_with_context=consume))
+    rule = {
+        "constants": [{"id": "c_rows0001", "name": "起始值", "value_type": {"type": "array", "items": "int"}, "value": [1]}],
+        "variables": [
+            {"id": "v_rows0001", "name": "记录", "value_type": {"type": "array", "items": "int"}, "initial": {"$ref": {"scope": "constant", "node": "c_rows0001", "path": []}}},
+            {"id": "v_count001", "name": "数量", "value_type": "int"},
+        ],
+        "actions": [
+            {"type": "set_variable", "binding_id": "a_invalid1", "variable": "v_rows0001", "value": [False], "on_error": "continue"},
+            {"type": "consume", "binding_id": "a_before01", "params": {"rows": {"$ref": {"scope": "variable", "node": "v_rows0001", "path": []}}}},
+            {"type": "if", "binding_id": "a_branch01", "condition": {"op": "is_true", "left": True},
+             "then": [{"type": "set_variable", "binding_id": "a_assign01", "variable": "v_rows0001", "value": [1, 2]}],
+             "else": [{"type": "set_variable", "binding_id": "a_assign02", "variable": "v_rows0001", "value": [9]}]},
+            {"type": "consume", "binding_id": "a_consume1", "params": {"rows": {"$ref": {"scope": "variable", "node": "v_rows0001", "path": []}}}},
+            {"type": "set_variable", "binding_id": "a_count001", "variable": "v_count001", "value": {"$ref": {"scope": "step", "node": "a_consume1", "path": ["count"]}}},
+        ],
+    }
+    context = build_context("规则", "hotkey", {}, [], run_id="run_variables")
+    engine.execute_workflow("rule", rule, "规则", context)
+    assert received == [[1], [1, 2]]
+    assert context["constants"]["c_rows0001"] == [1]
+    assert context["variables"] == {"v_rows0001": [1, 2], "v_count001": 2}
+    assert context["steps"]["a_invalid1"]["status"] == "failed"
+    assert "a_assign02" not in context["steps"]
+    assert context["steps"]["a_count001"]["result"] == {"value": 2}
+    assert next(data for name, data in events if name == "workflow_completed")["status"] == "failed"
+    history = RunHistory(str(tmp_path / "runs.jsonl"))
+    for timestamp, (name, data) in enumerate(events):
+        history.record({"type": name, "data": data, "ts": timestamp})
+    failed = next(step for step in history.get_run("run_variables")["steps"] if step["step_id"] == "a_invalid1")
+    assert failed["status"] == "failed"
+    assert failed["error"]["code"] == "type_mismatch"
+    assert failed["error"]["message"]
+
+
+def test_sensitive_variable_values_and_derived_action_outputs_stay_hidden():
+    events = []
+    engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+    register_action(engine, "derive", lambda meta, params: {"derived": params["value"] + "!"}, meta={
+        "params": [{"name": "value", "type": "string"}],
+        "outputs": [{"name": "derived", "type": "string"}],
+    })
+    rule = {
+        "constants": [
+            {"id": "c_value001", "name": "密钥", "value_type": "text", "value": "secret-input", "sensitive": True},
+            {"id": "c_secret01", "name": "密钥引用", "value_type": "text", "value": {"$ref": {"scope": "constant", "node": "c_value001", "path": []}}},
+        ],
+        "variables": [{"id": "v_secret01", "name": "运行密钥", "value_type": "text"}],
+        "actions": [
+            {"type": "set_variable", "binding_id": "a_secret01", "variable": "v_secret01", "value": {"$ref": {"scope": "constant", "node": "c_secret01", "path": []}}},
+            {"type": "derive", "binding_id": "a_derive01", "params": {"value": {"$ref": {"scope": "variable", "node": "v_secret01", "path": []}}}},
+        ],
+    }
+    context = _context()
+    engine.execute_workflow("rule", rule, "规则", context)
+    assert context["steps"]["a_derive01"]["result"] == {"derived": "secret-input!"}
+    assert "secret-input" not in repr(events)
 
 
 class TestExecuteAction:
@@ -141,7 +217,8 @@ class TestExecuteAction:
         assert {data.get("rule_id") for data in run_events} == {"r_rule001"}
         assert any(name == "workflow_completed" for name, data in events if data.get("run_id") == run_id)
 
-    def test_manual_run_can_continue_from_step_with_supplied_upstream_result(self):
+    @pytest.mark.parametrize("count", [2, Decimal("2.0000000000000000001")])
+    def test_manual_run_can_continue_from_step_with_supplied_upstream_result(self, count):
         events = []
         received = []
         engine = make_engine(on_event=lambda name, data: events.append((name, data)))
@@ -149,7 +226,7 @@ class TestExecuteAction:
         register_action(
             engine,
             "second",
-            lambda meta, params: received.append(params) or {"count": 2},
+            lambda meta, params: received.append(params) or {"count": count},
         )
         rule = {
             "rule_id": "r_partial001",
@@ -696,115 +773,61 @@ class TestExecuteAction:
         assert ok is False
         assert attempts == [1]
 
-    def test_precondition_defers_workflow_without_running_actions(self):
-        events = []
-        engine = make_engine(on_event=lambda t, p: events.append((t, p)))
-        module = types.SimpleNamespace(
-            check_precondition=lambda meta, params, context: {
-                "ok": False,
-                "reason": "目录仍在使用",
-                "retry_after_seconds": 10,
-            }
-        )
-        register_action(
-            engine,
-            "doc_check",
-            lambda meta, params: None,
-            meta={"precondition_api": "context-v1"},
-            module=module,
-        )
-        ran = []
-        register_action(engine, "real", lambda meta, params: ran.append(1))
-        rule = {
-            "preconditions": [{"type": "doc_check", "binding_id": "p_doc001", "params": {}}],
-            "actions": [{"type": "real", "binding_id": "a_rea001", "params": {}}],
-        }
-        engine.execute_workflow("wf", rule, "规则", _context())
-        assert ran == []
-        assert len(engine._deferred_workflows) == 1
-        assert any(t == "workflow_deferred" for t, _ in events)
-        engine._cancel_deferred_workflows()
-
-    def test_cancel_run_removes_deferred_timer(self):
+    @pytest.mark.parametrize("source", ["event", "step"])
+    @pytest.mark.parametrize("value, expected", [(True, ["else", "after"]), (False, ["then", "after"]), (None, [])])
+    def test_if_selects_one_branch_and_stops_on_missing_data(self, source, value, expected, tmp_path):
         events = []
         engine = make_engine(on_event=lambda name, data: events.append((name, data)))
-        module = types.SimpleNamespace(
-            check_precondition=lambda meta, params, context: {
-                "ok": False,
-                "reason": "目录仍在使用",
-                "retry_after_seconds": 30,
-            }
-        )
-        register_action(
-            engine,
-            "doc_check",
-            lambda meta, params: None,
-            meta={"precondition_api": "context-v1"},
-            module=module,
-        )
-        context = build_context(
-            "规则", "manual", {}, [], run_id="run_deferred001"
-        )
-
-        engine.execute_workflow(
-            "wf",
-            {"preconditions": [{
-                "type": "doc_check",
-                "binding_id": "p_doc001",
-                "params": {},
-            }], "actions": []},
-            "规则",
-            context,
-        )
-
-        assert "run_deferred001" in engine._deferred_workflows
-        assert engine.cancel_run("run_deferred001") is True
-        assert "run_deferred001" not in engine._deferred_workflows
-        completed = [data for name, data in events if name == "workflow_completed"]
-        assert completed[-1]["status"] == "cancelled"
-
-    def test_repeated_deferred_workflow_keeps_each_run(self):
-        events = []
-        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
-        module = types.SimpleNamespace(
-            check_precondition=lambda meta, params, context: {
-                "ok": False,
-                "reason": "目录仍在使用",
-                "retry_after_seconds": 30,
-            }
-        )
-        register_action(
-            engine,
-            "doc_check",
-            lambda meta, params: None,
-            meta={"precondition_api": "context-v1"},
-            module=module,
-        )
-        rule = {
-            "preconditions": [{
-                "type": "doc_check",
-                "binding_id": "p_doc001",
-                "params": {},
-            }],
-            "actions": [],
+        called = []
+        register_action(engine, "record", lambda meta, params: called.append(params["label"]))
+        context = build_context("规则", "hotkey", {}, [], run_id="run_branch")
+        if value is not None:
+            context["event"]["payload"]["ready"] = value
+        context["steps"]["a_source01"] = {"status": "failed" if value is None else "ok", "result": value}
+        reference = {"scope": "event", "path": ["ready"]} if source == "event" else {"scope": "step", "node": "a_source01", "path": []}
+        def action(label):
+            return {"type": "record", "binding_id": f"a_{label}001", "params": {"label": label}}
+        branch = {
+            "type": "if", "binding_id": "a_branch01",
+            "condition": {"op": "not", "children": [{
+                "op": "is_true", "left": {"$ref": reference},
+            }]},
+            "then": [action("then")], "else": [action("else")],
         }
-        first = build_context("规则", "manual", {}, [], run_id="run_deferred001")
-        second = build_context("规则", "manual", {}, [], run_id="run_deferred002")
+        result = engine.execute_actions([branch, action("after")], "规则", context)
+        assert result is (value is not None)
+        assert called == expected
+        assert context["steps"]["a_branch01"]["status"] == ("failed" if value is None else "ok")
+        history = RunHistory(str(tmp_path / "runs.jsonl"))
+        for timestamp, (name, data) in enumerate(events):
+            history.record({"type": name, "data": data, "ts": timestamp})
+        saved = next(step for step in history.get_run("run_branch")["steps"] if step["step_id"] == "a_branch01")
+        assert saved["status"] == ("failed" if value is None else "succeeded")
+        if value is None:
+            assert saved["error"]["code"] == "missing_binding_value"
 
-        engine.execute_workflow("wf", rule, "规则", first)
-        engine.execute_workflow("wf", rule, "规则", second)
-
-        assert set(engine._deferred_workflows) == {
-            "run_deferred001",
-            "run_deferred002",
-        }
-        assert not [data for name, data in events if name == "workflow_completed"]
-        engine._cancel_deferred_workflows()
-        completed = [data for name, data in events if name == "workflow_completed"]
-        assert {item["run_id"] for item in completed} == {
-            "run_deferred001",
-            "run_deferred002",
-        }
+    @pytest.mark.parametrize("count, threshold", [(2, 1), (Decimal("2.0000000000000000001"), Decimal("2.0000000000000000000"))])
+    def test_if_nested_branch_uses_previous_results_and_propagates_failure(self, count, threshold):
+        engine = make_engine()
+        called = []
+        register_action(engine, "query", lambda meta, params: {"count": count})
+        register_action(engine, "record", lambda meta, params: called.append(params["count"]))
+        def fail(meta, params):
+            raise RuntimeError("动作失败")
+        register_action(engine, "fail", fail)
+        source = {"$ref": {"scope": "step", "node": "a_query01", "path": ["count"]}}
+        actions = [
+            {"type": "query", "binding_id": "a_query01", "params": {}},
+            {"type": "if", "binding_id": "a_outer01", "condition": {"op": "gt", "left": source, "right": threshold}, "then": [
+                {"type": "if", "binding_id": "a_inner01", "condition": {"op": "eq", "left": source, "right": count}, "then": [
+                    {"type": "record", "binding_id": "a_record01", "params": {"count": source}},
+                    {"type": "fail", "binding_id": "a_failed01", "params": {}},
+                ], "else": []},
+            ], "else": []},
+            {"type": "record", "params": {"count": 99}},
+        ]
+        assert engine.execute_actions(actions, "规则", _context()) is False
+        assert called == [count]
 
     def test_validate_params_called(self):
         engine = make_engine()

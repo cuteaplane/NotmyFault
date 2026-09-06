@@ -6,6 +6,9 @@ import threading
 import time
 from pathlib import Path
 
+from notmyfault.core.data_types import DataTypeError, copy_value
+from notmyfault.core.value_codec import decode_value, encode_value
+
 
 STARTUP_TIMEOUT = 10.0
 EXECUTE_TIMEOUT = 120.0
@@ -43,21 +46,21 @@ def set_crash_callback(callback) -> None:
 
 
 def _sanitize_context(context):
-    """去掉 context 中的内部键，把其他值转成 JSON 能保存的类型"""
+    """上下文顶层的内部键不进入 worker，业务对象保留原字段名。"""
     def clean(value):
         if isinstance(value, dict):
             return {
                 key: clean(item)
                 for key, item in value.items()
-                if not str(key).startswith("_")
             }
         if isinstance(value, list):
             return [clean(item) for item in value]
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            return value
-        return repr(value)
+        try:
+            return copy_value(value)
+        except DataTypeError:
+            return repr(value)
 
-    return clean(context)
+    return clean({key: value for key, value in context.items() if not str(key).startswith("_")})
 
 
 def _stop_process(process: subprocess.Popen) -> None:
@@ -131,6 +134,8 @@ def run_isolated_action(
         "action_info": action_info,
         "params": params,
         "context": _sanitize_context(context),
+        "value_encoding": "typed-v1",
+        "data_types": context["_type_registry"].snapshot() if context.get("_type_registry") is not None else {},
     }
     process = subprocess.Popen(
         [sys.executable, "-X", "utf8", str(_WORKER_MAIN)],
@@ -201,7 +206,8 @@ def _drive(process, messages, request, execute_timeout):
     try:
         if process.stdin is None:
             raise OSError("stdin unavailable")
-        process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+        wire_request = encode_value(request) if request.get("value_encoding") == "typed-v1" else request
+        process.stdin.write(json.dumps(wire_request, ensure_ascii=False, allow_nan=False) + "\n")
         process.stdin.flush()
         process.stdin.close()
     except (OSError, ValueError):
@@ -217,7 +223,13 @@ def _drive(process, messages, request, execute_timeout):
     if payload.get("type") != "result":
         _fail_protocol(process, "worker 执行结果不符合协议")
     if payload.get("ok") is True:
-        return True, payload.get("result")
+        result = payload.get("result")
+        if payload.get("value_encoding") == "typed-v1":
+            try:
+                result = decode_value(result)
+            except DataTypeError:
+                _fail_protocol(process, "worker 返回的数据编码无效")
+        return True, result
     return False, payload.get("error") or "worker 执行失败"
 
 

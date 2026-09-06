@@ -2,7 +2,13 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from notmyfault.core.logging import engine_warn
+from notmyfault.core.binding_schema import prepare_binding_context
+from notmyfault.core.bindings import BindingResolutionError
+from notmyfault.core.data_types import DataTypeError, normalize_fields
+from notmyfault.core.type_registry import TypeRegistry
+from notmyfault.core.variables import resolve_trigger_constants
 from notmyfault.core.workflow import build_context
+from notmyfault.core.rules import get_rule_condition, get_rule_events, validate_condition_tree
 
 
 class EventBus:
@@ -58,9 +64,17 @@ class EventBus:
             rule_id = rule.get("rule_id", "")
             # 调度 key 用 rule_id，没有就用规则名；带数组下标会在规则重排后串到别的规则
             rule_key = rule_id or str(rule.get("name", ""))
+            try:
+                registry = TypeRegistry.from_plugins(self._triggers_meta_fn(), self._actions_meta_fn())
+                resolved = resolve_trigger_constants(rule, registry)
+                for leaf in get_rule_events(resolved):
+                    leaf["params"] = normalize_fields(leaf.get("params", {}), self._triggers_meta_fn().get(leaf.get("type"), {}).get("params"), registry, parameters=True)
+            except (DataTypeError, BindingResolutionError) as error:
+                self._safe_on_event("rule_error", {"rule_id": rule_id, "error": error.as_dict()})
+                continue
             matched_events = self._condition_runtime.match_and_take(
                 rule_key,
-                rule,
+                resolved,
                 event_type,
                 event_payload,
                 instance=instance,
@@ -68,33 +82,57 @@ class EventBus:
             if matched_events is None:
                 continue
 
-            rule_name = rule.get("name", "未命名规则")
-            run_id = f"run_{uuid.uuid4().hex}"
-            print(f"[EventBus] [OK] 匹配到规则: <{rule_name}>, 准备分发动作！")
-            self._safe_on_event(
-                "rule_triggered",
-                {
-                    "rule_id": rule_id,
-                    "run_id": run_id,
-                    "rule_name": rule_name,
-                    "event_type": event_type,
-                    "action_count": len(rule.get("actions", [])),
-                    "precondition_count": len(rule.get("preconditions", [])),
-                    "event_payload": masked_payload,
-                },
-            )
-            context = build_context(
-                rule_name,
-                event_type,
-                event_payload,
-                matched_events,
-                rule_id,
-                run_id,
-            )
-            if self._scheduler_submit_fn is not None:
-                self._scheduler_submit_fn(rule_key, rule, rule_name, context)
-            else:
-                self._execute_workflow_cb(rule_key, rule, rule_name, context)
+            self._dispatch(rule, rule_key, event_type, event_payload, masked_payload, matched_events)
+
+    def poll_absences(self, now=None):
+        if self._is_shutdown_fn():
+            return
+        with self._rules_lock:
+            rules = list(self._rules_fn())
+            for rule in rules:
+                condition = get_rule_condition(rule)
+                if validate_condition_tree(condition):
+                    continue
+                if any(event.get("type") not in self._triggers_meta_fn() for event in get_rule_events(rule)):
+                    continue
+                rule_key = rule.get("rule_id") or str(rule.get("name", ""))
+                matched = self._condition_runtime.poll_absences(rule_key, rule, now)
+                if matched is not None:
+                    self._dispatch(rule, rule_key, "absence", {}, {}, matched)
+
+    def _dispatch(self, rule, rule_key, event_type, event_payload, masked_payload, matched_events):
+        rule_id = rule.get("rule_id", "")
+        rule_name = rule.get("name", "未命名规则")
+        run_id = f"run_{uuid.uuid4().hex}"
+        print(f"[EventBus] [OK] 匹配到规则: <{rule_name}>, 准备分发动作！")
+        self._safe_on_event(
+            "rule_triggered",
+            {
+                "rule_id": rule_id,
+                "run_id": run_id,
+                "rule_name": rule_name,
+                "event_type": event_type,
+                "action_count": len(rule.get("actions", [])),
+                "event_payload": masked_payload,
+            },
+        )
+        context = build_context(
+            rule_name,
+            event_type,
+            event_payload,
+            matched_events,
+            rule_id,
+            run_id,
+        )
+        try:
+            prepare_binding_context(rule, context, self._triggers_meta_fn(), self._actions_meta_fn())
+        except (DataTypeError, BindingResolutionError) as error:
+            self._safe_on_event("workflow_failed", {"run_id": run_id, "rule_id": rule_id, "rule_name": rule_name, "error": error.as_dict()})
+            return
+        if self._scheduler_submit_fn is not None:
+            self._scheduler_submit_fn(rule_key, rule, rule_name, context)
+        else:
+            self._execute_workflow_cb(rule_key, rule, rule_name, context)
 
     def call_notmyfault(self, event_data: Dict[str, Any]) -> None:
         """接收触发器线程推送的外部事件"""
@@ -166,4 +204,10 @@ class EventBus:
                     actions_meta.get(step.get("type", ""), {}),
                     step.get("result"),
                 )
+        for scope, bucket in (("constant", "constants"), ("variable", "variables")):
+            marked = context.get("_sensitive_sources", {}).get(scope, {})
+            for identity in marked:
+                add_strings(context.get(bucket, {}).get(identity))
+        for identity in context.get("_sensitive_sources", {}).get("step", {}):
+            add_strings(context.get("steps", {}).get(identity, {}).get("result"))
         return values

@@ -3,6 +3,8 @@
 import importlib.util
 import json
 import threading
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -309,11 +311,15 @@ class V2MatchingTests:
             "actions": [],
         }
 
-    def test_v2_config_matching_hits_own_leaf(self):
+    @pytest.mark.parametrize("extra", [{}, {"amount": Decimal("1.20"), "data": b"\x00\xff", "day": date(2024, 2, 29)}])
+    def test_v2_config_matching_hits_own_leaf(self, extra):
         runtime = ConditionRuntime()
+        rule = self._v2_rule()
+        for leaf in rule["condition"]["children"]:
+            leaf["params"].update(extra)
         matched = runtime.match(
-            "rule:1", self._v2_rule(), "folder_monitor", {"event": "created"},
-            instance={"config": {"folder_path": "B"}},
+            "rule:1", rule, "folder_monitor", {"event": "created"},
+            instance={"config": {"folder_path": "B", **extra}},
         )
         assert matched is True
         hits = runtime.last_match("rule:1")
@@ -380,7 +386,11 @@ class V2OptimizationTests:
         assert config_fingerprint({"b": 2, "a": 1}) == config_fingerprint({"a": 1, "b": 2})
         assert config_fingerprint({"items": [1.0, 2]}) == config_fingerprint({"items": (1, 2.0)})
 
-    def test_supervisor_dedupes_normalized_identical_configs(self):
+    @pytest.mark.parametrize("configs", [
+        [{"threshold": 90}, {"threshold": 90.0}],
+        [{"amount": Decimal("1.20"), "data": b"\x00\xff"}, {"data": b"\x00\xff", "amount": Decimal("1.20")}],
+    ])
+    def test_supervisor_dedupes_normalized_identical_configs(self, configs):
         started = []
         did_start = threading.Event()
 
@@ -390,7 +400,7 @@ class V2OptimizationTests:
 
         supervisor = TriggerSupervisor()
         count = supervisor.start(
-            {"demo": [{"threshold": 90}, {"threshold": 90.0}]},
+            {"demo": configs},
             {"demo": lambda meta, cfg, emit, se=None: None},
             {"demo": {"trigger_api": "event-v2"}},
             run_cb,

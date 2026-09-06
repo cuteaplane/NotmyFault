@@ -1,22 +1,29 @@
-"""执行规则工作流、前置条件和动作"""
+"""执行规则工作流和动作分支"""
 
 from __future__ import annotations
 
+import copy
 import sys
 import threading
 import time
 import traceback
+from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from notmyfault.core.bindings import (
     BindingResolutionError,
+    contains_dynamic_value,
     contains_legacy_template,
     is_reference,
     references_available,
     resolve_value,
     unavailable_references,
 )
+from notmyfault.core.binding_schema import prepare_binding_context
+from notmyfault.core.data_types import DataTypeError
+from notmyfault.core.variables import assign_variable, expression_is_sensitive
 from notmyfault.core.diagnostics import Diagnostics
+from notmyfault.core.predicates import evaluate_predicate
 from notmyfault.core.logging import engine_error
 from notmyfault.core.run_summary import summarize_fields
 from notmyfault.core.workflow import (
@@ -36,13 +43,6 @@ EventSink = Callable[[str, Dict[str, Any]], None]
 WorkflowCallback = Callable[..., Any]
 SensitiveProvider = Callable[[Dict[str, Any]], set]
 _MISSING = object()
-MAX_PRECONDITION_RETRIES = 60
-
-
-class PreconditionCheckError(RuntimeError):
-    pass
-
-
 def _run_id(context: Dict[str, Any]) -> str:
     return str(context.get("run", {}).get("id", ""))
 
@@ -118,6 +118,9 @@ def _assertion_value(context: Dict[str, Any], assertion: Dict[str, Any]) -> Any:
         return _MISSING
     current = step.get("result", _MISSING)
     for segment in assertion.get("path", []):
+        if isinstance(current, list) and isinstance(segment, int) and not isinstance(segment, bool) and 0 <= segment < len(current):
+            current = current[segment]
+            continue
         if not isinstance(current, dict) or segment not in current:
             return _MISSING
         current = current[segment]
@@ -146,7 +149,7 @@ def _assertion_matches(actual: Any, operator: str, expected: Any) -> bool:
     if operator in {"gt", "gte", "lt", "lte"}:
         if isinstance(actual, bool) or isinstance(expected, bool):
             return False
-        if not isinstance(actual, (int, float)) or not isinstance(expected, (int, float)):
+        if not isinstance(actual, (int, float, Decimal)) or not isinstance(expected, (int, float, Decimal)):
             return False
         return {
             "gt": actual > expected,
@@ -176,8 +179,10 @@ class WorkflowExecutor:
         run_action: WorkflowCallback,
         action_resolver: Optional[ActionResolver] = None,
         sensitive_values: Optional[SensitiveProvider] = None,
+        triggers_meta: Optional[MappingProvider] = None,
     ) -> None:
         self._actions_meta = actions_meta
+        self._triggers_meta = triggers_meta or (lambda: {})
         self._actions_funcs = actions_funcs
         self._action_resolver = action_resolver
         self._plugin_modules = plugin_modules
@@ -299,97 +304,22 @@ class WorkflowExecutor:
         rule_name: str,
         context: Dict[str, Any],
     ) -> None:
-        """执行规则工作流，前置条件未满足时安排延迟重试"""
+        """执行规则工作流并记录运行结果"""
         if context.get("_run_finished") is True:
             return
+        if not context.get("_variables_initialized"):
+            try:
+                prepare_binding_context(rule, context, self._triggers_meta(), self._actions_meta())
+            except (DataTypeError, BindingResolutionError) as error:
+                self._finish_run(context)
+                self._on_event("workflow_failed", {
+                    "run_id": _run_id(context), "rule_id": rule.get("rule_id", ""),
+                    "rule_name": rule_name, "error": error.as_dict(),
+                })
+                return
         run_cancel_event = self._ensure_run_cancel_event(context)
         if run_cancel_event.is_set():
             self._complete_cancelled(context, rule_name)
-            return
-        try:
-            ready, reason, retry_after = self.check_preconditions(
-                rule.get("preconditions", []), context,
-            )
-        except BindingResolutionError as exc:
-            if not self._finish_run(context):
-                return
-            self._on_event(
-                "workflow_failed",
-                {
-                    "rule_id": context.get("rule", {}).get("id", ""),
-                    "run_id": _run_id(context),
-                    "rule_name": rule_name,
-                    "error": exc.as_dict(),
-                },
-            )
-            print(
-                f"[Engine] 工作流 <{rule_name}> 数据绑定失败: {exc}",
-                file=sys.stderr,
-            )
-            return
-        except PreconditionCheckError as exc:
-            if not self._finish_run(context):
-                return
-            message = self._masked_event_value(str(exc), context)
-            self._on_event(
-                "workflow_failed",
-                {
-                    "rule_id": context.get("rule", {}).get("id", ""),
-                    "run_id": _run_id(context),
-                    "rule_name": rule_name,
-                    "error": {
-                        "code": "precondition_check_failed",
-                        "message": message,
-                    },
-                },
-            )
-            print(
-                f"[Engine] 工作流 <{rule_name}> 前置条件检查失败: {message}",
-                file=sys.stderr,
-            )
-            return
-        if not ready:
-            if run_cancel_event.is_set():
-                self._complete_cancelled(context, rule_name)
-                return
-            attempts = int(context.get("_precondition_attempts", 0) or 0) + 1
-            context["_precondition_attempts"] = attempts
-            if attempts > MAX_PRECONDITION_RETRIES:
-                if self._finish_run(context):
-                    self._on_event(
-                        "workflow_failed",
-                        {
-                            "rule_id": context.get("rule", {}).get("id", ""),
-                            "run_id": _run_id(context),
-                            "rule_name": rule_name,
-                            "error": {
-                                "code": "precondition_retry_exhausted",
-                                "message": "前置条件长时间未满足，已停止重试",
-                            },
-                        },
-                    )
-                return
-            try:
-                delay = float(retry_after)
-            except (TypeError, ValueError):
-                delay = 60.0
-            delay = min(max(delay, 5), 3600)
-            event_reason = self._masked_event_value(str(reason), context)
-            self._on_event(
-                "workflow_deferred",
-                {
-                    "rule_id": context.get("rule", {}).get("id", ""),
-                    "run_id": _run_id(context),
-                    "rule_name": rule_name,
-                    "reason": event_reason,
-                    "retry_after_seconds": delay,
-                },
-            )
-            print(
-                f"[Engine] 工作流 <{rule_name}> 前置条件未满足，{delay}s 后重试: {event_reason}",
-                file=sys.stderr,
-            )
-            self._defer_workflow(workflow_key, rule, rule_name, context, delay)
             return
         actions = rule.get("actions", [])
         if not isinstance(actions, list):
@@ -464,64 +394,6 @@ class WorkflowExecutor:
         }
         self._on_event("test_assertions_completed", summary)
         return summary
-
-    def check_preconditions(
-        self,
-        preconditions: Any,
-        context: Dict[str, Any],
-    ) -> Tuple[bool, str, float | None]:
-        """调用动作插件的前置条件检查并返回结果"""
-        if not preconditions:
-            return True, "", None
-        if not isinstance(preconditions, list):
-            return False, "preconditions 必须是数组", None
-
-        actions_funcs = self._actions_funcs()
-        actions_meta = self._actions_meta()
-        for index, spec in enumerate(preconditions):
-            if not isinstance(spec, dict):
-                return False, f"preconditions[{index}] 必须是对象", None
-            action_type = spec.get("type")
-            action_func = self._resolve_action(action_type)
-            plugin_modules = self._plugin_modules()
-            module = plugin_modules.get(action_type)
-            action_meta = actions_meta.get(action_type, {})
-            check = getattr(module, "check_precondition", None)
-            if (
-                action_func is None
-                or not callable(check)
-                or action_meta.get("precondition_api") != "context-v1"
-            ):
-                raise PreconditionCheckError(
-                    f"前置条件插件不可用或未声明 context-v1: {action_type}",
-                )
-            try:
-                params = resolve_value(
-                    spec.get("params", {}),
-                    context,
-                    location=f"preconditions[{index}].params",
-                )
-                if not isinstance(params, dict):
-                    return False, f"前置条件 {action_type} 的 params 必须是对象", None
-                verdict = check(action_meta, params, context)
-            except BindingResolutionError:
-                raise
-            except Exception as error:
-                raise PreconditionCheckError(
-                    f"前置条件 {action_type} 检查异常"
-                ) from error
-            if verdict is True:
-                continue
-            if isinstance(verdict, dict):
-                if verdict.get("ok") is True:
-                    continue
-                return (
-                    False,
-                    str(verdict.get("reason") or f"前置条件 {action_type} 未满足"),
-                    verdict.get("retry_after_seconds"),
-                )
-            return False, f"前置条件 {action_type} 未满足", None
-        return True, "", None
 
     def defer_workflow(
         self,
@@ -637,6 +509,18 @@ class WorkflowExecutor:
                 f"{legacy_offset + index + 1}"
             )
             step_id = action.get("binding_id") or legacy_step_id
+            if action.get("type") == "set_variable":
+                ok = self._execute_assignment(action, step_id, rule_name, context)
+                all_ok = all_ok and ok
+                if not ok and action.get("on_error", "stop") != "continue":
+                    break
+                continue
+            if action.get("type") == "if":
+                ok = self._execute_if(action, step_id, rule_name, context, run_failure_actions)
+                all_ok = all_ok and ok
+                if not ok and action.get("on_error", "stop") != "continue":
+                    break
+                continue
             if not references_available(action.get("params", {}), context):
                 missing_sources = unavailable_references(
                     action.get("params", {}), context
@@ -710,6 +594,68 @@ class WorkflowExecutor:
                 break
         return all_ok
 
+    def _execute_assignment(self, action, step_id, rule_name, context):
+        event = {
+            "action_type": "set_variable", "step_id": step_id, "rule_name": rule_name,
+            "run_id": _run_id(context), "rule_id": context.get("rule", {}).get("id", ""),
+            "duration_ms": 0,
+        }
+        if not references_available(action.get("value"), context):
+            context["steps"][step_id] = {"type": "set_variable", "status": "skipped", "result": None, "error": None}
+            self._on_event("action_skipped", {**event, "reason": "赋值来源未参与本次运行"})
+            return True
+        try:
+            value = assign_variable(action.get("variable"), action.get("value"), context)
+            result = {"value": value}
+            context["steps"][step_id] = {"type": "set_variable", "status": "ok", "result": result, "error": None}
+            sensitive = bool(context.get("_sensitive_sources", {}).get("variable", {}).get(action.get("variable")))
+            if sensitive:
+                context.setdefault("_sensitive_sources", {}).setdefault("step", {})[step_id] = [["value"]]
+            self._on_event("action_executed", {**event, "status": "ok", "result": {"value": "***"} if sensitive else result})
+            return True
+        except (DataTypeError, BindingResolutionError) as error:
+            message = self._masked_event_value(str(error), context)
+            context["steps"][step_id] = {"type": "set_variable", "status": "failed", "result": None, "error": message}
+            self._on_event("error", {**event, "error": {
+                "code": error.code, "location": error.location, "message": message,
+            }, "status": "failed"})
+            return False
+
+    def _execute_if(self, action, step_id, rule_name, context, run_failure_actions):
+        started = time.perf_counter()
+        event = {
+            "action_type": "if", "step_id": step_id, "rule_name": rule_name,
+            "rule_id": context.get("rule", {}).get("id", ""), "run_id": _run_id(context),
+        }
+        try:
+            matched = evaluate_predicate(action.get("condition"), context)
+            branch = "then" if matched else "else"
+            succeeded = self._execute_action_sequence(
+                action.get(branch, []), rule_name, context,
+                legacy_prefix=f"{step_id}_{branch}_", run_failure_actions=run_failure_actions,
+            )
+            result = {"matched": matched, "branch": branch}
+            context["steps"][step_id] = {
+                "type": "if", "status": "ok" if succeeded else "failed",
+                "result": result if succeeded else None,
+                "error": None if succeeded else "分支动作执行失败",
+            }
+            self._on_event("action_executed" if succeeded else "error", {
+                **event, "status": "ok" if succeeded else "failed", "result": result,
+                "error": None if succeeded else {"code": "action_execution_failed", "message": "分支动作执行失败"},
+                "duration_ms": round((time.perf_counter() - started) * 1000),
+            })
+            return succeeded
+        except (BindingResolutionError, ValueError, TypeError) as error:
+            message = self._masked_event_value(str(error), context)
+            context["steps"][step_id] = {
+                "type": "if", "status": "failed", "result": None, "error": message,
+            }
+            self._on_event("error", {**event, "error": {
+                "code": getattr(error, "code", "condition_evaluation_failed"), "message": message,
+            }, "duration_ms": 0})
+            return False
+
     def execute_action(
         self,
         action: Dict[str, Any],
@@ -743,7 +689,7 @@ class WorkflowExecutor:
         if isinstance(raw_params, dict):
             for param_name in sorted(literal_only_params(action_meta)):
                 raw_value = raw_params.get(param_name)
-                if is_reference(raw_value) or contains_legacy_template(raw_value):
+                if contains_dynamic_value(raw_value):
                     dynamic_parameter_name = param_name
                     dynamic_parameter_error = (
                         f"参数 {param_name!r} 只允许使用固定值"
@@ -862,7 +808,12 @@ class WorkflowExecutor:
 
         attempt = 0
         try:
-            input_summary = summarize_fields(params, action_meta.get("params"))
+            sensitive_params = {name for name, value in raw_params.items() if expression_is_sensitive(value, context)}
+            input_definitions = [
+                {**field, "sensitive": True, "summary": "hidden"} if isinstance(field, dict) and field.get("name") in sensitive_params else field
+                for field in action_meta.get("params", [])
+            ]
+            input_summary = summarize_fields(params, input_definitions)
             retries = min(max(int(action.get("retry", 0) or 0), 0), 3)
             delay = min(
                 max(float(action.get("retry_delay_seconds", 0) or 0), 0),
@@ -876,11 +827,8 @@ class WorkflowExecutor:
                         self._shutdown_event(),
                         timeout_seconds,
                     )
-                    action_context = {
-                        key: value
-                        for key, value in context.items()
-                        if key != "_run_cancel_event"
-                    }
+                    action_context = {key: copy.deepcopy(value) for key, value in context.items() if not key.startswith("_")}
+                    action_context["_type_registry"] = context.get("_type_registry")
                     runtime = dict(action_context.get("runtime", {}))
                     runtime["cancellation"] = cancellation
                     action_context["runtime"] = runtime
@@ -888,6 +836,8 @@ class WorkflowExecutor:
                         action_func, module, action_meta, params, action_context
                     )
                     cancellation.raise_if_cancelled()
+                    if sensitive_params:
+                        context.setdefault("_sensitive_sources", {}).setdefault("step", {})[action.get("binding_id") or action_type] = [[]]
                     self._diagnostics.inc_action_ok()
                     if self._sensitive_values is not None:
                         hidden = self._sensitive_values(context)
@@ -901,6 +851,11 @@ class WorkflowExecutor:
                         )
                     else:
                         event_params = params
+                    if sensitive_params:
+                        event_params = {name: "***" if name in sensitive_params else value for name, value in event_params.items()}
+                    output_definitions = action_meta.get("outputs")
+                    if sensitive_params:
+                        output_definitions = [{"name": name, "sensitive": True, "summary": "hidden"} for name in result] if isinstance(result, dict) else []
                     self._on_event(
                         "action_executed",
                         {
@@ -913,9 +868,9 @@ class WorkflowExecutor:
                             "status": "ok",
                             "input_summary": input_summary,
                             "output_summary": summarize_fields(
-                                result, action_meta.get("outputs")
+                                result, output_definitions
                             ),
-                            "result": _mask_declared_outputs(
+                            "result": "***" if sensitive_params else _mask_declared_outputs(
                                 result, action_meta.get("outputs")
                             ),
                             "attempt": attempt + 1,
@@ -995,9 +950,11 @@ class WorkflowExecutor:
             )
             engine_error(
                 "action_failed",
+                plugin=action_type,
                 action_type=action_type,
                 rule_name=rule_name,
                 error_type=type(error).__name__,
+                reason=type(error).__name__,
             )
             self._on_event(
                 "error",

@@ -7,11 +7,13 @@ import sys
 import threading
 import time
 from contextlib import redirect_stderr
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from notmyfault.core import plugin_worker
+from notmyfault.core.type_registry import TypeRegistry
 from notmyfault.core.plugin_worker import (
     PluginWorkerCrashed,
     PluginWorkerStartupTimeout,
@@ -115,6 +117,26 @@ time.sleep(30)
 
 
 class TestRunIsolatedAction:
+    def test_shared_typed_values_survive_isolated_action_round_trip(self, tmp_path):
+        identity = "com.test.transport/record@1"
+        meta = {
+            "id": "transport", "package_name": "com.test.transport",
+            "execution_api": "context-v1",
+            "contributes": {"data_types": [{
+                "id": "record", "version": 1, "binding": "shared",
+                "schema": {"type": "object", "properties": {"amount": "decimal", "data": "bytes", "count": "int"}, "required": ["amount", "data", "count"]},
+            }]},
+            "params": [{"name": "value", "type": "textarea", "value_type": identity}],
+            "outputs": [{"name": "echo", "type": "object", "value_type": identity}],
+        }
+        registry = TypeRegistry.from_plugins([meta])
+        value = registry.make_value(identity, {"amount": Decimal("1.00000000000000001"), "data": b"\x00\xff", "count": 2**100 + 1, "_business_key": "kept"})
+        entry = write_action(tmp_path, "typed", "def run(meta, params):\n    return {}\ndef run_with_context(meta, params, context):\n    assert params['value'] == context['variables']['saved']\n    return {'echo': params['value']}\n")
+        ok, result = run_isolated_action(entry, meta, {"value": value}, {"variables": {"saved": value}, "_type_registry": registry})
+        assert ok is True
+        assert result == {"echo": value}
+        assert isinstance(result["echo"]["data"]["amount"], Decimal)
+
     def test_runpy_cannot_bypass_strict_package_guard(self):
         code = (
             "import runpy\n"
@@ -123,6 +145,7 @@ class TestRunIsolatedAction:
         result = subprocess.run(
             [sys.executable, "-c", code],
             cwd=str(Path(__file__).resolve().parents[2]),
+            env={**os.environ, "NOTMYFAULT_MODE": "stable"},
             capture_output=True,
             text=True,
             encoding="utf-8",

@@ -31,6 +31,11 @@ from notmyfault.security.security import (
 )
 from notmyfault.core.trigger_supervisor import TriggerSupervisor
 from notmyfault.core.workflow import build_context
+from notmyfault.core.binding_schema import prepare_binding_context
+from notmyfault.core.bindings import BindingResolutionError
+from notmyfault.core.data_types import DataTypeError, normalize_fields
+from notmyfault.core.type_registry import TypeRegistry
+from notmyfault.core.variables import resolve_trigger_constants
 from notmyfault.core.workflow_executor import WorkflowExecutor
 
 
@@ -126,6 +131,7 @@ class AutomationEngine:
         )
         self._workflow_executor = WorkflowExecutor(
             actions_meta=lambda: self.actions_meta,
+            triggers_meta=lambda: self.triggers_meta,
             actions_funcs=lambda: self.actions_funcs,
             plugin_modules=lambda: self._plugin_modules,
             diagnostics=self._diag_obj,
@@ -212,11 +218,13 @@ class AutomationEngine:
         """触发器线程入口，隔离插件异常并上报崩溃"""
         # 触发器代码来自插件，异常由这里捕获并上报
         try:
+            registry = TypeRegistry.from_plugins(self.triggers_meta, self.actions_meta)
             def emit_checked(event_name: str, payload: Dict[str, Any]) -> None:
                 if not isinstance(payload, dict):
                     raise TypeError("emit_event 的 payload 必须是对象")
                 problems = check_payload_contract(
-                    trigger_meta.get("outputs"), payload
+                    trigger_meta.get("outputs"), payload,
+                    registry,
                 )
                 if problems:
                     print(
@@ -242,7 +250,7 @@ class AutomationEngine:
                     return
                 self.emit_event(
                     event_name,
-                    payload,
+                    normalize_fields(payload, trigger_meta.get("outputs"), registry),
                     instance={"config": config},
                 )
 
@@ -266,8 +274,10 @@ class AutomationEngine:
             )
             engine_error(
                 "trigger_crashed",
+                plugin=instance_id,
                 trigger=instance_id,
                 error_type=error_type,
+                reason=error_type,
             )
             self._diag_obj.record_trigger_crash(instance_id, error_type)
             self._trigger_supervisor.mark_crashed(instance_id, error_type)
@@ -524,6 +534,7 @@ class AutomationEngine:
         start_step_id: str = "",
         end_step_id: str = "",
         test_assertions: Optional[List[Dict[str, Any]]] = None,
+        variable_values: Optional[Dict[str, Any]] = None,
     ) -> tuple[bool, str, str]:
         """执行调用方传入的规则快照"""
         rule = copy.deepcopy(rule)
@@ -592,13 +603,21 @@ class AutomationEngine:
             for event in get_rule_events(rule)
             if isinstance(event.get("binding_id"), str)
         }
+        context["manual_test"]["variable_values"] = variable_values
+        try:
+            prepared_rule = resolve_trigger_constants(rule, TypeRegistry.from_plugins(self.triggers_meta, self.actions_meta))
+            configs = {event.get("binding_id"): event.get("params", {}) for event in get_rule_events(prepared_rule)}
+            for identity, trigger in context["triggers"].items():
+                trigger["config"] = configs.get(identity, trigger["config"])
+            prepare_binding_context(rule, context, self.triggers_meta, self.actions_meta)
+        except (DataTypeError, BindingResolutionError) as error:
+            return False, str(error), run_id
         self._safe_on_event("rule_triggered", {
             "rule_id": rule_id,
             "run_id": run_id,
             "rule_name": rule_name,
             "event_type": "manual",
             "action_count": selected_count,
-            "precondition_count": len(rule.get("preconditions", [])),
             "start_step_id": start_step_id,
             "end_step_id": end_step_id,
             "assertion_count": len(test_assertions or []),
@@ -626,11 +645,6 @@ class AutomationEngine:
         return self._workflow_executor.execute_workflow(
             workflow_key, rule, rule_name, context
         )
-
-    def _check_preconditions(
-        self, preconditions: Any, context: Dict[str, Any],
-    ) -> Tuple[bool, str, float | None]:
-        return self._workflow_executor.check_preconditions(preconditions, context)
 
     def _defer_workflow(
         self,
@@ -691,7 +705,17 @@ class AutomationEngine:
                 rules = list(self.rules)
 
         # event-v1 每类触发器共用一条线程，event-v2 每个配置使用独立实例
-        aggregated = aggregate_trigger_params(rules)
+        registry = TypeRegistry.from_plugins(self.triggers_meta, self.actions_meta)
+        resolved_rules = []
+        for rule in rules:
+            try:
+                resolved = resolve_trigger_constants(rule, registry)
+                for event in get_rule_events(resolved):
+                    event["params"] = normalize_fields(event.get("params", {}), self.triggers_meta.get(event.get("type"), {}).get("params"), registry, parameters=True)
+                resolved_rules.append(resolved)
+            except (DataTypeError, BindingResolutionError) as error:
+                self._diag_obj.add_rule_issue(rule.get("name", ""), str(error))
+        aggregated = aggregate_trigger_params(resolved_rules)
 
         # 规则驱动的懒加载：只物化被规则引用的触发器，未引用的保持 pending
         for trigger_id in aggregated:
@@ -767,7 +791,7 @@ class AutomationEngine:
                     engine_error("integrity_check_failed", files=",".join(bad))
                     self._alert_user(
                         "NotmyFault 完整性校验失败",
-                        f"核心文件可能被篡改（{detail}）请重新运行 python build.py 生成完整性清单",
+                        f"安装文件缺失、损坏或被修改（{detail}）。请从可信来源重新安装 NotmyFault。",
                         open_dashboard=True,
                     )
                     raise RuntimeError("核心文件完整性校验失败")
@@ -801,11 +825,13 @@ class AutomationEngine:
 
             se = self._shutdown_flag
             self._hot_reloader.begin()
+            self._event_bus.poll_absences()
 
             try:
                 while not se.is_set():
                     se.wait(1)
                     self._hot_reloader.check_once()
+                    self._event_bus.poll_absences()
             except KeyboardInterrupt:
                 print("[Engine] 主程序收到中断，退出中...")
         finally:

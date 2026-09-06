@@ -61,6 +61,45 @@ class TestCallNotmyfault:
 
 
 class TestConditionRuntime:
+    @pytest.mark.parametrize("combined", [False, True])
+    def test_not_waits_for_absence_and_rearms_only_after_matching_event(self, combined):
+        runtime = ConditionRuntime()
+        absence = {"op": "not", "within_seconds": 10, "children": [{
+            "type": "signal", "binding_id": "t_signal01", "params": {"channel": "a"},
+        }]}
+        rule = {"condition": {"op": "all", "children": [
+            {"type": "start", "binding_id": "t_start01", "params": {}}, absence,
+        ]} if combined else absence}
+        assert runtime.poll_absences("r", rule, now=0) is None
+        if combined:
+            assert runtime.match_and_take("r", rule, "start", {}, now=1) is None
+        assert runtime.match_and_take("r", rule, "signal", {"channel": "a"}, now=9) is None
+        assert runtime.poll_absences("r", rule, now=10) is None
+        assert runtime.match_and_take("r", rule, "signal", {"channel": "b"}, now=18) is None
+        assert runtime.poll_absences("r", rule, now=19) is not None
+        assert runtime.poll_absences("r", rule, now=100) is None
+        assert runtime.match_and_take("r", rule, "signal", {}, now=101, instance={"config": {"channel": "a"}}) is None
+        if combined:
+            assert runtime.match_and_take("r", rule, "start", {}, now=102) is None
+        assert runtime.poll_absences("r", rule, now=111) is not None
+        runtime.reset()
+        assert runtime.poll_absences("r", rule, now=200) is None
+
+    def test_absence_event_is_dispatched_through_rule_scheduler(self):
+        rule = {"name": "无事件", "condition": {"op": "not", "within_seconds": 10, "children": [
+            {"type": "signal", "params": {}},
+        ]}, "actions": []}
+        engine = make_engine([rule])
+        engine.triggers_meta["signal"] = {}
+        dispatched = []
+        engine._event_bus._scheduler_submit_fn = lambda *args: dispatched.append(args)
+        engine._event_bus.poll_absences(now=0)
+        engine._event_bus.poll_absences(now=10)
+        engine._event_bus.poll_absences(now=20)
+        assert len(dispatched) == 1
+        assert dispatched[0][3]["event"]["type"] == "absence"
+        assert dispatched[0][3]["triggers"] == {}
+
     def test_all_condition_respects_time_window(self):
         runtime = ConditionRuntime()
         rule = {"condition": {
@@ -311,27 +350,10 @@ class TestValidateAllRules:
         assert engine._validate_all_rules() == (1, 1)
         assert alerts == []
 
-    def test_uia_selector_must_contain_window_and_target_identity(self):
-        meta = {"params": [{
-            "name": "target",
-            "type": "uia_selector",
-            "label": "屏幕控件",
-        }]}
-        engine, alerts = self._engine_with_meta(
-            [self._rule(params={"target": {}})], meta
-        )
-
-        assert engine._validate_all_rules() == (0, 1)
-        assert alerts
-        assert any(
-            "没有有效的屏幕控件" in issue[1]
-            for issue in engine._diag_obj.data["rule_issues"]
-        )
-
     def test_required_action_param_must_be_present(self):
         meta = {"params": [{
             "name": "target",
-            "type": "uia_selector",
+            "type": "string",
             "label": "屏幕控件",
             "required": True,
         }]}
@@ -343,27 +365,6 @@ class TestValidateAllRules:
             "缺少必填参数: target" in issue[1]
             for issue in engine._diag_obj.data["rule_issues"]
         )
-
-    def test_uia_selector_accepts_recorded_identity(self):
-        meta = {"params": [{
-            "name": "target",
-            "type": "uia_selector",
-            "label": "屏幕控件",
-        }]}
-        selector = {
-            "version": 1,
-            "window": {"process": "notepad.exe"},
-            "target": {
-                "automation_id": "FileSave",
-                "control_type": 50000,
-            },
-        }
-        engine, alerts = self._engine_with_meta(
-            [self._rule(params={"target": selector})], meta
-        )
-
-        assert engine._validate_all_rules() == (1, 1)
-        assert alerts == []
 
     def test_plugin_data_requires_declared_owner_and_version(self):
         meta = {
@@ -547,3 +548,21 @@ def test_validate_rules_rejects_invalid_or_duplicate_rule_ids():
     assert any("rule_id 无效" in error for error in validate_rules_structure([invalid]))
     errors = validate_rules_structure([duplicate, dict(duplicate)])
     assert any("rule_id 与其他规则重复" in error for error in errors)
+
+
+def test_control_flow_structure_and_normalization():
+    from notmyfault.config import normalize_rules
+    from notmyfault.core.rules import get_rule_admin_plugins
+    rule = {"name": "分支", "condition": {"op": "not", "within_seconds": 10, "children": [{"type": "signal", "params": {}}]}, "actions": [
+        {"type": "if", "condition": {"op": "eq", "left": 1, "right": 1}, "then": [{"type": "admin_action", "params": {}}], "else": []},
+    ]}
+    normalized = normalize_rules([rule])[0]
+    assert normalized["condition"]["op"] == "not"
+    assert validate_rule_structure(normalized) == []
+    assert validate_rule_binding_ids(normalized) == []
+    assert get_rule_admin_plugins(normalized, {"signal": {}}, {"admin_action": {"permissions": ["admin"]}}) == ["admin_action"]
+    normalized["preconditions"] = [{"type": "check"}]
+    assert any("运行前检查已移除" in error for error in validate_rule_structure(normalized))
+    del normalized["preconditions"]
+    normalized["condition"]["within_seconds"] = 0
+    assert validate_rule_structure(normalized)

@@ -4,6 +4,8 @@ import threading
 import time
 from typing import Any, Callable, Dict
 
+from notmyfault.core.data_types import normalize_fields
+
 
 class ActionCancelled(RuntimeError):
     """动作在执行前或协作等待期间收到取消请求"""
@@ -113,12 +115,15 @@ def invoke_action(
     context: Dict[str, Any],
 ) -> Any:
     """按插件元数据调用新旧动作 API，兼容 run 和 run_with_context"""
-    # 插件元数据声明执行接口，调用方按声明传入参数
+    registry = context.get("_type_registry")
+    params = normalize_fields(params, action_meta.get("params"), registry, parameters=True, location="params")
     if action_meta.get("execution_api") == "context-v1":
         context_runner = getattr(module, "run_with_context", None)
         if not callable(context_runner):
             context_runner = getattr(action_func, "run_with_context", None)
         if not callable(context_runner):
             raise TypeError("execution_api=context-v1 的插件必须定义 run_with_context()")
-        return context_runner(action_meta, params, context)
-    return action_func(action_meta, params)
+        result = context_runner(action_meta, params, context)
+    else:
+        result = action_func(action_meta, params)
+    return normalize_fields(result, action_meta.get("outputs"), registry, location="outputs")

@@ -7,9 +7,14 @@ import pytest
 
 from notmyfault.core.bindings import (
     BindingResolutionError,
+    BindingSkip,
+    contains_dynamic_value,
     iter_references,
+    references_available,
     resolve_value,
 )
+from notmyfault.core.data_types import DataTypeError
+from notmyfault.core.variables import assign_variable, initialize_variables, resolve_trigger_constants
 from notmyfault.core.rules import guaranteed_trigger_ids, validate_rule_bindings
 from notmyfault.core.workflow import build_context
 
@@ -137,25 +142,6 @@ def test_actions_allow_conditional_or_source():
     assert validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META) == []
 
 
-def test_preconditions_reject_conditional_or_source():
-    rule = _rule(
-        {
-            "op": "any",
-            "children": [_leaf("usb_insert", "t_usb001"), _leaf("hotkey", "t_hot001")],
-        },
-        [{"type": "notify", "binding_id": "a_not001", "params": {"message": "x"}}],
-        preconditions=[
-            {
-                "type": "notify",
-                "binding_id": "p_che001",
-                "params": {"message": _ref("trigger", "t_usb001", ["drive"])},
-            }
-        ],
-    )
-    issues = validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META)
-    assert [issue["code"] for issue in issues] == ["conditional_source"]
-
-
 def test_static_validation_accepts_guaranteed_typed_trigger_output():
     rule = _rule(
         _leaf("usb_insert", "t_usb001"),
@@ -170,37 +156,18 @@ def test_static_validation_accepts_guaranteed_typed_trigger_output():
     assert validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META) == []
 
 
-def test_static_validation_rejects_conditional_or_source():
-    # 开始前确认既不能引用 or 分支触发器，也不能引用步骤结果
-    rule = _rule(
-        {
-            "op": "any",
-            "children": [_leaf("usb_insert", "t_usb001"), _leaf("hotkey", "t_hot001")],
-        },
-        [
-            {
-                "type": "open_url",
-                "binding_id": "a_url001",
-                "params": {"url": _ref("step", "a_not001", ["status"])},
-            },
-            {
-                "type": "notify",
-                "binding_id": "a_not001",
-                "params": {"message": _ref("trigger", "t_hot001", ["keys"])},
-            }
-        ],
-        preconditions=[
-            {
-                "type": "notify",
-                "binding_id": "p_che001",
-                "params": {"message": _ref("step", "a_not001", ["status"])},
-            }
-        ],
-    )
-    codes = [issue["code"] for issue in validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META)]
-    assert "step_not_available" in codes
-    # 动作引用后面的步骤算前向引用
-    assert "forward_reference" in codes
+def test_if_bindings_cannot_cross_branches_or_reference_later_actions():
+    first = {"type": "open_url", "binding_id": "a_first01", "params": {"url": "https://example.com"}}
+    second = {"type": "notify", "binding_id": "a_second01", "params": {"message": _ref("step", "a_first01", ["status"])}}
+    branch = {"type": "if", "binding_id": "a_branch01", "condition": {"op": "eq", "left": _ref("trigger", "t_usb001", ["drive"]), "right": "D:"}, "then": [first, second], "else": []}
+    rule = _rule(_leaf("usb_insert", "t_usb001"), [branch])
+    assert validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META) == []
+    branch["then"] = [first]
+    branch["else"] = [second]
+    assert [issue["code"] for issue in validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META)] == ["forward_reference"]
+    branch["else"] = []
+    rule["actions"].append(second)
+    assert [issue["code"] for issue in validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META)] == ["forward_reference"]
 
 
 def test_event_reference_and_legacy_template_remain_supported():
@@ -373,6 +340,113 @@ def test_structured_reference_preserves_original_types():
     assert resolved == [1, 2]
     resolved = resolve_value(_ref("trigger", "t_usb001", ["ok"]), context)
     assert resolved is True
-    # 整串旧模板也保留原类型，不转成字符串
     resolved = resolve_value("{{ triggers.t_usb001.payload.count }}", context)
     assert resolved == 5 and isinstance(resolved, int)
+
+
+def test_nested_keys_templates_and_explicit_conversion_preserve_literal_data():
+    context = {"steps": {"a_source01": {"status": "ok", "result": {"记录": [{"文件.名": "report.csv", "数量": "12"}]}}}}
+    source = _ref("step", "a_source01", ["记录", 0, "文件.名"])
+    count = {"$convert": {"value": _ref("step", "a_source01", ["记录", 0, "数量"]), "to": "int"}}
+    assert resolve_value(count, context) == 12
+    assert resolve_value({"$template": ["目标/", source]}, context) == "目标/report.csv"
+    with pytest.raises(BindingResolutionError):
+        resolve_value({"$template": [count]}, context)
+    literal = {"$literal": {"$ref": {"scope": "step", "node": "missing"}, "text": "{{ event.payload.secret }}"}}
+    assert resolve_value(literal, context) == literal["$literal"]
+    assert list(iter_references(literal)) == []
+    assert not contains_dynamic_value(literal)
+    assert contains_dynamic_value({"nested": [count]})
+    assert references_available(literal, context)
+
+
+def test_optional_reference_policies_do_not_hide_failed_sources_or_null_values():
+    context = {"steps": {"a_source01": {"status": "ok", "result": {"null": None, "zero": 0, "flag": False}}}}
+    def optional(path, policy="default", fallback="missing"):
+        reference = {"scope": "step", "node": "a_source01", "path": [path], "on_missing": policy}
+        if policy == "default":
+            reference["default"] = fallback
+        return {"$ref": reference}
+    assert resolve_value(optional("absent"), context) == "missing"
+    for field, expected in (("null", None), ("zero", 0), ("flag", False)):
+        assert resolve_value(optional(field), context) is expected
+    assert not references_available(optional("absent", "skip"), context)
+    with pytest.raises(BindingSkip):
+        resolve_value(optional("absent", "skip"), context)
+    assert references_available(optional("null", fallback=_ref("step", "unavailable", [])), context)
+    context["steps"]["a_source01"]["status"] = "failed"
+    with pytest.raises(BindingResolutionError) as caught:
+        resolve_value(optional("absent"), context)
+    assert caught.value.code == "failed_binding_source"
+
+
+def test_constants_and_run_variables_have_independent_values_and_atomic_assignment():
+    rule = {
+        "constants": [
+            {"id": "c_folder01", "name": "输出目录", "value_type": "path", "value": "D:/results"},
+            {"id": "c_values01", "name": "初始列表", "value_type": {"type": "array", "items": "int"}, "value": [1]},
+        ],
+        "variables": [
+            {"id": "v_values01", "name": "当前列表", "value_type": {"type": "array", "items": "int"}, "initial": _ref("constant", "c_values01", [])},
+            {"id": "v_total001", "name": "合计", "value_type": {"type": "int", "nullable": True}},
+        ],
+        "condition": {"type": "path_exists", "params": {"path": _ref("constant", "c_folder01", [])}},
+    }
+    first, second = {}, {}
+    initialize_variables(rule, first)
+    initialize_variables(rule, second)
+    assert resolve_trigger_constants(rule)["condition"]["params"]["path"] == "D:/results"
+    assert "$ref" in rule["condition"]["params"]["path"]
+    value = resolve_value(_ref("variable", "v_values01", []), first)
+    value.append(2)
+    assign_variable("v_values01", value, first)
+    assert first["variables"]["v_values01"] == [1, 2]
+    assert second["variables"]["v_values01"] == [1]
+    assert first["constants"]["c_values01"] == [1]
+    with pytest.raises(DataTypeError):
+        assign_variable("v_values01", [False], first)
+    assert first["variables"]["v_values01"] == [1, 2]
+    with pytest.raises(DataTypeError):
+        assign_variable("c_values01", [], first)
+    with pytest.raises(BindingResolutionError):
+        resolve_value(_ref("variable", "v_total001", []), first)
+    assign_variable("v_total001", None, first)
+    assert resolve_value(_ref("variable", "v_total001", []), first) is None
+    initialize_variables(rule, second, overrides={"v_total001": 7})
+    assert second["variables"]["v_total001"] == 7
+
+
+def test_constant_dependencies_are_checked_before_run_initialization():
+    rule = {"constants": [
+        {"id": "c_first001", "name": "第一项", "value_type": "text", "value": _ref("constant", "c_second01", [])},
+        {"id": "c_second01", "name": "第二项", "value_type": "text", "value": "value", "sensitive": True},
+    ]}
+    context = {}
+    initialize_variables(rule, context)
+    assert context["constants"]["c_first001"] == "value"
+    rule["constants"][1]["value"] = _ref("constant", "c_first001", [])
+    with pytest.raises(DataTypeError) as caught:
+        initialize_variables(rule, {})
+    assert caught.value.code == "cyclic_constant"
+    rule["constants"][1]["value"] = _ref("variable", "v_future01", [])
+    with pytest.raises(DataTypeError):
+        initialize_variables(rule, {})
+
+
+def test_typed_nested_bindings_conversion_and_optional_policy_are_checked_on_save():
+    actions_meta = {
+        "source": {"outputs": [{"name": "rows", "type": "array", "value_type": {"type": "array", "items": {"type": "object", "properties": {"count": "int"}, "required": ["count"], "additional_properties": False}}}]},
+        "consume": {"params": [{"name": "record", "type": "textarea", "value_type": {"type": "object", "properties": {"text": "text"}, "required": ["text"]}}]},
+    }
+    reference = {"$ref": {"scope": "step", "node": "a_source01", "path": ["rows", 0, "count"], "on_missing": "error"}}
+    rule = _rule(_leaf("usb_insert", "t_usb001"), [
+        {"type": "source", "binding_id": "a_source01", "params": {}},
+        {"type": "consume", "binding_id": "a_consume1", "params": {"record": {"text": reference}}},
+    ])
+    issues = validate_rule_bindings(rule, TRIGGERS_META, actions_meta)
+    assert [issue["code"] for issue in issues] == ["binding_type_mismatch"]
+    assert issues[0]["location"] == "actions[1].params.record.text"
+    rule["actions"][1]["params"]["record"]["text"] = {"$convert": {"value": reference, "to": "text"}}
+    assert validate_rule_bindings(rule, TRIGGERS_META, actions_meta) == []
+    reference["$ref"].pop("on_missing")
+    assert [issue["code"] for issue in validate_rule_bindings(rule, TRIGGERS_META, actions_meta)] == ["optional_output"]

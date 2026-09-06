@@ -7,6 +7,8 @@ import traceback
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from notmyfault.core.logging import engine_error, engine_info
+
 
 EngineFactory = Callable[..., Any]
 EventSink = Callable[[str, dict[str, Any]], None]
@@ -98,6 +100,7 @@ class RuntimeController:
                 return
             self._state = state
             listeners = tuple(self._state_listeners)
+        engine_info(f"引擎状态：{state}")
         for listener in listeners:
             try:
                 listener(state)
@@ -135,9 +138,14 @@ class RuntimeController:
             self._set_state("starting")
             try:
                 thread.start()
-            except Exception:
+            except Exception as exc:
                 self._engine_thread = None
                 self._set_state("stopped")
+                engine_error(
+                    "engine_start_failed",
+                    reason=str(exc),
+                    error_type=type(exc).__name__,
+                )
                 raise
             return True
 
@@ -159,6 +167,11 @@ class RuntimeController:
         except Exception as exc:
             with self._lifecycle_lock:
                 self._last_error = str(exc)
+            engine_error(
+                "engine_failed",
+                reason=str(exc),
+                error_type=type(exc).__name__,
+            )
             print(f"[Engine] 引擎错误: {exc}")
             traceback.print_exc()
             self._emit_event("error", {"error": str(exc)})

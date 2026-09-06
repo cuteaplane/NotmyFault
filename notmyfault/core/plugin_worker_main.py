@@ -15,6 +15,10 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 import notmyfault as _notmyfault
+from notmyfault.core.data_types import DataTypeError
+from notmyfault.core.type_registry import TypeRegistry
+from notmyfault.core.value_codec import decode_value, encode_value
+from notmyfault.core.workflow import invoke_action
 
 
 def _jsonable(value):
@@ -36,6 +40,9 @@ def main() -> None:
 
     sys.stdout = sys.stderr
     try:
+        typed = request.get("value_encoding") == "typed-v1"
+        if typed:
+            request = decode_value(request)
         entry = Path(request["entry"])
         source = entry.read_bytes()
         expected_hash = request.get("entry_sha256")
@@ -52,15 +59,20 @@ def main() -> None:
         module.__file__ = str(entry)
         exec(compile(source, str(entry), "exec"), module.__dict__)
         action_info = request["action_info"]
-        if action_info.get("execution_api") == "context-v1":
-            result = module.run_with_context(
-                action_info,
-                request["params"],
-                request.get("context", {}),
-            )
+        context = request.get("context", {})
+        if typed:
+            context["_type_registry"] = TypeRegistry(request.get("data_types"))
+        result = invoke_action(module.run, module, action_info, request["params"], context)
+        if typed:
+            try:
+                result = encode_value(result)
+            except DataTypeError:
+                result = repr(result)
         else:
-            result = module.run(action_info, request["params"])
-        payload = {"type": "result", "ok": True, "result": _jsonable(result)}
+            result = _jsonable(result)
+        payload = {"type": "result", "ok": True, "result": result}
+        if typed:
+            payload["value_encoding"] = "typed-v1"
     except BaseException as exc:  # 动作代码什么都能抛，包括 SystemExit
         payload = {
             "type": "result",
