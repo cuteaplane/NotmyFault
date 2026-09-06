@@ -11,7 +11,9 @@ import tempfile
 from typing import Any, Dict, List
 
 from notmyfault.application_paths import ApplicationPaths
-from notmyfault.core.bindings import is_reference
+from notmyfault.core.bindings import is_reference, is_literal, is_typed_value
+from notmyfault.core.data_types import DataTypeError
+from notmyfault.core.value_codec import decode_value, encode_value
 
 
 _BINDING_ID_RE = re.compile(r"^[tap]_[a-z0-9_]{6,64}$")
@@ -106,6 +108,12 @@ def ensure_rule_binding_ids(rule: Dict[str, Any]) -> Dict[str, Any]:
                 item_copy["failure_actions"] = normalize_items(
                     item_copy["failure_actions"], "a", include_failures=False
                 )
+            if item_copy.get("type") == "if":
+                for branch in ("then", "else"):
+                    if branch in item_copy:
+                        item_copy[branch] = normalize_items(
+                            item_copy[branch], "a", include_failures=include_failures
+                        )
             normalized.append(item_copy)
         return normalized
 
@@ -313,7 +321,7 @@ def _normalize_condition(condition: Any) -> Any:
         return copied
 
     op = copied.get("op", copied.get("type", "any"))
-    copied["op"] = "all" if op in ("all", "and") else "any"
+    copied["op"] = "all" if op in ("all", "and") else "not" if op == "not" else "any"
     copied["children"] = [_normalize_condition(child) for child in children]
     copied.pop("events", None)
     copied.pop("type", None)
@@ -327,6 +335,8 @@ def _unwrap_single_condition(condition: Any) -> Dict[str, Any] | None:
     """从单分支条件组中取出事件，消除旧版重复字段"""
     current = condition
     while isinstance(current, dict):
+        if current.get("op") == "not":
+            return None
         children = current.get("children")
         if isinstance(children, list):
             if len(children) != 1:
@@ -338,6 +348,8 @@ def _unwrap_single_condition(condition: Any) -> Dict[str, Any] | None:
 
 
 def _replace_step_references(value: Any, replacements: Dict[str, str]) -> Any:
+    if is_literal(value) or is_typed_value(value):
+        return copy.deepcopy(value)
     if isinstance(value, str):
         def replace(match: re.Match[str]) -> str:
             parts = match.group(1).split(".")
@@ -425,6 +437,8 @@ def _upgrade_legacy_templates(
     step_refs: Dict[str, str],
 ) -> Any:
     """把纯模板字符串转换为结构化 $ref，并更新混合模板中的步骤 ID"""
+    if is_literal(value) or is_typed_value(value):
+        return copy.deepcopy(value)
     if isinstance(value, str):
         full = _LEGACY_TEMPLATE_RE.fullmatch(value)
         if full:
@@ -698,7 +712,7 @@ class SignedConfigStore:
         if not isinstance(rules, list):
             print("[Config] 保存规则失败: rules 必须是列表", file=sys.stderr)
             return False
-        data = {"schema_version": 2, "rules": _normalize_rules(rules)}
+        data = {"schema_version": 2, "value_encoding": "typed-v1", "rules": encode_value(_normalize_rules(rules))}
         return self._write_signed_json(
             self.rules_path,
             self.rules_path + ".bak",
@@ -720,7 +734,19 @@ class SignedConfigStore:
             raise ConfigValidationError(f"{label}缺少签名")
         if not self._verify(raw, signature):
             raise ConfigValidationError(f"{label}签名校验失败")
-        return raw
+        return self._decode_rules_data(raw)
+
+    @staticmethod
+    def _decode_rules_data(data):
+        encoding = data.get("value_encoding")
+        if encoding is None:
+            return data
+        if encoding != "typed-v1":
+            raise ConfigValidationError("规则数据编码版本不受支持")
+        try:
+            return {**data, "rules": decode_value(data.get("rules"))}
+        except DataTypeError as error:
+            raise ConfigValidationError(str(error)) from error
 
     def load_verified_config(self) -> Dict[str, Any]:
         normalized = _normalize_config(self._read_signed(self.config_path, "配置"))
@@ -728,14 +754,23 @@ class SignedConfigStore:
             raise ConfigValidationError("规范化后的配置必须是对象")
         return normalized
 
-    def load_verified_rules(self) -> List[Dict[str, Any]]:
+    def load_verified_rules(self, *, for_editing: bool = False) -> List[Dict[str, Any]]:
         raw = self._read_signed(self.rules_path, "规则")
         rules = raw.get("rules")
         if not isinstance(rules, list):
             raise ConfigValidationError("rules 必须是列表")
-        _validate_rules_for_runtime(rules)
+        def validate(items):
+            if for_editing:
+                items = [
+                    {key: value for key, value in rule.items() if key != "preconditions"}
+                    if isinstance(rule, dict) else rule
+                    for rule in items
+                ]
+            _validate_rules_for_runtime(items)
+
+        validate(rules)
         normalized = _normalize_rules(rules)
-        _validate_rules_for_runtime(normalized)
+        validate(normalized)
         return normalized
 
     def _keep_premigration_backup(self) -> None:
@@ -833,7 +868,7 @@ class SignedConfigStore:
             return None
         if not signature or not self._verify(data, signature):
             return None
-        rules = _normalize_rules(data.get("rules", []))
+        rules = _normalize_rules(self._decode_rules_data(data).get("rules", []))
         _validate_rules_for_runtime(rules)
         return rules if self.save_rules(rules) else None
 
@@ -949,11 +984,12 @@ class SignedConfigStore:
                 ),
                 "params": summarize_params(item.get("params")),
             }
-            failures = item.get("failure_actions", [])
-            if isinstance(failures, list) and failures:
-                summary["failure_actions"] = [
-                    summarize_item(failure) for failure in failures
-                ]
+            child_fields = ("then", "else", "failure_actions") if action_type == "if" else ("failure_actions",)
+            for field in child_fields:
+                children = item.get(field, [])
+                if isinstance(children, list) and (children or field in ("then", "else")):
+                    summary[field] = [summarize_item(child) for child in children]
+                    summary["high_risk"] |= any(child["high_risk"] for child in summary[field])
             return summary
 
         status["summary"] = {
@@ -1013,6 +1049,7 @@ class SignedConfigStore:
             if not isinstance(rules_data, dict):
                 raise ConfigValidationError("规则文件根节点不是对象")
             rules_data.pop(_SIGNATURE_KEY, None)
+            rules_data = self._decode_rules_data(rules_data)
             rules = rules_data.get("rules", [])
             if not isinstance(rules, list):
                 rules = []
