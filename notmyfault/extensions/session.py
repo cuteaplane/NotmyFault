@@ -35,6 +35,7 @@ class ExtensionSession:
         self.allowed_commands = frozenset(allowed_commands)
         self.data_type = data_type
         self.value_type = value_type
+        self.type_registry = None
         self.current_value = current_value
         self.session_id = uuid.uuid4().hex
         self.created_at = time.time()
@@ -217,7 +218,7 @@ class ExtensionContext:
         value_type = self.session.value_type
         if value_type is None:
             raise ValueError("当前参数需要插件私有数据")
-        if not value_matches_type(value, value_type):
+        if not value_matches_type(value, value_type, self.session.type_registry):
             raise ValueError(f"提交值不是 {value_type}")
         self.session.current_value = copy.deepcopy(value)
         return {

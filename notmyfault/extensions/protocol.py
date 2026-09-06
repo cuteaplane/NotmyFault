@@ -3,6 +3,8 @@
 import copy
 import json
 from typing import Any, Dict, Tuple
+from notmyfault.core.data_types import DataTypeError, normalize_value
+from notmyfault.core.value_codec import encode_value
 
 
 OWNED_VALUE_KEY = "$type"
@@ -36,7 +38,7 @@ def make_owned_value(
         "data": copy.deepcopy(data),
     }
     try:
-        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(
+        encoded = json.dumps(encode_value(value), ensure_ascii=False, separators=(",", ":")).encode(
             "utf-8"
         )
     except (TypeError, ValueError) as exc:
@@ -89,17 +91,9 @@ def owned_value_summary(value: Any) -> str:
     return summary if isinstance(summary, str) else ""
 
 
-def value_matches_type(value: Any, value_type: str) -> bool:
-    if value_type == "any":
+def value_matches_type(value: Any, value_type, registry=None) -> bool:
+    try:
+        normalize_value(value, value_type, registry)
         return True
-    if value_type == "string":
-        return isinstance(value, str)
-    if value_type == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if value_type == "bool":
-        return isinstance(value, bool)
-    if value_type == "array":
-        return isinstance(value, list)
-    if value_type == "object":
-        return isinstance(value, dict)
-    return False
+    except DataTypeError:
+        return False

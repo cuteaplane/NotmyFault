@@ -99,6 +99,8 @@ def native_editor_meta():
 
 class ExtensionEngine:
     def __init__(self, root):
+        self.triggers_meta = {}
+        self.actions_meta = {"sample": extension_meta()}
         self.extensions = ExtensionRegistry()
         self.extensions.register_manifest("sample", "action", extension_meta(), str(root))
         self.extensions.register_command("sample", "open", self.open_editor, self)
@@ -124,6 +126,8 @@ class ExtensionEngine:
 
 class NativeEditorEngine:
     def __init__(self, root):
+        self.triggers_meta = {"native_sample": native_editor_meta()}
+        self.actions_meta = {}
         self.extensions = ExtensionRegistry()
         self.extensions.register_manifest(
             "native_sample", "trigger", native_editor_meta(), str(root)
