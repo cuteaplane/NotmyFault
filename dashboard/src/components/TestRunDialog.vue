@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
-import { buildAllTestInputFields, buildPreparedTestContext, buildTestInputFields, normalizedType, outputDefs } from '../lib/bindings'
+import { actionOutputDefs, buildAllTestInputFields, buildPreparedTestContext, buildTestInputFields } from '../lib/bindings'
+import { fieldType, typeLabel, typeAtPath, typeSpec, parseExactJson } from '../lib/valueTypes'
 import BaseDialog from './BaseDialog.vue'
 
 const props = defineProps({
@@ -22,6 +23,7 @@ function buildValues() {
   ]))
 }
 const values = ref(buildValues())
+const enabledFields = ref({})
 const errors = ref({})
 const submitError = ref('')
 const remember = ref(true)
@@ -61,13 +63,14 @@ const assertionSources = computed(() => actions.value
   .flatMap((action, localIndex) => {
     const actionIndex = startIndex.value + localIndex
     const meta = props.schema.actions?.[action.type]
-    return outputDefs(meta)
+    return actionOutputDefs(action, props.schema, props.rule)
       .filter(output => output.sensitive !== true)
       .map(output => ({
         key: `${action.binding_id}:${output.name}`,
         stepId: action.binding_id,
         path: [output.name],
-        type: normalizedType(output.type),
+        type: fieldType(output).type,
+        valueType: fieldType(output),
         label: `动作 ${actionIndex + 1}：${meta?.name || action.type} · ${output.label || output.name}`,
       }))
   }))
@@ -76,14 +79,23 @@ function sourceForAssertion(assertion) {
   return assertionSources.value.find(source => source.key === assertion.sourceKey)
 }
 
+function assertionType(assertion) {
+  const source = sourceForAssertion(assertion)
+  const path = parseExactJson(assertion.subpath || '[]')
+  if (!Array.isArray(path)) throw new Error('字段路径必须是数组，例如 [0, "名称"]')
+  const catalog = Object.entries(props.schema.data_types?.custom || {}).map(([id, definition]) => ({ id, ...definition }))
+  return { path: [...source.path, ...path], type: typeAtPath(source.valueType, path, catalog).type }
+}
+
 function assertionOperators(assertion) {
-  const type = sourceForAssertion(assertion)?.type
+  let type = sourceForAssertion(assertion)?.type
+  try { type = assertionType(assertion).type.type } catch {}
   const result = [{ value: 'equals', label: '等于' }, { value: 'exists', label: '存在' }]
-  if (['number', 'integer'].includes(type)) result.push(
+  if (['number', 'int', 'float', 'decimal', 'timestamp', 'duration'].includes(type)) result.push(
     { value: 'gt', label: '大于' }, { value: 'gte', label: '大于等于' },
     { value: 'lt', label: '小于' }, { value: 'lte', label: '小于等于' },
   )
-  if (['string', 'array', 'object', 'any'].includes(type)) result.push({ value: 'contains', label: '包含' })
+  if (['text', 'array', 'object', 'any'].includes(type)) result.push({ value: 'contains', label: '包含' })
   return result
 }
 
@@ -101,9 +113,11 @@ function normalizeAssertions() {
   return assertions.value.map((assertion, index) => {
     const source = sourceForAssertion(assertion)
     if (!source) throw new Error(`检查项 #${index + 1} 的动作输出不在本次运行范围内`)
-    const result = { step_id: source.stepId, path: source.path, operator: assertion.operator }
+    const selected = assertionType(assertion)
+    const result = { step_id: source.stepId, path: selected.path, operator: assertion.operator }
     if (assertion.operator !== 'exists') {
-      const field = { type: source.type, required: true }
+      const valueType = assertion.operator === 'contains' ? selected.type.type === 'array' ? typeSpec(selected.type.items) : { type: 'text' } : selected.type
+      const field = { type: valueType.type, valueType, required: true }
       try {
         result.expected = buildPreparedTestContext(
           [{ ...field, key: 'expected', scope: 'event', node: '', path: ['value'] }],
@@ -123,9 +137,9 @@ watch(assertionSources, sources => {
 })
 
 function inputKind(field) {
-  if (['object', 'array'].includes(field.type) || field.fullPayload) return 'json'
+  if (['object', 'array', 'union', 'any'].includes(field.type) && field.valueType || field.fullPayload || field.type?.includes('/')) return 'json'
   if (['bool', 'boolean'].includes(field.type)) return 'boolean'
-  if (['number', 'integer'].includes(field.type)) return 'number'
+  if (['number', 'float'].includes(field.type)) return 'number'
   return field.sensitive ? 'password' : 'text'
 }
 
@@ -140,14 +154,15 @@ function submit() {
   errors.value = {}
   submitError.value = ''
   try {
-    const context = buildPreparedTestContext(fields.value, values.value)
+    const included = fields.value.filter(field => field.required || enabledFields.value[field.key])
+    const context = buildPreparedTestContext(included.map(field => ({ ...field, required: true })), values.value)
     context.start_step_id = startStepId.value
     context.end_step_id = endStepId.value
     context.test_assertions = normalizeAssertions()
     emit('run', {
       context,
       fields: fields.value,
-      values: { ...values.value },
+      values: Object.fromEntries(included.map(field => [field.key, values.value[field.key]])),
       remember: remember.value,
     })
   } catch (error) {
@@ -159,6 +174,7 @@ function submit() {
 watch(() => props.open, async open => {
   if (!open) return
   values.value = buildValues()
+  enabledFields.value = Object.fromEntries(allFields.value.filter(field => !field.required).map(field => [field.key, Object.hasOwn(props.savedValues, field.key) && props.savedValues[field.key] !== '']))
   errors.value = {}
   submitError.value = ''
   assertions.value = []
@@ -215,11 +231,12 @@ watch(() => props.open, async open => {
               <span class="test-data-label">
                 <span>{{ field.label }}</span>
                 <em v-if="field.sensitive"><span class="material-symbols-outlined">lock</span>敏感，不保存</em>
-                <small v-else>{{ field.type === 'any' ? '文本' : field.type }}</small>
+                <small v-else>{{ typeLabel(field.valueType || field.type) }}</small>
               </span>
-              <input v-if="inputKind(field) === 'boolean'" v-model="values[field.key]" type="checkbox" class="test-boolean" @change="clearError(field.key)">
-              <textarea v-else-if="inputKind(field) === 'json'" v-model="values[field.key]" class="text-field test-json-input" spellcheck="false" rows="3" :placeholder="field.placeholder || (field.type === 'array' ? '[]' : '{}')" @input="clearError(field.key)"></textarea>
-              <input v-else v-model="values[field.key]" class="text-field" :type="inputKind(field)" :placeholder="field.placeholder" autocomplete="off" spellcheck="false" @input="clearError(field.key)">
+              <span v-if="!field.required"><input v-model="enabledFields[field.key]" type="checkbox">{{ field.scope === 'variable' ? '覆盖本次初始值' : '提供这个可选值' }}</span>
+              <input v-if="inputKind(field) === 'boolean'" v-model="values[field.key]" :disabled="!field.required && !enabledFields[field.key]" type="checkbox" class="test-boolean" @change="clearError(field.key)">
+              <textarea v-else-if="inputKind(field) === 'json'" v-model="values[field.key]" :disabled="!field.required && !enabledFields[field.key]" class="text-field test-json-input" spellcheck="false" rows="3" :placeholder="field.placeholder || (field.type === 'array' ? '[]' : '{}')" @input="clearError(field.key)"></textarea>
+              <input v-else v-model="values[field.key]" :disabled="!field.required && !enabledFields[field.key]" class="text-field" :type="inputKind(field)" :placeholder="field.placeholder" autocomplete="off" spellcheck="false" @input="clearError(field.key)">
               <span v-if="errors[field.key]" class="test-field-error"><span class="material-symbols-outlined">error</span>{{ errors[field.key] }}</span>
             </label>
           </div>
@@ -232,6 +249,7 @@ watch(() => props.open, async open => {
               <select v-model="assertion.sourceKey" class="text-field" @change="assertion.operator = 'equals'"><option v-for="source in assertionSources" :key="source.key" :value="source.key">{{ source.label }}</option></select>
               <select v-model="assertion.operator" class="text-field"><option v-for="operator in assertionOperators(assertion)" :key="operator.value" :value="operator.value">{{ operator.label }}</option></select>
               <input v-if="assertion.operator !== 'exists'" v-model="assertion.expected" class="text-field" placeholder="期望值" autocomplete="off">
+              <input v-model="assertion.subpath" class="text-field" placeholder="子字段路径，例如 [0]" aria-label="检查输出的子字段路径" autocomplete="off">
               <button class="icon-btn" title="删除检查项" @click="removeAssertion(index)"><span class="material-symbols-outlined">delete</span></button>
             </div>
           </div>

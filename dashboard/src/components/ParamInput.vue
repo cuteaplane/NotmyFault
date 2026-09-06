@@ -1,12 +1,14 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { optValue, optLabel } from '../lib/utils'
-import { hasBridge, invokeExtensionCommand } from '../lib/api'
+import { hasBridge } from '../lib/api'
 import { store } from '../lib/store'
 import { isReference, referenceLabel, typesCompatible } from '../lib/bindings'
 import BindingPicker from './BindingPicker.vue'
 import PluginDataField from './PluginDataField.vue'
 import ParameterEditorButton from './ParameterEditorButton.vue'
+import TypedValueInput from './TypedValueInput.vue'
+import { isExpression, isLiteralValue, isEncodedValue, fieldType, typeSpec, typeLabel, defaultTypedValue, parseExactJson } from '../lib/valueTypes'
 
 const props = defineProps({
   def: Object,
@@ -17,17 +19,23 @@ const props = defineProps({
 })
 const emit = defineEmits(['update:modelValue'])
 const value = computed({
-  get: () => props.modelValue != null ? props.modelValue : (props.def.default ?? ''),
+  get: () => props.modelValue !== undefined ? props.modelValue : (props.def.default ?? ''),
   set: (v) => emit('update:modelValue', v)
 })
 const type = computed(() => props.def.type || 'string')
-const bindingType = computed(() => props.def.value_type || type.value)
+const bindingType = computed(() => fieldType(props.def, true))
 const bindingOpen = ref(false)
-const selectingElement = ref(false)
-const checkingElement = ref(false)
-const elementCountdown = ref(0)
-const elementStatus = ref('')
-const bound = computed(() => isReference(props.modelValue))
+const optionsId = `param-options-${Math.random().toString(36).slice(2)}`
+const bound = computed(() => isExpression(props.modelValue))
+const advanced = ref(false), expressionText = ref(''), expressionError = ref('')
+const expressionControl = ref(null)
+watch(expressionError, value => expressionControl.value?.setCustomValidity(value))
+watch(() => props.modelValue, value => { expressionText.value = JSON.stringify(value, null, 2) ?? ''; expressionError.value = '' }, { immediate: true, deep: true })
+const useTypedEditor = computed(() => !!props.def.value_type && (bindingType.value.nullable || !['text', 'path', 'time', 'any', 'union'].includes(bindingType.value.type)) || !!props.def.value_type && props.modelValue != null && typeof props.modelValue === 'object' && !bound.value || isLiteralValue(props.modelValue) || isEncodedValue(props.modelValue))
+function setExpression(text) {
+  expressionText.value = text
+  try { const value = parseExactJson(text); emit('update:modelValue', value); expressionError.value = '' } catch (e) { expressionError.value = '表达式 JSON 无效' }
+}
 const boundLabel = computed(() => referenceLabel(props.modelValue, props.bindingSources))
 const compatibleSources = computed(() => props.bindingSources.filter(
   source => typesCompatible(source.type, bindingType.value),
@@ -44,28 +52,12 @@ function useBinding(binding) {
 }
 
 function useFixedValue() {
+  if (props.def.value_type) { emit('update:modelValue', defaultTypedValue(bindingType.value)); return }
   const emptyValue = type.value === 'bool'
     ? false
-    : ['uia_selector', 'plugin_data'].includes(type.value) ? {} : ''
+    : type.value === 'plugin_data' ? {} : ''
   emit('update:modelValue', props.def.default ?? emptyValue)
 }
-
-const elementSelected = computed(() => type.value === 'uia_selector'
-  && props.modelValue
-  && typeof props.modelValue === 'object'
-  && props.modelValue.version === 1)
-const elementDisplay = computed(() => {
-  const selector = props.modelValue || {}
-  const display = selector.display || {}
-  const target = selector.target || {}
-  const windowInfo = selector.window || {}
-  return {
-    control: display.control || target.name || '未命名控件',
-    controlType: display.control_type || '屏幕控件',
-    window: display.window || windowInfo.name || '未命名窗口',
-    app: display.app || windowInfo.process || '未知程序',
-  }
-})
 
 async function pickFolder() {
   if (!hasBridge()) return
@@ -75,82 +67,16 @@ async function pickFolder() {
   } catch (e) { /* bridge 不可用时保持手动输入。 */ }
 }
 
-async function pickDesktopElement() {
-  const editor = parameterEditor.value
-  if (!editor || selectingElement.value) return
-  selectingElement.value = true
-  elementCountdown.value = 3
-  elementStatus.value = '把鼠标移到目标控件上，不需要点击。'
-  const timer = window.setInterval(() => {
-    elementCountdown.value = Math.max(0, elementCountdown.value - 1)
-  }, 1000)
-  try {
-    const result = await invokeExtensionCommand(
-      editor.plugin_id,
-      editor.command,
-      {
-        sourceKind: 'parameter_editors',
-        sourceId: editor.id,
-        currentValue: props.modelValue,
-        payload: { operation: 'capture', delay_seconds: 3 },
-      },
-    )
-    const selector = result?.value
-    if (!result?.ok || !selector) {
-      elementStatus.value = result?.error || '没有读到屏幕控件，请再试一次。'
-      return
-    }
-    value.value = selector
-    elementStatus.value = '已读取控件；保存前可以检查一次。'
-  } catch (error) {
-    elementStatus.value = error.message || '读取屏幕控件失败。'
-  } finally {
-    window.clearInterval(timer)
-    elementCountdown.value = 0
-    selectingElement.value = false
-  }
-}
-
-async function verifyDesktopElement() {
-  const editor = parameterEditor.value
-  if (!editor || !elementSelected.value || checkingElement.value) return
-  checkingElement.value = true
-  elementStatus.value = '正在重新查找这个控件…'
-  try {
-    const result = await invokeExtensionCommand(
-      editor.plugin_id,
-      editor.command,
-      {
-        sourceKind: 'parameter_editors',
-        sourceId: editor.id,
-        currentValue: props.modelValue,
-        payload: { operation: 'check', selector: props.modelValue },
-      },
-    )
-    const data = result?.data || {}
-    elementStatus.value = result?.ok && data.ok
-      ? '检查通过，现在仍能找到这个控件。'
-      : (result?.error || data.error || '现在找不到这个控件，请重新选择。')
-  } catch (error) {
-    elementStatus.value = error.message || '检查屏幕控件失败。'
-  } finally {
-    checkingElement.value = false
-  }
-}
-
-function clearDesktopElement() {
-  value.value = {}
-  elementStatus.value = ''
-}
 </script>
 
 <template>
   <div class="field">
     <span class="field-label">
       {{ def.label || def.name }}
+      <span v-if="def.value_type" class="inspector-lead">{{ typeLabel(bindingType) }}</span>
       <button v-if="allowBinding && !bound && type !== 'plugin_data'" type="button" class="field-binding-button"
-        :disabled="!compatibleSources.length" @click="bindingOpen = !bindingOpen">
-        <span class="material-symbols-outlined">data_object</span>使用运行数据
+        :disabled="!bindingSources.length" @click="bindingOpen = !bindingOpen">
+        <span class="material-symbols-outlined">data_object</span>使用变量或数据
       </button>
     </span>
     <div v-if="bound && !allowBinding" class="plugin-data-error">
@@ -171,6 +97,7 @@ function clearDesktopElement() {
     </div>
     <BindingPicker v-if="bindingOpen" :sources="bindingSources" :target-type="bindingType"
       @select="useBinding" @cancel="bindingOpen = false" />
+    <TypedValueInput v-else-if="!bound && useTypedEditor && type !== 'plugin_data'" :model-value="props.modelValue" :value-type="bindingType" :label="def.label || def.name" @update:model-value="emit('update:modelValue', $event)" />
     <PluginDataField v-else-if="!bound && type === 'plugin_data' && parameterEditor" :editor="parameterEditor"
       :model-value="props.modelValue" :sensitive="props.def.sensitive === true"
       @update:model-value="emit('update:modelValue', $event)" />
@@ -192,38 +119,19 @@ function clearDesktopElement() {
         <span class="material-symbols-outlined">folder_open</span>选择
       </button>
     </div>
-    <div v-else-if="!bound && type === 'uia_selector'" class="uia-selector-field">
-      <div v-if="elementSelected" class="uia-selector-card">
-        <span class="uia-selector-mark material-symbols-outlined">ads_click</span>
-        <span class="uia-selector-copy">
-          <b>{{ elementDisplay.control }}</b>
-          <small>{{ elementDisplay.controlType }} · {{ elementDisplay.app }}</small>
-          <small>{{ elementDisplay.window }}</small>
-        </span>
-        <button v-if="parameterEditor" type="button" class="btn btn-text btn-sm" :disabled="checkingElement" @click="verifyDesktopElement">
-          {{ checkingElement ? '检查中' : '检查' }}
-        </button>
-      </div>
-      <div v-else class="uia-selector-empty">
-        <span class="material-symbols-outlined">select_window</span>
-        <span><b>还没选择控件</b><small>NotmyFault 会保存控件和窗口特征，不会保存鼠标坐标。</small></span>
-      </div>
-      <div class="uia-selector-actions">
-        <button v-if="parameterEditor" type="button" class="btn btn-tonal btn-sm" :disabled="selectingElement" @click="pickDesktopElement">
-          <span class="material-symbols-outlined">center_focus_strong</span>
-          {{ selectingElement ? `${elementCountdown || '正在'} 秒后读取` : (elementSelected ? '重新选择' : '选择屏幕上的控件') }}
-        </button>
-        <button v-if="elementSelected" type="button" class="btn btn-text btn-sm danger-text" @click="clearDesktopElement">清除</button>
-      </div>
-      <p v-if="elementStatus" class="uia-selector-status">{{ elementStatus }}</p>
-      <p v-else-if="!parameterEditor" class="uia-selector-status">自动化引擎运行后可以选择屏幕控件。</p>
-    </div>
     <textarea v-else-if="!bound && type === 'textarea'" v-model="value" class="text-field textarea-field" :placeholder="def.placeholder" :rows="def.rows || 5" />
     <input v-else-if="!bound && type === 'number'" v-model.number="value" type="number" class="text-field" :placeholder="def.placeholder" :min="def.min" :max="def.max" :step="def.step">
     <input v-else-if="!bound && type === 'bool'" type="checkbox" v-model="value">
-    <input v-else-if="!bound" v-model="value" type="text" class="text-field" :placeholder="def.placeholder">
+    <input v-else-if="!bound" v-model="value" type="text" class="text-field" :placeholder="def.placeholder" :list="def.options?.length ? optionsId : undefined">
+    <datalist v-if="def.options?.length && type !== 'select'" :id="optionsId"><option v-for="option in def.options" :key="optValue(option)" :value="optValue(option)">{{ optLabel(option) }}</option></datalist>
     <ParameterEditorButton v-if="!bound && parameterEditor && !['plugin_data', 'hotkey'].includes(type)"
       :editor="parameterEditor" :model-value="props.modelValue"
       @update:model-value="emit('update:modelValue', $event)" />
+    <details v-if="allowBinding && type !== 'plugin_data'" class="expression-editor" @toggle="advanced = $event.target.open">
+      <summary>表达式 JSON</summary>
+      <textarea v-if="advanced" ref="expressionControl" :value="expressionText" class="text-field textarea-field" rows="5" aria-label="参数表达式 JSON" @input="setExpression($event.target.value)" />
+      <p v-if="expressionError" class="danger-text">{{ expressionError }}</p>
+      <p class="inspector-lead">可使用 $ref、$convert 和 $template；用 { "$literal": 值 } 保存包含表达式符号的原始数据。</p>
+    </details>
   </div>
 </template>

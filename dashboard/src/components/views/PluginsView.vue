@@ -5,29 +5,71 @@ import { apiDownload, apiRead, apiWrite, loadPlugins, getSchema } from '../../li
 import { snackbar } from '../../lib/notify'
 import { alertDialog, confirmDialog } from '../../lib/dialog'
 import { useEngineControl } from '../../composables/useEngineControl'
-import PluginCard from '../PluginCard.vue'
 import BaseDialog from '../BaseDialog.vue'
 
 const { restartEngine } = useEngineControl()
 
-const tab = ref('triggers')
-const list = computed(() => store.pluginsData[tab.value] || {})
+function openSecurity() {
+  window.__nmf?.switchPage?.('security')
+}
+
+const originTab = ref('builtin')
+const typeFilter = ref('all')
 const query = ref('')
 const searchRef = ref(null)
 const focusedPluginId = ref('')
+const focusedPluginKind = ref('')
 const focusReason = ref('')
-const filteredList = computed(() => {
-  const q = query.value.trim().toLowerCase()
-  if (!q) return list.value
-  return Object.fromEntries(Object.entries(list.value).filter(([id, meta]) => (
-    [id, meta?.name, meta?.description].some(value => String(value || '').toLowerCase().includes(q))
-  )))
-})
-const focusedPluginMissing = computed(() => focusedPluginId.value && !list.value[focusedPluginId.value])
-const tabCounts = computed(() => ({
-  triggers: Object.keys(store.pluginsData.triggers || {}).length,
-  actions: Object.keys(store.pluginsData.actions || {}).length,
+const selectedPluginKey = ref('')
+const permissionLabels = {
+  notification: '发送通知',
+  audio: '音频',
+  clipboard: '剪贴板',
+  network: '网络访问',
+  external_binary: '外部程序',
+  native_api: '原生 API',
+  filesystem: '文件系统',
+  process: '进程管理',
+  registry: '注册表',
+  screen_reader: '屏幕读取',
+  input_monitor: '监听键盘和鼠标',
+  admin: '管理员权限',
+}
+const allPlugins = computed(() => [
+  ...Object.entries(store.pluginsData.triggers || {}).map(([id, meta]) => ({
+    id, meta, kind: 'triggers', origin: meta?.origin === 'builtin' ? 'builtin' : 'user',
+  })),
+  ...Object.entries(store.pluginsData.actions || {}).map(([id, meta]) => ({
+    id, meta, kind: 'actions', origin: meta?.origin === 'builtin' ? 'builtin' : 'user',
+  })),
+].sort((left, right) => String(left.meta?.name || left.id).localeCompare(
+  String(right.meta?.name || right.id), 'zh-CN',
+)))
+const originCounts = computed(() => ({
+  builtin: allPlugins.value.filter(plugin => plugin.origin === 'builtin').length,
+  user: allPlugins.value.filter(plugin => plugin.origin === 'user').length,
 }))
+const filteredPlugins = computed(() => {
+  const q = query.value.trim().toLowerCase()
+  return allPlugins.value.filter(plugin => (
+    plugin.origin === originTab.value
+    && (typeFilter.value === 'all' || plugin.kind === typeFilter.value)
+    && (!q || [plugin.id, plugin.meta?.name, plugin.meta?.description, plugin.meta?.package_name]
+      .some(value => String(value || '').toLowerCase().includes(q)))
+  )).sort((left, right) => (
+    Number(pluginHasProblem(right.meta)) - Number(pluginHasProblem(left.meta))
+    || String(left.meta?.name || left.id).localeCompare(String(right.meta?.name || right.id), 'zh-CN')
+  ))
+})
+const visibleProblemCount = computed(() => filteredPlugins.value.filter(plugin => pluginHasProblem(plugin.meta)).length)
+const focusedPlugin = computed(() => allPlugins.value.find(plugin => (
+  plugin.id === focusedPluginId.value
+  && (!focusedPluginKind.value || plugin.kind === focusedPluginKind.value)
+)))
+const focusedPluginMissing = computed(() => focusedPluginId.value && !focusedPlugin.value)
+const selectedPlugin = computed(() => allPlugins.value.find(
+  plugin => `${plugin.kind}:${plugin.id}` === selectedPluginKey.value,
+))
 const showInstall = ref(false)
 const showKey = ref(false)
 const signingPassword = ref('')
@@ -127,9 +169,74 @@ async function promptRestart(message) {
   await restartEngine()
 }
 
-async function togglePlugin(pid) {
+function pluginKindLabel(kind) {
+  return kind === 'triggers' ? '触发器' : '动作'
+}
+
+function pluginKindIcon(kind) {
+  return kind === 'triggers' ? 'bolt' : 'play_arrow'
+}
+
+function pluginOriginLabel(origin) {
+  return origin === 'builtin' ? '内置' : '用户安装'
+}
+
+function pluginVersion(meta) {
+  return meta?.version || String(meta?.version_code || '—')
+}
+
+function pluginIsAvailable(meta) {
+  return meta?.platform_compatible !== false && meta?.availability !== 'unavailable'
+}
+
+function pluginStatus(meta) {
+  if (meta?._error) return '加载失败'
+  if (!pluginIsAvailable(meta)) return '当前不可用'
+  if (meta?.availability === 'partial') return '部分可用'
+  if (meta?.enabled === false) return '已停用'
+  return ''
+}
+
+function pluginHasProblem(meta) {
+  return Boolean(pluginStatus(meta))
+}
+
+function pluginStatusDetail(meta) {
+  if (meta?._error) return String(meta._error)
+  const reasons = Array.isArray(meta?.unavailable_reasons) ? meta.unavailable_reasons : []
+  return reasons.join('；')
+}
+
+const selectedProblemDetail = computed(() => {
+  if (!selectedPlugin.value) return ''
+  const isFocused = selectedPlugin.value.id === focusedPluginId.value
+    && selectedPlugin.value.kind === focusedPluginKind.value
+  return pluginStatusDetail(selectedPlugin.value.meta) || (isFocused ? focusReason.value : '')
+})
+
+function permissionLabel(permission) {
+  return permissionLabels[permission] || permission
+}
+
+async function openPlugin(plugin) {
+  selectedPluginKey.value = `${plugin.kind}:${plugin.id}`
+  if (window.matchMedia?.('(max-width: 1100px)')?.matches) {
+    await nextTick()
+    document.querySelector('.plugin-back-button')?.focus()
+  }
+}
+
+async function closePlugin() {
+  const previousKey = selectedPluginKey.value
+  selectedPluginKey.value = ''
+  await nextTick()
+  const previousButton = [...document.querySelectorAll('.plugin-open-button')].find(button => button.dataset.pluginKey === previousKey)
+  ;(previousButton || searchRef.value)?.focus()
+}
+
+async function togglePlugin(plugin) {
   try {
-    const r = await apiWrite('/api/plugins/toggle', 'POST', { type: tab.value, id: pid })
+    const r = await apiWrite('/api/plugins/toggle', 'POST', { type: plugin.kind, id: plugin.id })
     const d = await r.json()
     if (d.ok) {
       await refresh()
@@ -140,12 +247,16 @@ async function togglePlugin(pid) {
   } catch (e) { alertDialog('请求失败', e.message) }
 }
 
-async function uninstallPlugin(pid) {
-  if (!await confirmDialog('卸载插件 "' + pid + '"？', '此操作不可撤销。', '卸载')) return
+async function uninstallPlugin(plugin) {
+  if (!await confirmDialog('卸载插件 "' + plugin.id + '"？', '此操作不可撤销。', '卸载')) return
   try {
-    const r = await apiWrite('/api/plugins/' + tab.value + '/' + pid, 'DELETE')
+    const r = await apiWrite('/api/plugins/' + plugin.kind + '/' + plugin.id, 'DELETE')
     const d = await r.json()
-    if (d.ok) { await refresh(); await promptRestart('刚卸载的插件会在引擎重启后完全移除。') }
+    if (d.ok) {
+      selectedPluginKey.value = ''
+      await refresh()
+      await promptRestart('刚卸载的插件会在引擎重启后完全移除。')
+    }
     else alertDialog('卸载失败', d.error || '未知错误')
   } catch (e) { alertDialog('请求失败', e.message) }
 }
@@ -272,13 +383,19 @@ async function consumePluginFocus() {
   const focus = store.pendingPluginFocus
   if (!focus) return
   store.pendingPluginFocus = null
-  tab.value = focus.kind === 'trigger' ? 'triggers' : 'actions'
+  focusedPluginKind.value = focus.kind === 'trigger' ? 'triggers' : 'actions'
   focusedPluginId.value = focus.id || ''
+  const target = allPlugins.value.find(plugin => (
+    plugin.id === focusedPluginId.value && plugin.kind === focusedPluginKind.value
+  ))
+  originTab.value = target?.origin || 'user'
+  typeFilter.value = focusedPluginKind.value
   focusReason.value = focus.reason || ''
   query.value = focus.id || ''
+  selectedPluginKey.value = target ? `${target.kind}:${target.id}` : ''
   await nextTick()
   searchRef.value?.focus()
-  document.querySelector('.plugin-card.focused')?.scrollIntoView?.({ block: 'center' })
+  document.querySelector('.plugin-list-row.focused')?.scrollIntoView?.({ block: 'center' })
 }
 
 onMounted(async () => {
@@ -288,75 +405,190 @@ onMounted(async () => {
 </script>
 
 <template>
-  <section class="page active">
-    <div class="page-head"><h2>插件管理</h2><div class="actions">
+  <section class="page active plugin-management-page">
+    <div class="page-head"><div><h2>插件管理</h2><p class="page-subtitle">异常插件优先显示；选择插件查看状态、权限和来源。</p></div><div class="actions">
       <button class="btn btn-filled" @click="openInstall"><span class="material-symbols-outlined">install_desktop</span>安装插件</button>
     </div></div>
-    <section v-if="showRegistry" class="plugin-registry-panel">
-      <div class="plugin-registry-head">
-        <div>
-          <h3>只读插件索引</h3>
-          <p>填写 registry.json 的 HTTPS 地址。下载后仍会进入本地安全预览，不会直接安装。</p>
-        </div>
-        <div class="plugin-registry-load">
-          <input v-model="registryUrl" class="text-field" type="url" spellcheck="false" placeholder="https://raw.githubusercontent.com/.../registry.json" @keyup.enter="loadRegistry">
-          <button class="btn btn-filled" :disabled="registryLoading" @click="loadRegistry">{{ registryLoading ? '读取中…' : '读取索引' }}</button>
-        </div>
-      </div>
-      <p v-if="registryError" class="plugin-registry-error"><span class="material-symbols-outlined">warning</span>{{ registryError }}</p>
-      <div v-if="registryPlugins.length" class="plugin-registry-grid">
-        <article v-for="entry in registryPlugins" :key="entry.package_name + '@' + entry.version" class="plugin-registry-card">
-          <div>
-            <h4>{{ entry.name }}</h4>
-            <p>{{ entry.package_name }}</p>
+    <div class="plugin-workbench" :class="{ 'has-selection': selectedPlugin }">
+      <div class="plugin-list-view">
+        <section v-if="showRegistry" class="plugin-registry-panel">
+          <div class="plugin-registry-head">
+            <div>
+              <h3>只读插件索引</h3>
+              <p>填写 registry.json 的 HTTPS 地址。下载后仍会进入本地安全预览，不会直接安装。</p>
+            </div>
+            <div class="plugin-registry-load">
+              <input v-model="registryUrl" class="text-field" type="url" spellcheck="false" placeholder="https://raw.githubusercontent.com/.../registry.json" @keyup.enter="loadRegistry">
+              <button class="btn btn-filled" :disabled="registryLoading" @click="loadRegistry">{{ registryLoading ? '读取中…' : '读取索引' }}</button>
+            </div>
           </div>
-          <div class="preview-meta">
-            <span class="chip">v{{ entry.version }}</span>
-            <span v-for="platform in entry.supported_platforms" :key="platform" class="chip">{{ platform }}</span>
-            <span class="chip" :class="installedPackages.has(entry.package_name) ? 'chip-clean' : ''">{{ installedPackages.has(entry.package_name) ? '已安装' : '未安装' }}</span>
+          <p v-if="registryError" class="plugin-registry-error"><span class="material-symbols-outlined">warning</span>{{ registryError }}</p>
+          <div v-if="registryPlugins.length" class="plugin-registry-grid">
+            <article v-for="entry in registryPlugins" :key="entry.package_name + '@' + entry.version" class="plugin-registry-card">
+              <div>
+                <h4>{{ entry.name }}</h4>
+                <p>{{ entry.package_name }}</p>
+              </div>
+              <div class="preview-meta">
+                <span class="chip">v{{ entry.version }}</span>
+                <span v-for="platform in entry.supported_platforms" :key="platform" class="chip">{{ platform }}</span>
+                <span class="chip" :class="installedPackages.has(entry.package_name) ? 'chip-clean' : ''">{{ installedPackages.has(entry.package_name) ? '已安装' : '未安装' }}</span>
+              </div>
+              <div class="plugin-registry-actions">
+                <a class="btn btn-text" :href="entry.homepage" target="_blank" rel="noreferrer">主页</a>
+                <button class="btn btn-filled btn-sm" :disabled="registryDownloading === entry.package_name + '@' + entry.version" @click="previewRegistryPlugin(entry)">
+                  {{ registryDownloading === entry.package_name + '@' + entry.version ? '下载中…' : installedPackages.has(entry.package_name) ? '检查更新' : '下载并检查' }}
+                </button>
+              </div>
+            </article>
           </div>
-          <div class="plugin-registry-actions">
-            <a class="btn btn-text" :href="entry.homepage" target="_blank" rel="noreferrer">主页</a>
-            <button class="btn btn-filled btn-sm" :disabled="registryDownloading === entry.package_name + '@' + entry.version" @click="previewRegistryPlugin(entry)">
-              {{ registryDownloading === entry.package_name + '@' + entry.version ? '下载中…' : installedPackages.has(entry.package_name) ? '检查更新' : '下载并检查' }}
-            </button>
+          <p v-else-if="!registryLoading && !registryError" class="plugin-registry-empty">索引尚未读取。</p>
+        </section>
+
+        <div class="plugin-origin-switch" :class="{ 'user-active': originTab === 'user' }" role="tablist" aria-label="插件来源">
+          <button type="button" role="tab" :aria-selected="originTab === 'builtin'"
+            :class="{ active: originTab === 'builtin' }" @click="originTab = 'builtin'">
+            内置<span>{{ originCounts.builtin }}</span>
+          </button>
+          <button type="button" role="tab" :aria-selected="originTab === 'user'"
+            :class="{ active: originTab === 'user' }" @click="originTab = 'user'">
+            用户<span>{{ originCounts.user }}</span>
+          </button>
+        </div>
+
+        <div v-if="visibleProblemCount" class="plugin-problem-summary">
+          <span class="material-symbols-outlined">report</span>
+          <span>当前列表有 {{ visibleProblemCount }} 个插件需要处理，已排在前面。</span>
+        </div>
+
+        <div class="plugin-tools">
+          <label class="plugin-search">
+            <span class="material-symbols-outlined">search</span>
+            <input ref="searchRef" v-model="query" type="search" aria-label="搜索插件" autocomplete="off" spellcheck="false" placeholder="搜索名称、说明、插件 ID 或包名">
+          </label>
+          <select v-model="typeFilter" class="select plugin-type-filter" aria-label="筛选插件类型">
+            <option value="all">全部类型</option>
+            <option value="triggers">触发器</option>
+            <option value="actions">动作</option>
+          </select>
+          <p v-if="focusReason" class="plugin-focus-reason"><span class="material-symbols-outlined">info</span>{{ focusReason }}</p>
+        </div>
+        <div v-if="focusedPluginMissing" class="plugin-missing-callout">
+          <span class="material-symbols-outlined">extension_off</span>
+          <div><b>未找到插件 {{ focusedPluginId }}</b><p>请安装对应的 .nmfp 插件包；安装完成后可以继续使用刚才的模板。</p></div>
+          <button class="btn btn-filled" @click="openInstall"><span class="material-symbols-outlined">install_desktop</span>安装插件</button>
+        </div>
+
+        <Transition :name="originTab === 'user' ? 'plugin-list-next' : 'plugin-list-prev'" mode="out-in">
+          <div :key="originTab" class="plugin-list-stage" tabindex="0" role="region" aria-label="插件列表">
+            <div v-if="!filteredPlugins.length" class="empty-state plugin-list-empty">
+              <div class="material-symbols-outlined">extension_off</div>
+              <h3>{{ query.trim() || typeFilter !== 'all' ? '没有匹配的插件' : originTab === 'user' ? '还没有用户插件' : '暂无内置插件' }}</h3>
+              <p>{{ query.trim() || typeFilter !== 'all' ? '可以清除搜索或调整类型筛选。' : originTab === 'user' ? '安装 .nmfp 插件后会显示在这里。' : '启动引擎后刷新插件列表。' }}</p>
+              <button v-if="query || typeFilter !== 'all'" class="btn btn-text" @click="query = ''; typeFilter = 'all'">清空筛选</button>
+            </div>
+            <div v-else class="plugin-list-shell">
+              <article v-for="plugin in filteredPlugins" :key="plugin.kind + ':' + plugin.id"
+                class="plugin-list-row" :class="{
+                  focused: focusedPluginId === plugin.id && focusedPluginKind === plugin.kind,
+                  selected: selectedPluginKey === `${plugin.kind}:${plugin.id}`,
+                  disabled: plugin.meta.enabled === false || !pluginIsAvailable(plugin.meta),
+                }" @click="openPlugin(plugin)">
+                <span class="material-symbols-outlined plugin-list-icon" :class="plugin.kind === 'triggers' ? 'trigger' : 'action'">
+                  {{ pluginKindIcon(plugin.kind) }}
+                </span>
+                <button class="plugin-list-copy plugin-open-button" :data-plugin-key="`${plugin.kind}:${plugin.id}`" :aria-label="`查看${plugin.meta.name || plugin.id}详情`" @click.stop="openPlugin(plugin)">
+                  <b>{{ plugin.meta.name || plugin.id }}</b>
+                  <small>{{ pluginKindLabel(plugin.kind) }} · v{{ pluginVersion(plugin.meta) }}</small>
+                </button>
+                <span v-if="pluginStatus(plugin.meta)" class="plugin-list-status" :class="{
+                  error: plugin.meta._error || !pluginIsAvailable(plugin.meta),
+                  muted: plugin.meta.enabled === false,
+                }">{{ pluginStatus(plugin.meta) }}</span>
+                <label class="switch plugin-list-switch" :class="{ 'is-disabled': !pluginIsAvailable(plugin.meta) }" @click.stop>
+                  <input type="checkbox" :checked="plugin.meta.enabled !== false" :disabled="!pluginIsAvailable(plugin.meta)" :aria-label="`启用${plugin.meta.name || plugin.id}`" @change="togglePlugin(plugin)">
+                  <span class="switch-track"><span class="switch-thumb"></span></span>
+                </label>
+                <span class="material-symbols-outlined plugin-list-go">chevron_right</span>
+              </article>
+            </div>
           </div>
-        </article>
+        </Transition>
       </div>
-      <p v-else-if="!registryLoading && !registryError" class="plugin-registry-empty">索引尚未读取。</p>
-    </section>
-    <div class="tabs">
-      <button class="tab" :class="{ active: tab === 'triggers' }" @click="tab = 'triggers'">
-        触发器<span class="ml-1.5 inline-flex min-w-5 items-center justify-center rounded-full bg-on-surface/10 px-1.5 py-0.5 text-label-s">{{ tabCounts.triggers }}</span>
-      </button>
-      <button class="tab" :class="{ active: tab === 'actions' }" @click="tab = 'actions'">
-        动作<span class="ml-1.5 inline-flex min-w-5 items-center justify-center rounded-full bg-on-surface/10 px-1.5 py-0.5 text-label-s">{{ tabCounts.actions }}</span>
-      </button>
-    </div>
-    <div class="plugin-tools">
-      <label class="plugin-search">
-        <span class="material-symbols-outlined">search</span>
-        <input ref="searchRef" v-model="query" type="search" aria-label="搜索插件" autocomplete="off" spellcheck="false" placeholder="搜索名称、说明或插件 ID">
-      </label>
-      <p v-if="focusReason" class="plugin-focus-reason"><span class="material-symbols-outlined">info</span>{{ focusReason }}</p>
-    </div>
-    <div v-if="focusedPluginMissing" class="plugin-missing-callout">
-      <span class="material-symbols-outlined">extension_off</span>
-      <div><b>未找到插件 {{ focusedPluginId }}</b><p>请安装对应的 .nmfp 插件包；安装完成后可以继续使用刚才的模板。</p></div>
-      <button class="btn btn-filled" @click="openInstall"><span class="material-symbols-outlined">install_desktop</span>安装插件</button>
-    </div>
-    <Transition name="content-swap" mode="out-in">
-      <div :key="tab" class="plugin-tab-content">
-        <div v-if="!Object.keys(filteredList).length" class="empty-state">
-          <div class="material-symbols-outlined">extension_off</div><h3>{{ query ? '没有匹配的插件' : '暂无插件' }}</h3><p>{{ query ? '可以清除搜索，或安装对应插件。' : '安装插件或启动引擎后刷新' }}</p>
+
+      <Transition name="plugin-detail" mode="out-in">
+      <div v-if="selectedPlugin" :key="selectedPluginKey" class="plugin-detail-view" tabindex="0" role="region" aria-label="插件详情">
+        <button type="button" class="plugin-back-button" @click="closePlugin">
+          <span class="material-symbols-outlined">arrow_back</span>插件管理
+        </button>
+
+        <section class="plugin-detail-hero">
+          <span class="material-symbols-outlined plugin-detail-icon" :class="selectedPlugin.kind === 'triggers' ? 'trigger' : 'action'">
+            {{ pluginKindIcon(selectedPlugin.kind) }}
+          </span>
+          <div class="plugin-detail-identity">
+            <h2>{{ selectedPlugin.meta.name || selectedPlugin.id }}</h2>
+            <p>{{ pluginKindLabel(selectedPlugin.kind) }} · v{{ pluginVersion(selectedPlugin.meta) }}</p>
+            <span>{{ selectedPlugin.meta.description || '没有插件说明' }}</span>
+          </div>
+          <button v-if="selectedPlugin.origin === 'user'" type="button" class="btn btn-outlined plugin-uninstall-button" @click="uninstallPlugin(selectedPlugin)">
+            <span class="material-symbols-outlined">delete</span>卸载插件
+          </button>
+        </section>
+
+        <div v-if="selectedProblemDetail" class="plugin-detail-alert">
+          <span class="material-symbols-outlined">error</span>
+          <div v-if="selectedPlugin.origin === 'builtin' && /签名|完整性/.test(selectedProblemDetail)"><b>安装文件异常</b><p>内置插件属于 NotmyFault 安装内容，请重新安装完整应用。</p><button class="btn btn-outlined" @click="openSecurity">查看重新安装说明</button></div>
+          <div v-else><b>{{ pluginStatus(selectedPlugin.meta) || '需要处理' }}</b><p>{{ selectedProblemDetail }}</p></div>
         </div>
-        <div v-else class="plugin-grid">
-          <PluginCard v-for="(meta, pid) in filteredList" :key="pid" :pid="pid" :meta="meta" :type="tab"
-            :class="{ focused: focusedPluginId === pid }"
-            @toggle="togglePlugin" @uninstall="uninstallPlugin" />
-        </div>
+
+        <section class="plugin-detail-section">
+          <h3>插件状态</h3>
+          <div class="plugin-detail-group">
+            <label class="plugin-detail-row plugin-detail-toggle">
+              <span><b>启用插件</b><small>控制这个插件是否参与自动化</small></span>
+              <span class="switch" :class="{ 'is-disabled': !pluginIsAvailable(selectedPlugin.meta) }">
+                <input type="checkbox" :checked="selectedPlugin.meta.enabled !== false" :disabled="!pluginIsAvailable(selectedPlugin.meta)" @change="togglePlugin(selectedPlugin)">
+                <span class="switch-track"><span class="switch-thumb"></span></span>
+              </span>
+            </label>
+            <div class="plugin-detail-row">
+              <span>当前状态</span>
+              <strong :class="{ error: selectedPlugin.meta._error || !pluginIsAvailable(selectedPlugin.meta) }">{{ pluginStatus(selectedPlugin.meta) || '已启用' }}</strong>
+            </div>
+          </div>
+        </section>
+
+        <section class="plugin-detail-section">
+          <h3>权限</h3>
+          <div class="plugin-detail-group">
+            <div v-for="permission in selectedPlugin.meta.permissions || []" :key="permission" class="plugin-detail-row">
+              <span>{{ permissionLabel(permission) }}</span>
+            </div>
+            <div v-if="!(selectedPlugin.meta.permissions || []).length" class="plugin-detail-row">
+              <span>无特殊权限</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="plugin-detail-section">
+          <h3>插件信息</h3>
+          <div class="plugin-detail-group">
+            <div class="plugin-detail-row"><span>插件 ID</span><strong>{{ selectedPlugin.id }}</strong></div>
+            <div class="plugin-detail-row"><span>包名</span><strong>{{ selectedPlugin.meta.package_name || '—' }}</strong></div>
+            <div class="plugin-detail-row"><span>版本</span><strong>{{ pluginVersion(selectedPlugin.meta) }}</strong></div>
+            <div class="plugin-detail-row"><span>类型</span><strong>{{ pluginKindLabel(selectedPlugin.kind) }}</strong></div>
+            <div class="plugin-detail-row"><span>来源</span><strong>{{ pluginOriginLabel(selectedPlugin.origin) }}</strong></div>
+          </div>
+        </section>
       </div>
-    </Transition>
+      <div v-else class="plugin-detail-empty">
+        <span class="material-symbols-outlined">extension</span>
+        <h3>选择一个插件</h3>
+        <p>这里会显示插件状态、声明权限、版本和来源。</p>
+      </div>
+      </Transition>
+    </div>
 
     <BaseDialog :open="showInstall" @close="showInstall = false">
       <div v-if="showInstall" class="preview-dialog">

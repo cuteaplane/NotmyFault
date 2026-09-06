@@ -1,12 +1,7 @@
 <script setup>
-import { ref, watch, onMounted, onUnmounted } from 'vue'
+import { defineAsyncComponent, nextTick, ref, watch, onMounted, onUnmounted } from 'vue'
 import NavRail from './components/NavRail.vue'
 import HomeView from './components/views/HomeView.vue'
-import PluginsView from './components/views/PluginsView.vue'
-import SecurityView from './components/views/SecurityView.vue'
-import SettingsView from './components/views/SettingsView.vue'
-import RulesView from './components/views/RulesView.vue'
-import LogsView from './components/views/LogsView.vue'
 import AppDialog from './components/AppDialog.vue'
 import { store } from './lib/store'
 import { snack } from './lib/notify'
@@ -16,11 +11,38 @@ import { useTheme } from './composables/useTheme'
 
 const { init: initTheme } = useTheme()
 const currentPage = ref('home')
-const views = { home: HomeView, plugins: PluginsView, security: SecurityView, settings: SettingsView, rules: RulesView, logs: LogsView }
+const pageTransitioning = ref(false)
+let queuedPage = ''
+const PluginsView = defineAsyncComponent(() => import('./components/views/PluginsView.vue'))
+const SettingsView = defineAsyncComponent(() => import('./components/views/SettingsView.vue'))
+const RulesView = defineAsyncComponent(() => import('./components/views/RulesView.vue'))
+const views = { home: HomeView, plugins: PluginsView, settings: SettingsView, rules: RulesView }
 
 function switchPage(p) {
+  if (p === 'security') {
+    store.pendingSettingsSection = 'security'
+    p = 'settings'
+  } else if (p === 'logs') {
+    store.pendingAutomationSection = 'runs'
+    p = 'rules'
+  }
   if (p === currentPage.value || !views[p]) return
+  if (pageTransitioning.value) {
+    queuedPage = p
+    return
+  }
   currentPage.value = p
+}
+
+function finishPageTransition() {
+  pageTransitioning.value = false
+  const main = document.querySelector('.app-main')
+  if (main) main.scrollTop = 0
+  nextTick(() => main?.focus({ preventScroll: true }))
+  if (!queuedPage) return
+  const page = queuedPage
+  queuedPage = ''
+  switchPage(page)
 }
 
 let sseAbort = null
@@ -28,6 +50,7 @@ let sseRetry = 0
 const SSE_MAX = 10
 let sseReconnectTimer = null
 let sseEventSeq = 0
+let refreshSignalTimer = null
 // 规则测试回显只关心这几类执行事件。
 const RULE_EVENTS = ['action_executed', 'action_skipped', 'action_cancelled', 'action_timed_out', 'workflow_failed', 'workflow_deferred', 'workflow_completed', 'test_assertions_completed', 'error', 'run_dropped', 'run_replaced']
 const timers = []
@@ -36,6 +59,8 @@ function setTracked(fn, ms) { const id = setInterval(fn, ms); timers.push(id); r
 const OFFLINE_STATUS = { api_alive: false, engine_running: false, engine_state: 'offline' }
 const CONFIG_LOAD_ATTEMPTS = 30
 const CONFIG_LOAD_INTERVAL = 150
+const REFRESH_SIGNAL_DELAY = 100
+let configLoadPromise = null
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -48,8 +73,13 @@ function applyConfig(cfg) {
   return true
 }
 
-async function loadConfigData() {
-  return applyConfig(await loadConfig())
+function loadConfigData() {
+  if (!configLoadPromise) {
+    configLoadPromise = loadConfig()
+      .then(applyConfig)
+      .finally(() => { configLoadPromise = null })
+  }
+  return configLoadPromise
 }
 
 async function loadConfigAtStartup() {
@@ -75,16 +105,16 @@ async function refreshAll(status = null) {
   const currentStatus = status || await getEngineStatus().catch(() => OFFLINE_STATUS)
   updateStatus(currentStatus)
   if (!currentStatus.api_alive) return
-  await loadConfigData().catch(() => {})
   void loadAISettingsOnce()
-  try {
-    const [sch, plugins, extensions] = await Promise.all([
-      getSchema(), loadPlugins(), getPluginExtensions(),
-    ])
+  const configPromise = loadConfigData().catch(() => {})
+  const catalogPromise = Promise.all([
+    getSchema(), loadPlugins(), getPluginExtensions(),
+  ]).then(([sch, plugins, extensions]) => {
     store.schema = sch
     store.pluginsData = plugins
     store.extensions = extensions
-  } catch (e) { /* 后台短暂不可用时保留已加载的数据。 */ }
+  }).catch(() => { /* 后台短暂不可用时保留已加载的数据。 */ })
+  await Promise.all([configPromise, catalogPromise])
 }
 
 async function refreshStatus() {
@@ -146,6 +176,14 @@ function scheduleSSEReconnect() {
   sseReconnectTimer = setTimeout(connectSSE, delay)
 }
 
+function scheduleRefreshSignal() {
+  if (refreshSignalTimer) return
+  refreshSignalTimer = setTimeout(() => {
+    refreshSignalTimer = null
+    store.refreshSignal++
+  }, REFRESH_SIGNAL_DELAY)
+}
+
 function dispatchSSEEvent(eventName, dataText) {
   if (eventName === 'engine_state_changed') {
     let d = {}
@@ -157,7 +195,7 @@ function dispatchSSEEvent(eventName, dataText) {
     })
     if (d.state === 'running') refreshAll()
   } else if (eventName === 'action_executed' || eventName === 'workflow_completed') {
-    store.refreshSignal++
+    scheduleRefreshSignal()
   }
   if (RULE_EVENTS.includes(eventName)) {
     let d = {}
@@ -216,7 +254,7 @@ async function consumeSSE(res, abort) {
 
 // 后台控制服务离线时返回首页，自动化暂停时仍可编辑。
 watch(() => store.controllerOnline, (on) => {
-  if (!on && ['plugins', 'rules', 'logs', 'security', 'settings'].includes(currentPage.value)) {
+  if (!on && ['plugins', 'rules', 'settings'].includes(currentPage.value)) {
     switchPage('home')
   }
 })
@@ -225,6 +263,7 @@ watch(() => store.controllerOnline, (on) => {
 window.__nmf = { refreshAll, updateStatus, switchPage }
 
 onMounted(async () => {
+  window.addEventListener('pywebviewready', refreshStatus)
   initTheme()
   void loadConfigAtStartup()
   const status = await getEngineStatus().catch(() => OFFLINE_STATUS)
@@ -238,19 +277,21 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  window.removeEventListener('pywebviewready', refreshStatus)
   if (sseAbort) sseAbort.abort()
   if (sseReconnectTimer) clearTimeout(sseReconnectTimer)
+  if (refreshSignalTimer) clearTimeout(refreshSignalTimer)
   timers.forEach(id => clearInterval(id))
 })
 </script>
 
 <template>
   <NavRail :current="currentPage" @switch="switchPage" />
-  <main class="app-main">
-    <Transition name="page" mode="out-in">
+  <main class="app-main" tabindex="-1" aria-label="页面内容">
+    <Transition name="page" mode="out-in" @before-leave="pageTransitioning = true" @after-enter="finishPageTransition">
       <component :is="views[currentPage]" :key="currentPage" />
     </Transition>
   </main>
-  <div class="snackbar" :class="{ show: snack.show }">{{ snack.msg }}</div>
+  <div class="snackbar" :class="{ show: snack.show }" role="status">{{ snack.show ? snack.msg : '' }}</div>
   <AppDialog />
 </template>

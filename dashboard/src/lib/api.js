@@ -39,7 +39,7 @@ function bridgeResponse(data) {
 
 async function bridgeRequest(path, method = 'GET', data = null) {
   if (!hasBridge()) throw new Error('Dashboard 桌面桥接尚未就绪')
-  const result = await window.pywebview.api.request_api(path, method, data)
+  const result = await window.pywebview.api.request_api(path, method, data, 'typed-v1')
   if (result?.status === 403) throw new Error('Dashboard 与后台服务认证不同步')
   return bridgeResponse(result)
 }
@@ -57,7 +57,7 @@ export async function apiWrite(path, method, body, isForm) {
     ? { method, body }
     : {
       method,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-NMF-Value-Encoding': 'typed-v1' },
       body: body == null ? null : JSON.stringify(body),
     }
   const res = await fetchAuthenticated(path, options)
@@ -81,7 +81,7 @@ export async function loadConfig() {
 }
 
 export async function saveConfig(rules, adminKeyPassword = '') {
-  if (hasBridge()) return await window.pywebview.api.save_config(rules, adminKeyPassword)
+  if (hasBridge()) return await window.pywebview.api.save_config(rules, adminKeyPassword, 'typed-v1')
   const response = await apiWrite('/api/rules', 'PUT', {
     rules,
     admin_key_password: adminKeyPassword,

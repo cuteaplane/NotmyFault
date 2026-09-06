@@ -162,6 +162,7 @@ export function normalizeConditionTree(node) {
 
 function unwrapSingleCondition(node) {
   if (isConditionLeaf(node)) return node
+  if (node?.op === 'not') return null
   if (!isObject(node) || !Array.isArray(node.children) || node.children.length !== 1) return null
   return unwrapSingleCondition(node.children[0])
 }

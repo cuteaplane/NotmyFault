@@ -8,7 +8,7 @@ import PluginPicker from './PluginPicker.vue'
 
 defineOptions({ name: 'ConditionEditor' })
 
-const props = defineProps({ node: Object, nested: Boolean })
+const props = defineProps({ node: Object, nested: Boolean, constants: { type: Array, default: () => [] } })
 const emit = defineEmits(['remove'])
 
 // 旧配置或手写配置可能没有 children，这里补成空数组。
@@ -44,7 +44,8 @@ function changeEvent(index, type) {
   }
 }
 function changeOp() {
-  if (props.node.op !== 'all') delete props.node.within_seconds
+  if (props.node.op === 'not') props.node.within_seconds ||= 60
+  else if (props.node.op !== 'all') delete props.node.within_seconds
 }
 function addEvent() {
   if (!triggerKeys.value.length) return
@@ -71,6 +72,9 @@ function chooseTrigger(type) {
   pickerIndex.value = null
 }
 function removeChild(index) { props.node.children.splice(index, 1) }
+function useNotEvent(index) {
+  props.node.children[index] = { op: 'not', within_seconds: 60, children: [props.node.children[index]] }
+}
 function moveChild(index, offset) {
   const target = index + offset
   if (target < 0 || target >= props.node.children.length) return
@@ -86,8 +90,9 @@ function moveChild(index, offset) {
       <select v-model="node.op" class="select condition-op" @change="changeOp">
         <option value="any">满足以下任一条件</option>
         <option value="all">以下条件需全部满足</option>
+        <option value="not">以下事件未发生（NOT）</option>
       </select>
-      <label v-if="node.op === 'all'" class="condition-window">
+      <label v-if="['all', 'not'].includes(node.op)" class="condition-window">
         <span>在</span>
         <input v-model.number="node.within_seconds" type="number" min="1" class="text-field">
         <span>秒内</span>
@@ -113,6 +118,7 @@ function moveChild(index, offset) {
             <span class="material-symbols-outlined flow-expand">expand_more</span>
           </summary>
           <div class="flow-card-body">
+            <button v-if="node.op !== 'not'" class="btn btn-text btn-sm" @click="useNotEvent(index)">未发生时（NOT）</button>
             <div class="field field-wide"><span class="field-label">触发方式</span>
               <button class="plugin-type-button" type="button" @click="replaceEvent(index)">
                 <span class="material-symbols-outlined">bolt</span>
@@ -120,10 +126,10 @@ function moveChild(index, offset) {
                 <span class="material-symbols-outlined">arrow_forward</span>
               </button>
             </div>
-            <div class="param-grid"><ParamInput v-for="param in eventParams(child)" :key="param.name" :def="param" :plugin-id="child.type" v-model="child.params[param.name]" /></div>
+            <div class="param-grid"><ParamInput v-for="param in eventParams(child)" :key="param.name" :def="param" :plugin-id="child.type" v-model="child.params[param.name]" :allow-binding="param.type !== 'plugin_data'" :binding-sources="constants" /></div>
           </div>
         </details>
-        <ConditionEditor v-else-if="isObjectNode(child)" :node="child" nested @remove="removeChild(index)" />
+        <ConditionEditor v-else-if="isObjectNode(child)" :node="child" :constants="constants" nested @remove="removeChild(index)" />
         <div v-else class="flow-inline-empty">
           条件 {{ index + 1 }} 格式无效。
           <button class="btn btn-text btn-sm danger-text" @click="removeChild(index)">移除</button>
@@ -131,9 +137,10 @@ function moveChild(index, offset) {
       </template>
     </div>
 
-    <footer class="flow-add-row">
+    <p v-if="node.op === 'not'" class="inspector-lead">只放一个事件。等待期间收到事件会重新计时；超时触发一次。</p>
+    <footer v-if="node.op !== 'not' || !node.children.length" class="flow-add-row">
       <button class="btn btn-text btn-sm" :disabled="!triggerKeys.length" @click="addEvent"><span class="material-symbols-outlined">add</span>添加条件</button>
-      <button class="btn btn-text btn-sm" :disabled="!triggerKeys.length" @click="addGroup"><span class="material-symbols-outlined">account_tree</span>添加条件组</button>
+      <button v-if="node.op !== 'not'" class="btn btn-text btn-sm" :disabled="!triggerKeys.length" @click="addGroup"><span class="material-symbols-outlined">account_tree</span>添加条件组</button>
     </footer>
     <PluginPicker :open="pickerOpen" kind="trigger" :keys="triggerKeys" :groups="triggerGroups"
       :title="pickerTitle"

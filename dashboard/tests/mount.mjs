@@ -9,7 +9,8 @@ import { aiProviderIdFor } from '../src/lib/providers.js'
 import { streamRuleDraftWithAI } from '../src/lib/api.js'
 import { computeChangeSet, summarizeRuleChanges } from '../src/lib/ruleDiff.js'
 import { ensureParams } from '../src/lib/utils.js'
-import { buildNodeDataPorts, parameterAllowsBinding } from '../src/lib/bindings.js'
+import { actionOutputDefs, bindingSourceFor, buildNodeDataPorts, collectReferences, parameterAllowsBinding, regenerateBindingIds } from '../src/lib/bindings.js'
+import { compatibleTypes, formatTypedInput, isOpaqueValue, parseTypedInput, typeAtPath } from '../src/lib/valueTypes.js'
 
 const bindingPolicyMeta = {
   params:[
@@ -29,14 +30,18 @@ const bindingPolicyOk = parameterAllowsBinding(bindingPolicyMeta, 'source')
 console.log((bindingPolicyOk?'PASS':'FAIL')+' - literal-only parameters stay out of graph binding ports')
 if (!bindingPolicyOk) process.exit(1)
 
-const dashboardStyles = fs.readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8')
-const settingsStageStyles = dashboardStyles.match(/\.settings-stage\{([^}]*)\}/)?.[1] || ''
-const settingsTransitionStyles = dashboardStyles.match(/\.settings-forward-enter-active,[^{]+\{([^}]*)\}/)?.[1] || ''
-const settingsTransitionLayerOk = !settingsStageStyles.includes('will-change')
-  && settingsStageStyles.includes('transform:none')
-  && settingsTransitionStyles.includes('will-change:transform,opacity')
-console.log((settingsTransitionLayerOk?'PASS':'FAIL')+' - settings transition releases its compositor layer after animation')
-if (!settingsTransitionLayerOk) process.exit(1)
+const copiedBranch = {
+  type:'if', binding_id:'a_branch01', condition:{ op:'is_true', left:true },
+  then:[
+    { type:'query', binding_id:'a_query001', params:{} },
+    { type:'notify', binding_id:'a_notify01', params:{ message:{ $ref:{ scope:'step', node:'a_query001', path:['text'] } } } },
+  ], else:[],
+}
+regenerateBindingIds(copiedBranch, 'action')
+const copiedBranchOk = copiedBranch.then[0].binding_id !== 'a_query001'
+  && copiedBranch.then[1].params.message.$ref.node === copiedBranch.then[0].binding_id
+console.log((copiedBranchOk?'PASS':'FAIL')+' - copying an IF branch keeps its internal data references')
+if (!copiedBranchOk) process.exit(1)
 
 const distDir = process.env.DASHBOARD_DIST_DIR || 'dist'
 const dom = new JSDOM('<!DOCTYPE html><html><head></head><body><div id="app"></div></body></html>', {
@@ -69,6 +74,7 @@ let launchCalls = 0
 let mockAdminAuthorization = 'per_execution'
 let mockAdminRuleVerification = true
 let mockAiDrafting = { enabled: false, endpoint_url: '', model: '', api_format: 'chat_completions' }
+let mockConfigSecurity = { status:'ok', reason:'', summary:null }
 let mockAiApiKeyStatus = 'none'
 let mockBluetoothInstalled = false
 let exportedRunBlob = null
@@ -79,6 +85,16 @@ let engineEventController = null
 
 function pause(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function waitFor(selector, timeout = 1000) {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    const element = typeof selector === 'function' ? selector() : window.document.querySelector(selector)
+    if (element) return element
+    await pause(10)
+  }
+  return null
 }
 
 function sseFrame(type, data) {
@@ -243,7 +259,7 @@ window.pywebview = { api: {
   },
   request_api: async (path, method, data) => {
     bridgeCalls.push({ path, method, data })
-    if (path === '/api/config/security-status') return { status:'ok', reason:'', summary:null }
+    if (path === '/api/config/security-status') return mockConfigSecurity
     if (path === '/api/platform') return {
       platform:'windows', session_type:'desktop', capabilities:{
         'audio.control':{ available:true, degraded:false, backend:'pycaw', reason:'' },
@@ -308,11 +324,6 @@ window.pywebview = { api: {
       commands: [],
       parameter_editors: [
         {
-          plugin_id:'uia_control', id:'selector_editor', parameter:'target', value_type:'object',
-          command:'edit_selector',
-          ui:{ control:'button', empty_label:'选择屏幕控件', icon:'center_focus_strong' },
-        },
-        {
           plugin_id:'hotkey', id:'hotkey_recorder', parameter:'hotkey', value_type:'string',
           command:'capture_hotkey',
           ui:{ control:'button', label:'录制', busy_label:'请按快捷键…', icon:'keyboard' },
@@ -330,6 +341,9 @@ window.pywebview = { api: {
       return { ok:true, html:'<h1>操作宏插件页面</h1>' }
     }
     if (path === '/api/plugins/macro_run/extensions/commands/open_macro/invoke' && method === 'POST') {
+      if (data.current_value != null && data.current_value?.$type !== 'com.test.macro/mouse_macro@1') {
+        return { ok:false, error:'当前值不是该插件声明的数据' }
+      }
       const current = data.current_value?.data || data.current_value || {}
       return { ok:true, session_id:'s_macro', view:'macro_workbench', state:{ steps:current.steps || [] }, close:false }
     }
@@ -353,45 +367,6 @@ window.pywebview = { api: {
     if (path === '/api/plugins/macro_run/extensions/sessions/s_macro' && method === 'DELETE') {
       return { ok:true }
     }
-    if (path === '/api/plugins/uia_control/extensions/commands/edit_selector/invoke' && method === 'POST') {
-      if (data?.payload?.operation === 'check') return {
-        ok:true, session_id:'s_uia', close:true,
-        data:{ ok:true, display:data.payload?.selector?.display || {}, capabilities:{ invoke:true, focus:true } },
-      }
-      if (data?.payload?.operation === 'to_actions') {
-        const steps = Array.isArray(data.payload?.steps) ? data.payload.steps : []
-        const actions = steps.map(step => {
-          const selector = step.selector || {}
-          if (step.operation === 'wait_present') return {
-            type:'uia_wait',
-            params:{ target:selector, wait_seconds:Number(step.waitSeconds) || 30 },
-          }
-          if (step.operation === 'focus_window') return {
-            type:'uia_focus_window', params:{ target:selector },
-          }
-          if (step.operation === 'read_text') return {
-            type:'uia_read_text', params:{ target:selector },
-          }
-          return {
-            type:'uia_control',
-            params:{
-              target:selector,
-              operation:['focus','set_text'].includes(step.operation) ? step.operation : 'invoke',
-              text:step.operation === 'set_text' ? String(step.text || '') : '',
-            },
-          }
-        })
-        return { ok:true, session_id:'s_uia', close:true, data:{ actions } }
-      }
-      return { ok:true, session_id:'s_uia', close:true, value:{
-        version:1,
-        window:{ process:'notepad.exe', name:'无标题 - 记事本', control_type:50032, class_name:'Notepad' },
-        target:{ automation_id:'FileSave', name:'保存', control_type:50000, class_name:'Button' },
-        ancestors:[], captured_at:'2026-08-10T00:00:00Z', bounds:{ left:10, top:10, width:80, height:30 },
-        capabilities:{ invoke:true, focus:true, set_text:true, read_text:true },
-        display:{ control:'保存', control_type:'按钮', window:'无标题 - 记事本', app:'notepad.exe' },
-      } }
-    }
     if (path === '/api/plugins/hotkey/extensions/commands/capture_hotkey/invoke' && method === 'POST') {
       return { ok:true, session_id:'s_hot', value:'Ctrl+Shift+M', close:true }
     }
@@ -409,21 +384,6 @@ const T = {
 const A = {
   notify: { id:'notify', name:'显示通知', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['admin'], params:[{ name:'message', label:'消息', type:'string', default:'' }, { name:'secret', label:'密钥', type:'string', default:'', sensitive:true }], outputs:[{ name:'delivered', label:'已送达', type:'bool' }] },
   shutdown_system: { id:'shutdown_system', name:'关闭电脑', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['admin'], params:[], outputs:[] },
-  uia_control: { id:'uia_control', name:'操作屏幕控件', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['native_api','screen_reader'], params:[
-    { name:'target', label:'屏幕控件', type:'uia_selector', value_type:'object' },
-    { name:'operation', label:'怎么操作', type:'select', default:'invoke', options:[{ value:'invoke', label:'按下控件' }, { value:'focus', label:'让控件获得焦点' }, { value:'set_text', label:'写入文本' }] },
-    { name:'text', label:'要写入的文本', type:'textarea', default:'', sensitive:true, summary:'hidden', visible_when:{ operation:['set_text'] } },
-  ], outputs:[] },
-  uia_wait: { id:'uia_wait', name:'等待屏幕控件出现', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['native_api','screen_reader'], cancellation_api:'runtime-v1', params:[
-    { name:'target', label:'屏幕控件', type:'uia_selector', value_type:'object' },
-    { name:'wait_seconds', label:'最多等待（秒）', type:'number', default:30 },
-  ], outputs:[{ name:'found', label:'已经出现', type:'bool' }] },
-  uia_focus_window: { id:'uia_focus_window', name:'切换到录制窗口', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['native_api','screen_reader'], params:[
-    { name:'target', label:'窗口里的控件', type:'uia_selector', value_type:'object' },
-  ], outputs:[{ name:'focused', label:'已经切换', type:'bool' }] },
-  uia_read_text: { id:'uia_read_text', name:'读取屏幕控件文本', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['native_api','screen_reader'], params:[
-    { name:'target', label:'屏幕控件', type:'uia_selector', value_type:'object' },
-  ], outputs:[{ name:'text', label:'读取的文本', type:'string', sensitive:true, summary:'hidden' }] },
   macro_run: { id:'macro_run', name:'宏录制动作', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:[], params:[
     { name:'macro', label:'操作宏', type:'plugin_data', data_type:'mouse_macro', value_type:'object', summary:'hidden' },
   ], outputs:[] },
@@ -484,6 +444,14 @@ Object.defineProperty(global, 'navigator', { value: window.navigator, configurab
 global.requestAnimationFrame = (cb) => setTimeout(cb, 0)
 global.cancelAnimationFrame = (id) => clearTimeout(id)
 global.fetch = window.fetch  // 覆盖 node 原生 fetch，确保用 mock
+const appendToHead = window.document.head.appendChild.bind(window.document.head)
+window.document.head.appendChild = element => {
+  const result = appendToHead(element)
+  if (element.tagName === 'LINK' && element.rel === 'stylesheet') {
+    queueMicrotask(() => element.dispatchEvent(new window.Event('load')))
+  }
+  return result
+}
 
 async function checkDraftStreamParser() {
   const originalFetch = window.fetch
@@ -584,8 +552,10 @@ const recoveryDiffOk = recoveryDiff.length === 1
 console.log((ensuredParamsOk && recoveryDiffOk?'PASS':'FAIL')+' - missing params and recovery changes stay editable and visible')
 if (!ensuredParamsOk || !recoveryDiffOk) process.exit(1)
 
-const jsFile = fs.readdirSync(path.join(distDir, 'assets')).find(f => f.endsWith('.js'))
-await import(pathToFileURL(path.resolve(distDir, 'assets', jsFile)).href)
+const builtHtml = fs.readFileSync(path.join(distDir, 'index.html'), 'utf8')
+const entryPath = builtHtml.match(/<script[^>]*type="module"[^>]*src="([^"]+)"/)?.[1]
+if (!entryPath) throw new Error('Dashboard 构建结果缺少入口脚本')
+await import(new URL(entryPath, pathToFileURL(path.resolve(distDir, 'index.html'))).href)
 await new Promise(r => setTimeout(r, 100))
 
 const offlineHtml = document.getElementById('app').innerHTML
@@ -595,16 +565,17 @@ const offlineStateOk = offlineHtml.includes('引擎未运行')
 console.log((offlineStateOk?'PASS':'FAIL')+' - offline home shows the final state without a connection spinner')
 if (!offlineStateOk) process.exit(1)
 
-await new Promise(r => setTimeout(r, 2100))
+window.dispatchEvent(new window.Event('pywebviewready'))
+await new Promise(r => setTimeout(r, 100))
 const html = document.getElementById('app').innerHTML
 const checks = [
   ['engine running', html.includes('运行中')],
 ]
 const startupRetryOk = engineStatusReads >= 2 && configReads >= 2
-  && document.querySelector('.dashboard-metrics')?.textContent.includes('1')
+  && document.querySelector('.home-engine-metrics')?.textContent.includes('1')
   && !document.querySelector('.dashboard-first-run')
 const homeKeepsCapabilitiesOutOfDiagnostics = !document.querySelector('.dashboard-capability-report')
-checks.push(['status polling restores engine state and startup config retries', startupRetryOk])
+checks.push(['bridge readiness restores engine state without waiting for polling', startupRetryOk])
 checks.push(['home diagnostics omit the full platform capability list', homeKeepsCapabilitiesOutOfDiagnostics])
 let ok = true
 for (const [name, pass] of checks) { console.log((pass?'PASS':'FAIL')+' - '+name); if(!pass) ok=false }
@@ -614,16 +585,16 @@ const homeNav = [...document.querySelectorAll('.nav-item')].find(
   button => button.textContent.includes('首页'),
 )
 const pauseAutomation = [...document.querySelectorAll('button')].find(
-  button => button.textContent.includes('暂停自动化'),
+  button => button.textContent.trim() === 'pause暂停',
 )
 pauseAutomation?.click()
 await new Promise(r => setTimeout(r, 50))
-const pausedControls = [...document.querySelectorAll('.apatch-hero .hero-control')]
+const pausedControls = [...document.querySelectorAll('.home-engine-actions .btn')]
 const pausedControlsOk = pausedControls.length === 2
   && pausedControls.some(button => button.textContent.includes('启动自动化'))
-  && pausedControls.some(button => button.textContent.includes('彻底停止引擎'))
-const startupAlertOk = document.querySelector('.engine-startup-alert')?.textContent.includes('核心文件完整性校验失败')
-  && document.querySelector('.engine-startup-alert .btn')?.textContent.includes('前往安全页处理')
+  && pausedControls.some(button => button.textContent.includes('彻底停止'))
+const startupAlertOk = document.querySelector('.engine-startup-alert')?.textContent.includes('安装文件异常，请重新安装 NotmyFault')
+  && document.querySelector('.engine-startup-alert .btn')?.textContent.includes('查看重新安装说明')
 console.log((pausedControlsOk && startupAlertOk?'PASS':'FAIL')+' - paused automation keeps controls and startup failure in separate layouts')
 if (!pausedControlsOk || !startupAlertOk) process.exit(1)
 
@@ -631,7 +602,7 @@ const rulesNav = [...document.querySelectorAll('.nav-item')].find(
   button => button.textContent.includes('自动化'),
 )
 rulesNav?.click()
-await new Promise(r => setTimeout(r, 50))
+await waitFor('.rules-library')
 const automationPageOk = document.querySelector('.rules-library')?.textContent.includes('创建、测试和管理这台电脑上的自动化')
   && !document.querySelector('.automation-create-panel')
 ;[...document.querySelectorAll('.rules-library button')].find(button => button.textContent.includes('创建自动化'))?.click()
@@ -657,7 +628,7 @@ const earlySettingsNav = [...document.querySelectorAll('.nav-item')].find(
   button => button.textContent.includes('设置'),
 )
 earlySettingsNav?.click()
-await new Promise(r => setTimeout(r, 50))
+await waitFor('.settings-root-list')
 ;[...document.querySelectorAll('.settings-root-list button')].find(button => button.textContent.includes('AI 功能'))?.click()
 await new Promise(r => setTimeout(r, 20))
 const earlyAiEnabled = document.querySelector('.ai-drafting-settings input[type="checkbox"]')
@@ -884,17 +855,75 @@ const preparedContext = buildPreparedTestContext([
   { key:'count', scope:'event', node:'', path:['count'], type:'number', required:true },
   { key:'ready', scope:'event', node:'', path:['ready'], type:'bool', required:true },
   { key:'meta', scope:'trigger', node:'t_full01', path:['meta'], type:'object', required:true },
-], { count:'12.5', ready:true, meta:'{"source":"test"}' })
+  { key:'precise', scope:'variable', node:'v_precise01', path:[], valueType:'int', required:true },
+  { key:'nested', scope:'step', node:'a_nested01', path:['rows', 0, '名称'], valueType:'text', required:true },
+], { count:'12.5', ready:true, meta:'{"source":"test"}', precise:'9007199254740993', nested:'条目' })
 let unsafeContextRejected = false
 try {
   buildPreparedTestContext([{ key:'unsafe', scope:'event', path:['__proto__', 'polluted'], type:'string' }], { unsafe:'yes' })
 } catch { unsafeContextRejected = true }
+const encodedInputCases = [
+  ['int', 'int', '9007199254740993'],
+  ['decimal', 'decimal', '9007199254740993.12345'],
+  ['bytes', 'bytes', 'AAEC'],
+  ['date', 'date', '2026-09-06'],
+  ['time', 'time', '12:34:56+08:00'],
+  ['datetime', 'datetime', '2026-09-06T12:34:56+08:00'],
+  ['uuid', 'uuid', 'e7cc3f52-319b-4cbb-8c6b-cd8ec2e18c13'],
+  ['path', 'windows_path', 'C:\\data\\example.txt'],
+  ['path', 'posix_path', '/data/example.txt'],
+]
+const encodedInputsOk = encodedInputCases.every(([declaration, kind, data]) => {
+  const value = { $nmf_value:{ type:kind, data } }
+  const specialized = parseTypedInput(formatTypedInput(value, declaration), declaration)
+  const expected = ['int', 'decimal', 'bytes'].includes(declaration) ? value : data
+  return JSON.stringify(specialized) === JSON.stringify(expected)
+    && ['any', { type:'union', variants:[declaration, 'null'] }].every(type => (
+      JSON.stringify(parseTypedInput(formatTypedInput(value, type), type)) === JSON.stringify(value)
+    ))
+})
+const ordinaryReference = { $ref:{ scope:'trigger', node:'t_full01', path:['matched_title'] } }
+const ordinaryObjects = [
+  { $literal:'business label', content:ordinaryReference },
+  { $nmf_value:'business label', content:ordinaryReference },
+  { $type:'business/name', data:ordinaryReference },
+  { $type:'io.example.plugin/record@1', content:ordinaryReference },
+]
+const ordinaryObjectsOk = ordinaryObjects.every(value => (
+  !isOpaqueValue(value) && collectReferences(value).length === 1
+  && JSON.stringify(parseTypedInput(formatTypedInput(value, 'any'), 'any')) === JSON.stringify(value)
+  && collectReferences({ $literal:value }).length === 0
+)) && collectReferences({ $type:'io.example.plugin/record@1', data:ordinaryReference }).length === 0
 const preparedTypesOk = preparedContext.event_payload.count === 12.5
   && preparedContext.event_payload.ready === true
   && preparedContext.trigger_payloads.t_full01.meta.source === 'test'
-  && unsafeContextRejected && !({}).polluted
+  && preparedContext.variable_values.v_precise01.$nmf_value.data === '9007199254740993'
+  && preparedContext.step_outputs.a_nested01.rows[0]['名称'] === '条目'
+  && unsafeContextRejected && !({}).polluted && encodedInputsOk && ordinaryObjectsOk
 console.log((preparedTypesOk?'PASS':'FAIL')+' - prepared test data follows output types and expands full payload references')
 if (!preparedTypesOk) process.exit(1)
+
+const objectCompatibilityCases = [
+  [{ type:'object', additional_properties:'text' }, { type:'object', properties:{ count:'int' } }, false],
+  [{ type:'object', additional_properties:'int' }, { type:'object', properties:{ count:'int' } }, true],
+  [{ type:'object', additional_properties:'int' }, { type:'object', additional_properties:'text' }, false],
+  [{ type:'object', properties:{ name:'text' }, additional_properties:false }, { type:'object', additional_properties:'int' }, false],
+  [{ type:'object', additional_properties:false }, { type:'object', additional_properties:'int' }, true],
+  [{ type:'object' }, { type:'object', additional_properties:false }, false],
+]
+const sharedIdentity = 'io.example.plugin/record@1'
+const sharedCatalog = [{ id:sharedIdentity, binding:'shared', schema:{ type:'object', properties:{ count:'int' }, required:['count'] } }]
+const sharedSources = [{ type:sharedIdentity, value:{ $ref:{ scope:'constant', node:'c_record01', path:[] } } }]
+const sharedPathCases = [[['$type'], 'text', false], [['summary'], 'text', true], [['data', 'count'], 'int', false]]
+const bindingTypesOk = objectCompatibilityCases.every(([source, target, expected]) => compatibleTypes(source, target) === expected)
+  && typeAtPath({ type:'object', additional_properties:'text' }, ['extra']).type.type === 'text'
+  && sharedPathCases.every(([path, type, optional]) => {
+    const selected = typeAtPath(sharedIdentity, path, sharedCatalog)
+    const source = bindingSourceFor({ scope:'constant', node:'c_record01', path }, sharedSources, sharedCatalog)
+    return selected.type.type === type && selected.optional === optional && source?.type.type === type
+  })
+console.log((bindingTypesOk?'PASS':'FAIL')+' - object and shared binding types follow their declared fields')
+if (!bindingTypesOk) process.exit(1)
 
 const partialSchema = {
   triggers: {},
@@ -904,20 +933,38 @@ const partialSchema = {
   },
 }
 const partialRule = {
+  variables: [
+    { id:'v_secret01', name:'凭据', value_type:'text', sensitive:true },
+    { id:'v_count001', name:'计数', value_type:'int' },
+  ],
   actions: [
     { binding_id:'a_source001', type:'produce', params:{} },
-    { binding_id:'a_target001', type:'consume', params:{ url:{ $ref:{ scope:'step', node:'a_source001', path:['url'] } } } },
+    { binding_id:'a_secret001', type:'set_variable', variable:'v_secret01', value:'测试凭据' },
+    { binding_id:'a_count001', type:'set_variable', variable:'v_count001', value:42 },
+    { binding_id:'a_target001', type:'consume', params:{
+      url:{ $ref:{ scope:'step', node:'a_source001', path:['url'] } },
+      secret:{ $ref:{ scope:'step', node:'a_secret001', path:['value'] } },
+      count:{ $ref:{ scope:'step', node:'a_count001', path:['value'] } },
+    } },
   ],
 }
 const partialFields = buildTestInputFields(partialRule, partialSchema, { startStepId:'a_target001' })
+const secretOutputField = partialFields.find(field => field.node === 'a_secret001')
+const countOutputField = partialFields.find(field => field.node === 'a_count001')
 const partialContext = buildPreparedTestContext(partialFields, {
   [partialFields[0].key]:'https://example.com',
+  [secretOutputField?.key]:'测试凭据',
+  [countOutputField?.key]:'42',
 })
 const allPartialFields = buildAllTestInputFields(partialRule, partialSchema)
-const partialInputsOk = partialFields.length === 1
+const partialInputsOk = partialFields.filter(field => field.scope === 'step').length === 3
   && partialFields[0].scope === 'step'
   && partialFields[0].node === 'a_source001'
   && partialContext.step_outputs.a_source001.url === 'https://example.com'
+  && partialContext.step_outputs.a_count001.value === 42
+  && secretOutputField?.sensitive === true && secretOutputField?.type === 'text'
+  && allPartialFields.find(field => field.node === 'a_secret001')?.sensitive === true
+  && actionOutputDefs(partialRule.actions[1], partialSchema, partialRule)[0].sensitive === true
   && allPartialFields.some(field => field.scope === 'step')
 console.log((partialInputsOk?'PASS':'FAIL')+' - partial test run collects skipped upstream action outputs')
 if (!partialInputsOk) process.exit(1)
@@ -927,6 +974,34 @@ const settingsNav = [...document.querySelectorAll('.nav-item')].find(
 )
 settingsNav?.click()
 await new Promise(r => setTimeout(r, 50))
+mockConfigSecurity = {
+  status:'tampered', reason:'配置签名无效', summary:{ rule_count:1, rules:[{
+    name:'分支审批摘要', actions:[{
+      type:'if', high_risk:true, params:{},
+      then:[{ type:'run_powershell', high_risk:true, params:{ command:'Write-Output branch-safe', secret:'***' } }],
+      else:[{ type:'if', high_risk:true, params:{}, then:[{
+        type:'launch_program', high_risk:true, params:{ path:'nested-example.exe' },
+        failure_actions:[{ type:'notify', high_risk:false, params:{ message:'分支补救摘要' } }],
+      }], else:[] }],
+    }],
+  }] },
+}
+;[...document.querySelectorAll('.settings-root-list button')].find(
+  button => button.textContent.includes('安全与权限'),
+)?.click()
+await new Promise(r => setTimeout(r, 50))
+const securitySummaryDetails = document.querySelector('.config-security-rule-details')
+const securitySummaryOk = securitySummaryDetails?.textContent.includes('动作 1 · 成立时 1')
+  && securitySummaryDetails?.textContent.includes('Write-Output branch-safe')
+  && securitySummaryDetails?.textContent.includes('动作 1 · 否则 1 · 成立时 1')
+  && securitySummaryDetails?.textContent.includes('nested-example.exe')
+  && securitySummaryDetails?.textContent.includes('失败补救 1')
+  && securitySummaryDetails?.textContent.includes('分支补救摘要')
+  && securitySummaryDetails?.textContent.includes('"secret":"***"')
+  && securitySummaryDetails?.querySelectorAll('.chip-admin').length === 4
+console.log((securitySummaryOk?'PASS':'FAIL')+' - security approval shows nested branches, fallback actions and masked parameters')
+if (!securitySummaryOk) process.exit(1)
+mockConfigSecurity = { status:'ok', reason:'', summary:null }
 ;[...document.querySelectorAll('.settings-root-list button')].find(
   button => button.textContent.includes('关于 NotmyFault'),
 )?.click()
@@ -1129,7 +1204,7 @@ const failedTurn = aiDraftCalls.at(-1)
 const requestHasNoRemovedPluginFields = !('consent' in failedTurn)
 const visibleErrorMessages = [...document.querySelectorAll('.natural-draft-conversation .ai-message')]
   .filter(message => message.textContent.includes(mockAiDraftError))
-const retryButton = document.querySelector('.ai-error-retry')
+const retryButton = await waitFor('.ai-error-retry:not(:disabled)')
 const errorCallCount = aiDraftCalls.length
 retryButton?.click()
 await new Promise(r => setTimeout(r, 50))
@@ -1286,11 +1361,12 @@ await new Promise(r => setTimeout(r, 30))
 ;[...document.querySelectorAll('.app-dialog button')].find(button => button.textContent.trim() === '删除')?.click()
 await new Promise(r => setTimeout(r, 80))
 
-const logsNav = [...document.querySelectorAll('.nav-item')].find(
-  button => button.textContent.includes('日志'),
-)
-logsNav?.click()
-await new Promise(r => setTimeout(r, 80))
+rulesNav?.click()
+await waitFor('.rules-library')
+;[...document.querySelectorAll('.automation-section-tabs button')].find(
+  button => button.textContent.includes('运行记录'),
+)?.click()
+await waitFor('.run-center-page')
 document.querySelector('.run-export-btn')?.click()
 await new Promise(r => setTimeout(r, 20))
 const runExportConfirmOk = document.querySelector('.app-dialog')?.textContent.includes('不包含触发输入、动作参数、动作返回值或测试期望值')
@@ -1346,103 +1422,17 @@ const failureBranchOk = failurePickerOk
 console.log((failureBranchOk?'PASS':'FAIL')+' - failed actions can run an editable recovery branch')
 if (!failureBranchOk) process.exit(1)
 
-const replaceRecoveryType = document.querySelector('.node-inspector .plugin-type-button')
-replaceRecoveryType?.click()
-await new Promise(r => setTimeout(r, 20))
-;[...document.querySelectorAll('.plugin-picker-item')].find(
-  button => button.textContent.includes('操作屏幕控件'),
-)?.click()
-await new Promise(r => setTimeout(r, 40))
-const chooseDesktopElement = [...document.querySelectorAll('.uia-selector-field button')].find(
-  button => button.textContent.includes('选择屏幕上的控件'),
-)
-chooseDesktopElement?.click()
-await new Promise(r => setTimeout(r, 60))
-const desktopElementCard = document.querySelector('.uia-selector-card')
-const verifyDesktopElement = [...document.querySelectorAll('.uia-selector-field button')].find(
-  button => button.textContent.trim() === '检查',
-)
-verifyDesktopElement?.click()
-await new Promise(r => setTimeout(r, 40))
-const desktopSelectorOk = desktopElementCard?.textContent.includes('保存')
-  && desktopElementCard.textContent.includes('notepad.exe')
-  && bridgeCalls.some(call => (
-    call.path === '/api/plugins/uia_control/extensions/commands/edit_selector/invoke'
-    && call.data?.payload?.operation === 'capture'
-  ))
-  && bridgeCalls.some(call => (
-    call.path === '/api/plugins/uia_control/extensions/commands/edit_selector/invoke'
-    && call.data?.payload?.operation === 'check'
-  ))
-  && document.querySelector('.uia-selector-status')?.textContent.includes('检查通过')
-console.log((desktopSelectorOk?'PASS':'FAIL')+' - screen control selector captures and rechecks a UIA target')
-if (!desktopSelectorOk) process.exit(1)
-
-const actionCountBeforeRecording = document.querySelectorAll('.graph-node-action').length
-;[...document.querySelectorAll('.node-canvas-toolbar button')].find(
-  button => button.textContent.includes('录制桌面步骤'),
-)?.click()
+document.querySelector('.graph-node-trigger')?.click()
 await new Promise(r => setTimeout(r, 30))
-let recordNext = [...document.querySelectorAll('.desktop-recorder-dialog button')].find(
-  button => button.textContent.includes('选择第一个控件'),
-)
-recordNext?.click()
-await new Promise(r => setTimeout(r, 40))
-recordNext = [...document.querySelectorAll('.desktop-recorder-dialog button')].find(
-  button => button.textContent.includes('选择下一个控件'),
-)
-recordNext?.click()
-await new Promise(r => setTimeout(r, 40))
-document.querySelector('.desktop-recorder-steps li .icon-btn-danger')?.click()
-await new Promise(r => setTimeout(r, 20))
-const recordedStepCount = document.querySelectorAll('.desktop-recorder-steps li').length
-const recordedOperation = document.querySelector('.desktop-recorder-steps select')
-if (recordedOperation) {
-  recordedOperation.value = 'set_text'
-  recordedOperation.dispatchEvent(new window.Event('change', { bubbles:true }))
-}
-await new Promise(r => setTimeout(r, 20))
-const recordedText = document.querySelector('.desktop-recorder-text textarea')
-if (recordedText) {
-  recordedText.value = '月度报告'
-  recordedText.dispatchEvent(new window.Event('input', { bubbles:true }))
-}
-;[...document.querySelectorAll('.desktop-recorder-foot button')].find(
-  button => button.textContent.includes('加入 1 个步骤'),
-)?.click()
-await new Promise(r => setTimeout(r, 50))
-const recorderOk = recordedStepCount === 1
-  && !document.querySelector('.desktop-recorder-dialog')
-  && document.querySelectorAll('.graph-node-action').length === actionCountBeforeRecording + 1
-  && [...document.querySelectorAll('.graph-node-action')].some(node => node.textContent.includes('操作屏幕控件'))
-  && [...document.querySelectorAll('.node-inspector textarea')].some(input => input.value === '月度报告')
-console.log((recorderOk?'PASS':'FAIL')+' - desktop recording session deletes mistakes and inserts editable steps')
-if (!recorderOk) process.exit(1)
-
-const actionCountBeforeRead = document.querySelectorAll('.graph-node-action').length
-;[...document.querySelectorAll('.node-canvas-toolbar button')].find(
-  button => button.textContent.includes('录制桌面步骤'),
-)?.click()
-await new Promise(r => setTimeout(r, 20))
-;[...document.querySelectorAll('.desktop-recorder-dialog button')].find(
-  button => button.textContent.includes('选择第一个控件'),
-)?.click()
-await new Promise(r => setTimeout(r, 40))
-const readOperation = document.querySelector('.desktop-recorder-steps select')
-if (readOperation) {
-  readOperation.value = 'read_text'
-  readOperation.dispatchEvent(new window.Event('change', { bubbles:true }))
-}
-await new Promise(r => setTimeout(r, 20))
-;[...document.querySelectorAll('.desktop-recorder-foot button')].find(
-  button => button.textContent.includes('加入 1 个步骤'),
-)?.click()
-await new Promise(r => setTimeout(r, 50))
-const recordedReadOk = document.querySelectorAll('.graph-node-action').length === actionCountBeforeRead + 1
-  && [...document.querySelectorAll('.graph-node-action')].some(node => node.textContent.includes('读取屏幕控件文本'))
-  && document.querySelector('.node-inspector .workflow-output-hint')?.textContent.includes('读取的文本')
-console.log((recordedReadOk?'PASS':'FAIL')+' - recorded text reading exposes a sensitive bindable output')
-if (!recordedReadOk) process.exit(1)
+;[...document.querySelectorAll('.node-inspector button')].find(button => button.textContent.includes('未发生时（NOT）'))?.click()
+await new Promise(r => setTimeout(r, 30))
+const absenceEditorOk = [...document.querySelectorAll('.graph-node-condition')].some(node => node.textContent.includes('未发生 · NOT'))
+  && document.querySelector('.node-inspector')?.textContent.includes('等待时长（秒）')
+  && !document.querySelector('.stage-check')
+console.log((absenceEditorOk?'PASS':'FAIL')+' - NOT exposes an absence timer and replaces pre-run checks')
+if (!absenceEditorOk) process.exit(1)
+;[...document.querySelectorAll('.node-inspector button')].find(button => button.textContent.includes('改为事件发生时'))?.click()
+await new Promise(r => setTimeout(r, 30))
 
 // 私有数据参数只显示插件编辑入口。
 ;[...document.querySelectorAll('button')].find(
@@ -1500,11 +1490,105 @@ const macroPageOk = macroPageSource.includes('操作宏插件页面')
 console.log((macroCaptured && macroPageOk && macroFullPageOpen?'PASS':'FAIL')+' - private macro data is edited through the full-page plugin extension view')
 if (!macroCaptured || !macroPageOk || !macroFullPageOpen) process.exit(1)
 
+;[...document.querySelectorAll('.classic-rule-editor .flow-add-control button')].find(button => button.textContent.includes('添加 IF'))?.click()
+await new Promise(r => setTimeout(r, 30))
+const ifCard = [...document.querySelectorAll('.classic-rule-editor .action-flow-card')].at(-1)
+if (ifCard && !ifCard.open) ifCard.querySelector('summary')?.click()
+await new Promise(r => setTimeout(r, 30))
+const ifBranches = [...ifCard.querySelectorAll('.if-action-editor > .if-branch')]
+for (const branch of ifBranches) {
+  branch.querySelector('.flow-add-row button')?.click()
+  await new Promise(r => setTimeout(r, 20))
+  document.querySelector('.plugin-picker-item')?.click()
+  await new Promise(r => setTimeout(r, 30))
+}
+const ifEditorOk = ifBranches.length === 2
+  && ifBranches.every(branch => branch.querySelector('.if-branch-action'))
+console.log((ifEditorOk?'PASS':'FAIL')+' - IF edits separate THEN and ELSE action lists')
+if (!ifEditorOk) process.exit(1)
+
 const saveMacroBaseline = [...document.querySelectorAll('.rule-editor-actions button')].find(
   button => button.textContent.includes('保存规则'),
 )
 saveMacroBaseline?.click()
 await new Promise(r => setTimeout(r, 50))
+const savedIf = savedRulesPayload?.find(rule => rule.rule_id === 'r_mount001')?.actions?.find(action => action.type === 'if')
+const ifSavedOk = savedIf?.then?.length === 1 && savedIf?.else?.length === 1
+  && savedIf.condition?.op === 'is_true' && !Object.hasOwn(savedIf, 'params')
+console.log((ifSavedOk?'PASS':'FAIL')+' - saving preserves IF branches and predicate data')
+if (!ifSavedOk) process.exit(1)
+
+const definitionsPanel = document.querySelector('.variables-editor')
+definitionsPanel.open = true
+let invalidTypeKeptDraft = true
+for (const [buttonText, name] of [['添加常量', '批次号'], ['添加变量', '当前批次']]) {
+  ;[...definitionsPanel.querySelectorAll('button')].find(button => button.textContent.includes(buttonText)).click()
+  await pause(20)
+  const definition = [...definitionsPanel.querySelectorAll('.variable-definition')].at(-1)
+  const nameField = definition.querySelector('.variable-heading input')
+  nameField.value = name
+  nameField.dispatchEvent(new window.Event('input', { bubbles:true }))
+  const typeField = definition.querySelector('select[aria-label="数据类型"]')
+  const schemaField = definition.querySelector('textarea[aria-label="类型结构 JSON"]')
+  for (const invalidType of [123, {}]) {
+    schemaField.value = JSON.stringify({ type:invalidType })
+    schemaField.dispatchEvent(new window.Event('input', { bubbles:true }))
+    await pause(20)
+    invalidTypeKeptDraft &&= typeField.value === 'text' && !!definition.querySelector('.type-picker .danger-text')
+  }
+  typeField.value = 'int'
+  typeField.dispatchEvent(new window.Event('change', { bubbles:true }))
+  await pause(20)
+  const valueField = definition.querySelector('.typed-value-input input')
+  valueField.value = buttonText === '添加常量' ? '9007199254740993' : '0'
+  valueField.dispatchEvent(new window.Event('input', { bubbles:true }))
+}
+;[...definitionsPanel.querySelectorAll('button')].find(button => button.textContent.includes('添加常量')).click()
+await pause(20)
+const objectDefinition = [...definitionsPanel.querySelector('section').querySelectorAll('.variable-definition')].at(-1)
+const objectNameField = objectDefinition.querySelector('.variable-heading input')
+objectNameField.value = '业务对象'
+objectNameField.dispatchEvent(new window.Event('input', { bubbles:true }))
+const objectTypeField = objectDefinition.querySelector('select[aria-label="数据类型"]')
+objectTypeField.value = 'any'
+objectTypeField.dispatchEvent(new window.Event('change', { bubbles:true }))
+objectDefinition.querySelector('.expression-editor').open = true
+await pause(20)
+const objectExpression = objectDefinition.querySelector('textarea[aria-label="参数表达式 JSON"]')
+const businessObject = { $literal:'business label', content:'保留字段' }
+objectExpression.value = JSON.stringify(businessObject)
+objectExpression.dispatchEvent(new window.Event('input', { bubbles:true }))
+await pause(20)
+const objectValueField = objectDefinition.querySelector('.typed-value-input textarea')
+const mixedObjectDisplayed = JSON.parse(objectValueField.value).content === '保留字段'
+objectValueField.value = JSON.stringify({ ...businessObject, content:'已编辑字段' })
+objectValueField.dispatchEvent(new window.Event('input', { bubbles:true }))
+await pause(20)
+;[...document.querySelectorAll('.node-canvas-tools button')].find(button => button.textContent.includes('变量赋值')).click()
+await pause(30)
+const assignmentEditor = [...document.querySelectorAll('.variable-assignment-editor')].at(-1)
+assignmentEditor.querySelector('.field-binding-button')?.click()
+await pause(20)
+const sourcePicker = assignmentEditor.querySelector('.binding-picker > select')
+const constantOption = [...sourcePicker.options].find(option => option.textContent.includes('批次号'))
+sourcePicker.value = constantOption.value
+sourcePicker.dispatchEvent(new window.Event('change', { bubbles:true }))
+await pause(20)
+assignmentEditor.querySelector('.binding-picker-actions button').click()
+await pause(20)
+;[...document.querySelectorAll('.rule-editor-actions button')].find(button => button.textContent.includes('保存规则')).click()
+await pause(60)
+const typedRule = savedRulesPayload?.find(rule => rule.rule_id === 'r_mount001')
+const typedAssignment = typedRule?.actions?.find(action => action.type === 'set_variable')
+const variableEditorOk = typedRule?.constants?.[0]?.value?.$nmf_value?.data === '9007199254740993'
+  && typedRule?.variables?.[0]?.value_type === 'int'
+  && typedAssignment?.variable === typedRule.variables[0].id
+  && typedAssignment?.value?.$ref?.node === typedRule.constants[0].id
+  && invalidTypeKeptDraft && mixedObjectDisplayed
+  && typedRule.constants.find(item => item.name === '业务对象')?.value?.content === '已编辑字段'
+  && typedRule.constants.find(item => item.name === '业务对象')?.value?.$literal === 'business label'
+console.log((variableEditorOk?'PASS':'FAIL')+' - variable editor saves precise constants and a bound assignment')
+if (!variableEditorOk) process.exit(1)
 
 const reopenMacroButton = [...document.querySelectorAll('.plugin-data-field button')].find(
   button => button.textContent.includes('1 个操作宏 · 1 步'),
@@ -1571,12 +1655,20 @@ const replacedMacroRunsCurrentDraft = testedMacroSteps?.length === 2
 console.log((replacedMacroRunsCurrentDraft?'PASS':'FAIL')+' - testing a replaced macro executes the current steps')
 if (!replacedMacroRunsCurrentDraft) process.exit(1)
 ;[...document.querySelectorAll('.test-result-dialog button')].find(
-  button => button.textContent.includes('关闭'),
+  button => button.textContent.includes('查看日志'),
 )?.click()
-await new Promise(r => setTimeout(r, 20))
+await waitFor(() => document.querySelector('.run-center-page') && !document.querySelector('.rule-back-btn') && !document.querySelector('.test-result-dialog'), 3000)
+const testLogsOpened = !!document.querySelector('.run-center-page')
+  && !document.querySelector('.rule-back-btn')
+  && !document.querySelector('.test-result-dialog')
+console.log((testLogsOpened?'PASS':'FAIL')+' - test results open the run center from the rule editor')
+if (!testLogsOpened) process.exit(1)
 
 homeNav?.click()
-await new Promise(r => setTimeout(r, 50))
+await waitFor('.home-run-row')
+const homeReloadedRuns = document.querySelector('.home-run-row')?.textContent.includes('挂载测试规则')
+console.log((homeReloadedRuns?'PASS':'FAIL')+' - returning home loads recent runs without waiting for polling')
+if (!homeReloadedRuns) process.exit(1)
 
 // 创建入口和用途示例只在自动化页出现，缺少插件时定向到插件页。
 rulesNav?.click()
@@ -1602,8 +1694,11 @@ simulateSlowStop = true
 const targetedPluginSearch = document.querySelector('.plugin-search input')
 targetedPluginSearch.value = ''
 targetedPluginSearch.dispatchEvent(new window.Event('input', { bubbles:true }))
+;[...document.querySelectorAll('.plugin-origin-switch button')].find(
+  button => button.textContent.includes('内置'),
+)?.click()
 await new Promise(r => setTimeout(r, 40))
-document.querySelector('.plugin-card .switch input')?.dispatchEvent(new window.Event('change', { bubbles: true }))
+document.querySelector('.plugin-list-row .switch input')?.dispatchEvent(new window.Event('change', { bubbles: true }))
 await new Promise(r => setTimeout(r, 50))
 const restartConfirm = [...document.querySelectorAll('.app-dialog button')].find(
   button => button.textContent.includes('立即重启'),
@@ -1638,7 +1733,7 @@ const pluginsNav = [...document.querySelectorAll('.nav-item')].find(
   item => item.textContent.includes('插件'),
 )
 pluginsNav?.click()
-await pause(80)
+await waitFor('.plugin-management-page')
 ;[...document.querySelectorAll('.page-head button')].find(
   button => button.textContent.includes('安装插件'),
 )?.click()

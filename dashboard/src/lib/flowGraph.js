@@ -46,7 +46,7 @@ export function buildFlowGraph({
   if (condition) {
     const maxDepth = conditionDepth(condition)
 
-    function visit(node, path, depth) {
+    function visit(node, path, depth, negated = false) {
       const id = pathId(path)
       if (!node || typeof node !== 'object' || Array.isArray(node)) {
         const y = TOP + leafIndex * FLOW_ROW_STEP
@@ -73,6 +73,7 @@ export function buildFlowGraph({
         nodes.push({
           id,
           kind: 'trigger',
+          negated,
           path,
           source: node,
           x: LEFT + (maxDepth - depth) * FLOW_COLUMN_STEP,
@@ -89,11 +90,11 @@ export function buildFlowGraph({
       }
 
       const children = Array.isArray(node?.children) ? node.children : []
-      const childLayouts = children.map((child, index) => visit(child, [...path, index], depth + 1))
+      const childLayouts = children.map((child, index) => visit(child, [...path, index], depth + 1, node.op === 'not'))
       const y = childLayouts.length
         ? childLayouts.reduce((total, child) => total + child.y, 0) / childLayouts.length
         : TOP
-      const op = node?.op === 'all' ? 'all' : 'any'
+      const op = node?.op || 'any'
       nodes.push({
         id,
         kind: 'condition',
@@ -101,10 +102,10 @@ export function buildFlowGraph({
         source: node,
         x: LEFT + (maxDepth - depth) * FLOW_COLUMN_STEP,
         y,
-        icon: op === 'all' ? 'done_all' : 'alt_route',
+        icon: op === 'not' ? 'timer' : op === 'all' ? 'done_all' : 'alt_route',
         kicker: '逻辑汇合',
-        label: op === 'all' ? '全部满足 · AND' : '满足任一 · OR',
-        meta: `${children.length} 条分支${op === 'all' && node?.within_seconds ? ` · ${node.within_seconds} 秒内` : ''}`,
+        label: op === 'not' ? '未发生 · NOT' : op === 'all' ? '全部满足 · AND' : '满足任一 · OR',
+        meta: op === 'not' ? `等待 ${node.within_seconds || 0} 秒未发生` : `${children.length} 条分支${op === 'all' && node?.within_seconds ? ` · ${node.within_seconds} 秒内` : ''}`,
         hasInput: childLayouts.length > 0,
         hasOutput: true,
       })
@@ -145,36 +146,6 @@ export function buildFlowGraph({
   let x = conditionExitNode.x + FLOW_COLUMN_STEP
   const pipelineY = conditionExit.y
 
-  const preconditions = Array.isArray(rule.preconditions) ? rule.preconditions : []
-  preconditions.forEach((item, index) => {
-    const id = `precondition-${item.binding_id || index}`
-    nodes.push({
-      id,
-      kind: 'precondition',
-      index,
-      source: item,
-      x,
-      y: pipelineY,
-      icon: 'verified_user',
-      kicker: `确认 ${index + 1}`,
-      label: actionName(item),
-      meta: describeItem(item, 'action'),
-      admin: isAdmin(item, 'action'),
-      hasInput: true,
-      hasOutput: true,
-    })
-    edges.push({
-      id: `${previousId}-${id}`,
-      from: previousId,
-      to: id,
-      kind: 'pipeline',
-      channel: 'control',
-      label: index ? '再确认' : '开始前',
-    })
-    previousId = id
-    x += FLOW_COLUMN_STEP
-  })
-
   const actions = Array.isArray(rule.actions) ? rule.actions : []
   const actionNodes = []
   actions.forEach((item, index) => {
@@ -186,10 +157,10 @@ export function buildFlowGraph({
       source: item,
       x,
       y: pipelineY,
-      icon: 'play_arrow',
+      icon: item.type === 'if' ? 'call_split' : 'play_arrow',
       kicker: `动作 ${index + 1}`,
       label: actionName(item),
-      meta: describeItem(item, 'action'),
+      meta: item.type === 'if' ? `成立 ${item.then?.length || 0} 步 · 否则 ${item.else?.length || 0} 步` : describeItem(item, 'action'),
       admin: isAdmin(item, 'action'),
       hasInput: true,
       hasOutput: true,
@@ -206,7 +177,7 @@ export function buildFlowGraph({
       channel: 'control',
       label: previousAction?.failure_actions?.length
         ? '成功后'
-        : (index || preconditions.length ? '然后' : '执行'),
+        : (index ? '然后' : '执行'),
       insertActionIndex: index,
     })
     previousId = id

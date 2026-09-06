@@ -4,7 +4,7 @@ import { JSDOM, VirtualConsole } from 'jsdom'
 
 
 const html = fs.readFileSync(
-  path.resolve('../notmyfault/actions/uia_macro/pages/macro.html'),
+  path.resolve('../notmyfault/actions/uia_automation/pages/macro.html'),
   'utf8',
 )
 const scriptErrors = []
@@ -83,3 +83,56 @@ const replacementStartsClean = invokes.some(message => (
 ))
 console.log((replacementStartsClean ? 'PASS' : 'FAIL') + ' - re-recording replaces existing macro steps by default')
 if (!replacementStartsClean) process.exit(1)
+
+const selectorHtml = fs.readFileSync(
+  path.resolve('../notmyfault/actions/uia_automation/pages/selector.html'),
+  'utf8',
+)
+const selectorScriptErrors = []
+const selectorConsole = new VirtualConsole()
+selectorConsole.on('jsdomError', error => selectorScriptErrors.push(error))
+const selectorDom = new JSDOM(selectorHtml, {
+  runScripts: 'dangerously',
+  pretendToBeVisual: true,
+  url: 'http://notmyfault.test/selector',
+  virtualConsole: selectorConsole,
+})
+const selectorWindow = selectorDom.window
+const savedSelector = {
+  version: 1,
+  window: { process:'notepad.exe', name:'无标题 - 记事本' },
+  target: { automation_id:'FileSave', name:'保存', control_type:50000 },
+  display: { control:'保存', control_type:'按钮', window:'无标题 - 记事本', app:'notepad.exe' },
+}
+selectorWindow.dispatchEvent(new selectorWindow.MessageEvent('message', {
+  source: selectorWindow,
+  data: {
+    source: 'notmyfault:extension-host',
+    type: 'init',
+    state: { selector:savedSelector },
+  },
+}))
+
+const selectorPageOk = selectorScriptErrors.length === 0
+  && selectorWindow.document.getElementById('selectorCard')?.hidden === false
+  && selectorWindow.document.getElementById('controlName')?.textContent === '保存'
+  && selectorWindow.document.getElementById('appName')?.textContent === 'notepad.exe'
+  && selectorWindow.document.getElementById('verifyButton')?.disabled === false
+  && selectorWindow.document.getElementById('saveButton')?.disabled === false
+console.log((selectorPageOk ? 'PASS' : 'FAIL') + ' - selector page renders plugin-owned control data')
+if (!selectorPageOk) {
+  console.error(selectorScriptErrors)
+  process.exit(1)
+}
+
+const selectorInvokes = []
+selectorWindow.postMessage = message => selectorInvokes.push(message)
+selectorWindow.document.getElementById('verifyButton')?.click()
+await new Promise(resolve => selectorWindow.setTimeout(resolve, 0))
+const selectorChecksThroughPlugin = selectorInvokes.some(message => (
+  message.type === 'invoke'
+  && message.command === 'verify_selector'
+  && message.payload?.selector?.target?.automation_id === 'FileSave'
+))
+console.log((selectorChecksThroughPlugin ? 'PASS' : 'FAIL') + ' - selector verification stays inside the plugin view protocol')
+if (!selectorChecksThroughPlugin) process.exit(1)

@@ -41,7 +41,7 @@ async function openEditor() {
       {
         sourceKind: 'parameter_editors',
         sourceId: props.editor.id,
-        currentValue: props.modelValue,
+        currentValue: props.modelValue === '' ? null : props.modelValue,
       },
     )
     if (!response?.ok) {

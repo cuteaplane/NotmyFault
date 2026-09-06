@@ -6,7 +6,13 @@ import { snackbar } from '../../lib/notify'
 import { confirmDialog } from '../../lib/dialog'
 import { buildRunExport } from '../../lib/runExport'
 
-const activeTab = ref('runs')
+const props = defineProps({
+  initialTab: { type: String, default: 'runs' },
+  showTabs: { type: Boolean, default: true },
+  embedded: { type: Boolean, default: false },
+})
+
+const activeTab = ref(props.initialTab)
 const runs = ref([])
 const entries = ref([])
 const files = ref([])
@@ -315,7 +321,8 @@ watch(() => store.refreshSignal, () => {
 })
 
 onMounted(async () => {
-  await Promise.all([loadFiles(), refreshRuns()])
+  await loadFiles()
+  await refresh()
   if (store.pendingRunId) {
     expandedRunId.value = store.pendingRunId
     store.pendingRunId = ''
@@ -328,11 +335,10 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section class="page active run-center-page">
-    <div class="page-head">
+  <section class="page active run-center-page" :class="{ 'run-center-embedded': embedded }">
+    <div class="page-head" :class="{ 'run-center-embedded-head': embedded }">
       <div>
-        <h2>运行与日志</h2>
-        <p class="page-subtitle">先看每次自动化的结果，需要排障时再查看原始日志。</p>
+        <h2 v-if="!embedded">运行与日志</h2>
       </div>
       <div class="actions">
         <label class="check-row"><input type="checkbox" v-model="autoRefresh">自动刷新</label>
@@ -345,26 +351,26 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <div class="tabs run-center-tabs" role="tablist" aria-label="运行记录和原始日志">
+    <div v-if="showTabs" class="tabs run-center-tabs" role="tablist" aria-label="运行记录和原始日志">
       <button class="tab" :class="{ active: activeTab === 'runs' }" role="tab" @click="activeTab = 'runs'">运行记录</button>
       <button class="tab" :class="{ active: activeTab === 'logs' }" role="tab" @click="activeTab = 'logs'">原始日志</button>
     </div>
 
     <template v-if="activeTab === 'runs'">
       <div class="run-summary-grid">
-        <button class="run-summary-card" :class="{ active: statusFilter === 'all' }" @click="statusFilter = 'all'">
+        <button class="run-summary-card" :class="{ active: statusFilter === 'all' }" :aria-pressed="statusFilter === 'all'" @click="statusFilter = 'all'">
           <span>最近运行</span><strong>{{ runs.length }}</strong>
         </button>
-        <button class="run-summary-card succeeded" :class="{ active: statusFilter === 'succeeded' }" @click="statusFilter = 'succeeded'">
+        <button class="run-summary-card succeeded" :class="{ active: statusFilter === 'succeeded' }" :aria-pressed="statusFilter === 'succeeded'" @click="statusFilter = 'succeeded'">
           <span>成功</span><strong>{{ runCounts.succeeded }}</strong>
         </button>
-        <button class="run-summary-card failed" :class="{ active: statusFilter === 'failed' }" @click="statusFilter = 'failed'">
+        <button class="run-summary-card failed" :class="{ active: statusFilter === 'failed' }" :aria-pressed="statusFilter === 'failed'" @click="statusFilter = 'failed'">
           <span>失败</span><strong>{{ runCounts.failed }}</strong>
         </button>
-        <button class="run-summary-card cancelled" :class="{ active: statusFilter === 'cancelled' }" @click="statusFilter = 'cancelled'">
+        <button class="run-summary-card cancelled" :class="{ active: statusFilter === 'cancelled' }" :aria-pressed="statusFilter === 'cancelled'" @click="statusFilter = 'cancelled'">
           <span>已停止</span><strong>{{ runCounts.cancelled }}</strong>
         </button>
-        <button class="run-summary-card pending" :class="{ active: statusFilter === 'pending' }" @click="statusFilter = 'pending'">
+        <button class="run-summary-card pending" :class="{ active: statusFilter === 'pending' }" :aria-pressed="statusFilter === 'pending'" @click="statusFilter = 'pending'">
           <span>进行中</span><strong>{{ runCounts.running + runCounts.deferred }}</strong>
         </button>
       </div>
@@ -388,7 +394,7 @@ onUnmounted(() => {
         <div class="run-filter-tools">
           <div class="log-search-wrap run-search-wrap">
             <span class="material-symbols-outlined">search</span>
-            <input v-model="searchText" type="search" class="text-field log-search" placeholder="搜索自动化、触发方式或动作">
+            <input v-model="searchText" type="search" class="text-field log-search" aria-label="搜索运行记录" placeholder="搜索自动化、触发方式或动作">
           </div>
           <button class="btn btn-outlined run-export-btn" :disabled="!filteredRuns.length" @click="exportRuns">
             <span class="material-symbols-outlined">download</span>导出这些记录
@@ -520,7 +526,7 @@ onUnmounted(() => {
         </div>
         <div class="log-search-wrap">
           <span class="material-symbols-outlined">search</span>
-          <input v-model="searchText" type="text" class="text-field log-search" placeholder="搜索日志内容">
+          <input v-model="searchText" type="text" class="text-field log-search" aria-label="搜索日志内容" placeholder="搜索日志内容">
         </div>
       </div>
 

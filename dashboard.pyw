@@ -271,6 +271,7 @@ class DashboardAPI:
 
     def get_config(self) -> dict:
         """有效规则先补齐身份，验签失败时保留原文供安全页核对"""
+        from notmyfault.core.value_codec import encode_value
         try:
             if self._paths.rules_file.exists():
                 with open(self._paths.rules_file, "r", encoding="utf-8") as f:
@@ -279,17 +280,21 @@ class DashboardAPI:
                 rules = rules if isinstance(rules, list) else []
                 try:
                     normalized = self._store.load_verified_rules()
-                    if normalized != rules:
+                    encoded = encode_value(normalized)
+                    if encoded != rules:
                         self._store.save_rules(normalized)
-                    return {"rules": normalized}
+                    return {"rules": encoded}
                 except Exception:
-                    return {"rules": rules}
+                    return {"rules": rules if data.get("value_encoding") == "typed-v1" else encode_value(rules)}
         except Exception as e:
             return {"_error": str(e), "rules": []}
         return {"rules": []}
 
-    def save_config(self, rules: list, admin_key_password: str = "") -> dict:
+    def save_config(self, rules: list, admin_key_password: str = "", value_encoding: str = "") -> dict:
         try:
+            from notmyfault.core.value_codec import decode_value, encode_value
+            if value_encoding == "typed-v1":
+                rules = decode_value(rules)
             from notmyfault.config import (
                 ConfigValidationError,
                 normalize_rules,
@@ -358,7 +363,7 @@ class DashboardAPI:
                     "plugins": error.plugins,
                 }
             ok = self._store.save_rules(normalized_rules)
-            return {"ok": ok, "rules": normalized_rules if ok else None}
+            return {"ok": ok, "rules": encode_value(normalized_rules) if ok else None}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -375,6 +380,7 @@ class DashboardAPI:
         method: str = "POST",
         data: dict = None,
         timeout: float = 5,
+        value_encoding: str = "",
     ) -> dict:
         """发送带认证的 HTTP 请求，认证失败时重读令牌并重试一次"""
         last_error = ""
@@ -391,6 +397,8 @@ class DashboardAPI:
                     req.add_header("Authorization", f"Bearer {token}")
                 if data is not None:
                     req.add_header("Content-Type", "application/json")
+                if value_encoding:
+                    req.add_header("X-NMF-Value-Encoding", value_encoding)
                 return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", errors="replace")
@@ -420,12 +428,12 @@ class DashboardAPI:
                 }
         return {"ok": False, "error": last_error, "status": 403}
 
-    def request_api(self, path: str, method: str = "GET", data: dict = None) -> dict:
+    def request_api(self, path: str, method: str = "GET", data: dict = None, value_encoding: str = "") -> dict:
         """通过 pywebview bridge 转发 Dashboard 的 JSON API 请求"""
         if not isinstance(path, str) or not path.startswith("/api/"):
             return {"ok": False, "error": "无效的 API 路径", "status": 400}
         timeout = 30 if path == "/api/rules/draft/ai" else 5
-        return self._auth_request(path, method.upper(), data, timeout=timeout)
+        return self._auth_request(path, method.upper(), data, timeout=timeout, value_encoding=value_encoding)
 
     def get_engine_status(self) -> dict:
         result = self._auth_request("/api/engine/status", "GET")

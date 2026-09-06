@@ -1,10 +1,12 @@
+import { compatibleTypes, fieldType, typeSpec, typeLabel, typeAtPath, isOpaqueValue, isExpression, parseTypedInput, defaultTypedValue, formatTypedInput } from './valueTypes.js'
+
 function randomHex() {
   if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID().replaceAll('-', '').slice(0, 12)
   return Math.random().toString(16).slice(2, 14).padEnd(12, '0')
 }
 
 export function createBindingId(kind) {
-  const prefix = kind === 'trigger' ? 't' : kind === 'precondition' ? 'p' : 'a'
+  const prefix = { trigger: 't', precondition: 'p', constant: 'c', variable: 'v' }[kind] || 'a'
   return `${prefix}_${randomHex()}`
 }
 
@@ -47,10 +49,10 @@ export function outputDefs(meta) {
   ))
 }
 
-export function collectTriggerLeaves(rule) {
+export function collectTriggerLeaves(rule, includeAbsence = true) {
   const leaves = []
   function visit(node) {
-    if (!node || typeof node !== 'object') return
+    if (!node || typeof node !== 'object' || (!includeAbsence && node.op === 'not')) return
     if (node.type && !Array.isArray(node.children) && !Array.isArray(node.events)) {
       leaves.push(node)
       return
@@ -62,6 +64,7 @@ export function collectTriggerLeaves(rule) {
 }
 
 export function guaranteedTriggerIds(node) {
+  if (node?.op === 'not') return new Set()
   if (!node || typeof node !== 'object') return new Set()
   if (node.type && !Array.isArray(node.children) && !Array.isArray(node.events)) {
     return node.binding_id ? new Set([node.binding_id]) : new Set()
@@ -90,65 +93,102 @@ export function ensureRuleBindingIds(rule) {
   }
   ensureNode(rule.event)
   ensureNode(rule.condition)
-  for (const [field, kind] of [['preconditions', 'precondition'], ['actions', 'action']]) {
-    for (const item of rule[field] || []) {
-      if (!item.binding_id || seen.has(item.binding_id)) item.binding_id = createBindingId(kind)
-      if (!item.params || typeof item.params !== 'object') item.params = {}
+  function ensureActions(items) {
+    for (const item of items || []) {
+      if (!item.binding_id || seen.has(item.binding_id)) item.binding_id = createBindingId('action')
       seen.add(item.binding_id)
-      if (field === 'actions') {
-        const failureActions = Array.isArray(item.failure_actions) ? item.failure_actions : []
-        for (const failureAction of failureActions) {
-          if (!failureAction.binding_id || seen.has(failureAction.binding_id)) {
-            failureAction.binding_id = createBindingId('action')
-          }
-          if (!failureAction.params || typeof failureAction.params !== 'object') failureAction.params = {}
-          seen.add(failureAction.binding_id)
-        }
-      }
+      if (item.type === 'if') {
+        item.then ||= []
+        item.else ||= []
+        ensureActions(item.then)
+        ensureActions(item.else)
+      } else if (!item.params || typeof item.params !== 'object') item.params = {}
+      ensureActions(item.failure_actions)
     }
   }
+  ensureActions(rule.actions)
   return rule
 }
 
 export function regenerateBindingIds(node, kind = 'trigger') {
-  if (!node || typeof node !== 'object') return node
-  if (kind === 'trigger') {
-    if (node.type && !Array.isArray(node.children) && !Array.isArray(node.events)) {
-      node.binding_id = createBindingId('trigger')
-      return node
+  const replacements = new Map()
+  function visit(item, itemKind) {
+    if (!item || typeof item !== 'object') return
+    if (itemKind === 'trigger' && (Array.isArray(item.children) || Array.isArray(item.events))) {
+      ;(item.children || item.events).forEach(child => visit(child, itemKind))
+      return
     }
-    ;(node.children || node.events || []).forEach(child => regenerateBindingIds(child, 'trigger'))
-    return node
+    const previous = item.binding_id
+    item.binding_id = createBindingId(itemKind)
+    if (previous) replacements.set(previous, item.binding_id)
+    if (itemKind === 'action') {
+      for (const field of ['then', 'else', 'failure_actions']) (item[field] || []).forEach(child => visit(child, 'action'))
+    }
   }
-  node.binding_id = createBindingId(kind)
-  if (kind === 'action') {
-    ;(Array.isArray(node.failure_actions) ? node.failure_actions : [])
-      .forEach(action => regenerateBindingIds(action, 'action'))
+  visit(node, kind)
+  for (const reference of collectReferences(node)) {
+    if (replacements.has(reference.node)) reference.node = replacements.get(reference.node)
   }
   return node
 }
 
 export function normalizedType(type) {
-  if (['string', 'textarea', 'path', 'time', 'hotkey', 'select'].includes(type)) return 'string'
-  return type || 'any'
+  if (['textarea', 'hotkey', 'select'].includes(type)) return 'text'
+  return typeSpec(type).type
 }
 
 export function typesCompatible(source, target) {
-  source = normalizedType(source)
-  target = normalizedType(target)
-  return source === 'any' || target === 'any' || source === target
+  return compatibleTypes(source, target)
 }
 
 function sourceItem(group, label, output, ref, conditional = false) {
   return {
     group,
     label,
-    type: output.type || 'any',
+    type: fieldType(output),
     format: output.format,
     value: { $ref: ref },
     sensitive: output.sensitive,
     conditional,
+    optional: output.required === false,
   }
+}
+
+export function variableBindingSources(rule, { constantsOnly = false } = {}) {
+  return ['constant', ...(constantsOnly ? [] : ['variable'])].flatMap(scope => (
+    (rule[scope === 'constant' ? 'constants' : 'variables'] || []).map(item => sourceItem(
+      scope === 'constant' ? '规则常量' : '运行变量', item.name,
+      { value_type: item.value_type, sensitive: item.sensitive, required: scope === 'constant' || Object.hasOwn(item, 'initial') },
+      { scope, node: item.id, path: [] },
+    ))
+  ))
+}
+
+export function actionOutputDefs(action, schema, rule = {}) {
+  if (action?.type === 'set_variable') {
+    const variable = rule.variables?.find(item => item.id === action.variable)
+    return [{ name: 'value', label: '赋值结果', value_type: variable?.value_type || 'any', required: true, sensitive: variable?.sensitive === true }]
+  }
+  return outputDefs(schema.actions?.[action?.type])
+}
+
+export function expandBindingSources(sources, catalog = {}) {
+  const result = []
+  function visit(source, depth) {
+    result.push(source)
+    if (depth >= 8) return
+    const spec = typeSpec(source.type)
+    if (spec.type === 'object') {
+      for (const [key, child] of Object.entries(spec.properties || {})) {
+        if (key.startsWith('_') || ['constructor', 'prototype'].includes(key)) continue
+        visit({ ...source, label: `${source.label} · ${key}`, type: typeSpec(child), optional: source.optional || !(spec.required || []).includes(key), value: { $ref: { ...source.value.$ref, path: [...source.value.$ref.path, key] } } }, depth + 1)
+      }
+    } else if (spec.type.includes('/') && catalog[spec.type]?.binding === 'shared') {
+      visit({ ...source, label: `${source.label} · 数据`, type: catalog[spec.type].schema, value: { $ref: { ...source.value.$ref, path: [...source.value.$ref.path, 'data'] } } }, depth + 1)
+    }
+  }
+  sources.forEach(source => visit(source, 0))
+  return result
 }
 
 export function buildBindingSources(
@@ -157,15 +197,15 @@ export function buildBindingSources(
   schema,
   { allowSteps = true, allowConditionalTriggers = true } = {},
 ) {
-  const result = []
-  const leaves = collectTriggerLeaves(rule)
+  const result = variableBindingSources(rule)
+  const leaves = collectTriggerLeaves(rule, false)
   const guaranteed = guaranteedTriggerIds(rule.condition || rule.event)
 
   for (const leaf of leaves) {
     const conditional = !guaranteed.has(leaf.binding_id)
     if (conditional && !allowConditionalTriggers) continue
     const meta = schema.triggers[leaf.type]
-    for (const output of outputDefs(meta).filter(item => item.required !== false)) {
+    for (const output of outputDefs(meta)) {
       result.push(sourceItem(
         conditional ? '条件分支（仅命中时执行）' : '触发条件',
         `${meta?.name || leaf.type} · ${output.label || output.name}`,
@@ -175,10 +215,11 @@ export function buildBindingSources(
       ))
     }
     for (const param of meta?.params || []) {
+      if (param.type === 'plugin_data') continue
       result.push(sourceItem(
         conditional ? '条件分支配置（仅命中时执行）' : '触发条件配置',
         `${meta?.name || leaf.type} · 配置·${param.label || param.name}`,
-        { type: normalizedType(param.value_type || param.type), format: param.format },
+        { value_type: fieldType(param, true), format: param.format, sensitive: param.sensitive },
         { scope: 'trigger_config', node: leaf.binding_id, path: [param.name] },
         conditional,
       ))
@@ -188,7 +229,7 @@ export function buildBindingSources(
   if (allowSteps) {
     ;(rule.actions || []).slice(0, Math.max(0, actionIndex)).forEach((action, index) => {
       const meta = schema.actions[action.type]
-      for (const output of outputDefs(meta).filter(item => item.required !== false)) {
+      for (const output of actionOutputDefs(action, schema, rule)) {
         result.push(sourceItem(
           '之前的动作',
           `动作 ${index + 1}：${meta?.name || action.type} · ${output.label || output.name}`,
@@ -198,7 +239,7 @@ export function buildBindingSources(
       }
     })
   }
-  return result
+  return expandBindingSources(result, schema.data_types?.custom)
 }
 
 export function buildFailureBindingSources(rule, actionIndex, failureIndex, schema) {
@@ -207,7 +248,7 @@ export function buildFailureBindingSources(rule, actionIndex, failureIndex, sche
   const failureActions = Array.isArray(configuredActions) ? configuredActions : []
   failureActions.slice(0, Math.max(0, failureIndex)).forEach((action, index) => {
     const meta = schema.actions[action.type]
-    for (const output of outputDefs(meta).filter(item => item.required !== false)) {
+    for (const output of actionOutputDefs(action, schema, rule)) {
       result.push(sourceItem(
         '之前的补救动作',
         `补救动作 ${index + 1}：${meta?.name || action.type} · ${output.label || output.name}`,
@@ -220,12 +261,15 @@ export function buildFailureBindingSources(rule, actionIndex, failureIndex, sche
 }
 
 export function parameterAllowsBinding(meta, paramName) {
+  if (meta?.params?.find(item => item.name === paramName)?.type === 'plugin_data') return false
   const fixedParams = meta?.security?.literal_only_params
   return !Array.isArray(fixedParams) || !fixedParams.includes(paramName)
 }
 
-export function buildNodeDataPorts(node, schema) {
-  const meta = node.kind === 'trigger'
+export function buildNodeDataPorts(node, schema, rule = {}) {
+  const meta = node.source?.type === 'set_variable'
+    ? { params: [{ name: 'value', label: '赋值内容', type: 'string', value_type: rule.variables?.find(item => item.id === node.source.variable)?.value_type || 'any' }], outputs: actionOutputDefs(node.source, schema, rule) }
+    : node.kind === 'trigger'
     ? schema.triggers[node.source?.type]
     : schema.actions[node.source?.type]
   const dataInputs = ['action', 'failure-action', 'precondition'].includes(node.kind)
@@ -236,17 +280,17 @@ export function buildNodeDataPorts(node, schema) {
         index,
         name: param.name,
         label: param.label || param.name,
-        type: normalizedType(param.value_type || param.type),
+        type: fieldType(param, true),
         format: param.format,
       }))
     : []
-  const dataOutputs = ['trigger', 'action', 'failure-action'].includes(node.kind)
+  const dataOutputs = !node.negated && ['trigger', 'action', 'failure-action'].includes(node.kind)
     ? outputDefs(meta).map((output, index) => ({
         id: `output:${output.name}`,
         index,
         name: output.name,
         label: output.label || output.name,
-        type: normalizedType(output.type),
+        type: fieldType(output),
         format: output.format,
         required: output.required !== false,
         sensitive: output.sensitive,
@@ -260,7 +304,7 @@ export function buildNodeDataPorts(node, schema) {
   }
 }
 
-export function deriveDataEdges(rule, nodes) {
+export function deriveDataEdges(rule, nodes, catalog = []) {
   const guaranteed = guaranteedTriggerIds(rule.condition || rule.event)
   const nodesByBindingId = new Map(
     nodes
@@ -269,7 +313,7 @@ export function deriveDataEdges(rule, nodes) {
   )
   const edges = []
   for (const target of nodes.filter(node => ['action', 'failure-action', 'precondition'].includes(node.kind))) {
-    const params = target.source?.params || {}
+    const params = target.source?.type === 'set_variable' ? { value: target.source.value } : target.source?.params || {}
     for (const [paramName, value] of Object.entries(params)) {
       const targetPort = target.dataInputs.find(port => port.name === paramName)
       for (const [referenceIndex, reference] of collectReferences(value).entries()) {
@@ -284,8 +328,10 @@ export function deriveDataEdges(rule, nodes) {
         const validCondition = target.kind !== 'precondition'
           || source.kind !== 'trigger'
           || guaranteed.has(source.source.binding_id)
-        const valid = sourcePort.required
-          && typesCompatible(sourcePort.type, targetPort.type)
+        let selectedType = sourcePort.type
+        try { selectedType = typeAtPath(sourcePort.type, reference.path.slice(1), catalog).type } catch {}
+        const valid = (sourcePort.required || reference.on_missing)
+          && (isExpression(value) && !isReference(value) || typesCompatible(selectedType, targetPort.type))
           && validOrder
           && validCondition
         edges.push({
@@ -298,7 +344,7 @@ export function deriveDataEdges(rule, nodes) {
           targetPortName: targetPort.name,
           sourcePortIndex: sourcePort.index,
           targetPortIndex: targetPort.index,
-          label: `${sourcePort.type} → ${targetPort.label}`,
+          label: `${typeLabel(selectedType)} → ${targetPort.label}`,
           valid,
         })
       }
@@ -308,14 +354,27 @@ export function deriveDataEdges(rule, nodes) {
 }
 
 export function referenceLabel(value, sources) {
+  if (value?.$convert) return `转换为${typeLabel(value.$convert.to)} · ${referenceLabel(value.$convert.value, sources)}`
+  if (value?.$template) return '文本模板'
   if (!isReference(value)) return ''
-  const serialized = JSON.stringify(value)
-  return sources.find(source => JSON.stringify(source.value) === serialized)?.label || '不可用的数据引用'
+  const ref = value.$ref
+  const found = sources.find(source => source.value.$ref.scope === ref.scope && source.value.$ref.node === ref.node && JSON.stringify(source.value.$ref.path) === JSON.stringify(ref.path))
+  if (found) return found.label
+  const root = sources.find(source => source.value.$ref.scope === ref.scope && source.value.$ref.node === ref.node)
+  return root ? `${root.label} · ${JSON.stringify(ref.path)}` : '不可用的数据引用'
+}
+
+export function bindingSourceFor(reference, sources, catalog = []) {
+  const source = sources.filter(item => item.value.$ref.scope === reference.scope && item.value.$ref.node === reference.node && item.value.$ref.path.every((segment, index) => segment === reference.path?.[index])).sort((a, b) => b.value.$ref.path.length - a.value.$ref.path.length)[0]
+  if (!source) return null
+  try { return { ...source, ...typeAtPath(source.type, reference.path.slice(source.value.$ref.path.length), catalog) } } catch { return null }
 }
 
 export function collectReferences(value, result = []) {
+  if (isOpaqueValue(value)) return result
   if (isReference(value)) {
     result.push(value.$ref)
+    if (value.$ref.on_missing === 'default') collectReferences(value.$ref.default, result)
     return result
   }
   if (Array.isArray(value)) value.forEach(item => collectReferences(item, result))
@@ -326,6 +385,7 @@ export function collectReferences(value, result = []) {
 }
 
 export function collectLegacyEventPayloadPaths(value, result = []) {
+  if (isOpaqueValue(value)) return result
   if (typeof value === 'string') {
     const pattern = /{{\s*event\.payload((?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*}}/g
     for (const match of value.matchAll(pattern)) {
@@ -377,10 +437,11 @@ function setPath(target, path, value) {
   if (!Array.isArray(path) || !path.length) throw new Error('规则引用路径无效')
   let current = target
   path.forEach((segment, index) => {
-    assertSafeContextKey(segment)
+    if (!Number.isInteger(segment)) assertSafeContextKey(segment)
+    else if (segment < 0) throw new Error('数组下标不能为负数')
     if (index === path.length - 1) current[segment] = safeContextValue(value)
     else {
-      if (!Object.prototype.hasOwnProperty.call(current, segment)) current[segment] = contextRecord()
+      if (!Object.prototype.hasOwnProperty.call(current, segment)) current[segment] = Number.isInteger(path[index + 1]) ? [] : contextRecord()
       current = current[segment]
     }
   })
@@ -403,13 +464,14 @@ function testFieldKey(scope, node, path) {
 
 function testDefaultValue(output, fullPayload = false) {
   if (fullPayload) return '{}'
+  if (output?.value_type) return formatTypedInput(output.example ?? defaultTypedValue(output.value_type), output.value_type)
   if (output?.example !== undefined) {
     return ['object', 'array'].includes(normalizedType(output.type))
       ? JSON.stringify(output.example, null, 2)
       : output.example
   }
   const type = normalizedType(output?.type)
-  if (type === 'number' || type === 'integer') return 0
+  if (['number', 'int', 'float'].includes(type)) return 0
   if (type === 'bool' || type === 'boolean') return false
   if (type === 'array') return '[]'
   if (type === 'object') return '{}'
@@ -455,11 +517,12 @@ export function buildTestInputFields(rule, schema, { startStepId = '', endStepId
         path: [output.name],
         sourceName: source.name,
         label: output.label || output.name,
-        type: normalizedType(output.type),
-        required: output.required !== false,
+        type: fieldType(output).type,
+        valueType: fieldType(output),
+        required: output.required !== false && !['skip', 'default'].includes(reference.on_missing),
         sensitive: output.sensitive === true,
         placeholder: output.placeholder || '',
-        defaultValue: testDefaultValue(output),
+        defaultValue: output.required === false || ['skip', 'default'].includes(reference.on_missing) ? '' : testDefaultValue(output),
       })
     }
   }
@@ -493,7 +556,7 @@ export function buildTestInputFields(rule, schema, { startStepId = '', endStepId
     const path = Array.isArray(reference.path) ? reference.path : []
     const source = sourceFor(reference)
     if (reference.scope === 'step' && (source.actionIndex < 0 || source.actionIndex >= startIndex)) continue
-    const outputs = outputDefs(source.meta)
+    const outputs = reference.scope === 'step' ? actionOutputDefs(source.action, schema, rule) : outputDefs(source.meta)
     if (reference.scope === 'trigger' && outputs.length) {
       addOutputFields(reference, source, outputs)
       if (!path.length || outputs.some(output => output.name === path[0])) continue
@@ -502,22 +565,26 @@ export function buildTestInputFields(rule, schema, { startStepId = '', endStepId
       continue
     }
     const output = outputs.find(item => item.name === path[0])
-    const nested = path.length > 1
+    const selectedType = !path.length ? { type: 'object' } : typeAtPath(fieldType(output), path.slice(1), Object.entries(schema.data_types?.custom || {}).map(([id, definition]) => ({ id, ...definition }))).type
     addTestField(fields, {
       scope: reference.scope,
       node: ['trigger', 'step'].includes(reference.scope) ? reference.node : '',
       path,
       sourceName: source.name,
       label: output?.label || path.join('.') || '完整数据',
-      type: path.length ? (nested ? 'any' : normalizedType(output?.type)) : 'object',
-      required: output?.required !== false,
+      type: selectedType.type,
+      valueType: selectedType.type === 'any' ? undefined : selectedType,
+      required: output?.required !== false && !['skip', 'default'].includes(reference.on_missing),
       sensitive: output?.sensitive === true,
       placeholder: output?.placeholder || '',
-      defaultValue: testDefaultValue(output, !path.length),
+      defaultValue: output?.required === false || ['skip', 'default'].includes(reference.on_missing) ? '' : testDefaultValue({ value_type: selectedType }, !path.length),
       fullPayload: !path.length,
     })
   }
 
+  for (const variable of rule.variables || []) {
+    addTestField(fields, { scope: 'variable', node: variable.id, path: [], sourceName: '运行变量（留空使用规则初始值）', label: variable.name, type: normalizedType(variable.value_type), valueType: variable.value_type, required: false, sensitive: variable.sensitive === true, defaultValue: '' })
+  }
   for (const path of legacyPaths) {
     addTestField(fields, {
       scope: 'event',
@@ -546,6 +613,8 @@ export function buildAllTestInputFields(rule, schema) {
 }
 
 function parsePreparedTestValue(raw, field) {
+  if (!field.required && (raw === '' || raw === undefined)) return undefined
+  if (field.valueType) return parseTypedInput(raw, field.valueType)
   const type = normalizedType(field.type)
   if (field.fullPayload || type === 'object' || type === 'array') {
     let value
@@ -556,14 +625,12 @@ function parsePreparedTestValue(raw, field) {
     } else if (!Array.isArray(value)) throw new Error('请输入 JSON 数组')
     return value
   }
-  if (type === 'number' || type === 'integer') {
+  if (['number', 'int', 'float', 'decimal', 'timestamp', 'duration'].includes(type)) {
     if (raw === '' || raw === null || raw === undefined) {
       if (!field.required) return undefined
       throw new Error('请输入数字')
     }
-    const value = Number(raw)
-    if (!Number.isFinite(value)) throw new Error('请输入有效数字')
-    return type === 'integer' ? Math.trunc(value) : value
+    return parseTypedInput(raw, field.type)
   }
   if (type === 'bool' || type === 'boolean') return raw === true || raw === 'true'
   return String(raw ?? '')
@@ -574,6 +641,7 @@ export function buildPreparedTestContext(fields, values) {
     trigger_payloads: contextRecord(),
     event_payload: contextRecord(),
     step_outputs: contextRecord(),
+    variable_values: contextRecord(),
   }
   let hasEvent = false
   for (const field of fields) {
@@ -584,6 +652,7 @@ export function buildPreparedTestContext(fields, values) {
       throw error
     }
     if (value === undefined) continue
+    if (field.scope === 'variable') { context.variable_values[field.node] = safeContextValue(value); continue }
     const target = field.scope === 'event'
       ? context.event_payload
       : field.scope === 'step'
@@ -595,6 +664,7 @@ export function buildPreparedTestContext(fields, values) {
   }
   if (!hasEvent) delete context.event_payload
   if (!Object.keys(context.step_outputs).length) delete context.step_outputs
+  if (!Object.keys(context.variable_values).length) delete context.variable_values
   return context
 }
 

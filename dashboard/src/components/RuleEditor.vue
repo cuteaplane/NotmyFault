@@ -36,13 +36,20 @@ import {
   parameterAllowsBinding,
   regenerateBindingIds,
   typesCompatible,
+  variableBindingSources,
+  expandBindingSources,
+  referenceLabel,
+  bindingSourceFor,
 } from '../lib/bindings'
+import { typeLabel, fieldType } from '../lib/valueTypes'
 import ParamInput from './ParamInput.vue'
 import ConditionEditor from './ConditionEditor.vue'
+import IfActionEditor from './IfActionEditor.vue'
+import VariablesEditor from './VariablesEditor.vue'
+import VariableAssignmentEditor from './VariableAssignmentEditor.vue'
 import PluginPicker from './PluginPicker.vue'
 import FolderPicker from './FolderPicker.vue'
 import ActionFailureSettings from './ActionFailureSettings.vue'
-import DesktopRecorderDialog from './DesktopRecorderDialog.vue'
 import NaturalDraftPanel from './NaturalDraftPanel.vue'
 import { validateRuleDraft } from '../lib/api'
 
@@ -59,8 +66,6 @@ const props = defineProps({
 const emit = defineEmits(['back', 'delete', 'save', 'save-run', 'undo', 'redo', 'ai-draft'])
 
 const newTriggerType = ref('')
-const newActionType = ref('')
-const newPreconditionType = ref('')
 
 const aiEnabled = computed(() => store.aiDrafting?.enabled)
 const aiPanelOpen = ref(false)
@@ -159,7 +164,7 @@ function stopAiPanelResize() {
 const aiContextRule = computed(() => {
   const rule = props.rule
   if (!rule) return null
-  const nodes = 1 + (rule.preconditions?.length || 0) + (rule.actions?.length || 0)
+  const nodes = 1 + (rule.actions?.length || 0)
   return { name: rule.name || '未命名规则', nodes }
 })
 const nodePositions = ref({})
@@ -168,7 +173,6 @@ const dataDrag = ref(null)
 const dataDropTarget = ref(null)
 const picker = ref({ open: false, kind: 'action', mode: 'append', index: null, path: [], op: 'any' })
 const folderPickerOpen = ref(false)
-const desktopRecorderOpen = ref(false)
 const editingRuleName = ref(false)
 const ruleNameInput = ref(null)
 let dragState = null
@@ -206,16 +210,7 @@ const triggerGroups = computed(() => groupTriggerKeys(triggerKeys.value))
 const actionKeys = computed(() => Object.keys(store.schema.actions).filter(
   key => !pluginUnavailableReason('actions', key)
 ))
-const desktopRecorder = computed(() => store.extensions.parameter_editors.find(editor => (
-  editor.plugin_id === 'uia_control'
-  && editor.parameter === 'target'
-)) || null)
-const desktopRecorderAvailable = computed(() => !!desktopRecorder.value)
-const preconditionKeys = computed(() => actionKeys.value.filter(
-  key => store.schema.actions[key]?.precondition_api === 'context-v1'
-))
 const actionGroups = computed(() => groupActionKeys(actionKeys.value))
-const preconditionGroups = computed(() => groupActionKeys(preconditionKeys.value))
 const isCondition = computed(() => (
   !!props.rule.condition
   && typeof props.rule.condition === 'object'
@@ -232,7 +227,9 @@ const actionParamAllowsBinding = (action, param) => parameterAllowsBinding(
   param.name,
 )
 const eventName = (event) => store.schema.triggers[event?.type]?.name || event?.type || '未选择触发器'
-const actionName = (action) => store.schema.actions[action?.type]?.name || action?.type || '未选择动作'
+const actionName = (action) => action?.type === 'if' ? 'IF 条件分支' : action?.type === 'set_variable' ? '变量赋值' : store.schema.actions[action?.type]?.name || action?.type || '未选择动作'
+const constantSources = computed(() => expandBindingSources(variableBindingSources(props.rule, { constantsOnly: true }), store.schema.data_types?.custom))
+const typeCatalog = computed(() => Object.entries(store.schema.data_types?.custom || {}).map(([id, definition]) => ({ id, ...definition })))
 function actionFailureSummary(action) {
   const parts = [action?.on_error === 'continue' ? '失败后继续' : '失败后停止']
   const retries = Math.min(Math.max(Number(action?.retry || 0), 0), 3)
@@ -240,16 +237,6 @@ function actionFailureSummary(action) {
   if (action?.timeout_seconds) parts.push(`最多运行 ${action.timeout_seconds} 秒`)
   if (action?.failure_actions?.length) parts.push(`${action.failure_actions.length} 个补救动作`)
   return parts.join(' · ')
-}
-function validUiaSelector(value) {
-  return value && typeof value === 'object'
-    && value.version === 1
-    && value.window && typeof value.window === 'object'
-    && value.target && typeof value.target === 'object'
-    && Number.isInteger(value.target.control_type)
-    && ['automation_id', 'name', 'class_name'].some(
-      key => typeof value.target[key] === 'string' && value.target[key],
-    )
 }
 function formatParamValue(value, def) {
   if (isReference(value)) return '运行数据'
@@ -320,8 +307,8 @@ const graph = computed(() => {
       kind === 'trigger' ? store.schema.triggers[item?.type] : store.schema.actions[item?.type],
     ),
   })
-  const fullNodes = controlGraph.nodes.map(node => buildNodeDataPorts(node, store.schema))
-  const dataEdges = deriveDataEdges(props.rule, fullNodes)
+  const fullNodes = controlGraph.nodes.map(node => buildNodeDataPorts(node, store.schema, props.rule))
+  const dataEdges = deriveDataEdges(props.rule, fullNodes, typeCatalog.value)
   const usedInputs = new Map()
   const usedOutputs = new Map()
   for (const edge of dataEdges) {
@@ -351,7 +338,7 @@ const graph = computed(() => {
     const contentExtraHeight = node.admin ? FLOW_NODE_ADMIN_EXTRA_HEIGHT : 0
     const dataStartY = FLOW_NODE_BASE_HEIGHT + contentExtraHeight
       + (hasDataPorts ? FLOW_DATA_SUMMARY_HEIGHT : 0)
-    const footerHeight = ['action', 'failure-action', 'precondition'].includes(node.kind) ? 34 : node.kind === 'condition' ? 40 : 0
+    const footerHeight = ['action', 'failure-action'].includes(node.kind) ? 34 : node.kind === 'condition' ? 40 : 0
     return {
       ...node,
       visibleDataInputs,
@@ -385,12 +372,10 @@ const selectedGraphNode = computed(() => layoutNodes.value.find(node => node.id 
 watch(layoutNodes, nodes => {
   if (
     selectedNodeId.value
-    && selectedNodeId.value !== 'add-precondition'
     && !nodes.some(node => node.id === selectedNodeId.value)
   ) selectedNodeId.value = null
 })
 const selectedKind = computed(() => {
-  if (selectedNodeId.value === 'add-precondition') return 'add-precondition'
   return selectedGraphNode.value?.kind || 'trigger'
 })
 const selectedIndex = computed(() => selectedGraphNode.value?.index ?? -1)
@@ -398,7 +383,6 @@ const selectedAction = computed(() => selectedKind.value === 'action' ? props.ru
 const selectedFailureAction = computed(() => selectedKind.value === 'failure-action'
   ? props.rule.actions?.[selectedGraphNode.value?.parentIndex]?.failure_actions?.[selectedIndex.value]
   : null)
-const selectedPrecondition = computed(() => selectedKind.value === 'precondition' ? props.rule.preconditions?.[selectedIndex.value] : null)
 const selectedConditionNode = computed(() => (
   ['condition', 'trigger'].includes(selectedKind.value) && selectedGraphNode.value?.path
     ? selectedGraphNode.value.source
@@ -425,10 +409,14 @@ const clientValidationIssues = computed(() => {
       if (node.params != null && (typeof node.params !== 'object' || Array.isArray(node.params))) add(`${path}参数格式无效`, 'trigger')
       return
     }
-    if (!['any', 'all'].includes(node.op)) add(`${path}的组合方式无效`, 'trigger')
+    if (!['any', 'all', 'not'].includes(node.op)) add(`${path}的组合方式无效`, 'trigger')
     if (!Array.isArray(node.children) || !node.children.length) {
       add(`${path}组不能为空`, 'trigger')
       return
+    }
+    if (node.op === 'not') {
+      if (node.children.length !== 1 || !node.children[0]?.type) add(`${path}的 NOT 需要一个事件条件`, 'trigger')
+      if (!(Number(node.within_seconds) > 0)) add(`${path}的 NOT 需要等待时长`, 'trigger')
     }
     if ('within_seconds' in node) {
       const seconds = Number(node.within_seconds)
@@ -456,6 +444,14 @@ const clientValidationIssues = computed(() => {
     }
   }
   actions.forEach((action, index) => {
+    if (action?.type === 'set_variable') {
+      if (!props.rule.variables?.some(item => item.id === action.variable)) add(`动作 ${index + 1} 的赋值目标不存在`, `action:${index}`)
+      return
+    }
+    if (action?.type === 'if') {
+      if (!action.then?.length && !action.else?.length) add(`IF ${index + 1} 需要至少一个分支动作`, `action:${index}`)
+      return
+    }
     const actionReason = pluginUnavailableReason('actions', action?.type)
     if (actionReason) add(`动作 ${index + 1} 引用了当前系统不可用的插件（${actionReason}）`, `action:${index}`)
     if (action?.params != null && (typeof action.params !== 'object' || Array.isArray(action.params))) add(`动作 ${index + 1} 参数格式无效`, `action:${index}`)
@@ -463,13 +459,10 @@ const clientValidationIssues = computed(() => {
     const sources = actionBindingSources(index)
     for (const def of actionParams(action)) {
       const value = action?.params?.[def.name]
-      if (def.type === 'uia_selector' && !isReference(value)) {
-        if (!validUiaSelector(value)) add(`动作 ${index + 1} 还没有选择有效的屏幕控件`, `action:${index}`)
-      }
       if (!isReference(value)) continue
-      const source = sources.find(item => JSON.stringify(item.value) === JSON.stringify(value))
+      const source = bindingSourceFor(value.$ref, sources, typeCatalog.value)
       if (!source) add(`动作 ${index + 1} 的“${def.label || def.name}”引用了不可用数据`, `action:${index}`)
-      else if (!typesCompatible(source.type, def.value_type || def.type)) {
+      else if (!typesCompatible(source.type, fieldType(def, true))) {
         add(`动作 ${index + 1} 的“${def.label || def.name}”数据类型不兼容`, `action:${index}`)
       }
     }
@@ -483,36 +476,16 @@ const clientValidationIssues = computed(() => {
       const failureSources = failureActionBindingSources(index, failureIndex)
       for (const def of actionParams(failureAction)) {
         const value = failureAction?.params?.[def.name]
-        if (def.type === 'uia_selector' && !isReference(value)) {
-          if (!validUiaSelector(value)) add(`动作 ${index + 1} 的补救动作 ${failureIndex + 1} 还没有选择有效的屏幕控件`, `action:${index}`)
-        }
         if (!isReference(value)) continue
-        const source = failureSources.find(item => JSON.stringify(item.value) === JSON.stringify(value))
+        const source = bindingSourceFor(value.$ref, failureSources, typeCatalog.value)
         if (!source) add(`动作 ${index + 1} 的补救动作 ${failureIndex + 1} 引用了不可用数据`, `action:${index}`)
-        else if (!typesCompatible(source.type, def.value_type || def.type)) {
+        else if (!typesCompatible(source.type, fieldType(def, true))) {
           add(`动作 ${index + 1} 的补救动作 ${failureIndex + 1} 数据类型不兼容`, `action:${index}`)
         }
       }
     })
   })
-  const preconditions = props.rule.preconditions == null
-    ? []
-    : Array.isArray(props.rule.preconditions) ? props.rule.preconditions : null
-  if (preconditions === null) add('开始前确认列表格式无效', 'preconditions')
-  ;(preconditions || []).forEach((item, index) => {
-    if (!preconditionKeys.value.includes(item?.type)) add(`开始前确认 ${index + 1} 不可用`, `precondition:${index}`)
-    if (item?.params != null && (typeof item.params !== 'object' || Array.isArray(item.params))) add(`开始前确认 ${index + 1} 参数格式无效`, `precondition:${index}`)
-    const sources = preconditionBindingSources()
-    for (const def of actionParams(item)) {
-      const value = item?.params?.[def.name]
-      if (!isReference(value)) continue
-      const source = sources.find(candidate => JSON.stringify(candidate.value) === JSON.stringify(value))
-      if (!source) add(`开始前确认 ${index + 1} 的“${def.label || def.name}”引用了不可用数据`, `precondition:${index}`)
-      else if (!typesCompatible(source.type, def.value_type || def.type)) {
-        add(`开始前确认 ${index + 1} 的“${def.label || def.name}”数据类型不兼容`, `precondition:${index}`)
-      }
-    }
-  })
+  if (props.rule.preconditions?.length) add('运行前检查已移除，请移除旧配置并改用 NOT 或 IF', 'actions')
   return issues
 })
 
@@ -527,8 +500,6 @@ function issueTarget(issue) {
   const text = `${issue.location || ''} ${issue.message || ''}`
   const action = text.match(/actions\[(\d+)\]/)
   if (action) return `action:${action[1]}`
-  const precondition = text.match(/preconditions\[(\d+)\]/)
-  if (precondition) return `precondition:${precondition[1]}`
   if (/event|condition|触发器|触发条件/.test(text)) return 'trigger'
   if (/name 不能为空|规则名称/.test(text)) return 'name'
   return ''
@@ -589,9 +560,7 @@ function focusValidationIssue(issue) {
     else if (issue.target?.startsWith('action:')) {
       const action = props.rule.actions?.[Number(issue.target.split(':')[1])]
       if (action) selectNode(`action-${action.binding_id}`)
-    } else if (issue.target?.startsWith('precondition:')) {
-      const item = props.rule.preconditions?.[Number(issue.target.split(':')[1])]
-      if (item) selectNode(`precondition-${item.binding_id}`)
+
     }
   })
 }
@@ -633,13 +602,34 @@ function useSingleEvent() {
   selectedNodeId.value = 'trigger'
   nodePositions.value = {}
 }
+function useNotEvent() {
+  if (isCondition.value && selectedKind.value === 'trigger') {
+    const path = selectedConditionPath.value
+    const parent = selectedConditionParent.value
+    if (!parent || parent.op === 'not') return
+    parent.children[path.at(-1)] = { op: 'not', within_seconds: 60, children: [selectedConditionNode.value] }
+    return
+  }
+  if (!props.rule.event) return
+  props.rule.condition = { op: 'not', within_seconds: 60, children: [props.rule.event] }
+  delete props.rule.event
+  selectedNodeId.value = 'condition-root'
+}
+function unwrapNotEvent() {
+  const node = selectedConditionNode.value
+  if (node?.op !== 'not' || node.children?.length !== 1) return
+  const parent = selectedConditionParent.value
+  if (parent) parent.children[selectedConditionPath.value.at(-1)] = node.children[0]
+  else useSingleEvent()
+}
 function conditionId(path) {
   return path.length ? `condition-${path.join('-')}` : 'condition-root'
 }
 function changeConditionOp() {
   const node = selectedConditionNode.value
   if (!node || selectedKind.value !== 'condition') return
-  if (node.op !== 'all') delete node.within_seconds
+  if (node.op === 'not') node.within_seconds ||= 60
+  else if (node.op !== 'all') delete node.within_seconds
 }
 function removeSelectedCondition() {
   const parent = selectedConditionParent.value
@@ -672,7 +662,23 @@ function duplicateSelectedCondition() {
   selectedNodeId.value = conditionId([...path.slice(0, -1), index + 1])
   nodePositions.value = {}
 }
-function addAction(type = newActionType.value || actionKeys.value[0], insertIndex = null) {
+function addAssignment() {
+  const action = { binding_id: createBindingId('action'), type: 'set_variable', variable: props.rule.variables?.[0]?.id || '', value: '' }
+  ;(props.rule.actions ||= []).push(action)
+  selectedNodeId.value = `action-${action.binding_id}`
+}
+function saveFromEditor(event, run = false) {
+  const root = event.currentTarget.closest('.rule-editor-page')
+  if (root && [...root.querySelectorAll('input,textarea,select')].some(control => !control.reportValidity())) return
+  emit(run ? 'save-run' : 'save')
+}
+function addIf() {
+  const action = { binding_id: createBindingId('action'), type: 'if', condition: { op: 'is_true', left: false }, then: [], else: [] }
+  if (!Array.isArray(props.rule.actions)) props.rule.actions = []
+  props.rule.actions.push(action)
+  selectedNodeId.value = `action-${action.binding_id}`
+}
+function addAction(type, insertIndex = null) {
   if (!type) return
   if (!Array.isArray(props.rule.actions)) props.rule.actions = []
   const action = {
@@ -685,18 +691,6 @@ function addAction(type = newActionType.value || actionKeys.value[0], insertInde
     : Math.max(0, Math.min(props.rule.actions.length, insertIndex))
   props.rule.actions.splice(index, 0, action)
   selectedNodeId.value = `action-${action.binding_id}`
-  newActionType.value = ''
-}
-function insertRecordedSteps(actions) {
-  if (!Array.isArray(actions) || !actions.length) return
-  if (!Array.isArray(props.rule.actions)) props.rule.actions = []
-  const inserted = actions.map(action => ({
-    ...action,
-    binding_id: createBindingId('action'),
-  }))
-  props.rule.actions.push(...inserted)
-  selectedNodeId.value = `action-${inserted[inserted.length - 1].binding_id}`
-  nodePositions.value = {}
 }
 function changeAction(action, type) {
   action.type = type
@@ -707,7 +701,7 @@ function removeAction(index) {
   props.rule.actions.splice(index, 1)
   selectedNodeId.value = props.rule.actions.length
     ? `action-${props.rule.actions[Math.min(index, props.rule.actions.length - 1)].binding_id}`
-    : 'add-action'
+    : null
 }
 function duplicateAction(index) {
   const source = props.rule.actions?.[index]
@@ -724,21 +718,6 @@ function moveAction(index, offset) {
   props.rule.actions.splice(target, 0, action)
   selectedNodeId.value = `action-${action.binding_id}`
 }
-function addPrecondition(type = newPreconditionType.value || preconditionKeys.value[0]) {
-  if (!type) return
-  if (!Array.isArray(props.rule.preconditions)) props.rule.preconditions = []
-  props.rule.preconditions.push({
-    binding_id: createBindingId('precondition'),
-    type,
-    params: buildDefaultParams(store.schema.actions[type]),
-  })
-  selectedNodeId.value = `precondition-${props.rule.preconditions.at(-1).binding_id}`
-  newPreconditionType.value = ''
-}
-function changePrecondition(item, type) {
-  item.type = type
-  item.params = buildDefaultParams(store.schema.actions[type])
-}
 function actionOutputHint(action, index) {
   const outputs = outputDefs(store.schema.actions[action.type])
   return outputs.map(output => `${action.binding_id} · ${output.label || output.name}`).join('　')
@@ -748,18 +727,6 @@ function actionBindingSources(index) {
 }
 function failureActionBindingSources(actionIndex, failureIndex) {
   return buildFailureBindingSources(props.rule, actionIndex, failureIndex, store.schema)
-}
-function preconditionBindingSources() {
-  return buildBindingSources(props.rule, 0, store.schema, {
-    allowSteps: false,
-    allowConditionalTriggers: false,
-  })
-}
-function removePrecondition(index) {
-  props.rule.preconditions.splice(index, 1)
-  selectedNodeId.value = props.rule.preconditions.length
-    ? `precondition-${props.rule.preconditions[Math.min(index, props.rule.preconditions.length - 1)].binding_id}`
-    : 'trigger'
 }
 function addFailureAction(actionIndex, type) {
   const action = props.rule.actions?.[actionIndex]
@@ -890,7 +857,6 @@ function choosePlugin(key) {
     const action = props.rule.actions?.[context.parentIndex]?.failure_actions?.[context.failureIndex]
     if (action) changeAction(action, key)
   }
-  else if (context.mode === 'precondition') addPrecondition(key)
   else if (context.mode === 'condition-child') addConditionFromPicker(key, { path: context.path })
   else if (context.mode === 'condition-group') addConditionFromPicker(key, { path: context.path, group: true })
   else if (context.mode === 'upgrade') upgradeWithCondition(key, context.op)
@@ -983,20 +949,18 @@ function dataReference(node, port) {
       scope: node.kind === 'trigger' ? 'trigger' : 'step',
       node: node.source.binding_id,
       path: [port.name],
+      ...(!port.required ? { on_missing: 'error' } : {}),
     },
   }
 }
 function canConnectDataPorts(sourceNode, sourcePort, targetNode, targetPort) {
-  if (!sourcePort.required || !typesCompatible(sourcePort.type, targetPort.type)) return false
+  if (!typesCompatible(sourcePort.type, targetPort.type)) return false
   if (['action', 'failure-action'].includes(sourceNode.kind)) {
     return ['action', 'failure-action'].includes(targetNode.kind)
       && (targetNode.availableStepIds || []).includes(sourceNode.source.binding_id)
   }
   if (sourceNode.kind !== 'trigger') return false
-  if (targetNode.kind === 'precondition') {
-    const guaranteed = guaranteedTriggerIds(props.rule.condition || props.rule.event)
-    return guaranteed.has(sourceNode.source.binding_id)
-  }
+
   return ['action', 'failure-action'].includes(targetNode.kind)
 }
 function inputPortAt(event) {
@@ -1018,7 +982,7 @@ function updateDataDropTarget(event) {
     : null
 }
 function startDataDrag(event, node, port) {
-  if (event.button !== 0 || !port.required) return
+  if (event.button !== 0) return
   event.stopPropagation()
   dataDrag.value = {
     sourceNodeId: node.id,
@@ -1036,8 +1000,11 @@ function endDataDrag(event) {
   const sourcePort = source?.dataOutputs.find(port => port.name === dataDrag.value.sourcePortName)
   const target = dataDropTarget.value
   if (source && sourcePort && target && canConnectDataPorts(source, sourcePort, target.node, target.port)) {
-    target.node.source.params ||= {}
-    target.node.source.params[target.port.name] = dataReference(source, sourcePort)
+    if (target.node.source.type === 'set_variable') target.node.source.value = dataReference(source, sourcePort)
+    else {
+      target.node.source.params ||= {}
+      target.node.source.params[target.port.name] = dataReference(source, sourcePort)
+    }
   }
   dataDrag.value = null
   dataDropTarget.value = null
@@ -1414,12 +1381,12 @@ function onEditorKeydown(event) {
         </button>
         <button class="btn btn-text danger-text" @click="emit('delete')"><span class="material-symbols-outlined">delete</span>删除</button>
         <button class="btn btn-outlined rule-test-btn" :disabled="validationErrorCount || testing"
-          title="保存当前修改，并真实执行一次规则中的动作" @click="emit('save-run')">
+          title="保存当前修改，并真实执行一次规则中的动作" @click="saveFromEditor($event, true)">
           <span v-if="testing" class="spinner"></span>
           <span v-else class="material-symbols-outlined">experiment</span>
           {{ testing ? '测试中…' : '测试规则' }}
         </button>
-        <button class="btn btn-filled" :disabled="validationErrorCount || !dirty" @click="emit('save')"><span class="material-symbols-outlined">save</span>保存规则</button>
+        <button class="btn btn-filled" :disabled="validationErrorCount || !dirty" @click="saveFromEditor($event)"><span class="material-symbols-outlined">save</span>保存规则</button>
       </div>
     </div>
 
@@ -1434,6 +1401,7 @@ function onEditorKeydown(event) {
       </div>
     </Transition>
 
+    <VariablesEditor :rule="rule" />
     <div class="rule-editor-main-grid">
     <div class="editor-canvas-column">
     <main v-show="editorMode === 'canvas'" class="node-editor-workspace" :class="{ 'editor-mode-active': editorMode === 'canvas' }">
@@ -1441,8 +1409,8 @@ function onEditorKeydown(event) {
         <div class="node-canvas-toolbar">
           <div class="node-canvas-tools">
             <button class="btn btn-text btn-sm" @click="selectNode(isCondition ? 'condition-root' : 'trigger')"><span class="material-symbols-outlined">bolt</span>触发条件</button>
-            <button v-if="preconditionKeys.length" class="btn btn-text btn-sm" @click="openPluginPicker('precondition', { mode: 'precondition', title: '添加开始前确认' })"><span class="material-symbols-outlined">verified_user</span>添加确认</button>
-            <button v-if="desktopRecorderAvailable" class="btn btn-text btn-sm" @click="desktopRecorderOpen = true"><span class="material-symbols-outlined">screen_record</span>{{ desktopRecorder.ui?.button_label || '录制桌面步骤' }}</button>
+            <button class="btn btn-text btn-sm" @click="addIf"><span class="material-symbols-outlined">call_split</span>添加 IF</button>
+            <button class="btn btn-text btn-sm" @click="addAssignment"><span class="material-symbols-outlined">edit_note</span>变量赋值</button>
             <button class="btn btn-text btn-sm" @click="selectNode('add-action')"><span class="material-symbols-outlined">add</span>添加动作</button>
           </div>
           <div class="node-canvas-toolbar-side">
@@ -1518,14 +1486,14 @@ function onEditorKeydown(event) {
                  <div class="data-port-column data-port-column-input">
                    <span v-for="port in node.visibleDataInputs" :key="port.id" class="data-port-row"
                      :class="dataInputDropState(node, port)" :data-input-node="node.id" :data-input-port="port.name"
-                     :title="`${port.label} · ${port.type}`">
-                      <i class="data-port-dot"></i><small>{{ port.label }}</small><code class="data-type-chip">{{ port.type }}</code>
+                     :title="`${port.label} · ${typeLabel(port.type)} · ${JSON.stringify(port.type)}`">
+                      <i class="data-port-dot"></i><small>{{ port.label }}</small><code class="data-type-chip">{{ typeLabel(port.type) }}</code>
                    </span>
                  </div>
                  <div class="data-port-column data-port-column-output">
-                   <span v-for="port in node.visibleDataOutputs" :key="port.id" class="data-port-row" :class="{ optional: !port.required }" :title="`${port.label} · ${port.type}`">
-                      <small>{{ port.label }}</small><code class="data-type-chip">{{ port.type }}</code><i class="data-port-dot"
-                       :class="{ draggable: port.required }" @pointerdown="startDataDrag($event, node, port)"></i>
+                   <span v-for="port in node.visibleDataOutputs" :key="port.id" class="data-port-row" :class="{ optional: !port.required }" :title="`${port.label} · ${typeLabel(port.type)} · ${JSON.stringify(port.type)}`">
+                      <small>{{ port.label }}</small><code class="data-type-chip">{{ typeLabel(port.type) }}</code><i class="data-port-dot draggable"
+                       @pointerdown="startDataDrag($event, node, port)"></i>
                    </span>
                 </div>
               </div>
@@ -1538,10 +1506,6 @@ function onEditorKeydown(event) {
                 <button class="icon-btn" :disabled="node.index === 0" title="上移" @click.stop="moveFailureAction(node.parentIndex, node.index, -1)"><span class="material-symbols-outlined">arrow_back</span></button>
                 <button class="icon-btn" :disabled="node.index === rule.actions[node.parentIndex].failure_actions.length - 1" title="下移" @click.stop="moveFailureAction(node.parentIndex, node.index, 1)"><span class="material-symbols-outlined">arrow_forward</span></button>
                 <button class="icon-btn icon-btn-danger" title="删除补救动作" @click.stop="removeFailureAction(node.parentIndex, node.index)"><span class="material-symbols-outlined">delete</span></button>
-              </footer>
-              <footer v-else-if="node.kind === 'precondition'" class="graph-node-actions">
-                <span></span><span></span>
-                <button class="icon-btn icon-btn-danger" title="删除确认" @click.stop="removePrecondition(node.index)"><span class="material-symbols-outlined">delete</span></button>
               </footer>
               <footer v-else-if="node.kind === 'condition'" class="graph-node-logic-actions">
                 <button @click.stop="requestConditionChild(node, false)"><span class="material-symbols-outlined">add</span>条件</button>
@@ -1573,7 +1537,7 @@ function onEditorKeydown(event) {
         <div class="stage-content">
           <header class="stage-head"><div><span class="stage-kicker">当</span><h2>什么情况会触发这条规则？</h2></div><span class="stage-required">必填</span></header>
 
-          <ConditionEditor v-if="isCondition" :node="conditionNode" />
+          <ConditionEditor v-if="isCondition" :node="conditionNode" :constants="constantSources" />
           <details v-else-if="rule.event" class="flow-card condition-flow-card" open>
             <summary>
               <span class="flow-card-index">1</span>
@@ -1590,7 +1554,7 @@ function onEditorKeydown(event) {
                   <span class="material-symbols-outlined">arrow_forward</span>
                 </button>
               </div>
-              <div class="param-grid"><ParamInput v-for="param in eventParams(rule.event)" :key="param.name" :def="param" :plugin-id="rule.event.type" v-model="rule.event.params[param.name]" /></div>
+              <div class="param-grid"><ParamInput v-for="param in eventParams(rule.event)" :key="param.name" :def="param" :plugin-id="rule.event.type" v-model="rule.event.params[param.name]" :allow-binding="param.type !== 'plugin_data'" :binding-sources="constantSources" /></div>
             </div>
           </details>
           <div v-else class="flow-empty-card">
@@ -1616,25 +1580,11 @@ function onEditorKeydown(event) {
         </div>
       </section>
 
-      <section v-if="preconditionKeys.length" class="automation-stage stage-check">
-        <div class="stage-rail"><span class="stage-node"><span class="material-symbols-outlined">verified_user</span></span></div>
-        <div class="stage-content">
-          <header class="stage-head"><div><span class="stage-kicker">开始前确认</span><h2>执行前还需要确认什么？</h2><p>未通过时，引擎会稍后重试。</p></div><span class="stage-optional">可选</span></header>
-          <details v-for="(item, index) in (rule.preconditions || [])" :key="item" class="flow-card check-flow-card">
-            <summary><span class="material-symbols-outlined flow-kind-icon">verified</span><span class="flow-card-copy"><b>{{ actionName(item) }}</b><small>开始前确认</small></span><button class="icon-btn icon-btn-danger" title="移除确认" @click.prevent.stop="removePrecondition(index)"><span class="material-symbols-outlined">delete</span></button><span class="material-symbols-outlined flow-expand">expand_more</span></summary>
-            <div class="flow-card-body">
-              <label class="field field-wide"><span class="field-label">确认方式</span><select class="select" :value="item.type" @change="changePrecondition(item, $event.target.value)"><option v-for="key in preconditionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option></select></label>
-              <div class="param-grid"><ParamInput v-for="param in actionParams(item)" :key="param.name" :def="param" :plugin-id="item.type" v-model="item.params[param.name]" :allow-binding="actionParamAllowsBinding(item, param)" :binding-sources="preconditionBindingSources()" /></div>
-            </div>
-          </details>
-          <div class="flow-add-control"><button class="btn btn-tonal" @click="openPluginPicker('precondition', { mode: 'precondition', title: '添加开始前确认' })"><span class="material-symbols-outlined">add</span>添加确认</button></div>
-        </div>
-      </section>
 
       <section class="automation-stage stage-then">
         <div class="stage-rail stage-rail-last"><span class="stage-node"><span class="material-symbols-outlined">play_arrow</span></span></div>
         <div class="stage-content">
-          <header class="stage-head"><div><span class="stage-kicker">然后</span><h2>按顺序执行这些动作</h2></div><div class="stage-head-tools"><button v-if="desktopRecorderAvailable" class="btn btn-text btn-sm" @click="desktopRecorderOpen = true"><span class="material-symbols-outlined">screen_record</span>{{ desktopRecorder.ui?.button_label || '录制桌面步骤' }}</button><span class="stage-required">必填</span></div></header>
+          <header class="stage-head"><div><span class="stage-kicker">然后</span><h2>按顺序执行这些动作</h2></div><div class="stage-head-tools"><span class="stage-required">必填</span></div></header>
           <details v-for="(action, index) in rule.actions" :key="action" class="flow-card action-flow-card" :open="rule.actions.length === 1">
             <summary>
               <span class="flow-card-index">{{ index + 1 }}</span><span class="flow-card-copy"><b>{{ actionName(action) }}</b><small>第 {{ index + 1 }} 步 · {{ actionFailureSummary(action) }}</small></span>
@@ -1643,6 +1593,9 @@ function onEditorKeydown(event) {
               <span class="material-symbols-outlined flow-expand">expand_more</span>
             </summary>
             <div class="flow-card-body">
+              <IfActionEditor v-if="action.type === 'if'" :action="action" :rule="rule" :sources="actionBindingSources(index)" />
+              <VariableAssignmentEditor v-else-if="action.type === 'set_variable'" :action="action" :sources="actionBindingSources(index)" />
+              <template v-else>
               <div class="field field-wide"><span class="field-label">动作类型</span>
                 <button class="plugin-type-button" type="button"
                   @click="openPluginPicker('action', { mode: 'replace-action', index, title: '更换动作类型' })">
@@ -1659,14 +1612,18 @@ function onEditorKeydown(event) {
                 @replace-failure-action="failureIndex => requestReplaceFailureAction(index, failureIndex)"
                 @remove-failure-action="failureIndex => removeFailureAction(index, failureIndex)"
                 @move-failure-action="(failureIndex, offset) => moveFailureAction(index, failureIndex, offset)" />
+              </template>
             </div>
           </details>
           <div v-if="!rule.actions?.length" class="flow-inline-empty">还没有动作。规则触发后不会执行任何操作。</div>
-          <div class="flow-add-control"><button class="btn btn-tonal" @click="openPluginPicker('action', { mode: 'action', index: rule.actions?.length || 0, title: '添加动作' })"><span class="material-symbols-outlined">add</span>添加动作</button></div>
+          <div class="flow-add-control"><button class="btn btn-tonal" @click="openPluginPicker('action', { mode: 'action', index: rule.actions?.length || 0, title: '添加动作' })"><span class="material-symbols-outlined">add</span>添加动作</button><button class="btn btn-text" @click="addIf">添加 IF</button><button class="btn btn-text" @click="addAssignment">变量赋值</button></div>
         </div>
       </section>
     </main>
 
+    <div v-if="rule.preconditions?.length" class="flow-inline-empty">旧的运行前检查已停用。请配置 NOT 或 IF 后移除旧检查。
+      <button class="btn btn-text danger-text" @click="delete rule.preconditions">移除旧检查</button>
+    </div>
     <footer class="flow-validation" :class="{ valid: !validationErrorCount, warning: !validationErrorCount && validationWarningCount, expanded: validationExpanded }">
       <span class="material-symbols-outlined">{{ validationErrorCount ? 'error' : validationWarningCount ? 'warning' : 'check_circle' }}</span>
       <div class="flow-validation-body">
@@ -1703,10 +1660,10 @@ function onEditorKeydown(event) {
         <aside v-if="selectedNodeId && editorMode === 'canvas'" :key="selectedNodeId" class="node-inspector" role="complementary" aria-label="节点设置" @pointerdown.stop>
           <header class="node-inspector-head">
             <span class="material-symbols-outlined">
-              {{ selectedKind === 'invalid' ? 'error' : selectedKind === 'condition' ? 'alt_route' : selectedKind === 'trigger' ? 'bolt' : selectedKind.includes('precondition') ? 'verified_user' : selectedKind === 'failure-action' ? 'build' : selectedKind === 'action' ? 'play_arrow' : 'add' }}
+              {{ selectedKind === 'invalid' ? 'error' : selectedKind === 'condition' ? 'alt_route' : selectedKind === 'trigger' ? 'bolt' : selectedKind === 'failure-action' ? 'build' : selectedKind === 'action' ? 'play_arrow' : 'add' }}
             </span>
             <div><small>节点设置</small><h2>
-              {{ selectedKind === 'invalid' ? '无效条件' : selectedKind === 'condition' ? '逻辑组' : selectedKind === 'trigger' ? '触发条件' : selectedKind === 'precondition' ? '开始前确认' : selectedKind === 'failure-action' ? `补救动作 ${selectedIndex + 1}` : selectedKind === 'action' ? `动作 ${selectedIndex + 1}` : selectedKind === 'add-precondition' ? '添加确认' : '添加动作' }}
+              {{ selectedKind === 'invalid' ? '无效条件' : selectedKind === 'condition' ? '逻辑组' : selectedKind === 'trigger' ? '触发条件' : selectedKind === 'failure-action' ? `补救动作 ${selectedIndex + 1}` : selectedKind === 'action' ? `动作 ${selectedIndex + 1}` : '添加动作' }}
             </h2></div>
             <button class="icon-btn node-inspector-close" title="关闭设置" @click="selectedNodeId = null"><span class="material-symbols-outlined">close</span></button>
           </header>
@@ -1722,14 +1679,17 @@ function onEditorKeydown(event) {
                 <select v-model="selectedConditionNode.op" class="select" @change="changeConditionOp">
                   <option value="any">任一满足（OR）</option>
                   <option value="all">全部满足（AND）</option>
+                  <option value="not">未发生（NOT）</option>
                 </select>
               </label>
-              <label v-if="selectedConditionNode.op === 'all'" class="field"><span class="field-label">完成时间窗口（秒，可选）</span>
+              <label v-if="['all', 'not'].includes(selectedConditionNode.op)" class="field"><span class="field-label">{{ selectedConditionNode.op === 'not' ? '等待时长（秒）' : '完成时间窗口（秒，可选）' }}</span>
                 <input v-model.number="selectedConditionNode.within_seconds" type="number" min="1" class="text-field" placeholder="不限制">
               </label>
-              <div class="inspector-add-grid">
+              <p v-if="selectedConditionNode.op === 'not'" class="inspector-lead">只放一个事件。等待期间收到事件会重新计时；超时触发一次。</p>
+              <button v-if="selectedConditionNode.op === 'not'" class="btn btn-text btn-sm" @click="unwrapNotEvent">改为事件发生时</button>
+              <div v-if="selectedConditionNode.op !== 'not' || !selectedConditionNode.children?.length" class="inspector-add-grid">
                 <button class="btn btn-tonal btn-sm" :disabled="!triggerKeys.length" @click="requestConditionChild(selectedGraphNode, false)"><span class="material-symbols-outlined">add</span>添加条件</button>
-                <button class="btn btn-tonal btn-sm" :disabled="!triggerKeys.length" @click="requestConditionChild(selectedGraphNode, true)"><span class="material-symbols-outlined">account_tree</span>添加子组</button>
+                <button v-if="selectedConditionNode.op !== 'not'" class="btn btn-tonal btn-sm" :disabled="!triggerKeys.length" @click="requestConditionChild(selectedGraphNode, true)"><span class="material-symbols-outlined">account_tree</span>添加子组</button>
               </div>
               <div v-if="selectedConditionPath.length" class="inspector-action-row">
                 <button class="btn btn-text btn-sm" @click="moveSelectedCondition(-1)"><span class="material-symbols-outlined">arrow_upward</span>上移</button>
@@ -1743,6 +1703,7 @@ function onEditorKeydown(event) {
             <template v-else-if="selectedKind === 'trigger'">
               <template v-if="isCondition && selectedConditionNode">
                 <p class="inspector-lead">此事件是一个独立分支；它会连接到所属逻辑组。</p>
+                <button v-if="selectedConditionParent?.op !== 'not'" class="btn btn-tonal btn-sm" @click="useNotEvent">未发生时（NOT）</button>
                 <div class="field"><span class="field-label">触发方式</span>
                   <button class="plugin-type-button" type="button"
                     @click="openPluginPicker('trigger', { mode: 'replace-condition-trigger', path: selectedConditionPath, title: '更换触发方式' })">
@@ -1751,7 +1712,7 @@ function onEditorKeydown(event) {
                     <span class="material-symbols-outlined">arrow_forward</span>
                   </button>
                 </div>
-                <div class="param-grid"><ParamInput v-for="param in eventParams(selectedConditionNode)" :key="param.name" :def="param" :plugin-id="selectedConditionNode.type" v-model="selectedConditionNode.params[param.name]" /></div>
+                <div class="param-grid"><ParamInput v-for="param in eventParams(selectedConditionNode)" :key="param.name" :def="param" :plugin-id="selectedConditionNode.type" v-model="selectedConditionNode.params[param.name]" :allow-binding="param.type !== 'plugin_data'" :binding-sources="constantSources" /></div>
                 <div class="inspector-action-row">
                   <button class="btn btn-text btn-sm" @click="moveSelectedCondition(-1)"><span class="material-symbols-outlined">arrow_upward</span>上移</button>
                   <button class="btn btn-text btn-sm" @click="moveSelectedCondition(1)"><span class="material-symbols-outlined">arrow_downward</span>下移</button>
@@ -1768,8 +1729,9 @@ function onEditorKeydown(event) {
                     <span class="material-symbols-outlined">arrow_forward</span>
                   </button>
                 </div>
-                <div class="param-grid"><ParamInput v-for="param in eventParams(rule.event)" :key="param.name" :def="param" :plugin-id="rule.event.type" v-model="rule.event.params[param.name]" /></div>
+                <div class="param-grid"><ParamInput v-for="param in eventParams(rule.event)" :key="param.name" :def="param" :plugin-id="rule.event.type" v-model="rule.event.params[param.name]" :allow-binding="param.type !== 'plugin_data'" :binding-sources="constantSources" /></div>
                 <div class="inspector-upgrade-grid">
+                  <button class="btn btn-tonal btn-sm" @click="useNotEvent">未发生时（NOT）</button>
                   <button class="btn btn-tonal btn-sm" @click="openPluginPicker('trigger', { mode: 'upgrade', op: 'all', title: '添加“并且”条件' })"><span class="material-symbols-outlined">done_all</span>并且满足</button>
                   <button class="btn btn-tonal btn-sm" @click="openPluginPicker('trigger', { mode: 'upgrade', op: 'any', title: '添加“或者”条件' })"><span class="material-symbols-outlined">alt_route</span>或者满足</button>
                 </div>
@@ -1780,18 +1742,11 @@ function onEditorKeydown(event) {
               </template>
             </template>
 
-            <template v-else-if="selectedKind === 'precondition' && selectedPrecondition">
-              <p class="inspector-lead">确认未通过时，引擎会稍后重试。</p>
-              <label class="field"><span class="field-label">确认方式</span>
-                <select class="select" :value="selectedPrecondition.type" @change="changePrecondition(selectedPrecondition, $event.target.value)">
-                  <option v-for="key in preconditionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option>
-                </select>
-              </label>
-              <div class="param-grid"><ParamInput v-for="param in actionParams(selectedPrecondition)" :key="param.name" :def="param" :plugin-id="selectedPrecondition.type" v-model="selectedPrecondition.params[param.name]" :allow-binding="actionParamAllowsBinding(selectedPrecondition, param)" :binding-sources="preconditionBindingSources()" /></div>
-              <button class="btn btn-text btn-sm danger-text inspector-switch" @click="removePrecondition(selectedIndex)"><span class="material-symbols-outlined">delete</span>删除确认</button>
-            </template>
 
             <template v-else-if="selectedKind === 'action' && selectedAction">
+              <IfActionEditor v-if="selectedAction.type === 'if'" :action="selectedAction" :rule="rule" :sources="actionBindingSources(selectedIndex)" />
+              <VariableAssignmentEditor v-else-if="selectedAction.type === 'set_variable'" :action="selectedAction" :sources="actionBindingSources(selectedIndex)" />
+              <template v-else>
               <div class="field"><span class="field-label">动作类型</span>
                 <button class="plugin-type-button" type="button"
                   @click="openPluginPicker('action', { mode: 'replace-action', index: selectedIndex, title: '更换动作类型' })">
@@ -1808,6 +1763,7 @@ function onEditorKeydown(event) {
                 @replace-failure-action="failureIndex => requestReplaceFailureAction(selectedIndex, failureIndex)"
                 @remove-failure-action="failureIndex => removeFailureAction(selectedIndex, failureIndex)"
                 @move-failure-action="(failureIndex, offset) => moveFailureAction(selectedIndex, failureIndex, offset)" />
+              </template>
               <div class="inspector-action-row">
                 <button class="btn btn-text btn-sm" :disabled="selectedIndex === 0" @click="moveAction(selectedIndex, -1)"><span class="material-symbols-outlined">arrow_back</span>提前</button>
                 <button class="btn btn-text btn-sm" :disabled="selectedIndex === rule.actions.length - 1" @click="moveAction(selectedIndex, 1)">稍后<span class="material-symbols-outlined">arrow_forward</span></button>
@@ -1836,21 +1792,7 @@ function onEditorKeydown(event) {
               </div>
             </template>
 
-            <template v-else-if="selectedKind === 'add-precondition'">
-              <p class="inspector-lead">在执行动作前增加一项确认。</p>
-              <label class="field"><span class="field-label">确认方式</span>
-                <select v-model="newPreconditionType" class="select"><option value="" disabled>选择确认方式…</option><option v-for="key in preconditionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option></select>
-              </label>
-              <button class="btn btn-filled inspector-primary" :disabled="!newPreconditionType" @click="addPrecondition"><span class="material-symbols-outlined">add</span>添加确认</button>
-            </template>
 
-            <template v-else>
-              <p class="inspector-lead">选择动作并把它接到流程末尾。</p>
-              <label class="field"><span class="field-label">动作类型</span>
-                <select v-model="newActionType" class="select"><option value="" disabled>选择动作…</option><option v-for="key in actionKeys" :key="key" :value="key">{{ store.schema.actions[key].name || key }}</option></select>
-              </label>
-              <button class="btn btn-filled inspector-primary" :disabled="!newActionType" @click="addAction"><span class="material-symbols-outlined">add</span>添加动作</button>
-            </template>
           </div>
         </aside>
         </Transition>
@@ -1883,13 +1825,10 @@ function onEditorKeydown(event) {
     </div>
 
     <PluginPicker :open="picker.open" :kind="picker.kind"
-      :keys="picker.kind === 'trigger' ? triggerKeys : picker.kind === 'precondition' ? preconditionKeys : actionKeys"
-      :groups="picker.kind === 'trigger' ? triggerGroups : picker.kind === 'precondition' ? preconditionGroups : actionGroups"
+      :keys="picker.kind === 'trigger' ? triggerKeys : actionKeys"
+      :groups="picker.kind === 'trigger' ? triggerGroups : actionGroups"
       :title="picker.title" @close="closePluginPicker" @select="choosePlugin" />
     <FolderPicker :open="folderPickerOpen" :folders="folders" :current="currentFolderName"
       @close="folderPickerOpen = false" @select="chooseFolder" />
-    <DesktopRecorderDialog :open="desktopRecorderOpen"
-      :editor="desktopRecorder"
-      @close="desktopRecorderOpen = false" @insert="insertRecordedSteps" />
   </section>
 </template>
