@@ -15,13 +15,13 @@ _REQUIRED_META_FIELDS = {"id", "name", "description", "enabled", "version_code",
 _TRIGGER_OPTIONAL_FIELDS = {
     "semantic", "params", "permissions", "origin", "trigger_api", "platforms",
     "entrypoints", "outputs", "build", "contributes",
-    "requires_capabilities", "engines", "security",
+    "requires_capabilities", "engines", "security", "author",
 }
 _ACTION_OPTIONAL_FIELDS = {
     "params", "permissions", "origin", "execution_api", "precondition_api",
     "outputs", "platforms", "entrypoints", "build", "idempotent",
     "cancellation_api", "contributes", "requires_capabilities",
-    "execution_mode", "engines", "security",
+    "execution_mode", "engines", "security", "author",
 }
 _ALLOWED_EXECUTION_MODES = {"in-process", "isolated"}
 _ACTION_SECURITY_FIELDS = {
@@ -654,6 +654,8 @@ def validate_plugin_meta(
         errors.append(f"字段 'name' 必须是字符串")
     if "description" in meta and not isinstance(meta["description"], str):
         errors.append(f"字段 'description' 必须是字符串")
+    if "author" in meta and not isinstance(meta["author"], str):
+        errors.append("字段 'author' 必须是字符串")
     if "enabled" in meta and not isinstance(meta["enabled"], bool):
         errors.append(f"字段 'enabled' 必须为布尔值 (true/false)，实际: {type(meta['enabled']).__name__}")
     if "version_code" in meta:

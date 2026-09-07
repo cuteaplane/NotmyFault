@@ -176,6 +176,8 @@ def _find_plugin_callers() -> list[tuple[str, Any]]:
             module_name = frame_info.frame.f_globals.get("__name__", "")
             for prefix in ("notmyfault.action_", "notmyfault.trigger_"):
                 if module_name.startswith(prefix):
+                    if "." in module_name[len(prefix):]:
+                        continue
                     globals_id = id(frame_info.frame.f_globals)
                     if globals_id not in seen_globals:
                         callers.append((module_name[len(prefix):], frame_info.frame.f_globals))

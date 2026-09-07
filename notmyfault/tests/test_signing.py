@@ -29,7 +29,6 @@ class TestPluginFiles:
         assert signing.plugin_files(tmp_path) == []
 
     def test_returns_all_regular_files_sorted(self, tmp_path):
-        # 二进制和其他资源都进签名清单，只排除签名产物和生成目录
         (tmp_path / "b.py").write_text("x = 1")
         (tmp_path / "a.json").write_text("{}")
         (tmp_path / "c.txt").write_text("included")
@@ -44,10 +43,15 @@ class TestPluginFiles:
         hidden = tmp_path / ".hidden"
         hidden.mkdir()
         (hidden / "e.py").write_text("VALUE = 1")
+        for directory in ("node_modules", "__pypackages__", "__pycache__"):
+            dependency = tmp_path / directory
+            dependency.mkdir()
+            (dependency / "helper.py").write_text("VALUE = 2")
         files = signing.plugin_files(tmp_path)
         rel = [f.relative_to(tmp_path).as_posix() for f in files]
         assert rel == [
-            ".hidden/e.py", "a.json", "b.py", "bin/tool.exe", "c.txt", "sub/d.json"
+            ".hidden/e.py", "__pypackages__/helper.py", "a.json", "b.py", "bin/tool.exe",
+            "c.txt", "node_modules/helper.py", "sub/d.json"
         ]
 
 

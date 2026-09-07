@@ -1,7 +1,6 @@
 """加载插件并完成元数据校验、安全检查、导入、注册和 setup，加载器只依赖调用方提供的运行时协作者且不持有 AutomationEngine。"""
 
 import hashlib
-import importlib.util
 import inspect
 import json
 import os
@@ -17,10 +16,9 @@ from notmyfault.core.logging import engine_error, engine_info, engine_warn
 from notmyfault.extensions.registry import ExtensionRegistry
 from notmyfault.security.plugin_schema import (
     admin_executables,
-    check_permissions_conform,
-    is_known_permission,
     validate_plugin_meta,
 )
+from notmyfault.security.plugin_imports import PluginImports
 from notmyfault.security.plugins import (
     analyze_plugin_source,
     check_sudo_import,
@@ -84,7 +82,7 @@ def _snapshot_plugin_files(folder_path: str) -> Dict[str, str] | None:
 class PluginTree:
     files: list[Path]
     file_snapshot: dict[str, str]
-    py_sources: dict[str, str]
+    py_sources: dict[str, bytes]
     payload: bytes
     legacy_payload: bytes
 
@@ -94,7 +92,7 @@ def inspect_plugin_tree(folder_path: str) -> Optional[PluginTree]:
     try:
         files = plugin_files(folder_path)
         snapshot: dict[str, str] = {}
-        py_sources: dict[str, str] = {}
+        py_sources: dict[str, bytes] = {}
         payload_entries: list[tuple[str, bytes]] = []
         for path in files:
             data = path.read_bytes()
@@ -102,7 +100,7 @@ def inspect_plugin_tree(folder_path: str) -> Optional[PluginTree]:
             snapshot[relative] = hashlib.sha256(data).hexdigest()
             payload_entries.append((relative, data))
             if path.suffix == ".py":
-                py_sources[str(path)] = data.decode("utf-8", errors="replace")
+                py_sources[str(path)] = data
     except (OSError, ValueError):
         return None
     from notmyfault.security.signing import plugin_payload_from_entries
@@ -114,6 +112,27 @@ def inspect_plugin_tree(folder_path: str) -> Optional[PluginTree]:
         payload=plugin_payload_from_entries(payload_entries),
         legacy_payload=b"".join(content for _relative, content in payload_entries),
     )
+
+
+def validate_plugin_signature(
+    root: Path, meta: dict, origin: str, mode: SecurityMode,
+    signature_kind: str | None = None,
+) -> str:
+    kind = signature_kind if signature_kind is not None else plugin_signature_kind(str(root), origin)
+    if mode != SecurityMode.STRICT:
+        return kind
+    if kind == "none":
+        raise ValueError("签名无效")
+    if "admin" in (meta.get("permissions") or []):
+        if kind not in ("official", "official-legacy"):
+            raise ValueError("声明了 'admin' 权限但未使用官方签名")
+    elif origin == "user" and kind == "author":
+        from notmyfault.security.signing import verify_author_key_counter_signature
+        from notmyfault.security.signing_keys import get_public_keys
+
+        if not verify_author_key_counter_signature(root, get_public_keys()):
+            raise ValueError("作者公钥缺少有效的本地副签")
+    return kind
 
 
 def _current_platform_name() -> str:
@@ -168,8 +187,7 @@ class PluginRegistry:
         self.plugin_roots: Dict[str, str] = {}
         self.plugin_kinds: Dict[str, PluginKind] = {}
         self.extensions = ExtensionRegistry()
-        # 每个插件插进 sys.path 的目录，卸载时按这份清单移除。
-        self.sys_path_entries: Dict[str, str] = {}
+        self.importers: Dict[str, PluginImports] = {}
         self._action_materializer: Optional[Callable[[str], Any]] = None
         self._trigger_materializer: Optional[Callable[[str], Any]] = None
 
@@ -238,12 +256,12 @@ class PluginRegistry:
         self.plugin_roots.pop(plugin_id, None)
         self.plugin_kinds.pop(plugin_id, None)
         self.extensions.unregister_plugin(plugin_id)
-        self._cleanup_plugin_path(plugin_id)
+        self._cleanup_plugin_imports(plugin_id)
 
     def clear(self) -> None:
         """清理本代引擎加载的插件模块和导入路径。"""
-        for plugin_id in tuple(self.sys_path_entries):
-            self._cleanup_plugin_path(plugin_id)
+        for plugin_id in tuple(self.importers):
+            self._cleanup_plugin_imports(plugin_id)
         for module in tuple(self.modules.values()):
             sys.modules.pop(getattr(module, "__name__", ""), None)
         self.triggers_meta.clear()
@@ -256,27 +274,10 @@ class PluginRegistry:
         self.plugin_kinds.clear()
         self.extensions.clear()
 
-    def _cleanup_plugin_path(self, plugin_id: str) -> None:
-        """移除插件插进 sys.path 的目录和从该目录导入的模块"""
-        root = self.sys_path_entries.pop(plugin_id, None)
-        if root is None:
-            return
-        try:
-            sys.path.remove(root)
-        except ValueError:
-            pass
-        for name, mod in list(sys.modules.items()):
-            if name.startswith("notmyfault."):
-                continue
-            mod_file = getattr(mod, "__file__", None)
-            if not mod_file:
-                continue
-            try:
-                inside = os.path.commonpath((os.path.realpath(mod_file), root)) == root
-            except ValueError:
-                inside = False
-            if inside:
-                sys.modules.pop(name, None)
+    def _cleanup_plugin_imports(self, plugin_id: str) -> None:
+        importer = self.importers.pop(plugin_id, None)
+        if importer is not None:
+            importer.close()
 
 
 class PluginLoader:
@@ -577,25 +578,18 @@ class PluginLoader:
                         origin,
                         tree.legacy_payload,
                     )
-            if (
-                self._security_mode == SecurityMode.STRICT
-                and origin == "user"
-                and signature_kind == "author"
-                and "admin" not in (meta.get("permissions") or [])
-            ):
-                from notmyfault.security.signing import (
-                    verify_author_key_counter_signature,
+            signature_error = "签名无效"
+            try:
+                validate_plugin_signature(
+                    Path(folder_path), meta, origin, self._security_mode, signature_kind
                 )
-                from notmyfault.security.signing_keys import get_public_keys
-
-                if not verify_author_key_counter_signature(
-                    Path(folder_path), get_public_keys()
-                ):
-                    signature_kind = "none"
+            except ValueError as error:
+                signature_error = str(error)
+                signature_kind = "none"
             signature_ok = signature_kind != "none"
             if not signature_ok:
                 if self._security_mode == SecurityMode.STRICT:
-                    reason = "签名无效"
+                    reason = signature_error
                     print(
                         f"[Engine] [!!] {store_name} \"{plugin_id}\" {reason}，不加载",
                         file=sys.stderr,
@@ -614,28 +608,6 @@ class PluginLoader:
                         f"[Engine] [!!] {store_name} \"{plugin_id}\" 签名无效，降级加载",
                         file=sys.stderr,
                     )
-
-            # permissive 和 normal 接受未知权限，strict 在导入前拒绝。
-            if self._security_mode == SecurityMode.STRICT:
-                perms = meta.get("permissions") or []
-                perm_conform, _ = check_permissions_conform(perms)
-                if not perm_conform:
-                    unknown = [p for p in perms if not is_known_permission(p)]
-                    reason = f"包含未知权限: {', '.join(unknown)}"
-                    print(
-                        f"[Engine] [!!] {store_name} \"{plugin_id}\" {reason}，"
-                        "strict 模式不加载",
-                        file=sys.stderr,
-                    )
-                    failed_count += 1
-                    self._diagnostics.record_plugin_error(store_name, plugin_id, reason)
-                    engine_error(
-                        "plugin_load_failed",
-                        plugin=plugin_id,
-                        type=store_name,
-                        reason=reason,
-                    )
-                    continue
 
             # 每个 .py 只解析一次，所有来源执行相同的能力与借用权限检查。
             caps: set[str] = set()
@@ -682,27 +654,6 @@ class PluginLoader:
 
             # strict 模式要求导入 sudo 与声明 admin 同时出现，缺一项即拒绝。
             has_admin = "admin" in (meta.get("permissions") or [])
-            # admin 能走 sudo 提权，作者自签的公钥谁都能造，strict 只认官方签名。
-            if (
-                self._security_mode == SecurityMode.STRICT
-                and has_admin
-                and signature_kind not in ("official", "official-legacy")
-            ):
-                reason = "声明了 'admin' 权限但未使用官方签名"
-                print(
-                    f'[Engine] [!!] 插件 "{plugin_id}" {reason}，'
-                    "strict 模式不加载",
-                    file=sys.stderr,
-                )
-                failed_count += 1
-                self._diagnostics.record_plugin_error(store_name, plugin_id, reason)
-                engine_error(
-                    "plugin_load_failed",
-                    plugin=plugin_id,
-                    type=store_name,
-                    reason=reason,
-                )
-                continue
             if uses_sudo and not has_admin:
                 reason = "import 了 notmyfault.security.sudo 但未在元数据中声明 'admin' 权限"
                 print(
@@ -767,7 +718,6 @@ class PluginLoader:
                 continue
 
             previous_root = self._registry.plugin_roots.get(plugin_id)
-            previous_path = self._registry.sys_path_entries.get(plugin_id)
             meta_with_origin = {
                 **meta,
                 "origin": origin,
@@ -791,7 +741,6 @@ class PluginLoader:
                 "meta_store": meta_store,
                 "prev": None,
                 "previous_root": previous_root,
-                "previous_path": previous_path,
                 "file_snapshot": file_snapshot,
                 "signature_kind": signature_kind,
             }
@@ -867,7 +816,6 @@ class PluginLoader:
         meta_store = entry["meta_store"]
         prev = entry.get("prev")
         previous_root = entry.get("previous_root")
-        previous_path = entry.get("previous_path")
 
         with self._materialize_lock:
             if prev is None and plugin_id in func_store:
@@ -881,7 +829,9 @@ class PluginLoader:
                     meta_store.get(plugin_id),
                     func_store.get(plugin_id),
                 )
+            previous_importer = None
             if prev is not None:
+                previous_importer = self._registry.importers.pop(plugin_id, None)
                 self._registry.unregister(plugin_type, plugin_id)
                 # 直接调用 _load_plugins() 时也要清理传入的存储字典。
                 func_store.pop(plugin_id, None)
@@ -893,30 +843,23 @@ class PluginLoader:
                 plugin_id, plugin_type, meta, folder_path
             )
 
-            # 插件目录放进 sys.path，入口文件才能 import 到兄弟模块
-            root = os.path.realpath(folder_path)
-            if root not in sys.path:
-                sys.path.insert(0, root)
-            self._registry.sys_path_entries[plugin_id] = root
-
             module_name = f"{module_prefix}{plugin_id}"
 
             def fail(reason: str) -> None:
                 sys.modules.pop(module_name, None)
                 self._registry.extensions.unregister_plugin(plugin_id)
-                self._registry._cleanup_plugin_path(plugin_id)
+                self._registry._cleanup_plugin_imports(plugin_id)
                 self._registry.plugin_roots.pop(plugin_id, None)
                 self._registry.plugin_kinds.pop(plugin_id, None)
                 if prev is not None:
                     self._restore_override(
                         plugin_type, plugin_id, prev, func_store, meta_store
                     )
+                    if previous_importer is not None:
+                        self._registry.importers[plugin_id] = previous_importer
+                        sys.modules.update(previous_importer.modules)
                     if previous_root is not None:
                         self._registry.plugin_roots[plugin_id] = previous_root
-                    if previous_path is not None:
-                        if previous_path not in sys.path:
-                            sys.path.insert(0, previous_path)
-                        self._registry.sys_path_entries[plugin_id] = previous_path
                     old_module, old_meta, _old_run = prev
                     if old_meta is not None and previous_root is not None:
                         self._registry.extensions.register_manifest(
@@ -990,7 +933,8 @@ class PluginLoader:
                     _info=meta,
                 ):
                     ok, result = run_isolated_action(
-                        _entry, _entry_hash, _info, params, {}
+                        _entry, _entry_hash, _info, params, {},
+                        plugin_root=folder_path, file_snapshot=tree.file_snapshot,
                     )
                     if not ok:
                         raise RuntimeError(f"isolated worker 执行失败: {result}")
@@ -1005,33 +949,34 @@ class PluginLoader:
                     _info=meta,
                 ):
                     ok, result = run_isolated_action(
-                        _entry, _entry_hash, _info, params, context
+                        _entry, _entry_hash, _info, params, context,
+                        plugin_root=folder_path, file_snapshot=tree.file_snapshot,
                     )
                     if not ok:
                         raise RuntimeError(f"isolated worker 执行失败: {result}")
                     return result
 
                 setattr(isolated_run, "run_with_context", isolated_run_with_context)
+                if prev is not None:
+                    old_module = prev[0]
+                    if old_module is not None and hasattr(old_module, "teardown"):
+                        try:
+                            old_module.teardown()
+                        except Exception:
+                            engine_warn(f"override teardown \"{plugin_id}\" 异常: {traceback.format_exc()[-200:]}")
+                    self._sudo.deauthorize_plugin(plugin_id, self._engine_token)
+                if previous_importer is not None:
+                    previous_importer.close()
                 self._registry.register(plugin_type, plugin_id, meta, isolated_run, None)
                 func_store[plugin_id] = isolated_run
                 meta_store[plugin_id] = meta
                 self._registry.pending.pop(plugin_id, None)
                 return meta
 
-            sys.modules.pop(module_name, None)
-            spec = importlib.util.spec_from_file_location(module_name, py_file)
-            if spec is None or spec.loader is None:
-                print(
-                    f"[Engine] 无法创建模块规格，跳过: {py_file}",
-                    file=sys.stderr,
-                )
-                fail("无法创建模块规格")
-                return None
-
             try:
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[module_name] = module
-                spec.loader.exec_module(module)
+                importer = PluginImports(folder_path, module_name, tree.py_sources)
+                self._registry.importers[plugin_id] = importer
+                module = importer.load_entry(py_file)
             except Exception:
                 print(
                     f"[Engine] 插件 \"{plugin_id}\" Python 加载失败 ({py_file}):",
@@ -1103,6 +1048,8 @@ class PluginLoader:
                     previous_module.teardown()
                 except Exception:
                     engine_warn(f"override teardown \"{plugin_id}\" 异常: {traceback.format_exc()[-200:]}")
+            if previous_importer is not None:
+                previous_importer.close()
 
             # teardown 走完再撤销旧模块授权，随后按新模块声明授权。
             if prev is not None:
@@ -1173,21 +1120,8 @@ class PluginLoader:
 
             command_module = loaded_modules.get(command_path)
             if command_module is None:
-                module_name = (
-                    f"{module_prefix}{plugin_id}__extension_"
-                    f"{len(loaded_modules)}"
-                )
-                sys.modules.pop(module_name, None)
-                spec = importlib.util.spec_from_file_location(module_name, command_path)
-                if spec is None or spec.loader is None:
-                    self._diagnostics.record_plugin_error(
-                        "plugin", plugin_id, f"扩展命令 {command_id} 无法创建模块规格"
-                    )
-                    continue
                 try:
-                    command_module = importlib.util.module_from_spec(spec)
-                    sys.modules[module_name] = command_module
-                    spec.loader.exec_module(command_module)
+                    command_module = self._registry.importers[plugin_id].load_file(command_path)
                 except Exception:
                     print(
                         f"[Engine] 插件 \"{plugin_id}\" 扩展命令 {command_id} "
@@ -1198,7 +1132,6 @@ class PluginLoader:
                     self._diagnostics.record_plugin_error(
                         "plugin", plugin_id, f"扩展命令 {command_id} 导入异常"
                     )
-                    sys.modules.pop(module_name, None)
                     continue
                 loaded_modules[command_path] = command_module
 

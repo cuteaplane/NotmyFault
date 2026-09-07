@@ -153,6 +153,7 @@ class TestEngineStart:
         assert engine.rules == []
         engine.emit_event("hotkey", {})
 
+
     def test_get_diagnostics_initial(self):
         engine = make_engine(rules=[{"name": "a"}])
         diag = engine.get_diagnostics()
@@ -511,7 +512,7 @@ class TestSecurityScanIntegration:
         loader, _, errors, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
         loaded, failed, _, _ = load_actions(loader, tmp_path, origin="user")
         assert (loaded, failed) == (0, 1)
-        assert any("签名无效" in msg for _, _, msg in errors)
+        assert any("副签" in msg for _, _, msg in errors)
 
         user_key = ed25519.Ed25519PrivateKey.generate()
         user_pub = user_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
@@ -542,3 +543,41 @@ def test_plugin_registry_registers_and_unregisters_atomically():
     assert registry.get_module("plug_a") is None
     # 重复卸载不产生异常
     registry.unregister("action", "plug_a")
+
+
+def test_plugins_keep_separate_verified_sibling_modules(tmp_path, monkeypatch):
+    import sys
+    from notmyfault.security import plugin_loader
+
+    loader, registry, errors, _sudo = make_loader(tmp_path)
+    for plugin_id, value in (("first", 1), ("second", 2)):
+        folder = write_plugin(tmp_path / "actions", plugin_id, make_meta(plugin_id),
+                              "def run(meta, params):\n    from helper import VALUE\n    from lib import nested\n    return VALUE, nested.VALUE\n")
+        (folder / "helper.py").write_text(f"VALUE = {value}\n", encoding="utf-8")
+        (folder / "lib").mkdir()
+        (folder / "lib" / "__init__.py").write_text("from . import nested\n", encoding="utf-8")
+        (folder / "lib" / "nested.py").write_text(f"VALUE = {value * 10}\n", encoding="utf-8")
+    loaded, failed, _meta, funcs = load_actions(loader, tmp_path)
+    assert (loaded, failed) == (2, 0)
+    original_inspect = plugin_loader.inspect_plugin_tree
+
+    def inspect_then_change(path):
+        tree = original_inspect(path)
+        (Path(path) / "action.py").write_text("raise RuntimeError('changed entry')\n", encoding="utf-8")
+        (Path(path) / "helper.py").write_text("VALUE = 99\n", encoding="utf-8")
+        return tree
+
+    monkeypatch.setattr(plugin_loader, "inspect_plugin_tree", inspect_then_change)
+    try:
+        loader.materialize_pending_action("first")
+        loader.materialize_pending_action("second")
+        assert errors == []
+        assert funcs["first"]({}, {}) == (1, 10)
+        assert funcs["second"]({}, {}) == (2, 20)
+        assert registry.plugin_roots["first"] not in sys.path
+        first_names = set(registry.importers["first"].modules)
+        registry.unregister("action", "first")
+        assert first_names.isdisjoint(sys.modules)
+        assert funcs["second"]({}, {}) == (2, 20)
+    finally:
+        registry.clear()

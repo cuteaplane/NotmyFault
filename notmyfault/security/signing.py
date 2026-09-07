@@ -18,8 +18,8 @@ def _get_crypto():
     return ed25519, Encoding, PrivateFormat, PublicFormat, NoEncryption, BestAvailableEncryption, load_pem_private_key, Ed25519PrivateKey
 
 
-# 插件目录里解释器和开发工具生成的目录不进签名清单。
-_GENERATED_DIR_NAMES = frozenset({"__pycache__", "__pypackages__", "node_modules"})
+# Python 字节码缓存随解释器版本变化，签名覆盖对应源码。
+_GENERATED_DIR_NAMES = frozenset({"__pycache__"})
 # 签名文件、随包公钥和公钥副签都不能进签名清单，否则签名和清单会互相咬住。
 _SIGNATURE_ARTIFACT_NAMES = frozenset({"signature.sig", "public_key.pem", "public_key.sig"})
 
