@@ -106,6 +106,12 @@ class PlatformServices:
                 error.kind,
                 str(error),
             ) from error
+        except (OSError, RuntimeError) as error:
+            raise PlatformServiceError(
+                capability,
+                "permission_denied" if isinstance(error, PermissionError) else "backend_failed",
+                str(error),
+            ) from error
 
     def read_clipboard(self) -> str | None:
         return self._call("clipboard.read", "read_text")

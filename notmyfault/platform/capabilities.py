@@ -82,7 +82,11 @@ def _probe_windows(capability: str) -> dict:
         AUDIO_DEVICE_QUERY: lambda: _entry(True, "MMDeviceEnumerator"),
         BLUETOOTH_CONTROL: lambda: _entry(True, "WinRT"),
         SESSION_LOCK: lambda: _entry(True, "LockWorkStation"),
-        TTS: lambda: _entry(True, "SAPI"),
+        TTS: lambda: (
+            _entry(True, "SAPI", "SAPI 语音服务在执行时检查", degraded=True)
+            if _has_module("pythoncom") and _has_module("win32com.client")
+            else _entry(False, None, "未安装 pywin32")
+        ),
         TRAY: lambda: _entry(True, "explorer-tray"),
     }
     return probes[capability]()
@@ -110,7 +114,7 @@ def _probe_linux(capability: str) -> dict:
         path, reason = _linux_command(*names)
         return _entry(bool(path), path, reason)
     if capability == INPUT_SEND:
-        path, reason = _linux_command("xdotool", "ydotool")
+        path, reason = _linux_command(*(("ydotool",) if wayland else ("xdotool", "ydotool")))
         return _entry(bool(path), path, reason)
     if capability == INPUT_GLOBAL_HOTKEY:
         if wayland:
@@ -129,6 +133,10 @@ def _probe_linux(capability: str) -> dict:
         if wayland:
             return _entry(False, None, "Wayland 下没有统一的窗口置顶接口")
         path, reason = _linux_command("wmctrl")
+        if path:
+            xprop, reason = _linux_command("xprop")
+            if not xprop:
+                return _entry(False, None, reason)
         return _entry(bool(path), path, reason)
     if capability == SCREEN_CAPTURE:
         if wayland:
@@ -137,7 +145,7 @@ def _probe_linux(capability: str) -> dict:
                 import importlib.util
 
                 if importlib.util.find_spec("dbus_next"):
-                    return _entry(True, "xdg-desktop-portal+dbus_next")
+                    return _entry(True, "xdg-desktop-portal+dbus_next", "Portal 服务和截图授权在执行时检查", degraded=True)
             except (ImportError, ValueError):
                 pass
             return _entry(False, None, "未安装 dbus-next，无法调用截图 portal")

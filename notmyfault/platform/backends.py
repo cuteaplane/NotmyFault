@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -85,6 +86,19 @@ _SPECIAL_KEYS = {
     "f11": "F11", "f12": "F12",
 }
 
+_EVDEV_KEYS = {
+    "ctrl": 29, "shift": 42, "alt": 56, "super": 125, "win": 125,
+    "enter": 28, "return": 28, "tab": 15, "esc": 1, "escape": 1,
+    "space": 57, "backspace": 14, "delete": 111, "insert": 110,
+    "home": 102, "end": 107, "pgup": 104, "pgdn": 109,
+    "up": 103, "down": 108, "left": 105, "right": 106, "capslock": 58,
+    **dict(zip("1234567890", range(2, 12))),
+    **dict(zip("qwertyuiop", range(16, 26))),
+    **dict(zip("asdfghjkl", range(30, 39))),
+    **dict(zip("zxcvbnm", range(44, 51))),
+    **{f"f{index}": 58 + index for index in range(1, 11)}, "f11": 87, "f12": 88,
+}
+
 
 class InputBackend:
     """xdotool / ydotool 键盘输入"""
@@ -94,7 +108,9 @@ class InputBackend:
 
     def _tool(self) -> tuple[str, str]:
         _require_linux()
-        path = self._runner.which("xdotool", "ydotool")
+        from notmyfault.platform.linux_support import session_type
+
+        path = self._runner.which(*(("ydotool",) if session_type() == "wayland" else ("xdotool", "ydotool")))
         if not path:
             raise BackendMissingError("依赖缺失：模拟按键需要 xdotool 或 ydotool")
         return path, os.path.basename(path)
@@ -111,6 +127,7 @@ class InputBackend:
 
     def send_hotkey(self, parts: Iterable[str]) -> None:
         tool, name = self._tool()
+        parts = list(parts)
         mapped = []
         for part in parts:
             if part in _SPECIAL_KEYS:
@@ -123,7 +140,12 @@ class InputBackend:
         if name == "xdotool":
             args = [tool, "key", "--clearmodifiers", combo]
         else:
-            args = [tool, "key", combo]
+            try:
+                codes = [_EVDEV_KEYS[part.lower()] for part in parts]
+            except KeyError as error:
+                raise ValueError(f"ydotool 不支持此按键名称: {error.args[0]}") from None
+            args = [tool, "key", *[f"{code}:1" for code in codes],
+                    *[f"{code}:0" for code in reversed(codes)]]
         result = self._runner.run(args, timeout=10)
         if result.returncode != 0:
             raise BackendFailedError(_failed_detail(result))
@@ -283,13 +305,25 @@ class WindowBackend:
         return path
 
     def _find_window(self, wmctrl: str, target: str, title: str) -> str:
+        if target == "active":
+            xprop = self._runner.which("xprop")
+            if not xprop:
+                raise BackendMissingError("依赖缺失：读取活动窗口需要 xprop")
+            result = self._runner.run([xprop, "-root", "_NET_ACTIVE_WINDOW"], timeout=5)
+            if result.returncode != 0:
+                raise BackendFailedError(_failed_detail(result))
+            match = re.search(r"0x[0-9a-fA-F]+", result.stdout)
+            if not match or int(match[0], 16) == 0:
+                raise BackendFailedError("没有活动窗口")
+            return match[0]
         result = self._runner.run([wmctrl, "-l"], timeout=5)
         if result.returncode != 0:
             raise BackendFailedError(_failed_detail(result))
 
         lines = result.stdout.strip().splitlines()
         if target == "title":
-            matches = [line for line in lines if title.lower() in line.lower()]
+            matches = [line for line in lines if len(line.split(None, 3)) == 4
+                       and title.lower() in line.split(None, 3)[3].lower()]
             if not matches:
                 raise BackendFailedError(f'未找到标题包含 "{title}" 的窗口')
             if len(matches) > 1:
@@ -297,25 +331,26 @@ class WindowBackend:
                     f"标题匹配到 {len(matches)} 个窗口，请使用更精确的标题"
                 )
             return matches[0].split()[0]
-        if not lines:
-            raise BackendFailedError("没有可见窗口")
-        return lines[0].split()[0]
+        raise ValueError(f"不支持的窗口目标: {target}")
 
     def set_pinned(self, action: str, target: str, title: str = "") -> dict[str, str]:
         if target == "title" and not title:
             raise ValueError("按标题匹配时必须填写窗口标题")
+        if action not in ("pin", "unpin", "toggle"):
+            raise ValueError(f"不支持的置顶操作: {action}")
 
         wmctrl = self._wmctrl()
         window_id = self._find_window(wmctrl, target, title)
+        xprop = self._runner.which("xprop")
+        if not xprop:
+            raise BackendMissingError("依赖缺失：读取窗口置顶状态需要 xprop")
+        def is_pinned():
+            result = self._runner.run([xprop, "-id", window_id, "_NET_WM_STATE"], timeout=5)
+            if result.returncode != 0:
+                raise BackendFailedError(_failed_detail(result))
+            return "_NET_WM_STATE_ABOVE" in result.stdout
         if action == "toggle":
-            pinned = False
-            if xprop := self._runner.which("xprop"):
-                result = self._runner.run(
-                    [xprop, "-id", window_id, "_NET_WM_STATE"],
-                    timeout=5,
-                )
-                if result.returncode == 0:
-                    pinned = "_NET_WM_STATE_ABOVE" in result.stdout
+            pinned = is_pinned()
             action = "unpin" if pinned else "pin"
 
         change = "add,above" if action == "pin" else "remove,above"
@@ -325,6 +360,11 @@ class WindowBackend:
         )
         if result.returncode != 0:
             raise BackendFailedError(_failed_detail(result))
+        deadline = time.monotonic() + 1
+        while is_pinned() != (action == "pin"):
+            if time.monotonic() >= deadline:
+                raise BackendFailedError("窗口管理器尚未应用置顶状态")
+            time.sleep(0.05)
         return {
             "state": "pinned" if action == "pin" else "unpinned",
             "window_id": window_id,

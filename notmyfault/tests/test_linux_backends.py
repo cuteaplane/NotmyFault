@@ -1,4 +1,6 @@
 import tempfile
+import asyncio
+import importlib.util
 import sys
 import types
 import unittest
@@ -103,6 +105,11 @@ class InputBackendTests(LinuxPathTest):
             runner.calls[0]["args"],
             ["/usr/bin/xdotool", "key", "--clearmodifiers", "ctrl+super+Return"],
         )
+        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"):
+            runner.paths["ydotool"] = "/usr/bin/ydotool"
+            InputBackend(runner).send_hotkey(["ctrl", "win", "enter"])
+        self.assertEqual(runner.calls[-1]["args"],
+                         ["/usr/bin/ydotool", "key", "29:1", "125:1", "28:1", "28:0", "125:0", "29:0"])
 
     def test_missing_tool_raises_backend_missing(self):
         runner = FakeRunner()
@@ -283,8 +290,8 @@ class ClipboardBackendTests(LinuxPathTest):
 class WindowBackendTests(LinuxPathTest):
     def test_title_match_and_pin(self):
         runner = FakeRunner(
-            paths={"wmctrl": "/usr/bin/wmctrl"},
-            results=[ok(stdout="0x1 host 旧窗口\n0x2 host 记事本\n"), ok()],
+            paths={"wmctrl": "/usr/bin/wmctrl", "xprop": "/usr/bin/xprop"},
+            results=[ok(stdout="0x1 0 记事本 旧窗口\n0x2 0 host 记事本\n"), ok(), ok(stdout="_NET_WM_STATE_ABOVE")],
         )
 
         result = WindowBackend(runner).set_pinned("pin", "title", "记事本")
@@ -300,9 +307,10 @@ class WindowBackendTests(LinuxPathTest):
         runner = FakeRunner(
             paths={"wmctrl": "/usr/bin/wmctrl", "xprop": "/usr/bin/xprop"},
             results=[
-                ok(stdout="0x2 host 记事本\n"),
+                ok(stdout="_NET_ACTIVE_WINDOW(WINDOW): window id # 0x2"),
                 ok(stdout="_NET_WM_STATE(ATOM) = _NET_WM_STATE_ABOVE"),
                 ok(),
+                ok(stdout="_NET_WM_STATE(ATOM) = "),
             ],
         )
 
@@ -310,7 +318,7 @@ class WindowBackendTests(LinuxPathTest):
 
         self.assertEqual(result["state"], "unpinned")
         self.assertEqual(
-            runner.calls[-1]["args"],
+            runner.calls[-2]["args"],
             ["/usr/bin/wmctrl", "-i", "-r", "0x2", "-b", "remove,above"],
         )
 
@@ -320,7 +328,7 @@ class WindowBackendTests(LinuxPathTest):
 
     def test_window_command_failure_raises(self):
         runner = FakeRunner(
-            paths={"wmctrl": "/usr/bin/wmctrl"},
+            paths={"wmctrl": "/usr/bin/wmctrl", "xprop": "/usr/bin/xprop"},
             results=[ok(stderr="no display", returncode=1)],
         )
         with self.assertRaisesRegex(BackendFailedError, "no display"):
@@ -368,6 +376,51 @@ class DisplayBackendTests(LinuxPathTest):
 
 
 class ScreenshotBackendTests(LinuxPathTest):
+    def test_portal_subscribes_before_request_and_closes_pending_request(self):
+        for responds in (True, False):
+            class Bus:
+                unique_name = ":1.42"
+                def __init__(self):
+                    self.calls = []
+                    self.disconnected = False
+                async def connect(self):
+                    return self
+                def add_message_handler(self, handler):
+                    self.handler = handler
+                def disconnect(self):
+                    self.disconnected = True
+                async def call(self, message):
+                    self.calls.append(message.member)
+                    if message.member == "Screenshot":
+                        self.request_path = "/org/freedesktop/portal/desktop/request/1_42/" + message.body[1]["handle_token"].value
+                        if responds:
+                            self.handler(types.SimpleNamespace(
+                                message_type=4, path=self.request_path,
+                                interface="org.freedesktop.portal.Request", member="Response",
+                                body=[0, {"uri": types.SimpleNamespace(value="file:///tmp/capture.png")}],
+                            ))
+                        return types.SimpleNamespace(message_type=2, body=[self.request_path])
+                    return types.SimpleNamespace(message_type=2, body=[])
+            bus = Bus()
+            source = Path(__file__).resolve().parents[1] / "platform" / "portal_screenshot.py"
+            spec = importlib.util.spec_from_file_location("portal_under_test", source)
+            module = importlib.util.module_from_spec(spec)
+            with patch.dict(sys.modules, {
+                "dbus_next": types.SimpleNamespace(Message=lambda **kwargs: types.SimpleNamespace(**kwargs),
+                    MessageType=types.SimpleNamespace(ERROR=3, SIGNAL=4),
+                    Variant=lambda signature, value: types.SimpleNamespace(value=value)),
+                "dbus_next.aio": types.SimpleNamespace(MessageBus=lambda: bus),
+            }):
+                spec.loader.exec_module(module)
+            with patch.object(module.shutil, "copyfile"):
+                if responds:
+                    asyncio.run(module._take_screenshot("unused.png", False, timeout=0.05))
+                else:
+                    with self.assertRaises(TimeoutError):
+                        asyncio.run(module._take_screenshot("unused.png", False, timeout=0.005))
+            self.assertEqual(bus.calls, ["AddMatch", "Screenshot"] + ([] if responds else ["Close"]))
+            self.assertTrue(bus.disconnected)
+
     def test_active_window_uses_gnome_screenshot(self):
         runner = FakeRunner(paths={"gnome-screenshot": "/usr/bin/gnome-screenshot"})
         with tempfile.TemporaryDirectory() as temp_dir, patch(
