@@ -29,7 +29,7 @@ async function fetchAuthenticated(path, options = {}) {
 export { fetchAuthenticated }
 
 function bridgeResponse(data) {
-  const status = Number(data?.status || (data?.ok === false ? 400 : 200))
+  const status = Number.isInteger(data?.status) ? data.status : (data?.ok === false ? 400 : 200)
   return {
     ok: status >= 200 && status < 300 && data?.ok !== false,
     status,
@@ -112,6 +112,7 @@ export async function cancelRun(runId) {
 
 export async function getPluginExtensions() {
   const res = await apiRead('/api/plugins/extensions')
+  if (!res.ok) throw new Error('读取插件扩展失败')
   const data = await res.json()
   return {
     commands: Array.isArray(data?.commands) ? data.commands : [],
@@ -164,7 +165,9 @@ export async function closeExtensionSession(pluginId, sessionId) {
     `/api/plugins/${encodeURIComponent(pluginId)}/extensions/sessions/${encodeURIComponent(sessionId)}`,
     'DELETE',
   )
-  return await res.json()
+  const data = await res.json()
+  if (!res.ok || data?.ok === false) throw new Error(data?.error || '关闭插件会话失败')
+  return data
 }
 
 export async function validateRuleDraft(rule) {
@@ -269,16 +272,14 @@ export async function streamRuleDraftWithAI(messages, {
 }
 
 export async function loadPlugins() {
-  try {
-    const r = await apiRead('/api/plugins/list')
-    return await r.json()
-  } catch (e) {
-    return { triggers: {}, actions: {} }
-  }
+  const r = await apiRead('/api/plugins/list')
+  if (!r.ok) throw new Error('读取插件列表失败')
+  return await r.json()
 }
 
 export async function getSchema() {
   const r = await apiRead('/api/plugins')
+  if (!r.ok) throw new Error('读取插件参数失败')
   return await r.json()
 }
 
@@ -379,13 +380,11 @@ export async function readDiagnostics() {
 }
 
 export async function listRuns(limit = 100) {
-  try {
-    const response = await apiRead(`/api/runs?limit=${limit}`)
-    const data = await response.json()
-    return Array.isArray(data?.runs) ? data.runs : []
-  } catch (e) {
-    return []
-  }
+  const response = await apiRead(`/api/runs?limit=${limit}`)
+  if (!response.ok) throw new Error('读取运行记录失败')
+  const data = await response.json()
+  if (!Array.isArray(data?.runs)) throw new Error('运行记录格式无效')
+  return data.runs
 }
 
 export async function getRun(runId) {

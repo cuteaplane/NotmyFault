@@ -4,9 +4,6 @@ import { alertDialog, passwordDialog } from './dialog'
 const PASSWORD_CODES = new Set(['admin_key_required', 'admin_key_invalid'])
 const KEY_PROBLEM_CODES = new Set(['admin_key_missing', 'admin_key_unencrypted'])
 
-// 打开编辑器前验证通过的私钥密码，下一次保存规则时先用它，不用再问一遍。
-let pendingAdminKeyPassword = ''
-
 function keyProblemMessage(result) {
   if (result?.code === 'admin_key_missing') {
     return `${result?.error || '严格模式缺少签名私钥'}。在项目目录运行 python build.py build 生成密码加密的私钥，或在设置页关闭“创建管理员规则时要求验证密钥”。`
@@ -17,9 +14,7 @@ function keyProblemMessage(result) {
   return ''
 }
 
-export async function saveRulesWithApproval(rules) {
-  let password = pendingAdminKeyPassword
-  pendingAdminKeyPassword = ''
+export async function saveRulesWithApproval(rules, password = '') {
   while (true) {
     const result = await saveConfig(rules, password)
     password = ''
@@ -50,11 +45,10 @@ export async function approveRuleBeforeEditing(rule) {
     const result = await approveRuleDraft(rule, password)
     password = ''
     if (!PASSWORD_CODES.has(result?.code)) {
-      if (result?.ok && verified) pendingAdminKeyPassword = verified
       if (KEY_PROBLEM_CODES.has(result?.code)) {
         await alertDialog('无法打开规则编辑器', keyProblemMessage(result))
       }
-      return result
+      return result?.ok ? { ...result, adminKeyPassword: verified } : result
     }
     const plugins = Array.isArray(result.plugins) && result.plugins.length
       ? `涉及管理员插件或高风险动作：${result.plugins.join('、')}`

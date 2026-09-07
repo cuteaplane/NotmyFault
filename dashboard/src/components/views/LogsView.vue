@@ -25,6 +25,11 @@ const searchText = ref('')
 const autoRefresh = ref(true)
 const expandedRunId = ref('')
 let timer = null
+let runsLoading = false
+let logsGeneration = 0
+const loadingLogFiles = new Set()
+let disposed = false
+const runsError = ref('')
 
 const isLatest = computed(() => currentFile.value === '')
 const levelMeta = {
@@ -223,17 +228,37 @@ async function loadFiles() {
 }
 
 async function refreshRuns() {
-  runs.value = await listRuns(200)
+  if (runsLoading || disposed) return
+  runsLoading = true
+  try {
+    const result = await listRuns(200)
+    if (disposed) return
+    runs.value = result
+    runsError.value = ''
+  } catch (error) {
+    if (!disposed) runsError.value = error.message
+  } finally {
+    runsLoading = false
+  }
 }
 
 async function refreshLogs() {
-  const nearBottom = isNearBottom()
-  const list = isLatest.value
-    ? await readLogEntries(600)
-    : await readLogFileEntries(currentFile.value, 600)
-  entries.value = Array.isArray(list) ? list : []
-  await nextTick()
-  if (nearBottom) scrollToEnd()
+  const file = currentFile.value
+  if (disposed || loadingLogFiles.has(file)) return
+  loadingLogFiles.add(file)
+  const generation = ++logsGeneration
+  try {
+    const nearBottom = isNearBottom()
+    const list = file === ''
+      ? await readLogEntries(600)
+      : await readLogFileEntries(file, 600)
+    if (disposed || generation !== logsGeneration || file !== currentFile.value) return
+    entries.value = Array.isArray(list) ? list : []
+    await nextTick()
+    if (nearBottom) scrollToEnd()
+  } finally {
+    loadingLogFiles.delete(file)
+  }
 }
 
 async function refresh() {
@@ -330,6 +355,7 @@ onMounted(async () => {
   syncTimer()
 })
 onUnmounted(() => {
+  disposed = true
   if (timer) clearInterval(timer)
 })
 </script>
@@ -357,6 +383,7 @@ onUnmounted(() => {
     </div>
 
     <template v-if="activeTab === 'runs'">
+      <p v-if="runsError" class="danger-text" role="status">{{ runsError }}，可刷新重试。</p>
       <div class="run-summary-grid">
         <button class="run-summary-card" :class="{ active: statusFilter === 'all' }" :aria-pressed="statusFilter === 'all'" @click="statusFilter = 'all'">
           <span>最近运行</span><strong>{{ runs.length }}</strong>

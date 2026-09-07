@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import { store } from '../../lib/store'
+import { store, syncEngineStatus } from '../../lib/store'
 import { getEngineStatus, getConfigSecurityStatus, approveConfigSecurity, loadPlugins } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
 import { alertDialog, confirmDialog, passwordDialog } from '../../lib/dialog'
@@ -107,8 +107,7 @@ async function refresh() {
   configSec.value = security.status === 'fulfilled'
     ? security.value : { status: 'unavailable', reason: '无法连接后台服务' }
   if (engine.status === 'fulfilled') {
-    store.engineStatus = { ...store.engineStatus, ...engine.value }
-    store.engineOnline = engine.value.engine_running === true
+    syncEngineStatus(engine.value)
   }
   if (plugins.status === 'fulfilled') store.pluginsData = plugins.value
   loading.value = false

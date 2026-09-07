@@ -1,5 +1,5 @@
-import { createBindingId, ensureRuleBindingIds } from './bindings'
-import { buildDefaultParams } from './utils'
+import { createBindingId, ensureRuleBindingIds } from './bindings.js'
+import { buildDefaultParams, pluginUnavailableReason } from './utils.js'
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value))
@@ -93,6 +93,10 @@ function requirementState(data, kind, id) {
   }
   if (meta?.enabled === false) {
     return { available: false, kind, id, label, state: 'disabled', reason: `“${label}”尚未启用` }
+  }
+  const unavailable = pluginUnavailableReason(meta)
+  if (meta && unavailable) {
+    return { available: false, kind, id, label, state: 'unavailable', reason: `“${label}”${unavailable}` }
   }
   if (!usable) {
     return { available: false, kind, id, label, state: installed ? 'pending' : 'missing', reason: installed ? `“${label}”重启后可用` : `缺少“${label}”插件` }

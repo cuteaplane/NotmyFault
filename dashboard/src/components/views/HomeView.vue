@@ -10,6 +10,9 @@ const stats = ref({ rules: '-', triggers: '-', actions: '-' })
 const schedulerText = ref('0 / 0')
 const diag = ref(null)
 const recentRuns = ref([])
+const runsError = ref('')
+let statsLoading = false
+let disposed = false
 let diagTimer = null
 
 const isRunning = computed(() => store.engineStatus.engine_running === true)
@@ -116,8 +119,11 @@ function goDiagnostics() {
 }
 
 async function loadStats() {
+  if (statsLoading || disposed) return
+  statsLoading = true
   try {
     const status = await getEngineStatus()
+    if (disposed) return
     await syncStatus(status)
     const scheduler = status.scheduler || {}
     schedulerText.value = `${scheduler.running ?? 0} / ${scheduler.queued ?? 0}`
@@ -128,11 +134,20 @@ async function loadStats() {
           actions: status.actions_count ?? '-',
         }
       : { rules: '-', triggers: '-', actions: '-' }
-    if (status.api_alive === true) recentRuns.value = await listRuns(5)
+    if (status.api_alive === true) {
+      try {
+        recentRuns.value = await listRuns(5)
+        runsError.value = ''
+      } catch (error) {
+        runsError.value = error.message
+      }
+    }
+    diag.value = isRunning.value ? await readDiagnostics() : null
   } catch {
     stats.value = { rules: '-', triggers: '-', actions: '-' }
+  } finally {
+    statsLoading = false
   }
-  diag.value = isRunning.value ? await readDiagnostics() : null
 }
 
 function refreshHome() {
@@ -162,7 +177,7 @@ onMounted(() => {
   if (isControllerOnline.value) loadStats()
   if (hasBridge()) diagTimer = setInterval(loadStats, 30000)
 })
-onUnmounted(() => { if (diagTimer) clearInterval(diagTimer) })
+onUnmounted(() => { disposed = true; if (diagTimer) clearInterval(diagTimer) })
 </script>
 
 <template>
@@ -221,6 +236,7 @@ onUnmounted(() => { if (diagTimer) clearInterval(diagTimer) })
           <div><h3>最近运行</h3><p>最新的自动化执行结果</p></div>
           <button class="btn btn-text" @click="goRuns()">查看全部<span class="material-symbols-outlined">arrow_forward</span></button>
         </header>
+        <p v-if="runsError" class="danger-text" role="status">{{ runsError }}，可刷新重试。</p>
         <div v-if="recentRuns.length" class="home-run-list">
           <button v-for="run in recentRuns" :key="run.run_id" class="home-run-row" @click="goRuns(run.run_id)">
             <span class="material-symbols-outlined" :class="`run-${run.status}`">{{ runMeta(run.status).icon }}</span>

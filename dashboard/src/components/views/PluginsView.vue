@@ -83,7 +83,6 @@ const previewLoading = ref(false)
 const previewError = ref('')
 const fileForUpload = ref(null)
 const installError = ref('')
-// 页面暂时没有修改 showRegistry 的入口，索引面板和下载代码留给后续继续用。
 const showRegistry = ref(false)
 let savedRegistryUrl = ''
 try { savedRegistryUrl = localStorage.getItem('nmf-plugin-registry-url') || '' } catch {}
@@ -407,6 +406,7 @@ onMounted(async () => {
 <template>
   <section class="page active plugin-management-page">
     <div class="page-head"><div><h2>插件管理</h2><p class="page-subtitle">异常插件优先显示；选择插件查看状态、权限和来源。</p></div><div class="actions">
+      <button class="btn btn-outlined" :aria-expanded="showRegistry" @click="showRegistry = !showRegistry">插件索引</button>
       <button class="btn btn-filled" @click="openInstall"><span class="material-symbols-outlined">install_desktop</span>安装插件</button>
     </div></div>
     <div class="plugin-workbench" :class="{ 'has-selection': selectedPlugin }">

@@ -17,6 +17,7 @@ import LogsView from './LogsView.vue'
 
 const automationSection = ref(store.pendingAutomationSection || 'rules')
 const activeRuleIndex = ref(null)
+let editorAdminKeyPassword = ''
 const draftRule = ref(null)
 const baseline = ref('')
 const pendingRuleIndex = ref(null)
@@ -284,6 +285,7 @@ function redoDraft() {
   if (draftHistoryIndex.value < draftHistory.value.length - 1) applyDraftHistory(draftHistoryIndex.value + 1)
 }
 async function openRule(index) {
+  editorAdminKeyPassword = ''
   showCreatePanel.value = false
   activeRuleIndex.value = index
   draftRule.value = ensureRuleBindingIds(
@@ -294,6 +296,7 @@ async function openRule(index) {
   resetDraftHistory()
 }
 async function addRule(seed = null) {
+  editorAdminKeyPassword = ''
   showCreatePanel.value = false
   activeRuleIndex.value = -1
   draftRule.value = seed ? ensureRuleBindingIds(normalizeRuleDraft(clone(seed))) : ensureRuleBindingIds({
@@ -319,6 +322,7 @@ async function createWithAi() {
 async function leaveEditor() {
   if (isDirty.value && !await confirmDialog('要放弃这些修改吗？', `尚未保存：${draftChangeText.value}。`, '放弃')) return
   activeRuleIndex.value = null
+  editorAdminKeyPassword = ''
   draftRule.value = null
   baseline.value = ''
   clearDraftRecovery()
@@ -340,8 +344,8 @@ function triggerSummary(rule) {
   return `${op === 'all' ? '全部满足' : '满足任一'} · ${triggerCount(rule)} 个条件`
 }
 
-async function persistRules(nextRules, successMessage) {
-  const result = await saveRulesWithApproval(nextRules)
+async function persistRules(nextRules, successMessage, password = '') {
+  const result = await saveRulesWithApproval(nextRules, password)
   if (result?.cancelled) return null
   if (!result?.ok) {
     const details = Array.isArray(result?.details) ? result.details.join(' · ') : ''
@@ -353,6 +357,8 @@ async function persistRules(nextRules, successMessage) {
   return savedRules
 }
 async function doSave(runAfter = false) {
+  const password = editorAdminKeyPassword
+  editorAdminKeyPassword = ''
   try {
     const nextRules = clone(store.configData.rules)
     let savedIndex = activeRuleIndex.value
@@ -365,6 +371,7 @@ async function doSave(runAfter = false) {
     const savedRules = await persistRules(
       nextRules,
       runAfter ? '规则已保存，正在启动测试' : '规则已保存',
+      password,
     )
     if (!savedRules) return
     activeRuleIndex.value = savedIndex
@@ -396,6 +403,7 @@ async function deleteActiveRule() {
   await deleteRule(activeRuleIndex.value)
 }
 function leaveEditorAfterDelete() {
+  editorAdminKeyPassword = ''
   activeRuleIndex.value = null
   draftRule.value = null
   baseline.value = ''
@@ -529,7 +537,9 @@ function processTestEvents() {
     } else if (ev.name === 'test_assertions_completed') {
       t.assertions = ev.data
     } else if (ev.name === 'workflow_completed') {
-      if (ev.data.status === 'cancelled') {
+      if (ev.data.recovered) {
+        t.note = '连接中断期间这次运行已结束，可到运行记录查看结果和完整步骤。'
+      } else if (ev.data.status === 'cancelled') {
         t.note = '测试已停止。'
       } else if (!t.expected && ev.data.status === 'succeeded') {
         t.note = '这条规则没有动作，测试已验证触发与前置条件链路。'
@@ -584,6 +594,7 @@ watch(() => store.engineEvents.length
 onUnmounted(() => { if (testResult.value?.timer) clearTimeout(testResult.value.timer) })
 watch(draftRule, scheduleDraftHistory, { deep: true, flush: 'sync' })
 onUnmounted(() => {
+  editorAdminKeyPassword = ''
   if (draftHistoryTimer) commitDraftHistory()
   else persistDraftRecovery()
 })
@@ -622,6 +633,7 @@ async function openCandidateRule(rule) {
   const approval = await approveRuleBeforeEditing(rule)
   if (!approval?.ok) return
   await addRule(rule)
+  editorAdminKeyPassword = approval.adminKeyPassword || ''
 }
 async function addTemplate(t) {
   if (!t.availability.available) {

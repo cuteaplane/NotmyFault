@@ -68,7 +68,9 @@ async function closeSession(session) {
   try {
     await closeExtensionSession(session.pluginId, session.sessionId)
   } catch (reason) {
-    void reason
+    throw reason
+  } finally {
+    closingSessions.delete(key)
   }
 }
 
@@ -79,7 +81,7 @@ watch(() => [props.open, props.pluginId, props.viewId, props.sessionId], async (
     activeSession.value = null
     html.value = ''
     error.value = ''
-    await closeSession(previous)
+    await closeSession(previous).catch(() => {})
     return
   }
   const session = {
@@ -88,7 +90,7 @@ watch(() => [props.open, props.pluginId, props.viewId, props.sessionId], async (
     generation,
   }
   activeSession.value = session
-  if (previous && sessionKey(previous) !== sessionKey(session)) void closeSession(previous)
+  if (previous && sessionKey(previous) !== sessionKey(session)) void closeSession(previous).catch(() => {})
   loading.value = true
   closing.value = false
   error.value = ''
@@ -127,11 +129,14 @@ async function requestClose() {
   closing.value = true
   pageGeneration += 1
   const session = activeSession.value
-  activeSession.value = null
   try {
     await closeSession(session)
-  } finally {
+    activeSession.value = null
     emit('close')
+  } catch (reason) {
+    error.value = reason.message || '关闭插件会话失败，请重试。'
+  } finally {
+    closing.value = false
   }
 }
 
@@ -202,7 +207,7 @@ onBeforeUnmount(() => {
   pageGeneration += 1
   const session = activeSession.value
   activeSession.value = null
-  void closeSession(session)
+  void closeSession(session).catch(() => {})
 })
 </script>
 

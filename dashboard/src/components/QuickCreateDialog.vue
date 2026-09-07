@@ -1,7 +1,7 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
 import { store } from '../lib/store'
-import { groupActionKeys, groupTriggerKeys } from '../lib/utils'
+import { groupActionKeys, groupTriggerKeys, pluginUnavailableReason } from '../lib/utils'
 import BaseDialog from './BaseDialog.vue'
 
 const props = defineProps({ open: Boolean })
@@ -16,7 +16,7 @@ const schema = computed(() => step.value === 'trigger' ? store.schema.triggers :
 const storageKey = computed(() => `notmyfault.recent.${step.value}`)
 const availableKeys = computed(() => Object.keys(schema.value || {}).filter(key => {
   const meta = schema.value[key]
-  return meta?.enabled !== false && meta?.platform_compatible !== false
+  return !pluginUnavailableReason(meta)
 }))
 
 function recentKeys() {

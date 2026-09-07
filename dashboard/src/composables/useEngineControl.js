@@ -1,5 +1,5 @@
 import { ref } from 'vue'
-import { store } from '../lib/store'
+import { store, syncEngineStatus as syncStatus } from '../lib/store'
 import { getEngineStatus, hasBridge } from '../lib/api'
 import { snackbar } from '../lib/notify'
 import { alertDialog, confirmDialog } from '../lib/dialog'
@@ -11,15 +11,6 @@ const restarting = ref(false)
 const shuttingDown = ref(false)
 
 export function useEngineControl() {
-  // 更新状态时合并字段，保留 security_mode、pid 和 rules_count 等已有值。
-  function syncStatus(s) {
-    store.engineStatus = { ...store.engineStatus, ...s }
-    if ('api_alive' in s) store.controllerOnline = s.api_alive === true
-    if ('engine_running' in s) store.engineOnline = s.engine_running === true
-    document.body.classList.toggle('controller-online', store.controllerOnline)
-    document.body.classList.toggle('engine-online', store.engineOnline)
-  }
-
   async function startEngine() {
     if (starting.value) return
     starting.value = true

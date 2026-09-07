@@ -6,6 +6,7 @@ import path from 'path'
 import { pathToFileURL } from 'url'
 import { buildRunExport } from '../src/lib/runExport.js'
 import { aiProviderIdFor } from '../src/lib/providers.js'
+import { templateAvailability } from '../src/lib/automationTemplates.js'
 import { streamRuleDraftWithAI } from '../src/lib/api.js'
 import { computeChangeSet, summarizeRuleChanges } from '../src/lib/ruleDiff.js'
 import { ensureParams } from '../src/lib/utils.js'
@@ -82,6 +83,8 @@ let exportedRunFileName = ''
 const exportedFileNames = []
 const textEncoder = new TextEncoder()
 let engineEventController = null
+let engineConnections = 0
+let recoveredRun = null
 
 function pause(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -318,6 +321,7 @@ window.pywebview = { api: {
         output_summary:[{ name:'delivered', label:'已送达', type:'bool', display:'布尔值', redacted:false }],
       }],
     }] }
+    if (path === '/api/runs/run_test001') return recoveredRun || { run_id:'run_test001', status:'running' }
     if (path === '/api/plugins/toggle') return { ok:true, restart_required:true }
     if (path === '/api/plugins/key-status') return { exists:true, encrypted:true }
     if (path === '/api/plugins/extensions') return {
@@ -391,11 +395,15 @@ const A = {
 window.fetch = async (url, options = {}) => {
   const u = String(url); const j = (o) => ({ json: async () => o, ok: true, status: 200 })
   if (u.endsWith('/api/events')) {
+    engineConnections++
     return {
       ok: true,
       status: 200,
       body: new ReadableStream({
-        start(controller) { engineEventController = controller },
+        start(controller) {
+          engineEventController = controller
+          options.signal?.addEventListener('abort', () => controller.error(new DOMException('已停止', 'AbortError')), { once:true })
+        },
         cancel() { engineEventController = null },
       }),
     }
@@ -644,6 +652,9 @@ const automationTemplatesOk = [...document.querySelectorAll('.automation-templat
   button => button.textContent.includes('每天固定时间提醒我') && button.textContent.includes('可以直接使用'),
 ) && !document.querySelector('.natural-draft-panel')
   && !document.querySelector('#natural-draft-description')
+  && !templateAvailability({ triggerType:'blocked', actionTypes:[] }, {
+    schema:{ triggers:{ blocked:{ availability:'unavailable', unavailable_reasons:['缺少设备'] } } },
+  }).available
 console.log((automationTemplatesOk?'PASS':'FAIL')+' - AI-on creation keeps templates without the legacy draft card')
 if (!automationTemplatesOk) process.exit(1)
 
@@ -793,16 +804,19 @@ if (!testRunCanStop) process.exit(1)
 const manualTestStayedLocked = [...document.querySelectorAll('button')].find(
   button => button.textContent.includes('测试中'),
 )?.disabled === true
-engineEventController?.enqueue(textEncoder.encode(sseFrame(
-  'workflow_completed',
-  { run_id:'run_test001', status:'cancelled' },
-)))
-await new Promise(r => setTimeout(r, 30))
+recoveredRun = { run_id:'run_test001', status:'cancelled' }
+engineEventController?.close()
+await waitFor(() => [...document.querySelectorAll('button')].find(
+  button => button.textContent.includes('测试规则') && !button.disabled,
+), 2000)
 const manualTestUnlockedAtTerminal = [...document.querySelectorAll('button')].find(
   button => button.textContent.includes('测试规则'),
 )?.disabled === false
-console.log((manualTestStayedLocked && manualTestUnlockedAtTerminal?'PASS':'FAIL')+' - manual test stays locked until its terminal event')
-if (!manualTestStayedLocked || !manualTestUnlockedAtTerminal) process.exit(1)
+console.log((manualTestStayedLocked && manualTestUnlockedAtTerminal?'PASS':'FAIL')+' - manual test recovers its terminal status after an SSE disconnect')
+if (!manualTestStayedLocked || !manualTestUnlockedAtTerminal) {
+  console.error(JSON.stringify({ manualTestStayedLocked, manualTestUnlockedAtTerminal, engineConnections, runReads:bridgeCalls.filter(call => call.path === '/api/runs/run_test001') }))
+  process.exit(1)
+}
 ;[...document.querySelectorAll('.test-result-dialog button')].find(
   button => button.textContent.includes('关闭'),
 )?.click()
@@ -1734,6 +1748,10 @@ const pluginsNav = [...document.querySelectorAll('.nav-item')].find(
 )
 pluginsNav?.click()
 await waitFor('.plugin-management-page')
+const registryButton = [...document.querySelectorAll('.page-head button')].find(button => button.textContent.trim() === '插件索引')
+registryButton?.click()
+if (!await waitFor('.plugin-registry-panel')) throw new Error('插件索引入口没有打开面板')
+registryButton.click()
 ;[...document.querySelectorAll('.page-head button')].find(
   button => button.textContent.includes('安装插件'),
 )?.click()
@@ -1761,5 +1779,9 @@ const signingPasswordUsesDedicatedField = pluginInstallForms.length === 1
 console.log((signingPasswordUsesDedicatedField?'PASS':'FAIL')+' - author counter-signing uses the signing_password form field')
 if (!signingPasswordUsesDedicatedField) process.exit(1)
 
+const connectionsBeforeUnmount = engineConnections
+document.getElementById('app').__vue_app__.unmount()
+await pause(1100)
+if (engineConnections !== connectionsBeforeUnmount) throw new Error('Dashboard 关闭后仍在重连 SSE')
+window.close()
 console.log('\nDashboard mount test: PASS')
-process.exit(0)

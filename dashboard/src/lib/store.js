@@ -26,3 +26,11 @@ export const store = reactive({
   aiDrafting: { enabled: false, endpoint_url: '', model: '', api_format: 'chat_completions' },
   aiApiKeyStatus: 'none',
 })
+
+export function syncEngineStatus(status) {
+  store.engineStatus = { ...store.engineStatus, ...status }
+  if ('api_alive' in status) store.controllerOnline = status.api_alive === true
+  if ('engine_running' in status) store.engineOnline = status.engine_running === true
+  document.body.classList.toggle('controller-online', store.controllerOnline)
+  document.body.classList.toggle('engine-online', store.engineOnline)
+}

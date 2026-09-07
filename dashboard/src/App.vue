@@ -3,9 +3,9 @@ import { defineAsyncComponent, nextTick, ref, watch, onMounted, onUnmounted } fr
 import NavRail from './components/NavRail.vue'
 import HomeView from './components/views/HomeView.vue'
 import AppDialog from './components/AppDialog.vue'
-import { store } from './lib/store'
+import { store, syncEngineStatus as updateStatus } from './lib/store'
 import { snack } from './lib/notify'
-import { fetchAuthenticated, hasBridge, loadConfig, loadPlugins, getSchema, getEngineStatus, getPluginExtensions, getAIDraftingSetting } from './lib/api'
+import { fetchAuthenticated, hasBridge, loadConfig, loadPlugins, getSchema, getEngineStatus, getPluginExtensions, getAIDraftingSetting, getRun } from './lib/api'
 import { ensureRuleIds } from './lib/bindings'
 import { useTheme } from './composables/useTheme'
 
@@ -46,6 +46,8 @@ function finishPageTransition() {
 }
 
 let sseAbort = null
+let disposed = false
+let sseGeneration = 0
 let sseRetry = 0
 const SSE_MAX = 10
 let sseReconnectTimer = null
@@ -93,14 +95,6 @@ async function loadConfigAtStartup() {
   return false
 }
 
-function updateStatus(s) {
-  store.engineStatus = { ...store.engineStatus, ...s }
-  if ('api_alive' in s) store.controllerOnline = s.api_alive === true
-  if ('engine_running' in s) store.engineOnline = s.engine_running === true
-  document.body.classList.toggle('controller-online', store.controllerOnline)
-  document.body.classList.toggle('engine-online', store.engineOnline)
-}
-
 async function refreshAll(status = null) {
   const currentStatus = status || await getEngineStatus().catch(() => OFFLINE_STATUS)
   updateStatus(currentStatus)
@@ -141,10 +135,14 @@ async function loadAISettingsOnce() {
 }
 
 async function connectSSE() {
+  if (disposed) return
+  const generation = ++sseGeneration
+  if (sseReconnectTimer) clearTimeout(sseReconnectTimer)
   sseReconnectTimer = null
   if (sseAbort) { sseAbort.abort(); sseAbort = null }
   let token = ''
   try { token = await window.pywebview?.api?.get_api_token() || '' } catch (e) { /* bridge 暂时不可用时按无 token 处理。 */ }
+  if (disposed || generation !== sseGeneration) return
   if (hasBridge() && !token) {
     // 后台服务重启时 token 文件可能尚未发布，这里按退避重连直到 token 出现。
     updateStatus({ engine_running: false })
@@ -159,8 +157,20 @@ async function connectSSE() {
   try {
     const res = await fetchAuthenticated('/api/events', { signal: abort.signal })
     if (!res.ok || !res.body) throw new Error('SSE HTTP ' + res.status)
+    if (disposed || generation !== sseGeneration) { abort.abort(); return }
     sseRetry = 0
     consumeSSE(res, abort)
+    const activeRun = store.activeManualRun
+    if (activeRun) {
+      getRun(activeRun.runId).then(run => {
+        if (disposed || store.activeManualRun !== activeRun) return
+        if (run && ['succeeded', 'failed', 'cancelled'].includes(run.status)) {
+          dispatchSSEEvent('workflow_completed', JSON.stringify({
+            run_id: activeRun.runId, status: run.status, recovered: true,
+          }))
+        }
+      }).catch(() => {})
+    }
   } catch (e) {
     if (abort.signal.aborted) return
     scheduleSSEReconnect()
@@ -168,6 +178,7 @@ async function connectSSE() {
 }
 
 function scheduleSSEReconnect() {
+  if (disposed) return
   sseRetry++
   if (sseRetry > SSE_MAX) updateStatus({ engine_running: false })
   // 长时间休眠、WebView 网络栈重置或 token 重新发布期间都可能连续失败，超过阈值仍会继续按退避重连。
@@ -247,9 +258,12 @@ async function consumeSSE(res, abort) {
     /* 流断开或主动终止时结束读取 */
   } finally {
     clearInterval(watchdog)
-    if (sseAbort === abort) sseAbort = null
+    reader.releaseLock()
+    if (sseAbort === abort) {
+      sseAbort = null
+      scheduleSSEReconnect()
+    }
   }
-  scheduleSSEReconnect()
 }
 
 // 后台控制服务离线时返回首页，自动化暂停时仍可编辑。
@@ -267,9 +281,11 @@ onMounted(async () => {
   initTheme()
   void loadConfigAtStartup()
   const status = await getEngineStatus().catch(() => OFFLINE_STATUS)
+  if (disposed) return
   updateStatus(status)
   if (status.api_alive) {
     await refreshAll(status)
+    if (disposed) return
     connectSSE()
   }
   setTracked(refreshStatus, 2000)
@@ -277,6 +293,8 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  disposed = true
+  sseGeneration++
   window.removeEventListener('pywebviewready', refreshStatus)
   if (sseAbort) sseAbort.abort()
   if (sseReconnectTimer) clearTimeout(sseReconnectTimer)
