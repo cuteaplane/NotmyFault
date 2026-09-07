@@ -22,6 +22,32 @@ from notmyfault.host import app as host_app
 from notmyfault.security.security import SecurityMode
 
 
+def test_simulator_stubs_rule_actions_without_replacing_global_modules(monkeypatch):
+    import datetime
+    import sys
+    import psutil
+    from pathlib import Path
+    from notmyfault.security.plugin_loader import PluginRegistry
+    from notmyfault.simulator.environment import SimulatedEnvironment
+    from notmyfault.simulator.runner import SimulatedRunner
+
+    def resolve(*args):
+        raise AssertionError("模拟器加载了真实插件")
+    monkeypatch.setattr(PluginRegistry, "resolve_action", resolve)
+    actions = ["file_operation", "http_request", "set_volume", "open_url"]
+    config = {"rules": [{"name": "模拟", "event": {"type": "manual", "params": {}}, "actions": [
+        {"type": action, "params": {}} for action in actions
+    ]}]}
+    with SimulatedRunner(SimulatedEnvironment()) as runner:
+        runner.start(config)
+        directory = Path(runner._store.rules_path).parent
+        runner.emit("manual")
+        assert [item["data"]["action_type"] for item in runner.events if item["type"] == "action_executed"] == actions
+        assert sys.modules["datetime"] is datetime
+        assert sys.modules["psutil"] is psutil
+    assert not directory.exists()
+
+
 def make_engine(rules=None, on_event=None):
     engine = create_test_engine({"rules": rules or []}, on_event=on_event)
     engine._alert_user = lambda *a, **k: None

@@ -1,6 +1,6 @@
-import sys, copy, tempfile
+import copy
+import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock
 from notmyfault.simulator.environment import SimulatedEnvironment
 
 
@@ -33,9 +33,13 @@ _SIM_DEMO_RULES = [
 class _SimulationRulesStore:
     def __init__(self, rules):
         self._rules = rules
-        directory = Path(tempfile.mkdtemp(prefix="notmyfault-simulator-"))
+        self._directory = tempfile.TemporaryDirectory(prefix="notmyfault-simulator-")
+        directory = Path(self._directory.name)
         self.rules_path = str(directory / "rules.json")
         self.plugin_manifest_path = str(directory / "plugin_manifest.json")
+
+    def close(self):
+        self._directory.cleanup()
 
     def load_verified_rules(self):
         return copy.deepcopy(self._rules)
@@ -46,66 +50,41 @@ class SimulatedRunner:
         self.env = env
         self.events = []
         self.engine = None
-        self._originals = {}
+        self._store = None
 
     def __enter__(self):
-        self._setup_mocks()
         return self
 
     def __exit__(self, *a):
         self.stop()
-        self._teardown_mocks()
-
-    def _setup_mocks(self):
-        mp = MagicMock()
-        mp.NoSuchProcess = type("NSP", (Exception,), {})
-        mp.AccessDenied = type("AD", (Exception,), {})
-        mp.process_iter = lambda a=None: self._mock_procs(a)
-        mp.disk_partitions = lambda a=False: self.env.usb.disk_partitions(a)
-        mw = MagicMock()
-        mw.user32.EnumWindows = self.env.windows.enum_windows
-        mw.user32.IsWindowVisible = self.env.windows.is_window_visible
-        mw.user32.GetWindowTextLengthW = self.env.windows.get_window_text_length
-        mw.user32.GetWindowTextW = self.env.windows.get_window_text
-        mw.user32.GetLastInputInfo = self.env.idle.get_last_input_info
-        mw.kernel32.GetTickCount = self.env.idle.get_tick_count
-        import datetime as dt
-        md = MagicMock()
-        md.datetime.now = staticmethod(self.env.time.now)
-        md.datetime.strptime = staticmethod(dt.datetime.strptime)
-        for name, m in [("psutil", mp), ("datetime", md)]:
-            self._originals[name] = sys.modules.get(name)
-            sys.modules[name] = m
-
-    def _mock_procs(self, attrs):
-        refs = self.env.processes.process_iter(attrs)
-        return [type("MockProc", (), {"info": r.info})() for r in refs]
-
-    def _teardown_mocks(self):
-        for name, orig in self._originals.items():
-            if orig: sys.modules[name] = orig
-            else: sys.modules.pop(name, None)
-        self._originals.clear()
 
     def start(self, config=None):
         from notmyfault.core.engine import AutomationEngine
+        from notmyfault.core.rules import get_rule_events, iter_action_nodes
+
+        self.stop()
         if config is None:
             from notmyfault.config import DEFAULT_CONFIG
             config = copy.deepcopy(DEFAULT_CONFIG)
             # 默认配置不再携带示例规则，模拟器自带微信音量演示规则
             config["rules"] = copy.deepcopy(_SIM_DEMO_RULES)
-        self.engine = AutomationEngine(
-            config,
-            on_event=self._on,
-            rules_store=_SimulationRulesStore(config.get("rules", [])),
-        )
+        self._store = _SimulationRulesStore(config.get("rules", []))
+        try:
+            self.engine = AutomationEngine(config, on_event=self._on, rules_store=self._store)
+        except Exception:
+            self._store.close()
+            self._store = None
+            raise
         self.engine._alert_user = lambda *a, **kw: None
-        for t in ["process_state","usb_insert","time_schedule","window_title","idle_detect"]:
-            self.engine.triggers_funcs[t] = lambda m,c,e,se=None: None
-            self.engine.triggers_meta[t] = {"semantic": "state"}
-        for a in ["set_volume","notify","launch_program","kill_process","lock_screen","run_powershell"]:
-            self.engine.actions_funcs[a] = lambda m,p: None
-            self.engine.actions_meta[a] = {}
+        self.engine._workflow_executor._action_resolver = None
+        for rule in config.get("rules", []):
+            for event in get_rule_events(rule):
+                self.engine.triggers_meta[event["type"]] = {"semantic": "state"}
+            for action, _path in iter_action_nodes(rule.get("actions", [])):
+                action_type = action.get("type")
+                if action_type not in ("if", "set_variable"):
+                    self.engine.actions_funcs[action_type] = lambda meta, params: None
+                    self.engine.actions_meta[action_type] = {}
 
     def _on(self, et, data):
         self.events.append({"type": et, "data": data})
@@ -113,7 +92,8 @@ class SimulatedRunner:
     def emit(self, tid, payload=None):
         if self.engine:
             self.engine.emit_event(tid, payload or {})
-            self.engine._rule_scheduler.wait_for_idle(timeout=5)
+            if not self.engine._rule_scheduler.wait_for_idle(timeout=5):
+                raise TimeoutError("模拟动作未能在 5 秒内完成")
 
     def step(self, seconds=1.0):
         self.env.time.advance(seconds)
@@ -121,7 +101,12 @@ class SimulatedRunner:
     def stop(self):
         if self.engine:
             self.engine.shutdown()
+            if not self.engine._shutdown_clean:
+                raise RuntimeError("模拟引擎尚未完全停止")
             self.engine = None
+        if self._store is not None:
+            self._store.close()
+            self._store = None
 
     def last_action(self):
         for ev in reversed(self.events):
