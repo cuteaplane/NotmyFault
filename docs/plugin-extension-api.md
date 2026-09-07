@@ -213,6 +213,12 @@ def save(context, payload):
 
 `context.result(data, close=False)` 返回普通结果。`context.error(message, close=False)` 返回插件错误。`close=True` 会在返回错误前关闭会话。
 
+新建会话的首次命令返回错误时，会话立即关闭。处理函数抛出异常、返回无法编码的
+数据或响应超过 1 MiB 时，同样关闭会话并运行清理函数。已有页面会话返回
+`context.error(..., close=False)` 时保留会话，页面可以继续调用命令。
+
+Dashboard 关闭页面会话失败时保留返回按钮，显示错误并允许重试。
+
 `context.commit_value(value, close=True)` 提交普通值。`context.commit(data, summary, close=True)` 生成自有数据信封并提交给 Dashboard。两个提交方法不能混用：普通值会话不能调用 `commit()`，自有数据会话不能调用 `commit_value()`。
 
 后台线程或输入钩子需要跟着会话停下来，可以把停止函数传给 `context.register_cleanup(callback)`。页面关闭和引擎停止会直接清理；会话超时或插件更新会在下次访问该会话时清理。

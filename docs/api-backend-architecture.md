@@ -59,7 +59,8 @@ HMAC-SHA256 密钥。
 7. Uvicorn 使用已经独占的监听 socket 提供 HTTP 服务。
 
 `ApiTokenStore` 创建和修复 token 文件。除 `OPTIONS` 外，所有 `/api/` 请求都要带
-`Authorization: Bearer <token>`。令牌缺失或不匹配时返回 403，并尝试修复 token 文件。
+`Authorization: Bearer <token>`。令牌缺失或不匹配时返回 403。认证通过的请求每秒最多检查一次 token 文件，
+文件检查和修复在线程中执行。
 
 Dashboard 的普通 JSON 请求通过 `window.pywebview.api.request_api()` 发送。文件上传、
 下载和 SSE 直接访问 HTTP，在请求前通过 `window.pywebview.api.get_api_token()` 读取
@@ -67,6 +68,18 @@ Dashboard 的普通 JSON 请求通过 `window.pywebview.api.request_api()` 发�
 
 `EventBroker` 接收引擎线程发布的事件，写入运行记录，再投递给每个 SSE
 订阅。每个订阅保存自己的事件循环和队列。
+
+`POST /api/engine/start`、`POST /api/engine/stop` 和状态接口都返回
+`engine_running`。状态接口无法验证规则文件时，`config_error` 说明错误，规则、
+触发器和动作计数为 `null`。
+
+AI 草稿请求只有使用已保存的 `endpoint_url` 时才会读取保存的 API Key。
+请求临时指定其他端点时，需要同时提供该端点的 `api_key`。每个 API 应用最多
+执行两个流式草稿请求；取消后尚未退出的工作线程仍占用名额。客户端断开时，
+已建立的上游流响应会关闭。仍在建立连接或不响应取消的外部实现需要等待其调用返回。
+
+Dashboard 重新连接 SSE 后会查询当前手工运行的详情。已经结束的运行解除测试按钮
+锁定，并提示从运行记录查看完整步骤。页面关闭后停止读取和重连。
 
 新增接口时先选现有路由组。请求字段、状态码和响应转换写在路由。规则、
 插件、AI 或会话处理写在对应业务对象。需要操作系统、网络、密钥或文件替换

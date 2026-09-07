@@ -188,7 +188,9 @@ manifest 写 `"execution_mode": "isolated"` 的动作不会在引擎进程中导
 子进程调用 `run()` 或 `run_with_context()`；父子进程之间使用 JSON 标准输入和输出，
 新宿主使用 `typed-v1` 编解码保留大整数、Decimal 和二进制等值。
 子进程先发 `{"type":"ready","protocol":1}`，父进程再发送 entry、action_info、
-params 和最小 context。执行结果的 `type` 是 `result`。
+params、最小 context 和整棵插件目录的文件快照。worker 每次运行前复核文件快照，
+入口、兄弟模块和扩展命令使用校验时读取的源码；目录内容变化时拒绝执行。
+执行结果的 `type` 是 `result`，无法通过数据编解码的返回值按动作失败处理。
 这只隔离崩溃，不是安全沙箱，也不限制文件、网络、进程或系统调用权限。worker 异常退出时，引擎发布
 `plugin_worker_crashed` 事件，规则中的该步骤失败。默认启动等待为 10 秒，动作执行等待为
 120 秒，进程退出等待为 5 秒。
@@ -217,6 +219,21 @@ notmyfault.core.workflow_executor、notmyfault.host.*、notmyfault.platform.linu
 安全扫描目前只拦危险调用和动态导入，不检查 import 了哪些内部模块，
 越界引用不会被扫描器拦下来，但引擎改内部结构时插件会跟着坏。
 
+插件内的 Python 兄弟模块在各自插件的模块名称下加载。`import helper` 和包内相对
+导入可以使用；两个插件包含同名 `helper.py` 时分别取得自己的模块。插件目录不会
+加入全局 `sys.path`，卸载时清理该插件创建的模块。
+
+## 插件包签名与安装
+
+`pack_plugin.py` 保留 `signature.sig`、`public_key.pem` 和 `public_key.sig`。
+安装构建命令也保留这些文件，作者签名必须与构建后的文件内容相符。安装端在替换
+旧版本前使用与加载器相同的签名规则校验暂存目录；strict 要求有效签名，作者自签
+的非管理员插件还需本地密钥副签，管理员插件仅接受官方或本地可信密钥签名。
+
+签名覆盖插件源码、资源以及 `node_modules`、`__pypackages__` 内的文件，排除
+Python 的 `__pycache__` 缓存与签名材料本身。修改依赖内容也需要重新签名。
+动作与触发器共用插件 ID 空间，安装预览与安装会检查另一种类型中的同名 ID。
+
 ## 安全扫描的边界
 
 `scan_plugin_security`、能力扫描和借壳提权扫描用于提示风险和检查权限声明，
@@ -229,6 +246,7 @@ notmyfault.core.workflow_executor、notmyfault.host.*、notmyfault.platform.linu
 
 - setup：trigger 加载后、启动前调一次，返回 False 拒绝启用（action 没有 setup）
 - 执行：动作按规则触发；isolated 动作在子进程
+- 参数校验：插件定义 `validate_params(action_info, params)` 时，返回错误列表或抛出异常都会拒绝执行本步
 - teardown：引擎停止时调用，插件在这里注销热键、关连接
 - 引擎停止：扩展会话一并关闭
 - isolated worker：引擎 shutdown 时 shutdown_all() 终止所有活着的子进程

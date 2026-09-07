@@ -60,6 +60,10 @@ cd dashboard
 npm run dev
 ```
 
+源码版 `dashboard.pyw` 会比较源码、字体、构建配置和版本源码的修改时间；
+已有 `dist/index.html` 过期时重新运行 `npm run build`，构建失败不继续打开旧页面。
+发行包直接使用随包产物。静态页面禁止缓存，文件名带 hash 的资产允许长期缓存。
+
 提交前至少执行：
 
 ```powershell
@@ -278,19 +282,23 @@ def run(meta, config, emit_event, shutdown_event):
 - 触发器必须用 `shutdown_event` 轮询退出，并在退出时清理原生资源
   （如 power_state 的隐藏窗口）。
 
-## 5.1 导入安全限制
+## 5.1 导入与管理员执行
 
-`notmyfault` 包在 **strict** 安全模式下拒绝外部代码直接 `import notmyfault`
-（pytest 与项目根目录下的官方脚本除外），防止第三方进程把引擎组件当库随意
-加载。需要以库方式使用引擎时，请将安全模式设为 `normal`/`permissive`，或从
-`NOTMYFAULT.pyw` 启动。
+`notmyfault` 包在 strict 模式下拒绝外部代码直接导入，允许真实 pytest 测试调用、
+项目目录内脚本及 `python -m notmyfault` 入口。往 `sys.modules` 放入名为
+`pytest` 的空模块不会获得测试豁免。包入口创建 `ApplicationPaths` 和
+`SignedConfigStore`，再调用 Host 的 `run(store=...)`。
 
-`notmyfault.security.sudo` 的导入守卫更严：只允许插件命名空间
-（`notmyfault.action_*` / `notmyfault.trigger_*`）与引擎核心
-（`notmyfault.core.engine`）导入，strict 模式下其他一切导入都会触发
-`ImportError`。插件需要管理员权限时，请在元数据声明
-`"permissions": ["admin"]` 并通过 `notmyfault.security.sudo.run_as_admin`
-走受控通道。
+插件通过 `notmyfault.security.sudo.run_as_admin` 请求管理员执行，元数据需要
+声明 `admin` 权限和 `security.admin_executables` 中的可执行文件名。检查发生在
+调用时；`sudo` 模块没有单独的导入守卫。Windows 每次请求都需要通知确认和 UAC，
+Linux 使用 pkexec。源码与运行进程属于当前用户，导入检查和权限扫描不是 Python
+沙箱，也不提供同一用户进程之间的隔离。
+
+`nmf.py plugin create trigger` 生成 event-v2 入口，每个实例接收单个 `config`，
+等待 `shutdown_event` 后退出。插件清单可用字符串 `author` 填写作者。
+
+安装、打包和完整性检查见 [插件 API](plugin-api-v1.md#插件包签名与安装)。
 
 ## 6. 改代码时的检查项
 
