@@ -182,7 +182,21 @@ def _send_mouse_flags(flags: tuple[int, ...], mouse_data: int = 0) -> None:
     user32.SendInput.restype = wintypes.UINT
     sent = user32.SendInput(len(inputs), inputs, ctypes.sizeof(INPUT))
     if sent != len(inputs):
-        raise RuntimeError(f"SendInput 只发送了 {sent}/{len(inputs)} 个鼠标事件")
+        pressed = set()
+        pairs = {MOUSEEVENTF_LEFTDOWN: MOUSEEVENTF_LEFTUP,
+                 MOUSEEVENTF_RIGHTDOWN: MOUSEEVENTF_RIGHTUP,
+                 MOUSEEVENTF_MIDDLEDOWN: MOUSEEVENTF_MIDDLEUP}
+        for flag in flags[:sent]:
+            if flag in pairs:
+                pressed.add(pairs[flag])
+            else:
+                pressed.discard(flag)
+        message = f"SendInput 只发送了 {sent}/{len(inputs)} 个鼠标事件"
+        if pressed:
+            releases = (INPUT * len(pressed))(*(_mouse_input(flag) for flag in sorted(pressed)))
+            if user32.SendInput(len(releases), releases, ctypes.sizeof(INPUT)) != len(releases):
+                message += "，部分鼠标按键未能释放"
+        raise RuntimeError(message)
 
 
 def perform_coordinate(

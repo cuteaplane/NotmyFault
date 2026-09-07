@@ -251,11 +251,18 @@
   let recording = false
   let busy = false
   let pollTimer = 0
+  let recordingGeneration = 0
 
   function invoke(command, payload) {
     const requestId = 'macro-' + (++requestSequence)
     window.parent.postMessage({ source:viewSource, type:'invoke', request_id:requestId, command, payload:payload || {} }, '*')
-    return new Promise(function (resolve) { pending.set(requestId, resolve) })
+    return new Promise(function (resolve) {
+      const timer = window.setTimeout(function () {
+        pending.delete(requestId)
+        resolve({ ok:false, error:'插件命令响应超时' })
+      }, 30000)
+      pending.set(requestId, function (response) { window.clearTimeout(timer); resolve(response) })
+    })
   }
 
   function setStatus(message, isError, persistent) {
@@ -398,7 +405,7 @@
     recording = Boolean(data && data.recording)
     if (!recording && Array.isArray(data && data.steps)) steps = JSON.parse(JSON.stringify(data.steps))
     if (!recording) {
-      window.clearInterval(pollTimer); pollTimer = 0
+      window.clearTimeout(pollTimer); pollTimer = 0
       setStatus(data && data.error || '录制完成，已生成 ' + steps.length + ' 个步骤', Boolean(data && data.error), false)
     }
     render()
@@ -407,6 +414,7 @@
   async function startRecording() {
     if (busy || recording) return
     busy = true; render(); setStatus('正在启动全局录制…', false, true)
+    const generation = ++recordingGeneration
     try {
       const response = await invoke('start_recording', {
         append:document.getElementById('appendOption').checked && steps.length > 0,
@@ -415,27 +423,32 @@
       })
       if (!response || !response.ok) throw new Error(response && response.error || '录制启动失败')
       applyRecordingResult(response.data || {})
-      pollTimer = window.setInterval(pollRecording, 500)
+      if (recording) pollTimer = window.setTimeout(function () { pollRecording(generation) }, 500)
       setStatus('', false, false)
     } catch (error) {
       setStatus(error.message || '录制启动失败', true, true)
     } finally { busy = false; render() }
   }
 
-  async function pollRecording() {
-    if (!recording) return
+  async function pollRecording(generation) {
+    if (!recording || generation !== recordingGeneration) return
     try {
       const response = await invoke('recording_status', {})
+      if (generation !== recordingGeneration) return
       if (!response || !response.ok) throw new Error(response && response.error || '读取录制状态失败')
       applyRecordingResult(response.data || {})
+      if (recording) pollTimer = window.setTimeout(function () { pollRecording(generation) }, 500)
     } catch (error) {
-      window.clearInterval(pollTimer); pollTimer = 0
+      if (generation !== recordingGeneration) return
+      window.clearTimeout(pollTimer); pollTimer = 0
       setStatus(error.message || '读取录制状态失败', true, true)
     }
   }
 
   async function stopRecording() {
     if (busy || !recording) return
+    ++recordingGeneration
+    window.clearTimeout(pollTimer); pollTimer = 0
     busy = true; render(); setStatus('正在整理录制内容…', false, true)
     try {
       const response = await invoke('stop_recording', {})
@@ -458,6 +471,8 @@
   async function cancel() {
     if (busy) return
     busy = true; render()
+    ++recordingGeneration
+    window.clearTimeout(pollTimer); pollTimer = 0
     try {
       const response = await invoke('cancel_macro', {})
       if (!response || !response.ok) throw new Error(response && response.error || '取消失败')

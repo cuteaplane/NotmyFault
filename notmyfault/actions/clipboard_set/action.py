@@ -49,8 +49,8 @@ def run(action_info, params):
     handle = None
     transferred = False
     # 剪贴板 API 也是共享 user32 函数对象，与项目其他 ctypes 调用一样持锁
-    try:
-        with NATIVE_LOCK:
+    with NATIVE_LOCK:
+        try:
             if not user32.OpenClipboard(None):
                 raise RuntimeError("无法打开剪贴板（可能被其他程序占用）")
             clipboard_open = True
@@ -76,8 +76,7 @@ def run(action_info, params):
                 raise RuntimeError("SetClipboardData 失败")
             transferred = True  # 成功后句柄所有权转交 Windows，不能再 GlobalFree
             print(f"[Action:clipboard_set] 剪贴板写入成功 ({len(text)} 字符)")
-    finally:
-        with NATIVE_LOCK:
+        finally:
             if handle and not transferred:
                 kernel32.GlobalFree(handle)
             if clipboard_open:

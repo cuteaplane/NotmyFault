@@ -22,7 +22,7 @@ _ALLOWED_ACTIONS = ("shutdown", "restart", "logoff", "hibernate", "sleep")
 _LINUX_COMMANDS = {
     "shutdown": ["systemctl", "poweroff"],
     "restart": ["systemctl", "reboot"],
-    "logoff": ["loginctl", "terminate-user"],
+    "logoff": ["loginctl", "terminate-session"],
     "hibernate": ["systemctl", "hibernate"],
     "sleep": ["systemctl", "suspend"],
 }
@@ -127,10 +127,10 @@ def _execute(params, cancellation=None):
     if os.name != "nt":
         command = _LINUX_COMMANDS[action]
         if action == "logoff":
-            getuid = getattr(os, "getuid", None)
-            if getuid is None:
-                raise RuntimeError("当前系统无法获取用户 ID，不能注销")
-            command = command + [str(getuid())]
+            session = os.environ.get("XDG_SESSION_ID", "")
+            if not session:
+                raise RuntimeError("当前系统无法获取会话 ID，不能注销")
+            command = command + [session]
         result = subprocess.run(
             command,
             capture_output=True,
@@ -150,7 +150,7 @@ def _execute(params, cancellation=None):
             powrprof = ctypes.windll.powrprof
             powrprof.SetSuspendState.argtypes = [ctypes.c_ubyte] * 3
             powrprof.SetSuspendState.restype = ctypes.c_ubyte
-            ok = powrprof.SetSuspendState(action == "hibernate", True, False)
+            ok = powrprof.SetSuspendState(action == "hibernate", False, False)
         else:
             flags = {
                 "shutdown": EWX_SHUTDOWN | EWX_POWEROFF,

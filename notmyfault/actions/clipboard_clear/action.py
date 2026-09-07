@@ -18,8 +18,8 @@ def run(action_info, params):
 
     user32 = ctypes.windll.user32
     opened = False
-    try:
-        with NATIVE_LOCK:
+    with NATIVE_LOCK:
+        try:
             user32.OpenClipboard.argtypes = [ctypes.c_void_p]
             user32.OpenClipboard.restype = ctypes.c_int
             user32.EmptyClipboard.argtypes = []
@@ -31,9 +31,8 @@ def run(action_info, params):
             opened = True
             if not user32.EmptyClipboard():
                 raise RuntimeError("清空剪贴板失败")
-    finally:
-        if opened:
-            with NATIVE_LOCK:
+        finally:
+            if opened:
                 user32.CloseClipboard()
     print("[Action:clipboard_clear] 剪贴板已清空")
     return {"cleared": True}

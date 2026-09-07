@@ -24,7 +24,7 @@ def _target_name(process_name: str) -> str:
     return target
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
     process_name = params.get("process_name", "").strip()
     if not process_name:
         raise ValueError("未指定进程名")
@@ -37,8 +37,27 @@ def run(action_info, params):
         raise ValueError("不允许终止 Windows 关键系统进程")
     killed = 0
     denied = 0
+    cancellation = context.get("runtime", {}).get("cancellation")
+    deadline = time.monotonic() + 10
+
+    def wait_for_exit(proc, seconds):
+        wait_until = min(deadline, time.monotonic() + seconds)
+        while True:
+            if cancellation:
+                cancellation.raise_if_cancelled()
+            remaining = wait_until - time.monotonic()
+            if remaining <= 0:
+                raise psutil.TimeoutExpired(seconds, pid=proc.pid)
+            try:
+                return proc.wait(timeout=min(remaining, 0.1))
+            except psutil.TimeoutExpired:
+                pass
 
     for proc in psutil.process_iter(["pid", "name"]):
+        if cancellation:
+            cancellation.raise_if_cancelled()
+        if time.monotonic() >= deadline:
+            raise RuntimeError("终止进程超过总时限（10s）")
         try:
             if proc.info["name"] and proc.info["name"].lower() == target:
                 pid = proc.info.get("pid")
@@ -47,15 +66,14 @@ def run(action_info, params):
                     continue
                 proc.terminate()
                 try:
-        # terminate() 是异步的，等待并验证进程确实退出
-                    proc.wait(timeout=5)
+                    wait_for_exit(proc, 5)
                 except psutil.TimeoutExpired:
                     print(
                         f"[Action:kill_process] PID={pid or '?'} "
                         "5 秒内未退出，发送强杀信号"
                     )
                     proc.kill()
-                    proc.wait(timeout=5)
+                    wait_for_exit(proc, 5)
                 killed += 1
                 print(f"[Action:kill_process] 已终止 PID={pid or '?'}")
         except psutil.AccessDenied:
@@ -79,3 +97,7 @@ def run(action_info, params):
         return {"killed": 0, "denied": denied}
     print(f"[Action:kill_process] 共终止了 {killed} 个进程")
     return {"killed": killed, "denied": denied}
+
+
+def run(action_info, params):
+    return run_with_context(action_info, params, {})

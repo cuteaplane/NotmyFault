@@ -1,5 +1,6 @@
 import fs from 'fs'
 import path from 'path'
+import assert from 'node:assert/strict'
 import { JSDOM, VirtualConsole } from 'jsdom'
 
 
@@ -84,6 +85,42 @@ const replacementStartsClean = invokes.some(message => (
 console.log((replacementStartsClean ? 'PASS' : 'FAIL') + ' - re-recording replaces existing macro steps by default')
 if (!replacementStartsClean) process.exit(1)
 
+const pollCallbacks = new Map()
+const originalSetTimeout = window.setTimeout.bind(window)
+const originalClearTimeout = window.clearTimeout.bind(window)
+let pollId = 100000
+window.setTimeout = (callback, delay, ...args) => {
+  if (delay !== 500) return originalSetTimeout(callback, delay, ...args)
+  pollCallbacks.set(++pollId, callback)
+  return pollId
+}
+window.clearTimeout = id => {
+  pollCallbacks.delete(id)
+  originalClearTimeout(id)
+}
+async function reply(request, data) {
+  window.dispatchEvent(new window.MessageEvent('message', {
+    source: window,
+    data: { source:'notmyfault:extension-host', type:'result', request_id:request.request_id, response:{ ok:true, data } },
+  }))
+  await Promise.resolve()
+  await Promise.resolve()
+}
+await reply(invokes.find(message => message.command === 'start_recording'), { recording:true })
+assert.equal(pollCallbacks.size, 1)
+const [timerId, poll] = pollCallbacks.entries().next().value
+pollCallbacks.delete(timerId)
+poll()
+assert.equal(pollCallbacks.size, 0)
+const statusRequest = invokes.find(message => message.command === 'recording_status')
+assert.ok(statusRequest)
+window.document.getElementById('stopButton').click()
+await reply(invokes.find(message => message.command === 'stop_recording'), { recording:false, steps:[] })
+await reply(statusRequest, { recording:true })
+assert.equal(window.document.getElementById('stopButton').hidden, true)
+assert.equal(pollCallbacks.size, 0)
+console.log('PASS - recording polls one request at a time and ignores replies preceding stop')
+
 const selectorHtml = fs.readFileSync(
   path.resolve('../notmyfault/actions/uia_automation/pages/selector.html'),
   'utf8',
@@ -136,3 +173,5 @@ const selectorChecksThroughPlugin = selectorInvokes.some(message => (
 ))
 console.log((selectorChecksThroughPlugin ? 'PASS' : 'FAIL') + ' - selector verification stays inside the plugin view protocol')
 if (!selectorChecksThroughPlugin) process.exit(1)
+dom.window.close()
+selectorDom.window.close()

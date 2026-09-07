@@ -46,6 +46,8 @@ _SHIFT_KEYS = {VK_SHIFT, VK_LSHIFT, VK_RSHIFT}
 _STOP_MODIFIERS = _CTRL_KEYS | _SHIFT_KEYS
 _PASSWORD_CHECK_TIMEOUT = 0.05
 _MOUSE_CHECK_TIMEOUT = 0.05
+_MAX_EVENTS = 10000
+_RESOLVER_SLOT = threading.Lock()
 _MOUSE_MESSAGES = {
     WM_LBUTTONDOWN: ("mouse_down", "left"),
     WM_LBUTTONUP: ("mouse_up", "left"),
@@ -101,7 +103,8 @@ class InputRecorder:
         self._last_move: tuple[float, int, int] | None = None
         self._stop_event = threading.Event()
         self._ready_event = threading.Event()
-        self._resolve_queue: queue.Queue = queue.Queue()
+        self._resolve_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._owns_resolver_slot = False
         self._thread: threading.Thread | None = None
         self._resolver_thread: threading.Thread | None = None
         self._resolver_stop_sent = False
@@ -136,6 +139,9 @@ class InputRecorder:
         kernel32 = ctypes.windll.kernel32
         kernel32.GetTickCount64.restype = ctypes.c_ulonglong
         self._started_tick_ms = int(kernel32.GetTickCount64())
+        if not _RESOLVER_SLOT.acquire(blocking=False):
+            raise RuntimeError("前一次控件查询尚未结束，请稍后再录制")
+        self._owns_resolver_slot = True
         self._resolver_thread = threading.Thread(
             target=self._resolve_loop,
             name="NotmyFaultMacroResolver",
@@ -171,12 +177,20 @@ class InputRecorder:
             self._thread.join(timeout=3)
         if self._resolver_thread is not None and not self._resolver_stop_sent:
             self._resolver_stop_sent = True
+            try:
+                while True:
+                    self._resolve_queue.get_nowait()
+                    self._resolve_queue.task_done()
+            except queue.Empty:
+                pass
             self._resolve_queue.put(None)
         if (
             self._resolver_thread is not None
             and self._resolver_thread is not threading.current_thread()
         ):
             self._resolver_thread.join(timeout=3)
+            if self._resolver_thread.is_alive():
+                self._error = "录制已停止，控件查询尚未结束"
         if not self._stopped_at:
             self._stopped_at = time.monotonic()
 
@@ -210,50 +224,71 @@ class InputRecorder:
             else time.monotonic()
         )
         with self._events_lock:
+            if self._stop_event.is_set():
+                return event
+            if len(self._events) >= _MAX_EVENTS:
+                self._error = f"录制达到 {_MAX_EVENTS} 个事件，已停止"
+                self._stop_event.set()
+                return event
             self._events.append(event)
         return event
+
+    def _resolve_before_dispatch(self, kind, result, timeout):
+        done = threading.Event()
+        try:
+            self._resolve_queue.put_nowait((kind, result, done, time.monotonic() + timeout))
+        except queue.Full:
+            return False
+        return done.wait(timeout) and not self._stop_event.is_set()
 
     def _resolve_mouse(self, event: dict) -> None:
         if self._mouse_resolver is None:
             return
         result = {"x": event["x"], "y": event["y"]}
-        done = threading.Event()
-        self._resolve_queue.put(("mouse", result, done))
         # 点击分发后控件可能消失，迟到的查询结果只留在独立对象中。
-        if done.wait(_MOUSE_CHECK_TIMEOUT):
+        if self._resolve_before_dispatch("mouse", result, _MOUSE_CHECK_TIMEOUT):
             with self._events_lock:
                 for key in ("selector", "selector_error"):
                     if key in result:
                         event[key] = result[key]
 
-    def _resolve_keyboard_password(self) -> bool:
+    def _resolve_keyboard_context(self, capture_window) -> dict:
         if self._keyboard_password_resolver is None:
-            return False
-        result = {"value": True}
-        done = threading.Event()
-        self._resolve_queue.put(("keyboard_password", result, done))
+            return {"value": True}
+        result = {"value": True, "capture_window": capture_window}
         # 钩子返回后焦点可能改变，超时的查询结果不能再决定是否录入按键。
-        if not done.wait(_PASSWORD_CHECK_TIMEOUT):
-            return True
-        return bool(result["value"])
+        if not self._resolve_before_dispatch("keyboard", result, _PASSWORD_CHECK_TIMEOUT):
+            return {"value": True}
+        return result
 
     def _resolve_loop(self) -> None:
+        try:
+            self._consume_resolutions()
+        finally:
+            if self._owns_resolver_slot:
+                self._owns_resolver_slot = False
+                _RESOLVER_SLOT.release()
+
+    def _consume_resolutions(self) -> None:
         while True:
             task = self._resolve_queue.get()
             if task is None:
                 self._resolve_queue.task_done()
                 return
-            kind, event, done = task
+            kind, event, done, deadline = task
+            if self._stop_event.is_set() or time.monotonic() >= deadline:
+                self._resolve_queue.task_done()
+                continue
             try:
                 with per_monitor_dpi_context():
-                    if kind == "keyboard_password":
+                    if kind == "keyboard":
+                        if event["capture_window"] and self._keyboard_window_resolver is not None:
+                            event["window"] = self._keyboard_window_resolver()
                         value = bool(self._keyboard_password_resolver())
-                    elif kind == "keyboard_window":
-                        value = self._keyboard_window_resolver()
                     else:
                         value = self._mouse_resolver(event["x"], event["y"])
             except Exception as exc:
-                value = True if kind == "keyboard_password" else None
+                value = True if kind == "keyboard" else None
                 error = str(exc)
             else:
                 error = ""
@@ -262,14 +297,8 @@ class InputRecorder:
                     event["selector"] = value
                     if error:
                         event["selector_error"] = error[:240]
-            elif kind == "keyboard_password":
+            elif kind == "keyboard":
                 event["value"] = value
-            elif kind == "keyboard_window":
-                with self._events_lock:
-                    if isinstance(value, dict) and value:
-                        event["window"] = value
-                    if error:
-                        event["window_error"] = error[:240]
             if done is not None:
                 done.set()
             self._resolve_queue.task_done()
@@ -288,7 +317,7 @@ class InputRecorder:
                 break
 
     def _keyboard_event(self, message: int, data: KBDLLHOOKSTRUCT) -> bool:
-        if data.flags & LLKHF_INJECTED:
+        if self._stop_event.is_set() or data.flags & LLKHF_INJECTED:
             return False
         state = "down" if message in (WM_KEYDOWN, WM_SYSKEYDOWN) else "up"
         vk = int(data.vkCode)
@@ -306,13 +335,14 @@ class InputRecorder:
         if state == "up" and vk in self._skipped_keys:
             self._skipped_keys.discard(vk)
             return False
-        if self._resolve_keyboard_password():
+        with self._events_lock:
+            starts_group = not self._events or self._events[-1].get("kind") != "keyboard"
+        resolved = self._resolve_keyboard_context(starts_group)
+        if resolved["value"]:
             if state == "down":
                 self._skipped_keys.add(vk)
             return False
         self._skipped_keys.discard(vk)
-        with self._events_lock:
-            starts_group = not self._events or self._events[-1].get("kind") != "keyboard"
         event = self._append({
             "kind": "keyboard",
             "event": state,
@@ -320,12 +350,12 @@ class InputRecorder:
             "scan_code": int(data.scanCode),
             "extended": bool(data.flags & LLKHF_EXTENDED),
         }, int(data.time))
-        if starts_group and self._keyboard_window_resolver is not None:
-            self._resolve_queue.put(("keyboard_window", event, None))
+        if starts_group and isinstance(resolved.get("window"), dict):
+            event["window"] = resolved["window"]
         return False
 
     def _mouse_event(self, message: int, data: MSLLHOOKSTRUCT) -> None:
-        if data.flags & LLMHF_INJECTED:
+        if self._stop_event.is_set() or data.flags & LLMHF_INJECTED:
             return
         x = int(data.pt.x)
         y = int(data.pt.y)

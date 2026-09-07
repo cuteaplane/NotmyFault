@@ -60,9 +60,10 @@
         },
         {
             "name": "force",
-            "label": "强制（不等待应用响应）",
+            "label": "强制关闭 Windows 会话中的应用",
             "type": "bool",
-            "default": false
+            "default": false,
+            "visible_when": {"action": ["shutdown", "restart", "logoff"]}
         },
         {
             "name": "delay_seconds",

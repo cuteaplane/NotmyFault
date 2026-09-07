@@ -15,7 +15,7 @@ def run(action_info, params):
         raise ValueError("没有可打开的链接")
 
     new_window = bool(params.get("new_window", False))
-    opened = []
+    normalized = []
     for url in urls:
         if not _SCHEME_RE.match(url):
             # 未写协议头时按域名补上 https://
@@ -23,6 +23,9 @@ def run(action_info, params):
         elif not url.lower().startswith(("http://", "https://")):
             # 自定义协议头会拉起任意注册程序，只放行 http/https
             raise ValueError(f"只支持 http/https 链接: {url}")
+        normalized.append(url)
+    opened = []
+    for url in normalized:
         print("[Action:open_url] 打开 HTTP(S) 链接")
         if webbrowser.open(url, new=1 if new_window else 0):
             opened.append(url)

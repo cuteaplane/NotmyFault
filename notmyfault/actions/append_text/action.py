@@ -3,6 +3,7 @@
 """
 
 from datetime import datetime
+import re
 
 
 def run(action_info, params):
@@ -17,7 +18,7 @@ def run_with_context(action_info, params, context):
     if not file_path:
         raise ValueError("未指定日志文件路径")
     text = str(params.get("text", "") or "")
-    lines = [line for line in text.splitlines() if line.strip()]
+    lines = text.splitlines()
     if not lines:
         raise ValueError("没有可写入的内容")
 
@@ -30,8 +31,7 @@ def run_with_context(action_info, params, context):
     )
     payload = []
     for line in lines:
-        # 行首是方括号时视为已有时间标记，直接写入
-        if timestamp and not line.lstrip().startswith("["):
+        if timestamp and line.strip() and not re.match(r"^\s*\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]", line):
             payload.append(f"[{timestamp}] {line}")
         else:
             payload.append(line)

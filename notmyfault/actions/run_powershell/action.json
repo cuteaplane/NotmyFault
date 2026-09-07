@@ -7,8 +7,11 @@
     "package_name": "io.github.notmyfault.run_powershell",
     "enabled": true,
     "idempotent": false,
+    "execution_api": "context-v1",
+    "cancellation_api": "runtime-v1",
     "permissions": [
-        "external_binary"
+        "external_binary",
+        "native_api"
     ],
     "security": {
         "rule_approval": "admin_key",

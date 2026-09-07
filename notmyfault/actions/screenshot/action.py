@@ -101,8 +101,10 @@ def run(action_info, params):
                 width = rect.right - rect.left
                 height = rect.bottom - rect.top
             else:
-                width = user32.GetSystemMetrics(0)
-                height = user32.GetSystemMetrics(1)
+                left = user32.GetSystemMetrics(76)
+                top = user32.GetSystemMetrics(77)
+                width = user32.GetSystemMetrics(78)
+                height = user32.GetSystemMetrics(79)
             if width <= 0 or height <= 0:
                 raise RuntimeError(
                     f"无法获取屏幕尺寸（{width}x{height}），会话可能已锁定"
@@ -126,7 +128,7 @@ def run(action_info, params):
                 if not user32.PrintWindow(capture_hwnd, hdc_mem, 0):
                     raise RuntimeError("PrintWindow 截图失败")
             else:
-                if not gdi32.BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, 0, 0, 0x00CC0020):
+                if not gdi32.BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, left, top, 0x00CC0020):
                     raise RuntimeError("BitBlt 截图失败")
 
             if not gdi32.SelectObject(hdc_mem, previous_bitmap):

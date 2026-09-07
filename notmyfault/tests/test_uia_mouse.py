@@ -114,6 +114,20 @@ def test_perform_coordinate_moves_and_sends_click(monkeypatch):
     }
 
 
+@pytest.mark.parametrize("sent", [0, 1, 2, 3])
+def test_partial_mouse_input_releases_only_buttons_still_pressed(monkeypatch, sent):
+    batches = []
+    def send(count, inputs, size):
+        batches.append([inputs[index].mi.dwFlags for index in range(count)])
+        return sent if len(batches) == 1 else count
+    fake = FakeUser32()
+    fake.SendInput = FakeFunction(send)
+    monkeypatch.setattr(mouse, "_user32", lambda: fake)
+    with pytest.raises(RuntimeError, match="SendInput"):
+        mouse._send_mouse_flags(mouse._OPERATIONS["double_click"])
+    assert batches[1:] == ([[mouse.MOUSEEVENTF_LEFTUP]] if sent in (1, 3) else [])
+
+
 def test_perform_coordinate_rejects_changed_screen(monkeypatch):
     monkeypatch.setattr(mouse, "_virtual_screen", lambda: SCREEN.copy())
     with pytest.raises(ValueError, match="显示器布局"):

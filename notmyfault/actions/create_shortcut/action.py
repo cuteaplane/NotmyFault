@@ -70,20 +70,27 @@ def _run_linux(action_info, params):
         raise ValueError("快捷方式参数引号不完整") from error
 
     def desktop_token(value: str) -> str:
-        escaped = value.replace("\\", "\\\\")
+        escaped = value.replace("\\", "\\\\\\\\")
         for char in ('"', "`", "$"):
-            escaped = escaped.replace(char, "\\" + char)
+            escaped = escaped.replace(char, "\\\\" + char)
         escaped = escaped.replace("%", "%%")
         return f'"{escaped}"'
+
+    def desktop_value(value: str) -> str:
+        return value.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 
     exec_line = " ".join(desktop_token(item) for item in (target, *argument_parts))
     desktop_entry = (
         "[Desktop Entry]\n"
         "Type=Application\n"
-        f"Name={name}\n"
+        f"Name={desktop_value(name)}\n"
         f"Exec={exec_line}\n"
         "Terminal=false\n"
     )
+    for parameter, field in (("working_directory", "Path"), ("icon_path", "Icon")):
+        value = str(params.get(parameter, "") or "")
+        if value:
+            desktop_entry += f"{field}={desktop_value(value)}\n"
 
     if location == "desktop":
         base_dir = Path.home() / "Desktop"

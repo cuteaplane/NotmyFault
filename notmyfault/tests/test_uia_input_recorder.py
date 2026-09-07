@@ -83,8 +83,9 @@ def test_click_uses_only_selector_available_before_dispatch(monkeypatch, resolve
 
 
 @pytest.mark.parametrize("password_after_hook", [True, False])
+@pytest.mark.parametrize("late_query", ["password", "window"])
 def test_keyboard_events_with_late_password_result_are_not_recorded(
-    password_after_hook,
+    password_after_hook, late_query,
 ):
     resolver_started = threading.Event()
     resolver_gate = threading.Event()
@@ -95,7 +96,8 @@ def test_keyboard_events_with_late_password_result_are_not_recorded(
         return password_after_hook
 
     recorder = InputRecorder(
-        keyboard_password_resolver=password_resolver,
+        keyboard_password_resolver=password_resolver if late_query == "password" else lambda: False,
+        keyboard_window_resolver=(lambda: password_resolver() or WINDOW) if late_query == "window" else None,
     )
     resolver_thread = threading.Thread(
         target=recorder._resolve_loop,
@@ -123,6 +125,19 @@ def test_keyboard_events_with_late_password_result_are_not_recorded(
         hook_thread.join(timeout=1)
         recorder._resolve_queue.put(None)
         resolver_thread.join(timeout=1)
+
+
+def test_recording_limits_events_and_pending_queries(monkeypatch):
+    monkeypatch.setattr(input_recorder, "_MAX_EVENTS", 2)
+    monkeypatch.setattr(input_recorder, "_MOUSE_CHECK_TIMEOUT", 0)
+    recorder = InputRecorder(mouse_resolver=lambda x, y: SELECTOR)
+    for index in range(20):
+        event = recorder._append({"kind": "mouse_down", "x": index, "y": 0})
+        recorder._resolve_mouse(event)
+    assert recorder._resolve_queue.qsize() == 1
+    recorder.stop()
+    assert len(recorder.snapshot()["events"]) == 2
+    assert "已停止" in recorder.error
 
 
 @pytest.mark.parametrize("password_result", [False, True, "error"])

@@ -3,6 +3,8 @@
 import http.client
 import socket
 import ssl
+import threading
+import time
 from urllib.parse import urlparse
 
 from notmyfault.plugin_api import network_security_api
@@ -33,11 +35,15 @@ def _open_pinned_socket(
     source_address=None,
 ):
     last_error = None
+    deadline = time.monotonic() + timeout
     for address in addresses:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("连接超过总时限")
         try:
             return socket.create_connection(
                 (address, port),
-                timeout,
+                remaining,
                 source_address,
             )
         except OSError as error:
@@ -59,6 +65,7 @@ class _PinnedHTTPConnection(http.client.HTTPConnection):
             self.timeout,
             self.source_address,
         )
+        self._active_socket = self.sock
 
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
@@ -73,10 +80,13 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
             self.timeout,
             self.source_address,
         )
-        self.sock = self._context.wrap_socket(
-            raw_socket,
-            server_hostname=self.host,
-        )
+        self._active_socket = raw_socket
+        try:
+            self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+        except BaseException:
+            raw_socket.close()
+            raise
+        self._active_socket = self.sock
 
 
 def _redact_url(url: str) -> str:
@@ -87,7 +97,7 @@ def _redact_url(url: str) -> str:
     return parsed._replace(query="***").geturl()
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
     method = str(params.get("method", "GET")).upper()
     url = str(params.get("url", "")).strip()
     body = params.get("body", "")
@@ -101,7 +111,14 @@ def run(action_info, params):
         raise ValueError("未指定 URL")
     if method not in _ALLOWED_METHODS:
         raise ValueError(f"不支持的 HTTP 方法: {method}")
+    cancellation = context.get("runtime", {}).get("cancellation")
+    if cancellation:
+        cancellation.raise_if_cancelled()
+    deadline = time.monotonic() + timeout
     parsed, addresses = resolve_public_http_url(url)
+    timeout = deadline - time.monotonic()
+    if timeout <= 0:
+        raise RuntimeError("请求超过总时限")
 
     print(f"[Action:http_request] {method} {_redact_url(url)}")
 
@@ -151,13 +168,38 @@ def run(action_info, params):
             port=port,
             timeout=timeout,
         )
+    finished = threading.Event()
+    def interrupt_connection():
+        while not finished.wait(0.05):
+            if time.monotonic() >= deadline or (cancellation and cancellation.is_cancelled()):
+                sock = getattr(connection, "_active_socket", None)
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+    watcher = threading.Thread(target=interrupt_connection, daemon=True)
+    watcher.start()
     try:
         connection.request(method, target, body=data, headers=headers)
         response = connection.getresponse()
         status = response.status
         if status >= 300:
             raise RuntimeError(f"HTTP {status}: {response.reason}")
-        raw_body = response.read(_MAX_RESPONSE_BYTES + 1)
+        raw_body = bytearray()
+        while len(raw_body) <= _MAX_RESPONSE_BYTES:
+            if cancellation:
+                cancellation.raise_if_cancelled()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("请求超过总时限")
+            chunk = response.read1(min(65536, _MAX_RESPONSE_BYTES + 1 - len(raw_body)))
+            if not chunk:
+                break
+            raw_body.extend(chunk)
+        if cancellation:
+            cancellation.raise_if_cancelled()
+        if time.monotonic() >= deadline:
+            raise TimeoutError("请求超过总时限")
         truncated = len(raw_body) > _MAX_RESPONSE_BYTES
         resp_body = raw_body[:_MAX_RESPONSE_BYTES].decode(
             "utf-8", errors="replace"
@@ -169,8 +211,20 @@ def run(action_info, params):
             "truncated": truncated,
         }
     except OSError as e:
+        if cancellation:
+            cancellation.raise_if_cancelled()
+        if time.monotonic() >= deadline:
+            raise RuntimeError("请求超过总时限") from e
         raise RuntimeError("请求失败") from e
     except http.client.HTTPException as e:
+        if cancellation:
+            cancellation.raise_if_cancelled()
         raise RuntimeError("请求异常") from e
     finally:
+        finished.set()
+        watcher.join(timeout=1)
         connection.close()
+
+
+def run(action_info, params):
+    return run_with_context(action_info, params, {})

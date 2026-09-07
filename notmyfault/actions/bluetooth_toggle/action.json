@@ -9,6 +9,8 @@
     "platforms": ["windows", "linux"],
     "enabled": true,
     "idempotent": false,
+    "execution_api": "context-v1",
+    "cancellation_api": "runtime-v1",
     "permissions": ["external_binary", "native_api"],
     "outputs": [
         {"name": "state", "label": "蓝牙状态", "type": "string"},

@@ -1,4 +1,5 @@
 import ctypes
+import io
 import importlib.util
 import json
 import os
@@ -15,6 +16,39 @@ import pytest
 from notmyfault.core.workflow import ActionCancellation, ActionCancelled, invoke_action
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_powershell_bounds_output_and_kills_cancelled_process(monkeypatch, cancel):
+    module = load_plugin("actions", "run_powershell")
+    event = threading.Event()
+    class Process:
+        returncode = None if cancel else 0
+        stdout = io.BytesIO(b"x" * (module._MAX_OUTPUT + 8192))
+        stderr = io.BytesIO(b"")
+        killed = False
+        def poll(self):
+            return self.returncode
+        def kill(self):
+            self.killed = True
+            self.returncode = -1
+        def wait(self, timeout):
+            return self.returncode
+    process = Process()
+    def launch(*args, **kwargs):
+        if cancel:
+            event.set()
+        return process
+    monkeypatch.setattr(module.subprocess, "Popen", launch)
+    monkeypatch.setattr(module, "_read_available", lambda stream: stream.read1(4096))
+    if cancel:
+        with pytest.raises(ActionCancelled):
+            module.run_with_context({}, {"command": "ignored"}, {"runtime": {"cancellation": ActionCancellation(event)}})
+        assert process.killed
+    else:
+        result = module.run({}, {"command": "ignored"})
+        assert result["stdout"] == "x" * module._MAX_OUTPUT + "...（已截断）"
+        assert result["stderr"] == ""
 
 def load_plugin(ptype, name):
     filename = "action.py" if ptype == "actions" else "trigger.py"
@@ -74,12 +108,14 @@ def test_append_text_writes_timestamped_lines(tmp_path, encoding):
     target = tmp_path / "log.txt"
     mod.run_with_context(
         {},
-        {"file_path": str(target), "text": "一行\n[已带标记]", "add_timestamp": True, "encoding": encoding},
+        {"file_path": str(target), "text": "一行\n\n[普通文本]\n[2024-01-01 12:00:00] 已带时间", "add_timestamp": True, "encoding": encoding},
         {},
     )
     lines = target.read_text(encoding=encoding).splitlines()
     assert lines[0].startswith("[") and lines[0].endswith("] 一行")
-    assert lines[1] == "[已带标记]"
+    assert lines[1] == ""
+    assert lines[2].endswith("] [普通文本]")
+    assert lines[3] == "[2024-01-01 12:00:00] 已带时间"
 
 
 def test_file_operation_compresses_a_single_file(tmp_path):
@@ -265,8 +301,9 @@ def test_media_control_rejects_unknown_command():
 
 
 @pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 GDI 截图")
+@pytest.mark.parametrize("mode", ["active_window", "fullscreen"])
 def test_screenshot_deselects_active_window_bitmap_before_reading(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, mode
 ):
     mod = load_plugin("actions", "screenshot")
     user32 = MagicMock()
@@ -275,6 +312,7 @@ def test_screenshot_deselects_active_window_bitmap_before_reading(
 
     user32.GetForegroundWindow.return_value = 101
     user32.GetDC.return_value = 201
+    user32.GetSystemMetrics.side_effect = lambda metric: {76:-320, 77:-180, 78:320, 79:180}[metric]
 
     def get_window_rect(hwnd, rect_pointer):
         assert hwnd == 101
@@ -291,6 +329,7 @@ def test_screenshot_deselects_active_window_bitmap_before_reading(
 
     user32.GetWindowRect.side_effect = get_window_rect
     user32.PrintWindow.side_effect = print_window
+    gdi32.BitBlt.side_effect = print_window
     gdi32.CreateCompatibleDC.return_value = 202
     gdi32.CreateCompatibleBitmap.return_value = 303
 
@@ -312,11 +351,14 @@ def test_screenshot_deselects_active_window_bitmap_before_reading(
     meta = json.loads((PKG_ROOT / "actions/screenshot/action.json").read_text(encoding="utf-8"))
     assert invoke_action(
         mod.run, mod, meta,
-        {"mode": "active_window", "output_path": str(target), "format": "bmp"},
+        {"mode": mode, "output_path": str(target), "format": "bmp"},
         {},
     ) == {"file": str(target)}
     gdi32.CreateCompatibleBitmap.assert_called_once_with(201, 320, 180)
-    user32.PrintWindow.assert_called_once_with(101, 202, 0)
+    if mode == "active_window":
+        user32.PrintWindow.assert_called_once_with(101, 202, 0)
+    else:
+        gdi32.BitBlt.assert_called_once_with(202, 0, 0, 320, 180, 201, -320, -180, 0x00CC0020)
     assert calls == ["select", "print", "restore", "read"]
     assert target.read_bytes()[:2] == b"BM"
 
@@ -333,6 +375,10 @@ def test_open_url_prepends_https_and_opens_all(monkeypatch):
     result = mod.run({}, {"urls": "example.com\nhttps://foo.bar"})
     assert result == {"opened": 2}
     assert opened == ["https://example.com", "https://foo.bar"]
+    opened.clear()
+    with pytest.raises(ValueError, match="只支持"):
+        mod.run({}, {"urls": "https://example.com\nfile:///bad"})
+    assert opened == []
 
 
 def test_open_url_requires_input():

@@ -89,7 +89,9 @@ def run(action_info, params):
             if working_directory and not os.path.isabs(path)
             else path
         )
-        if sys.platform == "win32" and os.path.isfile(association_path):
+        if (sys.platform == "win32"
+                and (getattr(error, "winerror", None) or error.errno) == 193
+                and os.path.isfile(association_path)):
             try:
                 os.startfile(
                     os.path.abspath(association_path),

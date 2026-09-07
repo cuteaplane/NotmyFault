@@ -32,7 +32,9 @@ def _safe_unpack(archive: str, target: str) -> None:
         with tarfile.open(archive) as tf:
             for member in tf.getmembers():
                 check_member(member.name, member.issym() or member.islnk())
-            tf.extractall(target)
+                if not member.isfile() and not member.isdir():
+                    raise ValueError(f"归档包含特殊文件，拒绝解压: {member.name}")
+            tf.extractall(target, filter="data")
 
 
 def _ensure_copy_safe(source: str, dest: str) -> None:
@@ -56,6 +58,8 @@ def run(action_info, params):
         raise ValueError("未指定源路径")
     if not os.path.exists(source):
         raise FileNotFoundError(f"源路径不存在: {source}")
+    if operation in ("copy", "move") and not dest:
+        raise ValueError("未指定目标路径")
 
     print(f"[Action:file_operation] {operation}: {source} -> {dest}")
 
@@ -73,7 +77,7 @@ def run(action_info, params):
     elif operation == "move":
         _ensure_copy_safe(source, dest)
         parent = os.path.dirname(dest)
-        if parent and not os.path.isdir(source):
+        if parent:
             os.makedirs(parent, exist_ok=True)
         shutil.move(source, dest)
         print(f"[Action:file_operation] 移动完成")
