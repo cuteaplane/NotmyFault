@@ -93,7 +93,6 @@ class AudioDeviceTrigger(PollingTrigger):
                 self._last_ids[flow] = current
                 continue
             if current != previous:
-                self._last_ids[flow] = current
                 self.log(f"默认{flow}设备变化: {previous!r} -> {current!r}")
                 self.emit({
                     "device_type": flow,
@@ -101,6 +100,7 @@ class AudioDeviceTrigger(PollingTrigger):
                     "previous_device_id": previous,
                     "changed": True,
                 })
+                self._last_ids[flow] = current
 
 
 def run(meta, config, emit_event, shutdown_event):

@@ -14,7 +14,7 @@ if os.name == "nt":
     _kernel32 = ctypes.windll.kernel32
     _user32 = ctypes.windll.user32
     _kernel32.GetSystemPowerStatus.argtypes = [ctypes.c_void_p]
-    _kernel32.GetSystemPowerStatus.restype = ctypes.c_bool
+    _kernel32.GetSystemPowerStatus.restype = wintypes.BOOL
     _kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
     _kernel32.GetModuleHandleW.restype = wintypes.HMODULE
     _user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
@@ -44,15 +44,18 @@ def _is_on_battery():
         if battery is None:
             return False, 100
         return not battery.power_plugged, round(battery.percent)
-    try:
-        SYSTEM_POWER_STATUS = ctypes.c_uint8 * 12
-        sps = SYSTEM_POWER_STATUS()
-        ctypes.windll.kernel32.GetSystemPowerStatus(sps)
-        ac_line = sps[0]
-        battery_life = sps[2]
-        return ac_line == 0, battery_life
-    except Exception:
-        return False, 100
+    SYSTEM_POWER_STATUS = ctypes.c_uint8 * 12
+    sps = SYSTEM_POWER_STATUS()
+    with native_lock():
+        if not ctypes.windll.kernel32.GetSystemPowerStatus(sps):
+            raise RuntimeError("读取系统电源状态失败")
+    ac_line = sps[0]
+    battery_life = sps[2]
+    if sps[1] == 128 and ac_line == 1:
+        battery_life = 100
+    if ac_line not in (0, 1) or battery_life > 100:
+        raise RuntimeError("系统电源状态未知")
+    return ac_line == 0, battery_life
 
 
 def _create_power_event_window():
@@ -187,10 +190,12 @@ class PowerStateTrigger(PollingTrigger):
     """电源状态监测：交流/电池/低电量轮询 + Windows 睡眠恢复事件监听"""
 
     interval = 2.0
-    native = True
+    native = False
 
     def validate(self):
         state = self.config.get("state", "ac")
+        if state == "resume" and os.name != "nt":
+            raise ValueError("睡眠恢复事件监听仅支持 Windows")
         if state not in ("ac", "battery", "low_battery", "resume"):
             raise ValueError(
                 f"无效的电源状态: {state!r}"
@@ -198,28 +203,30 @@ class PowerStateTrigger(PollingTrigger):
             )
 
     def setup(self):
+        self.power_window = None
         self.target_state = self.config.get("state", "ac")
         self.log(f"开始监控电源状态，目标: {self.target_state}")
-        # resume 只在 Windows 上通过电源广播消息实现；
-        # 建窗口也要改共享 user32 函数对象，和 poll 一样持 NATIVE_LOCK
+        # resume 只在 Windows 上通过电源广播消息实现。
         if os.name == "nt" and self.target_state == "resume":
             with native_lock():
                 self.power_window = _create_power_event_window()
         else:
             self.power_window = None
         if self.target_state == "resume" and self.power_window is None:
-            self.log("当前平台不支持睡眠恢复事件监听，resume 规则不会触发")
+            raise RuntimeError("无法创建睡眠恢复事件监听窗口")
         try:
             with native_lock():
                 on_battery, _ = _is_on_battery()
         except Exception as e:
             self.log(f"初始电源状态读取失败: {e}")
-            on_battery = False
-        self._last_state = "battery" if on_battery else "ac"
+            on_battery = None
+        self._last_state = None if on_battery is None else ("battery" if on_battery else "ac")
         self._low_battery_active = False
 
     def poll(self):
-        if _pump_power_messages(self.power_window):
+        with native_lock():
+            resumed = _pump_power_messages(self.power_window)
+        if resumed:
             if self.target_state == "resume":
                 self.log("系统从睡眠中恢复")
                 _, resume_pct = _is_on_battery()
@@ -227,6 +234,10 @@ class PowerStateTrigger(PollingTrigger):
 
         on_battery, battery_pct = _is_on_battery()
         current = "battery" if on_battery else "ac"
+
+        if self._last_state is None:
+            self._last_state = current
+            return
 
         if current != self._last_state:
             if current == self.target_state:

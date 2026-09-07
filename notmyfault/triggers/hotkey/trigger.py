@@ -78,7 +78,7 @@ if os.name == "nt":
 
     class HotkeyTrigger(PollingTrigger):
         interval = 0.05
-        native = True
+        native = False
 
         def validate(self):
             raw = str(self.config.get("hotkey", "")).strip()
@@ -100,9 +100,12 @@ if os.name == "nt":
 
         def poll(self):
             msg = wintypes.MSG()
-            while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
-                user32.TranslateMessage(ctypes.byref(msg))
-                user32.DispatchMessageW(ctypes.byref(msg))
+            while not self._stop_event.is_set():
+                with native_lock():
+                    if not user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                        break
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
                 if msg.message == WM_HOTKEY and msg.wParam == self._hkid:
                     self.log(f"热键触发: {self._raw}")
                     self.emit({"hotkey": self._raw})

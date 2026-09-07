@@ -112,11 +112,11 @@ class SessionLockTrigger(PollingTrigger):
         if self._pending == state:
             # 连续第二次采样仍为新状态：确认变化并上报
             previous = self._last_state
-            self._last_state = state
-            self._pending = None
             if self.target_state in ("any", state):
                 self.log(f"锁屏状态变化: {previous} -> {state}")
                 self.emit({"state": state, "previous_state": previous})
+            self._last_state = state
+            self._pending = None
         else:
             # 首次采到新状态时记录到 _pending，下一轮再次确认
             self._pending = state

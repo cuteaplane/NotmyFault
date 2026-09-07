@@ -53,7 +53,7 @@ class ClipboardTrigger(PollingTrigger):
     """剪贴板内容监控，match_text 为空时任意内容变化都会触发"""
 
     interval = 1.0
-    native = True
+    native = False
 
     def setup(self):
         self.match_text = str(self.config.get("match_text", "")).strip()

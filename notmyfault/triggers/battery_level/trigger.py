@@ -56,15 +56,15 @@ class BatteryLevelTrigger(PollingTrigger):
 
         if self.direction == "below":
             if self._armed and percent <= self.threshold:
-                self._armed = False
                 self._emit(percent, state)
+                self._armed = False
             elif not self._armed and percent > self.threshold + self.HYSTERESIS:
                 # 电量超过阈值加迟滞后再次允许触发
                 self._armed = True
         else:
             if self._armed and percent >= self.threshold:
-                self._armed = False
                 self._emit(percent, state)
+                self._armed = False
             elif not self._armed and percent < self.threshold - self.HYSTERESIS:
                 self._armed = True
 

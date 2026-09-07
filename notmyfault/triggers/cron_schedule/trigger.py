@@ -79,9 +79,8 @@ class CronScheduleTrigger(PollingTrigger):
             return
         if (now.hour, now.minute) < (self.hour, self.minute):
             return
-        # 到达或超过计划时间且当天尚未触发时记录日期并发送事件
-        self._fired_date = date_key
         self._emit(now, "daily")
+        self._fired_date = date_key
 
     def _poll_weekly(self, now: datetime) -> None:
         date_key = now.strftime("%Y-%m-%d")
@@ -91,8 +90,8 @@ class CronScheduleTrigger(PollingTrigger):
             return
         if (now.hour, now.minute) < (self.hour, self.minute):
             return
-        self._fired_date = date_key
         self._emit(now, "weekly")
+        self._fired_date = date_key
 
     def _poll_interval(self, now: datetime) -> None:
         if self._last_fired is None:
@@ -102,8 +101,8 @@ class CronScheduleTrigger(PollingTrigger):
         elapsed = (now - self._last_fired).total_seconds()
         if elapsed < self.interval_minutes * 60:
             return
-        self._last_fired = now
         self._emit(now, "interval")
+        self._last_fired = now
 
     def _emit(self, now: datetime, mode: str) -> None:
         self.log(f"计划触发: mode={mode}, time={now.strftime('%H:%M')}")

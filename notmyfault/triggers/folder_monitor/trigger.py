@@ -18,15 +18,14 @@ def _file_matches(pattern: str, name: str) -> bool:
 def _dir_snapshot(folder: str):
     snap = {}
     if not os.path.isdir(folder):
-        return snap
-    for root, dirs, files in os.walk(folder):
+        raise FileNotFoundError(f"监控目录不存在或不可读: {folder}")
+    def failed(error):
+        raise error
+    for root, dirs, files in os.walk(folder, onerror=failed):
         for f in files:
             fpath = os.path.join(root, f)
-            try:
-                stat = os.stat(fpath)
-                snap[fpath] = (stat.st_size, stat.st_mtime)
-            except OSError:
-                continue
+            stat = os.stat(fpath)
+            snap[fpath] = (stat.st_size, stat.st_mtime)
     return snap
 
 

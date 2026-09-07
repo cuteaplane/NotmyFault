@@ -1,4 +1,5 @@
 import socket
+import math
 
 from notmyfault.triggers.base import PollingTrigger
 
@@ -19,6 +20,13 @@ class NetworkStatusTrigger(PollingTrigger):
     interval = 5.0
 
     def validate(self):
+        self.host = str(self.config.get("host", "8.8.8.8")).strip()
+        self.port = int(self.config.get("port", 53))
+        self.timeout = float(self.config.get("timeout", 2))
+        if not self.host or not 1 <= self.port <= 65535:
+            raise ValueError("网络探测主机或端口无效")
+        if not math.isfinite(self.timeout) or not 0.1 <= self.timeout <= 10:
+            raise ValueError("网络探测超时必须在 0.1 到 10 秒之间")
         self.target_state = self.config.get("state", "disconnected")
         if self.target_state not in ("connected", "disconnected"):
             raise ValueError(
@@ -26,12 +34,12 @@ class NetworkStatusTrigger(PollingTrigger):
             )
 
     def setup(self):
-        self._last_connected = _is_connected()
+        self._last_connected = _is_connected(self.host, self.port, self.timeout)
         self.log(f"开始监控网络状态，目标: {self.target_state}")
         self.log(f"初始网络状态: {'已连接' if self._last_connected else '已断开'}")
 
     def poll(self):
-        current = _is_connected()
+        current = _is_connected(self.host, self.port, self.timeout)
         if current != self._last_connected:
             new_state = "connected" if current else "disconnected"
             if new_state == self.target_state:

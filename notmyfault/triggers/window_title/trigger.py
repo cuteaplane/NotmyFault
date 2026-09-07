@@ -72,7 +72,7 @@ def _get_window_titles_linux() -> dict:
 
 class WindowTitleTrigger(PollingTrigger):
     interval = 3.0
-    native = True
+    native = False
 
     def validate(self):
         if not str(self.config.get("title_pattern", "")).strip():

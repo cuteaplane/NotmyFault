@@ -66,7 +66,7 @@ def _current_ssid_linux() -> str | None:
         return None
     for line in result.stdout.splitlines():
         if line.startswith("yes:"):
-            return line[4:]
+            return re.sub(r"\\([\\:])", r"\1", line[4:])
     return ""
 
 
@@ -100,15 +100,15 @@ class WifiNetworkTrigger(PollingTrigger):
         if current == self._last_ssid:
             return
         previous = self._last_ssid
-        self._last_ssid = current
 
         if self.direction == "connected":
             hit = bool(current) and current == self.target
         elif self.direction == "disconnected":
-            hit = (not current) and previous == self.target
+            hit = previous == self.target and current != self.target
         else:
             hit = True  # any：任意变化都算命中
         if not hit:
+            self._last_ssid = current
             return
 
         self.log(f"WiFi 变化: {previous!r} -> {current!r}")
@@ -118,6 +118,7 @@ class WifiNetworkTrigger(PollingTrigger):
             "connected": bool(current),
             "target": self.target,
         })
+        self._last_ssid = current
 
 
 def run(meta, config, emit_event, shutdown_event):

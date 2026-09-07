@@ -665,6 +665,28 @@ def test_power_state_creates_message_window_only_for_resume(monkeypatch):
     assert ac_trigger.power_window is None
     assert resume_trigger.power_window is window
     assert created == [True]
+    monkeypatch.setattr(mod, "os", SimpleNamespace(name="posix"))
+    with pytest.raises(ValueError, match="仅支持 Windows"):
+        resume_trigger.validate()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 GetSystemPowerStatus")
+@pytest.mark.parametrize("success,ac,flags,percent,expected", [
+    (0, 0, 0, 0, None), (1, 255, 255, 255, None),
+    (1, 1, 255, 255, None), (1, 1, 128, 255, (False, 100)),
+    (1, 0, 1, 20, (True, 20)),
+])
+def test_power_read_preserves_unknown_state(monkeypatch, success, ac, flags, percent, expected):
+    mod = load_plugin("triggers", "power_state")
+    def query(status):
+        status[0], status[1], status[2] = ac, flags, percent
+        return success
+    monkeypatch.setattr(mod.ctypes.windll.kernel32, "GetSystemPowerStatus", query)
+    if expected is None:
+        with pytest.raises(RuntimeError):
+            mod._is_on_battery()
+    else:
+        assert mod._is_on_battery() == expected
 
 
 @pytest.mark.skipif(os.name != "nt", reason="仅 Windows 创建电源消息窗口")
@@ -840,16 +862,17 @@ def test_wifi_network_emits_on_target_connect(monkeypatch):
     ]
 
 
-def test_wifi_network_emits_on_leaving_target(monkeypatch):
+@pytest.mark.parametrize("next_ssid", ["", "Office"])
+def test_wifi_network_emits_on_leaving_target(monkeypatch, next_ssid):
     mod = load_plugin("triggers", "wifi_network")
-    scripted(monkeypatch, mod, "_current_ssid", ["Home", ""])
+    scripted(monkeypatch, mod, "_current_ssid", ["Home", next_ssid])
     trigger, events = make_trigger(
         mod, "WifiNetworkTrigger", {"direction": "disconnected", "ssid": "Home"}
     )
     trigger.poll()
     trigger.poll()
     assert events == [
-        {"ssid": "", "previous_ssid": "Home", "connected": False, "target": "Home"}
+        {"ssid": next_ssid, "previous_ssid": "Home", "connected": bool(next_ssid), "target": "Home"}
     ]
 
 

@@ -3,6 +3,7 @@ import math
 import os
 
 from notmyfault.triggers.base import PollingTrigger
+from notmyfault.plugin_api import native_lock
 
 
 class _LASTINPUTINFO(ctypes.Structure):
@@ -28,15 +29,16 @@ def _get_idle_seconds() -> float:
         return get_idle_seconds()
     lii = _LASTINPUTINFO()
     lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)
-    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
-        return 0.0
-    tick = ctypes.windll.kernel32.GetTickCount()
+    with native_lock():
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+            raise RuntimeError("读取用户空闲时间失败")
+        tick = ctypes.windll.kernel32.GetTickCount()
     return _tick_delta_seconds(tick, lii.dwTime)
 
 
 class IdleDetectTrigger(PollingTrigger):
     interval = 2.0
-    native = os.name == "nt"
+    native = False
 
     def validate(self):
         try:

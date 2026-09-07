@@ -7,9 +7,47 @@ from pathlib import Path
 import pytest
 
 from notmyfault.security.plugin_schema import check_payload_contract
+from notmyfault.triggers.base import PollingTrigger
 
 
 TRIGGERS = Path(__file__).resolve().parents[1] / "triggers"
+
+
+def test_partial_trigger_setup_releases_resources():
+    calls = []
+    class Trigger(PollingTrigger):
+        def setup(self):
+            calls.append("opened")
+            raise RuntimeError("setup failed")
+        def teardown(self):
+            calls.append("closed")
+    with pytest.raises(RuntimeError, match="setup failed"):
+        Trigger({}, {}, lambda event: None, threading.Event()).run()
+    assert calls == ["opened", "closed"]
+
+
+def test_folder_read_error_keeps_the_last_complete_snapshot(tmp_path, monkeypatch):
+    module, meta = load_trigger("folder_monitor")
+    path = tmp_path / "watched.txt"
+    path.touch()
+    events = []
+    trigger = module.FolderMonitorTrigger(meta, {"folder_path": str(tmp_path)}, events.append, threading.Event())
+    trigger.validate()
+    trigger.setup()
+    original_stat = module.os.stat
+    def failing_stat(target, *args, **kwargs):
+        if str(target) == str(path):
+            raise PermissionError("unreadable")
+        return original_stat(target, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(module.os, "stat", failing_stat)
+        with pytest.raises(PermissionError):
+            trigger.poll()
+    trigger.poll()
+    assert events == []
+    path.unlink()
+    trigger.poll()
+    assert [event["event"] for event in events] == ["deleted"]
 
 
 def load_trigger(name):

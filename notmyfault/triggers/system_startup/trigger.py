@@ -29,13 +29,13 @@ class SystemStartupTrigger(PollingTrigger):
             return
         if (datetime.now() - self._started_at).total_seconds() < self.delay_seconds:
             return
-        self._fired = True
         started_at = self._started_at.strftime("%Y-%m-%d %H:%M:%S")
         self.log(f"引擎已启动，触发开机任务（延迟 {self.delay_seconds}s）")
         self.emit({
             "started_at": started_at,
             "delay_seconds": self.delay_seconds,
         })
+        self._fired = True
 
 
 def run(meta, config, emit_event, shutdown_event):

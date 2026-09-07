@@ -45,8 +45,8 @@ class PollingTrigger:
 
     def run(self) -> None:
         self.validate()
-        self.setup()
         try:
+            self.setup()
             while not self._stop_event.is_set():
                 try:
                     if self.native:

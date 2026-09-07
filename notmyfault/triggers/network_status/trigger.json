@@ -3,7 +3,7 @@
     "name": "网络状态变化",
     "semantic": "state",
     "trigger_api": "event-v2",
-    "description": "网络连接/断开时触发",
+    "description": "指定主机的 TCP 端口可达状态变化时触发，默认探测 8.8.8.8:53",
     "version_code": 2,
     "version": "1.1",
     "package_name": "io.github.notmyfault.network_status",
@@ -13,6 +13,9 @@
         {"name": "state", "label": "网络状态", "type": "string"}
     ],
     "params": [
+        {"name": "host", "label": "探测主机", "type": "string", "default": "8.8.8.8", "value_type": "text"},
+        {"name": "port", "label": "探测端口", "type": "number", "default": 53, "min": 1, "max": 65535, "value_type": "int"},
+        {"name": "timeout", "label": "连接超时（秒）", "type": "number", "default": 2, "min": 0.1, "max": 10, "value_type": {"type": "duration", "unit": "seconds"}},
         {
             "name": "state",
             "label": "目标状态",
