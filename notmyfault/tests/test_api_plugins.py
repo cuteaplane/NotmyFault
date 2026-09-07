@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import py7zr
+import pytest
 
 from notmyfault.host.api.plugin_installation import PluginFileSystem
 from notmyfault.tests.api_support import make_api_env
@@ -111,7 +112,7 @@ def test_builtin_plugin_id_cannot_be_installed_as_user_plugin(tmp_path):
     assert not (env.paths.user_plugins_dir / "actions" / "notify").exists()
 
 
-def test_builtin_plugin_id_in_other_kind_does_not_conflict(tmp_path):
+def test_builtin_plugin_id_in_other_kind_conflicts(tmp_path):
     env = make_api_env(tmp_path)
     archive = build_nmfp(
         tmp_path,
@@ -126,8 +127,70 @@ def test_builtin_plugin_id_in_other_kind_does_not_conflict(tmp_path):
 
     installed = post_archive(env, "/api/plugins/install", archive)
 
-    assert installed.status_code == 200
-    assert (env.paths.user_plugins_dir / "triggers" / "notify").is_dir()
+    assert installed.status_code == 400
+    assert "plugin_id_collision" in {risk["id"] for risk in installed.json()["risks"]}
+    assert not (env.paths.user_plugins_dir / "triggers" / "notify").exists()
+
+
+@pytest.mark.parametrize("value", [[], "manifest", None])
+def test_non_object_manifest_is_rejected_by_preview_and_reported_in_catalog(tmp_path, value):
+    env = make_api_env(tmp_path)
+    archive = build_nmfp(tmp_path, value, "actions")
+    preview = post_archive(env, "/api/plugins/preview", archive)
+    assert preview.status_code == 400
+    plugin = env.paths.user_plugins_dir / "actions" / "invalid"
+    plugin.mkdir(parents=True)
+    (plugin / "action.json").write_text(json.dumps(value), encoding="utf-8")
+    listed = env.client.get("/api/plugins/list", headers=env.headers)
+    assert listed.status_code == 200
+    assert "JSON 对象" in listed.json()["actions"]["invalid"]["_error"]
+
+
+def test_strict_install_validates_signature_before_replacing_installed_plugin(tmp_path, monkeypatch):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    from notmyfault.host.api.services import plugin_installation
+    from notmyfault.security import signing, signing_keys
+    from notmyfault.security.security import SecurityMode
+
+    env = make_api_env(tmp_path)
+    meta = make_meta("actions", author="插件作者", build={"outputs": ["action.py"]})
+    root = tmp_path / "signed"
+    root.mkdir()
+    (root / "action.json").write_text(json.dumps(meta), encoding="utf-8")
+    original = b"def run(meta, params): return 1\n"
+    (root / "action.py").write_bytes(original)
+    author = Ed25519PrivateKey.generate()
+    owner = Ed25519PrivateKey.generate()
+    signing.self_sign_plugin(root, author)
+    monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [
+        owner.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    ])
+    monkeypatch.setattr(plugin_installation, "detect_security_mode", lambda: SecurityMode.STRICT)
+    monkeypatch.setattr(plugin_installation.PluginInstallationService, "_counter_sign_author_key",
+                        lambda self, path, password: signing.counter_sign_author_key(path, owner) and None)
+
+    def install(tag):
+        archive = tmp_path / f"{tag}.nmfp"
+        with py7zr.SevenZipFile(archive, "w") as output:
+            for path in root.iterdir():
+                output.write(path, f"signed/{path.name}")
+        preview = post_archive(env, "/api/plugins/preview", archive)
+        assert preview.status_code == 200
+        return env.client.post("/api/plugins/install", headers=env.headers, data={
+            "preview_token": preview.json()["preview_token"],
+            "confirmed_risk_ids": '["build_hook"]',
+        })
+
+    assert install("valid").status_code == 200
+    installed = env.paths.user_plugins_dir / "actions" / meta["id"]
+    assert signing.verify_author_key_counter_signature(installed, signing_keys.get_public_keys())
+    assert (installed / "signature.sig").read_bytes() == (root / "signature.sig").read_bytes()
+    (root / "action.py").write_text("def run(meta, params): return 2\n", encoding="utf-8")
+    rejected = install("changed")
+    assert rejected.status_code == 400
+    assert "签名无效" in rejected.json()["error"]
+    assert (installed / "action.py").read_bytes() == original
 
 
 def test_preview_token_installs_the_exact_previewed_directory(tmp_path):

@@ -266,6 +266,19 @@ def test_rule_save_rejects_missing_binding_source(tmp_path):
     assert response.json()["error"] == "规则数据绑定无效"
     assert response.json()["details"]
 
+    from notmyfault.host.api.services.rules import RuleService, RuleServiceError
+    service = RuleService(env.store, lambda: {
+        "triggers": {"hotkey": {"params": []}},
+        "actions": {"notify": {"params": [{"name": "message", "type": "string", "required": True}]}},
+    })
+    rule = {"name": "必填参数", "event": {"type": "hotkey", "params": {}},
+            "actions": [{"type": "notify", "params": {}}]}
+    assert service.validate_draft(rule)["valid"] is False
+    with pytest.raises(RuleServiceError) as caught:
+        service.save([rule], None)
+    assert caught.value.status_code == 400
+    assert env.store.load_verified_rules() == []
+
 
 def test_rules_transport_preserves_typed_constants_and_literal_objects(tmp_path):
     from decimal import Decimal
@@ -299,6 +312,7 @@ def test_engine_control_and_status_contract(tmp_path):
     assert started.json() == {
         "ok": True,
         "running": True,
+        "engine_running": True,
         "engine_state": "running",
         "api_alive": True,
     }
@@ -311,6 +325,7 @@ def test_engine_control_and_status_contract(tmp_path):
         "ok": True,
         "stopped": True,
         "stopping": False,
+        "engine_running": False,
         "engine_state": "stopped",
         "api_alive": True,
     }

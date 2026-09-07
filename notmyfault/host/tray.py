@@ -2,6 +2,7 @@
 
 import ctypes
 import os
+import subprocess
 import sys
 import threading
 from typing import Optional, Callable
@@ -114,8 +115,11 @@ class TrayIcon:
             pass
 
     def set_auto_start(self, enable: bool):
+        if not (_register_auto_start if enable else _unregister_auto_start)():
+            self.show_balloon("开机自启设置失败", "无法写入当前用户的开机自启设置", NIIF_ERROR)
+            return False
         self._auto_start_enabled = enable
-        (_register_auto_start if enable else _unregister_auto_start)()
+        return True
 
     def _run(self):
         # 先设置线程 DPI，再调用 RegisterClass() 和 CreateWindow()。
@@ -314,15 +318,22 @@ def _load_icon():
 AUTO_START_NAME = "NotmyFaultEngine"
 
 
+def _auto_start_command() -> str:
+    if getattr(sys, "frozen", False):
+        return subprocess.list2cmdline([sys.executable])
+    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    executable = pythonw if os.path.isfile(pythonw) else sys.executable
+    return subprocess.list2cmdline([executable, os.path.join(PROJECT_ROOT, "NOTMYFAULT.pyw")])
+
+
 def _register_auto_start():
     import winreg
-    exe = sys.executable if getattr(sys, "frozen", False) else \
-        os.path.abspath(os.path.join(PROJECT_ROOT, "NOTMYFAULT.pyw"))
+    command = _auto_start_command()
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                             r"Software\Microsoft\Windows\CurrentVersion\Run",
                             0, winreg.KEY_SET_VALUE) as k:
-            winreg.SetValueEx(k, AUTO_START_NAME, 0, winreg.REG_SZ, exe)
+            winreg.SetValueEx(k, AUTO_START_NAME, 0, winreg.REG_SZ, command)
         return True
     except Exception:
         return False
@@ -336,7 +347,7 @@ def _unregister_auto_start():
                             0, winreg.KEY_SET_VALUE) as k:
             try:
                 winreg.DeleteValue(k, AUTO_START_NAME)
-            except OSError:
+            except FileNotFoundError:
                 pass
         return True
     except Exception:
@@ -349,7 +360,7 @@ def _is_auto_start_enabled() -> bool:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                             r"Software\Microsoft\Windows\CurrentVersion\Run",
                             0, winreg.KEY_READ) as k:
-            winreg.QueryValueEx(k, AUTO_START_NAME)
-            return True
+            command, _kind = winreg.QueryValueEx(k, AUTO_START_NAME)
+            return command == _auto_start_command()
     except Exception:
         return False

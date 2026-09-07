@@ -184,24 +184,11 @@ class PluginCatalogService:
     def plugin_id_collision(self, plugin_kind: str, meta: Dict[str, Any]):
         plugin_id = meta.get("id", "")
         package_name = meta.get("package_name", "")
-        builtin = self.find_builtin_plugin_by_id(plugin_kind, plugin_id)
-        if builtin is not None:
-            return builtin
-        user_dir = str(self.paths.user_plugins_dir)
-        json_name = (
-            "trigger.json" if plugin_kind == "triggers" else "action.json"
-        )
-        existing_meta = scan_plugins(
-            user_dir,
-            plugin_kind,
-            json_name,
-            include_disabled=True,
-        ).get(plugin_id)
-        existing = (
-            (plugin_kind, plugin_id, existing_meta)
-            if existing_meta is not None
-            else None
-        )
+        for kind in ("triggers", "actions"):
+            builtin = self.find_builtin_plugin_by_id(kind, plugin_id)
+            if builtin is not None:
+                return builtin
+        existing = self.find_user_plugin_by_id(plugin_id)
         if existing and existing[2].get("package_name") != package_name:
             return existing
         return None
@@ -285,6 +272,13 @@ class PluginCatalogService:
                 with open(json_path, "r", encoding="utf-8") as file:
                     meta = json.load(file)
             except (json.JSONDecodeError, OSError):
+                continue
+            if not isinstance(meta, dict):
+                result.setdefault(folder_name, {
+                    "id": folder_name,
+                    "origin": origin,
+                    "_error": "schema: 插件元数据不是有效的 JSON 对象",
+                })
                 continue
             plugin_id = meta.get("id", folder_name)
             if plugin_id in result:

@@ -9,7 +9,6 @@ from notmyfault.config import (
     SignedConfigStore,
     ensure_rule_binding_ids,
     ensure_rule_id,
-    validate_rules_safety,
 )
 from notmyfault.core.rules import (
     get_rule_events,
@@ -67,11 +66,13 @@ class RuleService:
         else:
             normalized = ensure_rule_binding_ids(rule)
             schema = self._plugin_schema()
-            _valid, _total, _plugin_errors, plugin_warnings = validate_rules(
+            _valid, _total, plugin_errors, plugin_warnings = validate_rules(
                 [normalized],
                 schema["triggers"],
                 schema["actions"],
             )
+            for _rule_name, message in plugin_errors:
+                add("error", "plugin_parameter", message)
             for _rule_name, message in plugin_warnings:
                 add("warning", "plugin_parameter", message)
 
@@ -152,12 +153,6 @@ class RuleService:
                     issue.get("message", "规则数据绑定无效"),
                     issue.get("location", ""),
                 )
-
-            safety_warnings, safety_errors = validate_rules_safety([normalized])
-            for message in safety_warnings:
-                add("warning", "safety_warning", message)
-            for message in safety_errors:
-                add("error", "unsafe_action", message)
 
         unique_issues: list[Dict[str, Any]] = []
         seen: set[tuple[Any, ...]] = set()
@@ -254,14 +249,16 @@ class RuleService:
                 },
             )
 
-        _warnings, errors = validate_rules_safety(normalized_rules)
-        if errors:
+        _valid, _total, plugin_errors, _warnings = validate_rules(
+            normalized_rules, schema["triggers"], schema["actions"]
+        )
+        if plugin_errors:
             raise RuleServiceError(
                 400,
                 {
                     "ok": False,
-                    "error": "规则安全校验失败",
-                    "details": errors[:10],
+                    "error": "规则插件参数无效",
+                    "details": [f"{name}: {message}" for name, message in plugin_errors[:20]],
                 },
             )
 

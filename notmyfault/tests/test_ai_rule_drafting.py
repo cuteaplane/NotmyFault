@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -170,7 +172,7 @@ def test_stream_emits_final_result_and_done(tmp_path):
     ]
 
 
-def test_stream_disconnect_stops_without_done(tmp_path):
+def test_stream_disconnect_stops_without_done(tmp_path, monkeypatch):
     service, _store = build_service(tmp_path, StreamingProvider())
     plan = service.prepare_stream(
         {"messages": [{"role": "user", "content": "提醒"}]}
@@ -188,6 +190,38 @@ def test_stream_disconnect_stops_without_done(tmp_path):
     events = asyncio.run(collect())
     assert events[0] == ("status", {"status": "started"})
     assert all(kind != "done" for kind, _payload in events)
+
+    reading = threading.Event()
+    released = threading.Event()
+    finished = threading.Event()
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            finished.set()
+
+        def read(self, _count):
+            reading.set()
+            assert released.wait(2)
+            return b""
+
+        def close(self):
+            released.set()
+
+    monkeypatch.setattr(ai_provider, "resolve_public_http_url", lambda *_args, **_kwargs: (None, ("8.8.8.8",)))
+    monkeypatch.setattr(ai_provider, "_is_private_host", lambda _host: False)
+    monkeypatch.setattr(ai_provider, "_build_request_opener", lambda _addresses: SimpleNamespace(open=lambda *_args, **_kwargs: Response()))
+    provider = OpenAICompatibleDraftProvider("https://example.invalid/v1", "test-model", "test-key")
+    service, _store = build_service(tmp_path / "blocking", provider)
+    plan = service.prepare_stream({"messages": [{"role": "user", "content": "提醒"}]})
+
+    async def collect_blocking():
+        return [item async for item in service.stream(plan, lambda: asyncio.sleep(0, reading.is_set()))]
+
+    assert asyncio.run(collect_blocking()) == [("status", {"status": "started"})]
+    assert released.is_set() and finished.is_set()
 
 
 def test_stream_reports_120_second_idle_timeout(tmp_path):
@@ -231,6 +265,9 @@ def test_provider_stream_translates_socket_timeout(monkeypatch):
     provider._request_host = "example.test"
     provider._request_url = "https://example.test/v1/chat/completions"
     provider._opener = TimeoutOpener()
+    provider._response_lock = threading.Lock()
+    provider._stream_response = None
+    provider._cancelled = threading.Event()
     monkeypatch.setattr(ai_provider, "_is_private_host", lambda _host: False)
 
     with pytest.raises(AIProviderIdleTimeoutError):
@@ -271,7 +308,7 @@ def test_key_store_failure_is_generic(tmp_path):
     assert "secret-value" not in response.text
 
 
-def test_settings_never_write_api_key_to_config(tmp_path):
+def test_settings_never_write_api_key_to_config(tmp_path, monkeypatch):
     key_store = FakeKeyStore()
     env = make_api_env(tmp_path, ai_key_store=key_store)
     response = env.client.put(
@@ -288,6 +325,20 @@ def test_settings_never_write_api_key_to_config(tmp_path):
     assert response.status_code == 200
     raw = env.paths.config_file.read_text(encoding="utf-8")
     assert "must-not-be-written" not in raw
+    from notmyfault.host.api.services import ai_drafting
+    from notmyfault.host.ai_provider import AIProviderRequestError
+
+    key_store.save_api_key("saved-provider-key")
+    service, _store = build_service(tmp_path / "provider", key_store=key_store)
+    settings = enabled_config()["settings"]["ai_drafting"]
+    monkeypatch.setattr(ai_drafting, "OpenAICompatibleDraftProvider", lambda **options: SimpleNamespace(**options))
+    assert service._build_configured_provider({}, settings).api_key == "saved-provider-key"
+    with pytest.raises(AIProviderRequestError):
+        service._build_configured_provider({"endpoint_url": "https://other.invalid/v1"}, settings)
+    temporary = service._build_configured_provider({
+        "endpoint_url": "https://other.invalid/v1", "api_key": "temporary-key",
+    }, settings)
+    assert temporary.api_key == "temporary-key"
 
 
 def test_status_maps_injected_key_state(tmp_path):

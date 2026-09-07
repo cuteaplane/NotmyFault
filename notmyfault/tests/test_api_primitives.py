@@ -173,7 +173,7 @@ def test_backup_store_prefers_backup_named_after_current_plugin(tmp_path) -> Non
 class _EventHistory:
     def __init__(self) -> None:
         self.events = []
-    def record(self, event) -> None:
+    def record_async(self, event) -> None:
         self.events.append(event)
 
 

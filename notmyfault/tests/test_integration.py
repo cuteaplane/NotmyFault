@@ -404,3 +404,16 @@ class TestLoggingPipeline:
         assert diag["plugin_errors"] == [
             {"plugin": "p1", "type": "?", "reason": "bad"}
         ]
+        from notmyfault.host.api.services.engine import EngineService
+
+        service = EngineService(None, None, SimpleNamespace(logs_dir=tmp_path), None, None)
+        assert service.logs(2)["total"] == 3
+        assert len(service.logs(2)["lines"]) == 2
+        with log_path.open("a", encoding="utf-8") as file:
+            file.write("后续")
+        assert service.logs(1) == {"lines": ["后续"], "total": 4}
+        with log_path.open("a", encoding="utf-8") as file:
+            file.write("内容\n")
+        assert service.logs(1) == {"lines": ["后续内容"], "total": 4}
+        log_path.write_text("重新开始\n", encoding="utf-8")
+        assert service.logs(1) == {"lines": ["重新开始"], "total": 1}

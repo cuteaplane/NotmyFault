@@ -7,6 +7,7 @@ import codecs
 import json
 import socket
 import ssl
+import threading
 from http.client import HTTPException, HTTPSConnection
 from typing import Any, Callable, Dict, Iterator
 from urllib import parse, request
@@ -428,6 +429,24 @@ class OpenAICompatibleDraftProvider:
         self._api_key = api_key
         self._request_host = parsed.hostname or ""
         self._opener = _build_request_opener(addresses)
+        self._response_lock = threading.Lock()
+        self._stream_response = None
+        self._cancelled = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+        with self._response_lock:
+            response = self._stream_response
+        if response is None:
+            return
+        raw = getattr(getattr(response, "fp", None), "raw", None)
+        connection = getattr(raw, "_sock", None)
+        if connection is not None:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        response.close()
 
     def __call__(
         self,
@@ -523,10 +542,14 @@ class OpenAICompatibleDraftProvider:
         decoder = _SSEDecoder()
         total_bytes = 0
         finished = False
+        if self._cancelled.is_set() or (should_stop is not None and should_stop()):
+            return
         try:
             with self._opener.open(req, timeout=idle_timeout) as response:
+                with self._response_lock:
+                    self._stream_response = response
                 while True:
-                    if should_stop is not None and should_stop():
+                    if self._cancelled.is_set() or (should_stop is not None and should_stop()):
                         return
                     chunk = response.read(_STREAM_CHUNK_BYTES)
                     if not chunk:
@@ -552,6 +575,9 @@ class OpenAICompatibleDraftProvider:
             raise AIProviderIdleTimeoutError("AI 草稿请求超时") from error
         except (OSError, HTTPException) as error:
             raise AIProviderRequestError(_request_failure_message(error)) from error
+        finally:
+            with self._response_lock:
+                self._stream_response = None
 
         body = accumulator.body()
         if self._api_format == "responses":

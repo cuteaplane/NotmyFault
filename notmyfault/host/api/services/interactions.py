@@ -155,6 +155,7 @@ class PluginInteractionService:
         try:
             result = await asyncio.to_thread(invoke_handler)
         except Exception as error:
+            self._extension_sessions.drop(session.session_id)
             raise PluginInteractionError(
                 400,
                 {
@@ -168,7 +169,7 @@ class PluginInteractionService:
         if not isinstance(result, dict):
             result = {"ok": True, "data": result}
         if result.get("ok") is False:
-            if result.get("close") is True:
+            if result.get("close") is True or not session_id:
                 self._extension_sessions.drop(session.session_id)
             raise PluginInteractionError(
                 400,
@@ -215,11 +216,13 @@ class PluginInteractionService:
                 json.dumps(encode_value(response), ensure_ascii=False).encode("utf-8")
             )
         except (TypeError, ValueError) as error:
+            self._extension_sessions.drop(session.session_id)
             raise PluginInteractionError(
                 400,
                 {"ok": False, "error": "插件命令返回了无法保存为 JSON 的数据"},
             ) from error
         if response_size > _MESSAGE_MAX_BYTES:
+            self._extension_sessions.drop(session.session_id)
             raise PluginInteractionError(
                 413,
                 {"ok": False, "error": "插件命令返回数据不能超过 1 MiB"},

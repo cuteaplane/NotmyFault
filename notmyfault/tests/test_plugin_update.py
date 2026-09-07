@@ -192,7 +192,7 @@ def _prepare_engine_recovery(monkeypatch, tmp_path):
 
     paths = make_paths(tmp_path)
     store = make_store(paths)
-    monkeypatch.setattr(app, "_ensure_first_run_build", lambda: None)
+    monkeypatch.setattr(app, "_ensure_first_run_build", lambda package_root: None)
     monkeypatch.setattr(
         app,
         "_get_plugin_paths",

@@ -28,13 +28,12 @@ from notmyfault.security.plugin_schema import (
     current_platform_name,
     get_permission_info,
     is_valid_plugin_id,
-    is_known_permission,
     scan_plugin_security,
     validate_plugin_meta,
 )
 from notmyfault.security.plugin_package import PluginPackageLimits, extract_nmfp
 from notmyfault.security.plugins import plugin_signature_kind, scan_borrowed_privilege
-from notmyfault.security.security import SecurityMode, detect_security_mode
+from notmyfault.security.security import detect_security_mode
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,12 +276,7 @@ class PluginInstallationService:
             )
             root_path = self._plugin_root(extract_dir)
             plugin_kind, json_name = self._plugin_kind(root_path)
-            try:
-                meta = json.loads(
-                    (root_path / json_name).read_text(encoding="utf-8")
-                )
-            except (json.JSONDecodeError, OSError):
-                self._fail(400, "插件元数据 JSON 损坏或缺失")
+            meta = self._read_manifest(root_path / json_name)
             plugin_type = "trigger" if plugin_kind == "triggers" else "action"
             schema_valid, schema_errors = validate_plugin_meta(meta, plugin_type)
             risks = self.scan_install_risks(str(root_path), json_name, meta)
@@ -487,18 +481,6 @@ class PluginInstallationService:
             if destination.parent != expected_parent:
                 self._fail(400, "插件路径越界")
 
-            permissions = meta.get("permissions", [])
-            permission_conform, _ = check_permissions_conform(permissions)
-            if detect_security_mode() == SecurityMode.STRICT and not permission_conform:
-                unknown = [
-                    item for item in permissions if not is_known_permission(item)
-                ]
-                self._fail(
-                    400,
-                    "严格模式下拒绝安装：插件请求了未知权限: "
-                    + ", ".join(unknown),
-                )
-
             collision = self._catalog.plugin_id_collision(plugin_kind, meta)
             if collision is not None:
                 self._fail(409, "插件 id 已被其他包使用")
@@ -569,6 +551,11 @@ class PluginInstallationService:
                     )
                     error.risks = new_risks
                     raise error
+                from notmyfault.security.plugin_loader import validate_plugin_signature
+
+                validate_plugin_signature(
+                    staging, written_meta, "user", detect_security_mode()
+                )
 
             try:
                 backups = self._transaction.install_tree(
@@ -712,11 +699,6 @@ class PluginInstallationService:
         for relative_output in outputs:
             if not (root_path / relative_output).exists():
                 raise ValueError("插件构建没有生成声明的产物")
-        for signature_name in ("signature.sig", "public_key.pem"):
-            try:
-                (root_path / signature_name).unlink()
-            except FileNotFoundError:
-                pass
 
     @staticmethod
     def _validate_generated_plugin(staging: Path, json_name: str) -> None:

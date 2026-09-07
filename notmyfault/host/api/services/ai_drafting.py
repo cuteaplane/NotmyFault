@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-import queue
+import inspect
 import threading
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List
@@ -62,6 +62,7 @@ class AIDraftingService:
         provider: Any = None,
     ) -> None:
         self._store = store
+        self._stream_slots = threading.BoundedSemaphore(2)
         self._plugin_schema = plugin_schema
         self._validate_rule = validate_rule
         self._provider = provider
@@ -186,17 +187,31 @@ class AIDraftingService:
         plan: AIStreamPlan,
         is_disconnected: Callable[[], Awaitable[bool]],
     ) -> AsyncIterator[tuple[str, Dict[str, Any]]]:
-        yield "status", {"status": "started"}
-        items: queue.Queue = queue.Queue()
+        if not self._stream_slots.acquire(blocking=False):
+            yield "error", {"code": "ai_busy", "error": "AI 请求仍在结束，请稍后重试"}
+            yield "done", {"status": "done"}
+            return
+        items: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
         cancel_event = threading.Event()
+        active_provider = None
+
+        def enqueue(item):
+            if not cancel_event.is_set() and not loop.is_closed():
+                loop.call_soon_threadsafe(items.put_nowait, item)
 
         def make_stream():
+            nonlocal active_provider
+            active_provider = self._provider
             if self._provider is not None:
                 provider_stream = getattr(self._provider, "stream", None)
                 if callable(provider_stream):
+                    parameters = inspect.signature(provider_stream).parameters
+                    options = {"should_stop": cancel_event.is_set} if "should_stop" in parameters else {}
                     return provider_stream(
                         plan.messages,
                         plan.schema,
+                        **options,
                     )
                 if callable(self._provider):
                     def fallback():
@@ -213,6 +228,7 @@ class AIDraftingService:
                 plan.body,
                 plan.settings,
             )
+            active_provider = configured
             return configured.stream(
                 plan.messages,
                 plan.schema,
@@ -228,19 +244,22 @@ class AIDraftingService:
                 for kind, payload in generator:
                     if cancel_event.is_set():
                         break
-                    items.put(("event", kind, payload))
+                    enqueue(("event", kind, payload))
             except Exception as error:
                 failure = error
             finally:
-                if generator is not None:
-                    generator.close()
+                try:
+                    if generator is not None:
+                        generator.close()
+                finally:
+                    self._stream_slots.release()
             if not cancel_event.is_set():
                 marker = (
                     ("error", failure)
                     if failure is not None
                     else ("finish", None)
                 )
-                items.put(marker)
+                enqueue(marker)
 
         worker = threading.Thread(
             target=run,
@@ -251,16 +270,16 @@ class AIDraftingService:
         finalized = False
         disconnected = False
         try:
+            yield "status", {"status": "started"}
             while True:
                 if await is_disconnected():
                     disconnected = True
                     break
                 try:
-                    item = items.get_nowait()
-                except queue.Empty:
+                    item = await asyncio.wait_for(items.get(), timeout=0.1)
+                except asyncio.TimeoutError:
                     if not worker.is_alive():
                         break
-                    await asyncio.sleep(0.01)
                     continue
                 tag = item[0]
                 if tag == "event":
@@ -308,6 +327,10 @@ class AIDraftingService:
                     break
         finally:
             cancel_event.set()
+            cancel = getattr(active_provider, "cancel", None)
+            if callable(cancel):
+                await asyncio.to_thread(cancel)
+            await asyncio.to_thread(worker.join, 1.0)
         if not disconnected:
             yield "done", {"status": "done"}
 
@@ -337,7 +360,9 @@ class AIDraftingService:
     ) -> OpenAICompatibleDraftProvider:
         endpoint_url = body.get("endpoint_url") or settings.get("endpoint_url")
         model = body.get("model") or settings.get("model")
-        api_key = body.get("api_key") or self._load_saved_api_key()
+        api_key = body.get("api_key")
+        if not api_key and endpoint_url == settings.get("endpoint_url"):
+            api_key = self._load_saved_api_key()
         if not endpoint_url or not model or not api_key:
             raise AIProviderRequestError(
                 "AI 服务未配置：请先在设置中填写端点地址、模型名称并保存 API Key"

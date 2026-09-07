@@ -5,12 +5,16 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 import functools
 import http.server
 import socketserver
 import socket
 import threading
 import secrets
+import re
+import shutil
+from pathlib import Path
 
 DASHBOARD_PORT = 19199
 DASHBOARD_CONTROL_PORT = 19197
@@ -46,8 +50,8 @@ def _patch_qt_permission_policy():
 
     def handle_permission(self, url, requested_feature):
         local_page = url.scheme() == "http" and url.host() in {"127.0.0.1", "localhost"}
-        allowed = requested_feature in media_features or (
-            requested_feature == feature.ClipboardReadWrite and local_page
+        allowed = local_page and (
+            requested_feature in media_features or requested_feature == feature.ClipboardReadWrite
         )
         permission = (
             policy.PermissionGrantedByUser if allowed else policy.PermissionDeniedByUser
@@ -514,7 +518,7 @@ class DashboardAPI:
         """列出所有日志文件信息"""
         try:
             from notmyfault.core.logging import list_logs
-            return list_logs(self._LOG_DIR)
+            return list_logs(str(self._paths.logs_dir))
         except Exception as e:
             return []
 
@@ -528,7 +532,7 @@ class DashboardAPI:
                 or not (name.startswith("engine-") and name.endswith(".log"))
             ):
                 return []
-            log_path = os.path.join(self._LOG_DIR, name)
+            log_path = os.path.join(str(self._paths.logs_dir), name)
             if not os.path.isfile(log_path):
                 return []
             from notmyfault.core.logging import read_log_entries as _read
@@ -540,9 +544,11 @@ class DashboardAPI:
 
 class _DashboardStaticHandler(http.server.SimpleHTTPRequestHandler):
     def end_headers(self):
-        self.send_header("Cache-Control", "no-store, max-age=0")
-        self.send_header("Pragma", "no-cache")
-        self.send_header("Expires", "0")
+        path = urllib.parse.urlsplit(self.path).path
+        if path.startswith("/assets/") and re.search(r"-[A-Za-z0-9_-]{8,}\.[^/]+$", path):
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        else:
+            self.send_header("Cache-Control", "no-store, max-age=0")
         super().end_headers()
 
 
@@ -551,7 +557,7 @@ def _start_static_server(directory, port=DASHBOARD_PORT):
     Handler = functools.partial(_DashboardStaticHandler, directory=directory)
     for p in range(port, port + 20):
         try:
-            httpd = socketserver.TCPServer(("127.0.0.1", p), Handler)
+            httpd = http.server.ThreadingHTTPServer(("127.0.0.1", p), Handler)
             httpd.daemon_threads = True
             threading.Thread(target=httpd.serve_forever, daemon=True).start()
             version = int(os.path.getmtime(os.path.join(directory, "index.html")))
@@ -562,18 +568,31 @@ def _start_static_server(directory, port=DASHBOARD_PORT):
 
 
 def _ensure_dashboard_build():
-    """构建产物不存在时运行 npm run build 并返回是否成功"""
-    dist = os.path.join(PROJECT_ROOT, "dashboard", "dist")
-    if os.path.isdir(dist) and os.path.exists(os.path.join(dist, "index.html")):
-        return True
+    """源码或构建配置比 index.html 新时重新构建，发行包直接使用随包产物。"""
+    root = Path(PROJECT_ROOT) / "dashboard"
+    index = root / "dist" / "index.html"
+    if index.is_file():
+        if getattr(sys, "frozen", False):
+            return True
+        inputs = [root / name for name in (
+            "index.html", "package.json", "package-lock.json", "vite.config.js",
+        )]
+        inputs.append(root.parent / "notmyfault" / "version.py")
+        for directory in (root / "src", root / "public"):
+            inputs.append(directory)
+            if directory.is_dir():
+                inputs.extend(directory.rglob("*"))
+        built_at = index.stat().st_mtime_ns
+        if all(path.stat().st_mtime_ns <= built_at for path in inputs if path.exists()):
+            return True
     npm = os.path.join(PROJECT_ROOT, "dashboard")
     if not os.path.exists(os.path.join(npm, "package.json")):
         return False
-    print("[Dashboard] 构建产物不存在，自动 npm run build...")
+    print("[Dashboard] 构建产物缺失或已过期，自动 npm run build...")
     try:
         import subprocess
         result = subprocess.run(
-            ["npm", "run", "build"],
+            [shutil.which("npm") or "npm", "run", "build"],
             cwd=npm,
             capture_output=True,
             text=True,
@@ -583,7 +602,7 @@ def _ensure_dashboard_build():
         )
         if result.returncode == 0:
             print("[Dashboard] npm run build 成功")
-            return True
+            return index.is_file()
         print(f"[Dashboard] npm run build 失败 (code={result.returncode}): {result.stderr.strip()[:200]}")
     except FileNotFoundError:
         print("[Dashboard] npm 未安装，无法自动构建")
@@ -597,8 +616,8 @@ def _ensure_dashboard_build():
 def _resolve_dashboard_url():
     """准备构建产物和静态服务器并返回 Dashboard 地址"""
     dist = os.path.join(PROJECT_ROOT, "dashboard", "dist")
-    if not (os.path.isdir(dist) and os.path.exists(os.path.join(dist, "index.html"))):
-        _ensure_dashboard_build()
+    if not _ensure_dashboard_build():
+        return None, None
     if os.path.isdir(dist) and os.path.exists(os.path.join(dist, "index.html")):
         httpd, url = _start_static_server(dist)
         if url:

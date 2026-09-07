@@ -422,11 +422,20 @@ def test_extension_view_rejects_page_outside_plugin_root(tmp_path):
     assert "不应读取" not in response.text
 
 
-def test_extension_exception_is_logged_but_not_returned(tmp_path):
+@pytest.mark.parametrize("result_kind", ["exception", "json", "size", "error"])
+def test_extension_exception_is_logged_but_not_returned(tmp_path, result_kind):
     engine = ExtensionEngine(tmp_path)
+    cleaned = []
 
     def fail(_context, _payload):
-        raise RuntimeError("unit-test-secret-extension-detail")
+        _context.register_cleanup(lambda: cleaned.append(True))
+        if result_kind == "exception":
+            raise RuntimeError("unit-test-secret-extension-detail")
+        if result_kind == "json":
+            return {"data": object()}
+        if result_kind == "size":
+            return {"data": "x" * (1024 * 1024 + 1)}
+        return {"ok": False, "error": "操作失败"}
 
     engine.extensions.register_command("sample", "open", fail, engine)
     client, headers = make_client(tmp_path, engine)
@@ -440,9 +449,10 @@ def test_extension_exception_is_logged_but_not_returned(tmp_path):
         },
     )
 
-    assert response.status_code == 400
-    assert response.json()["error"] == "插件命令调用失败"
+    assert response.status_code == (413 if result_kind == "size" else 400)
+    assert response.json()["ok"] is False
     assert "unit-test-secret-extension-detail" not in response.text
+    assert cleaned == [True]
 
 
 def test_extension_session_manager_drop_all_runs_cleanup():

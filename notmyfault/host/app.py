@@ -28,10 +28,7 @@ def _notify_build_required(detail: str) -> None:
         print("[Startup] 无法发送安装完整性提示", file=sys.stderr)
 
 
-_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def _shipped_plugin_directories() -> list[str]:
+def _shipped_plugin_directories(package_root: str) -> list[str]:
     plugin_specs = (
         ("actions", "action.json"),
         ("triggers", "trigger.json"),
@@ -40,15 +37,15 @@ def _shipped_plugin_directories() -> list[str]:
         os.path.dirname(meta_path)
         for relative_root, json_name in plugin_specs
         for meta_path in glob.glob(
-            os.path.join(_PKG_ROOT, relative_root, "*", json_name)
+            os.path.join(package_root, relative_root, "*", json_name)
         )
     ]
 
 
-def _ensure_first_run_build() -> None:
+def _ensure_first_run_build(package_root: str) -> None:
     if getattr(sys, "frozen", False):
         return
-    project_root = os.path.dirname(_PKG_ROOT)
+    project_root = os.path.dirname(package_root)
     required_files = [
         os.path.join(project_root, "build.json"),
         os.path.join(project_root, "build.json.sig"),
@@ -57,7 +54,7 @@ def _ensure_first_run_build() -> None:
     if detect_security_mode() == SecurityMode.STRICT:
         missing.extend(
             os.path.join(plugin_dir, "signature.sig")
-            for plugin_dir in _shipped_plugin_directories()
+            for plugin_dir in _shipped_plugin_directories(package_root)
             if not os.path.isfile(os.path.join(plugin_dir, "signature.sig"))
         )
     if not missing:
@@ -292,7 +289,7 @@ def create_engine(
     on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     plugin_file_system: PluginFileSystem | None = None,
 ) -> AutomationEngine:
-    _ensure_first_run_build()
+    _ensure_first_run_build(str(store.paths.package_root))
     config = store.load_config()
     migrate_user_plugin_enabled_state(config, store)
     config["rules"] = store.load_rules()

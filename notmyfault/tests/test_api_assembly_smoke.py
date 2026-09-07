@@ -55,6 +55,8 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
         package_root / "actions" / "notify",
     )
     paths = make_paths(tmp_path, package_root=package_root)
+    (tmp_path / "build.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "build.json.sig").write_bytes(b"test-signature")
     store = make_store(paths)
     assert store.save_rules(
         [

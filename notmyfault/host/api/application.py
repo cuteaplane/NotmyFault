@@ -87,6 +87,7 @@ class ApiApplication:
             with suppress(asyncio.CancelledError):
                 await cleanup_task
             self._extension_sessions.drop_all()
+            await asyncio.to_thread(self._run_history.flush)
 
     async def _cleanup_extension_sessions(self) -> None:
         while True:

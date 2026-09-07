@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 import os
 import sys
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Protocol
 
@@ -41,6 +42,13 @@ class EngineService:
         self._history = history
         self._extension_sessions = extension_sessions
         self._process_id = process_id
+        self._log_lock = threading.Lock()
+        self._log_key = None
+        self._log_offset = 0
+        self._log_mtime = 0
+        self._log_total = 0
+        self._log_pending = b""
+        self._log_tail: deque[str] = deque(maxlen=2000)
 
     def start(self) -> Dict[str, Any]:
         current_state = self._engine.engine_state
@@ -48,6 +56,7 @@ class EngineService:
             return {
                 "ok": True,
                 "running": self._engine.engine_running,
+                "engine_running": self._engine.engine_running,
                 "engine_state": current_state,
                 "api_alive": True,
                 "message": (
@@ -62,6 +71,7 @@ class EngineService:
                 {
                     "ok": False,
                     "running": self._engine.engine_running,
+                    "engine_running": self._engine.engine_running,
                     "engine_state": self._engine.engine_state,
                     "message": "engine_stopping",
                 },
@@ -69,6 +79,7 @@ class EngineService:
         return {
             "ok": True,
             "running": self._engine.engine_running,
+            "engine_running": self._engine.engine_running,
             "engine_state": self._engine.engine_state,
             "api_alive": True,
         }
@@ -80,6 +91,7 @@ class EngineService:
             "ok": True,
             "stopped": stopped,
             "stopping": not stopped,
+            "engine_running": self._engine.engine_running,
             "engine_state": self._engine.engine_state,
             "api_alive": True,
         }
@@ -90,7 +102,12 @@ class EngineService:
         return {"ok": True, "message": "shutting_down"}
 
     def status(self) -> Dict[str, Any]:
-        rules = self._load_rules()
+        config_error = None
+        try:
+            rules = self._store.load_verified_rules(for_editing=True)
+        except ConfigValidationError as error:
+            rules = []
+            config_error = str(error)
         trigger_types = {
             event.get("type")
             for rule in rules
@@ -116,9 +133,10 @@ class EngineService:
             "engine_running": self._engine.engine_running,
             "engine_state": self._engine.engine_state,
             "pid": self._process_id(),
-            "rules_count": len(rules),
-            "triggers_count": len(trigger_types),
-            "actions_count": len(action_types),
+            "rules_count": None if config_error else len(rules),
+            "triggers_count": None if config_error else len(trigger_types),
+            "actions_count": None if config_error else len(action_types),
+            "config_error": config_error,
             "security_mode": detect_security_mode().value,
             "last_error": self._engine.last_error,
             "scheduler": self._scheduler_summary(),
@@ -172,24 +190,35 @@ class EngineService:
         if not log_path:
             return {"lines": [], "total": 0}
         try:
-            with open(log_path, "r", encoding="utf-8", errors="replace") as file:
-                tail: deque[str] = deque(maxlen=safe_lines)
-                total = 0
-                for line in file:
-                    total += 1
-                    tail.append(line.rstrip("\n"))
+            with self._log_lock, open(log_path, "rb") as file:
+                stat = os.fstat(file.fileno())
+                key = (log_path, stat.st_dev, stat.st_ino)
+                if key != self._log_key or stat.st_size < self._log_offset or (
+                    stat.st_size == self._log_offset and stat.st_mtime_ns != self._log_mtime
+                ):
+                    self._log_key = key
+                    self._log_offset = 0
+                    self._log_total = 0
+                    self._log_pending = b""
+                    self._log_tail.clear()
+                file.seek(self._log_offset)
+                while chunk := file.read(65536):
+                    parts = (self._log_pending + chunk).split(b"\n")
+                    self._log_pending = parts.pop()
+                    self._log_total += len(parts)
+                    self._log_tail.extend(part.rstrip(b"\r").decode("utf-8", errors="replace") for part in parts)
+                self._log_offset = file.tell()
+                self._log_mtime = stat.st_mtime_ns
+                tail = list(self._log_tail)
+                if self._log_pending:
+                    tail.append(self._log_pending.decode("utf-8", errors="replace"))
+                total = self._log_total + bool(self._log_pending)
         except FileNotFoundError:
             return {"lines": [], "total": 0}
         return {
-            "lines": list(tail),
+            "lines": tail[-safe_lines:],
             "total": total,
         }
-
-    def _load_rules(self) -> list[Dict[str, Any]]:
-        try:
-            return self._store.load_verified_rules(for_editing=True)
-        except ConfigValidationError:
-            return []
 
     def _scheduler_summary(self) -> Dict[str, Any]:
         current_engine = self._engine.current_engine
