@@ -244,10 +244,10 @@ def _create_plugin(
         "params": [],
     }
     if kind == "trigger":
-        meta.update({"semantic": "oneshot", "trigger_api": "event-v1"})
+        meta.update({"semantic": "oneshot", "trigger_api": "event-v2"})
         source = (
-            "def run(meta, configs, emit_event, shutdown_event):\n"
-            "    return None\n"
+            "def run(meta, config, emit_event, shutdown_event):\n"
+            "    shutdown_event.wait()\n"
         )
         test_source = (
             "import trigger\n\n\n"

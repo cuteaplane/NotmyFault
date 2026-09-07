@@ -129,7 +129,7 @@ def cmd_sign(args):
     """签名所有插件并返回供构建签名复用的私钥"""
     if not PRIVATE_KEY_FILE.exists():
         print("! 私钥不存在，请先运行 build.py init-keys")
-        return None
+        raise SystemExit(1)
 
     private_key = load_private_key(PRIVATE_KEY_FILE)
     plugins = _collect_plugins()
@@ -150,11 +150,11 @@ def cmd_verify(args):
         pub_keys = get_public_keys()
     except ImportError:
         print("! 无法导入公钥模块，请先运行 build.py init-keys")
-        return
+        raise SystemExit(1)
     
     if not pub_keys:
         print("! 没有可用的公钥，请先运行 build.py init-keys")
-        return
+        raise SystemExit(1)
     
     pubs = [ed25519.Ed25519PublicKey.from_public_bytes(k) for k in pub_keys]
     
@@ -358,6 +358,7 @@ def main():
         else:
             print(f"未知命令: {cmd_name}")
             _print_usage(cmds)
+            raise SystemExit(1)
 
 if __name__ == "__main__":
     main()

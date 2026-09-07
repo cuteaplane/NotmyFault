@@ -20,19 +20,16 @@ def _detect_json_name(plugin_dir: Path) -> str | None:
     return None
 
 
-_IGNORE_SUFFIXES = {".pyc"}
-_IGNORE_NAMES = {"__pycache__", "signature.sig"}
+_IGNORE_NAMES = {"__pycache__"}
 
 
 def _collect_files(plugin_dir: Path) -> list[tuple[Path, str]]:
-    """递归收集插件文件，排除 __pycache__/*.pyc/signature.sig"""
+    """归档保留作者签名和公钥，运行缓存不参与分发。"""
     result = []
     for p in sorted(plugin_dir.rglob("*")):
         if not p.is_file():
             continue
-        if p.suffix in _IGNORE_SUFFIXES:
-            continue
-        if any(part in _IGNORE_NAMES for part in p.parts):
+        if any(part in _IGNORE_NAMES for part in p.relative_to(plugin_dir).parts):
             continue
         result.append((p, p.relative_to(plugin_dir.parent).as_posix()))
     return result
@@ -51,7 +48,6 @@ def pack_plugin(plugin_dir: Path, output_dir: Path = DIST_DIR, arc_prefix: str |
         return None
 
     meta = json.loads((plugin_dir / json_name).read_text(encoding="utf-8"))
-    plugin_id = meta.get("id", plugin_dir.name)
     ptype = "action" if json_name == "action.json" else "trigger"
     valid, errors = validate_plugin_meta(meta, ptype)
     if not valid:
@@ -60,6 +56,7 @@ def pack_plugin(plugin_dir: Path, output_dir: Path = DIST_DIR, arc_prefix: str |
             file=sys.stderr,
         )
         return None
+    plugin_id = meta["id"]
 
     output_dir.mkdir(parents=True, exist_ok=True)
     nmfp_path = output_dir / f"{plugin_id}.nmfp"
@@ -89,6 +86,7 @@ def main():
             print(f"! 用户插件目录不存在: {user_root}", file=sys.stderr)
             sys.exit(1)
         count = 0
+        failed = 0
         for ptype in ("actions", "triggers"):
             ptype_dir = user_root / ptype
             if not ptype_dir.is_dir():
@@ -98,8 +96,10 @@ def main():
                     # 归档内以插件 id 为顶层目录，安装端才能识别出唯一插件文件夹
                     if pack_plugin(p, arc_prefix=p.name):
                         count += 1
+                    else:
+                        failed += 1
         print(f"已打包 {count} 个插件到 {DIST_DIR}")
-        return
+        return 1 if failed else 0
 
     plugin_dir = Path(args[0])
     if not plugin_dir.is_absolute():
@@ -107,7 +107,8 @@ def main():
     result = pack_plugin(plugin_dir)
     if result:
         print(f"完成: {result}")
+    return 0 if result else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
