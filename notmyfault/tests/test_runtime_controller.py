@@ -85,10 +85,39 @@ def test_desktop_runner_forwards_event_sink_to_engine_factory(monkeypatch, tmp_p
 
     assert created is engine
     assert observed == {"store": runner._store, "on_event": event_sink}
+    from types import SimpleNamespace
+
+    notifications = []
+    runner._tray = SimpleNamespace(
+        set_engine_state=lambda state: None,
+        show_balloon=lambda *args: notifications.append(args),
+    )
+    runner._handle_engine_state("starting")
+    runner._handle_engine_state("stopped")
+    assert notifications == []
+    runner._handle_engine_state("running")
+    assert notifications == [("NotmyFault", "引擎已启动")]
+    cleanup = []
+    runner._runtime = SimpleNamespace(
+        request_stop=lambda: cleanup.append("request_stop"),
+        stop=lambda timeout: cleanup.append("engine_stop") or True,
+    )
+    runner._tray.stop = lambda: cleanup.append("tray_stop")
+    runner._run_history = SimpleNamespace(flush=lambda: cleanup.append("history_flush") or True)
+    runner._cleanup()
+    assert cleanup == ["request_stop", "tray_stop", "engine_stop", "history_flush"]
 
 
 def test_runtime_controller_rejects_restart_while_old_thread_is_stopping():
-    controller = RuntimeController(lambda on_event=None: FakeEngine())
+    class DirtyEngine(FakeEngine):
+        _shutdown_clean = False
+        release = False
+
+        def shutdown(self, timeout):
+            self._shutdown_clean = self.release
+
+    engine = DirtyEngine()
+    controller = RuntimeController(lambda on_event=None: engine)
     assert controller.start() is True
     assert _wait(lambda: controller.running)
 
@@ -96,6 +125,14 @@ def test_runtime_controller_rejects_restart_while_old_thread_is_stopping():
     assert controller.request_stop() is True
     if controller.engine_thread.is_alive():
         assert controller.start() is False
+    assert controller.stop() is False
+    assert controller.state == "stopping"
+    assert controller.current_engine is engine
+    assert controller.start() is False
+    engine.release = True
+    assert controller.stop() is True
+    assert controller.current_engine is None
+    assert controller.start() is True
     controller.stop()
 
 

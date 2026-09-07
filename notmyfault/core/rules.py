@@ -112,7 +112,10 @@ def validate_condition_tree(node: Dict[str, Any] | None) -> List[str]:
         op = _condition_op(current)
         if op not in ("any", "all", "not"):
             errors.append(f"{path} 的 op 必须为 any、all 或 not")
-        children = _condition_children(current)
+        children = current.get("children", current.get("events", []))
+        if not isinstance(children, list):
+            errors.append(f"{path}.children 必须是数组")
+            children = []
         if not children:
             errors.append(f"{path} 至少需要一个子条件")
         for index, child in enumerate(children):
@@ -150,8 +153,8 @@ def validate_rule_structure(rule: Any) -> List[str]:
     ):
         errors.append("rule_id 无效")
 
-    if not str(rule.get("name", "")).strip():
-        errors.append("name 不能为空")
+    if not isinstance(rule.get("name"), str) or not rule["name"].strip():
+        errors.append("name 必须是非空字符串")
 
     if "concurrency" in rule:
         concurrency = rule["concurrency"]
@@ -601,10 +604,6 @@ class ConditionRuntime:
             matching_leaves = [leaf for leaf in matching_leaves if _event_key(leaf) in positive_keys]
             if not matching_leaves:
                 return False
-            oldest_allowed = timestamp - 3600.0
-            for key, entry in list(seen.items()):
-                if float(entry.get("timestamp", 0.0)) < oldest_allowed:
-                    seen.pop(key, None)
             fired = self._fired.get(rule_key, ())
             if any(key not in seen for key, _fired_at in fired):
                 self._fired.pop(rule_key, None)
@@ -789,7 +788,7 @@ def validate_rules(
             if not isinstance(event_params, dict):
                 continue
             for schema in trigger_meta.get("params", []):
-                if not isinstance(schema, dict) or schema.get("type") != "plugin_data":
+                if not isinstance(schema, dict):
                     continue
                 param_name = schema.get("name", "")
                 if schema.get("required") is True and param_name not in event_params:
@@ -800,6 +799,8 @@ def validate_rules(
                     all_events_valid = False
                     continue
                 if param_name not in event_params:
+                    continue
+                if schema.get("type") != "plugin_data":
                     continue
                 if is_reference(event_params[param_name]) or not _valid_plugin_data(
                     event_params[param_name], trigger_meta, schema

@@ -100,20 +100,22 @@ class TestConditionRuntime:
         assert dispatched[0][3]["event"]["type"] == "absence"
         assert dispatched[0][3]["triggers"] == {}
 
-    def test_all_condition_respects_time_window(self):
+    @pytest.mark.parametrize("window", [10, 7200, None])
+    def test_all_condition_respects_time_window(self, window):
         runtime = ConditionRuntime()
         rule = {"condition": {
             "op": "all",
-            "within_seconds": 10,
             "children": [
                 {"type": "evt_a", "params": {}},
                 {"type": "evt_b", "params": {}},
             ],
         }}
+        if window is not None:
+            rule["condition"]["within_seconds"] = window
         assert runtime.match("r", rule, "evt_a", {}, now=0.0) is False
-        # 第二个事件超出时间窗口，组合不能成立
-        assert runtime.match("r", rule, "evt_b", {}, now=50.0) is False
-        assert runtime.match("r", rule, "evt_b", {}, now=5.0) is True
+        if window is not None:
+            assert runtime.match("r", rule, "evt_b", {}, now=window + 1) is False
+        assert runtime.match("r", rule, "evt_b", {}, now=window / 2 if window else 10000) is True
 
     def test_nested_events_are_aggregated(self):
         rule = {"condition": {
@@ -333,7 +335,7 @@ class TestValidateAllRules:
         assert alerts
         assert any(
             "不支持安全取消" in issue[1]
-            for issue in engine._diag_obj.data["rule_issues"]
+            for issue in engine._diag_obj.snapshot()["rule_issues"]
         )
 
     def test_timeout_accepts_action_cancellation_contract(self):
@@ -363,7 +365,7 @@ class TestValidateAllRules:
         assert alerts
         assert any(
             "缺少必填参数: target" in issue[1]
-            for issue in engine._diag_obj.data["rule_issues"]
+            for issue in engine._diag_obj.snapshot()["rule_issues"]
         )
 
     def test_plugin_data_requires_declared_owner_and_version(self):
@@ -566,3 +568,10 @@ def test_control_flow_structure_and_normalization():
     del normalized["preconditions"]
     normalized["condition"]["within_seconds"] = 0
     assert validate_rule_structure(normalized)
+    for changes in (
+        {"name": 42},
+        {"condition": {"op": "all", "children": [{"type": "signal"}, 42]}},
+        {"condition": {"op": "invalid", "children": [{"type": "signal"}]}},
+        {"condition": {"op": "all", "within_seconds": float("nan"), "children": [{"type": "signal"}]}},
+    ):
+        assert validate_rule_structure(normalize_rules([{**rule, **changes}])[0])

@@ -829,18 +829,24 @@ class TestExecuteAction:
         assert engine.execute_actions(actions, "规则", _context()) is False
         assert called == [count]
 
-    def test_validate_params_called(self):
+    @pytest.mark.parametrize("validation", [[], ["参数无效"], RuntimeError("校验异常")])
+    def test_validate_params_called(self, validation):
         engine = make_engine()
         seen = []
-        module = types.SimpleNamespace(
-            validate_params=lambda meta, params: seen.append((meta, params)) or []
-        )
+        called = []
+        def validate(meta, params):
+            seen.append((meta, params))
+            if isinstance(validation, Exception):
+                raise validation
+            return validation
+        module = types.SimpleNamespace(validate_params=validate)
         register_action(
-            engine, "checked", lambda meta, params: None, meta={"params": []}, module=module
+            engine, "checked", lambda meta, params: called.append(params), meta={"params": []}, module=module
         )
         engine._run_action({"type": "checked", "params": {"a": 1}}, "规则", _context())
         assert len(seen) == 1
         assert seen[0][1] == {"a": 1}
+        assert bool(called) is (validation == [])
 
 
     def test_document_quiescent_requires_observation_then_allows(self, tmp_path):
@@ -869,17 +875,21 @@ class TestExecuteAction:
 
 
 class TestErrorIsolation:
-    def test_run_trigger_isolates_crash(self):
+    @pytest.mark.parametrize("exit_mode", ["crash", "return", "stopped"])
+    def test_run_trigger_isolates_crash(self, exit_mode):
         engine = make_engine()
         alerts = []
         engine._alert_user = lambda title, message, open_dashboard=False: alerts.append(title)
 
         def broken(meta, config, emit, stop_event):
-            raise RuntimeError("触发器炸了")
+            if exit_mode == "crash":
+                raise RuntimeError("触发器炸了")
+            if exit_mode == "stopped":
+                stop_event.set()
 
         engine._run_trigger("hotkey", "hotkey", broken, {}, {}, threading.Event())
-        assert engine._diag_obj.data["trigger_crashes"] == 1
-        assert len(alerts) == 1
+        assert engine._diag_obj.snapshot()["trigger_crashes"] == (exit_mode != "stopped")
+        assert len(alerts) == (exit_mode != "stopped")
 
 
     def test_stop_trigger_threads_keeps_unstoppable_thread_registered(self):

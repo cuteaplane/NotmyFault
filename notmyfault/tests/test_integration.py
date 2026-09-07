@@ -182,7 +182,6 @@ class TestHotReloadIntegration:
             load_rules_fn=lambda: new_rules,
             stop_triggers_fn=lambda timeout: True,
             apply_rules_fn=apply_rules,
-            cancel_deferred_fn=lambda: None,
             validate_rules_fn=lambda: None,
             start_triggers_fn=lambda rules: 1,
             diagnostics=Diagnostics(),
@@ -216,7 +215,6 @@ class TestHotReloadIntegration:
             load_rules_fn=lambda: new_rules,
             stop_triggers_fn=lambda timeout: True,
             apply_rules_fn=apply_rules,
-            cancel_deferred_fn=lambda: None,
             validate_rules_fn=lambda: None,
             start_triggers_fn=start_triggers,
             diagnostics=Diagnostics(),
@@ -280,7 +278,8 @@ class TestHotReloadIntegration:
             thread.join(timeout=10)
         assert not thread.is_alive()
 
-    def test_hot_reload_restores_old_rules_after_trigger_start_failure(self, monkeypatch):
+    @pytest.mark.parametrize("stop_immediately", [True, False])
+    def test_hot_reload_restores_old_rules_after_trigger_start_failure(self, monkeypatch, stop_immediately):
         old_rules = [{"name": "旧规则"}]
         new_rules = [{"name": "新规则"}]
         active_rules = list(old_rules)
@@ -302,9 +301,8 @@ class TestHotReloadIntegration:
         reloader = RulesHotReloader(
             rules_path_fn=lambda: "rules.json",
             load_rules_fn=lambda: new_rules,
-            stop_triggers_fn=lambda timeout: stopped.append(timeout) or True,
+            stop_triggers_fn=lambda timeout: stopped.append(timeout) or len(stopped) != 2 or stop_immediately,
             apply_rules_fn=apply_rules,
-            cancel_deferred_fn=lambda: None,
             validate_rules_fn=lambda: None,
             start_triggers_fn=start_triggers,
             diagnostics=Diagnostics(),
@@ -315,11 +313,17 @@ class TestHotReloadIntegration:
 
         reloader.check_once()
 
+        if not stop_immediately:
+            assert active_rules == new_rules
+            assert started == [new_rules]
+            assert reloader._rules_mtime == 1.0
+            reloader.check_once()
+
         assert active_rules == old_rules
         assert started == [new_rules, old_rules]
-        assert len(stopped) == 2
+        assert len(stopped) == (2 if stop_immediately else 3)
         assert reloader._rules_mtime == 2.0
-        assert alerts == [("热加载失败", "新规则未能启动，已尝试恢复原有规则")]
+        assert alerts == ([("热加载失败", "新规则未能启动，已尝试恢复原有规则")] if stop_immediately else [("规则恢复失败", "热加载失败且原有规则恢复失败，请重启引擎")])
 
 
 class TestLoggingPipeline:

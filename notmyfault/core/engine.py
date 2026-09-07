@@ -88,9 +88,6 @@ class AutomationEngine:
         self._plugin_integrity_errors: list[str] = []
 
         self._diag_obj = Diagnostics()
-        # 旧代码仍读取 _diag 和 _diag_lock，保留这两个兼容属性
-        self._diag: Dict[str, Any] = self._diag_obj.data
-        self._diag_lock = self._diag_obj.lock
 
         self._shutdown_flag: "threading.Event | None" = None
 
@@ -137,11 +134,6 @@ class AutomationEngine:
             diagnostics=self._diag_obj,
             shutdown_event=lambda: self._shutdown_flag,
             on_event=self._safe_on_event,
-            defer_workflow=lambda *args: self._defer_workflow(*args),
-            resume_workflow=lambda *args: self._resume_workflow(*args),
-            execute_workflow=lambda *args: self.execute_workflow(*args),
-            execute_actions=lambda *args: self.execute_actions(*args),
-            run_action=lambda *args: self._run_action(*args),
             action_resolver=self._plugin_registry.resolve_action,
             sensitive_values=self._collect_sensitive_values,
         )
@@ -149,7 +141,7 @@ class AutomationEngine:
         self._rule_scheduler = RuleScheduler(
             execute_fn=self.execute_workflow,
             cancel_run_fn=self._workflow_executor.cancel_run,
-            is_deferred_fn=self._workflow_executor.is_run_deferred,
+            is_deferred_fn=lambda run_id: False,
             on_history_event=self._safe_on_event,
             prepare_run_fn=self._workflow_executor.prepare_run,
         )
@@ -158,16 +150,11 @@ class AutomationEngine:
         # 旧扩展和测试仍直接读取这些同步对象
         self._action_lock = self._workflow_executor.action_lock
         self._action_done = self._workflow_executor.action_done
-        self._deferred_workflows = self._workflow_executor.deferred_workflows
-        self._deferred_workflows_lock = (
-            self._workflow_executor.deferred_workflows_lock
-        )
         self._hot_reloader = RulesHotReloader(
             rules_path_fn=lambda: self._rules_store.rules_path,
             load_rules_fn=self._rules_store.load_verified_rules,
             stop_triggers_fn=self._stop_trigger_threads,
             apply_rules_fn=self._apply_hot_reload_rules,
-            cancel_deferred_fn=self._cancel_deferred_workflows,
             validate_rules_fn=self._validate_all_rules,
             start_triggers_fn=self._start_trigger_threads,
             diagnostics=self._diag_obj,
@@ -192,13 +179,12 @@ class AutomationEngine:
         if event_type in ("workflow_completed", "workflow_failed"):
             scheduler = getattr(self, "_rule_scheduler", None)
             if scheduler is not None:
-                # deferred 的 run 靠终态事件退场，排队中的下一条也在这里补发
                 scheduler.on_run_event(event_type, payload.get("run_id"))
         if not self.on_event:
             return
         # UI 或 SSE 推送失败时记录错误并继续分发
         try:
-            self.on_event(event_type, payload)
+            self.on_event(event_type, copy.deepcopy(payload))
         except Exception:
             err = traceback.format_exc()
             print(f"[Engine] [!!] on_event 回调异常 ({event_type}):", file=sys.stderr)
@@ -265,6 +251,8 @@ class AutomationEngine:
                     emit_checked(event_name, payload)
 
                 trigger_func(trigger_meta, config, emit_legacy, stop_event)
+            if not stop_event.is_set():
+                raise RuntimeError("触发器在收到停止信号前退出")
         except Exception as error:
             error_type = type(error).__name__
             print(
@@ -646,32 +634,6 @@ class AutomationEngine:
             workflow_key, rule, rule_name, context
         )
 
-    def _defer_workflow(
-        self,
-        workflow_key: str,
-        rule: Dict[str, Any],
-        rule_name: str,
-        context: Dict[str, Any],
-        delay: float,
-    ) -> None:
-        self._workflow_executor.defer_workflow(
-            workflow_key, rule, rule_name, context, delay
-        )
-
-    def _resume_workflow(
-        self,
-        workflow_key: str,
-        rule: Dict[str, Any],
-        rule_name: str,
-        context: Dict[str, Any],
-    ) -> None:
-        self._workflow_executor.resume_workflow(
-            workflow_key, rule, rule_name, context
-        )
-
-    def _cancel_deferred_workflows(self) -> None:
-        self._workflow_executor.cancel_deferred_workflows()
-
     def cancel_run(self, run_id: str) -> bool:
         return self._workflow_executor.cancel_run(run_id)
 
@@ -741,7 +703,8 @@ class AutomationEngine:
         try:
             self._run(shutdown_event=shutdown_event)
         finally:
-            self.close()
+            if self._shutdown_clean:
+                self.close()
 
     def close(self) -> None:
         """撤销本代引擎权限会话并允许重复调用"""
@@ -837,7 +800,7 @@ class AutomationEngine:
         finally:
             self._cleanup_runtime()
 
-    def _cleanup_runtime(self) -> None:
+    def _cleanup_runtime(self, timeout: float = 90.0) -> None:
         with self._runtime_cleanup_lock:
             if self._runtime_cleaned:
                 return
@@ -846,12 +809,16 @@ class AutomationEngine:
             cancel_pending_admin_requests()
             self._rule_scheduler.shutdown()
             self._trigger_supervisor.request_stop_all()
-            self._cancel_deferred_workflows()
-            stopped = self._stop_trigger_threads(timeout=30)
-            scheduled_stopped, drained = self._wait_runtime_work()
+            deadline = time.monotonic() + max(0.0, timeout)
+            stopped = self._stop_trigger_threads(timeout=min(30.0, max(0.0, timeout)))
+            scheduled_stopped, drained = self._wait_runtime_work(
+                timeout=max(0.0, deadline - time.monotonic())
+            )
+            self._shutdown_clean = bool(stopped and scheduled_stopped and drained)
+            if not self._shutdown_clean:
+                return
             plugin_worker.shutdown_all()
             self._shutdown_plugins()
-            self._shutdown_clean = bool(stopped and scheduled_stopped and drained)
             self._runtime_cleaned = True
 
     def _shutdown_plugins(self) -> None:
@@ -891,9 +858,10 @@ class AutomationEngine:
         drained = self._wait_active_actions(timeout=remaining)
         return scheduled_stopped, drained
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float = 90.0) -> None:
         # API、信号和 finally 可能同时调用 shutdown()，每个清理步骤都支持重复执行
         if self._shutdown_flag is not None:
             self._shutdown_flag.set()
-        self._cleanup_runtime()
-        self.close()
+        self._cleanup_runtime(timeout=timeout)
+        if self._shutdown_clean:
+            self.close()

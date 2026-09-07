@@ -127,22 +127,37 @@ class TestExecutorSingleTerminal:
         engine = self._make_engine(events)
         engine.actions_funcs["noop"] = lambda meta, params: {"ok": True}
         engine.actions_meta["noop"] = {}
+        compensation_started = threading.Event()
+        release = threading.Event()
+        def compensate(meta, params):
+            compensation_started.set()
+            release.wait(5)
+        engine.actions_funcs["compensate"] = compensate
+        engine.actions_meta["compensate"] = {}
         rule = {
             "name": "绑定失败规则",
+            "concurrency": {"mode": "single"},
             "event": {"type": "hotkey", "params": {}},
             "actions": [{
                 "type": "noop",
                 "params": {"x": {"$ref": {"scope": "event", "path": ["missing"]}}},
+                "failure_actions": [{"type": "compensate", "params": {}}],
             }],
         }
         engine.rules = [rule]
         engine.triggers_meta.setdefault("hotkey", {"semantic": "oneshot"})
         engine.emit_event("hotkey", {})
+        assert compensation_started.wait(5)
+        assert not [e for e in events if e[0] in ("workflow_failed", "workflow_completed")]
+        engine.emit_event("hotkey", {})
+        assert any(e[0] == "run_dropped" for e in events)
+        release.set()
         assert engine._rule_scheduler.wait_for_idle(timeout=5)
 
         terminals = [e for e in events if e[0] in ("workflow_failed", "workflow_completed")]
         assert len(terminals) == 1
-        assert terminals[0][0] == "workflow_failed"
+        assert terminals[0][0] == "workflow_completed"
+        assert terminals[0][1]["status"] == "failed"
 
     def test_cancel_run_twice_only_first_wins(self):
         events = []
@@ -230,7 +245,6 @@ class TestStopPathDropsQueue:
         assert scheduler.submit("rule-stop-1", rule, "停止路径规则", context2) == "queued"
 
         # 模拟 _run 循环退出后的清理序列
-        engine._cancel_deferred_workflows()
         engine._rule_scheduler.shutdown()
         assert scheduler.stats()["rule-stop-1"]["queued"] == 0
         dropped = [e for e in events if e[0] == "run_dropped"]

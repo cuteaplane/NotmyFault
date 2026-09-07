@@ -7,6 +7,8 @@ import json
 import math
 import os
 import threading
+import time
+from collections import deque
 from typing import Any, Dict, Iterable
 
 from notmyfault.core import run_lifecycle as lifecycle
@@ -327,6 +329,12 @@ class RunHistory:
         self.path = path
         self.max_events = max(100, int(max_events))
         self._lock = threading.Lock()
+        self._file_lock = threading.Lock()
+        self._writer_done = threading.Condition(self._lock)
+        self._events = deque(self._read_events_unlocked()[-self.max_events:], maxlen=self.max_events)
+        self._pending: deque[str] = deque(maxlen=self.max_events)
+        self._writer: threading.Thread | None = None
+        self._write_error: OSError | None = None
         self._event_count = self._count_events()
 
     def _count_events(self) -> int:
@@ -361,31 +369,79 @@ class RunHistory:
         os.replace(temp_path, self.path)
         self._event_count = len(events)
 
-    def record(self, packet: Dict[str, Any]) -> None:
-        # 每条事件带格式版本，读侧遇到没有 schema 字段的旧事件按 v1 解释
+    def _prepare_packet(self, packet: Dict[str, Any]) -> Dict[str, Any] | None:
         if isinstance(packet, dict) and "schema" not in packet:
             packet = {**packet, "schema": lifecycle.RUN_EVENT_SCHEMA_VERSION}
-        safe_packet = _safe_event(packet)
-        if safe_packet is None:
-            return
-        with self._lock:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        return _safe_event(packet)
+
+    def _write_batch(self, packets: list[Dict[str, Any] | str]) -> None:
+        with self._file_lock:
+            os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
             with open(self.path, "a", encoding="utf-8", newline="\n") as file:
-                file.write(
-                    json.dumps(safe_packet, ensure_ascii=False, separators=(",", ":"))
-                )
-                file.write("\n")
-            self._event_count += 1
+                for packet in packets:
+                    file.write(packet if isinstance(packet, str) else json.dumps(packet, ensure_ascii=False, separators=(",", ":")))
+                    file.write("\n")
+            self._event_count += len(packets)
             if self._event_count > self.max_events + 500:
                 self._compact_unlocked()
 
+    def record(self, packet: Dict[str, Any]) -> None:
+        safe_packet = self._prepare_packet(packet)
+        if safe_packet is None:
+            return
+        self._write_batch([safe_packet])
+        with self._lock:
+            self._events.append(safe_packet)
+
+    def record_async(self, packet: Dict[str, Any]) -> None:
+        safe_packet = self._prepare_packet(packet)
+        if safe_packet is None:
+            return
+        encoded = json.dumps(safe_packet, ensure_ascii=False, separators=(",", ":"))
+        with self._writer_done:
+            self._events.append(safe_packet)
+            self._pending.append(encoded)
+            if self._writer is None:
+                self._writer = threading.Thread(target=self._write_pending, name="RunHistory", daemon=True)
+                self._writer.start()
+            self._writer_done.notify_all()
+
+    def _write_pending(self) -> None:
+        while True:
+            with self._writer_done:
+                if not self._pending:
+                    self._writer_done.wait(timeout=0.25)
+                    if not self._pending:
+                        self._writer = None
+                        self._writer_done.notify_all()
+                        return
+                batch = [self._pending.popleft() for _ in range(min(128, len(self._pending)))]
+            try:
+                self._write_batch(batch)
+            except OSError as error:
+                from notmyfault.core.logging import engine_error
+
+                with self._lock:
+                    self._write_error = error
+                engine_error("run_history_write_failed", error=str(error))
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._writer_done:
+            while self._writer is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._writer_done.wait(remaining)
+            return self._write_error is None
+
     def list_runs(self, limit: int = 100) -> list[Dict[str, Any]]:
         with self._lock:
-            events = self._read_events_unlocked()
-        return build_runs(events)[: max(1, min(int(limit), 500))]
+            events = list(self._events)
+        return build_runs(events)[:max(1, min(int(limit), 1000))]
 
     def get_run(self, run_id: str) -> Dict[str, Any] | None:
-        for run in self.list_runs(limit=500):
-            if run["run_id"] == run_id:
-                return run
-        return None
+        with self._lock:
+            events = [packet for packet in self._events if isinstance(packet.get("data"), dict) and packet["data"].get("run_id") == run_id]
+        runs = build_runs(events)
+        return runs[0] if runs else None

@@ -137,9 +137,10 @@ class TestRunIsolatedAction:
         assert result == {"echo": value}
         assert isinstance(result["echo"]["data"]["amount"], Decimal)
 
-    def test_runpy_cannot_bypass_strict_package_guard(self):
+    @pytest.mark.parametrize("prefix", ["", "import sys, types\nsys.modules['pytest'] = types.ModuleType('pytest')\n"])
+    def test_runpy_cannot_bypass_strict_package_guard(self, prefix):
         code = (
-            "import runpy\n"
+            prefix + "import runpy\n"
             "runpy.run_module('notmyfault.security.security')\n"
         )
         result = subprocess.run(
@@ -164,7 +165,7 @@ class TestRunIsolatedAction:
         assert result == {"echo": 42}
 
     def test_public_plugin_api_is_available_in_strict_worker(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("NOTMYFAULT_MODE", "strict")
+        monkeypatch.setenv("NOTMYFAULT_MODE", "stable")
         entry = write_action(tmp_path, "plugin_api", PLUGIN_API_ACTION)
         ok, result = run_isolated_action(entry, {"id": "plugin_api"}, {}, {})
         assert ok is True
@@ -383,7 +384,12 @@ class TestLoaderIsolatedMode:
 
     @pytest.mark.parametrize("origin", ["builtin", "user"])
     def test_isolated_action_runs_in_worker(self, tmp_path, origin):
-        loader = self._make_plugin(tmp_path)
+        loader = self._make_plugin(tmp_path, source=(
+            "from helper import double\n"
+            "def run(meta, params): return {'doubled': double(params['n'])}\n"
+        ))
+        helper = tmp_path / "actions" / "iso_action" / "helper.py"
+        helper.write_text("def double(value): return value * 2\n", encoding="utf-8")
         meta_store, func_store = {}, {}
         loaded, failed = loader.load(
             base_dir=str(tmp_path),
@@ -404,6 +410,9 @@ class TestLoaderIsolatedMode:
         # isolated 动作不 import 进引擎进程
         assert loader._registry.get_module("iso_action") is None
         assert func_store["iso_action"]({}, {"n": 21}) == {"doubled": 42}
+        helper.write_text("def double(value): return value * 3\n", encoding="utf-8")
+        with pytest.raises(RuntimeError, match="完整性校验失败"):
+            func_store["iso_action"]({}, {"n": 21})
 
     def test_isolated_context_action_runs_through_registered_proxy(self, tmp_path):
         from notmyfault.core.workflow import invoke_action

@@ -80,6 +80,7 @@ class RuleScheduler:
         self._queues: Dict[str, deque] = {}
         # rule_key -> queue 模式的并发配置，入队时的规则快照说了算
         self._queue_configs: Dict[str, Dict[str, Any]] = {}
+        self._removed_rules: set[str] = set()
         self._shutting_down = False
 
     def stats(self) -> Dict[str, Dict[str, int]]:
@@ -104,72 +105,50 @@ class RuleScheduler:
         run_id = str(context.get("run", {}).get("id", ""))
         config = _concurrency_config(rule)
         mode = config["mode"]
-        run_now = False
+        to_cancel = []
         with self._lock:
             if self._shutting_down:
                 self._emit_history("run_dropped", rule, run_id, rule_name, "引擎正在关闭")
                 return "dropped"
+            self._removed_rules.discard(rule_key)
             active = self._active_runs.setdefault(rule_key, set())
-
-            if mode == "single":
-                if active:
-                    self._emit_history("run_dropped", rule, run_id, rule_name, "已有运行中的 run")
-                    return "dropped"
-                self._prepare_run(context)
-                active.add(run_id)
-                run_now = True
-                decision = "started"
-
-            elif mode == "replace":
-                for old_run_id in list(active):
-                    self._emit_history("run_replaced", rule, old_run_id, rule_name, "被新触发的 run 替换")
-                # 锁外再取消，cancel 回调可能反过来碰调度器
+            queue = self._queues.setdefault(rule_key, deque())
+            if mode == "single" and (active or queue):
+                self._emit_history("run_dropped", rule, run_id, rule_name, "已有运行中的 run")
+                return "dropped"
+            if mode == "replace":
                 to_cancel = list(active)
+                for old_run_id in to_cancel:
+                    self._emit_history("run_replaced", rule, old_run_id, rule_name, "被新触发的 run 替换")
+                for old_rule, old_name, _old_context, old_run_id in queue:
+                    self._emit_history("run_replaced", old_rule, old_run_id, old_name, "被新触发的 run 替换")
                 active.clear()
+                queue.clear()
+            max_concurrency = config.get(
+                "max_concurrency",
+                self._max_workers if mode == "parallel" else DEFAULT_MAX_CONCURRENCY,
+            )
+            run_now = len(active) < max_concurrency and self._worker_count < self._max_workers
+            if run_now:
                 self._prepare_run(context)
                 active.add(run_id)
-                run_now = True
-                decision = "replaced"
-
+                self._worker_count += 1
+                decision = "replaced" if mode == "replace" else "started"
+            elif len(queue) >= config.get("queue_limit", DEFAULT_QUEUE_LIMIT):
+                self._emit_history("run_dropped", rule, run_id, rule_name, "排队已满")
+                decision = "dropped"
+            elif sum(len(items) for items in self._queues.values()) >= self._max_pending_runs:
+                self._emit_history("run_dropped", rule, run_id, rule_name, "调度队列已满")
+                decision = "dropped"
             else:
-                queue = self._queues.setdefault(rule_key, deque())
-                max_concurrency = config.get(
-                    "max_concurrency",
-                    self._max_workers if mode == "parallel" else DEFAULT_MAX_CONCURRENCY,
-                )
-                if (
-                    len(active) < max_concurrency
-                    and self._worker_count < self._max_workers
-                ):
-                    self._prepare_run(context)
-                    active.add(run_id)
-                    run_now = True
-                    decision = "started"
-                elif len(queue) >= config.get("queue_limit", DEFAULT_QUEUE_LIMIT):
-                    self._emit_history("run_dropped", rule, run_id, rule_name, "排队已满")
-                    return "dropped"
-                elif sum(len(items) for items in self._queues.values()) >= self._max_pending_runs:
-                    self._emit_history("run_dropped", rule, run_id, rule_name, "调度队列已满")
-                    return "dropped"
-                else:
-                    # 规则快照入队时冻结，热重载改规则不影响这条
-                    frozen_rule = copy.deepcopy(rule)
-                    queue.append((frozen_rule, rule_name, context, run_id))
-                    self._queue_configs[rule_key] = config
-                    self._emit_history("run_queued", rule, run_id, rule_name, f"排队中（第 {len(queue)} 个）")
-                    return "queued"
-
-        if mode == "replace":
-            for old_run_id in to_cancel:
-                self._cancel_with_retry(old_run_id)
+                queue.append((copy.deepcopy(rule), rule_name, context, run_id))
+                self._queue_configs[rule_key] = config
+                self._emit_history("run_queued", rule, run_id, rule_name, f"排队中（第 {len(queue)} 个）")
+                decision = "queued"
+        for old_run_id in to_cancel:
+            self._cancel_with_retry(old_run_id)
         if run_now:
-            self._dispatch_entry(
-                rule_key,
-                copy.deepcopy(rule),
-                rule_name,
-                context,
-                run_id,
-            )
+            self._dispatch_entry(rule_key, copy.deepcopy(rule), rule_name, context, run_id)
         return decision
 
     def _cancel_with_retry(self, run_id: str) -> None:
@@ -199,12 +178,15 @@ class RuleScheduler:
                 return
             active.discard(run_id)
             self._dispatch_queued_locked(rule_key)
+            self._prune_removed_rule(rule_key)
 
     def drop_rule(self, rule_key: str) -> int:
         """规则被删掉时丢弃它的排队条目，返回丢弃数量"""
         with self._lock:
             queue = self._queues.pop(rule_key, None)
             self._queue_configs.pop(rule_key, None)
+            self._removed_rules.add(rule_key)
+            self._prune_removed_rule(rule_key)
             if not queue:
                 return 0
             count = len(queue)
@@ -264,6 +246,7 @@ class RuleScheduler:
             rule, rule_name, context, run_id = queue.popleft()
             self._prepare_run(context)
             active.add(run_id)
+            self._worker_count += 1
             self._dispatch_entry(rule_key, rule, rule_name, context, run_id)
 
     def _dispatch_entry(
@@ -274,9 +257,6 @@ class RuleScheduler:
         context: Dict[str, Any],
         run_id: str,
     ) -> None:
-        with self._workers_done:
-            self._worker_count += 1
-
         def entry() -> None:
             try:
                 self._run_entry(rule_key, rule, rule_name, context, run_id)
@@ -335,6 +315,7 @@ class RuleScheduler:
             before = self._worker_count
             for rule_key in list(self._queues):
                 self._dispatch_queued_locked(rule_key)
+                self._prune_removed_rule(rule_key)
                 if self._worker_count >= self._max_workers:
                     break
             if self._worker_count == before:
@@ -355,6 +336,14 @@ class RuleScheduler:
             if active is not None:
                 active.discard(run_id)
             self._dispatch_queued_locked(rule_key)
+            self._prune_removed_rule(rule_key)
+
+    def _prune_removed_rule(self, rule_key: str) -> None:
+        if rule_key in self._removed_rules and not self._active_runs.get(rule_key):
+            self._active_runs.pop(rule_key, None)
+            self._queues.pop(rule_key, None)
+            self._queue_configs.pop(rule_key, None)
+            self._removed_rules.discard(rule_key)
 
     def _emit_history(
         self,

@@ -2,6 +2,7 @@ import copy
 import threading
 import time
 import uuid
+import pytest
 
 from notmyfault.core.rule_scheduler import RuleScheduler
 
@@ -264,21 +265,28 @@ class TestQueueMode:
         first.join(timeout=5)
         second.join(timeout=5)
 
-    def test_parallel_mode_bounds_workers_and_pending_runs(self):
+    @pytest.mark.parametrize("mode", ["parallel", "single", "replace"])
+    def test_parallel_mode_bounds_workers_and_pending_runs(self, mode):
         runtime = FakeRuntime()
-        rule = {"concurrency": {"mode": "parallel", "queue_limit": 2}}
-        scheduler = make_scheduler(rule, runtime, max_workers=2)
+        rule = {"concurrency": {"mode": mode, "queue_limit": 2}}
+        scheduler = make_scheduler(rule, runtime, max_workers=2, max_pending_runs=2)
 
         decisions = [
-            scheduler.submit("key", rule, "规则", make_context())
-            for _ in range(5)
+            scheduler.submit("key" if mode == "parallel" else str(index), rule, "规则", make_context())
+            for index in range(5)
         ]
 
-        assert decisions == ["started", "started", "queued", "queued", "dropped"]
-        assert scheduler.stats()["key"] == {"running": 2, "queued": 2}
+        started = "replaced" if mode == "replace" else "started"
+        assert decisions == [started, started, "queued", "queued", "dropped"]
+        assert sum(row["running"] for row in scheduler.stats().values()) == 2
+        assert sum(row["queued"] for row in scheduler.stats().values()) == 2
         runtime.block.set()
         wait_until(lambda: len(runtime.executed_ids()) == 4)
-        wait_until(lambda: scheduler.stats()["key"] == {"running": 0, "queued": 0})
+        assert scheduler.wait_for_idle(timeout=5)
+        assert all(row == {"running": 0, "queued": 0} for row in scheduler.stats().values())
+        for key in list(scheduler.stats()):
+            scheduler.drop_rule(key)
+        assert scheduler.stats() == {}
         scheduler.shutdown()
 
 

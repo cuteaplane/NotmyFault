@@ -282,6 +282,7 @@ class V2ContractTests:
 
         def bad_trigger(plugin_meta, configs, emit_event, shutdown_event):
             emit_event("demo_trigger", {"value": "not a number"})
+            shutdown_event.set()
 
         engine._run_trigger(
             "demo_trigger",

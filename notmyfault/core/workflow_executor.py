@@ -40,7 +40,6 @@ MappingProvider = Callable[[], Dict[str, Any]]
 ActionResolver = Callable[[str], Optional[Callable[..., Any]]]
 ShutdownProvider = Callable[[], "threading.Event | None"]
 EventSink = Callable[[str, Dict[str, Any]], None]
-WorkflowCallback = Callable[..., Any]
 SensitiveProvider = Callable[[Dict[str, Any]], set]
 _MISSING = object()
 def _run_id(context: Dict[str, Any]) -> str:
@@ -172,11 +171,6 @@ class WorkflowExecutor:
         diagnostics: Diagnostics,
         shutdown_event: ShutdownProvider,
         on_event: EventSink,
-        defer_workflow: WorkflowCallback,
-        resume_workflow: WorkflowCallback,
-        execute_workflow: WorkflowCallback,
-        execute_actions: WorkflowCallback,
-        run_action: WorkflowCallback,
         action_resolver: Optional[ActionResolver] = None,
         sensitive_values: Optional[SensitiveProvider] = None,
         triggers_meta: Optional[MappingProvider] = None,
@@ -189,23 +183,12 @@ class WorkflowExecutor:
         self._diagnostics = diagnostics
         self._shutdown_event = shutdown_event
         self._on_event = on_event
-        self._defer_workflow = defer_workflow
-        self._resume_workflow = resume_workflow
-        self._execute_workflow = execute_workflow
-        self._execute_actions = execute_actions
-        self._run_action = run_action
         self._sensitive_values = sensitive_values
 
         self._active_actions = 0
         self.action_lock = threading.Lock()
-        self.action_done = threading.Condition()
-        self.deferred_workflows: Dict[str, threading.Timer] = {}
-        self.deferred_workflows_lock = threading.RLock()
+        self.action_done = threading.Condition(self.action_lock)
         self._run_cancel_events: Dict[str, threading.Event] = {}
-        self._deferred_run_keys: Dict[str, str] = {}
-        self._deferred_run_contexts: Dict[
-            str, Tuple[Dict[str, Any], str]
-        ] = {}
         self._run_cancel_lock = threading.RLock()
 
     def _resolve_action(self, action_type: Any) -> Optional[Callable[..., Any]]:
@@ -241,9 +224,6 @@ class WorkflowExecutor:
             context["_run_finished"] = True
             if run_id:
                 self._run_cancel_events.pop(run_id, None)
-                self._deferred_run_keys.pop(run_id, None)
-                self._deferred_run_contexts.pop(run_id, None)
-            context.pop("_deferred_timer_key", None)
         return True
 
     def _complete_cancelled(
@@ -264,26 +244,12 @@ class WorkflowExecutor:
             },
         )
 
-    def is_run_deferred(self, run_id: str) -> bool:
-        """run 是否处于 deferred 等待重试状态，调度器据此把它算作活跃 run"""
-        with self._run_cancel_lock:
-            return run_id in self._deferred_run_keys
-
     def cancel_run(self, run_id: str) -> bool:
         with self._run_cancel_lock:
             event = self._run_cancel_events.get(run_id)
-            timer_key = self._deferred_run_keys.pop(run_id, None)
-            deferred = self._deferred_run_contexts.pop(run_id, None)
         if event is None:
             return False
         event.set()
-        if timer_key:
-            with self.deferred_workflows_lock:
-                timer = self.deferred_workflows.pop(timer_key, None)
-            if timer is not None:
-                timer.cancel()
-            if deferred is not None:
-                self._complete_cancelled(deferred[0], deferred[1])
         return True
 
     @property
@@ -332,7 +298,7 @@ class WorkflowExecutor:
             manual_test["active_offset"] = start_index
         else:
             selected_actions = actions
-        succeeded = self._execute_actions(selected_actions, rule_name, context)
+        succeeded = self.execute_actions(selected_actions, rule_name, context)
         if run_cancel_event.is_set():
             self._complete_cancelled(context, rule_name)
             return
@@ -394,78 +360,6 @@ class WorkflowExecutor:
         }
         self._on_event("test_assertions_completed", summary)
         return summary
-
-    def defer_workflow(
-        self,
-        workflow_key: str,
-        rule: Dict[str, Any],
-        rule_name: str,
-        context: Dict[str, Any],
-        delay: float,
-    ) -> None:
-        run_cancel_event = self._ensure_run_cancel_event(context)
-        if run_cancel_event.is_set():
-            self._complete_cancelled(context, rule_name)
-            return
-        run_id = _run_id(context)
-        timer_key = run_id or f"{workflow_key}:{id(context)}"
-        timer = threading.Timer(
-            delay,
-            self._resume_workflow,
-            args=(workflow_key, rule, rule_name, context),
-        )
-        timer.daemon = True
-        with self._run_cancel_lock:
-            if run_cancel_event.is_set():
-                self._complete_cancelled(context, rule_name)
-                return
-            context["_deferred_timer_key"] = timer_key
-            if run_id:
-                self._deferred_run_keys[run_id] = timer_key
-                self._deferred_run_contexts[run_id] = (context, rule_name)
-            with self.deferred_workflows_lock:
-                old_timer = self.deferred_workflows.pop(timer_key, None)
-                self.deferred_workflows[timer_key] = timer
-            if old_timer is not None:
-                old_timer.cancel()
-            timer.start()
-
-    def resume_workflow(
-        self,
-        workflow_key: str,
-        rule: Dict[str, Any],
-        rule_name: str,
-        context: Dict[str, Any],
-    ) -> None:
-        run_id = _run_id(context)
-        with self._run_cancel_lock:
-            timer_key = context.pop("_deferred_timer_key", None)
-            if run_id:
-                self._deferred_run_keys.pop(run_id, None)
-                self._deferred_run_contexts.pop(run_id, None)
-            if timer_key:
-                with self.deferred_workflows_lock:
-                    self.deferred_workflows.pop(timer_key, None)
-        shutdown_event = self._shutdown_event()
-        if shutdown_event and shutdown_event.is_set():
-            self._complete_cancelled(context, rule_name)
-            return
-        self._execute_workflow(workflow_key, rule, rule_name, context)
-
-    def cancel_deferred_workflows(self) -> None:
-        with self._run_cancel_lock:
-            deferred = list(self._deferred_run_contexts.values())
-            for context, _rule_name in deferred:
-                event = context.get("_run_cancel_event")
-                if isinstance(event, threading.Event):
-                    event.set()
-        with self.deferred_workflows_lock:
-            timers = list(self.deferred_workflows.values())
-            self.deferred_workflows.clear()
-        for timer in timers:
-            timer.cancel()
-        for context, rule_name in deferred:
-            self._complete_cancelled(context, rule_name)
 
     def execute_actions(
         self,
@@ -553,7 +447,7 @@ class WorkflowExecutor:
                 )
                 ok = True
             else:
-                ok, result = self._run_action(action, rule_name, context)
+                ok, result = self.run_action(action, rule_name, context)
                 status = "ok" if ok else (
                     "timed_out"
                     if isinstance(result, ActionCancelled)
@@ -665,7 +559,7 @@ class WorkflowExecutor:
         """执行一个动作并返回插件结果，供旧调用方使用"""
         if context is None:
             context = build_context(rule_name, "", {}, [])
-        ok, result = self._run_action(action, rule_name, context)
+        ok, result = self.run_action(action, rule_name, context)
         return result if ok else None
 
     def run_action(
@@ -703,26 +597,24 @@ class WorkflowExecutor:
                 rule_name=rule_name,
                 error=dynamic_parameter_error,
             )
-            # workflow_failed 是终态，只有第一个终态事件能发出去
-            if self._finish_run(context):
-                self._on_event(
-                    "workflow_failed",
-                    {
-                        "action_type": action_type,
-                        "rule_id": context.get("rule", {}).get("id", ""),
-                        "run_id": _run_id(context),
-                        "rule_name": rule_name,
-                        "step_id": action.get("binding_id") or action_type,
-                        "error": {
-                            "code": "unsafe_dynamic_parameter",
-                            "location": (
-                                f"actions.{action_type}.params."
-                                f"{dynamic_parameter_name}"
-                            ),
-                            "message": dynamic_parameter_error,
-                        },
+            self._on_event(
+                "error",
+                {
+                    "action_type": action_type,
+                    "rule_id": context.get("rule", {}).get("id", ""),
+                    "run_id": _run_id(context),
+                    "rule_name": rule_name,
+                    "step_id": action.get("binding_id") or action_type,
+                    "error": {
+                        "code": "unsafe_dynamic_parameter",
+                        "location": (
+                            f"actions.{action_type}.params."
+                            f"{dynamic_parameter_name}"
+                        ),
+                        "message": dynamic_parameter_error,
                     },
-                )
+                },
+            )
             print(
                 f"[Engine] [!!] 拦截 {action_type} 动态参数: {rule_name}",
                 file=sys.stderr,
@@ -736,18 +628,17 @@ class WorkflowExecutor:
             )
         except BindingResolutionError as exc:
             self._diagnostics.inc_action_fail()
-            if self._finish_run(context):
-                self._on_event(
-                    "workflow_failed",
-                    {
-                        "action_type": action_type,
-                        "rule_id": context.get("rule", {}).get("id", ""),
-                        "run_id": _run_id(context),
-                        "rule_name": rule_name,
-                        "step_id": action.get("binding_id") or action_type,
-                        "error": exc.as_dict(),
-                    },
-                )
+            self._on_event(
+                "error",
+                {
+                    "action_type": action_type,
+                    "rule_id": context.get("rule", {}).get("id", ""),
+                    "run_id": _run_id(context),
+                    "rule_name": rule_name,
+                    "step_id": action.get("binding_id") or action_type,
+                    "error": exc.as_dict(),
+                },
+            )
             print(
                 f"[Engine] action \"{action_type}\" 数据绑定失败: {exc}",
                 file=sys.stderr,
@@ -783,21 +674,22 @@ class WorkflowExecutor:
                     actions_meta.get(action_type, {}), params
                 )
                 if validation_errors:
-                    print(
-                        f"[Engine] [!!] action \"{action_type}\" validate_params 警告:",
-                        file=sys.stderr,
-                    )
-                    for validation_error in validation_errors:
-                        print(f"         - {validation_error}", file=sys.stderr)
+                    message = self._masked_event_value("; ".join(map(str, validation_errors)), context)
+                else:
+                    message = ""
             except Exception:
-                validation_error = self._masked_event_value(
-                    traceback.format_exc(), context
-                )
-                print(
-                    f"[Engine] action \"{action_type}\" validate_params() 执行异常:",
-                    file=sys.stderr,
-                )
-                print(validation_error, file=sys.stderr)
+                message = "插件参数校验失败"
+            if message:
+                self._diagnostics.inc_action_fail()
+                self._on_event("error", {
+                    "action_type": action_type,
+                    "rule_id": context.get("rule", {}).get("id", ""),
+                    "run_id": _run_id(context),
+                    "rule_name": rule_name,
+                    "step_id": action.get("binding_id") or action_type,
+                    "error": {"code": "invalid_action_params", "message": message},
+                })
+                return False, message
 
         with self.action_lock:
             # 在锁内再查一次 shutdown，两次检查之间引擎可能已经开始关闭
@@ -975,27 +867,17 @@ class WorkflowExecutor:
             )
             return False, error_message
         finally:
-            with self.action_lock:
-                self._active_actions -= 1
             with self.action_done:
+                self._active_actions -= 1
                 self.action_done.notify_all()
 
     def wait_active_actions(self, timeout: float = 60.0) -> bool:
         """等待活跃动作排空，返回是否在超时内全部完成"""
-        print("[Engine] 正在关闭，等待活跃动作完成...")
-        deadline = time.time() + timeout
-        while True:
-            remaining = self.active_actions
-            if remaining == 0:
-                print("[Engine] 所有动作已完成，引擎安全关闭")
-                return True
-            if time.time() >= deadline:
-                print(
-                    f"[Engine] [!!] shutdown: {remaining} active action(s) still "
-                    f"running after {timeout}s, forcing exit",
-                    file=sys.stderr,
-                )
-                return False
-            print(f"[Engine] 等待 {remaining} 个活跃动作完成...")
-            with self.action_done:
-                self.action_done.wait(timeout=3)
+        deadline = time.monotonic() + timeout
+        with self.action_done:
+            while self._active_actions:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.action_done.wait(timeout=remaining)
+        return True

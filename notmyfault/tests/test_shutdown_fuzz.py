@@ -1,6 +1,6 @@
 import threading
-
-import pytest
+import time
+from types import SimpleNamespace
 
 from notmyfault.tests.api_support import create_test_engine
 from notmyfault.core.workflow import build_context
@@ -66,8 +66,12 @@ class TestShutdownFuzz:
         engine = make_engine()
         shorten_timeouts(engine)
         release = threading.Event()
+        entered = threading.Event()
+        teardown = []
+        engine._plugin_modules["fuzz_slow"] = SimpleNamespace(teardown=lambda: teardown.append(True))
 
         def slow_action(meta, params):
+            entered.set()
             release.wait(timeout=10)
 
         engine.actions_funcs["fuzz_slow"] = slow_action
@@ -80,25 +84,17 @@ class TestShutdownFuzz:
             daemon=True,
         )
         thread.start()
+        assert entered.wait(5)
+        started = time.monotonic()
         engine.shutdown()
+        assert time.monotonic() - started < 1.5
+        assert not teardown
         release.set()
         thread.join(timeout=5)
         assert engine._shutdown_clean is False
-
-    def test_shutdown_cancels_deferred_workflow(self):
-        engine = make_engine()
-        shorten_timeouts(engine)
-        executed = threading.Event()
-        engine.actions_funcs["fuzz_deferred"] = lambda meta, params: executed.set()
-        engine.actions_meta["fuzz_deferred"] = {}
-        rule = {
-            "name": "延迟规则",
-            "actions": [{"type": "fuzz_deferred", "params": {}}],
-        }
-        context = build_context(rule["name"], "fuzz", {}, [], run_id="fuzz-run")
-        engine._defer_workflow("fuzz_key", rule, rule["name"], context, 0.1)
         engine.shutdown()
-        assert executed.wait(timeout=0.2) is False
+        assert engine._shutdown_clean is True
+        assert teardown == [True]
 
     def test_repeated_shutdown_calls_are_safe(self):
         engine = make_engine()

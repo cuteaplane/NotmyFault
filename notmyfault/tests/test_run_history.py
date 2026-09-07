@@ -5,6 +5,32 @@ import json
 from notmyfault.core.run_history import RunHistory
 
 
+def test_async_history_keeps_queries_current_and_flushes_batches(tmp_path, monkeypatch):
+    import threading
+
+    history = RunHistory(str(tmp_path / "runs.jsonl"))
+    writing = threading.Event()
+    release = threading.Event()
+    original = history._write_batch
+    def slow_write(packets):
+        writing.set()
+        assert release.wait(5)
+        original(packets)
+    monkeypatch.setattr(history, "_write_batch", slow_write)
+    try:
+        for index in range(1100):
+            history.record_async({"type": "rule_triggered", "ts": index, "data": {"run_id": f"run_{index}"}})
+        assert writing.wait(5)
+        assert len(history.list_runs(1000)) == 1000
+        assert history.get_run("run_1")["run_id"] == "run_1"
+    finally:
+        release.set()
+    assert history.flush()
+    saved = RunHistory(history.path)
+    assert saved.get_run("run_1") is not None
+    assert len(saved.list_runs(1000)) == 1000
+
+
 def packet(name, timestamp, **data):
     return {"type": name, "ts": timestamp, "data": data}
 
@@ -98,7 +124,7 @@ def test_run_history_builds_completed_run_with_steps(tmp_path):
 def test_run_history_recovers_from_broken_lines(tmp_path):
     path = tmp_path / "runs.jsonl"
     path.write_text(
-        "not-json\n"
+        "not-json\n{\"type\":\"rule_triggered\",\"data\":null}\n"
         + json.dumps(
             packet(
                 "rule_triggered",
@@ -113,11 +139,13 @@ def test_run_history_recovers_from_broken_lines(tmp_path):
         encoding="utf-8",
     )
 
-    runs = RunHistory(str(path)).list_runs()
+    history = RunHistory(str(path))
+    runs = history.list_runs()
 
     assert len(runs) == 1
     assert runs[0]["run_id"] == "run_ok"
     assert runs[0]["status"] == "running"
+    assert history.get_run("run_ok") == runs[0]
 
 
 def test_run_history_rejects_malformed_counts_and_timestamps(tmp_path):

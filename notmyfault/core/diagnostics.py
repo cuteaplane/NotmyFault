@@ -25,15 +25,6 @@ class Diagnostics:
         }
         self._lock = threading.RLock()
 
-    # 旧代码仍通过 engine._diag 和 engine._diag_lock 访问这两个属性
-    @property
-    def data(self) -> Dict[str, Any]:
-        return self._data
-
-    @property
-    def lock(self) -> threading.RLock:
-        return self._lock
-
     def record_plugin_error(self, store: str, plugin_id: str, reason: str) -> None:
         with self._lock:
             self._data["plugin_errors"].append((store, plugin_id, reason))
@@ -61,10 +52,6 @@ class Diagnostics:
     def inc_hot_reload_error(self) -> None:
         with self._lock:
             self._data["hot_reload_errors"] += 1
-
-    def inc_trigger_crash(self) -> None:
-        with self._lock:
-            self._data["trigger_crashes"] += 1
 
     def record_error(self, category: str, detail: str) -> None:
         """记录错误并保留最近 _MAX_ERRORS 条"""

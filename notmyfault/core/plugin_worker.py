@@ -127,10 +127,20 @@ def run_isolated_action(
     context: dict,
     startup_timeout: float = STARTUP_TIMEOUT,
     execute_timeout: float = EXECUTE_TIMEOUT,
+    *,
+    plugin_root: str | None = None,
+    file_snapshot: dict[str, str] | None = None,
 ):
+    from notmyfault.security.plugin_loader import _snapshot_plugin_files
+
+    plugin_root = plugin_root or str(Path(entry).resolve().parent)
+    if file_snapshot is None:
+        file_snapshot = _snapshot_plugin_files(plugin_root)
     request = {
         "entry": entry,
         "entry_sha256": entry_sha256,
+        "plugin_root": plugin_root,
+        "file_snapshot": file_snapshot,
         "action_info": action_info,
         "params": params,
         "context": _sanitize_context(context),
