@@ -273,14 +273,6 @@ $access = @($acl.GetAccessRules(
         raise ConfigValidationError("配置签名密钥权限过宽")
 
 
-def _validate_rules_safety(rules: list) -> tuple[list[str], list[str]]:
-    return [], []
-
-
-def validate_rules_safety(rules: list) -> tuple[list[str], list[str]]:
-    return _validate_rules_safety(rules)
-
-
 def normalize_rules(rules: Any) -> List[Dict[str, Any]]:
     return _normalize_rules(rules)
 
@@ -290,22 +282,13 @@ class ConfigValidationError(ValueError):
 
 
 def _validate_rules_for_runtime(rules: List[Dict[str, Any]]) -> None:
-    """打印安全提醒，并拒绝会在运行时执行的危险规则。"""
+    """拒绝不符合规则结构的运行时配置"""
     from notmyfault.core.rules import validate_rules_structure
 
     structure_errors = validate_rules_structure(rules)
     if structure_errors:
         raise ConfigValidationError(
             "规则结构校验失败: " + "; ".join(structure_errors[:3])
-        )
-    safety_warnings, safety_errors = _validate_rules_safety(rules)
-    for warning in safety_warnings:
-        print(f"[Config] [安全] {warning}", file=sys.stderr)
-    if safety_errors:
-        for error in safety_errors:
-            print(f"[Config] [安全-严重] {error}", file=sys.stderr)
-        raise ConfigValidationError(
-            "规则安全校验失败: " + "; ".join(safety_errors[:3])
         )
 
 
@@ -321,7 +304,7 @@ def _normalize_condition(condition: Any) -> Any:
         return copied
 
     op = copied.get("op", copied.get("type", "any"))
-    copied["op"] = "all" if op in ("all", "and") else "not" if op == "not" else "any"
+    copied["op"] = {"and": "all", "or": "any"}.get(op, op) if isinstance(op, str) else op
     copied["children"] = [_normalize_condition(child) for child in children]
     copied.pop("events", None)
     copied.pop("type", None)
