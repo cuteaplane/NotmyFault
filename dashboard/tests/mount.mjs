@@ -1213,20 +1213,21 @@ if (!aiDraftReviewOnlyOk) {
 
 mockAiDraftError = 'AI 模拟错误：请稍后重试'
 await sendNaturalDraft('继续说明这个草稿')
-await new Promise(r => setTimeout(r, 50))
+const retryButton = await waitFor('.ai-error-retry:not(:disabled)')
 const failedTurn = aiDraftCalls.at(-1)
 const requestHasNoRemovedPluginFields = !('consent' in failedTurn)
 const visibleErrorMessages = [...document.querySelectorAll('.natural-draft-conversation .ai-message')]
   .filter(message => message.textContent.includes(mockAiDraftError))
-const retryButton = await waitFor('.ai-error-retry:not(:disabled)')
 const errorCallCount = aiDraftCalls.length
 retryButton?.click()
-await new Promise(r => setTimeout(r, 50))
+// TransitionGroup 会短暂保留离场消息；等旧错误退出后再检查重试结果。
+const retryCompleted = await waitFor(() => visibleErrorMessages.every(message => !message.isConnected)
+  && document.querySelector('.ai-error-retry:not(:disabled)'))
 const retryTurn = aiDraftCalls.at(-1)
 const errorRetryKeepsOneRequest = aiDraftCalls.length === errorCallCount + 1
   && retryTurn?.messages?.at(-1)?.content === '继续说明这个草稿'
   && retryTurn.messages.filter(message => message.content === '继续说明这个草稿').length === 1
-const errorAnnouncedOnce = visibleErrorMessages.length === 1
+const errorAnnouncedOnce = !!retryCompleted && visibleErrorMessages.length === 1
   && document.querySelectorAll('.ai-error[role="alert"]').length === 1
   && errorRetryKeepsOneRequest
 await new Promise(r => setTimeout(r, 550))
@@ -1425,7 +1426,8 @@ addFailureAction?.click()
 await new Promise(r => setTimeout(r, 20))
 const failurePickerOk = document.querySelector('.plugin-picker-dialog')?.textContent.includes('添加补救动作')
 document.querySelector('.plugin-picker-item')?.click()
-await new Promise(r => setTimeout(r, 40))
+// 节点设置使用 out-in 过渡，先等主动作面板换成补救动作面板。
+await waitFor(() => document.querySelector('.node-inspector')?.textContent.includes('这个动作只会在上方主动作最终失败时执行'))
 const controlLabels = [...document.querySelectorAll('.node-link-label')].map(label => label.textContent)
 const failureBranchOk = failurePickerOk
   && document.querySelectorAll('.graph-node-failure-action').length === 1
