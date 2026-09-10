@@ -484,7 +484,7 @@ class TestSecurityScanIntegration:
         assert (loaded, failed) == (0, 1)
         assert any("未使用官方签名" in msg for _, _, msg in errors)
 
-    def test_strict_loads_officially_signed_admin_plugin(self, tmp_path, monkeypatch):
+    def test_strict_rejects_legacy_signed_user_admin_plugin(self, tmp_path, monkeypatch):
         loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
         admin_code = (
             "from notmyfault.security.sudo import run_as_admin\n"
@@ -496,9 +496,45 @@ class TestSecurityScanIntegration:
             make_meta("officialadmin", permissions=["admin"]), admin_code,
         )
         sign_with_test_key(folder, monkeypatch)
-        loaded, failed, meta_store, _ = load_actions(loader, tmp_path, origin="user")
+        loaded, failed, _, _ = load_actions(loader, tmp_path, origin="user")
+        assert (loaded, failed) == (0, 1)
+        assert any("未使用官方签名" in msg for _, _, msg in errors)
+
+    def test_strict_loads_builtin_admin_plugin(self, tmp_path, monkeypatch):
+        loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
+        admin_code = (
+            "from notmyfault.security.sudo import run_as_admin\n"
+            "def run(meta, params):\n"
+            "    return None\n"
+        )
+        folder = write_plugin(
+            tmp_path / "actions", "builtinadmin",
+            make_meta("builtinadmin", permissions=["admin"]), admin_code,
+        )
+        sign_with_test_key(folder, monkeypatch)
+        loaded, failed, meta_store, _ = load_actions(loader, tmp_path)
         assert (loaded, failed) == (1, 0)
-        assert meta_store["officialadmin"]["signature_kind"] == "official-legacy"
+        assert meta_store["builtinadmin"]["signature_kind"] == "official"
+
+    def test_strict_rejects_user_plugin_when_recorded_hashes_change(
+        self, tmp_path, monkeypatch
+    ):
+        loader, _, errors, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
+        folder = write_plugin(
+            tmp_path / "actions", "hashed", make_meta("hashed"), CLEAN_RUN
+        )
+        sign_with_test_key(folder, monkeypatch)
+        loaded, failed, _, _ = load_actions(loader, tmp_path, origin="user")
+        assert (loaded, failed) == (1, 0)
+        (folder / "action.py").write_text(
+            "def run(meta, params):\n    return {'value': 2}\n",
+            encoding="utf-8",
+        )
+        sign_with_test_key(folder, monkeypatch)
+        loader2, _, errors2, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
+        loaded2, failed2, _, _ = load_actions(loader2, tmp_path, origin="user")
+        assert (loaded2, failed2) == (0, 1)
+        assert any("已被修改" in msg for _, _, msg in errors2)
 
     def test_author_signature_requires_user_counter_signature(self, tmp_path, monkeypatch):
         from cryptography.hazmat.primitives.asymmetric import ed25519

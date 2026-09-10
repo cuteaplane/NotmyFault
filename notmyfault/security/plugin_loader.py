@@ -124,7 +124,7 @@ def validate_plugin_signature(
     if kind == "none":
         raise ValueError("签名无效")
     if "admin" in (meta.get("permissions") or []):
-        if kind not in ("official", "official-legacy"):
+        if kind != "official":
             raise ValueError("声明了 'admin' 权限但未使用官方签名")
     elif origin == "user" and kind == "author":
         from notmyfault.security.signing import verify_author_key_counter_signature
@@ -677,7 +677,7 @@ class PluginLoader:
                     engine_error("plugin_load_failed", plugin=plugin_id, type=store_name, reason=reason)
                     continue
 
-            # 内置插件使用构建时 Ed25519 签名，用户插件记录首次文件哈希，完整性失败只告警。
+            # 用户插件第一次加载记下文件哈希；strict 下以后对不上就当文件被改过，不加载。
             if origin != "builtin":
                 integrity_ok, integrity_msg = verify_plugin_integrity_from_hashes(
                     plugin_id,
@@ -692,6 +692,18 @@ class PluginLoader:
                     print(warning, file=sys.stderr)
                     engine_warn(f"integrity_check: {integrity_msg}")
                     self._integrity_errors.append(warning)
+                    if self._security_mode == SecurityMode.STRICT:
+                        failed_count += 1
+                        self._diagnostics.record_plugin_error(
+                            store_name, plugin_id, integrity_msg
+                        )
+                        engine_error(
+                            "plugin_load_failed",
+                            plugin=plugin_id,
+                            type=store_name,
+                            reason=integrity_msg,
+                        )
+                        continue
 
             if borrowed_findings:
                 warning = (
