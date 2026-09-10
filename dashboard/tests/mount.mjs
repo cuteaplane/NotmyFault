@@ -1213,15 +1213,18 @@ if (!aiDraftReviewOnlyOk) {
 
 mockAiDraftError = 'AI 模拟错误：请稍后重试'
 await sendNaturalDraft('继续说明这个草稿')
-await new Promise(r => setTimeout(r, 50))
+const retryButton = await waitFor('.ai-error-retry:not(:disabled)')
+if (!retryButton) throw new Error('AI 错误提示未就绪')
 const failedTurn = aiDraftCalls.at(-1)
 const requestHasNoRemovedPluginFields = !('consent' in failedTurn)
 const visibleErrorMessages = [...document.querySelectorAll('.natural-draft-conversation .ai-message')]
   .filter(message => message.textContent.includes(mockAiDraftError))
-const retryButton = await waitFor('.ai-error-retry:not(:disabled)')
 const errorCallCount = aiDraftCalls.length
-retryButton?.click()
-await new Promise(r => setTimeout(r, 50))
+retryButton.click()
+const retryFinished = await waitFor(() => (
+  !retryButton.isConnected && document.querySelector('.ai-error-retry:not(:disabled)')
+))
+if (!retryFinished) throw new Error('AI 重试后的错误提示未就绪')
 const retryTurn = aiDraftCalls.at(-1)
 const errorRetryKeepsOneRequest = aiDraftCalls.length === errorCallCount + 1
   && retryTurn?.messages?.at(-1)?.content === '继续说明这个草稿'
@@ -1425,13 +1428,13 @@ addFailureAction?.click()
 await new Promise(r => setTimeout(r, 20))
 const failurePickerOk = document.querySelector('.plugin-picker-dialog')?.textContent.includes('添加补救动作')
 document.querySelector('.plugin-picker-item')?.click()
-await new Promise(r => setTimeout(r, 40))
+const failureActionNote = await waitFor('.node-inspector .failure-action-note')
 const controlLabels = [...document.querySelectorAll('.node-link-label')].map(label => label.textContent)
 const failureBranchOk = failurePickerOk
   && document.querySelectorAll('.graph-node-failure-action').length === 1
   && controlLabels.includes('失败时')
   && controlLabels.includes('处理后继续')
-  && document.querySelector('.node-inspector')?.textContent.includes('这个动作只会在上方主动作最终失败时执行')
+  && failureActionNote?.closest('.node-inspector').textContent.includes('这个动作只会在上方主动作最终失败时执行')
   && document.querySelector('.classic-rule-editor .action-flow-card .flow-card-copy small')?.textContent.includes('1 个补救动作')
 console.log((failureBranchOk?'PASS':'FAIL')+' - failed actions can run an editable recovery branch')
 if (!failureBranchOk) process.exit(1)
