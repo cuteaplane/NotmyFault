@@ -22,6 +22,16 @@ from notmyfault.tests.api_support import make_paths, make_store
 from notmyfault.tests.test_api_plugins import build_nmfp, make_meta, post_archive
 
 
+@pytest.fixture(autouse=True)
+def normal_plugin_installation_mode(monkeypatch):
+    from notmyfault.host.api.services import plugin_installation
+    from notmyfault.security.security import SecurityMode
+
+    monkeypatch.setattr(
+        plugin_installation, "detect_security_mode", lambda: SecurityMode.NORMAL
+    )
+
+
 def test_preview_rejects_directory_tampering_and_deletes_temporary_tree(tmp_path):
     previews = PendingPreviewStore()
     env = make_api_env(tmp_path, pending_previews=previews)

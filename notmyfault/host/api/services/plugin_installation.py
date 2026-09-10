@@ -37,7 +37,7 @@ from notmyfault.security.plugins import plugin_signature_kind, scan_borrowed_pri
 from notmyfault.security.security import detect_security_mode
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class PluginInstallationError(Exception):
     status_code: int
     body: Dict[str, Any]

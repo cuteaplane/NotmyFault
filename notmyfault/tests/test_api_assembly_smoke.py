@@ -7,6 +7,8 @@ import signal
 import time
 from pathlib import Path
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from fastapi.testclient import TestClient
 
 from notmyfault.core.run_history import RunHistory
@@ -20,6 +22,7 @@ from notmyfault.host.api.plugin_installation import (
 from notmyfault.host.api_server import create_api_server
 from notmyfault.host.app import create_engine
 from notmyfault.host.plugin_registry import PluginRegistryClient
+from notmyfault.security import signing, signing_keys
 from notmyfault.tests.api_support import (
     API_TOKEN,
     FakeKeyStore,
@@ -54,6 +57,13 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
         source_package / "actions" / "notify",
         package_root / "actions" / "notify",
     )
+    signing_key = Ed25519PrivateKey.generate()
+    public_key = signing_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [public_key])
+    signing.sign_plugin(
+        package_root / "triggers" / "time_schedule", "trigger.json", signing_key
+    )
+    signing.sign_plugin(package_root / "actions" / "notify", "action.json", signing_key)
     paths = make_paths(tmp_path, package_root=package_root)
     (tmp_path / "build.json").write_text("{}", encoding="utf-8")
     (tmp_path / "build.json.sig").write_bytes(b"test-signature")
@@ -110,6 +120,7 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
             assert runner.start_engine() is True
             while True:
                 packet = await asyncio.wait_for(subscription.queue.get(), timeout=15)
+                assert packet["type"] != "engine_failed", packet["data"]
                 if packet["type"] == "engine_state_changed" and packet["data"] == {
                     "state": "running"
                 }:

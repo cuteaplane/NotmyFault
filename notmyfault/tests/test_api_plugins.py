@@ -9,6 +9,16 @@ from notmyfault.host.api.plugin_installation import PluginFileSystem
 from notmyfault.tests.api_support import make_api_env
 
 
+@pytest.fixture(autouse=True)
+def normal_plugin_installation_mode(monkeypatch):
+    from notmyfault.host.api.services import plugin_installation
+    from notmyfault.security.security import SecurityMode
+
+    monkeypatch.setattr(
+        plugin_installation, "detect_security_mode", lambda: SecurityMode.NORMAL
+    )
+
+
 def make_meta(plugin_kind: str, **overrides):
     meta = {
         "id": f"demo_{plugin_kind}",
