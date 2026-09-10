@@ -57,6 +57,7 @@ class TestCallNotmyfault:
         )
         register_action(engine, "noop", lambda meta, params: ran.append(1))
         engine.call_notmyfault({"trigger_id": "hotkey", "triggered_params": {}})
+        assert engine._rule_scheduler.wait_for_idle(timeout=5)
         assert ran == [1]
 
 
