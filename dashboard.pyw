@@ -274,7 +274,7 @@ class DashboardAPI:
         return {"ok": False, "error": last_error or "后台服务启动超时"}
 
     def get_config(self) -> dict:
-        """有效规则先补齐身份，验签失败时保留原文供安全页核对"""
+        """验签失败时保留原文供安全页核对"""
         from notmyfault.core.value_codec import encode_value
         try:
             if self._paths.rules_file.exists():
@@ -283,11 +283,8 @@ class DashboardAPI:
                 rules = data.get("rules", []) if isinstance(data, dict) else []
                 rules = rules if isinstance(rules, list) else []
                 try:
-                    normalized = self._store.load_verified_rules()
-                    encoded = encode_value(normalized)
-                    if encoded != rules:
-                        self._store.save_rules(normalized)
-                    return {"rules": encoded}
+                    normalized = self._store.load_verified_rules(for_editing=True)
+                    return {"rules": encode_value(normalized)}
                 except Exception:
                     return {"rules": rules if data.get("value_encoding") == "typed-v1" else encode_value(rules)}
         except Exception as e:
@@ -302,10 +299,10 @@ class DashboardAPI:
             from notmyfault.config import (
                 ConfigValidationError,
                 normalize_rules,
-                validate_rules_safety,
             )
             from notmyfault.core.rules import (
                 validate_rule_bindings,
+                validate_rules,
                 validate_rules_structure,
             )
             normalized_rules = normalize_rules(rules)
@@ -332,17 +329,22 @@ class DashboardAPI:
                     "error": "规则数据绑定无效",
                     "details": binding_issues[:20],
                 }
-            _warnings, errors = validate_rules_safety(normalized_rules)
-            if errors:
+            _valid, _total, plugin_errors, _warnings = validate_rules(
+                normalized_rules, schema["triggers"], schema["actions"],
+            )
+            if plugin_errors:
                 return {
                     "ok": False,
-                    "error": "规则安全校验失败",
-                    "details": errors[:10],
+                    "error": "规则插件参数无效",
+                    "details": [
+                        f"{name}: {message}"
+                        for name, message in plugin_errors[:20]
+                    ],
                 }
             previous_rules = []
             if self._paths.rules_file.exists():
                 try:
-                    previous_rules = self._store.load_verified_rules()
+                    previous_rules = self._store.load_verified_rules(for_editing=True)
                 except ConfigValidationError as error:
                     return {
                         "ok": False,

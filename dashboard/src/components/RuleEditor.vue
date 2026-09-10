@@ -40,6 +40,7 @@ import {
   expandBindingSources,
   referenceLabel,
   bindingSourceFor,
+  actionOutputDefs,
 } from '../lib/bindings'
 import { typeLabel, fieldType } from '../lib/valueTypes'
 import ParamInput from './ParamInput.vue'
@@ -443,47 +444,86 @@ const clientValidationIssues = computed(() => {
       add(`${label}不能安全停止，不能设置最长运行时间`, nodeId)
     }
   }
-  actions.forEach((action, index) => {
+  function branchSources(base, siblings, index) {
+    const result = [...base]
+    siblings.slice(0, index).forEach(item => {
+      if (item?.type === 'if') return
+      actionOutputDefs(item, store.schema, props.rule).forEach(output => result.push({
+        group: '当前分支的前序动作',
+        label: `${store.schema.actions[item.type]?.name || item.type} · ${output.label || output.name}`,
+        type: fieldType(output),
+        optional: output.required === false,
+        sensitive: output.sensitive,
+        value: { $ref: { scope: 'step', node: item.binding_id, path: [output.name] } },
+      }))
+    })
+    return expandBindingSources(result, store.schema.data_types?.custom)
+  }
+  function validateActionNode(action, label, nodeId, sources) {
     if (action?.type === 'set_variable') {
-      if (!props.rule.variables?.some(item => item.id === action.variable)) add(`动作 ${index + 1} 的赋值目标不存在`, `action:${index}`)
+      if (!props.rule.variables?.some(item => item.id === action.variable)) add(`${label} 的赋值目标不存在`, nodeId)
       return
     }
     if (action?.type === 'if') {
-      if (!action.then?.length && !action.else?.length) add(`IF ${index + 1} 需要至少一个分支动作`, `action:${index}`)
+      if (!action.then?.length && !action.else?.length) add(`${label} 需要至少一个分支动作`, nodeId)
+      ;(action.then || []).forEach((item, index) => {
+        validateActionNode(item, `${label} THEN ${index + 1}`, nodeId, branchSources(sources, action.then, index))
+      })
+      ;(action.else || []).forEach((item, index) => {
+        validateActionNode(item, `${label} ELSE ${index + 1}`, nodeId, branchSources(sources, action.else, index))
+      })
       return
     }
     const actionReason = pluginUnavailableReason('actions', action?.type)
-    if (actionReason) add(`动作 ${index + 1} 引用了当前系统不可用的插件（${actionReason}）`, `action:${index}`)
-    if (action?.params != null && (typeof action.params !== 'object' || Array.isArray(action.params))) add(`动作 ${index + 1} 参数格式无效`, `action:${index}`)
-    validateTimeout(action, `动作 ${index + 1}`, `action:${index}`)
-    const sources = actionBindingSources(index)
+    if (actionReason) add(`${label} 引用了当前系统不可用的插件（${actionReason}）`, nodeId)
+    if (action?.params != null && (typeof action.params !== 'object' || Array.isArray(action.params))) add(`${label} 参数格式无效`, nodeId)
+    validateTimeout(action, label, nodeId)
     for (const def of actionParams(action)) {
       const value = action?.params?.[def.name]
       if (!isReference(value)) continue
       const source = bindingSourceFor(value.$ref, sources, typeCatalog.value)
-      if (!source) add(`动作 ${index + 1} 的“${def.label || def.name}”引用了不可用数据`, `action:${index}`)
+      if (!source) add(`${label} 的“${def.label || def.name}”引用了不可用数据`, nodeId)
       else if (!typesCompatible(source.type, fieldType(def, true))) {
-        add(`动作 ${index + 1} 的“${def.label || def.name}”数据类型不兼容`, `action:${index}`)
+        add(`${label} 的“${def.label || def.name}”数据类型不兼容`, nodeId)
       }
     }
     ;(Array.isArray(action?.failure_actions) ? action.failure_actions : []).forEach((failureAction, failureIndex) => {
+      const failureLabel = `${label} 的补救动作 ${failureIndex + 1}`
       const failureReason = pluginUnavailableReason('actions', failureAction?.type)
-      if (failureReason) add(`动作 ${index + 1} 的补救动作 ${failureIndex + 1} 不可用（${failureReason}）`, `action:${index}`)
+      if (failureReason) add(`${failureLabel} 不可用（${failureReason}）`, nodeId)
       if (failureAction?.params != null && (typeof failureAction.params !== 'object' || Array.isArray(failureAction.params))) {
-        add(`动作 ${index + 1} 的补救动作 ${failureIndex + 1} 参数格式无效`, `action:${index}`)
+        add(`${failureLabel} 参数格式无效`, nodeId)
       }
-      validateTimeout(failureAction, `动作 ${index + 1} 的补救动作 ${failureIndex + 1}`, `action:${index}`)
-      const failureSources = failureActionBindingSources(index, failureIndex)
+      validateTimeout(failureAction, failureLabel, nodeId)
+      const failureSources = [...sources]
+      action.failure_actions.slice(0, failureIndex).forEach(item => {
+        actionOutputDefs(item, store.schema, props.rule).forEach(output => failureSources.push({
+          group: '之前的补救动作',
+          label: `${item.type} · ${output.label || output.name}`,
+          type: fieldType(output),
+          optional: output.required === false,
+          sensitive: output.sensitive,
+          value: { $ref: { scope: 'step', node: item.binding_id, path: [output.name] } },
+        }))
+      })
       for (const def of actionParams(failureAction)) {
         const value = failureAction?.params?.[def.name]
         if (!isReference(value)) continue
         const source = bindingSourceFor(value.$ref, failureSources, typeCatalog.value)
-        if (!source) add(`动作 ${index + 1} 的补救动作 ${failureIndex + 1} 引用了不可用数据`, `action:${index}`)
+        if (!source) add(`${failureLabel} 引用了不可用数据`, nodeId)
         else if (!typesCompatible(source.type, fieldType(def, true))) {
-          add(`动作 ${index + 1} 的补救动作 ${failureIndex + 1} 数据类型不兼容`, `action:${index}`)
+          add(`${failureLabel} 数据类型不兼容`, nodeId)
         }
       }
     })
+  }
+  actions.forEach((action, index) => {
+    validateActionNode(
+      action,
+      `动作 ${index + 1}`,
+      `action:${index}`,
+      actionBindingSources(index),
+    )
   })
   if (props.rule.preconditions?.length) add('运行前检查已移除，请移除旧配置并改用 NOT 或 IF', 'actions')
   return issues

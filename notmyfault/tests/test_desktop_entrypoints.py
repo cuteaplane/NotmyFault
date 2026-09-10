@@ -25,6 +25,58 @@ def dashboard(monkeypatch):
     return module
 
 
+def test_dashboard_get_config_does_not_rewrite_rules_file(dashboard, tmp_path):
+    import hashlib
+    import hmac
+    import json
+
+    from notmyfault.core.value_codec import encode_value
+    from notmyfault.tests.api_support import make_paths, make_store
+
+    paths = make_paths(tmp_path)
+    store = make_store(paths)
+    rule = {
+        "name": "提醒",
+        "event": {"type": "time_schedule", "params": {"time": "08:00"}},
+        "actions": [{"type": "notify", "params": {"title": "提醒"}}],
+    }
+    payload = {
+        "schema_version": 2,
+        "value_encoding": "typed-v1",
+        "rules": encode_value([rule]),
+    }
+    secret = paths.config_secret_file.read_bytes()
+    content = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    payload["_signature"] = hmac.new(
+        secret, content.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    paths.rules_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    before = paths.rules_file.read_bytes()
+    result = dashboard.DashboardAPI(store=store, paths=paths).get_config()
+    assert "_error" not in result
+    assert result["rules"]
+    assert paths.rules_file.read_bytes() == before
+
+
+def test_dashboard_save_config_writes_signed_rules(dashboard, tmp_path):
+    from notmyfault.core.value_codec import encode_value
+    from notmyfault.tests.api_support import make_paths, make_store
+
+    paths = make_paths(tmp_path)
+    store = make_store(paths)
+    api = dashboard.DashboardAPI(store=store, paths=paths)
+    rule = {
+        "name": "提醒",
+        "event": {"type": "time_schedule", "params": {"time": "08:00"}},
+        "actions": [{"type": "notify", "params": {"title": "提醒"}}],
+    }
+    result = api.save_config(encode_value([rule]), "", "typed-v1")
+    assert result.get("ok") is True, result
+    loaded = store.load_verified_rules()
+    assert loaded[0]["name"] == "提醒"
+    assert loaded[0]["actions"][0]["type"] == "notify"
+
+
 def test_dashboard_reads_history_from_application_paths(dashboard, tmp_path):
     paths = ApplicationPaths(tmp_path / "config", tmp_path / "package", tmp_path)
     paths.logs_dir.mkdir(parents=True)

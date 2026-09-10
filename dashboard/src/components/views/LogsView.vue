@@ -119,38 +119,58 @@ function matchingRule(run) {
     || rules.find(rule => rule.name === run.rule_name)
 }
 
+function walkActions(actions, visit, trail = []) {
+  ;(actions || []).forEach((action, index) => {
+    visit(action, index, trail)
+    for (const field of ['then', 'else', 'failure_actions']) {
+      if (Array.isArray(action?.[field]) && action[field].length) {
+        walkActions(action[field], visit, [...trail, { action, field, index }])
+      }
+    }
+  })
+}
+
+function findAction(actions, bindingId) {
+  let found = null
+  walkActions(actions, (action, index, trail) => {
+    if (!found && action?.binding_id === bindingId) found = { action, index, trail }
+  })
+  return found
+}
+
 function runScope(run) {
   if (!run.start_step_id && !run.end_step_id) return ''
   const actions = matchingRule(run)?.actions || []
-  const start = run.start_step_id
-    ? actions.findIndex(action => action.binding_id === run.start_step_id) + 1
-    : 1
-  const end = run.end_step_id
-    ? actions.findIndex(action => action.binding_id === run.end_step_id) + 1
-    : actions.length
-  if (start <= 0 || end <= 0) return `局部测试 · ${run.action_count} 个动作`
-  return `局部测试 · 动作 ${start}–${end} / 共 ${actions.length} 个`
+  const startHit = run.start_step_id ? findAction(actions, run.start_step_id) : { index: 0, trail: [] }
+  const endHit = run.end_step_id ? findAction(actions, run.end_step_id) : { index: actions.length - 1, trail: [] }
+  if (!startHit || !endHit) return `局部测试 · ${run.action_count} 个动作`
+  if (startHit.trail.length || endHit.trail.length) return `局部测试 · ${run.action_count} 个动作`
+  return `局部测试 · 动作 ${startHit.index + 1}–${endHit.index + 1} / 共 ${actions.length} 个`
 }
 
 function stepNumber(run, step, fallback) {
-  const index = (matchingRule(run)?.actions || [])
-    .findIndex(action => action.binding_id === step.step_id)
-  return index >= 0 ? index + 1 : fallback
+  const found = findAction(matchingRule(run)?.actions || [], step.step_id)
+  if (!found) return fallback
+  if (!found.trail.length) return found.index + 1
+  const parent = found.trail[0]
+  const branch = parent.field === 'then' ? 'THEN' : parent.field === 'else' ? 'ELSE' : '失败处理'
+  return `${parent.index + 1}.${branch}.${found.index + 1}`
 }
 
 function stepContext(run, step) {
-  const rule = matchingRule(run)
-  const actions = rule?.actions || []
-  const action = actions.find(item => item.binding_id === step.step_id)
-  if (action) return { kind: 'action', label: '' }
-  for (const parent of actions) {
-    const failure = (parent.failure_actions || []).find(item => item.binding_id === step.step_id)
-    if (failure) {
-      return {
-        kind: 'failure',
-        label: `“${actionName(parent.type)}”的失败处理`,
-      }
+  const found = findAction(matchingRule(run)?.actions || [], step.step_id)
+  if (!found) return { kind: 'action', label: '' }
+  const failureParent = found.trail.find(item => item.field === 'failure_actions')
+  if (failureParent) {
+    return {
+      kind: 'failure',
+      label: `“${actionName(failureParent.action.type)}”的失败处理`,
     }
+  }
+  if (found.trail.some(item => item.field === 'then' || item.field === 'else')) {
+    const parent = found.trail[0]
+    const branch = parent.field === 'then' ? '成立时' : '否则'
+    return { kind: 'action', label: `“${actionName(parent.action.type)}”${branch}` }
   }
   return { kind: 'action', label: '' }
 }

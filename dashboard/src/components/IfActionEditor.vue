@@ -50,9 +50,9 @@ function move(items, index, offset) {
   items.splice(index + offset, 0, item)
 }
 function replace(item, type) {
-  const id = item.binding_id
-  Object.keys(item).forEach(key => delete item[key])
-  Object.assign(item, newAction(type), { binding_id: id })
+  item.type = type
+  item.params = buildDefaultParams(store.schema.actions[type])
+  if (store.schema.actions[type]?.cancellation_api !== 'runtime-v1') delete item.timeout_seconds
 }
 </script>
 

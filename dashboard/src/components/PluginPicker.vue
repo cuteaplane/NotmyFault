@@ -67,7 +67,7 @@ function choose(key) {
   <BaseDialog :open="open" @close="emit('close')">
     <section class="plugin-picker-dialog" role="dialog" aria-modal="true" :aria-label="title || '选择插件'">
       <header class="plugin-picker-head">
-        <div><small>{{ kind === 'trigger' ? '触发方式' : kind === 'precondition' ? '开始前确认' : '执行动作' }}</small><h2>{{ title || '选择插件' }}</h2></div>
+        <div><small>{{ kind === 'trigger' ? '触发方式' : '执行动作' }}</small><h2>{{ title || '选择插件' }}</h2></div>
         <button class="icon-btn" title="关闭" @click="emit('close')"><span class="material-symbols-outlined">close</span></button>
       </header>
       <label class="plugin-picker-search">
@@ -82,7 +82,7 @@ function choose(key) {
         <template v-for="([group, items]) in visibleGroups" :key="group">
           <h3>{{ group }}</h3>
           <button v-for="key in items" :key="key" class="plugin-picker-item" @click="choose(key)">
-            <span class="material-symbols-outlined">{{ kind === 'trigger' ? 'bolt' : kind === 'precondition' ? 'verified_user' : 'play_arrow' }}</span>
+            <span class="material-symbols-outlined">{{ kind === 'trigger' ? 'bolt' : 'play_arrow' }}</span>
             <span><b>{{ schema[key]?.name || key }}</b><small>{{ schema[key]?.description || key }}</small></span>
             <span v-if="schema[key]?.permissions?.includes('admin')" class="chip chip-admin">管理员</span>
             <span class="material-symbols-outlined plugin-picker-arrow">arrow_forward</span>

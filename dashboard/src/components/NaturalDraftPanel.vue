@@ -264,7 +264,9 @@ function highlightNode(item) {
 
 function applyChangeSet(draft) {
   if (!draft) return
-  emit('create', draft)
+  const next = { ...draft }
+  delete next.preconditions
+  emit('create', next)
 }
 
 function ensureActivity(message) {
