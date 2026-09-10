@@ -1,0 +1,84 @@
+name: Windows installer
+
+on:
+  push:
+    paths:
+      - '.github/workflows/windows-installer.yml'
+      - 'installer/windows/**'
+      - 'notmyfault/**'
+      - 'dashboard/**'
+      - 'Win_toaster/**'
+      - 'requirements*.txt'
+      - 'build.py'
+      - 'dashboard.pyw'
+      - 'NOTMYFAULT.pyw'
+      - 'nmf.py'
+      - 'logo.*'
+      - 'LICENSE'
+  pull_request:
+    paths:
+      - '.github/workflows/windows-installer.yml'
+      - 'installer/windows/**'
+      - 'notmyfault/**'
+      - 'dashboard/**'
+      - 'Win_toaster/**'
+      - 'requirements*.txt'
+      - 'build.py'
+      - 'dashboard.pyw'
+      - 'NOTMYFAULT.pyw'
+      - 'nmf.py'
+      - 'logo.*'
+      - 'LICENSE'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-installer-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+          architecture: x64
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          architecture: x64
+          package-manager-cache: false
+      - name: Build installer
+        run: ./installer/windows/build.ps1 -DevelopmentKey -NonInteractive
+      - name: Test installer
+        run: |
+          $installer = Get-Item installer/windows/dist/*-windows-x64-setup.exe
+          ./installer/windows/tests/run_smoke.ps1 -Installer $installer.FullName -WorkDirectory (Join-Path $PWD 'installer/windows/build/ci-smoke')
+      - name: Upload installer
+        uses: actions/upload-artifact@v6
+        with:
+          name: NotmyFault-windows-x64-installer
+          path: installer/windows/dist/*-windows-x64-setup.exe
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: NotmyFault-windows-x64-logs
+          path: |
+            installer/windows/build/**/build.log
+            installer/windows/build/**/smoke.log
+          if-no-files-found: ignore
+          retention-days: 7
