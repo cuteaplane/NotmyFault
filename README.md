@@ -67,6 +67,7 @@ cd ..
 ```
 
 ```bash
+./.venv/bin/python build.py
 ./.venv/bin/python dashboard.pyw
 ```
 

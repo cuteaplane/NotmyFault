@@ -76,7 +76,8 @@ self_sign_plugin("my_plugin", key)   # 生成 signature.sig 与 public_key.pem
   当前安装者的本地插件密钥为该公钥生成 `public_key.sig` 副签；安装流程会完成这一步。
 - 验签结果分为 `official`、`author`、`official-legacy` 和 `none`。严格模式不加载
   `none`。普通作者签名还要有当前安装使用的本地密钥副签。声明 `admin` 权限的插件
-  在严格模式下只接受 `official` 或 `official-legacy` 签名，作者签名不能加载。
+  在严格模式下只接受 `official` 签名。本机用户钥代签得到的 `official-legacy`
+  不能作为管理员插件加载。
 - 私钥自己保管，不要放进插件目录或归档。
 
 ## 打包
@@ -102,8 +103,9 @@ python nmf.py plugin pack <插件目录路径>
 }
 ```
 
-- 安装时在插件目录内逐条执行 `command`，120 秒超时；任一命令失败或
-  `outputs` 缺失即安装失败。
+- 有 `command` 时先按用户插件规则验签，签名无效则不执行命令、安装失败。
+- 安装时在插件目录内逐条执行 `command`。每条用空格拆成参数列表，不经过
+  cmd 或 sh。120 秒超时。任一命令失败或 `outputs` 缺失即安装失败。
 - `outputs` 必须是插件目录内的相对路径。
 - 安装构建流程保留归档里的签名材料，作者签名必须与构建后的文件内容相符。
   安装端在替换旧版本前按加载器的签名规则校验暂存目录；严格模式要求有效签名，
