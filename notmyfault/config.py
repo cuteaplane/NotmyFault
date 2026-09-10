@@ -193,68 +193,53 @@ def _validate_secret_permissions(path: str) -> None:
             raise ConfigValidationError("配置签名密钥权限过宽")
         return
 
-    import subprocess as _sp
+    import pywintypes
+    import win32api
+    import win32con
+    import win32security
 
-    script = """
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$acl = [System.IO.File]::GetAccessControl($env:NMF_CONFIG_SECRET_PATH)
-$access = @($acl.GetAccessRules(
-    $true,
-    $true,
-    [System.Security.Principal.SecurityIdentifier]
-) | ForEach-Object {
-    [pscustomobject]@{
-        Sid = $_.IdentityReference.Value
-        Type = $_.AccessControlType.ToString()
-    }
-})
-[pscustomobject]@{
-    Current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    Owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
-    Access = $access
-} | ConvertTo-Json -Compress -Depth 4
-"""
-    command_env = os.environ.copy()
-    command_env["NMF_CONFIG_SECRET_PATH"] = path
-    import base64
-
-    encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
     try:
-        result = _sp.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-NonInteractive",
-                "-EncodedCommand",
-                encoded_script,
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=10,
-            env=command_env,
+        token = win32security.OpenProcessToken(
+            win32api.GetCurrentProcess(), win32con.TOKEN_QUERY
         )
-        if result.returncode != 0:
-            raise OSError("PowerShell ACL 检查失败")
-        acl = json.loads(result.stdout)
-    except (json.JSONDecodeError, OSError, _sp.SubprocessError) as error:
+        try:
+            current_sid = win32security.GetTokenInformation(
+                token, win32security.TokenUser
+            )[0]
+        finally:
+            token.Close()
+        allowed = {
+            win32security.ConvertSidToStringSid(current_sid),
+            "S-1-5-18",
+            "S-1-5-32-544",
+        }
+        descriptor = win32security.GetNamedSecurityInfo(
+            path,
+            win32security.SE_FILE_OBJECT,
+            win32security.OWNER_SECURITY_INFORMATION
+            | win32security.DACL_SECURITY_INFORMATION,
+        )
+        owner = descriptor.GetSecurityDescriptorOwner()
+        if owner is None or win32security.ConvertSidToStringSid(owner) not in allowed:
+            raise ConfigValidationError("配置签名密钥所有者无效")
+        dacl = descriptor.GetSecurityDescriptorDacl()
+        if dacl is None:
+            raise ConfigValidationError("配置签名密钥权限过宽")
+        for index in range(dacl.GetAceCount()):
+            ace = dacl.GetAce(index)
+            if ace[0][0] in (
+                win32security.ACCESS_ALLOWED_ACE_TYPE,
+                win32security.ACCESS_ALLOWED_OBJECT_ACE_TYPE,
+            ):
+                if win32security.ConvertSidToStringSid(ace[-1]) not in allowed:
+                    raise ConfigValidationError("配置签名密钥权限过宽")
+            elif ace[0][0] not in (
+                win32security.ACCESS_DENIED_ACE_TYPE,
+                win32security.ACCESS_DENIED_OBJECT_ACE_TYPE,
+            ):
+                raise ConfigValidationError("配置签名密钥权限无法验证")
+    except (pywintypes.error, NotImplementedError) as error:
         raise ConfigValidationError("配置签名密钥权限无法验证") from error
-    current_sid = acl.get("Current") if isinstance(acl, dict) else None
-    allowed = {current_sid, "S-1-5-18", "S-1-5-32-544"}
-    if not current_sid or acl.get("Owner") not in allowed:
-        raise ConfigValidationError("配置签名密钥所有者无效")
-    access = acl.get("Access", [])
-    if isinstance(access, dict):
-        access = [access]
-    if not isinstance(access, list) or any(
-        isinstance(entry, dict)
-        and entry.get("Type") == "Allow"
-        and entry.get("Sid") not in allowed
-        for entry in access
-    ):
-        raise ConfigValidationError("配置签名密钥权限过宽")
 
 
 def normalize_rules(rules: Any) -> List[Dict[str, Any]]:
