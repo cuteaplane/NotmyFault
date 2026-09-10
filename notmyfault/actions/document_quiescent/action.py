@@ -193,6 +193,8 @@ def check_precondition(_meta: Dict[str, Any], params: Dict[str, Any], _context: 
     return {"ok": True}
 
 
-def run(_meta: Dict[str, Any], _params: Dict[str, Any]):
-    """动作插件入口不执行操作，工作流通过 check_precondition 检查目录状态"""
-    return None
+def run(meta: Dict[str, Any], params: Dict[str, Any]):
+    result = check_precondition(meta, params, {})
+    if not result.get("ok"):
+        raise RuntimeError(result.get("reason") or "目录尚未静默")
+    return {"ok": True}

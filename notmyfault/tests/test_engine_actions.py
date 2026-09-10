@@ -871,7 +871,10 @@ class TestExecuteAction:
         assert first["ok"] is False
         second = mod.check_precondition({}, params, {})
         assert second == {"ok": True}
+        assert mod.run({}, params) == {"ok": True}
         mod._observations.clear()
+        with pytest.raises(RuntimeError):
+            mod.run({}, params)
 
 
 class TestErrorIsolation:
