@@ -11,19 +11,26 @@ export function useTheme() {
   function init() {
     if (initialized) return
     initialized = true
-    const root = document.documentElement
-    const stored = localStorage.getItem('nmf-theme')
-    if (stored) root.setAttribute('data-theme', stored)
-    else if (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches)
-      root.setAttribute('data-theme', 'dark')
+    applyMode(localStorage.getItem('nmf-theme') || 'system')
+    window.matchMedia?.('(prefers-color-scheme: dark)').addEventListener('change', () => {
+      if (!localStorage.getItem('nmf-theme')) applyMode('system')
+    })
+  }
+  function applyMode(mode) {
+    const dark = mode === 'dark' || (
+      mode === 'system' && window.matchMedia?.('(prefers-color-scheme: dark)').matches
+    )
+    document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light')
     sync()
+  }
+  function setMode(mode) {
+    if (!['system', 'light', 'dark'].includes(mode)) throw new Error('未知的主题选项')
+    if (mode === 'system') localStorage.removeItem('nmf-theme')
+    else localStorage.setItem('nmf-theme', mode)
+    applyMode(mode)
   }
   function toggle() {
-    const root = document.documentElement
-    const dark = root.getAttribute('data-theme') === 'dark'
-    root.setAttribute('data-theme', dark ? 'light' : 'dark')
-    localStorage.setItem('nmf-theme', dark ? 'light' : 'dark')
-    sync()
+    setMode(isDark.value ? 'light' : 'dark')
   }
-  return { isDark, init, toggle }
+  return { isDark, init, toggle, setMode }
 }

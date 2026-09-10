@@ -16,7 +16,21 @@ let queuedPage = ''
 const PluginsView = defineAsyncComponent(() => import('./components/views/PluginsView.vue'))
 const SettingsView = defineAsyncComponent(() => import('./components/views/SettingsView.vue'))
 const RulesView = defineAsyncComponent(() => import('./components/views/RulesView.vue'))
+const FirstRunSetup = defineAsyncComponent(() => import('./components/FirstRunSetup.vue'))
 const views = { home: HomeView, plugins: PluginsView, settings: SettingsView, rules: RulesView }
+const firstRun = ref(new URLSearchParams(window.location.search).get('first_run') === '1'
+  || !!localStorage.getItem('nmf-first-run'))
+if (firstRun.value && !localStorage.getItem('nmf-first-run')) {
+  localStorage.setItem('nmf-first-run', JSON.stringify({ step: 0 }))
+}
+
+function finishFirstRun() {
+  firstRun.value = false
+  const url = new URL(window.location.href)
+  url.searchParams.delete('first_run')
+  window.history.replaceState(null, '', url)
+  nextTick(() => document.querySelector('.app-main')?.focus({ preventScroll: true }))
+}
 
 function switchPage(p) {
   if (p === 'security') {
@@ -304,12 +318,15 @@ onUnmounted(() => {
 </script>
 
 <template>
+  <FirstRunSetup v-if="firstRun" @complete="finishFirstRun" />
+  <template v-else>
   <NavRail :current="currentPage" @switch="switchPage" />
   <main class="app-main" tabindex="-1" aria-label="页面内容">
     <Transition name="page" mode="out-in" @before-leave="pageTransitioning = true" @after-enter="finishPageTransition">
       <component :is="views[currentPage]" :key="currentPage" />
     </Transition>
   </main>
+  </template>
   <div class="snackbar" :class="{ show: snack.show }" role="status">{{ snack.show ? snack.msg : '' }}</div>
   <AppDialog />
 </template>
