@@ -2,34 +2,13 @@ name: Windows installer
 
 on:
   push:
+    branches:
+      - '**'
     paths:
-      - '.github/workflows/windows-installer.yml'
-      - 'installer/windows/**'
-      - 'notmyfault/**'
-      - 'dashboard/**'
-      - 'Win_toaster/**'
-      - 'requirements*.txt'
-      - 'build.py'
-      - 'dashboard.pyw'
-      - 'NOTMYFAULT.pyw'
-      - 'nmf.py'
-      - 'logo.*'
-      - 'LICENSE'
+      - 'notmyfault/version.py'
   pull_request:
     paths:
-      - '.github/workflows/windows-installer.yml'
-      - 'installer/windows/**'
-      - 'notmyfault/**'
-      - 'dashboard/**'
-      - 'Win_toaster/**'
-      - 'requirements*.txt'
-      - 'build.py'
-      - 'dashboard.pyw'
-      - 'NOTMYFAULT.pyw'
-      - 'nmf.py'
-      - 'logo.*'
-      - 'LICENSE'
-  workflow_dispatch:
+      - 'notmyfault/version.py'
 
 permissions:
   contents: read
