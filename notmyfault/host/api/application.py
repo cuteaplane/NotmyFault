@@ -73,6 +73,9 @@ class ApiApplication:
             title="NotmyFault Engine API",
             version=__version__,
             lifespan=self._lifespan,
+            docs_url=None,
+            redoc_url=None,
+            openapi_url=None,
         )
         install_api_middleware(self.app, self._token_store)
         self._setup_routes()

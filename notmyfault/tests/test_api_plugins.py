@@ -258,6 +258,70 @@ def test_build_hook_requires_matching_server_confirmation(tmp_path):
     assert confirmed.status_code == 200
 
 
+def test_unsigned_build_command_is_not_executed(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from notmyfault.host.api.services import plugin_installation
+
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    env = make_api_env(tmp_path)
+    monkeypatch.setattr(plugin_installation.subprocess, "run", fake_run)
+    archive = build_nmfp(
+        tmp_path,
+        make_meta(
+            "actions",
+            build={"command": ["echo pwned"], "outputs": ["action.py"]},
+        ),
+        "actions",
+        "unsigned-build",
+    )
+    preview = post_archive(env, "/api/plugins/preview", archive)
+    assert preview.status_code == 200
+    installed = env.client.post(
+        "/api/plugins/install",
+        headers=env.headers,
+        data={
+            "preview_token": preview.json()["preview_token"],
+            "confirmed_risk_ids": '["build_hook"]',
+        },
+    )
+    assert installed.status_code == 400
+    assert "签名" in installed.json()["error"]
+    assert calls == []
+
+
+def test_build_command_runs_as_argv_without_shell(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from notmyfault.host.api.services import plugin_installation
+    from notmyfault.host.api.services.plugin_installation import (
+        PluginInstallationService,
+    )
+
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["shell"] = kwargs.get("shell")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(plugin_installation.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        plugin_installation, "plugin_signature_kind", lambda *a, **k: "author"
+    )
+    PluginInstallationService._run_build_hook(
+        tmp_path,
+        {"build": {"command": ["python setup.py"]}},
+    )
+    assert captured["shell"] is False
+    assert captured["command"] == ["python", "setup.py"]
+
+
 def test_downgrade_requires_force_and_keeps_backup(tmp_path):
     env = make_api_env(tmp_path)
     high = build_nmfp(

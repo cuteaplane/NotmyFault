@@ -65,6 +65,12 @@ def concrete_path(path: str) -> str:
     )
 
 
+@pytest.mark.parametrize("path", ["/docs", "/redoc", "/openapi.json"])
+def test_docs_routes_are_disabled(tmp_path, path):
+    env = make_api_env(tmp_path)
+    assert env.client.get(path).status_code == 404
+
+
 def test_openapi_keeps_every_http_operation(tmp_path):
     env = make_api_env(tmp_path)
     actual = {

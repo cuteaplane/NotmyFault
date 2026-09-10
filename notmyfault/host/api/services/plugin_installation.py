@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -191,6 +192,7 @@ class PluginInstallationService:
                 self._file_system.remove_tree(backup)
         except OSError:
             return {"ok": False, "error": "删除插件文件失败"}
+        self._forget_installed_hashes(plugin_id)
         return {"ok": True, "restart_required": True}
 
     def key_status(self) -> Dict[str, Any]:
@@ -580,6 +582,10 @@ class PluginInstallationService:
                     500,
                     {"ok": False, "error": "安装失败，已恢复旧版本"},
                 ) from error
+            self._record_installed_hashes(destination, plugin_id)
+            if obsolete:
+                for old_destination in obsolete:
+                    self._forget_installed_hashes(old_destination.name)
             return {
                 "ok": True,
                 "id": plugin_id,
@@ -666,6 +672,35 @@ class PluginInstallationService:
             return "签名私钥密码错误或副签失败"
         return None
 
+    def _record_installed_hashes(self, plugin_dir: Path, plugin_id: str) -> None:
+        from notmyfault.security.plugin_loader import inspect_plugin_tree
+        from notmyfault.security.plugins import load_plugin_manifest, save_plugin_manifest
+
+        tree = inspect_plugin_tree(str(plugin_dir))
+        if tree is None:
+            return
+        path = self._paths.plugin_manifest_file
+        manifest = load_plugin_manifest(path)
+        manifest[plugin_id] = tree.file_snapshot
+        save_plugin_manifest(manifest, path)
+
+    def _forget_installed_hashes(self, plugin_id: str) -> None:
+        from notmyfault.security.plugins import load_plugin_manifest, save_plugin_manifest
+
+        path = self._paths.plugin_manifest_file
+        manifest = load_plugin_manifest(path)
+        if plugin_id not in manifest:
+            return
+        del manifest[plugin_id]
+        save_plugin_manifest(manifest, path)
+
+    @staticmethod
+    def _build_command_argv(command: str) -> list[str]:
+        argv = shlex.split(command, posix=(os.name != "nt"))
+        if not argv:
+            raise ValueError("插件构建命令为空")
+        return argv
+
     @staticmethod
     def _run_build_hook(root_path: Path, meta: Dict[str, Any]) -> None:
         build = meta.get("build")
@@ -675,11 +710,14 @@ class PluginInstallationService:
         outputs = build.get("outputs") or []
         if not commands and not outputs:
             return
+        if commands and plugin_signature_kind(str(root_path), "user") == "none":
+            raise ValueError("插件签名无效，拒绝执行构建命令")
         for command in commands:
+            argv = PluginInstallationService._build_command_argv(command)
             try:
                 result = subprocess.run(
-                    command,
-                    shell=True,
+                    argv,
+                    shell=False,
                     cwd=root_path,
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
