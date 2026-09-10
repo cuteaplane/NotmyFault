@@ -165,31 +165,15 @@ def _secure_write_secret(path: str, data: bytes) -> None:
     fd = -1
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        if os.name == "nt":
+            from notmyfault.security.api_key_store import _restrict_key_file
+
+            _restrict_key_file(path)
         with os.fdopen(fd, "wb") as f:
             fd = -1
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        if os.name == "nt":
-            import subprocess as _sp
-
-            userdomain = os.environ.get("USERDOMAIN", "")
-            username = os.environ.get("USERNAME") or os.getlogin()
-            full_user = f"{userdomain}\\{username}" if userdomain else username
-            grant = _sp.run(
-                ["icacls", path, "/grant:r", f"{full_user}:F"],
-                capture_output=True,
-                timeout=5,
-            )
-            if grant.returncode != 0:
-                raise OSError("icacls 无法授予密钥文件权限")
-            inheritance = _sp.run(
-                ["icacls", path, "/inheritance:r"],
-                capture_output=True,
-                timeout=5,
-            )
-            if inheritance.returncode != 0:
-                raise OSError("icacls 无法移除密钥文件继承权限")
     except Exception:
         if fd >= 0:
             os.close(fd)

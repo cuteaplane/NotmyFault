@@ -118,18 +118,30 @@ def test_round_trip_uses_the_existing_files_and_json_shape(tmp_path):
     assert editable[0]["actions"] == restored["actions"]
 
 
-def test_reopened_store_accepts_secure_existing_secret(tmp_path):
+def test_reopened_store_accepts_secure_existing_secret(tmp_path, monkeypatch):
+    if os.name == "nt":
+        monkeypatch.setenv("USERDOMAIN", "")
+        monkeypatch.setenv("USERNAME", "notmyfault-not-the-current-user")
     paths = make_paths(tmp_path)
     make_store(paths)
 
     assert SignedConfigStore(paths).load_verified_config()["settings"] == {}
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX 文件模式检查")
 def test_reopened_store_rejects_world_readable_secret(tmp_path):
     paths = make_paths(tmp_path)
     make_store(paths)
-    paths.config_secret_file.chmod(0o644)
+    if os.name == "nt":
+        import subprocess
+
+        subprocess.run(
+            ["icacls", str(paths.config_secret_file), "/grant:r", "*S-1-1-0:R"],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+    else:
+        paths.config_secret_file.chmod(0o644)
 
     with pytest.raises(ConfigValidationError, match="权限过宽"):
         SignedConfigStore(paths).load_verified_config()
