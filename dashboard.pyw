@@ -453,6 +453,34 @@ class DashboardAPI:
     def get_api_token(self) -> str:
         return self._get_api_token()
 
+    def get_auto_start(self) -> dict:
+        try:
+            if sys.platform == "win32":
+                from notmyfault.host.tray import _is_auto_start_enabled
+                enabled = _is_auto_start_enabled()
+            else:
+                from notmyfault.platform.platform_support import linux_autostart_path
+                enabled = linux_autostart_path().exists()
+            return {"ok": True, "enabled": enabled}
+        except Exception as error:
+            return {"ok": False, "error": str(error)}
+
+    def set_auto_start(self, enabled: bool) -> dict:
+        if not isinstance(enabled, bool):
+            return {"ok": False, "error": "开机启动选项必须是布尔值"}
+        try:
+            if sys.platform == "win32":
+                from notmyfault.host.tray import _register_auto_start, _unregister_auto_start
+                saved = (_register_auto_start if enabled else _unregister_auto_start)()
+            else:
+                from notmyfault.platform.platform_support import set_linux_autostart
+                saved = set_linux_autostart(enabled, PROJECT_ROOT)
+            if not saved:
+                return {"ok": False, "error": "无法保存开机启动设置，请重试"}
+            return {"ok": True, "enabled": enabled}
+        except Exception as error:
+            return {"ok": False, "error": str(error)}
+
     def select_folder(self, initial_path: str = "") -> str:
         """通过桌面窗口选择本地目录并返回路径"""
         if self._window is None:
@@ -664,6 +692,8 @@ def main():
         control_server.server_close()
         _remove_control_secret(paths.dashboard_control_token_file, control_secret)
         return
+    if "--first-run" in sys.argv:
+        dashboard_url += "&first_run=1"
     icon_path = os.path.join(PROJECT_ROOT, "logo.ico")
 
     api = DashboardAPI(SignedConfigStore(paths), paths)
@@ -718,10 +748,14 @@ def main():
     window.events.closed += lambda: print("[Dashboard] 窗口已关闭")
 
     try:
+        webview_options = {
+            "private_mode": False,
+            "storage_path": str(paths.config_dir / "dashboard-webview"),
+        }
         if sys.platform.startswith("linux"):
-            webview.start(gui="qt")
+            webview.start(gui="qt", **webview_options)
         else:
-            webview.start()
+            webview.start(**webview_options)
     except KeyboardInterrupt:
         pass
     control_server.shutdown()
