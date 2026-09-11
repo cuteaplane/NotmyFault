@@ -125,7 +125,7 @@ def version_string():
                    for item in statement.targets):
                 value = ast.literal_eval(statement.value)
                 if isinstance(value, str) and value and all(
-                    character.isalnum() or character in ".-_" for character in value
+                    character.isalnum() or character in ".-_()" for character in value
                 ):
                     return value
     raise BuildError("notmyfault/version.py 中的版本号无效。")
