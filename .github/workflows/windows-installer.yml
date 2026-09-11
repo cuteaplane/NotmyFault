@@ -6,6 +6,7 @@ on:
       - '**'
     paths:
       - 'notmyfault/version.py'
+      - '.github/workflows/windows-installer.yml'
   pull_request:
     paths:
       - 'notmyfault/version.py'
