@@ -64,6 +64,8 @@ namespace NotmyFault.Setup
         public static string ValidateDirectory(string directory)
         {
             string path = InstallMaintenance.NormalizeDirectory(directory);
+            string pending = InstallMaintenance.FindPendingUninstall(path);
+            if (pending != null) throw new IOException("请先完成原安装的卸载清理：" + pending);
             if (System.IO.Directory.Exists(path) && !IsInstalledDirectory(path))
             {
                 using (IEnumerator<string> entries = System.IO.Directory.EnumerateFileSystemEntries(path).GetEnumerator())

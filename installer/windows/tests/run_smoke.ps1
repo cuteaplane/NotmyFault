@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Installer,
-    [Parameter(Mandatory = $true)][string]$WorkDirectory
+    [Parameter(Mandatory = $true)][string]$WorkDirectory,
+    [switch]$MaintenanceOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,5 +20,7 @@ $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $testExecutable = Join-Path $testDirectory 'InstallerSmoke.exe'
 & $compiler /nologo /target:exe /platform:x64 /optimize+ /utf8output "/reference:$installerPath" "/out:$testExecutable" (Join-Path $PSScriptRoot 'Smoke.cs')
 if ($LASTEXITCODE -ne 0) { throw "测试程序编译失败，退出码 $LASTEXITCODE。" }
-& $testExecutable $installerPath (Join-Path $testDirectory 'work') 2>&1 | Tee-Object -FilePath (Join-Path $testDirectory 'smoke.log')
+$testArguments = @($installerPath, (Join-Path $testDirectory 'work'))
+if ($MaintenanceOnly) { $testArguments += '--maintenance-only' }
+& $testExecutable @testArguments 2>&1 | Tee-Object -FilePath (Join-Path $testDirectory 'smoke.log')
 if ($LASTEXITCODE -ne 0) { throw "安装器测试失败，退出码 $LASTEXITCODE。" }

@@ -255,7 +255,7 @@ def compile_installer(payload, version_file, executable, runner):
     common_command.extend("/reference:" + str(reference) for reference in references)
     sources = [SOURCES / name for name in (
         "InstallerWindow.cs", "MotionScene.cs", "InstallEngine.cs",
-        "InstallMaintenance.cs", "UninstallerWindow.cs",
+        "InstallMaintenance.cs", "UninstallerWindow.cs", "SetupWindowLayout.cs",
     )]
     uninstaller = executable.parent / "NotmyFault-Uninstall.exe"
     runner.run(common_command + [

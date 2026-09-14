@@ -10,14 +10,31 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Win32;
 
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("InstallerSmoke")]
+
 namespace NotmyFault.Setup
 {
+    public sealed class UninstallFailure : IOException
+    {
+        public string RetryDirectory { get; private set; }
+
+        internal UninstallFailure(string directory, Exception error)
+            : base("卸载未完成，文件位于：" + directory + "\n解除文件占用或权限问题后可重试。" +
+                "如已退出卸载窗口，可重新运行安装包并传入 --resume-uninstall " + InstallEngine.Quote(directory) +
+                "。\n" + error.Message, error)
+        {
+            RetryDirectory = directory;
+        }
+    }
+
     public static class InstallMaintenance
     {
         internal const string RegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\NotmyFault";
         internal const string StateFile = ".notmyfault-install";
         internal const string FilesFile = ".notmyfault-files";
+        internal const string UninstallFile = ".notmyfault-uninstall";
         private const string StateHeader = "NotmyFault Windows installer 1";
+        private const string UninstallHeader = "NotmyFault Windows uninstall 1";
 
         internal static string NormalizeDirectory(string directory)
         {
@@ -128,15 +145,22 @@ namespace NotmyFault.Setup
             }
         }
 
-        private static bool IsPreserved(string relative)
+        private enum InstalledFileKind { Program, UserData, SigningKey }
+
+        private static InstalledFileKind ClassifyFile(string relative, bool programFile)
         {
             string value = relative.Replace('\\', '/');
-            return value.Equals("app/.private", StringComparison.OrdinalIgnoreCase) ||
+            if (value.Equals("app/.private/signing_private_key.pem", StringComparison.OrdinalIgnoreCase) ||
+                value.Equals("app/.private/signing_public.pem", StringComparison.OrdinalIgnoreCase))
+                return InstalledFileKind.SigningKey;
+            if (value.Equals("app/.private", StringComparison.OrdinalIgnoreCase) ||
                 value.StartsWith("app/.private/", StringComparison.OrdinalIgnoreCase) ||
                 value.Equals("app/user_plugins", StringComparison.OrdinalIgnoreCase) ||
                 value.StartsWith("app/user_plugins/", StringComparison.OrdinalIgnoreCase) ||
                 value.Equals("user_plugins", StringComparison.OrdinalIgnoreCase) ||
-                value.StartsWith("user_plugins/", StringComparison.OrdinalIgnoreCase);
+                value.StartsWith("user_plugins/", StringComparison.OrdinalIgnoreCase))
+                return InstalledFileKind.UserData;
+            return programFile ? InstalledFileKind.Program : InstalledFileKind.UserData;
         }
 
         private static bool LegacyProgramFile(string relative)
@@ -186,8 +210,9 @@ namespace NotmyFault.Setup
             return path;
         }
 
-        internal static HashSet<string> ReadOwnedFiles(string directory)
+        private static Dictionary<string, InstalledFileKind> ReadInstallationFiles(string directory)
         {
+            List<string> files = new List<string>(EnumerateFiles(directory));
             HashSet<string> owned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             string manifest = Path.Combine(directory, FilesFile);
             if (File.Exists(manifest))
@@ -195,16 +220,16 @@ namespace NotmyFault.Setup
                 foreach (string relative in File.ReadAllLines(manifest, Encoding.UTF8))
                 {
                     OwnedPath(directory, relative);
-                    if (!IsPreserved(relative)) owned.Add(relative);
+                    owned.Add(relative.Replace('/', Path.DirectorySeparatorChar));
                 }
             }
             else
-                foreach (string file in EnumerateFiles(directory))
+                foreach (string file in files)
                 {
                     string relative = Relative(directory, file);
-                    if (LegacyProgramFile(relative) && !IsPreserved(relative)) owned.Add(relative);
+                    if (LegacyProgramFile(relative)) owned.Add(relative);
                 }
-            foreach (string file in EnumerateFiles(directory))
+            foreach (string file in files)
             {
                 string relative = Relative(directory, file);
                 if (!relative.EndsWith(".pyc", StringComparison.OrdinalIgnoreCase)) continue;
@@ -218,7 +243,13 @@ namespace NotmyFault.Setup
             }
             owned.Add(StateFile);
             owned.Add(FilesFile);
-            return owned;
+            Dictionary<string, InstalledFileKind> classified = new Dictionary<string, InstalledFileKind>(StringComparer.OrdinalIgnoreCase);
+            foreach (string file in files)
+            {
+                string relative = Relative(directory, file);
+                classified.Add(relative, ClassifyFile(relative, owned.Contains(relative)));
+            }
+            return classified;
         }
 
         internal static void WriteState(string directory, string version, HashSet<string> preserved)
@@ -228,7 +259,7 @@ namespace NotmyFault.Setup
             foreach (string file in EnumerateFiles(directory))
             {
                 string relative = Relative(directory, file);
-                if (!IsPreserved(relative) && !preserved.Contains(relative) && relative != FilesFile) owned.Add(relative);
+                if (ClassifyFile(relative, true) == InstalledFileKind.Program && !preserved.Contains(relative) && relative != FilesFile) owned.Add(relative);
             }
             owned.Add(FilesFile);
             owned.Sort(StringComparer.OrdinalIgnoreCase);
@@ -344,30 +375,145 @@ namespace NotmyFault.Setup
 
         public static Task<string> UninstallAsync(string directory, IProgress<InstallProgress> progress, CancellationToken token)
         {
+            return UninstallAsync(directory, progress, token, new UninstallOperations());
+        }
+
+        internal class UninstallOperations
+        {
+            internal virtual void MoveDirectory(string source, string destination) { Directory.Move(source, destination); }
+            internal virtual void DeleteFile(string file)
+            {
+                if (!File.Exists(file)) return;
+                File.SetAttributes(file, FileAttributes.Normal);
+                File.Delete(file);
+            }
+            internal virtual void RemoveEntries(string directory) { InstallMaintenance.RemoveEntries(directory); }
+        }
+
+        private sealed class UninstallPlan
+        {
+            internal string OriginalDirectory;
+            internal readonly List<string> Files = new List<string>();
+
+            internal void Write(string directory)
+            {
+                List<string> lines = new List<string> { UninstallHeader, OriginalDirectory };
+                lines.AddRange(Files);
+                string destination = OwnedPath(directory, UninstallFile);
+                string temporary = destination + ".tmp-" + Guid.NewGuid().ToString("N");
+                try
+                {
+                    using (FileStream stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write))
+                    using (StreamWriter writer = new StreamWriter(stream, new UTF8Encoding(false)))
+                        foreach (string line in lines) writer.WriteLine(line);
+                    File.Move(temporary, destination);
+                }
+                finally
+                {
+                    try { File.Delete(temporary); }
+                    catch (IOException) { }
+                    catch (UnauthorizedAccessException) { }
+                }
+            }
+        }
+
+        private static UninstallPlan ReadUninstallPlan(string directory)
+        {
+            string[] lines = File.ReadAllLines(OwnedPath(directory, UninstallFile), Encoding.UTF8);
+            if (lines.Length < 2 || lines[0] != UninstallHeader) throw new InvalidDataException("卸载清理清单无效。");
+            var plan = new UninstallPlan { OriginalDirectory = NormalizeDirectory(lines[1]) };
+            if (!SamePath(directory, plan.OriginalDirectory))
+            {
+                string prefix = Path.GetFileName(plan.OriginalDirectory) + "-保留文件-";
+                string name = Path.GetFileName(directory);
+                Guid identifier;
+                if (!SamePath(Path.GetDirectoryName(directory), Path.GetDirectoryName(plan.OriginalDirectory)) ||
+                    !name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ||
+                    !Guid.TryParseExact(name.Substring(prefix.Length), "N", out identifier))
+                    throw new InvalidDataException("卸载清理目录与原安装路径不匹配。");
+            }
+            for (int i = 2; i < lines.Length; i++)
+            {
+                OwnedPath(directory, lines[i]);
+                if (lines[i].Equals(UninstallFile, StringComparison.OrdinalIgnoreCase) ||
+                    ClassifyFile(lines[i], true) == InstalledFileKind.UserData)
+                    throw new InvalidDataException("卸载清理清单包含保留文件。");
+                plan.Files.Add(lines[i]);
+            }
+            return plan;
+        }
+
+        internal static bool HasUninstallPlan(string directory)
+        {
+            return File.Exists(OwnedPath(directory, UninstallFile));
+        }
+
+        internal static string FindPendingUninstall(string directory)
+        {
+            if (Directory.Exists(directory) && HasUninstallPlan(directory)) return directory;
+            string parent = Path.GetDirectoryName(directory);
+            if (!Directory.Exists(parent)) return null;
+            foreach (string candidate in Directory.EnumerateDirectories(parent, Path.GetFileName(directory) + "-保留文件-*"))
+                if (HasUninstallPlan(candidate) && SamePath(ReadUninstallPlan(candidate).OriginalDirectory, directory)) return candidate;
+            return null;
+        }
+
+        internal static Task<string> UninstallAsync(string directory, IProgress<InstallProgress> progress, CancellationToken token,
+            UninstallOperations operations)
+        {
             return Task.Run(delegate
             {
                 token.ThrowIfCancellationRequested();
                 string path = NormalizeDirectory(directory);
-                if (!IsInstalledDirectory(path)) throw new IOException("这个目录不是 NotmyFault 安装目录。");
                 EnsureNotRunning(path);
-                HashSet<string> owned = ReadOwnedFiles(path);
-                foreach (string file in EnumerateFiles(path)) { }
-                token.ThrowIfCancellationRequested();
-                int completed = 0;
-                foreach (string relative in owned)
+                UninstallPlan plan;
+                if (HasUninstallPlan(path)) plan = ReadUninstallPlan(path);
+                else
                 {
-                    if (relative == StateFile || relative == FilesFile) continue;
-                    string file = OwnedPath(path, relative);
-                    if (File.Exists(file)) { File.SetAttributes(file, FileAttributes.Normal); File.Delete(file); }
-                    completed++;
-                    if (progress != null && completed % 30 == 0)
-                        progress.Report(new InstallProgress { Step = 0, Fraction = (double)completed / owned.Count, Message = "正在移除程序文件", Detail = relative });
+                    if (!IsInstalledDirectory(path)) throw new IOException("这个目录不是 NotmyFault 安装目录。");
+                    plan = new UninstallPlan { OriginalDirectory = path };
+                    foreach (var file in ReadInstallationFiles(path))
+                        if (file.Value != InstalledFileKind.UserData) plan.Files.Add(file.Key);
+                    plan.Files.Sort(StringComparer.OrdinalIgnoreCase);
+                    plan.Write(path);
                 }
-                RemoveEntries(path);
-                File.Delete(Path.Combine(path, FilesFile));
-                File.Delete(Path.Combine(path, StateFile));
-                DeleteEmptyDirectories(path);
-                if (progress != null) progress.Report(new InstallProgress { Step = 0, Fraction = 1, Message = "卸载已完成", Detail = "用户配置、规则、插件和签名密钥已保留。" });
+                token.ThrowIfCancellationRequested();
+                try
+                {
+                    if (SamePath(path, plan.OriginalDirectory))
+                    {
+                        string retained = NormalizeDirectory(Path.Combine(Path.GetDirectoryName(path),
+                            Path.GetFileName(path) + "-保留文件-" + Guid.NewGuid().ToString("N")));
+                        operations.MoveDirectory(path, retained);
+                        path = retained;
+                    }
+                    int completed = 0;
+                    foreach (string relative in plan.Files)
+                    {
+                        if (relative == StateFile || relative == FilesFile) continue;
+                        operations.DeleteFile(OwnedPath(path, relative));
+                        completed++;
+                        if (progress != null && completed % 30 == 0)
+                            progress.Report(new InstallProgress { Step = 0, Fraction = (double)completed / plan.Files.Count, Message = "正在移除程序文件", Detail = relative });
+                    }
+                    operations.RemoveEntries(plan.OriginalDirectory);
+                    operations.DeleteFile(OwnedPath(path, FilesFile));
+                    operations.DeleteFile(OwnedPath(path, StateFile));
+                    DeleteEmptyDirectories(path);
+                    operations.DeleteFile(OwnedPath(path, UninstallFile));
+                }
+                catch (Exception error)
+                {
+                    throw new UninstallFailure(path, error);
+                }
+                using (IEnumerator<string> entries = Directory.EnumerateFileSystemEntries(path).GetEnumerator())
+                    if (!entries.MoveNext())
+                    {
+                        try { Directory.Delete(path); }
+                        catch (IOException) { }
+                        catch (UnauthorizedAccessException) { }
+                    }
+                if (progress != null) progress.Report(new InstallProgress { Step = 0, Fraction = 1, Message = "卸载已完成", Detail = "签名密钥已删除，用户配置、规则和插件已保留。" });
                 return Directory.Exists(path) ? path : "";
             });
         }
@@ -376,6 +522,12 @@ namespace NotmyFault.Setup
         {
             string executable = Assembly.GetExecutingAssembly().Location;
             string directory = Path.GetDirectoryName(executable);
+            if (args.Length == 2 && args[0] == "--resume-uninstall")
+            {
+                directory = NormalizeDirectory(args[1]);
+                ReadUninstallPlan(directory);
+                return directory;
+            }
             if (args.Length == 4 && args[0] == "--uninstall-root" && args[2] == "--wait-pid")
             {
                 int pid;
@@ -383,12 +535,12 @@ namespace NotmyFault.Setup
                 try { using (Process parent = Process.GetProcessById(pid)) parent.WaitForExit(10000); }
                 catch (ArgumentException) { }
                 directory = NormalizeDirectory(args[1]);
-                if (!IsInstalledDirectory(directory)) throw new IOException("找不到有效的 NotmyFault 安装目录。");
+                if (!IsInstalledDirectory(directory) && !HasUninstallPlan(directory)) throw new IOException("找不到有效的 NotmyFault 安装目录。");
                 ScheduleTemporaryCleanup(executable);
                 return directory;
             }
             if (args.Length != 0) throw new ArgumentException("卸载器启动参数无效。");
-            if (!IsInstalledDirectory(directory)) throw new IOException("请从 NotmyFault 安装目录或 Windows 已安装的应用中运行卸载。");
+            if (!IsInstalledDirectory(directory) && !HasUninstallPlan(directory)) throw new IOException("请从 NotmyFault 安装目录或 Windows 已安装的应用中运行卸载。");
             string temporary = Path.Combine(Path.GetTempPath(), "NotmyFault-Uninstall-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(temporary);
             string copy = Path.Combine(temporary, "NotmyFault-Uninstall.exe");
@@ -471,12 +623,8 @@ namespace NotmyFault.Setup
                 if (upgrade)
                 {
                     EnsureNotRunning(directory);
-                    HashSet<string> owned = ReadOwnedFiles(directory);
-                    foreach (string file in EnumerateFiles(directory))
-                    {
-                        string relative = Relative(directory, file);
-                        if (!owned.Contains(relative) || IsPreserved(relative)) Preserved.Add(relative);
-                    }
+                    foreach (var file in ReadInstallationFiles(directory))
+                        if (file.Value != InstalledFileKind.Program) Preserved.Add(file.Key);
                     BackupPath = Path.Combine(Path.GetDirectoryName(directory), "." + Path.GetFileName(directory) + ".upgrade-" + Guid.NewGuid().ToString("N"));
                     if (!SamePath(Path.GetDirectoryName(BackupPath), Path.GetDirectoryName(directory)))
                         throw new IOException("无法创建升级工作目录。");

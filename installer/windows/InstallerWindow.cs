@@ -22,6 +22,8 @@ namespace NotmyFault.Setup
         [STAThread]
         public static int Main(string[] args)
         {
+            if (args.Length == 2 && args[0] == "--resume-uninstall")
+                return UninstallProgram.Main(args);
             var app = new Application();
             app.DispatcherUnhandledException += delegate(object sender, DispatcherUnhandledExceptionEventArgs e)
             {
@@ -37,10 +39,11 @@ namespace NotmyFault.Setup
         private readonly bool preview;
         private readonly MotionScene scene;
         private readonly Grid pageHost;
-        private readonly Brush ink = BrushOf("#E5E1EA");
-        private readonly Brush muted = BrushOf("#C8C4CF");
-        private readonly Brush primary = BrushOf("#A7C9FF");
+        private readonly Brush ink = SetupWindowLayout.BrushOf("#E5E1EA");
+        private readonly Brush muted = SetupWindowLayout.BrushOf("#C8C4CF");
+        private readonly Brush primary = SetupWindowLayout.BrushOf("#A7C9FF");
         private readonly FontFamily displayFont;
+        private readonly SetupWindowLayout layout;
         private readonly StepIndicator[] indicators = new StepIndicator[4];
         private readonly TextBlock[] stepLabels = new TextBlock[4];
         private readonly string[] steps = { "配置 Python 环境", "释放程序文件", "完成构建", "完成安装" };
@@ -79,7 +82,7 @@ namespace NotmyFault.Setup
             MinWidth = 800;
             MinHeight = 640;
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
-            Background = BrushOf("#121318");
+            Background = SetupWindowLayout.BrushOf("#121318");
             string fontResource = "/" + typeof(InstallerWindow).Assembly.GetName().Name + ";component/fonts/#";
             FontFamily = new FontFamily(new Uri("pack://application:,,,/"), fontResource + "Roboto, Microsoft YaHei UI");
             displayFont = new FontFamily(new Uri("pack://application:,,,/"), fontResource + "Google Sans Flex, Microsoft YaHei UI");
@@ -87,7 +90,8 @@ namespace NotmyFault.Setup
             FontSize = 14;
             UseLayoutRounding = true;
             TextOptions.SetTextFormattingMode(this, TextFormattingMode.Display);
-            Resources = (ResourceDictionary)XamlReader.Parse(Styles);
+            Resources = (ResourceDictionary)XamlReader.Parse(SetupWindowLayout.Styles);
+            layout = new SetupWindowLayout(Resources, displayFont, ink, muted, true);
             var root = new Grid { ClipToBounds = true, Background = Background };
             scene = new MotionScene();
             root.Children.Add(scene);
@@ -109,82 +113,6 @@ namespace NotmyFault.Setup
         [DllImport("dwmapi.dll")]
         private static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
 
-        private static Brush BrushOf(string value)
-        {
-            var brush = new SolidColorBrush((Color)ColorConverter.ConvertFromString(value));
-            brush.Freeze();
-            return brush;
-        }
-
-        private TextBlock Text(string value, double size, Brush color)
-        {
-            return new TextBlock { Text = value, FontSize = size, Foreground = color,
-                TextWrapping = TextWrapping.Wrap, LineHeight = size * 1.5 };
-        }
-
-        private Button Button(string label, Action action, bool filled)
-        {
-            var button = new Button { Content = label, Style = (Style)Resources[filled ? "PrimaryButton" : "PlainButton"] };
-            AddButtonMotion(button);
-            button.Click += delegate { action(); };
-            return button;
-        }
-
-        internal static void AddButtonMotion(Button button)
-        {
-            var scale = new ScaleTransform(1, 1);
-            button.RenderTransform = scale;
-            button.RenderTransformOrigin = new Point(0.5, 0.5);
-            Action<bool> press = delegate(bool down)
-            {
-                if (!SystemParameters.ClientAreaAnimation) return;
-                var animation = new DoubleAnimation(down ? 0.96 : 1, TimeSpan.FromMilliseconds(down ? 95 : 180))
-                    { EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } };
-                scale.BeginAnimation(ScaleTransform.ScaleXProperty, animation);
-                scale.BeginAnimation(ScaleTransform.ScaleYProperty, animation);
-            };
-            button.PreviewMouseLeftButtonDown += delegate { press(true); };
-            button.PreviewMouseLeftButtonUp += delegate { press(false); };
-            button.LostMouseCapture += delegate { press(false); };
-            button.PreviewKeyDown += delegate(object sender, KeyEventArgs e) { if (e.Key == Key.Space || e.Key == Key.Enter) press(true); };
-            button.PreviewKeyUp += delegate(object sender, KeyEventArgs e) { if (e.Key == Key.Space || e.Key == Key.Enter) press(false); };
-        }
-
-        private Grid Page(string title, string description)
-        {
-            var page = new Grid();
-            page.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            page.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-            page.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            var heading = new StackPanel { Margin = new Thickness(0, 0, 0, 30) };
-            var headline = Text(title, 32, ink);
-            headline.FontFamily = displayFont;
-            headline.FontWeight = FontWeight.FromOpenTypeWeight(650);
-            heading.Children.Add(headline);
-            if (!string.IsNullOrEmpty(description))
-            {
-                var subtitle = Text(description, 14, muted);
-                subtitle.Margin = new Thickness(0, 12, 0, 0);
-                heading.Children.Add(subtitle);
-            }
-            page.Children.Add(heading);
-            return page;
-        }
-
-        private void Footer(Grid page, Button left, Button right)
-        {
-            var footer = new Grid { Margin = new Thickness(0, 20, 0, 0) };
-            if (left != null) { left.HorizontalAlignment = HorizontalAlignment.Left; footer.Children.Add(left); }
-            if (right != null)
-            {
-                right.HorizontalAlignment = HorizontalAlignment.Right;
-                right.IsDefault = right.Style == Resources["PrimaryButton"];
-                footer.Children.Add(right);
-            }
-            Grid.SetRow(footer, 2);
-            page.Children.Add(footer);
-        }
-
         private async void ChangePage(Grid page, bool first, bool focusPage = false, bool back = false)
         {
             int token = ++transition;
@@ -198,22 +126,7 @@ namespace NotmyFault.Setup
                 await Task.Delay(100);
                 if (token != transition) return;
             }
-            pageHost.Children.Clear();
-            pageHost.Children.Add(page);
-            pageHost.IsEnabled = true;
-            pageHost.BeginAnimation(OpacityProperty, null);
-            pageHost.Opacity = 1;
-            if (animate)
-            {
-                var transform = new TranslateTransform(back ? -20 : 24, 0);
-                page.RenderTransform = transform;
-                transform.BeginAnimation(TranslateTransform.XProperty,
-                    new DoubleAnimation(0, TimeSpan.FromMilliseconds(260)) {
-                        EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } });
-                page.BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(180)));
-            }
-            if (focusPage) { page.Focusable = true; page.Focus(); }
-            else page.MoveFocus(new TraversalRequest(FocusNavigationDirection.First));
+            SetupWindowLayout.ShowPage(pageHost, page, animate, focusPage, back);
         }
 
         private void ShowWelcome()
@@ -224,12 +137,12 @@ namespace NotmyFault.Setup
             page.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             var body = new StackPanel { VerticalAlignment = VerticalAlignment.Center,
                 HorizontalAlignment = HorizontalAlignment.Left, MaxWidth = 540, Margin = new Thickness(0, 0, 0, 34) };
-            var title = Text("欢迎使用\nNotmyFault", 44, ink);
+            var title = SetupWindowLayout.Text("欢迎使用\nNotmyFault", 44, ink);
             title.LineHeight = 56;
             title.FontFamily = displayFont;
             title.FontWeight = FontWeight.FromOpenTypeWeight(650);
             body.Children.Add(title);
-            var introduction = Text("本程序将协助您安装 NotmyFault、配置运行环境，并在安装完成后引导您进行初次设置。", 16, muted);
+            var introduction = SetupWindowLayout.Text("本程序将协助您安装 NotmyFault、配置运行环境，并在安装完成后引导您进行初次设置。", 16, muted);
             introduction.MaxWidth = 430;
             introduction.HorizontalAlignment = HorizontalAlignment.Left;
             introduction.Margin = new Thickness(0, 24, 0, 0);
@@ -237,20 +150,20 @@ namespace NotmyFault.Setup
             upgrade = !preview && InstallEngine.IsInstalledDirectory(selectedDirectory);
             if (upgrade)
             {
-                var installed = Text("已安装 " + InstallEngine.GetInstalledVersion(selectedDirectory) + " → " + InstallEngine.PackageVersion + "\n继续以升级现有安装，您的配置和签名密钥会保留。", 14, primary);
+                var installed = SetupWindowLayout.Text("已安装 " + InstallEngine.GetInstalledVersion(selectedDirectory) + " → " + InstallEngine.PackageVersion + "\n继续以升级现有安装，您的配置和签名密钥会保留。", 14, primary);
                 installed.Margin = new Thickness(0, 24, 0, 0);
                 body.Children.Add(installed);
             }
             Grid.SetRow(body, 1);
             page.Children.Add(body);
-            Footer(page, Button("开源许可证", ShowLicense, false), Button(upgrade ? "继续升级" : "开始安装", ShowOptions, true));
+            layout.Footer(page, layout.Button("开源许可证", ShowLicense, false), layout.Button(upgrade ? "继续升级" : "开始安装", ShowOptions, true));
             ChangePage(page, true, false, true);
         }
 
         private StackPanel Field(string label, Control control)
         {
             var field = new StackPanel();
-            var caption = Text(label, 13, muted);
+            var caption = SetupWindowLayout.Text(label, 13, muted);
             caption.Margin = new Thickness(2, 0, 0, 8);
             field.Children.Add(caption);
             AutomationProperties.SetName(control, label);
@@ -260,7 +173,7 @@ namespace NotmyFault.Setup
 
         private void ShowOptions()
         {
-            var page = Page("安装 NotmyFault", "创建签名密码，并选择安装位置。");
+            var page = layout.Page("安装 NotmyFault", "创建签名密码，并选择安装位置。");
             var heading = (StackPanel)page.Children[0];
             optionsTitle = (TextBlock)heading.Children[0];
             optionsDescription = (TextBlock)heading.Children[1];
@@ -276,7 +189,7 @@ namespace NotmyFault.Setup
             Grid.SetColumn(confirmField, 2);
             passwords.Children.Add(confirmField);
             body.Children.Add(passwords);
-            passwordHint = Text("此密码用于保护签名私钥，修改插件或重新构建时需要使用。", 13, muted);
+            passwordHint = SetupWindowLayout.Text("此密码用于保护签名私钥，修改插件或重新构建时需要使用。", 13, muted);
             passwordHint.Margin = new Thickness(2, 10, 0, 28);
             body.Children.Add(passwordHint);
             var pathRow = new Grid();
@@ -285,24 +198,24 @@ namespace NotmyFault.Setup
             directory = new TextBox { Text = selectedDirectory, Style = (Style)Resources["TextField"] };
             AutomationProperties.SetName(directory, "安装路径");
             pathRow.Children.Add(directory);
-            var browse = Button("更改", Browse, false);
+            var browse = layout.Button("更改", Browse, false);
             browse.Margin = new Thickness(12, 0, 0, 0);
             Grid.SetColumn(browse, 1);
             pathRow.Children.Add(browse);
-            var pathLabel = Text("安装路径", 13, muted);
+            var pathLabel = SetupWindowLayout.Text("安装路径", 13, muted);
             pathLabel.Margin = new Thickness(2, 0, 0, 8);
             body.Children.Add(pathLabel);
             body.Children.Add(pathRow);
-            pathHint = Text("默认安装到当前用户的 AppData 文件夹。请选择空文件夹。", 13, muted);
+            pathHint = SetupWindowLayout.Text("默认安装到当前用户的 AppData 文件夹。请选择空文件夹。", 13, muted);
             pathHint.Margin = new Thickness(2, 10, 0, 0);
             body.Children.Add(pathHint);
-            validation = Text("", 13, BrushOf("#FFB4AB"));
+            validation = SetupWindowLayout.Text("", 13, SetupWindowLayout.BrushOf("#FFB4AB"));
             validation.Margin = new Thickness(2, 16, 0, 0);
             body.Children.Add(validation);
             Grid.SetRow(body, 1);
             page.Children.Add(body);
-            installButton = Button(preview ? "预览安装" : "安装", BeginInstall, true);
-            Footer(page, Button("返回", delegate { selectedDirectory = directory.Text.Trim(); password.Clear(); confirmation.Clear(); ShowWelcome(); }, false), installButton);
+            installButton = layout.Button(preview ? "预览安装" : "安装", BeginInstall, true);
+            layout.Footer(page, layout.Button("返回", delegate { selectedDirectory = directory.Text.Trim(); password.Clear(); confirmation.Clear(); ShowWelcome(); }, false), installButton);
             directory.TextChanged += delegate { RefreshInstallMode(); };
             RefreshInstallMode();
             ChangePage(page, false);
@@ -409,19 +322,19 @@ namespace NotmyFault.Setup
 
         private void ShowProgress()
         {
-            var page = Page(upgrade ? "正在升级 NotmyFault" : "正在安装 NotmyFault", "当前安装器仍在开发，如果出现问题，请按照项目说明手动安装。" +
+            var page = layout.Page(upgrade ? "正在升级 NotmyFault" : "正在安装 NotmyFault", "当前安装器仍在开发，如果出现问题，请按照项目说明手动安装。" +
                 (preview ? "\n界面预览，不会执行安装。" : ""));
             var body = new StackPanel { Margin = new Thickness(0, 12, 0, 0) };
             for (int i = 0; i < steps.Length; i++)
             {
                 var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 22) };
                 indicators[i] = new StepIndicator { Width = 26, Height = 26, Margin = new Thickness(0, 0, 20, 0), VerticalAlignment = VerticalAlignment.Center };
-                stepLabels[i] = Text(steps[i], 19, muted);
+                stepLabels[i] = SetupWindowLayout.Text(steps[i], 19, muted);
                 row.Children.Add(indicators[i]);
                 row.Children.Add(stepLabels[i]);
                 body.Children.Add(row);
             }
-            detail = Text("", 13, muted);
+            detail = SetupWindowLayout.Text("", 13, muted);
             detail.Margin = new Thickness(46, 2, 0, 0);
             detail.TextTrimming = TextTrimming.CharacterEllipsis;
             detail.TextWrapping = TextWrapping.NoWrap;
@@ -430,8 +343,8 @@ namespace NotmyFault.Setup
             page.Children.Add(body);
             currentStep = preview ? 3 : 0;
             PaintSteps(currentStep, false);
-            Footer(page, preview ? Button("返回", ShowOptions, false) : null,
-                preview ? Button("预览完成", ShowComplete, true) : Button("取消", Cancel, false));
+            layout.Footer(page, preview ? layout.Button("返回", ShowOptions, false) : null,
+                preview ? layout.Button("预览完成", ShowComplete, true) : layout.Button("取消", Cancel, false));
             ChangePage(page, false, true);
         }
 
@@ -443,7 +356,7 @@ namespace NotmyFault.Setup
                 bool active = i == step && !finished;
                 indicators[i].SetState(done ? 2 : active ? 1 : 0);
                 stepLabels[i].Text = steps[i] + (active ? "…" : "");
-                stepLabels[i].Foreground = done || active ? ink : BrushOf("#91909B");
+                stepLabels[i].Foreground = done || active ? ink : SetupWindowLayout.BrushOf("#91909B");
                 stepLabels[i].FontWeight = active ? FontWeights.SemiBold : FontWeights.Normal;
                 AutomationProperties.SetName(indicators[i], done ? "已完成" : active ? "正在进行" : "等待中");
             }
@@ -460,17 +373,17 @@ namespace NotmyFault.Setup
         private void ShowComplete()
         {
             bool upgraded = result != null && result.Upgraded;
-            var page = Page(upgraded ? "升级已完成" : "安装已完成", "");
+            var page = layout.Page(upgraded ? "升级已完成" : "安装已完成", "");
             var body = new StackPanel { Margin = new Thickness(0, 12, 0, 0) };
             var success = new StepIndicator { Width = 52, Height = 52, HorizontalAlignment = HorizontalAlignment.Left,
                 Margin = new Thickness(0, 0, 0, 24) };
             AutomationProperties.SetName(success, upgraded ? "升级成功" : "安装成功");
             success.Loaded += delegate { success.SetState(2); };
             body.Children.Add(success);
-            countdownText = Text("NotmyFault 将在 10 秒后启动初次配置流程……", 17, muted);
+            countdownText = SetupWindowLayout.Text("NotmyFault 将在 10 秒后启动初次配置流程……", 17, muted);
             body.Children.Add(countdownText);
             countdownTrack = new Grid { Height = 6, Margin = new Thickness(0, 32, 0, 0), ClipToBounds = true };
-            countdownTrack.Children.Add(new Border { Background = BrushOf("#34353B"), CornerRadius = new CornerRadius(3) });
+            countdownTrack.Children.Add(new Border { Background = SetupWindowLayout.BrushOf("#34353B"), CornerRadius = new CornerRadius(3) });
             countdownFill = new Border { Background = primary, CornerRadius = new CornerRadius(3), Width = 0, HorizontalAlignment = HorizontalAlignment.Left };
             countdownTrack.Children.Add(countdownFill);
             AutomationProperties.SetName(countdownTrack, "启动倒计时");
@@ -478,19 +391,19 @@ namespace NotmyFault.Setup
             body.Children.Add(countdownTrack);
             if (result != null && !String.IsNullOrEmpty(result.Warning))
             {
-                var warning = Text(result.Warning, 13, muted);
+                var warning = SetupWindowLayout.Text(result.Warning, 13, muted);
                 warning.Margin = new Thickness(0, 18, 0, 0);
                 body.Children.Add(warning);
             }
             if (preview)
             {
-                var note = Text("界面预览，倒计时结束后不会启动程序。", 13, muted);
+                var note = SetupWindowLayout.Text("界面预览，倒计时结束后不会启动程序。", 13, muted);
                 note.Margin = new Thickness(0, 18, 0, 0);
                 body.Children.Add(note);
             }
             Grid.SetRow(body, 1);
             page.Children.Add(body);
-            Footer(page, preview ? Button("返回", ShowWelcome, false) : null, Button(upgraded ? "立即启动" : "立即重启", Launch, true));
+            layout.Footer(page, preview ? layout.Button("返回", ShowWelcome, false) : null, layout.Button(upgraded ? "立即启动" : "立即重启", Launch, true));
             remaining = 10;
             page.Loaded += delegate
             {
@@ -544,19 +457,19 @@ namespace NotmyFault.Setup
 
         private void ShowFailure(string title, string message)
         {
-            var page = Page(title, message);
+            var page = layout.Page(title, message);
             var body = new StackPanel();
             string log = Path.Combine(selectedDirectory, "install.log");
             if (File.Exists(log))
             {
-                body.Children.Add(Text("安装日志", 15, ink));
+                body.Children.Add(SetupWindowLayout.Text("安装日志", 15, ink));
                 body.Children.Add(new TextBox { Text = log, IsReadOnly = true, BorderThickness = new Thickness(0),
                     Background = Brushes.Transparent, Foreground = muted, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 10, 0, 20) });
-                body.Children.Add(Button("打开日志", delegate { Process.Start("notepad.exe", "\"" + log + "\""); }, false));
+                body.Children.Add(layout.Button("打开日志", delegate { Process.Start("notepad.exe", "\"" + log + "\""); }, false));
             }
             Grid.SetRow(body, 1);
             page.Children.Add(body);
-            Footer(page, Button("退出", Close, false), Button("返回安装设置", ShowOptions, true));
+            layout.Footer(page, layout.Button("退出", Close, false), layout.Button("返回安装设置", ShowOptions, true));
             ChangePage(page, false);
         }
 
@@ -586,56 +499,7 @@ namespace NotmyFault.Setup
                     Foreground = ink, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Padding = new Thickness(24) } }.ShowDialog();
         }
 
-        internal const string Styles = @"<ResourceDictionary
-            xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'
-            xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
-          <Style x:Key='PlainButton' TargetType='Button'>
-            <Setter Property='Foreground' Value='#A7C9FF'/><Setter Property='Background' Value='Transparent'/>
-            <Setter Property='Padding' Value='24,12'/><Setter Property='MinHeight' Value='46'/>
-            <Setter Property='FontSize' Value='14'/><Setter Property='FontWeight' Value='SemiBold'/>
-            <Setter Property='BorderThickness' Value='0'/><Setter Property='Cursor' Value='Hand'/>
-            <Setter Property='Template'><Setter.Value><ControlTemplate TargetType='Button'>
-              <Grid><Border x:Name='Shape' Background='{TemplateBinding Background}' CornerRadius='24'
-                Padding='{TemplateBinding Padding}'><ContentPresenter HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
-                <Border x:Name='Focus' CornerRadius='26' Margin='-4' BorderBrush='#A7C9FF' BorderThickness='0'/></Grid>
-              <ControlTemplate.Triggers>
-                <Trigger Property='IsMouseOver' Value='True'><Setter TargetName='Shape' Property='Opacity' Value='0.8'/></Trigger>
-                <Trigger Property='IsPressed' Value='True'><Setter TargetName='Shape' Property='CornerRadius' Value='14'/></Trigger>
-                <Trigger Property='IsKeyboardFocused' Value='True'><Setter TargetName='Focus' Property='BorderThickness' Value='2'/></Trigger>
-                <Trigger Property='IsEnabled' Value='False'><Setter TargetName='Shape' Property='Opacity' Value='0.45'/></Trigger>
-              </ControlTemplate.Triggers>
-            </ControlTemplate></Setter.Value></Setter>
-          </Style>
-          <Style x:Key='PrimaryButton' TargetType='Button' BasedOn='{StaticResource PlainButton}'>
-            <Setter Property='Background' Value='#A7C9FF'/><Setter Property='Foreground' Value='#00315F'/>
-            <Setter Property='MinWidth' Value='120'/>
-          </Style>
-          <Style x:Key='Input' TargetType='Control'>
-            <Setter Property='Height' Value='48'/><Setter Property='Padding' Value='15,0'/>
-            <Setter Property='VerticalContentAlignment' Value='Center'/>
-            <Setter Property='Foreground' Value='#E5E1EA'/><Setter Property='Background' Value='#0D0E13'/>
-            <Setter Property='BorderBrush' Value='#47464F'/><Setter Property='BorderThickness' Value='1'/>
-            <Setter Property='Template'><Setter.Value><ControlTemplate TargetType='Control'>
-              <Border x:Name='Field' CornerRadius='14' Background='{TemplateBinding Background}'
-                BorderBrush='{TemplateBinding BorderBrush}' BorderThickness='{TemplateBinding BorderThickness}'>
-                <ScrollViewer x:Name='PART_ContentHost' Margin='{TemplateBinding Padding}'
-                    VerticalAlignment='{TemplateBinding VerticalContentAlignment}'/>
-              </Border>
-              <ControlTemplate.Triggers>
-                <Trigger Property='IsKeyboardFocusWithin' Value='True'>
-                  <Setter TargetName='Field' Property='BorderBrush' Value='#A7C9FF'/>
-                  <Setter TargetName='Field' Property='BorderThickness' Value='2'/>
-                </Trigger>
-              </ControlTemplate.Triggers>
-            </ControlTemplate></Setter.Value></Setter>
-          </Style>
-          <Style x:Key='PasswordField' TargetType='PasswordBox' BasedOn='{StaticResource Input}'>
-            <Setter Property='CaretBrush' Value='#A7C9FF'/>
-          </Style>
-          <Style x:Key='TextField' TargetType='TextBox' BasedOn='{StaticResource Input}'>
-            <Setter Property='CaretBrush' Value='#A7C9FF'/>
-          </Style>
-        </ResourceDictionary>";
+
     }
 
     public sealed class StepIndicator : FrameworkElement

@@ -37,14 +37,19 @@ public static class Smoke
             {
                 int result = RegOverridePredefKey(currentUser, isolated.Handle.DangerousGetHandle());
                 if (result != 0) throw new System.ComponentModel.Win32Exception(result);
-                try { Scenarios.Run(installer, workspace); }
+                try
+                {
+                    if (args.Length > 2 && args[2] == "--maintenance-only") Scenarios.RunMaintenance(workspace);
+                    else Scenarios.Run(installer, workspace);
+                }
                 finally
                 {
                     result = RegOverridePredefKey(currentUser, IntPtr.Zero);
                     if (result != 0) throw new System.ComponentModel.Win32Exception(result);
                 }
             }
-            Console.WriteLine("PASS: all installer lifecycle checks");
+            Console.WriteLine(args.Length > 2 && args[2] == "--maintenance-only" ?
+                "PASS: installer maintenance checks" : "PASS: all installer lifecycle checks");
             return 0;
         }
         catch (Exception error)
@@ -80,6 +85,90 @@ internal static class Scenarios
     private static void Check(bool success, string message)
     {
         if (!success) throw new Exception(message);
+    }
+
+    private sealed class InterruptedUninstall : InstallMaintenance.UninstallOperations
+    {
+        internal string Failure;
+
+        internal override void MoveDirectory(string source, string destination)
+        {
+            if (Failure == "move") throw new IOException("模拟目录移动失败");
+            base.MoveDirectory(source, destination);
+        }
+
+        internal override void DeleteFile(string file)
+        {
+            if ((Failure == "delete" && Path.GetFileName(file) == "program-b.bin") ||
+                (Failure == "marker" && Path.GetFileName(file) == ".notmyfault-install"))
+                throw new IOException("模拟文件删除失败");
+            base.DeleteFile(file);
+        }
+
+        internal override void RemoveEntries(string directory)
+        {
+            if (Failure == "registration") throw new IOException("模拟注册信息清理失败");
+            base.RemoveEntries(directory);
+        }
+    }
+
+    internal static void RunMaintenance(string root)
+    {
+        foreach (string failure in new[] { "move", "delete", "registration", "marker" })
+        {
+            string original = Path.Combine(root, failure);
+            Directory.CreateDirectory(Path.Combine(original, "app", ".private"));
+            Directory.CreateDirectory(Path.Combine(original, "app", "user_plugins", "sample"));
+            File.WriteAllText(Path.Combine(original, ".notmyfault-install"), "NotmyFault Windows installer 1\ntest\n");
+            string[] owned = { "program-a.bin", "program-b.bin", "app/.private/signing_private_key.pem",
+                "app/.private/signing_public.pem", "app/.private/notes.txt", "app/user_plugins/sample/resource.txt" };
+            File.WriteAllLines(Path.Combine(original, ".notmyfault-files"), owned);
+            foreach (string relative in owned) File.WriteAllText(Path.Combine(original, relative), relative);
+            File.WriteAllText(Path.Combine(original, "keep-me.txt"), "user data");
+            using (RegistryKey registration = Registry.CurrentUser.CreateSubKey(Registration))
+                registration.SetValue("InstallLocation", original);
+            string retry = null;
+            try
+            {
+                InstallMaintenance.UninstallAsync(original, new Progress(), CancellationToken.None,
+                    new InterruptedUninstall { Failure = failure }).GetAwaiter().GetResult();
+            }
+            catch (UninstallFailure error) { retry = error.RetryDirectory; }
+            Check(retry != null, "uninstall did not report the interruption");
+            Check(Directory.Exists(retry), "retry directory does not exist");
+            Check(File.Exists(Path.Combine(retry, ".notmyfault-uninstall")), "uninstall lost its cleanup list");
+            Check(File.ReadAllText(Path.Combine(retry, "keep-me.txt")) == "user data", "interrupted uninstall changed user data");
+            Check(File.ReadAllText(Path.Combine(retry, "app", "user_plugins", "sample", "resource.txt")) == owned[5], "interrupted uninstall changed a user plugin");
+            Check(File.ReadAllText(Path.Combine(retry, "app", ".private", "notes.txt")) == owned[4], "uninstaller removed another private file");
+            if (failure == "move")
+            {
+                Check(String.Equals(original, retry, StringComparison.OrdinalIgnoreCase), "failed move changed the retry path");
+                foreach (string relative in owned) Check(File.Exists(Path.Combine(original, relative)), "failed move deleted an installation file");
+            }
+            else
+            {
+                Check(!Directory.Exists(original), "uninstall did not move the installation before deleting files");
+                Check(!File.Exists(Path.Combine(retry, "program-a.bin")), "uninstall did not reach file cleanup");
+                if (failure == "delete") Check(File.Exists(Path.Combine(retry, "program-b.bin")), "fixture did not interrupt partial cleanup");
+                if (failure == "marker") Check(!File.Exists(Path.Combine(retry, ".notmyfault-files")), "fixture did not interrupt after marker cleanup");
+            }
+            bool refused = false;
+            try { InstallEngine.ValidateDirectory(original); }
+            catch (IOException) { refused = true; }
+            Check(refused, "installation replaced a directory with unfinished uninstall cleanup");
+            string retained = InstallMaintenance.UninstallAsync(retry, new Progress(), CancellationToken.None).GetAwaiter().GetResult();
+            Check(Directory.Exists(retained) && !Directory.Exists(original), "retry did not retain user data separately");
+            Check(File.ReadAllText(Path.Combine(retained, "keep-me.txt")) == "user data", "retry changed user data");
+            Check(File.Exists(Path.Combine(retained, "app", "user_plugins", "sample", "resource.txt")), "retry removed a user plugin");
+            Check(File.Exists(Path.Combine(retained, "app", ".private", "notes.txt")), "retry removed another private file");
+            foreach (string relative in new[] { "program-a.bin", "program-b.bin", owned[2], owned[3],
+                ".notmyfault-install", ".notmyfault-files", ".notmyfault-uninstall" })
+                Check(!File.Exists(Path.Combine(retained, relative)), "retry left an installation file: " + relative);
+            using (RegistryKey registration = Registry.CurrentUser.OpenSubKey(Registration))
+                Check(registration == null, "retry left the installation registered");
+            Check(InstallEngine.ValidateDirectory(original) == original, "completed uninstall did not release the original path");
+            Console.WriteLine("PASS: uninstall resumes after " + failure + " failure and preserves user data");
+        }
     }
 
     private static InstallResult Install(string directory, bool upgrade, string password, CancellationToken token, Progress progress)
@@ -145,6 +234,11 @@ internal static class Scenarios
     private static void DataSurvives(string directory, byte[] key)
     {
         Check(File.ReadAllBytes(Path.Combine(directory, "app", ".private", "signing_private_key.pem")).SequenceEqual(key), "existing signing key changed");
+        UserDataSurvives(directory);
+    }
+
+    private static void UserDataSurvives(string directory)
+    {
         Check(File.ReadAllText(Path.Combine(directory, "app", "user_plugins", "sample", "resource.txt")) == "user plugin", "user plugin changed");
         Check(File.ReadAllText(Path.Combine(directory, "keep-me.txt")) == "unrelated file", "unknown file changed");
         Check(File.ReadAllText(Path.Combine(workspace, "profile", "NotmyFault", "config.json")) == "{\"smoke\":true}", "user configuration changed");
@@ -153,6 +247,7 @@ internal static class Scenarios
     public static void Run(string installer, string root)
     {
         workspace = root;
+        RunMaintenance(Path.Combine(root, "maintenance"));
         Console.OutputEncoding = System.Text.Encoding.UTF8;
         string unrelated = Path.Combine(workspace, "unrelated");
         Directory.CreateDirectory(unrelated);
@@ -279,7 +374,11 @@ internal static class Scenarios
 
         string retained = InstallMaintenance.UninstallAsync(directory, new Progress(), CancellationToken.None).GetAwaiter().GetResult();
         Check(Directory.Exists(retained), "uninstaller did not report retained user data");
-        DataSurvives(directory, signingKey);
+        UserDataSurvives(retained);
+        Check(!File.Exists(Path.Combine(retained, "app", ".private", "signing_private_key.pem")), "uninstaller left the signing private key");
+        Check(!File.Exists(Path.Combine(retained, "app", ".private", "signing_public.pem")), "uninstaller left the signing public key");
+        Check(!Directory.Exists(directory), "uninstaller left the original installation directory");
+        Check(!File.Exists(Path.Combine(retained, ".notmyfault-install")) && !File.Exists(Path.Combine(retained, ".notmyfault-files")), "retained data includes installation markers");
         Check(!File.Exists(Path.Combine(directory, "NotmyFault.vbs")), "uninstaller left the launcher");
         Check(!Directory.Exists(Path.Combine(directory, "runtime")), "uninstaller left the Python runtime");
         Check(!Directory.Exists(Path.Combine(directory, ".venv")), "uninstaller left the virtual environment");
@@ -287,5 +386,13 @@ internal static class Scenarios
             Check(key == null, "uninstaller left the program registered");
         Check(!InstallEngine.IsInstalledDirectory(directory), "uninstalled program still detected as installed");
         Console.WriteLine("PASS: uninstall removes application files and registration while retaining user data");
+
+        InstallResult reinstalled = Install(directory, false, Password, CancellationToken.None, new Progress());
+        Check(!reinstalled.Upgraded, "reinstallation was reported as an upgrade");
+        RegistrationMatches(directory);
+        UserDataSurvives(retained);
+        string remaining = InstallMaintenance.UninstallAsync(directory, new Progress(), CancellationToken.None).GetAwaiter().GetResult();
+        Check(remaining == "" && !Directory.Exists(directory), "uninstall without retained files left the installation directory");
+        Console.WriteLine("PASS: the original path accepts a fresh installation after uninstall");
     }
 }
