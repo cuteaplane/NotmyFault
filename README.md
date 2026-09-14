@@ -105,7 +105,8 @@ Wayland 默认禁止普通应用监听全局按键或枚举其他应用的窗口
 触发条件（AND / OR / NOT）→ 动作流水线（支持 IF / ELSE）
 ```
 
-单一触发条件使用 `event`；复杂条件使用可嵌套的 `condition`：
+触发条件统一使用 `condition`：单个触发器直接作为叶子，多个触发器用条件组组合。
+旧规则的 `event/trigger` 在读取或导入时转换，保存后使用 `condition`：
 
 ```json
 {
