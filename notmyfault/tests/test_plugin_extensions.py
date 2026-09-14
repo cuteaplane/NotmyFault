@@ -65,28 +65,39 @@ def make_loader(tmp_path):
 
 
 def load_actions(loader, tmp_path, origin="builtin"):
-    return loader.load(
-        base_dir=str(tmp_path),
-        plugins_dir="actions",
-        json_filename="action.json",
-        py_filename="action.py",
-        module_prefix="notmyfault.action_extension_",
-        meta_store={},
-        func_store={},
-        store_name="Action",
-        origin=origin,
-    )
+    return loader.load(str(tmp_path / "actions"), "action", origin=origin)
 
 
-def test_plugin_resource_resolves_inside_registered_plugin(tmp_path):
-    loader, _errors = make_loader(tmp_path)
-    folder = write_plugin(tmp_path / "actions", "res", make_meta("res_a"))
-    (folder / "bin").mkdir()
-    (folder / "bin" / "tool.exe").write_bytes(b"\x00")
-    assert load_actions(loader, tmp_path) == (1, 0)
-    assert plugin_resource("res_a", "bin", "tool.exe") == os.path.realpath(
-        str(folder / "bin" / "tool.exe")
-    )
+@pytest.mark.parametrize("import_code,resource", [
+    ("from notmyfault.security.plugin_resources import plugin_resource", "plugin_resource"),
+    ("import notmyfault.security.plugin_resources as resources", "resources.plugin_resource"),
+    ("import notmyfault.security.plugin_resources\nassert notmyfault.__name__ == 'notmyfault'", "notmyfault.security.plugin_resources.plugin_resource"),
+    ("from notmyfault.security import plugin_resources", "plugin_resources.plugin_resource"),
+])
+def test_plugin_resource_resolves_inside_registered_plugin(tmp_path, import_code, resource):
+    loaded = []
+    for name in ("first", "second"):
+        base = tmp_path / name
+        loader, _errors = make_loader(base)
+        folder = write_plugin(base / "actions", "res", make_meta("res_a"))
+        (folder / "bin").mkdir()
+        (folder / "bin" / "tool.exe").write_bytes(b"\x00")
+        (folder / "action.py").write_text(
+            f"{import_code}\ndef run(meta, params):\n    return {resource}('res_a', 'bin', 'tool.exe')\n",
+            encoding="utf-8",
+        )
+        assert load_actions(loader, base) == (1, 0)
+        run = loader._registry.resolve_action("res_a")
+        assert run is not None
+        loaded.append((loader, run, folder))
+    try:
+        for loader, run, folder in loaded:
+            expected = os.path.realpath(str(folder / "bin" / "tool.exe"))
+            assert run({}, {}) == expected
+            assert loader._registry.resource("res_a", "bin", "tool.exe") == expected
+    finally:
+        for loader, _, _ in loaded:
+            loader._registry.clear()
 
 
 @pytest.mark.parametrize(
@@ -97,7 +108,7 @@ def test_plugin_resource_rejects_escape(tmp_path, parts):
     write_plugin(tmp_path / "actions", "res", make_meta("res_b"))
     assert load_actions(loader, tmp_path) == (1, 0)
     with pytest.raises(ValueError):
-        plugin_resource("res_b", *parts)
+        loader._registry.resource("res_b", *parts)
 
 
 def test_plugin_resource_rejects_unknown_plugin():

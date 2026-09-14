@@ -8,8 +8,15 @@ import types
 from pathlib import Path
 
 
+def _module_view(module, **attributes):
+    view = types.ModuleType(module.__name__)
+    view.__getattr__ = lambda name: getattr(module, name)
+    view.__dict__.update(attributes)
+    return view
+
+
 class PluginImports:
-    def __init__(self, root: str, namespace: str, sources: dict[str, bytes]) -> None:
+    def __init__(self, root: str, namespace: str, sources: dict[str, bytes], *, resource_roots: dict[str, str] | None = None) -> None:
         self.root = Path(root).resolve()
         self.namespace = namespace
         self.sources = {
@@ -19,6 +26,9 @@ class PluginImports:
         self.modules: dict[str, types.ModuleType] = {}
         self._lock = threading.RLock()
         self._builtins = {**vars(builtins), "__import__": self._import}
+        from notmyfault.security.plugin_resources import resource_module
+
+        self._resources = resource_module(resource_roots if resource_roots is not None else {})
 
     def _has_module(self, relative: str) -> bool:
         path = relative.replace(".", "/")
@@ -27,6 +37,15 @@ class PluginImports:
         )
 
     def _import(self, name, globals=None, locals=None, fromlist=(), level=0):
+        if not level and name == "notmyfault.security.plugin_resources":
+            if fromlist:
+                return self._resources
+            package = builtins.__import__(name, globals, locals, fromlist, level)
+            security = _module_view(package.security, plugin_resources=self._resources)
+            return _module_view(package, security=security)
+        if not level and name == "notmyfault.security" and "plugin_resources" in (fromlist or ()):
+            package = builtins.__import__(name, globals, locals, fromlist, level)
+            return _module_view(package, plugin_resources=self._resources)
         if level:
             package = globals.get("__package__", "") if globals else ""
             fullname = importlib.util.resolve_name("." * level + name, package)

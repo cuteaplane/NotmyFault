@@ -80,40 +80,14 @@ def make_loader(tmp_path, mode=SecurityMode.PERMISSIVE, config=None):
 
 
 def load_actions(loader, tmp_path, meta_store=None, func_store=None, origin="builtin"):
-    if meta_store is None:
-        meta_store = {}
-    if func_store is None:
-        func_store = {}
-    loaded, failed = loader.load(
-        base_dir=str(tmp_path),
-        plugins_dir="actions",
-        json_filename="action.json",
-        py_filename="action.py",
-        module_prefix="notmyfault.action_",
-        meta_store=meta_store,
-        func_store=func_store,
-        store_name="Action",
-        origin=origin,
-    )
+    meta_store, func_store = loader._registry.stores("action")
+    loaded, failed = loader.load(str(tmp_path / "actions"), "action", origin=origin)
     return loaded, failed, meta_store, func_store
 
 
 def load_triggers(loader, tmp_path, meta_store=None, func_store=None, origin="builtin"):
-    if meta_store is None:
-        meta_store = {}
-    if func_store is None:
-        func_store = {}
-    loaded, failed = loader.load(
-        base_dir=str(tmp_path),
-        plugins_dir="triggers",
-        json_filename="trigger.json",
-        py_filename="trigger.py",
-        module_prefix="notmyfault.trigger_",
-        meta_store=meta_store,
-        func_store=func_store,
-        store_name="Trigger",
-        origin=origin,
-    )
+    meta_store, func_store = loader._registry.stores("trigger")
+    loaded, failed = loader.load(str(tmp_path / "triggers"), "trigger", origin=origin)
     return loaded, failed, meta_store, func_store
 
 
@@ -176,7 +150,9 @@ class TestEngineStart:
             lambda title, message, open_dashboard=False: alerts.append((title, open_dashboard))
         )
         engine._security_mode = SecurityMode.PERMISSIVE
-        engine.start(shutdown_event=threading.Event())
+        from notmyfault.config import ConfigValidationError
+        with pytest.raises(ConfigValidationError, match="ghost_trigger"):
+            engine.start(shutdown_event=threading.Event())
         assert any("启动失败" in title and dashboard for title, dashboard in alerts)
 
 
@@ -402,6 +378,9 @@ class TestSecurityScanIntegration:
         loaded, failed, meta_store, _ = load_actions(loader, tmp_path, origin="user")
         assert (loaded, failed) == (1, 0)
         assert meta_store["legacy"]["signature_kind"] == "official-legacy"
+        run = registry.resolve_action("legacy")
+        assert run is not None
+        assert run(meta_store["legacy"], {}) is None
 
     def test_strict_migrates_old_payload_with_existing_integrity_record(
         self, tmp_path, monkeypatch
@@ -581,14 +560,16 @@ def test_plugin_registry_registers_and_unregisters_atomically():
     registry.unregister("action", "plug_a")
 
 
-def test_plugins_keep_separate_verified_sibling_modules(tmp_path, monkeypatch):
+@pytest.mark.parametrize("relative", [False, True])
+def test_plugins_keep_separate_verified_sibling_modules(tmp_path, monkeypatch, relative):
     import sys
     from notmyfault.security import plugin_loader
 
     loader, registry, errors, _sudo = make_loader(tmp_path)
+    prefix = "." if relative else ""
     for plugin_id, value in (("first", 1), ("second", 2)):
         folder = write_plugin(tmp_path / "actions", plugin_id, make_meta(plugin_id),
-                              "def run(meta, params):\n    from helper import VALUE\n    from lib import nested\n    return VALUE, nested.VALUE\n")
+                              f"def run(meta, params):\n    from {prefix}helper import VALUE\n    from {prefix}lib import nested\n    return VALUE, nested.VALUE\n")
         (folder / "helper.py").write_text(f"VALUE = {value}\n", encoding="utf-8")
         (folder / "lib").mkdir()
         (folder / "lib" / "__init__.py").write_text("from . import nested\n", encoding="utf-8")

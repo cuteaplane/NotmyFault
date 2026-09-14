@@ -29,6 +29,7 @@ def test_import_notmyfault_public_api_no_findings(tmp_path):
         "import notmyfault\n"
         "import notmyfault.config\n"
         "from notmyfault.core.logging import engine_info\n"
+        "from notmyfault.triggers.base import PollingTrigger\n"
     )
     assert scan(tmp_path, source) == []
 
@@ -38,10 +39,11 @@ def test_import_sudo_via_public_api_no_findings(tmp_path):
     assert scan(tmp_path, source) == []
 
 
-def test_direct_import_of_engine_plugin_module(tmp_path):
-    findings = scan(tmp_path, "import notmyfault.action_other\n")
+@pytest.mark.parametrize("module", ["notmyfault.action_other", "notmyfault.actions.other", "notmyfault.triggers.other"])
+def test_direct_import_of_engine_plugin_module(tmp_path, module):
+    findings = scan(tmp_path, f"import {module}\n")
     assert any(
-        "直接导入引擎插件模块 notmyfault.action_other" in f for f in findings
+        f"直接导入引擎插件模块 {module}" in f for f in findings
     )
 
 
@@ -176,17 +178,7 @@ def test_loader_warns_on_borrowed_privilege_for_every_origin(
         integrity_errors=integrity_errors,
         plugin_manifest_path=str(tmp_path / "manifest.json"),
     )
-    loaded, failed = loader.load(
-        base_dir=str(tmp_path),
-        plugins_dir="actions",
-        json_filename="action.json",
-        py_filename="action.py",
-        module_prefix="notmyfault.action_",
-        meta_store={},
-        func_store={},
-        store_name="Action",
-        origin=origin,
-    )
+    loaded, failed = loader.load(str(tmp_path / "actions"), "action", origin=origin)
 
     # 所有来源执行相同的借用权限检查；宽松模式记录告警但不拒载。
     assert loaded == 1

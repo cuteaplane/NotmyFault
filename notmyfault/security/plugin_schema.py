@@ -257,11 +257,11 @@ def _risk_ids_for_name(name: str, is_call: bool) -> List[str]:
 
 
 def scan_plugin_source_security(
-    source: str, filename: str = "plugin.py"
+    source: str, filename: str = "plugin.py", *, tree: ast.Module | None = None
 ) -> List[Dict[str, Any]]:
     risks: List[Dict[str, Any]] = []
     try:
-        tree = ast.parse(source, filename=filename)
+        tree = tree if tree is not None else ast.parse(source, filename=filename)
     except (SyntaxError, ValueError):
         return risks
 
@@ -1042,58 +1042,20 @@ def scan_plugins(
     *,
     include_disabled: bool = False,
 ) -> Dict[str, Dict]:
+    from notmyfault.security.plugin_checks import (
+        inspect_plugin_metadata, is_plugin_platform_compatible, plugin_directories,
+    )
+
     result: Dict[str, Dict] = {}
-    root = os.path.join(base_dir, plugins_dir)
-    if not os.path.isdir(root):
-        return result
-
-    for folder_name in sorted(os.listdir(root)):
-        # 与加载器一致，跳过解释器和开发工具生成的目录；.nmf-backup 是更新时留下的旧版本备份
-        if folder_name.startswith(".") or folder_name in (
-            "__pycache__", "__pypackages__", "node_modules",
-        ) or folder_name.endswith(".nmf-backup"):
+    kind = "trigger" if json_filename == "trigger.json" else "action"
+    for folder in plugin_directories(Path(base_dir) / plugins_dir):
+        meta, errors, schema_errors = inspect_plugin_metadata(folder, kind)
+        if errors or schema_errors or (meta.get("enabled") is False and not include_disabled):
             continue
-        folder_path = os.path.join(root, folder_name)
-        if not os.path.isdir(folder_path):
-            continue
-
-        json_file = os.path.join(folder_path, json_filename)
-        if not os.path.exists(json_file):
-            continue
-
-        try:
-            with open(json_file, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-        except Exception:
-            continue
-
-        if not isinstance(meta, dict):
-            continue
-        plugin_id = meta.get("id")
-        if not plugin_id:
-            continue
-
-        if meta.get("enabled") is False and not include_disabled:
-            continue
-
-        plugin_type = "trigger" if json_filename == "trigger.json" else "action"
-        is_valid, _ = validate_plugin_meta(meta, plugin_type)
-        if not is_valid:
-            continue
-
-        current_platform = current_platform_name()
-        entrypoints = meta.get("entrypoints") or {}
-        platforms = meta.get("platforms") or list(entrypoints)
-        compatible = (
-            current_platform in entrypoints
-            if entrypoints
-            else not platforms or current_platform in platforms
-        )
-        result[plugin_id] = {
+        result[meta["id"]] = {
             **meta,
-            "platform_compatible": compatible,
-            "current_platform": current_platform,
-            "selected_entrypoint": entrypoints.get(current_platform),
+            "platform_compatible": is_plugin_platform_compatible(meta),
+            "current_platform": current_platform_name(),
+            "selected_entrypoint": (meta.get("entrypoints") or {}).get(current_platform_name()),
         }
-
     return result

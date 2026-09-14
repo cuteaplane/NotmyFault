@@ -86,17 +86,7 @@ def test_materialize_rejects_plugin_changed_after_discovery(
         json_name=json_name,
         py_name=py_name,
     )
-    loaded, failed = loader.load(
-        base_dir=str(tmp_path),
-        plugins_dir=plugins_dir,
-        json_filename=json_name,
-        py_filename=py_name,
-        module_prefix=f"notmyfault.{kind}_",
-        meta_store={},
-        func_store={},
-        store_name=kind.title(),
-        origin="builtin",
-    )
+    loaded, failed = loader.load(str(tmp_path / plugins_dir), kind, origin="builtin")
     assert (loaded, failed) == (1, 0)
 
     (folder / py_name).write_text(

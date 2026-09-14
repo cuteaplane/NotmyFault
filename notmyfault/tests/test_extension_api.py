@@ -262,17 +262,7 @@ def test_action_extension_commands_follow_lazy_loading(tmp_path):
         integrity_errors=[],
         plugin_manifest_path=str(tmp_path / "manifest.json"),
     )
-    loaded, failed = loader.load(
-        base_dir=str(tmp_path),
-        plugins_dir="actions",
-        json_filename="action.json",
-        py_filename="action.py",
-        module_prefix="notmyfault.test_extension_",
-        meta_store=registry.actions_meta,
-        func_store=registry.actions_funcs,
-        store_name="Action",
-        origin="builtin",
-    )
+    loaded, failed = loader.load(str(tmp_path / "actions"), "action", origin="builtin")
     assert (loaded, failed) == (1, 0)
     assert registry.extensions.handler("sample", "open") is None
     assert registry.resolve_action("sample") is not None

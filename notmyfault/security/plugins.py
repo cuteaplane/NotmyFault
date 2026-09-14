@@ -255,8 +255,17 @@ def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
     return scan_plugin_capabilities_from_source(source)
 
 
-_PLUGIN_MODULE_PREFIXES = ("notmyfault.action_", "notmyfault.trigger_")
+_PLUGIN_MODULE_PREFIXES = (
+    "notmyfault.action_", "notmyfault.trigger_",
+    "notmyfault.actions.", "notmyfault.triggers.",
+)
 _DYNAMIC_EXEC_BYPASS = {"exec", "eval", "compile", "__import__"}
+
+
+def _is_plugin_module(name: str) -> bool:
+    if name == "notmyfault.triggers.base" or name.startswith("notmyfault.triggers.base."):
+        return False
+    return name.startswith(_PLUGIN_MODULE_PREFIXES)
 
 
 def _scan_borrowed_from_tree(tree: ast.Module) -> list[str]:
@@ -293,20 +302,20 @@ def _scan_borrowed_from_tree(tree: ast.Module) -> list[str]:
                 and val.value.value.id == "sys"
                 and isinstance(val.slice, ast.Constant)
                 and isinstance(val.slice.value, str)
-                and val.slice.value.startswith(_PLUGIN_MODULE_PREFIXES)
+                and _is_plugin_module(val.slice.value)
             ):
                 module_aliases[node.targets[0].id] = val.slice.value
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name.startswith(_PLUGIN_MODULE_PREFIXES):
+                if _is_plugin_module(alias.name):
                     findings.append(
                         f"直接导入引擎插件模块 {alias.name}：可借壳其管理员授权"
                     )
         elif isinstance(node, ast.ImportFrom):
             mod = node.module or ""
-            if mod.startswith(_PLUGIN_MODULE_PREFIXES):
+            if _is_plugin_module(mod) or any(_is_plugin_module(f"{mod}.{alias.name}") for alias in node.names):
                 names = ", ".join(alias.name for alias in node.names)
                 findings.append(
                     f"from-import 引擎插件模块 {mod} 的 {names}：可借壳其管理员授权"
@@ -321,7 +330,7 @@ def _scan_borrowed_from_tree(tree: ast.Module) -> list[str]:
                 and value.value.id == "sys"
                 and isinstance(node.slice, ast.Constant)
                 and isinstance(node.slice.value, str)
-                and node.slice.value.startswith(_PLUGIN_MODULE_PREFIXES)
+                and _is_plugin_module(node.slice.value)
             ):
                 findings.append(
                     f"通过 sys.modules 获取引擎插件模块 {node.slice.value}"
@@ -356,7 +365,7 @@ def _scan_borrowed_from_tree(tree: ast.Module) -> list[str]:
                 chain = ".".join(reversed(chain_parts))
                 first, dot, rest = chain.partition(".")
                 resolved = module_aliases.get(first, first) + ("." + rest if dot else "")
-                if resolved.startswith(_PLUGIN_MODULE_PREFIXES):
+                if _is_plugin_module(resolved):
                     findings.append(
                         f"调用引擎插件模块内部函数 {resolved}()"
                     )
@@ -364,7 +373,7 @@ def _scan_borrowed_from_tree(tree: ast.Module) -> list[str]:
                 target = module_aliases.get(func.id)
                 if (
                     target is not None
-                    and target.startswith(_PLUGIN_MODULE_PREFIXES)
+                    and _is_plugin_module(target)
                     and "." in target
                 ):
                     findings.append(
@@ -390,10 +399,10 @@ def scan_borrowed_privilege(py_file_path: str) -> list[str]:
 
 
 def analyze_plugin_source(
-    source: str, *, include_borrowed: bool = True
+    source: str, *, include_borrowed: bool = True, tree: ast.Module | None = None
 ) -> tuple[Set[str], bool, list[str]]:
     """一次解析返回能力集合、sudo 导入和借壳扫描结果"""
-    tree = parse_plugin_source(source)
+    tree = tree if tree is not None else parse_plugin_source(source)
     borrowed = _scan_borrowed_from_tree(tree) if include_borrowed else []
     return (
         _scan_capabilities_from_tree(tree),
@@ -562,15 +571,10 @@ def save_plugin_manifest(
                 pass
 
 
-def verify_plugin_integrity_from_hashes(
-    plugin_id: str,
+def plugin_integrity_problems(
     current_hashes: dict[str, str],
-    manifest_path: str | os.PathLike[str] | None = None,
-) -> Tuple[bool, str]:
-    """按清单比对文件哈希并记录首次值，空串哈希表示读不了的文件"""
-    manifest = load_plugin_manifest(manifest_path)
-    has_existing = plugin_id in manifest
-    existing = manifest.get(plugin_id, {})
+    existing: dict[str, str] | None,
+) -> list[str]:
     present_files: set[str] = set(current_hashes.keys())
     readable: dict[str, str] = {
         file_type: h for file_type, h in current_hashes.items() if h
@@ -580,7 +584,7 @@ def verify_plugin_integrity_from_hashes(
         if not h:
             messages.append("无法读取 " + file_type)
 
-    if has_existing:
+    if existing is not None:
         for file_type in sorted(existing.keys() - present_files):
             messages.append(file_type + " 文件已被删除")
         for file_type in sorted(present_files - existing.keys()):
@@ -590,11 +594,22 @@ def verify_plugin_integrity_from_hashes(
             if readable[file_type] == expected_hash:
                 continue
             messages.append(file_type + " 文件已被修改！（期望 " + expected_hash[:12] + "...）")
+    return messages
+
+
+def verify_plugin_integrity_from_hashes(
+    plugin_id: str,
+    current_hashes: dict[str, str],
+    manifest_path: str | os.PathLike[str] | None = None,
+) -> Tuple[bool, str]:
+    """按清单比对文件哈希并记录首次值，空串哈希表示读不了的文件"""
+    manifest = load_plugin_manifest(manifest_path)
+    messages = plugin_integrity_problems(current_hashes, manifest.get(plugin_id))
 
     if messages:
         return False, "；".join(messages)
-    if not has_existing:
-        manifest[plugin_id] = readable
+    if plugin_id not in manifest:
+        manifest[plugin_id] = dict(current_hashes)
         if not save_plugin_manifest(manifest, manifest_path):
             return False, "无法保存完整性清单"
     return True, "完整性校验通过"
