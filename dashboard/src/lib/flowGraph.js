@@ -26,7 +26,8 @@ function conditionDepth(node) {
   return 1 + Math.max(0, ...children.map(conditionDepth))
 }
 
-function pathId(path) {
+export function conditionNodeId(node, path = []) {
+  if (isLeaf(node) && node.binding_id) return `trigger-${node.binding_id}`
   return path.length ? `condition-${path.join('-')}` : 'condition-root'
 }
 
@@ -47,7 +48,7 @@ export function buildFlowGraph({
     const maxDepth = conditionDepth(condition)
 
     function visit(node, path, depth, negated = false) {
-      const id = pathId(path)
+      const id = conditionNodeId(node, path)
       if (!node || typeof node !== 'object' || Array.isArray(node)) {
         const y = TOP + leafIndex * FLOW_ROW_STEP
         leafIndex += 1
@@ -123,22 +124,22 @@ export function buildFlowGraph({
 
     conditionExit = visit(condition, [], 0)
   } else {
-    const item = rule.event
     nodes.push({
-      id: 'trigger',
+      id: 'condition-root',
       kind: 'trigger',
-      source: item,
+      source: null,
+      path: [],
       x: LEFT,
       y: TOP,
       icon: 'bolt',
       kicker: '当',
-      label: eventName(item),
-      meta: item ? describeItem(item, 'trigger') : '需要配置',
-      admin: item ? isAdmin(item, 'trigger') : false,
+      label: eventName(null),
+      meta: '需要配置',
+      admin: false,
       hasInput: false,
       hasOutput: true,
     })
-    conditionExit = { id: 'trigger', y: TOP }
+    conditionExit = { id: 'condition-root', y: TOP }
   }
 
   const conditionExitNode = nodes.find(node => node.id === conditionExit.id)

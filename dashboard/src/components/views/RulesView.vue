@@ -50,7 +50,7 @@ const showCreatePanel = ref(false)
 const showQuickCreate = ref(false)
 const quickCreateReturnFocus = ref(null)
 const createPanelVisible = computed(() => (
-  store.aiDrafting.enabled && (!store.configData.rules.length || showCreatePanel.value)
+  !store.configError && store.aiDrafting.enabled && (!store.configData.rules.length || showCreatePanel.value)
 ))
 
 const ruleQuery = ref('')
@@ -90,7 +90,6 @@ function visitRuleNodes(rule, visitor) {
     if (node.type) visitor(node, 'trigger')
     ;(node.children || []).forEach(visitCondition)
   }
-  if (rule?.event) visitor(rule.event, 'trigger')
   visitCondition(rule?.condition)
   ;(rule?.preconditions || []).forEach(visitAction)
   ;(rule?.actions || []).forEach(visitAction)
@@ -237,9 +236,13 @@ async function restoreDraftRecovery(index) {
     '恢复草稿',
   )
   if (restore) {
-    const restored = ensureRuleBindingIds(normalizeRuleDraft(clone(recovery.draft)))
-    restoreSensitiveParams(restored, draftRule.value)
-    draftRule.value = restored
+    try {
+      const restored = ensureRuleBindingIds(normalizeRuleDraft(clone(recovery.draft)))
+      restoreSensitiveParams(restored, draftRule.value)
+      draftRule.value = restored
+    } catch (error) {
+      await alertDialog('草稿无法恢复', error.message)
+    }
   } else clearDraftRecovery()
 }
 function resetDraftHistory() {
@@ -285,26 +288,26 @@ function redoDraft() {
   if (draftHistoryIndex.value < draftHistory.value.length - 1) applyDraftHistory(draftHistoryIndex.value + 1)
 }
 async function openRule(index) {
+  let next
+  try { next = ensureRuleBindingIds(normalizeRuleDraft(clone(store.configData.rules[index]))) }
+  catch (error) { await alertDialog('规则无法编辑', error.message); return }
   editorAdminKeyPassword = ''
   showCreatePanel.value = false
   activeRuleIndex.value = index
-  draftRule.value = ensureRuleBindingIds(
-    normalizeRuleDraft(clone(store.configData.rules[index])),
-  )
+  draftRule.value = next
   baseline.value = JSON.stringify(draftRule.value)
   await restoreDraftRecovery(index)
   resetDraftHistory()
 }
 async function addRule(seed = null) {
+  let next
+  try {
+    next = seed ? ensureRuleBindingIds(normalizeRuleDraft(clone(seed))) : ensureRuleBindingIds({ name: '新规则', folder: '未分类', actions: [] })
+  } catch (error) { await alertDialog('草稿无法打开', error.message); return }
   editorAdminKeyPassword = ''
   showCreatePanel.value = false
   activeRuleIndex.value = -1
-  draftRule.value = seed ? ensureRuleBindingIds(normalizeRuleDraft(clone(seed))) : ensureRuleBindingIds({
-    name: '新规则',
-    folder: '未分类',
-    event: null,
-    actions: [],
-  })
+  draftRule.value = next
   baseline.value = JSON.stringify(draftRule.value)
   if (seed) clearDraftRecovery()
   else await restoreDraftRecovery(-1)
@@ -329,22 +332,29 @@ async function leaveEditor() {
   resetDraftHistory()
 }
 
+function openConfigSecurity() {
+  store.pendingSettingsSection = 'security'
+  window.__nmf?.switchPage?.('settings')
+}
+
 function triggerCount(rule) {
   function count(node) {
     if (!node) return 0
     if (node.type && !node.children && !node.events) return 1
     return (node.children || node.events || []).reduce((sum, child) => sum + count(child), 0)
   }
-  return rule.condition ? count(rule.condition) : (rule.event ? 1 : 0)
+  return count(rule.condition)
 }
 function triggerSummary(rule) {
-  if (!rule.condition) return store.schema.triggers[rule.event?.type]?.name || rule.event?.type || '未配置触发条件'
+  if (!rule.condition) return '未配置触发条件'
+  if (rule.condition.type && !rule.condition.children) return store.schema.triggers[rule.condition.type]?.name || rule.condition.type
   const op = rule.condition.op || (rule.condition.type === 'and' ? 'all' : 'any')
   if (op === 'not') return `未发生 · 等待 ${rule.condition.within_seconds} 秒`
   return `${op === 'all' ? '全部满足' : '满足任一'} · ${triggerCount(rule)} 个条件`
 }
 
 async function persistRules(nextRules, successMessage, password = '') {
+  if (store.configError) throw new Error('规则文件尚未通过完整性检查，请先到安全与权限页面处理。')
   const result = await saveRulesWithApproval(nextRules, password)
   if (result?.cancelled) return null
   if (!result?.ok) {
@@ -731,7 +741,7 @@ onMounted(() => {
   <section v-else key="library" class="page active rules-library">
     <div class="page-head">
       <div><h2>自动化</h2><p class="page-subtitle">{{ automationSection === 'rules' ? '创建、测试和管理这台电脑上的自动化。' : '查看每一次自动化的执行过程和结果。' }}</p></div>
-      <div v-if="automationSection === 'rules'" class="actions">
+      <div v-if="automationSection === 'rules' && !store.configError" class="actions">
         <button class="btn btn-filled" @click="createAutomation"><span class="material-symbols-outlined">add</span>创建自动化</button>
       </div>
     </div>
@@ -741,7 +751,13 @@ onMounted(() => {
     </div>
     <Transition name="automation-section" mode="out-in">
     <div v-if="automationSection === 'rules'" key="rules" class="automation-rules-section">
-    <section v-if="!store.configData.rules.length && !createPanelVisible" class="automation-welcome">
+    <section v-if="store.configError" class="rules-integrity-error" role="alert">
+      <h3>规则文件未通过完整性检查</h3>
+      <p>{{ store.configError }}</p>
+      <p>当前无法读取和保存规则。请到安全与权限页面核对规则文件。</p>
+      <button class="btn btn-tonal" @click="openConfigSecurity">查看安全与权限</button>
+    </section>
+    <section v-if="!store.configError && !store.configData.rules.length && !createPanelVisible" class="automation-welcome">
       <span class="material-symbols-outlined">account_tree</span><h3>从第一条自动化开始</h3><p>选择什么时候开始，再安排接下来要做的事。</p>
       <div class="automation-welcome-path"><span>触发条件</span><span class="material-symbols-outlined">arrow_forward</span><span>执行动作</span><span class="material-symbols-outlined">arrow_forward</span><span>查看结果</span></div>
       <button class="btn btn-tonal" @click="openQuickCreate">选择触发条件和动作</button>

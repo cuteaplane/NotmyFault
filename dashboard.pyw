@@ -28,10 +28,8 @@ if PROJECT_ROOT not in sys.path:
 
 import webview
 from notmyfault.application_paths import ApplicationPaths
-from notmyfault.config import SignedConfigStore
 from notmyfault.host.api.auth import ApiTokenStore
 from notmyfault.platform.platform_support import launch_python_entry
-from notmyfault.security.plugin_schema import scan_plugins
 
 def _patch_qt_permission_policy():
     try:
@@ -62,21 +60,6 @@ def _patch_qt_permission_policy():
 
 
 API = "http://127.0.0.1:19198"
-def _get_plugins_schema(paths: ApplicationPaths) -> dict:
-    base = str(paths.package_root)
-    result = {
-        "triggers": scan_plugins(base, "triggers", "trigger.json"),
-        "actions": scan_plugins(base, "actions", "action.json"),
-    }
-    user_dir = str(paths.user_plugins_dir)
-    if os.path.isdir(user_dir):
-        for plugin_type in ("triggers", "actions"):
-            filename = "trigger.json" if plugin_type == "triggers" else "action.json"
-            for plugin_id, meta in scan_plugins(
-                user_dir, plugin_type, filename,
-            ).items():
-                result[plugin_type].setdefault(plugin_id, meta)
-    return result
 
 
 def _read_control_secret(path) -> bytes:
@@ -186,11 +169,12 @@ class DashboardAPI:
 
     def __init__(
         self,
-        store: SignedConfigStore | None = None,
         paths: ApplicationPaths | None = None,
     ) -> None:
         self._paths = paths or ApplicationPaths.default()
-        self._store = store or SignedConfigStore(self._paths)
+        from notmyfault.host.log_files import LogFiles
+
+        self._logs = LogFiles(str(self._paths.logs_dir))
         self._window = None
 
     def set_window_state(self, action: str) -> dict:
@@ -274,104 +258,12 @@ class DashboardAPI:
         return {"ok": False, "error": last_error or "后台服务启动超时"}
 
     def get_config(self) -> dict:
-        """验签失败时保留原文供安全页核对"""
-        from notmyfault.core.value_codec import encode_value
-        try:
-            if self._paths.rules_file.exists():
-                with open(self._paths.rules_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                rules = data.get("rules", []) if isinstance(data, dict) else []
-                rules = rules if isinstance(rules, list) else []
-                try:
-                    normalized = self._store.load_verified_rules(for_editing=True)
-                    return {"rules": encode_value(normalized)}
-                except Exception:
-                    return {"rules": rules if data.get("value_encoding") == "typed-v1" else encode_value(rules)}
-        except Exception as e:
-            return {"_error": str(e), "rules": []}
-        return {"rules": []}
+        return self.request_api("/api/rules", value_encoding="typed-v1")
 
     def save_config(self, rules: list, admin_key_password: str = "", value_encoding: str = "") -> dict:
-        try:
-            from notmyfault.core.value_codec import decode_value, encode_value
-            if value_encoding == "typed-v1":
-                rules = decode_value(rules)
-            from notmyfault.config import (
-                ConfigValidationError,
-                normalize_rules,
-            )
-            from notmyfault.core.rules import (
-                validate_rule_bindings,
-                validate_rules,
-                validate_rules_structure,
-            )
-            normalized_rules = normalize_rules(rules)
-            structure_errors = validate_rules_structure(normalized_rules)
-            if structure_errors:
-                return {
-                    "ok": False,
-                    "error": "规则结构校验失败",
-                    "details": structure_errors[:10],
-                }
-            schema = _get_plugins_schema(self._paths)
-            binding_issues = []
-            for index, rule in enumerate(normalized_rules):
-                for issue in validate_rule_bindings(
-                    rule, schema["triggers"], schema["actions"],
-                ):
-                    binding_issues.append({
-                        "rule": rule.get("name", f"规则 #{index + 1}"),
-                        **issue,
-                    })
-            if binding_issues:
-                return {
-                    "ok": False,
-                    "error": "规则数据绑定无效",
-                    "details": binding_issues[:20],
-                }
-            _valid, _total, plugin_errors, _warnings = validate_rules(
-                normalized_rules, schema["triggers"], schema["actions"],
-            )
-            if plugin_errors:
-                return {
-                    "ok": False,
-                    "error": "规则插件参数无效",
-                    "details": [
-                        f"{name}: {message}"
-                        for name, message in plugin_errors[:20]
-                    ],
-                }
-            previous_rules = []
-            if self._paths.rules_file.exists():
-                try:
-                    previous_rules = self._store.load_verified_rules(for_editing=True)
-                except ConfigValidationError as error:
-                    return {
-                        "ok": False,
-                        "error": f"现有规则未通过完整性校验: {error}",
-                    }
-            from notmyfault.security.rule_approval import (
-                AdminRuleApprovalError,
-                require_admin_rule_approval,
-            )
-            try:
-                require_admin_rule_approval(
-                    previous_rules,
-                    normalized_rules,
-                    schema,
-                    admin_key_password,
-                )
-            except AdminRuleApprovalError as error:
-                return {
-                    "ok": False,
-                    "code": error.code,
-                    "error": str(error),
-                    "plugins": error.plugins,
-                }
-            ok = self._store.save_rules(normalized_rules)
-            return {"ok": ok, "rules": encode_value(normalized_rules) if ok else None}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        return self.request_api("/api/rules", "PUT", {
+            "rules": rules, "admin_key_password": admin_key_password,
+        }, value_encoding=value_encoding)
 
     def _get_api_token(self) -> str:
         try:
@@ -503,73 +395,17 @@ class DashboardAPI:
         """彻底退出引擎进程"""
         return self._auth_request("/api/engine/shutdown")
 
-    def _get_latest_log(self):
-        from notmyfault.core.logging import get_latest_log
-        return get_latest_log(str(self._paths.logs_dir))
-
     def read_log_entries(self, lines: int = 500) -> list:
-        """读取最新日志末尾 N 行，返回解析后的结构化条目列表"""
-        try:
-            from notmyfault.core.logging import read_log_entries as _read
-            log_path = self._get_latest_log()
-            if not log_path:
-                return [{"ts": "", "level": "INFO", "text": "还没有日志文件，请启动引擎", "data": None}]
-            return _read(log_path, lines=lines)
-        except Exception as e:
-            return [{"ts": "", "level": "ERROR", "text": f"读取日志失败: {e}", "data": None}]
-
-    def read_diagnostics(self) -> dict:
-        """从最新日志文件构建诊断摘要"""
-        try:
-            from notmyfault.core.logging import read_log_entries as _read, build_diagnostics
-            log_path = self._get_latest_log()
-            if not log_path:
-                return {"error_count": 0, "warn_count": 0, "last_errors": ["还没有日志文件，请启动引擎"]}
-            entries = _read(log_path, lines=500)
-            return build_diagnostics(entries)
-        except Exception as e:
-            return {"error_count": 1, "last_errors": [str(e)]}
+        return self._logs.entries(lines)
 
     def read_log_raw(self, lines: int = 300) -> str:
-        """读取最新日志文件原始文本，供日志查看器使用"""
-        try:
-            log_path = self._get_latest_log()
-            if not log_path:
-                return "(还没有日志文件)\n\n请先启动引擎。"
-            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                all_lines = f.readlines()
-            if not all_lines:
-                return f"(日志为空)\n{log_path}"
-            return "".join(all_lines[-lines:])
-        except Exception as e:
-            return f"读取日志失败: {e}"
+        return self._logs.raw(lines)
 
     def list_log_files(self) -> list:
-        """列出所有日志文件信息"""
-        try:
-            from notmyfault.core.logging import list_logs
-            return list_logs(str(self._paths.logs_dir))
-        except Exception as e:
-            return []
+        return self._logs.list_files()
 
     def read_log_file_entries(self, name: str, lines: int = 600) -> list:
-        """读取指定历史日志文件末尾 N 行，返回解析后的结构化条目列表"""
-        try:
-            # 文件名只认 engine-*.log，堵住 ../ 之类构造出来的路径
-            if (
-                not isinstance(name, str)
-                or os.path.basename(name) != name
-                or not (name.startswith("engine-") and name.endswith(".log"))
-            ):
-                return []
-            log_path = os.path.join(str(self._paths.logs_dir), name)
-            if not os.path.isfile(log_path):
-                return []
-            from notmyfault.core.logging import read_log_entries as _read
-            return _read(log_path, lines=lines)
-        except Exception as e:
-            return [{"ts": "", "level": "ERROR", "text": f"读取日志失败: {e}", "data": None}]
-
+        return self._logs.entries(lines, name)
 
 
 class _DashboardStaticHandler(http.server.SimpleHTTPRequestHandler):
@@ -698,7 +534,7 @@ def main():
         dashboard_url += "&first_run=1"
     icon_path = os.path.join(PROJECT_ROOT, "logo.ico")
 
-    api = DashboardAPI(SignedConfigStore(paths), paths)
+    api = DashboardAPI(paths)
 
     window = webview.create_window(
         title="NotmyFault",

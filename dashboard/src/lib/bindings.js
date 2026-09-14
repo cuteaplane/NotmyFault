@@ -1,4 +1,5 @@
 import { compatibleTypes, fieldType, typeSpec, typeLabel, typeAtPath, isOpaqueValue, isExpression, parseTypedInput, defaultTypedValue, formatTypedInput } from './valueTypes.js'
+import { normalizeRuleDraft } from './utils.js'
 
 function randomHex() {
   if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID().replaceAll('-', '').slice(0, 12)
@@ -6,7 +7,7 @@ function randomHex() {
 }
 
 export function createBindingId(kind) {
-  const prefix = { trigger: 't', precondition: 'p', constant: 'c', variable: 'v' }[kind] || 'a'
+  const prefix = { trigger: 't', constant: 'c', variable: 'v' }[kind] || 'a'
   return `${prefix}_${randomHex()}`
 }
 
@@ -59,7 +60,7 @@ export function collectTriggerLeaves(rule, includeAbsence = true) {
     }
     ;(node.children || node.events || []).forEach(visit)
   }
-  visit(rule.condition || rule.event)
+  visit(rule.condition)
   return leaves
 }
 
@@ -79,6 +80,7 @@ export function guaranteedTriggerIds(node) {
 }
 
 export function ensureRuleBindingIds(rule) {
+  normalizeRuleDraft(rule)
   ensureRuleId(rule)
   const seen = new Set()
   function ensureNode(node) {
@@ -91,7 +93,6 @@ export function ensureRuleBindingIds(rule) {
     }
     ;(node.children || node.events || []).forEach(ensureNode)
   }
-  ensureNode(rule.event)
   ensureNode(rule.condition)
   function ensureActions(items) {
     for (const item of items || []) {
@@ -199,7 +200,7 @@ export function buildBindingSources(
 ) {
   const result = variableBindingSources(rule)
   const leaves = collectTriggerLeaves(rule, false)
-  const guaranteed = guaranteedTriggerIds(rule.condition || rule.event)
+  const guaranteed = guaranteedTriggerIds(rule.condition)
 
   for (const leaf of leaves) {
     const conditional = !guaranteed.has(leaf.binding_id)
@@ -272,7 +273,7 @@ export function buildNodeDataPorts(node, schema, rule = {}) {
     : node.kind === 'trigger'
     ? schema.triggers[node.source?.type]
     : schema.actions[node.source?.type]
-  const dataInputs = ['action', 'failure-action', 'precondition'].includes(node.kind)
+  const dataInputs = ['action', 'failure-action'].includes(node.kind)
     ? (meta?.params || [])
       .filter(param => parameterAllowsBinding(meta, param.name))
       .map((param, index) => ({
@@ -305,14 +306,13 @@ export function buildNodeDataPorts(node, schema, rule = {}) {
 }
 
 export function deriveDataEdges(rule, nodes, catalog = []) {
-  const guaranteed = guaranteedTriggerIds(rule.condition || rule.event)
   const nodesByBindingId = new Map(
     nodes
       .filter(node => node.source?.binding_id)
       .map(node => [node.source.binding_id, node]),
   )
   const edges = []
-  for (const target of nodes.filter(node => ['action', 'failure-action', 'precondition'].includes(node.kind))) {
+  for (const target of nodes.filter(node => ['action', 'failure-action'].includes(node.kind))) {
     const params = target.source?.type === 'set_variable' ? { value: target.source.value } : target.source?.params || {}
     for (const [paramName, value] of Object.entries(params)) {
       const targetPort = target.dataInputs.find(port => port.name === paramName)
@@ -325,15 +325,11 @@ export function deriveDataEdges(rule, nodes, catalog = []) {
         const sourceIsAction = ['action', 'failure-action'].includes(source.kind)
         const validOrder = !sourceIsAction
           || (target.availableStepIds || []).includes(source.source.binding_id)
-        const validCondition = target.kind !== 'precondition'
-          || source.kind !== 'trigger'
-          || guaranteed.has(source.source.binding_id)
         let selectedType = sourcePort.type
         try { selectedType = typeAtPath(sourcePort.type, reference.path.slice(1), catalog).type } catch {}
         const valid = (sourcePort.required || reference.on_missing)
           && (isExpression(value) && !isReference(value) || typesCompatible(selectedType, targetPort.type))
           && validOrder
-          && validCondition
         edges.push({
           id: `data:${reference.node}:${outputName}:${target.source.binding_id}:${paramName}:${referenceIndex}`,
           channel: 'data',
@@ -498,7 +494,7 @@ export function buildTestInputFields(rule, schema, { startStepId = '', endStepId
   const rawEndIndex = actions.findIndex(action => action.binding_id === endStepId)
   const endIndex = rawEndIndex >= 0 ? rawEndIndex : actions.length - 1
   const selectedActions = actions.slice(startIndex, endIndex + 1)
-  const executionSource = { preconditions: rule.preconditions || [], actions: selectedActions }
+  const executionSource = { actions: selectedActions }
   const references = [...new Map(
     collectReferences(executionSource)
       .filter(reference => ['trigger', 'event', 'step'].includes(reference.scope))

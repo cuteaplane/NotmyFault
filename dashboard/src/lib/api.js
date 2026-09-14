@@ -76,12 +76,10 @@ export async function apiDownload(path, body) {
 }
 
 export async function loadConfig() {
-  if (hasBridge()) return await window.pywebview.api.get_config()
   return await (await apiRead('/api/rules')).json()
 }
 
 export async function saveConfig(rules, adminKeyPassword = '') {
-  if (hasBridge()) return await window.pywebview.api.save_config(rules, adminKeyPassword, 'typed-v1')
   const response = await apiWrite('/api/rules', 'PUT', {
     rules,
     admin_key_password: adminKeyPassword,
@@ -333,27 +331,39 @@ export async function approveRuleDraft(rule, adminKeyPassword = '') {
   return await r.json()
 }
 
+async function readLogData(path, offline) {
+  const response = await apiRead(path)
+  if (response.status === 0 && hasBridge()) return await offline()
+  const data = await response.json()
+  if (!response.ok) throw new Error(data?.error || '读取日志失败')
+  return data
+}
+
 export async function readLogRaw(lines = 300) {
-  try { return await window.pywebview.api.read_log_raw(lines) }
+  try {
+    const data = await readLogData(`/api/engine/logs?lines=${lines}`,
+      async () => ({ raw: await window.pywebview.api.read_log_raw(lines) }))
+    return data.raw ?? (data.lines || []).join('\n')
+  }
   catch (e) { return '读取日志失败: ' + e.message }
 }
 
 export async function readLogEntries(lines = 600) {
-  try { return await window.pywebview.api.read_log_entries(lines) }
+  try { return await readLogData(`/api/engine/logs/entries?lines=${lines}`, () => window.pywebview.api.read_log_entries(lines)) }
   catch (e) { return [{ ts: '', level: 'ERROR', text: '读取日志失败: ' + e.message, data: null }] }
 }
 
 export async function listLogFiles() {
-  try { return await window.pywebview.api.list_log_files() }
+  try { return await readLogData('/api/engine/logs/files', () => window.pywebview.api.list_log_files()) }
   catch (e) { return [] }
 }
 
 export async function readLogFileEntries(name, lines = 600) {
-  try { return await window.pywebview.api.read_log_file_entries(name, lines) }
+  try { return await readLogData(`/api/engine/logs/entries?lines=${lines}&name=${encodeURIComponent(name)}`, () => window.pywebview.api.read_log_file_entries(name, lines)) }
   catch (e) { return [] }
 }
 
-// 诊断优先从认证 HTTP 读取引擎实时数据，离线时读取 bridge 日志，因为日志只有 action_failed，无法统计成功次数。
+// 日志没有完整的动作成功记录，诊断计数来自引擎。
 export async function readDiagnostics() {
   try {
     const r = await apiRead('/api/engine/diagnostics')

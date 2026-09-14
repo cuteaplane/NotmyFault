@@ -1,9 +1,9 @@
 <script setup>
 import { computed, ref } from 'vue'
 import { store } from '../lib/store'
-import { buildDefaultParams, ensureParams, getVisibleParamDefs, groupTriggerKeys, pluginUnavailableReason } from '../lib/utils'
+import { buildDefaultParams, groupTriggerKeys, pluginUnavailableReason } from '../lib/utils'
 import { createBindingId } from '../lib/bindings'
-import ParamInput from './ParamInput.vue'
+import TriggerForm from './TriggerForm.vue'
 import PluginPicker from './PluginPicker.vue'
 
 defineOptions({ name: 'ConditionEditor' })
@@ -28,7 +28,6 @@ const pickerTitle = computed(() => ({
 const isLeaf = (node) => !!node?.type && !node.children && !node.events
 const isObjectNode = (node) => !!node && typeof node === 'object' && !Array.isArray(node)
 const eventName = (event) => store.schema.triggers[event?.type]?.name || event?.type || '未选择触发器'
-const eventParams = (event) => getVisibleParamDefs(store.schema.triggers[event.type], ensureParams(event))
 
 function defaultEvent(type = triggerKeys.value[0] || '') {
   // 新条件带有 binding_id，绑定选择器用它定位运行数据。
@@ -119,14 +118,7 @@ function moveChild(index, offset) {
           </summary>
           <div class="flow-card-body">
             <button v-if="node.op !== 'not'" class="btn btn-text btn-sm" @click="useNotEvent(index)">未发生时（NOT）</button>
-            <div class="field field-wide"><span class="field-label">触发方式</span>
-              <button class="plugin-type-button" type="button" @click="replaceEvent(index)">
-                <span class="material-symbols-outlined">bolt</span>
-                <span>{{ eventName(child) }}</span>
-                <span class="material-symbols-outlined">arrow_forward</span>
-              </button>
-            </div>
-            <div class="param-grid"><ParamInput v-for="param in eventParams(child)" :key="param.name" :def="param" :plugin-id="child.type" v-model="child.params[param.name]" :allow-binding="param.type !== 'plugin_data'" :binding-sources="constants" /></div>
+            <TriggerForm :node="child" :sources="constants" @replace="replaceEvent(index)" />
           </div>
         </details>
         <ConditionEditor v-else-if="isObjectNode(child)" :node="child" :constants="constants" nested @remove="removeChild(index)" />

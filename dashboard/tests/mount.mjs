@@ -190,7 +190,7 @@ window.pywebview = { api: {
     condition: {
       op: 'all',
       children: [
-        { type: 'window_title', params: {} },
+        { type: 'window_title', params: { title: 'NotmyFault' } },
         {
           op: 'all',
           within_seconds: 30,
@@ -262,6 +262,8 @@ window.pywebview = { api: {
   },
   request_api: async (path, method, data) => {
     bridgeCalls.push({ path, method, data })
+    if (path === '/api/rules' && method === 'GET') return window.pywebview.api.get_config()
+    if (path === '/api/rules' && method === 'PUT') return window.pywebview.api.save_config(data.rules, data.admin_key_password)
     if (path === '/api/config/security-status') return mockConfigSecurity
     if (path === '/api/platform') return {
       platform:'windows', session_type:'desktop', capabilities:{
@@ -380,7 +382,7 @@ window.pywebview = { api: {
   },
 } }
 const T = {
-  window_title: { id:'window_title', name:'窗口标题检测', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['native_api','admin'], params:[], outputs:[{ name:'matched_title', label:'匹配标题', type:'string', sensitive:true }, { name:'state', label:'窗口状态', type:'string' }] },
+  window_title: { id:'window_title', name:'窗口标题检测', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['native_api','admin'], params:[{ name:'title', label:'窗口标题', type:'string', default:'' }], outputs:[{ name:'matched_title', label:'匹配标题', type:'string', sensitive:true }, { name:'state', label:'窗口状态', type:'string' }] },
   window_title_alt: { id:'window_title_alt', name:'窗口标题备用', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['native_api'], params:[], outputs:[{ name:'matched_title', label:'匹配标题', type:'string', sensitive:true }] },
   time_schedule: { id:'time_schedule', name:'定时', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:[], params:[], outputs:[] },
   clipboard: { id:'clipboard', name:'剪贴板监控', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['clipboard','native_api'], params:[], outputs:[] },
@@ -717,6 +719,41 @@ document.querySelector('.graph-node-action .data-port-column-input .data-port-ro
   new window.MouseEvent('pointerup', { bubbles: true, button: 0, clientX: 330, clientY: 160 }),
 )
 await new Promise(r => setTimeout(r, 20))
+
+await pause(400)
+const groupedRule = bridgeCalls.filter(call => call.path === '/api/rules/validate').at(-1)?.data.rule
+const firstTrigger = groupedRule?.condition?.children?.[0]
+let singleConditionOk = !!firstTrigger
+for (const mode of ['节点编辑', '普通模式']) {
+  ;[...document.querySelectorAll('.editor-mode-switch button')].find(button => button.textContent.includes(mode))?.click()
+  await pause(20)
+  if (mode === '节点编辑') {
+    document.querySelector('.node-canvas-tools button')?.click()
+    await pause(20)
+  }
+  const scope = mode === '节点编辑' ? '.node-inspector' : '.classic-rule-editor'
+  ;[...document.querySelectorAll(`${scope} button`)].find(button => button.textContent.includes('改为单个条件'))?.click()
+  await pause(20)
+  const checksBefore = bridgeCalls.filter(call => call.path === '/api/rules/validate').length
+  document.querySelector('.rule-check-btn')?.click()
+  await pause(20)
+  const checksAfter = bridgeCalls.filter(call => call.path === '/api/rules/validate')
+  const single = checksAfter.at(-1)?.data.rule
+  singleConditionOk &&= checksAfter.length === checksBefore + 1
+    && single?.condition?.binding_id === firstTrigger?.binding_id
+    && JSON.stringify(single?.condition?.params) === JSON.stringify(firstTrigger?.params)
+    && single?.actions?.[0]?.params?.message?.$ref?.node === firstTrigger?.binding_id
+    && !Object.hasOwn(single || {}, 'event')
+    && document.querySelectorAll('.graph-node-trigger').length === 1
+    && document.querySelectorAll('.graph-node-condition').length === 0
+  document.querySelector('.rule-history-actions button:first-child')?.click()
+  await pause(30)
+  singleConditionOk &&= document.querySelectorAll('.graph-node-trigger').length === 3
+}
+console.log((singleConditionOk?'PASS':'FAIL')+' - both editors keep the first trigger and its references when simplifying, and manual checks validate immediately')
+if (!singleConditionOk) process.exit(1)
+;[...document.querySelectorAll('.editor-mode-switch button')].find(button => button.textContent.includes('节点编辑'))?.click()
+await pause(20)
 
 const saveRun = [...document.querySelectorAll('button')].find(
   button => button.textContent.includes('测试规则'),
@@ -1438,6 +1475,26 @@ const failureBranchOk = failurePickerOk
   && document.querySelector('.classic-rule-editor .action-flow-card .flow-card-copy small')?.textContent.includes('1 个补救动作')
 console.log((failureBranchOk?'PASS':'FAIL')+' - failed actions can run an editable recovery branch')
 if (!failureBranchOk) process.exit(1)
+
+await pause(350)
+document.querySelector('.graph-node-failure-action button[title="删除补救动作"]')?.click()
+await pause(30)
+let canvasDeleteOk = document.querySelectorAll('.graph-node-failure-action').length === 0
+  && document.querySelectorAll('.graph-node-action').length === 1
+document.querySelector('.rule-history-actions button:first-child')?.click()
+await pause(30)
+canvasDeleteOk &&= document.querySelectorAll('.graph-node-failure-action').length === 1
+document.querySelector('.graph-node-action')?.click()
+await pause(30)
+;[...document.querySelectorAll('.node-inspector button')].find(button => button.textContent.includes('复制'))?.click()
+await pause(30)
+canvasDeleteOk &&= document.querySelectorAll('.graph-node-action').length === 2
+;[...document.querySelectorAll('.graph-node-action')].at(-1)?.querySelector('button[title="删除动作"]')?.click()
+await pause(30)
+canvasDeleteOk &&= document.querySelectorAll('.graph-node-action').length === 1
+  && document.querySelectorAll('.graph-node-failure-action').length === 1
+console.log((canvasDeleteOk?'PASS':'FAIL')+' - canvas delete buttons remove the selected action or recovery action')
+if (!canvasDeleteOk) process.exit(1)
 
 document.querySelector('.graph-node-trigger')?.click()
 await new Promise(r => setTimeout(r, 30))

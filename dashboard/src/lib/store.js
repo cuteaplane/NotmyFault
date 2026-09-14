@@ -8,6 +8,7 @@ export const store = reactive({
   configLoaded: false,
   pluginsData: { triggers: {}, actions: {} },
   engineStatus: { api_alive: false, engine_running: false, engine_state: 'offline', pid: null },
+  configError: '',
   controllerOnline: false,
   engineOnline: false,
   refreshSignal: 0,   // SSE 事件到达时自增，视图监听它后刷新统计。

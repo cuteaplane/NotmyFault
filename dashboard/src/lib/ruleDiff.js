@@ -46,8 +46,8 @@ export function summarizeRuleChanges(before, after) {
   const changes = []
   if (String(before.name || '') !== String(after.name || '')) changes.push('名称已改')
   if (String(before.folder || '') !== String(after.folder || '')) changes.push('文件夹已改')
-  if (!equal(before.event || before.condition, after.event || after.condition)) changes.push('触发条件已改')
-  changes.push(...describeList(before.preconditions, after.preconditions, '确认'))
+  if (!equal(before.condition, after.condition)) changes.push('触发条件已改')
+  if (!equal(before.preconditions, after.preconditions)) changes.push('旧版 preconditions 配置已改')
   changes.push(...describeList(before.actions, after.actions, '动作', withoutFailureActions))
   const previousActions = new Map((before.actions || []).map((item, index) => [item?.binding_id || `index:${index}`, item]))
   ;(after.actions || []).forEach((action, index) => {
@@ -90,7 +90,7 @@ export function computeChangeSet(before, after, schema) {
   if (before && String(before.name || '') !== String(after.name || '')) {
     items.push({ op: 'modify', target: 'name', label: '规则名称', detail: before.name + ' → ' + (after.name || '未命名') })
   }
-  if (before && !equal(before.event || before.condition, after.event || after.condition)) {
+  if (before && !equal(before.condition, after.condition)) {
     items.push({ op: 'modify', target: 'trigger', label: '触发条件', detail: '已变更' })
   }
   const diffList = (beforeArr, afterArr, noun, kind, options = {}) => {
@@ -128,7 +128,9 @@ export function computeChangeSet(before, after, schema) {
       }
     }
   }
-  diffList(before?.preconditions, after.preconditions, '确认', 'precondition')
+  if (!equal(before?.preconditions, after.preconditions)) {
+    items.push({ op: after.preconditions?.length ? 'modify' : 'delete', target: 'rule', label: '旧版 preconditions 配置', detail: after.preconditions?.length ? '已变更' : '已删除' })
+  }
   diffList(before?.actions, after.actions, '动作', 'action', { transform: withoutFailureActions })
   const previousActions = new Map((before?.actions || []).map((item, index) => [item?.binding_id || `idx:${index}`, item]))
   ;(after.actions || []).forEach((action, parentIndex) => {

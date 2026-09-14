@@ -68,7 +68,7 @@ function jumpToRule(rule) {
           <span class="material-symbols-outlined">rule</span>
           <div>
             <b>{{ rule.name }}</b>
-            <p>当 {{ rule.event.params.process_name }} {{ rule.event.params.state === 'running' ? '运行' : '退出' }} · {{ rule.actions.length }} 个动作</p>
+            <p>当 {{ rule.condition.params.process_name }} {{ rule.condition.params.state === 'running' ? '运行' : '退出' }} · {{ rule.actions.length }} 个动作</p>
           </div>
           <span class="material-symbols-outlined origin-rule-go">arrow_forward</span>
         </button>

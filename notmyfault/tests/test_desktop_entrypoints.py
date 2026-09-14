@@ -25,16 +25,28 @@ def dashboard(monkeypatch):
     return module
 
 
+def dashboard_api(dashboard, env):
+    api = dashboard.DashboardAPI(paths=env.paths)
+
+    def request(path, method="POST", data=None, timeout=5, value_encoding=""):
+        headers = {**env.headers, "X-NMF-Value-Encoding": value_encoding}
+        response = env.client.request(method, path, json=data, headers=headers)
+        return response.json()
+
+    api._auth_request = request
+    return api
+
+
 def test_dashboard_get_config_does_not_rewrite_rules_file(dashboard, tmp_path):
     import hashlib
     import hmac
     import json
 
     from notmyfault.core.value_codec import encode_value
-    from notmyfault.tests.api_support import make_paths, make_store
+    from notmyfault.tests.api_support import make_api_env
 
-    paths = make_paths(tmp_path)
-    store = make_store(paths)
+    env = make_api_env(tmp_path)
+    paths = env.paths
     rule = {
         "name": "提醒",
         "event": {"type": "time_schedule", "params": {"time": "08:00"}},
@@ -52,7 +64,7 @@ def test_dashboard_get_config_does_not_rewrite_rules_file(dashboard, tmp_path):
     ).hexdigest()
     paths.rules_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     before = paths.rules_file.read_bytes()
-    result = dashboard.DashboardAPI(store=store, paths=paths).get_config()
+    result = dashboard_api(dashboard, env).get_config()
     assert "_error" not in result
     assert result["rules"]
     assert paths.rules_file.read_bytes() == before
@@ -60,11 +72,11 @@ def test_dashboard_get_config_does_not_rewrite_rules_file(dashboard, tmp_path):
 
 def test_dashboard_save_config_writes_signed_rules(dashboard, tmp_path):
     from notmyfault.core.value_codec import encode_value
-    from notmyfault.tests.api_support import make_paths, make_store
+    from notmyfault.tests.api_support import make_api_env
 
-    paths = make_paths(tmp_path)
-    store = make_store(paths)
-    api = dashboard.DashboardAPI(store=store, paths=paths)
+    env = make_api_env(tmp_path)
+    paths, store = env.paths, env.store
+    api = dashboard_api(dashboard, env)
     rule = {
         "name": "提醒",
         "event": {"type": "time_schedule", "params": {"time": "08:00"}},
@@ -75,6 +87,18 @@ def test_dashboard_save_config_writes_signed_rules(dashboard, tmp_path):
     loaded = store.load_verified_rules()
     assert loaded[0]["name"] == "提醒"
     assert loaded[0]["actions"][0]["type"] == "notify"
+    assert "event" not in loaded[0]
+    assert loaded[0]["condition"]["type"] == "time_schedule"
+    saved = paths.rules_file.read_bytes()
+    for invalid in (None, {}, [None], [rule, None]):
+        result = api.save_config(invalid, "", "typed-v1")
+        assert result["ok"] is False
+        assert paths.rules_file.read_bytes() == saved
+    paths.rules_file.write_bytes(saved.replace(b'"_signature": "', b'"_signature": "invalid'))
+    result = api.get_config()
+    assert result["ok"] is False
+    assert result["rules"] is None
+    assert result["config_error"]
 
 
 def test_dashboard_reads_history_from_application_paths(dashboard, tmp_path):

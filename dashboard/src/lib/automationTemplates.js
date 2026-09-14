@@ -18,7 +18,7 @@ export const automationTemplates = [
       return {
         name: 'U盘插入后备份文件',
         folder: '文件自动化',
-        event: { binding_id: triggerId, type: 'usb_insert', params: { drive_letter: 'ANY' } },
+        condition: { binding_id: triggerId, type: 'usb_insert', params: { drive_letter: 'ANY' } },
         actions: [{
           type: 'file_operation',
           params: {
@@ -42,7 +42,7 @@ export const automationTemplates = [
       return {
         name: '文件夹有新文件时通知我',
         folder: '文件自动化',
-        event: {
+        condition: {
           binding_id: triggerId,
           type: 'folder_monitor',
           params: { folder_path: '', event_type: 'created', file_pattern: '*' },
@@ -68,7 +68,7 @@ export const automationTemplates = [
       return {
         name: '每天固定时间提醒我',
         folder: '日常提醒',
-        event: { type: 'time_schedule', params: { time: '22:00' } },
+        condition: { type: 'time_schedule', params: { time: '22:00' } },
         actions: [{
           type: 'notify',
           params: { title: 'NotmyFault', message: '到时间了，别忘了处理今天的事项。' },
@@ -127,7 +127,7 @@ export function createQuickDraft(triggerType, actionType, schema) {
   return ensureRuleBindingIds({
     name: `${trigger?.name || triggerType}后${action?.name || actionType}`,
     folder: '未分类',
-    event: { type: triggerType, params: buildDefaultParams(trigger) },
+    condition: { type: triggerType, params: buildDefaultParams(trigger) },
     actions: [{ type: actionType, params: buildDefaultParams(action) }],
   })
 }

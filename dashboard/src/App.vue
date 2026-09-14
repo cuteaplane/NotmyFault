@@ -7,6 +7,7 @@ import { store, syncEngineStatus as updateStatus } from './lib/store'
 import { snack } from './lib/notify'
 import { fetchAuthenticated, hasBridge, loadConfig, loadPlugins, getSchema, getEngineStatus, getPluginExtensions, getAIDraftingSetting, getRun } from './lib/api'
 import { ensureRuleIds } from './lib/bindings'
+import { normalizeRuleDraft } from './lib/utils'
 import { useTheme } from './composables/useTheme'
 
 const { init: initTheme } = useTheme()
@@ -83,8 +84,19 @@ function delay(ms) {
 }
 
 function applyConfig(cfg) {
+  if (cfg?.config_error) {
+    store.configError = cfg.config_error
+    store.configLoaded = true
+    return true
+  }
   if (!cfg || !Array.isArray(cfg.rules)) return false
-  store.configData = { ...cfg, rules: ensureRuleIds(cfg.rules) }
+  try {
+    const rules = ensureRuleIds(cfg.rules.map(rule => normalizeRuleDraft(rule)))
+    store.configError = ''
+    store.configData = { ...cfg, rules }
+  } catch (error) {
+    store.configError = error.message
+  }
   store.configLoaded = true
   return true
 }
