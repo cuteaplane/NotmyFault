@@ -131,11 +131,12 @@ def run_isolated_action(
     plugin_root: str | None = None,
     file_snapshot: dict[str, str] | None = None,
 ):
-    from notmyfault.security.plugin_loader import _snapshot_plugin_files
+    from notmyfault.security.plugin_checks import inspect_plugin_tree
 
     plugin_root = plugin_root or str(Path(entry).resolve().parent)
     if file_snapshot is None:
-        file_snapshot = _snapshot_plugin_files(plugin_root)
+        tree = inspect_plugin_tree(plugin_root)
+        file_snapshot = tree.file_snapshot if tree is not None else None
     request = {
         "entry": entry,
         "entry_sha256": entry_sha256,

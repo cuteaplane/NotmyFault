@@ -46,7 +46,6 @@ class RuleScheduler:
         self,
         execute_fn: Callable[[str, Dict[str, Any], str, Dict[str, Any]], None],
         cancel_run_fn: Callable[[str], bool],
-        is_deferred_fn: Callable[[str], bool],
         on_history_event: Callable[[str, Dict[str, Any]], None] | None = None,
         spawn_thread_fn: Callable[[Callable[[], None]], None] | None = None,
         prepare_run_fn: Callable[[Dict[str, Any]], None] | None = None,
@@ -55,7 +54,6 @@ class RuleScheduler:
     ) -> None:
         self._execute_fn = execute_fn
         self._cancel_run_fn = cancel_run_fn
-        self._is_deferred_fn = is_deferred_fn
         self._on_history_event = on_history_event or (lambda kind, data: None)
         self._prepare_run = prepare_run_fn or (lambda context: None)
         self._max_workers = max_workers
@@ -74,8 +72,8 @@ class RuleScheduler:
         self._lock = threading.RLock()
         self._workers_done = threading.Condition(self._lock)
         self._worker_count = 0
-        # rule_key -> 活跃 run_id 集合，deferred 的 run 也在里面
         self._active_runs: Dict[str, set[str]] = {}
+        self._executing_runs: Dict[str, set[str]] = {}
         # rule_key -> 排队条目（规则快照 + context）
         self._queues: Dict[str, deque] = {}
         # rule_key -> queue 模式的并发配置，入队时的规则快照说了算
@@ -88,10 +86,10 @@ class RuleScheduler:
         with self._lock:
             return {
                 rule_key: {
-                    "running": len(runs),
+                    "running": len(self._executing_runs.get(rule_key, ())),
                     "queued": len(self._queues.get(rule_key, ())),
                 }
-                for rule_key, runs in self._active_runs.items()
+                for rule_key in self._active_runs.keys() | self._executing_runs.keys()
             }
 
     def submit(
@@ -132,6 +130,7 @@ class RuleScheduler:
             if run_now:
                 self._prepare_run(context)
                 active.add(run_id)
+                self._executing_runs.setdefault(rule_key, set()).add(run_id)
                 self._worker_count += 1
                 decision = "replaced" if mode == "replace" else "started"
             elif len(queue) >= config.get("queue_limit", DEFAULT_QUEUE_LIMIT):
@@ -246,6 +245,7 @@ class RuleScheduler:
             rule, rule_name, context, run_id = queue.popleft()
             self._prepare_run(context)
             active.add(run_id)
+            self._executing_runs.setdefault(rule_key, set()).add(run_id)
             self._worker_count += 1
             self._dispatch_entry(rule_key, rule, rule_name, context, run_id)
 
@@ -263,6 +263,8 @@ class RuleScheduler:
             finally:
                 with self._workers_done:
                     self._worker_count -= 1
+                    self._executing_runs[rule_key].discard(run_id)
+                    self._prune_removed_rule(rule_key)
                     self._dispatch_available_locked()
                     self._workers_done.notify_all()
 
@@ -271,6 +273,7 @@ class RuleScheduler:
         except Exception:
             with self._workers_done:
                 self._worker_count -= 1
+                self._executing_runs[rule_key].discard(run_id)
                 active = self._active_runs.get(rule_key)
                 if active is not None:
                     active.discard(run_id)
@@ -308,7 +311,7 @@ class RuleScheduler:
             except Exception:
                 pass
         finally:
-            self._retire_if_done(rule_key, run_id)
+            self._retire_run(rule_key, run_id)
 
     def _dispatch_available_locked(self) -> None:
         while self._worker_count < self._max_workers:
@@ -321,15 +324,8 @@ class RuleScheduler:
             if self._worker_count == before:
                 return
 
-    def _retire_if_done(self, rule_key: str, run_id: str) -> None:
-        """execute_fn 返回后：deferred 的继续留在活跃集合等终态事件，其余直接退场"""
+    def _retire_run(self, rule_key: str, run_id: str) -> None:
         if not run_id:
-            return
-        try:
-            still_deferred = self._is_deferred_fn(run_id)
-        except Exception:
-            still_deferred = False
-        if still_deferred:
             return
         with self._lock:
             active = self._active_runs.get(rule_key)
@@ -339,8 +335,9 @@ class RuleScheduler:
             self._prune_removed_rule(rule_key)
 
     def _prune_removed_rule(self, rule_key: str) -> None:
-        if rule_key in self._removed_rules and not self._active_runs.get(rule_key):
+        if rule_key in self._removed_rules and not self._active_runs.get(rule_key) and not self._executing_runs.get(rule_key):
             self._active_runs.pop(rule_key, None)
+            self._executing_runs.pop(rule_key, None)
             self._queues.pop(rule_key, None)
             self._queue_configs.pop(rule_key, None)
             self._removed_rules.discard(rule_key)

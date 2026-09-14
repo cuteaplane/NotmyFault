@@ -8,6 +8,7 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 from notmyfault.core.diagnostics import Diagnostics
+from notmyfault.config import ConfigValidationError
 from notmyfault.core.event_bus import EventBus
 from notmyfault.core.hot_reloader import RulesHotReloader
 from notmyfault.core.logging import engine_error, engine_info, engine_warn
@@ -18,11 +19,11 @@ from notmyfault.security.plugin_loader import (
 )
 from notmyfault.core.rule_scheduler import RuleScheduler
 from notmyfault.core.rules import (
-    ConditionRuntime,
-    aggregate_trigger_params,
     get_rule_events,
     validate_rules,
 )
+from notmyfault.core.rule_model import normalize_rules
+from notmyfault.core.runtime_rules import PreparedRules, prepare_rules, rule_key
 from notmyfault.security.plugin_schema import check_payload_contract
 from notmyfault.security.security import (
     SecurityMode,
@@ -92,8 +93,6 @@ class AutomationEngine:
         self._shutdown_flag: "threading.Event | None" = None
 
         self._rules_lock = threading.RLock()
-        # 热重载时整体替换条件运行时，保留 AND 分支的最近命中
-        self._condition_runtime = ConditionRuntime()
 
         self._trigger_supervisor = TriggerSupervisor(
             # 运行时查找 _alert_user，构造后替换的告警回调仍然生效
@@ -114,9 +113,8 @@ class AutomationEngine:
         )
         # rules 和 meta 走 lambda 运行时取值，锁和条件运行时传同一个对象
         self._event_bus = EventBus(
-            rules_fn=lambda: self.rules,
+            snapshot_fn=self._get_runtime_snapshot,
             rules_lock=self._rules_lock,
-            condition_runtime=self._condition_runtime,
             triggers_meta_fn=lambda: self.triggers_meta,
             actions_meta_fn=lambda: self.actions_meta,
             is_shutdown_fn=lambda: bool(
@@ -141,7 +139,6 @@ class AutomationEngine:
         self._rule_scheduler = RuleScheduler(
             execute_fn=self.execute_workflow,
             cancel_run_fn=self._workflow_executor.cancel_run,
-            is_deferred_fn=lambda run_id: False,
             on_history_event=self._safe_on_event,
             prepare_run_fn=self._workflow_executor.prepare_run,
         )
@@ -154,12 +151,45 @@ class AutomationEngine:
             rules_path_fn=lambda: self._rules_store.rules_path,
             load_rules_fn=self._rules_store.load_verified_rules,
             stop_triggers_fn=self._stop_trigger_threads,
+            prepare_rules_fn=self._prepare_rules,
             apply_rules_fn=self._apply_hot_reload_rules,
-            validate_rules_fn=self._validate_all_rules,
+            accept_rules_fn=self._accept_hot_reload_rules,
             start_triggers_fn=self._start_trigger_threads,
             diagnostics=self._diag_obj,
             alert_cb=lambda title, message: self._alert_user(title, message),
         )
+
+    @property
+    def rules(self):
+        return self._rules
+
+    @rules.setter
+    def rules(self, rules):
+        self._rules = rules
+        self._prepared_rules = None
+
+    @property
+    def _condition_runtime(self):
+        return self._get_runtime_snapshot().runtime
+
+    def _get_runtime_snapshot(self):
+        with self._rules_lock:
+            if self._prepared_rules is None:
+                self._prepared_rules = prepare_rules(
+                    self.rules, self.triggers_meta, self.actions_meta, validate=False,
+                )
+                self._rules = self._prepared_rules.rules
+            return self._prepared_rules
+
+    def _prepare_rules(self, rules):
+        try:
+            prepared = prepare_rules(rules, self.triggers_meta, self.actions_meta)
+            for trigger_id in prepared.trigger_params:
+                if self._plugin_registry.resolve_trigger(trigger_id) is None:
+                    raise ValueError(f"触发器未能加载: {trigger_id}")
+            return prepared
+        except (ValueError, DataTypeError, BindingResolutionError) as error:
+            raise ConfigValidationError(str(error)) from error
 
     @property
     def _active_actions(self) -> int:
@@ -204,7 +234,7 @@ class AutomationEngine:
         """触发器线程入口，隔离插件异常并上报崩溃"""
         # 触发器代码来自插件，异常由这里捕获并上报
         try:
-            registry = TypeRegistry.from_plugins(self.triggers_meta, self.actions_meta)
+            registry = self._get_runtime_snapshot().registry
             def emit_checked(event_name: str, payload: Dict[str, Any]) -> None:
                 if not isinstance(payload, dict):
                     raise TypeError("emit_event 的 payload 必须是对象")
@@ -237,7 +267,11 @@ class AutomationEngine:
                 self.emit_event(
                     event_name,
                     normalize_fields(payload, trigger_meta.get("outputs"), registry),
-                    instance={"config": config},
+                    instance=(
+                        {"config": config}
+                        if trigger_meta.get("trigger_api") == "event-v2"
+                        else None
+                    ),
                 )
 
             if trigger_meta.get("trigger_api") == "event-v2":
@@ -333,25 +367,13 @@ class AutomationEngine:
         t_loaded = t_failed = a_loaded = a_failed = 0
         for base_dir, origin in load_paths:
             _t, _tf = self._load_plugins(
-                base_dir=base_dir,
-                plugins_dir="triggers",
-                json_filename="trigger.json",
-                py_filename="trigger.py",
-                module_prefix="notmyfault.trigger_",
-                meta_store=self.triggers_meta,
-                func_store=self.triggers_funcs,
-                store_name="Trigger",
+                base_dir=os.path.join(base_dir, "triggers"),
+                kind="trigger",
                 origin=origin,
             )
             _a, _af = self._load_plugins(
-                base_dir=base_dir,
-                plugins_dir="actions",
-                json_filename="action.json",
-                py_filename="action.py",
-                module_prefix="notmyfault.action_",
-                meta_store=self.actions_meta,
-                func_store=self.actions_funcs,
-                store_name="Actioner",
+                base_dir=os.path.join(base_dir, "actions"),
+                kind="action",
                 origin=origin,
             )
             t_loaded += _t; t_failed += _tf
@@ -386,27 +408,10 @@ class AutomationEngine:
     def _load_plugins(
         self,
         base_dir: str,
-        plugins_dir: str,
-        json_filename: str,
-        py_filename: str,
-        module_prefix: str,
-        meta_store: Dict[str, Dict[str, Any]],
-        func_store: Dict[str, Any],
-        store_name: str,
+        kind: str,
         origin: str = "builtin",
     ) -> Tuple[int, int]:
-        """转发到 PluginLoader 并保留旧加载接口的返回值"""
-        return self._plugin_loader.load(
-            base_dir=base_dir,
-            plugins_dir=plugins_dir,
-            json_filename=json_filename,
-            py_filename=py_filename,
-            module_prefix=module_prefix,
-            meta_store=meta_store,
-            func_store=func_store,
-            store_name=store_name,
-            origin=origin,
-        )
+        return self._plugin_loader.load(base_dir, kind, origin)
 
     @property
     def extensions(self):
@@ -525,7 +530,7 @@ class AutomationEngine:
         variable_values: Optional[Dict[str, Any]] = None,
     ) -> tuple[bool, str, str]:
         """执行调用方传入的规则快照"""
-        rule = copy.deepcopy(rule)
+        rule = normalize_rules([rule])[0]
 
         rule_name = rule.get("name", f"规则 #{rule_index + 1}")
         rule_id = rule.get("rule_id", "")
@@ -661,30 +666,13 @@ class AutomationEngine:
     ) -> Tuple[bool, Any]:
         return self._workflow_executor.run_action(action, rule_name, context)
 
-    def _start_trigger_threads(self, rules: List[Dict[str, Any]] | None = None) -> int:
-        if rules is None:
-            with self._rules_lock:
-                rules = list(self.rules)
-
-        # event-v1 每类触发器共用一条线程，event-v2 每个配置使用独立实例
-        registry = TypeRegistry.from_plugins(self.triggers_meta, self.actions_meta)
-        resolved_rules = []
-        for rule in rules:
-            try:
-                resolved = resolve_trigger_constants(rule, registry)
-                for event in get_rule_events(resolved):
-                    event["params"] = normalize_fields(event.get("params", {}), self.triggers_meta.get(event.get("type"), {}).get("params"), registry, parameters=True)
-                resolved_rules.append(resolved)
-            except (DataTypeError, BindingResolutionError) as error:
-                self._diag_obj.add_rule_issue(rule.get("name", ""), str(error))
-        aggregated = aggregate_trigger_params(resolved_rules)
-
-        # 规则驱动的懒加载：只物化被规则引用的触发器，未引用的保持 pending
-        for trigger_id in aggregated:
+    def _start_trigger_threads(self, rules: PreparedRules | None = None) -> int:
+        snapshot = rules if rules is not None else self._get_runtime_snapshot()
+        for trigger_id in snapshot.trigger_params:
             self._plugin_registry.resolve_trigger(trigger_id)
 
         return self._trigger_supervisor.start(
-            aggregated=aggregated,
+            aggregated=snapshot.trigger_params,
             triggers_funcs=self.triggers_funcs,
             triggers_meta=self.triggers_meta,
             run_trigger_cb=self._run_trigger,
@@ -715,30 +703,20 @@ class AutomationEngine:
             self._privilege_session_closed = True
 
     def _apply_hot_reload_rules(
-        self, new_rules: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        # 锁内整体替换规则并重置条件运行时，返回换之前的规则
+        self, new_rules: PreparedRules
+    ) -> PreparedRules:
         with self._rules_lock:
-            old_rules = list(self.rules)
-            self.rules = new_rules
-            self._condition_runtime.reset()
-        # 被删掉的规则连排队中的 run 一起丢弃；还在的规则排队条目用入队时的快照
-        def rule_key_of(rule: Dict[str, Any]) -> str:
-            # 调度 key 与 EventBus 一致，先取 rule_id，没有时取规则名
-            return str(rule.get("rule_id", "")) or str(rule.get("name", ""))
+            previous = self._get_runtime_snapshot()
+            self._prepared_rules = new_rules
+            self._rules = new_rules.rules
+        return previous
 
-        new_keys = {
-            rule_key_of(rule)
-            for rule in new_rules
-            if isinstance(rule, dict)
-        }
-        for rule in old_rules:
-            if not isinstance(rule, dict):
-                continue
-            key = rule_key_of(rule)
+    def _accept_hot_reload_rules(self, previous: PreparedRules) -> None:
+        new_keys = {rule_key(rule) for rule in self.rules}
+        for rule in previous.rules:
+            key = rule_key(rule)
             if key not in new_keys:
                 self._rule_scheduler.drop_rule(key)
-        return old_rules
 
     def _run(
         self, shutdown_event: "threading.Event | None" = None
@@ -759,7 +737,16 @@ class AutomationEngine:
                     )
                     raise RuntimeError("核心文件完整性校验失败")
 
-            self._validate_all_rules()
+            try:
+                snapshot = self._prepare_rules(self.rules)
+            except ConfigValidationError as error:
+                self._diag_obj.add_rule_issue("", str(error))
+                engine_error("rule_issue", issue=str(error))
+                self._alert_user("NotmyFault 启动失败", str(error), open_dashboard=True)
+                raise
+            with self._rules_lock:
+                self._prepared_rules = snapshot
+                self._rules = snapshot.rules
 
             from notmyfault.platform.platform_support import show_notification
 

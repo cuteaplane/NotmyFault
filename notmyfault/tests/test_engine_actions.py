@@ -904,7 +904,12 @@ class TestErrorIsolation:
 
         engine.triggers_funcs["hotkey"] = stubborn
         engine.triggers_meta["hotkey"] = {}
-        engine._start_trigger_threads([{"event": {"type": "hotkey", "params": {}}}])
+        register_action(engine, "noop", lambda meta, params: None)
+        snapshot = engine._prepare_rules([{
+            "name": "等待停止", "condition": {"type": "hotkey", "params": {}},
+            "actions": [{"type": "noop", "params": {}}],
+        }])
+        engine._start_trigger_threads(snapshot)
         assert engine._stop_trigger_threads(timeout=0.1) is False
         assert "hotkey" in engine._trigger_supervisor._threads
         hold.set()
@@ -958,6 +963,7 @@ class TestErrorIsolation:
         started = threading.Event()
         stopped = threading.Event()
         rule = {
+            "name": "启动失败清理",
             "event": {"type": "hotkey", "params": {}},
             "actions": [{"type": "noop", "params": {}}],
         }

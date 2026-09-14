@@ -356,6 +356,27 @@ class V2MatchingTests:
             {"process_name": "WeChat.exe", "state": "stopped"},
         ) is False
 
+        engine = make_engine(rule)
+        engine.triggers_meta["process_state"] = {
+            "trigger_api": "event-v1",
+            "outputs": [{"name": name, "type": "string"} for name in ("process_name", "state")],
+        }
+        dispatched = []
+        engine._event_bus._scheduler_submit_fn = lambda *args: dispatched.append(args)
+
+        def trigger(meta, configs, emit, stop):
+            assert configs == [rule["condition"]["params"]]
+            emit("process_state", {"process_name": "WeChat.exe", "state": "stopped"})
+            emit("process_state", {"process_name": "WeChat.exe", "state": "running"})
+            stop.set()
+
+        engine._run_trigger(
+            "process_state", "process_state", trigger,
+            engine.triggers_meta["process_state"], [rule["condition"]["params"]], threading.Event(),
+        )
+        assert len(dispatched) == 1
+        assert dispatched[0][3]["event"]["payload"]["state"] == "running"
+
     def test_v2_and_v1_semantics_coexist_in_one_rule(self):
         rule = {
             "name": "混合语义",

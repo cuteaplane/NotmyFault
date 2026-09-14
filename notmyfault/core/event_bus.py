@@ -2,13 +2,10 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from notmyfault.core.logging import engine_warn
-from notmyfault.core.binding_schema import prepare_binding_context
 from notmyfault.core.bindings import BindingResolutionError
-from notmyfault.core.data_types import DataTypeError, normalize_fields
-from notmyfault.core.type_registry import TypeRegistry
-from notmyfault.core.variables import resolve_trigger_constants
+from notmyfault.core.data_types import DataTypeError
 from notmyfault.core.workflow import build_context
-from notmyfault.core.rules import get_rule_condition, get_rule_events, validate_condition_tree
+from notmyfault.core.runtime_rules import PreparedRules, rule_key
 
 
 class EventBus:
@@ -16,9 +13,8 @@ class EventBus:
 
     def __init__(
         self,
-        rules_fn: Callable[[], List[Dict[str, Any]]],
+        snapshot_fn: Callable[[], PreparedRules],
         rules_lock: Any,
-        condition_runtime: Any,
         triggers_meta_fn: Callable[[], Dict[str, Dict[str, Any]]],
         actions_meta_fn: Callable[[], Dict[str, Dict[str, Any]]],
         is_shutdown_fn: Callable[[], bool],
@@ -26,10 +22,8 @@ class EventBus:
         execute_workflow_cb: Callable[..., None],
         scheduler_submit_fn: Callable[..., str] | None = None,
     ) -> None:
-        self._rules_fn = rules_fn
-        # 和 engine 共用同一把锁对象，快照和热重载换规则才不会打架
+        self._snapshot_fn = snapshot_fn
         self._rules_lock = rules_lock
-        self._condition_runtime = condition_runtime
         self._triggers_meta_fn = triggers_meta_fn
         self._actions_meta_fn = actions_meta_fn
         self._is_shutdown_fn = is_shutdown_fn
@@ -57,24 +51,13 @@ class EventBus:
         )
 
         with self._rules_lock:
-            # 规则快照在锁内复制，动作执行在锁外进行
-            rules_snapshot = list(self._rules_fn())
+            snapshot = self._snapshot_fn()
 
-        for rule in rules_snapshot:
-            rule_id = rule.get("rule_id", "")
-            # 调度 key 用 rule_id，没有就用规则名；带数组下标会在规则重排后串到别的规则
-            rule_key = rule_id or str(rule.get("name", ""))
-            try:
-                registry = TypeRegistry.from_plugins(self._triggers_meta_fn(), self._actions_meta_fn())
-                resolved = resolve_trigger_constants(rule, registry)
-                for leaf in get_rule_events(resolved):
-                    leaf["params"] = normalize_fields(leaf.get("params", {}), self._triggers_meta_fn().get(leaf.get("type"), {}).get("params"), registry, parameters=True)
-            except (DataTypeError, BindingResolutionError) as error:
-                self._safe_on_event("rule_error", {"rule_id": rule_id, "error": error.as_dict()})
-                continue
-            matched_events = self._condition_runtime.match_and_take(
-                rule_key,
-                resolved,
+        for rule in snapshot.rules:
+            key = rule_key(rule)
+            matched_events = snapshot.runtime.match_and_take(
+                key,
+                rule,
                 event_type,
                 event_payload,
                 instance=instance,
@@ -82,25 +65,20 @@ class EventBus:
             if matched_events is None:
                 continue
 
-            self._dispatch(rule, rule_key, event_type, event_payload, masked_payload, matched_events)
+            self._dispatch(snapshot, rule, key, event_type, event_payload, masked_payload, matched_events)
 
     def poll_absences(self, now=None):
         if self._is_shutdown_fn():
             return
         with self._rules_lock:
-            rules = list(self._rules_fn())
-            for rule in rules:
-                condition = get_rule_condition(rule)
-                if validate_condition_tree(condition):
-                    continue
-                if any(event.get("type") not in self._triggers_meta_fn() for event in get_rule_events(rule)):
-                    continue
-                rule_key = rule.get("rule_id") or str(rule.get("name", ""))
-                matched = self._condition_runtime.poll_absences(rule_key, rule, now)
-                if matched is not None:
-                    self._dispatch(rule, rule_key, "absence", {}, {}, matched)
+            snapshot = self._snapshot_fn()
+        for rule in snapshot.rules:
+            key = rule_key(rule)
+            matched = snapshot.runtime.poll_absences(key, rule, now)
+            if matched is not None:
+                self._dispatch(snapshot, rule, key, "absence", {}, {}, matched)
 
-    def _dispatch(self, rule, rule_key, event_type, event_payload, masked_payload, matched_events):
+    def _dispatch(self, snapshot, rule, rule_key, event_type, event_payload, masked_payload, matched_events):
         rule_id = rule.get("rule_id", "")
         rule_name = rule.get("name", "未命名规则")
         run_id = f"run_{uuid.uuid4().hex}"
@@ -125,7 +103,7 @@ class EventBus:
             run_id,
         )
         try:
-            prepare_binding_context(rule, context, self._triggers_meta_fn(), self._actions_meta_fn())
+            snapshot.prepare_context(rule, context)
         except (DataTypeError, BindingResolutionError) as error:
             self._safe_on_event("workflow_failed", {"run_id": run_id, "rule_id": rule_id, "rule_name": rule_name, "error": error.as_dict()})
             return

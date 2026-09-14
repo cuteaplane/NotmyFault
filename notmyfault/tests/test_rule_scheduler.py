@@ -19,13 +19,12 @@ def make_context(rule_id="r1", run_id=None):
 
 
 class FakeRuntime:
-    """记录执行、取消和 deferred 状态的可控执行端"""
+    """记录执行和取消的可控执行端"""
 
     def __init__(self):
         self.lock = threading.Lock()
         self.executed = []          # (rule_key, 规则名, run_id)
         self.cancelled = []         # 被 cancel_run 的 run_id
-        self.deferred = set()       # 处于 deferred 的 run_id
         self.history = []           # (事件类型, run_id, reason)
         self.observed_rules = []
         self.block = threading.Event()
@@ -44,9 +43,6 @@ class FakeRuntime:
             self.cancelled.append(run_id)
         return True
 
-    def is_deferred(self, run_id):
-        return run_id in self.deferred
-
     def on_history(self, kind, data):
         with self.lock:
             self.history.append((kind, data.get("run_id"), data.get("reason")))
@@ -64,7 +60,6 @@ def make_scheduler(rule, runtime, **kwargs):
     return RuleScheduler(
         execute_fn=runtime.execute,
         cancel_run_fn=runtime.cancel_run,
-        is_deferred_fn=runtime.is_deferred,
         on_history_event=runtime.on_history,
         **kwargs,
     )
@@ -104,7 +99,6 @@ class TestSingleMode:
         scheduler = RuleScheduler(
             execute_fn=execute,
             cancel_run_fn=lambda run_id: True,
-            is_deferred_fn=lambda run_id: False,
         )
         caller_thread = threading.get_ident()
         started = time.perf_counter()
@@ -299,7 +293,6 @@ def test_execute_exception_emits_stable_terminal_event():
     scheduler = RuleScheduler(
         execute_fn=fail,
         cancel_run_fn=lambda run_id: True,
-        is_deferred_fn=lambda run_id: False,
         on_history_event=lambda kind, data: events.append((kind, data)),
     )
     context = make_context()
@@ -348,7 +341,7 @@ class TestReplaceMode:
 
         # 旧 run 的终态事件晚到也不影响新 run
         scheduler.on_run_event("workflow_completed", first_context["run"]["id"])
-        assert scheduler.stats()["key"]["running"] == 1
+        assert scheduler.stats()["key"]["running"] == 2
 
         runtime.block.set()
         second_thread.join(timeout=5)
@@ -367,36 +360,11 @@ class TestReplaceMode:
         second_thread, _ = submit_async(scheduler, rule, "key", holder, 1)
         wait_until(lambda: runtime.cancelled == [first_context["run"]["id"]],
                    message="replace 没有取消卡在重试里的旧 run")
-        # 第一个 run 还没退出，活跃集合里只剩新 run
-        assert scheduler.stats()["key"]["running"] == 1
+        assert scheduler.stats()["key"]["running"] == 2
         runtime.block.set()
         second_thread.join(timeout=5)
         first_thread.join(timeout=5)
         assert holder[1][0] == "replaced"
-
-
-class TestDeferredInteraction:
-    def test_deferred_counts_as_active(self):
-        runtime = FakeRuntime()
-        rule = {"concurrency": {"mode": "single"}}
-        scheduler = make_scheduler(rule, runtime)
-        first_thread, first_context = submit_async(scheduler, rule, "key", {}, 0)
-        wait_until(lambda: scheduler.stats().get("key", {}).get("running") == 1)
-
-        runtime.deferred.add(first_context["run"]["id"])
-        runtime.block.set()
-        first_thread.join(timeout=5)
-        wait_until(lambda: scheduler.stats()["key"]["running"] == 1,
-                   message="deferred run 不应退出活跃集合")
-
-        # run1 在 deferred 等待重试，仍算活跃，新事件被丢弃
-        assert scheduler.submit("key", rule, "规则", make_context()) == "dropped"
-
-        # deferred 的 run 收到终态事件后退场
-        scheduler.on_run_event("workflow_completed", first_context["run"]["id"])
-        wait_until(lambda: scheduler.stats()["key"]["running"] == 0)
-        runtime.blocking = False
-        assert scheduler.submit("key", rule, "规则", make_context()) == "started"
 
 
 class TestShutdownAndReload:
@@ -466,7 +434,7 @@ class TestEngineWiring:
             return {"ok": True}
 
         rule = {
-            "rule_id": "rule-single-1",
+            "rule_id": "r_single01",
             "name": "单实例规则",
             "event": {"type": "hotkey", "params": {"key": "f1"}},
             "concurrency": {"mode": "single"},
@@ -483,7 +451,7 @@ class TestEngineWiring:
 
         def running_count():
             return engine.scheduler_stats().get(
-                "rule-single-1", {"running": 0}
+                "r_single01", {"running": 0}
             )["running"]
 
         deadline = time.time() + 5
@@ -507,9 +475,12 @@ class TestEngineWiring:
         import threading
 
         rule = {
-            "rule_id": "rule-q-1",
+            "rule_id": "r_queue001",
             "name": "排队规则",
-            "event": {"type": "hotkey", "params": {"key": "f2"}},
+            "condition": {"op": "all", "children": [
+                {"type": "hotkey", "params": {"key": "f2"}},
+                {"type": "ready", "params": {}},
+            ]},
             "concurrency": {"mode": "queue"},
             "actions": [{"type": "noop", "params": {}}],
         }
@@ -523,31 +494,65 @@ class TestEngineWiring:
         engine = self._make_engine(rule, lambda kind, data: events.append((kind, data)))
         engine.actions_funcs["noop"] = slow_action
         engine.actions_meta["noop"] = {}
+        engine.triggers_meta["ready"] = {}
 
-        first = threading.Thread(
-            target=lambda: engine.emit_event("hotkey", {"key": "f2"}), daemon=True
-        )
+        def trigger_rule():
+            engine.emit_event("hotkey", {"key": "f2"})
+            engine.emit_event("ready", {})
+
+        first = threading.Thread(target=trigger_rule, daemon=True)
         first.start()
 
         def queued_count():
             return engine.scheduler_stats().get(
-                "rule-q-1", {"queued": 0}
+                "r_queue001", {"queued": 0}
             )["queued"]
 
         deadline = time.time() + 5
-        while engine.scheduler_stats().get("rule-q-1", {}).get("running", 0) < 1 \
+        while engine.scheduler_stats().get("r_queue001", {}).get("running", 0) < 1 \
                 and time.time() < deadline:
             time.sleep(0.01)
 
         for _ in range(3):
-            engine.emit_event("hotkey", {"key": "f2"})
+            trigger_rule()
+        assert queued_count() == 3
+        engine.emit_event("hotkey", {"key": "f2"})
+
+        snapshot = engine._get_runtime_snapshot()
+        reloader = engine._hot_reloader
+        reloader._rules_mtime = 1
+        reloader.current_mtime = lambda: 2
+        reloader._load_rules_fn = lambda: [{
+            "name": "无效规则", "condition": {"type": "missing"},
+            "actions": [{"type": "noop", "params": {}}],
+        }]
+        stopped = []
+        reloader._stop_triggers_fn = lambda timeout: stopped.append(timeout) or True
+        reloader.check_once()
+        assert stopped == []
+        assert engine._get_runtime_snapshot() is snapshot
         assert queued_count() == 3
 
-        # 热重载把规则删掉，排队中的 run 一起丢弃
-        engine._apply_hot_reload_rules([])
+        reloader.current_mtime = lambda: 3
+        reloader._load_rules_fn = lambda: []
+        def start_triggers(candidate):
+            if candidate is not snapshot:
+                raise RuntimeError("启动失败")
+            return 1
+        reloader._start_triggers_fn = start_triggers
+        reloader.check_once()
+        assert engine._get_runtime_snapshot() is snapshot
+        assert queued_count() == 3
+        assert not [event for event in events if event[0] == "run_dropped"]
+        engine.emit_event("ready", {})
+        assert queued_count() == 4
+
+        previous = engine._apply_hot_reload_rules(engine._prepare_rules([]))
+        assert queued_count() == 4
+        engine._accept_hot_reload_rules(previous)
         assert queued_count() == 0
         dropped = [e for e in events if e[0] == "run_dropped"]
-        assert len(dropped) == 3
+        assert len(dropped) == 4
         assert all(d[1]["reason"] == "规则已删除" for d in dropped)
 
         release.set()

@@ -53,12 +53,13 @@ def rule_binding_types(rule, triggers_meta, actions_meta):
     return result
 
 
-def prepare_binding_context(rule, context, triggers_meta, actions_meta):
+def prepare_binding_context(rule, context, triggers_meta, actions_meta, *, registry=None):
     from notmyfault.core.rules import get_rule_events, iter_action_nodes
 
     if context.get("_variables_initialized"):
         return
-    registry = TypeRegistry.from_plugins(triggers_meta, actions_meta)
+    if registry is None:
+        registry = TypeRegistry.from_plugins(triggers_meta, actions_meta)
     initialize_variables(rule, context, registry, overrides=context.get("manual_test", {}).get("variable_values"))
     sources = rule_binding_types(rule, triggers_meta, actions_meta)
     sources["event"] = output_type(triggers_meta.get(context.get("event", {}).get("type"), {}))

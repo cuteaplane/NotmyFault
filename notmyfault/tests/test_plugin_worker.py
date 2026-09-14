@@ -390,18 +390,8 @@ class TestLoaderIsolatedMode:
         ))
         helper = tmp_path / "actions" / "iso_action" / "helper.py"
         helper.write_text("def double(value): return value * 2\n", encoding="utf-8")
-        meta_store, func_store = {}, {}
-        loaded, failed = loader.load(
-            base_dir=str(tmp_path),
-            plugins_dir="actions",
-            json_filename="action.json",
-            py_filename="action.py",
-            module_prefix="notmyfault.action_iso_",
-            meta_store=meta_store,
-            func_store=func_store,
-            store_name="Actioner",
-            origin=origin,
-        )
+        meta_store, func_store = loader._registry.stores("action")
+        loaded, failed = loader.load(str(tmp_path / "actions"), "action", origin=origin)
         assert (loaded, failed) == (1, 0)
         assert "iso_action" not in func_store
 
@@ -418,18 +408,8 @@ class TestLoaderIsolatedMode:
         from notmyfault.core.workflow import invoke_action
 
         loader = self._make_plugin(tmp_path, context_api=True)
-        meta_store, func_store = {}, {}
-        loaded, failed = loader.load(
-            base_dir=str(tmp_path),
-            plugins_dir="actions",
-            json_filename="action.json",
-            py_filename="action.py",
-            module_prefix="notmyfault.action_iso_context_",
-            meta_store=meta_store,
-            func_store=func_store,
-            store_name="Actioner",
-            origin="user",
-        )
+        meta_store, func_store = loader._registry.stores("action")
+        loaded, failed = loader.load(str(tmp_path / "actions"), "action", origin="user")
         assert (loaded, failed) == (1, 0)
 
         assert loader.materialize_pending_action("iso_action") is not None
@@ -453,18 +433,8 @@ class TestLoaderIsolatedMode:
             execution_mode="in-process",
             source=PLUGIN_API_ACTION,
         )
-        meta_store, func_store = {}, {}
-        loaded, failed = loader.load(
-            base_dir=str(tmp_path),
-            plugins_dir="actions",
-            json_filename="action.json",
-            py_filename="action.py",
-            module_prefix="notmyfault.action_public_api_",
-            meta_store=meta_store,
-            func_store=func_store,
-            store_name="Actioner",
-            origin="user",
-        )
+        meta_store, func_store = loader._registry.stores("action")
+        loaded, failed = loader.load(str(tmp_path / "actions"), "action", origin="user")
         assert (loaded, failed) == (1, 0)
         assert loader.materialize_pending_action("iso_action") is not None
         result = func_store["iso_action"]({}, {})

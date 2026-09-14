@@ -130,8 +130,8 @@ class TestConfigEnginePipeline:
         config["rules"] = store.load_rules()
         engine = create_test_engine(config, rules_store=store)
         rule = engine.rules[0]
-        assert rule["event"]["type"] == "process_state"
-        assert rule["event"]["params"]["process_name"] == "WeChat.exe"
+        assert rule["condition"]["type"] == "process_state"
+        assert rule["condition"]["params"]["process_name"] == "WeChat.exe"
         assert rule["actions"][0]["type"] == "set_volume"
 
     def test_legacy_trigger_config_normalized(self, isolated_config):
@@ -144,7 +144,7 @@ class TestConfigEnginePipeline:
         }])
         rule = store.load_verified_rules()[0]
         assert "trigger" not in rule
-        assert rule["event"]["type"] == "hotkey"
+        assert rule["condition"]["type"] == "hotkey"
 
 
 class TestEngineEventPipeline:
@@ -208,7 +208,7 @@ class TestHotReloadIntegration:
             load_rules_fn=lambda: new_rules,
             stop_triggers_fn=lambda timeout: True,
             apply_rules_fn=apply_rules,
-            validate_rules_fn=lambda: None,
+            prepare_rules_fn=lambda rules: rules,
             start_triggers_fn=lambda rules: 1,
             diagnostics=Diagnostics(),
             alert_cb=lambda title, message: alerts.append((title, message)),
@@ -241,7 +241,7 @@ class TestHotReloadIntegration:
             load_rules_fn=lambda: new_rules,
             stop_triggers_fn=lambda timeout: True,
             apply_rules_fn=apply_rules,
-            validate_rules_fn=lambda: None,
+            prepare_rules_fn=lambda rules: rules,
             start_triggers_fn=start_triggers,
             diagnostics=Diagnostics(),
             alert_cb=lambda title, message: alerts.append((title, message)),
@@ -329,7 +329,7 @@ class TestHotReloadIntegration:
             load_rules_fn=lambda: new_rules,
             stop_triggers_fn=lambda timeout: stopped.append(timeout) or len(stopped) != 2 or stop_immediately,
             apply_rules_fn=apply_rules,
-            validate_rules_fn=lambda: None,
+            prepare_rules_fn=lambda rules: rules,
             start_triggers_fn=start_triggers,
             diagnostics=Diagnostics(),
             alert_cb=lambda title, message: alerts.append((title, message)),

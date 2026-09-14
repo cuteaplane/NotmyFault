@@ -8,6 +8,7 @@ from notmyfault.tests.api_support import create_test_engine
 from notmyfault.core.rules import (
     ConditionRuntime,
     get_rule_events,
+    normalize_rule_input,
     validate_rule_binding_ids,
     validate_rule_structure,
     validate_rules,
@@ -86,20 +87,34 @@ class TestConditionRuntime:
         runtime.reset()
         assert runtime.poll_absences("r", rule, now=200) is None
 
-    def test_absence_event_is_dispatched_through_rule_scheduler(self):
+    def test_absence_event_is_dispatched_through_rule_scheduler(self, monkeypatch):
         rule = {"name": "无事件", "condition": {"op": "not", "within_seconds": 10, "children": [
-            {"type": "signal", "params": {}},
-        ]}, "actions": []}
+            {"type": "signal", "params": {"channel": {"$ref": {"scope": "constant", "node": "c_channel01", "path": []}}}},
+        ]}, "actions": [], "constants": [{
+            "id": "c_channel01", "name": "通道", "value_type": "text", "value": "a",
+        }], "variables": [{
+            "id": "v_values01", "name": "值", "value_type": {"type": "array", "items": "int"}, "initial": [1],
+        }]}
         engine = make_engine([rule])
-        engine.triggers_meta["signal"] = {}
+        engine.triggers_meta["signal"] = {"params": [{"name": "channel", "value_type": "text"}]}
         dispatched = []
         engine._event_bus._scheduler_submit_fn = lambda *args: dispatched.append(args)
         engine._event_bus.poll_absences(now=0)
+        from notmyfault.core.type_registry import TypeRegistry
+        monkeypatch.setattr(TypeRegistry, "from_plugins", lambda *args, **kwargs: pytest.fail("运行中重新构建类型表"))
+        monkeypatch.setattr("notmyfault.core.condition_runtime.time.monotonic", lambda: 9)
+        engine.emit_event("signal", {"channel": "a"})
         engine._event_bus.poll_absences(now=10)
-        engine._event_bus.poll_absences(now=20)
+        assert dispatched == []
+        engine._event_bus.poll_absences(now=19)
         assert len(dispatched) == 1
         assert dispatched[0][3]["event"]["type"] == "absence"
         assert dispatched[0][3]["triggers"] == {}
+        dispatched[0][3]["variables"]["v_values01"].append(2)
+        monkeypatch.setattr("notmyfault.core.condition_runtime.time.monotonic", lambda: 20)
+        engine.emit_event("signal", {"channel": "a"})
+        engine._event_bus.poll_absences(now=30)
+        assert dispatched[1][3]["variables"]["v_values01"] == [1]
 
     @pytest.mark.parametrize("window", [10, 7200, None])
     def test_all_condition_respects_time_window(self, window):
@@ -148,7 +163,7 @@ class TestConditionRuntime:
 
     def test_concurrent_match_returns_each_events_payload(self):
         runtime = ConditionRuntime()
-        rule = {"event": {"type": "evt", "params": {}}}
+        rule = {"condition": {"type": "evt", "params": {}}}
         gate = threading.Barrier(3)
         results = {}
 
@@ -513,6 +528,24 @@ def test_validate_rules_rejects_duplicate_or_invalid_step_ids():
     errors = validate_rule_binding_ids(invalid)
     assert any("binding_id 无效" in error for error in errors)
     assert validate_rules_structure([invalid])
+
+    nested = {
+        "name": "分支",
+        "event": {"type": "hotkey", "params": {}},
+        "actions": [{
+            "type": "if",
+            "condition": {"op": "is_true", "left": True},
+            "then": [{"type": "noop", "binding_id": "a_existing01", "params": {}}],
+            "else": [],
+        }],
+    }
+    normalized = normalize_rule_input([nested])[0]
+    assert normalized["actions"][0]["then"][0]["binding_id"] == "a_existing01"
+    assert validate_rule_binding_ids(normalized) == []
+    for invalid_id in ("BAD ID", None):
+        nested["actions"][0]["then"][0]["binding_id"] = invalid_id
+        with pytest.raises(ValueError, match="binding_id 无效"):
+            normalize_rule_input([nested])
 
 
 def test_validate_rules_rejects_failure_action_id_reused_by_main_flow():

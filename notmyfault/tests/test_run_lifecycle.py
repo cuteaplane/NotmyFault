@@ -271,13 +271,9 @@ class TestReplaceCancelWindow:
         def execute(rule_key, rule, rule_name, context):
             time_mod.sleep(0.05)
 
-        def is_deferred(run_id):
-            return False
-
         scheduler = RuleScheduler(
             execute_fn=execute,
             cancel_run_fn=cancel_run,
-            is_deferred_fn=is_deferred,
         )
         rule = {"concurrency": {"mode": "replace"}}
         first = {"run": {"id": "run_w1"}, "rule": {}}

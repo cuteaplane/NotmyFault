@@ -1,7 +1,6 @@
 """rules.json 热重载，从 engine.py 的 _run 主循环拆出。
 
-每秒看一眼 rules.json 的修改时间，变了就重载：先停旧触发器，
-停了才换规则、校验并重启触发器。
+每秒检查 rules.json 的修改时间，候选规则准备成功后再停止旧触发器。
 """
 import os
 import sys
@@ -20,22 +19,24 @@ class RulesHotReloader:
         rules_path_fn: Callable[[], str],
         load_rules_fn: Callable[[], List[Any]],
         stop_triggers_fn: Callable[..., bool],
-        apply_rules_fn: Callable[[List[Any]], List[Any]],
-        validate_rules_fn: Callable[[], Any],
-        start_triggers_fn: Callable[[List[Any]], int],
+        prepare_rules_fn: Callable[[List[Any]], Any],
+        apply_rules_fn: Callable[[Any], Any],
+        start_triggers_fn: Callable[[Any], int],
         diagnostics: Any,
         alert_cb: Callable[..., None],
+        accept_rules_fn: Callable[[Any], None] | None = None,
     ) -> None:
         self._rules_path_fn = rules_path_fn
         self._load_rules_fn = load_rules_fn
         self._stop_triggers_fn = stop_triggers_fn
+        self._prepare_rules_fn = prepare_rules_fn
         self._apply_rules_fn = apply_rules_fn
-        self._validate_rules_fn = validate_rules_fn
+        self._accept_rules_fn = accept_rules_fn or (lambda previous: None)
         self._start_triggers_fn = start_triggers_fn
         self._diagnostics = diagnostics
         self._alert_cb = alert_cb
         self._rules_mtime = 0.0
-        self._pending_restore: tuple[List[Any], float] | None = None
+        self._pending_restore: tuple[Any, float] | None = None
         # 同一类错误只弹一次告警，原来是 engine 的 _hot_reload_error_reported
         self._error_reported = False
 
@@ -50,7 +51,7 @@ class RulesHotReloader:
         self._error_reported = False
 
     def _restore_previous_rules(
-        self, previous_rules: List[Any], new_mtime: float
+        self, previous_rules: Any, new_mtime: float
     ) -> bool:
         self._pending_restore = (previous_rules, new_mtime)
         try:
@@ -75,13 +76,13 @@ class RulesHotReloader:
             self._restore_previous_rules(*self._pending_restore)
             return
         new_mtime = self._rules_mtime
-        previous_rules: List[Any] | None = None
+        previous_rules: Any = None
 
         try:
             new_mtime = self.current_mtime()
             if new_mtime != self._rules_mtime:
                 # 文件写入中被读取时可能出现临时 JSON 错误，下一轮继续尝试
-                new_rules = self._load_rules_fn()
+                new_rules = self._prepare_rules_fn(self._load_rules_fn())
 
                 # 旧触发器仍在运行时先等待退出，再决定是否加载新配置
                 if not self._stop_triggers_fn(timeout=30):
@@ -96,13 +97,12 @@ class RulesHotReloader:
 
                 previous_rules = self._apply_rules_fn(new_rules)
 
+                started = self._start_triggers_fn(new_rules)
+                self._accept_rules_fn(previous_rules)
                 print(
                     f"[Engine] 规则已热加载（{len(previous_rules)} -> {len(new_rules)} 条规则）"
                 )
                 self._error_reported = False
-                self._validate_rules_fn()
-
-                started = self._start_triggers_fn(new_rules)
                 if started == 0:
                     print("[Engine] 热加载后无可用触发器，保持Engine运行")
                 self._rules_mtime = new_mtime
@@ -134,6 +134,8 @@ class RulesHotReloader:
                 f"[Engine] 读取规则文件失败: {e}",
                 file=sys.stderr,
             )
+            if previous_rules is not None:
+                self._restore_previous_rules(previous_rules, new_mtime)
         except Exception as error:
             print(
                 "[Engine] 热加载规则失败:",

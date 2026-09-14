@@ -46,9 +46,14 @@ def main() -> None:
             or tree.file_snapshot.get(relative_entry) != expected_hash
         ):
             raise PermissionError("隔离动作入口完整性校验失败")
-        importer = PluginImports(str(plugin_root), "isolated_action", tree.py_sources)
-        module = importer.load_entry(str(entry))
         action_info = request["action_info"]
+        importer = PluginImports(
+            str(plugin_root), "isolated_action", tree.py_sources,
+            resource_roots=(
+                {action_info["id"]: str(plugin_root)} if action_info.get("id") else {}
+            ),
+        )
+        module = importer.load_entry(str(entry))
         context = request.get("context", {})
         if typed:
             context["_type_registry"] = TypeRegistry(request.get("data_types"))

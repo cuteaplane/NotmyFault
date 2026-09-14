@@ -1,11 +1,8 @@
-"""规则引擎的纯函数负责条件树、事件匹配、规则校验和触发器参数聚合"""
-import json
+"""规则结构、插件参数和数据引用校验"""
 import copy
 import math
-import threading
-import time
 import re
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from notmyfault.core.bindings import (
     contains_dynamic_value,
@@ -14,50 +11,20 @@ from notmyfault.core.bindings import (
 )
 from notmyfault.core.data_types import DataTypeError
 from notmyfault.core.variables import variable_definitions
-from notmyfault.core.value_codec import encode_value
 from notmyfault.extensions.protocol import owned_value_identity
 from notmyfault.core.predicates import validate_predicate
+from notmyfault.core.rule_model import normalize_rule_shape, normalize_rules
+from notmyfault.core.condition_runtime import ConditionRuntime
+from notmyfault.core.conditions import (
+    get_rule_condition, _is_event_leaf, _condition_children, iter_condition_events,
+    get_rule_events, validate_condition_tree, check_event_params,
+    config_fingerprint, _condition_op, _absence_nodes, _positive_events,
+    _event_key, _canonical_config_value,
+)
 
 
 _BINDING_ID_RE = re.compile(r"^[tap]_[a-z0-9_]{6,64}$")
 _RULE_ID_RE = re.compile(r"^r_[a-z0-9_]{6,64}$")
-
-def get_rule_condition(rule: Dict[str, Any]) -> Dict[str, Any] | None:
-    """返回规则条件树并兼容旧版扁平 event 和 trigger 字段"""
-    condition = rule.get("condition")
-    if isinstance(condition, dict):
-        return condition
-    event = rule.get("event") or rule.get("trigger")
-    return event if isinstance(event, dict) else None
-
-
-def _is_event_leaf(node: Any) -> bool:
-    return isinstance(node, dict) and isinstance(node.get("type"), str) and \
-        "children" not in node and "events" not in node
-
-
-def _condition_children(node: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """取条件节点子项，兼容旧的 events 字段"""
-    children = node.get("children")
-    if not isinstance(children, list):
-        children = node.get("events", [])
-    return [child for child in children if isinstance(child, dict)]
-
-
-def iter_condition_events(node: Dict[str, Any] | None) -> Iterable[Dict[str, Any]]:
-    """深度优先枚举条件树中的事件叶子"""
-    if not isinstance(node, dict):
-        return
-    if _is_event_leaf(node):
-        yield node
-        return
-    for child in _condition_children(node):
-        yield from iter_condition_events(child)
-
-
-def get_rule_events(rule: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """从规则的任意条件树中提取所有事件条件"""
-    return list(iter_condition_events(get_rule_condition(rule)))
 
 
 def iter_action_nodes(actions: Any, path: str = "actions"):
@@ -95,53 +62,15 @@ def get_rule_admin_plugins(
     return sorted(required)
 
 
-def validate_condition_tree(node: Dict[str, Any] | None) -> List[str]:
-    """校验可序列化的条件树结构和运算符"""
-    errors: List[str] = []
-
-    def visit(current: Any, path: str) -> None:
-        if not isinstance(current, dict):
-            errors.append(f"{path} 必须是对象")
-            return
-        if _is_event_leaf(current):
-            if not current.get("type"):
-                errors.append(f"{path}.type 不能为空")
-            if "params" in current and not isinstance(current["params"], dict):
-                errors.append(f"{path}.params 必须是对象")
-            return
-        op = _condition_op(current)
-        if op not in ("any", "all", "not"):
-            errors.append(f"{path} 的 op 必须为 any、all 或 not")
-        children = current.get("children", current.get("events", []))
-        if not isinstance(children, list):
-            errors.append(f"{path}.children 必须是数组")
-            children = []
-        if not children:
-            errors.append(f"{path} 至少需要一个子条件")
-        for index, child in enumerate(children):
-            visit(child, f"{path}.children[{index}]")
-        if op == "not":
-            if len(children) != 1 or not _is_event_leaf(children[0]):
-                errors.append(f"{path} 的 NOT 必须包含一个事件条件")
-            if "within_seconds" not in current:
-                errors.append(f"{path} 的 NOT 必须设置等待时长 within_seconds")
-        if "within_seconds" in current:
-            try:
-                seconds = float(current["within_seconds"])
-                if isinstance(current["within_seconds"], bool) or not math.isfinite(seconds) or seconds <= 0:
-                    errors.append(f"{path}.within_seconds 必须大于 0")
-            except (TypeError, ValueError):
-                errors.append(f"{path}.within_seconds 必须是数字")
-
-    visit(node, "condition")
-    return errors
-
-
 def validate_rule_structure(rule: Any) -> List[str]:
     """校验规则结构是否符合引擎输入格式"""
     errors: List[str] = []
     if not isinstance(rule, dict):
         return ["规则必须是对象"]
+    try:
+        rule = normalize_rule_shape(rule)
+    except ValueError as error:
+        return [str(error)]
     try:
         variable_definitions(rule)
     except DataTypeError as error:
@@ -182,12 +111,8 @@ def validate_rule_structure(rule: Any) -> List[str]:
                         f"concurrency.{field} 必须是 1 到 {ceiling} 的整数"
                     )
 
-    has_event = "event" in rule or "trigger" in rule
-    has_condition = "condition" in rule
-    if has_event and has_condition:
-        errors.append("event/trigger 与 condition 不能同时存在")
-    elif not has_event and not has_condition:
-        errors.append("必须配置 event 或 condition")
+    if "condition" not in rule:
+        errors.append("必须配置 condition")
     else:
         errors.extend(validate_condition_tree(get_rule_condition(rule)))
 
@@ -324,29 +249,38 @@ def _validate_node_binding_id(
     seen.add(binding_id)
 
 
-def validate_rule_binding_ids(rule: Dict[str, Any]) -> List[str]:
+def validate_rule_binding_ids(rule: Dict[str, Any], *, allow_missing: bool = False) -> List[str]:
     """校验 v2 节点身份，v1 规则的补齐由配置迁移器完成"""
     errors: List[str] = []
+    try:
+        rule = normalize_rule_shape(rule)
+    except ValueError as error:
+        return [str(error)]
     seen: set[str] = set()
+
+    def check(node: Dict[str, Any], prefix: str, path: str) -> None:
+        if allow_missing and "binding_id" not in node:
+            return
+        _validate_node_binding_id(node, prefix, path, seen, errors)
 
     def visit(node: Any, path: str) -> None:
         if not isinstance(node, dict):
             return
         if _is_event_leaf(node):
-            _validate_node_binding_id(node, "t", path, seen, errors)
+            check(node, "t", path)
             return
         for index, child in enumerate(_condition_children(node)):
             visit(child, f"{path}.children[{index}]")
 
     condition = get_rule_condition(rule)
     if condition is not None:
-        visit(condition, "condition" if "condition" in rule else "event")
+        visit(condition, "condition")
     for field, prefix in (("preconditions", "p"), ("actions", "a")):
         items = rule.get(field, [])
         if not isinstance(items, list):
             continue
         for item, location in iter_action_nodes(items, field):
-            _validate_node_binding_id(item, prefix, location, seen, errors)
+            check(item, prefix, location)
     return errors
 
 
@@ -364,27 +298,8 @@ def validate_rules_structure(rules: Any) -> List[str]:
             for error in (
                 validate_rule_structure(rule)
                 + (
-                    validate_rule_binding_ids(rule)
+                    validate_rule_binding_ids(rule, allow_missing=True)
                     if isinstance(rule, dict)
-                    and any(
-                        "binding_id" in node
-                        for node in (
-                            get_rule_events(rule)
-                            + [
-                                item for field in ("preconditions", "actions")
-                                for item in rule.get(field, [])
-                                if isinstance(item, dict)
-                            ]
-                            + [
-                                failure_action
-                                for action in rule.get("actions", [])
-                                if isinstance(action, dict)
-                                and isinstance(action.get("failure_actions"), list)
-                                for failure_action in action["failure_actions"]
-                                if isinstance(failure_action, dict)
-                            ]
-                        )
-                    )
                     else []
                 )
             )
@@ -397,283 +312,27 @@ def validate_rules_structure(rules: Any) -> List[str]:
     return errors
 
 
-def check_event_params(event_def: Dict[str, Any], event_payload: Dict[str, Any]) -> bool:
-    """检查事件参数是否匹配并允许 payload 含额外字段"""
-    expected_params = event_def.get("params", {})
-    for key, expected_val in expected_params.items():
-        # 缺少字段时不算命中，多个规则只在字段完整时触发
-        if key not in event_payload or event_payload[key] != expected_val:
-            return False
-    return True
+class RuleStructureError(ValueError):
+    def __init__(self, errors: List[str]) -> None:
+        self.errors = errors
+        super().__init__("；".join(errors))
 
 
-def _canonical_config_value(value: Any) -> Any:
-    """递归规范化配置值，等价写法使用相同指纹"""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        try:
-            return int(value) if float(value).is_integer() else value
-        except (OverflowError, ValueError):
-            return value
-    if isinstance(value, dict):
-        return {str(key): _canonical_config_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_canonical_config_value(item) for item in value]
-    return value
-
-
-def config_fingerprint(params: Any) -> str:
-    """生成 event-v2 触发器实例配置的稳定指纹"""
-    if not isinstance(params, dict):
-        params = {}
-    return json.dumps(
-        encode_value(_canonical_config_value(params)),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
-def _condition_op(node: Dict[str, Any]) -> str:
-    """读取条件运算符，兼容 ``type: and/or`` 的早期格式"""
-    op = node.get("op", node.get("type", "any"))
-    return {"or": "any", "and": "all"}.get(str(op).lower(), str(op).lower())
-
-
-def _event_key(event_def: Dict[str, Any]) -> str:
-    """生成事件叶子的稳定键，优先使用 binding_id"""
-    binding_id = event_def.get("binding_id")
-    if isinstance(binding_id, str) and binding_id:
-        return f"id:{binding_id}"
-    return json.dumps(
-        encode_value({"type": event_def.get("type", ""), "params": event_def.get("params", {})}),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
-def _absence_nodes(node):
-    if not isinstance(node, dict) or _is_event_leaf(node):
-        return
-    if _condition_op(node) == "not":
-        yield node
-        return
-    for child in _condition_children(node):
-        yield from _absence_nodes(child)
-
-
-def _positive_events(node):
-    if not isinstance(node, dict):
-        return
-    if _is_event_leaf(node):
-        yield node
-    elif _condition_op(node) != "not":
-        for child in _condition_children(node):
-            yield from _positive_events(child)
-
-
-class ConditionRuntime:
-    """维护条件树的命中状态并判断新的组合"""
-
-    def __init__(self) -> None:
-        self._seen: Dict[str, Dict[str, Dict[str, Any]]] = {}
-        self._fired: Dict[str, tuple[tuple[str, float], ...]] = {}
-        self._last_matches: Dict[str, List[Dict[str, Any]]] = {}
-        self._absence_deadlines: Dict[str, Dict[str, tuple[float, bool]]] = {}
-        self._lock = threading.RLock()
-
-    def reset(self) -> None:
-        with self._lock:
-            self._seen.clear()
-            self._fired.clear()
-            self._last_matches.clear()
-            self._absence_deadlines.clear()
-
-    def poll_absences(self, rule_key, rule, now=None):
-        timestamp = time.monotonic() if now is None else now
-        node = get_rule_condition(rule)
-        with self._lock:
-            deadlines = self._absence_deadlines.setdefault(rule_key, {})
-            seen = self._seen.setdefault(rule_key, {})
-            changed = False
-            for absence in _absence_nodes(node):
-                children = _condition_children(absence)
-                if len(children) != 1 or not _is_event_leaf(children[0]):
-                    continue
-                seconds = float(absence["within_seconds"])
-                key = "not:" + _event_key(children[0])
-                deadline, emitted = deadlines.setdefault(key, (timestamp + seconds, False))
-                if not emitted and timestamp >= deadline:
-                    deadlines[key] = (deadline, True)
-                    seen[key] = {
-                        "event": {"type": "absence", "params": {}},
-                        "payload": {"wait_seconds": seconds}, "timestamp": timestamp,
-                    }
-                    changed = True
-            if changed and self._record_match(rule_key, node, seen):
-                return self.take_last_match(rule_key)
-            return None
-
-    def last_match(self, rule_key: str) -> List[Dict[str, Any]]:
-        """返回最近一次命中的事件供动作执行"""
-        with self._lock:
-            return [
-                {
-                    **item,
-                    "event": dict(item["event"]),
-                    "payload": dict(item["payload"]),
-                }
-                for item in self._last_matches.get(rule_key, [])
-            ]
-
-    def take_last_match(self, rule_key: str) -> List[Dict[str, Any]]:
-        with self._lock:
-            result = self.last_match(rule_key)
-            signature = self._fired.pop(rule_key, ())
-            seen = self._seen.get(rule_key, {})
-            for key, _timestamp in signature:
-                seen.pop(key, None)
-            if not seen:
-                self._seen.pop(rule_key, None)
-            self._last_matches.pop(rule_key, None)
-            return result
-
-    def match_and_take(
-        self,
-        rule_key: str,
-        rule: Dict[str, Any],
-        event_type: str,
-        event_payload: Dict[str, Any],
-        now: float | None = None,
-        instance: Dict[str, Any] | None = None,
-    ) -> List[Dict[str, Any]] | None:
-        with self._lock:
-            if not self.match(
-                rule_key,
-                rule,
-                event_type,
-                event_payload,
-                now=now,
-                instance=instance,
-            ):
-                return None
-            return self.take_last_match(rule_key)
-
-    def match(
-        self,
-        rule_key: str,
-        rule: Dict[str, Any],
-        event_type: str,
-        event_payload: Dict[str, Any],
-        now: float | None = None,
-        instance: Dict[str, Any] | None = None,
-    ) -> bool:
-        """记录事件并按 event-v1 或 event-v2 规则判断新的命中组合"""
-        node = get_rule_condition(rule)
-        if node is None:
-            return False
-        timestamp = time.monotonic() if now is None else now
-        if instance is not None:
-            fingerprint = config_fingerprint(instance.get("config"))
-            matching_leaves = [
-                leaf for leaf in iter_condition_events(node)
-                if leaf.get("type") == event_type
-                and config_fingerprint(leaf.get("params")) == fingerprint
-            ]
-        else:
-            matching_leaves = [
-                leaf for leaf in iter_condition_events(node)
-                if leaf.get("type") == event_type and check_event_params(leaf, event_payload)
-            ]
-        if not matching_leaves:
-            return False
-
-        with self._lock:
-            seen = self._seen.setdefault(rule_key, {})
-            deadlines = self._absence_deadlines.setdefault(rule_key, {})
-            matching_keys = {_event_key(leaf) for leaf in matching_leaves}
-            for absence in _absence_nodes(node):
-                children = _condition_children(absence)
-                if len(children) == 1 and _event_key(children[0]) in matching_keys:
-                    key = "not:" + _event_key(children[0])
-                    deadlines[key] = (timestamp + float(absence["within_seconds"]), False)
-                    seen.pop(key, None)
-            positive_keys = {_event_key(leaf) for leaf in _positive_events(node)}
-            matching_leaves = [leaf for leaf in matching_leaves if _event_key(leaf) in positive_keys]
-            if not matching_leaves:
-                return False
-            fired = self._fired.get(rule_key, ())
-            if any(key not in seen for key, _fired_at in fired):
-                self._fired.pop(rule_key, None)
-            for leaf in matching_leaves:
-                seen[_event_key(leaf)] = {
-                    "binding_id": leaf.get("binding_id"),
-                    "event": {
-                        "type": leaf.get("type", ""),
-                        "params": dict(leaf.get("params", {})),
-                    },
-                    "timestamp": timestamp,
-                    "payload": dict(event_payload),
-                }
-
-            return self._record_match(rule_key, node, seen)
-
-    def _record_match(self, rule_key, node, seen):
-        matched, signature = self._evaluate(node, seen)
-        if not matched or self._fired.get(rule_key) == signature:
-            return False
-        self._fired[rule_key] = signature
-        self._last_matches[rule_key] = [dict(seen[key]) for key, _timestamp in signature if key in seen]
-        return True
-
-    def _evaluate(
-        self,
-        node: Dict[str, Any],
-        seen: Dict[str, Dict[str, Any]],
-    ) -> tuple[bool, tuple[tuple[str, float], ...]]:
-        if _is_event_leaf(node):
-            key = _event_key(node)
-            entry = seen.get(key)
-            return (
-                entry is not None,
-                ((key, float(entry["timestamp"])),) if entry else (),
-            )
-
-        children = _condition_children(node)
-        if not children:
-            return False, ()
-        if _condition_op(node) == "not":
-            key = "not:" + _event_key(children[0])
-            entry = seen.get(key)
-            return entry is not None, ((key, float(entry["timestamp"])),) if entry else ()
-        states = [self._evaluate(child, seen) for child in children]
-        op = _condition_op(node)
-        if op == "all":
-            if not all(ok for ok, _signature in states):
-                return False, ()
-            signature = tuple(item for _ok, part in states for item in part)
-            window = node.get("within_seconds")
-            if window not in (None, ""):
-                try:
-                    limit = float(window)
-                except (TypeError, ValueError):
-                    return False, ()
-                timestamps = [item[1] for item in signature]
-                if limit < 0 or (timestamps and max(timestamps) - min(timestamps) > limit):
-                    return False, ()
-            return True, tuple(sorted(signature))
-
-        # any 条件组选最近命中的分支，缓存顺序不再决定 OR 组合
-        matches = [signature for ok, signature in states if ok]
-        if matches:
-            latest = max(
-                matches,
-                key=lambda signature: max((item[1] for item in signature), default=float("-inf")),
-            )
-            return True, latest
-        return False, ()
+def normalize_rule_input(rules: Any) -> List[Dict[str, Any]]:
+    try:
+        shaped = [normalize_rule_shape(rule) if isinstance(rule, dict) else rule for rule in rules] if isinstance(rules, list) else rules
+        errors = validate_rules_structure(shaped)
+        if errors:
+            raise RuleStructureError(errors)
+        normalized = normalize_rules(shaped)
+        errors = validate_rules_structure(normalized)
+        if errors:
+            raise RuleStructureError(errors)
+        return normalized
+    except RuleStructureError:
+        raise
+    except ValueError as error:
+        raise RuleStructureError([str(error)]) from error
 
 
 def aggregate_trigger_params(rules: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
@@ -755,7 +414,7 @@ def validate_rule_bindings(
 ) -> List[Dict[str, Any]]:
     from notmyfault.core.binding_schema import check_rule_bindings
 
-    return check_rule_bindings(rule, triggers_meta, actions_meta)
+    return check_rule_bindings(normalize_rule_shape(rule), triggers_meta, actions_meta)
 
 
 def validate_rules(
@@ -770,6 +429,11 @@ def validate_rules(
 
     for i, rule in enumerate(rules):
         rule_name = rule.get("name", f"规则 #{i+1}")
+        try:
+            rule = normalize_rule_shape(rule)
+        except ValueError as error:
+            issues.append((rule_name, str(error)))
+            continue
 
         condition_errors = validate_condition_tree(get_rule_condition(rule))
         if condition_errors:
