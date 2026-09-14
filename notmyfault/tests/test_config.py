@@ -14,6 +14,7 @@ from notmyfault.config import (
     normalize_rules,
 )
 from notmyfault.core.bindings import resolve_value
+from notmyfault.host.api.services.settings import SettingsService, SettingsServiceError
 from notmyfault.tests.api_support import make_paths, make_store
 
 
@@ -104,6 +105,8 @@ def test_round_trip_uses_the_existing_files_and_json_shape(tmp_path):
     assert rules_on_disk["value_encoding"] == "typed-v1"
     assert store.load_verified_config()["custom"] == "value"
     restored = store.load_verified_rules()[0]
+    assert normalize_rules([restored]) == [restored]
+    assert "event" not in restored and "trigger" not in restored
     assert restored["name"] == "提醒"
     assert restored["condition"]["op"] == "not"
     assert restored["condition"]["within_seconds"] == 10
@@ -287,9 +290,9 @@ def test_security_inspection_summarizes_rules_and_detects_tamper(tmp_path):
         }],
     })
     assert store.save_rules([rule])
-    status = store.inspect_security({
+    status = SettingsService(store, lambda: {"actions": {
         "shutdown_system": {"security": {"rule_approval": "admin_key"}},
-    })
+    }}).security_summary()
     assert status["status"] == "ok"
     assert status["summary"]["rule_count"] == 1
     assert status["summary"]["rules"][0]["actions"][0]["high_risk"] is True
@@ -311,7 +314,7 @@ def test_security_inspection_summarizes_rules_and_detects_tamper(tmp_path):
     raw = json.loads(paths.rules_file.read_text(encoding="utf-8"))
     raw["rules"][0]["name"] = "篡改"
     paths.rules_file.write_text(json.dumps(raw), encoding="utf-8")
-    assert store.inspect_security()["status"] == "tampered"
+    assert SettingsService(store).security_summary()["status"] == "tampered"
 
 
 def test_approve_current_files_resigns_reviewed_content(tmp_path):
@@ -321,7 +324,7 @@ def test_approve_current_files_resigns_reviewed_content(tmp_path):
     raw["approved_value"] = 7
     raw["_signature"] = "invalid"
     paths.config_file.write_text(json.dumps(raw), encoding="utf-8")
-    store.approve_current_files({"triggers": {}, "actions": {}}, None)
+    SettingsService(store).approve_security()
     assert store.load_verified_config()["approved_value"] == 7
 
 
@@ -362,5 +365,5 @@ def test_approve_rejects_dynamic_literal_only_parameter(tmp_path):
             }
         },
     }
-    with pytest.raises(ConfigValidationError, match="数据绑定无效"):
-        store.approve_current_files(schema, None)
+    with pytest.raises(SettingsServiceError, match="数据绑定无效"):
+        SettingsService(store, lambda: schema).approve_security()
