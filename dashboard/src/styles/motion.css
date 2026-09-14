@@ -1,0 +1,69 @@
+.page-enter-active{transition:opacity .22s ease-out,transform .22s cubic-bezier(.16,1,.3,1),filter .2s ease-out}
+.page-leave-active{transition:opacity .14s ease-in,transform .14s cubic-bezier(.4,0,1,1),filter .14s ease-in}
+.page-enter-from{opacity:0;transform:translateY(12px) scale(.992);filter:blur(2px)}
+.page-leave-to{opacity:0;transform:translateY(-8px) scale(.995);filter:blur(1px)}
+
+.content-swap-enter-active,.rule-route-enter-active{
+  transition:opacity .26s ease-out,transform .38s cubic-bezier(.16,1,.3,1),filter .24s ease-out
+}
+.content-swap-leave-active,.rule-route-leave-active{
+  transition:opacity .14s ease-in,transform .18s cubic-bezier(.4,0,1,1),filter .14s ease-in
+}
+.content-swap-enter-from{opacity:0;transform:translateY(14px) scale(.99);filter:blur(3px)}
+.content-swap-leave-to{opacity:0;transform:translateY(-7px) scale(.995);filter:blur(2px)}
+.rule-route-enter-from{opacity:0;transform:translateX(22px) scale(.992);filter:blur(3px)}
+.rule-route-leave-to{opacity:0;transform:translateX(-10px) scale(.996);filter:blur(2px)}
+/* 两套编辑器常驻 DOM，切换时只给当前表面播放入场动画。 */
+.editor-mode-active{animation:editor-mode-arrive .38s cubic-bezier(.16,1,.3,1)}
+@keyframes editor-mode-arrive{from{opacity:0;transform:translateY(14px) scale(.99);filter:blur(3px)}to{opacity:1;transform:none;filter:none}}
+
+.dialog-stage-enter-active{transition:opacity .22s ease-out,transform .3s cubic-bezier(.16,1,.3,1)}
+.dialog-stage-leave-active{transition:opacity .12s ease-in,transform .15s ease-in}
+.dialog-stage-enter-from{opacity:0;transform:translateX(18px)}
+.dialog-stage-leave-to{opacity:0;transform:translateX(-9px)}
+
+/* 用 >* 选所有子元素，旧的 picker-surface 只写了 .plugin-picker-dialog，QuickCreate 和 DesktopRecorder 没吃到动画 */
+.nmf-dialog-enter-active,.nmf-dialog-leave-active{transition:opacity .2s ease}
+.nmf-dialog-enter-active>*,.nmf-dialog-leave-active>*{transition:opacity .26s ease,transform .34s cubic-bezier(.16,1,.3,1)}
+.nmf-dialog-enter-from,.nmf-dialog-leave-to{opacity:0}
+.nmf-dialog-enter-from>*{opacity:0;transform:translateY(22px) scale(.96)}
+.nmf-dialog-leave-to>*{opacity:0;transform:translateY(10px) scale(.98)}
+
+/* 主题切换只给导航、表单和按钮等主要元素加过渡。 */
+.nav-rail,.app-main,.nav-item,.btn,.tab,.chip,.switch-track,.text-field,.select{
+  transition:background-color .3s ease,color .3s ease,border-color .3s ease
+}
+
+.stat-card,.card,.rule-card,.plugin-card,.status-hero,.sec-banner{
+  transition:box-shadow .2s ease,transform .2s ease,background-color .3s ease,border-color .3s ease
+}
+.plugin-card:hover{border-color:color-mix(in srgb,var(--md-primary) 46%,var(--md-outline-variant));background:var(--md-surface-c)}
+
+/* 按钮悬停和按下时分别使用 8% 与 12% 的状态层。 */
+.btn{transition:box-shadow .18s ease,background-color .18s ease,border-radius .18s ease,transform .1s ease}
+.btn::after{content:'';position:absolute;inset:0;background:currentColor;opacity:0;transition:opacity .15s ease;pointer-events:none;border-radius:inherit}
+.btn:hover::after{opacity:var(--st-hover)}
+.btn:active::after{opacity:var(--st-press)}
+.btn:active{transform:scale(.97)}
+
+.nav-item{transition:background .18s,color .18s,transform .12s ease}
+.nav-item:active{transform:scale(.96)}
+
+.status-dot.running{animation:nmf-pulse 2.4s ease-in-out infinite}
+@keyframes nmf-pulse{
+  0%,100%{box-shadow:0 0 0 0 color-mix(in srgb,var(--md-success) 45%,transparent)}
+  50%{box-shadow:0 0 0 10px transparent}
+}
+
+.text-field,.select{transition:border-color .18s ease,box-shadow .18s ease}
+.text-field:focus,.select:focus{box-shadow:0 0 0 3px color-mix(in srgb,var(--md-primary) 14%,transparent)}
+
+.snackbar{transition:transform .3s cubic-bezier(.2,0,0,1),opacity .25s ease}
+
+/* 暗色主题下卡片增加细边框，边缘仍能和背景分开。 */
+:root[data-theme="dark"] .stat-card,
+:root[data-theme="dark"] .card,
+:root[data-theme="dark"] .rule-card,
+:root[data-theme="dark"] .plugin-card{
+  border:1px solid color-mix(in srgb,var(--md-surface-c-highest) 50%,transparent)
+}

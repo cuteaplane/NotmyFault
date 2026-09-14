@@ -1,0 +1,42 @@
+@media(max-width:980px){
+  .flow-rule-editor{padding:18px}
+  .rule-title-capsule{width:min(300px,38vw)}
+  .node-editor-workspace{grid-template-columns:1fr}
+  .node-canvas-panel{min-height:520px}
+  .node-minimap{display:none}
+  .automation-stage{grid-template-columns:38px minmax(0,1fr)}
+  .stage-content{padding-left:7px}
+  .flow-empty-card,.flow-add-control{align-items:stretch;flex-direction:column}
+  .flow-empty-card .select,.flow-add-control .select{width:100%}
+}
+@media(max-width:620px){
+  .rule-editor-identity{width:100%;flex-wrap:wrap}.rule-back-btn{padding-left:4px}.rule-title-capsule{order:3;width:calc(100% - 86px);max-width:none}.rule-title-edit{order:4}.rule-folder-button{order:5}
+  .editor-mode-bar{align-items:stretch}.rule-editor-actions{justify-content:flex-end;flex-wrap:wrap}.draft-state{margin-right:auto}
+  .action-retry-body,.failure-action-policy-grid{grid-template-columns:1fr}
+  .node-canvas-tools .btn{width:34px;padding:0;justify-content:center}
+  .node-canvas-tools .btn{font-size:0}
+  .node-canvas-tools .btn .material-symbols-outlined{font-size:19px}
+  .editor-mode-bar{align-items:flex-start;flex-direction:column}
+  .draft-change-strip{grid-template-columns:22px minmax(0,1fr) auto}.draft-change-items{grid-column:1/-1}.draft-change-strip>small{grid-column:3}
+  .plugin-picker-dialog{max-height:calc(100vh - 20px)}
+  .plugin-picker-item{grid-template-columns:38px minmax(0,1fr) 20px}.plugin-picker-item .chip{display:none}
+  .folder-picker-create{align-items:stretch;flex-direction:column}.folder-picker-create>.btn{justify-content:center}
+}
+/* 列表项交错入场，给容器加 .stagger 类 */
+.stagger>*{animation:nmf-stagger .4s cubic-bezier(.16,1,.3,1) both}
+.stagger>*:nth-child(2){animation-delay:45ms}.stagger>*:nth-child(3){animation-delay:90ms}
+.stagger>*:nth-child(4){animation-delay:135ms}.stagger>*:nth-child(5){animation-delay:180ms}
+.stagger>*:nth-child(6){animation-delay:225ms}.stagger>*:nth-child(7){animation-delay:270ms}
+.stagger>*:nth-child(8){animation-delay:315ms}
+@keyframes nmf-stagger{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+
+@media(prefers-reduced-motion:reduce){
+  .graph-node,.flow-expand,.flow-card>summary,.node-inspector-slide-enter-active,.node-inspector-slide-leave-active,
+  .page-enter-active,.page-leave-active,.content-swap-enter-active,.content-swap-leave-active,
+  .rule-route-enter-active,.rule-route-leave-active,
+  .dialog-stage-enter-active,.dialog-stage-leave-active,
+  .status-strip-enter-active,.status-strip-leave-active,
+  .plugin-origin-switch::before,.plugin-list-next-enter-active,.plugin-list-next-leave-active,.plugin-list-prev-enter-active,.plugin-list-prev-leave-active,
+  .nmf-dialog-enter-active,.nmf-dialog-leave-active,.nmf-dialog-enter-active>*,.nmf-dialog-leave-active>*{transition:none}
+  .nav-item.active .nav-ind,.status-dot.running,.editor-mode-active,dialog,dialog::backdrop,.stagger>*{animation:none}
+}
