@@ -12,13 +12,11 @@ from notmyfault.security.plugin_schema import (
     check_permissions_conform,
     current_platform_name,
     get_permission_info,
-    scan_plugin_security,
     validate_plugin_meta,
 )
-from notmyfault.security.plugins import (
-    plugin_signature_kind,
-    scan_borrowed_privilege,
-)
+from notmyfault.security.plugin_checks import inspect_plugin, inspection_report
+from notmyfault.security.plugins import load_plugin_manifest
+from notmyfault.security.security import detect_security_mode
 
 
 def _manifest_path(plugin_dir: Path) -> tuple[Path | None, str | None]:
@@ -32,24 +30,6 @@ def _manifest_path(plugin_dir: Path) -> tuple[Path | None, str | None]:
     return None, None
 
 
-def _entrypoint_report(
-    plugin_dir: Path, meta: dict[str, Any], plugin_type: str
-) -> dict[str, Any]:
-    platform = current_platform_name()
-    entrypoints = meta.get("entrypoints")
-    if isinstance(entrypoints, dict):
-        relative = entrypoints.get(platform)
-    else:
-        relative = "action.py" if plugin_type == "action" else "trigger.py"
-    path = plugin_dir / relative if isinstance(relative, str) else None
-    return {
-        "platform": platform,
-        "declared": entrypoints if isinstance(entrypoints, dict) else {},
-        "selected": relative,
-        "exists": bool(path and path.is_file()),
-    }
-
-
 def check_plugin(plugin_dir: str | Path) -> dict[str, Any]:
     root = Path(plugin_dir).resolve()
     report: dict[str, Any] = {"path": str(root), "ok": False}
@@ -57,28 +37,19 @@ def check_plugin(plugin_dir: str | Path) -> dict[str, Any]:
     if manifest_path is None or plugin_type is None:
         report["errors"] = ["未找到 action.json 或 trigger.json"]
         return report
-    try:
-        meta = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        report["errors"] = ["插件清单无法读取或不是有效 JSON"]
+    capability_report = probe_capabilities()
+    inspection = inspect_plugin(root, plugin_type, capability_report=capability_report, installed_manifest=load_plugin_manifest())
+    if inspection.errors:
+        report["errors"] = ["插件清单无法读取或不是有效 JSON"] if any(error.startswith("JSON 解析失败") for error in inspection.errors) else inspection.errors
         return report
-    if not isinstance(meta, dict):
-        report["errors"] = ["插件清单根节点必须是对象"]
-        return report
-
-    schema_ok, schema_errors = validate_plugin_meta(meta, plugin_type)
+    meta = inspection.meta
+    schema_errors = inspection.schema_errors
+    schema_ok = not schema_errors
     platform = current_platform_name()
-    platforms = meta.get("platforms")
-    entrypoints = meta.get("entrypoints")
-    platform_ok = (
-        platform in entrypoints
-        if isinstance(entrypoints, dict) and entrypoints
-        else not platforms or platform in platforms
-    )
+    platform_ok = inspection.platform_compatible
     required = meta.get("requires_capabilities") or []
     if not isinstance(required, list):
         required = []
-    capability_report = probe_capabilities()
     capabilities = [
         {"id": capability, **capability_report.get(capability, {
             "available": False,
@@ -100,12 +71,14 @@ def check_plugin(plugin_dir: str | Path) -> dict[str, Any]:
             "known": info is not None,
             "risk": info["risk"] if info else "unknown",
         })
-    risks = scan_plugin_security(str(root))
-    borrowed = []
-    for source in sorted(root.rglob("*.py")):
-        if source.is_file():
-            borrowed.extend(scan_borrowed_privilege(str(source)))
-    entrypoint = _entrypoint_report(root, meta, plugin_type)
+    checks = inspection_report(inspection, detect_security_mode())
+    selected = Path(inspection.entrypoint).relative_to(root).as_posix() if inspection.entrypoint else None
+    entrypoint = {
+        "platform": platform,
+        "declared": meta.get("entrypoints") or {},
+        "selected": selected,
+        "exists": inspection.entrypoint_exists,
+    }
     contributes = meta.get("contributes") or {}
     if not isinstance(contributes, dict):
         contributes = {}
@@ -129,25 +102,20 @@ def check_plugin(plugin_dir: str | Path) -> dict[str, Any]:
             "errors": permission_errors,
             "items": permission_report,
         },
-        "risks": risks,
-        "borrowed_privilege": sorted(set(borrowed)),
-        "signature": plugin_signature_kind(str(root), "user"),
+        "risks": inspection.risks,
+        "borrowed_privilege": sorted(set(inspection.borrowed)),
+        "signature": inspection.signature.kind,
+        "checks": checks,
         "entrypoints": entrypoint,
         "contributions": contribution_ids,
     })
-    report["ok"] = bool(
-        schema_ok
-        and platform_ok
-        and permission_ok
-        and entrypoint["exists"]
-        and all(item["available"] for item in capabilities)
-    )
+    report["ok"] = checks["development"]["allowed"]
     return report
 
 
 def _print_report(report: dict[str, Any]) -> None:
     state = "通过" if report.get("ok") else "未通过"
-    print(f"plugin check: {state}")
+    print(f"plugin check 开发检查: {state}")
     print(f"路径: {report.get('path', '')}")
     if "type" not in report:
         for error in report.get("errors", []):
@@ -170,6 +138,10 @@ def _print_report(report: dict[str, Any]) -> None:
     for item in report["permissions"]["items"]:
         print(f"permission: {item['id']} {item['risk']}")
     print(f"signature: {report['signature']}")
+    policy = report["checks"]["load_policy"]
+    print(f"load policy ({policy['mode']}): {'allowed' if policy['allowed'] else 'rejected'}")
+    for error in policy["errors"]:
+        print(f"  - {error}")
     selected = report["entrypoints"].get("selected") or "none"
     print(f"entrypoint: {selected} {'ok' if report['entrypoints']['exists'] else 'missing'}")
     for kind, identifiers in report["contributions"].items():

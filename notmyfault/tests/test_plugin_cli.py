@@ -30,7 +30,10 @@ def write_action(root: Path, **overrides) -> Path:
     return root
 
 
-def test_check_reports_all_plugin_surfaces(tmp_path):
+def test_check_reports_all_plugin_surfaces(tmp_path, monkeypatch):
+    from notmyfault.security.security import SecurityMode
+
+    monkeypatch.setattr(plugin_cli, "detect_security_mode", lambda: SecurityMode.STRICT)
     root = write_action(
         tmp_path / "sample_action",
         contributes={
@@ -55,6 +58,9 @@ def test_check_reports_all_plugin_surfaces(tmp_path):
     assert report["permissions"]["items"] == []
     assert report["risks"] == []
     assert report["signature"] == "none"
+    assert report["checks"]["development"]["allowed"] is True
+    assert report["checks"]["load_policy"]["allowed"] is False
+    assert "签名无效" in report["checks"]["load_policy"]["errors"]
     assert report["entrypoints"]["selected"] == "action.py"
     assert set(report["contributions"]) == {
         "commands", "views", "parameter_editors", "data_types"
