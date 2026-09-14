@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 from typing import Any, Dict
 
@@ -10,8 +9,13 @@ from notmyfault.core.type_registry import TypeRegistry
 from notmyfault.core.data_types import DataTypeError
 from notmyfault.host.api.ports import EngineControlPort
 from notmyfault.platform.capabilities import probe_capabilities
-from notmyfault.security.plugin_loader import is_plugin_platform_compatible
-from notmyfault.security.plugin_schema import scan_plugins, validate_plugin_meta
+from notmyfault.security.plugin_checks import (
+    inspect_plugin, inspect_plugin_metadata, inspection_report,
+    is_plugin_platform_compatible, plugin_directories,
+)
+from notmyfault.security.security import detect_security_mode
+from notmyfault.security.plugins import load_plugin_manifest
+from notmyfault.security.plugin_schema import scan_plugins
 
 
 class PluginCatalogService:
@@ -112,6 +116,7 @@ class PluginCatalogService:
                 json_name,
                 "builtin",
                 plugin_kind,
+                capability_report,
             )
             if os.path.isdir(user_dir):
                 for plugin_id, meta in scan_plugins(
@@ -129,6 +134,7 @@ class PluginCatalogService:
                     json_name,
                     "user",
                     plugin_kind,
+                    capability_report,
                 )
             for plugin_id in disabled_set:
                 if plugin_id in result[plugin_kind]:
@@ -253,38 +259,33 @@ class PluginCatalogService:
             meta["availability"] = "partial" if degraded else "available"
             meta["unavailable_reasons"] = degraded
 
-    @staticmethod
     def _include_unscannable_plugins(
+        self,
         result: Dict[str, Any],
         plugin_root: str,
         json_name: str,
         origin: str,
         plugin_kind: str,
+        capability_report: Dict[str, Dict[str, Any]],
     ) -> None:
-        if not os.path.isdir(plugin_root):
-            return
-        plugin_type = "trigger" if plugin_kind == "triggers" else "action"
-        for folder_name in sorted(os.listdir(plugin_root)):
-            json_path = os.path.join(plugin_root, folder_name, json_name)
-            if not os.path.exists(json_path):
+        kind = "trigger" if plugin_kind == "triggers" else "action"
+        mode = detect_security_mode()
+        installed = load_plugin_manifest(self.paths.plugin_manifest_file) if origin == "user" else {}
+        for folder in plugin_directories(plugin_root):
+            if not (folder / json_name).is_file():
                 continue
-            try:
-                with open(json_path, "r", encoding="utf-8") as file:
-                    meta = json.load(file)
-            except (json.JSONDecodeError, OSError):
+            meta, errors, schema_errors = inspect_plugin_metadata(folder, kind)
+            if errors:
                 continue
-            if not isinstance(meta, dict):
-                result.setdefault(folder_name, {
-                    "id": folder_name,
-                    "origin": origin,
-                    "_error": "schema: 插件元数据不是有效的 JSON 对象",
+            plugin_id = meta.get("id", folder.name)
+            existing = result.get(plugin_id)
+            if existing is not None and existing.get("origin") != origin:
+                continue
+            if schema_errors:
+                result.setdefault(plugin_id, {
+                    **meta, "id": plugin_id, "origin": origin,
+                    "_error": "schema: " + "; ".join(schema_errors[:2]),
                 })
                 continue
-            plugin_id = meta.get("id", folder_name)
-            if plugin_id in result:
-                continue
-            meta["origin"] = origin
-            valid, errors = validate_plugin_meta(meta, plugin_type)
-            if not valid:
-                meta["_error"] = "schema: " + "; ".join(errors[:2])
-            result[plugin_id] = meta
+            inspection = inspect_plugin(folder, kind, origin, capability_report=capability_report, installed_manifest=installed)
+            result.setdefault(plugin_id, {**meta, "origin": origin})["checks"] = inspection_report(inspection, mode)

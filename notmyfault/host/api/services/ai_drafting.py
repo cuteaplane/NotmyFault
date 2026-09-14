@@ -402,8 +402,6 @@ class AIDraftingService:
         if not isinstance(candidate, dict):
             raise ValueError("invalid AI draft candidate")
         draft = dict(candidate)
-        if "event" not in draft and isinstance(draft.get("trigger"), dict):
-            draft["event"] = draft.pop("trigger")
         draft = ensure_rule_binding_ids(draft)
         return {
             "ok": True,

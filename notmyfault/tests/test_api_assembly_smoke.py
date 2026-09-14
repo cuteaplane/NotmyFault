@@ -4,6 +4,7 @@ import asyncio
 import runpy
 import shutil
 import signal
+import sys
 import time
 from pathlib import Path
 
@@ -41,6 +42,10 @@ def wait_for(predicate, timeout=5.0):
 
 
 def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_path):
+    monkeypatch.setattr("notmyfault.core.engine.AutomationEngine._alert_user", lambda *args, **kwargs: None)
+    monkeypatch.setattr("notmyfault.platform.platform_support.show_notification", lambda *args, **kwargs: None)
+    if sys.platform == "win32":
+        monkeypatch.setattr("Win_toaster.AUMID_Register.register_toaster", lambda *args, **kwargs: None)
     launcher_path = Path(__file__).resolve().parents[2] / "NOTMYFAULT.pyw"
     namespace = runpy.run_path(str(launcher_path), run_name="notmyfault_assembly_test")
     monkeypatch.setattr(signal, "signal", lambda *args: None)

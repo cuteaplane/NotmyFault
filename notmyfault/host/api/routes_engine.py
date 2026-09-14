@@ -74,6 +74,17 @@ def create_engine_router(
     async def engine_logs(lines: int = 200):
         return service.logs(lines)
 
+    @router.get("/api/engine/logs/files")
+    async def engine_log_files():
+        return service.log_files()
+
+    @router.get("/api/engine/logs/entries")
+    async def engine_log_entries(lines: int = 600, name: str = ""):
+        try:
+            return service.log_entries(lines, name)
+        except ValueError as error:
+            return JSONResponse({"ok": False, "error": str(error)}, status_code=400)
+
     @router.get("/api/events")
     async def event_stream(request: Request):
         async def generate():

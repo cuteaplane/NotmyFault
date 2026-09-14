@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -22,6 +23,8 @@ EXPECTED_OPERATIONS = {
     ("GET", "/api/runs/{run_id}"),
     ("POST", "/api/runs/{run_id}/cancel"),
     ("GET", "/api/engine/logs"),
+    ("GET", "/api/engine/logs/files"),
+    ("GET", "/api/engine/logs/entries"),
     ("GET", "/api/events"),
     ("GET", "/api/plugins/extensions"),
     ("POST", "/api/plugins/{plugin_id}/extensions/commands/{command_id}/invoke"),
@@ -128,7 +131,7 @@ def test_security_status_separates_installation_from_config_without_engine(
         {"path": "actions/notify", "reason": "内置插件签名缺失或无效"}
     ]
 
-    monkeypatch.setattr(settings, "verify_plugin_sig", lambda path, origin: True)
+    monkeypatch.setattr(settings, "inspect_signature", lambda *args: SimpleNamespace(kind="official"))
     env.paths.config_file.write_text("{broken", encoding="utf-8")
     body = env.client.get("/api/config/security-status", headers=env.headers).json()
     assert body["installation"]["status"] == "ok"

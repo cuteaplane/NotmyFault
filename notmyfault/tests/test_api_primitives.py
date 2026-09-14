@@ -235,7 +235,7 @@ def test_rule_run_route_rejects_test_data_over_one_mib(tmp_path) -> None:
 def test_rule_run_service_validates_and_forwards_scoped_test_context(upstream, policy, valid) -> None:
     rule = {
         "name": "局部运行",
-        "event": {
+        "condition": {
             "type": "hotkey",
             "binding_id": "t_hot001",
             "params": {},
@@ -326,7 +326,7 @@ def test_rule_run_service_validates_and_forwards_scoped_test_context(upstream, p
 def test_rule_run_service_checks_missing_and_invalid_reference_payloads() -> None:
     rule = {
         "name": "引用检查",
-        "event": {
+        "condition": {
             "type": "hotkey",
             "binding_id": "t_hot001",
             "params": {},

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Mapping, TypeAlias
+from notmyfault.core.rule_model import normalize_rule_shape
 
 from notmyfault.host.ai_tools import (
     JSON,
@@ -52,16 +53,20 @@ def _catalog_map(catalog: PluginCatalog, key: str) -> dict[str, JSON]:
     return value
 
 
-_RULE_FIELDS = frozenset({"name", "event", "actions"})
+_RULE_FIELDS = frozenset({"name", "condition", "actions"})
 _NODE_FIELDS = frozenset({"type", "params"})
 
 
 def parse_rule_draft(
     args: Mapping[str, JSON], catalog: PluginCatalog
 ) -> Mapping[str, JSON]:
+    try:
+        args = normalize_rule_shape(dict(args))
+    except ValueError as error:
+        raise ToolCallError("rule_invalid", str(error)) from error
     _reject_extra_fields(args, _RULE_FIELDS, "rule", "rule_invalid")
     name = _require_str(args.get("name"), "rule.name", "rule_invalid")
-    event = _require_object(args.get("event"), "rule.event", "rule_invalid")
+    condition = _require_object(args.get("condition"), "rule.condition", "rule_invalid")
     actions = _require_list(
         args.get("actions"), "rule.actions", "rule_invalid", nonempty=True
     )
@@ -80,7 +85,7 @@ def parse_rule_draft(
         )
     draft: dict[str, JSON] = {
         "name": name,
-        "event": _parse_node(event, triggers, "event", "触发器"),
+        "condition": _parse_node(condition, triggers, "condition", "触发器"),
         "actions": normalized,
     }
     return draft

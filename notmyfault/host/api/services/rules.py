@@ -7,12 +7,13 @@ from typing import Any, Callable, Dict, List
 from notmyfault.config import (
     ConfigValidationError,
     SignedConfigStore,
-    ensure_rule_binding_ids,
-    ensure_rule_id,
 )
+from notmyfault.core.rule_model import normalize_rule_shape, normalize_rules
 from notmyfault.core.rules import (
+    RuleStructureError,
     get_rule_events,
     iter_action_nodes,
+    normalize_rule_input,
     validate_rule_bindings,
     validate_rules,
     validate_rules_structure,
@@ -41,8 +42,8 @@ class RuleService:
     def list_rules(self) -> Dict[str, Any]:
         try:
             rules = self._store.load_verified_rules(for_editing=True)
-        except ConfigValidationError:
-            rules = []
+        except ConfigValidationError as error:
+            return {"ok": False, "rules": None, "config_error": str(error)}
         return {"rules": rules}
 
     def validate_draft(self, rule: Any) -> Dict[str, Any]:
@@ -59,12 +60,16 @@ class RuleService:
                 item["location"] = location
             issues.append(item)
 
-        structure_errors = validate_rules_structure([rule])
+        try:
+            rule = normalize_rule_shape(rule) if isinstance(rule, dict) else rule
+            structure_errors = validate_rules_structure([rule])
+        except ValueError as error:
+            structure_errors = [str(error)]
         if structure_errors:
             for message in structure_errors[:20]:
                 add("error", "invalid_structure", message)
         else:
-            normalized = ensure_rule_binding_ids(rule)
+            normalized = normalize_rules([rule])[0]
             schema = self._plugin_schema()
             _valid, _total, plugin_errors, plugin_warnings = validate_rules(
                 [normalized],
@@ -178,6 +183,7 @@ class RuleService:
                 400,
                 {"ok": False, "error": "rules 必须是列表"},
             )
+        rules = self._normalize_input(rules)
         try:
             require_admin_rule_approval(
                 [],
@@ -194,26 +200,7 @@ class RuleService:
         rules: Any,
         admin_key_password: Any,
     ) -> Dict[str, Any]:
-        structure_errors = validate_rules_structure(rules)
-        if structure_errors:
-            raise RuleServiceError(
-                400,
-                {
-                    "ok": False,
-                    "error": "规则结构校验失败",
-                    "details": structure_errors[:10],
-                },
-            )
-        if not isinstance(rules, list):
-            raise RuleServiceError(
-                400,
-                {"ok": False, "error": "rules 必须是列表"},
-            )
-        seen_rule_ids: set[str] = set()
-        normalized_rules = [
-            ensure_rule_binding_ids(ensure_rule_id(rule, seen_rule_ids))
-            for rule in rules
-        ]
+        normalized_rules = self._normalize_input(rules)
         structure_errors = validate_rules_structure(normalized_rules)
         if structure_errors:
             raise RuleServiceError(
@@ -288,11 +275,15 @@ class RuleService:
             )
         return {"ok": True, "rules": normalized_rules}
 
-    def _load_config(self) -> Dict[str, Any]:
+    @staticmethod
+    def _normalize_input(rules: Any) -> List[Dict[str, Any]]:
         try:
-            return self._store.load_verified_config()
-        except ConfigValidationError:
-            return {"rules": []}
+            return normalize_rule_input(rules)
+        except RuleStructureError as error:
+            errors = error.errors
+        raise RuleServiceError(400, {
+            "ok": False, "error": "规则结构校验失败", "details": errors[:10],
+        })
 
     @staticmethod
     def _approval_error(error: AdminRuleApprovalError) -> RuleServiceError:

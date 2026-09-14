@@ -10,6 +10,7 @@ from notmyfault.core.data_types import DataTypeError
 from notmyfault.core.type_registry import TypeRegistry
 from notmyfault.core.variables import initialize_variables
 from notmyfault.core.rules import get_rule_events, validate_rules_structure
+from notmyfault.core.rule_model import normalize_rule_shape
 from notmyfault.host.api.ports import EngineControlPort
 from notmyfault.security.plugin_schema import check_payload_contract
 
@@ -122,10 +123,7 @@ class RuleRunService:
                 },
             )
 
-        execution_source = {
-            "preconditions": candidate_rule.get("preconditions", []),
-            "actions": selected_actions,
-        }
+        execution_source = {"actions": selected_actions}
         references = list(iter_references(execution_source))
         required_upstream_ids = sorted(
             {
@@ -257,6 +255,10 @@ class RuleRunService:
         snapshot: Any,
     ) -> Dict[str, Any]:
         if has_snapshot:
+            try:
+                snapshot = normalize_rule_shape(snapshot) if isinstance(snapshot, dict) else snapshot
+            except ValueError as error:
+                self._fail(400, str(error))
             structure_errors = validate_rules_structure([snapshot])
             if structure_errors:
                 raise RuleRunServiceError(

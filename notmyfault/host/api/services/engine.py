@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-from collections import deque
 import os
 import sys
-import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Protocol
 
 from notmyfault.application_paths import ApplicationPaths
 from notmyfault.config import ConfigValidationError, SignedConfigStore
-from notmyfault.core.logging import get_latest_log
+from notmyfault.host.log_files import LogFiles
 from notmyfault.core.rules import get_rule_events
 from notmyfault.core.run_history import RunHistory
 from notmyfault.host.api.ports import EngineControlPort
@@ -42,13 +40,7 @@ class EngineService:
         self._history = history
         self._extension_sessions = extension_sessions
         self._process_id = process_id
-        self._log_lock = threading.Lock()
-        self._log_key = None
-        self._log_offset = 0
-        self._log_mtime = 0
-        self._log_total = 0
-        self._log_pending = b""
-        self._log_tail: deque[str] = deque(maxlen=2000)
+        self._logs = LogFiles(str(paths.logs_dir))
 
     def start(self) -> Dict[str, Any]:
         current_state = self._engine.engine_state
@@ -185,40 +177,13 @@ class EngineService:
         return {"ok": True, "message": "已请求停止这次运行"}
 
     def logs(self, lines: int) -> Dict[str, Any]:
-        safe_lines = min(max(int(lines), 1), 2000)
-        log_path = get_latest_log(str(self._paths.logs_dir))
-        if not log_path:
-            return {"lines": [], "total": 0}
-        try:
-            with self._log_lock, open(log_path, "rb") as file:
-                stat = os.fstat(file.fileno())
-                key = (log_path, stat.st_dev, stat.st_ino)
-                if key != self._log_key or stat.st_size < self._log_offset or (
-                    stat.st_size == self._log_offset and stat.st_mtime_ns != self._log_mtime
-                ):
-                    self._log_key = key
-                    self._log_offset = 0
-                    self._log_total = 0
-                    self._log_pending = b""
-                    self._log_tail.clear()
-                file.seek(self._log_offset)
-                while chunk := file.read(65536):
-                    parts = (self._log_pending + chunk).split(b"\n")
-                    self._log_pending = parts.pop()
-                    self._log_total += len(parts)
-                    self._log_tail.extend(part.rstrip(b"\r").decode("utf-8", errors="replace") for part in parts)
-                self._log_offset = file.tell()
-                self._log_mtime = stat.st_mtime_ns
-                tail = list(self._log_tail)
-                if self._log_pending:
-                    tail.append(self._log_pending.decode("utf-8", errors="replace"))
-                total = self._log_total + bool(self._log_pending)
-        except FileNotFoundError:
-            return {"lines": [], "total": 0}
-        return {
-            "lines": tail[-safe_lines:],
-            "total": total,
-        }
+        return self._logs.tail(lines)
+
+    def log_entries(self, lines: int, name: str = "") -> list[dict]:
+        return self._logs.entries(lines, name)
+
+    def log_files(self) -> list[dict]:
+        return self._logs.list_files()
 
     def _scheduler_summary(self) -> Dict[str, Any]:
         current_engine = self._engine.current_engine

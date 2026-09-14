@@ -26,14 +26,16 @@ from notmyfault.host.plugin_registry import (
 from notmyfault.host.api.ports import PluginRegistryPort
 from notmyfault.security.plugin_schema import (
     check_permissions_conform,
-    current_platform_name,
     get_permission_info,
     is_valid_plugin_id,
-    scan_plugin_security,
     validate_plugin_meta,
 )
 from notmyfault.security.plugin_package import PluginPackageLimits, extract_nmfp
-from notmyfault.security.plugins import plugin_signature_kind, scan_borrowed_privilege
+from notmyfault.security.plugins import plugin_signature_kind
+from notmyfault.security.plugin_checks import (
+    inspect_plugin, inspection_report, is_plugin_platform_compatible,
+    validate_plugin_signature,
+)
 from notmyfault.security.security import detect_security_mode
 
 
@@ -211,8 +213,11 @@ class PluginInstallationService:
         root_path: str,
         json_name: str,
         meta: Dict[str, Any],
+        inspection=None,
     ) -> list[Dict[str, Any]]:
-        risks = scan_plugin_security(root_path)
+        kind = "trigger" if json_name == "trigger.json" else "action"
+        inspection = inspection or inspect_plugin(root_path, kind)
+        risks = list(inspection.risks)
         build = meta.get("build")
         if isinstance(build, dict) and (
             build.get("command") or build.get("outputs")
@@ -226,10 +231,7 @@ class PluginInstallationService:
                     "file": json_name,
                 }
             )
-        borrowed_findings = []
-        for py_file in sorted(Path(root_path).rglob("*.py")):
-            if py_file.is_file():
-                borrowed_findings.extend(scan_borrowed_privilege(str(py_file)))
+        borrowed_findings = inspection.borrowed
         if borrowed_findings:
             risks.append(
                 {
@@ -280,8 +282,10 @@ class PluginInstallationService:
             plugin_kind, json_name = self._plugin_kind(root_path)
             meta = self._read_manifest(root_path / json_name)
             plugin_type = "trigger" if plugin_kind == "triggers" else "action"
-            schema_valid, schema_errors = validate_plugin_meta(meta, plugin_type)
-            risks = self.scan_install_risks(str(root_path), json_name, meta)
+            inspection = inspect_plugin(root_path, plugin_type)
+            schema_errors = inspection.errors + inspection.schema_errors
+            schema_valid = not schema_errors
+            risks = self.scan_install_risks(str(root_path), json_name, meta, inspection)
             permissions = []
             for permission in meta.get("permissions", []):
                 info = get_permission_info(permission)
@@ -347,6 +351,11 @@ class PluginInstallationService:
                 "risks": risks,
                 "schema_valid": schema_valid,
                 "schema_errors": schema_errors[:5] if schema_errors else [],
+                "checks": inspection_report(inspection, detect_security_mode()),
+                "installation": {
+                    "requires_confirmation": bool(risks),
+                    "required_risk_ids": [risk["id"] for risk in risks if risk.get("id") == "build_hook"],
+                },
                 "update_diff": update_diff,
             }
         except PluginInstallationError:
@@ -532,13 +541,13 @@ class PluginInstallationService:
 
             def validate_staging(staging: Path) -> None:
                 written_meta = self._read_manifest(staging / json_name)
-                written_ok, written_errors = validate_plugin_meta(
-                    written_meta, plugin_type
-                )
+                inspection = inspect_plugin(staging, plugin_type)
+                written_errors = inspection.errors + inspection.schema_errors
+                written_ok = not written_errors
                 new_risks = [
                     risk
                     for risk in self.scan_install_risks(
-                        str(staging), json_name, written_meta
+                        str(staging), json_name, written_meta, inspection
                     )
                     if risk.get("id") not in accepted_risk_ids
                 ]
@@ -553,10 +562,8 @@ class PluginInstallationService:
                     )
                     error.risks = new_risks
                     raise error
-                from notmyfault.security.plugin_loader import validate_plugin_signature
-
                 validate_plugin_signature(
-                    staging, written_meta, "user", detect_security_mode()
+                    staging, written_meta, "user", detect_security_mode(), inspection.signature.kind
                 )
 
             try:
@@ -673,7 +680,7 @@ class PluginInstallationService:
         return None
 
     def _record_installed_hashes(self, plugin_dir: Path, plugin_id: str) -> None:
-        from notmyfault.security.plugin_loader import inspect_plugin_tree
+        from notmyfault.security.plugin_checks import inspect_plugin_tree
         from notmyfault.security.plugins import load_plugin_manifest, save_plugin_manifest
 
         tree = inspect_plugin_tree(str(plugin_dir))
@@ -832,11 +839,7 @@ class PluginInstallationService:
 
     @staticmethod
     def _platform_compatible(meta: Dict[str, Any]) -> bool:
-        entrypoints = meta.get("entrypoints", {})
-        if entrypoints:
-            return current_platform_name() in entrypoints
-        platforms = meta.get("platforms", [])
-        return not platforms or current_platform_name() in platforms
+        return is_plugin_platform_compatible(meta)
 
     @staticmethod
     def _list_diff(old_items: Any, new_items: Any) -> Dict[str, list[str]]:

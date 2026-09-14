@@ -59,10 +59,10 @@ _RULE_DRAFT_PARAMETERS: JSON = {
     "type": "object",
     "properties": {
         "name": {"type": "string"},
-        "event": _NODE_SCHEMA,
+        "condition": _NODE_SCHEMA,
         "actions": {"type": "array", "items": _NODE_SCHEMA},
     },
-    "required": ["name", "event", "actions"],
+    "required": ["name", "condition", "actions"],
     "additionalProperties": False,
 }
 

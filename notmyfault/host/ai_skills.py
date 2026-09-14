@@ -38,13 +38,13 @@ def _rule_draft_parameters(catalog: PluginCatalog) -> JSON:
         "type": "object",
         "properties": {
             "name": {"type": "string"},
-            "event": _node_schema(_sorted_ids(catalog, "triggers")),
+            "condition": _node_schema(_sorted_ids(catalog, "triggers")),
             "actions": {
                 "type": "array",
                 "items": _node_schema(_sorted_ids(catalog, "actions")),
             },
         },
-        "required": ["name", "event", "actions"],
+        "required": ["name", "condition", "actions"],
         "additionalProperties": False,
     }
 

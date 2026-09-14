@@ -33,7 +33,10 @@ def rule_args(**overrides):
 
 
 def test_valid_rule_returns_normalized_draft():
-    assert parse_rule_draft(rule_args(), make_catalog()) == rule_args()
+    expected = rule_args()
+    expected["condition"] = expected.pop("event")
+    assert parse_rule_draft(rule_args(), make_catalog()) == expected
+    assert parse_rule_draft(expected, make_catalog()) == expected
 
 
 @pytest.mark.parametrize(
