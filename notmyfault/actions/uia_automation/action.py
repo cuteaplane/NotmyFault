@@ -3,28 +3,16 @@
 import time
 
 from notmyfault.plugin_api import owned_value_api
-if __package__ == "notmyfault.actions.uia_automation":
-    from .nmf_uia_plugin.keyboard import perform_key_event
-    from .nmf_uia_plugin.macro_validation import validate_steps
-    from .nmf_uia_plugin.mouse import perform_coordinate
-    from .nmf_uia_plugin.uia import (
-        focus_selector_window,
-        focus_window_signature,
-        perform_selector,
-        read_selector_text,
-        wait_for_selector,
-    )
-else:
-    from nmf_uia_plugin.keyboard import perform_key_event
-    from nmf_uia_plugin.macro_validation import validate_steps
-    from nmf_uia_plugin.mouse import perform_coordinate
-    from nmf_uia_plugin.uia import (
-        focus_selector_window,
-        focus_window_signature,
-        perform_selector,
-        read_selector_text,
-        wait_for_selector,
-    )
+from .nmf_uia_plugin.keyboard import perform_key_event
+from .nmf_uia_plugin.macro_validation import validate_steps
+from .nmf_uia_plugin.mouse import perform_coordinate
+from .nmf_uia_plugin.uia import (
+    focus_selector_window,
+    focus_window_signature,
+    perform_selector,
+    read_selector_text,
+    wait_for_selector,
+)
 
 
 _owned_values = owned_value_api()

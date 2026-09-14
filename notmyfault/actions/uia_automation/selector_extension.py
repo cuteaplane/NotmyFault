@@ -3,20 +3,12 @@
 import copy
 import time
 
-if __package__ == "notmyfault.actions.uia_automation":
-    from .nmf_uia_plugin.uia import (
-        DesktopElementError,
-        capture_element_under_cursor,
-        check_selector,
-        validate_selector,
-    )
-else:
-    from nmf_uia_plugin.uia import (
-        DesktopElementError,
-        capture_element_under_cursor,
-        check_selector,
-        validate_selector,
-    )
+from .nmf_uia_plugin.uia import (
+    DesktopElementError,
+    capture_element_under_cursor,
+    check_selector,
+    validate_selector,
+)
 
 
 def _clamp_delay(value) -> float:

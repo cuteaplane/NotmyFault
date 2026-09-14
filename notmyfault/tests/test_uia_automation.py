@@ -29,6 +29,26 @@ POINT = {
 }
 
 
+def test_plugin_imports_action_and_both_workbenches_from_verified_sources():
+    from notmyfault.security.plugin_checks import inspect_plugin_tree
+    from notmyfault.security.plugin_imports import PluginImports
+
+    root = Path(macro_action.__file__).parent
+    tree = inspect_plugin_tree(str(root))
+    assert tree is not None
+    importer = PluginImports(str(root), "notmyfault.action_uia_import_test", tree.py_sources)
+    try:
+        action = importer.load_entry(str(root / "action.py"))
+        macro = importer.load_file(str(root / "component.py"))
+        selector = importer.load_file(str(root / "selector_extension.py"))
+        assert action.validate_steps(STEPS) == macro.validate_steps(STEPS)
+        assert callable(macro.open_macro)
+        assert callable(selector.edit_selector)
+        assert action.validate_steps.__module__.startswith(importer.namespace + ".")
+    finally:
+        importer.close()
+
+
 class TestExecuteMacro:
     def test_executes_steps_in_order(self, monkeypatch):
         calls = []

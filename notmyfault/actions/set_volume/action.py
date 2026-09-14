@@ -1,4 +1,4 @@
-from notmyfault.actions.set_volume.volume import set_volume
+from .volume import set_volume
 
 
 def run(action_info, params):

@@ -2,24 +2,14 @@
 
 import copy
 
-if __package__ == "notmyfault.actions.uia_automation":
-    from .nmf_uia_plugin.input_recorder import InputRecorder, build_macro_steps
-    from .nmf_uia_plugin.macro_validation import validate_steps
-    from .nmf_uia_plugin.mouse import current_virtual_screen
-    from .nmf_uia_plugin.uia import (
-        capture_element_at,
-        capture_foreground_window,
-        is_focused_password_control,
-    )
-else:
-    from nmf_uia_plugin.input_recorder import InputRecorder, build_macro_steps
-    from nmf_uia_plugin.macro_validation import validate_steps
-    from nmf_uia_plugin.mouse import current_virtual_screen
-    from nmf_uia_plugin.uia import (
-        capture_element_at,
-        capture_foreground_window,
-        is_focused_password_control,
-    )
+from .nmf_uia_plugin.input_recorder import InputRecorder, build_macro_steps
+from .nmf_uia_plugin.macro_validation import validate_steps
+from .nmf_uia_plugin.mouse import current_virtual_screen
+from .nmf_uia_plugin.uia import (
+    capture_element_at,
+    capture_foreground_window,
+    is_focused_password_control,
+)
 
 
 def _current_steps(value) -> list:
