@@ -19,7 +19,7 @@ def available(backend="test-backend"):
 
 
 def test_capability_returns_public_status():
-    with patch(
+    with patch("notmyfault.platform.services._platform_name", return_value="linux"), patch(
         "notmyfault.platform.capabilities.probe_capability",
         return_value=available("/usr/bin/wl-copy"),
     ):
@@ -73,7 +73,7 @@ def test_unavailable_service_uses_capability_reason():
         "reason": "未安装 wl-copy",
         "degraded": False,
     }
-    with patch(
+    with patch("notmyfault.platform.services._platform_name", return_value="linux"), patch(
         "notmyfault.platform.capabilities.probe_capability",
         return_value=value,
     ):
@@ -110,3 +110,19 @@ def test_internal_error_is_translated_to_public_error():
     assert caught.value.kind == "permission_denied"
     assert caught.value.reason == "拒绝写入：secret"
     assert isinstance(caught.value.__cause__, BackendPermissionDeniedError)
+
+
+@pytest.mark.parametrize("platform", ["windows", "macos"])
+def test_service_reports_unavailable_when_only_system_capability_exists(platform):
+    with (
+        patch("notmyfault.platform.services._platform_name", return_value=platform),
+        patch("notmyfault.platform.capabilities.probe_capability", return_value=available()),
+    ):
+        from notmyfault.platform.capabilities import probe_capability
+
+        assert probe_capability("clipboard.write")["available"] is True
+        services = platform_services()
+        assert services.capability("clipboard.write").available is False
+        with pytest.raises(PlatformServiceError) as caught:
+            services.write_clipboard("hello")
+        assert caught.value.kind == "unsupported"
