@@ -543,6 +543,130 @@ def test_window_pin_linux_dispatches_wmctrl(monkeypatch):
     assert calls == [mod.default_runner, ("pin", "title", "记事本")]
 
 
+class WindowControlBackend:
+    def __init__(self):
+        self.windows = {
+            22: {"hwnd": 22, "title": "文档 — App", "pid": 88, "process_name": "app.exe", "class_name": "AppWindow",
+                 "x": 20, "y": 30, "width": 800, "height": 600, "visible": True, "minimized": False,
+                 "maximized": False, "topmost": False, "opacity": 100},
+            11: {"hwnd": 11, "title": "草稿 — App", "pid": 88, "process_name": "app.exe", "class_name": "AppWindow",
+                 "x": 10, "y": 10, "width": 400, "height": 300, "visible": False, "minimized": False,
+                 "maximized": False, "topmost": False, "opacity": 100},
+        }
+        self.changed = []
+
+    def foreground(self):
+        return 22
+
+    def handles(self):
+        return list(self.windows)
+
+    def info(self, hwnd):
+        return dict(self.windows[hwnd]) if hwnd in self.windows else None
+
+    def show(self, hwnd, command):
+        self.changed.append((hwnd, "show"))
+        self.windows[hwnd].update(visible=command != 0, minimized=command == 6, maximized=command == 3)
+
+    def pin(self, hwnd, enabled):
+        self.changed.append((hwnd, "pin"))
+        self.windows[hwnd]["topmost"] = enabled
+
+    def position(self, hwnd, rect):
+        self.changed.append((hwnd, "position"))
+        self.windows[hwnd].update(rect)
+
+    def monitor_for(self, hwnd):
+        return 1
+
+    def monitors(self):
+        return [{"handle": 1, "work": {"x": 0, "y": 0, "width": 1920, "height": 1040}},
+                {"handle": 2, "work": {"x": -1441, "y": -100, "width": 1441, "height": 1001}}]
+
+
+def window_control(monkeypatch):
+    module = load_plugin("actions", "window_control")
+    backend = WindowControlBackend()
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(module, "_backend", lambda: backend)
+    meta = json.loads((PKG_ROOT / "actions/window_control/action.json").read_text(encoding="utf-8"))
+    return module, backend, meta
+
+
+@pytest.mark.parametrize("selector,expected", [
+    ({"target": "title", "title": "app"}, [22]),
+    ({"target": "class_name", "class_name": "^appwindow$", "match_mode": "regex"}, [22]),
+    ({"target": "process", "process_name": "APP", "include_hidden": True}, [22, 11]),
+    ({"target": "pid", "pid": 88, "include_hidden": True}, [22, 11]),
+    ({"target": "hwnd", "hwnd": 11}, [11]),
+])
+def test_window_control_selection_and_output_contract(monkeypatch, selector, expected):
+    module, backend, meta = window_control(monkeypatch)
+    result = invoke_action(module.run, module, meta, {"action": "list", **selector}, {})
+    assert [item["hwnd"] for item in result["windows"]] == expected
+    assert result["count"] == len(expected)
+    assert backend.changed == []
+
+
+def test_window_control_requires_explicit_multiple_match_policy(monkeypatch):
+    module, backend, _ = window_control(monkeypatch)
+    params = {"action": "pin", "target": "title", "title": "App", "include_hidden": True}
+    with pytest.raises(RuntimeError, match="匹配到 2 个窗口"):
+        module.run({}, params)
+    assert backend.changed == []
+    result = module.run({}, {**params, "match": "first"})
+    assert result["hwnd"] == 22
+    assert backend.changed == [(22, "pin")]
+    backend.changed.clear()
+    result = module.run({}, {**params, "match": "all"})
+    assert result["count"] == 2 and result["hwnd"] == 0
+    assert backend.changed == [(22, "pin"), (11, "pin")]
+
+
+@pytest.mark.parametrize("options,expected", [
+    ({"action": "snap", "layout": "right"}, {"x": -721, "y": -100, "width": 721, "height": 1001}),
+    ({"action": "snap", "layout": "bottom_left"}, {"x": -1441, "y": 400, "width": 720, "height": 501}),
+    ({"action": "move_to_monitor"}, {"x": -1121, "y": 100, "width": 800, "height": 600}),
+    ({"action": "move_resize", "x": -1200, "y": -80, "width": 640, "height": 480},
+     {"x": -1200, "y": -80, "width": 640, "height": 480}),
+])
+def test_window_control_restores_and_positions_in_monitor_work_area(monkeypatch, options, expected):
+    module, backend, meta = window_control(monkeypatch)
+    backend.windows[22]["minimized"] = True
+    result = invoke_action(module.run, module, meta, {**options, "monitor": "next"}, {})
+    window = result["windows"][0]
+    assert {key: window[key] for key in expected} == expected
+    assert not window["minimized"]
+    assert backend.changed == [(22, "show"), (22, "position")]
+
+
+def test_window_control_wait_can_be_cancelled(monkeypatch):
+    module, backend, meta = window_control(monkeypatch)
+    cancelled = threading.Event()
+    def disappear():
+        cancelled.set()
+        return []
+    monkeypatch.setattr(backend, "handles", disappear)
+    with pytest.raises(ActionCancelled):
+        invoke_action(module.run, module, meta, {"target": "all", "wait_seconds": 30},
+                      {"runtime": {"cancellation": ActionCancellation(cancelled)}})
+    assert backend.changed == []
+
+
+def test_window_control_batch_uses_one_deadline(monkeypatch):
+    module, backend, _ = window_control(monkeypatch)
+    clock = [0]
+    original = backend.pin
+    def slow_pin(hwnd, enabled):
+        original(hwnd, enabled)
+        clock[0] += 2
+    monkeypatch.setattr(backend, "pin", slow_pin)
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    with pytest.raises(RuntimeError, match="已完成 1/2"):
+        module.run({}, {"action": "pin", "target": "all", "match": "all", "include_hidden": True, "timeout_seconds": 1})
+    assert backend.changed == [(22, "pin")]
+
+
 
 # --------------------------------------------------------------- audio_device
 

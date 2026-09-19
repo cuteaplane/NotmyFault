@@ -1,0 +1,727 @@
+{
+    "id": "window_control",
+    "name": "Windows 窗口控制",
+    "description": "查找和读取窗口，控制前台、显示状态、位置、尺寸、分屏、显示器、置顶、透明度及正常关闭",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.window_control",
+    "enabled": true,
+    "platforms": [
+        "windows"
+    ],
+    "requires_capabilities": [
+        "window.enumerate",
+        "window.pin"
+    ],
+    "permissions": [
+        "native_api",
+        "process"
+    ],
+    "execution_api": "context-v1",
+    "cancellation_api": "runtime-v1",
+    "idempotent": false,
+    "outputs": [
+        {
+            "name": "action",
+            "label": "操作",
+            "type": "string"
+        },
+        {
+            "name": "count",
+            "label": "返回窗口或显示器数",
+            "type": "number",
+            "value_type": "int"
+        },
+        {
+            "name": "hwnd",
+            "label": "唯一结果的窗口句柄",
+            "type": "number",
+            "value_type": "int"
+        },
+        {
+            "name": "windows",
+            "label": "窗口信息",
+            "type": "array",
+            "value_type": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "hwnd": "int",
+                        "title": "string",
+                        "class_name": "string",
+                        "pid": "int",
+                        "process_name": "string",
+                        "x": "int",
+                        "y": "int",
+                        "width": "int",
+                        "height": "int",
+                        "visible": "bool",
+                        "minimized": "bool",
+                        "maximized": "bool",
+                        "topmost": "bool",
+                        "opacity": {
+                            "type": "int",
+                            "nullable": true
+                        },
+                        "closed": "bool"
+                    },
+                    "required": [
+                        "hwnd",
+                        "title",
+                        "class_name",
+                        "pid",
+                        "process_name",
+                        "x",
+                        "y",
+                        "width",
+                        "height",
+                        "visible",
+                        "minimized",
+                        "maximized",
+                        "topmost",
+                        "opacity"
+                    ],
+                    "additional_properties": false
+                }
+            },
+            "summary": "shape"
+        },
+        {
+            "name": "monitors",
+            "label": "显示器信息",
+            "type": "array",
+            "value_type": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "handle": "int",
+                        "device": "string",
+                        "primary": "bool",
+                        "index": "int",
+                        "bounds": {
+                            "type": "object",
+                            "properties": {
+                                "x": "int",
+                                "y": "int",
+                                "width": "int",
+                                "height": "int"
+                            },
+                            "required": [
+                                "x",
+                                "y",
+                                "width",
+                                "height"
+                            ],
+                            "additional_properties": false
+                        },
+                        "work": {
+                            "type": "object",
+                            "properties": {
+                                "x": "int",
+                                "y": "int",
+                                "width": "int",
+                                "height": "int"
+                            },
+                            "required": [
+                                "x",
+                                "y",
+                                "width",
+                                "height"
+                            ],
+                            "additional_properties": false
+                        }
+                    },
+                    "required": [
+                        "handle",
+                        "device",
+                        "primary",
+                        "index",
+                        "bounds",
+                        "work"
+                    ],
+                    "additional_properties": false
+                }
+            },
+            "summary": "shape"
+        }
+    ],
+    "params": [
+        {
+            "name": "action",
+            "label": "窗口操作",
+            "type": "select",
+            "value_type": {
+                "type": "string",
+                "enum": [
+                    "bring_to_front",
+                    "list",
+                    "get_info",
+                    "list_monitors",
+                    "minimize",
+                    "maximize",
+                    "restore",
+                    "show",
+                    "hide",
+                    "move",
+                    "resize",
+                    "move_resize",
+                    "center",
+                    "snap",
+                    "move_to_monitor",
+                    "pin",
+                    "unpin",
+                    "toggle_pin",
+                    "set_opacity",
+                    "close"
+                ]
+            },
+            "default": "bring_to_front",
+            "options": [
+                {
+                    "value": "bring_to_front",
+                    "label": "激活并切到前台"
+                },
+                {
+                    "value": "list",
+                    "label": "查找并列出窗口"
+                },
+                {
+                    "value": "get_info",
+                    "label": "读取窗口信息"
+                },
+                {
+                    "value": "list_monitors",
+                    "label": "列出显示器"
+                },
+                {
+                    "value": "minimize",
+                    "label": "最小化"
+                },
+                {
+                    "value": "maximize",
+                    "label": "最大化"
+                },
+                {
+                    "value": "restore",
+                    "label": "还原窗口"
+                },
+                {
+                    "value": "show",
+                    "label": "显示窗口"
+                },
+                {
+                    "value": "hide",
+                    "label": "隐藏窗口"
+                },
+                {
+                    "value": "move",
+                    "label": "移动窗口"
+                },
+                {
+                    "value": "resize",
+                    "label": "调整窗口大小"
+                },
+                {
+                    "value": "move_resize",
+                    "label": "移动并调整大小"
+                },
+                {
+                    "value": "center",
+                    "label": "居中窗口"
+                },
+                {
+                    "value": "snap",
+                    "label": "分屏排列"
+                },
+                {
+                    "value": "move_to_monitor",
+                    "label": "移动到显示器并居中"
+                },
+                {
+                    "value": "pin",
+                    "label": "设为置顶"
+                },
+                {
+                    "value": "unpin",
+                    "label": "取消置顶"
+                },
+                {
+                    "value": "toggle_pin",
+                    "label": "切换置顶"
+                },
+                {
+                    "value": "set_opacity",
+                    "label": "设置不透明度"
+                },
+                {
+                    "value": "close",
+                    "label": "正常关闭窗口"
+                }
+            ]
+        },
+        {
+            "name": "target",
+            "label": "查找目标",
+            "type": "select",
+            "value_type": {
+                "type": "string",
+                "enum": [
+                    "active",
+                    "title",
+                    "process",
+                    "pid",
+                    "class_name",
+                    "hwnd",
+                    "all"
+                ]
+            },
+            "default": "active",
+            "options": [
+                {
+                    "value": "active",
+                    "label": "当前活动窗口"
+                },
+                {
+                    "value": "title",
+                    "label": "按窗口标题"
+                },
+                {
+                    "value": "process",
+                    "label": "按进程名"
+                },
+                {
+                    "value": "pid",
+                    "label": "按进程 PID"
+                },
+                {
+                    "value": "class_name",
+                    "label": "按窗口类名"
+                },
+                {
+                    "value": "hwnd",
+                    "label": "按窗口句柄"
+                },
+                {
+                    "value": "all",
+                    "label": "所有顶层窗口"
+                }
+            ],
+            "visible_when": {
+                "action": [
+                    "bring_to_front",
+                    "list",
+                    "get_info",
+                    "minimize",
+                    "maximize",
+                    "restore",
+                    "show",
+                    "hide",
+                    "move",
+                    "resize",
+                    "move_resize",
+                    "center",
+                    "snap",
+                    "move_to_monitor",
+                    "pin",
+                    "unpin",
+                    "toggle_pin",
+                    "set_opacity",
+                    "close"
+                ]
+            }
+        },
+        {
+            "name": "title",
+            "label": "窗口标题",
+            "type": "string",
+            "value_type": "string",
+            "default": "",
+            "placeholder": "如 Chrome、记事本",
+            "visible_when": {
+                "target": [
+                    "title"
+                ]
+            }
+        },
+        {
+            "name": "process_name",
+            "label": "进程名",
+            "type": "string",
+            "value_type": "string",
+            "default": "",
+            "placeholder": "如 chrome.exe、notepad",
+            "visible_when": {
+                "target": [
+                    "process"
+                ]
+            }
+        },
+        {
+            "name": "class_name",
+            "label": "窗口类名",
+            "type": "string",
+            "value_type": "string",
+            "default": "",
+            "placeholder": "如 Chrome_WidgetWin_1",
+            "visible_when": {
+                "target": [
+                    "class_name"
+                ]
+            }
+        },
+        {
+            "name": "pid",
+            "label": "进程 PID",
+            "type": "number",
+            "value_type": {
+                "type": "int",
+                "min": 0,
+                "max": 4294967295
+            },
+            "default": 0,
+            "min": 0,
+            "max": 4294967295,
+            "visible_when": {
+                "target": [
+                    "pid"
+                ]
+            }
+        },
+        {
+            "name": "hwnd",
+            "label": "窗口句柄",
+            "type": "number",
+            "value_type": {
+                "type": "int",
+                "min": 0,
+                "max": 9007199254740991
+            },
+            "default": 0,
+            "min": 0,
+            "max": 9007199254740991,
+            "visible_when": {
+                "target": [
+                    "hwnd"
+                ]
+            }
+        },
+        {
+            "name": "match_mode",
+            "label": "文本匹配",
+            "type": "select",
+            "value_type": {
+                "type": "string",
+                "enum": [
+                    "contains",
+                    "exact",
+                    "regex"
+                ]
+            },
+            "default": "contains",
+            "options": [
+                {
+                    "value": "contains",
+                    "label": "包含，不区分大小写"
+                },
+                {
+                    "value": "exact",
+                    "label": "完全相同，不区分大小写"
+                },
+                {
+                    "value": "regex",
+                    "label": "正则表达式，不区分大小写"
+                }
+            ],
+            "visible_when": {
+                "target": [
+                    "title",
+                    "class_name"
+                ]
+            }
+        },
+        {
+            "name": "match",
+            "label": "匹配多个窗口时",
+            "type": "select",
+            "value_type": {
+                "type": "string",
+                "enum": [
+                    "unique",
+                    "first",
+                    "all"
+                ]
+            },
+            "default": "unique",
+            "options": [
+                {
+                    "value": "unique",
+                    "label": "要求唯一匹配"
+                },
+                {
+                    "value": "first",
+                    "label": "只操作首个窗口"
+                },
+                {
+                    "value": "all",
+                    "label": "操作全部匹配窗口"
+                }
+            ],
+            "description": "首个窗口按系统窗口层级顺序选择。列出窗口始终返回全部匹配结果。"
+        },
+        {
+            "name": "include_hidden",
+            "label": "包含隐藏窗口",
+            "type": "bool",
+            "value_type": "bool",
+            "default": false,
+            "description": "按句柄查找时始终允许隐藏窗口，便于重新显示。"
+        },
+        {
+            "name": "wait_seconds",
+            "label": "等待窗口出现（秒）",
+            "type": "number",
+            "value_type": {
+                "type": "float",
+                "min": 0,
+                "max": 60
+            },
+            "default": 0,
+            "min": 0,
+            "max": 60,
+            "description": "0 表示只查找一次。"
+        },
+        {
+            "name": "timeout_seconds",
+            "label": "操作完成总时限（秒）",
+            "type": "number",
+            "value_type": {
+                "type": "float",
+                "min": 0.1,
+                "max": 60
+            },
+            "default": 5,
+            "min": 0.1,
+            "max": 60,
+            "description": "全部匹配窗口共用此时限。关闭窗口可能需要先处理应用的保存提示。"
+        },
+        {
+            "name": "x",
+            "label": "横坐标（物理像素）",
+            "type": "number",
+            "value_type": {
+                "type": "int",
+                "min": -2147483648,
+                "max": 2147483647
+            },
+            "default": 0,
+            "min": -2147483648,
+            "max": 2147483647,
+            "visible_when": {
+                "action": [
+                    "move",
+                    "move_resize"
+                ]
+            }
+        },
+        {
+            "name": "y",
+            "label": "纵坐标（物理像素）",
+            "type": "number",
+            "value_type": {
+                "type": "int",
+                "min": -2147483648,
+                "max": 2147483647
+            },
+            "default": 0,
+            "min": -2147483648,
+            "max": 2147483647,
+            "visible_when": {
+                "action": [
+                    "move",
+                    "move_resize"
+                ]
+            }
+        },
+        {
+            "name": "width",
+            "label": "窗口宽度（物理像素）",
+            "type": "number",
+            "value_type": {
+                "type": "int",
+                "min": 1,
+                "max": 2147483647
+            },
+            "default": 800,
+            "min": 1,
+            "max": 2147483647,
+            "visible_when": {
+                "action": [
+                    "resize",
+                    "move_resize"
+                ]
+            }
+        },
+        {
+            "name": "height",
+            "label": "窗口高度（物理像素）",
+            "type": "number",
+            "value_type": {
+                "type": "int",
+                "min": 1,
+                "max": 2147483647
+            },
+            "default": 600,
+            "min": 1,
+            "max": 2147483647,
+            "visible_when": {
+                "action": [
+                    "resize",
+                    "move_resize"
+                ]
+            }
+        },
+        {
+            "name": "monitor",
+            "label": "目标显示器",
+            "type": "select",
+            "value_type": {
+                "type": "string",
+                "enum": [
+                    "current",
+                    "primary",
+                    "next",
+                    "previous",
+                    "index"
+                ]
+            },
+            "default": "current",
+            "options": [
+                {
+                    "value": "current",
+                    "label": "窗口当前显示器"
+                },
+                {
+                    "value": "primary",
+                    "label": "主显示器"
+                },
+                {
+                    "value": "next",
+                    "label": "下一台显示器"
+                },
+                {
+                    "value": "previous",
+                    "label": "上一台显示器"
+                },
+                {
+                    "value": "index",
+                    "label": "指定显示器序号"
+                }
+            ],
+            "visible_when": {
+                "action": [
+                    "center",
+                    "snap",
+                    "move_to_monitor"
+                ]
+            }
+        },
+        {
+            "name": "monitor_index",
+            "label": "显示器序号",
+            "type": "number",
+            "value_type": {
+                "type": "int",
+                "min": 1,
+                "max": 64
+            },
+            "default": 1,
+            "min": 1,
+            "max": 64,
+            "visible_when": {
+                "monitor": [
+                    "index"
+                ]
+            },
+            "description": "主显示器为 1，其余按屏幕位置排序。可先执行“列出显示器”。"
+        },
+        {
+            "name": "layout",
+            "label": "分屏位置",
+            "type": "select",
+            "value_type": {
+                "type": "string",
+                "enum": [
+                    "left",
+                    "right",
+                    "top",
+                    "bottom",
+                    "top_left",
+                    "top_right",
+                    "bottom_left",
+                    "bottom_right"
+                ]
+            },
+            "default": "left",
+            "options": [
+                {
+                    "value": "left",
+                    "label": "左半屏"
+                },
+                {
+                    "value": "right",
+                    "label": "右半屏"
+                },
+                {
+                    "value": "top",
+                    "label": "上半屏"
+                },
+                {
+                    "value": "bottom",
+                    "label": "下半屏"
+                },
+                {
+                    "value": "top_left",
+                    "label": "左上四分之一"
+                },
+                {
+                    "value": "top_right",
+                    "label": "右上四分之一"
+                },
+                {
+                    "value": "bottom_left",
+                    "label": "左下四分之一"
+                },
+                {
+                    "value": "bottom_right",
+                    "label": "右下四分之一"
+                }
+            ],
+            "visible_when": {
+                "action": [
+                    "snap"
+                ]
+            }
+        },
+        {
+            "name": "opacity",
+            "label": "不透明度（%）",
+            "type": "number",
+            "value_type": {
+                "type": "int",
+                "min": 0,
+                "max": 100
+            },
+            "default": 100,
+            "min": 0,
+            "max": 100,
+            "visible_when": {
+                "action": [
+                    "set_opacity"
+                ]
+            },
+            "description": "100 为完全不透明，0 为完全透明。"
+        }
+    ]
+}
