@@ -1,7 +1,6 @@
 """规则结构、插件参数和数据引用校验"""
 import copy
 import math
-import re
 from typing import Any, Dict, List, Tuple
 
 from notmyfault.core.bindings import (
@@ -13,7 +12,7 @@ from notmyfault.core.data_types import DataTypeError
 from notmyfault.core.variables import variable_definitions
 from notmyfault.extensions.protocol import owned_value_identity
 from notmyfault.core.predicates import validate_predicate
-from notmyfault.core.rule_model import normalize_rule_shape, normalize_rules
+from notmyfault.core.rule_model import normalize_rule_shape, normalize_rules, _BINDING_ID_RE, _RULE_ID_RE
 from notmyfault.core.condition_runtime import ConditionRuntime
 from notmyfault.core.conditions import (
     get_rule_condition, _is_event_leaf, _condition_children, iter_condition_events,
@@ -23,20 +22,20 @@ from notmyfault.core.conditions import (
 )
 
 
-_BINDING_ID_RE = re.compile(r"^[tap]_[a-z0-9_]{6,64}$")
-_RULE_ID_RE = re.compile(r"^r_[a-z0-9_]{6,64}$")
 
 
-def iter_action_nodes(actions: Any, path: str = "actions"):
+def iter_action_nodes(actions: Any, path: str = "actions", *, include_invalid: bool = False):
     if not isinstance(actions, list):
         return
     for index, action in enumerate(actions):
         if not isinstance(action, dict):
+            if include_invalid:
+                yield action, f"{path}[{index}]"
             continue
         location = f"{path}[{index}]"
         yield action, location
         for field in ("then", "else", "failure_actions"):
-            yield from iter_action_nodes(action.get(field), f"{location}.{field}")
+            yield from iter_action_nodes(action.get(field), f"{location}.{field}", include_invalid=include_invalid)
 
 
 def get_rule_admin_plugins(
@@ -51,14 +50,10 @@ def get_rule_admin_plugins(
         if "admin" in (triggers_meta.get(plugin_id, {}).get("permissions") or []):
             required.add(plugin_id)
 
-    for field in ("preconditions", "actions"):
-        items = rule.get(field, [])
-        if not isinstance(items, list):
-            continue
-        for item, _location in iter_action_nodes(items, field):
-            plugin_id = item.get("type")
-            if "admin" in (actions_meta.get(plugin_id, {}).get("permissions") or []):
-                required.add(plugin_id)
+    for item, _location in iter_action_nodes(rule.get("actions"), "actions"):
+        plugin_id = item.get("type")
+        if "admin" in (actions_meta.get(plugin_id, {}).get("permissions") or []):
+            required.add(plugin_id)
     return sorted(required)
 
 
@@ -275,12 +270,8 @@ def validate_rule_binding_ids(rule: Dict[str, Any], *, allow_missing: bool = Fal
     condition = get_rule_condition(rule)
     if condition is not None:
         visit(condition, "condition")
-    for field, prefix in (("preconditions", "p"), ("actions", "a")):
-        items = rule.get(field, [])
-        if not isinstance(items, list):
-            continue
-        for item, location in iter_action_nodes(items, field):
-            check(item, prefix, location)
+    for item, location in iter_action_nodes(rule.get("actions"), "actions"):
+        check(item, "a", location)
     return errors
 
 
@@ -466,7 +457,11 @@ def validate_rules(
                     continue
                 if schema.get("type") != "plugin_data":
                     continue
-                if is_reference(event_params[param_name]) or not _valid_plugin_data(
+                if is_reference(event_params[param_name]):
+                    issues.append((rule_name, f'trigger "{event_type}" 参数 {param_name!r} 不支持数据引用'))
+                    all_events_valid = False
+                    continue
+                if not _valid_plugin_data(
                     event_params[param_name], trigger_meta, schema
                 ):
                     issues.append((
@@ -480,12 +475,12 @@ def validate_rules(
             continue
 
         rule_ok = True
-        for action, action_path in iter_action_nodes(rule.get("actions", [])):
-            if action.get("type") in ("if", "set_variable"):
-                continue
+        for action, action_path in iter_action_nodes(rule.get("actions", []), include_invalid=True):
             if not isinstance(action, dict):
                 issues.append((rule_name, f"{action_path} 必须是对象"))
                 rule_ok = False
+                continue
+            if action.get("type") in ("if", "set_variable"):
                 continue
             action_type = action.get("type", "")
             if not action_type:
@@ -536,67 +531,19 @@ def validate_rules(
                     continue
 
                 schema = schema_param_names[param_name]
-                expected_type = schema.get("type", "string")
+                if schema.get("type") != "plugin_data":
+                    continue
                 if is_literal(param_value):
                     param_value = param_value["$literal"]
                 elif contains_dynamic_value(param_value):
-                    # 绑定类型由 validate_rule_bindings 检查
                     continue
-                if "value_type" in schema and expected_type != "plugin_data":
-                    continue
-
-                if expected_type == "number":
-                    if (
-                        isinstance(param_value, bool)
-                        or not isinstance(param_value, (int, float))
-                    ):
-                        issues.append((
-                            rule_name,
-                            f'action "{action_type}" 参数 \'{param_name}\' '
-                            f'应为数字，实际: {type(param_value).__name__}',
-                        ))
-                        rule_ok = False
-                elif expected_type == "bool":
-                    if not isinstance(param_value, bool):
-                        issues.append((
-                            rule_name,
-                            f'action "{action_type}" 参数 \'{param_name}\' '
-                            f'应为布尔值，实际: {type(param_value).__name__}',
-                        ))
-                        rule_ok = False
-                elif expected_type == "select":
-                    raw_options = schema.get("options", [])
-                    # 同时接受包含 value 和 label 的对象以及旧版字符串
-                    opt_values = [
-                        o["value"] if isinstance(o, dict) else o
-                        for o in raw_options
-                    ]
-                    if opt_values and param_value not in opt_values:
-                        issues.append((
-                            rule_name,
-                            f'action "{action_type}" 参数 \'{param_name}\' '
-                            f'值 \'{param_value}\' 不在可选项中 '
-                            f"({', '.join(map(str, opt_values))})",
-                        ))
-                        rule_ok = False
-                elif expected_type in {
-                    "string", "textarea", "time", "hotkey", "path"
-                } and not isinstance(param_value, str):
+                if not _valid_plugin_data(param_value, action_meta, schema):
                     issues.append((
                         rule_name,
-                        f'action "{action_type}" 参数 \'{param_name}\' '
-                        f'应为字符串，实际: {type(param_value).__name__}',
+                        f'action "{action_type}" 参数 {param_name!r} '
+                        "不是该插件声明的数据，请重新编辑",
                     ))
                     rule_ok = False
-                elif expected_type == "plugin_data":
-                    if not _valid_plugin_data(param_value, action_meta, schema):
-                        issues.append((
-                            rule_name,
-                            f'action "{action_type}" 参数 \'{param_name}\' '
-                            "不是该插件声明的数据，请重新编辑",
-                        ))
-                        rule_ok = False
-                # string 参数保留原值，不做严格类型检查
 
         binding_issues = validate_rule_bindings(
             rule,

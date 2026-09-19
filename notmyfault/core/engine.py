@@ -63,6 +63,7 @@ class AutomationEngine:
         # 热重载只替换 rules，构造函数传入的 config 保持原对象
         self.config = config
         self._rules_store = rules_store
+        self._rules_lock = threading.RLock()
         self.rules: List[Dict[str, Any]] = config.get("rules", [])
         self.on_event = on_event
 
@@ -91,8 +92,6 @@ class AutomationEngine:
         self._diag_obj = Diagnostics()
 
         self._shutdown_flag: "threading.Event | None" = None
-
-        self._rules_lock = threading.RLock()
 
         self._trigger_supervisor = TriggerSupervisor(
             # 运行时查找 _alert_user，构造后替换的告警回调仍然生效
@@ -165,8 +164,9 @@ class AutomationEngine:
 
     @rules.setter
     def rules(self, rules):
-        self._rules = rules
-        self._prepared_rules = None
+        with self._rules_lock:
+            self._rules = rules
+            self._prepared_rules = None
 
     @property
     def _condition_runtime(self):
@@ -183,13 +183,26 @@ class AutomationEngine:
 
     def _prepare_rules(self, rules):
         try:
-            prepared = prepare_rules(rules, self.triggers_meta, self.actions_meta)
-            for trigger_id in prepared.trigger_params:
-                if self._plugin_registry.resolve_trigger(trigger_id) is None:
-                    raise ValueError(f"触发器未能加载: {trigger_id}")
-            return prepared
+            return prepare_rules(
+                rules, self.triggers_meta, self.actions_meta,
+                resolve_trigger=self._plugin_registry.resolve_trigger,
+            )
         except (ValueError, DataTypeError, BindingResolutionError) as error:
             raise ConfigValidationError(str(error)) from error
+
+    def _report_rule_issues(self, prepared: PreparedRules) -> None:
+        self._diag_obj.reset_rule_issues()
+        for name, message in prepared.issues:
+            self._diag_obj.add_rule_issue(name, message)
+            engine_error("rule_issue", rule=name, issue=message)
+            print(f'[Engine] 已跳过规则 "{name}": {message}', file=sys.stderr)
+        for name, message in prepared.warnings:
+            engine_warn(f'规则 "{name}": {message}')
+        if prepared.issues:
+            self._alert_user(
+                "部分规则不可用",
+                f"已跳过 {prepared.total - len(prepared)} 条规则，引擎继续运行。请在 Dashboard 查看规则错误并修正。",
+            )
 
     @property
     def _active_actions(self) -> int:
@@ -236,6 +249,8 @@ class AutomationEngine:
         try:
             registry = self._get_runtime_snapshot().registry
             def emit_checked(event_name: str, payload: Dict[str, Any]) -> None:
+                if stop_event.is_set():
+                    return
                 if not isinstance(payload, dict):
                     raise TypeError("emit_event 的 payload 必须是对象")
                 problems = check_payload_contract(
@@ -286,7 +301,8 @@ class AutomationEngine:
 
                 trigger_func(trigger_meta, config, emit_legacy, stop_event)
             if not stop_event.is_set():
-                raise RuntimeError("触发器在收到停止信号前退出")
+                self._safe_on_event("trigger_stopped", {"trigger_id": trigger_id, "instance_id": instance_id})
+                self._alert_user(f"触发器 {instance_id} 已停止", "触发器已返回，相关规则将不再接收该实例的事件", open_dashboard=False)
         except Exception as error:
             error_type = type(error).__name__
             print(
@@ -340,7 +356,7 @@ class AutomationEngine:
                 "integrity_errors": self._plugin_integrity_errors[-10:],
             },
             "rules": {
-                "total": len(self.rules),
+                "total": self._prepared_rules.total if self._prepared_rules is not None else len(self.rules),
                 "issues": snap["rule_issues"],
                 "issue_count": len(snap["rule_issues"]),
             },
@@ -366,12 +382,12 @@ class AutomationEngine:
         engine_info("=== SESSION_START ===")
         t_loaded = t_failed = a_loaded = a_failed = 0
         for base_dir, origin in load_paths:
-            _t, _tf = self._load_plugins(
+            _t, _tf = self._plugin_loader.load(
                 base_dir=os.path.join(base_dir, "triggers"),
                 kind="trigger",
                 origin=origin,
             )
-            _a, _af = self._load_plugins(
+            _a, _af = self._plugin_loader.load(
                 base_dir=os.path.join(base_dir, "actions"),
                 kind="action",
                 origin=origin,
@@ -404,14 +420,6 @@ class AutomationEngine:
                 f"[Engine] [!!] 以下插件声明了 admin 权限: {', '.join(admin_plugins)}"
             )
         print()
-
-    def _load_plugins(
-        self,
-        base_dir: str,
-        kind: str,
-        origin: str = "builtin",
-    ) -> Tuple[int, int]:
-        return self._plugin_loader.load(base_dir, kind, origin)
 
     @property
     def extensions(self):
@@ -709,6 +717,7 @@ class AutomationEngine:
             previous = self._get_runtime_snapshot()
             self._prepared_rules = new_rules
             self._rules = new_rules.rules
+        self._report_rule_issues(new_rules)
         return previous
 
     def _accept_hot_reload_rules(self, previous: PreparedRules) -> None:
@@ -747,31 +756,23 @@ class AutomationEngine:
             with self._rules_lock:
                 self._prepared_rules = snapshot
                 self._rules = snapshot.rules
+            self._report_rule_issues(snapshot)
 
             from notmyfault.platform.platform_support import show_notification
 
             if os.name == "nt":
-                from Win_toaster.AUMID_Register import register_toaster
-                register_toaster()
+                try:
+                    from Win_toaster.AUMID_Register import register_toaster
+                    register_toaster()
+                except Exception as error:
+                    engine_error("notification_registration_failed", error_type=type(error).__name__)
 
             show_notification("NotmyFault 已加载", "")
 
             thread_count = self._start_trigger_threads()
 
             if thread_count == 0:
-                print("[Engine] 没有找到可用触发器，程序将退出")
-                hint = "没有可用的触发器，请检查规则配置"
-                if self._security_mode == SecurityMode.STRICT:
-                    hint += (
-                        "Tips: 当前安全模式为 strict 严格模式：若是源码运行，内置插件因缺少签名被拒载，"
-                        "请先运行 `python build.py` 生成插件签名与 build.json"
-                    )
-                self._alert_user(
-                    "NotmyFault 启动失败 😥",
-                    hint,
-                    open_dashboard=True,
-                )
-                return
+                print("[Engine] 当前没有可用触发器，保持运行并等待规则更新")
 
             se = self._shutdown_flag
             self._hot_reloader.begin()
@@ -802,9 +803,10 @@ class AutomationEngine:
                 timeout=max(0.0, deadline - time.monotonic())
             )
             self._shutdown_clean = bool(stopped and scheduled_stopped and drained)
+            plugin_worker.shutdown_all()
+            self.close()
             if not self._shutdown_clean:
                 return
-            plugin_worker.shutdown_all()
             self._shutdown_plugins()
             self._runtime_cleaned = True
 

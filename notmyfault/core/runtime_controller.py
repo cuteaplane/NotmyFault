@@ -164,7 +164,7 @@ class RuntimeController:
                 if generation != self._generation:
                     return
                 self._current_engine = engine
-            self._set_state("running")
+                self._set_state("stopping" if shutdown_event.is_set() else "running")
             engine.start(shutdown_event=shutdown_event)
         except KeyboardInterrupt:
             pass
@@ -204,7 +204,7 @@ class RuntimeController:
             if alive:
                 self._set_state("stopping")
             shutdown_event = self._shutdown_event
-        shutdown_event.set()
+            shutdown_event.set()
         return alive
 
     def stop(self, timeout: float = 5.0) -> bool:

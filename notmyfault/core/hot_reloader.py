@@ -45,7 +45,7 @@ class RulesHotReloader:
         return os.path.getmtime(path) if os.path.exists(path) else 0
 
     def begin(self) -> None:
-        """主循环开始前记录当前修改时间当基线"""
+        """主循环开始前记下 rules.json 的修改时间"""
         # 热重载只盯 rules.json，开关插件等设置变更不再触发重载
         self._rules_mtime = self.current_mtime()
         self._error_reported = False
@@ -129,22 +129,13 @@ class RulesHotReloader:
                 )
             if restored:
                 self._rules_mtime = new_mtime
-        except OSError as e:
-            print(
-                f"[Engine] 读取规则文件失败: {e}",
-                file=sys.stderr,
-            )
-            if previous_rules is not None:
-                self._restore_previous_rules(previous_rules, new_mtime)
         except Exception as error:
             print(
                 "[Engine] 热加载规则失败:",
                 file=sys.stderr,
             )
             traceback.print_exc(file=sys.stderr)
-            if previous_rules is None:
-                return
-            restored = self._restore_previous_rules(previous_rules, new_mtime)
+            restored = previous_rules is None or self._restore_previous_rules(previous_rules, new_mtime)
             self._diagnostics.inc_hot_reload_error()
             engine_error("hot_reload_error", error=str(error))
             if not restored:
@@ -153,3 +144,5 @@ class RulesHotReloader:
                 self._alert_cb("热加载失败", "新规则未能启动，已尝试恢复原有规则")
             if not self._error_reported:
                 self._error_reported = True
+            if restored:
+                self._rules_mtime = new_mtime

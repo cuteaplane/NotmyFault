@@ -74,7 +74,7 @@ def is_reference(value: Any) -> bool:
     )
 
 
-def _validate_path(path: Any, location: str, reference: Any) -> tuple:
+def validate_binding_path(path: Any, location: str, reference: Any) -> tuple:
     if not isinstance(path, list):
         raise BindingResolutionError(
             "invalid_reference", location, reference, "$ref.path 必须是对象键和数组下标组成的数组"
@@ -97,17 +97,21 @@ def _validate_path(path: Any, location: str, reference: Any) -> tuple:
     return tuple(result)
 
 
+def validate_reference_fields(reference: Dict[str, Any], location: str) -> None:
+    unknown = set(reference) - {"scope", "node", "path", "on_missing", "default"}
+    policy = reference.get("on_missing")
+    if unknown or policy not in (None, "error", "skip", "default") or ("default" in reference) != (policy == "default"):
+        raise BindingResolutionError("invalid_reference", location, reference, "引用字段或缺失处理方式无效")
+
+
 def _reference_root(
     reference: Dict[str, Any],
     context: Dict[str, Any],
     location: str,
 ) -> tuple[Any, Tuple[str, ...]]:
     scope = reference.get("scope")
-    unknown = set(reference) - {"scope", "node", "path", "on_missing", "default"}
-    policy = reference.get("on_missing")
-    if unknown or policy not in (None, "error", "skip", "default") or ("default" in reference) != (policy == "default"):
-        raise BindingResolutionError("invalid_reference", location, reference, "引用字段或缺失处理方式无效")
-    path = _validate_path(reference.get("path", []), location, reference)
+    validate_reference_fields(reference, location)
+    path = validate_binding_path(reference.get("path", []), location, reference)
     if scope == "event":
         return context.get("event", {}).get("payload", _MISSING), path
 

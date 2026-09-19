@@ -7,7 +7,7 @@ import binascii
 import json
 import math
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from notmyfault.core.data_types import (
     TIME_UNITS,
@@ -101,7 +101,7 @@ def convert_value(value, target, registry=None, *, source=None, options=None, lo
                     invalid("取整方式无效")
                 if rounding == "exact" and number != number.to_integral_value():
                     invalid("小数转整数须选择取整方式")
-                value = {"exact": int, "truncate": int, "floor": math.floor, "ceil": math.ceil, "round": round}[rounding](number)
+                value = int(number.to_integral_value(rounding=ROUND_HALF_UP)) if rounding == "round" else {"exact": int, "truncate": int, "floor": math.floor, "ceil": math.ceil}[rounding](number)
             elif kind == "decimal":
                 value = number
             elif kind == "number" and number == number.to_integral_value():

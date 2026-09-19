@@ -12,7 +12,6 @@ except ValueError:
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-import notmyfault as _notmyfault
 from notmyfault.core.type_registry import TypeRegistry
 from notmyfault.core.value_codec import decode_value, encode_value
 from notmyfault.core.workflow import invoke_action

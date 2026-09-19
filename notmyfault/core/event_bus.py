@@ -1,5 +1,5 @@
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 from notmyfault.core.logging import engine_warn
 from notmyfault.core.bindings import BindingResolutionError
@@ -78,7 +78,7 @@ class EventBus:
             if matched is not None:
                 self._dispatch(snapshot, rule, key, "absence", {}, {}, matched)
 
-    def _dispatch(self, snapshot, rule, rule_key, event_type, event_payload, masked_payload, matched_events):
+    def _dispatch(self, snapshot, rule, key, event_type, event_payload, masked_payload, matched_events):
         rule_id = rule.get("rule_id", "")
         rule_name = rule.get("name", "未命名规则")
         run_id = f"run_{uuid.uuid4().hex}"
@@ -108,9 +108,9 @@ class EventBus:
             self._safe_on_event("workflow_failed", {"run_id": run_id, "rule_id": rule_id, "rule_name": rule_name, "error": error.as_dict()})
             return
         if self._scheduler_submit_fn is not None:
-            self._scheduler_submit_fn(rule_key, rule, rule_name, context)
+            self._scheduler_submit_fn(key, rule, rule_name, context)
         else:
-            self._execute_workflow_cb(rule_key, rule, rule_name, context)
+            self._execute_workflow_cb(key, rule, rule_name, context)
 
     def call_notmyfault(self, event_data: Dict[str, Any]) -> None:
         """接收触发器线程推送的外部事件"""

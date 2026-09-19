@@ -5,7 +5,6 @@ import math
 from typing import Any, Dict, Iterable, List
 
 from notmyfault.core.value_codec import encode_value
-from notmyfault.extensions.protocol import owned_value_identity
 
 
 def get_rule_condition(rule: Dict[str, Any]) -> Dict[str, Any] | None:
@@ -79,7 +78,7 @@ def check_event_params(event_def: Dict[str, Any], event_payload: Dict[str, Any])
     """检查事件参数是否匹配并允许 payload 含额外字段"""
     expected_params = event_def.get("params", {})
     for key, expected_val in expected_params.items():
-        # 缺少字段时不算命中，多个规则只在字段完整时触发
+        # 缺少字段时不算命中
         if key not in event_payload or event_payload[key] != expected_val:
             return False
     return True

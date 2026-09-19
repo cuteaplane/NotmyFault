@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from notmyfault.core.bindings import (
-    BindingResolutionError, _validate_path, contains_dynamic_value,
+    BindingResolutionError, validate_binding_path, validate_reference_fields, contains_dynamic_value,
     contains_legacy_template, is_literal, is_reference, is_typed_value, iter_references,
 )
 from notmyfault.core.data_types import (
-    DataTypeError, field_type, infer_type, is_custom_type, normalize_type,
+    DataTypeError, field_type, infer_type, normalize_type,
     normalize_value, type_at_path, types_compatible,
 )
 from notmyfault.core.type_registry import TypeRegistry
@@ -106,14 +106,12 @@ def check_rule_bindings(rule, triggers_meta, actions_meta):
         node = reference.get("node")
         path = reference.get("path")
         try:
-            _validate_path(path, location, reference)
+            validate_binding_path(path, location, reference)
+            validate_reference_fields(reference, location)
         except BindingResolutionError as error:
             add(error.code, location, str(error), reference)
             return None
         policy = reference.get("on_missing")
-        if set(reference) - {"scope", "node", "path", "on_missing", "default"} or policy not in (None, "error", "skip", "default") or ("default" in reference) != (policy == "default"):
-            add("invalid_reference", location, "引用字段或缺失处理方式无效", reference)
-            return None
         if scope in ("trigger", "trigger_config"):
             if node not in leaves_by_id:
                 add("unknown_source", location, "引用的触发条件不存在", reference)
@@ -238,7 +236,9 @@ def check_rule_bindings(rule, triggers_meta, actions_meta):
             elif field.get("type") == "plugin_data" and contains_dynamic_value(value):
                 add("private_plugin_data", path, "插件自有数据不能绑定运行数据")
             else:
-                check(value, target, path, available, strict="value_type" in field and field.get("type") != "plugin_data")
+                if "value_type" not in field and field.get("options") and not contains_dynamic_value(value):
+                    target = {**target, "enum": [option["value"] if isinstance(option, dict) else option for option in field["options"]]}
+                check(value, target, path, available, strict=bool(field) and field.get("type") != "plugin_data")
 
     def sequence(items, location, previous):
         available = set(previous)

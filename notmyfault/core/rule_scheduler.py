@@ -74,10 +74,8 @@ class RuleScheduler:
         self._worker_count = 0
         self._active_runs: Dict[str, set[str]] = {}
         self._executing_runs: Dict[str, set[str]] = {}
-        # rule_key -> 排队条目（规则快照 + context）
+        # 排队条目保存规则快照和运行上下文
         self._queues: Dict[str, deque] = {}
-        # rule_key -> queue 模式的并发配置，入队时的规则快照说了算
-        self._queue_configs: Dict[str, Dict[str, Any]] = {}
         self._removed_rules: set[str] = set()
         self._shutting_down = False
 
@@ -103,7 +101,6 @@ class RuleScheduler:
         run_id = str(context.get("run", {}).get("id", ""))
         config = _concurrency_config(rule)
         mode = config["mode"]
-        to_cancel = []
         with self._lock:
             if self._shutting_down:
                 self._emit_history("run_dropped", rule, run_id, rule_name, "引擎正在关闭")
@@ -115,12 +112,12 @@ class RuleScheduler:
                 self._emit_history("run_dropped", rule, run_id, rule_name, "已有运行中的 run")
                 return "dropped"
             if mode == "replace":
-                to_cancel = list(active)
-                for old_run_id in to_cancel:
-                    self._emit_history("run_replaced", rule, old_run_id, rule_name, "被新触发的 run 替换")
+                for old_run_id in list(active):
+                    if self._cancel_with_retry(old_run_id):
+                        active.discard(old_run_id)
+                        self._emit_history("run_replaced", rule, old_run_id, rule_name, "被新触发的 run 替换")
                 for old_rule, old_name, _old_context, old_run_id in queue:
                     self._emit_history("run_replaced", old_rule, old_run_id, old_name, "被新触发的 run 替换")
-                active.clear()
                 queue.clear()
             max_concurrency = config.get(
                 "max_concurrency",
@@ -141,26 +138,27 @@ class RuleScheduler:
                 decision = "dropped"
             else:
                 queue.append((copy.deepcopy(rule), rule_name, context, run_id))
-                self._queue_configs[rule_key] = config
                 self._emit_history("run_queued", rule, run_id, rule_name, f"排队中（第 {len(queue)} 个）")
                 decision = "queued"
-        for old_run_id in to_cancel:
-            self._cancel_with_retry(old_run_id)
         if run_now:
             self._dispatch_entry(rule_key, copy.deepcopy(rule), rule_name, context, run_id)
         return decision
 
-    def _cancel_with_retry(self, run_id: str) -> None:
+    def _cancel_with_retry(self, run_id: str) -> bool:
         # run 线程可能晚一步创建取消事件，短暂重试可接住刚启动的 run
         import time
 
         for _ in range(20):
             try:
                 if self._cancel_run_fn(run_id):
-                    return
+                    return True
             except Exception:
-                return
+                break
             time.sleep(0.005)
+        from notmyfault.core.logging import engine_error
+
+        engine_error("run_cancel_failed", run_id=run_id)
+        return False
 
     def on_run_event(self, event_type: str, run_id: Any) -> None:
         """workflow 终态事件回来时把 run 从活跃集合里去掉并补发排队中的 run"""
@@ -183,7 +181,6 @@ class RuleScheduler:
         """规则被删掉时丢弃它的排队条目，返回丢弃数量"""
         with self._lock:
             queue = self._queues.pop(rule_key, None)
-            self._queue_configs.pop(rule_key, None)
             self._removed_rules.add(rule_key)
             self._prune_removed_rule(rule_key)
             if not queue:
@@ -204,7 +201,6 @@ class RuleScheduler:
                     self._emit_history("run_dropped", rule, run_id, rule_name, "引擎关闭")
                 queue.clear()
             self._queues.clear()
-            self._queue_configs.clear()
         if self._executor is not None:
             self._executor.shutdown(wait=False, cancel_futures=False)
 
@@ -233,15 +229,11 @@ class RuleScheduler:
         active = self._active_runs.get(rule_key)
         if not queue or active is None:
             return
-        config = self._queue_configs.get(rule_key) or {}
-        max_concurrency = config.get("max_concurrency", DEFAULT_MAX_CONCURRENCY)
-        if config.get("mode") == "parallel" and "max_concurrency" not in config:
-            max_concurrency = self._max_workers
-        while (
-            queue
-            and len(active) < max_concurrency
-            and self._worker_count < self._max_workers
-        ):
+        while queue and self._worker_count < self._max_workers:
+            config = _concurrency_config(queue[0][0])
+            max_concurrency = config.get("max_concurrency", self._max_workers if config["mode"] == "parallel" else DEFAULT_MAX_CONCURRENCY)
+            if len(active) >= max_concurrency:
+                break
             rule, rule_name, context, run_id = queue.popleft()
             self._prepare_run(context)
             active.add(run_id)
@@ -280,6 +272,7 @@ class RuleScheduler:
                 self._emit_history(
                     "run_dropped", rule, run_id, rule_name, "无法启动工作线程"
                 )
+                self._dispatch_available_locked()
                 self._workers_done.notify_all()
             raise
 
@@ -339,7 +332,6 @@ class RuleScheduler:
             self._active_runs.pop(rule_key, None)
             self._executing_runs.pop(rule_key, None)
             self._queues.pop(rule_key, None)
-            self._queue_configs.pop(rule_key, None)
             self._removed_rules.discard(rule_key)
 
     def _emit_history(

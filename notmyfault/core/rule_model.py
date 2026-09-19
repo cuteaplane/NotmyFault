@@ -5,11 +5,10 @@ import re
 import secrets
 from typing import Any, Dict, List
 
-from notmyfault.core.bindings import is_reference, is_literal, is_typed_value
+from notmyfault.core.bindings import is_reference, is_literal, is_typed_value, _LEGACY_TEMPLATE as _LEGACY_TEMPLATE_RE
 
-_BINDING_ID_RE = re.compile(r"^[tap]_[a-z0-9_]{6,64}$")
+_BINDING_ID_RE = re.compile(r"^[ta]_[a-z0-9_]{6,64}$")
 _RULE_ID_RE = re.compile(r"^r_[a-z0-9_]{6,64}$")
-_LEGACY_TEMPLATE_RE = re.compile(r"{{\s*([a-zA-Z_][\w.]*)\s*}}")
 
 
 def _new_binding_id(prefix: str) -> str:
@@ -103,13 +102,8 @@ def ensure_rule_binding_ids(rule: Dict[str, Any]) -> Dict[str, Any]:
             normalized.append(item_copy)
         return normalized
 
-    for field, prefix in (("preconditions", "p"), ("actions", "a")):
-        items = copied.get(field)
-        if not isinstance(items, list):
-            continue
-        copied[field] = normalize_items(
-            items, prefix, include_failures=field == "actions"
-        )
+    if "actions" in copied:
+        copied["actions"] = normalize_items(copied["actions"], "a", include_failures=True)
     return copied
 
 def _normalize_condition(condition: Any) -> Any:
@@ -150,6 +144,15 @@ def _unwrap_single_condition(condition: Any) -> Dict[str, Any] | None:
 
 
 def normalize_rule_shape(rule: Dict[str, Any]) -> Dict[str, Any]:
+    pending = [(rule, 0)]
+    while pending:
+        item, depth = pending.pop()
+        if depth > 64:
+            raise ValueError("规则嵌套不能超过 64 层")
+        if isinstance(item, dict):
+            pending.extend((value, depth + 1) for value in item.values())
+        elif isinstance(item, list):
+            pending.extend((value, depth + 1) for value in item)
     copied = dict(rule)
     legacy_fields = [copied.pop(name) for name in ("event", "trigger") if name in copied]
     legacy = legacy_fields[0] if legacy_fields else None
@@ -276,39 +279,38 @@ def _upgrade_legacy_templates(
     return value
 
 def _upgrade_rule_templates(
-    rule: Dict[str, Any], *, inherited: Dict[str, str] | None = None,
+    rule: Dict[str, Any], *, inherited: Dict[str, str] | None = None, prefix: str = "",
 ) -> Dict[str, Any]:
-    """升级规则动作和确认参数中的旧模板引用"""
+    """升级规则动作参数中的旧模板引用"""
     step_refs: Dict[str, str] = dict(inherited or {})
     actions = rule.get("actions")
     if isinstance(actions, list):
         for index, action in enumerate(actions):
             if not isinstance(action, dict):
                 continue
-            legacy_key = f"{action.get('type', 'action')}_{index + 1}"
+            legacy_key = f"{prefix}{action.get('type', 'action')}_{index + 1}"
             step_refs[legacy_key] = action.get("binding_id", legacy_key)
 
     copied = dict(rule)
-    for field in ("preconditions", "actions"):
-        items = copied.get(field)
-        if not isinstance(items, list):
+    if not isinstance(actions, list):
+        return copied
+    normalized = []
+    for index, item in enumerate(actions):
+        if not isinstance(item, dict):
+            normalized.append(item)
             continue
-        normalized = []
-        for item in items:
-            if not isinstance(item, dict):
-                normalized.append(item)
-                continue
-            item_copy = dict(item)
-            for value_field in ("params", "condition", "value"):
-                if value_field in item_copy:
-                    item_copy[value_field] = _upgrade_legacy_templates(item_copy[value_field], step_refs)
-            for branch in ("then", "else", "failure_actions"):
-                if isinstance(item_copy.get(branch), list):
-                    item_copy[branch] = _upgrade_rule_templates(
-                        {"actions": item_copy[branch]}, inherited=step_refs
-                    )["actions"]
-            normalized.append(item_copy)
-        copied[field] = normalized
+        item_copy = dict(item)
+        for value_field in ("params", "condition", "value"):
+            if value_field in item_copy:
+                item_copy[value_field] = _upgrade_legacy_templates(item_copy[value_field], step_refs)
+        for branch in ("then", "else", "failure_actions"):
+            if isinstance(item_copy.get(branch), list):
+                item_copy[branch] = _upgrade_rule_templates(
+                    {"actions": item_copy[branch]}, inherited=step_refs,
+                    prefix=f"{prefix}{item.get('type', 'action')}_{index + 1}_{branch}_"
+                )["actions"]
+        normalized.append(item_copy)
+    copied["actions"] = normalized
     return copied
 
 def normalize_rules(rules: Any) -> List[Dict[str, Any]]:

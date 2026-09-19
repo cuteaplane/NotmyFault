@@ -17,7 +17,6 @@ from notmyfault.core import run_lifecycle as lifecycle
 _RUN_EVENT_TYPES = frozenset(
     {
         "rule_triggered",
-        "workflow_deferred",
         "workflow_failed",
         "workflow_completed",
         "action_executed",
@@ -267,9 +266,10 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
             if "output_summary" in data:
                 step["output_summary"] = data["output_summary"]
 
-    new_status = lifecycle.status_after(event_type, data, run["status"])
+    current = "queued" if run["status"] == "deferred" else run["status"]
+    new_status = lifecycle.status_after(event_type, data, current)
     if event_type == "workflow_deferred":
-        run["status"] = new_status or run["status"]
+        run["status"] = "deferred"
         run["deferred_reason"] = data.get("reason")
         run["retry_after_seconds"] = data.get("retry_after_seconds")
     elif event_type == "run_queued":
@@ -299,7 +299,6 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
             "duration_ms", _duration_ms(run["started_at"], timestamp)
         )
     elif new_status == "running":
-        # deferred 的 run 收到动作事件说明重试已经跑起来了
         run["status"] = "running"
 
 
@@ -355,8 +354,12 @@ class RunHistory:
                         continue
                     if isinstance(packet, dict):
                         events.append(packet)
-        except OSError:
+        except FileNotFoundError:
             pass
+        except (OSError, UnicodeDecodeError) as error:
+            from notmyfault.core.logging import engine_error
+
+            engine_error("run_history_read_failed", error=str(error))
         return events
 
     def _compact_unlocked(self) -> None:
@@ -400,6 +403,11 @@ class RunHistory:
         encoded = json.dumps(safe_packet, ensure_ascii=False, separators=(",", ":"))
         with self._writer_done:
             self._events.append(safe_packet)
+            if len(self._pending) == self.max_events and self._write_error is None:
+                self._write_error = OSError("运行历史写入队列已满，部分事件未能保存")
+                from notmyfault.core.logging import engine_error
+
+                engine_error("run_history_queue_full", error=str(self._write_error))
             self._pending.append(encoded)
             if self._writer is None:
                 self._writer = threading.Thread(target=self._write_pending, name="RunHistory", daemon=True)

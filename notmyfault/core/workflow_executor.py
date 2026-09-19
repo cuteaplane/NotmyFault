@@ -284,60 +284,63 @@ class WorkflowExecutor:
         context: Dict[str, Any],
     ) -> None:
         """执行规则工作流并记录运行结果"""
-        if context.get("_run_finished") is True:
-            return
-        if not context.get("_variables_initialized"):
-            try:
-                prepare_binding_context(rule, context, self._triggers_meta(), self._actions_meta())
-            except (DataTypeError, BindingResolutionError) as error:
-                self._finish_run(context)
-                self._on_event("workflow_failed", {
-                    "run_id": _run_id(context), "rule_id": rule.get("rule_id", ""),
-                    "rule_name": rule_name, "error": error.as_dict(),
-                })
+        try:
+            if context.get("_run_finished") is True:
                 return
-        run_cancel_event = self._ensure_run_cancel_event(context)
-        if run_cancel_event.is_set():
-            self._complete_cancelled(context, rule_name)
-            return
-        actions = rule.get("actions", [])
-        if not isinstance(actions, list):
-            actions = []
-        manual_test = context.get("manual_test")
-        if isinstance(manual_test, dict):
-            start_index = int(manual_test.get("start_index", 0) or 0)
-            end_index = int(manual_test.get("end_index", len(actions) - 1))
-            selected_actions = actions[start_index : end_index + 1]
-            manual_test["active_offset"] = start_index
-        else:
-            selected_actions = actions
-        succeeded = self.execute_actions(selected_actions, rule_name, context)
-        if run_cancel_event.is_set():
-            self._complete_cancelled(context, rule_name)
-            return
-        assertion_results = self.evaluate_test_assertions(context, rule_name)
-        if assertion_results is not None:
-            succeeded = succeeded and assertion_results["passed"] == assertion_results["total"]
-        if run_cancel_event.is_set():
-            self._complete_cancelled(context, rule_name)
-            return
-        if not self._finish_run(context):
-            return
-        self._on_event(
-            "workflow_completed",
-            {
-                "run_id": _run_id(context),
-                "rule_id": context.get("rule", {}).get("id", ""),
-                "rule_name": rule_name,
-                "status": "succeeded" if succeeded else "failed",
-                "assertions_passed": assertion_results["passed"] if assertion_results else 0,
-                "assertions_total": assertion_results["total"] if assertion_results else 0,
-                "failure_kind": (
-                    "assertion" if assertion_results and assertion_results["passed"] < assertion_results["total"]
-                    else ""
-                ),
-            },
-        )
+            if not context.get("_variables_initialized"):
+                try:
+                    prepare_binding_context(rule, context, self._triggers_meta(), self._actions_meta())
+                except (DataTypeError, BindingResolutionError) as error:
+                    self._finish_run(context)
+                    self._on_event("workflow_failed", {
+                        "run_id": _run_id(context), "rule_id": rule.get("rule_id", ""),
+                        "rule_name": rule_name, "error": error.as_dict(),
+                    })
+                    return
+            run_cancel_event = self._ensure_run_cancel_event(context)
+            if run_cancel_event.is_set():
+                self._complete_cancelled(context, rule_name)
+                return
+            actions = rule.get("actions", [])
+            if not isinstance(actions, list):
+                actions = []
+            manual_test = context.get("manual_test")
+            if isinstance(manual_test, dict):
+                start_index = int(manual_test.get("start_index", 0) or 0)
+                end_index = int(manual_test.get("end_index", len(actions) - 1))
+                selected_actions = actions[start_index : end_index + 1]
+                manual_test["active_offset"] = start_index
+            else:
+                selected_actions = actions
+            succeeded = self.execute_actions(selected_actions, rule_name, context)
+            if run_cancel_event.is_set():
+                self._complete_cancelled(context, rule_name)
+                return
+            assertion_results = self.evaluate_test_assertions(context, rule_name)
+            if assertion_results is not None:
+                succeeded = succeeded and assertion_results["passed"] == assertion_results["total"]
+            if run_cancel_event.is_set():
+                self._complete_cancelled(context, rule_name)
+                return
+            if not self._finish_run(context):
+                return
+            self._on_event(
+                "workflow_completed",
+                {
+                    "run_id": _run_id(context),
+                    "rule_id": context.get("rule", {}).get("id", ""),
+                    "rule_name": rule_name,
+                    "status": "succeeded" if succeeded else "failed",
+                    "assertions_passed": assertion_results["passed"] if assertion_results else 0,
+                    "assertions_total": assertion_results["total"] if assertion_results else 0,
+                    "failure_kind": (
+                        "assertion" if assertion_results and assertion_results["passed"] < assertion_results["total"]
+                        else ""
+                    ),
+                },
+            )
+        finally:
+            self._finish_run(context)
 
     def evaluate_test_assertions(
         self,
@@ -497,7 +500,7 @@ class WorkflowExecutor:
                         run_failure_actions=False,
                     )
             if not ok and action.get("on_error", "stop") != "continue":
-                print(f"[Engine] 动作流水线在步骤 {step_id} 停止", file=sys.stderr)
+                print(f"[Engine] 动作在步骤 {step_id} 停止", file=sys.stderr)
                 break
         return all_ok
 
@@ -701,12 +704,8 @@ class WorkflowExecutor:
             action_type, action_func, action_meta, raw_params, params, module, timeout_seconds,
         )
 
-    def _invoke_action_once(self, prepared, context):
-        cancellation = ActionCancellation(
-            self._ensure_run_cancel_event(context),
-            self._shutdown_event(),
-            prepared.timeout_seconds,
-        )
+    def _invoke_action_once(self, prepared, context, cancellation):
+        cancellation.raise_if_cancelled()
         action_context = {key: copy.deepcopy(value) for key, value in context.items() if not key.startswith("_")}
         action_context["_type_registry"] = context.get("_type_registry")
         runtime = dict(action_context.get("runtime", {}))
@@ -876,9 +875,10 @@ class WorkflowExecutor:
                 3600,
             )
             backoff = action.get("retry_backoff", "fixed")
+            cancellation = ActionCancellation(self._ensure_run_cancel_event(context), self._shutdown_event(), prepared.timeout_seconds)
             for attempt in range(retries + 1):
                 try:
-                    result = self._invoke_action_once(prepared, context)
+                    result = self._invoke_action_once(prepared, context, cancellation)
                     self._record_action_success(
                         prepared, action, rule_name, context, result,
                         sensitive_params, input_summary, attempt, started,
@@ -886,14 +886,8 @@ class WorkflowExecutor:
                     return True, result
                 except AdminExecutionBlocked:
                     raise
-                except ActionCancelled as exc:
-                    if exc.reason == "timeout" and attempt < retries:
-                        print(
-                            f"[Engine] action \"{action_type}\" 运行超时，准备重试",
-                            file=sys.stderr,
-                        )
-                    else:
-                        raise
+                except ActionCancelled:
+                    raise
                 except Exception:
                     if attempt < retries:
                         print(
@@ -910,14 +904,10 @@ class WorkflowExecutor:
                             if backoff == "exponential"
                             else delay
                         )
-                        retry_wait = ActionCancellation(
-                            self._ensure_run_cancel_event(context),
-                            self._shutdown_event(),
-                        )
+                        retry_wait = cancellation
                         if retry_wait.wait(min(wait_seconds, 3600)):
                             retry_wait.raise_if_cancelled()
                     continue
-                raise
         except ActionCancelled as error:
             return self._record_action_cancelled(action, rule_name, context, error, input_summary, attempt, started)
         except Exception as error:
