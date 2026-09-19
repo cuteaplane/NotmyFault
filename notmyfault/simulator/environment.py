@@ -99,6 +99,8 @@ class SimWindowManager:
         return len(self._windows.get(hwnd, ""))
 
     def get_window_text(self, hwnd, buf, size):
+        if size <= 0:
+            return 0
         title = self._windows.get(hwnd, "")
         truncated = title[:size-1]
         for i, ch in enumerate(truncated):
