@@ -77,6 +77,7 @@ def create_rules_router(
             return value_response(service.save(
                 body.get("rules"),
                 body.get("admin_key_password"),
+                body.get("expected_revision"),
             ))
         except RuleServiceError as error:
             return JSONResponse(error.body, status_code=error.status_code)

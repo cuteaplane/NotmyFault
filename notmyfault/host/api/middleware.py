@@ -20,7 +20,7 @@ DASHBOARD_ORIGINS = tuple(
 
 
 def install_api_middleware(app: FastAPI, token_store: ApiTokenStore) -> None:
-    request_times: collections.deque[float] = collections.deque()
+    clients: dict[tuple[str, str], collections.deque[float]] = {}
     request_times_lock = threading.Lock()
     rate_window_seconds = 10.0
     rate_limit = 300
@@ -48,9 +48,23 @@ def install_api_middleware(app: FastAPI, token_store: ApiTokenStore) -> None:
             return JSONResponse(
                 {"detail": "Forbidden: invalid API Token"}, status_code=403
             )
+        if request.method in {"POST", "PUT", "PATCH"}:
+            limit = (65 if request.url.path in {"/api/plugins/preview", "/api/plugins/install"} else 1) * 1024 * 1024
+            body = bytearray()
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > limit:
+                    return JSONResponse({"ok": False, "error": "请求体超过大小上限"}, status_code=413)
+                body.extend(chunk)
+            request._body = bytes(body)
         now = time.monotonic()
         with request_times_lock:
             cutoff = now - rate_window_seconds
+            for key in list(clients):
+                if not clients[key] or clients[key][-1] <= cutoff:
+                    clients.pop(key)
+            origin = request.headers.get("origin", "")
+            client_key = (request.client.host if request.client else "", origin if origin in DASHBOARD_ORIGINS else "")
+            request_times = clients.setdefault(client_key, collections.deque())
             while request_times and request_times[0] <= cutoff:
                 request_times.popleft()
             if len(request_times) >= rate_limit:

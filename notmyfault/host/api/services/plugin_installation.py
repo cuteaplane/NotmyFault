@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shlex
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict
@@ -50,6 +52,9 @@ class PluginDownload:
     content: bytes
     filename: str
     sha256: str
+
+
+_MANIFEST_LOCK = threading.RLock()
 
 
 class PluginInstallationService:
@@ -124,7 +129,7 @@ class PluginInstallationService:
         if plugin_kind not in ("triggers", "actions") or not plugin_id:
             self._fail(400, "需要 type (triggers/actions) 和 id")
         if not self._safe_plugin_id(plugin_id):
-            return {"ok": False, "error": "插件 id 含非法字符（禁止路径分隔符）"}
+            self._fail(400, "插件 id 含非法字符（禁止路径分隔符）")
         json_name = (
             "trigger.json" if plugin_kind == "triggers" else "action.json"
         )
@@ -139,7 +144,7 @@ class PluginInstallationService:
         elif builtin_json.exists():
             origin = "builtin"
         else:
-            return {"ok": False, "error": "插件不存在"}
+            self._fail(404, "插件不存在")
         try:
             config = self._load_config_for_update()
             disabled = config.get("disabled_plugins", {})
@@ -157,7 +162,7 @@ class PluginInstallationService:
             disabled[plugin_kind] = disabled_list
             config["disabled_plugins"] = disabled
             if not self._store.save_config(config):
-                return {"ok": False, "error": "无法保存配置"}
+                self._fail(500, "无法保存配置")
             return {
                 "ok": True,
                 "enabled": enabled,
@@ -165,35 +170,43 @@ class PluginInstallationService:
                 "restart_required": True,
             }
         except ConfigValidationError:
-            return {"ok": False, "error": "配置未通过完整性校验"}
+            self._fail(409, "配置未通过完整性校验")
+        except PluginInstallationError:
+            raise
         except Exception:
-            return {"ok": False, "error": "切换插件状态失败"}
+            self._fail(500, "切换插件状态失败")
 
     def uninstall(self, plugin_kind: str, plugin_id: str) -> Dict[str, Any]:
         if plugin_kind not in ("triggers", "actions"):
             self._fail(400, "type 必须为 triggers 或 actions")
         if not self._safe_plugin_id(plugin_id):
-            return {"ok": False, "error": "插件 id 含非法字符（禁止路径分隔符）"}
+            self._fail(400, "插件 id 含非法字符（禁止路径分隔符）")
         json_name = (
             "trigger.json" if plugin_kind == "triggers" else "action.json"
         )
         plugin_dir = self._paths.user_plugins_dir / plugin_kind / plugin_id
         if not (plugin_dir / json_name).exists():
-            return {"ok": False, "error": "只能卸载用户插件，或插件不存在"}
-        try:
-            meta = json.loads((plugin_dir / json_name).read_text(encoding="utf-8"))
-            package_name = meta.get("package_name") if isinstance(meta, dict) else None
-        except (OSError, ValueError):
-            package_name = None
+            self._fail(404, "只能卸载用户插件，或插件不存在")
         backups = {plugin_dir.with_name(plugin_dir.name + ".nmf-backup")}
-        if isinstance(package_name, str) and package_name:
-            backups.update(self._backups_for_package(package_name))
+        from notmyfault.security.plugins import load_plugin_manifest
+
+        try:
+            metadata = (plugin_dir / json_name).read_bytes()
+            installed = load_plugin_manifest(self._paths.plugin_manifest_file)
+            recorded = installed.get(plugin_id, {}) if isinstance(installed, dict) else {}
+            if isinstance(recorded, dict) and recorded.get(json_name) == hashlib.sha256(metadata).hexdigest():
+                meta = json.loads(metadata)
+                package_name = meta.get("package_name")
+                if isinstance(package_name, str) and package_name:
+                    backups.update(self._backups_for_package(package_name))
+        except (OSError, ValueError):
+            pass
         try:
             self._file_system.remove_tree(plugin_dir)
             for backup in backups:
                 self._file_system.remove_tree(backup)
         except OSError:
-            return {"ok": False, "error": "删除插件文件失败"}
+            self._fail(500, "删除插件文件失败")
         self._forget_installed_hashes(plugin_id)
         return {"ok": True, "restart_required": True}
 
@@ -354,7 +367,7 @@ class PluginInstallationService:
                 "checks": inspection_report(inspection, detect_security_mode()),
                 "installation": {
                     "requires_confirmation": bool(risks),
-                    "required_risk_ids": [risk["id"] for risk in risks if risk.get("id") == "build_hook"],
+                    "required_risk_ids": [risk["id"] for risk in risks],
                 },
                 "update_diff": update_diff,
             }
@@ -437,6 +450,12 @@ class PluginInstallationService:
                             "required_risk_ids": ["build_hook"],
                         },
                     )
+                missing = current_risk_ids - confirmed
+                if missing:
+                    raise PluginInstallationError(400, {
+                        "ok": False, "code": "risk_confirmation_required",
+                        "error": "安装插件前需要确认列出的风险", "required_risk_ids": sorted(missing),
+                    })
                 self._previews.pop(preview_token)
                 preview_owned = True
             else:
@@ -686,20 +705,22 @@ class PluginInstallationService:
         tree = inspect_plugin_tree(str(plugin_dir))
         if tree is None:
             return
-        path = self._paths.plugin_manifest_file
-        manifest = load_plugin_manifest(path)
-        manifest[plugin_id] = tree.file_snapshot
-        save_plugin_manifest(manifest, path)
+        with _MANIFEST_LOCK:
+            path = self._paths.plugin_manifest_file
+            manifest = load_plugin_manifest(path)
+            manifest[plugin_id] = tree.file_snapshot
+            save_plugin_manifest(manifest, path)
 
     def _forget_installed_hashes(self, plugin_id: str) -> None:
         from notmyfault.security.plugins import load_plugin_manifest, save_plugin_manifest
 
-        path = self._paths.plugin_manifest_file
-        manifest = load_plugin_manifest(path)
-        if plugin_id not in manifest:
-            return
-        del manifest[plugin_id]
-        save_plugin_manifest(manifest, path)
+        with _MANIFEST_LOCK:
+            path = self._paths.plugin_manifest_file
+            manifest = load_plugin_manifest(path)
+            if plugin_id not in manifest:
+                return
+            del manifest[plugin_id]
+            save_plugin_manifest(manifest, path)
 
     @staticmethod
     def _build_command_argv(command: str) -> list[str]:

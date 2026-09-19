@@ -16,7 +16,7 @@ from notmyfault.security.signing import verify_file
 
 @dataclass(slots=True)
 class SettingsServiceError(Exception):
-    kind: Literal["invalid", "integrity", "write", "approval"]
+    kind: Literal["invalid", "approval"]
     message: str
     code: str | None = None
 
@@ -113,15 +113,6 @@ class SettingsService:
                         rule.get("name", f"规则 #{index + 1}")
                         if isinstance(rule, dict)
                         else f"规则 #{index + 1}"
-                    ),
-                    "preconditions": (
-                        [
-                            summarize_item(item)
-                            for item in rule.get("preconditions", [])
-                        ]
-                        if isinstance(rule, dict)
-                        and isinstance(rule.get("preconditions", []), list)
-                        else []
                     ),
                     "actions": (
                         [summarize_item(action) for action in rule.get("actions", [])]

@@ -7,6 +7,7 @@ import secrets
 import hashlib
 import json
 import tempfile
+import threading
 from collections.abc import Iterator, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -321,50 +322,68 @@ class PendingPreviewStore(MutableMapping[str, dict[str, Any]]):
         self._ttl_seconds = ttl_seconds
         self._token_factory = token_factory or (lambda: secrets.token_hex(16))
         self._items: dict[str, dict[str, Any]] = {}
+        self._lock = threading.RLock()
 
     def __getitem__(self, key: str) -> dict[str, Any]:
-        return self._items[key]
+        with self._lock:
+            return self._items[key]
 
     def __setitem__(self, key: str, value: dict[str, Any]) -> None:
-        self._items[key] = value
+        with self._lock:
+            self._items[key] = value
 
     def __delitem__(self, key: str) -> None:
-        del self._items[key]
+        with self._lock:
+            del self._items[key]
 
     def __iter__(self) -> Iterator[str]:
-        return iter(self._items)
+        with self._lock:
+            return iter(tuple(self._items))
 
     def __len__(self) -> int:
-        return len(self._items)
+        with self._lock:
+            return len(self._items)
 
     def purge_expired(self) -> None:
-        now = self._clock()
-        expired = [
-            token
-            for token, preview in self._items.items()
-            if now - float(preview.get("created_at", 0)) > self._ttl_seconds
-        ]
-        for token in expired:
-            preview = self._items.pop(token)
+        with self._lock:
+            now = self._clock()
+            expired = [
+                token
+                for token, preview in self._items.items()
+                if now - float(preview.get("created_at", 0)) > self._ttl_seconds
+            ]
+            for token in expired:
+                preview = self._items.pop(token)
+                extract_dir = preview.get("extract_dir")
+                if isinstance(extract_dir, str) and extract_dir:
+                    self._remove_tree(Path(extract_dir))
+
+    def create(self, preview: dict[str, Any]) -> str:
+        with self._lock:
+            self.purge_expired()
+            token = self._token_factory()
+            item = dict(preview)
+            item["created_at"] = self._clock()
+            self._items[token] = item
+            return token
+
+    def discard(self, token: str) -> None:
+        with self._lock:
+            preview = self._items.pop(token, None)
+            if preview is None:
+                return
             extract_dir = preview.get("extract_dir")
             if isinstance(extract_dir, str) and extract_dir:
                 self._remove_tree(Path(extract_dir))
 
-    def create(self, preview: dict[str, Any]) -> str:
-        self.purge_expired()
-        token = self._token_factory()
-        item = dict(preview)
-        item["created_at"] = self._clock()
-        self._items[token] = item
-        return token
+    def pop(self, key, *default):
+        with self._lock:
+            return self._items.pop(key, *default)
 
-    def discard(self, token: str) -> None:
-        preview = self._items.pop(token, None)
-        if preview is None:
-            return
-        extract_dir = preview.get("extract_dir")
-        if isinstance(extract_dir, str) and extract_dir:
-            self._remove_tree(Path(extract_dir))
+    def drop_all(self) -> None:
+        with self._lock:
+            for token in list(self._items):
+                self.discard(token)
 
 
 def snapshot_plugin_directory(root_path: str) -> dict[str, str] | None:

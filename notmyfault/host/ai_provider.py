@@ -500,7 +500,7 @@ class OpenAICompatibleDraftProvider:
         try:
             # HTTPError、socket、SSL 报错都在 OSError 下；HTTPException 是读响应中途断线的报错。
             with self._opener.open(req, timeout=_REQUEST_TIMEOUT_SECONDS) as response:
-                raw = response.read()
+                raw = response.read(_MAX_RESPONSE_BYTES + 1)
         except (OSError, HTTPException) as error:
             raise AIProviderRequestError(_request_failure_message(error)) from error
         if len(raw) > _MAX_RESPONSE_BYTES:

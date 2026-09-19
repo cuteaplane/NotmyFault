@@ -10,9 +10,9 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List
 from notmyfault.config import (
     ConfigValidationError,
     SignedConfigStore,
-    ensure_rule_binding_ids,
     get_ai_drafting_settings,
 )
+from notmyfault.core.rule_model import ensure_rule_binding_ids
 from notmyfault.host.ai_provider import (
     AIProviderIdleTimeoutError,
     AIProviderRequestError,
@@ -115,6 +115,10 @@ class AIDraftingService:
             ) from error
         settings = config.get("settings")
         settings = dict(settings) if isinstance(settings, dict) else {}
+        old_endpoint = get_ai_drafting_settings(config)["endpoint_url"]
+        new_endpoint = body.get("endpoint_url") if isinstance(body.get("endpoint_url"), str) else ""
+        if new_endpoint != old_endpoint and self._api_key_status_label() == "saved":
+            self.delete_api_key()
         settings["ai_drafting"] = {
             "enabled": (
                 body.get("enabled")
@@ -140,7 +144,7 @@ class AIDraftingService:
         config["settings"] = settings
         if not self._store.save_config(config):
             self._fail(500, "无法保存配置")
-        return {"ok": True, "settings": get_ai_drafting_settings(config)}
+        return {"ok": True, "settings": {**get_ai_drafting_settings(config), "api_key_status": self._api_key_status_label()}}
 
     async def draft(self, body: Dict[str, Any]) -> Dict[str, Any]:
         plan = self._prepare(body)

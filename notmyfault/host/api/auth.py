@@ -7,27 +7,9 @@ from typing import Callable
 
 
 def restrict_token_file(path: str) -> None:
-    if os.name != "nt":
-        os.chmod(path, 0o600)
-        return
+    from notmyfault.security.api_key_store import _restrict_key_file
 
-    import subprocess
-
-    userdomain = os.environ.get("USERDOMAIN", "")
-    username = os.environ.get("USERNAME") or os.getlogin()
-    account = f"{userdomain}\\{username}" if userdomain else username
-    grant = subprocess.run(
-        ["icacls", path, "/grant:r", f"{account}:F"],
-        capture_output=True,
-        timeout=5,
-    )
-    inheritance = subprocess.run(
-        ["icacls", path, "/inheritance:r"],
-        capture_output=True,
-        timeout=5,
-    )
-    if grant.returncode != 0 or inheritance.returncode != 0:
-        raise RuntimeError("无法设置 API 令牌文件权限")
+    _restrict_key_file(path)
 
 
 class ApiTokenStore:
@@ -48,23 +30,20 @@ class ApiTokenStore:
         return self._token
 
     def matches(self, candidate: str) -> bool:
-        return bool(candidate) and secrets.compare_digest(candidate, self._token)
+        return bool(candidate) and candidate.isascii() and secrets.compare_digest(candidate, self._token)
 
     def repair_file(self) -> None:
         try:
-            if secrets.compare_digest(
-                self.path.read_text(encoding="utf-8").strip(),
-                self._token,
-            ):
+            if self.matches(self.path.read_text(encoding="utf-8").strip()):
                 return
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             pass
         self._secure_write(self._token)
 
     def _load_or_create(self) -> str:
         try:
             token = self.path.read_text(encoding="utf-8").strip()
-            if len(token) == 64:
+            if len(token) == 64 and token.isascii():
                 int(token, 16)
                 self._secure_write(token)
                 return token

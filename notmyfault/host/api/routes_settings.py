@@ -8,15 +8,10 @@ from notmyfault.host.api.services.settings import (
 
 
 def _settings_error(error: SettingsServiceError) -> JSONResponse:
-    status_code = 400
-    if error.kind == "integrity":
-        status_code = 409
-    elif error.kind == "write":
-        status_code = 500
     body = {"ok": False, "error": str(error)}
     if error.code:
         body["code"] = error.code
-    return JSONResponse(body, status_code=status_code)
+    return JSONResponse(body, status_code=400)
 
 
 def create_settings_router(service: SettingsService) -> APIRouter:

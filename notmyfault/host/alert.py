@@ -3,14 +3,11 @@
 import os
 import sys
 import threading
-import time
 
 from notmyfault.platform.platform_support import launch_python_entry, show_notification
 
 if os.name == "nt":
     from windows_toasts import Toast, ToastButton
-    _active_toasts: list[Toast] = []
-    _toasts_lock = threading.Lock()
 
 
 def _dashboard_pyw_path() -> str:
@@ -54,7 +51,7 @@ def alert_user(
 
 def _show_windows_alert(title: str, message: str, display_seconds: int) -> None:
     """发送带 Dashboard 操作按钮的 Windows Toast"""
-    from Win_toaster.show_notification import toaster
+    from Win_toaster.show_notification import show_toast
 
     toast = Toast([f"[!] {title}", message])
 
@@ -67,23 +64,4 @@ def _show_windows_alert(title: str, message: str, display_seconds: int) -> None:
 
     toast.on_activated = _on_activated
 
-    with _toasts_lock:
-        _active_toasts.append(toast)
-
-    toaster.show_toast(toast)
-
-    def _keepalive_and_cleanup():
-        deadline = time.time() + display_seconds + 2
-        while time.time() < deadline:
-            time.sleep(0.5)
-        try:
-            toaster.remove_toast(toast)
-        except Exception:
-            pass
-        try:
-            with _toasts_lock:
-                _active_toasts.remove(toast)
-        except ValueError:
-            pass
-
-    threading.Thread(target=_keepalive_and_cleanup, daemon=True).start()
+    show_toast(toast, display_seconds + 2)

@@ -1,3 +1,4 @@
+from notmyfault.host.api.services.ai_drafting import AIDraftingService
 from notmyfault.host.api.services.engine import EngineService
 from notmyfault.host.api.services.interactions import PluginInteractionService
 from notmyfault.host.api.services.plugin_catalog import PluginCatalogService
@@ -16,4 +17,3 @@ __all__ = [
     "RuleService",
     "SettingsService",
 ]
-from notmyfault.host.api.services.ai_drafting import AIDraftingService

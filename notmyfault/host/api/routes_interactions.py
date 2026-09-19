@@ -40,6 +40,8 @@ def create_interactions_router(service: PluginInteractionService) -> APIRouter:
             )
         try:
             body = decode_request(request, json.loads(raw_body) if raw_body else {})
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return JSONResponse({"ok": False, "error": "无效的 JSON 请求体"}, status_code=400)
         except (TypeError, ValueError):
             return JSONResponse({"ok": False, "error": "扩展请求数据编码无效"}, status_code=400)
         if not isinstance(body, dict):

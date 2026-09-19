@@ -1,4 +1,3 @@
-import os
 import glob
 import json
 import os
@@ -20,7 +19,7 @@ def _notify_build_required(detail: str) -> None:
 
         alert_user(
             "NotmyFault 安装文件不完整",
-            f"{detail}。为防止安全模式被自动降低，引擎已拒绝启动。"
+            f"{detail}。安装文件无法验证，引擎已拒绝启动。"
             "请从可信来源重新安装 NotmyFault。源码开发者可在确认文件完整后重新构建。",
             open_dashboard=False,
         )

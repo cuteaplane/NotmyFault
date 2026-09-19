@@ -86,7 +86,7 @@ def create_ai_router(service: AIDraftingService) -> APIRouter:
             body = await request.json()
         except Exception:
             return JSONResponse(
-                {"ok": False, "error": "请求体必须是 JSON 对象"},
+                {"ok": False, "error": "无效的 JSON 请求体"},
                 status_code=400,
             )
         if not isinstance(body, dict):

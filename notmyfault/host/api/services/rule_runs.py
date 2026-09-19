@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from notmyfault.config import ConfigValidationError, SignedConfigStore
-from notmyfault.core.bindings import BindingResolutionError, _validate_path, iter_legacy_event_payload_paths, iter_references, resolve_reference
+from notmyfault.core.bindings import BindingResolutionError, validate_binding_path, iter_legacy_event_payload_paths, iter_references, resolve_reference
 from notmyfault.core.data_types import DataTypeError
 from notmyfault.core.type_registry import TypeRegistry
 from notmyfault.core.variables import initialize_variables
@@ -295,7 +295,7 @@ class RuleRunService:
             path = assertion.get("path", [])
             operator = assertion.get("operator")
             try:
-                _validate_path(path, f"test_assertions[{index}]", {})
+                validate_binding_path(path, f"test_assertions[{index}]", {})
             except BindingResolutionError:
                 self._fail(400, f"检查项 #{index + 1} 的数据路径无效")
             if (

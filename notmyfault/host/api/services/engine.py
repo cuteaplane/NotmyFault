@@ -169,7 +169,9 @@ class EngineService:
 
     def cancel_run(self, run_id: str) -> Dict[str, Any]:
         current_engine = self._engine.current_engine
-        if current_engine is None or not current_engine.cancel_run(run_id):
+        if current_engine is None:
+            raise EngineServiceError("conflict", {"ok": False, "error": "引擎未运行"})
+        if not current_engine.cancel_run(run_id):
             raise EngineServiceError(
                 "not_found",
                 {"ok": False, "error": "这次运行已经结束或不存在"},

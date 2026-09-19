@@ -146,7 +146,10 @@ class PluginInteractionService:
 
         def invoke_handler() -> Any:
             if not self._invoke_slots.acquire(blocking=False):
-                raise RuntimeError("扩展命令并发数已达上限")
+                raise PluginInteractionError(429, {
+                    "ok": False, "code": "extension_busy",
+                    "error": "扩展命令并发数已达上限，请稍后重试", "session_id": session.session_id,
+                })
             try:
                 return session.invoke(handler, context, body.get("payload"))
             finally:
@@ -154,7 +157,12 @@ class PluginInteractionService:
 
         try:
             result = await asyncio.to_thread(invoke_handler)
+        except PluginInteractionError:
+            raise
         except Exception as error:
+            from notmyfault.core.logging import engine_error
+
+            engine_error("extension_command_failed", plugin=plugin_id, command=command_id, error_type=type(error).__name__)
             self._extension_sessions.drop(session.session_id)
             raise PluginInteractionError(
                 400,

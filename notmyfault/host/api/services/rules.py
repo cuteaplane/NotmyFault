@@ -41,10 +41,12 @@ class RuleService:
 
     def list_rules(self) -> Dict[str, Any]:
         try:
-            rules = self._store.load_verified_rules(for_editing=True)
+            with self._store.rules_lock:
+                rules = self._store.load_verified_rules(for_editing=True)
+                revision = self._store.rules_revision()
         except ConfigValidationError as error:
             return {"ok": False, "rules": None, "config_error": str(error)}
-        return {"rules": rules}
+        return {"rules": rules, "revision": revision}
 
     def validate_draft(self, rule: Any) -> Dict[str, Any]:
         issues: List[Dict[str, Any]] = []
@@ -98,34 +100,10 @@ class RuleService:
                 plugin = schema["actions"].get(
                     action_item.get("type", "")
                 )
-                if plugin is None:
-                    add(
-                        "error",
-                        "plugin_reference",
-                        f"{item_label}引用了未加载的动作: "
-                        f"{action_item.get('type', '')}",
-                        location,
-                    )
-                elif plugin.get("platform_compatible") is False:
-                    add(
-                        "error",
-                        "platform_incompatible",
-                        f"{item_label}“{plugin.get('name') or action_item.get('type')}”"
-                        "不支持当前系统",
-                        location,
-                    )
-                elif plugin.get("availability") == "unavailable":
-                    reasons = "；".join(
-                        plugin.get("unavailable_reasons") or []
-                    )
-                    add(
-                        "error",
-                        "capability_incompatible",
-                        f"{item_label}“{plugin.get('name') or action_item.get('type')}”"
-                        f"当前系统缺少能力（{reasons}）",
-                        location,
-                    )
-                elif (
+                self._add_plugin_availability_issue(add, plugin, action_item.get("type", ""), item_label, location)
+                if plugin is None or plugin.get("platform_compatible") is False or plugin.get("availability") == "unavailable":
+                    continue
+                if (
                     action_item.get("timeout_seconds") is not None
                     and plugin.get("cancellation_api") != "runtime-v1"
                 ):
@@ -199,7 +177,17 @@ class RuleService:
         self,
         rules: Any,
         admin_key_password: Any,
+        expected_revision: Any = None,
     ) -> Dict[str, Any]:
+        with self._store.rules_lock:
+            if expected_revision is not None and expected_revision != self._store.rules_revision():
+                raise RuleServiceError(409, {
+                    "ok": False, "code": "rules_conflict",
+                    "error": "规则已被其他操作修改，请刷新后重新保存",
+                })
+            return self._save(rules, admin_key_password)
+
+    def _save(self, rules: Any, admin_key_password: Any) -> Dict[str, Any]:
         normalized_rules = self._normalize_input(rules)
         structure_errors = validate_rules_structure(normalized_rules)
         if structure_errors:
@@ -273,7 +261,7 @@ class RuleService:
                 500,
                 {"ok": False, "error": "写入规则文件失败"},
             )
-        return {"ok": True, "rules": normalized_rules}
+        return {"ok": True, "rules": normalized_rules, "revision": self._store.rules_revision()}
 
     @staticmethod
     def _normalize_input(rules: Any) -> List[Dict[str, Any]]:

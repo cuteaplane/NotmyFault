@@ -80,12 +80,6 @@ class TrayIcon:
     def stop(self):
         """停止托盘图标"""
         self._shutdown_event.set()
-        if self._hwnd:
-            try:
-                win32gui.DestroyWindow(self._hwnd)
-            except Exception:
-                pass
-            self._hwnd = None
         if self._thread and self._thread.is_alive():
             # 托盘线程不能 join() 自身，退出循环后会自行清理。
             if self._thread is not threading.current_thread():
@@ -166,6 +160,8 @@ class TrayIcon:
                 win32gui.DestroyWindow(self._hwnd)
             except Exception:
                 pass
+            self._hwnd = None
+        win32gui.UnregisterClass(class_atom, hinst)
 
     def _wndproc(self, hwnd: int, msg: int, wparam: int, lparam: int):
         if msg == WM_TASKBARCREATED:
@@ -251,6 +247,7 @@ class TrayIcon:
             pass
 
     def _show_context_menu(self, hwnd: int):
+        self._auto_start_enabled = _is_auto_start_enabled()
         menu = win32gui.CreatePopupMenu()
 
         win32gui.AppendMenu(menu, win32con.MF_STRING,

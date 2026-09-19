@@ -30,59 +30,7 @@ class PluginCatalogService:
         self._engine = engine
 
     def schema(self) -> Dict[str, Any]:
-        base = str(self.paths.package_root)
-        capability_report = probe_capabilities()
-        result: Dict[str, Dict[str, Any]] = {
-            "triggers": scan_plugins(base, "triggers", "trigger.json"),
-            "actions": scan_plugins(base, "actions", "action.json"),
-        }
-        for plugin_kind in ("triggers", "actions"):
-            for meta in result[plugin_kind].values():
-                meta["origin"] = "builtin"
-        user_dir = str(self.paths.user_plugins_dir)
-        if os.path.isdir(user_dir):
-            for plugin_kind in ("triggers", "actions"):
-                json_name = (
-                    "trigger.json" if plugin_kind == "triggers" else "action.json"
-                )
-                for plugin_id, meta in scan_plugins(
-                    user_dir,
-                    plugin_kind,
-                    json_name,
-                    include_disabled=True,
-                ).items():
-                    if plugin_id not in result[plugin_kind]:
-                        meta["origin"] = "user"
-                        result[plugin_kind][plugin_id] = meta
-        disabled = self._load_config().get("disabled_plugins", {})
-        if not isinstance(disabled, dict):
-            disabled = {}
-        current_engine = self._engine.current_engine
-        plugin_errors = []
-        if current_engine is not None:
-            plugin_errors = (
-                current_engine.get_diagnostics()
-                .get("plugins", {})
-                .get("errors", [])
-            )
-        for plugin_kind in ("triggers", "actions"):
-            disabled_set = set(disabled.get(plugin_kind, []))
-            for plugin_id, meta in result[plugin_kind].items():
-                if not isinstance(meta, dict):
-                    continue
-                if meta.get("origin") == "user":
-                    meta["enabled"] = plugin_id not in disabled_set
-                elif plugin_id in disabled_set:
-                    meta["enabled"] = False
-                for error in plugin_errors:
-                    if len(error) < 3 or error[1] != plugin_id:
-                        continue
-                    category = (
-                        "triggers" if error[0] == "Trigger" else "actions"
-                    )
-                    if category == plugin_kind:
-                        meta.setdefault("_error", error[2])
-                self._annotate_availability(meta, capability_report)
+        result = self._scan(include_checks=False)
         try:
             result["data_types"] = TypeRegistry.from_plugins(result["triggers"], result["actions"], include_disabled=True).catalog()
         except DataTypeError as error:
@@ -90,10 +38,14 @@ class PluginCatalogService:
         return result
 
     def list_all(self) -> Dict[str, Any]:
+        return self._scan(include_checks=True)
+
+    def _scan(self, *, include_checks: bool) -> Dict[str, Any]:
         base = str(self.paths.package_root)
         capability_report = probe_capabilities()
         user_dir = str(self.paths.user_plugins_dir)
-        disabled = self._load_config().get("disabled_plugins", {})
+        config = self._load_config()
+        disabled = config.get("disabled_plugins", {})
         if not isinstance(disabled, dict):
             disabled = {"triggers": [], "actions": []}
 
@@ -110,14 +62,15 @@ class PluginCatalogService:
             ).items():
                 meta["origin"] = "builtin"
                 result[plugin_kind][plugin_id] = meta
-            self._include_unscannable_plugins(
-                result[plugin_kind],
-                os.path.join(base, plugin_kind),
-                json_name,
-                "builtin",
-                plugin_kind,
-                capability_report,
-            )
+            if include_checks:
+                self._include_unscannable_plugins(
+                    result[plugin_kind],
+                    os.path.join(base, plugin_kind),
+                    json_name,
+                    "builtin",
+                    plugin_kind,
+                    capability_report,
+                )
             if os.path.isdir(user_dir):
                 for plugin_id, meta in scan_plugins(
                     user_dir,
@@ -128,14 +81,15 @@ class PluginCatalogService:
                     meta["origin"] = "user"
                     if plugin_id not in result[plugin_kind]:
                         result[plugin_kind][plugin_id] = meta
-                self._include_unscannable_plugins(
-                    result[plugin_kind],
-                    os.path.join(user_dir, plugin_kind),
-                    json_name,
-                    "user",
-                    plugin_kind,
-                    capability_report,
-                )
+                if include_checks:
+                    self._include_unscannable_plugins(
+                        result[plugin_kind],
+                        os.path.join(user_dir, plugin_kind),
+                        json_name,
+                        "user",
+                        plugin_kind,
+                        capability_report,
+                    )
             for plugin_id in disabled_set:
                 if plugin_id in result[plugin_kind]:
                     result[plugin_kind][plugin_id]["enabled"] = False
@@ -161,6 +115,12 @@ class PluginCatalogService:
                 plugin_id = error[1]
                 if plugin_id in result[category]:
                     result[category][plugin_id]["_error"] = error[2]
+        if config.get("config_error"):
+            result["config_error"] = config["config_error"]
+            for plugin_kind in ("triggers", "actions"):
+                for meta in result[plugin_kind].values():
+                    meta["enabled"] = False
+                    meta["_error"] = config["config_error"]
         return result
 
     def find_user_plugin_by_package(self, package_name: str):
@@ -220,8 +180,8 @@ class PluginCatalogService:
     def _load_config(self) -> Dict[str, Any]:
         try:
             return self._store.load_verified_config()
-        except ConfigValidationError:
-            return {"rules": []}
+        except ConfigValidationError as error:
+            return {"config_error": str(error)}
 
     @staticmethod
     def _annotate_availability(
