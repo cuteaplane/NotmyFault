@@ -7,11 +7,12 @@ import secrets
 import stat
 import sys
 import tempfile
+import threading
 from typing import Any, Dict, List
 
 from notmyfault.application_paths import ApplicationPaths
 from notmyfault.core.rule_model import (
-    ensure_rule_id, ensure_rule_binding_ids, normalize_rules, normalize_rule_shape,
+    normalize_rules, normalize_rule_shape,
     _extract_legacy_rules,
 )
 from notmyfault.core.data_types import DataTypeError
@@ -137,6 +138,10 @@ def _validate_secret_permissions(path: str) -> None:
 class ConfigValidationError(ValueError):
     """运行时配置未通过完整性或安全校验"""
 
+    def __init__(self, message: str, *, recoverable: bool = False):
+        super().__init__(message)
+        self.recoverable = recoverable
+
 
 def _validate_rules_for_runtime(rules: List[Dict[str, Any]]) -> None:
     """拒绝不符合规则结构的运行时配置"""
@@ -185,6 +190,13 @@ class SignedConfigStore:
     def __init__(self, paths: ApplicationPaths) -> None:
         self.paths = paths
         self._secret_cache: bytes | None = None
+        self.rules_lock = threading.RLock()
+
+    def rules_revision(self) -> str:
+        try:
+            return hashlib.sha256(self.paths.rules_file.read_bytes()).hexdigest()
+        except FileNotFoundError:
+            return hashlib.sha256(b"").hexdigest()
 
     @property
     def config_path(self) -> str:
@@ -227,13 +239,19 @@ class SignedConfigStore:
 
     def _sign(self, data: Dict[str, Any]) -> str:
         content = json.dumps(data, sort_keys=True, ensure_ascii=False, default=str)
+        try:
+            encoded = content.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ConfigValidationError("配置包含无效的 Unicode 字符") from error
         return hmac.new(
             self._get_or_create_secret(),
-            content.encode("utf-8"),
+            encoded,
             hashlib.sha256,
         ).hexdigest()
 
     def _verify(self, data: Dict[str, Any], signature: str) -> bool:
+        if not isinstance(signature, str) or not signature.isascii():
+            return False
         return hmac.compare_digest(self._sign(data), signature)
 
     def _write_signed_json(
@@ -278,7 +296,7 @@ class SignedConfigStore:
                 atomic_write(backup_path, previous)
             atomic_write(path, content)
             return True
-        except OSError as error:
+        except (OSError, ConfigValidationError, UnicodeEncodeError) as error:
             print(
                 f"[Config] 写入 {os.path.basename(path)} 失败: {error}",
                 file=sys.stderr,
@@ -297,6 +315,10 @@ class SignedConfigStore:
         )
 
     def save_rules(self, rules: List[Dict[str, Any]]) -> bool:
+        with self.rules_lock:
+            return self._save_rules(rules)
+
+    def _save_rules(self, rules: List[Dict[str, Any]]) -> bool:
         if not isinstance(rules, list):
             print("[Config] 保存规则失败: rules 必须是列表", file=sys.stderr)
             return False
@@ -316,10 +338,10 @@ class SignedConfigStore:
         try:
             with open(path, "r", encoding="utf-8") as file:
                 raw = json.load(file)
-        except (json.JSONDecodeError, OSError) as error:
-            raise ConfigValidationError(f"{label}文件无法解析: {error}") from error
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as error:
+            raise ConfigValidationError(f"{label}文件无法解析: {error}", recoverable=True) from error
         if not isinstance(raw, dict):
-            raise ConfigValidationError(f"{label}文件根节点必须是对象")
+            raise ConfigValidationError(f"{label}文件根节点必须是对象", recoverable=True)
         signature = raw.pop(_SIGNATURE_KEY, "")
         if not self.paths.config_secret_file.is_file():
             raise ConfigValidationError(f"{label}签名密钥缺失")
@@ -474,14 +496,12 @@ class SignedConfigStore:
         try:
             config = self.load_verified_config()
         except ConfigValidationError as error:
-            if "无法解析" not in str(error):
+            if not error.recoverable:
                 raise
             recovered = self._recover_config()
             if recovered is not None:
                 return recovered
-            default = _default_v2_config()
-            self.save_config(default)
-            return default
+            raise
         self._migrate_rules_file()
         return config
 
@@ -494,15 +514,12 @@ class SignedConfigStore:
         try:
             rules = self.load_verified_rules()
         except ConfigValidationError as error:
-            if not any(
-                marker in str(error) for marker in ("无法解析", "根节点")
-            ):
+            if not error.recoverable:
                 raise
             recovered = self._recover_rules()
             if recovered is not None:
                 return recovered
-            self.save_rules([])
-            return []
+            raise
         return rules
 
     def inspect_files(self) -> Dict[str, Any]:
