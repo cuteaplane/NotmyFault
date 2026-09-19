@@ -63,7 +63,7 @@ def create_shortcut():
         shell_link.SetPath(str(target))
         if args:
             shell_link.SetArguments(args)
-        if icon:
+        if icon.is_file():
             shell_link.SetIconLocation(str(icon), 0)
 
         lnk_path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,5 +87,4 @@ def create_shortcut():
         persist_file.Save(str(lnk_path), 1)
     finally:
         comtypes.CoUninitialize()
-        print(f"Shortcut created: {lnk_path}")
-        print(f"Exists: {lnk_path.exists()}")
+    print(f"[Notification] 快捷方式已创建: {lnk_path}")

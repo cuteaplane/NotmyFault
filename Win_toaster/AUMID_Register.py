@@ -40,6 +40,15 @@ def register_protocol() -> bool:
         return False
 
 
+def _record_install_location(key):
+    app_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    install_root = os.path.dirname(app_root)
+    if os.path.basename(app_root).lower() == "app" and os.path.isfile(
+        os.path.join(install_root, ".notmyfault-install")
+    ):
+        winreg.SetValueEx(key, "InstallLocation", 0, winreg.REG_SZ, install_root)
+
+
 def register_aumid_registry(aumid: str, display_name: str, icon_path: str | None) -> bool:
     key_path = f"SOFTWARE\\Classes\\AppUserModelId\\{aumid}"
     try:
@@ -47,6 +56,7 @@ def register_aumid_registry(aumid: str, display_name: str, icon_path: str | None
             winreg.SetValueEx(master_key, "DisplayName", 0, winreg.REG_SZ, display_name)
             if icon_path:
                 winreg.SetValueEx(master_key, "IconUri", 0, winreg.REG_SZ, icon_path)
+            _record_install_location(master_key)
         return True
     except OSError as e:
         print(f"[AUMID_Register] 直接写注册表失败：{e}")
@@ -71,8 +81,11 @@ def register_toaster():
     # 直接查询注册表确认 AUMID，Get-StartApps 不列出仅写入注册表的 AUMID
     key_path = f"SOFTWARE\\Classes\\AppUserModelId\\{aumid}"
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as check_key:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE
+        ) as check_key:
             winreg.QueryValueEx(check_key, "DisplayName")
+            _record_install_location(check_key)
         print(f"[AUMID_Register] AUMID '{aumid}' 已注册（注册表检测），跳过。")
         return
     except OSError:
@@ -105,42 +118,20 @@ def register_toaster():
         else:
             register_exe = None
 
-    if register_exe and os.path.isfile(register_exe):
-        args = f'--app_id "{aumid}" --name "{display_name}"'
-        if icon_uri:
-            args += f' --icon "{icon_uri}"'
-        print(f"[AUMID_Register] 尝试以管理员方式执行：{register_exe} {args}")
-        try:
-            ret = ctypes.windll.shell32.ShellExecuteW(None, 'runas', register_exe, args, None, 1)
-            succeeded = False
-            try:
-                succeeded = int(ret) > 32
-            except Exception:
-                succeeded = False
-            if succeeded:
-                print(f"[AUMID_Register] 通过 register_hkey_aumid.exe 成功注册 AUMID：{aumid}")
-                return
-            print(f"[AUMID_Register] 以管理员运行 register_hkey_aumid.exe 失败，返回值：{ret}，将回退到 python -m register_hkey_aumid。")
-        except Exception as e:
-            print(f"[AUMID_Register] 以管理员运行 register_hkey_aumid.exe 时出现异常：{e}，将回退到 python -m register_hkey_aumid。")
-    else:
-        print('未找到 register_hkey_aumid.exe，准备回退到 python -m register_hkey_aumid。')
-
-    python_cmd = python_exe
-    py_params = f'-m register_hkey_aumid --app_id "{aumid}" --name "{display_name}"'
+    arguments = ["--app_id", aumid, "--name", display_name]
     if icon_uri:
-        py_params += f' --icon "{icon_uri}"'
-    print(f"[AUMID_Register] 尝试以管理员方式执行：{python_cmd} {py_params}")
-    try:
-        ret = ctypes.windll.shell32.ShellExecuteW(None, 'runas', python_cmd, py_params, None, 1)
-        succeeded = False
+        arguments += ["--icon", icon_uri]
+    candidates = []
+    if register_exe and os.path.isfile(register_exe):
+        candidates.append((register_exe, arguments))
+    candidates.append((python_exe, ["-m", "register_hkey_aumid", *arguments]))
+    for executable, command_args in candidates:
+        parameters = subprocess.list2cmdline(command_args)
         try:
-            succeeded = int(ret) > 32
-        except Exception:
-            succeeded = False
-        if succeeded:
-            print(f"[AUMID_Register] 通过 python -m register_hkey_aumid 成功注册 AUMID：{aumid}")
-            return
-        print(f"[AUMID_Register] 以管理员运行 python -m register_hkey_aumid 失败，返回值：{ret}。请检查 python 环境和模块安装。")
-    except Exception as e:
-        print(f"[AUMID_Register] 以管理员运行 python -m register_hkey_aumid 时出现异常：{e}。请检查 python 环境和模块安装。")
+            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", executable, parameters, None, 1)
+            if int(result) > 32:
+                print(f"[AUMID_Register] 已启动注册工具: {executable}")
+                return
+            print(f"[AUMID_Register] 注册工具启动失败: {executable}，返回值 {result}")
+        except Exception as error:
+            print(f"[AUMID_Register] 注册工具启动失败: {executable}，{error}")
