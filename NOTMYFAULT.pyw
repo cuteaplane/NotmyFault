@@ -4,7 +4,7 @@ import signal
 import socket
 import threading
 from datetime import datetime
-from notmyfault.platform.platform_support import launch_python_entry, show_notification
+from notmyfault.platform.platform_support import launch_python_entry
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
@@ -72,20 +72,24 @@ def setup_logging(log_dir: str) -> str:
                 for i, line in enumerate(text.splitlines(True)):
                     if i == 0 and not self._pending:
                         self.file.write(line)
-                        self.orig.write(line)
+                        if self.orig is not None:
+                            self.orig.write(line)
                     elif line.strip():
                         prefix = f"[{ts}] "
                         self.file.write(prefix + line)
-                        self.orig.write(prefix + line)
+                        if self.orig is not None:
+                            self.orig.write(prefix + line)
                         self._pending = False
                     else:
                         self.file.write(line)
-                        self.orig.write(line)
+                        if self.orig is not None:
+                            self.orig.write(line)
                     if line.endswith("\n"):
                         self._pending = True
                 try:
                     self.file.flush()
-                    self.orig.flush()
+                    if self.orig is not None:
+                        self.orig.flush()
                 except Exception:
                     pass
 
@@ -94,12 +98,11 @@ def setup_logging(log_dir: str) -> str:
 
         def flush(self):
             self.file.flush()
-            self.orig.flush()
+            if self.orig is not None:
+                self.orig.flush()
 
-    # pythonw.exe 没有控制台时标准输出可能为 None，日志改写器使用 os.devnull
-    _devnull = open(os.devnull, "w")
-    sys.stdout = _TimestampWriter(log_fp, sys.__stdout__ or _devnull, _log_io_lock)  # type: ignore
-    sys.stderr = _TimestampWriter(log_fp, sys.__stderr__ or _devnull, _log_io_lock)  # type: ignore
+    sys.stdout = _TimestampWriter(log_fp, sys.__stdout__, _log_io_lock)
+    sys.stderr = _TimestampWriter(log_fp, sys.__stderr__, _log_io_lock)
     print(f"--------     NotmyFault Engine     --------")
     print(f"------ {datetime.now().isoformat()} ------")
     print(f"------     Welcome to NotmyFault!    ------")
@@ -131,8 +134,6 @@ def _open_dashboard():
     dashboard_pyw = os.path.join(PROJECT_ROOT, "dashboard.pyw")
     if os.path.exists(dashboard_pyw):
         try:
-            from notmyfault.platform.platform_support import launch_python_entry
-            print(dashboard_pyw)
             launch_python_entry(dashboard_pyw)
             return
         except Exception:
@@ -336,14 +337,23 @@ class EngineRunner:
             self._runtime.set_event_sink(self._api.publish_event)
 
             if _HAS_TRAY:
-                self._tray = TrayIcon(
-                    on_open_dashboard=_open_dashboard,
-                    on_toggle_engine=self._toggle_engine,
-                    on_exit=self._tray_exit,
-                )
-                self._tray.start()
-                self._tray.set_engine_state(self.engine_state)
-                print("[Tray] 系统托盘图标已启动")
+                try:
+                    self._tray = TrayIcon(
+                        on_open_dashboard=_open_dashboard,
+                        on_toggle_engine=self._toggle_engine,
+                        on_exit=self._tray_exit,
+                    )
+                    self._tray.start()
+                    self._tray.set_engine_state(self.engine_state)
+                    print("[Tray] 系统托盘图标已启动")
+                except Exception as error:
+                    print(f"[Tray] 托盘启动失败: {error}", file=sys.stderr)
+                    if self._tray is not None:
+                        try:
+                            self._tray.stop()
+                        except Exception as stop_error:
+                            print(f"[Tray] 托盘清理失败: {stop_error}", file=sys.stderr)
+                    self._tray = None
 
             print("[启动] 启动主引擎...")
             self.start_engine()

@@ -26,10 +26,17 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-import webview
-from notmyfault.application_paths import ApplicationPaths
-from notmyfault.host.api.auth import ApiTokenStore
-from notmyfault.platform.platform_support import launch_python_entry
+
+def _preload_webview() -> None:
+    """先加载 WebView 的 .NET 程序集，窗口创建只等这一步"""
+    # PYWEBVIEW_GUI 指定渲染后端时要等 initialize 导入，先导入 winforms 会把后端定死
+    if sys.platform != "win32" or os.environ.get("PYWEBVIEW_GUI"):
+        return
+    try:
+        from webview.platforms import winforms  # noqa: F401
+    except Exception:
+        pass
+
 
 def _patch_qt_permission_policy():
     try:
@@ -97,6 +104,8 @@ def _remove_control_secret(path, expected: str) -> None:
 
 def _claim_dashboard_instance(control_token_path, port: int = DASHBOARD_CONTROL_PORT):
     """占用 Dashboard 控制端口，已有实例时通知它恢复到前台"""
+    from notmyfault.host.api.auth import ApiTokenStore
+
     show_requested = threading.Event()
     quit_requested = threading.Event()
     control_secret = secrets.token_hex(32)
@@ -159,7 +168,7 @@ def _claim_dashboard_instance(control_token_path, port: int = DASHBOARD_CONTROL_
         token_store.repair_file()
     except Exception as error:
         server.server_close()
-        raise RuntimeError("Dashboard 控制令牌无法安全写入") from error
+        raise RuntimeError(f"Dashboard 控制令牌无法安全写入: {error}") from error
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, show_requested, quit_requested, control_secret
 
@@ -169,10 +178,12 @@ class DashboardAPI:
 
     def __init__(
         self,
-        paths: ApplicationPaths | None = None,
+        paths: "ApplicationPaths | None" = None,
     ) -> None:
-        self._paths = paths or ApplicationPaths.default()
+        from notmyfault.application_paths import ApplicationPaths
         from notmyfault.host.log_files import LogFiles
+
+        self._paths = paths or ApplicationPaths.default()
 
         self._logs = LogFiles(str(self._paths.logs_dir))
         self._window = None
@@ -242,6 +253,8 @@ class DashboardAPI:
             if not os.path.exists(pyw):
                 return {"ok": False, "error": f"找不到 {pyw}"}
             try:
+                from notmyfault.platform.platform_support import launch_python_entry
+
                 launch_python_entry(pyw)
             except Exception as e:
                 return {"ok": False, "error": str(e)}
@@ -380,6 +393,8 @@ class DashboardAPI:
         if self._window is None:
             return ""
         try:
+            import webview
+
             result = self._window.create_file_dialog(
                 webview.FOLDER_DIALOG,
                 directory=initial_path if os.path.isdir(initial_path) else "",
@@ -491,8 +506,13 @@ def _resolve_dashboard_url():
     return None, None
 
 def main():
+    preload = threading.Thread(target=_preload_webview, name="webview-preload", daemon=True)
+    preload.start()
+
     if sys.platform.startswith("linux"):
         _patch_qt_permission_policy()
+
+    from notmyfault.application_paths import ApplicationPaths
 
     paths = ApplicationPaths.default()
     try:
@@ -532,7 +552,9 @@ def main():
         return
     if "--first-run" in sys.argv:
         dashboard_url += "&first_run=1"
-    icon_path = os.path.join(PROJECT_ROOT, "logo.ico")
+
+    preload.join()
+    import webview
 
     api = DashboardAPI(paths)
 
@@ -564,13 +586,12 @@ def main():
         quit_requested.wait()
         try:
             window.destroy()
-        except Exception:
-            pass
+        except Exception as error:
+            print(f"[Dashboard] 关闭窗口失败: {error}", file=sys.stderr)
 
     threading.Thread(target=watch_quit_requests, daemon=True).start()
 
-    # Windows 进程需要设置应用图标
-    if os.name == "nt" and os.path.exists(icon_path):
+    if os.name == "nt":
         try:
             import ctypes
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
