@@ -98,8 +98,8 @@ class PlatformServices:
                 str(error),
             ) from error
 
-    def read_clipboard(self) -> str | None:
-        return self._call("clipboard.read", "read_text")
+    def read_clipboard(self, max_chars: int | None = None) -> str | None:
+        return self._call("clipboard.read", "read_text", max_chars)
 
     def write_clipboard(self, text: str) -> None:
         self._call("clipboard.write", "write_text", text)

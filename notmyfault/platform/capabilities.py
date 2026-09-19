@@ -55,39 +55,54 @@ def _linux_command(*names: str) -> tuple[str | None, str | None]:
     return None, "未安装 " + " 或 ".join(names)
 
 
-def _probe_windows(capability: str) -> dict:
+def _windows_backend(backend: str, *, modules=(), apis=None, reason=None) -> dict:
+    import ctypes
     import importlib.util
 
-    def _has_module(name: str) -> bool:
+    for name in modules:
         try:
-            return importlib.util.find_spec(name) is not None
+            present = importlib.util.find_spec(name) is not None
         except (ImportError, ValueError):
-            return False
+            present = False
+        if not present:
+            return _entry(False, None, f"未安装 {name}")
+    for library, names in (apis or {}).items():
+        try:
+            dll = ctypes.WinDLL(library, use_last_error=True)
+            for name in names:
+                getattr(dll, name)
+        except (OSError, AttributeError) as error:
+            return _entry(False, None, f"{library} 接口不可用: {error}")
+    return _entry(True, backend, reason)
 
+
+def _probe_windows(capability: str) -> dict:
+    import shutil
+
+    if capability == DISPLAY_BRIGHTNESS:
+        ddc = _windows_backend("DDC-CI", apis={"user32": ("EnumDisplayMonitors",), "Dxva2": ("GetPhysicalMonitorsFromHMONITOR", "GetMonitorBrightness", "SetMonitorBrightness")}, reason="显示器亮度支持在执行时检查")
+        if shutil.which("powershell"):
+            return _entry(True, "WMI/DDC-CI" if ddc["available"] else "WMI", "显示器亮度支持在执行时检查", degraded=not ddc["available"])
+        return ddc
+    if capability == AUDIO_DEVICE_QUERY:
+        return _windows_backend("MMDeviceEnumerator", modules=("pycaw", "comtypes"), reason="音频设备在执行时检查")
+    if capability == BLUETOOTH_CONTROL:
+        path = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+        if not os.path.isfile(path):
+            return _entry(False, None, "未安装 Windows PowerShell")
+        return _windows_backend("WinRT", apis={"combase": ("RoGetActivationFactory",)}, reason="蓝牙设备和无线电权限在执行时检查")
     probes = {
-        CLIPBOARD_READ: lambda: _entry(True, "user32-clipboard"),
-        CLIPBOARD_WRITE: lambda: _entry(True, "user32-clipboard"),
-        INPUT_SEND: lambda: _entry(True, "SendInput"),
-        INPUT_GLOBAL_HOTKEY: lambda: _entry(True, "RegisterHotKey"),
-        WINDOW_ENUMERATE: lambda: _entry(True, "EnumWindows"),
-        WINDOW_PIN: lambda: _entry(True, "SetWindowPos"),
-        SCREEN_CAPTURE: lambda: _entry(True, "BitBlt"),
-        DISPLAY_BRIGHTNESS: lambda: _entry(True, "WMI/DDC-CI"),
-        # pycaw 是运行期 import 的第三方包，装不上时音量动作才会 ImportError
-        AUDIO_CONTROL: lambda: (
-            _entry(True, "pycaw")
-            if _has_module("pycaw")
-            else _entry(False, None, "未安装 pycaw")
-        ),
-        AUDIO_DEVICE_QUERY: lambda: _entry(True, "MMDeviceEnumerator"),
-        BLUETOOTH_CONTROL: lambda: _entry(True, "WinRT"),
-        SESSION_LOCK: lambda: _entry(True, "LockWorkStation"),
-        TTS: lambda: (
-            _entry(True, "SAPI", "SAPI 语音服务在执行时检查", degraded=True)
-            if _has_module("pythoncom") and _has_module("win32com.client")
-            else _entry(False, None, "未安装 pywin32")
-        ),
-        TRAY: lambda: _entry(True, "explorer-tray"),
+        CLIPBOARD_READ: lambda: _windows_backend("user32-clipboard", apis={"user32": ("OpenClipboard", "CloseClipboard", "GetClipboardData", "IsClipboardFormatAvailable"), "kernel32": ("GlobalLock", "GlobalUnlock", "GlobalSize")}),
+        CLIPBOARD_WRITE: lambda: _windows_backend("user32-clipboard", apis={"user32": ("OpenClipboard", "CloseClipboard", "EmptyClipboard", "SetClipboardData"), "kernel32": ("GlobalAlloc", "GlobalLock", "GlobalUnlock", "GlobalFree")}),
+        INPUT_SEND: lambda: _windows_backend("SendInput", apis={"user32": ("SendInput",)}),
+        INPUT_GLOBAL_HOTKEY: lambda: _windows_backend("RegisterHotKey", apis={"user32": ("RegisterHotKey", "UnregisterHotKey", "PeekMessageW", "GetAsyncKeyState")}),
+        WINDOW_ENUMERATE: lambda: _windows_backend("EnumWindows", apis={"user32": ("EnumWindows", "GetWindowTextW", "GetWindowTextLengthW", "IsWindowVisible")}),
+        WINDOW_PIN: lambda: _windows_backend("SetWindowPos", apis={"user32": ("EnumWindows", "GetWindowTextW", "SetWindowPos")}),
+        SCREEN_CAPTURE: lambda: _windows_backend("BitBlt", apis={"user32": ("GetDC", "ReleaseDC"), "gdi32": ("BitBlt", "CreateCompatibleDC", "CreateCompatibleBitmap", "SelectObject", "GetDIBits", "DeleteObject", "DeleteDC")}),
+        AUDIO_CONTROL: lambda: _windows_backend("pycaw", modules=("pycaw", "comtypes"), reason="音频设备在执行时检查"),
+        SESSION_LOCK: lambda: _windows_backend("LockWorkStation", apis={"user32": ("LockWorkStation",)}),
+        TTS: lambda: _windows_backend("SAPI", modules=("pythoncom", "win32com.client"), reason="SAPI 语音服务在执行时检查"),
+        TRAY: lambda: _windows_backend("explorer-tray", modules=("win32api", "win32con", "win32gui"), apis={"shell32": ("Shell_NotifyIconW",)}),
     }
     return probes[capability]()
 

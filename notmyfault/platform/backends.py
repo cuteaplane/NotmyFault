@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Iterable
@@ -31,6 +32,38 @@ class BackendFailedError(BackendError):
 
 
 class CommandRunner:
+    def read_output(self, args: list[str], max_chars: int, timeout: float) -> subprocess.CompletedProcess:
+        timed_out = threading.Event()
+        try:
+            with subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, text=True, errors="replace") as process:
+                def expire():
+                    timed_out.set()
+                    if process.poll() is None:
+                        process.kill()
+
+                timer = threading.Timer(timeout, expire)
+                timer.daemon = True
+                timer.start()
+                try:
+                    output = process.stdout.read(max_chars)
+                    truncated = len(output) == max_chars
+                    if truncated and process.poll() is None:
+                        process.kill()
+                    process.wait()
+                finally:
+                    timer.cancel()
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait()
+                if timed_out.is_set():
+                    raise BackendFailedError(f"命令超时（{timeout}s）: {args[0]}")
+                return subprocess.CompletedProcess(args, 0 if truncated else process.returncode, output, "")
+        except PermissionError as exc:
+            raise BackendPermissionDeniedError(f"系统拒绝执行: {args[0]}") from exc
+        except FileNotFoundError as exc:
+            raise BackendMissingError(f"未安装 {args[0]}") from exc
+
     def run(
         self,
         args: list[str],
@@ -251,8 +284,7 @@ class ClipboardBackend:
         self._runner = runner or default_runner
 
     def _pick(self, write: bool) -> str | None:
-        # 按会话类型选命令：X11 会话装了 wl-clipboard 也不优先走它，
-        # wl-paste 在 X11 下会失败，失败还不能回退，否则剪贴板触发器静默失效
+        # wl-clipboard 依赖 Wayland 连接，X11 会话使用 xclip 或 xsel。
         from notmyfault.platform.linux_support import session_type
 
         if session_type() == "wayland":
@@ -269,7 +301,7 @@ class ClipboardBackend:
                     return path
         return None
 
-    def read_text(self) -> str | None:
+    def read_text(self, max_chars: int | None = None) -> str | None:
         _require_linux()
         path = self._pick(write=False)
         if not path:
@@ -277,7 +309,12 @@ class ClipboardBackend:
                 "依赖缺失：读取剪贴板需要 wl-clipboard（Wayland）或 xclip/xsel（X11）"
             )
         args = self._READ_ARGS[Path(path).name]
-        result = self._runner.run([path, *args], timeout=3)
+        if max_chars is None:
+            result = self._runner.run([path, *args], timeout=3)
+        else:
+            if isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars <= 0:
+                raise ValueError("max_chars 必须是正整数")
+            result = self._runner.read_output([path, *args], max_chars=max_chars, timeout=3)
         return result.stdout if result.returncode == 0 else None
 
     def write_text(self, text: str) -> None:
