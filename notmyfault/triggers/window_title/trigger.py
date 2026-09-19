@@ -5,7 +5,6 @@ Windows 用 EnumWindows；Linux 用 xdotool（仅 X11，Wayland 不可用）
 import os
 import shutil
 import subprocess
-import sys
 
 from notmyfault.plugin_api import platform_backend_api
 from notmyfault.triggers.base import PollingTrigger
@@ -42,32 +41,21 @@ def _get_window_titles_windows() -> dict:
 def _get_window_titles_linux() -> dict:
     xdotool = shutil.which("xdotool")
     if not xdotool:
-        return {}
+        raise BackendMissingError("依赖缺失：窗口标题监视需要 xdotool")
+    if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland" or not os.environ.get("DISPLAY"):
+        raise RuntimeError("窗口标题监视需要 X11 会话")
     try:
         result = subprocess.run(
-            [xdotool, "search", "--name", ""],
+            [xdotool, "search", "--name", "", "getwindowname", "%@"],
             capture_output=True, text=True, errors="replace", timeout=5,
         )
-    except (OSError, subprocess.SubprocessError):
-        return {}
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError("窗口标题查询失败") from error
     if result.returncode != 0:
-        return {}
-    titles = {}
-    for line in result.stdout.splitlines():
-        wid = line.strip()
-        if not wid.isdigit():
-            continue
-        try:
-            title_result = subprocess.run(
-                [xdotool, "getwindowname", wid],
-                capture_output=True, text=True, errors="replace", timeout=5,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        title = title_result.stdout.strip()
-        if title_result.returncode == 0 and title:
-            titles[wid] = title
-    return titles
+        if result.returncode == 1 and not result.stderr.strip() and not result.stdout.strip():
+            return {}
+        raise RuntimeError(f"窗口标题查询失败: {result.stderr.strip()}")
+    return {index: title for index, title in enumerate(result.stdout.splitlines()) if title.strip()}
 
 
 class WindowTitleTrigger(PollingTrigger):
@@ -80,18 +68,18 @@ class WindowTitleTrigger(PollingTrigger):
         state = self.config.get("state", "opened")
         if state not in ("opened", "closed"):
             raise ValueError(f"无效的窗口状态: {state!r}（可选: opened/closed）")
-        if sys.platform != "win32" and not shutil.which("xdotool"):
+        if os.name != "nt" and not shutil.which("xdotool"):
             raise BackendMissingError("依赖缺失：窗口标题监视需要 xdotool")
 
     def setup(self):
-        self.pattern = str(self.config.get("title_pattern", "")).strip().lower()
+        self.pattern = str(self.config.get("title_pattern", "")).strip()
         self.target_state = self.config.get("state", "opened")
         self._was_matched = False
         self.log(f"开始监视窗口标题: {self.pattern}")
 
     def poll(self):
         titles = _get_window_titles()
-        matched_titles = [t for t in titles.values() if self.pattern in t.lower()]
+        matched_titles = [t for t in titles.values() if self.pattern.lower() in t.lower()]
         matched = bool(matched_titles)
 
         if matched and not self._was_matched:

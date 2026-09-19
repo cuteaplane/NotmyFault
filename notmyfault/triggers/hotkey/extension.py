@@ -1,3 +1,5 @@
+"""临时捕获全局热键，Esc 取消，退出时解除键盘捕获。"""
+
 import os
 import threading
 import time
@@ -43,13 +45,13 @@ def _wait_for_hotkey_windows(
     key_down=None,
     cancelled=None,
 ) -> dict:
-    from notmyfault.triggers.hotkey.trigger import _VK_MAP
+    from .keys import VK_MAP
 
     if key_down is None:
         key_down = _key_down
     vk_escape = 0x1B
     vk_modifiers = [("CTRL", 0x11), ("ALT", 0x12), ("SHIFT", 0x10), ("WIN", 0x5B)]
-    vk_names = {vk: name for name, vk in _VK_MAP.items()}
+    vk_names = {vk: name for name, vk in VK_MAP.items() if name not in {"CAPSLOCK", "NUMLOCK"}}
     pretty = {"CTRL": "Ctrl", "ALT": "Alt", "SHIFT": "Shift", "WIN": "Win"}
 
     deadline = time.monotonic() + timeout
@@ -60,6 +62,9 @@ def _wait_for_hotkey_windows(
         if key_down(vk_escape):
             return {"cancelled": True}
         modifiers = [name for name, vk in vk_modifiers if key_down(vk)]
+        if not modifiers:
+            time.sleep(0.05)
+            continue
         for vk, name in vk_names.items():
             if key_down(vk):
                 return {"hotkey": "+".join([*(pretty[mod] for mod in modifiers), name])}
@@ -75,7 +80,10 @@ def _wait_for_hotkey_linux(context, timeout: float, cancelled=None) -> dict:
         return {"error": "Linux 热键录制需要 python-xlib，请运行 pip install python-xlib"}
 
     modifier_masks = ((4, "Ctrl"), (8, "Alt"), (1, "Shift"), (64, "Super"))
-    display = Display()
+    try:
+        display = Display()
+    except Exception:
+        return {"error": "无法连接 X11，Linux 热键录制需要可用的 X11 会话"}
     root = display.screen().root
     root.grab_keyboard(False, X.GrabModeAsync, X.GrabModeAsync, X.CurrentTime)
     display.sync()
@@ -101,7 +109,7 @@ def _wait_for_hotkey_linux(context, timeout: float, cancelled=None) -> dict:
             name = XK.keysym_to_string(keysym) or ""
             if not name or name.lower() in {
                 "control_l", "control_r", "shift_l", "shift_r", "alt_l", "alt_r",
-                "super_l", "super_r",
+                "super_l", "super_r", "caps_lock", "num_lock", "scroll_lock",
             }:
                 continue
             display_name = name.upper() if len(name) == 1 else name
@@ -112,6 +120,8 @@ def _wait_for_hotkey_linux(context, timeout: float, cancelled=None) -> dict:
             modifiers = [
                 label for mask, label in modifier_masks if event.state & mask
             ]
+            if not modifiers:
+                continue
             result["hotkey"] = "+".join([*modifiers, display_name])
             break
     finally:

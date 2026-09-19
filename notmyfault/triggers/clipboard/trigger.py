@@ -9,7 +9,6 @@ CF_UNICODETEXT = 13
 if os.name == "nt":
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
-    # ctypes 在多线程下共享 _objects 引用表，函数声明需要完整
     user32.OpenClipboard.argtypes = [ctypes.c_void_p]
     user32.OpenClipboard.restype = ctypes.c_bool
     user32.CloseClipboard.argtypes = []
@@ -66,13 +65,13 @@ class ClipboardTrigger(PollingTrigger):
             return
         if not self.match_text:
             self.log("剪贴板内容变化")
-            self.emit({"text": current[:200], "match_text": ""})
+            self.emit({"text": current, "match_text": ""})
         else:
             current_lower = current.lower()
             if self.match_text.lower() in current_lower:
                 self.log(f"剪贴板匹配: {self.match_text}")
                 self.emit({
-                    "text": current[:200],
+                    "text": current,
                     "match_text": self.match_text,
                     "matched": self.match_text,
                 })

@@ -21,8 +21,11 @@ class NetworkStatusTrigger(PollingTrigger):
 
     def validate(self):
         self.host = str(self.config.get("host", "8.8.8.8")).strip()
-        self.port = int(self.config.get("port", 53))
-        self.timeout = float(self.config.get("timeout", 2))
+        try:
+            self.port = int(self.config.get("port", 53))
+            self.timeout = float(self.config.get("timeout", 2))
+        except (TypeError, ValueError):
+            raise ValueError("网络探测端口必须是整数，超时必须是数字") from None
         if not self.host or not 1 <= self.port <= 65535:
             raise ValueError("网络探测主机或端口无效")
         if not math.isfinite(self.timeout) or not 0.1 <= self.timeout <= 10:

@@ -27,6 +27,10 @@ class ProcessStateTrigger(PollingTrigger):
                 name = proc.info["name"]
                 if name and name.lower() == self.target_process:
                     return "running"
+                if os.name != "nt":
+                    executable = proc.exe()
+                    if executable and os.path.basename(executable).lower() == self.target_process:
+                        return "running"
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
         return "stopped"

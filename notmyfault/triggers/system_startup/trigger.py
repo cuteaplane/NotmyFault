@@ -3,6 +3,7 @@
 """
 
 from datetime import datetime
+import time
 
 from notmyfault.triggers.base import PollingTrigger
 
@@ -22,12 +23,13 @@ class SystemStartupTrigger(PollingTrigger):
             raise ValueError(f"delay_seconds 必须在 0-300 之间，实际: {delay}")
         self.delay_seconds = delay
         self._started_at = datetime.now()
+        self._deadline = time.monotonic() + delay
         self._fired = False
 
     def poll(self) -> None:
         if self._fired:
             return
-        if (datetime.now() - self._started_at).total_seconds() < self.delay_seconds:
+        if time.monotonic() < self._deadline:
             return
         started_at = self._started_at.strftime("%Y-%m-%d %H:%M:%S")
         self.log(f"引擎已启动，触发开机任务（延迟 {self.delay_seconds}s）")

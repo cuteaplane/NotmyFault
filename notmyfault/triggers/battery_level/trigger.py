@@ -41,7 +41,10 @@ class BatteryLevelTrigger(PollingTrigger):
         self._armed = True
 
     def poll(self) -> None:
-        battery = psutil.sensors_battery()
+        try:
+            battery = psutil.sensors_battery()
+        except (NotImplementedError, OSError) as error:
+            raise RuntimeError("无法读取电池状态，系统可能未提供电池接口") from error
         if battery is None:
             # 无电池设备没有可观测电量，本轮返回并保持 _armed
             return

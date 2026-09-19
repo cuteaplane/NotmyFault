@@ -154,8 +154,6 @@ def _pump_power_messages(window) -> bool:
         user32 = window["user32"]
         msg = window["msg_cls"]()
         while user32.PeekMessageW(ctypes.byref(msg), window["hwnd"], 0, 0, 1):
-            if msg.message == 0x0012:  # WM_QUIT
-                break
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
         resumed = window["state"]["resume"]
@@ -251,7 +249,7 @@ class PowerStateTrigger(PollingTrigger):
             self.log(f"低电量: {battery_pct}%")
             self.emit({"state": "low_battery", "battery_percent": battery_pct})
             self._low_battery_active = True
-        elif not is_low:
+        elif not on_battery or battery_pct > 25:
             self._low_battery_active = False
 
     def teardown(self):

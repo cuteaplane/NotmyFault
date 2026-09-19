@@ -20,6 +20,7 @@ class CronScheduleTrigger(PollingTrigger):
     native: bool = False
 
     def validate(self) -> None:
+        self._started_at = datetime.now()
         mode = self.config.get("mode", "daily")
         if mode not in ("daily", "weekly", "interval"):
             raise ValueError(
@@ -74,6 +75,9 @@ class CronScheduleTrigger(PollingTrigger):
             self._poll_interval(now)
 
     def _poll_daily(self, now: datetime) -> None:
+        scheduled = now.replace(hour=self.hour, minute=self.minute, second=0, microsecond=0)
+        if scheduled < self._started_at.replace(second=0, microsecond=0):
+            return
         date_key = now.strftime("%Y-%m-%d")
         if self._fired_date == date_key:
             return
@@ -83,6 +87,9 @@ class CronScheduleTrigger(PollingTrigger):
         self._fired_date = date_key
 
     def _poll_weekly(self, now: datetime) -> None:
+        scheduled = now.replace(hour=self.hour, minute=self.minute, second=0, microsecond=0)
+        if scheduled < self._started_at.replace(second=0, microsecond=0):
+            return
         date_key = now.strftime("%Y-%m-%d")
         if self._fired_date == date_key:
             return

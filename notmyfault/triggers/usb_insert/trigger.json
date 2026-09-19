@@ -25,10 +25,14 @@
     "params": [
         {
             "name": "drive_letter",
-            "label": "目标盘符",
+            "label": "盘符或挂载路径",
             "type": "string",
             "default": "ANY",
-            "placeholder": "ANY 匹配任意盘符，或指定如 E:"
+            "placeholder": "Windows: E:；Linux: /media/user/USB；ANY 表示任意设备"
         }
+    ],
+    "platforms": [
+        "windows",
+        "linux"
     ]
 }

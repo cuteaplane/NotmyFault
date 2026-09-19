@@ -1,20 +1,12 @@
 """音频设备变化触发器：默认播放或录音设备切换时发送事件
-Windows 用 PowerShell MediaDevice API；Linux 用 wpctl 或 pactl
+Windows 用 Core Audio API；Linux 用 wpctl 或 pactl
 """
 
 import os
-import subprocess
 
 from notmyfault.plugin_api import PlatformServiceError, platform_services
 from notmyfault.triggers.base import PollingTrigger
 
-_POWERSHELL_QUERY = r"""
-[Windows.Media.Devices.MediaDevice, Windows.Media.Devices, ContentType = WindowsRuntime] | Out-Null
-$r = [Windows.Media.Devices.MediaDevice]::GetDefaultAudioRenderId("Default")
-$c = [Windows.Media.Devices.MediaDevice]::GetDefaultAudioCaptureId("Default")
-Write-Output ("render=" + $r)
-Write-Output ("capture=" + $c)
-"""
 
 
 def _query_default_devices() -> dict[str, str]:
@@ -25,34 +17,23 @@ def _query_default_devices() -> dict[str, str]:
 
 
 def _query_default_devices_windows() -> dict[str, str]:
+    from comtypes import CoInitialize, CoUninitialize, COMError
+    from pycaw.pycaw import AudioUtilities
+
+    CoInitialize()
     try:
-        result = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                _POWERSHELL_QUERY,
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=10,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    if result.returncode != 0:
-        return {}
-    devices: dict[str, str] = {}
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("render="):
-            devices["render"] = line[len("render="):].strip() or ""
-        elif line.startswith("capture="):
-            devices["capture"] = line[len("capture="):].strip() or ""
-    return devices
+        enumerator = AudioUtilities.GetDeviceEnumerator()
+        devices = {}
+        for flow, name in ((0, "render"), (1, "capture")):
+            try:
+                devices[name] = enumerator.GetDefaultAudioEndpoint(flow, 0).GetId()
+            except COMError as error:
+                if error.hresult & 0xffffffff != 0x80070490:
+                    raise RuntimeError("读取默认音频设备失败") from error
+                devices[name] = ""
+        return devices
+    finally:
+        CoUninitialize()
 
 
 def _query_default_devices_linux() -> dict[str, str]:
@@ -66,7 +47,6 @@ class AudioDeviceTrigger(PollingTrigger):
     """音频设备变化触发器，使用 event-v2 轮询"""
 
     interval: float = 5.0
-    # PowerShell 子进程处理原生调用，native 设为 False
     native: bool = False
 
     def validate(self) -> None:
@@ -81,8 +61,7 @@ class AudioDeviceTrigger(PollingTrigger):
     def poll(self) -> None:
         devices = _query_default_devices()
         if not devices:
-            # PowerShell 查询失败或超时就保持现状，下次再试
-            return
+            raise RuntimeError("无法查询默认音频设备，请检查音频服务")
         for flow in ("render", "capture"):
             if self.device_type != "any" and self.device_type != flow:
                 continue

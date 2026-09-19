@@ -12,6 +12,7 @@ if os.name == "nt":
     from ctypes import wintypes
 
     from notmyfault.triggers.base import PollingTrigger
+    from .keys import VK_MAP
 
     user32 = ctypes.windll.user32
     user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
@@ -33,31 +34,6 @@ if os.name == "nt":
     MOD_NOREPEAT = 0x4000
     WM_HOTKEY = 0x0312
 
-    _VK_MAP = {
-        'F1': 0x70, 'F2': 0x71, 'F3': 0x72, 'F4': 0x73,
-        'F5': 0x74, 'F6': 0x75, 'F7': 0x76, 'F8': 0x77,
-        'F9': 0x78, 'F10': 0x79, 'F11': 0x7A, 'F12': 0x7B,
-        'A': 0x41, 'B': 0x42, 'C': 0x43, 'D': 0x44,
-        'E': 0x45, 'F': 0x46, 'G': 0x47, 'H': 0x48,
-        'I': 0x49, 'J': 0x4A, 'K': 0x4B, 'L': 0x4C,
-        'M': 0x4D, 'N': 0x4E, 'O': 0x4F, 'P': 0x50,
-        'Q': 0x51, 'R': 0x52, 'S': 0x53, 'T': 0x54,
-        'U': 0x55, 'V': 0x56, 'W': 0x57, 'X': 0x58,
-        'Y': 0x59, 'Z': 0x5A,
-        '0': 0x30, '1': 0x31, '2': 0x32, '3': 0x33,
-        '4': 0x34, '5': 0x35, '6': 0x36, '7': 0x37,
-        '8': 0x38, '9': 0x39,
-        'RETURN': 0x0D, 'ENTER': 0x0D, 'ESCAPE': 0x1B, 'ESC': 0x1B,
-        'TAB': 0x09, 'SPACE': 0x20, 'BACKSPACE': 0x08,
-        'DELETE': 0x2E, 'DEL': 0x2E, 'INSERT': 0x2D, 'INS': 0x2D,
-        'HOME': 0x24, 'END': 0x23, 'PAGEUP': 0x21, 'PAGEDOWN': 0x22,
-        'UP': 0x26, 'DOWN': 0x28, 'LEFT': 0x25, 'RIGHT': 0x27,
-        'CAPSLOCK': 0x14, 'NUMLOCK': 0x90,
-        'F13': 0x7C, 'F14': 0x7D, 'F15': 0x7E, 'F16': 0x7F,
-        'F17': 0x80, 'F18': 0x81, 'F19': 0x82, 'F20': 0x83,
-        'F21': 0x84, 'F22': 0x85, 'F23': 0x86, 'F24': 0x87,
-    }
-
     _MOD_MAP = {
         'ALT': MOD_ALT, 'CTRL': MOD_CONTROL, 'CONTROL': MOD_CONTROL,
         'SHIFT': MOD_SHIFT, 'WIN': MOD_WIN, 'SUPER': MOD_WIN,
@@ -70,8 +46,8 @@ if os.name == "nt":
         for p in parts:
             if p in _MOD_MAP:
                 mod |= _MOD_MAP[p]
-            elif p in _VK_MAP:
-                key = _VK_MAP[p]
+            elif p in VK_MAP:
+                key = VK_MAP[p]
         if key == 0 and parts:
             key = ord(parts[-1]) if len(parts[-1]) == 1 else 0
         return mod, key
@@ -87,6 +63,8 @@ if os.name == "nt":
             mod, vk = _parse_hotkey(raw)
             if vk == 0:
                 raise ValueError(f"无法解析热键: {raw}")
+            if mod == 0:
+                raise ValueError("全局热键必须包含 Ctrl、Alt、Shift 或 Win 修饰键")
             self._raw = raw
             self._mod = mod
             self._vk = vk
@@ -95,7 +73,7 @@ if os.name == "nt":
             self._hkid = 1
             with native_lock():
                 if not user32.RegisterHotKey(None, self._hkid, self._mod | MOD_NOREPEAT, self._vk):
-                    raise RuntimeError(f"热键注册失败（可能与其他程序冲突）: {self._raw}")
+                    raise RuntimeError(f"热键注册失败，组合键已被其他规则或程序占用: {self._raw}")
             self.log(f"已注册热键: {self._raw}")
 
         def poll(self):
@@ -155,6 +133,8 @@ else:
             raw = str(self.config.get("hotkey", "")).strip()
             if not raw:
                 raise ValueError("未配置热键（hotkey 参数为空）")
+            if not _parse_x11_hotkey(raw)[0]:
+                raise ValueError("全局热键必须包含 Ctrl、Alt、Shift 或 Super 修饰键")
             self._raw = raw
 
         def setup(self):
@@ -176,7 +156,6 @@ else:
             keycode = self._disp.keysym_to_keycode(keysym)
             if keycode == 0:
                 raise RuntimeError(f"当前键盘没有映射 {main_key_name} 的按键")
-            # GrabModeAsync=1, AnyModifier=0 但我们自己指定修饰键
             root.grab_key(keycode, modifiers, False, X.GrabModeAsync, X.GrabModeAsync)
             # XGrabKey 不吃 NumLock/CapsLock，注册带锁的变体
             for extra in (0, X.LockMask, X.Mod2Mask, X.LockMask | X.Mod2Mask):

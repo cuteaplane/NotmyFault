@@ -19,13 +19,13 @@ def _dir_snapshot(folder: str):
     snap = {}
     if not os.path.isdir(folder):
         raise FileNotFoundError(f"监控目录不存在或不可读: {folder}")
-    def failed(error):
+    def raise_walk_error(error):
         raise error
-    for root, dirs, files in os.walk(folder, onerror=failed):
+    for root, dirs, files in os.walk(folder, onerror=raise_walk_error):
         for f in files:
             fpath = os.path.join(root, f)
             stat = os.stat(fpath)
-            snap[fpath] = (stat.st_size, stat.st_mtime)
+            snap[fpath] = (stat.st_size, stat.st_mtime_ns)
     return snap
 
 
@@ -33,7 +33,7 @@ class FolderMonitorTrigger(PollingTrigger):
     interval = 3.0
 
     def validate(self):
-        self.event_type = self.config.get("event_type", "all")
+        self.event_type = self.config.get("event_type", "created")
         if self.event_type not in ("created", "modified", "deleted", "all"):
             raise ValueError(
                 f"无效的事件类型: {self.event_type!r}"

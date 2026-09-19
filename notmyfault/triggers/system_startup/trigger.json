@@ -3,7 +3,7 @@
     "name": "引擎启动",
     "semantic": "oneshot",
     "trigger_api": "event-v2",
-    "description": "引擎启动后延迟指定秒数触发一次（开机自动化）",
+    "description": "此触发器启动后延迟指定秒数触发一次；重启引擎或重新启用触发器后重新计时",
     "version_code": 1,
     "version": "1.0",
     "package_name": "io.github.notmyfault.system_startup",
@@ -11,7 +11,7 @@
     "outputs": [
         {
             "name": "started_at",
-            "label": "引擎启动时间",
+            "label": "触发器启动时间",
             "type": "string",
             "value_type": {
                 "type": "datetime",

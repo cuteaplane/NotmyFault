@@ -59,10 +59,10 @@ class IdleDetectTrigger(PollingTrigger):
         idle = idle_secs >= self.threshold
         if idle and not self._was_idle:
             self.log(f"用户进入空闲状态 ({int(idle_secs)}s >= {self.threshold}s)")
-            self.emit({"state": "idle", "idle_seconds": self.threshold})
+            self.emit({"state": "idle", "idle_seconds": idle_secs})
         elif not idle and self._was_idle:
             self.log(f"用户恢复活动 (阈值 {self.threshold}s)")
-            self.emit({"state": "active", "idle_seconds": self.threshold})
+            self.emit({"state": "active", "idle_seconds": idle_secs})
         self._was_idle = idle
 
 

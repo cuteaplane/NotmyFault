@@ -5,6 +5,7 @@ Windows 用 netsh wlan show interfaces；Linux 用 nmcli -t -f ACTIVE,SSID dev w
 import os
 import re
 import subprocess
+import ctypes
 
 from notmyfault.triggers.base import PollingTrigger
 
@@ -12,13 +13,14 @@ _SSID_LINE_RE = re.compile(r"^\s*SSID\s*:\s*(.*)$", re.IGNORECASE)
 
 
 def _decode_netsh(raw: bytes) -> str:
-    """netsh 输出编码取决于系统控制台代码页，UTF-8 解码失败时尝试 GBK"""
-    for enc in ("utf-8", "gbk"):
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace")
+    """netsh 使用当前控制台输出代码页，无控制台时使用系统 OEM 代码页。"""
+    from notmyfault.plugin_api import native_lock
+    with native_lock():
+        kernel32 = ctypes.WinDLL("kernel32")
+        kernel32.GetConsoleOutputCP.restype = ctypes.c_uint
+        kernel32.GetOEMCP.restype = ctypes.c_uint
+        codepage = kernel32.GetConsoleOutputCP() or kernel32.GetOEMCP()
+    return raw.decode(f"cp{codepage}", errors="replace")
 
 
 def _current_ssid() -> str | None:
@@ -92,7 +94,7 @@ class WifiNetworkTrigger(PollingTrigger):
     def poll(self) -> None:
         current = _current_ssid()
         if current is None:
-            return
+            raise RuntimeError("Wi-Fi 查询失败，请检查无线服务及 netsh/nmcli")
         if self._last_ssid is None:
             # 第一轮只记录当前状态，不触发
             self._last_ssid = current

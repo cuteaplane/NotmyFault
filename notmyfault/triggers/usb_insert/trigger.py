@@ -8,12 +8,19 @@ class UsbInsertTrigger(PollingTrigger):
     interval = 3.0
 
     def validate(self):
-        self.expected_drive = self.config.get("drive_letter", "").strip().upper()
-        # 用户填 e 或 E: 都归一成 E:
+        self.expected_drive = self.config.get("drive_letter", "").strip()
+        if self.expected_drive.upper() == "ANY":
+            self.expected_drive = "ANY"
         if self.expected_drive and self.expected_drive != "ANY":
-            letter = self.expected_drive.rstrip(":")
-            if len(letter) == 1 and letter.isalpha():
-                self.expected_drive = letter + ":"
+            if os.name == "nt":
+                letter = self.expected_drive.rstrip("/\\:")
+                if len(letter) != 1 or not letter.isascii() or not letter.isalpha():
+                    raise ValueError("Windows 盘符须为单个字母，例如 E:")
+                self.expected_drive = letter.upper() + ":"
+            else:
+                if not os.path.isabs(self.expected_drive):
+                    raise ValueError("Linux 请填写绝对挂载路径，例如 /media/user/USB，或 ANY")
+                self.expected_drive = os.path.normpath(self.expected_drive)
 
     @staticmethod
     def _get_removable_drives():
@@ -39,7 +46,7 @@ class UsbInsertTrigger(PollingTrigger):
             if self._stop_event.is_set():
                 return
             self.log(f"检测到U盘插入: {drive}")
-            if self.expected_drive in ("ANY", "") or self.expected_drive == drive.upper():
+            if self.expected_drive in ("ANY", "") or self.expected_drive == drive:
                 self.emit({"drive_letter": self.expected_drive, "actual_drive": drive})
         self._last_drives = current_drives
 
