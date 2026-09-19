@@ -1,6 +1,5 @@
 """将插件源码目录打包为 .nmfp 安装包，调用方式为 python pack_plugin.py <plugin_dir> 或 python pack_plugin.py --all"""
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -93,7 +92,7 @@ def main():
                 continue
             for p in sorted(ptype_dir.iterdir()):
                 if p.is_dir() and not p.name.startswith("_"):
-                    # 归档内以插件 id 为顶层目录，安装端才能识别出唯一插件文件夹
+                    # 归档保留插件目录名作为顶层目录。
                     if pack_plugin(p, arc_prefix=p.name):
                         count += 1
                     else:

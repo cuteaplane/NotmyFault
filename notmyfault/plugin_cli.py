@@ -181,7 +181,13 @@ def _pack(plugin_dir: Path, output_dir: Path | None) -> int:
     if not report.get("ok"):
         _print_report(report)
         return 1
-    import pack_plugin
+    try:
+        import pack_plugin
+    except ModuleNotFoundError as error:
+        if error.name != "pack_plugin":
+            raise
+        print("插件打包需要项目根目录中的 pack_plugin.py，请在完整源码目录运行命令。", file=sys.stderr)
+        return 1
 
     result = pack_plugin.pack_plugin(
         plugin_dir,
