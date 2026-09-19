@@ -31,7 +31,9 @@ from notmyfault.security.plugin_resources import plugin_resource
 tool = plugin_resource("my_plugin", "bin", "win64", "tool.exe")
 ```
 
-返回插件目录内的绝对路径；路径越出插件目录会抛 ValueError。
+返回插件目录内的绝对路径；路径越出插件目录会抛 ValueError。插件导入的
+`plugin_resource` 绑定到所属加载器，同一进程中的其他加载器不会改变它查找的目录。
+直接运行源码测试时，应通过 `PluginImports` 提供资源目录，或替换插件使用的资源函数。
 
 ## 提权
 
@@ -78,6 +80,11 @@ self_sign_plugin("my_plugin", key)   # 生成 signature.sig 与 public_key.pem
   `none`。普通作者签名还要有当前安装使用的本地密钥副签。声明 `admin` 权限的插件
   在严格模式下只接受 `official` 签名。本机用户钥代签得到的 `official-legacy`
   不能作为管理员插件加载。
+- `signature_source` 区分 `official`、`author`、`local` 和 `none`，
+  `signature_format` 区分当前的 `v1` 和旧的 `legacy`。兼容字段 `signature_kind` 中的
+  `official-legacy` 表示本地密钥签名，不决定文件摘要格式。
+- 用户插件的完整性清单固定已安装的文件版本，安装更新时替换对应记录。旧摘要格式
+  只有与已有完整性记录完全匹配时才允许迁移；延迟导入前仍复查签名和全部文件。
 - 私钥自己保管，不要放进插件目录或归档。
 
 ## 打包
@@ -104,8 +111,9 @@ python nmf.py plugin pack <插件目录路径>
 ```
 
 - 有 `command` 时先按用户插件规则验签，签名无效则不执行命令、安装失败。
-- 安装时在插件目录内逐条执行 `command`。每条用空格拆成参数列表，不经过
-  cmd 或 sh。120 秒超时。任一命令失败或 `outputs` 缺失即安装失败。
+- 安装时在插件目录内逐条执行 `command`。参数列表由
+  `shlex.split(command, posix=(os.name != "nt"))` 解析，以 `shell=False` 执行，
+  不经过 cmd 或 sh。每条命令超时 120 秒，任一命令失败或 `outputs` 缺失即安装失败。
 - `outputs` 必须是插件目录内的相对路径。
 - 安装构建流程保留归档里的签名材料，作者签名必须与构建后的文件内容相符。
   安装端在替换旧版本前按加载器的签名规则校验暂存目录；严格模式要求有效签名，

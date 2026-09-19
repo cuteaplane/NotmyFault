@@ -100,11 +100,11 @@ npm exec vite build -- --emptyOutDir
 
 ### 触发条件
 
-单事件仍可使用旧格式：
+单个触发器直接放入 `condition`：
 
 ```json
 {
-  "event": {
+  "condition": {
     "binding_id": "t_schedule01",
     "type": "time_schedule",
     "params": {"time": "17:00"}
@@ -112,7 +112,8 @@ npm exec vite build -- --emptyOutDir
 }
 ```
 
-多个条件使用 `condition`。`any` 是“满足任一项”，`all` 是“全部满足”；两者可以嵌套。
+旧规则的 `event/trigger` 在读取或导入时转换，保存时只写 `condition`。
+多个条件也使用 `condition`。`any` 是“满足任一项”，`all` 是“全部满足”；两者可以嵌套。
 
 ```json
 {
@@ -146,7 +147,7 @@ npm exec vite build -- --emptyOutDir
 NOT 触发条件。NOT 不查询进程、窗口或文件的当前状态，旧检查也不会自动转换。
 结构与示例见 [规则格式](rule-schema-v2.md)。
 
-### 动作流水线和上一步结果
+### 动作执行顺序和上一步结果
 
 动作按顺序执行。每个动作使用稳定的 `binding_id`，后续动作通过结构化 `$ref`
 引用前面的结果：
@@ -265,7 +266,7 @@ def run(meta, config, emit_event, shutdown_event):
 
 轮询型触发器（clipboard / window_title / hotkey / power_state 等）应继承
 `notmyfault/triggers/base.PollingTrigger`，统一"配置校验 → 原生段自动持锁 →
-间隔轮询 → 退出清理"的骨架，避免手写 while 循环导致原生加锁纪律不一致。
+间隔轮询 → 退出清理"的骨架。
 详见 `docs/native-safety.md`。
 
 ### event-v2 怎么启动
@@ -273,12 +274,12 @@ def run(meta, config, emit_event, shutdown_event):
 - **每配置一个实例**：同一条触发器被 N 条规则使用时启动 N 个隔离线程，
   实例 ID 为 `trigger_id:序号`（只有一个配置时就是 `trigger_id`）。
 - **相同配置去重**：多条规则使用完全相同的配置（如同一热键、同一监控目录）
-  时只启动一个实例；事件仍按配置指纹匹配所有规则，避免重复执行。
+  时只启动一个实例；事件仍按配置指纹匹配所有规则。
 - **配置指纹**：JSON 规范化后比较（整数值 90 与 90.0 视为相同）。事件命中
   = 实例配置指纹与规则叶子 `params` 指纹相等，payload 不参与命中判断。
 - **无效配置抛异常**：缺失字段、非法枚举值（hotkey 为空、state 取值不在
   清单内、threshold 非数字等）一律抛 `ValueError`，引擎会标记该触发器崩溃
-  并告警，而不是让线程空转、规则永远不触发。
+  并告警。
 - 触发器必须用 `shutdown_event` 轮询退出，并在退出时清理原生资源
   （如 power_state 的隐藏窗口）。
 
@@ -330,8 +331,7 @@ python -m pytest notmyfault/tests/test_api_server.py notmyfault/tests/test_api_p
 
 API 测试使用 `notmyfault/tests/api_support.py` 创建临时
 `ApplicationPaths`、`SignedConfigStore` 和固定 token。`FakeRunner` 提供引擎
-启停和状态；`FakeKeyStore` 保存测试密钥；`FakeDesktopElements` 返回固定的
-桌面控件结果。文件替换失败测试传入 `PluginFileSystem` 的故障实现，预览过期
+启停和状态；`FakeKeyStore` 保存测试密钥。文件替换失败测试传入 `PluginFileSystem` 的故障实现，预览过期
 测试给 `PendingPreviewStore` 传入固定时钟。测试不修改 `api_server` 或
 `config` 的模块属性。
 
@@ -343,3 +343,23 @@ API 测试使用 `notmyfault/tests/api_support.py` 创建临时
 `variables.py` 初始化常量与变量并执行赋值。
 Dashboard 的 `valueTypes.js` 保留编码值并提供端口标签、编辑和兼容提示。
 类型与规则格式见 [data-types.md](data-types.md)。
+
+## 8. Windows 安装升级恢复
+
+升级在安装目录旁写入 `.<目录名>.upgrade-state`，记录原安装的备份路径和卸载注册表值。记录刷新到磁盘后，旧目录才会移动到 `.<目录名>.upgrade-<随机值>`。
+
+升级进程中断后，重新运行安装包仍可选择原安装目录。目录检测会读取恢复记录，并在升级尚未提交时显示旧版本。开始安装时先恢复旧目录及原注册表值，再执行本次升级。
+
+升级提交会先刷新记录中的提交状态，然后清理备份。如果进程在清理期间中断，下次只继续清理备份，已经安装的新版本会保留。恢复记录与备份处在安装目录的同一父目录，读取时检查目录与随机后缀格式。
+
+安装失败日志会复制到临时目录。失败异常通过 `InstallFailure.LogPath` 提供本次日志，失败页面使用此路径。升级回滚恢复的旧 `install.log` 不作为本次失败日志展示。
+
+卸载在删除每个文件和清理注册项前检查取消信号。目录已经移动时取消会保留清理清单，卸载未完成页可继续清理剩余文件。关闭窗口发起取消时，会等待当前文件操作结束再退出。
+
+### 构建与检查
+
+安装器构建在输出目录内创建临时 `work-*` 目录，完成或失败后清理该目录。构建日志保存在输出目录的 `work-*.log`，临时目录清理后仍可读取。Dashboard 从安装包暂存目录读取版本号和图标；安装包只保留编译后的 `dashboard/dist/`。
+
+`installer/windows/tests/run_smoke.ps1` 使用 Windows PowerShell 5.1 可读取的 UTF-8 BOM 编码。测试失败时，`smoke.log` 保留标准输出和标准错误，脚本按测试进程的退出码报告失败。
+
+`-MaintenanceOnly` 包含窗口样式初始化、快捷方式归属、首次启动参数、卸载器临时复制交接，以及升级和卸载恢复检查；不会释放完整离线安装内容。维护测试仍需要创建隔离的 HKCU 测试项。

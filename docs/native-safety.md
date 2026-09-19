@@ -103,8 +103,8 @@ result = subprocess.run(
   `json.loads(sys.stdin.buffer.read().decode("utf-8"))`
   （中文 Windows 文本模式 stdin 是 GBK，直接 `sys.stdin.read()` 会把
   UTF-8 中文读成乱码，SAPI 会念出 "ting-shen" 这类音）。
-- 父进程用 `timeout=` 兜底卡死；子进程退出码非 0 时抛 `RuntimeError`
-  让动作流水线标记失败。
+- 父进程用 `timeout=` 结束卡住的动作；子进程退出码非 0 时抛 `RuntimeError`，
+  动作记为失败。
 - 参考实现：`notmyfault/actions/text_to_speech/action.py`。
 
 ## 排查方法
@@ -122,4 +122,4 @@ result = subprocess.run(
 
 堆损坏 / 访问冲突发生在原生层，Python 解释器根本不知道；Windows 在堆管理
 检查点直接终止进程。`faulthandler` 也救不了（它只处理 Python 级 fault）。
-所以这类 bug 只能靠"规则 + 隔离"预防，而不是事后看日志。
+原生调用的线程约束与进程隔离用于控制此类崩溃的影响。

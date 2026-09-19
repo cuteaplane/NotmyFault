@@ -19,6 +19,10 @@
 
 ## 类型声明
 
+规则保存和启动校验也检查未声明 `value_type` 的旧插件参数，类型通过 `field_type`
+从原有声明推导。`select` 的固定值仍须属于 `options`。`plugin_data` 由插件自有
+数据格式校验处理，不允许绑定运行数据。
+
 参数的 `type` 描述表单控件，`value_type` 描述传递的数据。输出也可以通过
 `value_type` 精化原有 `type`。显式声明的 `value_type` 均在运行时校验，包含
 `bool`、`array`、`object` 等原有类型名称。字符串简写与结构声明均可使用：
@@ -137,6 +141,7 @@
 引用通常能推导来源类型，固定数字表示时间戳时需要 `from` 指明单位。
 转换选项包括 `rounding`、`timezone`、`encoding` 和 `allow_lossy`。
 整数舍入支持 `exact`、`truncate`、`floor`、`ceil`、`round`，默认 `exact`。
+`round` 在半值处向远离零的方向取整，`2.5` 得到 `3`，`-2.5` 得到 `-3`。
 时区支持 `preserve`、`utc`、`local` 和可用的 IANA 时区名。
 二进制与文本之间可指定文本编码或 `base64`。
 对象与文本默认使用 JSON；包含 `Decimal`、二进制等值时，往返双方指定

@@ -112,7 +112,7 @@
       "type": "plugin_data",
       "data_type": "mouse_macro",
       "value_type": "object",
-      "required": true
+      "required": false
     }
   ]
 }

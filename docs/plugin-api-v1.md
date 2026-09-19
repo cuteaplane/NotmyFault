@@ -85,8 +85,8 @@ TypeError，加载期不拦。仓库例子：`notmyfault/actions/append_text/act
 
 ### cancellation_api=runtime-v1（稳定）
 
-声明后规则可以给这一步配 timeout_seconds。引擎把取消事件放进 context，
-动作里长循环要周期检查：
+声明后规则可以给这一步配 `timeout_seconds`。时限包含该动作的全部执行尝试和重试等待，
+到期后结束当前动作，不再发起重试。引擎把取消事件放进 context，动作里的长循环要周期检查：
 
 ```python
 cancel = context.get("runtime", {}).get("cancellation")
@@ -127,7 +127,7 @@ def run(meta, config, emit_event, shutdown_event):
 
 ## 贡献（contributes，稳定）
 
-四种贡献都登记在 `notmyfault/extensions/registry.py`：
+四种贡献都保存在 `notmyfault/extensions/registry.py`：
 
 - commands：由参数编辑器或页面调用的处理函数
 - views：插件自带的 HTML 页面，路径必须位于插件目录内
@@ -155,9 +155,12 @@ def run(action_info, params):
 ```
 
 `capability()` 返回 `CapabilityStatus`，字段是 `id`、`available`、`backend`、
-`reason` 和 `degraded`。Linux 平台服务直接提供这些方法：
+`reason` 和 `degraded`。这里的 `available` 表示公开服务能够调用该能力，系统存在
+同类能力不等于宿主已提供对应公开方法。Windows 的内置插件仍使用系统能力探测；
+尚未开放的公开服务返回 `available=False`，调用时报 `unsupported`。
+Linux 平台服务直接提供这些方法：
 
-- clipboard.read：`read_clipboard()`
+- clipboard.read：`read_clipboard(max_chars=None)`；正整数 `max_chars` 限制返回字符数及命令输出读取量
 - clipboard.write：`write_clipboard(text)`
 - input.send：`type_text(text)`、`send_hotkey(parts)`
 - audio.control：`set_volume(percent)`、`set_mute(muted)`
@@ -221,7 +224,16 @@ notmyfault.core.workflow_executor、notmyfault.host.*、notmyfault.platform.linu
 
 插件内的 Python 兄弟模块在各自插件的模块名称下加载。`import helper` 和包内相对
 导入可以使用；两个插件包含同名 `helper.py` 时分别取得自己的模块。插件目录不会
-加入全局 `sys.path`，卸载时清理该插件创建的模块。
+加入全局 `sys.path`，卸载时清理该插件创建的模块。已验证插件的兄弟模块和扩展命令模块
+可使用该插件声明的管理员权限，授权检查绑定实际模块对象。
+
+`run_as_admin(..., wait=False)` 返回 `subprocess.Popen`，调用方可用 `poll()` 或 `wait()`
+检查提权启动程序的状态。`wait=True` 继续返回 `subprocess.CompletedProcess`。内置插件也使用包内相对导入，
+兄弟模块执行的是验签时读取的源码。直接导入 `notmyfault.actions.*` 或
+`notmyfault.triggers.*` 会作为跨插件引用报告。
+
+`plugin_resource` 绑定到当前插件的加载器，返回该加载器内已加载插件的资源路径；
+不同加载器使用相同插件 ID 时各自解析自己的目录。
 
 ## 插件包签名与安装
 
@@ -234,10 +246,18 @@ notmyfault.core.workflow_executor、notmyfault.host.*、notmyfault.platform.linu
 签名覆盖插件源码、资源以及 `node_modules`、`__pypackages__` 内的文件，排除
 Python 的 `__pycache__` 缓存与签名材料本身。修改依赖内容也需要重新签名。
 动作与触发器共用插件 ID 空间，安装预览与安装会检查另一种类型中的同名 ID。
+插件文件上传上限为 64 MiB，归档实际解压字节总数上限为 500 MiB。
+安装预览返回 `installation.required_risk_ids`；安装的 `confirmed_risk_ids` 必须包含
+这些 ID，遗漏时返回 HTTP 400 和 `risk_confirmation_required`。构建命令遗漏确认时
+继续使用 `build_hook_confirmation_required`。
+签名来源与摘要格式分开记录，旧本地密钥签名可以使用当前摘要格式。用户插件继续
+核对已安装文件清单，旧摘要格式只在文件与已安装记录一致时接受。安装构建后的检查
+和延迟导入前的复查分别执行。
 
 ## 安全扫描的边界
 
-`scan_plugin_security`、能力扫描和借壳提权扫描用于提示风险和检查权限声明，
+`inspect_plugin` 汇总插件检查结果，源码由 `analyze_plugin_source` 解析。能力与风险
+使用同一次 AST 遍历，sudo 导入和借壳提权也检查同一棵 AST。这些检查用于提示风险和检查权限声明，
 不是 Python 安全沙箱。扫描器只看静态源码，字符串拼接、运行时生成代码和原生
 模块都可能超出它的判断范围。安装插件仍等于信任插件以当前用户身份运行。
 带 build 钩子且签名有效的插件才会在安装时执行清单里的命令，命令按参数列表执行，

@@ -14,21 +14,27 @@
 | `file_info` | 读取文件信息 | 返回是否存在、是否为文件或目录、扩展名、字节数和 UTC 修改时间。路径不存在时 `exists=false`。 |
 | `create_directory` | 创建目录 | 创建缺少的父目录，返回 `path` 和 `created`；已有目录返回 `created=false`，同名文件报错。 |
 | `clipboard_read` | 读取剪贴板 | 返回 `text`、`length`、`has_text` 和 `truncated`。只读取文本，默认最多 1000000 字符。 |
-| `download_file` | 下载文件 | 从公网 HTTP/HTTPS 下载，返回 `file`、`bytes` 和 `status`。默认不覆盖，最多 100 MiB，网络超时 15 秒。 |
+| `download_file` | 下载文件 | 从公网 HTTP/HTTPS 下载，返回 `file`、`bytes` 和 `status`。默认不覆盖，最多 100 MiB，下载总期限默认 15 秒。 |
 
 文本文件读写支持 UTF-8、带 BOM 的 UTF-8、GBK 和 UTF-16。
 `list_files` 的通配符匹配相对路径，`*` 可以跨过目录分隔符；递归时不进入符号链接
-目录，Windows 目录联接仍可被遍历。
+目录，Windows 目录联接仍可被遍历。子目录读取失败时整个查找报错，不返回不完整的成功结果。
+`file_info.modified_time` 是带日期时间类型的修改时间，`modified_at` 保留供旧规则
+引用。路径中间不是目录时也返回 `exists=false`，权限不足则报错。
 
 写文件、创建目录和下载动作声明了 `admin_key` 规则审批，沿用项目严格模式下的
-私钥确认规则。它们的目标路径及覆盖选项限定为规则中的字面量，文本内容可以
-引用前序结果。下载地址也限定为字面量。
+私钥确认规则。读取、写入和创建目录的路径，以及下载地址和保存路径，都可以
+引用触发数据或前序结果。`write_text` 的 `overwrite`、`create_parents` 和
+`download_file` 的 `overwrite` 限定为规则中的字面量。参数是否固定以各插件
+`security.literal_only_params` 为准，与是否要求规则审批分别判断。
 
 下载最多跟随 5 次重定向，每个地址都执行公网检查，使用已检查的 IP 建立连接。
 本机、内网和保留地址会被拒绝，包括代理使用的 `198.18.0.0/15` Fake-IP。
 目标父目录必须已存在，内容下载完整后才写入目标路径。网络或大小检查失败时
 删除临时文件，保留原目标文件。Linux 下默认不覆盖模式需要目标文件系统支持硬链接。
-网络连接和单次读取受 `timeout_seconds` 限制，规则取消会在每次读取之间检查。
+候选地址连接、重定向和响应体读取共用 `timeout_seconds` 的剩余时间；取消或
+期限到达时中断活动连接。同步 DNS 查询不能中途结束，返回后才检查剩余时间。
+Content-Length 非整数、为负数或与实际下载长度不符时，下载失败。
 
 ## 数据处理
 
@@ -39,6 +45,10 @@
 | `csv_data` | CSV 数据 | CSV 文本和记录数组互转；返回 `records`、`columns`、`text` 和 `row_count`。 |
 | `datetime_format` | 日期时间格式化 | 当前时间或指定 ISO 8601 时间的格式化与偏移；返回 `text`、`iso`、`timestamp`、`date` 和 `time`。 |
 | `url_codec` | URL 编解码 | 百分号编码、解码、URL 解析和查询参数生成；返回 `text`、主机、端口、路径、查询对象和片段。 |
+
+`text_transform` 的 `join` 操作接受绑定的文本数组，也接受在 `parts` 中填写的
+JSON 文本数组，例如 `["a", "b"]`。`split` 的拆分结果位于 `lines`，`text`
+保留原始输入；`join` 的连接结果位于 `text`。
 
 `json_data.pointer` 使用 `/items/0/name` 格式，键中的 `/` 写成 `~1`，`~` 写成
 `~0`。路径不存在时报错，JSON `null` 作为正常值返回。`stringify` 接受绑定的
@@ -58,11 +68,12 @@
 | --- | --- | --- |
 | `path_exists` | 路径出现或消失 | `path` 指定路径；`kind` 可选文件、目录或任意类型；`state` 可选 `exists`、`missing`、`changed`。 |
 | `file_content` | 文件文本状态变化 | `path` 指定文本文件，`text` 指定查找内容；`state` 可选 `contains`、`absent`、`changed`，可设置大小写和编码。 |
-| `tcp_port` | TCP 端口状态变化 | `host` 支持 IPv4、IPv6 和 `localhost`，`port` 指定端口；`state` 可选 `reachable`、`unreachable`、`changed`。 |
+| `tcp_port` | TCP 端口状态变化 | `host` 支持主机名、IPv4 和 IPv6，`port` 指定端口；`state` 可选 `reachable`、`unreachable`、`changed`。 |
 
 三个触发器首次成功采样只记录状态，之后在所选状态变化时触发，相同状态不重复
-触发。`interval` 控制检查间隔，可设为 0.2–3600 秒。TCP 不支持域名，只建立
-连接，不发送应用数据，连接超时可设为 0.1–10 秒。
+触发。`interval` 控制检查间隔，可设为 0.2–3600 秒。TCP 支持域名，只建立
+连接，不发送应用数据，连接超时可设为 0.1–10 秒。域名解析不受该连接超时限制，
+停止触发器后不再使用尚未返回的解析结果。
 
 文件内容触发器默认最多读 1024 KiB，支持 UTF-8、带 BOM 的 UTF-16 和 GB18030。
 文件缺失、不可读、超限或编码错误时保留上次成功读取的状态；需要检测文件消失
