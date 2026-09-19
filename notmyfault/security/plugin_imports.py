@@ -24,6 +24,7 @@ class PluginImports:
             for path, source in sources.items()
         }
         self.modules: dict[str, types.ModuleType] = {}
+        self.on_module_loaded = None
         self._lock = threading.RLock()
         self._builtins = {**vars(builtins), "__import__": self._import}
         from notmyfault.security.plugin_resources import resource_module
@@ -104,6 +105,8 @@ class PluginImports:
             raise
         if parent is not None:
             setattr(parent, child, module)
+        if self.on_module_loaded is not None:
+            self.on_module_loaded(module)
         return module
 
     def load_entry(self, path: str) -> types.ModuleType:

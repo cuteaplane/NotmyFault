@@ -48,16 +48,19 @@ def _plugin_files(plugin_dir: Path, json_name: str) -> list[Path]:
     return plugin_files(plugin_dir)
 
 
-def plugin_payload_from_entries(entries) -> bytes:
-    payload = bytearray(b"NotmyFault-plugin-signature\x00\x01")
+def plugin_payload_chunks(entries):
+    yield b"NotmyFault-plugin-signature\x00\x01"
     for relative_path, content in entries:
         path_bytes = relative_path.replace("\\", "/").encode("utf-8")
         data = bytes(content)
-        payload.extend(struct.pack(">Q", len(path_bytes)))
-        payload.extend(path_bytes)
-        payload.extend(struct.pack(">Q", len(data)))
-        payload.extend(data)
-    return bytes(payload)
+        yield struct.pack(">Q", len(path_bytes))
+        yield path_bytes
+        yield struct.pack(">Q", len(data))
+        yield data
+
+
+def plugin_payload_from_entries(entries) -> bytes:
+    return b"".join(plugin_payload_chunks(entries))
 
 
 def plugin_payload(plugin_dir) -> bytes:
@@ -162,6 +165,18 @@ def sign_file(path, private_key) -> None:
     Path(str(path) + ".sig").write_bytes(sig)
 
 
+def load_public_key_bytes(data: bytes) -> bytes:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding, PublicFormat, load_pem_public_key,
+    )
+
+    key = load_pem_public_key(data) if data.startswith(b"-----BEGIN ") else Ed25519PublicKey.from_public_bytes(data)
+    if not isinstance(key, Ed25519PublicKey):
+        raise ValueError("签名公钥必须是 Ed25519")
+    return key.public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+
 def verify_file(path) -> bool:
     """校验文件旁的 .sig 文件，缺少签名或校验失败都返回 False。"""
     sig_path = Path(str(path) + ".sig")
@@ -173,7 +188,6 @@ def verify_file(path) -> bool:
         if not pub_keys:
             return False
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-        pubs = [Ed25519PublicKey.from_public_bytes(k) for k in pub_keys]
     except ImportError:
         return False
     try:
@@ -182,8 +196,9 @@ def verify_file(path) -> bool:
     except OSError:
         return False
     digest = hashlib.sha256(data).digest()
-    for pub in pubs:
+    for key in pub_keys:
         try:
+            pub = Ed25519PublicKey.from_public_bytes(key)
             pub.verify(sig, digest)
             return True
         except Exception:

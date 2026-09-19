@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import hashlib
 import json
 import os
@@ -12,14 +11,13 @@ from typing import Literal
 
 from notmyfault.security.plugin_schema import (
     current_platform_name,
-    scan_plugin_source_security,
     validate_plugin_meta,
 )
 from notmyfault.security.plugins import (
-    analyze_plugin_source, plugin_integrity_problems, plugin_signature_kind_from_payload,
+    analyze_plugin_source, plugin_integrity_problems, plugin_signature_kind_from_digest,
 )
 from notmyfault.security.security import SecurityMode
-from notmyfault.security.signing import plugin_files, plugin_payload_from_entries
+from notmyfault.security.signing import plugin_files, plugin_payload_chunks
 
 PluginKind = Literal["trigger", "action"]
 
@@ -63,26 +61,39 @@ class PluginTree:
     files: list[Path]
     file_snapshot: dict[str, str]
     py_sources: dict[str, bytes]
-    payload: bytes
-    legacy_payload: bytes
+    payload_digest: bytes
+    legacy_digest: bytes
     contents: dict[str, bytes]
 
 
 def inspect_plugin_tree(folder_path: str) -> PluginTree | None:
+    contents = {}
+    file_snapshot = {}
+    legacy_digest = hashlib.sha256()
+    digest = hashlib.sha256()
+
+    def entries(files):
+        for path in files:
+            name = path.relative_to(folder_path).as_posix()
+            data = path.read_bytes()
+            file_snapshot[name] = hashlib.sha256(data).hexdigest()
+            legacy_digest.update(data)
+            if name.endswith(".py") or name in {"action.json", "trigger.json"}:
+                contents[name] = data
+            yield name, data
+
     try:
         files = plugin_files(folder_path)
-        contents = {
-            path.relative_to(folder_path).as_posix(): path.read_bytes()
-            for path in files
-        }
+        for chunk in plugin_payload_chunks(entries(files)):
+            digest.update(chunk)
     except (OSError, ValueError):
         return None
     return PluginTree(
         files=files,
-        file_snapshot={name: hashlib.sha256(data).hexdigest() for name, data in contents.items()},
+        file_snapshot=file_snapshot,
         py_sources={str(Path(folder_path) / name): data for name, data in contents.items() if name.endswith(".py")},
-        payload=plugin_payload_from_entries(contents.items()),
-        legacy_payload=b"".join(contents.values()),
+        payload_digest=digest.digest(),
+        legacy_digest=legacy_digest.digest(),
         contents=contents,
     )
 
@@ -98,9 +109,9 @@ class PluginSignature:
 
 
 def inspect_signature(root: str | Path, origin: str, tree: PluginTree, installed_hashes=None) -> PluginSignature:
-    kind = plugin_signature_kind_from_payload(str(root), origin, tree.payload)
+    kind = plugin_signature_kind_from_digest(str(root), origin, tree.payload_digest)
     if kind == "none" and origin == "user" and installed_hashes == tree.file_snapshot:
-        legacy_kind = plugin_signature_kind_from_payload(str(root), origin, tree.legacy_payload)
+        legacy_kind = plugin_signature_kind_from_digest(str(root), origin, tree.legacy_digest)
         if legacy_kind != "none":
             return PluginSignature(legacy_kind, "legacy")
     return PluginSignature(kind)
@@ -184,16 +195,12 @@ def inspect_plugin(root: str | Path, kind: PluginKind, origin: str = "user", *, 
     if not engines_ok:
         result.errors.append(reason)
     for filename, source in tree.py_sources.items():
-        try:
-            syntax = ast.parse(source, filename=filename)
-        except (SyntaxError, ValueError):
-            syntax = ast.Module(body=[], type_ignores=[])
-        caps, sudo, borrowed = analyze_plugin_source(source, tree=syntax)
-        result.capabilities.update(caps)
-        result.uses_sudo |= sudo
-        result.borrowed.extend(borrowed)
         relative = Path(filename).relative_to(root).as_posix()
-        result.risks.extend(scan_plugin_source_security(source, relative, tree=syntax))
+        analysis = analyze_plugin_source(source, relative)
+        result.capabilities.update(analysis.capabilities)
+        result.uses_sudo |= analysis.uses_sudo
+        result.borrowed.extend(analysis.borrowed)
+        result.risks.extend(analysis.risks)
     installed_hashes = (installed_manifest or {}).get(meta.get("id"))
     if installed_hashes is not None:
         result.integrity_errors = plugin_integrity_problems(tree.file_snapshot, installed_hashes)
@@ -238,7 +245,9 @@ def evaluate_plugin(result: PluginInspection, mode: SecurityMode, *, check_signa
             warnings.append("签名无效，降级加载")
     (errors if mode == SecurityMode.STRICT else warnings).extend(strict_findings)
     if result.borrowed:
-        warnings.append("借壳提权嫌疑: " + "；".join(sorted(set(result.borrowed))))
+        (errors if mode == SecurityMode.STRICT else warnings).append(
+            "借壳提权嫌疑: " + "；".join(sorted(set(result.borrowed)))
+        )
     return {"allowed": not errors, "errors": errors, "warnings": warnings}
 
 

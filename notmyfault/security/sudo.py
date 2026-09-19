@@ -176,11 +176,9 @@ def _find_plugin_callers() -> list[tuple[str, Any]]:
             module_name = frame_info.frame.f_globals.get("__name__", "")
             for prefix in ("notmyfault.action_", "notmyfault.trigger_"):
                 if module_name.startswith(prefix):
-                    if "." in module_name[len(prefix):]:
-                        continue
                     globals_id = id(frame_info.frame.f_globals)
                     if globals_id not in seen_globals:
-                        callers.append((module_name[len(prefix):], frame_info.frame.f_globals))
+                        callers.append((module_name[len(prefix):].split(".", 1)[0], frame_info.frame.f_globals))
                         seen_globals.add(globals_id)
                     break
         return callers
@@ -221,7 +219,7 @@ def _run_with_uac(
     allowed_executables: set[str],
     wait: bool = True,
     timeout: int = 30,
-) -> subprocess.CompletedProcess:
+) -> subprocess.CompletedProcess | subprocess.Popen:
     command = _resolve_admin_command(command, allowed_executables)
     if os.name == "nt":
         # PowerShell 单引号使用两个单引号转义。
@@ -229,7 +227,7 @@ def _run_with_uac(
             return "'" + value.replace("'", "''") + "'"
 
         executable = _ps_quote(command[0])
-        arguments = ", ".join(_ps_quote(argument) for argument in command[1:])
+        arguments = _ps_quote(subprocess.list2cmdline(command[1:])) if command[1:] else ""
         start_process = (
             f"Start-Process -FilePath {executable}"
             + (f" -ArgumentList {arguments}" if arguments else "")
@@ -261,14 +259,13 @@ def _run_with_uac(
 
     try:
         if not wait:
-            subprocess.Popen(
+            return subprocess.Popen(
                 elevated_command,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=os.name != "nt",
             )
-            return subprocess.CompletedProcess(elevated_command, 0)
 
         result = subprocess.run(
             elevated_command,
@@ -298,8 +295,8 @@ def run_as_admin(
     command: list[str],
     wait: bool = True,
     timeout: int = 30,
-) -> subprocess.CompletedProcess:
-    """确认本次请求后执行管理员命令。"""
+) -> subprocess.CompletedProcess | subprocess.Popen:
+    """确认后执行管理员命令，wait=False 时返回认证进程句柄。"""
     if not command:
         raise ValueError("command 不能为空")
 

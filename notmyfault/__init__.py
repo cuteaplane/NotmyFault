@@ -13,15 +13,16 @@ _PROJECT_ROOT = _os.path.realpath(
 def _in_pytest() -> bool:
     import inspect
 
+    pytest_module = _sys.modules.get("_pytest.python")
+    if pytest_module is None:
+        return False
+    entry_codes = {
+        function.__code__
+        for name in ("importtestmodule", "pytest_runtest_call")
+        if inspect.isfunction(function := getattr(pytest_module, name, None))
+    }
     for frame_info in inspect.stack():
-        if frame_info.function not in ("importtestmodule", "pytest_runtest_call"):
-            continue
-        code_file = _os.path.realpath(frame_info.frame.f_code.co_filename)
-        if (
-            _os.path.basename(code_file) == "python.py"
-            and _os.path.basename(_os.path.dirname(code_file)) == "_pytest"
-            and _os.path.isfile(code_file)
-        ):
+        if frame_info.frame.f_code in entry_codes:
             return True
     return False
 

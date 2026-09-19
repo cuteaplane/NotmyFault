@@ -35,7 +35,7 @@ def confirm_admin_request(
             ToastDismissalReason,
             ToastDuration,
         )
-        from Win_toaster.show_notification import toaster
+        from Win_toaster.show_notification import show_toast
     except Exception as error:
         raise RuntimeError(f"无法创建管理员确认通知: {error}") from error
 
@@ -70,14 +70,14 @@ def confirm_admin_request(
     toast.on_failed = on_failed
     with _pending_lock:
         _pending_decisions.add(decision)
+    toast_thread = None
     try:
-        toaster.show_toast(toast)
+        toast_thread = show_toast(toast, timeout, decision)
         decision.wait(timeout=max(float(timeout), 0.0))
         return approved
     finally:
         with _pending_lock:
             _pending_decisions.discard(decision)
-        try:
-            toaster.remove_toast(toast)
-        except Exception:
-            pass
+        decision.set()
+        if toast_thread is not None:
+            toast_thread.join()

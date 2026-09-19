@@ -1,4 +1,3 @@
-import ast
 import json
 import os
 import re
@@ -33,7 +32,6 @@ _ALLOWED_PARAM_TYPES = {
     "string", "number", "select", "bool", "time", "hotkey", "path",
     "textarea", "macro", "plugin_data",
 }
-_ALLOWED_OUTPUT_TYPES = BUILTIN_TYPES | TYPE_ALIASES.keys()
 _ALLOWED_SUMMARY_POLICIES = {"shape", "value", "hidden"}
 _REQUIRED_PARAM_FIELDS = {"name", "type", "label"}
 _REQUIRED_OUTPUT_FIELDS = {"name", "type", "label"}
@@ -199,135 +197,6 @@ def get_permission_info(perm: str) -> PermissionInfo | None:
 
 def is_known_permission(perm: str) -> bool:
     return perm in PERMISSION_REGISTRY
-
-
-_RISK_INFO = {
-    "code_injection": ("代码注入", PERM_RISK_HIGH),
-    "subprocess": ("子进程", PERM_RISK_HIGH),
-    "dynamic_import": ("动态导入", PERM_RISK_MEDIUM),
-    "file_write": ("文件写入", PERM_RISK_MEDIUM),
-    "network_request": ("网络请求", PERM_RISK_MEDIUM),
-    "registry_access": ("注册表访问", PERM_RISK_HIGH),
-    "native_call": ("原生调用", PERM_RISK_MEDIUM),
-}
-
-
-def _resolved_name(
-    node: ast.AST,
-    module_aliases: Dict[str, str],
-    imported_symbols: Dict[str, str],
-) -> str | None:
-    if isinstance(node, ast.Name):
-        return imported_symbols.get(node.id, module_aliases.get(node.id, node.id))
-    if isinstance(node, ast.Attribute):
-        owner = _resolved_name(node.value, module_aliases, imported_symbols)
-        if owner:
-            return owner + "." + node.attr
-    return None
-
-
-def _risk_ids_for_name(name: str, is_call: bool) -> List[str]:
-    risk_ids: List[str] = []
-    if is_call and name in {
-        "eval", "exec", "compile", "__import__",
-        "builtins.eval", "builtins.exec", "builtins.compile", "builtins.__import__",
-    }:
-        risk_ids.append("code_injection")
-    if name in {"__import__", "builtins.__import__"}:
-        if "code_injection" not in risk_ids:
-            risk_ids.append("code_injection")
-        risk_ids.append("dynamic_import")
-    if name.startswith("subprocess.") or name in {"os.system", "os.popen"}:
-        risk_ids.append("subprocess")
-    if name.startswith("importlib."):
-        risk_ids.append("dynamic_import")
-    if is_call and (
-        name in {"open", "builtins.open"}
-        or name.startswith("shutil.copy")
-        or name == "shutil.move"
-    ):
-        risk_ids.append("file_write")
-    if name.startswith(("requests.", "urllib.", "socket.")):
-        risk_ids.append("network_request")
-    if name.startswith(("winreg.", "_winreg.")):
-        risk_ids.append("registry_access")
-    if name.startswith("ctypes."):
-        risk_ids.append("native_call")
-    return risk_ids
-
-
-def scan_plugin_source_security(
-    source: str, filename: str = "plugin.py", *, tree: ast.Module | None = None
-) -> List[Dict[str, Any]]:
-    risks: List[Dict[str, Any]] = []
-    try:
-        tree = tree if tree is not None else ast.parse(source, filename=filename)
-    except (SyntaxError, ValueError):
-        return risks
-
-    module_aliases: Dict[str, str] = {}
-    imported_symbols: Dict[str, str] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                local_name = alias.asname or alias.name.split(".")[0]
-                module_aliases[local_name] = (
-                    alias.name if alias.asname else alias.name.split(".")[0]
-                )
-        elif isinstance(node, ast.ImportFrom):
-            module_name = node.module or ""
-            for alias in node.names:
-                imported_symbols[alias.asname or alias.name] = (
-                    module_name + "." + alias.name
-                ).strip(".")
-
-    findings: Dict[str, str] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            name = _resolved_name(node.func, module_aliases, imported_symbols)
-            is_call = True
-        elif isinstance(node, ast.Attribute):
-            name = _resolved_name(node, module_aliases, imported_symbols)
-            is_call = False
-        elif isinstance(node, ast.Name) and node.id == "__import__":
-            name = _resolved_name(node, module_aliases, imported_symbols)
-            is_call = False
-        else:
-            continue
-        if not name:
-            continue
-        for risk_id in _risk_ids_for_name(name, is_call):
-            findings.setdefault(risk_id, name)
-
-    for risk_id, (label, level) in _RISK_INFO.items():
-        evidence = findings.get(risk_id)
-        if evidence is None:
-            continue
-        risks.append({
-            "id": risk_id,
-            "label": label,
-            "level": level,
-            "detail": f"文件 \"{filename}\" 中发现 \"{evidence}\"",
-            "file": filename,
-        })
-    return risks
-
-
-def scan_plugin_security(plugin_dir: str) -> List[Dict[str, Any]]:
-    """扫描插件目录下的 .py 文件，返回发现的风险列表"""
-    risks: List[Dict[str, Any]] = []
-    if not os.path.isdir(plugin_dir):
-        return risks
-    for fpath_obj in sorted(Path(plugin_dir).rglob("*.py")):
-        if not fpath_obj.is_file():
-            continue
-        fname = fpath_obj.relative_to(plugin_dir).as_posix()
-        try:
-            source = fpath_obj.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        risks.extend(scan_plugin_source_security(source, fname))
-    return risks
 
 
 def check_permissions_conform(

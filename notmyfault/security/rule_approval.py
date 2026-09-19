@@ -26,14 +26,10 @@ def _rule_approval_plugins(
     triggers_meta = schema.get("triggers", {})
     actions_meta = schema.get("actions", {})
     required = set(get_rule_admin_plugins(rule, triggers_meta, actions_meta))
-    for field in ("preconditions", "actions"):
-        items = rule.get(field, [])
-        if not isinstance(items, list):
-            continue
-        for item, _location in iter_action_nodes(items, field):
-            plugin_id = item.get("type")
-            if requires_admin_rule_approval(actions_meta.get(plugin_id, {})):
-                required.add(plugin_id)
+    for item, _location in iter_action_nodes(rule.get("actions"), "actions"):
+        plugin_id = item.get("type")
+        if requires_admin_rule_approval(actions_meta.get(plugin_id, {})):
+            required.add(plugin_id)
     return sorted(required)
 
 

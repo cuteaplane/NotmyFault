@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import tempfile
+from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple
 
 from notmyfault.application_paths import ApplicationPaths
@@ -84,24 +85,88 @@ def _constant_string(node: ast.AST) -> str | None:
     return None
 
 
-def _scan_capabilities_from_tree(tree: ast.Module) -> Set[str]:
+_RISK_INFO = {
+    "code_injection": ("代码注入", "high"),
+    "subprocess": ("子进程", "high"),
+    "dynamic_import": ("动态导入", "medium"),
+    "file_write": ("文件写入", "medium"),
+    "network_request": ("网络请求", "medium"),
+    "registry_access": ("注册表访问", "high"),
+    "native_call": ("原生调用", "medium"),
+}
+
+
+def _resolved_name(
+    node: ast.AST,
+    names: dict[str, str],
+) -> str | None:
+    if isinstance(node, ast.Name):
+        return names.get(node.id, node.id)
+    if isinstance(node, ast.Attribute):
+        owner = _resolved_name(node.value, names)
+        if owner:
+            return owner + "." + node.attr
+    return None
+
+
+def _risk_ids_for_name(name: str, is_call: bool) -> List[str]:
+    risk_ids: List[str] = []
+    if is_call and name in {
+        "eval", "exec", "compile", "__import__",
+        "builtins.eval", "builtins.exec", "builtins.compile", "builtins.__import__",
+    }:
+        risk_ids.append("code_injection")
+    if name in {"__import__", "builtins.__import__"}:
+        if "code_injection" not in risk_ids:
+            risk_ids.append("code_injection")
+        risk_ids.append("dynamic_import")
+    if name.startswith("subprocess.") or name in {"os.system", "os.popen"}:
+        risk_ids.append("subprocess")
+    if name.startswith("importlib."):
+        risk_ids.append("dynamic_import")
+    if is_call and (
+        name in {"open", "builtins.open"}
+        or name.startswith("shutil.copy")
+        or name == "shutil.move"
+    ):
+        risk_ids.append("file_write")
+    if name.startswith(("requests.", "urllib.", "socket.")):
+        risk_ids.append("network_request")
+    if name.startswith(("winreg.", "_winreg.")):
+        risk_ids.append("registry_access")
+    if name.startswith("ctypes."):
+        risk_ids.append("native_call")
+    return risk_ids
+
+
+def _scan_source_from_tree(tree: ast.Module, filename: str) -> tuple[Set[str], list[dict]]:
     """记录模块树里的 native_api、external_binary、self_elevation 和 dynamic_exec"""
     caps: Set[str] = set()
+    findings: dict[str, str] = {}
 
     # 同时记录 import 别名，覆盖 os as system 和 importlib as il。
     module_aliases: dict[str, str] = {}
     imported_symbols: dict[str, tuple[str, str]] = {}
+    names: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 top = alias.name.split(".")[0]
                 module_aliases[alias.asname or top] = top
+                names[alias.asname or top] = alias.name if alias.asname else top
         elif isinstance(node, ast.ImportFrom):
             top = (node.module or "").split(".")[0]
             for alias in node.names:
                 imported_symbols[alias.asname or alias.name] = (top, alias.name)
+                names[alias.asname or alias.name] = ((node.module or "") + "." + alias.name).strip(".")
 
     for node in ast.walk(tree):
+        risk_node = node.func if isinstance(node, ast.Call) else node
+        if isinstance(node, (ast.Call, ast.Attribute)) or isinstance(node, ast.Name) and node.id == "__import__":
+            name = _resolved_name(risk_node, names)
+            if name:
+                for risk_id in _risk_ids_for_name(name, isinstance(node, ast.Call)):
+                    findings.setdefault(risk_id, name)
         if isinstance(node, ast.Import):
             for alias in node.names:
                 top = alias.name.split(".")[0]
@@ -190,6 +255,14 @@ def _scan_capabilities_from_tree(tree: ast.Module) -> Set[str]:
                     and len(node.args) >= 2):
                 target, name_arg = node.args[0], node.args[1]
                 attr = _constant_string(name_arg)
+                if attr is None and isinstance(target, ast.Name):
+                    owner = module_aliases.get(target.id, target.id)
+                    if owner in {"os", "subprocess"}:
+                        caps.add("external_binary")
+                    elif owner == "ctypes":
+                        caps.add("native_api")
+                    elif owner in _BUILTIN_OWNERS:
+                        caps.add("dynamic_exec")
                 if attr is not None:
                     if isinstance(target, ast.Name):
                         owner = module_aliases.get(target.id, target.id)
@@ -237,12 +310,23 @@ def _scan_capabilities_from_tree(tree: ast.Module) -> Set[str]:
             # 只认恰好等于 runas 的字符串，包含子串的文案不该拒载插件。
             if isinstance(node.value, str) and node.value.strip().lower() == _ELEVATION_VERB:
                 caps.add("self_elevation")
-    return caps
+    risks = [
+        {
+            "id": risk_id,
+            "label": label,
+            "level": level,
+            "detail": f'文件 "{filename}" 中发现 "{findings[risk_id]}"',
+            "file": filename,
+        }
+        for risk_id, (label, level) in _RISK_INFO.items()
+        if risk_id in findings
+    ]
+    return caps, risks
 
 
 def scan_plugin_capabilities_from_source(source: str) -> Set[str]:
     """用 AST 记录源码使用的 native_api、external_binary、self_elevation 和 dynamic_exec"""
-    return _scan_capabilities_from_tree(parse_plugin_source(source))
+    return _scan_source_from_tree(parse_plugin_source(source), "plugin.py")[0]
 
 
 def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
@@ -398,22 +482,23 @@ def scan_borrowed_privilege(py_file_path: str) -> list[str]:
     return scan_borrowed_privilege_from_source(source)
 
 
-def analyze_plugin_source(
-    source: str, *, include_borrowed: bool = True, tree: ast.Module | None = None
-) -> tuple[Set[str], bool, list[str]]:
-    """一次解析返回能力集合、sudo 导入和借壳扫描结果"""
-    tree = tree if tree is not None else parse_plugin_source(source)
-    borrowed = _scan_borrowed_from_tree(tree) if include_borrowed else []
-    return (
-        _scan_capabilities_from_tree(tree),
-        _check_sudo_from_tree(tree),
-        borrowed,
+@dataclass
+class PluginSourceAnalysis:
+    capabilities: Set[str]
+    uses_sudo: bool
+    borrowed: list[str]
+    risks: list[dict]
+
+
+def analyze_plugin_source(source: str, filename: str = "plugin.py") -> PluginSourceAnalysis:
+    tree = parse_plugin_source(source)
+    capabilities, risks = _scan_source_from_tree(tree, filename)
+    return PluginSourceAnalysis(
+        capabilities, _check_sudo_from_tree(tree), _scan_borrowed_from_tree(tree), risks,
     )
 
 
-def _verify_sig_with_payload(sig: bytes, payload: bytes, pubs) -> bool:
-    """用给定公钥列表验 payload 的 SHA-256 摘要签名，验不过返回 False"""
-    digest = hashlib.sha256(payload).digest()
+def _verify_sig_with_digest(sig: bytes, digest: bytes, pubs) -> bool:
     for pub in pubs:
         try:
             pub.verify(sig, digest)
@@ -423,23 +508,14 @@ def _verify_sig_with_payload(sig: bytes, payload: bytes, pubs) -> bool:
     return False
 
 
-def _verify_sig_with_keys(plugin_dir: str, pubs) -> bool:
-    """用给定公钥列表校验 signature.sig，清单与签名时保持同一份。"""
-    sig_file = os.path.join(plugin_dir, "signature.sig")
-    if not os.path.exists(sig_file):
-        return False
-    try:
-        with open(sig_file, "rb") as f:
-            sig = f.read()
-        from notmyfault.security.signing import plugin_payload
-        payload = plugin_payload(plugin_dir)
-    except OSError:
-        return False
-    return _verify_sig_with_payload(sig, payload, pubs)
-
-
 def plugin_signature_kind_from_payload(
     plugin_dir: str, origin: str, payload: bytes
+) -> str:
+    return plugin_signature_kind_from_digest(plugin_dir, origin, hashlib.sha256(payload).digest())
+
+
+def plugin_signature_kind_from_digest(
+    plugin_dir: str, origin: str, digest: bytes
 ) -> str:
     """返回签名来源：official、author、official-legacy 或 none，验签失败一律算 none"""
     try:
@@ -465,7 +541,7 @@ def plugin_signature_kind_from_payload(
             pubs = [Ed25519PublicKey.from_public_bytes(k) for k in pub_keys]
         except Exception:
             return "none"
-        return "official" if _verify_sig_with_payload(sig, payload, pubs) else "none"
+        return "official" if _verify_sig_with_digest(sig, digest, pubs) else "none"
 
     # 非内置插件由作者自签，公钥随插件目录分发，验的是没被篡改过。
     key_path = os.path.join(plugin_dir, "public_key.pem")
@@ -476,7 +552,7 @@ def plugin_signature_kind_from_payload(
                 pub = load_pem_public_key(f.read())
         except Exception:
             return "none"
-        return "author" if _verify_sig_with_payload(sig, payload, [pub]) else "none"
+        return "author" if _verify_sig_with_digest(sig, digest, [pub]) else "none"
 
     if origin == "third_party":
         return "none"
@@ -490,7 +566,7 @@ def plugin_signature_kind_from_payload(
         pubs = [Ed25519PublicKey.from_public_bytes(k) for k in pub_keys]
     except Exception:
         return "none"
-    return "official-legacy" if _verify_sig_with_payload(sig, payload, pubs) else "none"
+    return "official-legacy" if _verify_sig_with_digest(sig, digest, pubs) else "none"
 
 
 def plugin_signature_kind(plugin_dir: str, origin: str = "builtin") -> str:

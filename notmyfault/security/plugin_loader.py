@@ -1,4 +1,4 @@
-"""加载插件并完成元数据校验、安全检查、导入、注册和 setup，加载器只依赖调用方提供的运行时协作者且不持有 AutomationEngine。"""
+"""插件校验后再导入，使用调用方传入的注册表、诊断对象和提权模块。"""
 
 import inspect
 import os
@@ -25,7 +25,7 @@ from notmyfault.security.plugin_checks import (
 )
 from notmyfault.security.plugins import (
     load_plugin_manifest,
-    plugin_signature_kind_from_payload,
+    plugin_signature_kind_from_digest,
     verify_plugin_integrity_from_hashes,
 )
 from notmyfault.security.security import SecurityMode
@@ -182,7 +182,7 @@ class PluginLoader:
         self._integrity_errors = integrity_errors
         self._plugin_manifest_path = plugin_manifest_path
         # 多个工作流线程可能同时首次执行同一个懒加载动作。
-        self._materialize_lock = threading.Lock()
+        self._materialize_lock = threading.RLock()
         registry.set_action_materializer(self.materialize_pending_action)
         registry.set_trigger_materializer(self.materialize_pending_trigger)
 
@@ -305,14 +305,14 @@ class PluginLoader:
         return loaded_count, failed_count
 
     def materialize_pending_action(self, plugin_id: str) -> Optional[Any]:
-        """导入还没加载的动作插件，没有对应待物化条目时返回 None"""
+        """导入还没加载的动作插件，找不到对应条目时返回 None"""
         entry = self._registry.pending.get(plugin_id)
         if entry is None:
             return None
         return self.materialize_entry(entry)
 
     def materialize_pending_trigger(self, plugin_id: str) -> Optional[Any]:
-        """导入还没加载的触发器插件，没有对应待物化条目时返回 None"""
+        """导入还没加载的触发器插件，找不到对应条目时返回 None"""
         entry = self._registry.pending.get(plugin_id)
         if entry is None:
             return None
@@ -408,14 +408,14 @@ class PluginLoader:
                 fail("无法读取插件文件，拒绝导入")
                 return None
             # 物化阶段必须使用与发现阶段相同的 payload 格式
-            signature_payload = (
-                tree.legacy_payload
+            signature_digest = (
+                tree.legacy_digest
                 if entry.get("signature_format") == "legacy"
-                else tree.payload
+                else tree.payload_digest
             )
             if (
-                plugin_signature_kind_from_payload(
-                    folder_path, origin, signature_payload
+                plugin_signature_kind_from_digest(
+                    folder_path, origin, signature_digest
                 )
                 != expected_signature
             ):
@@ -561,12 +561,15 @@ class PluginLoader:
                 self._sudo.deauthorize_plugin(plugin_id, self._engine_token)
             if "admin" in (meta.get("permissions") or []):
                 try:
-                    self._sudo.authorize_plugin(
-                        plugin_id,
-                        self._engine_token,
-                        module=module,
-                        allowed_executables=admin_executables(meta),
-                    )
+                    def authorize_module(loaded_module):
+                        self._sudo.authorize_plugin(
+                            plugin_id, self._engine_token, module=loaded_module,
+                            allowed_executables=admin_executables(meta),
+                        )
+
+                    for loaded_module in importer.modules.values():
+                        authorize_module(loaded_module)
+                    importer.on_module_loaded = authorize_module
                     print(f"[Engine] [安全] 插件 \"{plugin_id}\" 已注册管理员权限")
                 except PermissionError as e:
                     print(f"[Engine] [!!] 插件 \"{plugin_id}\" 管理员权限注册失败: {e}", file=sys.stderr)
