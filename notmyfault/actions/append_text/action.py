@@ -4,6 +4,7 @@
 
 from datetime import datetime
 import re
+from pathlib import Path
 
 
 def run(action_info, params):
@@ -23,9 +24,15 @@ def run_with_context(action_info, params, context):
         raise ValueError("没有可写入的内容")
 
     encoding = str(params.get("encoding", "utf-8") or "utf-8")
-    b"".decode(encoding)
+    try:
+        b"".decode(encoding)
+    except LookupError:
+        raise ValueError(f"未知或不适用于文本的编码: {encoding}") from None
 
-    add_timestamp = bool(params.get("add_timestamp", True))
+    file_path = str(Path(file_path).expanduser().absolute())
+    add_timestamp = params.get("add_timestamp", True)
+    if not isinstance(add_timestamp, bool):
+        raise ValueError("自动加时间戳必须是布尔值")
     timestamp = (
         datetime.now().strftime("%Y-%m-%d %H:%M:%S") if add_timestamp else None
     )

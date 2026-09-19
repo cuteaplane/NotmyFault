@@ -48,11 +48,17 @@ def run_with_context(action_info, params, context):
     deadline = time.monotonic() + 60
     streams = [{"data": bytearray(), "truncated": False} for _ in range(2)]
     stop_readers = threading.Event()
+    process_exited = threading.Event()
     def read_output(stream, result):
         try:
             while not stop_readers.is_set():
+                if time.monotonic() >= deadline or cancellation and cancellation.is_cancelled():
+                    result["truncated"] = True
+                    break
                 chunk = _read_available(stream)
                 if chunk is None:
+                    if process_exited.is_set():
+                        break
                     stop_readers.wait(0.01)
                     continue
                 if not chunk:
@@ -97,8 +103,11 @@ def run_with_context(action_info, params, context):
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=5)
-            for reader in readers:
-                reader.join(timeout=1)
+            process_exited.set()
+            for reader, result in zip(readers, streams):
+                reader.join(timeout=max(0, deadline - time.monotonic()))
+                if reader.is_alive():
+                    result["truncated"] = True
             stop_readers.set()
             for reader in readers:
                 reader.join()
@@ -115,7 +124,7 @@ def run_with_context(action_info, params, context):
         raise RuntimeError(f"命令执行失败 (code={process.returncode})")
     if cancellation:
         cancellation.raise_if_cancelled()
-    print(f"[Action:run_powershell] 执行成功")
+    print("[Action:run_powershell] 执行成功")
     return {
         "returncode": 0,
         **{name: bytes(result["data"]).decode(locale.getpreferredencoding(False), errors="replace")

@@ -71,7 +71,6 @@ def run(action_info, params):
 
     args = [path] + _split_args(raw_args) if raw_args else [path]
 
-    # Windows 使用 CREATE_NO_WINDOW，启动进程不创建控制台窗口
     if sys.platform == "win32":
         popen_kwargs = {
             "creationflags": subprocess.CREATE_NO_WINDOW,
@@ -105,5 +104,7 @@ def run(action_info, params):
             except OSError as fallback_error:
                 raise RuntimeError("程序不存在或无法打开") from fallback_error
         if isinstance(error, FileNotFoundError):
+            if working_directory and not os.path.isdir(working_directory):
+                raise RuntimeError(f"工作目录不存在或不是目录: {working_directory}") from error
             raise RuntimeError("程序不存在或不可执行") from error
         raise RuntimeError("启动失败") from error

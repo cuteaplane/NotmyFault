@@ -1,6 +1,7 @@
 """UIA 自动化插件的操作宏录制和编辑命令。"""
 
 import copy
+from .action import _unpack_plugin_data
 
 from .nmf_uia_plugin.input_recorder import InputRecorder, build_macro_steps
 from .nmf_uia_plugin.macro_validation import validate_steps
@@ -15,8 +16,7 @@ from .nmf_uia_plugin.uia import (
 def _current_steps(value) -> list:
     if not isinstance(value, dict):
         return []
-    if value.get("$type") == "io.github.notmyfault.uia_automation/mouse_macro@1":
-        value = value.get("data")
+    value = _unpack_plugin_data(value, "mouse_macro")
     if not isinstance(value, dict):
         return []
     steps = value.get("steps")

@@ -61,27 +61,16 @@
             "name": "add_timestamp",
             "label": "自动加时间戳",
             "type": "bool",
-            "default": true
+            "default": true,
+            "value_type": "bool"
         },
         {
             "name": "encoding",
             "label": "编码",
             "type": "string",
             "default": "utf-8",
-            "options": [
-                {
-                    "value": "utf-8",
-                    "label": "UTF-8"
-                },
-                {
-                    "value": "utf-8-sig",
-                    "label": "UTF-8 带 BOM"
-                },
-                {
-                    "value": "gbk",
-                    "label": "GBK（兼容旧系统日志）"
-                }
-            ]
+            "value_type": "text",
+            "placeholder": "Python 编码名称，例如 utf-8、utf-8-sig、gbk"
         }
     ]
 }

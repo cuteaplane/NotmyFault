@@ -72,7 +72,9 @@ def _set_wmi_brightness(level: int) -> int:
         "[Console]::Out.Write(($levels -join ','))"
     )
     result = subprocess.run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        [os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32",
+                      "WindowsPowerShell", "v1.0", "powershell.exe"),
+         "-NoProfile", "-NonInteractive", "-Command", script],
         capture_output=True,
         text=True,
         errors="replace",

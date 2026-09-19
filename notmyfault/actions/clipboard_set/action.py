@@ -34,6 +34,8 @@ if os.name == "nt":
 
 def run(action_info, params):
     text = params.get("text", "")
+    if not isinstance(text, str):
+        raise ValueError("剪贴板内容必须是文本")
 
     if not text:
         raise ValueError("没有文本可写入")

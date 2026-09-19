@@ -72,19 +72,21 @@ def _enable_shutdown_privilege():
                 TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
                 ctypes.byref(token),
             ):
-                return
+                raise RuntimeError("无法打开当前进程的关机权限令牌")
             try:
                 luid = LUID()
                 if not advapi32.LookupPrivilegeValueW(
                     None, SE_SHUTDOWN_NAME, ctypes.byref(luid)
                 ):
-                    return
+                    raise RuntimeError("无法查询 Windows 关机权限")
                 tp = TOKEN_PRIVILEGES(1, luid, SE_PRIVILEGE_ENABLED)
-                advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None)
+                kernel32.SetLastError(0)
+                if not advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None) or kernel32.GetLastError():
+                    raise RuntimeError("无法启用 Windows 关机权限")
             finally:
                 kernel32.CloseHandle(token)
-    except Exception:
-        pass
+    except Exception as error:
+        raise RuntimeError(f"启用关机权限失败: {error}") from error
 
 
 def _execute(params, cancellation=None):
@@ -106,7 +108,7 @@ def _execute(params, cancellation=None):
         )
     if confirm is not True:
         raise PermissionError(
-            "shutdown_system 需要显式设置 confirm=true 才会执行，防止误触发关机"
+            "shutdown_system 需要显式设置 confirm=true 才会执行"
         )
     if not isinstance(force, bool):
         raise ValueError(f"force 必须为布尔值，实际: {force!r}")
@@ -131,20 +133,24 @@ def _execute(params, cancellation=None):
             if not session:
                 raise RuntimeError("当前系统无法获取会话 ID，不能注销")
             command = command + [session]
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=15,
-        )
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise RuntimeError(f"执行系统电源操作失败: {error}") from error
         if result.returncode != 0:
             raise RuntimeError(
                 f"操作失败: {result.stderr.strip() or f'退出码 {result.returncode}'}"
             )
         return
 
-    _enable_shutdown_privilege()
+    if action != "logoff":
+        _enable_shutdown_privilege()
     with native_lock():
         if action in ("hibernate", "sleep"):
             powrprof = ctypes.windll.powrprof

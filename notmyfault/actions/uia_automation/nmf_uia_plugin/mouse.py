@@ -81,14 +81,16 @@ def per_monitor_dpi_context():
     if setter is None:
         yield
         return
-    setter.argtypes = [ctypes.c_void_p]
-    setter.restype = ctypes.c_void_p
-    previous = setter(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    with NATIVE_LOCK:
+        setter.argtypes = [ctypes.c_void_p]
+        setter.restype = ctypes.c_void_p
+        previous = setter(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
     try:
         yield
     finally:
         if previous:
-            setter(previous)
+            with NATIVE_LOCK:
+                setter(previous)
 
 
 def _virtual_screen() -> dict:

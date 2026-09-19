@@ -227,6 +227,8 @@
     </footer>
   </main>
 <script>
+  const hostOrigin = new URL(document.referrer || document.baseURI).origin
+  const targetOrigin = hostOrigin === 'null' ? '*' : hostOrigin
   const hostSource = 'notmyfault:extension-host'
   const viewSource = 'notmyfault:extension-view'
   const controlOperations = [
@@ -255,7 +257,7 @@
 
   function invoke(command, payload) {
     const requestId = 'macro-' + (++requestSequence)
-    window.parent.postMessage({ source:viewSource, type:'invoke', request_id:requestId, command, payload:payload || {} }, '*')
+    window.parent.postMessage({ source:viewSource, type:'invoke', request_id:requestId, command, payload:payload || {} }, targetOrigin)
     return new Promise(function (resolve) {
       const timer = window.setTimeout(function () {
         pending.delete(requestId)
@@ -330,7 +332,7 @@
     if (step.operation === 'wait_present') {
       const label = document.createElement('label')
       const input = document.createElement('input')
-      input.className = 'field-input'; input.type = 'number'; input.min = '0.1'; input.max = '300'; input.step = '0.5'
+      input.className = 'field-input'; input.type = 'number'; input.min = '0.1'; input.max = '600'; input.step = '0.5'
       input.value = String(Number(step.wait_seconds || 30))
       input.addEventListener('input', function () { step.wait_seconds = Number(input.value) || 30 })
       label.append('最长等待（秒）'); label.appendChild(input); container.appendChild(label)
@@ -482,7 +484,7 @@
 
   window.addEventListener('message', function (event) {
     const message = event.data || {}
-    if (event.source !== window.parent || message.source !== hostSource) return
+    if (event.source !== window.parent || event.origin !== hostOrigin || message.source !== hostSource) return
     if (message.type === 'init') {
       const state = message.state || {}
       steps = Array.isArray(state.steps) ? JSON.parse(JSON.stringify(state.steps)) : []
@@ -502,10 +504,10 @@
   document.addEventListener('keydown', function (event) {
     if (event.key !== 'Escape' || recording || busy) return
     event.preventDefault()
-    window.parent.postMessage({ source:viewSource, type:'close' }, '*')
+    window.parent.postMessage({ source:viewSource, type:'close' }, targetOrigin)
   })
   render()
-  window.parent.postMessage({ source:viewSource, type:'ready' }, '*')
+  window.parent.postMessage({ source:viewSource, type:'ready' }, targetOrigin)
 </script>
 </body>
 </html>

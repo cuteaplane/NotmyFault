@@ -62,6 +62,14 @@
                 {
                     "value": "DELETE",
                     "label": "DELETE（删除）"
+                },
+                {
+                    "value": "PATCH",
+                    "label": "PATCH"
+                },
+                {
+                    "value": "HEAD",
+                    "label": "HEAD"
                 }
             ]
         },

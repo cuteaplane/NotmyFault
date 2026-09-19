@@ -114,11 +114,17 @@
       "name": "parts",
       "type": "textarea",
       "value_type": {
-        "type": "array",
-        "items": "text"
+        "type": "union",
+        "variants": [
+          "text",
+          {
+            "type": "array",
+            "items": "text"
+          }
+        ]
       },
       "label": "连接内容（文本数组）",
-      "default": [],
+      "default": "[]",
       "sensitive": true,
       "summary": "hidden",
       "visible_when": {

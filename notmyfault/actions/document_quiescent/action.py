@@ -2,6 +2,7 @@
 import ctypes
 import os
 import time
+import threading
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -11,6 +12,7 @@ from notmyfault.plugin_api import native_lock
 _MAX_FILES = 5000
 _MAX_OBSERVATIONS = 64
 _observations: Dict[str, Tuple[Tuple[Tuple[str, int, int], ...], float]] = {}
+_observations_lock = threading.Lock()
 
 _GENERIC_TITLES = {
     "word", "microsoft word", "excel", "microsoft excel", "powerpoint",
@@ -149,18 +151,20 @@ def check_precondition(_meta: Dict[str, Any], params: Dict[str, Any], _context: 
         return {"ok": False, "reason": f"待归档目录不可用: {folder}", "retry_after_seconds": 300}
     try:
         quiet_seconds = max(float(params.get("quiet_seconds", 120) or 0), 0)
-        snapshot = _snapshot(folder)
+        with _observations_lock:
+            snapshot = _snapshot(folder)
+            key = os.path.normcase(str(folder.resolve()))
+            now = time.monotonic()
+            previous = _observations.get(key)
+            changed = previous is None or previous[0] != snapshot
+            if changed:
+                _observations[key] = (snapshot, now)
+                if len(_observations) > _MAX_OBSERVATIONS:
+                    _observations.pop(next(iter(_observations)), None)
     except Exception as exc:
         return {"ok": False, "reason": f"无法确认目录状态: {exc}", "retry_after_seconds": 120}
 
-    key = str(folder.resolve()).lower()
-    now = time.monotonic()
-    previous = _observations.get(key)
-    if previous is None or previous[0] != snapshot:
-        _observations[key] = (snapshot, now)
-        # 目录多了以后淘汰最早记录的条目，观察中的目录被踢掉只是重新计时
-        if len(_observations) > _MAX_OBSERVATIONS:
-            _observations.pop(next(iter(_observations)), None)
+    if changed:
         return {
             "ok": False,
             "reason": f"目录文件刚发生变化，等待静默 {int(quiet_seconds)} 秒",
@@ -177,7 +181,7 @@ def check_precondition(_meta: Dict[str, Any], params: Dict[str, Any], _context: 
     if params.get("check_file_locks", True):
         for path, _size, _mtime in snapshot:
             if not _can_open_exclusively(path):
-                return {"ok": False, "reason": f"文件仍被占用: {path}", "retry_after_seconds": 60}
+                return {"ok": False, "reason": f"无法独占读取文件，请检查占用状态和读取权限: {path}", "retry_after_seconds": 60}
 
     if params.get("check_document_windows", True):
         try:

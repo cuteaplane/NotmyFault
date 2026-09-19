@@ -56,7 +56,7 @@ def run_with_context(action_info, params, context):
     text = (
         _read_windows(max_chars)
         if os.name == "nt"
-        else platform_services().read_clipboard()
+        else platform_services().read_clipboard(max_chars=max_chars + 1)
     )
     value = text or ""
     return {

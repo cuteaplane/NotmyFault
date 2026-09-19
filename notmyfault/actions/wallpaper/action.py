@@ -21,6 +21,8 @@ _WALLPAPER_STYLES = {
 def run(action_info, params):
     image_path = params.get("image_path", "").strip()
     style = params.get("style", "fill")
+    if style not in _WALLPAPER_STYLES:
+        raise ValueError(f"未知壁纸样式: {style}")
 
     if not image_path:
         raise ValueError("未指定图片路径")
@@ -39,7 +41,13 @@ def run(action_info, params):
         desktop = desktop_environment()
         if desktop == "gnome":
             uri = Path(abspath).as_uri()
+            keys = subprocess.run(
+                ["gsettings", "list-keys", "org.gnome.desktop.background"],
+                capture_output=True, text=True, check=True, timeout=5,
+            ).stdout.splitlines()
             for key in ("picture-uri", "picture-uri-dark"):
+                if key == "picture-uri-dark" and key not in keys:
+                    continue
                 subprocess.run(
                     ["gsettings", "set", "org.gnome.desktop.background", key, uri],
                     check=True,
@@ -64,6 +72,8 @@ def run(action_info, params):
                 timeout=5,
             )
         elif command_path("plasma-apply-wallpaperimage"):
+            if style != "fill":
+                raise ValueError("当前 Plasma 壁纸后端只支持填充样式")
             subprocess.run(
                 ["plasma-apply-wallpaperimage", abspath],
                 check=True,

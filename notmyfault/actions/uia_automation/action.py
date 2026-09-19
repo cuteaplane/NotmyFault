@@ -1,6 +1,7 @@
 """执行 UIA 控件操作或录制的桌面操作宏。"""
 
 import time
+import sys
 
 from notmyfault.plugin_api import owned_value_api
 from .nmf_uia_plugin.keyboard import perform_key_event
@@ -127,13 +128,13 @@ def execute_macro(steps, cancellation=None):
         for event in reversed(list(pressed_keys.values())):
             try:
                 perform_key_event({**event, "event": "up"})
-            except Exception:
-                pass
+            except Exception as error:
+                print(f"[Action:uia_automation] 释放按键失败: {error}", file=sys.stderr)
         for button, point in list(pressed_buttons.items()):
             try:
                 perform_coordinate(point, f"{button}_up")
-            except Exception:
-                pass
+            except Exception as error:
+                print(f"[Action:uia_automation] 释放鼠标键失败: {error}", file=sys.stderr)
     return {"executed": len(results), "steps": results}
 
 

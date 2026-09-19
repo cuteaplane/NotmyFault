@@ -68,6 +68,13 @@ def run(action_info, params):
 
 
 def run_with_context(action_info, params, context):
+    try:
+        return _execute(params)
+    except RecursionError:
+        raise ValueError("JSON 数据嵌套过深") from None
+
+
+def _execute(params):
     operation = params.get("operation", "parse")
     value = params.get("value", "")
     if operation not in ("parse", "extract", "stringify"):

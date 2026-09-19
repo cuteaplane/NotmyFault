@@ -8,6 +8,9 @@ def run(action_info, params):
     if not isinstance(message, str):
         message = str(message)
     # 系统 Toast 处理超长文本不可靠，标题截断为 100 字符，正文截断为 500 字符
+    truncated = len(title) > 100 or len(message) > 500
+    if truncated:
+        print("[Action:notify] 通知内容已截断，标题最多 100 字符，正文最多 500 字符")
     title = title[:100]
     message = message[:500]
     print(f"[Action:notify] 显示通知 (标题 {len(title)} 字符，正文 {len(message)} 字符)")

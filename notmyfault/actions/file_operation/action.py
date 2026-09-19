@@ -16,7 +16,7 @@ def _safe_unpack(archive: str, target: str) -> None:
         if is_link:
             raise ValueError(f"归档包含符号链接，拒绝解压: {name}")
         normalized = os.path.normpath(name)
-        if normalized.startswith("..") or os.path.isabs(normalized):
+        if normalized == ".." or normalized.startswith(".." + os.sep) or os.path.isabs(normalized):
             raise ValueError(f"归档包含非法路径: {name}")
         dest = os.path.join(target_real, normalized)
         dest_real = os.path.realpath(dest)
@@ -53,6 +53,9 @@ def run(action_info, params):
     operation = params.get("operation", "copy")
     source = params.get("source", "").strip()
     dest = params.get("destination", "").strip()
+    overwrite = params.get("overwrite", False)
+    if not isinstance(overwrite, bool):
+        raise ValueError("允许覆盖必须是布尔值")
 
     if not source:
         raise ValueError("未指定源路径")
@@ -60,13 +63,17 @@ def run(action_info, params):
         raise FileNotFoundError(f"源路径不存在: {source}")
     if operation in ("copy", "move") and not dest:
         raise ValueError("未指定目标路径")
+    if operation in ("copy", "move"):
+        actual_dest = os.path.join(dest, os.path.basename(source.rstrip("/\\"))) if os.path.isdir(dest) and (operation == "move" or os.path.isfile(source)) else dest
+        if not overwrite and os.path.lexists(actual_dest):
+            raise FileExistsError("目标已存在，请更换路径或允许覆盖")
 
     print(f"[Action:file_operation] {operation}: {source} -> {dest}")
 
     if operation == "copy":
         _ensure_copy_safe(source, dest)
         if os.path.isdir(source):
-            shutil.copytree(source, dest, dirs_exist_ok=True)
+            shutil.copytree(source, dest, dirs_exist_ok=overwrite)
         else:
             parent = os.path.dirname(dest)
             if parent:

@@ -10,7 +10,10 @@
     ],
     "enabled": true,
     "idempotent": false,
-    "platforms": ["windows", "linux"],
+    "platforms": [
+        "windows",
+        "linux"
+    ],
     "permissions": [
         "screen_reader",
         "filesystem",
@@ -18,7 +21,12 @@
         "external_binary"
     ],
     "outputs": [
-        {"name": "file", "label": "截图文件路径", "type": "string", "value_type": "path"}
+        {
+            "name": "file",
+            "label": "截图文件路径",
+            "type": "string",
+            "value_type": "path"
+        }
     ],
     "params": [
         {
@@ -61,6 +69,14 @@
                 {
                     "value": "jpg",
                     "label": "JPEG（较小文件）"
+                },
+                {
+                    "value": "jpeg",
+                    "label": "JPEG"
+                },
+                {
+                    "value": "bmp",
+                    "label": "BMP"
                 }
             ]
         }

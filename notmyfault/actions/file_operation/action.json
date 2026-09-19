@@ -14,7 +14,8 @@
         "rule_approval": "admin_key",
         "literal_only_params": [
             "operation",
-            "destination"
+            "destination",
+            "overwrite"
         ]
     },
     "params": [
@@ -63,6 +64,19 @@
             "value_type": {
                 "type": "path",
                 "allow_empty": true
+            }
+        },
+        {
+            "name": "overwrite",
+            "label": "允许覆盖已有目标",
+            "type": "bool",
+            "value_type": "bool",
+            "default": false,
+            "visible_when": {
+                "operation": [
+                    "copy",
+                    "move"
+                ]
             }
         }
     ]

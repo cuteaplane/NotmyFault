@@ -76,6 +76,8 @@ def run_with_context(action_info, params, context):
                     wait_for_exit(proc, 5)
                 killed += 1
                 print(f"[Action:kill_process] 已终止 PID={pid or '?'}")
+        except psutil.TimeoutExpired as error:
+            raise RuntimeError(f"已发送终止信号，但 PID={proc.pid} 未在总时限内确认退出") from error
         except psutil.AccessDenied:
             denied += 1
             pid = proc.info.get("pid", "?")

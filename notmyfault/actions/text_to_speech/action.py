@@ -67,7 +67,7 @@ def _speak_windows(text: str, rate, volume, voice_name: str) -> None:
 
 
 def run(action_info, params):
-    text = params.get("text", "").strip()
+    text = str(params.get("text", "")).strip()
     rate = params.get("rate", 0)
     volume = params.get("volume", 100)
     voice_name = str(params.get("voice", "")).strip()

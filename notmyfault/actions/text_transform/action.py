@@ -1,3 +1,6 @@
+import json
+
+
 def run(action_info, params):
     return run_with_context(action_info, params, {})
 
@@ -15,6 +18,11 @@ def run_with_context(action_info, params, context):
             parts = text.split(delimiter)
         else:
             parts = params.get("parts", [])
+            if isinstance(parts, str):
+                try:
+                    parts = json.loads(parts)
+                except json.JSONDecodeError:
+                    raise ValueError("连接内容须填写 JSON 文本数组") from None
             if not isinstance(parts, list) or any(not isinstance(item, str) for item in parts):
                 raise ValueError("连接内容必须是文本数组")
             text = delimiter.join(parts)

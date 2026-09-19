@@ -20,7 +20,32 @@ _WINDOWS_ERRORS = {
     "state_not_applied": "Windows 接受了请求，但蓝牙状态没有改变",
     "disabled_radio": "蓝牙无线电已被硬件开关或系统策略禁用",
     "winrt_unavailable": "当前 Windows 无法使用蓝牙无线电接口",
+    "operation_timeout": "等待 Windows 更改蓝牙状态超时",
 }
+
+
+def _run_command(command, *, cancellation=None, timeout, **kwargs):
+    if cancellation is None:
+        return subprocess.run(command, timeout=timeout, check=False, **kwargs)
+    cancellation.raise_if_cancelled()
+    deadline = time.monotonic() + timeout
+    kwargs.pop("capture_output", None)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+    try:
+        while True:
+            cancellation.raise_if_cancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                stdout, stderr = process.communicate(timeout=min(remaining, 0.1))
+                return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            except subprocess.TimeoutExpired:
+                continue
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate()
 
 
 def _decode_payload(output: str) -> dict[str, Any]:
@@ -55,7 +80,7 @@ def _windows_failure(
     return RuntimeError(f"蓝牙辅助程序退出码为 {result.returncode}")
 
 
-def _run_windows(action: str) -> dict[str, Any]:
+def _run_windows(action: str, cancellation=None) -> dict[str, Any]:
     helper = Path(__file__).with_name("radio.ps1")
     if not helper.is_file():
         raise RuntimeError("蓝牙插件缺少 radio.ps1")
@@ -78,14 +103,14 @@ def _run_windows(action: str) -> dict[str, Any]:
         action,
     ]
     try:
-        result = subprocess.run(
+        result = _run_command(
             command,
+            cancellation=cancellation,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=30,
-            check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except FileNotFoundError as error:
@@ -118,13 +143,13 @@ def _run_bluetoothctl(executable: str, *args: str, deadline=None, cancellation=N
     if timeout <= 0:
         raise RuntimeError("等待蓝牙状态超过总时限（30s）")
     try:
-        return subprocess.run(
+        return _run_command(
             [executable, *args],
+            cancellation=cancellation,
             capture_output=True,
             text=True,
             errors="replace",
             timeout=timeout,
-            check=False,
         )
     except subprocess.TimeoutExpired as error:
         raise RuntimeError("等待 bluetoothctl 超时") from error
@@ -200,7 +225,7 @@ def run_with_context(_action_info: dict[str, Any], params: dict[str, Any], conte
     if cancellation:
         cancellation.raise_if_cancelled()
     if sys.platform == "win32":
-        result = _run_windows(action)
+        result = _run_windows(action, cancellation)
         if cancellation:
             cancellation.raise_if_cancelled()
         return result

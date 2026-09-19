@@ -17,6 +17,8 @@ def run_with_context(action_info, params, context):
         data = text.encode(encoding)
     except LookupError:
         raise ValueError(f"未知或不适用于文本的编码: {encoding}") from None
+    except UnicodeEncodeError:
+        raise ValueError(f"写入内容包含 {encoding} 无法表示的字符") from None
     path = Path(file_path).expanduser().absolute()
     if params.get("create_parents", False):
         path.parent.mkdir(parents=True, exist_ok=True)

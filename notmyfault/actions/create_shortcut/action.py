@@ -42,6 +42,7 @@ def _validate_common(params) -> tuple[str, str, str]:
         raise ValueError("未指定快捷方式名称")
     if (
         any(ch in name for ch in ("\\", "/", ":"))
+        or sys.platform == "win32" and any(ch in name for ch in '*?"<>|')
         or ".." in name
         or any(ord(ch) < 32 for ch in name)
     ):

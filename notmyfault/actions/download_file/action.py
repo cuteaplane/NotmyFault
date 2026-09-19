@@ -4,6 +4,8 @@ import os
 import socket
 import ssl
 import tempfile
+import time
+import threading
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -15,9 +17,13 @@ resolve_public_http_url = network_security_api().resolve_public_http_url
 
 def _connect(addresses, port, timeout):
     last_error = None
+    deadline = time.monotonic() + timeout
     for address in addresses:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("下载连接超过总时限")
         try:
-            return socket.create_connection((address, port), timeout)
+            return socket.create_connection((address, port), remaining)
         except OSError as error:
             last_error = error
     raise OSError("无法连接下载服务器") from last_error
@@ -30,6 +36,7 @@ class _HTTPConnection(http.client.HTTPConnection):
 
     def connect(self):
         self.sock = _connect(self.addresses, self.port, self.timeout)
+        self._active_socket = self.sock
 
 
 class _HTTPSConnection(http.client.HTTPSConnection):
@@ -39,25 +46,33 @@ class _HTTPSConnection(http.client.HTTPSConnection):
 
     def connect(self):
         raw = _connect(self.addresses, self.port, self.timeout)
+        self._active_socket = raw
         try:
             self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+            self._active_socket = self.sock
         except BaseException:
             raw.close()
             raise
 
 
-def _open_response(url, timeout, cancellation):
+def _open_response(url, timeout, cancellation, on_connection=None):
+    deadline = time.monotonic() + timeout
     for redirect in range(6):
         if cancellation:
             cancellation.raise_if_cancelled()
         parsed, addresses = resolve_public_http_url(url)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("下载超过总时限")
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         connection = (
-            _HTTPSConnection(parsed.hostname, addresses, port=port, timeout=timeout,
+            _HTTPSConnection(parsed.hostname, addresses, port=port, timeout=remaining,
                              context=ssl.create_default_context())
             if parsed.scheme == "https"
-            else _HTTPConnection(parsed.hostname, addresses, port=port, timeout=timeout)
+            else _HTTPConnection(parsed.hostname, addresses, port=port, timeout=remaining)
         )
+        if on_connection is not None:
+            on_connection(connection)
         target = parsed.path or "/"
         if parsed.params:
             target += ";" + parsed.params
@@ -107,11 +122,31 @@ def run_with_context(action_info, params, context):
     if destination.exists() and not overwrite:
         raise FileExistsError("目标文件已存在，请更换路径或允许覆盖")
     cancellation = context.get("runtime", {}).get("cancellation")
-    connection, response = _open_response(url, timeout, cancellation)
+    deadline = time.monotonic() + timeout
+    active = []
+    finished = threading.Event()
+
+    def watch_connection():
+        while not finished.wait(0.05):
+            if time.monotonic() >= deadline or cancellation and cancellation.is_cancelled():
+                sock = getattr(active[-1], "_active_socket", None) if active else None
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+    watcher = threading.Thread(target=watch_connection, daemon=True)
+    watcher.start()
+    connection = None
     temporary = None
     try:
+        connection, response = _open_response(url, timeout, cancellation, active.append)
         declared = response.getheader("Content-Length")
-        expected = int(declared) if declared is not None else None
+        try:
+            expected = int(declared) if declared is not None else None
+        except ValueError:
+            raise ValueError("服务器返回的 Content-Length 不是有效整数") from None
         if expected is not None and (expected < 0 or expected > limit):
             raise ValueError("服务器返回的文件大小超过下载上限或无效")
         total = 0
@@ -122,6 +157,12 @@ def run_with_context(action_info, params, context):
             while True:
                 if cancellation:
                     cancellation.raise_if_cancelled()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("下载超过总时限")
+                sock = connection.sock or getattr(getattr(response.fp, "raw", None), "_sock", None)
+                if sock is not None:
+                    sock.settimeout(remaining)
                 chunk = response.read1(min(65536, limit - total + 1))
                 if not chunk:
                     break
@@ -129,6 +170,8 @@ def run_with_context(action_info, params, context):
                 if total > limit:
                     raise ValueError("下载内容超过大小上限")
                 output.write(chunk)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("下载超过总时限")
         if expected is not None and total != expected:
             raise RuntimeError("下载中断，文件长度与服务器声明不符")
         if cancellation:
@@ -141,7 +184,16 @@ def run_with_context(action_info, params, context):
             # 创建硬链接时目标必须不存在，检查路径之后新增的文件也会保留。
             os.link(temporary, destination)
         return {"file": str(destination), "bytes": total, "status": response.status}
+    except OSError as error:
+        if cancellation:
+            cancellation.raise_if_cancelled()
+        if isinstance(error, TimeoutError) or time.monotonic() >= deadline:
+            raise RuntimeError("下载超过总时限") from error
+        raise
     finally:
-        connection.close()
+        finished.set()
+        watcher.join()
+        if connection is not None:
+            connection.close()
         if temporary is not None:
             temporary.unlink(missing_ok=True)

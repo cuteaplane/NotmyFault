@@ -35,7 +35,16 @@ def set_volume(action):
     device = AudioUtilities.GetSpeakers()
     if device is None:
         raise RuntimeError("未找到音频输出设备")
-    endpoint = device.EndpointVolume
+    endpoint = getattr(device, "EndpointVolume", None)
+    if endpoint is None:
+        if hasattr(device, "SetMute"):
+            endpoint = device
+        else:
+            from ctypes import POINTER, cast
+            from comtypes import CLSCTX_ALL
+            from pycaw.pycaw import IAudioEndpointVolume
+            endpoint = cast(device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None),
+                            POINTER(IAudioEndpointVolume))
 
     if action_lower == "mute":
         # 静音通过 Mute 状态控制，音量标尺仍可保留

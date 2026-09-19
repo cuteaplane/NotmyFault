@@ -5,7 +5,7 @@
 import re
 import webbrowser
 
-_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:(?![0-9]+(?:[/?#]|$))")
 
 
 def run(action_info, params):

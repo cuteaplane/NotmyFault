@@ -62,7 +62,7 @@
     },
     {
       "name": "modified_at",
-      "label": "UTC 修改时间，不存在时为空",
+      "label": "修改时间文本（兼容旧规则）",
       "type": "string",
       "value_type": "text"
     },

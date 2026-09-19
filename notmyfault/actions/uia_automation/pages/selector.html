@@ -100,6 +100,8 @@
   </footer>
 </main>
 <script>
+  const hostOrigin = new URL(document.referrer || document.baseURI).origin
+  const targetOrigin = hostOrigin === 'null' ? '*' : hostOrigin
   const hostSource = 'notmyfault:extension-host'
   const viewSource = 'notmyfault:extension-view'
   const pending = new Map()
@@ -109,8 +111,14 @@
 
   function invoke(command, payload) {
     const requestId = 'selector-' + (++requestSequence)
-    window.parent.postMessage({ source:viewSource, type:'invoke', request_id:requestId, command, payload:payload || {} }, '*')
-    return new Promise(function (resolve) { pending.set(requestId, resolve) })
+    window.parent.postMessage({ source:viewSource, type:'invoke', request_id:requestId, command, payload:payload || {} }, targetOrigin)
+    return new Promise(function (resolve) {
+      const timer = window.setTimeout(function () {
+        pending.delete(requestId)
+        resolve({ ok:false, error:'插件命令响应超时' })
+      }, 30000)
+      pending.set(requestId, function (response) { window.clearTimeout(timer); resolve(response) })
+    })
   }
 
   function setStatus(message, isError) {
@@ -136,7 +144,7 @@
     document.getElementById('captureButton').disabled = busy
     document.getElementById('verifyButton').disabled = busy || !selected
     document.getElementById('saveButton').disabled = busy || !selected
-    document.getElementById('cancelButton').disabled = busy
+    document.getElementById('cancelButton').disabled = false
   }
 
   async function capture() {
@@ -175,7 +183,10 @@
   }
 
   async function cancel() {
-    if (busy) return
+    if (busy) {
+      window.parent.postMessage({ source:viewSource, type:'close' }, targetOrigin)
+      return
+    }
     busy = true; render()
     try {
       const response = await invoke('cancel_selector', {})
@@ -185,7 +196,7 @@
 
   window.addEventListener('message', function (event) {
     const message = event.data || {}
-    if (event.source !== window.parent || message.source !== hostSource) return
+    if (event.source !== window.parent || event.origin !== hostOrigin || message.source !== hostSource) return
     if (message.type === 'init') {
       selector = message.state && message.state.selector || null
       render(); return
@@ -202,12 +213,12 @@
   document.getElementById('saveButton').addEventListener('click', save)
   document.getElementById('cancelButton').addEventListener('click', cancel)
   document.addEventListener('keydown', function (event) {
-    if (event.key !== 'Escape' || busy) return
+    if (event.key !== 'Escape') return
     event.preventDefault()
-    window.parent.postMessage({ source:viewSource, type:'close' }, '*')
+    window.parent.postMessage({ source:viewSource, type:'close' }, targetOrigin)
   })
   render()
-  window.parent.postMessage({ source:viewSource, type:'ready' }, '*')
+  window.parent.postMessage({ source:viewSource, type:'ready' }, targetOrigin)
 </script>
 </body>
 </html>

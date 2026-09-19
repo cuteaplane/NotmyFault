@@ -1,6 +1,7 @@
 """HTTP 请求动作，仅接受 http 和 https URL"""
 
 import http.client
+import math
 import socket
 import ssl
 import threading
@@ -103,9 +104,11 @@ def run_with_context(action_info, params, context):
     body = params.get("body", "")
     headers_raw = params.get("headers", "")
     try:
-        timeout = max(1, min(float(params.get("timeout_seconds", 30)), 300))
+        timeout = float(params.get("timeout_seconds", 30))
     except (TypeError, ValueError):
-        timeout = 30
+        raise ValueError("请求超时必须是 1 到 300 秒之间的数字") from None
+    if not math.isfinite(timeout) or not 1 <= timeout <= 300:
+        raise ValueError("请求超时必须是 1 到 300 秒之间的数字")
 
     if not url:
         raise ValueError("未指定 URL")
@@ -215,6 +218,8 @@ def run_with_context(action_info, params, context):
             cancellation.raise_if_cancelled()
         if time.monotonic() >= deadline:
             raise RuntimeError("请求超过总时限") from e
+        if isinstance(e, TimeoutError):
+            raise RuntimeError("请求超时") from e
         raise RuntimeError("请求失败") from e
     except http.client.HTTPException as e:
         if cancellation:

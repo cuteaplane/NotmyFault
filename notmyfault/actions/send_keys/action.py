@@ -29,6 +29,7 @@ def _linux_send_hotkey(keys: str) -> None:
             if main_key_seen:
                 raise ValueError(f"组合键只能包含一个主键: {keys!r}")
             main_key_seen = True
+    parts = [part.upper() if part.startswith("f") and part[1:].isdigit() else part for part in parts]
     platform_services().send_hotkey(parts)
 
 
@@ -55,7 +56,7 @@ if os.name == "nt":
         _fields_ = [
             ("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
             ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
-            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+            ("dwExtraInfo", wintypes.WPARAM),
         ]
 
     class MOUSEINPUT(ctypes.Structure):
@@ -63,7 +64,7 @@ if os.name == "nt":
             ("dx", wintypes.LONG), ("dy", wintypes.LONG),
             ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
             ("time", wintypes.DWORD),
-            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+            ("dwExtraInfo", wintypes.WPARAM),
         ]
 
     class HARDWAREINPUT(ctypes.Structure):

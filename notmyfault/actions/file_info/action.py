@@ -26,7 +26,7 @@ def run_with_context(action_info, params, context):
     }
     try:
         info = path.stat()
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         return result
     result.update({
         "exists": True,

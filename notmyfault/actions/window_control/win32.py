@@ -54,7 +54,11 @@ class Windows:
             "SetThreadDpiAwarenessContext": (ctypes.c_void_p, [ctypes.c_void_p]),
         }
         for name, (result, arguments) in declarations.items():
-            function = getattr(self.api, name)
+            function = getattr(self.api, name, None)
+            if function is None and name == "SetThreadDpiAwarenessContext":
+                continue
+            if function is None:
+                raise RuntimeError(f"Windows 缺少窗口接口: {name}")
             function.restype, function.argtypes = result, arguments
 
     def _check(self, result, operation):
@@ -66,6 +70,9 @@ class Windows:
 
     @contextmanager
     def coordinates(self):
+        if not hasattr(self.api, "SetThreadDpiAwarenessContext"):
+            yield
+            return
         previous = self.api.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
         self._check(previous, "设置线程 DPI 坐标")
         try:
@@ -163,12 +170,14 @@ class Windows:
     def opacity(self, hwnd, percent):
         with native_lock():
             style = self.api.GetWindowLongW(hwnd, -20)
+            color, alpha, flags = wt.DWORD(), wt.BYTE(), wt.DWORD()
+            if style & 0x80000:
+                self._check(self.api.GetLayeredWindowAttributes(hwnd, ctypes.byref(color), ctypes.byref(alpha), ctypes.byref(flags)),
+                            "读取窗口透明度")
             ctypes.set_last_error(0)
             previous = self.api.SetWindowLongW(hwnd, -20, style | 0x80000)
             if not previous and ctypes.get_last_error():
                 self._check(False, "设置透明窗口样式")
-            color, alpha, flags = wt.DWORD(), wt.BYTE(), wt.DWORD()
-            self.api.GetLayeredWindowAttributes(hwnd, ctypes.byref(color), ctypes.byref(alpha), ctypes.byref(flags))
             self._check(self.api.SetLayeredWindowAttributes(hwnd, color.value, round(percent * 255 / 100), (flags.value & 1) | 2),
                         "设置窗口透明度")
 

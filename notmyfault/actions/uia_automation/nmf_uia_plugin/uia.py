@@ -81,8 +81,10 @@ def _text(value: Any, limit: int = 240) -> str:
 def _current(element: Any, name: str, default: Any = "") -> Any:
     try:
         return getattr(element, name)
-    except Exception:
+    except AttributeError:
         return default
+    except Exception as error:
+        raise DesktopElementError("property_unavailable", f"读取控件属性 {name} 失败，请重新选择控件") from error
 
 
 def _process_name(process_id: Any) -> str:
@@ -472,8 +474,8 @@ def validate_window_signature(window: Any) -> Dict[str, Any]:
     return window
 
 
-def _elements(collection: Any, limit: int = 600) -> Iterable[Any]:
-    length = min(int(collection.Length), limit)
+def _elements(collection: Any) -> Iterable[Any]:
+    length = int(collection.Length)
     for index in range(length):
         yield collection.GetElement(index)
 

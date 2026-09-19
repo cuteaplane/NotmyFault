@@ -20,7 +20,8 @@ def run_with_context(action_info, params, context):
         raise ValueError("日期时间必须是 ISO 8601 文本，留空表示当前时间")
     if source.strip():
         try:
-            moment = datetime.fromisoformat(source.strip().replace("Z", "+00:00"))
+            source = source.strip()
+            moment = datetime.fromisoformat(source[:-1] + "+00:00" if source.endswith("Z") else source)
         except ValueError:
             raise ValueError("日期时间格式错误，请使用 ISO 8601，例如 2026-09-05T09:30:00+08:00") from None
         if moment.tzinfo is None:

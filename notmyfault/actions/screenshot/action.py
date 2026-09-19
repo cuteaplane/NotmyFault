@@ -1,6 +1,7 @@
 import os
 import ctypes
 import struct
+import io
 from datetime import datetime
 
 from notmyfault.plugin_api import native_lock, platform_backend_api
@@ -65,7 +66,14 @@ if os.name == "nt":
 def run(action_info, params):
     mode = params.get("mode", "fullscreen")
     output_path = params.get("output_path", "").strip()
-    fmt = params.get("format", "png")
+    fmt = str(params.get("format", "png")).lower()
+    if fmt not in ("png", "jpg", "jpeg", "bmp"):
+        raise ValueError("截图格式必须为 png、jpg、jpeg 或 bmp")
+    if os.name == "nt" and fmt != "bmp":
+        try:
+            from PIL import Image
+        except ImportError:
+            raise RuntimeError("保存 PNG/JPG 截图需要 Pillow") from None
 
     if not output_path:
         if os.name == "nt":
@@ -146,7 +154,7 @@ def run(action_info, params):
 
         raw_bytes = bytes(bmp_bits)
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        with open(output_path, "wb") as f:
+        with io.BytesIO() as f:
             row_size = (width * 3 + 3) & ~3
             pixel_size = row_size * height
             file_size = 54 + pixel_size
@@ -166,7 +174,6 @@ def run(action_info, params):
             f.write(struct.pack("<I", 0))
             f.write(struct.pack("<I", 0))
             # 32位 DIB 像素顺序为 BGRA，BMP 24位文件顺序为 BGR
-        # 用字节切片交错重组，C 级实现比逐像素循环快一个数量级
             for y in range(height):
                 start = y * width * 4
                 src = raw_bytes[start:start + width * 4]
@@ -175,29 +182,16 @@ def run(action_info, params):
                 row_bgr[1:width * 3:3] = src[1:width * 4:4]      # G
                 row_bgr[2:width * 3:3] = src[2:width * 4:4]      # R
                 f.write(row_bgr)
-
-        # GDI 截图产出的是 BMP 字节流，png/jpg 目标格式要经 Pillow 转码
-        fmt_lower = fmt.lower()
-        if fmt_lower in ("png", "jpg", "jpeg"):
-            try:
-                from PIL import Image
-                suffix = ".jpg" if fmt_lower in ("jpg", "jpeg") else ".png"
-                target = os.path.splitext(output_path)[0] + suffix
-                with Image.open(output_path) as img:
-                    if suffix == ".jpg":
-                        img.convert("RGB").save(target, "JPEG", quality=92)
+            if fmt == "bmp":
+                with open(output_path, "wb") as output:
+                    output.write(f.getvalue())
+            else:
+                f.seek(0)
+                with Image.open(f) as img:
+                    if fmt in ("jpg", "jpeg"):
+                        img.convert("RGB").save(output_path, "JPEG", quality=92)
                     else:
-                        img.save(target, "PNG")
-                if os.path.abspath(target) != os.path.abspath(output_path):
-                    os.remove(output_path)
-                output_path = target
-            except ImportError:
-                # 没装 Pillow 时只能保留 BMP，扩展名改成真实的 .bmp
-                bmp_path = os.path.splitext(output_path)[0] + ".bmp"
-                if bmp_path != output_path:
-                    os.replace(output_path, bmp_path)
-                    output_path = bmp_path
-                print("[Action:screenshot] png/jpg 转换需要 Pillow 库，已保存为 BMP")
+                        img.save(output_path, "PNG")
 
         print(f"[Action:screenshot] 截图已保存: {output_path}")
         return {"file": output_path}

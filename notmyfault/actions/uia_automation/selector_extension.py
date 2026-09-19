@@ -2,6 +2,7 @@
 
 import copy
 import time
+import threading
 
 from .nmf_uia_plugin.uia import (
     DesktopElementError,
@@ -50,9 +51,14 @@ def edit_selector(context, payload):
 
 def capture_selector(context, payload):
     options = payload if isinstance(payload, dict) else {}
+    cancelled = threading.Event()
+    context.register_cleanup(cancelled.set)
     try:
-        time.sleep(_clamp_delay(options.get("delay_seconds", 3)))
+        if cancelled.wait(_clamp_delay(options.get("delay_seconds", 3))):
+            return context.error("屏幕控件采集已取消")
         selector = capture_element_under_cursor()
+        if cancelled.is_set():
+            return context.error("屏幕控件采集已取消")
     except (DesktopElementError, ValueError) as error:
         return context.error(str(error))
     context.session.data["selector"] = copy.deepcopy(selector)

@@ -100,7 +100,9 @@ def validate_steps(steps) -> list:
             if operation not in _CONTROL_OPERATIONS:
                 raise ValueError(f"第 {index + 1} 步控件操作不支持: {operation}")
             normalized["operation"] = operation
-            normalized["text"] = str(step.get("text", ""))[:10000]
+            normalized["text"] = str(step.get("text", ""))
+            if len(normalized["text"]) > 10000:
+                raise ValueError(f"第 {index + 1} 步写入文本超过 10000 字符")
             normalized["wait_seconds"] = max(
                 0.1, _delay(step.get("wait_seconds"), 30.0)
             )
