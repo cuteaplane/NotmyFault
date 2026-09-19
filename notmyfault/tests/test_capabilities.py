@@ -22,19 +22,53 @@ class ProbeStructureTests(unittest.TestCase):
 
     def test_windows_probe_reports_builtin_backends(self):
         with patch("notmyfault.platform.capabilities.os.name", "nt"), \
-                patch("importlib.util.find_spec", return_value=object()):
+                patch("importlib.util.find_spec", return_value=object()), \
+                patch("ctypes.WinDLL", create=True), \
+                patch("shutil.which", return_value="powershell.exe"), \
+                patch("os.path.isfile", return_value=True):
             report = capabilities.probe_capabilities()
         for entry in report.values():
             self.assertTrue(entry["available"])
             self.assertIsNotNone(entry["backend"])
+            self.assertFalse(entry["degraded"])
+        for capability in (
+            capabilities.DISPLAY_BRIGHTNESS,
+            capabilities.AUDIO_CONTROL,
+            capabilities.AUDIO_DEVICE_QUERY,
+            capabilities.BLUETOOTH_CONTROL,
+            capabilities.TTS,
+        ):
+            self.assertTrue(report[capability]["reason"])
 
-    def test_windows_missing_pycaw_reports_reason(self):
+    def test_windows_missing_dependencies_reports_reason(self):
         with patch("notmyfault.platform.capabilities.os.name", "nt"), \
-                patch("importlib.util.find_spec", return_value=None):
+                patch("importlib.util.find_spec", return_value=None), \
+                patch("ctypes.WinDLL", side_effect=OSError("DLL unavailable"), create=True), \
+                patch("shutil.which", return_value=None), \
+                patch("os.path.isfile", return_value=False):
             report = capabilities.probe_capabilities()
-        audio = report[capabilities.AUDIO_CONTROL]
-        self.assertFalse(audio["available"])
-        self.assertIn("pycaw", audio["reason"])
+        for entry in report.values():
+            self.assertFalse(entry["available"])
+            self.assertTrue(entry["reason"])
+        self.assertIn("pycaw", report[capabilities.AUDIO_CONTROL]["reason"])
+        with patch("notmyfault.platform.capabilities.os.name", "nt"), \
+                patch("ctypes.WinDLL", create=True) as dll:
+            del dll.return_value.SendInput
+            self.assertFalse(capabilities.probe_capability(capabilities.INPUT_SEND)["available"])
+        with patch("notmyfault.platform.capabilities.os.name", "nt"), \
+                patch("importlib.util.find_spec", return_value=object()), \
+                patch("ctypes.WinDLL", side_effect=OSError("DDC unavailable"), create=True), \
+                patch("shutil.which", return_value="powershell.exe"):
+            self.assertTrue(capabilities.probe_capability(capabilities.AUDIO_CONTROL)["available"])
+            self.assertFalse(capabilities.probe_capability(capabilities.INPUT_SEND)["available"])
+            brightness = capabilities.probe_capability(capabilities.DISPLAY_BRIGHTNESS)
+            self.assertTrue(brightness["available"])
+            self.assertTrue(brightness["degraded"])
+        with patch("notmyfault.platform.capabilities.os.name", "nt"), \
+                patch("importlib.util.find_spec", return_value=None), \
+                patch("ctypes.WinDLL", create=True):
+            self.assertFalse(capabilities.probe_capability(capabilities.AUDIO_CONTROL)["available"])
+            self.assertTrue(capabilities.probe_capability(capabilities.INPUT_SEND)["available"])
 
     def test_linux_missing_backend_reports_reason(self):
         with patch("notmyfault.platform.capabilities.os.name", "posix"), \

@@ -123,8 +123,7 @@ def test_runtime_controller_rejects_restart_while_old_thread_is_stopping():
 
     # 只发出停止信号，线程仍在收尾时不允许启动新一代
     assert controller.request_stop() is True
-    if controller.engine_thread.is_alive():
-        assert controller.start() is False
+    assert controller.start() is False
     assert controller.stop() is False
     assert controller.state == "stopping"
     assert controller.current_engine is engine

@@ -31,7 +31,7 @@ def test_folder_read_error_keeps_the_last_complete_snapshot(tmp_path, monkeypatc
     path = tmp_path / "watched.txt"
     path.touch()
     events = []
-    trigger = module.FolderMonitorTrigger(meta, {"folder_path": str(tmp_path)}, events.append, threading.Event())
+    trigger = module.FolderMonitorTrigger(meta, {"folder_path": str(tmp_path), "event_type": "all"}, events.append, threading.Event())
     trigger.validate()
     trigger.setup()
     original_stat = module.os.stat
@@ -328,11 +328,22 @@ def test_tcp_hostname_tries_both_address_families(monkeypatch, host, families):
 
 def test_tcp_pending_dns_can_stop_without_more_samples(monkeypatch):
     module, meta = load_trigger("tcp_port")
-    shutdown = threading.Event()
     resolving = threading.Event()
     release = threading.Event()
     resolved = threading.Event()
-    extra_sample = threading.Event()
+    checked_pending = threading.Event()
+
+    class ObservedStop(threading.Event):
+        checks = 0
+
+        def is_set(self):
+            if resolving.is_set() and not release.is_set():
+                self.checks += 1
+                if self.checks >= 3:
+                    checked_pending.set()
+            return super().is_set()
+
+    shutdown = ObservedStop()
     resolutions = []
     events = []
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -344,8 +355,6 @@ def test_tcp_pending_dns_can_stop_without_more_samples(monkeypatch):
         resolutions.append(host)
         if len(resolutions) == 1:
             return [(socket.AF_INET, kind, 6, "", address)]
-        if len(resolutions) > 2:
-            extra_sample.set()
         resolving.set()
         release.wait(5)
         resolved.set()
@@ -359,7 +368,8 @@ def test_tcp_pending_dns_can_stop_without_more_samples(monkeypatch):
     worker.start()
     try:
         assert resolving.wait(2)
-        assert not extra_sample.wait(0.5)
+        assert checked_pending.wait(3)
+        assert len(resolutions) == 2
         assert events == []
         shutdown.set()
         worker.join(1)

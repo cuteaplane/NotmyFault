@@ -256,7 +256,8 @@ class TestHotReloadIntegration:
             ("规则恢复失败", "热加载失败且原有规则恢复失败，请重启引擎")
         ]
 
-    def test_hot_reload_picks_up_changes(self, monkeypatch, isolated_config):
+    @pytest.mark.parametrize("initial_valid", [True, False])
+    def test_hot_reload_picks_up_changes(self, monkeypatch, isolated_config, initial_valid):
         from notmyfault.platform import platform_support
         monkeypatch.setattr(platform_support, "show_notification", lambda *a, **k: None)
 
@@ -264,12 +265,14 @@ class TestHotReloadIntegration:
             return {
                 "name": name,
                 "event": {"type": "hotkey", "params": {}},
-                "actions": [{"type": "noop", "params": {}}],
+                "actions": [{"type": "noop", "params": {"name": name}}],
             }
 
+        broken = rule("不可用规则")
+        broken["actions"][0]["type"] = "missing_action"
         store = isolated_config.store
         store.save_config({})
-        store.save_rules([rule("r1")])
+        store.save_rules([*([rule("r1")] if initial_valid else []), broken])
         config = store.load_verified_config()
         config["rules"] = store.load_verified_rules()
         engine = create_test_engine(config, rules_store=store)
@@ -277,28 +280,56 @@ class TestHotReloadIntegration:
         engine._security_mode = SecurityMode.PERMISSIVE
         engine.triggers_funcs["hotkey"] = lambda meta, config, emit, stop: stop.wait(30)
         engine.triggers_meta["hotkey"] = {}
-        engine.actions_funcs["noop"] = lambda meta, params: None
-        engine.actions_meta["noop"] = {}
+        executed = []
+        engine.actions_funcs["noop"] = lambda meta, params: executed.append(params["name"])
+        engine.actions_meta["noop"] = {"params": [{"name": "name", "type": "string"}]}
 
         shutdown = threading.Event()
         thread = threading.Thread(target=engine.start, kwargs={"shutdown_event": shutdown})
         thread.start()
         try:
             deadline = time.monotonic() + 5
-            while "hotkey" not in engine._trigger_supervisor._threads:
+            while engine._hot_reloader._rules_mtime == 0:
                 if time.monotonic() > deadline:
-                    raise AssertionError("触发器线程未启动")
+                    raise AssertionError("引擎未开始等待规则更新")
                 time.sleep(0.05)
+            assert thread.is_alive()
+            assert [r["name"] for r in engine.rules] == (["r1"] if initial_valid else [])
+            assert engine.get_diagnostics()["rules"]["total"] == 1 + initial_valid
+            assert any("missing_action" in issue[1] for issue in engine.get_diagnostics()["rules"]["issues"])
+            engine.emit_event("hotkey", {})
+            assert engine._rule_scheduler.wait_for_idle(timeout=5)
+            assert executed == (["r1"] if initial_valid else [])
 
-            # 触发 mtime 变化后引擎应在轮询中应用新规则
-            time.sleep(0.01)
-            store.save_rules([rule("r1"), rule("r2")])
+            previous_mtime = engine._hot_reloader._rules_mtime
+            store.save_rules([rule("r1"), rule("r2"), broken])
+            os.utime(store.rules_path, (previous_mtime + 2, previous_mtime + 2))
             deadline = time.monotonic() + 8
             while len(engine.rules) < 2:
                 if time.monotonic() > deadline:
                     raise AssertionError("热重载未生效")
                 time.sleep(0.1)
             assert [r["name"] for r in engine.rules] == ["r1", "r2"]
+            assert engine.get_diagnostics()["rules"]["issue_count"] == 1
+            executed.clear()
+            engine.emit_event("hotkey", {})
+            assert engine._rule_scheduler.wait_for_idle(timeout=5)
+            assert sorted(executed) == ["r1", "r2"]
+
+            for updated, expected in (([broken], []), ([rule("已修正")], ["已修正"])):
+                store.save_rules(updated)
+                deadline = time.monotonic() + 8
+                while [r["name"] for r in engine.rules] != expected:
+                    if time.monotonic() > deadline:
+                        raise AssertionError("热重载未应用规则")
+                    time.sleep(0.05)
+                assert thread.is_alive()
+                executed.clear()
+                engine.emit_event("hotkey", {})
+                assert engine._rule_scheduler.wait_for_idle(timeout=5)
+                assert executed == expected
+            assert engine.get_diagnostics()["rules"]["issues"] == []
+            assert any(r["actions"][0]["type"] == "noop" for r in store.load_verified_rules())
         finally:
             shutdown.set()
             thread.join(timeout=10)

@@ -137,12 +137,15 @@ def test_reopened_store_rejects_world_readable_secret(tmp_path):
     if os.name == "nt":
         import subprocess
 
-        subprocess.run(
-            ["icacls", str(paths.config_secret_file), "/grant:r", "*S-1-1-0:R"],
-            check=True,
-            capture_output=True,
-            timeout=5,
-        )
+        try:
+            result = subprocess.run(
+                ["icacls", str(paths.config_secret_file), "/grant:r", "*S-1-1-0:R"],
+                capture_output=True, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            pytest.skip(f"当前环境不能设置测试文件 ACL: {error}")
+        if result.returncode:
+            pytest.skip("当前账户不能为测试文件添加 Everyone 读取权限")
     else:
         paths.config_secret_file.chmod(0o644)
 
@@ -178,12 +181,15 @@ def test_signature_algorithm_stays_hmac_sha256_over_sorted_json(tmp_path):
 
 
 @pytest.mark.parametrize("target", ["config", "rules"])
-def test_tampering_is_rejected(target, tmp_path):
+@pytest.mark.parametrize("bad_signature", [None, 123, ["bad"], "错误签名"])
+def test_tampering_is_rejected(target, bad_signature, tmp_path):
     paths = make_paths(tmp_path)
     store = make_store(paths)
     path = paths.config_file if target == "config" else paths.rules_file
     raw = json.loads(path.read_text(encoding="utf-8"))
     raw["tampered"] = True
+    if bad_signature is not None:
+        raw["_signature"] = bad_signature
     path.write_text(json.dumps(raw), encoding="utf-8")
     loader = (
         store.load_verified_config
@@ -223,12 +229,21 @@ def test_config_parse_failure_recovers_signed_backup(tmp_path):
     assert store.load_verified_config()["generation"] == 1
 
 
-def test_rules_parse_failure_recovers_signed_backup(tmp_path):
+@pytest.mark.parametrize("backup_valid", [True, False])
+def test_rules_parse_failure_recovers_signed_backup(tmp_path, backup_valid):
     paths = make_paths(tmp_path)
     store = make_store(paths)
     assert store.save_rules([simple_rule("旧")])
     assert store.save_rules([simple_rule("新")])
     paths.rules_file.write_text("{broken", encoding="utf-8")
+    if not backup_valid:
+        backup = paths.rules_file.with_suffix(".json.bak")
+        backup.write_text("{bad-backup", encoding="utf-8")
+        with pytest.raises(ConfigValidationError):
+            store.load_rules()
+        assert paths.rules_file.read_text(encoding="utf-8") == "{broken"
+        assert backup.read_text(encoding="utf-8") == "{bad-backup"
+        return
     recovered = store.load_rules()
     assert [rule["name"] for rule in recovered] == ["旧"]
 

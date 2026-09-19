@@ -186,6 +186,10 @@ def test_token_store_creates_token_and_reapplies_file_permissions(tmp_path):
     )
     assert reloaded.token == store.token
     assert len(restricted) == 1
+    assert not reloaded.matches("无效令牌")
+    path.write_text("损坏令牌", encoding="utf-8")
+    reloaded.repair_file()
+    assert path.read_text(encoding="utf-8") == store.token
 
 
 def test_sse_rejects_query_token(tmp_path):
@@ -312,6 +316,15 @@ def test_rules_transport_preserves_typed_constants_and_literal_objects(tmp_path)
     saved_again = env.client.put("/api/rules", headers={**env.headers, "X-NMF-Value-Encoding": "typed-v1"}, json=fetched.json())
     assert saved_again.status_code == 200, saved_again.text
     assert env.store.load_verified_rules()[0] == stored
+    updated = decode_value(fetched.json())
+    updated["expected_revision"] = updated["revision"]
+    updated["rules"][0]["name"] = "新的规则名称"
+    accepted = env.client.put("/api/rules", headers={**env.headers, "X-NMF-Value-Encoding": "typed-v1"}, json=encode_value(updated))
+    assert accepted.status_code == 200
+    assert accepted.json()["revision"] != updated["expected_revision"]
+    stale = env.client.put("/api/rules", headers={**env.headers, "X-NMF-Value-Encoding": "typed-v1"}, json=encode_value(updated))
+    assert stale.status_code == 409
+    assert stale.json()["code"] == "rules_conflict"
 
 
 def test_engine_control_and_status_contract(tmp_path):

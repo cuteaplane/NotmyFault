@@ -1,6 +1,7 @@
 """插件签名：密钥加载、文件清单与签名往返"""
 
 import hashlib
+import os
 
 import pytest
 from cryptography.exceptions import InvalidSignature
@@ -18,6 +19,43 @@ from notmyfault.security import signing
 
 def make_key():
     return ed25519.Ed25519PrivateKey.generate()
+
+
+def test_private_key_replacement_preserves_previous_file_on_failure(tmp_path, monkeypatch):
+    import build
+
+    path = tmp_path / "key.pem"
+    old_key = make_key()
+    build._save_private_key(old_key, path)
+    previous = path.read_bytes()
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o600
+
+    def fail_replace(source, destination):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(build.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        build._save_private_key(make_key(), path)
+    assert path.read_bytes() == previous
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_file_signature_uses_valid_key_when_another_key_is_malformed(tmp_path, monkeypatch):
+    from notmyfault.security import signing_keys
+
+    key = make_key()
+    public = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    pem = key.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+    assert signing.load_public_key_bytes(pem) == public
+    assert signing.load_public_key_bytes(public) == public
+    path = tmp_path / "data"
+    path.write_bytes(b"signed content")
+    signing.sign_file(path, key)
+    monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [b"invalid", public])
+    assert signing.verify_file(path)
+    path.write_bytes(b"changed")
+    assert not signing.verify_file(path)
 
 
 class TestPluginFiles:

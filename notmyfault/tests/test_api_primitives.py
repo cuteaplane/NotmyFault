@@ -202,7 +202,7 @@ def test_event_broker_closes_slow_subscriber() -> None:
         broker = EventBroker(_EventHistory())
         subscription = broker.subscribe()
 
-        for index in range(201):
+        for index in range(subscription.queue.maxsize + 1):
             broker.publish("progress", {"index": index})
         await asyncio.sleep(0)
 
@@ -211,16 +211,23 @@ def test_event_broker_closes_slow_subscriber() -> None:
     asyncio.run(exercise())
 
 
-def test_rule_run_route_rejects_test_data_over_one_mib(tmp_path) -> None:
+@pytest.mark.parametrize("method,path", [
+    ("POST", "/api/rules/0/run"),
+    ("POST", "/api/rules/validate"),
+    ("PUT", "/api/rules"),
+    ("POST", "/api/rules/draft/ai/stream"),
+    ("POST", "/api/plugins/demo/extensions/commands/read/invoke"),
+])
+def test_rule_run_route_rejects_test_data_over_one_mib(tmp_path, method, path) -> None:
     env = make_api_env(tmp_path)
-    response = env.client.post(
-        "/api/rules/0/run",
+    response = env.client.request(
+        method, path,
         headers={**env.headers, "Content-Type": "application/json"},
         content=b'"' + b"x" * (1024 * 1024) + b'"',
     )
 
     assert response.status_code == 413
-    assert response.json() == {"ok": False, "error": "测试数据超过 1 MiB 上限"}
+    assert response.json()["ok"] is False
 
 
 @pytest.mark.parametrize("upstream,policy,valid", [

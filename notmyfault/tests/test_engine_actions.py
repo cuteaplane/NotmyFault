@@ -622,6 +622,7 @@ class TestExecuteAction:
         self, monkeypatch
     ):
         events = []
+        attempts = []
         engine = make_engine(on_event=lambda name, data: events.append((name, data)))
 
         def short_cancellation(run_event=None, shutdown_event=None, timeout_seconds=None):
@@ -632,6 +633,7 @@ class TestExecuteAction:
             )
 
         def run_with_context(meta, params, context):
+            attempts.append(True)
             cancellation = context["runtime"]["cancellation"]
             cancellation.wait(1)
             cancellation.raise_if_cancelled()
@@ -658,12 +660,14 @@ class TestExecuteAction:
                 "binding_id": "a_wait001",
                 "params": {},
                 "timeout_seconds": 1,
+                "retry": 3,
             }]},
             "规则",
             context,
         )
 
         assert context["steps"]["a_wait001"]["status"] == "timed_out"
+        assert len(attempts) == 1
         assert any(name == "action_timed_out" for name, _data in events)
 
     def test_cancel_run_interrupts_retry_wait(self):
@@ -891,7 +895,7 @@ class TestErrorIsolation:
                 stop_event.set()
 
         engine._run_trigger("hotkey", "hotkey", broken, {}, {}, threading.Event())
-        assert engine._diag_obj.snapshot()["trigger_crashes"] == (exit_mode != "stopped")
+        assert engine._diag_obj.snapshot()["trigger_crashes"] == (exit_mode == "crash")
         assert len(alerts) == (exit_mode != "stopped")
 
 
@@ -947,13 +951,14 @@ class TestErrorIsolation:
         assert calls == ["drain", "teardown"]
         assert engine._plugin_modules == {}
 
-    def test_start_revokes_privilege_session_when_runtime_fails(self, monkeypatch):
+    def test_start_revokes_privilege_session_after_empty_runtime_stops(self, monkeypatch):
         from notmyfault.platform import platform_support
         monkeypatch.setattr(platform_support, "show_notification", lambda *a, **k: None)
         engine = make_engine()
         engine._security_mode = type(engine._security_mode).PERMISSIVE
-        # 没有任何触发器时 _run 直接返回，start() 仍应撤销权限会话
-        engine.start(shutdown_event=threading.Event())
+        shutdown = threading.Event()
+        shutdown.set()
+        engine.start(shutdown_event=shutdown)
         assert engine._privilege_session_closed is True
 
     def test_partial_trigger_start_failure_cleans_runtime(self, monkeypatch):

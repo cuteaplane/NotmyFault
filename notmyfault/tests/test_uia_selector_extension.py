@@ -39,7 +39,7 @@ def _context():
 
 def test_capture_and_commit_plugin_owned_selector(monkeypatch):
     context = _context()
-    monkeypatch.setattr(selector_extension.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(selector_extension.threading.Event, "wait", lambda self, _delay: False)
     monkeypatch.setattr(
         selector_extension,
         "capture_element_under_cursor",

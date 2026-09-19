@@ -108,7 +108,7 @@ class TestRunAsAdmin:
                 "cmd.exe",
             ).replace("'", "''")
             + "'"
-            " -ArgumentList '/c', 'dir' -Verb RunAs -Wait -PassThru; "
+            " -ArgumentList '/c dir' -Verb RunAs -Wait -PassThru; "
             "exit $process.ExitCode",
         ]
 
@@ -123,13 +123,13 @@ class TestRunAsAdmin:
         module, captured = authorized_plugin
         call_from(module, sudo.run_as_admin, ["notepad.exe", "it's a test"])
         # PowerShell 单引号内的单引号必须双写转义
-        assert "'it''s a test'" in captured["cmd"][3]
+        assert "'\"it''s a test\"'" in captured["cmd"][3]
 
     @WINDOWS_ONLY
     def test_ps_quote_empty_argument(self, authorized_plugin):
         module, captured = authorized_plugin
         call_from(module, sudo.run_as_admin, ["tool.exe", ""])
-        assert "-ArgumentList ''" in captured["cmd"][3]
+        assert "-ArgumentList '\"\"'" in captured["cmd"][3]
 
     @WINDOWS_ONLY
     def test_single_executable_no_args(self, authorized_plugin):
@@ -151,13 +151,18 @@ class TestRunAsAdmin:
     def test_wait_false(self, authorized_plugin, monkeypatch):
         module, captured = authorized_plugin
         popened = []
+        process = object()
+
+        def start(cmd, **kwargs):
+            popened.append((cmd, kwargs))
+            return process
+
         monkeypatch.setattr(
             sudo.subprocess, "Popen",
-            lambda cmd, **kwargs: popened.append((cmd, kwargs)),
+            start,
         )
         result = call_from(module, sudo.run_as_admin, ["cmd.exe"], wait=False)
-        assert isinstance(result, subprocess.CompletedProcess)
-        assert result.returncode == 0
+        assert result is process
         assert len(popened) == 1
         cmd, kwargs = popened[0]
         assert "-Wait" not in cmd[3]

@@ -349,7 +349,7 @@ class TestReplaceMode:
         assert holder[1][0] == "replaced"
 
     def test_replace_during_retry_loop(self):
-        # 旧 run 卡在重试里（一直没退出），replace 仍然取消它并启动新 run
+        # 重试期间仍可通过 run_id 取消旧 run
         runtime = FakeRuntime()
         rule = {"concurrency": {"mode": "replace"}}
         scheduler = make_scheduler(rule, runtime)
@@ -523,7 +523,7 @@ class TestEngineWiring:
         reloader._rules_mtime = 1
         reloader.current_mtime = lambda: 2
         reloader._load_rules_fn = lambda: [{
-            "name": "无效规则", "condition": {"type": "missing"},
+            "name": "无效规则", "condition": {"op": "invalid", "children": [{"type": "hotkey"}]},
             "actions": [{"type": "noop", "params": {}}],
         }]
         stopped = []

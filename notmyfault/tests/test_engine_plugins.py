@@ -114,8 +114,9 @@ def sign_with_old_payload(plugin_dir, monkeypatch):
     old_payload = b"".join(
         path.read_bytes() for path in signing.plugin_files(plugin_dir)
     )
-    monkeypatch.setattr(signing, "plugin_payload", lambda _folder: old_payload)
-    signing.sign_plugin(Path(plugin_dir), "action.json", private_key=key)
+    import hashlib
+
+    (Path(plugin_dir) / "signature.sig").write_bytes(key.sign(hashlib.sha256(old_payload).digest()))
 
 
 CLEAN_RUN = "def run(meta, params):\n    return None\n"
@@ -139,6 +140,10 @@ class TestEngineStart:
     def test_start_no_trigger_threads_alerts(self, monkeypatch):
         from notmyfault.platform import platform_support
         monkeypatch.setattr(platform_support, "show_notification", lambda *a, **k: None)
+        import os
+        if os.name == "nt":
+            from Win_toaster import AUMID_Register
+            monkeypatch.setattr(AUMID_Register, "register_toaster", lambda: None)
 
         alerts = []
         engine = make_engine(rules=[{
@@ -150,10 +155,11 @@ class TestEngineStart:
             lambda title, message, open_dashboard=False: alerts.append((title, open_dashboard))
         )
         engine._security_mode = SecurityMode.PERMISSIVE
-        from notmyfault.config import ConfigValidationError
-        with pytest.raises(ConfigValidationError, match="ghost_trigger"):
-            engine.start(shutdown_event=threading.Event())
-        assert any("启动失败" in title and dashboard for title, dashboard in alerts)
+        stopped = threading.Event()
+        monkeypatch.setattr(engine._hot_reloader, "begin", stopped.set)
+        engine.start(shutdown_event=stopped)
+        assert engine.get_diagnostics()["rules"]["issue_count"] == 1
+        assert alerts
 
 
 class TestLoadPlugins:

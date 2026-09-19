@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import runpy
 import shutil
 import signal
@@ -139,7 +140,8 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
         assert client.get("/api/engine/status", headers=headers).json()[
             "engine_state"
         ] == "running"
-        time.sleep(1.05)
+        assert wait_for(lambda: runner.current_engine._hot_reloader._rules_mtime > 0)
+        previous_mtime = runner.current_engine._hot_reloader._rules_mtime
 
         response = client.put(
             "/api/rules",
@@ -166,6 +168,7 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
             },
         )
         assert response.status_code == 200, response.text
+        os.utime(paths.rules_file, (previous_mtime + 2, previous_mtime + 2))
         assert wait_for(
             lambda: runner.current_engine is not None
             and runner.current_engine.rules[0]["name"] == "装配热重载",

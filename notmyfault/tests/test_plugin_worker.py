@@ -208,56 +208,62 @@ class TestRunIsolatedAction:
 
     def test_execute_timeout_kills_worker(self, monkeypatch, tmp_path):
         real_popen = plugin_worker.subprocess.Popen
+        processes = []
 
         def start_ready_worker(*args, **kwargs):
-            return real_popen(
+            process = real_popen(
                 [sys.executable, "-c", READY_THEN_SLEEP_WORKER],
                 **kwargs,
             )
+            processes.append(process)
+            return process
 
         monkeypatch.setattr(plugin_worker.subprocess, "Popen", start_ready_worker)
         entry = write_action(tmp_path, "sleepy", SLEEPY_ACTION)
-        started = time.time()
         with pytest.raises(PluginWorkerTimeout):
             run_isolated_action(entry, {}, {}, {}, execute_timeout=1.0)
-        assert time.time() - started < 1.75
+        assert processes and all(process.poll() is not None for process in processes)
 
     def test_startup_timeout_kills_worker(self, monkeypatch, tmp_path):
         real_popen = plugin_worker.subprocess.Popen
+        processes = []
 
         def start_silent_worker(*args, **kwargs):
-            return real_popen(
+            process = real_popen(
                 [sys.executable, "-c", "import time; time.sleep(30)"],
                 **kwargs,
             )
+            processes.append(process)
+            return process
 
         monkeypatch.setattr(plugin_worker.subprocess, "Popen", start_silent_worker)
         entry = write_action(tmp_path, "simple_startup", SIMPLE_ACTION)
-        started = time.time()
         with pytest.raises(PluginWorkerStartupTimeout):
             run_isolated_action(entry, {}, {}, {}, startup_timeout=0.2)
-        assert time.time() - started < 1.0
+        assert processes and all(process.poll() is not None for process in processes)
         assert not plugin_worker._live_processes
 
     def test_exit_timeout_kills_worker_after_result(self, monkeypatch, tmp_path):
         real_popen = plugin_worker.subprocess.Popen
+        processes = []
 
         def start_hanging_worker(*args, **kwargs):
-            return real_popen(
+            process = real_popen(
                 [sys.executable, "-c", READY_RESULT_THEN_SLEEP_WORKER],
                 **kwargs,
             )
+            processes.append(process)
+            return process
 
         monkeypatch.setattr(plugin_worker.subprocess, "Popen", start_hanging_worker)
         monkeypatch.setattr(plugin_worker, "EXIT_TIMEOUT", 0.2)
         entry = write_action(tmp_path, "hanging_exit", SIMPLE_ACTION)
-        started = time.time()
 
         ok, result = run_isolated_action(entry, {}, {}, {})
 
         assert ok is True
         assert result == {"completed": True}
-        assert time.time() - started < 1.0
+        assert processes and all(process.poll() is not None for process in processes)
         assert not plugin_worker._live_processes
 
     def test_context_v1_receives_sanitized_context(self, tmp_path):

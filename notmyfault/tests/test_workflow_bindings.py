@@ -312,7 +312,7 @@ def test_reference_path_rejects_special_attribute_names():
 
 
 def test_missing_reference_is_a_permanent_configuration_error():
-    # 缺失数据是配置错误，抛 ValueError 子类而不是可重试的运行时异常
+    # 缺失数据属于配置错误，调用方通过 ValueError 识别
     context = {"triggers": {"t_usb001": {"payload": {}}}, "steps": {}}
     with pytest.raises(ValueError) as excinfo:
         resolve_value(

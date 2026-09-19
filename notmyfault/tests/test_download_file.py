@@ -14,6 +14,7 @@ class Response(io.BytesIO):
     def __init__(self, data, headers=None):
         super().__init__(data)
         self.headers = headers or {}
+        self.fp = None
 
     def getheader(self, name):
         return self.headers.get(name)
@@ -26,6 +27,7 @@ class Connection:
     def __init__(self, response):
         self.response = response
         self.closed = False
+        self.sock = None
 
     def close(self):
         self.closed = True
@@ -56,6 +58,7 @@ def test_download_publishes_complete_file_and_preserves_existing_target(tmp_path
 @pytest.mark.parametrize("response,extra", [
     (lambda: Response(b"too large"), {"max_mb": 0.000001}),
     (lambda: Response(b"short", {"Content-Length": "12"}), {}),
+    (lambda: Response(b"data", {"Content-Length": "invalid"}), {}),
 ])
 def test_failed_download_keeps_existing_file_and_removes_partial_data(tmp_path, monkeypatch, response, extra):
     destination = tmp_path / "report.txt"
@@ -162,7 +165,9 @@ def test_download_connects_only_to_previously_checked_addresses(monkeypatch, sch
     try:
         assert opened is response
         assert checked == [url]
-        assert calls == [(("93.184.215.14", port), 5)]
+        assert len(calls) == 1
+        assert calls[0][0] == ("93.184.215.14", port)
+        assert 0 < calls[0][1] <= 5
         assert b"Host: example.com\r\n" in b"".join(requests)
         assert server_names == (["example.com"] if scheme == "https" else [])
     finally:

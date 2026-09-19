@@ -19,7 +19,7 @@ from notmyfault.host.api.services.plugin_installation import (
 from notmyfault.host.plugin_registry import PluginRegistryClient
 from notmyfault.tests.api_support import make_api_env
 from notmyfault.tests.api_support import make_paths, make_store
-from notmyfault.tests.test_api_plugins import build_nmfp, make_meta, post_archive
+from notmyfault.tests.plugin_support import build_nmfp, make_meta, post_archive
 
 
 @pytest.fixture(autouse=True)
@@ -70,7 +70,8 @@ def test_expired_preview_cannot_be_used(tmp_path):
     assert token not in previews
 
 
-def test_changed_package_id_is_backed_up_and_uninstall_removes_backup(tmp_path):
+@pytest.mark.parametrize("tamper", [False, True])
+def test_changed_package_id_is_backed_up_and_uninstall_removes_backup(tmp_path, tamper):
     env = make_api_env(tmp_path)
     first = build_nmfp(tmp_path, make_meta("actions"), "actions", "old")
     assert post_archive(env, "/api/plugins/install", first).status_code == 200
@@ -83,11 +84,23 @@ def test_changed_package_id_is_backed_up_and_uninstall_removes_backup(tmp_path):
     assert post_archive(env, "/api/plugins/install", second).status_code == 200
     backup = env.paths.user_plugins_dir / "actions" / "demo_actions.nmf-backup"
     assert backup.is_dir()
+    other_backup = env.paths.user_plugins_dir / "actions" / "other.nmf-backup"
+    other_backup.mkdir()
+    (other_backup / "action.json").write_text(
+        json.dumps(make_meta("actions", id="other", package_name="other-package")),
+        encoding="utf-8",
+    )
+    if tamper:
+        metadata_path = env.paths.user_plugins_dir / "actions" / "new_id" / "action.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["package_name"] = "other-package"
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
     response = env.client.delete(
         "/api/plugins/actions/new_id", headers=env.headers
     )
     assert response.json()["ok"] is True
-    assert not backup.exists()
+    assert backup.exists() is tamper
+    assert other_backup.is_dir()
 
 
 def test_update_after_id_change_keeps_only_latest_backup(tmp_path):

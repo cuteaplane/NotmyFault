@@ -1,4 +1,5 @@
 import tempfile
+import subprocess
 import asyncio
 import importlib.util
 import sys
@@ -59,11 +60,21 @@ def ok(stdout="", stderr="", returncode=0):
 class CommandRunnerTests(unittest.TestCase):
     def test_timeout_raises_backend_failed(self):
         runner = CommandRunner()
-        with self.assertRaises(BackendFailedError) as ctx:
-            runner.run(
-                [sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.3
-            )
+        with patch("notmyfault.platform.backends.subprocess.run", side_effect=subprocess.TimeoutExpired(["tool"], 3)):
+            with self.assertRaises(BackendFailedError) as ctx:
+                runner.run(["tool"], timeout=3)
         self.assertIn("超时", str(ctx.exception))
+
+    def test_output_limit_preserves_short_output_and_bounds_long_output(self):
+        runner = CommandRunner()
+        for count in (4, 8, 100000):
+            with self.subTest(count=count):
+                result = runner.read_output(
+                    [sys.executable, "-c", f"import sys; sys.stdout.write('a' * {count})"],
+                    max_chars=8, timeout=5,
+                )
+                self.assertEqual(result.stdout, "a" * min(count, 8))
+                self.assertEqual(result.returncode, 0)
 
     def test_missing_command_raises_backend_missing(self):
         runner = CommandRunner()

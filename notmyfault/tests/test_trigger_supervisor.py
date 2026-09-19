@@ -18,7 +18,7 @@ def _wait(condition, timeout=5.0):
 
 
 def _body_waits_on_stop(*args):
-    # args: instance_id, event_type, func, meta, config, stop_event
+    # 停止事件是触发器入口的第六个参数
     args[5].wait(timeout=10)
 
 
@@ -82,8 +82,7 @@ class TestRegistration:
             raise RuntimeError("cannot start thread")
 
         monkeypatch.setattr(threading.Thread, "start", boom)
-        with pytest.raises(RuntimeError):
-            sup.start({"hotkey": [{}]}, {"hotkey": lambda *a: None}, {"hotkey": {}}, _body_waits_on_stop)
+        assert sup.start({"hotkey": [{}]}, {"hotkey": lambda *a: None}, {"hotkey": {}}, _body_waits_on_stop) == 0
         assert sup._threads == {}
         assert sup._events == {}
 

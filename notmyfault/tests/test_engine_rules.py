@@ -327,6 +327,32 @@ class TestValidateAllRules:
             "actions": [{"type": action_type, "params": params or {}}],
         }
 
+    @pytest.mark.parametrize("failure", ["reference", "trigger"])
+    def test_prepared_rules_isolate_errors_with_duplicate_names(self, failure):
+        good = self._rule(params={"mode": "fast"})
+        broken = self._rule(params={"mode": "fast"})
+        if failure == "reference":
+            broken["actions"][0]["params"]["mode"] = {
+                "$ref": {"scope": "step", "node": "a_absent01", "path": ["value"]}
+            }
+        else:
+            broken["event"]["type"] = "unavailable"
+        engine, _ = self._engine_with_meta([broken, good], {"params": [{
+            "name": "mode", "type": "select", "options": ["fast", "slow"],
+        }]})
+        engine.triggers_funcs["hotkey"] = lambda *args: None
+        engine.triggers_meta["unavailable"] = {}
+        try:
+            prepared = engine._prepare_rules(engine.rules)
+            assert prepared.total == 2
+            assert len(prepared) == 1
+            assert prepared.rules[0]["actions"][0]["params"] == {"mode": "fast"}
+            assert set(prepared.trigger_params) == {"hotkey"}
+            assert len(prepared.contexts) == 1
+            assert prepared.issues and all(name == "r" for name, _ in prepared.issues)
+        finally:
+            engine.close()
+
     def test_select_param_invalid_value(self, capsys):
         meta = {"params": [{
             "name": "mode",
@@ -338,7 +364,7 @@ class TestValidateAllRules:
         )
         valid, total = engine._validate_all_rules()
         assert (valid, total) == (0, 1)
-        assert "不在可选项中" in capsys.readouterr().err
+        assert "数据不在允许的枚举值中" in capsys.readouterr().err
 
     def test_timeout_requires_action_cancellation_contract(self):
         rule = self._rule()

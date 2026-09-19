@@ -28,8 +28,8 @@ class TestStatusAfter:
 
     def test_normal_progression(self):
         assert status_after("rule_triggered", {}, "queued") == "running"
-        assert status_after("workflow_deferred", {}, "running") == "deferred"
-        assert status_after("action_executed", {}, "deferred") == "running"
+        assert status_after("run_queued", {}, "running") == "queued"
+        assert status_after("action_executed", {}, "queued") == "running"
         assert status_after("run_dropped", {}, "queued") == "dropped"
 
 
@@ -65,14 +65,22 @@ class TestReplayInvariants:
         assert runs[0]["status"] == "cancelled"
         assert runs[0]["steps"] == []
 
-    def test_deferred_run_resumes_to_running(self):
+    def test_deferred_run_resumes_to_running(self, tmp_path):
         run_id = f"run_{uuid.uuid4().hex}"
-        partial = build_runs(packets(
+        events = packets(
             ("rule_triggered", {"run_id": run_id}),
             ("workflow_deferred", {"run_id": run_id, "reason": "前置未满足"}),
-            ("action_executed", {"run_id": run_id, "step_id": "s1", "duration_ms": 5}),
-        ))
-        assert partial[0]["status"] == "running"
+        )
+        path = tmp_path / "runs.jsonl"
+        path.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+        history = RunHistory(str(path))
+        assert history.get_run(run_id)["status"] == "deferred"
+        history.record({"type": "action_executed", "data": {"run_id": run_id, "step_id": "s1"}, "ts": 3})
+        assert history.get_run(run_id)["status"] == "running"
+        history.record(events[-1])
+        history.record_async(events[-1])
+        assert history.get_run(run_id)["status"] == "running"
+        assert len(path.read_text(encoding="utf-8").splitlines()) == 3
 
     def test_late_steps_after_dropped_do_not_appear(self):
         run_id = f"run_{uuid.uuid4().hex}"

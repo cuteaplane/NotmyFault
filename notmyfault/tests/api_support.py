@@ -37,6 +37,9 @@ class StaticRulesStore:
     def load_verified_rules(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self._rules)
 
+    def close(self) -> None:
+        self._directory.cleanup()
+
 
 def create_test_engine(config, *args, **kwargs):
     from notmyfault.core.engine import AutomationEngine

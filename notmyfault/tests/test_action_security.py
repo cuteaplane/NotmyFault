@@ -27,7 +27,7 @@ def test_tar_rejects_special_members_before_extracting_any_file(tmp_path, member
     target = tmp_path / "out"
     target.mkdir()
     with pytest.raises(ValueError):
-        file_operation._safe_unpack(str(archive), str(target))
+        file_operation.run({}, {"operation": "unpack", "source": str(archive), "destination": str(target)})
     assert list(target.iterdir()) == []
 
 
@@ -164,9 +164,10 @@ def test_pinned_socket_never_resolves_the_hostname_again(monkeypatch):
     assert calls == [5, 2]
 
 
-def test_linux_shortcut_rejects_multiline_fields():
+def test_linux_shortcut_rejects_multiline_fields(monkeypatch):
+    monkeypatch.setattr(create_shortcut.sys, "platform", "linux")
     with pytest.raises(ValueError, match="换行"):
-        create_shortcut._run_linux(
+        create_shortcut.run(
             {},
             {
                 "name": "safe",
@@ -178,7 +179,8 @@ def test_linux_shortcut_rejects_multiline_fields():
 
 def test_linux_shortcut_quotes_exec_tokens(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-    result = create_shortcut._run_linux(
+    monkeypatch.setattr(create_shortcut.sys, "platform", "linux")
+    result = create_shortcut.run(
         {},
         {
             "name": "safe",
@@ -199,14 +201,15 @@ def test_linux_shortcut_quotes_exec_tokens(tmp_path, monkeypatch):
 
 def test_launch_program_rejects_unbalanced_quotes():
     with pytest.raises(ValueError, match="引号"):
-        launch_program._split_args('"unfinished')
+        launch_program.run({}, {"path": "tool", "args": '"unfinished'})
 
 
 @pytest.mark.skipif(launch_program.sys.platform != "win32", reason="仅 Windows 参数规则")
-def test_launch_program_preserves_windows_path_backslashes():
-    assert launch_program._split_args(
-        r'--config C:\Temp\a.txt --label "two words"'
-    ) == ["--config", r"C:\Temp\a.txt", "--label", "two words"]
+def test_launch_program_preserves_windows_path_backslashes(monkeypatch):
+    started = []
+    monkeypatch.setattr(launch_program.subprocess, "Popen", lambda args, **kwargs: started.append(args))
+    launch_program.run({}, {"path": "tool", "args": r'--config C:\Temp\a.txt --label "two words"'})
+    assert started == [["tool", "--config", r"C:\Temp\a.txt", "--label", "two words"]]
 
 
 def test_kill_process_rejects_critical_windows_process(monkeypatch):

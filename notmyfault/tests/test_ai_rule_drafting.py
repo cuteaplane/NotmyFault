@@ -258,16 +258,9 @@ def test_stream_reports_120_second_idle_timeout(tmp_path):
 
 
 def test_provider_stream_translates_socket_timeout(monkeypatch):
-    provider = object.__new__(OpenAICompatibleDraftProvider)
-    provider._model = "test-model"
-    provider._api_format = "chat_completions"
-    provider._api_key = "test-key"
-    provider._request_host = "example.test"
-    provider._request_url = "https://example.test/v1/chat/completions"
-    provider._opener = TimeoutOpener()
-    provider._response_lock = threading.Lock()
-    provider._stream_response = None
-    provider._cancelled = threading.Event()
+    monkeypatch.setattr(ai_provider, "resolve_public_http_url", lambda url, **kwargs: (None, ("203.0.113.10",)))
+    monkeypatch.setattr(ai_provider, "_build_request_opener", lambda addresses: TimeoutOpener())
+    provider = OpenAICompatibleDraftProvider("https://example.test/v1", "test-model", "test-key")
     monkeypatch.setattr(ai_provider, "_is_private_host", lambda _host: False)
 
     with pytest.raises(AIProviderIdleTimeoutError):
@@ -339,6 +332,10 @@ def test_settings_never_write_api_key_to_config(tmp_path, monkeypatch):
         "endpoint_url": "https://other.invalid/v1", "api_key": "temporary-key",
     }, settings)
     assert temporary.api_key == "temporary-key"
+    changed = service.update_settings({**settings, "endpoint_url": "https://other.invalid/v1"})
+    assert changed["settings"]["api_key_status"] == "none"
+    with pytest.raises(AIProviderRequestError):
+        service._build_configured_provider({}, changed["settings"])
 
 
 def test_status_maps_injected_key_state(tmp_path):

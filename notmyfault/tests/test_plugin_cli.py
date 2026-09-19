@@ -113,7 +113,7 @@ def test_pack_writes_installable_nmfp(tmp_path):
     assert plugin_signature_kind(str(tmp_path / "unpacked" / "sample_action"), "user") == "author"
 
 
-def test_plugin_test_runs_pytest_in_plugin_directory(tmp_path):
+def test_plugin_test_runs_pytest_in_plugin_directory(tmp_path, capsys):
     root = write_action(tmp_path / "tested")
     (root / "test_action.py").write_text(
         "def test_plugin_template():\n    assert 2 + 2 == 4\n",
@@ -122,10 +122,12 @@ def test_plugin_test_runs_pytest_in_plugin_directory(tmp_path):
 
     result = plugin_cli.main(["plugin", "test", str(root), "-q"])
 
-    assert result == 0
+    captured = capsys.readouterr()
+    assert result == 0, captured.out + captured.err
+    assert "1 passed" in captured.out
 
 
-def test_create_action_and_trigger_templates(tmp_path):
+def test_create_action_and_trigger_templates(tmp_path, capsys):
     for kind in ("action", "trigger"):
         plugin_id = f"sample_{kind}"
         result = plugin_cli.main([
@@ -144,7 +146,9 @@ def test_create_action_and_trigger_templates(tmp_path):
             assert meta["trigger_api"] == "event-v2"
         assert (root / "test_plugin.py").is_file()
         assert (root / ".github" / "workflows" / "test.yml").is_file()
-        assert plugin_cli.main(["plugin", "test", str(root), "-q"]) == 0
+        test_result = plugin_cli.main(["plugin", "test", str(root), "-q"])
+        captured = capsys.readouterr()
+        assert test_result == 0, captured.out + captured.err
         assert plugin_cli.main([
             "plugin", "create", kind, plugin_id, "--output-dir", str(tmp_path)
         ]) == 1

@@ -39,7 +39,7 @@ def test_text_write_requires_explicit_overwrite_and_encodes_before_replacing(tmp
     with pytest.raises(FileExistsError):
         write_text({}, {"file_path": str(path), "text": "replacement"}, {})
     assert path.read_bytes() == b"original"
-    with pytest.raises(UnicodeEncodeError):
+    with pytest.raises(ValueError, match="无法表示"):
         write_text({}, {
             "file_path": str(path), "text": "😀", "encoding": "gbk", "overwrite": True,
         }, {})

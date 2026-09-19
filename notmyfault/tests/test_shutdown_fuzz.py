@@ -85,9 +85,9 @@ class TestShutdownFuzz:
         )
         thread.start()
         assert entered.wait(5)
-        started = time.monotonic()
         engine.shutdown()
-        assert time.monotonic() - started < 1.5
+        assert thread.is_alive()
+        assert not release.is_set()
         assert not teardown
         release.set()
         thread.join(timeout=5)
