@@ -1,4 +1,5 @@
 from pathlib import Path
+import argparse
 import sys
 
 from fontTools.ttLib import TTFont
@@ -29,7 +30,10 @@ def prepare(output):
                 6: family.replace(" ", "") + "-" + style,
                 16: family, 17: style,
             }
-            names[3] = font["name"].getDebugName(3).rsplit(";", 1)[0] + ";" + names[6]
+            unique_name = font["name"].getDebugName(3)
+            if not unique_name:
+                raise ValueError(f"字体缺少唯一标识 nameID 3：{source}")
+            names[3] = unique_name.rsplit(";", 1)[0] + ";" + names[6]
             for name_id, value in names.items():
                 font["name"].removeNames(nameID=name_id)
                 font["name"].setName(value, name_id, 3, 1, 0x409)
@@ -43,4 +47,10 @@ def prepare(output):
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
-    prepare(Path(sys.argv[1]).resolve())
+    parser = argparse.ArgumentParser(description="生成 NotmyFault 安装器使用的静态字体。")
+    parser.add_argument("output", type=Path, help="字体输出目录")
+    args = parser.parse_args()
+    try:
+        prepare(args.output.resolve())
+    except (OSError, ValueError, KeyError) as error:
+        parser.exit(1, "字体生成失败：" + str(error) + "\n")

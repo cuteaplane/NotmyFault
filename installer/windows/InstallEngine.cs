@@ -35,9 +35,19 @@ namespace NotmyFault.Setup
     {
         public string Directory;
         public string LauncherPath;
-        public string LogPath;
         public bool Upgraded;
         public string Warning;
+    }
+
+    public sealed class InstallFailure : IOException
+    {
+        public string LogPath { get; private set; }
+
+        internal InstallFailure(string logPath, Exception error)
+            : base(error.Message + Environment.NewLine + "安装日志：" + logPath, error)
+        {
+            LogPath = logPath;
+        }
     }
 
     public sealed class InstallEngine
@@ -101,6 +111,7 @@ namespace NotmyFault.Setup
         private InstallResult Install(InstallOptions options, IProgress<InstallProgress> progress, CancellationToken token)
         {
             token.ThrowIfCancellationRequested();
+            InstallMaintenance.RecoverUpgrade(InstallMaintenance.NormalizeDirectory(options.Directory));
             string directory = ValidateDirectory(options.Directory);
             if (options.Upgrade != IsInstalledDirectory(directory))
                 throw new IOException(options.Upgrade ? "原安装目录已变化，请重新选择。" : "该目录已安装 NotmyFault，请选择升级。");
@@ -202,13 +213,13 @@ namespace NotmyFault.Setup
                     token.ThrowIfCancellationRequested();
                     InstallMaintenance.DeleteTree(Path.Combine(directory, "wheels"));
                     InstallMaintenance.DeleteTree(Path.Combine(directory, ".setup-data"));
-                    InstallMaintenance.WriteState(directory, PackageVersion, transaction.Preserved);
-                    transaction.RegisterInstallation(PackageVersion);
+                    long installedSize = InstallMaintenance.WriteState(directory, PackageVersion, transaction.Preserved);
+                    transaction.RegisterInstallation(PackageVersion, installedSize);
                     Log(log, "安装完成");
                     string warning = transaction.Commit();
                     if (!String.IsNullOrEmpty(warning)) Log(log, warning);
                     Report(progress, 3, 1, "安装完成", directory);
-                    return new InstallResult { Directory = directory, LauncherPath = launcher, LogPath = log, Upgraded = options.Upgrade, Warning = warning };
+                    return new InstallResult { Directory = directory, LauncherPath = launcher, Upgraded = options.Upgrade, Warning = warning };
                 }
                 catch (OperationCanceledException)
                 {
@@ -221,7 +232,8 @@ namespace NotmyFault.Setup
                     System.IO.Directory.CreateDirectory(errorDirectory);
                     string errorLog = Path.Combine(errorDirectory, "install-" + Guid.NewGuid().ToString("N") + ".log");
                     File.Copy(log, errorLog);
-                    throw new InvalidOperationException(ex.Message + Environment.NewLine + "安装日志：" + errorLog, ex);
+                    transaction.FailureLogPath = errorLog;
+                    throw new InstallFailure(errorLog, ex);
                 }
                 }
             }
@@ -379,7 +391,7 @@ namespace NotmyFault.Setup
             return path;
         }
 
-        private static string CreateShortcut(string folder, string directory, string log)
+        internal static string CreateShortcut(string folder, string directory, string log)
         {
             if (String.IsNullOrEmpty(folder)) throw new IOException("无法取得快捷方式目录。");
             System.IO.Directory.CreateDirectory(folder);
@@ -389,13 +401,8 @@ namespace NotmyFault.Setup
                 Log(log, "已有同名快捷方式，保留：" + path);
                 return null;
             }
-            object shell = null;
-            object shortcut = null;
-            try
+            return InstallMaintenance.WithShortcut(path, delegate(object shortcut)
             {
-                Type type = Type.GetTypeFromProgID("WScript.Shell", true);
-                shell = Activator.CreateInstance(type);
-                shortcut = type.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell, new object[] { path });
                 Type shortcutType = shortcut.GetType();
                 shortcutType.InvokeMember("TargetPath", BindingFlags.SetProperty, null, shortcut,
                     new object[] { Path.Combine(directory, ".venv", "Scripts", "pythonw.exe") });
@@ -409,12 +416,7 @@ namespace NotmyFault.Setup
                 shortcutType.InvokeMember("Save", BindingFlags.InvokeMethod, null, shortcut, null);
                 Log(log, "已创建快捷方式：" + path);
                 return path;
-            }
-            finally
-            {
-                if (shortcut != null && Marshal.IsComObject(shortcut)) Marshal.FinalReleaseComObject(shortcut);
-                if (shell != null && Marshal.IsComObject(shell)) Marshal.FinalReleaseComObject(shell);
-            }
+            });
         }
 
         public static void Launch(InstallResult result)

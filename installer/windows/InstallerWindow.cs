@@ -10,7 +10,6 @@ using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Input;
-using System.Windows.Markup;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Threading;
@@ -24,13 +23,21 @@ namespace NotmyFault.Setup
         {
             if (args.Length == 2 && args[0] == "--resume-uninstall")
                 return UninstallProgram.Main(args);
-            var app = new Application();
-            app.DispatcherUnhandledException += delegate(object sender, DispatcherUnhandledExceptionEventArgs e)
+            try
             {
-                MessageBox.Show(e.Exception.Message, "NotmyFault 安装", MessageBoxButton.OK, MessageBoxImage.Error);
-                e.Handled = true;
-            };
-            return app.Run(new InstallerWindow(Array.IndexOf(args, "--preview") >= 0));
+                var app = new Application();
+                app.DispatcherUnhandledException += delegate(object sender, DispatcherUnhandledExceptionEventArgs e)
+                {
+                    MessageBox.Show(e.Exception.Message, "NotmyFault 安装", MessageBoxButton.OK, MessageBoxImage.Error);
+                    e.Handled = true;
+                };
+                return app.Run(new InstallerWindow(Array.IndexOf(args, "--preview") >= 0));
+            }
+            catch (Exception error)
+            {
+                MessageBox.Show(error.Message, "NotmyFault 安装", MessageBoxButton.OK, MessageBoxImage.Error);
+                return 1;
+            }
         }
     }
 
@@ -67,6 +74,7 @@ namespace NotmyFault.Setup
         private bool installing;
         private bool launching;
         private bool closeAfterCancel;
+        private const int LaunchDelaySeconds = 10;
         private int remaining;
         private int transition;
         private int currentStep;
@@ -77,20 +85,7 @@ namespace NotmyFault.Setup
         {
             preview = previewMode;
             Title = preview ? "NotmyFault 安装界面预览" : "NotmyFault 安装";
-            Width = 920;
-            Height = 660;
-            MinWidth = 800;
-            MinHeight = 640;
-            WindowStartupLocation = WindowStartupLocation.CenterScreen;
-            Background = SetupWindowLayout.BrushOf("#121318");
-            string fontResource = "/" + typeof(InstallerWindow).Assembly.GetName().Name + ";component/fonts/#";
-            FontFamily = new FontFamily(new Uri("pack://application:,,,/"), fontResource + "Roboto, Microsoft YaHei UI");
-            displayFont = new FontFamily(new Uri("pack://application:,,,/"), fontResource + "Google Sans Flex, Microsoft YaHei UI");
-            Foreground = ink;
-            FontSize = 14;
-            UseLayoutRounding = true;
-            TextOptions.SetTextFormattingMode(this, TextFormattingMode.Display);
-            Resources = (ResourceDictionary)XamlReader.Parse(SetupWindowLayout.Styles);
+            displayFont = SetupWindowLayout.Initialize(this, ink);
             layout = new SetupWindowLayout(Resources, displayFont, ink, muted, true);
             var root = new Grid { ClipToBounds = true, Background = Background };
             scene = new MotionScene();
@@ -101,17 +96,9 @@ namespace NotmyFault.Setup
             string installed = preview ? null : InstallEngine.FindInstalledDirectory();
             if (!String.IsNullOrEmpty(installed)) selectedDirectory = installed;
             ShowWelcome();
-            SourceInitialized += delegate
-            {
-                int enabled = 1;
-                DwmSetWindowAttribute(new System.Windows.Interop.WindowInteropHelper(this).Handle, 20, ref enabled, sizeof(int));
-            };
             Closing += OnClosing;
             Closed += delegate { StopCountdown(); };
         }
-
-        [DllImport("dwmapi.dll")]
-        private static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
 
         private async void ChangePage(Grid page, bool first, bool focusPage = false, bool back = false)
         {
@@ -309,7 +296,8 @@ namespace NotmyFault.Setup
                 catch (Exception e)
                 {
                     installing = false;
-                    if (!closeAfterCancel) ShowFailure(upgrade ? "升级未完成" : "安装未完成", e.Message);
+                    var failure = e as InstallFailure;
+                    if (!closeAfterCancel) ShowFailure(upgrade ? "升级未完成" : "安装未完成", e.Message, failure == null ? null : failure.LogPath);
                 }
                 finally
                 {
@@ -380,7 +368,7 @@ namespace NotmyFault.Setup
             AutomationProperties.SetName(success, upgraded ? "升级成功" : "安装成功");
             success.Loaded += delegate { success.SetState(2); };
             body.Children.Add(success);
-            countdownText = SetupWindowLayout.Text("NotmyFault 将在 10 秒后启动初次配置流程……", 17, muted);
+            countdownText = SetupWindowLayout.Text("NotmyFault 将在 " + LaunchDelaySeconds + " 秒后启动初次配置流程……", 17, muted);
             body.Children.Add(countdownText);
             countdownTrack = new Grid { Height = 6, Margin = new Thickness(0, 32, 0, 0), ClipToBounds = true };
             countdownTrack.Children.Add(new Border { Background = SetupWindowLayout.BrushOf("#34353B"), CornerRadius = new CornerRadius(3) });
@@ -403,15 +391,15 @@ namespace NotmyFault.Setup
             }
             Grid.SetRow(body, 1);
             page.Children.Add(body);
-            layout.Footer(page, preview ? layout.Button("返回", ShowWelcome, false) : null, layout.Button(upgraded ? "立即启动" : "立即重启", Launch, true));
-            remaining = 10;
+            layout.Footer(page, preview ? layout.Button("返回", ShowWelcome, false) : null, layout.Button(upgraded ? "立即重启" : "立即启动", Launch, true));
+            remaining = LaunchDelaySeconds;
             page.Loaded += delegate
             {
                 var elapsed = Stopwatch.StartNew();
                 countdown = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
                 countdown.Tick += delegate
                 {
-                    int next = Math.Max(0, 10 - (int)elapsed.Elapsed.TotalSeconds);
+                    int next = Math.Max(0, LaunchDelaySeconds - (int)elapsed.Elapsed.TotalSeconds);
                     if (next == remaining) return;
                     remaining = next;
                     UpdateCountdown();
@@ -426,7 +414,7 @@ namespace NotmyFault.Setup
         private void UpdateCountdown()
         {
             if (countdownTrack == null) return;
-            double width = countdownTrack.ActualWidth * (10 - remaining) / 10.0;
+            double width = countdownTrack.ActualWidth * (LaunchDelaySeconds - remaining) / (double)LaunchDelaySeconds;
             if (SystemParameters.ClientAreaAnimation)
                 countdownFill.BeginAnimation(WidthProperty, new DoubleAnimation(width, TimeSpan.FromMilliseconds(180))
                     { EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } });
@@ -451,15 +439,14 @@ namespace NotmyFault.Setup
             catch (Exception e)
             {
                 launching = false;
-                countdownText.Text = "无法启动 NotmyFault：" + e.Message + "\n请点击“" + (result.Upgraded ? "立即启动" : "立即重启") + "”重试。";
+                countdownText.Text = "无法启动 NotmyFault：" + e.Message + "\n请点击“" + (result.Upgraded ? "立即重启" : "立即启动") + "”重试。";
             }
         }
 
-        private void ShowFailure(string title, string message)
+        private void ShowFailure(string title, string message, string log = null)
         {
             var page = layout.Page(title, message);
             var body = new StackPanel();
-            string log = Path.Combine(selectedDirectory, "install.log");
             if (File.Exists(log))
             {
                 body.Children.Add(SetupWindowLayout.Text("安装日志", 15, ink));

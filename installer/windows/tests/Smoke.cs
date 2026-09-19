@@ -7,24 +7,51 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Threading;
+using System.Windows;
+using System.Windows.Controls;
 using Microsoft.Win32;
 using NotmyFault.Setup;
 
 public static class Smoke
 {
+    internal static string RegistryFixture;
+    internal static string InstallerPath;
     [DllImport("advapi32.dll", SetLastError = true)]
     private static extern int RegOverridePredefKey(IntPtr key, IntPtr replacement);
 
+    [STAThread]
     public static int Main(string[] args)
     {
+        string probeAssembly = Environment.GetEnvironmentVariable("NOTMYFAULT_SMOKE_INSTALLER");
+        if (!String.IsNullOrEmpty(probeAssembly))
+            AppDomain.CurrentDomain.AssemblyResolve += delegate(object sender, ResolveEventArgs request)
+            {
+                return new AssemblyName(request.Name).Name == AssemblyName.GetAssemblyName(probeAssembly).Name
+                    ? Assembly.LoadFrom(probeAssembly) : null;
+            };
+        if (args.Length > 0 && Path.GetFileName(args[0]) == "dashboard.pyw")
+        {
+            string observation = Path.Combine(Environment.CurrentDirectory, "launch-observed.txt");
+            File.WriteAllLines(observation + ".tmp", args);
+            File.Move(observation + ".tmp", observation);
+            return 0;
+        }
+        if (args.Length > 0 && (args[0] == "--uninstall-probe" || args[0] == "--uninstall-root"))
+        {
+            return Scenarios.ProbeUninstall(args);
+        }
         string installer = Path.GetFullPath(args[0]);
+        InstallerPath = installer;
         string workspace = Path.GetFullPath(args[1]);
         AppDomain.CurrentDomain.AssemblyResolve += delegate(object sender, ResolveEventArgs request)
         {
             return new AssemblyName(request.Name).Name == AssemblyName.GetAssemblyName(installer).Name
                 ? Assembly.LoadFrom(installer) : null;
         };
-        string registryPath = @"Software\NotmyFaultInstallerTests\" + Guid.NewGuid().ToString("N");
+        bool interruptUpgrade = args.Length > 2 && args[2] == "--interrupt-upgrade";
+        bool maintenanceOnly = args.Length > 2 && args[2] == "--maintenance-only";
+        string registryPath = interruptUpgrade ? args[3] : @"Software\NotmyFaultInstallerTests\" + Guid.NewGuid().ToString("N");
+        RegistryFixture = registryPath;
         IntPtr currentUser = new IntPtr(unchecked((int)0x80000001));
         try
         {
@@ -39,7 +66,8 @@ public static class Smoke
                 if (result != 0) throw new System.ComponentModel.Win32Exception(result);
                 try
                 {
-                    if (args.Length > 2 && args[2] == "--maintenance-only") Scenarios.RunMaintenance(workspace);
+                    if (interruptUpgrade) Scenarios.InterruptUpgrade(workspace, args[4]);
+                    else if (maintenanceOnly) Scenarios.RunMaintenance(workspace);
                     else Scenarios.Run(installer, workspace);
                 }
                 finally
@@ -48,7 +76,7 @@ public static class Smoke
                     if (result != 0) throw new System.ComponentModel.Win32Exception(result);
                 }
             }
-            Console.WriteLine(args.Length > 2 && args[2] == "--maintenance-only" ?
+            Console.WriteLine(maintenanceOnly ?
                 "PASS: installer maintenance checks" : "PASS: all installer lifecycle checks");
             return 0;
         }
@@ -65,6 +93,12 @@ internal static class Scenarios
 {
     private const string Registration = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\NotmyFault";
     private const string Password = "Smoke-临时 密码-2026!";
+    private const string RemovedProgram = "program-a.bin";
+    private const string InterruptedProgram = "program-b.bin";
+    private const string PrivateKey = "app/.private/signing_private_key.pem";
+    private const string PublicKey = "app/.private/signing_public.pem";
+    private const string PrivateNote = "app/.private/notes.txt";
+    private const string UserPluginResource = "app/user_plugins/sample/resource.txt";
     private static string workspace;
 
     private sealed class Progress : IProgress<InstallProgress>
@@ -87,9 +121,125 @@ internal static class Scenarios
         if (!success) throw new Exception(message);
     }
 
+    private static void CheckWindows()
+    {
+        if (Application.Current == null) new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+        Window[] windows = { new InstallerWindow(true), new UninstallerWindow(InstallEngine.DefaultDirectory, true) };
+        foreach (Window window in windows)
+        {
+            try
+            {
+                foreach (string name in new[] { "PlainButton", "PrimaryButton", "PasswordField", "TextField" })
+                {
+                    Style style = window.Resources[name] as Style;
+                    Check(style != null, "setup style is missing: " + name);
+                    Control control = (Control)Activator.CreateInstance(style.TargetType);
+                    control.Style = style;
+                    control.ApplyTemplate();
+                    control.Measure(new Size(400, 80));
+                    control.Arrange(new Rect(0, 0, 400, 80));
+                }
+                FrameworkElement content = (FrameworkElement)window.Content;
+                content.Measure(new Size(window.Width, window.Height));
+                content.Arrange(new Rect(0, 0, window.Width, window.Height));
+            }
+            finally { window.Close(); }
+        }
+        Console.WriteLine("PASS: setup windows and XAML control templates initialize");
+    }
+
+    private static void CheckShortcuts(string root)
+    {
+        string directory = Path.Combine(root, "shortcut-install");
+        string foreign = Path.Combine(root, "another-install");
+        string log = Path.Combine(root, "shortcut.log");
+        string ownedLink = InstallEngine.CreateShortcut(Path.Combine(root, "desktop"), directory, log);
+        string foreignLink = InstallEngine.CreateShortcut(Path.Combine(root, "programs"), foreign, log);
+        Check(File.Exists(ownedLink) && InstallMaintenance.ShortcutBelongsTo(ownedLink, directory), "created shortcut has incorrect ownership");
+        Check(!InstallMaintenance.ShortcutBelongsTo(foreignLink, directory), "another installation's shortcut was accepted");
+        InstallMaintenance.RemoveEntries(directory, new[] { ownedLink, foreignLink });
+        Check(!File.Exists(ownedLink) && File.Exists(foreignLink), "shortcut cleanup removed the wrong installation's entry");
+        InstallMaintenance.RemoveEntries(foreign, new[] { foreignLink });
+        Check(!File.Exists(foreignLink), "shortcut cleanup left an owned entry");
+        Console.WriteLine("PASS: shortcut creation and cleanup respect installation ownership");
+    }
+
+    private static void CheckLaunch(string root)
+    {
+        string directory = Path.Combine(root, "launch-install");
+        string scripts = Path.Combine(directory, ".venv", "Scripts");
+        string app = Path.Combine(directory, "app");
+        Directory.CreateDirectory(scripts);
+        Directory.CreateDirectory(app);
+        File.Copy(Assembly.GetExecutingAssembly().Location, Path.Combine(scripts, "pythonw.exe"));
+        string dashboard = Path.Combine(app, "dashboard.pyw");
+        File.WriteAllText(dashboard, "");
+        string observation = Path.Combine(app, "launch-observed.txt");
+        string previous = Environment.GetEnvironmentVariable("NOTMYFAULT_SMOKE_INSTALLER");
+        try
+        {
+            Environment.SetEnvironmentVariable("NOTMYFAULT_SMOKE_INSTALLER", Smoke.InstallerPath);
+            foreach (bool upgraded in new[] { false, true })
+            {
+                InstallEngine.Launch(new InstallResult { Directory = directory, Upgraded = upgraded });
+                Check(SpinWait.SpinUntil(delegate { return File.Exists(observation); }, 10000), "launcher did not start in the application directory");
+                string[] arguments = File.ReadAllLines(observation);
+                Check(arguments.Length == (upgraded ? 1 : 2) && arguments[0] == dashboard &&
+                    (upgraded || arguments[1] == "--first-run"), "launcher passed incorrect first-run arguments");
+                File.Delete(observation);
+            }
+        }
+        finally { Environment.SetEnvironmentVariable("NOTMYFAULT_SMOKE_INSTALLER", previous); }
+        Console.WriteLine("PASS: launcher selects first-run arguments for fresh installs");
+    }
+
+    internal static int ProbeUninstall(string[] args)
+    {
+        string directory = InstallMaintenance.PrepareUninstall(args[0] == "--uninstall-probe" ? new string[0] : args,
+            Assembly.GetExecutingAssembly().Location);
+        if (directory != null)
+        {
+            string observation = Path.Combine(directory, "handoff-observed.txt");
+            File.WriteAllLines(observation + ".tmp", new[] { directory, Assembly.GetExecutingAssembly().Location });
+            File.Move(observation + ".tmp", observation);
+        }
+        return 0;
+    }
+
+    private static void CheckUninstallHandoff(string root)
+    {
+        string directory = Path.Combine(root, "handoff-install");
+        Directory.CreateDirectory(directory);
+        File.WriteAllText(Path.Combine(directory, ".notmyfault-install"), "NotmyFault Windows installer 1\ntest\n");
+        File.WriteAllText(Path.Combine(directory, ".notmyfault-files"), "NotmyFault-Uninstall.exe\n");
+        string executable = Path.Combine(directory, "NotmyFault-Uninstall.exe");
+        File.Copy(Assembly.GetExecutingAssembly().Location, executable);
+        var start = new ProcessStartInfo(executable, "--uninstall-probe")
+        {
+            UseShellExecute = false, CreateNoWindow = true,
+            WorkingDirectory = directory
+        };
+        start.EnvironmentVariables["NOTMYFAULT_SMOKE_INSTALLER"] = Smoke.InstallerPath;
+        using (Process process = Process.Start(start))
+        {
+            if (!process.WaitForExit(10000)) { process.Kill(); throw new Exception("uninstall handoff did not release the parent process"); }
+            Check(process.ExitCode == 0, "uninstall handoff parent failed");
+        }
+        string observation = Path.Combine(directory, "handoff-observed.txt");
+        Check(SpinWait.SpinUntil(delegate { return File.Exists(observation); }, 15000), "uninstall handoff child did not resume");
+        string[] resumed = File.ReadAllLines(observation);
+        string relocated = resumed[1];
+        Check(resumed[0] == directory && Path.GetDirectoryName(Path.GetDirectoryName(relocated)) == Path.GetTempPath().TrimEnd(Path.DirectorySeparatorChar),
+            "uninstaller did not relocate into its temporary directory");
+        Check(File.Exists(executable), "uninstall handoff changed its source executable");
+        Check(SpinWait.SpinUntil(delegate { return !Directory.Exists(Path.GetDirectoryName(relocated)); }, 15000), "uninstaller left its temporary executable after exit");
+        Console.WriteLine("PASS: uninstaller relocates, resumes after the parent exits, and removes its temporary copy");
+    }
+
     private sealed class InterruptedUninstall : InstallMaintenance.UninstallOperations
     {
         internal string Failure;
+        internal override IEnumerable<string> ShortcutPaths { get { return new string[0]; } }
 
         internal override void MoveDirectory(string source, string destination)
         {
@@ -99,7 +249,7 @@ internal static class Scenarios
 
         internal override void DeleteFile(string file)
         {
-            if ((Failure == "delete" && Path.GetFileName(file) == "program-b.bin") ||
+            if ((Failure == "delete" && Path.GetFileName(file) == InterruptedProgram) ||
                 (Failure == "marker" && Path.GetFileName(file) == ".notmyfault-install"))
                 throw new IOException("模拟文件删除失败");
             base.DeleteFile(file);
@@ -114,19 +264,29 @@ internal static class Scenarios
 
     internal static void RunMaintenance(string root)
     {
+        Directory.CreateDirectory(root);
+        CheckWindows();
+        CheckShortcuts(root);
+        CheckLaunch(root);
+        CheckUninstallHandoff(root);
+        CheckUpgradeRecovery(root);
         foreach (string failure in new[] { "move", "delete", "registration", "marker" })
         {
             string original = Path.Combine(root, failure);
             Directory.CreateDirectory(Path.Combine(original, "app", ".private"));
             Directory.CreateDirectory(Path.Combine(original, "app", "user_plugins", "sample"));
             File.WriteAllText(Path.Combine(original, ".notmyfault-install"), "NotmyFault Windows installer 1\ntest\n");
-            string[] owned = { "program-a.bin", "program-b.bin", "app/.private/signing_private_key.pem",
-                "app/.private/signing_public.pem", "app/.private/notes.txt", "app/user_plugins/sample/resource.txt" };
+            string[] owned = { RemovedProgram, InterruptedProgram, PrivateKey, PublicKey, PrivateNote, UserPluginResource };
             File.WriteAllLines(Path.Combine(original, ".notmyfault-files"), owned);
             foreach (string relative in owned) File.WriteAllText(Path.Combine(original, relative), relative);
             File.WriteAllText(Path.Combine(original, "keep-me.txt"), "user data");
             using (RegistryKey registration = Registry.CurrentUser.CreateSubKey(Registration))
                 registration.SetValue("InstallLocation", original);
+            using (RegistryKey aumid = Registry.CurrentUser.CreateSubKey(@"Software\Classes\AppUserModelId\cuteaplane.notmyfault.app"))
+            {
+                aumid.SetValue("IconUri", "external-registration-icon");
+                if (failure == "marker") aumid.SetValue("InstallLocation", Path.Combine(root, "another-installation"));
+            }
             string retry = null;
             try
             {
@@ -138,8 +298,8 @@ internal static class Scenarios
             Check(Directory.Exists(retry), "retry directory does not exist");
             Check(File.Exists(Path.Combine(retry, ".notmyfault-uninstall")), "uninstall lost its cleanup list");
             Check(File.ReadAllText(Path.Combine(retry, "keep-me.txt")) == "user data", "interrupted uninstall changed user data");
-            Check(File.ReadAllText(Path.Combine(retry, "app", "user_plugins", "sample", "resource.txt")) == owned[5], "interrupted uninstall changed a user plugin");
-            Check(File.ReadAllText(Path.Combine(retry, "app", ".private", "notes.txt")) == owned[4], "uninstaller removed another private file");
+            Check(File.ReadAllText(Path.Combine(retry, UserPluginResource)) == UserPluginResource, "interrupted uninstall changed a user plugin");
+            Check(File.ReadAllText(Path.Combine(retry, PrivateNote)) == PrivateNote, "uninstaller removed another private file");
             if (failure == "move")
             {
                 Check(String.Equals(original, retry, StringComparison.OrdinalIgnoreCase), "failed move changed the retry path");
@@ -148,26 +308,90 @@ internal static class Scenarios
             else
             {
                 Check(!Directory.Exists(original), "uninstall did not move the installation before deleting files");
-                Check(!File.Exists(Path.Combine(retry, "program-a.bin")), "uninstall did not reach file cleanup");
-                if (failure == "delete") Check(File.Exists(Path.Combine(retry, "program-b.bin")), "fixture did not interrupt partial cleanup");
+                Check(!File.Exists(Path.Combine(retry, RemovedProgram)), "uninstall did not reach file cleanup");
+                if (failure == "delete") Check(File.Exists(Path.Combine(retry, InterruptedProgram)), "fixture did not interrupt partial cleanup");
                 if (failure == "marker") Check(!File.Exists(Path.Combine(retry, ".notmyfault-files")), "fixture did not interrupt after marker cleanup");
             }
             bool refused = false;
             try { InstallEngine.ValidateDirectory(original); }
             catch (IOException) { refused = true; }
             Check(refused, "installation replaced a directory with unfinished uninstall cleanup");
-            string retained = InstallMaintenance.UninstallAsync(retry, new Progress(), CancellationToken.None).GetAwaiter().GetResult();
+            string retained = InstallMaintenance.UninstallAsync(retry, new Progress(), CancellationToken.None,
+                new InterruptedUninstall()).GetAwaiter().GetResult();
             Check(Directory.Exists(retained) && !Directory.Exists(original), "retry did not retain user data separately");
             Check(File.ReadAllText(Path.Combine(retained, "keep-me.txt")) == "user data", "retry changed user data");
             Check(File.Exists(Path.Combine(retained, "app", "user_plugins", "sample", "resource.txt")), "retry removed a user plugin");
             Check(File.Exists(Path.Combine(retained, "app", ".private", "notes.txt")), "retry removed another private file");
-            foreach (string relative in new[] { "program-a.bin", "program-b.bin", owned[2], owned[3],
+            foreach (string relative in new[] { RemovedProgram, InterruptedProgram, PrivateKey, PublicKey,
                 ".notmyfault-install", ".notmyfault-files", ".notmyfault-uninstall" })
                 Check(!File.Exists(Path.Combine(retained, relative)), "retry left an installation file: " + relative);
             using (RegistryKey registration = Registry.CurrentUser.OpenSubKey(Registration))
                 Check(registration == null, "retry left the installation registered");
+            using (RegistryKey aumid = Registry.CurrentUser.OpenSubKey(@"Software\Classes\AppUserModelId\cuteaplane.notmyfault.app"))
+                Check(failure == "marker" ? aumid != null : aumid == null, "uninstall used the icon path instead of AUMID ownership");
+            Registry.CurrentUser.DeleteSubKeyTree(@"Software\Classes\AppUserModelId\cuteaplane.notmyfault.app", false);
             Check(InstallEngine.ValidateDirectory(original) == original, "completed uninstall did not release the original path");
             Console.WriteLine("PASS: uninstall resumes after " + failure + " failure and preserves user data");
+        }
+    }
+
+    internal static void InterruptUpgrade(string directory, string stage)
+    {
+        var transaction = new InstallMaintenance.Transaction(directory, true);
+        File.WriteAllText(Path.Combine(directory, "program.bin"), "new program");
+        transaction.RestoreUserFiles();
+        if (stage != "copied")
+        {
+            long size = InstallMaintenance.WriteState(directory, "new", transaction.Preserved);
+            transaction.RegisterInstallation("new", size);
+        }
+        if (stage == "committed")
+        {
+            using (FileStream locked = new FileStream(Path.Combine(transaction.BackupPath, "program.bin"), FileMode.Open, FileAccess.Read, FileShare.None))
+                Check(transaction.Commit().Length > 0, "backup cleanup did not leave a committed recovery record");
+        }
+        Environment.Exit(37);
+    }
+
+    private static void CheckUpgradeRecovery(string root)
+    {
+        foreach (string stage in new[] { "copied", "registered", "committed" })
+        {
+            string directory = Path.Combine(root, "upgrade-" + stage);
+            Directory.CreateDirectory(directory);
+            File.WriteAllText(Path.Combine(directory, "program.bin"), "old program");
+            File.WriteAllText(Path.Combine(directory, "keep.txt"), "user data");
+            long size = InstallMaintenance.WriteState(directory, "old", new HashSet<string> { "keep.txt" });
+            InstallMaintenance.Register(directory, "old", size);
+            using (RegistryKey registration = Registry.CurrentUser.OpenSubKey(Registration, true))
+            {
+                registration.SetValue("Extra", new[] { "first", "second" }, RegistryValueKind.MultiString);
+                registration.SetValue("Raw", new byte[] { 0, 127, 255 }, RegistryValueKind.Binary);
+            }
+            var start = new ProcessStartInfo(Assembly.GetExecutingAssembly().Location,
+                InstallEngine.Quote(Smoke.InstallerPath) + " " + InstallEngine.Quote(directory) +
+                " --interrupt-upgrade " + InstallEngine.Quote(Smoke.RegistryFixture) + " " + stage)
+                { UseShellExecute = false, CreateNoWindow = true };
+            using (Process child = Process.Start(start))
+            {
+                Check(child.WaitForExit(30000), "upgrade fixture did not exit");
+                Check(child.ExitCode == 37, "upgrade fixture did not interrupt the transaction");
+            }
+            Check(InstallEngine.IsInstalledDirectory(directory), "interrupted upgrade is absent from installation selection");
+            Check(InstallEngine.ValidateDirectory(directory) == directory, "interrupted upgrade cannot be selected");
+            Check(InstallEngine.GetInstalledVersion(directory) == (stage == "committed" ? "new" : "old"), "interrupted upgrade reports the wrong version");
+            InstallMaintenance.RecoverUpgrade(directory);
+            Check(File.ReadAllText(Path.Combine(directory, "program.bin")) == (stage == "committed" ? "new program" : "old program"), "recovery chose the wrong installation");
+            Check(File.ReadAllText(Path.Combine(directory, "keep.txt")) == "user data", "upgrade recovery changed user data");
+            Check(!File.Exists(InstallMaintenance.UpgradeRecordPath(directory)), "recovery left its record");
+            using (RegistryKey registration = Registry.CurrentUser.OpenSubKey(Registration))
+            {
+                Check((string)registration.GetValue("DisplayVersion") == (stage == "committed" ? "new" : "old"), "recovery did not restore the registration");
+                Check(((string[])registration.GetValue("Extra")).SequenceEqual(new[] { "first", "second" }), "recovery changed a registry multi-string");
+                Check(((byte[])registration.GetValue("Raw")).SequenceEqual(new byte[] { 0, 127, 255 }), "recovery changed binary registry data");
+            }
+            Registry.CurrentUser.DeleteSubKeyTree(Registration, false);
+            Console.WriteLine("PASS: upgrade recovery after process exit at " + stage);
         }
     }
 

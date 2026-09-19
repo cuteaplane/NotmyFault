@@ -1,7 +1,9 @@
 using System;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Markup;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 
@@ -24,6 +26,33 @@ namespace NotmyFault.Setup
             this.defaultPrimaryButton = defaultPrimaryButton;
         }
 
+        internal static FontFamily Initialize(Window window, Brush ink)
+        {
+            window.Width = 920;
+            window.Height = 660;
+            window.MinWidth = 800;
+            window.MinHeight = 640;
+            window.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            window.Background = BrushOf("#121318");
+            window.Foreground = ink;
+            string fonts = "/" + window.GetType().Assembly.GetName().Name + ";component/fonts/#";
+            var fontBase = new Uri("pack://application:,,,/");
+            window.FontFamily = new FontFamily(fontBase, fonts + "Roboto, Microsoft YaHei UI");
+            window.FontSize = 14;
+            window.UseLayoutRounding = true;
+            TextOptions.SetTextFormattingMode(window, TextFormattingMode.Display);
+            window.Resources = (ResourceDictionary)XamlReader.Parse(Styles);
+            window.SourceInitialized += delegate
+            {
+                int enabled = 1;
+                DwmSetWindowAttribute(new System.Windows.Interop.WindowInteropHelper(window).Handle, 20, ref enabled, sizeof(int));
+            };
+            return new FontFamily(fontBase, fonts + "Google Sans Flex, Microsoft YaHei UI");
+        }
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
+
         internal static Brush BrushOf(string value)
         {
             var brush = new SolidColorBrush((Color)ColorConverter.ConvertFromString(value));
@@ -39,7 +68,8 @@ namespace NotmyFault.Setup
 
         internal Button Button(string label, Action action, bool filled)
         {
-            var button = new Button { Content = label, Style = (Style)resources[filled ? "PrimaryButton" : "PlainButton"] };
+            var button = new Button { Content = label, Style = (Style)resources[filled ? "PrimaryButton" : "PlainButton"],
+                IsDefault = defaultPrimaryButton && filled };
             AddButtonMotion(button);
             button.Click += delegate { action(); };
             return button;
@@ -73,7 +103,6 @@ namespace NotmyFault.Setup
             if (right != null)
             {
                 right.HorizontalAlignment = HorizontalAlignment.Right;
-                if (defaultPrimaryButton) right.IsDefault = right.Style == resources["PrimaryButton"];
                 footer.Children.Add(right);
             }
             Grid.SetRow(footer, 2);

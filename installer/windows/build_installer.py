@@ -1,7 +1,6 @@
 import argparse
 import ast
 from contextlib import nullcontext
-from datetime import datetime
 import getpass
 import json
 import os
@@ -10,6 +9,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 
 
@@ -50,8 +50,8 @@ def subprocess_debug_context():
 
 
 class Runner:
-    def __init__(self, work):
-        self.log_path = work / "build.log"
+    def __init__(self, work, log_path=None):
+        self.log_path = log_path or work / "build.log"
         temporary = work / "temp"
         temporary.mkdir(parents=True, exist_ok=True)
         self.environment = os.environ.copy()
@@ -139,13 +139,9 @@ def prepare_app(app):
         shutil.copy2(ROOT / name, app / name)
 
 
-def prepare_frontend(work, app, runner, node, npm):
-    frontend = work / "frontend" / "dashboard"
+def prepare_frontend(app, runner, node, npm):
+    frontend = app / "dashboard"
     copy_tree(ROOT / "dashboard", frontend, {"node_modules", "dist", "tests"})
-    version_dir = frontend.parent / "notmyfault"
-    version_dir.mkdir()
-    shutil.copy2(ROOT / "notmyfault" / "version.py", version_dir / "version.py")
-    shutil.copy2(ROOT / "logo.png", frontend.parent / "logo.png")
     runner.run([npm, "ci", "--no-audit", "--no-fund"], frontend)
     runner.run([
         node, frontend / "node_modules" / "vite" / "bin" / "vite.js",
@@ -153,6 +149,13 @@ def prepare_frontend(work, app, runner, node, npm):
     ], frontend)
     if not (app / "dashboard" / "dist" / "index.html").is_file():
         raise BuildError("Dashboard 构建没有生成 index.html。")
+    for item in frontend.iterdir():
+        if item.name == "dist":
+            continue
+        if item.is_dir():
+            shutil.rmtree(item)
+        else:
+            item.unlink()
 
 
 def prepare_runtime(base, runtime):
@@ -311,53 +314,54 @@ def main():
         if not passphrase:
             raise BuildError("strict 构建的签名密码不能为空。")
     output.mkdir(parents=True, exist_ok=True)
-    work = SOURCES / "build" / ("work-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
-    work.mkdir(parents=True)
-    runner = Runner(work)
-    print("构建目录：" + str(work), flush=True)
-    build_venv = work / "build-venv"
-    runner.run([python, "-I", "-m", "venv", build_venv])
-    build_python = build_venv / "Scripts" / "python.exe"
-    if not build_python.is_file():
-        raise BuildError("Python 虚拟环境未创建成功，日志：" + str(runner.log_path))
-    runner.run([
-        build_python, "-m", "pip", "install", "--no-input",
-        "-r", ROOT / "requirements-dev.txt", "fonttools[woff]==4.64.0",
-    ])
-    stage = work / "payload"
-    app = stage / "app"
-    prepare_app(app)
-    sign_app(app, build_python, runner, args.development_key, passphrase)
-    prepare_frontend(work, app, runner, node, npm)
-    prepare_runtime(base, stage / "runtime")
-    wheels = stage / "wheels"
-    wheels.mkdir()
-    runner.run([
-        build_python, "-m", "pip", "wheel", "--no-input",
-        "-r", ROOT / "requirements.txt", "--wheel-dir", wheels,
-    ])
-    (app / "installer-build.json").write_text(json.dumps({
-        "version": version, "development_build": args.development_key,
-        "security_mode": "strict", "python_version": python_info["version"],
-        "platform": "windows-x64",
-    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    version_file = work / "version.txt"
-    version_file.write_text(version, encoding="utf-8")
-    payload = work / "payload.zip"
-    make_payload(stage, payload)
-    prepare_fonts(work, build_python, runner)
-    built_executable = work / "NotmyFault-Setup.exe"
-    compile_installer(payload, version_file, built_executable, runner)
-    executable = output / ("NotmyFault-" + version + "-windows-x64-setup.exe")
-    staged_executable = output / (work.name + ".tmp")
-    try:
-        shutil.copyfile(built_executable, staged_executable)
-        os.replace(staged_executable, executable)
-    finally:
-        staged_executable.unlink(missing_ok=True)
-    print("安装器已生成：" + str(executable), flush=True)
-    print("构建日志：" + str(runner.log_path), flush=True)
-    return 0
+    with tempfile.TemporaryDirectory(prefix="work-", dir=output) as temporary:
+        work = Path(temporary)
+        runner = Runner(work, output / (work.name + ".log"))
+        print("构建目录：" + str(work), flush=True)
+        print("构建日志：" + str(runner.log_path), flush=True)
+        build_venv = work / "build-venv"
+        runner.run([python, "-I", "-m", "venv", build_venv])
+        build_python = build_venv / "Scripts" / "python.exe"
+        if not build_python.is_file():
+            raise BuildError("Python 虚拟环境未创建成功，日志：" + str(runner.log_path))
+        runner.run([
+            build_python, "-m", "pip", "install", "--no-input",
+            "-r", ROOT / "requirements-dev.txt", "fonttools[woff]==4.64.0",
+        ])
+        stage = work / "payload"
+        app = stage / "app"
+        prepare_app(app)
+        sign_app(app, build_python, runner, args.development_key, passphrase)
+        prepare_frontend(app, runner, node, npm)
+        prepare_runtime(base, stage / "runtime")
+        wheels = stage / "wheels"
+        wheels.mkdir()
+        runner.run([
+            build_python, "-m", "pip", "wheel", "--no-input",
+            "-r", ROOT / "requirements.txt", "--wheel-dir", wheels,
+        ])
+        (app / "installer-build.json").write_text(json.dumps({
+            "version": version, "development_build": args.development_key,
+            "security_mode": "strict", "python_version": python_info["version"],
+            "platform": "windows-x64",
+        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        version_file = work / "version.txt"
+        version_file.write_text(version, encoding="utf-8")
+        payload = work / "payload.zip"
+        make_payload(stage, payload)
+        prepare_fonts(work, build_python, runner)
+        built_executable = work / "NotmyFault-Setup.exe"
+        compile_installer(payload, version_file, built_executable, runner)
+        executable = output / ("NotmyFault-" + version + "-windows-x64-setup.exe")
+        staged_executable = output / (work.name + ".tmp")
+        try:
+            shutil.copyfile(built_executable, staged_executable)
+            os.replace(staged_executable, executable)
+        finally:
+            staged_executable.unlink(missing_ok=True)
+        print("安装器已生成：" + str(executable), flush=True)
+        print("构建日志：" + str(runner.log_path), flush=True)
+        return 0
 
 
 if __name__ == "__main__":

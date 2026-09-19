@@ -1,11 +1,9 @@
 using System;
-using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Input;
-using System.Windows.Markup;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 
@@ -49,42 +47,29 @@ namespace NotmyFault.Setup
         private TextBlock progressMessage;
         private TextBlock progressDetail;
         private bool uninstalling;
+        private bool closeAfterCancel;
+        private CancellationTokenSource cancellation;
 
         public UninstallerWindow(string installationDirectory, bool previewMode = false)
         {
             directory = installationDirectory;
             preview = previewMode;
             Title = preview ? "NotmyFault 卸载界面预览" : "NotmyFault 卸载";
-            Width = 920;
-            Height = 660;
-            MinWidth = 800;
-            MinHeight = 640;
-            WindowStartupLocation = WindowStartupLocation.CenterScreen;
-            Background = SetupWindowLayout.BrushOf("#121318");
-            Foreground = ink;
-            string fonts = "/" + typeof(UninstallerWindow).Assembly.GetName().Name + ";component/fonts/#";
-            FontFamily = new FontFamily(new Uri("pack://application:,,,/"), fonts + "Roboto, Microsoft YaHei UI");
-            displayFont = new FontFamily(new Uri("pack://application:,,,/"), fonts + "Google Sans Flex, Microsoft YaHei UI");
-            FontSize = 14;
-            UseLayoutRounding = true;
-            TextOptions.SetTextFormattingMode(this, TextFormattingMode.Display);
-            Resources = (ResourceDictionary)XamlReader.Parse(SetupWindowLayout.Styles);
+            displayFont = SetupWindowLayout.Initialize(this, ink);
             layout = new SetupWindowLayout(Resources, displayFont, ink, muted);
             pageHost = new Grid { Margin = new Thickness(52, 44, 52, 28) };
             var root = new Grid { Background = Background, ClipToBounds = true };
             root.Children.Add(pageHost);
             Content = root;
-            SourceInitialized += delegate
+            Closing += delegate(object sender, System.ComponentModel.CancelEventArgs e)
             {
-                int enabled = 1;
-                DwmSetWindowAttribute(new System.Windows.Interop.WindowInteropHelper(this).Handle, 20, ref enabled, sizeof(int));
+                if (!uninstalling) return;
+                e.Cancel = true;
+                closeAfterCancel = true;
+                Cancel();
             };
-            Closing += delegate(object sender, System.ComponentModel.CancelEventArgs e) { if (uninstalling) e.Cancel = true; };
             ShowConfirmation();
         }
-
-        [DllImport("dwmapi.dll")]
-        private static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
 
         private void ChangePage(Grid page, bool focusPage = false)
         {
@@ -116,12 +101,13 @@ namespace NotmyFault.Setup
         {
             if (uninstalling) return;
             uninstalling = true;
+            cancellation = new CancellationTokenSource();
             ShowProgress();
             try
             {
                 string retained;
                 if (preview) retained = directory;
-                else retained = await InstallMaintenance.UninstallAsync(directory, new Progress<InstallProgress>(UpdateProgress), CancellationToken.None);
+                else retained = await InstallMaintenance.UninstallAsync(directory, new Progress<InstallProgress>(UpdateProgress), cancellation.Token);
                 uninstalling = false;
                 if (!preview) ShowComplete(retained);
             }
@@ -130,7 +116,15 @@ namespace NotmyFault.Setup
                 uninstalling = false;
                 var failure = e as UninstallFailure;
                 if (failure != null) directory = failure.RetryDirectory;
-                ShowFailure(e.Message);
+                bool cancelled = e is OperationCanceledException || (failure != null && failure.InnerException is OperationCanceledException);
+                ShowFailure(cancelled ? "卸载已取消。部分程序文件可能已移除，可继续卸载以清理剩余文件。" : e.Message);
+            }
+            finally
+            {
+                uninstalling = false;
+                cancellation.Dispose();
+                cancellation = null;
+                if (closeAfterCancel) Close();
             }
         }
 
@@ -154,7 +148,15 @@ namespace NotmyFault.Setup
             Grid.SetRow(body, 1);
             page.Children.Add(body);
             if (preview) layout.Footer(page, layout.Button("返回", ShowConfirmation, false), layout.Button("预览完成", delegate { ShowComplete(directory); }, true));
+            else layout.Footer(page, layout.Button("取消卸载", Cancel, false), null);
             ChangePage(page, true);
+        }
+
+        private void Cancel()
+        {
+            if (cancellation == null || cancellation.IsCancellationRequested) return;
+            cancellation.Cancel();
+            progressDetail.Text = "正在停止卸载，请等待当前文件操作完成。";
         }
 
         private void UpdateProgress(InstallProgress progress)

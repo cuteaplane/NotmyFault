@@ -36,6 +36,39 @@ namespace NotmyFault.Setup
         private const string StateHeader = "NotmyFault Windows installer 1";
         private const string UninstallHeader = "NotmyFault Windows uninstall 1";
 
+        internal static string UpgradeRecordPath(string directory)
+        {
+            return Path.Combine(Path.GetDirectoryName(directory), "." + Path.GetFileName(directory) + ".upgrade-state");
+        }
+
+        private static string PendingUpgradeDirectory(string directory)
+        {
+            string record = UpgradeRecordPath(directory);
+            if (!File.Exists(record)) return directory;
+            using (UpgradeRecord pending = UpgradeRecord.Read(directory, false))
+                return !pending.Committed && Directory.Exists(pending.Backup) ? pending.Backup : directory;
+        }
+
+        internal static void RecoverUpgrade(string directory)
+        {
+            if (!File.Exists(UpgradeRecordPath(directory))) return;
+            using (UpgradeRecord pending = UpgradeRecord.Read(directory, true))
+            {
+                EnsureNotRunning(directory);
+                if (pending.Committed) DeleteTree(pending.Backup);
+                else
+                {
+                    if (Directory.Exists(pending.Backup))
+                    {
+                        DeleteTree(directory);
+                        Directory.Move(pending.Backup, directory);
+                    }
+                    pending.RestoreRegistration();
+                }
+            }
+            File.Delete(UpgradeRecordPath(directory));
+        }
+
         internal static string NormalizeDirectory(string directory)
         {
             if (String.IsNullOrWhiteSpace(directory)) throw new ArgumentException("请选择安装目录。");
@@ -64,7 +97,7 @@ namespace NotmyFault.Setup
         {
             try
             {
-                string path = NormalizeDirectory(directory);
+                string path = PendingUpgradeDirectory(NormalizeDirectory(directory));
                 string marker = Path.Combine(path, StateFile);
                 if (File.Exists(marker))
                 {
@@ -88,6 +121,7 @@ namespace NotmyFault.Setup
         public static string GetInstalledVersion(string directory)
         {
             if (!IsInstalledDirectory(directory)) return "";
+            directory = PendingUpgradeDirectory(NormalizeDirectory(directory));
             string marker = Path.Combine(directory, StateFile);
             if (File.Exists(marker))
             {
@@ -147,7 +181,7 @@ namespace NotmyFault.Setup
 
         private enum InstalledFileKind { Program, UserData, SigningKey }
 
-        private static InstalledFileKind ClassifyFile(string relative, bool programFile)
+        private static InstalledFileKind ClassifyFile(string relative, bool installerOwned)
         {
             string value = relative.Replace('\\', '/');
             if (value.Equals("app/.private/signing_private_key.pem", StringComparison.OrdinalIgnoreCase) ||
@@ -160,7 +194,7 @@ namespace NotmyFault.Setup
                 value.Equals("user_plugins", StringComparison.OrdinalIgnoreCase) ||
                 value.StartsWith("user_plugins/", StringComparison.OrdinalIgnoreCase))
                 return InstalledFileKind.UserData;
-            return programFile ? InstalledFileKind.Program : InstalledFileKind.UserData;
+            return installerOwned ? InstalledFileKind.Program : InstalledFileKind.UserData;
         }
 
         private static bool LegacyProgramFile(string relative)
@@ -177,12 +211,19 @@ namespace NotmyFault.Setup
         internal static IEnumerable<string> EnumerateFiles(string directory)
         {
             EnsureOrdinaryPath(directory);
+            return EnumerateOrdinaryFiles(directory);
+        }
+
+        private static IEnumerable<string> EnumerateOrdinaryFiles(string directory)
+        {
             foreach (string entry in Directory.EnumerateFileSystemEntries(directory))
             {
-                EnsureOrdinaryPath(entry);
-                if (Directory.Exists(entry))
+                FileAttributes attributes = File.GetAttributes(entry);
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                    throw new IOException("安装文件不能位于文件或目录链接中：" + entry);
+                if ((attributes & FileAttributes.Directory) != 0)
                 {
-                    foreach (string file in EnumerateFiles(entry)) yield return file;
+                    foreach (string file in EnumerateOrdinaryFiles(entry)) yield return file;
                 }
                 else yield return entry;
             }
@@ -190,14 +231,14 @@ namespace NotmyFault.Setup
 
         private static string Relative(string directory, string path)
         {
-            string prefix = NormalizeDirectory(directory) + Path.DirectorySeparatorChar;
+            string prefix = Path.GetFullPath(directory).TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
             string full = Path.GetFullPath(path);
             if (!full.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
                 throw new IOException("文件路径超出安装目录。");
             return full.Substring(prefix.Length);
         }
 
-        private static string OwnedPath(string directory, string relative)
+        private static string OwnedPath(string directory, string relative, bool checkFilesystem = true)
         {
             if (String.IsNullOrWhiteSpace(relative) || Path.IsPathRooted(relative))
                 throw new InvalidDataException("安装文件清单包含无效路径。");
@@ -206,7 +247,7 @@ namespace NotmyFault.Setup
                     throw new InvalidDataException("安装文件清单包含无效路径。");
             string path = Path.GetFullPath(Path.Combine(directory, relative));
             Relative(directory, path);
-            EnsureOrdinaryPath(path);
+            if (checkFilesystem) EnsureOrdinaryPath(path);
             return path;
         }
 
@@ -219,7 +260,7 @@ namespace NotmyFault.Setup
             {
                 foreach (string relative in File.ReadAllLines(manifest, Encoding.UTF8))
                 {
-                    OwnedPath(directory, relative);
+                    OwnedPath(directory, relative, false);
                     owned.Add(relative.Replace('/', Path.DirectorySeparatorChar));
                 }
             }
@@ -252,21 +293,25 @@ namespace NotmyFault.Setup
             return classified;
         }
 
-        internal static void WriteState(string directory, string version, HashSet<string> preserved)
+        internal static long WriteState(string directory, string version, HashSet<string> preserved)
         {
+            EnsureOrdinaryPath(directory);
             File.WriteAllText(Path.Combine(directory, StateFile), StateHeader + "\n" + version + "\n", new UTF8Encoding(false));
             List<string> owned = new List<string>();
+            long size = 0;
             foreach (string file in EnumerateFiles(directory))
             {
+                if (!SamePath(file, Path.Combine(directory, FilesFile))) size += new FileInfo(file).Length;
                 string relative = Relative(directory, file);
                 if (ClassifyFile(relative, true) == InstalledFileKind.Program && !preserved.Contains(relative) && relative != FilesFile) owned.Add(relative);
             }
             owned.Add(FilesFile);
             owned.Sort(StringComparer.OrdinalIgnoreCase);
             File.WriteAllLines(Path.Combine(directory, FilesFile), owned.ToArray(), new UTF8Encoding(false));
+            return size + new FileInfo(Path.Combine(directory, FilesFile)).Length;
         }
 
-        internal static void Register(string directory, string version)
+        internal static void Register(string directory, string version, long size)
         {
             using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RegistryPath))
             {
@@ -279,8 +324,6 @@ namespace NotmyFault.Setup
                 key.SetValue("InstallDate", DateTime.Now.ToString("yyyyMMdd"));
                 key.SetValue("NoModify", 1, RegistryValueKind.DWord);
                 key.SetValue("NoRepair", 1, RegistryValueKind.DWord);
-                long size = 0;
-                foreach (string file in EnumerateFiles(directory)) size += new FileInfo(file).Length;
                 key.SetValue("EstimatedSize", (int)Math.Min(Int32.MaxValue, (size + 1023) / 1024), RegistryValueKind.DWord);
             }
         }
@@ -329,11 +372,16 @@ namespace NotmyFault.Setup
             finally { LocalFree(arguments); }
         }
 
-        private static void RemoveEntries(string directory)
+        private static IEnumerable<string> DefaultShortcutPaths()
         {
             foreach (Environment.SpecialFolder folder in new[] { Environment.SpecialFolder.DesktopDirectory, Environment.SpecialFolder.Programs })
+                yield return Path.Combine(Environment.GetFolderPath(folder), "NotmyFault.lnk");
+        }
+
+        internal static void RemoveEntries(string directory, IEnumerable<string> shortcutPaths)
+        {
+            foreach (string shortcut in shortcutPaths)
             {
-                string shortcut = Path.Combine(Environment.GetFolderPath(folder), "NotmyFault.lnk");
                 if (ShortcutBelongsTo(shortcut, directory)) File.Delete(shortcut);
             }
             using (RegistryKey run = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true))
@@ -342,19 +390,35 @@ namespace NotmyFault.Setup
             using (RegistryKey command = Registry.CurrentUser.OpenSubKey(@"Software\Classes\notmyfault\shell\open\command"))
                 ownProtocol = command != null && CommandUsesDirectory(command.GetValue("") as string, directory);
             if (ownProtocol) Registry.CurrentUser.DeleteSubKeyTree(@"Software\Classes\notmyfault", false);
-            bool ownAumid;
-            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Classes\AppUserModelId\cuteaplane.notmyfault.app"))
-                ownAumid = key != null && SamePath(key.GetValue("IconUri") as string, Path.Combine(directory, "app", "logo.ico"));
-            if (ownAumid) Registry.CurrentUser.DeleteSubKeyTree(@"Software\Classes\AppUserModelId\cuteaplane.notmyfault.app", false);
             bool ownRegistration;
             using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegistryPath))
                 ownRegistration = key != null && SamePath(key.GetValue("InstallLocation") as string, directory);
+            bool ownAumid = false;
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Classes\AppUserModelId\cuteaplane.notmyfault.app"))
+            {
+                if (key != null)
+                {
+                    string owner = key.GetValue("InstallLocation") as string;
+                    ownAumid = String.IsNullOrEmpty(owner) ? ownRegistration : SamePath(owner, directory);
+                }
+            }
+            if (ownAumid) Registry.CurrentUser.DeleteSubKeyTree(@"Software\Classes\AppUserModelId\cuteaplane.notmyfault.app", false);
             if (ownRegistration) Registry.CurrentUser.DeleteSubKeyTree(RegistryPath, false);
         }
 
         internal static bool ShortcutBelongsTo(string path, string directory)
         {
             if (!File.Exists(path)) return false;
+            return WithShortcut(path, delegate(object shortcut)
+            {
+                string target = shortcut.GetType().InvokeMember("TargetPath", BindingFlags.GetProperty, null, shortcut, null) as string;
+                return SamePath(target, Path.Combine(directory, ".venv", "Scripts", "pythonw.exe")) ||
+                    SamePath(target, Path.Combine(directory, "NotmyFault.vbs"));
+            });
+        }
+
+        internal static T WithShortcut<T>(string path, Func<object, T> use)
+        {
             object shell = null;
             object shortcut = null;
             try
@@ -362,9 +426,7 @@ namespace NotmyFault.Setup
                 Type type = Type.GetTypeFromProgID("WScript.Shell", true);
                 shell = Activator.CreateInstance(type);
                 shortcut = type.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell, new object[] { path });
-                string target = shortcut.GetType().InvokeMember("TargetPath", BindingFlags.GetProperty, null, shortcut, null) as string;
-                return SamePath(target, Path.Combine(directory, ".venv", "Scripts", "pythonw.exe")) ||
-                    SamePath(target, Path.Combine(directory, "NotmyFault.vbs"));
+                return use(shortcut);
             }
             finally
             {
@@ -380,6 +442,7 @@ namespace NotmyFault.Setup
 
         internal class UninstallOperations
         {
+            internal virtual IEnumerable<string> ShortcutPaths { get { return DefaultShortcutPaths(); } }
             internal virtual void MoveDirectory(string source, string destination) { Directory.Move(source, destination); }
             internal virtual void DeleteFile(string file)
             {
@@ -387,7 +450,7 @@ namespace NotmyFault.Setup
                 File.SetAttributes(file, FileAttributes.Normal);
                 File.Delete(file);
             }
-            internal virtual void RemoveEntries(string directory) { InstallMaintenance.RemoveEntries(directory); }
+            internal virtual void RemoveEntries(string directory) { InstallMaintenance.RemoveEntries(directory, ShortcutPaths); }
         }
 
         private sealed class UninstallPlan
@@ -490,12 +553,14 @@ namespace NotmyFault.Setup
                     int completed = 0;
                     foreach (string relative in plan.Files)
                     {
+                        token.ThrowIfCancellationRequested();
                         if (relative == StateFile || relative == FilesFile) continue;
                         operations.DeleteFile(OwnedPath(path, relative));
                         completed++;
                         if (progress != null && completed % 30 == 0)
                             progress.Report(new InstallProgress { Step = 0, Fraction = (double)completed / plan.Files.Count, Message = "正在移除程序文件", Detail = relative });
                     }
+                    token.ThrowIfCancellationRequested();
                     operations.RemoveEntries(plan.OriginalDirectory);
                     operations.DeleteFile(OwnedPath(path, FilesFile));
                     operations.DeleteFile(OwnedPath(path, StateFile));
@@ -520,7 +585,11 @@ namespace NotmyFault.Setup
 
         public static string PrepareUninstall(string[] args)
         {
-            string executable = Assembly.GetExecutingAssembly().Location;
+            return PrepareUninstall(args, Assembly.GetExecutingAssembly().Location);
+        }
+
+        internal static string PrepareUninstall(string[] args, string executable)
+        {
             string directory = Path.GetDirectoryName(executable);
             if (args.Length == 2 && args[0] == "--resume-uninstall")
             {
@@ -588,18 +657,140 @@ namespace NotmyFault.Setup
             };
         }
 
+        private sealed class UpgradeRecord : IDisposable
+        {
+            internal string Backup;
+            internal bool Committed;
+            private bool hadRegistration;
+            private FileStream stream;
+            private readonly Dictionary<string, object> values = new Dictionary<string, object>();
+            private readonly Dictionary<string, RegistryValueKind> kinds = new Dictionary<string, RegistryValueKind>();
+
+            internal static UpgradeRecord Create(string directory, string backup, bool hadRegistration,
+                Dictionary<string, object> values, Dictionary<string, RegistryValueKind> kinds)
+            {
+                string record = UpgradeRecordPath(directory);
+                string temporary = record + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                try
+                {
+                    using (FileStream output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                    using (BinaryWriter writer = new BinaryWriter(output, Encoding.UTF8, true))
+                    {
+                        writer.Write(false);
+                        writer.Write("NotmyFault Windows upgrade 1");
+                        writer.Write(directory);
+                        writer.Write(backup);
+                        writer.Write(hadRegistration);
+                        writer.Write(values.Count);
+                        foreach (var value in values)
+                        {
+                            writer.Write(value.Key);
+                            RegistryValueKind kind = kinds[value.Key];
+                            writer.Write((int)kind);
+                            if (kind == RegistryValueKind.Binary || kind == RegistryValueKind.None)
+                                writer.Write(Convert.ToBase64String((byte[])value.Value));
+                            else if (kind == RegistryValueKind.MultiString)
+                            {
+                                string[] strings = (string[])value.Value;
+                                writer.Write(strings.Length);
+                                foreach (string item in strings) writer.Write(item);
+                            }
+                            else writer.Write(Convert.ToString(value.Value, System.Globalization.CultureInfo.InvariantCulture));
+                        }
+                        writer.Flush();
+                        output.Flush(true);
+                    }
+                    File.Move(temporary, record);
+                    return Read(directory, true);
+                }
+                finally { if (File.Exists(temporary)) File.Delete(temporary); }
+            }
+
+            internal static UpgradeRecord Read(string directory, bool writable)
+            {
+                string path = UpgradeRecordPath(directory);
+                EnsureOrdinaryPath(path);
+                var record = new UpgradeRecord();
+                record.stream = new FileStream(path, FileMode.Open, writable ? FileAccess.ReadWrite : FileAccess.Read,
+                    writable ? FileShare.Read : FileShare.ReadWrite);
+                try
+                {
+                    using (BinaryReader reader = new BinaryReader(record.stream, Encoding.UTF8, true))
+                    {
+                        record.Committed = reader.ReadBoolean();
+                        if (reader.ReadString() != "NotmyFault Windows upgrade 1" || !SamePath(reader.ReadString(), directory))
+                            throw new InvalidDataException("升级恢复记录与安装目录不符。");
+                        record.Backup = NormalizeDirectory(reader.ReadString());
+                        string prefix = "." + Path.GetFileName(directory) + ".upgrade-";
+                        string name = Path.GetFileName(record.Backup);
+                        Guid suffix;
+                        if (!SamePath(Path.GetDirectoryName(record.Backup), Path.GetDirectoryName(directory)) ||
+                            !name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ||
+                            !Guid.TryParseExact(name.Substring(prefix.Length), "N", out suffix))
+                            throw new InvalidDataException("升级备份必须位于安装目录旁。");
+                        record.hadRegistration = reader.ReadBoolean();
+                        int count = reader.ReadInt32();
+                        for (int i = 0; i < count; i++)
+                        {
+                            string key = reader.ReadString();
+                            RegistryValueKind kind = (RegistryValueKind)reader.ReadInt32();
+                            object decoded;
+                            if (kind == RegistryValueKind.MultiString)
+                            {
+                                string[] strings = new string[reader.ReadInt32()];
+                                for (int j = 0; j < strings.Length; j++) strings[j] = reader.ReadString();
+                                decoded = strings;
+                            }
+                            else
+                            {
+                                string value = reader.ReadString();
+                                decoded = value;
+                                if (kind == RegistryValueKind.Binary || kind == RegistryValueKind.None) decoded = Convert.FromBase64String(value);
+                                else if (kind == RegistryValueKind.DWord) decoded = Int32.Parse(value, System.Globalization.CultureInfo.InvariantCulture);
+                                else if (kind == RegistryValueKind.QWord) decoded = Int64.Parse(value, System.Globalization.CultureInfo.InvariantCulture);
+                            }
+                            record.values.Add(key, decoded);
+                            record.kinds.Add(key, kind);
+                        }
+                    }
+                    return record;
+                }
+                catch { record.Dispose(); throw; }
+            }
+
+            internal void MarkCommitted()
+            {
+                stream.Position = 0;
+                stream.WriteByte(1);
+                stream.Flush(true);
+                Committed = true;
+            }
+
+            internal void RestoreRegistration()
+            {
+                Registry.CurrentUser.DeleteSubKeyTree(RegistryPath, false);
+                if (hadRegistration)
+                    using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RegistryPath))
+                        foreach (var value in values) key.SetValue(value.Key, value.Value, kinds[value.Key]);
+            }
+
+            public void Dispose() { stream.Dispose(); }
+        }
+
         internal sealed class Transaction : IDisposable
         {
             internal readonly string DirectoryPath;
             internal readonly string BackupPath;
             internal readonly HashSet<string> Preserved = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             internal readonly List<string> NewShortcuts = new List<string>();
+            internal string FailureLogPath;
             private readonly bool existed;
             private readonly Dictionary<string, object> oldRegistration = new Dictionary<string, object>();
             private readonly Dictionary<string, RegistryValueKind> oldKinds = new Dictionary<string, RegistryValueKind>();
             private readonly bool hadRegistration;
             private bool touchedRegistration;
             private bool committed;
+            private UpgradeRecord recovery;
 
             internal Transaction(string directory, bool upgrade)
             {
@@ -628,12 +819,24 @@ namespace NotmyFault.Setup
                     BackupPath = Path.Combine(Path.GetDirectoryName(directory), "." + Path.GetFileName(directory) + ".upgrade-" + Guid.NewGuid().ToString("N"));
                     if (!SamePath(Path.GetDirectoryName(BackupPath), Path.GetDirectoryName(directory)))
                         throw new IOException("无法创建升级工作目录。");
-                    Directory.Move(directory, BackupPath);
+                    recovery = UpgradeRecord.Create(directory, BackupPath, hadRegistration, oldRegistration, oldKinds);
+                    try { Directory.Move(directory, BackupPath); }
+                    catch
+                    {
+                        recovery.Dispose();
+                        File.Delete(UpgradeRecordPath(directory));
+                        throw;
+                    }
                 }
                 try { Directory.CreateDirectory(directory); }
                 catch
                 {
-                    if (BackupPath != null) Directory.Move(BackupPath, directory);
+                    try
+                    {
+                        if (BackupPath != null) Directory.Move(BackupPath, directory);
+                    }
+                    finally { if (recovery != null) recovery.Dispose(); }
+                    if (recovery != null) File.Delete(UpgradeRecordPath(directory));
                     throw;
                 }
             }
@@ -651,18 +854,25 @@ namespace NotmyFault.Setup
                 }
             }
 
-            internal void RegisterInstallation(string version)
+            internal void RegisterInstallation(string version, long size)
             {
                 touchedRegistration = true;
-                Register(DirectoryPath, version);
+                Register(DirectoryPath, version, size);
             }
 
             internal string Commit()
             {
+                if (recovery != null) recovery.MarkCommitted();
                 committed = true;
                 try
                 {
                     if (BackupPath != null) DeleteTree(BackupPath);
+                    if (recovery != null)
+                    {
+                        recovery.Dispose();
+                        recovery = null;
+                        File.Delete(UpgradeRecordPath(DirectoryPath));
+                    }
                     return "";
                 }
                 catch (IOException) { return "升级已完成，但旧程序文件未能全部清理。关闭占用文件的程序后可删除：" + BackupPath; }
@@ -671,27 +881,40 @@ namespace NotmyFault.Setup
 
             public void Dispose()
             {
-                if (committed) return;
-                foreach (string path in NewShortcuts)
-                    if (ShortcutBelongsTo(path, DirectoryPath)) File.Delete(path);
-                if (touchedRegistration)
+                if (committed)
                 {
-                    Registry.CurrentUser.DeleteSubKeyTree(RegistryPath, false);
-                    if (hadRegistration)
-                        using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RegistryPath))
-                            foreach (KeyValuePair<string, object> value in oldRegistration) key.SetValue(value.Key, value.Value, oldKinds[value.Key]);
+                    if (recovery != null) recovery.Dispose();
+                    return;
                 }
                 try
                 {
+                    foreach (string path in NewShortcuts)
+                        if (ShortcutBelongsTo(path, DirectoryPath)) File.Delete(path);
+                    if (touchedRegistration)
+                    {
+                        Registry.CurrentUser.DeleteSubKeyTree(RegistryPath, false);
+                        if (hadRegistration)
+                            using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RegistryPath))
+                                foreach (KeyValuePair<string, object> value in oldRegistration) key.SetValue(value.Key, value.Value, oldKinds[value.Key]);
+                    }
                     DeleteTree(DirectoryPath);
                     if (BackupPath != null) Directory.Move(BackupPath, DirectoryPath);
                     else if (existed) Directory.CreateDirectory(DirectoryPath);
+                    if (recovery != null)
+                    {
+                        recovery.Dispose();
+                        recovery = null;
+                        File.Delete(UpgradeRecordPath(DirectoryPath));
+                    }
                 }
                 catch (Exception ex)
                 {
-                    throw new IOException(BackupPath == null ? "未能清理全部安装文件，请关闭占用文件的程序后删除：" + DirectoryPath :
-                        "未能恢复原安装。原文件仍保存在：" + BackupPath + "。请关闭占用文件的程序，清理本次安装目录后将原文件移回：" + DirectoryPath, ex);
+                    var error = new IOException(BackupPath == null ? "未能清理全部安装文件，请关闭占用文件的程序后删除：" + DirectoryPath :
+                        "未能恢复原安装。恢复记录与原文件已保留，请关闭占用文件的程序后重新运行安装包并选择：" + DirectoryPath, ex);
+                    if (!String.IsNullOrEmpty(FailureLogPath)) throw new InstallFailure(FailureLogPath, error);
+                    throw error;
                 }
+                finally { if (recovery != null) recovery.Dispose(); }
             }
         }
 

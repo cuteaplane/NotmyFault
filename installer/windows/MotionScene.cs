@@ -13,7 +13,6 @@ namespace NotmyFault.Setup
         private double targetIntensity = 1;
         private double previousTime;
         private bool active = true;
-        public bool ReducedMotion { get; set; }
 
         public MotionScene()
         {
@@ -27,7 +26,7 @@ namespace NotmyFault.Setup
             if (welcome) clock.Restart();
             targetIntensity = welcome ? 1 : 0;
             active = welcome;
-            if (!SystemParameters.ClientAreaAnimation || ReducedMotion)
+            if (!SystemParameters.ClientAreaAnimation)
             {
                 intensity = targetIntensity;
                 InvalidateVisual();
@@ -37,7 +36,7 @@ namespace NotmyFault.Setup
 
         private void Subscribe()
         {
-            if (subscribed || !IsLoaded || !SystemParameters.ClientAreaAnimation || ReducedMotion) return;
+            if (subscribed || !IsLoaded || !SystemParameters.ClientAreaAnimation) return;
             previousTime = clock.Elapsed.TotalSeconds;
             CompositionTarget.Rendering += OnFrame;
             subscribed = true;
@@ -53,7 +52,7 @@ namespace NotmyFault.Setup
         private void OnFrame(object sender, EventArgs args)
         {
             double now = clock.Elapsed.TotalSeconds;
-            if (ReducedMotion || !SystemParameters.ClientAreaAnimation) { intensity = targetIntensity; Unsubscribe(); InvalidateVisual(); return; }
+            if (!SystemParameters.ClientAreaAnimation) { intensity = targetIntensity; Unsubscribe(); InvalidateVisual(); return; }
             double delta = Math.Min(0.1, now - previousTime);
             if (delta < 1.0 / 35) return;
             previousTime = now;
@@ -66,7 +65,7 @@ namespace NotmyFault.Setup
         {
             base.OnRender(dc);
             if (ActualWidth <= 0 || ActualHeight <= 0) return;
-            double t = SystemParameters.ClientAreaAnimation && !ReducedMotion ? Math.Min(2.4, clock.Elapsed.TotalSeconds) : 2.4;
+            double t = SystemParameters.ClientAreaAnimation ? Math.Min(2.4, clock.Elapsed.TotalSeconds) : 2.4;
             dc.PushClip(new RectangleGeometry(new Rect(0, 0, ActualWidth, ActualHeight)));
             dc.PushTransform(new ScaleTransform(ActualWidth / 920, ActualHeight / 620));
             dc.PushOpacity(intensity);
