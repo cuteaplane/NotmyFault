@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { store } from '../../lib/store'
 import {
+  API,
   deleteAIApiKey,
   getAIDraftingSetting,
   readPlatformCapabilities,
@@ -106,10 +107,11 @@ const runtimeInfo = computed(() => [
   { icon: 'rule', key: '已配置规则', val: ruleCount.value + ' 条' },
   { icon: 'memory', key: '触发器插件', val: triggerCount.value ? triggerCount.value + ' 个' : '引擎离线时不可用' },
   { icon: 'bolt', key: '动作插件', val: actionCount.value ? actionCount.value + ' 个' : '引擎离线时不可用' },
-  { icon: 'lan', key: 'NotmyFault API', val: '127.0.0.1:19198' },
+  { icon: 'lan', key: 'NotmyFault API', val: new URL(API).host },
 ])
 
 function applyAISavedSettings(settings) {
+  if (settings?.api_key_status !== undefined) store.aiApiKeyStatus = settings.api_key_status
   store.aiDrafting = { ...store.aiDrafting, ...settings }
   aiSavedSnapshot.value = { ...store.aiDrafting }
   aiServiceDraft.value = {
@@ -150,8 +152,9 @@ async function saveAIService() {
       ...aiServiceDraft.value,
     })
     if (!result.ok) return alertDialog('保存失败', result.error || '无法保存 AI 设置')
+    const clearedKey = store.aiApiKeyStatus === 'saved' && result.settings?.api_key_status === 'none'
     applyAISavedSettings(result.settings)
-    snackbar('服务配置已保存')
+    snackbar(clearedKey ? '服务地址已修改，请为新地址重新保存 API 密钥' : '服务配置已保存')
   } catch (error) { alertDialog('保存失败', error.message) } finally { savingAIService.value = false }
 }
 
@@ -211,6 +214,7 @@ const KONAMI_SEQUENCE = [
 let konamiProgress = 0
 const showOrigin = ref(false)
 function onKonamiKey(event) {
+  if (event.target?.closest?.('input, textarea, select, [contenteditable="true"]')) { konamiProgress = 0; return }
   const key = event.key.length === 1 ? event.key.toLowerCase() : event.key
   if (key === KONAMI_SEQUENCE[konamiProgress]) {
     konamiProgress++

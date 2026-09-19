@@ -1,5 +1,5 @@
 <script setup>
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import { store } from '../lib/store'
 import { ensureParams, getVisibleParamDefs } from '../lib/utils'
 import ParamInput from './ParamInput.vue'
@@ -7,7 +7,8 @@ import ParamInput from './ParamInput.vue'
 const props = defineProps({ node: { type: Object, required: true }, sources: { type: Array, default: () => [] } })
 const emit = defineEmits(['replace'])
 const meta = computed(() => store.schema.triggers[props.node.type])
-const params = computed(() => getVisibleParamDefs(meta.value, ensureParams(props.node)))
+watch(() => props.node, ensureParams, { immediate: true })
+const params = computed(() => getVisibleParamDefs(meta.value, props.node.params))
 </script>
 
 <template>

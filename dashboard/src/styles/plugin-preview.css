@@ -38,7 +38,6 @@
 .perm-list-item{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:12px;background:var(--md-surface-c-low)}
 .perm-list-item.perm-unknown{background:color-mix(in srgb,var(--md-error) 6%,var(--md-surface-c-low))}
 .perm-left{flex:1;min-width:0}
-.perm-name{font:var(--ts-body);font-weight:500;display:block}
 .perm-perm{font:var(--ts-lbl-sm);color:var(--md-outline)}
 .perm-desc{font:var(--ts-lbl-sm);color:var(--md-on-surface-variant);margin-top:2px;font-size:11px}
 .perm-right{flex-shrink:0;padding-top:2px}
@@ -70,3 +69,5 @@
   border:none;border-radius:var(--r-xl);padding:24px;max-width:420px;text-align:center;
   background:var(--md-surface-c-high);box-shadow:var(--md-elev3);
 }
+.plugin-install-error-icon.dialog-ico{color:var(--md-error)}
+.plugin-install-error-actions.dialog-actions{justify-content:center}

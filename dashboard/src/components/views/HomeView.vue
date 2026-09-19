@@ -75,7 +75,7 @@ function formatDuration(milliseconds) {
   if (milliseconds === null || milliseconds === undefined) return '尚未完成'
   if (milliseconds < 1000) return `${milliseconds} 毫秒`
   if (milliseconds < 60000) return `${(milliseconds / 1000).toFixed(1)} 秒`
-  return `${Math.floor(milliseconds / 60000)} 分 ${Math.round(milliseconds % 60000 / 1000)} 秒`
+  return `${Math.floor(Math.round(milliseconds / 1000) / 60)} 分 ${Math.round(milliseconds / 1000) % 60} 秒`
 }
 
 function goAutomations() {
@@ -118,22 +118,23 @@ function goDiagnostics() {
   window.__nmf?.switchPage?.('settings')
 }
 
+const statusError = ref('')
+function statsForStatus(status) {
+  return status.api_alive === true
+    ? { rules: status.rules_count ?? '-', triggers: status.triggers_count ?? '-', actions: status.actions_count ?? '-' }
+    : { rules: '-', triggers: '-', actions: '-' }
+}
 async function loadStats() {
   if (statsLoading || disposed) return
   statsLoading = true
   try {
     const status = await getEngineStatus()
+    statusError.value = ''
     if (disposed) return
     await syncStatus(status)
     const scheduler = status.scheduler || {}
     schedulerText.value = `${scheduler.running ?? 0} / ${scheduler.queued ?? 0}`
-    stats.value = status.api_alive === true
-      ? {
-          rules: status.rules_count ?? '-',
-          triggers: status.triggers_count ?? '-',
-          actions: status.actions_count ?? '-',
-        }
-      : { rules: '-', triggers: '-', actions: '-' }
+    stats.value = statsForStatus(status)
     if (status.api_alive === true) {
       try {
         recentRuns.value = await listRuns(5)
@@ -143,7 +144,9 @@ async function loadStats() {
       }
     }
     diag.value = isRunning.value ? await readDiagnostics() : null
-  } catch {
+    if (isRunning.value && !diag.value) statusError.value = '无法读取诊断数据，请刷新重试'
+  } catch (error) {
+    statusError.value = error.message || '无法读取引擎状态，请刷新重试'
     stats.value = { rules: '-', triggers: '-', actions: '-' }
   } finally {
     statsLoading = false
@@ -156,13 +159,7 @@ function refreshHome() {
 }
 
 watch(() => store.engineStatus, status => {
-  stats.value = status.api_alive === true
-    ? {
-        rules: status.rules_count ?? '-',
-        triggers: status.triggers_count ?? '-',
-        actions: status.actions_count ?? '-',
-      }
-    : { rules: '-', triggers: '-', actions: '-' }
+  stats.value = statsForStatus(status)
 }, { immediate: true })
 watch(() => store.refreshSignal, loadStats)
 watch(isControllerOnline, online => {
@@ -187,6 +184,7 @@ onUnmounted(() => { disposed = true; if (diagTimer) clearInterval(diagTimer) })
       <div class="actions"><button class="icon-btn" aria-label="刷新首页" title="刷新首页" @click="refreshHome"><span class="material-symbols-outlined">refresh</span></button><button v-if="isControllerOnline && !showFirstAutomationGuide" class="btn btn-filled" @click="goAutomations"><span class="material-symbols-outlined">add</span>创建自动化</button></div>
     </div>
 
+    <p v-if="statusError" class="danger-text" role="alert">{{ statusError }}</p>
     <section v-if="showFirstAutomationGuide" class="dashboard-first-run dashboard-first-run-compact">
       <span class="material-symbols-outlined">account_tree</span>
       <div><small>开始使用</small><h3>创建第一条自动化</h3><p>从常见用途开始，或自己指定触发条件和动作。</p></div>

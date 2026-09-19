@@ -9,7 +9,7 @@ const draft = (() => {
   catch { return {} }
 })()
 const step = ref(draft.step === 1 ? 1 : 0)
-const theme = ref(localStorage.getItem('nmf-theme') || 'system')
+const theme = ref((() => { try { return localStorage.getItem('nmf-theme') || 'system' } catch { return 'system' } })())
 const autoStart = ref(draft.autoStart === true)
 const autoStartChosen = ref(draft.autoStartChosen === true)
 const loading = ref(true)
@@ -58,7 +58,11 @@ function selectAutoStart(value) {
 }
 
 async function loadAutoStart() {
-  if (!window.pywebview?.api) return
+  if (!window.pywebview?.api) {
+    loading.value = false
+    error.value = '尚未连接桌面窗口，请从 NotmyFault 打开 Dashboard 后重新读取设置。'
+    return
+  }
   loading.value = true
   error.value = ''
   try {

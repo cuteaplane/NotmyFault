@@ -15,6 +15,8 @@ const props = defineProps({
 const activeTab = ref(props.initialTab)
 const runs = ref([])
 const entries = ref([])
+const logViewer = ref(null)
+const logsError = ref('')
 const files = ref([])
 const currentFile = ref('')
 const statusFilter = ref('all')
@@ -204,7 +206,7 @@ function formatDuration(milliseconds) {
   if (milliseconds === null || milliseconds === undefined) return '尚未完成'
   if (milliseconds < 1000) return `${milliseconds} 毫秒`
   if (milliseconds < 60000) return `${(milliseconds / 1000).toFixed(milliseconds < 10000 ? 1 : 0)} 秒`
-  return `${Math.floor(milliseconds / 60000)} 分 ${Math.round(milliseconds % 60000 / 1000)} 秒`
+  return `${Math.floor(Math.round(milliseconds / 1000) / 60)} 分 ${Math.round(milliseconds / 1000) % 60} 秒`
 }
 
 function errorText(error) {
@@ -232,19 +234,21 @@ function jumpToStep(run, step) {
 }
 
 function isNearBottom() {
-  const element = document.getElementById('logViewer')
+  const element = logViewer.value
   if (!element) return true
   return element.scrollTop + element.clientHeight >= element.scrollHeight - 48
 }
 
 function scrollToEnd() {
-  const element = document.getElementById('logViewer')
+  const element = logViewer.value
   if (element) element.scrollTop = element.scrollHeight
 }
 
 async function loadFiles() {
-  const list = await listLogFiles()
-  files.value = Array.isArray(list) ? list.slice(1) : []
+  try {
+    const list = await listLogFiles()
+    files.value = Array.isArray(list) ? list.slice(1) : []
+  } catch (error) { logsError.value = error.message }
 }
 
 async function refreshRuns() {
@@ -274,8 +278,11 @@ async function refreshLogs() {
       : await readLogFileEntries(file, 600)
     if (disposed || generation !== logsGeneration || file !== currentFile.value) return
     entries.value = Array.isArray(list) ? list : []
+    logsError.value = ''
     await nextTick()
     if (nearBottom) scrollToEnd()
+  } catch (error) {
+    if (!disposed && generation === logsGeneration) logsError.value = error.message
   } finally {
     loadingLogFiles.delete(file)
   }
@@ -292,7 +299,7 @@ async function copyLog() {
       .map(entry => `[${entry.ts || ''}] [${entry.level || 'INFO'}] ${entry.text || ''}`)
       .join('\n')
     await navigator.clipboard.writeText(text)
-    snackbar('日志已复制到剪贴板')
+    snackbar(`已复制当前筛选的 ${filteredEntries.value.length} 条日志`)
   } catch (error) {
     snackbar('复制失败：' + error.message)
   }
@@ -389,7 +396,7 @@ onUnmounted(() => {
       <div class="actions">
         <label class="check-row"><input type="checkbox" v-model="autoRefresh">自动刷新</label>
         <button v-if="activeTab === 'logs'" class="btn btn-outlined" @click="copyLog">
-          <span class="material-symbols-outlined">content_copy</span>复制日志
+          <span class="material-symbols-outlined">content_copy</span>复制筛选结果
         </button>
         <button class="btn btn-outlined" @click="refresh">
           <span class="material-symbols-outlined">refresh</span>刷新
@@ -577,10 +584,11 @@ onUnmounted(() => {
         </div>
       </div>
 
+      <p v-if="logsError" class="danger-text" role="alert">{{ logsError }}</p>
       <div v-if="!filteredEntries.length" class="log-viewer log-empty">
         {{ entries.length ? '没有符合筛选条件的日志' : '（日志为空）' }}
       </div>
-      <div v-else class="log-viewer log-entries" id="logViewer">
+      <div v-else class="log-viewer log-entries" ref="logViewer">
         <div v-for="(entry, index) in filteredEntries" :key="index" class="log-line" :class="levelMeta[entry.level]?.cls || 'log-info'" :title="entry.data ? JSON.stringify(entry.data) : ''">
           <span class="log-ts">{{ entry.ts }}</span>
           <span class="log-badge">{{ levelMeta[entry.level]?.label || entry.level || '信息' }}</span>

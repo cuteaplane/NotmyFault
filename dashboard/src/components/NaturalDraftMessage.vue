@@ -1,5 +1,5 @@
 <script setup>
-import MarkdownIt from 'markdown-it'
+import { renderMarkdown } from '../lib/markdown'
 import NaturalDraftRuleCard from './NaturalDraftRuleCard.vue'
 
 defineProps({
@@ -10,30 +10,6 @@ defineProps({
 })
 const emit = defineEmits(['retry', 'create', 'highlight-node'])
 
-const markdown = new MarkdownIt({ html: false, linkify: true, breaks: true })
-const defaultLinkOpen = markdown.renderer.rules.link_open || ((tokens, index, options, _env, self) => (
-  self.renderToken(tokens, index, options)
-))
-markdown.validateLink = (url) => {
-  const value = String(url ?? '').trim()
-  if (!/^(https?:|mailto:)/i.test(value)) return false
-  try {
-    const protocol = new URL(value).protocol
-    return protocol === 'http:' || protocol === 'https:' || protocol === 'mailto:'
-  } catch {
-    return false
-  }
-}
-markdown.renderer.rules.link_open = (tokens, index, options, env, self) => {
-  tokens[index].attrSet('target', '_blank')
-  tokens[index].attrSet('rel', 'noopener noreferrer')
-  return defaultLinkOpen(tokens, index, options, env, self)
-}
-markdown.renderer.rules.image = () => ''
-
-function renderMarkdown(content) {
-  return markdown.render(String(content ?? ''))
-}
 
 function formatTime(timestamp) {
   if (!timestamp) return ''
@@ -95,7 +71,7 @@ function activityHeadline(message) {
         </button>
         <div class="ai-activity-body">
           <div class="ai-activity-steps">
-            <div v-for="step in message.activity.steps" :key="step.label" class="ai-activity-step" :class="step.state">
+            <div v-for="(step, index) in message.activity.steps" :key="index" class="ai-activity-step" :class="step.state">
               <span v-if="step.state === 'done'" class="material-symbols-outlined">check</span>
               <span v-else class="material-symbols-outlined ai-activity-spin">progress_activity</span>
               <span>{{ step.label }}</span>

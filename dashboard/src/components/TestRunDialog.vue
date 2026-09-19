@@ -131,10 +131,7 @@ function normalizeAssertions() {
   })
 }
 
-watch(assertionSources, sources => {
-  const valid = new Set(sources.map(source => source.key))
-  assertions.value = assertions.value.filter(assertion => valid.has(assertion.sourceKey))
-})
+
 
 function inputKind(field) {
   if (['object', 'array', 'union', 'any'].includes(field.type) && field.valueType || field.fullPayload || field.type?.includes('/')) return 'json'

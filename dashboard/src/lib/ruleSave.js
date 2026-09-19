@@ -14,13 +14,13 @@ function keyProblemMessage(result) {
   return ''
 }
 
-export async function saveRulesWithApproval(rules, password = '') {
+export async function saveRulesWithApproval(rules, password = '', expectedRevision) {
   while (true) {
-    const result = await saveConfig(rules, password)
+    const result = await saveConfig(rules, password, expectedRevision)
     password = ''
     if (!PASSWORD_CODES.has(result?.code)) {
       if (KEY_PROBLEM_CODES.has(result?.code)) {
-        await alertDialog('无法保存这条规则', keyProblemMessage(result))
+        return { ...result, error: keyProblemMessage(result) }
       }
       return result
     }
@@ -47,6 +47,7 @@ export async function approveRuleBeforeEditing(rule) {
     if (!PASSWORD_CODES.has(result?.code)) {
       if (KEY_PROBLEM_CODES.has(result?.code)) {
         await alertDialog('无法打开规则编辑器', keyProblemMessage(result))
+        return { ...result, notified: true }
       }
       return result?.ok ? { ...result, adminKeyPassword: verified } : result
     }

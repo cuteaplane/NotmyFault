@@ -8,14 +8,20 @@ const control = ref(null)
 watch(error, value => control.value?.setCustomValidity(value))
 const spec = computed(() => typeSpec(props.valueType))
 const complex = computed(() => ['array', 'object', 'any', 'union'].includes(spec.value.type) || spec.value.type.includes('/'))
-watch(() => [props.modelValue, props.valueType], () => { draft.value = formatTypedInput(props.modelValue, props.valueType); error.value = '' }, { immediate: true, deep: true })
+let emittedValue
+watch(() => [props.modelValue, props.valueType], () => {
+  if (emittedValue !== undefined && emittedValue === JSON.stringify([props.modelValue, props.valueType])) return
+  emittedValue = undefined
+  draft.value = formatTypedInput(props.modelValue, props.valueType); error.value = '' }, { immediate: true, deep: true })
 function update(raw) {
   draft.value = raw
   try {
     const parsed = parseTypedInput(raw, spec.value)
     error.value = ''
-    emit('update:modelValue', isLiteralValue(props.modelValue) ? { $literal: parsed } : parsed)
-  } catch (e) { error.value = e.message }
+    const value = isLiteralValue(props.modelValue) ? { $literal: parsed } : parsed
+    emittedValue = JSON.stringify([value, props.valueType])
+    emit('update:modelValue', value)
+  } catch (e) { error.value = e instanceof SyntaxError ? '请输入有效的 JSON 值' : e.message }
 }
 </script>
 

@@ -7,7 +7,7 @@
 .log-toolbar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-bottom:20px}
 .log-file-select{min-width:220px;max-width:420px}
 .log-chips{display:flex;gap:8px;flex-wrap:wrap}
-.log-chip{border:1px solid var(--md-outline-variant);background:transparent;color:var(--md-on-surface-variant);border-radius:999px;padding:5px 12px;font:var(--ts-lbl-sm);cursor:pointer;transition:.15s}
+.log-chip{border:1px solid var(--md-outline-variant);background:transparent;color:var(--md-on-surface-variant);border-radius:var(--r-full);padding:5px 12px;font:var(--ts-lbl-sm);cursor:pointer;transition:.15s}
 .log-chip:hover{background:var(--md-surface-c-high)}
 .log-chip.active{background:var(--md-primary-container);color:var(--md-on-primary-container);border-color:transparent}
 .log-chip-err.active{background:var(--md-error-container);color:var(--md-on-error-container)}
@@ -19,7 +19,7 @@
 .log-line{display:flex;gap:10px;align-items:baseline;padding:5px 8px;border-radius:var(--r-xs)}
 .log-line:hover{background:var(--md-surface-c-high)}
 .log-ts{color:var(--md-on-surface-variant);flex-shrink:0;font-size:11px}
-.log-badge{flex-shrink:0;font-size:11px;padding:0 6px;border-radius:4px;border:1px solid currentColor;line-height:1.6}
+.log-badge{flex-shrink:0;font-size:11px;padding:0 6px;border-radius:var(--r-xs);border:1px solid currentColor;line-height:1.6}
 .log-text{white-space:pre-wrap;word-break:break-all}
 .log-err{color:var(--md-error)}.log-err .log-text{color:var(--md-on-surface)}
 .log-warn{color:var(--md-warn)}.log-warn .log-text{color:var(--md-on-surface)}
@@ -58,8 +58,8 @@
 .run-card.failed .run-status-icon{color:var(--md-error)}
 .run-card.cancelled .run-status-icon{color:var(--md-on-surface-variant)}
 .run-card.running .run-status-icon,.run-card.deferred .run-status-icon{color:var(--md-warn)}
-.run-card.running .run-status-icon{animation:run-spin 1.2s linear infinite}
-@keyframes run-spin{to{transform:rotate(360deg)}}
+.run-card.running .run-status-icon{animation:spin 1.2s linear infinite}
+
 .run-card-copy{display:flex;flex-direction:column;gap:5px;min-width:0}
 .run-card-title{overflow:hidden;font:var(--ts-title);text-overflow:ellipsis;white-space:nowrap}
 .run-card-meta{overflow:hidden;color:var(--md-on-surface-variant);font:var(--ts-body-s);text-overflow:ellipsis;white-space:nowrap}

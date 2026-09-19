@@ -24,14 +24,14 @@ async function openOriginRule(rule) {
       r => !rules.some(e => e.name === r.name),
     )
     const nextRules = [...clone(rules), ...missing.map(clone)]
-    const result = await saveRulesWithApproval(nextRules)
+    const result = await saveRulesWithApproval(nextRules, '', store.configData.revision)
     if (result?.cancelled) return
     if (!result?.ok) {
       snackbar(result?.error || '导入起源规则失败')
       return
     }
     const savedRules = Array.isArray(result.rules) ? result.rules : nextRules
-    store.configData = { ...store.configData, rules: savedRules }
+    store.configData = { ...store.configData, rules: savedRules, revision: result.revision }
     snackbar(`已导入 ${missing.length} 条起源规则`)
     jumpToRule(savedRules.find(item => item.name === rule.name) || rule)
   } catch (error) {

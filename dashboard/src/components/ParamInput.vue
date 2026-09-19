@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { optValue, optLabel } from '../lib/utils'
 import { hasBridge } from '../lib/api'
 import { store } from '../lib/store'
+import { snackbar } from '../lib/notify'
 import { isReference, referenceLabel, typesCompatible } from '../lib/bindings'
 import BindingPicker from './BindingPicker.vue'
 import PluginDataField from './PluginDataField.vue'
@@ -30,11 +31,15 @@ const bound = computed(() => isExpression(props.modelValue))
 const advanced = ref(false), expressionText = ref(''), expressionError = ref('')
 const expressionControl = ref(null)
 watch(expressionError, value => expressionControl.value?.setCustomValidity(value))
-watch(() => props.modelValue, value => { expressionText.value = JSON.stringify(value, null, 2) ?? ''; expressionError.value = '' }, { immediate: true, deep: true })
-const useTypedEditor = computed(() => !!props.def.value_type && (bindingType.value.nullable || !['text', 'path', 'time', 'any', 'union'].includes(bindingType.value.type)) || !!props.def.value_type && props.modelValue != null && typeof props.modelValue === 'object' && !bound.value || isLiteralValue(props.modelValue) || isEncodedValue(props.modelValue))
+let emittedExpression
+watch(() => props.modelValue, value => {
+  if (emittedExpression !== undefined && emittedExpression === JSON.stringify(value)) return
+  emittedExpression = undefined
+  expressionText.value = JSON.stringify(value, null, 2) ?? ''; expressionError.value = '' }, { immediate: true, deep: true })
+const useTypedEditor = computed(() => (!!props.def.value_type && (bindingType.value.nullable || !['text', 'path', 'time', 'any', 'union'].includes(bindingType.value.type))) || (!!props.def.value_type && props.modelValue != null && typeof props.modelValue === 'object' && !bound.value) || isLiteralValue(props.modelValue) || isEncodedValue(props.modelValue))
 function setExpression(text) {
   expressionText.value = text
-  try { const value = parseExactJson(text); emit('update:modelValue', value); expressionError.value = '' } catch (e) { expressionError.value = '表达式 JSON 无效' }
+  try { const value = parseExactJson(text); emittedExpression = JSON.stringify(value); emit('update:modelValue', value); expressionError.value = '' } catch (e) { expressionError.value = '表达式 JSON 无效' }
 }
 const boundLabel = computed(() => referenceLabel(props.modelValue, props.bindingSources))
 const compatibleSources = computed(() => props.bindingSources.filter(
@@ -64,7 +69,7 @@ async function pickFolder() {
   try {
     const selected = await window.pywebview.api.select_folder(String(value.value || ''))
     if (selected) value.value = selected
-  } catch (e) { /* bridge 不可用时保持手动输入。 */ }
+  } catch (e) { snackbar(e.message || '无法打开文件夹选择窗口') }
 }
 
 </script>

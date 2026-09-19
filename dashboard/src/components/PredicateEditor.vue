@@ -1,5 +1,7 @@
 <script setup>
 import { computed } from 'vue'
+import { isLiteralValue, isEncodedValue } from '../lib/valueTypes'
+import { confirmDialog } from '../lib/dialog'
 import ParamInput from './ParamInput.vue'
 
 defineOptions({ name: 'PredicateEditor' })
@@ -20,10 +22,14 @@ function changeOperator() {
   }
 }
 function valueType(key) {
-  const value = props.node[key]
+  const value = isLiteralValue(props.node[key]) ? props.node[key].$literal : props.node[key]
+  if (isEncodedValue(value)) return value.$nmf_value.type
+  if (value !== null && typeof value === 'object') return 'object'
   return typeof value === 'number' ? 'number' : typeof value === 'boolean' ? 'bool' : 'string'
 }
-function setType(key, type) {
+async function setType(key, type) {
+  if (type === valueType(key)) return
+  if (!await confirmDialog('更换比较值类型？', '更换类型会清空当前比较值。', '更换')) return
   props.node[key] = type === 'number' ? 0 : type === 'bool' ? false : ''
 }
 </script>
@@ -49,9 +55,9 @@ function setType(key, type) {
     <template v-else>
       <div v-for="key in (['is_true', 'is_false'].includes(node.op) ? ['left'] : ['left', 'right'])" :key="key" class="predicate-value">
         <select v-if="!node[key]?.$ref" class="select" :aria-label="key === 'left' ? '比较值类型' : '目标值类型'" :value="valueType(key)" @change="setType(key, $event.target.value)">
-          <option value="string">文本</option><option value="number">数字</option><option value="bool">布尔值</option>
+          <option v-if="!['string', 'number', 'bool'].includes(valueType(key))" :value="valueType(key)">{{ valueType(key) }}</option><option value="string">文本</option><option value="number">数字</option><option value="bool">布尔值</option>
         </select>
-        <ParamInput :def="{ name: key, label: key === 'left' ? '比较值' : '目标值', type: valueType(key), value_type: 'any' }" v-model="node[key]" allow-binding :binding-sources="sources" />
+        <ParamInput :def="{ name: key, label: key === 'left' ? '比较值' : '目标值', type: valueType(key), value_type: ['int', 'decimal', 'bytes', 'object'].includes(valueType(key)) ? valueType(key) : 'any' }" v-model="node[key]" allow-binding :binding-sources="sources" />
       </div>
     </template>
   </div>
@@ -59,6 +65,6 @@ function setType(key, type) {
 
 <style scoped>
 .predicate-editor { display: grid; gap: 12px; }
-.predicate-child { border-left: 2px solid var(--outline-variant); padding-left: 12px; }
+.predicate-child { border-left: 2px solid var(--md-outline-variant); padding-left: 12px; }
 .predicate-value { display: grid; gap: 8px; }
 </style>

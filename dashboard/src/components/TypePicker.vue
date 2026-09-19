@@ -10,9 +10,11 @@ const schemaText = ref(''), error = ref('')
 const schemaControl = ref(null)
 watch(error, value => schemaControl.value?.setCustomValidity(value))
 watch(() => props.modelValue, value => { schemaText.value = JSON.stringify(typeSpec(value), null, 2); error.value = '' }, { immediate: true, deep: true })
+const previousTypes = new Map()
 function choose(type) {
+  previousTypes.set(spec.value.type, JSON.parse(JSON.stringify(props.modelValue)))
   const presets = { timestamp: { type, unit: 'seconds' }, duration: { type, unit: 'seconds' }, array: { type, items: 'text' }, union: { type, variants: ['text', 'null'] } }
-  emit('update:modelValue', presets[type] || type)
+  emit('update:modelValue', previousTypes.get(type) || presets[type] || type)
 }
 function editSchema(text) {
   schemaText.value = text
@@ -35,5 +37,5 @@ function setOption(key, value) { emit('update:modelValue', { ...spec.value, [key
 </template>
 <style scoped>
 .type-picker { display: grid; gap: 8px; }
-summary { cursor: pointer; font-size: 12px; color: var(--md-on-surface-variant); }
+.type-picker summary { cursor: pointer; font-size: 12px; color: var(--md-on-surface-variant); }
 </style>

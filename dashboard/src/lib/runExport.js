@@ -95,6 +95,6 @@ export function buildRunExport(runs, filters = {}, exportedAt = new Date()) {
       action_type: text(filters.actionType || 'all', 100),
       search: text(filters.search || '', 200),
     },
-    runs: Array.isArray(runs) ? runs.slice(0, 500).map(safeRun) : [],
+    runs: Array.isArray(runs) ? runs.map(safeRun) : [],
   }
 }

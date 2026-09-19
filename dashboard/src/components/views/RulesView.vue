@@ -18,6 +18,7 @@ import LogsView from './LogsView.vue'
 const automationSection = ref(store.pendingAutomationSection || 'rules')
 const activeRuleIndex = ref(null)
 let editorAdminKeyPassword = ''
+let originalRuleSnapshot = ''
 const draftRule = ref(null)
 const baseline = ref('')
 const pendingRuleIndex = ref(null)
@@ -91,7 +92,6 @@ function visitRuleNodes(rule, visitor) {
     ;(node.children || []).forEach(visitCondition)
   }
   visitCondition(rule?.condition)
-  ;(rule?.preconditions || []).forEach(visitAction)
   ;(rule?.actions || []).forEach(visitAction)
 }
 function sensitiveParamNames(node, kind) {
@@ -102,6 +102,7 @@ function sensitiveParamNames(node, kind) {
 }
 function sanitizedRuleForRecovery(rule) {
   const sanitized = clone(rule)
+  if (sanitized.preconditions?.length) sanitized.preconditions = [{}]
   const sensitiveVariables = new Set((sanitized.variables || []).filter(item => item.sensitive).map(item => item.id))
   for (const field of ['constants', 'variables']) {
     for (const item of sanitized[field] || []) {
@@ -116,6 +117,7 @@ function sanitizedRuleForRecovery(rule) {
   return sanitized
 }
 function restoreSensitiveParams(targetRule, currentRule) {
+  if (targetRule.preconditions?.length && currentRule.preconditions) targetRule.preconditions = clone(currentRule.preconditions)
   for (const field of ['constants', 'variables']) {
     const current = new Map((currentRule[field] || []).map(item => [item.id, item]))
     for (const item of targetRule[field] || []) {
@@ -232,7 +234,7 @@ async function restoreDraftRecovery(index) {
   }
   const restore = await confirmDialog(
     '恢复未保存的草稿吗？',
-    'NotmyFault 找到了这条规则上次关闭前的修改。',
+    'NotmyFault 找到了这条规则上次关闭前的修改。敏感值不保存在草稿中：已有节点使用规则已保存的值，新节点和复制节点需要重新输入敏感值。',
     '恢复草稿',
   )
   if (restore) {
@@ -291,6 +293,7 @@ async function openRule(index) {
   let next
   try { next = ensureRuleBindingIds(normalizeRuleDraft(clone(store.configData.rules[index]))) }
   catch (error) { await alertDialog('规则无法编辑', error.message); return }
+  originalRuleSnapshot = JSON.stringify(store.configData.rules[index])
   editorAdminKeyPassword = ''
   showCreatePanel.value = false
   activeRuleIndex.value = index
@@ -355,14 +358,14 @@ function triggerSummary(rule) {
 
 async function persistRules(nextRules, successMessage, password = '') {
   if (store.configError) throw new Error('规则文件尚未通过完整性检查，请先到安全与权限页面处理。')
-  const result = await saveRulesWithApproval(nextRules, password)
+  const result = await saveRulesWithApproval(nextRules, password, store.configData.revision)
   if (result?.cancelled) return null
   if (!result?.ok) {
     const details = Array.isArray(result?.details) ? result.details.join(' · ') : ''
     throw new Error([result?.error || '未知错误', details].filter(Boolean).join('：'))
   }
   const savedRules = Array.isArray(result.rules) ? result.rules : nextRules
-  store.configData = { ...store.configData, rules: savedRules }
+  store.configData = { ...store.configData, rules: savedRules, revision: result.revision }
   snackbar(successMessage)
   return savedRules
 }
@@ -376,6 +379,9 @@ async function doSave(runAfter = false) {
       nextRules.unshift(clone(draftRule.value))
       savedIndex = 0
     } else {
+      savedIndex = nextRules.findIndex(rule => rule.rule_id === draftRule.value.rule_id)
+      if (savedIndex < 0) throw new Error('这条规则已被删除，请保留草稿并重新打开规则列表。')
+      if (JSON.stringify(nextRules[savedIndex]) !== originalRuleSnapshot) throw new Error('这条规则已在别处修改，请保留草稿并重新打开规则后合并修改。')
       nextRules[savedIndex] = clone(draftRule.value)
     }
     const savedRules = await persistRules(
@@ -384,6 +390,7 @@ async function doSave(runAfter = false) {
       password,
     )
     if (!savedRules) return
+    originalRuleSnapshot = JSON.stringify(savedRules[savedIndex])
     activeRuleIndex.value = savedIndex
     draftRule.value = clone(savedRules[savedIndex])
     baseline.value = JSON.stringify(draftRule.value)
@@ -397,20 +404,29 @@ async function doSave(runAfter = false) {
   }
 }
 async function deleteRule(index) {
+  const target = store.configData.rules[index]
+  if (!target) return
+  const ruleId = target.rule_id
+  const snapshot = JSON.stringify(target)
   if (!await confirmDialog('删除这条规则吗？', '此操作将在保存后立即生效。', '删除')) return
   try {
     const nextRules = clone(store.configData.rules)
-    nextRules.splice(index, 1)
+    const currentIndex = nextRules.findIndex(rule => rule.rule_id === ruleId)
+    if (currentIndex < 0) throw new Error('这条规则已被删除。')
+    if (JSON.stringify(nextRules[currentIndex]) !== snapshot) throw new Error('这条规则已在别处修改，请重新确认后删除。')
+    nextRules.splice(currentIndex, 1)
     const savedRules = await persistRules(nextRules, '规则已删除')
     if (!savedRules) return
-    if (activeRuleIndex.value === index) leaveEditorAfterDelete()
+    if (draftRule.value?.rule_id === ruleId) leaveEditorAfterDelete()
   } catch (error) {
     alertDialog('删除失败', error.message)
   }
 }
 async function deleteActiveRule() {
   if (activeRuleIndex.value === -1) { leaveEditorAfterDelete(); return }
-  await deleteRule(activeRuleIndex.value)
+  const index = store.configData.rules.findIndex(rule => rule.rule_id === draftRule.value?.rule_id)
+  if (index < 0) { await alertDialog('删除失败', '这条规则已被删除。'); return }
+  await deleteRule(index)
 }
 function leaveEditorAfterDelete() {
   editorAdminKeyPassword = ''
@@ -420,9 +436,9 @@ function leaveEditorAfterDelete() {
   clearDraftRecovery()
   resetDraftHistory()
 }
-async function runManualRule(index, ruleSnapshot = null) {
+async function runManualRule(index, ruleSnapshot) {
   if (runningRuleIndex.value !== null) return
-  const snapshot = ruleSnapshot ? clone(ruleSnapshot) : clone(store.configData.rules[index])
+  const snapshot = clone(ruleSnapshot)
   const fields = buildAllTestInputFields(snapshot, store.schema)
   testPreparation.value = {
     index,
@@ -541,9 +557,6 @@ function processTestEvents() {
     } else if (ev.name === 'error') {
       t.steps.push({ status: 'fail', type: ev.data.action_type || '', stepId: ev.data.step_id, detail: failText(ev.data.error) })
       finishTestWatch()
-    } else if (ev.name === 'workflow_deferred') {
-      t.steps.push({ status: 'deferred', type: '', detail: ev.data.reason || '前置条件未满足' })
-      t.note = '前置条件暂未满足，测试会在条件满足后继续。'
     } else if (ev.name === 'test_assertions_completed') {
       t.assertions = ev.data
     } else if (ev.name === 'workflow_completed') {
@@ -552,7 +565,7 @@ function processTestEvents() {
       } else if (ev.data.status === 'cancelled') {
         t.note = '测试已停止。'
       } else if (!t.expected && ev.data.status === 'succeeded') {
-        t.note = '这条规则没有动作，测试已验证触发与前置条件链路。'
+        t.note = '这条规则没有动作，测试已验证触发条件。'
       }
       finishTestWatch()
     }
@@ -640,10 +653,15 @@ const templates = computed(() => automationTemplates.map(template => ({
   availability: templateAvailability(template, store),
 })))
 async function openCandidateRule(rule) {
-  const approval = await approveRuleBeforeEditing(rule)
-  if (!approval?.ok) return
-  await addRule(rule)
-  editorAdminKeyPassword = approval.adminKeyPassword || ''
+  try {
+    const approval = await approveRuleBeforeEditing(rule)
+    if (!approval?.ok) {
+      if (!approval?.cancelled && !approval?.notified) await alertDialog('草稿无法打开', approval?.error || '规则审批失败')
+      return
+    }
+    await addRule(rule)
+    editorAdminKeyPassword = approval.adminKeyPassword || ''
+  } catch (error) { await alertDialog('草稿无法打开', error.message || '无法连接后台服务') }
 }
 async function addTemplate(t) {
   if (!t.availability.available) {
@@ -727,7 +745,6 @@ onMounted(() => {
 </script>
 
 <template>
-  <!-- 外层套普通容器，避免本视图的切换动画与 App 的页面过渡叠在同一个元素上。 -->
   <div class="rules-view">
   <Transition name="rule-route" mode="out-in">
   <RuleEditor v-if="activeRule" key="editor" :rule="activeRule" :dirty="isDirty"

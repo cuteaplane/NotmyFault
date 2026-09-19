@@ -6,6 +6,7 @@ function comparable(value) {
   return Object.fromEntries(
     Object.entries(value)
       .filter(([key]) => key !== 'binding_id' && key !== 'rule_id')
+      .sort(([left], [right]) => left.localeCompare(right))
       .map(([key, item]) => [key, comparable(item)]),
   )
 }
@@ -98,6 +99,10 @@ export function computeChangeSet(before, after, schema) {
     const curr = Array.isArray(afterArr) ? afterArr : []
     const prevMap = new Map(prev.map((item, i) => [item?.binding_id || 'idx:' + i, { item, index: i }]))
     const currMap = new Map(curr.map((item, i) => [item?.binding_id || 'idx:' + i, { item, index: i }]))
+    if (prevMap.size === currMap.size && [...prevMap.keys()].every(id => currMap.has(id))
+      && [...prevMap.keys()].some((id, index) => id !== [...currMap.keys()][index])) {
+      items.push({ op: 'modify', target: kind, label: `调整${noun}顺序`, parentIndex: options.parentIndex })
+    }
     for (const [id, { item, index }] of currMap) {
       if (!prevMap.has(id)) {
         const name = schema?.actions?.[item.type]?.name || item.type || noun

@@ -11,7 +11,12 @@ function add(field) {
   const constant = field === 'constants'
   ;(props.rule[field] ||= []).push({ id: createBindingId(constant ? 'constant' : 'variable'), name: constant ? '新常量' : '新变量', value_type: 'text', [constant ? 'value' : 'initial']: '' })
 }
-function references(id) { return collectReferences(props.rule).filter(ref => ref.node === id).length }
+const referenceCounts = computed(() => {
+  const counts = new Map()
+  for (const reference of collectReferences(props.rule)) counts.set(reference.node, (counts.get(reference.node) || 0) + 1)
+  return counts
+})
+function references(id) { return referenceCounts.value.get(id) || 0 }
 </script>
 <template>
   <details class="variables-editor">
@@ -33,11 +38,11 @@ function references(id) { return collectReferences(props.rule).filter(ref => ref
 </template>
 <style scoped>
 .variables-editor { padding: 12px 20px; border-bottom: 1px solid var(--md-outline-variant); max-height: 55vh; overflow-y: auto; }
-summary { display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 500; }
-section { display: grid; gap: 12px; margin: 16px 0; }
-h3 { font-size: 14px; margin: 0; }
+.variables-editor summary { display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 500; }
+.variables-editor section { display: grid; gap: 12px; margin: 16px 0; }
+.variables-editor h3 { font-size: 14px; margin: 0; }
 .variable-definition { display: grid; gap: 10px; padding: 12px; border: 1px solid var(--md-outline-variant); border-radius: 12px; }
 .variable-heading { display: flex; align-items: center; gap: 8px; }
 .variable-heading input { flex: 1; }
-small { color: var(--md-on-surface-variant); }
+.variables-editor small { color: var(--md-on-surface-variant); }
 </style>

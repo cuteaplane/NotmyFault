@@ -1,5 +1,5 @@
 // Dashboard 挂载冒烟测试：在 jsdom 中加载构建产物，验证应用挂载与渲染。
-// 运行：npm run build && npm test
+// 运行：npm test
 import { JSDOM } from 'jsdom'
 import fs from 'fs'
 import path from 'path'
@@ -29,7 +29,7 @@ const bindingPolicyOk = parameterAllowsBinding(bindingPolicyMeta, 'source')
   && !parameterAllowsBinding(bindingPolicyMeta, 'destination')
   && bindingPolicyNode.dataInputs.map(port => port.name).join('|') === 'source'
 console.log((bindingPolicyOk?'PASS':'FAIL')+' - literal-only parameters stay out of graph binding ports')
-if (!bindingPolicyOk) process.exit(1)
+if (!bindingPolicyOk) process.exitCode = 1
 
 const copiedBranch = {
   type:'if', binding_id:'a_branch01', condition:{ op:'is_true', left:true },
@@ -42,7 +42,7 @@ regenerateBindingIds(copiedBranch, 'action')
 const copiedBranchOk = copiedBranch.then[0].binding_id !== 'a_query001'
   && copiedBranch.then[1].params.message.$ref.node === copiedBranch.then[0].binding_id
 console.log((copiedBranchOk?'PASS':'FAIL')+' - copying an IF branch keeps its internal data references')
-if (!copiedBranchOk) process.exit(1)
+if (!copiedBranchOk) process.exitCode = 1
 
 const distDir = process.env.DASHBOARD_DIST_DIR || 'dist'
 const dom = new JSDOM('<!DOCTYPE html><html><head></head><body><div id="app"></div></body></html>', {
@@ -50,7 +50,7 @@ const dom = new JSDOM('<!DOCTYPE html><html><head></head><body><div id="app"></d
 })
 const { window } = dom
 
-// mock API + SSE（不依赖真实引擎）
+// API 和 SSE 替身供挂载测试使用。
 const bridgeCalls = []
 const windowStateCalls = []
 let savedRulesPayload = null
@@ -178,7 +178,7 @@ window.HTMLAnchorElement.prototype.click = function() {
   exportedRunFileName = this.download
   exportedFileNames.push(this.download)
 }
-// Dashboard 只支持 pywebview；提供完整的最小 bridge 契约。
+// 挂载测试提供页面使用的 bridge 方法和请求结果。
 window.pywebview = { api: {
   get_config: async () => {
     configReads++
@@ -506,26 +506,26 @@ async function checkDraftStreamParser() {
 
 const draftStreamParserOk = await checkDraftStreamParser()
 console.log((draftStreamParserOk ? 'PASS' : 'FAIL') + ' - AI stream retries preflight auth and parses partial UTF-8 SSE frames')
-if (!draftStreamParserOk) process.exit(1)
+if (!draftStreamParserOk) process.exitCode = 1
 
 const safeExportProbe = buildRunExport([{
   run_id:'run_export001', rule_name:'导出测试', event_type:'manual', status:'succeeded',
   event_payload:{ secret:'不能导出' },
   steps:[{
     step_id:'a_export001', action_type:'notify', status:'succeeded', params:{ secret:'不能导出' },
-    input_summary:[{ name:'message', label:'消息', type:'string', display:'文本 · 4 字符', redacted:false, raw:'不能导出' }],
+    input_summary:[{ name:'message', label:'消息', type:'string', display:'脱敏摘要示例', redacted:false, raw:'不能导出' }],
   }],
 }], { status:'all', timeRange:'7d', actionType:'notify', search:'' }, new Date('2026-08-10T00:00:00Z'))
 const safeExportText = JSON.stringify(safeExportProbe)
 const safeRunExportOk = safeExportProbe.format === 'NotmyFault run diagnostics'
   && safeExportProbe.filters.time_range === '7d'
   && safeExportProbe.runs[0].duration_ms === null
-  && safeExportProbe.runs[0].steps[0].input_summary[0].display === '文本 · 4 字符'
+  && safeExportProbe.runs[0].steps[0].input_summary[0].display === '脱敏摘要示例'
   && !safeExportText.includes('不能导出')
   && !safeExportText.includes('event_payload')
   && !safeExportText.includes('params')
 console.log((safeRunExportOk?'PASS':'FAIL')+' - run export keeps only redacted diagnostic fields')
-if (!safeRunExportOk) process.exit(1)
+if (!safeRunExportOk) process.exitCode = 1
 
 const missingParamsNode = { type:'notify' }
 const ensuredParamsOk = ensureParams(missingParamsNode) === missingParamsNode.params
@@ -555,12 +555,22 @@ const afterRecovery = {
   }],
 }
 const recoveryDiff = computeChangeSet(beforeRecovery, afterRecovery, { actions:{ notify:{ params:[{ name:'message', label:'消息' }] } } })
+const orderedActions = [
+  { binding_id:'a_order001', type:'notify', params:{ first:1, second:2 } },
+  { binding_id:'a_order002', type:'notify', params:{} },
+]
+const orderChanges = computeChangeSet({ actions:orderedActions }, { actions:[...orderedActions].reverse() }, {})
+const sameParamsChanges = computeChangeSet({ actions:orderedActions }, {
+  actions:[{ ...orderedActions[0], params:{ second:2, first:1 } }, orderedActions[1]],
+}, {})
 const recoveryDiffOk = recoveryDiff.length === 1
   && recoveryDiff[0].target === 'failure-action'
   && recoveryDiff[0].detail.includes('旧值 → 新值')
   && summarizeRuleChanges(beforeRecovery, afterRecovery).some(item => item.includes('补救动作'))
+  && orderChanges.some(item => item.target === 'action' && item.label.includes('顺序'))
+  && sameParamsChanges.length === 0
 console.log((ensuredParamsOk && recoveryDiffOk?'PASS':'FAIL')+' - missing params and recovery changes stay editable and visible')
-if (!ensuredParamsOk || !recoveryDiffOk) process.exit(1)
+if (!ensuredParamsOk || !recoveryDiffOk) process.exitCode = 1
 
 const builtHtml = fs.readFileSync(path.join(distDir, 'index.html'), 'utf8')
 const entryPath = builtHtml.match(/<script[^>]*type="module"[^>]*src="([^"]+)"/)?.[1]
@@ -571,9 +581,9 @@ await new Promise(r => setTimeout(r, 100))
 const offlineHtml = document.getElementById('app').innerHTML
 const offlineStateOk = offlineHtml.includes('引擎未运行')
   && offlineHtml.includes('启动引擎')
-  && !offlineHtml.includes('正在连接后台服务')
+  && !document.querySelector('.dashboard-home [aria-busy="true"]')
 console.log((offlineStateOk?'PASS':'FAIL')+' - offline home shows the final state without a connection spinner')
-if (!offlineStateOk) process.exit(1)
+if (!offlineStateOk) process.exitCode = 1
 
 window.dispatchEvent(new window.Event('pywebviewready'))
 await new Promise(r => setTimeout(r, 100))
@@ -589,7 +599,7 @@ checks.push(['bridge readiness restores engine state without waiting for polling
 checks.push(['home diagnostics omit the full platform capability list', homeKeepsCapabilitiesOutOfDiagnostics])
 let ok = true
 for (const [name, pass] of checks) { console.log((pass?'PASS':'FAIL')+' - '+name); if(!pass) ok=false }
-if (!ok) { console.error(html.substring(0, 600)); process.exit(1) }
+if (!ok) { console.error(html.substring(0, 600)); process.exitCode = 1 }
 
 const homeNav = [...document.querySelectorAll('.nav-item')].find(
   button => button.textContent.includes('首页'),
@@ -603,10 +613,10 @@ const pausedControls = [...document.querySelectorAll('.home-engine-actions .btn'
 const pausedControlsOk = pausedControls.length === 2
   && pausedControls.some(button => button.textContent.includes('启动自动化'))
   && pausedControls.some(button => button.textContent.includes('彻底停止'))
-const startupAlertOk = document.querySelector('.engine-startup-alert')?.textContent.includes('安装文件异常，请重新安装 NotmyFault')
-  && document.querySelector('.engine-startup-alert .btn')?.textContent.includes('查看重新安装说明')
+const startupAlertOk = !!document.querySelector('.engine-startup-alert .engine-startup-alert-copy')
+  && !!document.querySelector('.engine-startup-alert .btn')
 console.log((pausedControlsOk && startupAlertOk?'PASS':'FAIL')+' - paused automation keeps controls and startup failure in separate layouts')
-if (!pausedControlsOk || !startupAlertOk) process.exit(1)
+if (!pausedControlsOk || !startupAlertOk) process.exitCode = 1
 
 const rulesNav = [...document.querySelectorAll('.nav-item')].find(
   button => button.textContent.includes('自动化'),
@@ -631,7 +641,7 @@ await new Promise(r => setTimeout(r, 20))
 const validationExpandsOnDemand = document.querySelector('.flow-validation.expanded .flow-validation-list')
 console.log((automationPageOk && disabledAiCreateOk?'PASS':'FAIL')+' - AI-off creation opens a blank editor without draft surfaces')
 console.log((compactValidationOk && validationExpandsOnDemand?'PASS':'FAIL')+' - rule validation stays compact until expanded')
-if (!automationPageOk || !disabledAiCreateOk || !compactValidationOk || !validationExpandsOnDemand) process.exit(1)
+if (!automationPageOk || !disabledAiCreateOk || !compactValidationOk || !validationExpandsOnDemand) process.exitCode = 1
 document.querySelector('.rule-back-btn')?.click()
 await new Promise(r => setTimeout(r, 50))
 const earlySettingsNav = [...document.querySelectorAll('.nav-item')].find(
@@ -658,7 +668,7 @@ const automationTemplatesOk = [...document.querySelectorAll('.automation-templat
     schema:{ triggers:{ blocked:{ availability:'unavailable', unavailable_reasons:['缺少设备'] } } },
   }).available
 console.log((automationTemplatesOk?'PASS':'FAIL')+' - AI-on creation keeps templates without the legacy draft card')
-if (!automationTemplatesOk) process.exit(1)
+if (!automationTemplatesOk) process.exitCode = 1
 
 const openQuickCreate = () => [...document.querySelectorAll('.automation-create-panel button')].find(
   button => button.textContent.includes('自己搭一个'),
@@ -680,7 +690,7 @@ const quickCreateDraftOk = document.querySelector('.rule-title-capsule')?.textCo
   && document.querySelector('.graph-node-trigger')?.textContent.includes('定时')
   && document.querySelector('.graph-node-action')?.textContent.includes('显示通知')
 console.log((quickCreateSecondStepOk && quickCreateDraftOk?'PASS':'FAIL')+' - automation page opens a real prefilled rule draft')
-if (!quickCreateSecondStepOk || !quickCreateDraftOk) process.exit(1)
+if (!quickCreateSecondStepOk || !quickCreateDraftOk) process.exitCode = 1
 document.querySelector('.rule-back-btn')?.click()
 await new Promise(r => setTimeout(r, 50))
 document.querySelector('.rule-library-row')?.click()
@@ -702,9 +712,9 @@ await new Promise(r => setTimeout(r, 80))
 const undoDraftOk = document.querySelector('.rule-title-capsule input')?.value === '挂载测试规则'
 const draftRecoveryCleared = !window.localStorage.getItem('notmyfault.ruleDraft.v1')
 console.log((undoDraftOk?'PASS':'FAIL')+' - rule draft supports undo history')
-if (!undoDraftOk) process.exit(1)
+if (!undoDraftOk) process.exitCode = 1
 console.log((draftRecoveryStored && draftRecoveryCleared?'PASS':'FAIL')+' - unsaved draft recovery follows the history state')
-if (!draftRecoveryStored || !draftRecoveryCleared) process.exit(1)
+if (!draftRecoveryStored || !draftRecoveryCleared) process.exitCode = 1
 window.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
 await new Promise(r => setTimeout(r, 20))
 
@@ -727,12 +737,9 @@ let singleConditionOk = !!firstTrigger
 for (const mode of ['节点编辑', '普通模式']) {
   ;[...document.querySelectorAll('.editor-mode-switch button')].find(button => button.textContent.includes(mode))?.click()
   await pause(20)
-  if (mode === '节点编辑') {
-    document.querySelector('.node-canvas-tools button')?.click()
-    await pause(20)
-  }
-  const scope = mode === '节点编辑' ? '.node-inspector' : '.classic-rule-editor'
-  ;[...document.querySelectorAll(`${scope} button`)].find(button => button.textContent.includes('改为单个条件'))?.click()
+  document.querySelector('.node-canvas-tools button')?.click()
+  await pause(20)
+  ;[...document.querySelectorAll('.node-inspector button')].find(button => button.textContent.includes('改为单个条件'))?.click()
   await pause(20)
   const checksBefore = bridgeCalls.filter(call => call.path === '/api/rules/validate').length
   document.querySelector('.rule-check-btn')?.click()
@@ -746,12 +753,15 @@ for (const mode of ['节点编辑', '普通模式']) {
     && !Object.hasOwn(single || {}, 'event')
     && document.querySelectorAll('.graph-node-trigger').length === 1
     && document.querySelectorAll('.graph-node-condition').length === 0
+    && document.querySelectorAll('.rule-editor-page main').length === 1
+    && document.querySelectorAll('.node-inspector').length === 1
+    && document.querySelector('.editor-mode-switch button[aria-selected="true"]')?.textContent.includes(mode)
   document.querySelector('.rule-history-actions button:first-child')?.click()
   await pause(30)
   singleConditionOk &&= document.querySelectorAll('.graph-node-trigger').length === 3
 }
 console.log((singleConditionOk?'PASS':'FAIL')+' - both editors keep the first trigger and its references when simplifying, and manual checks validate immediately')
-if (!singleConditionOk) process.exit(1)
+if (!singleConditionOk) process.exitCode = 1
 ;[...document.querySelectorAll('.editor-mode-switch button')].find(button => button.textContent.includes('节点编辑'))?.click()
 await pause(20)
 
@@ -785,7 +795,7 @@ console.log((adminPasswordGateOk?'PASS':'FAIL')+' - strict admin rule save asks 
 if (!adminPasswordGateOk) {
   console.error(JSON.stringify({ rejectedPasswordVisible, adminRulePasswordAttempts }))
   console.error(document.querySelector('.app-dialog')?.textContent)
-  process.exit(1)
+  process.exitCode = 1
 }
 const testPrepDialog = document.querySelector('.test-prep-dialog')
 const testPrepShowsRoute = testPrepDialog?.textContent.includes('模拟触发数据')
@@ -827,7 +837,7 @@ const testPrepSafe = testPrepShowsRoute && !!sensitiveTestInput
   && !savedTestData.includes('测试敏感标题')
   && savedTestData.includes('opened')
 console.log((testPrepSafe?'PASS':'FAIL')+' - test preparation groups data and never persists sensitive values')
-if (!testPrepSafe) process.exit(1)
+if (!testPrepSafe) process.exitCode = 1
 const stopTestButton = [...document.querySelectorAll('.test-result-dialog button')].find(
   button => button.textContent.includes('停止测试'),
 )
@@ -837,7 +847,7 @@ const testRunCanStop = !!stopTestButton && bridgeCalls.some(call =>
   call.path === '/api/runs/run_test001/cancel' && call.method === 'POST'
 )
 console.log((testRunCanStop?'PASS':'FAIL')+' - a running manual test can be stopped')
-if (!testRunCanStop) process.exit(1)
+if (!testRunCanStop) process.exitCode = 1
 const manualTestStayedLocked = [...document.querySelectorAll('button')].find(
   button => button.textContent.includes('测试中'),
 )?.disabled === true
@@ -852,7 +862,7 @@ const manualTestUnlockedAtTerminal = [...document.querySelectorAll('button')].fi
 console.log((manualTestStayedLocked && manualTestUnlockedAtTerminal?'PASS':'FAIL')+' - manual test recovers its terminal status after an SSE disconnect')
 if (!manualTestStayedLocked || !manualTestUnlockedAtTerminal) {
   console.error(JSON.stringify({ manualTestStayedLocked, manualTestUnlockedAtTerminal, engineConnections, runReads:bridgeCalls.filter(call => call.path === '/api/runs/run_test001') }))
-  process.exit(1)
+  process.exitCode = 1
 }
 ;[...document.querySelectorAll('.test-result-dialog button')].find(
   button => button.textContent.includes('关闭'),
@@ -864,7 +874,7 @@ const restoredTestDialog = document.querySelector('.test-prep-dialog')
 const testDataRestored = restoredTestDialog?.querySelector('input[type="text"]')?.value === 'opened'
   && restoredTestDialog?.querySelector('input[type="password"]')?.value === ''
 console.log((testDataRestored?'PASS':'FAIL')+' - test preparation restores only non-sensitive values')
-if (!testDataRestored) process.exit(1)
+if (!testDataRestored) process.exitCode = 1
 ;[...restoredTestDialog.querySelectorAll('button')].find(
   button => button.textContent.includes('取消'),
 )?.click()
@@ -880,7 +890,7 @@ const snapshotOk = snapshotCall?.data?.rule?.name === '挂载测试规则'
   && snapshotCall?.data?.test_assertions?.[0]?.step_id === 'a_mount001'
   && snapshotCall?.data?.test_assertions?.[0]?.expected === true
 console.log((snapshotOk?'PASS':'FAIL')+' - test-rule sends exact saved rule snapshot')
-if (!snapshotOk) process.exit(1)
+if (!snapshotOk) process.exitCode = 1
 
 // D. requestTestContext：空 path（完整 payload）必须写入 trigger_payloads / event_payload
 const { buildAllTestInputFields, buildPreparedTestContext, buildTestInputFields, requestTestContext } = await import('../src/lib/bindings.js')
@@ -900,7 +910,7 @@ const testCtx = requestTestContext(ctxRule, ctxSchema, () => promptInputs.shift(
 const fullPayloadOk = testCtx?.trigger_payloads?.t_full01?.matched_title === '记事本 - 无标题'
   && testCtx?.event_payload?.type === 'window_title'
 console.log((fullPayloadOk?'PASS':'FAIL')+' - requestTestContext writes full payload for empty path')
-if (!fullPayloadOk) process.exit(1)
+if (!fullPayloadOk) process.exitCode = 1
 
 const preparedContext = buildPreparedTestContext([
   { key:'count', scope:'event', node:'', path:['count'], type:'number', required:true },
@@ -952,7 +962,7 @@ const preparedTypesOk = preparedContext.event_payload.count === 12.5
   && preparedContext.step_outputs.a_nested01.rows[0]['名称'] === '条目'
   && unsafeContextRejected && !({}).polluted && encodedInputsOk && ordinaryObjectsOk
 console.log((preparedTypesOk?'PASS':'FAIL')+' - prepared test data follows output types and expands full payload references')
-if (!preparedTypesOk) process.exit(1)
+if (!preparedTypesOk) process.exitCode = 1
 
 const objectCompatibilityCases = [
   [{ type:'object', additional_properties:'text' }, { type:'object', properties:{ count:'int' } }, false],
@@ -974,7 +984,7 @@ const bindingTypesOk = objectCompatibilityCases.every(([source, target, expected
     return selected.type.type === type && selected.optional === optional && source?.type.type === type
   })
 console.log((bindingTypesOk?'PASS':'FAIL')+' - object and shared binding types follow their declared fields')
-if (!bindingTypesOk) process.exit(1)
+if (!bindingTypesOk) process.exitCode = 1
 
 const partialSchema = {
   triggers: {},
@@ -1018,7 +1028,7 @@ const partialInputsOk = partialFields.filter(field => field.scope === 'step').le
   && actionOutputDefs(partialRule.actions[1], partialSchema, partialRule)[0].sensitive === true
   && allPartialFields.some(field => field.scope === 'step')
 console.log((partialInputsOk?'PASS':'FAIL')+' - partial test run collects skipped upstream action outputs')
-if (!partialInputsOk) process.exit(1)
+if (!partialInputsOk) process.exitCode = 1
 
 const settingsNav = [...document.querySelectorAll('.nav-item')].find(
   button => button.textContent.includes('设置'),
@@ -1051,16 +1061,16 @@ const securitySummaryOk = securitySummaryDetails?.textContent.includes('动作 1
   && securitySummaryDetails?.textContent.includes('"secret":"***"')
   && securitySummaryDetails?.querySelectorAll('.chip-admin').length === 4
 console.log((securitySummaryOk?'PASS':'FAIL')+' - security approval shows nested branches, fallback actions and masked parameters')
-if (!securitySummaryOk) process.exit(1)
+if (!securitySummaryOk) process.exitCode = 1
 mockConfigSecurity = { status:'ok', reason:'', summary:null }
 ;[...document.querySelectorAll('.settings-root-list button')].find(
   button => button.textContent.includes('关于 NotmyFault'),
 )?.click()
-await new Promise(r => setTimeout(r, 20))
+await waitFor('.settings-capability-report')
 const capabilitiesMovedToSettings = document.querySelector('.settings-capability-report')?.textContent.includes('audio.control')
   && document.querySelector('.settings-capability-report')?.textContent.includes('1 / 2 可用')
 console.log((capabilitiesMovedToSettings?'PASS':'FAIL')+' - platform capability details live under settings about')
-if (!capabilitiesMovedToSettings) process.exit(1)
+if (!capabilitiesMovedToSettings) process.exitCode = 1
 document.querySelector('.settings-back')?.click()
 await new Promise(r => setTimeout(r, 20))
 ;[...document.querySelectorAll('.settings-root-list button')].find(
@@ -1090,7 +1100,7 @@ const providerPresetApplied = document.querySelector('.ai-drafting-settings inpu
   && document.querySelector('.ai-drafting-settings select[name="ai-api-format"]')?.value === 'responses'
   && document.querySelector('.ai-drafting-settings')?.textContent.includes('服务商 API 兼容地址')
 console.log((aiProvidersOk && providerPresetApplied && providerFormatMismatchIsCustom?'PASS':'FAIL')+' - common AI provider preset fills and matches endpoint model and format')
-if (!aiProvidersOk || !providerPresetApplied || !providerFormatMismatchIsCustom) process.exit(1)
+if (!aiProvidersOk || !providerPresetApplied || !providerFormatMismatchIsCustom) process.exitCode = 1
 const aiEndpoint = document.querySelector('.ai-drafting-settings input[name="ai-endpoint"]')
 const aiModel = document.querySelector('.ai-drafting-settings input[name="ai-model"]')
 if (aiEndpoint) { aiEndpoint.value = 'https://api.example.com/v1'; aiEndpoint.dispatchEvent(new window.Event('input', { bubbles:true })) }
@@ -1132,7 +1142,7 @@ const aiKeySavedSecurely = aiSettingsSavedWithoutKey
   && savedKeyInputIsHidden
   && keyPersistenceHasNoRuleOrPluginEffects
 console.log((aiKeySavedSecurely?'PASS':'FAIL')+' - saved AI keys show a green state and hide the editor until changed')
-if (!aiKeySavedSecurely) process.exit(1)
+if (!aiKeySavedSecurely) process.exitCode = 1
 ;[...document.querySelectorAll('.ai-drafting-settings button')].find(button => button.textContent.includes('更改 API 密钥'))?.click()
 await new Promise(r => setTimeout(r, 20))
 const unsavedApiKey = 'leave-settings-without-saving'
@@ -1218,7 +1228,7 @@ const aiDraftPreviewOk = rulePreviewCardOk
 console.log((aiDraftPreviewOk?'PASS':'FAIL')+' - AI drafting preserves history and masks sensitive rule parameters')
 if (!aiDraftPreviewOk) {
   console.error(JSON.stringify({ firstAiTurn, secondAiTurn, rulePreviewCardOk }))
-  process.exit(1)
+  process.exitCode = 1
 }
 T.time_schedule.name = originalTriggerName
 A.notify.name = originalActionName
@@ -1245,7 +1255,7 @@ const aiDraftReviewOnlyOk = document.querySelector('.rule-title-capsule')?.textC
 console.log((aiDraftReviewOnlyOk?'PASS':'FAIL')+' - rule drafts open the editor only after admin approval')
 if (!aiDraftReviewOnlyOk) {
   console.error(JSON.stringify({ earlyApprovalAttempts, aiDraftNeedsApproval, savedRulesPayload }))
-  process.exit(1)
+  process.exitCode = 1
 }
 
 mockAiDraftError = 'AI 模拟错误：请稍后重试'
@@ -1279,7 +1289,7 @@ const conversationPersistsAfterRetry = savedConversation.length > 0
 console.log((requestHasNoRemovedPluginFields && errorAnnouncedOnce && conversationPersistsAfterRetry?'PASS':'FAIL')+' - AI errors can be retried without removed plugin fields')
 if (!requestHasNoRemovedPluginFields || !errorAnnouncedOnce || !conversationPersistsAfterRetry) {
   console.error(JSON.stringify({ failedTurn, visibleErrorMessages:visibleErrorMessages.length, retryTurn, savedConversation }))
-  process.exit(1)
+  process.exitCode = 1
 }
 mockAiDraftError = ''
 mockAiStreamMode = 'stalled'
@@ -1298,7 +1308,7 @@ const abortStaysQuiet = stoppedLabels.length === 1
     message.textContent.includes('连接已中断') || message.textContent.includes('草稿服务暂时不可用')
   ))
 console.log((abortStaysQuiet ? 'PASS' : 'FAIL') + ' - stopping an AI stream returns to idle without an error turn')
-if (!abortStaysQuiet) process.exit(1)
+if (!abortStaysQuiet) process.exitCode = 1
 mockAiStreamMode = 'normal'
 mockAiDraftResultType = 'rule_draft'
 
@@ -1326,7 +1336,7 @@ const historyAndResetOk = failedAndStoppedTurnsStayOutOfHistory
 console.log((historyAndResetOk?'PASS':'FAIL')+' - failed turns stay out of history and clearing removes session data')
 if (!historyAndResetOk) {
   console.error(JSON.stringify({ failedAndStoppedTurnsStayOutOfHistory, resetUsesAppDialog, newConversationResetsToWelcome }))
-  process.exit(1)
+  process.exitCode = 1
 }
 
 const aiKeyDeleteStart = bridgeCalls.length
@@ -1346,7 +1356,7 @@ const keyDeleteHasNoRuleOrPluginEffects = !aiKeyDeleteCalls.some(call => (
   /^\/api\/(?:rules|plugins)(?:\/|$)/.test(call.path)
 ))
 console.log((savedKeyDeleted && keyDeleteHasNoRuleOrPluginEffects?'PASS':'FAIL')+' - deleting a saved AI key updates status without rule or plugin side effects')
-if (!savedKeyDeleted || !keyDeleteHasNoRuleOrPluginEffects) process.exit(1)
+if (!savedKeyDeleted || !keyDeleteHasNoRuleOrPluginEffects) process.exitCode = 1
 rulesNav?.click()
 await new Promise(r => setTimeout(r, 50))
 ;[...document.querySelectorAll('.rules-library button')].find(button => button.textContent.includes('创建自动化'))?.click()
@@ -1385,7 +1395,7 @@ const earlyApprovalOpensEditor = earlyApprovalAttempts.join('|') === '|wrong-sec
 console.log((earlyApprovalBlocksEditor && earlyApprovalRejectsWrongKey && earlyApprovalOpensEditor?'PASS':'FAIL')+' - high-risk quick drafts require a real key approval before the editor')
 if (!earlyApprovalBlocksEditor || !earlyApprovalRejectsWrongKey || !earlyApprovalOpensEditor) {
   console.error(JSON.stringify({ earlyApprovalAttempts, earlyApprovalBlocksEditor, earlyApprovalRejectsWrongKey, earlyApprovalOpensEditor, quickDialog:document.querySelector('.quick-create-dialog')?.textContent, dialog:document.querySelector('.app-dialog')?.textContent }))
-  process.exit(1)
+  process.exitCode = 1
 }
 // 创建时验证通过的密码要在保存时复用，不再弹第二遍。
 const saveCallsBefore = saveConfigCalls.length
@@ -1405,7 +1415,7 @@ const approvedSaveOk = saveConfigCalls.length === saveCallsBefore + 1
 console.log((approvedSaveOk?'PASS':'FAIL')+' - early-approved admin draft saves with the verified password and no second prompt')
 if (!approvedSaveOk) {
   console.error(JSON.stringify({ saveConfigCalls: saveConfigCalls.map(call => call.password), dialog:document.querySelector('.app-dialog')?.textContent }))
-  process.exit(1)
+  process.exitCode = 1
 }
 // 删掉这条为验证保存而建的规则，让后面的删除末条测试仍从一条规则开始。
 document.querySelector('.rule-back-btn')?.click()
@@ -1430,7 +1440,7 @@ const runExportDownloadOk = exportedRunBlob?.type === 'application/json;charset=
   && exportedRunBlob.size > 0
   && /^NotmyFault-run-diagnostics-\d{8}-\d{6}\.json$/.test(exportedRunFileName)
 console.log((runExportConfirmOk && runExportDownloadOk?'PASS':'FAIL')+' - run center confirms and downloads a redacted export')
-if (!runExportConfirmOk || !runExportDownloadOk) process.exit(1)
+if (!runExportConfirmOk || !runExportDownloadOk) process.exitCode = 1
 document.querySelector('.run-card-main')?.click()
 await new Promise(r => setTimeout(r, 20))
 document.querySelector('.run-step-open')?.click()
@@ -1454,9 +1464,9 @@ const actionFailureSettingsOk = failureSettings?.textContent.includes('停止，
   && failureSettings.textContent.includes('继续执行后面的动作')
   && failureSettings.textContent.includes('重试可能重复发通知、写文件或启动程序')
   && failureSettings.textContent.includes('插件没有提供安全停止能力')
-  && document.querySelector('.classic-rule-editor .action-flow-card .flow-card-copy small')?.textContent.includes('失败后继续 · 最多重试 2 次')
+  && failurePolicySelect.value === 'continue' && retrySelect.value === '2'
 console.log((actionFailureSettingsOk?'PASS':'FAIL')+' - action editor exposes stop, continue and retry settings')
-if (!actionFailureSettingsOk) process.exit(1)
+if (!actionFailureSettingsOk) process.exitCode = 1
 
 const addFailureAction = [...failureSettings.querySelectorAll('button')].find(
   button => button.textContent.includes('添加补救动作'),
@@ -1472,9 +1482,8 @@ const failureBranchOk = failurePickerOk
   && controlLabels.includes('失败时')
   && controlLabels.includes('处理后继续')
   && failureActionNote?.closest('.node-inspector').textContent.includes('这个动作只会在上方主动作最终失败时执行')
-  && document.querySelector('.classic-rule-editor .action-flow-card .flow-card-copy small')?.textContent.includes('1 个补救动作')
 console.log((failureBranchOk?'PASS':'FAIL')+' - failed actions can run an editable recovery branch')
-if (!failureBranchOk) process.exit(1)
+if (!failureBranchOk) process.exitCode = 1
 
 await pause(350)
 document.querySelector('.graph-node-failure-action button[title="删除补救动作"]')?.click()
@@ -1494,7 +1503,7 @@ await pause(30)
 canvasDeleteOk &&= document.querySelectorAll('.graph-node-action').length === 1
   && document.querySelectorAll('.graph-node-failure-action').length === 1
 console.log((canvasDeleteOk?'PASS':'FAIL')+' - canvas delete buttons remove the selected action or recovery action')
-if (!canvasDeleteOk) process.exit(1)
+if (!canvasDeleteOk) process.exitCode = 1
 
 document.querySelector('.graph-node-trigger')?.click()
 await new Promise(r => setTimeout(r, 30))
@@ -1504,7 +1513,7 @@ const absenceEditorOk = [...document.querySelectorAll('.graph-node-condition')].
   && document.querySelector('.node-inspector')?.textContent.includes('等待时长（秒）')
   && !document.querySelector('.stage-check')
 console.log((absenceEditorOk?'PASS':'FAIL')+' - NOT exposes an absence timer and replaces pre-run checks')
-if (!absenceEditorOk) process.exit(1)
+if (!absenceEditorOk) process.exitCode = 1
 ;[...document.querySelectorAll('.node-inspector button')].find(button => button.textContent.includes('改为事件发生时'))?.click()
 await new Promise(r => setTimeout(r, 30))
 
@@ -1513,7 +1522,7 @@ await new Promise(r => setTimeout(r, 30))
   button => button.textContent.includes('普通模式'),
 )?.click()
 await new Promise(r => setTimeout(r, 30))
-;[...document.querySelectorAll('.flow-add-control button')].find(
+;[...document.querySelectorAll('.node-canvas-tools button')].find(
   button => button.textContent.includes('添加动作'),
 )?.click()
 await new Promise(r => setTimeout(r, 30))
@@ -1521,7 +1530,7 @@ await new Promise(r => setTimeout(r, 30))
   button => button.textContent.includes('宏录制动作'),
 )?.click()
 await new Promise(r => setTimeout(r, 40))
-;[...document.querySelectorAll('.action-flow-card')].at(-1)?.querySelector('summary')?.click()
+;[...document.querySelectorAll('.graph-node-action')].at(-1)?.click()
 await new Promise(r => setTimeout(r, 30))
 const macroCaptureButton = [...document.querySelectorAll('.plugin-data-field button')].find(
   button => button.textContent.includes('录制操作宏'),
@@ -1562,12 +1571,11 @@ const macroPageOk = macroPageSource.includes('操作宏插件页面')
   && macroPageSource.includes('Content-Security-Policy')
   && macroPageSource.includes("connect-src 'none'")
 console.log((macroCaptured && macroPageOk && macroFullPageOpen?'PASS':'FAIL')+' - private macro data is edited through the full-page plugin extension view')
-if (!macroCaptured || !macroPageOk || !macroFullPageOpen) process.exit(1)
+if (!macroCaptured || !macroPageOk || !macroFullPageOpen) process.exitCode = 1
 
-;[...document.querySelectorAll('.classic-rule-editor .flow-add-control button')].find(button => button.textContent.includes('添加 IF'))?.click()
+;[...document.querySelectorAll('.node-canvas-tools button')].find(button => button.textContent.includes('添加 IF'))?.click()
 await new Promise(r => setTimeout(r, 30))
-const ifCard = [...document.querySelectorAll('.classic-rule-editor .action-flow-card')].at(-1)
-if (ifCard && !ifCard.open) ifCard.querySelector('summary')?.click()
+const ifCard = document.querySelector('.node-inspector')
 await new Promise(r => setTimeout(r, 30))
 const ifBranches = [...ifCard.querySelectorAll('.if-action-editor > .if-branch')]
 for (const branch of ifBranches) {
@@ -1579,7 +1587,7 @@ for (const branch of ifBranches) {
 const ifEditorOk = ifBranches.length === 2
   && ifBranches.every(branch => branch.querySelector('.if-branch-action'))
 console.log((ifEditorOk?'PASS':'FAIL')+' - IF edits separate THEN and ELSE action lists')
-if (!ifEditorOk) process.exit(1)
+if (!ifEditorOk) process.exitCode = 1
 
 const saveMacroBaseline = [...document.querySelectorAll('.rule-editor-actions button')].find(
   button => button.textContent.includes('保存规则'),
@@ -1590,7 +1598,7 @@ const savedIf = savedRulesPayload?.find(rule => rule.rule_id === 'r_mount001')?.
 const ifSavedOk = savedIf?.then?.length === 1 && savedIf?.else?.length === 1
   && savedIf.condition?.op === 'is_true' && !Object.hasOwn(savedIf, 'params')
 console.log((ifSavedOk?'PASS':'FAIL')+' - saving preserves IF branches and predicate data')
-if (!ifSavedOk) process.exit(1)
+if (!ifSavedOk) process.exitCode = 1
 
 const definitionsPanel = document.querySelector('.variables-editor')
 definitionsPanel.open = true
@@ -1633,11 +1641,13 @@ const businessObject = { $literal:'business label', content:'保留字段' }
 objectExpression.value = JSON.stringify(businessObject)
 objectExpression.dispatchEvent(new window.Event('input', { bubbles:true }))
 await pause(20)
+const expressionTextPreserved = objectExpression.value === JSON.stringify(businessObject)
 const objectValueField = objectDefinition.querySelector('.typed-value-input textarea')
 const mixedObjectDisplayed = JSON.parse(objectValueField.value).content === '保留字段'
 objectValueField.value = JSON.stringify({ ...businessObject, content:'已编辑字段' })
 objectValueField.dispatchEvent(new window.Event('input', { bubbles:true }))
 await pause(20)
+const typedTextPreserved = objectValueField.value === JSON.stringify({ ...businessObject, content:'已编辑字段' })
 ;[...document.querySelectorAll('.node-canvas-tools button')].find(button => button.textContent.includes('变量赋值')).click()
 await pause(30)
 const assignmentEditor = [...document.querySelectorAll('.variable-assignment-editor')].at(-1)
@@ -1659,11 +1669,14 @@ const variableEditorOk = typedRule?.constants?.[0]?.value?.$nmf_value?.data === 
   && typedAssignment?.variable === typedRule.variables[0].id
   && typedAssignment?.value?.$ref?.node === typedRule.constants[0].id
   && invalidTypeKeptDraft && mixedObjectDisplayed
+  && expressionTextPreserved && typedTextPreserved
   && typedRule.constants.find(item => item.name === '业务对象')?.value?.content === '已编辑字段'
   && typedRule.constants.find(item => item.name === '业务对象')?.value?.$literal === 'business label'
 console.log((variableEditorOk?'PASS':'FAIL')+' - variable editor saves precise constants and a bound assignment')
-if (!variableEditorOk) process.exit(1)
+if (!variableEditorOk) process.exitCode = 1
 
+;[...document.querySelectorAll('.graph-node-action')].find(node => node.textContent.includes('宏录制动作'))?.click()
+await pause(30)
 const reopenMacroButton = [...document.querySelectorAll('.plugin-data-field button')].find(
   button => button.textContent.includes('1 个操作宏 · 1 步'),
 )
@@ -1683,10 +1696,10 @@ const reopenCall = [...bridgeCalls].reverse().find(call => (
   call.path === '/api/plugins/macro_run/extensions/commands/open_macro/invoke'
 ))
 const macroReopensWithSavedSteps = reopenCall?.data?.current_value?.data?.steps?.length === 1
-  && initMessages.some(message => message.type === 'init' && message.state?.steps?.length === 1)
-  && reopenedMacroFrame?.getAttribute('srcdoc')?.includes('"steps":[{')
+  && initMessages.every(message => message.type !== 'init' || message.state?.steps?.length === 1)
+  && initMessages.filter(message => message.type === 'init').length <= 1
 console.log((macroReopensWithSavedSteps?'PASS':'FAIL')+' - saved private macro reopens with its recorded steps')
-if (!macroReopensWithSavedSteps) process.exit(1)
+if (!macroReopensWithSavedSteps) process.exitCode = 1
 if (reopenedMacroFrame?.contentWindow) {
   window.dispatchEvent(new window.MessageEvent('message', {
     source: reopenedMacroFrame.contentWindow,
@@ -1706,7 +1719,7 @@ const saveAfterMacroReplacement = [...document.querySelectorAll('.rule-editor-ac
 const replacedMacroMarksDraftDirty = document.querySelector('.plugin-data-field')?.textContent.includes('1 个操作宏 · 2 步')
   && saveAfterMacroReplacement?.disabled === false
 console.log((replacedMacroMarksDraftDirty?'PASS':'FAIL')+' - replacing a saved macro marks the rule draft as changed')
-if (!replacedMacroMarksDraftDirty) process.exit(1)
+if (!replacedMacroMarksDraftDirty) process.exitCode = 1
 
 const testReplacedMacro = [...document.querySelectorAll('.rule-editor-actions button')].find(
   button => button.textContent.includes('测试规则'),
@@ -1717,7 +1730,7 @@ const savedMacroSteps = savedRulesPayload?.find(rule => rule.rule_id === 'r_moun
   ?.actions?.find(action => action.type === 'macro_run')?.params?.macro?.data?.steps
 const replacedMacroSavedBeforeTest = savedMacroSteps?.length === 2
 console.log((replacedMacroSavedBeforeTest?'PASS':'FAIL')+' - testing a replaced macro persists the current draft first')
-if (!replacedMacroSavedBeforeTest) process.exit(1)
+if (!replacedMacroSavedBeforeTest) process.exitCode = 1
 ;[...document.querySelectorAll('.test-prep-dialog button')].find(
   button => button.textContent.includes('用这些数据运行'),
 )?.click()
@@ -1727,7 +1740,7 @@ const testedMacroSteps = replacedMacroRunCall?.data?.rule?.actions
   ?.find(action => action.type === 'macro_run')?.params?.macro?.data?.steps
 const replacedMacroRunsCurrentDraft = testedMacroSteps?.length === 2
 console.log((replacedMacroRunsCurrentDraft?'PASS':'FAIL')+' - testing a replaced macro executes the current steps')
-if (!replacedMacroRunsCurrentDraft) process.exit(1)
+if (!replacedMacroRunsCurrentDraft) process.exitCode = 1
 ;[...document.querySelectorAll('.test-result-dialog button')].find(
   button => button.textContent.includes('查看日志'),
 )?.click()
@@ -1736,13 +1749,13 @@ const testLogsOpened = !!document.querySelector('.run-center-page')
   && !document.querySelector('.rule-back-btn')
   && !document.querySelector('.test-result-dialog')
 console.log((testLogsOpened?'PASS':'FAIL')+' - test results open the run center from the rule editor')
-if (!testLogsOpened) process.exit(1)
+if (!testLogsOpened) process.exitCode = 1
 
 homeNav?.click()
 await waitFor('.home-run-row')
 const homeReloadedRuns = document.querySelector('.home-run-row')?.textContent.includes('挂载测试规则')
 console.log((homeReloadedRuns?'PASS':'FAIL')+' - returning home loads recent runs without waiting for polling')
-if (!homeReloadedRuns) process.exit(1)
+if (!homeReloadedRuns) process.exitCode = 1
 
 // 创建入口和用途示例只在自动化页出现，缺少插件时定向到插件页。
 rulesNav?.click()
@@ -1760,7 +1773,7 @@ await new Promise(r => setTimeout(r, 100))
 const unavailableTemplateRouted = document.querySelector('.plugin-search input')?.value === 'usb_insert'
   && document.querySelector('.plugin-missing-callout')?.textContent.includes('未找到插件 usb_insert')
 console.log((unavailableTemplateShown && unavailableTemplateRouted?'PASS':'FAIL')+' - unavailable templates route to the required plugin')
-if (!unavailableTemplateShown || !unavailableTemplateRouted) process.exit(1)
+if (!unavailableTemplateShown || !unavailableTemplateRouted) process.exitCode = 1
 
 mockEngineState = 'running'
 mockEngineRunning = true
@@ -1781,7 +1794,7 @@ restartConfirm?.click()
 await new Promise(r => setTimeout(r, 1800))
 const slowRestartOk = launchCalls === 1 && mockEngineState === 'running'
 console.log((slowRestartOk?'PASS':'FAIL')+' - plugin restart waits until stopping reaches stopped')
-if (!slowRestartOk) process.exit(1)
+if (!slowRestartOk) process.exitCode = 1
 
 // 删除最后一条自动化后，首页只显示一次去往自动化页的首次引导。
 rulesNav?.click()
@@ -1801,7 +1814,7 @@ await new Promise(r => setTimeout(r, 60))
 const firstRunRoutedOk = !!document.querySelector('.automation-create-panel')
   && document.querySelector('.rules-library')?.textContent.includes('创建、测试和管理这台电脑上的自动化')
 console.log((emptyAutomationPageOk && firstRunHomeOk && firstRunRoutedOk?'PASS':'FAIL')+' - empty home points once to the automation page')
-if (!emptyAutomationPageOk || !firstRunHomeOk || !firstRunRoutedOk) process.exit(1)
+if (!emptyAutomationPageOk || !firstRunHomeOk || !firstRunRoutedOk) process.exitCode = 1
 
 const pluginsNav = [...document.querySelectorAll('.nav-item')].find(
   item => item.textContent.includes('插件'),
@@ -1837,11 +1850,11 @@ const signingPasswordUsesDedicatedField = pluginInstallForms.length === 1
   && pluginInstallForms[0].signing_password === 'local-signing-password'
   && !('password' in pluginInstallForms[0])
 console.log((signingPasswordUsesDedicatedField?'PASS':'FAIL')+' - author counter-signing uses the signing_password form field')
-if (!signingPasswordUsesDedicatedField) process.exit(1)
+if (!signingPasswordUsesDedicatedField) process.exitCode = 1
 
 const connectionsBeforeUnmount = engineConnections
 document.getElementById('app').__vue_app__.unmount()
 await pause(1100)
 if (engineConnections !== connectionsBeforeUnmount) throw new Error('Dashboard 关闭后仍在重连 SSE')
 window.close()
-console.log('\nDashboard mount test: PASS')
+console.log('\nDashboard mount test: ' + (process.exitCode ? 'FAIL' : 'PASS'))

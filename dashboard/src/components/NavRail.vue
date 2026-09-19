@@ -1,17 +1,13 @@
 <script setup>
 import { useTheme } from '../composables/useTheme'
+import { navigationItems as items } from '../lib/navigation'
 import { appLogoUrl } from '../lib/branding'
 import { store } from '../lib/store'
 defineProps({ current: String })
 const emit = defineEmits(['switch'])
 const { isDark, toggle } = useTheme()
 const appVersion = __APP_VERSION__
-const items = [
-  { page: 'home', icon: 'dashboard', label: '首页', needs: false },
-  { page: 'rules', icon: 'account_tree', label: '自动化', needs: true },
-  { page: 'plugins', icon: 'extension', label: '插件', needs: true },
-  { page: 'settings', icon: 'settings', label: '设置', needs: true },
-]
+
 </script>
 
 <template>

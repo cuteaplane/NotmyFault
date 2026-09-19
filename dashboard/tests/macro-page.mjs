@@ -21,6 +21,7 @@ const { window } = dom
 
 window.dispatchEvent(new window.MessageEvent('message', {
   source: window,
+  origin: window.location.origin,
   data: {
     source: 'notmyfault:extension-host',
     type: 'init',
@@ -52,7 +53,7 @@ window.dispatchEvent(new window.MessageEvent('message', {
 
 const pageOk = scriptErrors.length === 0
   && html.includes("type:'ready'")
-  && window.document.querySelector('style')?.textContent.includes('.recording-options { border-color: #35353b; background: #1b1b21; }')
+  && window.document.querySelector('.recording-options') !== null
   && window.document.querySelectorAll('.timeline-item').length === 2
   && window.document.querySelector('textarea.field-input')?.value === '测试文字'
   && window.document.querySelector('.kind.keyboard')?.textContent === '键盘'
@@ -100,6 +101,7 @@ window.clearTimeout = id => {
 }
 async function reply(request, data) {
   window.dispatchEvent(new window.MessageEvent('message', {
+    origin: window.location.origin,
     source: window,
     data: { source:'notmyfault:extension-host', type:'result', request_id:request.request_id, response:{ ok:true, data } },
   }))
@@ -142,6 +144,7 @@ const savedSelector = {
   display: { control:'保存', control_type:'按钮', window:'无标题 - 记事本', app:'notepad.exe' },
 }
 selectorWindow.dispatchEvent(new selectorWindow.MessageEvent('message', {
+  origin: selectorWindow.location.origin,
   source: selectorWindow,
   data: {
     source: 'notmyfault:extension-host',

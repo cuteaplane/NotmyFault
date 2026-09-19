@@ -2,6 +2,7 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import { store } from '../lib/store'
 import { groupActionKeys, groupTriggerKeys, pluginUnavailableReason } from '../lib/utils'
+import { recentPlugins, rememberPlugin } from '../lib/recentPlugins'
 import BaseDialog from './BaseDialog.vue'
 
 const props = defineProps({ open: Boolean })
@@ -13,18 +14,12 @@ const query = ref('')
 const searchRef = ref(null)
 
 const schema = computed(() => step.value === 'trigger' ? store.schema.triggers : store.schema.actions)
-const storageKey = computed(() => `notmyfault.recent.${step.value}`)
 const availableKeys = computed(() => Object.keys(schema.value || {}).filter(key => {
   const meta = schema.value[key]
   return !pluginUnavailableReason(meta)
 }))
 
-function recentKeys() {
-  try {
-    const value = JSON.parse(localStorage.getItem(storageKey.value) || '[]')
-    return Array.isArray(value) ? value.filter(key => availableKeys.value.includes(key)).slice(0, 6) : []
-  } catch { return [] }
-}
+function recentKeys() { return recentPlugins(step.value, availableKeys.value) }
 
 const visibleGroups = computed(() => {
   const q = query.value.trim().toLowerCase()
@@ -55,26 +50,18 @@ async function focusSearch() {
   searchRef.value?.focus()
 }
 
-function remember(kind, key) {
-  const name = `notmyfault.recent.${kind}`
-  try {
-    const value = JSON.parse(localStorage.getItem(name) || '[]')
-    const recent = [key, ...(Array.isArray(value) ? value : []).filter(item => item !== key)].slice(0, 6)
-    localStorage.setItem(name, JSON.stringify(recent))
-  } catch {}
-}
 
 function choose(key) {
   if (step.value === 'trigger') {
     triggerType.value = key
-    remember('trigger', key)
+    rememberPlugin('trigger', key)
     step.value = 'action'
     query.value = ''
     focusSearch()
     return
   }
   actionType.value = key
-  remember('action', key)
+  rememberPlugin('action', key)
 }
 
 function back() {

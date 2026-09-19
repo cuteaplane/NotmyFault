@@ -5,12 +5,14 @@ export const MAX_HISTORY_ITEMS = 40
 
 export function loadConversation() {
   try {
-    localStorage.removeItem(STORAGE_KEY)
     const saved = sessionStorage.getItem(STORAGE_KEY)
     if (!saved) return []
     const parsed = JSON.parse(saved)
     if (Array.isArray(parsed) && parsed.length > 0) {
       const messages = parsed.map(msg => {
+        if (!msg || typeof msg !== 'object') return null
+        let result = null
+        try { result = normalizeDraftResult(msg.result) } catch (error) { console.warn('无法恢复这条消息的规则草稿:', error) }
         const activity = msg.activity
           ? {
             ...msg.activity,
@@ -21,7 +23,7 @@ export function loadConversation() {
           : null
         return {
           ...msg,
-          result: normalizeDraftResult(msg.result),
+          result,
           timestamp: msg.timestamp || Date.now(),
           transient: false,
           streaming: false,
@@ -35,7 +37,7 @@ export function loadConversation() {
           reasoningOpen: false,
         }
       })
-      return messages
+      return messages.filter(Boolean)
     }
   } catch (err) {
     console.warn('加载对话失败:', err)

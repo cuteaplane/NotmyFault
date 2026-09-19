@@ -7,8 +7,9 @@ import { buildNodeDataPorts, deriveDataEdges, typesCompatible } from '../lib/bin
 import { typeLabel } from '../lib/valueTypes'
 import { isAdmin, eventName, actionName, describeItem } from '../lib/rulePresentation'
 
-const props = defineProps({ rule: Object, active: Boolean, selectedNodeId: String })
+const props = defineProps({ rule: Object, layout: { type: String, default: 'canvas' }, selectedNodeId: String })
 const emit = defineEmits(['update:selectedNodeId', 'select-node', 'add-if', 'add-assignment', 'open-picker', 'move-action', 'remove-action', 'move-failure-action', 'remove-failure-action', 'add-condition-child'])
+const canvasLayout = computed(() => props.layout === 'canvas')
 const selectedNodeId = computed({ get: () => props.selectedNodeId, set: id => emit('update:selectedNodeId', id) })
 const conditionNode = computed(() => props.rule.condition || null)
 const typeCatalog = computed(() => Object.entries(store.schema.data_types?.custom || {}).map(([id, definition]) => ({ id, ...definition })))
@@ -182,6 +183,7 @@ function zoomAt(nextZoom, cx, cy) {
   zoom.value = z
 }
 function onCanvasWheel(event) {
+  if (!canvasLayout.value) return
   if (!viewportRef.value) return
   event.preventDefault()
   const rect = viewportRef.value.getBoundingClientRect()
@@ -199,6 +201,7 @@ function resetZoom() {
 
 // 只有在空白处拖拽才会平移画布。
 function startPan(event) {
+  if (!canvasLayout.value) return
   if (event.button !== 0) return
   if (event.target.closest('.graph-node') || event.target.closest('button')) return
   selectedNodeId.value = null
@@ -257,6 +260,7 @@ function updateDataDropTarget(event) {
     : null
 }
 function startDataDrag(event, node, port) {
+  if (!canvasLayout.value) return
   if (event.button !== 0) return
   event.stopPropagation()
   dataDrag.value = {
@@ -394,7 +398,7 @@ function centerOnNode(node) {
 }
 // 工具栏或添加节点触发选中时先把目标移到视野内，手动点击的节点直接保留原位。
 watch(selectedGraphNode, (node, previous) => {
-  if (node && node.id !== previous?.id && props.active) centerOnNode(node)
+  if (node && node.id !== previous?.id && canvasLayout.value) centerOnNode(node)
 })
 
 // 小地图显示整张内容和当前视口，点击或拖动后跳到对应位置。
@@ -439,6 +443,11 @@ function startMinimapDrag(event) {
   event.currentTarget.setPointerCapture?.(event.pointerId)
 }
 function moveMinimapDrag(event) { if (minimapDragging) jumpMinimap(event) }
+function handleCanvasKey(event) {
+  const movement = { ArrowLeft: [80, 0], ArrowRight: [-80, 0], ArrowUp: [0, 80], ArrowDown: [0, -80] }[event.key]
+  if (movement) { event.preventDefault(); pan.value = { x: pan.value.x + movement[0], y: pan.value.y + movement[1] }; return }
+  if (['+', '=', '-'].includes(event.key)) { event.preventDefault(); zoomStep(event.key === '-' ? 1 / 1.25 : 1.25) }
+}
 function endMinimapDrag() { minimapDragging = false }
 
 // 点阵背景按当前相机的平移和缩放绘制在视口上。
@@ -471,7 +480,7 @@ const highlightedIds = computed(() => {
   follow(nodeId, 'downstream')
   return ids
 })
-function nodeDimmed(id) { return highlightedIds.value ? !highlightedIds.value.has(id) : false }
+function nodeDimmed(id) { return canvasLayout.value && highlightedIds.value ? !highlightedIds.value.has(id) : false }
 function edgeDimmed(edge) { return highlightedIds.value ? !highlightedIds.value.has(edge.from) || !highlightedIds.value.has(edge.to) : false }
 
 function conditionStructureKey(node) {
@@ -481,7 +490,7 @@ function conditionStructureKey(node) {
   return `group:${node.op || node.type || 'any'}(${children.map(conditionStructureKey).join(',')})`
 }
 
-watch(() => props.active, async active => {
+watch(canvasLayout, async active => {
   if (!active) { resizeObserver?.disconnect(); return }
   await nextTick()
   observeViewport()
@@ -497,6 +506,7 @@ function resetLayout() {
 }
 
 function startNodeDrag(event, node) {
+  if (!canvasLayout.value) return
   if (event.button !== 0) return
   const current = nodePositions.value[node.id] || { x: node.x, y: node.y }
   dragState = {
@@ -528,8 +538,8 @@ function dragNode(event) {
     },
   }
 }
-function endNodeDrag() {
-  if (dragState?.moved) {
+function endNodeDrag(event) {
+  if (dragState?.moved && event?.type !== 'pointercancel') {
     // pointerup 后浏览器会补发 click，这里只屏蔽当前节点的一次点击。
     suppressNodeClickId = dragState.id
     if (suppressNodeClickTimer) clearTimeout(suppressNodeClickTimer)
@@ -558,7 +568,7 @@ function observeViewport() {
 }
 
 
-onMounted(() => { if (props.active) observeViewport() })
+onMounted(() => { if (canvasLayout.value) observeViewport() })
 onUnmounted(() => {
   resizeObserver?.disconnect()
   if (camAnimTimer) clearTimeout(camAnimTimer)
@@ -568,8 +578,8 @@ defineExpose({ nodes: layoutNodes })
 </script>
 
 <template>
-    <main v-show="active" class="node-editor-workspace" :class="{ 'editor-mode-active': active }">
-      <section class="node-canvas-panel" aria-label="规则节点画布">
+    <main class="node-editor-workspace editor-mode-active" :class="{ 'form-layout': !canvasLayout, 'with-inspector': canvasLayout && selectedNodeId }">
+      <section class="node-canvas-panel" :aria-label="canvasLayout ? '规则节点画布' : '规则步骤'">
         <div class="node-canvas-toolbar">
           <div class="node-canvas-tools">
             <button class="btn btn-text btn-sm" @click="selectNode(conditionNodeId(rule.condition, []))"><span class="material-symbols-outlined">bolt</span>触发条件</button>
@@ -577,7 +587,7 @@ defineExpose({ nodes: layoutNodes })
             <button class="btn btn-text btn-sm" @click="emit('add-assignment')"><span class="material-symbols-outlined">edit_note</span>变量赋值</button>
             <button class="btn btn-text btn-sm" @click="selectNode('add-action')"><span class="material-symbols-outlined">add</span>添加动作</button>
           </div>
-          <div class="node-canvas-toolbar-side">
+          <div v-if="canvasLayout" class="node-canvas-toolbar-side">
             <div class="node-canvas-zoom">
               <button class="icon-btn" title="缩小" @click="zoomStep(1 / 1.25)"><span class="material-symbols-outlined">remove</span></button>
               <button class="zoom-label" title="重置为 100%" @click="resetZoom">{{ Math.round(zoom * 100) }}%</button>
@@ -590,13 +600,13 @@ defineExpose({ nodes: layoutNodes })
             </div>
           </div>
         </div>
-        <div ref="viewportRef" class="node-canvas-viewport" :class="{ panning: isPanning }" :style="gridStyle"
+        <div ref="viewportRef" class="node-canvas-viewport" :class="{ panning: isPanning }" :style="canvasLayout ? gridStyle : null"
           @pointerdown="startPan" @pointermove="dataDrag ? updateDataDropTarget($event) : movePan($event)"
           @pointerup="dataDrag ? endDataDrag($event) : endPan()" @pointercancel="dataDrag ? cancelDataDrag() : endPan()"
-          @wheel="onCanvasWheel">
-          <div class="node-canvas" :class="{ 'cam-anim': camAnim }" :style="cameraStyle">
+          @wheel="onCanvasWheel" tabindex="0" aria-label="规则画布，可用方向键平移，加减号缩放" @keydown.self="handleCanvasKey">
+          <div class="node-canvas" :class="{ 'cam-anim': camAnim }" :style="canvasLayout ? cameraStyle : null">
             <!-- 画布和 SVG 共用逻辑像素坐标，overflow:visible 让连线绘制到容器外，设置 viewBox 会让端口错位。 -->
-            <svg class="node-links" aria-hidden="true">
+            <svg v-if="canvasLayout" class="node-links" aria-hidden="true">
               <defs>
                 <marker id="node-link-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
                   <path d="M 0 0 L 8 4 L 0 8 z" />
@@ -612,31 +622,32 @@ defineExpose({ nodes: layoutNodes })
                <path v-if="pendingDataEdge" class="node-link node-link-data node-link-pending" :d="pendingDataEdge.d" />
             </svg>
 
-            <button v-for="edge in graphEdges.filter(item => Number.isInteger(item.insertActionIndex) && item.to !== 'add-action')"
+            <button v-for="edge in graphEdges.filter(item => canvasLayout && Number.isInteger(item.insertActionIndex) && item.to !== 'add-action')"
               :key="`insert-${edge.id}`" class="canvas-edge-add" :style="{ left: `${edge.labelX}px`, top: `${edge.labelY + 9}px` }"
               :title="`在第 ${edge.insertActionIndex + 1} 步插入动作`"
               @click.stop="emit('open-picker', 'action', { mode: 'action', index: edge.insertActionIndex, title: '插入动作' })">
               <span class="material-symbols-outlined">add</span>
             </button>
 
-            <article v-for="node in layoutNodes" :key="node.id"
+            <template v-for="node in layoutNodes" :key="node.id">
+            <article
               class="graph-node" :class="[`graph-node-${node.kind}`, { selected: selectedNodeId === node.id, dimmed: nodeDimmed(node.id), 'data-incompatible': nodeDataIncompatible(node) }]"
-              :style="{ left: `${node.x}px`, top: `${node.y}px`, height: `${node.height}px` }"
-              role="button" tabindex="0" @click="selectNode(node.id)" @keydown.enter="selectNode(node.id)"
+              :style="canvasLayout ? { left: `${node.x}px`, top: `${node.y}px`, height: `${node.height}px` } : null"
+              role="button" tabindex="0" @click="selectNode(node.id)" @keydown.enter.self.prevent="selectNode(node.id)" @keydown.space.self.prevent="selectNode(node.id)" @focus="canvasLayout && centerOnNode(node)"
               @pointerenter="hoverNodeId = node.id" @pointerleave="hoverNodeId = null">
-              <span v-if="node.hasInput" class="node-port node-port-in"></span>
+              <span v-if="canvasLayout && node.hasInput" class="node-port node-port-in"></span>
               <header class="graph-node-head" @pointerdown.stop="startNodeDrag($event, node)"
                 @pointermove.stop="dragNode" @pointerup.stop="endNodeDrag" @pointercancel.stop="endNodeDrag">
                 <span class="material-symbols-outlined">{{ node.icon }}</span>
                 <span>{{ node.kicker }}</span>
-                <span class="material-symbols-outlined node-drag-handle">drag_indicator</span>
+                <span v-if="canvasLayout" class="material-symbols-outlined node-drag-handle">drag_indicator</span>
               </header>
               <div class="graph-node-body" :class="{ 'has-admin': node.admin }">
                 <b>{{ node.label }}</b>
                 <small :title="node.meta">{{ node.meta }}</small>
                 <span v-if="node.admin" class="node-admin">管理员权限</span>
               </div>
-              <div v-if="node.hasDataPorts" class="graph-node-data-summary">
+              <div v-if="canvasLayout && node.hasDataPorts" class="graph-node-data-summary">
                 <button :class="{ active: sideExpanded(node.id, 'inputs') }" :disabled="!node.dataInputs.length" @click.stop="togglePorts(node.id, 'inputs')">
                   <span class="material-symbols-outlined">input</span>{{ dataSideLabel(node, 'inputs') }}
                   <span class="material-symbols-outlined">{{ sideExpanded(node.id, 'inputs') ? 'expand_less' : 'expand_more' }}</span>
@@ -646,7 +657,7 @@ defineExpose({ nodes: layoutNodes })
                   <span class="material-symbols-outlined">{{ sideExpanded(node.id, 'outputs') ? 'expand_less' : 'expand_more' }}</span>
                 </button>
               </div>
-              <div v-if="node.dataPortRows" class="graph-node-data">
+              <div v-if="canvasLayout && node.dataPortRows" class="graph-node-data">
                  <div class="data-port-column data-port-column-input">
                    <span v-for="port in node.visibleDataInputs" :key="port.id" class="data-port-row"
                      :class="dataInputDropState(node, port)" :data-input-node="node.id" :data-input-port="port.name"
@@ -675,11 +686,13 @@ defineExpose({ nodes: layoutNodes })
                 <button @click.stop="emit('add-condition-child', node, false)"><span class="material-symbols-outlined">add</span>条件</button>
                 <button @click.stop="emit('add-condition-child', node, true)"><span class="material-symbols-outlined">account_tree</span>条件组</button>
               </footer>
-              <span v-if="node.hasOutput" class="node-port node-port-out"></span>
+              <span v-if="canvasLayout && node.hasOutput" class="node-port node-port-out"></span>
             </article>
+            <slot v-if="!canvasLayout && selectedNodeId === node.id" name="inspector" />
+            </template>
           </div>
 
-          <div v-if="layoutNodes.length" class="node-minimap" title="小地图：点击或拖动跳转"
+          <div v-if="canvasLayout && layoutNodes.length" class="node-minimap" tabindex="0" role="group" aria-label="小地图，可用方向键平移" title="小地图：点击或拖动跳转" @keydown.self="handleCanvasKey"
             @pointerdown.stop="startMinimapDrag" @pointermove="moveMinimapDrag"
             @pointerup="endMinimapDrag" @pointercancel="endMinimapDrag">
             <svg :viewBox="`${minimapFrame.x} ${minimapFrame.y} ${minimapFrame.w} ${minimapFrame.h}`" preserveAspectRatio="xMidYMid meet">
@@ -690,8 +703,9 @@ defineExpose({ nodes: layoutNodes })
             </svg>
           </div>
         </div>
-        <div class="canvas-help"><span class="material-symbols-outlined">pan_tool</span>拖空白处平移 · 从输出端口拖至输入端口绑定数据 · 实线为控制流，虚线为数据流</div>
+        <div v-if="canvasLayout" class="canvas-help"><span class="material-symbols-outlined">pan_tool</span>拖空白处平移 · 从输出端口拖至输入端口绑定数据 · 实线为控制流，虚线为数据流</div>
       </section>
+      <slot v-if="canvasLayout" name="inspector" />
 
           </main>
 </template>

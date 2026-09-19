@@ -1,10 +1,11 @@
 <script setup>
-import { ref, computed, nextTick, onMounted } from 'vue'
+import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue'
 import { store } from '../../lib/store'
 import { apiDownload, apiRead, apiWrite, loadPlugins, getSchema } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
 import { alertDialog, confirmDialog } from '../../lib/dialog'
 import { useEngineControl } from '../../composables/useEngineControl'
+import { permissionLabels } from '../../lib/permissions'
 import BaseDialog from '../BaseDialog.vue'
 
 const { restartEngine } = useEngineControl()
@@ -21,20 +22,7 @@ const focusedPluginId = ref('')
 const focusedPluginKind = ref('')
 const focusReason = ref('')
 const selectedPluginKey = ref('')
-const permissionLabels = {
-  notification: '发送通知',
-  audio: '音频',
-  clipboard: '剪贴板',
-  network: '网络访问',
-  external_binary: '外部程序',
-  native_api: '原生 API',
-  filesystem: '文件系统',
-  process: '进程管理',
-  registry: '注册表',
-  screen_reader: '屏幕读取',
-  input_monitor: '监听键盘和鼠标',
-  admin: '管理员权限',
-}
+
 const allPlugins = computed(() => [
   ...Object.entries(store.pluginsData.triggers || {}).map(([id, meta]) => ({
     id, meta, kind: 'triggers', origin: meta?.origin === 'builtin' ? 'builtin' : 'user',
@@ -74,9 +62,16 @@ const showInstall = ref(false)
 const showKey = ref(false)
 const signingPassword = ref('')
 const forceInstall = ref(false)
-const buildHookConfirmed = ref(false)
+const confirmedRiskIds = ref([])
 const fileInput = ref(null)
 let keyResolve = null
+let disposed = false
+onUnmounted(() => {
+  disposed = true
+  keyResolve?.(false)
+  keyResolve = null
+  signingPassword.value = ''
+})
 
 const preview = ref(null)
 const previewLoading = ref(false)
@@ -103,6 +98,8 @@ async function loadRegistry() {
     registryError.value = '请输入插件索引地址'
     return
   }
+  try { if (new URL(url).protocol !== 'https:') throw new Error() }
+  catch { registryError.value = '请输入有效的 HTTPS 插件索引地址'; return }
   registryLoading.value = true
   registryError.value = ''
   try {
@@ -266,7 +263,7 @@ function openInstall() {
   previewError.value = ''
   fileForUpload.value = null
   forceInstall.value = false
-  buildHookConfirmed.value = false
+  confirmedRiskIds.value = []
   installError.value = ''
   signingPassword.value = ''
 }
@@ -310,6 +307,9 @@ function diffRows(diff) {
     ...diff.removed.map(item => ({ item, sign: '-', cls: 'diff-remove' })),
   ]
 }
+const requiredRisks = computed(() => (preview.value?.risks || []).filter(risk =>
+  (preview.value?.required_risk_ids || (preview.value?.risks || []).map(item => item.id)).includes(risk.id)))
+const risksConfirmed = computed(() => requiredRisks.value.every(risk => confirmedRiskIds.value.includes(risk.id)))
 const hasBuildHookRisk = computed(() =>
   (preview.value?.risks || []).some(risk => risk.id === 'build_hook'))
 
@@ -337,6 +337,7 @@ async function doInstall() {
       const r = await apiRead('/api/plugins/key-status')
       if (r.ok) {
         const ks = await r.json()
+        if (disposed) return
         if (ks.encrypted) {
           signingPassword.value = ''
           showKey.value = true
@@ -347,13 +348,13 @@ async function doInstall() {
     } catch (e) { /* 引擎离线时无法读取密钥状态，继续安装请求。 */ }
   }
 
+  if (disposed) return
   const fd = new FormData()
   fd.append('preview_token', p.preview_token)
-  if (hasBuildHookRisk.value && buildHookConfirmed.value) {
-    fd.append('confirmed_risk_ids', JSON.stringify(['build_hook']))
-  }
+  fd.append('confirmed_risk_ids', JSON.stringify(confirmedRiskIds.value))
   if (signingPassword.value) fd.append('signing_password', signingPassword.value)
   if (forceInstall.value) fd.append('force', 'true')
+  signingPassword.value = ''
   try {
     const r = await apiWrite('/api/plugins/install', 'POST', fd, true)
     const d = await r.json()
@@ -605,15 +606,15 @@ onMounted(async () => {
         </div>
 
         <div v-else-if="previewLoading" key="loading" class="preview-loading">
-          <div class="spinner" style="margin:24px auto"></div>
+          <div class="spinner my-6 mx-auto"></div>
           <p>正在解析插件...</p>
         </div>
 
         <div v-else-if="previewError" key="error" class="preview-error">
-          <span class="material-symbols-outlined dialog-ico" style="color:var(--md-error)">error</span>
+          <span class="material-symbols-outlined dialog-ico plugin-install-error-icon">error</span>
           <h3 class="dialog-title">解析失败</h3>
           <p class="dialog-sub">{{ previewError }}</p>
-          <div class="dialog-actions" style="justify-content:center">
+          <div class="dialog-actions plugin-install-error-actions">
             <button class="btn btn-filled" @click="retryPreview">重试</button>
             <button class="btn btn-text" @click="showInstall = false">关闭</button>
           </div>
@@ -669,7 +670,7 @@ onMounted(async () => {
               <div class="preview-section-title">
                 <span class="material-symbols-outlined">security</span>权限申请
                 <span class="perm-count" v-if="preview.permissions.length">({{ preview.permissions.length }})</span>
-                <span v-if="!preview.permissions.length" class="chip chip-clean" style="margin-left:auto">无特殊权限</span>
+                <span v-if="!preview.permissions.length" class="chip chip-clean ml-auto">无特殊权限</span>
               </div>
               <div v-if="preview.permissions.length" class="perm-list">
                 <div v-for="perm in preview.permissions" :key="perm.permission"
@@ -744,14 +745,14 @@ onMounted(async () => {
             <label class="check-row" v-if="preview.plugin.package_name">
               <input type="checkbox" v-model="forceInstall">强制覆盖已安装的同包名插件
             </label>
-            <label class="check-row" v-if="hasBuildHookRisk">
-              <input type="checkbox" v-model="buildHookConfirmed">我确认执行这个插件的构建命令
+            <label v-for="risk in requiredRisks" :key="risk.id" class="check-row">
+              <input type="checkbox" v-model="confirmedRiskIds" :value="risk.id">{{ risk.id === 'build_hook' ? '我确认执行这个插件的构建命令' : `我已确认：${risk.label}` }}
             </label>
             <div class="preview-foot-actions">
               <button class="btn btn-text" @click="showInstall = false">取消</button>
               <button class="btn btn-filled" @click="doInstall"
                 :disabled="(!preview.permission_conform && store.engineStatus?.security_mode === 'strict')
-                  || (hasBuildHookRisk && !buildHookConfirmed)">
+                  || !risksConfirmed">
                 <span class="material-symbols-outlined">download</span>安装
               </button>
             </div>
@@ -766,7 +767,7 @@ onMounted(async () => {
         <span class="material-symbols-outlined dialog-ico">key</span>
         <h3 class="dialog-title">NotmyFault 安装密钥</h3>
         <p class="dialog-sub">安装 NotmyFault 时输入的密钥</p>
-        <input type="password" v-model="signingPassword" class="text-field" placeholder="输入私钥密码" style="width:100%;text-align:center">
+        <input type="password" v-model="signingPassword" class="text-field w-full text-center" placeholder="输入私钥密码">
         <div class="dialog-actions">
           <button class="btn btn-text" @click="cancelKey">取消</button>
           <button class="btn btn-filled" @click="submitKey">确认</button>

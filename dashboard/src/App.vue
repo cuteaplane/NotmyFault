@@ -1,7 +1,7 @@
 <script setup>
 import { defineAsyncComponent, nextTick, ref, watch, onMounted, onUnmounted } from 'vue'
 import NavRail from './components/NavRail.vue'
-import HomeView from './components/views/HomeView.vue'
+import { views } from './lib/navigation'
 import AppDialog from './components/AppDialog.vue'
 import { store, syncEngineStatus as updateStatus } from './lib/store'
 import { snack } from './lib/notify'
@@ -14,15 +14,12 @@ const { init: initTheme } = useTheme()
 const currentPage = ref('home')
 const pageTransitioning = ref(false)
 let queuedPage = ''
-const PluginsView = defineAsyncComponent(() => import('./components/views/PluginsView.vue'))
-const SettingsView = defineAsyncComponent(() => import('./components/views/SettingsView.vue'))
-const RulesView = defineAsyncComponent(() => import('./components/views/RulesView.vue'))
 const FirstRunSetup = defineAsyncComponent(() => import('./components/FirstRunSetup.vue'))
-const views = { home: HomeView, plugins: PluginsView, settings: SettingsView, rules: RulesView }
-const firstRun = ref(new URLSearchParams(window.location.search).get('first_run') === '1'
-  || !!localStorage.getItem('nmf-first-run'))
-if (firstRun.value && !localStorage.getItem('nmf-first-run')) {
-  localStorage.setItem('nmf-first-run', JSON.stringify({ step: 0 }))
+let savedFirstRun = ''
+try { savedFirstRun = localStorage.getItem('nmf-first-run') || '' } catch {}
+const firstRun = ref(new URLSearchParams(window.location.search).get('first_run') === '1' || !!savedFirstRun)
+if (firstRun.value && !savedFirstRun) {
+  try { localStorage.setItem('nmf-first-run', JSON.stringify({ step: 0 })) } catch {}
 }
 
 function finishFirstRun() {
@@ -69,7 +66,7 @@ let sseReconnectTimer = null
 let sseEventSeq = 0
 let refreshSignalTimer = null
 // 规则测试回显只关心这几类执行事件。
-const RULE_EVENTS = ['action_executed', 'action_skipped', 'action_cancelled', 'action_timed_out', 'workflow_failed', 'workflow_deferred', 'workflow_completed', 'test_assertions_completed', 'error', 'run_dropped', 'run_replaced']
+const RULE_EVENTS = ['action_executed', 'action_skipped', 'action_cancelled', 'action_timed_out', 'workflow_failed', 'workflow_completed', 'test_assertions_completed', 'error', 'run_dropped', 'run_replaced']
 const timers = []
 function setTracked(fn, ms) { const id = setInterval(fn, ms); timers.push(id); return id }
 

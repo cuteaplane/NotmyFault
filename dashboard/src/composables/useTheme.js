@@ -3,6 +3,9 @@ import { ref } from 'vue'
 // App 和 NavRail 共享模块里的 isDark 状态。
 const isDark = ref(false)
 let initialized = false
+function savedMode() {
+  try { return localStorage.getItem('nmf-theme') || 'system' } catch { return 'system' }
+}
 
 export function useTheme() {
   function sync() {
@@ -11,14 +14,14 @@ export function useTheme() {
   function init() {
     if (initialized) return
     initialized = true
-    applyMode(localStorage.getItem('nmf-theme') || 'system')
-    window.matchMedia?.('(prefers-color-scheme: dark)').addEventListener('change', () => {
-      if (!localStorage.getItem('nmf-theme')) applyMode('system')
+    applyMode(savedMode())
+    window.matchMedia?.('(prefers-color-scheme: dark)')?.addEventListener('change', () => {
+      if (savedMode() === 'system') applyMode('system')
     })
   }
   function applyMode(mode) {
     const dark = mode === 'dark' || (
-      mode === 'system' && window.matchMedia?.('(prefers-color-scheme: dark)').matches
+      mode === 'system' && window.matchMedia?.('(prefers-color-scheme: dark)')?.matches
     )
     document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light')
     sync()

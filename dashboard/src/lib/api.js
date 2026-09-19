@@ -16,14 +16,21 @@ async function authHeaders() {
 }
 
 async function fetchAuthenticated(path, options = {}) {
+  const streaming = options.headers?.Accept === 'text/event-stream'
+  const timeoutController = streaming ? new AbortController() : null
+  const timer = streaming ? setTimeout(() => timeoutController.abort(new DOMException('请求超时，请重试', 'TimeoutError')), 30000) : null
+  const timeout = timeoutController?.signal || AbortSignal.timeout(30000)
+  const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout
   const request = async () => {
     const headers = { ...(options.headers || {}), ...await authHeaders() }
-    return await fetch((hasBridge() ? API : '') + path, { ...options, headers })
+    return await fetch((hasBridge() ? API : '') + path, { ...options, headers, signal })
   }
-  let res = await request()
-  // 认证返回 403 时重新从 bridge 读取内存 token 再重试一次，运行中的 engine 会在这里重新发布 token。
-  if (res.status === 403 && hasBridge()) res = await request()
-  return res
+  try {
+    let res = await request()
+    // 引擎重启后 bridge 会重新发布 API token。
+    if (res.status === 403 && hasBridge()) res = await request()
+    return res
+  } finally { if (timer) clearTimeout(timer) }
 }
 
 export { fetchAuthenticated }
@@ -79,10 +86,11 @@ export async function loadConfig() {
   return await (await apiRead('/api/rules')).json()
 }
 
-export async function saveConfig(rules, adminKeyPassword = '') {
+export async function saveConfig(rules, adminKeyPassword = '', expectedRevision) {
   const response = await apiWrite('/api/rules', 'PUT', {
     rules,
     admin_key_password: adminKeyPassword,
+    expected_revision: expectedRevision,
   })
   return await response.json()
 }
@@ -195,7 +203,9 @@ function aiDraftRequestBody(messages, apiKey = '') {
 
 function dispatchAIDraftEvent(eventName, dataText, onEvent) {
   if (!AI_DRAFT_EVENT_TYPES.has(eventName) || !dataText) return
-  onEvent({ type: eventName, data: JSON.parse(dataText) })
+  let data
+  try { data = JSON.parse(dataText) } catch { throw new Error('连接已中断，收到的回复不完整，请重试') }
+  onEvent({ type: eventName, data })
 }
 
 export async function consumeAIDraftSSE(body, onEvent, signal) {
@@ -340,27 +350,21 @@ async function readLogData(path, offline) {
 }
 
 export async function readLogRaw(lines = 300) {
-  try {
-    const data = await readLogData(`/api/engine/logs?lines=${lines}`,
-      async () => ({ raw: await window.pywebview.api.read_log_raw(lines) }))
-    return data.raw ?? (data.lines || []).join('\n')
-  }
-  catch (e) { return '读取日志失败: ' + e.message }
+  const data = await readLogData(`/api/engine/logs?lines=${lines}`,
+    async () => ({ raw: await window.pywebview.api.read_log_raw(lines) }))
+  return data.raw ?? (data.lines || []).join('\n')
 }
 
 export async function readLogEntries(lines = 600) {
-  try { return await readLogData(`/api/engine/logs/entries?lines=${lines}`, () => window.pywebview.api.read_log_entries(lines)) }
-  catch (e) { return [{ ts: '', level: 'ERROR', text: '读取日志失败: ' + e.message, data: null }] }
+  return await readLogData(`/api/engine/logs/entries?lines=${lines}`, () => window.pywebview.api.read_log_entries(lines))
 }
 
 export async function listLogFiles() {
-  try { return await readLogData('/api/engine/logs/files', () => window.pywebview.api.list_log_files()) }
-  catch (e) { return [] }
+  return await readLogData('/api/engine/logs/files', () => window.pywebview.api.list_log_files())
 }
 
 export async function readLogFileEntries(name, lines = 600) {
-  try { return await readLogData(`/api/engine/logs/entries?lines=${lines}&name=${encodeURIComponent(name)}`, () => window.pywebview.api.read_log_file_entries(name, lines)) }
-  catch (e) { return [] }
+  return await readLogData(`/api/engine/logs/entries?lines=${lines}&name=${encodeURIComponent(name)}`, () => window.pywebview.api.read_log_file_entries(name, lines))
 }
 
 // 日志没有完整的动作成功记录，诊断计数来自引擎。

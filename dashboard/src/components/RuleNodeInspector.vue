@@ -1,5 +1,5 @@
 <script setup>
-import { computed } from 'vue'
+import { computed, watch, unref } from 'vue'
 import { store } from '../lib/store'
 import { ensureParams, getVisibleParamDefs } from '../lib/utils'
 import { buildFailureBindingSources, parameterAllowsBinding } from '../lib/bindings'
@@ -19,7 +19,8 @@ const selectedAction = computed(() => selectedKind.value === 'action' ? props.ru
 const selectedFailureAction = computed(() => selectedKind.value === 'failure-action'
   ? props.rule.actions?.[selectedGraphNode.value?.parentIndex]?.failure_actions?.[selectedIndex.value]
   : null)
-const actionParams = (action) => getVisibleParamDefs(store.schema.actions[action.type], ensureParams(action))
+watch(selectedFailureAction, action => { if (action) ensureParams(action) }, { immediate: true })
+const actionParams = (action) => getVisibleParamDefs(store.schema.actions[action.type], action.params || {})
 const actionParamAllowsBinding = (action, param) => parameterAllowsBinding(
   store.schema.actions[action?.type],
   param.name,
@@ -27,27 +28,29 @@ const actionParamAllowsBinding = (action, param) => parameterAllowsBinding(
 function failureActionBindingSources(actionIndex, failureIndex) {
   return buildFailureBindingSources(props.rule, actionIndex, failureIndex, store.schema)
 }
-const {
-  useSingleCondition,
-  wrapConditionInNot,
-  unwrapNotEvent,
-  changeConditionOp,
-  removeSelectedCondition,
-  moveSelectedCondition,
-  duplicateSelectedCondition,
-  removeAction,
-  duplicateAction,
-  moveAction,
-  removeFailureAction,
-  moveFailureAction,
-  requestAddFailureAction,
-  requestReplaceFailureAction,
-  openPluginPicker,
-  requestConditionChild,
-  selectedConditionNode,
-  selectedConditionPath,
-  selectedConditionParent,
-} = props.mutations
+const useSingleCondition = (...args) => props.mutations.useSingleCondition(...args)
+const wrapConditionInNot = (...args) => props.mutations.wrapConditionInNot(...args)
+const unwrapNotEvent = (...args) => props.mutations.unwrapNotEvent(...args)
+const changeConditionOp = (...args) => props.mutations.changeConditionOp(...args)
+const removeSelectedCondition = (...args) => props.mutations.removeSelectedCondition(...args)
+const moveSelectedCondition = (...args) => props.mutations.moveSelectedCondition(...args)
+const duplicateSelectedCondition = (...args) => props.mutations.duplicateSelectedCondition(...args)
+const removeAction = (...args) => props.mutations.removeAction(...args)
+const duplicateAction = (...args) => props.mutations.duplicateAction(...args)
+const moveAction = (...args) => props.mutations.moveAction(...args)
+const removeFailureAction = (...args) => props.mutations.removeFailureAction(...args)
+const moveFailureAction = (...args) => props.mutations.moveFailureAction(...args)
+const requestAddFailureAction = (...args) => props.mutations.requestAddFailureAction(...args)
+const requestReplaceFailureAction = (...args) => props.mutations.requestReplaceFailureAction(...args)
+const openPluginPicker = (...args) => props.mutations.openPluginPicker(...args)
+const requestConditionChild = (...args) => props.mutations.requestConditionChild(...args)
+const selectedConditionNode = computed(() => unref(props.mutations.selectedConditionNode))
+const selectedConditionPath = computed(() => unref(props.mutations.selectedConditionPath))
+const selectedConditionParent = computed(() => unref(props.mutations.selectedConditionParent))
+function setWithinSeconds(value) {
+  if (value.trim() === '') delete selectedConditionNode.value.within_seconds
+  else selectedConditionNode.value.within_seconds = Number(value)
+}
 </script>
 
 <template>
@@ -68,7 +71,7 @@ const {
             </template>
 
             <template v-else-if="selectedKind === 'condition' && selectedConditionNode">
-              <p class="inspector-lead">进入此节点的分支会按这里的逻辑汇合，再继续向右执行。</p>
+              <p class="inspector-lead">进入此节点的分支会按这里的逻辑汇合，再执行后续步骤。</p>
               <label class="field"><span class="field-label">组合方式</span>
                 <select v-model="selectedConditionNode.op" class="select" @change="changeConditionOp">
                   <option value="any">任一满足（OR）</option>
@@ -77,7 +80,7 @@ const {
                 </select>
               </label>
               <label v-if="['all', 'not'].includes(selectedConditionNode.op)" class="field"><span class="field-label">{{ selectedConditionNode.op === 'not' ? '等待时长（秒）' : '完成时间窗口（秒，可选）' }}</span>
-                <input v-model.number="selectedConditionNode.within_seconds" type="number" min="1" class="text-field" placeholder="不限制">
+                <input :value="selectedConditionNode.within_seconds ?? ''" @input="setWithinSeconds($event.target.value)" type="number" min="1" class="text-field" placeholder="不限制">
               </label>
               <p v-if="selectedConditionNode.op === 'not'" class="inspector-lead">只放一个事件。等待期间收到事件会重新计时；超时触发一次。</p>
               <button v-if="selectedConditionNode.op === 'not'" class="btn btn-text btn-sm" @click="unwrapNotEvent">改为事件发生时</button>

@@ -1,5 +1,5 @@
 <script setup>
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { store } from '../lib/store'
 import { computeChangeSet } from '../lib/ruleDiff'
 import {
@@ -12,6 +12,8 @@ const props = defineProps({
   fullRule: { type: Object, default: null },
 })
 const emit = defineEmits(['create', 'highlight-node'])
+const ruleDetailsOpen = ref(false)
+watch(() => props.message.id, () => { ruleDetailsOpen.value = false })
 const draft = computed(() => props.message.result?.draft)
 const changeSet = computed(() => draftEditsCurrentRule(draft.value, props.fullRule)
   ? computeChangeSet(props.fullRule, draft.value, store.schema) : [])
@@ -30,7 +32,6 @@ function highlightNode(item) {
 function applyDraft() {
   if (!draft.value) return
   const next = { ...draft.value }
-  if (changeSet.value.length) delete next.preconditions
   emit('create', next)
 }
 </script>
@@ -61,8 +62,8 @@ function applyDraft() {
       </div>
     </div>
     <div class="ai-rule-foot">
-      <button class="btn btn-text btn-sm" type="button" @click="message.ruleDetailsOpen = !message.ruleDetailsOpen">
-        {{ message.ruleDetailsOpen ? '收起详情' : '查看详情' }}
+      <button class="btn btn-text btn-sm" type="button" @click="ruleDetailsOpen = !ruleDetailsOpen">
+        {{ ruleDetailsOpen ? '收起详情' : '查看详情' }}
       </button>
       <button class="btn btn-tonal btn-sm" type="button" :disabled="!message.result.draft" @click="applyDraft()">
         全部应用<span class="material-symbols-outlined">arrow_forward</span>
@@ -85,8 +86,8 @@ function applyDraft() {
       </div>
     </div>
     <div class="ai-rule-foot">
-      <button class="btn btn-text btn-sm" type="button" @click="message.ruleDetailsOpen = !message.ruleDetailsOpen">
-        {{ message.ruleDetailsOpen ? '收起参数' : '查看参数' }}
+      <button class="btn btn-text btn-sm" type="button" @click="ruleDetailsOpen = !ruleDetailsOpen">
+        {{ ruleDetailsOpen ? '收起参数' : '查看参数' }}
       </button>
       <button class="btn btn-tonal btn-sm" type="button" :disabled="!message.result.draft" @click="applyDraft()">
         应用到编辑器<span class="material-symbols-outlined">arrow_forward</span>
@@ -98,7 +99,7 @@ function applyDraft() {
       <span class="material-symbols-outlined">{{ issue.severity === 'warning' ? 'warning' : 'error' }}</span>{{ issue.message }}
     </div>
   </div>
-  <div v-if="message.ruleDetailsOpen" class="ai-rule-params">
+  <div v-if="ruleDetailsOpen" class="ai-rule-params">
     <div v-for="row in paramRows" :key="`${row.node}-${row.key}`" class="ai-rule-param-row">
       <span>{{ row.node }}</span>
       <code>{{ row.key }} = {{ row.value }}</code>

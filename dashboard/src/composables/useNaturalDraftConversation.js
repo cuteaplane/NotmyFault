@@ -125,7 +125,7 @@ export function useNaturalDraftConversation({ scrollConversation, focusComposer,
     }
     messages.value.push(message)
     await scrollConversation()
-    // 裸对象的后续改动不会触发 Vue 更新，这里返回 messages 数组里的代理对象。
+    // 要拿到 messages 里的代理对象，后续改动才会触发更新，这里返回 messages 数组里的代理对象。
     return messages.value[messages.value.length - 1]
   }
 

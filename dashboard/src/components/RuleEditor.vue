@@ -3,16 +3,12 @@ import { computed, nextTick, ref, toRef, watch, onMounted, onUnmounted } from 'v
 import RuleCanvas from './RuleCanvas.vue'
 import RuleNodeInspector from './RuleNodeInspector.vue'
 import RuleValidationSummary from './RuleValidationSummary.vue'
-import { isAdmin, eventName, actionName } from '../lib/rulePresentation'
 import { useRuleMutations } from '../composables/useRuleMutations'
 import { store } from '../lib/store'
-import { groupActionKeys, groupTriggerKeys, isConditionLeaf, normalizeRuleDraft, pluginUnavailableReason as getPluginUnavailableReason } from '../lib/utils'
+import { groupActionKeys, groupTriggerKeys, normalizeRuleDraft, pluginUnavailableReason as getPluginUnavailableReason } from '../lib/utils'
 
 import { ensureRuleBindingIds, variableBindingSources, expandBindingSources } from '../lib/bindings'
 
-import ConditionEditor from './ConditionEditor.vue'
-import ActionForm from './ActionForm.vue'
-import TriggerForm from './TriggerForm.vue'
 import VariablesEditor from './VariablesEditor.vue'
 import PluginPicker from './PluginPicker.vue'
 import FolderPicker from './FolderPicker.vue'
@@ -34,11 +30,11 @@ const emit = defineEmits(['back', 'delete', 'save', 'save-run', 'undo', 'redo', 
 const aiEnabled = computed(() => store.aiDrafting?.enabled)
 const aiPanelOpen = ref(false)
 const aiPanelRef = ref(null)
-function savedEditorMode() {
+function savedEditorLayout() {
   try { return localStorage.getItem('notmyfault.ruleEditorMode') === 'form' ? 'form' : 'canvas' }
   catch { return 'canvas' }
 }
-const editorMode = ref(savedEditorMode())
+const editorLayout = ref(savedEditorLayout())
 const selectedNodeId = ref(null)
 
 const wideLayout = ref(false)
@@ -75,7 +71,7 @@ watch(selectedNodeId, id => {
   }
 })
 const hasSidePanels = computed(() => (
-  aiPanelOpen.value || (editorMode.value === 'canvas' && !!selectedNodeId.value)
+  aiPanelOpen.value || (editorLayout.value === 'canvas' && !!selectedNodeId.value)
 ))
 function onAiDraft(draft) {
   emit('ai-draft', draft)
@@ -169,30 +165,19 @@ const actionKeys = computed(() => Object.keys(store.schema.actions).filter(
   key => !pluginUnavailableReason('actions', key)
 ))
 const actionGroups = computed(() => groupActionKeys(actionKeys.value))
-normalizeRuleDraft(props.rule)
-ensureRuleBindingIds(props.rule)
-const conditionNode = computed(() => props.rule.condition || null)
-const rootIsGroup = computed(() => !!conditionNode.value && !isConditionLeaf(conditionNode.value))
+watch(() => props.rule, rule => { normalizeRuleDraft(rule); ensureRuleBindingIds(rule) }, { immediate: true })
 
 const constantSources = computed(() => expandBindingSources(variableBindingSources(props.rule, { constantsOnly: true }), store.schema.data_types?.custom))
 
-function actionFailureSummary(action) {
-  const parts = [action?.on_error === 'continue' ? '失败后继续' : '失败后停止']
-  const retries = Math.min(Math.max(Number(action?.retry || 0), 0), 3)
-  if (retries) parts.push(`最多重试 ${retries} 次`)
-  if (action?.timeout_seconds) parts.push(`最多运行 ${action.timeout_seconds} 秒`)
-  if (action?.failure_actions?.length) parts.push(`${action.failure_actions.length} 个补救动作`)
-  return parts.join(' · ')
-}
-
 const canvasRef = ref(null)
+const inspectorRef = ref(null)
 const layoutNodes = computed(() => canvasRef.value?.nodes || [])
 const selectedGraphNode = computed(() => layoutNodes.value.find(node => node.id === selectedNodeId.value) || null)
 
 const mutations = useRuleMutations(toRef(props, 'rule'), selectedNodeId, selectedGraphNode)
 const {
-  useSingleCondition, wrapConditionInNot, conditionId, addAssignment, addIf, removeAction, moveAction,
-  removeFailureAction, moveFailureAction, requestAddFailureAction, requestReplaceFailureAction,
+  conditionId, addAssignment, addIf, removeAction, moveAction,
+  removeFailureAction, moveFailureAction,
   openPluginPicker, closePluginPicker, choosePlugin, requestConditionChild, picker,
 } = mutations
 
@@ -200,7 +185,6 @@ const { validationIssues, validationErrorCount, validationWarningCount, checking
 
 function focusValidationIssue(issue) {
   if (issue.target === 'name') { startRuleNameEdit(); return }
-  editorMode.value = 'canvas'
   nextTick(() => {
     if (issue.target === 'trigger') selectNode(conditionId([]))
     else if (issue.target === 'actions') selectNode('add-action')
@@ -225,23 +209,29 @@ function selectNode(id) {
     return
   }
   selectedNodeId.value = id
+  if (id && editorLayout.value === 'form') nextTick(() => {
+    const inspector = inspectorRef.value?.$el
+    const viewport = inspector?.closest('.node-canvas-viewport')
+    if (viewport) viewport.scrollTop += inspector.getBoundingClientRect().top - viewport.getBoundingClientRect().top - 12
+  })
 }
 
 function focusInitialNode(id) {
   if (!id) return
-  editorMode.value = 'canvas'
   nextTick(() => {
     if (layoutNodes.value.some(node => node.id === id)) selectNode(id)
   })
 }
 watch([() => props.initialNodeId, canvasRef], ([id]) => focusInitialNode(id), { immediate: true })
 
-watch(editorMode, mode => {
+watch(editorLayout, mode => {
   try { localStorage.setItem('notmyfault.ruleEditorMode', mode) } catch {}
+  if (mode === 'form' && !selectedNodeId.value) selectedNodeId.value = conditionId([])
 })
 
 onMounted(() => {
   window.addEventListener('keydown', onEditorKeydown)
+  if (editorLayout.value === 'form' && !selectedNodeId.value) selectedNodeId.value = conditionId([])
   aiPanelOpen.value = store.pendingAiPanel === true
   store.pendingAiPanel = false
   let savedWidth = 0
@@ -260,6 +250,7 @@ onUnmounted(() => {
   stopAiPanelResize()
 })
 function onEditorKeydown(event) {
+  if (document.querySelector('.nmf-dialog-backdrop, .extension-page-layer')) return
   const target = event.target
   const editingText = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement
   if ((event.ctrlKey || event.metaKey) && !editingText) {
@@ -304,10 +295,10 @@ function onEditorKeydown(event) {
 
     <div class="editor-mode-bar">
       <div class="editor-mode-switch" role="tablist" aria-label="规则编辑方式">
-        <button role="tab" :aria-selected="editorMode === 'canvas'" :class="{ active: editorMode === 'canvas' }" @click="editorMode = 'canvas'">
+        <button role="tab" :aria-selected="editorLayout === 'canvas'" :class="{ active: editorLayout === 'canvas' }" @click="editorLayout = 'canvas'">
           <span class="material-symbols-outlined">account_tree</span>节点编辑
         </button>
-        <button role="tab" :aria-selected="editorMode === 'form'" :class="{ active: editorMode === 'form' }" @click="editorMode = 'form'">
+        <button role="tab" :aria-selected="editorLayout === 'form'" :class="{ active: editorLayout === 'form' }" @click="editorLayout = 'form'">
           <span class="material-symbols-outlined">view_agenda</span>普通模式
         </button>
       </div>
@@ -348,83 +339,31 @@ function onEditorKeydown(event) {
       </div>
     </Transition>
 
+    <div class="rule-definition-bar">
     <VariablesEditor :rule="rule" />
+    <label class="field rule-concurrency-field"><span class="field-label">重复触发</span>
+      <select class="select" :value="concurrencyMode" @change="setConcurrencyMode($event.target.value)">
+        <option value="parallel">同时运行（默认）</option>
+        <option value="single">运行中忽略新触发</option>
+        <option value="queue">排队依次执行</option>
+        <option value="replace">取消旧的执行最新的</option>
+      </select>
+    </label>
+    </div>
     <div class="rule-editor-main-grid">
     <div class="editor-canvas-column">
-    <RuleCanvas ref="canvasRef" :rule="rule" :active="editorMode === 'canvas'"
+    <RuleCanvas ref="canvasRef" :rule="rule" :layout="editorLayout"
       v-model:selected-node-id="selectedNodeId" @select-node="selectNode"
       @add-if="addIf" @add-assignment="addAssignment" @open-picker="openPluginPicker"
       @move-action="moveAction" @remove-action="removeAction"
       @move-failure-action="moveFailureAction" @remove-failure-action="removeFailureAction"
-      @add-condition-child="requestConditionChild" />
-
-    <main v-show="editorMode === 'form'" class="automation-flow classic-rule-editor" :class="{ 'editor-mode-active': editorMode === 'form' }">
-      <section class="automation-stage stage-when">
-        <div class="stage-rail"><span class="stage-node"><span class="material-symbols-outlined">bolt</span></span></div>
-        <div class="stage-content">
-          <header class="stage-head"><div><span class="stage-kicker">当</span><h2>什么情况会触发这条规则？</h2></div><span class="stage-required">必填</span></header>
-
-          <ConditionEditor v-if="rootIsGroup" :node="conditionNode" :constants="constantSources" />
-          <details v-else-if="conditionNode" class="flow-card condition-flow-card" open>
-            <summary>
-              <span class="flow-card-index">1</span>
-              <span class="flow-card-copy"><b>{{ eventName(conditionNode) }}</b><small>唯一触发条件</small></span>
-              <span v-if="isAdmin(store.schema.triggers[conditionNode.type])" class="chip chip-admin">管理员</span>
-              <span class="material-symbols-outlined flow-expand">expand_more</span>
-            </summary>
-            <div class="flow-card-body">
-              <TriggerForm :node="conditionNode" :sources="constantSources"
-                @replace="openPluginPicker('trigger', { mode: 'replace-condition-trigger', path: [], title: '更换触发方式' })" />
-            </div>
-          </details>
-          <div v-else class="flow-empty-card">
-            <span class="material-symbols-outlined">touch_app</span>
-            <div><b>选择触发方式</b><p>先说明什么时候开始执行，不默认替你选择。</p></div>
-            <button class="btn btn-filled" @click="openPluginPicker('trigger', { mode: 'set-trigger', title: '选择触发方式' })">选择</button>
-          </div>
-          <div class="flow-stage-actions">
-            <button v-if="rootIsGroup" class="btn btn-text btn-sm" @click="useSingleCondition"><span class="material-symbols-outlined">filter_1</span>改为单个条件</button>
-            <template v-if="conditionNode && !rootIsGroup">
-              <button class="btn btn-text btn-sm" @click="openPluginPicker('trigger', { mode: 'combine-root', op: 'all', title: '添加“并且”条件' })"><span class="material-symbols-outlined">done_all</span>并且满足</button>
-              <button class="btn btn-text btn-sm" @click="openPluginPicker('trigger', { mode: 'combine-root', op: 'any', title: '添加“或者”条件' })"><span class="material-symbols-outlined">alt_route</span>或者满足</button>
-            </template>
-            <label class="field rule-concurrency-field"><span class="field-label">重复触发</span>
-              <select class="select" :value="concurrencyMode" @change="setConcurrencyMode($event.target.value)">
-                <option value="parallel">同时运行（默认）</option>
-                <option value="single">运行中忽略新触发</option>
-                <option value="queue">排队依次执行</option>
-                <option value="replace">取消旧的执行最新的</option>
-              </select>
-            </label>
-          </div>
-        </div>
-      </section>
-
-      <section class="automation-stage stage-then">
-        <div class="stage-rail stage-rail-last"><span class="stage-node"><span class="material-symbols-outlined">play_arrow</span></span></div>
-        <div class="stage-content">
-          <header class="stage-head"><div><span class="stage-kicker">然后</span><h2>按顺序执行这些动作</h2></div><div class="stage-head-tools"><span class="stage-required">必填</span></div></header>
-          <details v-for="(action, index) in rule.actions" :key="action" class="flow-card action-flow-card" :open="rule.actions.length === 1">
-            <summary>
-              <span class="flow-card-index">{{ index + 1 }}</span><span class="flow-card-copy"><b>{{ actionName(action) }}</b><small>第 {{ index + 1 }} 步 · {{ actionFailureSummary(action) }}</small></span>
-              <span v-if="isAdmin(store.schema.actions[action.type])" class="chip chip-admin">管理员</span>
-              <span class="flow-card-tools"><button class="icon-btn" :disabled="index === 0" title="上移" @click.prevent.stop="moveAction(index, -1)"><span class="material-symbols-outlined">arrow_upward</span></button><button class="icon-btn" :disabled="index === rule.actions.length - 1" title="下移" @click.prevent.stop="moveAction(index, 1)"><span class="material-symbols-outlined">arrow_downward</span></button><button class="icon-btn icon-btn-danger" title="移除动作" @click.prevent.stop="removeAction(index)"><span class="material-symbols-outlined">delete</span></button></span>
-              <span class="material-symbols-outlined flow-expand">expand_more</span>
-            </summary>
-            <div class="flow-card-body">
-              <ActionForm :action="action" :rule="rule" :index="index"
-                @replace="openPluginPicker('action', { mode: 'replace-action', index: index, title: '更换动作类型' })"
-                @add-failure-action="requestAddFailureAction(index)"
-                @replace-failure-action="failureIndex => requestReplaceFailureAction(index, failureIndex)"
-                @remove-failure-action="failureIndex => removeFailureAction(index, failureIndex)"
-                @move-failure-action="(failureIndex, offset) => moveFailureAction(index, failureIndex, offset)" />
-            </div>
-          </details>
-          <div v-if="!rule.actions?.length" class="flow-inline-empty">还没有动作。规则触发后不会执行任何操作。</div>
-          <div class="flow-add-control"><button class="btn btn-tonal" @click="openPluginPicker('action', { mode: 'action', index: rule.actions?.length || 0, title: '添加动作' })"><span class="material-symbols-outlined">add</span>添加动作</button><button class="btn btn-text" @click="addIf">添加 IF</button><button class="btn btn-text" @click="addAssignment">变量赋值</button></div>
-        </div>
-      </section>
-    </main>
+      @add-condition-child="requestConditionChild">
+      <template #inspector>
+        <RuleNodeInspector ref="inspectorRef" v-if="selectedNodeId" :key="selectedNodeId"
+          :rule="rule" :node="selectedGraphNode" :mutations="mutations" :constant-sources="constantSources"
+          :has-triggers="!!triggerKeys.length" @select-node="selectNode" />
+      </template>
+    </RuleCanvas>
 
     <div v-if="rule.preconditions?.length" class="flow-inline-empty">旧的运行前检查已停用。请配置 NOT 或 IF 后移除旧检查。
       <button class="btn btn-text danger-text" @click="delete rule.preconditions">移除旧检查</button>
@@ -434,14 +373,8 @@ function onEditorKeydown(event) {
       @focus-issue="focusValidationIssue" />
     </div>
 
-    <Transition name="node-inspector-slide" mode="out-in">
-      <RuleNodeInspector v-if="selectedNodeId && editorMode === 'canvas'" :key="selectedNodeId"
-        :rule="rule" :node="selectedGraphNode" :mutations="mutations" :constant-sources="constantSources"
-        :has-triggers="!!triggerKeys.length" @select-node="selectNode" />
-        </Transition>
-
     <Transition name="ai-panel-slide">
-      <aside v-if="aiEnabled && aiPanelOpen" class="ai-editor-panel" :style="{ width: aiPanelWidth + 'px' }"
+      <aside v-if="aiEnabled && aiPanelOpen" class="ai-editor-panel" :style="{ '--ai-panel-width': aiPanelWidth + 'px' }"
         role="complementary" aria-label="AI 助手">
         <div class="ai-panel-resize" title="拖动调整宽度" @pointerdown="startAiPanelResize"></div>
         <header class="ai-editor-panel-head">

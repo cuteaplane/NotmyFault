@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
 import { store } from '../lib/store'
+import { recentPlugins, rememberPlugin } from '../lib/recentPlugins'
 import BaseDialog from './BaseDialog.vue'
 
 const props = defineProps({
@@ -16,14 +17,8 @@ const query = ref('')
 const category = ref('全部')
 const searchRef = ref(null)
 const schema = computed(() => props.kind === 'trigger' ? store.schema.triggers : store.schema.actions)
-const recentStorageKey = computed(() => `notmyfault.recent.${props.kind}`)
 
-function loadRecent() {
-  try {
-    const value = JSON.parse(localStorage.getItem(recentStorageKey.value) || '[]')
-    return Array.isArray(value) ? value.filter(key => props.keys.includes(key)).slice(0, 6) : []
-  } catch { return [] }
-}
+function loadRecent() { return recentPlugins(props.kind, props.keys) }
 
 const recentKeys = ref([])
 const normalizedGroups = computed(() => {
@@ -56,9 +51,7 @@ watch(() => props.open, async open => {
 })
 
 function choose(key) {
-  const recent = [key, ...loadRecent().filter(item => item !== key)].slice(0, 6)
-  try { localStorage.setItem(recentStorageKey.value, JSON.stringify(recent)) } catch {}
-  recentKeys.value = recent
+  recentKeys.value = rememberPlugin(props.kind, key)
   emit('select', key)
 }
 </script>
@@ -72,7 +65,7 @@ function choose(key) {
       </header>
       <label class="plugin-picker-search">
         <span class="material-symbols-outlined">search</span>
-        <input ref="searchRef" v-model="query" type="search" role="searchbox" aria-label="搜索插件"
+        <input ref="searchRef" v-model="query" type="search" aria-label="搜索插件"
           autocomplete="off" spellcheck="false" placeholder="搜索名称、说明或插件 ID">
       </label>
       <nav class="plugin-picker-categories" aria-label="插件分类">

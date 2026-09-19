@@ -4,11 +4,13 @@ import { store, syncEngineStatus } from '../../lib/store'
 import { getEngineStatus, getConfigSecurityStatus, approveConfigSecurity, loadPlugins } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
 import { alertDialog, confirmDialog, passwordDialog } from '../../lib/dialog'
+import { permissionLabels as pL, permissionClasses as pC, permissionIcons as pI } from '../../lib/permissions'
 import BaseDialog from '../BaseDialog.vue'
 
 const props = defineProps({ embedded: { type: Boolean, default: false } })
 const configSec = ref({ status: 'loading', reason: '', summary: null })
 const loading = ref(false)
+const pluginsError = ref('')
 const approving = ref(false)
 const showReinstall = ref(false)
 const permissionFilter = ref('all')
@@ -36,26 +38,10 @@ const heading = computed(() => {
   if (installationInvalid.value) return { icon: 'deployed_code_alert', title: '需要修复安装文件', text: '内置组件属于 NotmyFault 安装内容，请重新安装完整应用。' }
   if (configProblem.value) return { icon: 'policy', title: '需要核对设置与规则', text: '处理下方配置问题后，再启动引擎。' }
   if (!installation.value || configSec.value.status !== 'ok') return { icon: 'shield_question', title: '安全检查尚未完成', text: '暂时无法确认全部状态，请检查后台连接后重试。' }
+  if (pluginsError.value) return { icon: 'shield_question', title: '插件权限尚未读取', text: pluginsError.value }
   if (userProblems.value.length) return { icon: 'extension_off', title: '有用户插件需要处理', text: '查看下方问题插件，更新或重新安装对应扩展。' }
   return { icon: 'verified_user', title: '当前检查未发现异常', text: '安装签名、设置与规则的检查已完成。' }
 })
-const pL = {
-  notification: '发送通知', audio: '音频', clipboard: '剪贴板', network: '网络访问',
-  external_binary: '外部程序', native_api: '原生 API', filesystem: '文件系统',
-  process: '进程管理', registry: '注册表', screen_reader: '屏幕读取',
-  input_monitor: '监听键盘和鼠标', admin: '管理员权限',
-}
-const pC = {
-  notification: 'chip-clean', audio: 'chip-permission-low', clipboard: 'chip-permission-medium',
-  network: 'chip-permission-medium', external_binary: 'chip-external', native_api: 'chip-native',
-  filesystem: 'chip-permission-high', process: 'chip-permission-high', registry: 'chip-permission-high',
-  screen_reader: 'chip-permission-high', input_monitor: 'chip-permission-high', admin: 'chip-admin',
-}
-const pI = {
-  notification: 'notifications', audio: 'volume_up', clipboard: 'content_paste', network: 'language',
-  external_binary: 'terminal', native_api: 'code', filesystem: 'folder_open', process: 'memory',
-  registry: 'account_tree', screen_reader: 'screenshot_monitor', input_monitor: 'keyboard', admin: 'admin_panel_settings',
-}
 function summaryActions(actions, prefix = '动作') {
   return (actions || []).flatMap((action, index) => {
     const path = `${prefix} ${index + 1}`
@@ -68,7 +54,7 @@ function summaryActions(actions, prefix = '动作') {
   })
 }
 async function approveConfig() {
-  if (!await confirmDialog('重新签名配置？', '请核对规则、参数和失败动作。确认后为当前设置与规则重新签名；完成后可回到首页启动引擎。', '重新签名')) return
+  if (!await confirmDialog('重新签名配置？', '请先打开本机 rules.json 核对规则、实际参数和失败动作，此页摘要隐藏了参数值。确认后为当前设置与规则重新签名；完成后可回到首页启动引擎。', '重新签名')) return
   approving.value = true
   try {
     let r = await approveConfigSecurity()
@@ -109,7 +95,8 @@ async function refresh() {
   if (engine.status === 'fulfilled') {
     syncEngineStatus(engine.value)
   }
-  if (plugins.status === 'fulfilled') store.pluginsData = plugins.value
+  if (plugins.status === 'fulfilled') { store.pluginsData = plugins.value; pluginsError.value = '' }
+  else pluginsError.value = plugins.reason?.message || '无法读取插件权限，请重新检查'
   loading.value = false
 }
 onMounted(refresh)
@@ -118,6 +105,7 @@ onMounted(refresh)
 <template>
   <section class="page active security-center" :class="{ 'security-view-embedded': props.embedded }" :aria-busy="loading">
     <div v-if="!props.embedded" class="page-head"><h2>安全与权限</h2></div>
+    <p v-if="pluginsError" class="danger-text" role="alert">{{ pluginsError }}</p>
     <header class="security-overview" :class="{ 'needs-attention': installationInvalid || configProblem }" aria-live="polite">
       <span class="material-symbols-outlined security-emblem">{{ heading.icon }}</span>
       <div class="security-overview-copy"><h3>{{ heading.title }}</h3><p>{{ heading.text }}</p></div>
@@ -154,7 +142,7 @@ onMounted(refresh)
                     :class="a.high_risk ? 'chip-admin' : 'chip-clean'">{{ a.type }}</span>
             </span>
             <div class="config-security-rule-details">
-              <div v-for="entry in summaryActions([...(rule.preconditions || []), ...(rule.actions || [])])"
+              <div v-for="entry in summaryActions(rule.actions || [])"
                    :key="entry.path" class="config-security-rule-params">
                 <small>{{ entry.path }}</small>
                 <span class="chip" :class="entry.action.high_risk ? 'chip-admin' : 'chip-clean'">{{ entry.action.type }}</span>
@@ -166,7 +154,7 @@ onMounted(refresh)
         </div>
         <p class="config-security-risk">
           <span class="material-symbols-outlined">warning</span>
-          <span>红色标记为需要签名私钥审批的动作。请逐项核对动作参数、前置检查和失败动作。</span>
+          <span>红色标记为需要签名私钥审批的动作。此处参数值已隐藏；请打开本机 rules.json 核对实际参数、前置检查和失败动作，再重新签名。</span>
         </p>
       </div>
       <footer class="config-security-actions">

@@ -42,7 +42,7 @@ const showPath = computed(() => ['array', 'object', 'union', 'any'].includes(typ
 
 function apply(event) {
   if ([...event.currentTarget.closest('.binding-picker').querySelectorAll('input,textarea,select')].some(control => !control.reportValidity())) return
-  if (!selectedSource.value || selectedPath.value.error || !compatible.value && !convert.value) return
+  if (!selectedSource.value || selectedPath.value.error || (!compatible.value && !convert.value)) return
   const value = JSON.parse(JSON.stringify(selectedSource.value.value))
   value.$ref.path.push(...selectedPath.value.path)
   value.$ref.on_missing = policy.value
@@ -81,7 +81,7 @@ function apply(event) {
       <span>此数据被插件标记为敏感，可能包含隐私内容。绑定后，规则每次触发都会把它传给该动作使用。</span>
     </p>
     <div class="binding-picker-actions">
-      <button type="button" class="btn btn-tonal btn-sm" :disabled="!selected || !!selectedPath.error || !compatible && !convert" @click="apply">使用</button>
+      <button type="button" class="btn btn-tonal btn-sm" :disabled="!selected || !!selectedPath.error || (!compatible && !convert)" @click="apply">使用</button>
       <button type="button" class="btn btn-text btn-sm" @click="$emit('cancel')">取消</button>
     </div>
   </div>
