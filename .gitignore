@@ -1,11 +1,7 @@
-# Git Ultra ignore model file
-# Enjoy ~
-
-# Python bytecode
+# Python 字节码
 __pycache__/
 *.py[cod]
 *$py.class
-*.pyc
 .pytest-review-*/
 .omo/
 # Distribution / packaging
@@ -14,13 +10,12 @@ build/
 node_modules/
 *.egg-info/
 *.egg
-.gitignore
 # Virtual environments
 venv/
 .venv/
 env/
 
-# AI agent 配置与产物（一切与 AI agent 有关的内容）
+# AI agent 配置与产物
 .agents/
 .claude/
 .opencode/
@@ -45,8 +40,7 @@ Desktop.ini
 
 # Project specific
 *.log
-# OpenCode 无头任务的临时描述与输出；任务结束后仍会主动清理，
-# 忽略规则用于避免运行期间污染 VS Code Source Control。
+# OpenCode 后台任务的临时描述与输出
 .opencode-*.job.json
 
 # Website is a separate git repository
@@ -65,7 +59,7 @@ _patch_dash.py
 DECOUPLING.md
 .playwright-mcp/
 .codex/
-# 测试沙箱残留（含敏感凭据）
+# 测试沙箱内含临时凭据
 sandbox_appdata/
 
 .git_commit_msg.txt
