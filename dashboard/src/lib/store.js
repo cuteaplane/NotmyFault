@@ -8,6 +8,7 @@ export const store = reactive({
   configLoaded: false,
   pluginsData: { triggers: {}, actions: {} },
   engineStatus: { api_alive: false, engine_running: false, engine_state: 'offline', pid: null },
+  configError: '',
   controllerOnline: false,
   engineOnline: false,
   refreshSignal: 0,   // SSE 事件到达时自增，视图监听它后刷新统计。
@@ -20,7 +21,17 @@ export const store = reactive({
   pendingRuleDraft: null,
   pendingPluginFocus: null,
   pendingAutomationCreate: false,
+  pendingAutomationSection: '',
+  pendingSettingsSection: '',
   pendingAiPanel: false,
   aiDrafting: { enabled: false, endpoint_url: '', model: '', api_format: 'chat_completions' },
   aiApiKeyStatus: 'none',
 })
+
+export function syncEngineStatus(status) {
+  store.engineStatus = { ...store.engineStatus, ...status }
+  if ('api_alive' in status) store.controllerOnline = status.api_alive === true
+  if ('engine_running' in status) store.engineOnline = status.engine_running === true
+  document.body.classList.toggle('controller-online', store.controllerOnline)
+  document.body.classList.toggle('engine-online', store.engineOnline)
+}

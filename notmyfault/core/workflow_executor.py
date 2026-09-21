@@ -1,22 +1,27 @@
-"""执行规则工作流、前置条件和动作"""
+"""执行规则工作流和动作分支"""
 
 from __future__ import annotations
 
+import copy
 import sys
 import threading
 import time
-import traceback
+from decimal import Decimal
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from notmyfault.core.bindings import (
     BindingResolutionError,
-    contains_legacy_template,
-    is_reference,
+    contains_dynamic_value,
     references_available,
     resolve_value,
     unavailable_references,
 )
+from notmyfault.core.binding_schema import prepare_binding_context
+from notmyfault.core.data_types import DataTypeError
+from notmyfault.core.variables import assign_variable, expression_is_sensitive
 from notmyfault.core.diagnostics import Diagnostics
+from notmyfault.core.predicates import evaluate_predicate
 from notmyfault.core.logging import engine_error
 from notmyfault.core.run_summary import summarize_fields
 from notmyfault.core.workflow import (
@@ -33,16 +38,8 @@ MappingProvider = Callable[[], Dict[str, Any]]
 ActionResolver = Callable[[str], Optional[Callable[..., Any]]]
 ShutdownProvider = Callable[[], "threading.Event | None"]
 EventSink = Callable[[str, Dict[str, Any]], None]
-WorkflowCallback = Callable[..., Any]
 SensitiveProvider = Callable[[Dict[str, Any]], set]
 _MISSING = object()
-MAX_PRECONDITION_RETRIES = 60
-
-
-class PreconditionCheckError(RuntimeError):
-    pass
-
-
 def _run_id(context: Dict[str, Any]) -> str:
     return str(context.get("run", {}).get("id", ""))
 
@@ -118,6 +115,9 @@ def _assertion_value(context: Dict[str, Any], assertion: Dict[str, Any]) -> Any:
         return _MISSING
     current = step.get("result", _MISSING)
     for segment in assertion.get("path", []):
+        if isinstance(current, list) and isinstance(segment, int) and not isinstance(segment, bool) and 0 <= segment < len(current):
+            current = current[segment]
+            continue
         if not isinstance(current, dict) or segment not in current:
             return _MISSING
         current = current[segment]
@@ -146,7 +146,7 @@ def _assertion_matches(actual: Any, operator: str, expected: Any) -> bool:
     if operator in {"gt", "gte", "lt", "lte"}:
         if isinstance(actual, bool) or isinstance(expected, bool):
             return False
-        if not isinstance(actual, (int, float)) or not isinstance(expected, (int, float)):
+        if not isinstance(actual, (int, float, Decimal)) or not isinstance(expected, (int, float, Decimal)):
             return False
         return {
             "gt": actual > expected,
@@ -157,8 +157,23 @@ def _assertion_matches(actual: Any, operator: str, expected: Any) -> bool:
     return False
 
 
+class ActionPreparationError(ValueError):
+    pass
+
+
+@dataclass
+class PreparedAction:
+    action_type: str
+    action_func: Any
+    meta: dict
+    raw_params: dict
+    params: dict
+    module: Any
+    timeout_seconds: float | None
+
+
 class WorkflowExecutor:
-    """执行工作流并独占延迟任务和活跃动作计数"""
+    """执行工作流并维护取消请求和活跃动作计数"""
 
     def __init__(
         self,
@@ -169,38 +184,24 @@ class WorkflowExecutor:
         diagnostics: Diagnostics,
         shutdown_event: ShutdownProvider,
         on_event: EventSink,
-        defer_workflow: WorkflowCallback,
-        resume_workflow: WorkflowCallback,
-        execute_workflow: WorkflowCallback,
-        execute_actions: WorkflowCallback,
-        run_action: WorkflowCallback,
         action_resolver: Optional[ActionResolver] = None,
         sensitive_values: Optional[SensitiveProvider] = None,
+        triggers_meta: Optional[MappingProvider] = None,
     ) -> None:
         self._actions_meta = actions_meta
+        self._triggers_meta = triggers_meta or (lambda: {})
         self._actions_funcs = actions_funcs
         self._action_resolver = action_resolver
         self._plugin_modules = plugin_modules
         self._diagnostics = diagnostics
         self._shutdown_event = shutdown_event
         self._on_event = on_event
-        self._defer_workflow = defer_workflow
-        self._resume_workflow = resume_workflow
-        self._execute_workflow = execute_workflow
-        self._execute_actions = execute_actions
-        self._run_action = run_action
         self._sensitive_values = sensitive_values
 
         self._active_actions = 0
         self.action_lock = threading.Lock()
-        self.action_done = threading.Condition()
-        self.deferred_workflows: Dict[str, threading.Timer] = {}
-        self.deferred_workflows_lock = threading.RLock()
+        self.action_done = threading.Condition(self.action_lock)
         self._run_cancel_events: Dict[str, threading.Event] = {}
-        self._deferred_run_keys: Dict[str, str] = {}
-        self._deferred_run_contexts: Dict[
-            str, Tuple[Dict[str, Any], str]
-        ] = {}
         self._run_cancel_lock = threading.RLock()
 
     def _resolve_action(self, action_type: Any) -> Optional[Callable[..., Any]]:
@@ -236,9 +237,6 @@ class WorkflowExecutor:
             context["_run_finished"] = True
             if run_id:
                 self._run_cancel_events.pop(run_id, None)
-                self._deferred_run_keys.pop(run_id, None)
-                self._deferred_run_contexts.pop(run_id, None)
-            context.pop("_deferred_timer_key", None)
         return True
 
     def _complete_cancelled(
@@ -259,26 +257,12 @@ class WorkflowExecutor:
             },
         )
 
-    def is_run_deferred(self, run_id: str) -> bool:
-        """run 是否处于 deferred 等待重试状态，调度器据此把它算作活跃 run"""
-        with self._run_cancel_lock:
-            return run_id in self._deferred_run_keys
-
     def cancel_run(self, run_id: str) -> bool:
         with self._run_cancel_lock:
             event = self._run_cancel_events.get(run_id)
-            timer_key = self._deferred_run_keys.pop(run_id, None)
-            deferred = self._deferred_run_contexts.pop(run_id, None)
         if event is None:
             return False
         event.set()
-        if timer_key:
-            with self.deferred_workflows_lock:
-                timer = self.deferred_workflows.pop(timer_key, None)
-            if timer is not None:
-                timer.cancel()
-            if deferred is not None:
-                self._complete_cancelled(deferred[0], deferred[1])
         return True
 
     @property
@@ -299,136 +283,64 @@ class WorkflowExecutor:
         rule_name: str,
         context: Dict[str, Any],
     ) -> None:
-        """执行规则工作流，前置条件未满足时安排延迟重试"""
-        if context.get("_run_finished") is True:
-            return
-        run_cancel_event = self._ensure_run_cancel_event(context)
-        if run_cancel_event.is_set():
-            self._complete_cancelled(context, rule_name)
-            return
+        """执行规则工作流并记录运行结果"""
         try:
-            ready, reason, retry_after = self.check_preconditions(
-                rule.get("preconditions", []), context,
-            )
-        except BindingResolutionError as exc:
-            if not self._finish_run(context):
+            if context.get("_run_finished") is True:
                 return
-            self._on_event(
-                "workflow_failed",
-                {
-                    "rule_id": context.get("rule", {}).get("id", ""),
-                    "run_id": _run_id(context),
-                    "rule_name": rule_name,
-                    "error": exc.as_dict(),
-                },
-            )
-            print(
-                f"[Engine] 工作流 <{rule_name}> 数据绑定失败: {exc}",
-                file=sys.stderr,
-            )
-            return
-        except PreconditionCheckError as exc:
-            if not self._finish_run(context):
-                return
-            message = self._masked_event_value(str(exc), context)
-            self._on_event(
-                "workflow_failed",
-                {
-                    "rule_id": context.get("rule", {}).get("id", ""),
-                    "run_id": _run_id(context),
-                    "rule_name": rule_name,
-                    "error": {
-                        "code": "precondition_check_failed",
-                        "message": message,
-                    },
-                },
-            )
-            print(
-                f"[Engine] 工作流 <{rule_name}> 前置条件检查失败: {message}",
-                file=sys.stderr,
-            )
-            return
-        if not ready:
+            if not context.get("_variables_initialized"):
+                try:
+                    prepare_binding_context(rule, context, self._triggers_meta(), self._actions_meta())
+                except (DataTypeError, BindingResolutionError) as error:
+                    self._finish_run(context)
+                    self._on_event("workflow_failed", {
+                        "run_id": _run_id(context), "rule_id": rule.get("rule_id", ""),
+                        "rule_name": rule_name, "error": error.as_dict(),
+                    })
+                    return
+            run_cancel_event = self._ensure_run_cancel_event(context)
             if run_cancel_event.is_set():
                 self._complete_cancelled(context, rule_name)
                 return
-            attempts = int(context.get("_precondition_attempts", 0) or 0) + 1
-            context["_precondition_attempts"] = attempts
-            if attempts > MAX_PRECONDITION_RETRIES:
-                if self._finish_run(context):
-                    self._on_event(
-                        "workflow_failed",
-                        {
-                            "rule_id": context.get("rule", {}).get("id", ""),
-                            "run_id": _run_id(context),
-                            "rule_name": rule_name,
-                            "error": {
-                                "code": "precondition_retry_exhausted",
-                                "message": "前置条件长时间未满足，已停止重试",
-                            },
-                        },
-                    )
+            actions = rule.get("actions", [])
+            if not isinstance(actions, list):
+                actions = []
+            manual_test = context.get("manual_test")
+            if isinstance(manual_test, dict):
+                start_index = int(manual_test.get("start_index", 0) or 0)
+                end_index = int(manual_test.get("end_index", len(actions) - 1))
+                selected_actions = actions[start_index : end_index + 1]
+                manual_test["active_offset"] = start_index
+            else:
+                selected_actions = actions
+            succeeded = self.execute_actions(selected_actions, rule_name, context)
+            if run_cancel_event.is_set():
+                self._complete_cancelled(context, rule_name)
                 return
-            try:
-                delay = float(retry_after)
-            except (TypeError, ValueError):
-                delay = 60.0
-            delay = min(max(delay, 5), 3600)
-            event_reason = self._masked_event_value(str(reason), context)
+            assertion_results = self.evaluate_test_assertions(context, rule_name)
+            if assertion_results is not None:
+                succeeded = succeeded and assertion_results["passed"] == assertion_results["total"]
+            if run_cancel_event.is_set():
+                self._complete_cancelled(context, rule_name)
+                return
+            if not self._finish_run(context):
+                return
             self._on_event(
-                "workflow_deferred",
+                "workflow_completed",
                 {
-                    "rule_id": context.get("rule", {}).get("id", ""),
                     "run_id": _run_id(context),
+                    "rule_id": context.get("rule", {}).get("id", ""),
                     "rule_name": rule_name,
-                    "reason": event_reason,
-                    "retry_after_seconds": delay,
+                    "status": "succeeded" if succeeded else "failed",
+                    "assertions_passed": assertion_results["passed"] if assertion_results else 0,
+                    "assertions_total": assertion_results["total"] if assertion_results else 0,
+                    "failure_kind": (
+                        "assertion" if assertion_results and assertion_results["passed"] < assertion_results["total"]
+                        else ""
+                    ),
                 },
             )
-            print(
-                f"[Engine] 工作流 <{rule_name}> 前置条件未满足，{delay}s 后重试: {event_reason}",
-                file=sys.stderr,
-            )
-            self._defer_workflow(workflow_key, rule, rule_name, context, delay)
-            return
-        actions = rule.get("actions", [])
-        if not isinstance(actions, list):
-            actions = []
-        manual_test = context.get("manual_test")
-        if isinstance(manual_test, dict):
-            start_index = int(manual_test.get("start_index", 0) or 0)
-            end_index = int(manual_test.get("end_index", len(actions) - 1))
-            selected_actions = actions[start_index : end_index + 1]
-            manual_test["active_offset"] = start_index
-        else:
-            selected_actions = actions
-        succeeded = self._execute_actions(selected_actions, rule_name, context)
-        if run_cancel_event.is_set():
-            self._complete_cancelled(context, rule_name)
-            return
-        assertion_results = self.evaluate_test_assertions(context, rule_name)
-        if assertion_results is not None:
-            succeeded = succeeded and assertion_results["passed"] == assertion_results["total"]
-        if run_cancel_event.is_set():
-            self._complete_cancelled(context, rule_name)
-            return
-        if not self._finish_run(context):
-            return
-        self._on_event(
-            "workflow_completed",
-            {
-                "run_id": _run_id(context),
-                "rule_id": context.get("rule", {}).get("id", ""),
-                "rule_name": rule_name,
-                "status": "succeeded" if succeeded else "failed",
-                "assertions_passed": assertion_results["passed"] if assertion_results else 0,
-                "assertions_total": assertion_results["total"] if assertion_results else 0,
-                "failure_kind": (
-                    "assertion" if assertion_results and assertion_results["passed"] < assertion_results["total"]
-                    else ""
-                ),
-            },
-        )
+        finally:
+            self._finish_run(context)
 
     def evaluate_test_assertions(
         self,
@@ -464,136 +376,6 @@ class WorkflowExecutor:
         }
         self._on_event("test_assertions_completed", summary)
         return summary
-
-    def check_preconditions(
-        self,
-        preconditions: Any,
-        context: Dict[str, Any],
-    ) -> Tuple[bool, str, float | None]:
-        """调用动作插件的前置条件检查并返回结果"""
-        if not preconditions:
-            return True, "", None
-        if not isinstance(preconditions, list):
-            return False, "preconditions 必须是数组", None
-
-        actions_funcs = self._actions_funcs()
-        actions_meta = self._actions_meta()
-        for index, spec in enumerate(preconditions):
-            if not isinstance(spec, dict):
-                return False, f"preconditions[{index}] 必须是对象", None
-            action_type = spec.get("type")
-            action_func = self._resolve_action(action_type)
-            plugin_modules = self._plugin_modules()
-            module = plugin_modules.get(action_type)
-            action_meta = actions_meta.get(action_type, {})
-            check = getattr(module, "check_precondition", None)
-            if (
-                action_func is None
-                or not callable(check)
-                or action_meta.get("precondition_api") != "context-v1"
-            ):
-                raise PreconditionCheckError(
-                    f"前置条件插件不可用或未声明 context-v1: {action_type}",
-                )
-            try:
-                params = resolve_value(
-                    spec.get("params", {}),
-                    context,
-                    location=f"preconditions[{index}].params",
-                )
-                if not isinstance(params, dict):
-                    return False, f"前置条件 {action_type} 的 params 必须是对象", None
-                verdict = check(action_meta, params, context)
-            except BindingResolutionError:
-                raise
-            except Exception as error:
-                raise PreconditionCheckError(
-                    f"前置条件 {action_type} 检查异常"
-                ) from error
-            if verdict is True:
-                continue
-            if isinstance(verdict, dict):
-                if verdict.get("ok") is True:
-                    continue
-                return (
-                    False,
-                    str(verdict.get("reason") or f"前置条件 {action_type} 未满足"),
-                    verdict.get("retry_after_seconds"),
-                )
-            return False, f"前置条件 {action_type} 未满足", None
-        return True, "", None
-
-    def defer_workflow(
-        self,
-        workflow_key: str,
-        rule: Dict[str, Any],
-        rule_name: str,
-        context: Dict[str, Any],
-        delay: float,
-    ) -> None:
-        run_cancel_event = self._ensure_run_cancel_event(context)
-        if run_cancel_event.is_set():
-            self._complete_cancelled(context, rule_name)
-            return
-        run_id = _run_id(context)
-        timer_key = run_id or f"{workflow_key}:{id(context)}"
-        timer = threading.Timer(
-            delay,
-            self._resume_workflow,
-            args=(workflow_key, rule, rule_name, context),
-        )
-        timer.daemon = True
-        with self._run_cancel_lock:
-            if run_cancel_event.is_set():
-                self._complete_cancelled(context, rule_name)
-                return
-            context["_deferred_timer_key"] = timer_key
-            if run_id:
-                self._deferred_run_keys[run_id] = timer_key
-                self._deferred_run_contexts[run_id] = (context, rule_name)
-            with self.deferred_workflows_lock:
-                old_timer = self.deferred_workflows.pop(timer_key, None)
-                self.deferred_workflows[timer_key] = timer
-            if old_timer is not None:
-                old_timer.cancel()
-            timer.start()
-
-    def resume_workflow(
-        self,
-        workflow_key: str,
-        rule: Dict[str, Any],
-        rule_name: str,
-        context: Dict[str, Any],
-    ) -> None:
-        run_id = _run_id(context)
-        with self._run_cancel_lock:
-            timer_key = context.pop("_deferred_timer_key", None)
-            if run_id:
-                self._deferred_run_keys.pop(run_id, None)
-                self._deferred_run_contexts.pop(run_id, None)
-            if timer_key:
-                with self.deferred_workflows_lock:
-                    self.deferred_workflows.pop(timer_key, None)
-        shutdown_event = self._shutdown_event()
-        if shutdown_event and shutdown_event.is_set():
-            self._complete_cancelled(context, rule_name)
-            return
-        self._execute_workflow(workflow_key, rule, rule_name, context)
-
-    def cancel_deferred_workflows(self) -> None:
-        with self._run_cancel_lock:
-            deferred = list(self._deferred_run_contexts.values())
-            for context, _rule_name in deferred:
-                event = context.get("_run_cancel_event")
-                if isinstance(event, threading.Event):
-                    event.set()
-        with self.deferred_workflows_lock:
-            timers = list(self.deferred_workflows.values())
-            self.deferred_workflows.clear()
-        for timer in timers:
-            timer.cancel()
-        for context, rule_name in deferred:
-            self._complete_cancelled(context, rule_name)
 
     def execute_actions(
         self,
@@ -637,6 +419,18 @@ class WorkflowExecutor:
                 f"{legacy_offset + index + 1}"
             )
             step_id = action.get("binding_id") or legacy_step_id
+            if action.get("type") == "set_variable":
+                ok = self._execute_assignment(action, step_id, rule_name, context)
+                all_ok = all_ok and ok
+                if not ok and action.get("on_error", "stop") != "continue":
+                    break
+                continue
+            if action.get("type") == "if":
+                ok = self._execute_if(action, step_id, rule_name, context, run_failure_actions)
+                all_ok = all_ok and ok
+                if not ok and action.get("on_error", "stop") != "continue":
+                    break
+                continue
             if not references_available(action.get("params", {}), context):
                 missing_sources = unavailable_references(
                     action.get("params", {}), context
@@ -669,7 +463,7 @@ class WorkflowExecutor:
                 )
                 ok = True
             else:
-                ok, result = self._run_action(action, rule_name, context)
+                ok, result = self.run_action(action, rule_name, context)
                 status = "ok" if ok else (
                     "timed_out"
                     if isinstance(result, ActionCancelled)
@@ -706,9 +500,71 @@ class WorkflowExecutor:
                         run_failure_actions=False,
                     )
             if not ok and action.get("on_error", "stop") != "continue":
-                print(f"[Engine] 动作流水线在步骤 {step_id} 停止", file=sys.stderr)
+                print(f"[Engine] 动作在步骤 {step_id} 停止", file=sys.stderr)
                 break
         return all_ok
+
+    def _execute_assignment(self, action, step_id, rule_name, context):
+        event = {
+            "action_type": "set_variable", "step_id": step_id, "rule_name": rule_name,
+            "run_id": _run_id(context), "rule_id": context.get("rule", {}).get("id", ""),
+            "duration_ms": 0,
+        }
+        if not references_available(action.get("value"), context):
+            context["steps"][step_id] = {"type": "set_variable", "status": "skipped", "result": None, "error": None}
+            self._on_event("action_skipped", {**event, "reason": "赋值来源未参与本次运行"})
+            return True
+        try:
+            value = assign_variable(action.get("variable"), action.get("value"), context)
+            result = {"value": value}
+            context["steps"][step_id] = {"type": "set_variable", "status": "ok", "result": result, "error": None}
+            sensitive = bool(context.get("_sensitive_sources", {}).get("variable", {}).get(action.get("variable")))
+            if sensitive:
+                context.setdefault("_sensitive_sources", {}).setdefault("step", {})[step_id] = [["value"]]
+            self._on_event("action_executed", {**event, "status": "ok", "result": {"value": "***"} if sensitive else result})
+            return True
+        except (DataTypeError, BindingResolutionError) as error:
+            message = self._masked_event_value(str(error), context)
+            context["steps"][step_id] = {"type": "set_variable", "status": "failed", "result": None, "error": message}
+            self._on_event("error", {**event, "error": {
+                "code": error.code, "location": error.location, "message": message,
+            }, "status": "failed"})
+            return False
+
+    def _execute_if(self, action, step_id, rule_name, context, run_failure_actions):
+        started = time.perf_counter()
+        event = {
+            "action_type": "if", "step_id": step_id, "rule_name": rule_name,
+            "rule_id": context.get("rule", {}).get("id", ""), "run_id": _run_id(context),
+        }
+        try:
+            matched = evaluate_predicate(action.get("condition"), context)
+            branch = "then" if matched else "else"
+            succeeded = self._execute_action_sequence(
+                action.get(branch, []), rule_name, context,
+                legacy_prefix=f"{step_id}_{branch}_", run_failure_actions=run_failure_actions,
+            )
+            result = {"matched": matched, "branch": branch}
+            context["steps"][step_id] = {
+                "type": "if", "status": "ok" if succeeded else "failed",
+                "result": result if succeeded else None,
+                "error": None if succeeded else "分支动作执行失败",
+            }
+            self._on_event("action_executed" if succeeded else "error", {
+                **event, "status": "ok" if succeeded else "failed", "result": result,
+                "error": None if succeeded else {"code": "action_execution_failed", "message": "分支动作执行失败"},
+                "duration_ms": round((time.perf_counter() - started) * 1000),
+            })
+            return succeeded
+        except (BindingResolutionError, ValueError, TypeError) as error:
+            message = self._masked_event_value(str(error), context)
+            context["steps"][step_id] = {
+                "type": "if", "status": "failed", "result": None, "error": message,
+            }
+            self._on_event("error", {**event, "error": {
+                "code": getattr(error, "code", "condition_evaluation_failed"), "message": message,
+            }, "duration_ms": 0})
+            return False
 
     def execute_action(
         self,
@@ -719,8 +575,262 @@ class WorkflowExecutor:
         """执行一个动作并返回插件结果，供旧调用方使用"""
         if context is None:
             context = build_context(rule_name, "", {}, [])
-        ok, result = self._run_action(action, rule_name, context)
+        ok, result = self.run_action(action, rule_name, context)
         return result if ok else None
+
+    def _authorize_action_parameters(self, action, rule_name, context):
+        action_type = action.get("type")
+        dynamic_parameter_error = ""
+        dynamic_parameter_name = ""
+        action_meta = self._actions_meta().get(action_type, {})
+        raw_params = action.get("params", {})
+        if isinstance(raw_params, dict):
+            for param_name in sorted(literal_only_params(action_meta)):
+                raw_value = raw_params.get(param_name)
+                if contains_dynamic_value(raw_value):
+                    dynamic_parameter_name = param_name
+                    dynamic_parameter_error = (
+                        f"参数 {param_name!r} 只允许使用固定值"
+                    )
+                    break
+        if dynamic_parameter_error:
+            self._diagnostics.inc_action_fail()
+            engine_error(
+                "unsafe_dynamic_parameter",
+                action_type=action_type,
+                rule_name=rule_name,
+                error=dynamic_parameter_error,
+            )
+            self._on_event(
+                "error",
+                {
+                    "action_type": action_type,
+                    "rule_id": context.get("rule", {}).get("id", ""),
+                    "run_id": _run_id(context),
+                    "rule_name": rule_name,
+                    "step_id": action.get("binding_id") or action_type,
+                    "error": {
+                        "code": "unsafe_dynamic_parameter",
+                        "location": (
+                            f"actions.{action_type}.params."
+                            f"{dynamic_parameter_name}"
+                        ),
+                        "message": dynamic_parameter_error,
+                    },
+                },
+            )
+            print(
+                f"[Engine] [!!] 拦截 {action_type} 动态参数: {rule_name}",
+                file=sys.stderr,
+            )
+            raise ActionPreparationError(dynamic_parameter_error)
+
+    def _prepare_action(self, action, rule_name, context):
+        self._authorize_action_parameters(action, rule_name, context)
+        action_type = action.get("type")
+        raw_params = action.get("params", {})
+        try:
+            params = resolve_value(
+                action.get("params", {}),
+                context,
+                location=f"actions.{action.get('binding_id') or action_type}.params",
+            )
+        except BindingResolutionError as exc:
+            self._diagnostics.inc_action_fail()
+            self._on_event(
+                "error",
+                {
+                    "action_type": action_type,
+                    "rule_id": context.get("rule", {}).get("id", ""),
+                    "run_id": _run_id(context),
+                    "rule_name": rule_name,
+                    "step_id": action.get("binding_id") or action_type,
+                    "error": exc.as_dict(),
+                },
+            )
+            print(
+                f"[Engine] action \"{action_type}\" 数据绑定失败: {exc}",
+                file=sys.stderr,
+            )
+            raise ActionPreparationError(str(exc)) from exc
+        if not isinstance(params, dict):
+            raise ActionPreparationError("action.params 必须是对象")
+
+        action_func = self._resolve_action(action_type)
+        if action_func is None:
+            print(
+                f"[Engine] [?] 未知 action 类型或未装载模块: {action_type}",
+                file=sys.stderr,
+            )
+            raise ActionPreparationError(f"未知 action 类型: {action_type}")
+
+        actions_meta = self._actions_meta()
+        action_meta = actions_meta.get(action_type, {})
+        timeout_seconds = None
+        if action.get("timeout_seconds") is not None:
+            if action_meta.get("cancellation_api") != "runtime-v1":
+                raise ActionPreparationError("这个动作不支持安全取消，不能设置运行超时")
+            try:
+                timeout_seconds = float(action["timeout_seconds"])
+            except (TypeError, ValueError):
+                raise ActionPreparationError("timeout_seconds 必须是数字")
+            if not 1 <= timeout_seconds <= 86400:
+                raise ActionPreparationError("timeout_seconds 必须在 1 到 86400 秒之间")
+        module = self._plugin_modules().get(action_type)
+        if module is not None and hasattr(module, "validate_params"):
+            try:
+                validation_errors = module.validate_params(
+                    actions_meta.get(action_type, {}), params
+                )
+                if validation_errors:
+                    message = self._masked_event_value("; ".join(map(str, validation_errors)), context)
+                else:
+                    message = ""
+            except Exception:
+                message = "插件参数校验失败"
+            if message:
+                self._diagnostics.inc_action_fail()
+                self._on_event("error", {
+                    "action_type": action_type,
+                    "rule_id": context.get("rule", {}).get("id", ""),
+                    "run_id": _run_id(context),
+                    "rule_name": rule_name,
+                    "step_id": action.get("binding_id") or action_type,
+                    "error": {"code": "invalid_action_params", "message": message},
+                })
+                raise ActionPreparationError(message)
+
+        return PreparedAction(
+            action_type, action_func, action_meta, raw_params, params, module, timeout_seconds,
+        )
+
+    def _invoke_action_once(self, prepared, context, cancellation):
+        cancellation.raise_if_cancelled()
+        action_context = {key: copy.deepcopy(value) for key, value in context.items() if not key.startswith("_")}
+        action_context["_type_registry"] = context.get("_type_registry")
+        runtime = dict(action_context.get("runtime", {}))
+        runtime["cancellation"] = cancellation
+        action_context["runtime"] = runtime
+        result = invoke_action(
+            prepared.action_func, prepared.module, prepared.meta, prepared.params, action_context
+        )
+        cancellation.raise_if_cancelled()
+        return result
+
+    def _record_action_success(
+        self, prepared, action, rule_name, context, result,
+        sensitive_params, input_summary, attempt, started,
+    ):
+        action_type = prepared.action_type
+        action_meta = prepared.meta
+        params = prepared.params
+        if sensitive_params:
+            context.setdefault("_sensitive_sources", {}).setdefault("step", {})[action.get("binding_id") or action_type] = [[]]
+        self._diagnostics.inc_action_ok()
+        if self._sensitive_values is not None:
+            hidden = self._sensitive_values(context)
+            hidden.update(
+                _declared_sensitive_values(
+                    params, action_meta.get("params")
+                )
+            )
+            event_params = (
+                _mask_sensitive(params, hidden) if hidden else params
+            )
+        else:
+            event_params = params
+        if sensitive_params:
+            event_params = {name: "***" if name in sensitive_params else value for name, value in event_params.items()}
+        output_definitions = action_meta.get("outputs")
+        if sensitive_params:
+            output_definitions = [{"name": name, "sensitive": True, "summary": "hidden"} for name in result] if isinstance(result, dict) else []
+        self._on_event(
+            "action_executed",
+            {
+                "action_type": action_type,
+                "params": event_params,
+                "rule_id": context.get("rule", {}).get("id", ""),
+                "run_id": _run_id(context),
+                "rule_name": rule_name,
+                "step_id": action.get("binding_id") or action_type,
+                "status": "ok",
+                "input_summary": input_summary,
+                "output_summary": summarize_fields(
+                    result, output_definitions
+                ),
+                "result": "***" if sensitive_params else _mask_declared_outputs(
+                    result, action_meta.get("outputs")
+                ),
+                "attempt": attempt + 1,
+                "duration_ms": round(
+                    (time.perf_counter() - started) * 1000
+                ),
+            },
+        )
+
+    def _record_action_cancelled(self, action, rule_name, context, exc, input_summary, attempt, started):
+        action_type = action.get("type")
+        timed_out = exc.reason == "timeout"
+        if timed_out:
+            self._diagnostics.inc_action_fail()
+            engine_error(
+                "action_timed_out",
+                action_type=action_type,
+                rule_name=rule_name,
+                error=str(exc),
+            )
+        self._on_event(
+            "action_timed_out" if timed_out else "action_cancelled",
+            {
+                "action_type": action_type,
+                "rule_id": context.get("rule", {}).get("id", ""),
+                "run_id": _run_id(context),
+                "rule_name": rule_name,
+                "step_id": action.get("binding_id") or action_type,
+                "error": str(exc),
+                "input_summary": input_summary,
+                "attempt": attempt + 1,
+                "duration_ms": round((time.perf_counter() - started) * 1000),
+            },
+        )
+        return False, exc
+
+    def _record_action_failure(self, action, rule_name, context, error, input_summary, attempt, started):
+        action_type = action.get("type")
+        self._diagnostics.inc_action_fail()
+        error_code = "action_execution_failed"
+        error_message = f"动作 {action_type} 执行失败"
+        print(
+            f"[Engine] [ERR] 执行 action \"{action_type}\" 失败 "
+            f"({type(error).__name__})",
+            file=sys.stderr,
+        )
+        engine_error(
+            "action_failed",
+            plugin=action_type,
+            action_type=action_type,
+            rule_name=rule_name,
+            error_type=type(error).__name__,
+            reason=type(error).__name__,
+        )
+        self._on_event(
+            "error",
+            {
+                "action_type": action_type,
+                "rule_id": context.get("rule", {}).get("id", ""),
+                "run_id": _run_id(context),
+                "rule_name": rule_name,
+                "step_id": action.get("binding_id") or action_type,
+                "error": {
+                    "code": error_code,
+                    "message": error_message,
+                },
+                "input_summary": input_summary,
+                "attempt": attempt + 1,
+                "duration_ms": round((time.perf_counter() - started) * 1000),
+            },
+        )
+        return False, error_message
 
     def run_action(
         self,
@@ -735,123 +845,14 @@ class WorkflowExecutor:
             print(f"[Engine] 正在关闭，跳过动作: {action.get('type', '?')}")
             return False, "引擎正在关闭"
 
-        action_type = action.get("type")
-        dynamic_parameter_error = ""
-        dynamic_parameter_name = ""
-        action_meta = self._actions_meta().get(action_type, {})
-        raw_params = action.get("params", {})
-        if isinstance(raw_params, dict):
-            for param_name in sorted(literal_only_params(action_meta)):
-                raw_value = raw_params.get(param_name)
-                if is_reference(raw_value) or contains_legacy_template(raw_value):
-                    dynamic_parameter_name = param_name
-                    dynamic_parameter_error = (
-                        f"参数 {param_name!r} 只允许使用固定值"
-                    )
-                    break
-        if dynamic_parameter_error:
-            self._diagnostics.inc_action_fail()
-            engine_error(
-                "unsafe_dynamic_parameter",
-                action_type=action_type,
-                rule_name=rule_name,
-                error=dynamic_parameter_error,
-            )
-            # workflow_failed 是终态，只有第一个终态事件能发出去
-            if self._finish_run(context):
-                self._on_event(
-                    "workflow_failed",
-                    {
-                        "action_type": action_type,
-                        "rule_id": context.get("rule", {}).get("id", ""),
-                        "run_id": _run_id(context),
-                        "rule_name": rule_name,
-                        "step_id": action.get("binding_id") or action_type,
-                        "error": {
-                            "code": "unsafe_dynamic_parameter",
-                            "location": (
-                                f"actions.{action_type}.params."
-                                f"{dynamic_parameter_name}"
-                            ),
-                            "message": dynamic_parameter_error,
-                        },
-                    },
-                )
-            print(
-                f"[Engine] [!!] 拦截 {action_type} 动态参数: {rule_name}",
-                file=sys.stderr,
-            )
-            return False, dynamic_parameter_error
         try:
-            params = resolve_value(
-                action.get("params", {}),
-                context,
-                location=f"actions.{action.get('binding_id') or action_type}.params",
-            )
-        except BindingResolutionError as exc:
-            self._diagnostics.inc_action_fail()
-            if self._finish_run(context):
-                self._on_event(
-                    "workflow_failed",
-                    {
-                        "action_type": action_type,
-                        "rule_id": context.get("rule", {}).get("id", ""),
-                        "run_id": _run_id(context),
-                        "rule_name": rule_name,
-                        "step_id": action.get("binding_id") or action_type,
-                        "error": exc.as_dict(),
-                    },
-                )
-            print(
-                f"[Engine] action \"{action_type}\" 数据绑定失败: {exc}",
-                file=sys.stderr,
-            )
-            return False, str(exc)
-        if not isinstance(params, dict):
-            return False, "action.params 必须是对象"
-
-        action_func = self._resolve_action(action_type)
-        if action_func is None:
-            print(
-                f"[Engine] [?] 未知 action 类型或未装载模块: {action_type}",
-                file=sys.stderr,
-            )
-            return False, f"未知 action 类型: {action_type}"
-
-        actions_meta = self._actions_meta()
-        action_meta = actions_meta.get(action_type, {})
-        timeout_seconds = None
-        if action.get("timeout_seconds") is not None:
-            if action_meta.get("cancellation_api") != "runtime-v1":
-                return False, "这个动作不支持安全取消，不能设置运行超时"
-            try:
-                timeout_seconds = float(action["timeout_seconds"])
-            except (TypeError, ValueError):
-                return False, "timeout_seconds 必须是数字"
-            if not 1 <= timeout_seconds <= 86400:
-                return False, "timeout_seconds 必须在 1 到 86400 秒之间"
-        module = self._plugin_modules().get(action_type)
-        if module is not None and hasattr(module, "validate_params"):
-            try:
-                validation_errors = module.validate_params(
-                    actions_meta.get(action_type, {}), params
-                )
-                if validation_errors:
-                    print(
-                        f"[Engine] [!!] action \"{action_type}\" validate_params 警告:",
-                        file=sys.stderr,
-                    )
-                    for validation_error in validation_errors:
-                        print(f"         - {validation_error}", file=sys.stderr)
-            except Exception:
-                validation_error = self._masked_event_value(
-                    traceback.format_exc(), context
-                )
-                print(
-                    f"[Engine] action \"{action_type}\" validate_params() 执行异常:",
-                    file=sys.stderr,
-                )
-                print(validation_error, file=sys.stderr)
+            prepared = self._prepare_action(action, rule_name, context)
+        except ActionPreparationError as error:
+            return False, str(error)
+        action_type = prepared.action_type
+        action_meta = prepared.meta
+        raw_params = prepared.raw_params
+        params = prepared.params
 
         with self.action_lock:
             # 在锁内再查一次 shutdown，两次检查之间引擎可能已经开始关闭
@@ -862,79 +863,31 @@ class WorkflowExecutor:
 
         attempt = 0
         try:
-            input_summary = summarize_fields(params, action_meta.get("params"))
+            sensitive_params = {name for name, value in raw_params.items() if expression_is_sensitive(value, context)}
+            input_definitions = [
+                {**field, "sensitive": True, "summary": "hidden"} if isinstance(field, dict) and field.get("name") in sensitive_params else field
+                for field in action_meta.get("params", [])
+            ]
+            input_summary = summarize_fields(params, input_definitions)
             retries = min(max(int(action.get("retry", 0) or 0), 0), 3)
             delay = min(
                 max(float(action.get("retry_delay_seconds", 0) or 0), 0),
                 3600,
             )
             backoff = action.get("retry_backoff", "fixed")
+            cancellation = ActionCancellation(self._ensure_run_cancel_event(context), self._shutdown_event(), prepared.timeout_seconds)
             for attempt in range(retries + 1):
                 try:
-                    cancellation = ActionCancellation(
-                        self._ensure_run_cancel_event(context),
-                        self._shutdown_event(),
-                        timeout_seconds,
-                    )
-                    action_context = {
-                        key: value
-                        for key, value in context.items()
-                        if key != "_run_cancel_event"
-                    }
-                    runtime = dict(action_context.get("runtime", {}))
-                    runtime["cancellation"] = cancellation
-                    action_context["runtime"] = runtime
-                    result = invoke_action(
-                        action_func, module, action_meta, params, action_context
-                    )
-                    cancellation.raise_if_cancelled()
-                    self._diagnostics.inc_action_ok()
-                    if self._sensitive_values is not None:
-                        hidden = self._sensitive_values(context)
-                        hidden.update(
-                            _declared_sensitive_values(
-                                params, action_meta.get("params")
-                            )
-                        )
-                        event_params = (
-                            _mask_sensitive(params, hidden) if hidden else params
-                        )
-                    else:
-                        event_params = params
-                    self._on_event(
-                        "action_executed",
-                        {
-                            "action_type": action_type,
-                            "params": event_params,
-                            "rule_id": context.get("rule", {}).get("id", ""),
-                            "run_id": _run_id(context),
-                            "rule_name": rule_name,
-                            "step_id": action.get("binding_id") or action_type,
-                            "status": "ok",
-                            "input_summary": input_summary,
-                            "output_summary": summarize_fields(
-                                result, action_meta.get("outputs")
-                            ),
-                            "result": _mask_declared_outputs(
-                                result, action_meta.get("outputs")
-                            ),
-                            "attempt": attempt + 1,
-                            "duration_ms": round(
-                                (time.perf_counter() - started) * 1000
-                            ),
-                        },
+                    result = self._invoke_action_once(prepared, context, cancellation)
+                    self._record_action_success(
+                        prepared, action, rule_name, context, result,
+                        sensitive_params, input_summary, attempt, started,
                     )
                     return True, result
                 except AdminExecutionBlocked:
                     raise
-                except ActionCancelled as exc:
-                    if exc.reason == "timeout" and attempt < retries:
-                        print(
-                            f"[Engine] action \"{action_type}\" 运行超时，准备重试",
-                            file=sys.stderr,
-                        )
-                    else:
-                        raise
+                except ActionCancelled:
+                    raise
                 except Exception:
                     if attempt < retries:
                         print(
@@ -951,94 +904,26 @@ class WorkflowExecutor:
                             if backoff == "exponential"
                             else delay
                         )
-                        retry_wait = ActionCancellation(
-                            self._ensure_run_cancel_event(context),
-                            self._shutdown_event(),
-                        )
+                        retry_wait = cancellation
                         if retry_wait.wait(min(wait_seconds, 3600)):
                             retry_wait.raise_if_cancelled()
                     continue
-                raise
-        except ActionCancelled as exc:
-            timed_out = exc.reason == "timeout"
-            if timed_out:
-                self._diagnostics.inc_action_fail()
-                engine_error(
-                    "action_timed_out",
-                    action_type=action_type,
-                    rule_name=rule_name,
-                    error=str(exc),
-                )
-            self._on_event(
-                "action_timed_out" if timed_out else "action_cancelled",
-                {
-                    "action_type": action_type,
-                    "rule_id": context.get("rule", {}).get("id", ""),
-                    "run_id": _run_id(context),
-                    "rule_name": rule_name,
-                    "step_id": action.get("binding_id") or action_type,
-                    "error": str(exc),
-                    "input_summary": input_summary,
-                    "attempt": attempt + 1,
-                    "duration_ms": round((time.perf_counter() - started) * 1000),
-                },
-            )
-            return False, exc
+        except ActionCancelled as error:
+            return self._record_action_cancelled(action, rule_name, context, error, input_summary, attempt, started)
         except Exception as error:
-            self._diagnostics.inc_action_fail()
-            error_code = "action_execution_failed"
-            error_message = f"动作 {action_type} 执行失败"
-            print(
-                f"[Engine] [ERR] 执行 action \"{action_type}\" 失败 "
-                f"({type(error).__name__})",
-                file=sys.stderr,
-            )
-            engine_error(
-                "action_failed",
-                action_type=action_type,
-                rule_name=rule_name,
-                error_type=type(error).__name__,
-            )
-            self._on_event(
-                "error",
-                {
-                    "action_type": action_type,
-                    "rule_id": context.get("rule", {}).get("id", ""),
-                    "run_id": _run_id(context),
-                    "rule_name": rule_name,
-                    "step_id": action.get("binding_id") or action_type,
-                    "error": {
-                        "code": error_code,
-                        "message": error_message,
-                    },
-                    "input_summary": input_summary,
-                    "attempt": attempt + 1,
-                    "duration_ms": round((time.perf_counter() - started) * 1000),
-                },
-            )
-            return False, error_message
+            return self._record_action_failure(action, rule_name, context, error, input_summary, attempt, started)
         finally:
-            with self.action_lock:
-                self._active_actions -= 1
             with self.action_done:
+                self._active_actions -= 1
                 self.action_done.notify_all()
 
     def wait_active_actions(self, timeout: float = 60.0) -> bool:
         """等待活跃动作排空，返回是否在超时内全部完成"""
-        print("[Engine] 正在关闭，等待活跃动作完成...")
-        deadline = time.time() + timeout
-        while True:
-            remaining = self.active_actions
-            if remaining == 0:
-                print("[Engine] 所有动作已完成，引擎安全关闭")
-                return True
-            if time.time() >= deadline:
-                print(
-                    f"[Engine] [!!] shutdown: {remaining} active action(s) still "
-                    f"running after {timeout}s, forcing exit",
-                    file=sys.stderr,
-                )
-                return False
-            print(f"[Engine] 等待 {remaining} 个活跃动作完成...")
-            with self.action_done:
-                self.action_done.wait(timeout=3)
+        deadline = time.monotonic() + timeout
+        with self.action_done:
+            while self._active_actions:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.action_done.wait(timeout=remaining)
+        return True

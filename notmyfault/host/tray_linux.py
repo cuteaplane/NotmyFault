@@ -45,9 +45,14 @@ class TrayIcon:
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
+        try:
+            with Image.open(ICON_PATH) as source:
+                image = source.copy()
+        except OSError:
+            image = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
         self._icon = pystray.Icon(
             "notmyfault",
-            Image.open(ICON_PATH),
+            image,
             "NotmyFault",
             menu=pystray.Menu(
                 pystray.MenuItem("打开控制面板", self._open_dashboard, default=True),

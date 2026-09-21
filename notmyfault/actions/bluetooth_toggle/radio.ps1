@@ -165,9 +165,10 @@ try {
         detail = (Radio-State $radios)
     } 6
 } catch {
+    $code = if ($_.Exception.Message -like '*timed out*') { 'operation_timeout' } else { 'winrt_unavailable' }
     Write-Payload @{
         ok = $false
-        code = "winrt_unavailable"
+        code = $code
         detail = $_.Exception.Message
     } 7
 }

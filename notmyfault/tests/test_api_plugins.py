@@ -3,56 +3,21 @@ from __future__ import annotations
 import json
 
 import py7zr
+import pytest
 
 from notmyfault.host.api.plugin_installation import PluginFileSystem
 from notmyfault.tests.api_support import make_api_env
+from notmyfault.tests.plugin_support import build_nmfp, make_meta, post_archive
 
 
-def make_meta(plugin_kind: str, **overrides):
-    meta = {
-        "id": f"demo_{plugin_kind}",
-        "name": "演示插件",
-        "description": "演示用插件",
-        "enabled": True,
-        "version_code": 1,
-        "version": "1.0",
-        "package_name": f"com.test.demo_{plugin_kind}",
-    }
-    meta.update(overrides)
-    return meta
+@pytest.fixture(autouse=True)
+def normal_plugin_installation_mode(monkeypatch):
+    from notmyfault.host.api.services import plugin_installation
+    from notmyfault.security.security import SecurityMode
 
-
-def build_nmfp(tmp_path, meta, plugin_kind, tag="pkg", extra_files=None):
-    json_name = "trigger.json" if plugin_kind == "triggers" else "action.json"
-    source = tmp_path / f"source-{tag}" / f"plugin-{tag}"
-    source.mkdir(parents=True)
-    (source / json_name).write_text(
-        json.dumps(meta, ensure_ascii=False), encoding="utf-8"
+    monkeypatch.setattr(
+        plugin_installation, "detect_security_mode", lambda: SecurityMode.NORMAL
     )
-    entry = "trigger.py" if plugin_kind == "triggers" else "action.py"
-    (source / entry).write_text(
-        "def run(meta, params):\n    return {'ok': True}\n", encoding="utf-8"
-    )
-    for name, content in (extra_files or {}).items():
-        target = source / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
-    archive = tmp_path / f"plugin-{tag}.nmfp"
-    with py7zr.SevenZipFile(archive, "w") as output:
-        for path in sorted(source.rglob("*")):
-            if path.is_file():
-                output.write(path, f"plugin-{tag}/{path.relative_to(source).as_posix()}")
-    return archive
-
-
-def post_archive(env, route, archive, data=None):
-    with open(archive, "rb") as file:
-        return env.client.post(
-            route,
-            headers=env.headers,
-            data=data or {},
-            files={"file": (archive.name, file, "application/octet-stream")},
-        )
 
 
 def test_safe_nmfp_installs_to_injected_user_plugin_path(tmp_path):
@@ -105,13 +70,13 @@ def test_builtin_plugin_id_cannot_be_installed_as_user_plugin(tmp_path):
     installed = env.client.post(
         "/api/plugins/install",
         headers=env.headers,
-        data={"preview_token": preview.json()["preview_token"]},
+        data={"preview_token": preview.json()["preview_token"], "confirmed_risk_ids": json.dumps(preview.json()["installation"]["required_risk_ids"])},
     )
     assert installed.status_code == 409
     assert not (env.paths.user_plugins_dir / "actions" / "notify").exists()
 
 
-def test_builtin_plugin_id_in_other_kind_does_not_conflict(tmp_path):
+def test_builtin_plugin_id_in_other_kind_conflicts(tmp_path):
     env = make_api_env(tmp_path)
     archive = build_nmfp(
         tmp_path,
@@ -126,8 +91,70 @@ def test_builtin_plugin_id_in_other_kind_does_not_conflict(tmp_path):
 
     installed = post_archive(env, "/api/plugins/install", archive)
 
-    assert installed.status_code == 200
-    assert (env.paths.user_plugins_dir / "triggers" / "notify").is_dir()
+    assert installed.status_code == 400
+    assert "plugin_id_collision" in {risk["id"] for risk in installed.json()["risks"]}
+    assert not (env.paths.user_plugins_dir / "triggers" / "notify").exists()
+
+
+@pytest.mark.parametrize("value", [[], "manifest", None])
+def test_non_object_manifest_is_rejected_by_preview_and_reported_in_catalog(tmp_path, value):
+    env = make_api_env(tmp_path)
+    archive = build_nmfp(tmp_path, value, "actions")
+    preview = post_archive(env, "/api/plugins/preview", archive)
+    assert preview.status_code == 400
+    plugin = env.paths.user_plugins_dir / "actions" / "invalid"
+    plugin.mkdir(parents=True)
+    (plugin / "action.json").write_text(json.dumps(value), encoding="utf-8")
+    listed = env.client.get("/api/plugins/list", headers=env.headers)
+    assert listed.status_code == 200
+    assert "JSON 对象" in listed.json()["actions"]["invalid"]["_error"]
+
+
+def test_strict_install_validates_signature_before_replacing_installed_plugin(tmp_path, monkeypatch):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    from notmyfault.host.api.services import plugin_installation
+    from notmyfault.security import signing, signing_keys
+    from notmyfault.security.security import SecurityMode
+
+    env = make_api_env(tmp_path)
+    meta = make_meta("actions", author="插件作者", build={"outputs": ["action.py"]})
+    root = tmp_path / "signed"
+    root.mkdir()
+    (root / "action.json").write_text(json.dumps(meta), encoding="utf-8")
+    original = b"def run(meta, params): return 1\n"
+    (root / "action.py").write_bytes(original)
+    author = Ed25519PrivateKey.generate()
+    owner = Ed25519PrivateKey.generate()
+    signing.self_sign_plugin(root, author)
+    monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [
+        owner.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    ])
+    monkeypatch.setattr(plugin_installation, "detect_security_mode", lambda: SecurityMode.STRICT)
+    monkeypatch.setattr(plugin_installation.PluginInstallationService, "_counter_sign_author_key",
+                        lambda self, path, password: signing.counter_sign_author_key(path, owner) and None)
+
+    def install(tag):
+        archive = tmp_path / f"{tag}.nmfp"
+        with py7zr.SevenZipFile(archive, "w") as output:
+            for path in root.iterdir():
+                output.write(path, f"signed/{path.name}")
+        preview = post_archive(env, "/api/plugins/preview", archive)
+        assert preview.status_code == 200
+        return env.client.post("/api/plugins/install", headers=env.headers, data={
+            "preview_token": preview.json()["preview_token"],
+            "confirmed_risk_ids": '["build_hook"]',
+        })
+
+    assert install("valid").status_code == 200
+    installed = env.paths.user_plugins_dir / "actions" / meta["id"]
+    assert signing.verify_author_key_counter_signature(installed, signing_keys.get_public_keys())
+    assert (installed / "signature.sig").read_bytes() == (root / "signature.sig").read_bytes()
+    (root / "action.py").write_text("def run(meta, params): return 2\n", encoding="utf-8")
+    rejected = install("changed")
+    assert rejected.status_code == 400
+    assert "签名无效" in rejected.json()["error"]
+    assert (installed / "action.py").read_bytes() == original
 
 
 def test_preview_token_installs_the_exact_previewed_directory(tmp_path):
@@ -193,6 +220,70 @@ def test_build_hook_requires_matching_server_confirmation(tmp_path):
         },
     )
     assert confirmed.status_code == 200
+
+
+def test_unsigned_build_command_is_not_executed(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from notmyfault.host.api.services import plugin_installation
+
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    env = make_api_env(tmp_path)
+    monkeypatch.setattr(plugin_installation.subprocess, "run", fake_run)
+    archive = build_nmfp(
+        tmp_path,
+        make_meta(
+            "actions",
+            build={"command": ["echo pwned"], "outputs": ["action.py"]},
+        ),
+        "actions",
+        "unsigned-build",
+    )
+    preview = post_archive(env, "/api/plugins/preview", archive)
+    assert preview.status_code == 200
+    installed = env.client.post(
+        "/api/plugins/install",
+        headers=env.headers,
+        data={
+            "preview_token": preview.json()["preview_token"],
+            "confirmed_risk_ids": '["build_hook"]',
+        },
+    )
+    assert installed.status_code == 400
+    assert "签名" in installed.json()["error"]
+    assert calls == []
+
+
+def test_build_command_runs_as_argv_without_shell(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from notmyfault.host.api.services import plugin_installation
+    from notmyfault.host.api.services.plugin_installation import (
+        PluginInstallationService,
+    )
+
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["shell"] = kwargs.get("shell")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(plugin_installation.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        plugin_installation, "plugin_signature_kind", lambda *a, **k: "author"
+    )
+    PluginInstallationService._run_build_hook(
+        tmp_path,
+        {"build": {"command": ["python setup.py"]}},
+    )
+    assert captured["shell"] is False
+    assert captured["command"] == ["python", "setup.py"]
 
 
 def test_downgrade_requires_force_and_keeps_backup(tmp_path):

@@ -3,6 +3,7 @@ powercfg 在子进程中运行，并设置超时
 """
 
 import subprocess
+import uuid
 import sys
 
 # Windows 电源计划 GUID 在不同语言系统上保持一致
@@ -22,6 +23,10 @@ def run(action_info, params):
         guid = str(params.get("custom_guid", "") or "").strip()
         if not guid:
             raise ValueError("自定义电源计划必须提供 GUID")
+        try:
+            guid = str(uuid.UUID(guid))
+        except ValueError:
+            raise ValueError("自定义电源计划必须提供有效的 GUID") from None
     elif plan in _PLANS:
         guid = _PLANS[plan]
     else:

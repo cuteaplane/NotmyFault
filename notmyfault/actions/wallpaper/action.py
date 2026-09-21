@@ -3,6 +3,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from notmyfault.plugin_api import native_lock
+
 SPI_SETDESKWALLPAPER = 0x0014
 SPIF_UPDATEINIFILE = 0x01
 SPIF_SENDCHANGE = 0x02
@@ -19,6 +21,8 @@ _WALLPAPER_STYLES = {
 def run(action_info, params):
     image_path = params.get("image_path", "").strip()
     style = params.get("style", "fill")
+    if style not in _WALLPAPER_STYLES:
+        raise ValueError(f"未知壁纸样式: {style}")
 
     if not image_path:
         raise ValueError("未指定图片路径")
@@ -37,7 +41,13 @@ def run(action_info, params):
         desktop = desktop_environment()
         if desktop == "gnome":
             uri = Path(abspath).as_uri()
+            keys = subprocess.run(
+                ["gsettings", "list-keys", "org.gnome.desktop.background"],
+                capture_output=True, text=True, check=True, timeout=5,
+            ).stdout.splitlines()
             for key in ("picture-uri", "picture-uri-dark"):
+                if key == "picture-uri-dark" and key not in keys:
+                    continue
                 subprocess.run(
                     ["gsettings", "set", "org.gnome.desktop.background", key, uri],
                     check=True,
@@ -62,6 +72,8 @@ def run(action_info, params):
                 timeout=5,
             )
         elif command_path("plasma-apply-wallpaperimage"):
+            if style != "fill":
+                raise ValueError("当前 Plasma 壁纸后端只支持填充样式")
             subprocess.run(
                 ["plasma-apply-wallpaperimage", abspath],
                 check=True,
@@ -72,11 +84,16 @@ def run(action_info, params):
         print("[Action:wallpaper] 壁纸已更换")
         return
 
-    user32 = ctypes.windll.user32
-    result = user32.SystemParametersInfoW(
-        SPI_SETDESKWALLPAPER, 0, abspath,
-        SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
-    )
+    with native_lock():
+        user32 = ctypes.windll.user32
+        user32.SystemParametersInfoW.argtypes = [
+            ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint,
+        ]
+        user32.SystemParametersInfoW.restype = ctypes.c_int
+        result = user32.SystemParametersInfoW(
+            SPI_SETDESKWALLPAPER, 0, ctypes.c_wchar_p(abspath),
+            SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
+        )
     if not result:
         raise RuntimeError(
             f"SystemParametersInfoW 设置壁纸失败（返回 {result}）"

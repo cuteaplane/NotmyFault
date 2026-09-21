@@ -6,11 +6,25 @@
     "version": "1.0",
     "package_name": "io.github.notmyfault.power_plan",
     "enabled": true,
-    "platforms": ["windows"],
-    "permissions": ["external_binary"],
+    "idempotent": true,
+    "platforms": [
+        "windows"
+    ],
+    "permissions": [
+        "external_binary"
+    ],
     "outputs": [
-        {"name": "plan", "label": "电源计划", "type": "string"},
-        {"name": "guid", "label": "计划 GUID", "type": "string"}
+        {
+            "name": "plan",
+            "label": "电源计划",
+            "type": "string"
+        },
+        {
+            "name": "guid",
+            "label": "计划 GUID",
+            "type": "string",
+            "value_type": "uuid"
+        }
     ],
     "params": [
         {
@@ -19,10 +33,22 @@
             "type": "select",
             "default": "balanced",
             "options": [
-                {"value": "balanced", "label": "平衡"},
-                {"value": "high_performance", "label": "高性能"},
-                {"value": "power_saver", "label": "节能"},
-                {"value": "custom", "label": "自定义 GUID"}
+                {
+                    "value": "balanced",
+                    "label": "平衡"
+                },
+                {
+                    "value": "high_performance",
+                    "label": "高性能"
+                },
+                {
+                    "value": "power_saver",
+                    "label": "节能"
+                },
+                {
+                    "value": "custom",
+                    "label": "自定义 GUID"
+                }
             ]
         },
         {
@@ -31,7 +57,11 @@
             "type": "string",
             "default": "",
             "placeholder": "如 381b4222-f694-41f0-9685-ff5bb260df2e",
-            "visible_when": {"plan": ["custom"]}
+            "visible_when": {
+                "plan": [
+                    "custom"
+                ]
+            }
         }
     ]
 }

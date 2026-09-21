@@ -3,6 +3,7 @@ Windows 用 SetWindowPos；Linux 用 wmctrl（仅 X11）
 """
 
 import os
+import time
 
 from notmyfault.plugin_api import platform_backend_api
 
@@ -90,6 +91,14 @@ def run(action_info, params):
             )
             if not ok:
                 raise RuntimeError("设置窗口置顶失败")
+        deadline = time.monotonic() + 1
+        while True:
+            with NATIVE_LOCK:
+                if _is_pinned(hwnd) == pin:
+                    break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("窗口置顶状态未生效")
+            time.sleep(0.05)
         state = "pinned" if pin else "unpinned"
         print(f"[Action:window_pin] {state} hwnd={hwnd}")
         return {"state": state, "hwnd": hwnd}

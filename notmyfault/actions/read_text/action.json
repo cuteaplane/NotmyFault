@@ -1,0 +1,87 @@
+{
+  "id": "read_text",
+  "name": "读取文本文件",
+  "description": "读取本地文本，保留原始换行，供后续动作引用；文件超过字节上限时报错",
+  "version_code": 1,
+  "version": "1.0",
+  "package_name": "io.github.notmyfault.read_text",
+  "enabled": true,
+  "idempotent": true,
+  "permissions": [
+    "filesystem"
+  ],
+  "execution_api": "context-v1",
+  "outputs": [
+    {
+      "name": "file",
+      "label": "文件路径",
+      "type": "string",
+      "value_type": "path"
+    },
+    {
+      "name": "text",
+      "label": "文本内容",
+      "type": "string",
+      "sensitive": true,
+      "summary": "hidden",
+      "value_type": "text"
+    },
+    {
+      "name": "bytes",
+      "label": "读取字节数",
+      "type": "number",
+      "value_type": "int"
+    },
+    {
+      "name": "characters",
+      "label": "字符数",
+      "type": "number",
+      "value_type": "int"
+    }
+  ],
+  "params": [
+    {
+      "name": "file_path",
+      "label": "文件路径",
+      "type": "path",
+      "default": "",
+      "required": true,
+      "value_type": "path"
+    },
+    {
+      "name": "encoding",
+      "label": "编码",
+      "type": "string",
+      "default": "utf-8-sig",
+      "options": [
+        {
+          "value": "utf-8-sig",
+          "label": "UTF-8，去除 BOM"
+        },
+        {
+          "value": "utf-8",
+          "label": "UTF-8"
+        },
+        {
+          "value": "gbk",
+          "label": "GBK"
+        },
+        {
+          "value": "utf-16",
+          "label": "UTF-16"
+        }
+      ],
+      "value_type": "text",
+      "placeholder": "utf-8、utf-8-sig、utf-16、gbk、gb18030、big5、shift_jis"
+    },
+    {
+      "name": "max_bytes",
+      "label": "读取字节上限",
+      "type": "number",
+      "default": 1048576,
+      "min": 1,
+      "max": 104857600,
+      "value_type": "int"
+    }
+  ]
+}

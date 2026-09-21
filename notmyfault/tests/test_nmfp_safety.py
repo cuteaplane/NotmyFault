@@ -39,7 +39,7 @@ class FakeArchive:
 def install_fake_archive(monkeypatch, infos, raw_infos=None):
     archive = FakeArchive(infos, raw_infos)
 
-    def factory(path, mode="r", password=None):
+    def factory(path, mode="r", password=None, max_extract_size=None):
         return archive
 
     monkeypatch.setattr(py7zr, "SevenZipFile", factory)

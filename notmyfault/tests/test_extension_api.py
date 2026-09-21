@@ -99,6 +99,8 @@ def native_editor_meta():
 
 class ExtensionEngine:
     def __init__(self, root):
+        self.triggers_meta = {}
+        self.actions_meta = {"sample": extension_meta()}
         self.extensions = ExtensionRegistry()
         self.extensions.register_manifest("sample", "action", extension_meta(), str(root))
         self.extensions.register_command("sample", "open", self.open_editor, self)
@@ -124,6 +126,8 @@ class ExtensionEngine:
 
 class NativeEditorEngine:
     def __init__(self, root):
+        self.triggers_meta = {"native_sample": native_editor_meta()}
+        self.actions_meta = {}
         self.extensions = ExtensionRegistry()
         self.extensions.register_manifest(
             "native_sample", "trigger", native_editor_meta(), str(root)
@@ -258,17 +262,7 @@ def test_action_extension_commands_follow_lazy_loading(tmp_path):
         integrity_errors=[],
         plugin_manifest_path=str(tmp_path / "manifest.json"),
     )
-    loaded, failed = loader.load(
-        base_dir=str(tmp_path),
-        plugins_dir="actions",
-        json_filename="action.json",
-        py_filename="action.py",
-        module_prefix="notmyfault.test_extension_",
-        meta_store=registry.actions_meta,
-        func_store=registry.actions_funcs,
-        store_name="Action",
-        origin="builtin",
-    )
+    loaded, failed = loader.load(str(tmp_path / "actions"), "action", origin="builtin")
     assert (loaded, failed) == (1, 0)
     assert registry.extensions.handler("sample", "open") is None
     assert registry.resolve_action("sample") is not None
@@ -418,11 +412,20 @@ def test_extension_view_rejects_page_outside_plugin_root(tmp_path):
     assert "不应读取" not in response.text
 
 
-def test_extension_exception_is_logged_but_not_returned(tmp_path):
+@pytest.mark.parametrize("result_kind", ["exception", "json", "size", "error"])
+def test_extension_exception_is_logged_but_not_returned(tmp_path, result_kind):
     engine = ExtensionEngine(tmp_path)
+    cleaned = []
 
     def fail(_context, _payload):
-        raise RuntimeError("unit-test-secret-extension-detail")
+        _context.register_cleanup(lambda: cleaned.append(True))
+        if result_kind == "exception":
+            raise RuntimeError("unit-test-secret-extension-detail")
+        if result_kind == "json":
+            return {"data": object()}
+        if result_kind == "size":
+            return {"data": "x" * (1024 * 1024 + 1)}
+        return {"ok": False, "error": "操作失败"}
 
     engine.extensions.register_command("sample", "open", fail, engine)
     client, headers = make_client(tmp_path, engine)
@@ -436,9 +439,10 @@ def test_extension_exception_is_logged_but_not_returned(tmp_path):
         },
     )
 
-    assert response.status_code == 400
-    assert response.json()["error"] == "插件命令调用失败"
+    assert response.status_code == (413 if result_kind == "size" else 400)
+    assert response.json()["ok"] is False
     assert "unit-test-secret-extension-detail" not in response.text
+    assert cleaned == [True]
 
 
 def test_extension_session_manager_drop_all_runs_cleanup():

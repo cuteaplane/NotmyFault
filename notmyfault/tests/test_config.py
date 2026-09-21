@@ -14,6 +14,7 @@ from notmyfault.config import (
     normalize_rules,
 )
 from notmyfault.core.bindings import resolve_value
+from notmyfault.host.api.services.settings import SettingsService, SettingsServiceError
 from notmyfault.tests.api_support import make_paths, make_store
 
 
@@ -90,29 +91,63 @@ def test_round_trip_uses_the_existing_files_and_json_shape(tmp_path):
     paths = make_paths(tmp_path)
     store = make_store(paths)
     assert store.save_config({"custom": "value"})
-    assert store.save_rules([simple_rule()])
+    rule = simple_rule()
+    event = rule.pop("event")
+    rule["condition"] = {"op": "not", "within_seconds": 10, "children": [event]}
+    rule["actions"] = [{"type": "if", "condition": {"op": "eq", "left": 1, "right": 1}, "then": rule["actions"], "else": []}]
+    assert store.save_rules([rule])
     assert store.config_path == str(paths.config_dir / "config.json")
     assert store.rules_path == str(paths.config_dir / "rules.json")
     config_on_disk = json.loads(paths.config_file.read_text(encoding="utf-8"))
     rules_on_disk = json.loads(paths.rules_file.read_text(encoding="utf-8"))
     assert len(config_on_disk["_signature"]) == 64
-    assert set(rules_on_disk) == {"schema_version", "rules", "_signature"}
+    assert set(rules_on_disk) == {"schema_version", "rules", "_signature", "value_encoding"}
+    assert rules_on_disk["value_encoding"] == "typed-v1"
     assert store.load_verified_config()["custom"] == "value"
-    assert store.load_verified_rules()[0]["name"] == "提醒"
+    restored = store.load_verified_rules()[0]
+    assert normalize_rules([restored]) == [restored]
+    assert "event" not in restored and "trigger" not in restored
+    assert restored["name"] == "提醒"
+    assert restored["condition"]["op"] == "not"
+    assert restored["condition"]["within_seconds"] == 10
+    assert restored["actions"][0]["then"][0]["binding_id"].startswith("a_")
+    assert restored["actions"][0]["else"] == []
+    restored["preconditions"] = [{"type": "document_quiescent", "params": {}}]
+    assert store.save_rules([restored])
+    with pytest.raises(ConfigValidationError, match="运行前检查已移除"):
+        store.load_verified_rules()
+    editable = store.load_verified_rules(for_editing=True)
+    assert editable[0]["preconditions"][0]["type"] == "document_quiescent"
+    assert editable[0]["actions"] == restored["actions"]
 
 
-def test_reopened_store_accepts_secure_existing_secret(tmp_path):
+def test_reopened_store_accepts_secure_existing_secret(tmp_path, monkeypatch):
+    if os.name == "nt":
+        monkeypatch.setenv("USERDOMAIN", "")
+        monkeypatch.setenv("USERNAME", "notmyfault-not-the-current-user")
     paths = make_paths(tmp_path)
     make_store(paths)
 
     assert SignedConfigStore(paths).load_verified_config()["settings"] == {}
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX 文件模式检查")
 def test_reopened_store_rejects_world_readable_secret(tmp_path):
     paths = make_paths(tmp_path)
     make_store(paths)
-    paths.config_secret_file.chmod(0o644)
+    if os.name == "nt":
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["icacls", str(paths.config_secret_file), "/grant:r", "*S-1-1-0:R"],
+                capture_output=True, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            pytest.skip(f"当前环境不能设置测试文件 ACL: {error}")
+        if result.returncode:
+            pytest.skip("当前账户不能为测试文件添加 Everyone 读取权限")
+    else:
+        paths.config_secret_file.chmod(0o644)
 
     with pytest.raises(ConfigValidationError, match="权限过宽"):
         SignedConfigStore(paths).load_verified_config()
@@ -146,12 +181,15 @@ def test_signature_algorithm_stays_hmac_sha256_over_sorted_json(tmp_path):
 
 
 @pytest.mark.parametrize("target", ["config", "rules"])
-def test_tampering_is_rejected(target, tmp_path):
+@pytest.mark.parametrize("bad_signature", [None, 123, ["bad"], "错误签名"])
+def test_tampering_is_rejected(target, bad_signature, tmp_path):
     paths = make_paths(tmp_path)
     store = make_store(paths)
     path = paths.config_file if target == "config" else paths.rules_file
     raw = json.loads(path.read_text(encoding="utf-8"))
     raw["tampered"] = True
+    if bad_signature is not None:
+        raw["_signature"] = bad_signature
     path.write_text(json.dumps(raw), encoding="utf-8")
     loader = (
         store.load_verified_config
@@ -191,12 +229,21 @@ def test_config_parse_failure_recovers_signed_backup(tmp_path):
     assert store.load_verified_config()["generation"] == 1
 
 
-def test_rules_parse_failure_recovers_signed_backup(tmp_path):
+@pytest.mark.parametrize("backup_valid", [True, False])
+def test_rules_parse_failure_recovers_signed_backup(tmp_path, backup_valid):
     paths = make_paths(tmp_path)
     store = make_store(paths)
     assert store.save_rules([simple_rule("旧")])
     assert store.save_rules([simple_rule("新")])
     paths.rules_file.write_text("{broken", encoding="utf-8")
+    if not backup_valid:
+        backup = paths.rules_file.with_suffix(".json.bak")
+        backup.write_text("{bad-backup", encoding="utf-8")
+        with pytest.raises(ConfigValidationError):
+            store.load_rules()
+        assert paths.rules_file.read_text(encoding="utf-8") == "{broken"
+        assert backup.read_text(encoding="utf-8") == "{bad-backup"
+        return
     recovered = store.load_rules()
     assert [rule["name"] for rule in recovered] == ["旧"]
 
@@ -242,23 +289,47 @@ def test_security_inspection_summarizes_rules_and_detects_tamper(tmp_path):
             "params": {"message": "private-failure-message"},
         }],
     }]
-    assert store.save_rules([rule])
-    status = store.inspect_security({
-        "shutdown_system": {"security": {"rule_approval": "admin_key"}},
+    rule["actions"].append({
+        "type": "if",
+        "condition": {"op": "eq", "left": 1, "right": 1},
+        "then": [{
+            "type": "notify",
+            "params": {"message": "private-branch-message"},
+            "failure_actions": [{"type": "shutdown_system", "params": {}}],
+        }],
+        "else": [{
+            "type": "if",
+            "condition": {"op": "is_true", "left": True},
+            "then": [],
+            "else": [{"type": "shutdown_system", "params": {}}],
+        }],
     })
+    assert store.save_rules([rule])
+    status = SettingsService(store, lambda: {"actions": {
+        "shutdown_system": {"security": {"rule_approval": "admin_key"}},
+    }}).security_summary()
     assert status["status"] == "ok"
     assert status["summary"]["rule_count"] == 1
     assert status["summary"]["rules"][0]["actions"][0]["high_risk"] is True
     summary_text = json.dumps(status["summary"], ensure_ascii=False)
     assert "top-secret-token" not in summary_text
     assert "private-failure-message" not in summary_text
+    assert "private-branch-message" not in summary_text
     assert status["summary"]["rules"][0]["actions"][0]["params"] == {
         "token": "***"
     }
+    branch = status["summary"]["rules"][0]["actions"][1]
+    assert branch["high_risk"] is True
+    assert branch["then"][0]["params"] == {"message": "***"}
+    assert branch["then"][0]["high_risk"] is True
+    assert branch["then"][0]["failure_actions"][0]["type"] == "shutdown_system"
+    assert branch["else"][0]["high_risk"] is True
+    assert branch["else"][0]["then"] == []
+    assert branch["else"][0]["else"][0]["type"] == "shutdown_system"
     raw = json.loads(paths.rules_file.read_text(encoding="utf-8"))
     raw["rules"][0]["name"] = "篡改"
     paths.rules_file.write_text(json.dumps(raw), encoding="utf-8")
-    assert store.inspect_security()["status"] == "tampered"
+    assert SettingsService(store).security_summary()["status"] == "tampered"
 
 
 def test_approve_current_files_resigns_reviewed_content(tmp_path):
@@ -268,7 +339,7 @@ def test_approve_current_files_resigns_reviewed_content(tmp_path):
     raw["approved_value"] = 7
     raw["_signature"] = "invalid"
     paths.config_file.write_text(json.dumps(raw), encoding="utf-8")
-    store.approve_current_files({"triggers": {}, "actions": {}}, None)
+    SettingsService(store).approve_security()
     assert store.load_verified_config()["approved_value"] == 7
 
 
@@ -309,5 +380,5 @@ def test_approve_rejects_dynamic_literal_only_parameter(tmp_path):
             }
         },
     }
-    with pytest.raises(ConfigValidationError, match="数据绑定无效"):
-        store.approve_current_files(schema, None)
+    with pytest.raises(SettingsServiceError, match="数据绑定无效"):
+        SettingsService(store, lambda: schema).approve_security()

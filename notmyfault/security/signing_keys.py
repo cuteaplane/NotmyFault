@@ -3,6 +3,8 @@
 import os
 from typing import Optional
 
+from notmyfault.security.signing import load_public_key_bytes
+
 CURDIR = os.path.dirname(os.path.abspath(__file__))
 _PRIVATE_DIR = os.path.normpath(os.path.join(CURDIR, "..", "..", ".private"))
 
@@ -14,8 +16,8 @@ _USER_PUBLIC_KEY_PATH = os.path.join(_PRIVATE_DIR, "signing_public.pem")
 def _load_user_public_key() -> Optional[bytes]:
     try:
         with open(_USER_PUBLIC_KEY_PATH, "rb") as f:
-            return f.read()
-    except (OSError, FileNotFoundError):
+            return load_public_key_bytes(f.read())
+    except (OSError, ValueError, TypeError):
         return None
 
 

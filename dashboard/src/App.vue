@@ -1,55 +1,110 @@
 <script setup>
-import { ref, watch, onMounted, onUnmounted } from 'vue'
+import { defineAsyncComponent, nextTick, ref, watch, onMounted, onUnmounted } from 'vue'
 import NavRail from './components/NavRail.vue'
-import HomeView from './components/views/HomeView.vue'
-import PluginsView from './components/views/PluginsView.vue'
-import SecurityView from './components/views/SecurityView.vue'
-import SettingsView from './components/views/SettingsView.vue'
-import RulesView from './components/views/RulesView.vue'
-import LogsView from './components/views/LogsView.vue'
+import { views } from './lib/navigation'
 import AppDialog from './components/AppDialog.vue'
-import { store } from './lib/store'
+import { store, syncEngineStatus as updateStatus } from './lib/store'
 import { snack } from './lib/notify'
-import { fetchAuthenticated, hasBridge, loadConfig, loadPlugins, getSchema, getEngineStatus, getPluginExtensions, getAIDraftingSetting } from './lib/api'
+import { fetchAuthenticated, hasBridge, loadConfig, loadPlugins, getSchema, getEngineStatus, getPluginExtensions, getAIDraftingSetting, getRun } from './lib/api'
 import { ensureRuleIds } from './lib/bindings'
+import { normalizeRuleDraft } from './lib/utils'
 import { useTheme } from './composables/useTheme'
 
 const { init: initTheme } = useTheme()
 const currentPage = ref('home')
-const views = { home: HomeView, plugins: PluginsView, security: SecurityView, settings: SettingsView, rules: RulesView, logs: LogsView }
+const pageTransitioning = ref(false)
+let queuedPage = ''
+const FirstRunSetup = defineAsyncComponent(() => import('./components/FirstRunSetup.vue'))
+let savedFirstRun = ''
+try { savedFirstRun = localStorage.getItem('nmf-first-run') || '' } catch {}
+const firstRun = ref(new URLSearchParams(window.location.search).get('first_run') === '1' || !!savedFirstRun)
+if (firstRun.value && !savedFirstRun) {
+  try { localStorage.setItem('nmf-first-run', JSON.stringify({ step: 0 })) } catch {}
+}
+
+function finishFirstRun() {
+  firstRun.value = false
+  const url = new URL(window.location.href)
+  url.searchParams.delete('first_run')
+  window.history.replaceState(null, '', url)
+  nextTick(() => document.querySelector('.app-main')?.focus({ preventScroll: true }))
+}
 
 function switchPage(p) {
+  if (p === 'security') {
+    store.pendingSettingsSection = 'security'
+    p = 'settings'
+  } else if (p === 'logs') {
+    store.pendingAutomationSection = 'runs'
+    p = 'rules'
+  }
   if (p === currentPage.value || !views[p]) return
+  if (pageTransitioning.value) {
+    queuedPage = p
+    return
+  }
   currentPage.value = p
 }
 
+function finishPageTransition() {
+  pageTransitioning.value = false
+  const main = document.querySelector('.app-main')
+  if (main) main.scrollTop = 0
+  nextTick(() => main?.focus({ preventScroll: true }))
+  if (!queuedPage) return
+  const page = queuedPage
+  queuedPage = ''
+  switchPage(page)
+}
+
 let sseAbort = null
+let disposed = false
+let sseGeneration = 0
 let sseRetry = 0
 const SSE_MAX = 10
 let sseReconnectTimer = null
 let sseEventSeq = 0
+let refreshSignalTimer = null
 // 规则测试回显只关心这几类执行事件。
-const RULE_EVENTS = ['action_executed', 'action_skipped', 'action_cancelled', 'action_timed_out', 'workflow_failed', 'workflow_deferred', 'workflow_completed', 'test_assertions_completed', 'error', 'run_dropped', 'run_replaced']
+const RULE_EVENTS = ['action_executed', 'action_skipped', 'action_cancelled', 'action_timed_out', 'workflow_failed', 'workflow_completed', 'test_assertions_completed', 'error', 'run_dropped', 'run_replaced']
 const timers = []
 function setTracked(fn, ms) { const id = setInterval(fn, ms); timers.push(id); return id }
 
 const OFFLINE_STATUS = { api_alive: false, engine_running: false, engine_state: 'offline' }
 const CONFIG_LOAD_ATTEMPTS = 30
 const CONFIG_LOAD_INTERVAL = 150
+const REFRESH_SIGNAL_DELAY = 100
+let configLoadPromise = null
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
 function applyConfig(cfg) {
+  if (cfg?.config_error) {
+    store.configError = cfg.config_error
+    store.configLoaded = true
+    return true
+  }
   if (!cfg || !Array.isArray(cfg.rules)) return false
-  store.configData = { ...cfg, rules: ensureRuleIds(cfg.rules) }
+  try {
+    const rules = ensureRuleIds(cfg.rules.map(rule => normalizeRuleDraft(rule)))
+    store.configError = ''
+    store.configData = { ...cfg, rules }
+  } catch (error) {
+    store.configError = error.message
+  }
   store.configLoaded = true
   return true
 }
 
-async function loadConfigData() {
-  return applyConfig(await loadConfig())
+function loadConfigData() {
+  if (!configLoadPromise) {
+    configLoadPromise = loadConfig()
+      .then(applyConfig)
+      .finally(() => { configLoadPromise = null })
+  }
+  return configLoadPromise
 }
 
 async function loadConfigAtStartup() {
@@ -63,28 +118,20 @@ async function loadConfigAtStartup() {
   return false
 }
 
-function updateStatus(s) {
-  store.engineStatus = { ...store.engineStatus, ...s }
-  if ('api_alive' in s) store.controllerOnline = s.api_alive === true
-  if ('engine_running' in s) store.engineOnline = s.engine_running === true
-  document.body.classList.toggle('controller-online', store.controllerOnline)
-  document.body.classList.toggle('engine-online', store.engineOnline)
-}
-
 async function refreshAll(status = null) {
   const currentStatus = status || await getEngineStatus().catch(() => OFFLINE_STATUS)
   updateStatus(currentStatus)
   if (!currentStatus.api_alive) return
-  await loadConfigData().catch(() => {})
   void loadAISettingsOnce()
-  try {
-    const [sch, plugins, extensions] = await Promise.all([
-      getSchema(), loadPlugins(), getPluginExtensions(),
-    ])
+  const configPromise = loadConfigData().catch(() => {})
+  const catalogPromise = Promise.all([
+    getSchema(), loadPlugins(), getPluginExtensions(),
+  ]).then(([sch, plugins, extensions]) => {
     store.schema = sch
     store.pluginsData = plugins
     store.extensions = extensions
-  } catch (e) { /* 后台短暂不可用时保留已加载的数据。 */ }
+  }).catch(() => { /* 后台短暂不可用时保留已加载的数据。 */ })
+  await Promise.all([configPromise, catalogPromise])
 }
 
 async function refreshStatus() {
@@ -111,10 +158,14 @@ async function loadAISettingsOnce() {
 }
 
 async function connectSSE() {
+  if (disposed) return
+  const generation = ++sseGeneration
+  if (sseReconnectTimer) clearTimeout(sseReconnectTimer)
   sseReconnectTimer = null
   if (sseAbort) { sseAbort.abort(); sseAbort = null }
   let token = ''
   try { token = await window.pywebview?.api?.get_api_token() || '' } catch (e) { /* bridge 暂时不可用时按无 token 处理。 */ }
+  if (disposed || generation !== sseGeneration) return
   if (hasBridge() && !token) {
     // 后台服务重启时 token 文件可能尚未发布，这里按退避重连直到 token 出现。
     updateStatus({ engine_running: false })
@@ -129,8 +180,20 @@ async function connectSSE() {
   try {
     const res = await fetchAuthenticated('/api/events', { signal: abort.signal })
     if (!res.ok || !res.body) throw new Error('SSE HTTP ' + res.status)
+    if (disposed || generation !== sseGeneration) { abort.abort(); return }
     sseRetry = 0
     consumeSSE(res, abort)
+    const activeRun = store.activeManualRun
+    if (activeRun) {
+      getRun(activeRun.runId).then(run => {
+        if (disposed || store.activeManualRun !== activeRun) return
+        if (run && ['succeeded', 'failed', 'cancelled'].includes(run.status)) {
+          dispatchSSEEvent('workflow_completed', JSON.stringify({
+            run_id: activeRun.runId, status: run.status, recovered: true,
+          }))
+        }
+      }).catch(() => {})
+    }
   } catch (e) {
     if (abort.signal.aborted) return
     scheduleSSEReconnect()
@@ -138,12 +201,21 @@ async function connectSSE() {
 }
 
 function scheduleSSEReconnect() {
+  if (disposed) return
   sseRetry++
   if (sseRetry > SSE_MAX) updateStatus({ engine_running: false })
   // 长时间休眠、WebView 网络栈重置或 token 重新发布期间都可能连续失败，超过阈值仍会继续按退避重连。
   const delay = Math.min(1000 * 2 ** Math.min(sseRetry - 1, 4), 15000)
   if (sseReconnectTimer) clearTimeout(sseReconnectTimer)
   sseReconnectTimer = setTimeout(connectSSE, delay)
+}
+
+function scheduleRefreshSignal() {
+  if (refreshSignalTimer) return
+  refreshSignalTimer = setTimeout(() => {
+    refreshSignalTimer = null
+    store.refreshSignal++
+  }, REFRESH_SIGNAL_DELAY)
 }
 
 function dispatchSSEEvent(eventName, dataText) {
@@ -157,7 +229,7 @@ function dispatchSSEEvent(eventName, dataText) {
     })
     if (d.state === 'running') refreshAll()
   } else if (eventName === 'action_executed' || eventName === 'workflow_completed') {
-    store.refreshSignal++
+    scheduleRefreshSignal()
   }
   if (RULE_EVENTS.includes(eventName)) {
     let d = {}
@@ -209,14 +281,17 @@ async function consumeSSE(res, abort) {
     /* 流断开或主动终止时结束读取 */
   } finally {
     clearInterval(watchdog)
-    if (sseAbort === abort) sseAbort = null
+    reader.releaseLock()
+    if (sseAbort === abort) {
+      sseAbort = null
+      scheduleSSEReconnect()
+    }
   }
-  scheduleSSEReconnect()
 }
 
 // 后台控制服务离线时返回首页，自动化暂停时仍可编辑。
 watch(() => store.controllerOnline, (on) => {
-  if (!on && ['plugins', 'rules', 'logs', 'security', 'settings'].includes(currentPage.value)) {
+  if (!on && ['plugins', 'rules', 'settings'].includes(currentPage.value)) {
     switchPage('home')
   }
 })
@@ -225,12 +300,15 @@ watch(() => store.controllerOnline, (on) => {
 window.__nmf = { refreshAll, updateStatus, switchPage }
 
 onMounted(async () => {
+  window.addEventListener('pywebviewready', refreshStatus)
   initTheme()
   void loadConfigAtStartup()
   const status = await getEngineStatus().catch(() => OFFLINE_STATUS)
+  if (disposed) return
   updateStatus(status)
   if (status.api_alive) {
     await refreshAll(status)
+    if (disposed) return
     connectSSE()
   }
   setTracked(refreshStatus, 2000)
@@ -238,19 +316,26 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  disposed = true
+  sseGeneration++
+  window.removeEventListener('pywebviewready', refreshStatus)
   if (sseAbort) sseAbort.abort()
   if (sseReconnectTimer) clearTimeout(sseReconnectTimer)
+  if (refreshSignalTimer) clearTimeout(refreshSignalTimer)
   timers.forEach(id => clearInterval(id))
 })
 </script>
 
 <template>
+  <FirstRunSetup v-if="firstRun" @complete="finishFirstRun" />
+  <template v-else>
   <NavRail :current="currentPage" @switch="switchPage" />
-  <main class="app-main">
-    <Transition name="page" mode="out-in">
+  <main class="app-main" tabindex="-1" aria-label="页面内容">
+    <Transition name="page" mode="out-in" @before-leave="pageTransitioning = true" @after-enter="finishPageTransition">
       <component :is="views[currentPage]" :key="currentPage" />
     </Transition>
   </main>
-  <div class="snackbar" :class="{ show: snack.show }">{{ snack.msg }}</div>
+  </template>
+  <div class="snackbar" :class="{ show: snack.show }" role="status">{{ snack.show ? snack.msg : '' }}</div>
   <AppDialog />
 </template>

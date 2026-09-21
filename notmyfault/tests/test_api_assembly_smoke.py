@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import runpy
 import shutil
 import signal
+import sys
 import time
 from pathlib import Path
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from fastapi.testclient import TestClient
 
 from notmyfault.core.run_history import RunHistory
@@ -20,6 +24,7 @@ from notmyfault.host.api.plugin_installation import (
 from notmyfault.host.api_server import create_api_server
 from notmyfault.host.app import create_engine
 from notmyfault.host.plugin_registry import PluginRegistryClient
+from notmyfault.security import signing, signing_keys
 from notmyfault.tests.api_support import (
     API_TOKEN,
     FakeKeyStore,
@@ -38,6 +43,10 @@ def wait_for(predicate, timeout=5.0):
 
 
 def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_path):
+    monkeypatch.setattr("notmyfault.core.engine.AutomationEngine._alert_user", lambda *args, **kwargs: None)
+    monkeypatch.setattr("notmyfault.platform.platform_support.show_notification", lambda *args, **kwargs: None)
+    if sys.platform == "win32":
+        monkeypatch.setattr("Win_toaster.AUMID_Register.register_toaster", lambda *args, **kwargs: None)
     launcher_path = Path(__file__).resolve().parents[2] / "NOTMYFAULT.pyw"
     namespace = runpy.run_path(str(launcher_path), run_name="notmyfault_assembly_test")
     monkeypatch.setattr(signal, "signal", lambda *args: None)
@@ -54,7 +63,16 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
         source_package / "actions" / "notify",
         package_root / "actions" / "notify",
     )
+    signing_key = Ed25519PrivateKey.generate()
+    public_key = signing_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [public_key])
+    signing.sign_plugin(
+        package_root / "triggers" / "time_schedule", "trigger.json", signing_key
+    )
+    signing.sign_plugin(package_root / "actions" / "notify", "action.json", signing_key)
     paths = make_paths(tmp_path, package_root=package_root)
+    (tmp_path / "build.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "build.json.sig").write_bytes(b"test-signature")
     store = make_store(paths)
     assert store.save_rules(
         [
@@ -108,6 +126,7 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
             assert runner.start_engine() is True
             while True:
                 packet = await asyncio.wait_for(subscription.queue.get(), timeout=15)
+                assert packet["type"] != "engine_failed", packet["data"]
                 if packet["type"] == "engine_state_changed" and packet["data"] == {
                     "state": "running"
                 }:
@@ -121,7 +140,8 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
         assert client.get("/api/engine/status", headers=headers).json()[
             "engine_state"
         ] == "running"
-        time.sleep(1.05)
+        assert wait_for(lambda: runner.current_engine._hot_reloader._rules_mtime > 0)
+        previous_mtime = runner.current_engine._hot_reloader._rules_mtime
 
         response = client.put(
             "/api/rules",
@@ -148,6 +168,7 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
             },
         )
         assert response.status_code == 200, response.text
+        os.utime(paths.rules_file, (previous_mtime + 2, previous_mtime + 2))
         assert wait_for(
             lambda: runner.current_engine is not None
             and runner.current_engine.rules[0]["name"] == "装配热重载",

@@ -4,7 +4,7 @@ import signal
 import socket
 import threading
 from datetime import datetime
-from notmyfault.platform.platform_support import launch_python_entry, show_notification
+from notmyfault.platform.platform_support import launch_python_entry
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
@@ -72,20 +72,24 @@ def setup_logging(log_dir: str) -> str:
                 for i, line in enumerate(text.splitlines(True)):
                     if i == 0 and not self._pending:
                         self.file.write(line)
-                        self.orig.write(line)
+                        if self.orig is not None:
+                            self.orig.write(line)
                     elif line.strip():
                         prefix = f"[{ts}] "
                         self.file.write(prefix + line)
-                        self.orig.write(prefix + line)
+                        if self.orig is not None:
+                            self.orig.write(prefix + line)
                         self._pending = False
                     else:
                         self.file.write(line)
-                        self.orig.write(line)
+                        if self.orig is not None:
+                            self.orig.write(line)
                     if line.endswith("\n"):
                         self._pending = True
                 try:
                     self.file.flush()
-                    self.orig.flush()
+                    if self.orig is not None:
+                        self.orig.flush()
                 except Exception:
                     pass
 
@@ -94,12 +98,11 @@ def setup_logging(log_dir: str) -> str:
 
         def flush(self):
             self.file.flush()
-            self.orig.flush()
+            if self.orig is not None:
+                self.orig.flush()
 
-    # pythonw.exe 没有控制台时标准输出可能为 None，日志改写器使用 os.devnull
-    _devnull = open(os.devnull, "w")
-    sys.stdout = _TimestampWriter(log_fp, sys.__stdout__ or _devnull, _log_io_lock)  # type: ignore
-    sys.stderr = _TimestampWriter(log_fp, sys.__stderr__ or _devnull, _log_io_lock)  # type: ignore
+    sys.stdout = _TimestampWriter(log_fp, sys.__stdout__, _log_io_lock)
+    sys.stderr = _TimestampWriter(log_fp, sys.__stderr__, _log_io_lock)
     print(f"--------     NotmyFault Engine     --------")
     print(f"------ {datetime.now().isoformat()} ------")
     print(f"------     Welcome to NotmyFault!    ------")
@@ -131,8 +134,6 @@ def _open_dashboard():
     dashboard_pyw = os.path.join(PROJECT_ROOT, "dashboard.pyw")
     if os.path.exists(dashboard_pyw):
         try:
-            from notmyfault.platform.platform_support import launch_python_entry
-            print(dashboard_pyw)
             launch_python_entry(dashboard_pyw)
             return
         except Exception:
@@ -147,6 +148,7 @@ class EngineRunner:
         self._paths = paths
         self._store = store
         self._api = None
+        self._run_history = None
         self._tray = None
         self._api_socket = None
         self._force_exit_armed = threading.Event()
@@ -194,6 +196,8 @@ class EngineRunner:
     def _handle_engine_state(self, state: str) -> None:
         if self._tray:
             self._tray.set_engine_state(state)
+            if state == "running":
+                self._tray.show_balloon("NotmyFault", "引擎已启动")
         if self._api:
             self._api.publish_event("engine_state_changed", {"state": state})
 
@@ -276,7 +280,7 @@ class EngineRunner:
             return listener
         except OSError:
             listener.close()
-            return None
+            raise
 
     def run(self):
         log_dir = str(self._paths.logs_dir)
@@ -289,8 +293,10 @@ class EngineRunner:
         print(f"  当前日志: {log_path}")
 
         # 先独占监听端口再启动引擎，先调用 connect() 再 bind() 会让两个实例同时通过检查
-        self._api_socket = self._claim_api_socket()
-        if self._api_socket is None:
+        try:
+            self._api_socket = self._claim_api_socket()
+        except OSError as error:
+            print(f"[Engine] 无法监听 127.0.0.1:19198: {error}", file=sys.stderr)
             if self._check_already_running():
                 try:
                     print("[Engine] 已有实例或其他服务占用 127.0.0.1:19198，拒绝重复启动")
@@ -302,12 +308,18 @@ class EngineRunner:
                         "[Engine] 无法独占 127.0.0.1:19198，拒绝启动",
                         file=sys.stderr,
                     )
+            else:
+                from notmyfault.host.alert import alert_user
+
+                alert_user("NotmyFault 启动失败", f"无法监听 127.0.0.1:19198: {error}", open_dashboard=False)
+                raise SystemExit(1) from error
             return
 
         try:
             api_token_store = ApiTokenStore(self._paths.api_token_file)
             ai_key_store = AIKeyStore(self._paths.ai_api_key_file)
             run_history = RunHistory(str(self._paths.run_history_file))
+            self._run_history = run_history
             event_broker = EventBroker(run_history)
             self._api = create_api_server(
                 engine_runner=self,
@@ -324,19 +336,27 @@ class EngineRunner:
             )
             self._runtime.set_event_sink(self._api.publish_event)
 
+            if _HAS_TRAY:
+                try:
+                    self._tray = TrayIcon(
+                        on_open_dashboard=_open_dashboard,
+                        on_toggle_engine=self._toggle_engine,
+                        on_exit=self._tray_exit,
+                    )
+                    self._tray.start()
+                    self._tray.set_engine_state(self.engine_state)
+                    print("[Tray] 系统托盘图标已启动")
+                except Exception as error:
+                    print(f"[Tray] 托盘启动失败: {error}", file=sys.stderr)
+                    if self._tray is not None:
+                        try:
+                            self._tray.stop()
+                        except Exception as stop_error:
+                            print(f"[Tray] 托盘清理失败: {stop_error}", file=sys.stderr)
+                    self._tray = None
+
             print("[启动] 启动主引擎...")
             self.start_engine()
-
-            if _HAS_TRAY:
-                self._tray = TrayIcon(
-                    on_open_dashboard=_open_dashboard,
-                    on_toggle_engine=self._toggle_engine,
-                    on_exit=self._tray_exit,
-                )
-                self._tray.start()
-                self._tray.set_engine_state(self.engine_state)
-                self._tray.show_balloon("NotmyFault", "引擎已启动")
-                print("[Tray] 系统托盘图标已启动")
 
             # serve 会一直运行到 uvicorn 退出
             self._api.serve(
@@ -358,12 +378,13 @@ class EngineRunner:
         self._runtime.request_stop()
         if self._tray:
             self._tray.stop()
-        if self.engine_thread and self.engine_thread.is_alive():
-            self.engine_thread.join(timeout=5)
-            if self.engine_thread.is_alive():
-                print("[Cleanup] 引擎线程仍未退出，已安排强制终止", file=sys.stderr)
-                self.request_process_shutdown(force_after=5)
-        if self._tray:
+        stopped = self._runtime.stop(timeout=5)
+        if not stopped:
+            print("[Cleanup] 引擎动作仍未退出，已安排强制终止", file=sys.stderr)
+            self.request_process_shutdown(force_after=5)
+        if self._run_history is not None and not self._run_history.flush():
+            print("[Cleanup] 运行历史写入超时", file=sys.stderr)
+        if self._tray and stopped:
             self._tray.show_balloon("NotmyFault", "引擎已停止", 1)
         if self._api_socket is not None:
             try:

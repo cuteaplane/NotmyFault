@@ -6,7 +6,6 @@ import re
 from typing import Any, Dict, Iterable, List
 
 
-SUMMARY_POLICIES = frozenset({"shape", "value", "hidden"})
 _MAX_FIELDS = 8
 _MAX_LABEL_LENGTH = 80
 _MAX_VALUE_LENGTH = 120
@@ -85,7 +84,9 @@ def summarize_fields(value: Any, definitions: Any) -> List[Dict[str, Any]]:
         if policy == "hidden":
             continue
         sensitive = spec.get("sensitive") is True
-        field_type = str(spec.get("value_type") or spec.get("type") or "any")
+        field_type = spec.get("value_type") or spec.get("type") or "any"
+        if isinstance(field_type, dict):
+            field_type = field_type.get("type", "any")
         display = (
             "敏感值已隐藏"
             if sensitive

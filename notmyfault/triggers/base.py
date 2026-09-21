@@ -5,6 +5,7 @@
 import sys
 import threading
 import traceback
+import time
 from typing import Any, Dict
 
 from notmyfault.native import NATIVE_LOCK
@@ -23,6 +24,8 @@ class PollingTrigger:
         self._emit_event = emit_event
         self._stop_event = shutdown_event
         self.trigger_id = str(meta.get("id", type(self).__name__))
+        self._last_poll_error = None
+        self._last_error_at = 0.0
 
     def emit(self, payload: Dict[str, Any]) -> None:
         """向引擎发送带 trigger_id 校验的 event-v2 事件"""
@@ -45,8 +48,8 @@ class PollingTrigger:
 
     def run(self) -> None:
         self.validate()
-        self.setup()
         try:
+            self.setup()
             while not self._stop_event.is_set():
                 try:
                     if self.native:
@@ -54,12 +57,15 @@ class PollingTrigger:
                             self.poll()
                     else:
                         self.poll()
-                except Exception:
-                    print(
-                        f"[Trigger:{self.trigger_id}] 轮询出错:",
-                        file=sys.stderr,
-                    )
-                    traceback.print_exc(limit=3)
+                except Exception as error:
+                    key = (type(error), str(error))
+                    now = time.monotonic()
+                    if key != self._last_poll_error or now - self._last_error_at >= 60:
+                        print(f"[Trigger:{self.trigger_id}] 轮询出错:", file=sys.stderr)
+                        traceback.print_exc(limit=3)
+                        self._last_poll_error, self._last_error_at = key, now
+                else:
+                    self._last_poll_error = None
                 self._stop_event.wait(self.interval)
         finally:
             self.teardown()

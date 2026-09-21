@@ -6,9 +6,17 @@ import { snackbar } from '../../lib/notify'
 import { confirmDialog } from '../../lib/dialog'
 import { buildRunExport } from '../../lib/runExport'
 
-const activeTab = ref('runs')
+const props = defineProps({
+  initialTab: { type: String, default: 'runs' },
+  showTabs: { type: Boolean, default: true },
+  embedded: { type: Boolean, default: false },
+})
+
+const activeTab = ref(props.initialTab)
 const runs = ref([])
 const entries = ref([])
+const logViewer = ref(null)
+const logsError = ref('')
 const files = ref([])
 const currentFile = ref('')
 const statusFilter = ref('all')
@@ -19,6 +27,11 @@ const searchText = ref('')
 const autoRefresh = ref(true)
 const expandedRunId = ref('')
 let timer = null
+let runsLoading = false
+let logsGeneration = 0
+const loadingLogFiles = new Set()
+let disposed = false
+const runsError = ref('')
 
 const isLatest = computed(() => currentFile.value === '')
 const levelMeta = {
@@ -108,38 +121,58 @@ function matchingRule(run) {
     || rules.find(rule => rule.name === run.rule_name)
 }
 
+function walkActions(actions, visit, trail = []) {
+  ;(actions || []).forEach((action, index) => {
+    visit(action, index, trail)
+    for (const field of ['then', 'else', 'failure_actions']) {
+      if (Array.isArray(action?.[field]) && action[field].length) {
+        walkActions(action[field], visit, [...trail, { action, field, index }])
+      }
+    }
+  })
+}
+
+function findAction(actions, bindingId) {
+  let found = null
+  walkActions(actions, (action, index, trail) => {
+    if (!found && action?.binding_id === bindingId) found = { action, index, trail }
+  })
+  return found
+}
+
 function runScope(run) {
   if (!run.start_step_id && !run.end_step_id) return ''
   const actions = matchingRule(run)?.actions || []
-  const start = run.start_step_id
-    ? actions.findIndex(action => action.binding_id === run.start_step_id) + 1
-    : 1
-  const end = run.end_step_id
-    ? actions.findIndex(action => action.binding_id === run.end_step_id) + 1
-    : actions.length
-  if (start <= 0 || end <= 0) return `局部测试 · ${run.action_count} 个动作`
-  return `局部测试 · 动作 ${start}–${end} / 共 ${actions.length} 个`
+  const startHit = run.start_step_id ? findAction(actions, run.start_step_id) : { index: 0, trail: [] }
+  const endHit = run.end_step_id ? findAction(actions, run.end_step_id) : { index: actions.length - 1, trail: [] }
+  if (!startHit || !endHit) return `局部测试 · ${run.action_count} 个动作`
+  if (startHit.trail.length || endHit.trail.length) return `局部测试 · ${run.action_count} 个动作`
+  return `局部测试 · 动作 ${startHit.index + 1}–${endHit.index + 1} / 共 ${actions.length} 个`
 }
 
 function stepNumber(run, step, fallback) {
-  const index = (matchingRule(run)?.actions || [])
-    .findIndex(action => action.binding_id === step.step_id)
-  return index >= 0 ? index + 1 : fallback
+  const found = findAction(matchingRule(run)?.actions || [], step.step_id)
+  if (!found) return fallback
+  if (!found.trail.length) return found.index + 1
+  const parent = found.trail[0]
+  const branch = parent.field === 'then' ? 'THEN' : parent.field === 'else' ? 'ELSE' : '失败处理'
+  return `${parent.index + 1}.${branch}.${found.index + 1}`
 }
 
 function stepContext(run, step) {
-  const rule = matchingRule(run)
-  const actions = rule?.actions || []
-  const action = actions.find(item => item.binding_id === step.step_id)
-  if (action) return { kind: 'action', label: '' }
-  for (const parent of actions) {
-    const failure = (parent.failure_actions || []).find(item => item.binding_id === step.step_id)
-    if (failure) {
-      return {
-        kind: 'failure',
-        label: `“${actionName(parent.type)}”的失败处理`,
-      }
+  const found = findAction(matchingRule(run)?.actions || [], step.step_id)
+  if (!found) return { kind: 'action', label: '' }
+  const failureParent = found.trail.find(item => item.field === 'failure_actions')
+  if (failureParent) {
+    return {
+      kind: 'failure',
+      label: `“${actionName(failureParent.action.type)}”的失败处理`,
     }
+  }
+  if (found.trail.some(item => item.field === 'then' || item.field === 'else')) {
+    const parent = found.trail[0]
+    const branch = parent.field === 'then' ? '成立时' : '否则'
+    return { kind: 'action', label: `“${actionName(parent.action.type)}”${branch}` }
   }
   return { kind: 'action', label: '' }
 }
@@ -173,7 +206,7 @@ function formatDuration(milliseconds) {
   if (milliseconds === null || milliseconds === undefined) return '尚未完成'
   if (milliseconds < 1000) return `${milliseconds} 毫秒`
   if (milliseconds < 60000) return `${(milliseconds / 1000).toFixed(milliseconds < 10000 ? 1 : 0)} 秒`
-  return `${Math.floor(milliseconds / 60000)} 分 ${Math.round(milliseconds % 60000 / 1000)} 秒`
+  return `${Math.floor(Math.round(milliseconds / 1000) / 60)} 分 ${Math.round(milliseconds / 1000) % 60} 秒`
 }
 
 function errorText(error) {
@@ -201,33 +234,58 @@ function jumpToStep(run, step) {
 }
 
 function isNearBottom() {
-  const element = document.getElementById('logViewer')
+  const element = logViewer.value
   if (!element) return true
   return element.scrollTop + element.clientHeight >= element.scrollHeight - 48
 }
 
 function scrollToEnd() {
-  const element = document.getElementById('logViewer')
+  const element = logViewer.value
   if (element) element.scrollTop = element.scrollHeight
 }
 
 async function loadFiles() {
-  const list = await listLogFiles()
-  files.value = Array.isArray(list) ? list.slice(1) : []
+  try {
+    const list = await listLogFiles()
+    files.value = Array.isArray(list) ? list.slice(1) : []
+  } catch (error) { logsError.value = error.message }
 }
 
 async function refreshRuns() {
-  runs.value = await listRuns(200)
+  if (runsLoading || disposed) return
+  runsLoading = true
+  try {
+    const result = await listRuns(200)
+    if (disposed) return
+    runs.value = result
+    runsError.value = ''
+  } catch (error) {
+    if (!disposed) runsError.value = error.message
+  } finally {
+    runsLoading = false
+  }
 }
 
 async function refreshLogs() {
-  const nearBottom = isNearBottom()
-  const list = isLatest.value
-    ? await readLogEntries(600)
-    : await readLogFileEntries(currentFile.value, 600)
-  entries.value = Array.isArray(list) ? list : []
-  await nextTick()
-  if (nearBottom) scrollToEnd()
+  const file = currentFile.value
+  if (disposed || loadingLogFiles.has(file)) return
+  loadingLogFiles.add(file)
+  const generation = ++logsGeneration
+  try {
+    const nearBottom = isNearBottom()
+    const list = file === ''
+      ? await readLogEntries(600)
+      : await readLogFileEntries(file, 600)
+    if (disposed || generation !== logsGeneration || file !== currentFile.value) return
+    entries.value = Array.isArray(list) ? list : []
+    logsError.value = ''
+    await nextTick()
+    if (nearBottom) scrollToEnd()
+  } catch (error) {
+    if (!disposed && generation === logsGeneration) logsError.value = error.message
+  } finally {
+    loadingLogFiles.delete(file)
+  }
 }
 
 async function refresh() {
@@ -241,7 +299,7 @@ async function copyLog() {
       .map(entry => `[${entry.ts || ''}] [${entry.level || 'INFO'}] ${entry.text || ''}`)
       .join('\n')
     await navigator.clipboard.writeText(text)
-    snackbar('日志已复制到剪贴板')
+    snackbar(`已复制当前筛选的 ${filteredEntries.value.length} 条日志`)
   } catch (error) {
     snackbar('复制失败：' + error.message)
   }
@@ -315,7 +373,8 @@ watch(() => store.refreshSignal, () => {
 })
 
 onMounted(async () => {
-  await Promise.all([loadFiles(), refreshRuns()])
+  await loadFiles()
+  await refresh()
   if (store.pendingRunId) {
     expandedRunId.value = store.pendingRunId
     store.pendingRunId = ''
@@ -323,21 +382,21 @@ onMounted(async () => {
   syncTimer()
 })
 onUnmounted(() => {
+  disposed = true
   if (timer) clearInterval(timer)
 })
 </script>
 
 <template>
-  <section class="page active run-center-page">
-    <div class="page-head">
+  <section class="page active run-center-page" :class="{ 'run-center-embedded': embedded }">
+    <div class="page-head" :class="{ 'run-center-embedded-head': embedded }">
       <div>
-        <h2>运行与日志</h2>
-        <p class="page-subtitle">先看每次自动化的结果，需要排障时再查看原始日志。</p>
+        <h2 v-if="!embedded">运行与日志</h2>
       </div>
       <div class="actions">
         <label class="check-row"><input type="checkbox" v-model="autoRefresh">自动刷新</label>
         <button v-if="activeTab === 'logs'" class="btn btn-outlined" @click="copyLog">
-          <span class="material-symbols-outlined">content_copy</span>复制日志
+          <span class="material-symbols-outlined">content_copy</span>复制筛选结果
         </button>
         <button class="btn btn-outlined" @click="refresh">
           <span class="material-symbols-outlined">refresh</span>刷新
@@ -345,26 +404,27 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <div class="tabs run-center-tabs" role="tablist" aria-label="运行记录和原始日志">
+    <div v-if="showTabs" class="tabs run-center-tabs" role="tablist" aria-label="运行记录和原始日志">
       <button class="tab" :class="{ active: activeTab === 'runs' }" role="tab" @click="activeTab = 'runs'">运行记录</button>
       <button class="tab" :class="{ active: activeTab === 'logs' }" role="tab" @click="activeTab = 'logs'">原始日志</button>
     </div>
 
     <template v-if="activeTab === 'runs'">
+      <p v-if="runsError" class="danger-text" role="status">{{ runsError }}，可刷新重试。</p>
       <div class="run-summary-grid">
-        <button class="run-summary-card" :class="{ active: statusFilter === 'all' }" @click="statusFilter = 'all'">
+        <button class="run-summary-card" :class="{ active: statusFilter === 'all' }" :aria-pressed="statusFilter === 'all'" @click="statusFilter = 'all'">
           <span>最近运行</span><strong>{{ runs.length }}</strong>
         </button>
-        <button class="run-summary-card succeeded" :class="{ active: statusFilter === 'succeeded' }" @click="statusFilter = 'succeeded'">
+        <button class="run-summary-card succeeded" :class="{ active: statusFilter === 'succeeded' }" :aria-pressed="statusFilter === 'succeeded'" @click="statusFilter = 'succeeded'">
           <span>成功</span><strong>{{ runCounts.succeeded }}</strong>
         </button>
-        <button class="run-summary-card failed" :class="{ active: statusFilter === 'failed' }" @click="statusFilter = 'failed'">
+        <button class="run-summary-card failed" :class="{ active: statusFilter === 'failed' }" :aria-pressed="statusFilter === 'failed'" @click="statusFilter = 'failed'">
           <span>失败</span><strong>{{ runCounts.failed }}</strong>
         </button>
-        <button class="run-summary-card cancelled" :class="{ active: statusFilter === 'cancelled' }" @click="statusFilter = 'cancelled'">
+        <button class="run-summary-card cancelled" :class="{ active: statusFilter === 'cancelled' }" :aria-pressed="statusFilter === 'cancelled'" @click="statusFilter = 'cancelled'">
           <span>已停止</span><strong>{{ runCounts.cancelled }}</strong>
         </button>
-        <button class="run-summary-card pending" :class="{ active: statusFilter === 'pending' }" @click="statusFilter = 'pending'">
+        <button class="run-summary-card pending" :class="{ active: statusFilter === 'pending' }" :aria-pressed="statusFilter === 'pending'" @click="statusFilter = 'pending'">
           <span>进行中</span><strong>{{ runCounts.running + runCounts.deferred }}</strong>
         </button>
       </div>
@@ -388,7 +448,7 @@ onUnmounted(() => {
         <div class="run-filter-tools">
           <div class="log-search-wrap run-search-wrap">
             <span class="material-symbols-outlined">search</span>
-            <input v-model="searchText" type="search" class="text-field log-search" placeholder="搜索自动化、触发方式或动作">
+            <input v-model="searchText" type="search" class="text-field log-search" aria-label="搜索运行记录" placeholder="搜索自动化、触发方式或动作">
           </div>
           <button class="btn btn-outlined run-export-btn" :disabled="!filteredRuns.length" @click="exportRuns">
             <span class="material-symbols-outlined">download</span>导出这些记录
@@ -520,14 +580,15 @@ onUnmounted(() => {
         </div>
         <div class="log-search-wrap">
           <span class="material-symbols-outlined">search</span>
-          <input v-model="searchText" type="text" class="text-field log-search" placeholder="搜索日志内容">
+          <input v-model="searchText" type="text" class="text-field log-search" aria-label="搜索日志内容" placeholder="搜索日志内容">
         </div>
       </div>
 
+      <p v-if="logsError" class="danger-text" role="alert">{{ logsError }}</p>
       <div v-if="!filteredEntries.length" class="log-viewer log-empty">
         {{ entries.length ? '没有符合筛选条件的日志' : '（日志为空）' }}
       </div>
-      <div v-else class="log-viewer log-entries" id="logViewer">
+      <div v-else class="log-viewer log-entries" ref="logViewer">
         <div v-for="(entry, index) in filteredEntries" :key="index" class="log-line" :class="levelMeta[entry.level]?.cls || 'log-info'" :title="entry.data ? JSON.stringify(entry.data) : ''">
           <span class="log-ts">{{ entry.ts }}</span>
           <span class="log-badge">{{ levelMeta[entry.level]?.label || entry.level || '信息' }}</span>

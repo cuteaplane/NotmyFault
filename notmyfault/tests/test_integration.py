@@ -22,6 +22,32 @@ from notmyfault.host import app as host_app
 from notmyfault.security.security import SecurityMode
 
 
+def test_simulator_stubs_rule_actions_without_replacing_global_modules(monkeypatch):
+    import datetime
+    import sys
+    import psutil
+    from pathlib import Path
+    from notmyfault.security.plugin_loader import PluginRegistry
+    from notmyfault.simulator.environment import SimulatedEnvironment
+    from notmyfault.simulator.runner import SimulatedRunner
+
+    def resolve(*args):
+        raise AssertionError("模拟器加载了真实插件")
+    monkeypatch.setattr(PluginRegistry, "resolve_action", resolve)
+    actions = ["file_operation", "http_request", "set_volume", "open_url"]
+    config = {"rules": [{"name": "模拟", "event": {"type": "manual", "params": {}}, "actions": [
+        {"type": action, "params": {}} for action in actions
+    ]}]}
+    with SimulatedRunner(SimulatedEnvironment()) as runner:
+        runner.start(config)
+        directory = Path(runner._store.rules_path).parent
+        runner.emit("manual")
+        assert [item["data"]["action_type"] for item in runner.events if item["type"] == "action_executed"] == actions
+        assert sys.modules["datetime"] is datetime
+        assert sys.modules["psutil"] is psutil
+    assert not directory.exists()
+
+
 def make_engine(rules=None, on_event=None):
     engine = create_test_engine({"rules": rules or []}, on_event=on_event)
     engine._alert_user = lambda *a, **k: None
@@ -104,8 +130,8 @@ class TestConfigEnginePipeline:
         config["rules"] = store.load_rules()
         engine = create_test_engine(config, rules_store=store)
         rule = engine.rules[0]
-        assert rule["event"]["type"] == "process_state"
-        assert rule["event"]["params"]["process_name"] == "WeChat.exe"
+        assert rule["condition"]["type"] == "process_state"
+        assert rule["condition"]["params"]["process_name"] == "WeChat.exe"
         assert rule["actions"][0]["type"] == "set_volume"
 
     def test_legacy_trigger_config_normalized(self, isolated_config):
@@ -118,7 +144,7 @@ class TestConfigEnginePipeline:
         }])
         rule = store.load_verified_rules()[0]
         assert "trigger" not in rule
-        assert rule["event"]["type"] == "hotkey"
+        assert rule["condition"]["type"] == "hotkey"
 
 
 class TestEngineEventPipeline:
@@ -182,8 +208,7 @@ class TestHotReloadIntegration:
             load_rules_fn=lambda: new_rules,
             stop_triggers_fn=lambda timeout: True,
             apply_rules_fn=apply_rules,
-            cancel_deferred_fn=lambda: None,
-            validate_rules_fn=lambda: None,
+            prepare_rules_fn=lambda rules: rules,
             start_triggers_fn=lambda rules: 1,
             diagnostics=Diagnostics(),
             alert_cb=lambda title, message: alerts.append((title, message)),
@@ -216,8 +241,7 @@ class TestHotReloadIntegration:
             load_rules_fn=lambda: new_rules,
             stop_triggers_fn=lambda timeout: True,
             apply_rules_fn=apply_rules,
-            cancel_deferred_fn=lambda: None,
-            validate_rules_fn=lambda: None,
+            prepare_rules_fn=lambda rules: rules,
             start_triggers_fn=start_triggers,
             diagnostics=Diagnostics(),
             alert_cb=lambda title, message: alerts.append((title, message)),
@@ -232,7 +256,8 @@ class TestHotReloadIntegration:
             ("规则恢复失败", "热加载失败且原有规则恢复失败，请重启引擎")
         ]
 
-    def test_hot_reload_picks_up_changes(self, monkeypatch, isolated_config):
+    @pytest.mark.parametrize("initial_valid", [True, False])
+    def test_hot_reload_picks_up_changes(self, monkeypatch, isolated_config, initial_valid):
         from notmyfault.platform import platform_support
         monkeypatch.setattr(platform_support, "show_notification", lambda *a, **k: None)
 
@@ -240,12 +265,14 @@ class TestHotReloadIntegration:
             return {
                 "name": name,
                 "event": {"type": "hotkey", "params": {}},
-                "actions": [{"type": "noop", "params": {}}],
+                "actions": [{"type": "noop", "params": {"name": name}}],
             }
 
+        broken = rule("不可用规则")
+        broken["actions"][0]["type"] = "missing_action"
         store = isolated_config.store
         store.save_config({})
-        store.save_rules([rule("r1")])
+        store.save_rules([*([rule("r1")] if initial_valid else []), broken])
         config = store.load_verified_config()
         config["rules"] = store.load_verified_rules()
         engine = create_test_engine(config, rules_store=store)
@@ -253,34 +280,63 @@ class TestHotReloadIntegration:
         engine._security_mode = SecurityMode.PERMISSIVE
         engine.triggers_funcs["hotkey"] = lambda meta, config, emit, stop: stop.wait(30)
         engine.triggers_meta["hotkey"] = {}
-        engine.actions_funcs["noop"] = lambda meta, params: None
-        engine.actions_meta["noop"] = {}
+        executed = []
+        engine.actions_funcs["noop"] = lambda meta, params: executed.append(params["name"])
+        engine.actions_meta["noop"] = {"params": [{"name": "name", "type": "string"}]}
 
         shutdown = threading.Event()
         thread = threading.Thread(target=engine.start, kwargs={"shutdown_event": shutdown})
         thread.start()
         try:
             deadline = time.monotonic() + 5
-            while "hotkey" not in engine._trigger_supervisor._threads:
+            while engine._hot_reloader._rules_mtime == 0:
                 if time.monotonic() > deadline:
-                    raise AssertionError("触发器线程未启动")
+                    raise AssertionError("引擎未开始等待规则更新")
                 time.sleep(0.05)
+            assert thread.is_alive()
+            assert [r["name"] for r in engine.rules] == (["r1"] if initial_valid else [])
+            assert engine.get_diagnostics()["rules"]["total"] == 1 + initial_valid
+            assert any("missing_action" in issue[1] for issue in engine.get_diagnostics()["rules"]["issues"])
+            engine.emit_event("hotkey", {})
+            assert engine._rule_scheduler.wait_for_idle(timeout=5)
+            assert executed == (["r1"] if initial_valid else [])
 
-            # 触发 mtime 变化后引擎应在轮询中应用新规则
-            time.sleep(0.01)
-            store.save_rules([rule("r1"), rule("r2")])
+            previous_mtime = engine._hot_reloader._rules_mtime
+            store.save_rules([rule("r1"), rule("r2"), broken])
+            os.utime(store.rules_path, (previous_mtime + 2, previous_mtime + 2))
             deadline = time.monotonic() + 8
             while len(engine.rules) < 2:
                 if time.monotonic() > deadline:
                     raise AssertionError("热重载未生效")
                 time.sleep(0.1)
             assert [r["name"] for r in engine.rules] == ["r1", "r2"]
+            assert engine.get_diagnostics()["rules"]["issue_count"] == 1
+            executed.clear()
+            engine.emit_event("hotkey", {})
+            assert engine._rule_scheduler.wait_for_idle(timeout=5)
+            assert sorted(executed) == ["r1", "r2"]
+
+            for updated, expected in (([broken], []), ([rule("已修正")], ["已修正"])):
+                store.save_rules(updated)
+                deadline = time.monotonic() + 8
+                while [r["name"] for r in engine.rules] != expected:
+                    if time.monotonic() > deadline:
+                        raise AssertionError("热重载未应用规则")
+                    time.sleep(0.05)
+                assert thread.is_alive()
+                executed.clear()
+                engine.emit_event("hotkey", {})
+                assert engine._rule_scheduler.wait_for_idle(timeout=5)
+                assert executed == expected
+            assert engine.get_diagnostics()["rules"]["issues"] == []
+            assert any(r["actions"][0]["type"] == "noop" for r in store.load_verified_rules())
         finally:
             shutdown.set()
             thread.join(timeout=10)
         assert not thread.is_alive()
 
-    def test_hot_reload_restores_old_rules_after_trigger_start_failure(self, monkeypatch):
+    @pytest.mark.parametrize("stop_immediately", [True, False])
+    def test_hot_reload_restores_old_rules_after_trigger_start_failure(self, monkeypatch, stop_immediately):
         old_rules = [{"name": "旧规则"}]
         new_rules = [{"name": "新规则"}]
         active_rules = list(old_rules)
@@ -302,10 +358,9 @@ class TestHotReloadIntegration:
         reloader = RulesHotReloader(
             rules_path_fn=lambda: "rules.json",
             load_rules_fn=lambda: new_rules,
-            stop_triggers_fn=lambda timeout: stopped.append(timeout) or True,
+            stop_triggers_fn=lambda timeout: stopped.append(timeout) or len(stopped) != 2 or stop_immediately,
             apply_rules_fn=apply_rules,
-            cancel_deferred_fn=lambda: None,
-            validate_rules_fn=lambda: None,
+            prepare_rules_fn=lambda rules: rules,
             start_triggers_fn=start_triggers,
             diagnostics=Diagnostics(),
             alert_cb=lambda title, message: alerts.append((title, message)),
@@ -315,11 +370,17 @@ class TestHotReloadIntegration:
 
         reloader.check_once()
 
+        if not stop_immediately:
+            assert active_rules == new_rules
+            assert started == [new_rules]
+            assert reloader._rules_mtime == 1.0
+            reloader.check_once()
+
         assert active_rules == old_rules
         assert started == [new_rules, old_rules]
-        assert len(stopped) == 2
+        assert len(stopped) == (2 if stop_immediately else 3)
         assert reloader._rules_mtime == 2.0
-        assert alerts == [("热加载失败", "新规则未能启动，已尝试恢复原有规则")]
+        assert alerts == ([("热加载失败", "新规则未能启动，已尝试恢复原有规则")] if stop_immediately else [("规则恢复失败", "热加载失败且原有规则恢复失败，请重启引擎")])
 
 
 class TestLoggingPipeline:
@@ -374,3 +435,16 @@ class TestLoggingPipeline:
         assert diag["plugin_errors"] == [
             {"plugin": "p1", "type": "?", "reason": "bad"}
         ]
+        from notmyfault.host.api.services.engine import EngineService
+
+        service = EngineService(None, None, SimpleNamespace(logs_dir=tmp_path), None, None)
+        assert service.logs(2)["total"] == 3
+        assert len(service.logs(2)["lines"]) == 2
+        with log_path.open("a", encoding="utf-8") as file:
+            file.write("后续")
+        assert service.logs(1) == {"lines": ["后续"], "total": 4}
+        with log_path.open("a", encoding="utf-8") as file:
+            file.write("内容\n")
+        assert service.logs(1) == {"lines": ["后续内容"], "total": 4}
+        log_path.write_text("重新开始\n", encoding="utf-8")
+        assert service.logs(1) == {"lines": ["重新开始"], "total": 1}

@@ -153,7 +153,9 @@ export function normalizeConditionTree(node) {
   node.children = Array.isArray(node.children)
     ? node.children
     : (Array.isArray(node.events) ? node.events : [])
-  node.op = node.op || (node.type === 'and' ? 'all' : 'any')
+  const op = node.op || node.type || 'any'
+  node.op = ({ and: 'all', or: 'any' })[op] || op
+  if (node.op === 'any') delete node.within_seconds
   delete node.events
   delete node.type
   node.children.forEach(normalizeConditionTree)
@@ -162,24 +164,27 @@ export function normalizeConditionTree(node) {
 
 function unwrapSingleCondition(node) {
   if (isConditionLeaf(node)) return node
+  if (node?.op === 'not') return null
   if (!isObject(node) || !Array.isArray(node.children) || node.children.length !== 1) return null
   return unwrapSingleCondition(node.children[0])
 }
 
 export function normalizeRuleDraft(rule) {
   if (!isObject(rule)) return rule
-  if (!rule.event && isObject(rule.trigger)) rule.event = rule.trigger
-  delete rule.trigger
-
-  if (isObject(rule.condition)) {
-    normalizeConditionTree(rule.condition)
-    if (isConditionLeaf(rule.condition) && !rule.event) {
-      rule.event = rule.condition
-      delete rule.condition
-    } else if (isObject(rule.event)) {
-      const conditionEvent = unwrapSingleCondition(rule.condition)
-      if (conditionEvent && valuesEqual(conditionEvent, rule.event)) delete rule.condition
+  const aliases = ['event', 'trigger'].filter(key => Object.hasOwn(rule, key))
+  const legacy = rule[aliases[0]]
+  if (aliases.length === 2 && !valuesEqual(rule.event, rule.trigger)) {
+    throw new Error('event 与 trigger 的触发条件不一致')
+  }
+  if (Object.hasOwn(rule, 'condition') && aliases.length) {
+    const normalized = normalizeConditionTree(JSON.parse(JSON.stringify(rule.condition)))
+    if (!valuesEqual(unwrapSingleCondition(normalized), legacy)) {
+      throw new Error('event/trigger 与 condition 不能同时存在')
     }
   }
+  if (!Object.hasOwn(rule, 'condition') && aliases.length) rule.condition = legacy
+  if (isObject(rule.condition)) normalizeConditionTree(rule.condition)
+  delete rule.event
+  delete rule.trigger
   return rule
 }

@@ -28,8 +28,8 @@ class TestStatusAfter:
 
     def test_normal_progression(self):
         assert status_after("rule_triggered", {}, "queued") == "running"
-        assert status_after("workflow_deferred", {}, "running") == "deferred"
-        assert status_after("action_executed", {}, "deferred") == "running"
+        assert status_after("run_queued", {}, "running") == "queued"
+        assert status_after("action_executed", {}, "queued") == "running"
         assert status_after("run_dropped", {}, "queued") == "dropped"
 
 
@@ -65,14 +65,22 @@ class TestReplayInvariants:
         assert runs[0]["status"] == "cancelled"
         assert runs[0]["steps"] == []
 
-    def test_deferred_run_resumes_to_running(self):
+    def test_deferred_run_resumes_to_running(self, tmp_path):
         run_id = f"run_{uuid.uuid4().hex}"
-        partial = build_runs(packets(
+        events = packets(
             ("rule_triggered", {"run_id": run_id}),
             ("workflow_deferred", {"run_id": run_id, "reason": "前置未满足"}),
-            ("action_executed", {"run_id": run_id, "step_id": "s1", "duration_ms": 5}),
-        ))
-        assert partial[0]["status"] == "running"
+        )
+        path = tmp_path / "runs.jsonl"
+        path.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+        history = RunHistory(str(path))
+        assert history.get_run(run_id)["status"] == "deferred"
+        history.record({"type": "action_executed", "data": {"run_id": run_id, "step_id": "s1"}, "ts": 3})
+        assert history.get_run(run_id)["status"] == "running"
+        history.record(events[-1])
+        history.record_async(events[-1])
+        assert history.get_run(run_id)["status"] == "running"
+        assert len(path.read_text(encoding="utf-8").splitlines()) == 3
 
     def test_late_steps_after_dropped_do_not_appear(self):
         run_id = f"run_{uuid.uuid4().hex}"
@@ -127,22 +135,37 @@ class TestExecutorSingleTerminal:
         engine = self._make_engine(events)
         engine.actions_funcs["noop"] = lambda meta, params: {"ok": True}
         engine.actions_meta["noop"] = {}
+        compensation_started = threading.Event()
+        release = threading.Event()
+        def compensate(meta, params):
+            compensation_started.set()
+            release.wait(5)
+        engine.actions_funcs["compensate"] = compensate
+        engine.actions_meta["compensate"] = {}
         rule = {
             "name": "绑定失败规则",
+            "concurrency": {"mode": "single"},
             "event": {"type": "hotkey", "params": {}},
             "actions": [{
                 "type": "noop",
                 "params": {"x": {"$ref": {"scope": "event", "path": ["missing"]}}},
+                "failure_actions": [{"type": "compensate", "params": {}}],
             }],
         }
         engine.rules = [rule]
         engine.triggers_meta.setdefault("hotkey", {"semantic": "oneshot"})
         engine.emit_event("hotkey", {})
+        assert compensation_started.wait(5)
+        assert not [e for e in events if e[0] in ("workflow_failed", "workflow_completed")]
+        engine.emit_event("hotkey", {})
+        assert any(e[0] == "run_dropped" for e in events)
+        release.set()
         assert engine._rule_scheduler.wait_for_idle(timeout=5)
 
         terminals = [e for e in events if e[0] in ("workflow_failed", "workflow_completed")]
         assert len(terminals) == 1
-        assert terminals[0][0] == "workflow_failed"
+        assert terminals[0][0] == "workflow_completed"
+        assert terminals[0][1]["status"] == "failed"
 
     def test_cancel_run_twice_only_first_wins(self):
         events = []
@@ -230,7 +253,6 @@ class TestStopPathDropsQueue:
         assert scheduler.submit("rule-stop-1", rule, "停止路径规则", context2) == "queued"
 
         # 模拟 _run 循环退出后的清理序列
-        engine._cancel_deferred_workflows()
         engine._rule_scheduler.shutdown()
         assert scheduler.stats()["rule-stop-1"]["queued"] == 0
         dropped = [e for e in events if e[0] == "run_dropped"]
@@ -257,13 +279,9 @@ class TestReplaceCancelWindow:
         def execute(rule_key, rule, rule_name, context):
             time_mod.sleep(0.05)
 
-        def is_deferred(run_id):
-            return False
-
         scheduler = RuleScheduler(
             execute_fn=execute,
             cancel_run_fn=cancel_run,
-            is_deferred_fn=is_deferred,
         )
         rule = {"concurrency": {"mode": "replace"}}
         first = {"run": {"id": "run_w1"}, "rule": {}}

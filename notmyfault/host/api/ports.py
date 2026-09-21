@@ -38,6 +38,7 @@ class ActiveEnginePort(Protocol):
         start_step_id: str = "",
         end_step_id: str = "",
         test_assertions: List[Dict[str, Any]] | None = None,
+        variable_values: Dict[str, Any] | None = None,
     ) -> tuple[bool, str, str]: ...
 
     def cancel_run(self, run_id: str) -> bool: ...

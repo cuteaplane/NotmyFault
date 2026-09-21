@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import deque
 import os
 import sys
 from dataclasses import dataclass
@@ -8,7 +7,7 @@ from typing import Any, Callable, Dict, Protocol
 
 from notmyfault.application_paths import ApplicationPaths
 from notmyfault.config import ConfigValidationError, SignedConfigStore
-from notmyfault.core.logging import get_latest_log
+from notmyfault.host.log_files import LogFiles
 from notmyfault.core.rules import get_rule_events
 from notmyfault.core.run_history import RunHistory
 from notmyfault.host.api.ports import EngineControlPort
@@ -41,6 +40,7 @@ class EngineService:
         self._history = history
         self._extension_sessions = extension_sessions
         self._process_id = process_id
+        self._logs = LogFiles(str(paths.logs_dir))
 
     def start(self) -> Dict[str, Any]:
         current_state = self._engine.engine_state
@@ -48,6 +48,7 @@ class EngineService:
             return {
                 "ok": True,
                 "running": self._engine.engine_running,
+                "engine_running": self._engine.engine_running,
                 "engine_state": current_state,
                 "api_alive": True,
                 "message": (
@@ -62,6 +63,7 @@ class EngineService:
                 {
                     "ok": False,
                     "running": self._engine.engine_running,
+                    "engine_running": self._engine.engine_running,
                     "engine_state": self._engine.engine_state,
                     "message": "engine_stopping",
                 },
@@ -69,6 +71,7 @@ class EngineService:
         return {
             "ok": True,
             "running": self._engine.engine_running,
+            "engine_running": self._engine.engine_running,
             "engine_state": self._engine.engine_state,
             "api_alive": True,
         }
@@ -80,6 +83,7 @@ class EngineService:
             "ok": True,
             "stopped": stopped,
             "stopping": not stopped,
+            "engine_running": self._engine.engine_running,
             "engine_state": self._engine.engine_state,
             "api_alive": True,
         }
@@ -90,7 +94,12 @@ class EngineService:
         return {"ok": True, "message": "shutting_down"}
 
     def status(self) -> Dict[str, Any]:
-        rules = self._load_rules()
+        config_error = None
+        try:
+            rules = self._store.load_verified_rules(for_editing=True)
+        except ConfigValidationError as error:
+            rules = []
+            config_error = str(error)
         trigger_types = {
             event.get("type")
             for rule in rules
@@ -116,9 +125,10 @@ class EngineService:
             "engine_running": self._engine.engine_running,
             "engine_state": self._engine.engine_state,
             "pid": self._process_id(),
-            "rules_count": len(rules),
-            "triggers_count": len(trigger_types),
-            "actions_count": len(action_types),
+            "rules_count": None if config_error else len(rules),
+            "triggers_count": None if config_error else len(trigger_types),
+            "actions_count": None if config_error else len(action_types),
+            "config_error": config_error,
             "security_mode": detect_security_mode().value,
             "last_error": self._engine.last_error,
             "scheduler": self._scheduler_summary(),
@@ -159,7 +169,9 @@ class EngineService:
 
     def cancel_run(self, run_id: str) -> Dict[str, Any]:
         current_engine = self._engine.current_engine
-        if current_engine is None or not current_engine.cancel_run(run_id):
+        if current_engine is None:
+            raise EngineServiceError("conflict", {"ok": False, "error": "引擎未运行"})
+        if not current_engine.cancel_run(run_id):
             raise EngineServiceError(
                 "not_found",
                 {"ok": False, "error": "这次运行已经结束或不存在"},
@@ -167,29 +179,13 @@ class EngineService:
         return {"ok": True, "message": "已请求停止这次运行"}
 
     def logs(self, lines: int) -> Dict[str, Any]:
-        safe_lines = min(max(int(lines), 1), 2000)
-        log_path = get_latest_log(str(self._paths.logs_dir))
-        if not log_path:
-            return {"lines": [], "total": 0}
-        try:
-            with open(log_path, "r", encoding="utf-8", errors="replace") as file:
-                tail: deque[str] = deque(maxlen=safe_lines)
-                total = 0
-                for line in file:
-                    total += 1
-                    tail.append(line.rstrip("\n"))
-        except FileNotFoundError:
-            return {"lines": [], "total": 0}
-        return {
-            "lines": list(tail),
-            "total": total,
-        }
+        return self._logs.tail(lines)
 
-    def _load_rules(self) -> list[Dict[str, Any]]:
-        try:
-            return self._store.load_verified_rules()
-        except ConfigValidationError:
-            return []
+    def log_entries(self, lines: int, name: str = "") -> list[dict]:
+        return self._logs.entries(lines, name)
+
+    def log_files(self) -> list[dict]:
+        return self._logs.list_files()
 
     def _scheduler_summary(self) -> Dict[str, Any]:
         current_engine = self._engine.current_engine

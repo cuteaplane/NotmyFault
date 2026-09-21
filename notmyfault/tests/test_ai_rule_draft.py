@@ -33,19 +33,16 @@ def rule_args(**overrides):
 
 
 def test_valid_rule_returns_normalized_draft():
-    assert parse_rule_draft(rule_args(), make_catalog()) == rule_args()
-
-
-def test_preconditions_use_action_catalog():
-    args = rule_args(
-        preconditions=[{"type": "open_url", "params": {"url": "https://example.com"}}]
-    )
-    assert parse_rule_draft(args, make_catalog())["preconditions"] == args["preconditions"]
+    expected = rule_args()
+    expected["condition"] = expected.pop("event")
+    assert parse_rule_draft(rule_args(), make_catalog()) == expected
+    assert parse_rule_draft(expected, make_catalog()) == expected
 
 
 @pytest.mark.parametrize(
     "bad_args",
     [
+        rule_args(preconditions=[{"type": "open_url", "params": {"url": "https://example.com"}}]),
         {"name": "x", "event": {"type": "time_schedule", "params": {}}, "actions": [], "extra": 1},
         {"event": {"type": "time_schedule", "params": {}}, "actions": []},
         {"name": "", "event": {"type": "time_schedule", "params": {}}, "actions": []},

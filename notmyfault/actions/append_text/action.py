@@ -1,8 +1,10 @@
 """追加文本动作：把内容写到本地文件末尾并保留已有内容
-支持给每行加时间标记，并可选择 utf-8、utf-8-sig 或 gbk 编码
+支持给每行加时间标记，编码使用 Python 文本编码名称
 """
 
 from datetime import datetime
+import re
+from pathlib import Path
 
 
 def run(action_info, params):
@@ -17,22 +19,26 @@ def run_with_context(action_info, params, context):
     if not file_path:
         raise ValueError("未指定日志文件路径")
     text = str(params.get("text", "") or "")
-    lines = [line for line in text.splitlines() if line.strip()]
+    lines = text.splitlines()
     if not lines:
         raise ValueError("没有可写入的内容")
 
     encoding = str(params.get("encoding", "utf-8") or "utf-8")
-    if encoding not in ("utf-8", "utf-8-sig", "gbk"):
-        raise ValueError(f"不支持的编码: {encoding!r}（可选: utf-8/utf-8-sig/gbk）")
+    try:
+        b"".decode(encoding)
+    except LookupError:
+        raise ValueError(f"未知或不适用于文本的编码: {encoding}") from None
 
-    add_timestamp = bool(params.get("add_timestamp", True))
+    file_path = str(Path(file_path).expanduser().absolute())
+    add_timestamp = params.get("add_timestamp", True)
+    if not isinstance(add_timestamp, bool):
+        raise ValueError("自动加时间戳必须是布尔值")
     timestamp = (
         datetime.now().strftime("%Y-%m-%d %H:%M:%S") if add_timestamp else None
     )
     payload = []
     for line in lines:
-        # 行首是方括号时视为已有时间标记，直接写入
-        if timestamp and not line.lstrip().startswith("["):
+        if timestamp and line.strip() and not re.match(r"^\s*\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]", line):
             payload.append(f"[{timestamp}] {line}")
         else:
             payload.append(line)

@@ -21,18 +21,9 @@ const pageRef = ref(null)
 const activeSession = shallowRef(null)
 const closingSessions = new Set()
 let pageGeneration = 0
+let initializedGeneration = -1
 
-function scriptSafeJson(value) {
-  return JSON.stringify(value ?? null).replace(/[<>&\u2028\u2029]/g, character => ({
-    '<': '\\u003c',
-    '>': '\\u003e',
-    '&': '\\u0026',
-    '\u2028': '\\u2028',
-    '\u2029': '\\u2029',
-  }[character]))
-}
-
-function isolatePage(source, initialState) {
+function isolatePage(source) {
   const documentNode = new DOMParser().parseFromString(source, 'text/html')
   const policy = documentNode.createElement('meta')
   policy.httpEquiv = 'Content-Security-Policy'
@@ -50,9 +41,6 @@ function isolatePage(source, initialState) {
     "form-action 'none'",
   ].join('; ')
   documentNode.head.prepend(policy)
-  const bootstrap = documentNode.createElement('script')
-  bootstrap.textContent = `window.dispatchEvent(new MessageEvent('message',{source:window.parent,data:{source:'notmyfault:extension-host',type:'init',state:${scriptSafeJson(initialState)}}}))`
-  documentNode.body.append(bootstrap)
   return `<!DOCTYPE html>\n${documentNode.documentElement.outerHTML}`
 }
 
@@ -67,8 +55,8 @@ async function closeSession(session) {
   closingSessions.add(key)
   try {
     await closeExtensionSession(session.pluginId, session.sessionId)
-  } catch (reason) {
-    void reason
+  } finally {
+    closingSessions.delete(key)
   }
 }
 
@@ -79,7 +67,7 @@ watch(() => [props.open, props.pluginId, props.viewId, props.sessionId], async (
     activeSession.value = null
     html.value = ''
     error.value = ''
-    await closeSession(previous)
+    await closeSession(previous).catch(() => {})
     return
   }
   const session = {
@@ -88,7 +76,7 @@ watch(() => [props.open, props.pluginId, props.viewId, props.sessionId], async (
     generation,
   }
   activeSession.value = session
-  if (previous && sessionKey(previous) !== sessionKey(session)) void closeSession(previous)
+  if (previous && sessionKey(previous) !== sessionKey(session)) void closeSession(previous).catch(() => {})
   loading.value = true
   closing.value = false
   error.value = ''
@@ -119,6 +107,8 @@ function sendToView(message) {
 }
 
 function initializeView() {
+  if (!frameRef.value?.contentWindow || initializedGeneration === pageGeneration) return
+  initializedGeneration = pageGeneration
   sendToView({ type: 'init', state: props.initialState })
 }
 
@@ -127,11 +117,14 @@ async function requestClose() {
   closing.value = true
   pageGeneration += 1
   const session = activeSession.value
-  activeSession.value = null
   try {
     await closeSession(session)
-  } finally {
+    activeSession.value = null
     emit('close')
+  } catch (reason) {
+    error.value = reason.message || '关闭插件会话失败，请重试。'
+  } finally {
+    closing.value = false
   }
 }
 
@@ -196,13 +189,15 @@ async function receiveFromView(event) {
   if (response?.ok && response.close) window.setTimeout(requestClose, 0)
 }
 
-window.addEventListener('message', receiveFromView)
+watch(() => props.open, open => {
+  window[open ? 'addEventListener' : 'removeEventListener']('message', receiveFromView)
+}, { immediate: true })
 onBeforeUnmount(() => {
   window.removeEventListener('message', receiveFromView)
   pageGeneration += 1
   const session = activeSession.value
   activeSession.value = null
-  void closeSession(session)
+  void closeSession(session).catch(() => {})
 })
 </script>
 

@@ -5,8 +5,9 @@
 插件目录需要清单和 Python 入口。清单使用 `action.json` 或 `trigger.json`；入口使用
 `action.py`、`trigger.py`，也可以由 `entrypoints` 指向其他 `.py` 文件。目录里还可以放：
 
-- 其他 `.py` 模块：入口文件可以直接 `import helper`。插件加载后，其根目录会加入
-  `sys.path`。
+- 其他 `.py` 模块：入口文件可以直接 `import helper`，也可以使用包内相对导入。
+  模块在各自插件的模块名称下加载，同名兄弟模块互不混用；插件目录不会加入全局
+  `sys.path`，卸载时清理该插件创建的模块。
 - 预编译二进制与资源：放在目录内任意位置（惯例 `bin/<平台>/`），
   由插件自己的 py 代码调用，引擎不提供二进制直执行入口。
 
@@ -30,7 +31,9 @@ from notmyfault.security.plugin_resources import plugin_resource
 tool = plugin_resource("my_plugin", "bin", "win64", "tool.exe")
 ```
 
-返回插件目录内的绝对路径；路径越出插件目录会抛 ValueError。
+返回插件目录内的绝对路径；路径越出插件目录会抛 ValueError。插件导入的
+`plugin_resource` 绑定到所属加载器，同一进程中的其他加载器不会改变它查找的目录。
+直接运行源码测试时，应通过 `PluginImports` 提供资源目录，或替换插件使用的资源函数。
 
 ## 提权
 
@@ -52,7 +55,7 @@ result = run_as_admin(["netsh", "interface", "set", "interface", iface, "admin=e
 }
 ```
 
-按用户的授权偏好，执行前可能弹 toast 确认或走启动时授权会话。
+Windows 每次管理员执行请求都需要通知确认和 UAC，Linux 使用 pkexec。
 可执行文件名不能包含路径分隔符，引擎只从受信任的系统目录（Windows System32、
 POSIX `/usr/bin` 等）解析命令。插件自带的二进制文件目前无法通过提权通道执行。
 
@@ -75,7 +78,13 @@ self_sign_plugin("my_plugin", key)   # 生成 signature.sig 与 public_key.pem
   当前安装者的本地插件密钥为该公钥生成 `public_key.sig` 副签；安装流程会完成这一步。
 - 验签结果分为 `official`、`author`、`official-legacy` 和 `none`。严格模式不加载
   `none`。普通作者签名还要有当前安装使用的本地密钥副签。声明 `admin` 权限的插件
-  在严格模式下只接受 `official` 或 `official-legacy` 签名，作者签名不能加载。
+  在严格模式下只接受 `official` 签名。本机用户钥代签得到的 `official-legacy`
+  不能作为管理员插件加载。
+- `signature_source` 区分 `official`、`author`、`local` 和 `none`，
+  `signature_format` 区分当前的 `v1` 和旧的 `legacy`。兼容字段 `signature_kind` 中的
+  `official-legacy` 表示本地密钥签名，不决定文件摘要格式。
+- 用户插件的完整性清单固定已安装的文件版本，安装更新时替换对应记录。旧摘要格式
+  只有与已有完整性记录完全匹配时才允许迁移；延迟导入前仍复查签名和全部文件。
 - 私钥自己保管，不要放进插件目录或归档。
 
 ## 打包
@@ -85,9 +94,8 @@ python nmf.py plugin pack <插件目录路径>
 ```
 
 `nmf.py plugin pack` 会先做 schema、平台、能力、权限、入口和静态风险检查，再生成
-`.nmfp`。归档包含插件源码、资源、二进制和 `public_key.pem`，但当前打包工具会排除
-`signature.sig`。因此，发布需要保留作者签名的插件时，不应使用这个打包命令；应先确认
-安装端和归档格式已支持把签名文件原样带入。
+`.nmfp`。归档包含插件源码、资源和二进制，并保留 `signature.sig`、`public_key.pem`
+和 `public_key.sig`，只排除 `__pycache__` 缓存目录。
 
 ## 可选：安装期编译钩子
 
@@ -102,9 +110,21 @@ python nmf.py plugin pack <插件目录路径>
 }
 ```
 
-- 安装时在插件目录内逐条执行 `command`，120 秒超时；任一命令失败或
-  `outputs` 缺失即安装失败。
+- 有 `command` 时先按用户插件规则验签，签名无效则不执行命令、安装失败。
+- 安装时在插件目录内逐条执行 `command`。参数列表由
+  `shlex.split(command, posix=(os.name != "nt"))` 解析，以 `shell=False` 执行，
+  不经过 cmd 或 sh。每条命令超时 120 秒，任一命令失败或 `outputs` 缺失即安装失败。
 - `outputs` 必须是插件目录内的相对路径。
-- 经过 build 的插件不继承归档里的签名，按未签名插件处理。
+- 安装构建流程保留归档里的签名材料，作者签名必须与构建后的文件内容相符。
+  安装端在替换旧版本前按加载器的签名规则校验暂存目录；严格模式要求有效签名，
+  作者自签的非管理员插件还需本地密钥副签。
 - 钩子无依赖解析、无工具链检测，作者需保证目标机器能跑通命令；
   内置插件不允许携带 `build`。
+
+## 声明可传递的数据
+
+路径、网址、整数和日期时间使用对应 `value_type`，数组声明元素类型。
+具有特定业务结构的共享值在 `contributes.data_types` 中声明 `binding: shared`
+和 `schema`，消费者引用完整包名、类型 ID 与版本。插件不必提供专用编辑器。
+私有编辑数据继续使用 `plugin_data` 和 `binding: private`。升级类型版本不隐式
+迁移旧值；旧入口和规则可继续读取。示例与协议见 [data-types.md](data-types.md)。

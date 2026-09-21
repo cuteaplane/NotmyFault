@@ -1,7 +1,7 @@
 """run 从触发到结束的状态约束
 
 一个 run 只走到一个终点：succeeded / failed / cancelled / dropped / replaced。
-queued 是排队还没跑，running 是执行中，deferred 是等前置条件过会儿重试。
+queued 是排队还没跑，running 是执行中。
 
 终点定下来之后这个 run 的事件就不再改状态。写入侧 WorkflowExecutor 的
 _finish_run 只放行第一个终态事件，回放侧 run_history 遇到终态后的任何事件
@@ -25,12 +25,7 @@ TERMINAL_STATUSES = frozenset(
     {"succeeded", "failed", "cancelled", "dropped", "replaced"}
 )
 
-_TERMINAL_EVENTS = frozenset(
-    {"workflow_failed", "workflow_completed", "run_dropped", "run_replaced"}
-)
-
-# 动作类事件不改 run 状态，但 deferred 之后再来说明重试已把 run 拉回执行；
-# queued 的 run 派发后也靠第一个动作事件把状态翻回 running
+# 旧历史中的 deferred 和排队中的 queued 都由第一个动作事件恢复为 running
 _RESUME_SIGNALS = frozenset(
     {
         "action_executed",
@@ -58,8 +53,6 @@ def status_after(event_type: str, data: Dict[str, Any], current: str) -> str | N
         return "running"
     if event_type == "run_queued":
         return "queued"
-    if event_type == "workflow_deferred":
-        return "deferred"
     if event_type == "run_dropped":
         return "dropped"
     if event_type == "run_replaced":
@@ -69,6 +62,6 @@ def status_after(event_type: str, data: Dict[str, Any], current: str) -> str | N
     if event_type == "workflow_completed":
         status = data.get("status", "succeeded")
         return status if status in TERMINAL_STATUSES else "succeeded"
-    if event_type in _RESUME_SIGNALS and current in ("deferred", "queued"):
+    if event_type in _RESUME_SIGNALS and current == "queued":
         return "running"
     return None

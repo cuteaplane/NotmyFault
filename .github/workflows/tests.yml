@@ -1,0 +1,51 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python tests
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+          architecture: x64
+      - name: Install dependencies
+        run: python -m pip install --no-input -r requirements-dev.txt
+      - name: Run Python tests
+        run: python -m pytest -q
+
+  dashboard:
+    name: Dashboard tests
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          architecture: x64
+          package-manager-cache: false
+      - name: Install dependencies
+        run: npm ci
+      - name: Run Dashboard tests
+        run: npm test

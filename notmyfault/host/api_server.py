@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+import errno
 
 import uvicorn
 
@@ -47,6 +48,7 @@ class ApiServer:
             code = getattr(error, "winerror", None)
             if not (
                 str(code) == "10048"
+                or error.errno == errno.EADDRINUSE
                 or "10048" in str(error)
                 or "bind" in str(error).lower()
             ):

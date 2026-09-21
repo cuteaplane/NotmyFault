@@ -16,7 +16,7 @@ def _safe_unpack(archive: str, target: str) -> None:
         if is_link:
             raise ValueError(f"归档包含符号链接，拒绝解压: {name}")
         normalized = os.path.normpath(name)
-        if normalized.startswith("..") or os.path.isabs(normalized):
+        if normalized == ".." or normalized.startswith(".." + os.sep) or os.path.isabs(normalized):
             raise ValueError(f"归档包含非法路径: {name}")
         dest = os.path.join(target_real, normalized)
         dest_real = os.path.realpath(dest)
@@ -32,7 +32,9 @@ def _safe_unpack(archive: str, target: str) -> None:
         with tarfile.open(archive) as tf:
             for member in tf.getmembers():
                 check_member(member.name, member.issym() or member.islnk())
-            tf.extractall(target)
+                if not member.isfile() and not member.isdir():
+                    raise ValueError(f"归档包含特殊文件，拒绝解压: {member.name}")
+            tf.extractall(target, filter="data")
 
 
 def _ensure_copy_safe(source: str, dest: str) -> None:
@@ -51,18 +53,27 @@ def run(action_info, params):
     operation = params.get("operation", "copy")
     source = params.get("source", "").strip()
     dest = params.get("destination", "").strip()
+    overwrite = params.get("overwrite", False)
+    if not isinstance(overwrite, bool):
+        raise ValueError("允许覆盖必须是布尔值")
 
     if not source:
         raise ValueError("未指定源路径")
     if not os.path.exists(source):
         raise FileNotFoundError(f"源路径不存在: {source}")
+    if operation in ("copy", "move") and not dest:
+        raise ValueError("未指定目标路径")
+    if operation in ("copy", "move"):
+        actual_dest = os.path.join(dest, os.path.basename(source.rstrip("/\\"))) if os.path.isdir(dest) and (operation == "move" or os.path.isfile(source)) else dest
+        if not overwrite and os.path.lexists(actual_dest):
+            raise FileExistsError("目标已存在，请更换路径或允许覆盖")
 
     print(f"[Action:file_operation] {operation}: {source} -> {dest}")
 
     if operation == "copy":
         _ensure_copy_safe(source, dest)
         if os.path.isdir(source):
-            shutil.copytree(source, dest, dirs_exist_ok=True)
+            shutil.copytree(source, dest, dirs_exist_ok=overwrite)
         else:
             parent = os.path.dirname(dest)
             if parent:
@@ -73,7 +84,7 @@ def run(action_info, params):
     elif operation == "move":
         _ensure_copy_safe(source, dest)
         parent = os.path.dirname(dest)
-        if parent and not os.path.isdir(source):
+        if parent:
             os.makedirs(parent, exist_ok=True)
         shutil.move(source, dest)
         print(f"[Action:file_operation] 移动完成")
@@ -93,7 +104,16 @@ def run(action_info, params):
             dest += ".zip"
         _ensure_copy_safe(source, dest)
         base = os.path.splitext(dest)[0]
-        shutil.make_archive(base, "zip", source)
+        if os.path.isdir(source):
+            shutil.make_archive(base, "zip", root_dir=source)
+        else:
+            source_dir = os.path.dirname(source) or "."
+            shutil.make_archive(
+                base,
+                "zip",
+                root_dir=source_dir,
+                base_dir=os.path.basename(source),
+            )
         print(f"[Action:file_operation] 压缩完成: {dest}")
 
     elif operation == "extract":

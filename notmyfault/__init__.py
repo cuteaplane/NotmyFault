@@ -11,7 +11,20 @@ _PROJECT_ROOT = _os.path.realpath(
 
 
 def _in_pytest() -> bool:
-    return "pytest" in _sys.modules or "_pytest" in _sys.modules
+    import inspect
+
+    pytest_module = _sys.modules.get("_pytest.python")
+    if pytest_module is None:
+        return False
+    entry_codes = {
+        function.__code__
+        for name in ("importtestmodule", "pytest_runtest_call")
+        if inspect.isfunction(function := getattr(pytest_module, name, None))
+    }
+    for frame_info in inspect.stack():
+        if frame_info.frame.f_code in entry_codes:
+            return True
+    return False
 
 
 def _find_external_caller():
@@ -46,7 +59,12 @@ def _guard_package_import() -> None:
     if getattr(_sys, "frozen", False):
         return
     caller = _find_external_caller()
-    if caller is None or _in_pytest() or _is_project_script(caller):
+    arguments = getattr(_sys, "orig_argv", ())
+    module_entry = any(
+        arguments[index:index + 2] == ["-m", "notmyfault"]
+        for index in range(len(arguments) - 1)
+    )
+    if caller is None or module_entry or _in_pytest() or _is_project_script(caller):
         return
     from notmyfault.security.security import detect_security_mode
     mode = detect_security_mode()

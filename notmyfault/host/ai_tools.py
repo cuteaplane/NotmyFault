@@ -14,7 +14,7 @@ JSON: TypeAlias = Mapping[str, "JSON"] | Sequence["JSON"] | str | int | float | 
 
 
 class ToolCallError(ValueError):
-    """工具调用解析或参数校验失败，code 稳定可断言。"""
+    """工具调用解析或参数校验失败，code 表示具体原因。"""
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -59,10 +59,10 @@ _RULE_DRAFT_PARAMETERS: JSON = {
     "type": "object",
     "properties": {
         "name": {"type": "string"},
-        "event": _NODE_SCHEMA,
+        "condition": _NODE_SCHEMA,
         "actions": {"type": "array", "items": _NODE_SCHEMA},
     },
-    "required": ["name", "event", "actions"],
+    "required": ["name", "condition", "actions"],
     "additionalProperties": False,
 }
 

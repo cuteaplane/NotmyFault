@@ -47,7 +47,8 @@ def create_plugins_router(
                 status_code=400,
             )
         try:
-            return installation.registry(
+            return await asyncio.to_thread(
+                installation.registry,
                 body.get("url", "") if isinstance(body, dict) else ""
             )
         except PluginInstallationError as error:
@@ -60,7 +61,7 @@ def create_plugins_router(
         except Exception:
             body = None
         try:
-            artifact = installation.download_registry(body)
+            artifact = await asyncio.to_thread(installation.download_registry, body)
         except PluginInstallationError as error:
             return JSONResponse(error.body, status_code=error.status_code)
         return Response(

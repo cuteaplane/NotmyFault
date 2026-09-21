@@ -7,12 +7,13 @@ from typing import Any, Callable, Dict, List
 from notmyfault.config import (
     ConfigValidationError,
     SignedConfigStore,
-    ensure_rule_binding_ids,
-    ensure_rule_id,
-    validate_rules_safety,
 )
+from notmyfault.core.rule_model import normalize_rule_shape, normalize_rules
 from notmyfault.core.rules import (
+    RuleStructureError,
     get_rule_events,
+    iter_action_nodes,
+    normalize_rule_input,
     validate_rule_bindings,
     validate_rules,
     validate_rules_structure,
@@ -40,10 +41,12 @@ class RuleService:
 
     def list_rules(self) -> Dict[str, Any]:
         try:
-            rules = self._store.load_verified_rules()
-        except ConfigValidationError:
-            rules = []
-        return {"rules": rules}
+            with self._store.rules_lock:
+                rules = self._store.load_verified_rules(for_editing=True)
+                revision = self._store.rules_revision()
+        except ConfigValidationError as error:
+            return {"ok": False, "rules": None, "config_error": str(error)}
+        return {"rules": rules, "revision": revision}
 
     def validate_draft(self, rule: Any) -> Dict[str, Any]:
         issues: List[Dict[str, Any]] = []
@@ -59,18 +62,24 @@ class RuleService:
                 item["location"] = location
             issues.append(item)
 
-        structure_errors = validate_rules_structure([rule])
+        try:
+            rule = normalize_rule_shape(rule) if isinstance(rule, dict) else rule
+            structure_errors = validate_rules_structure([rule])
+        except ValueError as error:
+            structure_errors = [str(error)]
         if structure_errors:
             for message in structure_errors[:20]:
                 add("error", "invalid_structure", message)
         else:
-            normalized = ensure_rule_binding_ids(rule)
+            normalized = normalize_rules([rule])[0]
             schema = self._plugin_schema()
-            _valid, _total, _plugin_errors, plugin_warnings = validate_rules(
+            _valid, _total, plugin_errors, plugin_warnings = validate_rules(
                 [normalized],
                 schema["triggers"],
                 schema["actions"],
             )
+            for _rule_name, message in plugin_errors:
+                add("error", "plugin_parameter", message)
             for _rule_name, message in plugin_warnings:
                 add("warning", "plugin_parameter", message)
 
@@ -84,78 +93,37 @@ class RuleService:
                     "event",
                 )
 
-            for field in ("preconditions", "actions"):
-                for index, item in enumerate(normalized.get(field, [])):
-                    label = (
-                        f"开始前确认 {index + 1}"
-                        if field == "preconditions"
-                        else f"动作 {index + 1}"
+            for action_item, location in iter_action_nodes(normalized.get("actions", [])):
+                if action_item.get("type") in ("if", "set_variable"):
+                    continue
+                item_label = f"动作 {location}"
+                plugin = schema["actions"].get(
+                    action_item.get("type", "")
+                )
+                self._add_plugin_availability_issue(add, plugin, action_item.get("type", ""), item_label, location)
+                if plugin is None or plugin.get("platform_compatible") is False or plugin.get("availability") == "unavailable":
+                    continue
+                if (
+                    action_item.get("timeout_seconds") is not None
+                    and plugin.get("cancellation_api") != "runtime-v1"
+                ):
+                    add(
+                        "error",
+                        "timeout_not_supported",
+                        f"{item_label}不支持安全取消，不能设置运行超时",
+                        location,
                     )
-                    action_items = [(item, f"{field}[{index}]", label)]
-                    if field == "actions":
-                        action_items.extend(
-                            (
-                                failure_action,
-                                f"actions[{index}].failure_actions[{failure_index}]",
-                                f"动作 {index + 1} 的补救动作 {failure_index + 1}",
-                            )
-                            for failure_index, failure_action in enumerate(
-                                item.get("failure_actions", [])
-                            )
-                        )
-                    for action_item, location, item_label in action_items:
-                        plugin = schema["actions"].get(
-                            action_item.get("type", "")
-                        )
-                        if plugin is None:
-                            add(
-                                "error",
-                                "plugin_reference",
-                                f"{item_label}引用了未加载的动作: "
-                                f"{action_item.get('type', '')}",
-                                location,
-                            )
-                        elif plugin.get("platform_compatible") is False:
-                            add(
-                                "error",
-                                "platform_incompatible",
-                                f"{item_label}“{plugin.get('name') or action_item.get('type')}”"
-                                "不支持当前系统",
-                                location,
-                            )
-                        elif plugin.get("availability") == "unavailable":
-                            reasons = "；".join(
-                                plugin.get("unavailable_reasons") or []
-                            )
-                            add(
-                                "error",
-                                "capability_incompatible",
-                                f"{item_label}“{plugin.get('name') or action_item.get('type')}”"
-                                f"当前系统缺少能力（{reasons}）",
-                                location,
-                            )
-                        elif (
-                            action_item.get("timeout_seconds") is not None
-                            and plugin.get("cancellation_api") != "runtime-v1"
-                        ):
-                            add(
-                                "error",
-                                "timeout_not_supported",
-                                f"{item_label}不支持安全取消，不能设置运行超时",
-                                location,
-                            )
-                        elif (
-                            field == "actions"
-                            and int(action_item.get("retry", 0) or 0) > 0
-                            and plugin.get("idempotent") is not True
-                        ):
-                            add(
-                                "warning",
-                                "retry_may_repeat",
-                                f"{item_label}“{plugin.get('name') or action_item.get('type')}”"
-                                "没有声明可安全重复执行，重试可能重复产生结果",
-                                location,
-                            )
+                elif (
+                    int(action_item.get("retry", 0) or 0) > 0
+                    and plugin.get("idempotent") is not True
+                ):
+                    add(
+                        "warning",
+                        "retry_may_repeat",
+                        f"{item_label}“{plugin.get('name') or action_item.get('type')}”"
+                        "没有声明可安全重复执行，重试可能重复产生结果",
+                        location,
+                    )
 
             for issue in validate_rule_bindings(
                 normalized,
@@ -168,12 +136,6 @@ class RuleService:
                     issue.get("message", "规则数据绑定无效"),
                     issue.get("location", ""),
                 )
-
-            safety_warnings, safety_errors = validate_rules_safety([normalized])
-            for message in safety_warnings:
-                add("warning", "safety_warning", message)
-            for message in safety_errors:
-                add("error", "unsafe_action", message)
 
         unique_issues: list[Dict[str, Any]] = []
         seen: set[tuple[Any, ...]] = set()
@@ -199,6 +161,7 @@ class RuleService:
                 400,
                 {"ok": False, "error": "rules 必须是列表"},
             )
+        rules = self._normalize_input(rules)
         try:
             require_admin_rule_approval(
                 [],
@@ -214,27 +177,18 @@ class RuleService:
         self,
         rules: Any,
         admin_key_password: Any,
+        expected_revision: Any = None,
     ) -> Dict[str, Any]:
-        structure_errors = validate_rules_structure(rules)
-        if structure_errors:
-            raise RuleServiceError(
-                400,
-                {
-                    "ok": False,
-                    "error": "规则结构校验失败",
-                    "details": structure_errors[:10],
-                },
-            )
-        if not isinstance(rules, list):
-            raise RuleServiceError(
-                400,
-                {"ok": False, "error": "rules 必须是列表"},
-            )
-        seen_rule_ids: set[str] = set()
-        normalized_rules = [
-            ensure_rule_binding_ids(ensure_rule_id(rule, seen_rule_ids))
-            for rule in rules
-        ]
+        with self._store.rules_lock:
+            if expected_revision is not None and expected_revision != self._store.rules_revision():
+                raise RuleServiceError(409, {
+                    "ok": False, "code": "rules_conflict",
+                    "error": "规则已被其他操作修改，请刷新后重新保存",
+                })
+            return self._save(rules, admin_key_password)
+
+    def _save(self, rules: Any, admin_key_password: Any) -> Dict[str, Any]:
+        normalized_rules = self._normalize_input(rules)
         structure_errors = validate_rules_structure(normalized_rules)
         if structure_errors:
             raise RuleServiceError(
@@ -270,21 +224,23 @@ class RuleService:
                 },
             )
 
-        _warnings, errors = validate_rules_safety(normalized_rules)
-        if errors:
+        _valid, _total, plugin_errors, _warnings = validate_rules(
+            normalized_rules, schema["triggers"], schema["actions"]
+        )
+        if plugin_errors:
             raise RuleServiceError(
                 400,
                 {
                     "ok": False,
-                    "error": "规则安全校验失败",
-                    "details": errors[:10],
+                    "error": "规则插件参数无效",
+                    "details": [f"{name}: {message}" for name, message in plugin_errors[:20]],
                 },
             )
 
         previous_rules = []
         if os.path.exists(self._store.rules_path):
             try:
-                previous_rules = self._store.load_verified_rules()
+                previous_rules = self._store.load_verified_rules(for_editing=True)
             except ConfigValidationError as error:
                 raise RuleServiceError(
                     409,
@@ -305,13 +261,17 @@ class RuleService:
                 500,
                 {"ok": False, "error": "写入规则文件失败"},
             )
-        return {"ok": True, "rules": normalized_rules}
+        return {"ok": True, "rules": normalized_rules, "revision": self._store.rules_revision()}
 
-    def _load_config(self) -> Dict[str, Any]:
+    @staticmethod
+    def _normalize_input(rules: Any) -> List[Dict[str, Any]]:
         try:
-            return self._store.load_verified_config()
-        except ConfigValidationError:
-            return {"rules": []}
+            return normalize_rule_input(rules)
+        except RuleStructureError as error:
+            errors = error.errors
+        raise RuleServiceError(400, {
+            "ok": False, "error": "规则结构校验失败", "details": errors[:10],
+        })
 
     @staticmethod
     def _approval_error(error: AdminRuleApprovalError) -> RuleServiceError:

@@ -9,16 +9,30 @@
     "package_name": "io.github.notmyfault.usb_insert",
     "enabled": true,
     "outputs": [
-        {"name": "drive_letter", "label": "匹配盘符", "type": "string"},
-        {"name": "actual_drive", "label": "实际盘符", "type": "string", "format": "path"}
+        {
+            "name": "drive_letter",
+            "label": "匹配盘符",
+            "type": "string"
+        },
+        {
+            "name": "actual_drive",
+            "label": "实际盘符",
+            "type": "string",
+            "format": "path",
+            "value_type": "path"
+        }
     ],
     "params": [
         {
             "name": "drive_letter",
-            "label": "目标盘符",
+            "label": "盘符或挂载路径",
             "type": "string",
             "default": "ANY",
-            "placeholder": "ANY 匹配任意盘符，或指定如 E:"
+            "placeholder": "Windows: E:；Linux: /media/user/USB；ANY 表示任意设备"
         }
+    ],
+    "platforms": [
+        "windows",
+        "linux"
     ]
 }

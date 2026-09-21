@@ -11,9 +11,10 @@ const emit = defineEmits(['close', 'select'])
 
 const query = ref('')
 const inputRef = ref(null)
-const normalizedFolders = computed(() => [...new Set(
-  props.folders.map(name => String(name || '').trim()).filter(Boolean),
-)])
+const folderKey = name => name.toLocaleLowerCase('zh-CN')
+const normalizedFolders = computed(() => [...new Map(
+  props.folders.map(name => String(name || '').trim()).filter(Boolean).map(name => [folderKey(name), name]),
+).values()])
 const visibleFolders = computed(() => {
   const needle = query.value.trim().toLocaleLowerCase('zh-CN')
   if (!needle) return normalizedFolders.value
@@ -21,7 +22,7 @@ const visibleFolders = computed(() => {
 })
 const canCreate = computed(() => {
   const name = query.value.trim()
-  return !!name && !normalizedFolders.value.some(folder => folder === name)
+  return !!name && !normalizedFolders.value.some(folder => folderKey(folder) === folderKey(name))
 })
 
 watch(() => props.open, async open => {
@@ -33,7 +34,7 @@ watch(() => props.open, async open => {
 
 function createAndSelect() {
   const name = query.value.trim()
-  if (name) emit('select', name)
+  if (name) emit('select', normalizedFolders.value.find(folder => folderKey(folder) === folderKey(name)) || name)
 }
 </script>
 

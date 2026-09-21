@@ -1,4 +1,3 @@
-import os
 import glob
 import json
 import os
@@ -8,6 +7,7 @@ from typing import Any, Callable, Dict, Optional
 
 from notmyfault.config import SignedConfigStore
 from notmyfault.core.engine import AutomationEngine
+from notmyfault.security.security import SecurityMode, detect_security_mode
 from notmyfault.host.api.plugin_installation import (
     PluginBackupStore,
     PluginFileSystem,
@@ -19,18 +19,15 @@ def _notify_build_required(detail: str) -> None:
 
         alert_user(
             "NotmyFault 安装文件不完整",
-            f"{detail}。为防止安全模式被自动降低，引擎已拒绝启动。"
-            "请从可信来源恢复文件，或在确认源码完整后运行 `python build.py build`。",
+            f"{detail}。安装文件无法验证，引擎已拒绝启动。"
+            "请从可信来源重新安装 NotmyFault。源码开发者可在确认文件完整后重新构建。",
             open_dashboard=False,
         )
     except Exception:
         print("[Startup] 无法发送安装完整性提示", file=sys.stderr)
 
 
-_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def _shipped_plugin_directories() -> list[str]:
+def _shipped_plugin_directories(package_root: str) -> list[str]:
     plugin_specs = (
         ("actions", "action.json"),
         ("triggers", "trigger.json"),
@@ -39,25 +36,26 @@ def _shipped_plugin_directories() -> list[str]:
         os.path.dirname(meta_path)
         for relative_root, json_name in plugin_specs
         for meta_path in glob.glob(
-            os.path.join(_PKG_ROOT, relative_root, "*", json_name)
+            os.path.join(package_root, relative_root, "*", json_name)
         )
     ]
 
 
-def _ensure_first_run_build() -> None:
+def _ensure_first_run_build(package_root: str) -> None:
     if getattr(sys, "frozen", False):
         return
-    project_root = os.path.dirname(_PKG_ROOT)
+    project_root = os.path.dirname(package_root)
     required_files = [
         os.path.join(project_root, "build.json"),
         os.path.join(project_root, "build.json.sig"),
     ]
     missing = [path for path in required_files if not os.path.isfile(path)]
-    missing.extend(
-        os.path.join(plugin_dir, "signature.sig")
-        for plugin_dir in _shipped_plugin_directories()
-        if not os.path.isfile(os.path.join(plugin_dir, "signature.sig"))
-    )
+    if detect_security_mode() == SecurityMode.STRICT:
+        missing.extend(
+            os.path.join(plugin_dir, "signature.sig")
+            for plugin_dir in _shipped_plugin_directories(package_root)
+            if not os.path.isfile(os.path.join(plugin_dir, "signature.sig"))
+        )
     if not missing:
         return
     relative = [os.path.relpath(path, project_root) for path in missing]
@@ -290,7 +288,7 @@ def create_engine(
     on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     plugin_file_system: PluginFileSystem | None = None,
 ) -> AutomationEngine:
-    _ensure_first_run_build()
+    _ensure_first_run_build(str(store.paths.package_root))
     config = store.load_config()
     migrate_user_plugin_enabled_state(config, store)
     config["rules"] = store.load_rules()

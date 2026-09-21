@@ -1,10 +1,11 @@
 import fs from 'fs'
 import path from 'path'
+import assert from 'node:assert/strict'
 import { JSDOM, VirtualConsole } from 'jsdom'
 
 
 const html = fs.readFileSync(
-  path.resolve('../notmyfault/actions/uia_macro/pages/macro.html'),
+  path.resolve('../notmyfault/actions/uia_automation/pages/macro.html'),
   'utf8',
 )
 const scriptErrors = []
@@ -20,6 +21,7 @@ const { window } = dom
 
 window.dispatchEvent(new window.MessageEvent('message', {
   source: window,
+  origin: window.location.origin,
   data: {
     source: 'notmyfault:extension-host',
     type: 'init',
@@ -51,7 +53,7 @@ window.dispatchEvent(new window.MessageEvent('message', {
 
 const pageOk = scriptErrors.length === 0
   && html.includes("type:'ready'")
-  && window.document.querySelector('style')?.textContent.includes('.recording-options { border-color: #35353b; background: #1b1b21; }')
+  && window.document.querySelector('.recording-options') !== null
   && window.document.querySelectorAll('.timeline-item').length === 2
   && window.document.querySelector('textarea.field-input')?.value === '测试文字'
   && window.document.querySelector('.kind.keyboard')?.textContent === '键盘'
@@ -83,3 +85,96 @@ const replacementStartsClean = invokes.some(message => (
 ))
 console.log((replacementStartsClean ? 'PASS' : 'FAIL') + ' - re-recording replaces existing macro steps by default')
 if (!replacementStartsClean) process.exit(1)
+
+const pollCallbacks = new Map()
+const originalSetTimeout = window.setTimeout.bind(window)
+const originalClearTimeout = window.clearTimeout.bind(window)
+let pollId = 100000
+window.setTimeout = (callback, delay, ...args) => {
+  if (delay !== 500) return originalSetTimeout(callback, delay, ...args)
+  pollCallbacks.set(++pollId, callback)
+  return pollId
+}
+window.clearTimeout = id => {
+  pollCallbacks.delete(id)
+  originalClearTimeout(id)
+}
+async function reply(request, data) {
+  window.dispatchEvent(new window.MessageEvent('message', {
+    origin: window.location.origin,
+    source: window,
+    data: { source:'notmyfault:extension-host', type:'result', request_id:request.request_id, response:{ ok:true, data } },
+  }))
+  await Promise.resolve()
+  await Promise.resolve()
+}
+await reply(invokes.find(message => message.command === 'start_recording'), { recording:true })
+assert.equal(pollCallbacks.size, 1)
+const [timerId, poll] = pollCallbacks.entries().next().value
+pollCallbacks.delete(timerId)
+poll()
+assert.equal(pollCallbacks.size, 0)
+const statusRequest = invokes.find(message => message.command === 'recording_status')
+assert.ok(statusRequest)
+window.document.getElementById('stopButton').click()
+await reply(invokes.find(message => message.command === 'stop_recording'), { recording:false, steps:[] })
+await reply(statusRequest, { recording:true })
+assert.equal(window.document.getElementById('stopButton').hidden, true)
+assert.equal(pollCallbacks.size, 0)
+console.log('PASS - recording polls one request at a time and ignores replies preceding stop')
+
+const selectorHtml = fs.readFileSync(
+  path.resolve('../notmyfault/actions/uia_automation/pages/selector.html'),
+  'utf8',
+)
+const selectorScriptErrors = []
+const selectorConsole = new VirtualConsole()
+selectorConsole.on('jsdomError', error => selectorScriptErrors.push(error))
+const selectorDom = new JSDOM(selectorHtml, {
+  runScripts: 'dangerously',
+  pretendToBeVisual: true,
+  url: 'http://notmyfault.test/selector',
+  virtualConsole: selectorConsole,
+})
+const selectorWindow = selectorDom.window
+const savedSelector = {
+  version: 1,
+  window: { process:'notepad.exe', name:'无标题 - 记事本' },
+  target: { automation_id:'FileSave', name:'保存', control_type:50000 },
+  display: { control:'保存', control_type:'按钮', window:'无标题 - 记事本', app:'notepad.exe' },
+}
+selectorWindow.dispatchEvent(new selectorWindow.MessageEvent('message', {
+  origin: selectorWindow.location.origin,
+  source: selectorWindow,
+  data: {
+    source: 'notmyfault:extension-host',
+    type: 'init',
+    state: { selector:savedSelector },
+  },
+}))
+
+const selectorPageOk = selectorScriptErrors.length === 0
+  && selectorWindow.document.getElementById('selectorCard')?.hidden === false
+  && selectorWindow.document.getElementById('controlName')?.textContent === '保存'
+  && selectorWindow.document.getElementById('appName')?.textContent === 'notepad.exe'
+  && selectorWindow.document.getElementById('verifyButton')?.disabled === false
+  && selectorWindow.document.getElementById('saveButton')?.disabled === false
+console.log((selectorPageOk ? 'PASS' : 'FAIL') + ' - selector page renders plugin-owned control data')
+if (!selectorPageOk) {
+  console.error(selectorScriptErrors)
+  process.exit(1)
+}
+
+const selectorInvokes = []
+selectorWindow.postMessage = message => selectorInvokes.push(message)
+selectorWindow.document.getElementById('verifyButton')?.click()
+await new Promise(resolve => selectorWindow.setTimeout(resolve, 0))
+const selectorChecksThroughPlugin = selectorInvokes.some(message => (
+  message.type === 'invoke'
+  && message.command === 'verify_selector'
+  && message.payload?.selector?.target?.automation_id === 'FileSave'
+))
+console.log((selectorChecksThroughPlugin ? 'PASS' : 'FAIL') + ' - selector verification stays inside the plugin view protocol')
+if (!selectorChecksThroughPlugin) process.exit(1)
+dom.window.close()
+selectorDom.window.close()

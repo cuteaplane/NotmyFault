@@ -12,7 +12,7 @@ const toneIcons = { error: 'error', warn: 'warning', info: 'info' }
       <h3 class="dialog-title">{{ dialogState.title }}</h3>
       <p class="dialog-sub">{{ dialogState.message }}</p>
       <input v-if="dialogState.kind === 'password'" v-model="dialogState.inputValue"
-        class="text-field app-dialog-password" type="password" autocomplete="current-password"
+        class="text-field app-dialog-password" type="password" autocomplete="off"
         placeholder="输入签名私钥密码" autofocus @keydown.enter="dialogState.inputValue && closeDialog(dialogState.inputValue)">
       <span v-if="dialogState.kind === 'password' && dialogState.inputError" class="test-field-error">
         <span class="material-symbols-outlined">error</span>{{ dialogState.inputError }}

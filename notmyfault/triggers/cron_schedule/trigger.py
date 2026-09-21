@@ -20,6 +20,7 @@ class CronScheduleTrigger(PollingTrigger):
     native: bool = False
 
     def validate(self) -> None:
+        self._started_at = datetime.now()
         mode = self.config.get("mode", "daily")
         if mode not in ("daily", "weekly", "interval"):
             raise ValueError(
@@ -29,6 +30,8 @@ class CronScheduleTrigger(PollingTrigger):
 
         if mode in ("daily", "weekly"):
             raw_time = str(self.config.get("time", "") or "")
+            if len(raw_time) == 8 and raw_time.endswith(":00"):
+                raw_time = raw_time[:5]
             match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", raw_time)
             if not match:
                 raise ValueError(f"无效的触发时间: {raw_time!r}（应为 HH:MM）")
@@ -72,16 +75,21 @@ class CronScheduleTrigger(PollingTrigger):
             self._poll_interval(now)
 
     def _poll_daily(self, now: datetime) -> None:
+        scheduled = now.replace(hour=self.hour, minute=self.minute, second=0, microsecond=0)
+        if scheduled < self._started_at.replace(second=0, microsecond=0):
+            return
         date_key = now.strftime("%Y-%m-%d")
         if self._fired_date == date_key:
             return
         if (now.hour, now.minute) < (self.hour, self.minute):
             return
-        # 到达或超过计划时间且当天尚未触发时记录日期并发送事件
-        self._fired_date = date_key
         self._emit(now, "daily")
+        self._fired_date = date_key
 
     def _poll_weekly(self, now: datetime) -> None:
+        scheduled = now.replace(hour=self.hour, minute=self.minute, second=0, microsecond=0)
+        if scheduled < self._started_at.replace(second=0, microsecond=0):
+            return
         date_key = now.strftime("%Y-%m-%d")
         if self._fired_date == date_key:
             return
@@ -89,8 +97,8 @@ class CronScheduleTrigger(PollingTrigger):
             return
         if (now.hour, now.minute) < (self.hour, self.minute):
             return
-        self._fired_date = date_key
         self._emit(now, "weekly")
+        self._fired_date = date_key
 
     def _poll_interval(self, now: datetime) -> None:
         if self._last_fired is None:
@@ -100,8 +108,8 @@ class CronScheduleTrigger(PollingTrigger):
         elapsed = (now - self._last_fired).total_seconds()
         if elapsed < self.interval_minutes * 60:
             return
-        self._last_fired = now
         self._emit(now, "interval")
+        self._last_fired = now
 
     def _emit(self, now: datetime, mode: str) -> None:
         self.log(f"计划触发: mode={mode}, time={now.strftime('%H:%M')}")

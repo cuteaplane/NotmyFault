@@ -6,14 +6,22 @@
     "version": "1.1",
     "package_name": "io.github.notmyfault.wallpaper",
     "enabled": true,
-    "permissions": ["registry", "native_api", "filesystem", "external_binary"],
+    "idempotent": true,
+    "platforms": ["windows", "linux"],
+    "permissions": [
+        "registry",
+        "native_api",
+        "filesystem",
+        "external_binary"
+    ],
     "params": [
         {
             "name": "image_path",
             "label": "图片路径",
             "type": "string",
             "default": "",
-            "placeholder": "支持 jpg/png/bmp"
+            "placeholder": "支持 jpg/png/bmp",
+            "value_type": "path"
         },
         {
             "name": "style",
@@ -21,11 +29,26 @@
             "type": "select",
             "default": "fill",
             "options": [
-                {"value": "fill", "label": "填充"},
-                {"value": "fit", "label": "适应"},
-                {"value": "stretch", "label": "拉伸"},
-                {"value": "tile", "label": "平铺"},
-                {"value": "center", "label": "居中"}
+                {
+                    "value": "fill",
+                    "label": "填充"
+                },
+                {
+                    "value": "fit",
+                    "label": "适应"
+                },
+                {
+                    "value": "stretch",
+                    "label": "拉伸"
+                },
+                {
+                    "value": "tile",
+                    "label": "平铺"
+                },
+                {
+                    "value": "center",
+                    "label": "居中"
+                }
             ]
         }
     ]

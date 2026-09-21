@@ -6,7 +6,15 @@
     "version": "1.2",
     "package_name": "io.github.notmyfault.display_control",
     "enabled": true,
+    "idempotent": true,
+    "platforms": ["windows", "linux"],
     "permissions": ["native_api", "external_binary"],
+    "outputs": [
+        {"name": "action", "label": "执行的操作", "type": "string", "required": true},
+        {"name": "brightness", "label": "设置亮度", "type": "number", "value_type": "int", "required": false},
+        {"name": "methods", "label": "亮度控制方式", "type": "array", "value_type": {"type": "array", "items": "text"}, "required": false},
+        {"name": "warnings", "label": "未成功的亮度控制方式", "type": "array", "value_type": {"type": "array", "items": "text"}, "required": false}
+    ],
     "params": [
         {
             "name": "action",
@@ -23,6 +31,7 @@
             "name": "brightness",
             "label": "亮度（0–100）",
             "type": "number",
+            "value_type": "int",
             "default": 50,
             "min": 0,
             "max": 100,

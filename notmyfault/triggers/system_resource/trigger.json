@@ -10,10 +10,26 @@
     "enabled": true,
     "permissions": [],
     "outputs": [
-        {"name": "resource", "label": "资源类型", "type": "string"},
-        {"name": "value", "label": "当前数值", "type": "number"},
-        {"name": "threshold", "label": "配置阈值", "type": "number"},
-        {"name": "direction", "label": "触发方向", "type": "string"}
+        {
+            "name": "resource",
+            "label": "资源类型",
+            "type": "string"
+        },
+        {
+            "name": "value",
+            "label": "当前数值",
+            "type": "number"
+        },
+        {
+            "name": "threshold",
+            "label": "配置阈值",
+            "type": "number"
+        },
+        {
+            "name": "direction",
+            "label": "触发方向",
+            "type": "string"
+        }
     ],
     "params": [
         {
@@ -22,18 +38,30 @@
             "type": "select",
             "default": "cpu",
             "options": [
-                {"value": "cpu", "label": "处理器使用率"},
-                {"value": "memory", "label": "内存使用率"},
-                {"value": "disk", "label": "磁盘使用率"},
-                {"value": "network", "label": "网络使用率"}
+                {
+                    "value": "cpu",
+                    "label": "处理器使用率"
+                },
+                {
+                    "value": "memory",
+                    "label": "内存使用率"
+                },
+                {
+                    "value": "disk",
+                    "label": "磁盘使用率"
+                },
+                {
+                    "value": "network",
+                    "label": "网络吞吐量 (MB/s)"
+                }
             ]
         },
         {
             "name": "threshold",
-            "label": "阈值 (%)",
+            "label": "阈值 (% 或 MB/s)",
             "type": "number",
             "default": 90,
-            "placeholder": "0-100"
+            "placeholder": "处理器/内存/磁盘用百分比，网络用 MB/s"
         },
         {
             "name": "direction",
@@ -41,9 +69,28 @@
             "type": "select",
             "default": "above",
             "options": [
-                {"value": "above", "label": "高于阈值"},
-                {"value": "below", "label": "低于阈值"}
+                {
+                    "value": "above",
+                    "label": "高于阈值"
+                },
+                {
+                    "value": "below",
+                    "label": "低于阈值"
+                }
             ]
+        },
+        {
+            "name": "disk_path",
+            "label": "磁盘路径",
+            "type": "path",
+            "value_type": "path",
+            "default": "",
+            "placeholder": "留空时 Windows 检查系统盘，Linux 检查 /",
+            "visible_when": {
+                "resource": [
+                    "disk"
+                ]
+            }
         }
     ]
 }

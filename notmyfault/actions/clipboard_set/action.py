@@ -1,7 +1,7 @@
 import ctypes
 import os
 
-from notmyfault.plugin_api import native_lock
+from notmyfault.plugin_api import native_lock, platform_services
 
 NATIVE_LOCK = native_lock()
 
@@ -9,20 +9,33 @@ GMEM_MOVEABLE = 0x0002
 CF_UNICODETEXT = 13
 
 if os.name == "nt":
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
-    kernel32.GlobalAlloc.restype = ctypes.c_void_p
-    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
-    kernel32.GlobalLock.restype = ctypes.c_void_p
-    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
-    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
-    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
-    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
-    user32.SetClipboardData.restype = ctypes.c_void_p
+    from ctypes import wintypes
+
+    with NATIVE_LOCK:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GlobalAlloc.restype = ctypes.c_void_p
+        kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalUnlock.restype = wintypes.BOOL
+        kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalFree.restype = ctypes.c_void_p
+        user32.OpenClipboard.argtypes = [wintypes.HWND]
+        user32.OpenClipboard.restype = wintypes.BOOL
+        user32.EmptyClipboard.argtypes = []
+        user32.EmptyClipboard.restype = wintypes.BOOL
+        user32.CloseClipboard.argtypes = []
+        user32.CloseClipboard.restype = wintypes.BOOL
+        user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+        user32.SetClipboardData.restype = ctypes.c_void_p
 
 
 def run(action_info, params):
     text = params.get("text", "")
+    if not isinstance(text, str):
+        raise ValueError("剪贴板内容必须是文本")
 
     if not text:
         raise ValueError("没有文本可写入")
@@ -30,9 +43,7 @@ def run(action_info, params):
     print(f"[Action:clipboard_set] 准备写入剪贴板 ({len(text)} 字符)")
 
     if os.name != "nt":
-        from notmyfault.platform.linux_support import set_clipboard_text
-
-        set_clipboard_text(str(text))
+        platform_services().write_clipboard(str(text))
         print(f"[Action:clipboard_set] 剪贴板写入成功 ({len(text)} 字符)")
         return
 
@@ -40,8 +51,8 @@ def run(action_info, params):
     handle = None
     transferred = False
     # 剪贴板 API 也是共享 user32 函数对象，与项目其他 ctypes 调用一样持锁
-    try:
-        with NATIVE_LOCK:
+    with NATIVE_LOCK:
+        try:
             if not user32.OpenClipboard(None):
                 raise RuntimeError("无法打开剪贴板（可能被其他程序占用）")
             clipboard_open = True
@@ -67,8 +78,7 @@ def run(action_info, params):
                 raise RuntimeError("SetClipboardData 失败")
             transferred = True  # 成功后句柄所有权转交 Windows，不能再 GlobalFree
             print(f"[Action:clipboard_set] 剪贴板写入成功 ({len(text)} 字符)")
-    finally:
-        with NATIVE_LOCK:
+        finally:
             if handle and not transferred:
                 kernel32.GlobalFree(handle)
             if clipboard_open:

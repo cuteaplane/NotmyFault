@@ -2,6 +2,7 @@
 
 import ctypes
 import os
+import subprocess
 import sys
 import threading
 from typing import Optional, Callable
@@ -79,12 +80,6 @@ class TrayIcon:
     def stop(self):
         """停止托盘图标"""
         self._shutdown_event.set()
-        if self._hwnd:
-            try:
-                win32gui.DestroyWindow(self._hwnd)
-            except Exception:
-                pass
-            self._hwnd = None
         if self._thread and self._thread.is_alive():
             # 托盘线程不能 join() 自身，退出循环后会自行清理。
             if self._thread is not threading.current_thread():
@@ -114,8 +109,11 @@ class TrayIcon:
             pass
 
     def set_auto_start(self, enable: bool):
+        if not (_register_auto_start if enable else _unregister_auto_start)():
+            self.show_balloon("开机自启设置失败", "无法写入当前用户的开机自启设置", NIIF_ERROR)
+            return False
         self._auto_start_enabled = enable
-        (_register_auto_start if enable else _unregister_auto_start)()
+        return True
 
     def _run(self):
         # 先设置线程 DPI，再调用 RegisterClass() 和 CreateWindow()。
@@ -162,6 +160,8 @@ class TrayIcon:
                 win32gui.DestroyWindow(self._hwnd)
             except Exception:
                 pass
+            self._hwnd = None
+        win32gui.UnregisterClass(class_atom, hinst)
 
     def _wndproc(self, hwnd: int, msg: int, wparam: int, lparam: int):
         if msg == WM_TASKBARCREATED:
@@ -247,6 +247,7 @@ class TrayIcon:
             pass
 
     def _show_context_menu(self, hwnd: int):
+        self._auto_start_enabled = _is_auto_start_enabled()
         menu = win32gui.CreatePopupMenu()
 
         win32gui.AppendMenu(menu, win32con.MF_STRING,
@@ -314,15 +315,22 @@ def _load_icon():
 AUTO_START_NAME = "NotmyFaultEngine"
 
 
+def _auto_start_command() -> str:
+    if getattr(sys, "frozen", False):
+        return subprocess.list2cmdline([sys.executable])
+    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    executable = pythonw if os.path.isfile(pythonw) else sys.executable
+    return subprocess.list2cmdline([executable, os.path.join(PROJECT_ROOT, "NOTMYFAULT.pyw")])
+
+
 def _register_auto_start():
     import winreg
-    exe = sys.executable if getattr(sys, "frozen", False) else \
-        os.path.abspath(os.path.join(PROJECT_ROOT, "NOTMYFAULT.pyw"))
+    command = _auto_start_command()
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                             r"Software\Microsoft\Windows\CurrentVersion\Run",
                             0, winreg.KEY_SET_VALUE) as k:
-            winreg.SetValueEx(k, AUTO_START_NAME, 0, winreg.REG_SZ, exe)
+            winreg.SetValueEx(k, AUTO_START_NAME, 0, winreg.REG_SZ, command)
         return True
     except Exception:
         return False
@@ -336,7 +344,7 @@ def _unregister_auto_start():
                             0, winreg.KEY_SET_VALUE) as k:
             try:
                 winreg.DeleteValue(k, AUTO_START_NAME)
-            except OSError:
+            except FileNotFoundError:
                 pass
         return True
     except Exception:
@@ -349,7 +357,7 @@ def _is_auto_start_enabled() -> bool:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                             r"Software\Microsoft\Windows\CurrentVersion\Run",
                             0, winreg.KEY_READ) as k:
-            winreg.QueryValueEx(k, AUTO_START_NAME)
-            return True
+            command, _kind = winreg.QueryValueEx(k, AUTO_START_NAME)
+            return command == _auto_start_command()
     except Exception:
         return False

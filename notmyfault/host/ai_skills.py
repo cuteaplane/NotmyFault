@@ -38,18 +38,13 @@ def _rule_draft_parameters(catalog: PluginCatalog) -> JSON:
         "type": "object",
         "properties": {
             "name": {"type": "string"},
-            "event": _node_schema(_sorted_ids(catalog, "triggers")),
-            "preconditions": {
-                "type": "array",
-                "description": "执行前检查，全部通过才继续动作；仅在用户明确提出条件时填写。",
-                "items": _node_schema(_sorted_ids(catalog, "actions")),
-            },
+            "condition": _node_schema(_sorted_ids(catalog, "triggers")),
             "actions": {
                 "type": "array",
                 "items": _node_schema(_sorted_ids(catalog, "actions")),
             },
         },
-        "required": ["name", "event", "actions"],
+        "required": ["name", "condition", "actions"],
         "additionalProperties": False,
     }
 

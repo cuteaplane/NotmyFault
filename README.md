@@ -3,12 +3,13 @@
 闲着没事儿写的自动化工具......
 
 NotmyFault 顾名思义是一个自动化（废话），由各种条件出发，以各种方式执行。
+当前版本 `alpha-0.15.0`。项目站点：[https://www.marshmallowmc.cn/](https://www.marshmallowmc.cn/)
 
 ## 亮点
 
 自动化软件，能干的事还是有些少的，并且很零碎......为了解决这个问题，NotmyFault最大的亮点就是可扩展性！
 只要会Python，你随时可以编写一个属于自己的插件，让NotmyFault帮你办成任何事！
-通过插件，NotmyFault可以拓展出强大的能力，接入任何服务，构建一个更通用的自动化。
+通过插件，NotmyFault可以拓展出强大的能力，接入任何服务/接口/设备，构建一个更通用的自动化。
 
 ## 平台支持
 
@@ -20,13 +21,17 @@ NotmyFault 顾名思义是一个自动化（废话），由各种条件出发，
 
 ## 快速开始
 
-### 环境要求
+Windows x64 预览安装包不需要本机 Python 或 Node.js。从源码运行需要：
 
 - Python 3.11+
 - Node.js 18+
 - Windows 10/11，或较新的 Linux 桌面环境（实验性）
 
 ### Windows
+
+Windows x64 可以安装预览包。下载见项目站点。安装后从开始菜单打开 NotmyFault。
+
+从源码运行：
 
 ```powershell
 git clone https://github.com/cuteaplane/notmyfault.git
@@ -46,8 +51,8 @@ python build.py
 .\.venv\Scripts\python dashboard.pyw
 ```
 
-Dashboard用于操作引擎，用于日常管理和插件的安装。
-第一次启动时如果缺少签名或 build.json，引擎会自动通过严格方式构建，或许等我再过上十年做个安装脚本出来（啥）
+`dashboard.pyw` 会拉起引擎进程 `NOTMYFAULT.pyw`，用来日常管理规则和安装插件。
+首次运行源码前需要执行构建。缺少 build.json 或其签名时，引擎会拒绝启动；严格模式还会检查内置插件是否缺少签名。安装文件异常时，设置里的安全页会引导重新安装 NotmyFault。
 
 ### Linux
 
@@ -67,13 +72,14 @@ cd ..
 ```
 
 ```bash
+./.venv/bin/python build.py
 ./.venv/bin/python dashboard.pyw
 ```
 
-根据桌面环境，剪贴板、截图、空闲检测和亮度功能还可能需要：
+根据桌面环境，剪贴板、截图、空闲检测、亮度、按键和窗口功能还可能需要：
 
 ```bash
-sudo apt install wl-clipboard gnome-screenshot brightnessctl xprintidle
+sudo apt install wl-clipboard xclip xdotool ydotool wmctrl xprop gnome-screenshot brightnessctl xprintidle
 ```
 
 Wayland 默认禁止普通应用监听全局按键或枚举其他应用的窗口标题。NotmyFault
@@ -92,19 +98,23 @@ Wayland 默认禁止普通应用监听全局按键或枚举其他应用的窗口
 | `python build.py version` | 查看密钥状态、公钥指纹和插件签名数量 |
 
 - 修改内置插件或核心源码后需要重新 build，否则旧签名失效。
-- 安全模式有 strict / normal / permissive 三档。引擎按环境变量
-  `NOTMYFAULT_MODE`、签名 build.json、默认 strict 的顺序决定当前模式。
+- 安全模式有 strict / normal / permissive 三档，以通过签名验证的 build.json 为准，缺少有效构建信息时默认 strict。环境变量 `NOTMYFAULT_MODE` 只能提高安全等级，不能降低。
 - normal 和 permissive 都使用不加密私钥，适合本地开发和测试。
+- normal 和 permissive 允许加载签名缺失或无效的插件；配置与规则的签名验证、插件结构检查和管理员执行确认仍然生效。
+
+Windows 安装包由 `installer/windows/build.ps1` 构建。
 
 ## 规则模型
 
 一条规则由三部分组成：
 
 ```text
-触发条件 → 可选的执行前检查 → 动作流水线
+触发条件（AND / OR / NOT）→ 动作按顺序执行（支持 IF / ELSE）
 ```
 
-单一触发条件使用 `event`；复杂条件使用可嵌套的 `condition`：
+触发条件统一使用 `condition`：单个触发器直接作为叶子，多个触发器用条件组组合。
+旧规则的 `event/trigger` 在读取或导入时转换，保存后使用 `condition`。
+触发器和动作带稳定的 `binding_id`，保存时会补齐；后续动作用 `$ref` 引用这些节点的输出：
 
 ```json
 {
@@ -113,10 +123,12 @@ Wayland 默认禁止普通应用监听全局按键或枚举其他应用的窗口
     "op": "all",
     "children": [
       {
+        "binding_id": "t_time01",
         "type": "time_schedule",
         "params": {"time": "20:00"}
       },
       {
+        "binding_id": "t_power01",
         "type": "power_state",
         "params": {"state": "ac"}
       }
@@ -124,6 +136,7 @@ Wayland 默认禁止普通应用监听全局按键或枚举其他应用的窗口
   },
   "actions": [
     {
+      "binding_id": "a_bright01",
       "type": "display_control",
       "params": {
         "action": "set_brightness",
@@ -131,6 +144,7 @@ Wayland 默认禁止普通应用监听全局按键或枚举其他应用的窗口
       }
     },
     {
+      "binding_id": "a_notify01",
       "type": "notify",
       "params": {
         "title": "NotmyFault",
@@ -141,7 +155,16 @@ Wayland 默认禁止普通应用监听全局按键或枚举其他应用的窗口
 }
 ```
 
-Dashboard 负责编辑和校验规则。
+NOT 用于等待指定事件未发生，必须设置等待时长；收到匹配事件后重新计时，
+超时触发一次，直到再次收到事件后重新开始。它判断事件是否发生，不查询当前系统状态。
+IF 根据本次触发数据或前序动作结果选择 THEN / ELSE 分支，执行完分支后继续后续动作。
+运行前检查已移除，含非空 `preconditions` 的旧规则需要在编辑器中移除旧检查并重新配置。
+
+Dashboard 侧栏是首页、自动化、插件和设置。运行记录在自动化里，安全在设置里。
+规则在自动化页编辑和校验，也可以选用 AI 服务起草草稿。
+规则支持只读常量和单次运行内的变量，参数可传递路径、时间、精确数字、结构化数据
+及插件声明的共享类型。格式与类型协议见 [docs/data-types.md](docs/data-types.md)。
+
 条件树节点和数据引用格式见 [docs/rule-schema-v2.md](docs/rule-schema-v2.md)。
 
 ## 数据位置
@@ -155,6 +178,8 @@ Dashboard 负责编辑和校验规则。
 
 - `config.json`：引擎配置。
 - `rules.json`：规则。
+- `run-events.jsonl`：运行记录。
+- `plugin_manifest.json`：已安装用户插件清单。
 - `logs/`：执行日志。
 - `plugins/`：用户安装的插件。
 - `.api_token`：Dashboard 与本地 API 之间共享的认证令牌。
@@ -172,7 +197,8 @@ Dashboard 是 pywebview 桌面客户端，只能在本机使用。
 python -m pytest -q
 ```
 
-测试目录为 `notmyfault/tests/` 和 `tests/`（pytest.ini 的 testpaths）。
+测试目录为 `notmyfault/tests/`（pytest.ini 的 testpaths）。默认不跑
+`system_native` 和 `linux_smoke`。
 
 Dashboard 构建与挂载测试：
 
@@ -189,19 +215,33 @@ npm test
 python build.py verify
 ```
 
-`notmyfault/simulator/` 提供模拟环境，可以在不接触真实系统的情况下跑规则；
-对应测试见 `notmyfault/tests/test_simulator.py`。
+检查、测试和打包用户插件：
+
+```bash
+python nmf.py plugin check path/to/plugin
+python nmf.py plugin test path/to/plugin -q
+python nmf.py plugin pack path/to/plugin --output-dir dist
+```
+
+`notmyfault/simulator/` 提供模拟环境，可以在不接触真实系统的情况下跑规则。
 
 开发文档：
 
+- [文档目录](docs/index.md)
+- [Windows 安装、升级与卸载](docs/windows-installer.md)
+- [Dashboard 操作与恢复](docs/dashboard-behavior.md)
 - [项目开发与验证](docs/DEVELOPMENT.md)
 - [插件 API v1](docs/plugin-api-v1.md)
 - [插件扩展 API](docs/plugin-extension-api.md)
 - [插件开发命令](docs/plugin-cli.md)
 - [插件多文件、二进制与签名](docs/plugin-author-guide-extensions.md)
 - [插件索引](docs/plugin-registry.md)
+- [内置系统动作与状态触发器](docs/builtin-system-behavior.md)
+- [文件、数据处理与状态触发插件](docs/builtin-utilities.md)
+- [UIA 自动化插件](docs/uia-automation-plugin.md)
 - [动作运行摘要](docs/run-summary-policy.md)
 - [API 后端结构](docs/api-backend-architecture.md)
+- [变量与数据类型](docs/data-types.md)
 - [规则格式 v2](docs/rule-schema-v2.md)
 - [Windows 原生调用安全](docs/native-safety.md)
 
@@ -211,7 +251,7 @@ python build.py verify
 - Linux 基本上就是个可用，当然可以自己写插件。
 - 部分插件名称和参数仍然偏开发，比如你看到的这一堆文档。
 - 显示器亮度、蓝牙、睡眠等系统功能会受到驱动、权限和硬件能力限制，当然你真的可以自己写插件来绕过。
-- 目前没有稳定版安装包；从源码运行仍需要 Python 和 Node.js，之后会写的会写的
+- 目前没有稳定版。Windows x64 有预览安装包；从源码运行仍需要 Python 和 Node.js
 
 遇到问题时，请附上操作系统、复现步骤以及 `logs/` 里最新的日志文件？真的会有人来提Issue吗...
 

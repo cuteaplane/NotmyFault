@@ -54,8 +54,9 @@ user32.GetClipboardData.restype = ctypes.c_void_p
 - `validate()`：配置校验，非法取值抛 ValueError
 - `setup()` / `poll()` / `teardown()`：初始化 / 单次轮询 / 资源清理
 
-已迁移：clipboard、window_title、hotkey、power_state（tray 因是窗口循环，
-只做 argtypes 加固，不套基类）。新增触发器优先走基类，不要手写 while 循环。
+除 `manual` 只等待退出外，20 个内置触发器均使用该基类，包括目录、空闲状态、
+网络、进程、系统资源、每日定时和 USB 监控。新增轮询触发器使用基类；托盘的
+窗口消息循环不使用该基类。
 
 > 注意：`NATIVE_LOCK` 必须是可重入的 `threading.RLock`——基类在外层持锁
 > 调用 poll()，而 poll() 内部的 `_get_clipboard_text()` / `_get_window_titles()`
@@ -76,9 +77,12 @@ def _poll():
         ...
 ```
 
-`notmyfault.native.NATIVE_LOCK` 是全引擎共享的一把锁。原生段都是
-微秒级操作，加锁不影响轮询频率，但能杜绝"两个触发器同时写同一函数对象"
-这类竞态。**新增任何轮询型触发器，只要原生段不是一次性调用，就必须套这把锁。**
+`notmyfault.native.NATIVE_LOCK` 是全引擎共享的一把锁，用于串行访问共享的
+ctypes 函数对象。**新增任何轮询型触发器，只要原生段不是一次性调用，就必须套这把锁。**
+
+锁内不能同步等待另一个也需要此锁的线程。`power_state` 的隐藏窗口在持锁轮询时
+处理消息；显示器开关使用 `SendNotifyMessageW` 广播，跨线程发送后立即返回。
+持锁调用 `SendMessageW(HWND_BROADCAST, ...)` 会等待隐藏窗口处理消息，形成互相等待。
 
 ## 规则 3：不可信的原生代码放子进程
 
@@ -99,8 +103,8 @@ result = subprocess.run(
   `json.loads(sys.stdin.buffer.read().decode("utf-8"))`
   （中文 Windows 文本模式 stdin 是 GBK，直接 `sys.stdin.read()` 会把
   UTF-8 中文读成乱码，SAPI 会念出 "ting-shen" 这类音）。
-- 父进程用 `timeout=` 兜底卡死；子进程退出码非 0 时抛 `RuntimeError`
-  让动作流水线标记失败。
+- 父进程用 `timeout=` 结束卡住的动作；子进程退出码非 0 时抛 `RuntimeError`，
+  动作记为失败。
 - 参考实现：`notmyfault/actions/text_to_speech/action.py`。
 
 ## 排查方法
@@ -118,4 +122,4 @@ result = subprocess.run(
 
 堆损坏 / 访问冲突发生在原生层，Python 解释器根本不知道；Windows 在堆管理
 检查点直接终止进程。`faulthandler` 也救不了（它只处理 Python 级 fault）。
-所以这类 bug 只能靠"规则 + 隔离"预防，而不是事后看日志。
+原生调用的线程约束与进程隔离用于控制此类崩溃的影响。

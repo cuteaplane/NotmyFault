@@ -3,120 +3,21 @@ import hmac
 import hashlib
 import json
 import os
-import re
 import secrets
 import stat
 import sys
 import tempfile
+import threading
 from typing import Any, Dict, List
 
 from notmyfault.application_paths import ApplicationPaths
-from notmyfault.core.bindings import is_reference
+from notmyfault.core.rule_model import (
+    normalize_rules, normalize_rule_shape,
+    _extract_legacy_rules,
+)
+from notmyfault.core.data_types import DataTypeError
+from notmyfault.core.value_codec import decode_value, encode_value
 
-
-_BINDING_ID_RE = re.compile(r"^[tap]_[a-z0-9_]{6,64}$")
-_RULE_ID_RE = re.compile(r"^r_[a-z0-9_]{6,64}$")
-_LEGACY_TEMPLATE_RE = re.compile(r"{{\s*([a-zA-Z_][\w.]*)\s*}}")
-
-
-def _new_binding_id(prefix: str) -> str:
-    return f"{prefix}_{secrets.token_hex(6)}"
-
-
-def ensure_rule_id(
-    rule: Dict[str, Any],
-    seen: set[str] | None = None,
-) -> Dict[str, Any]:
-    """给规则补充跨保存和重排保持不变的身份"""
-    copied = dict(rule)
-    used = seen if seen is not None else set()
-    rule_id = copied.get("rule_id")
-    if (
-        not isinstance(rule_id, str)
-        or not _RULE_ID_RE.fullmatch(rule_id)
-        or rule_id in used
-    ):
-        rule_id = f"r_{secrets.token_hex(6)}"
-        while rule_id in used:
-            rule_id = f"r_{secrets.token_hex(6)}"
-    copied["rule_id"] = rule_id
-    used.add(rule_id)
-    return copied
-
-
-def _ensure_condition_binding_ids(
-    condition: Any,
-    seen: set[str],
-) -> Any:
-    """给条件树叶子补充持久、可被动作引用的运行时身份"""
-    if not isinstance(condition, dict):
-        return condition
-    copied = dict(condition)
-    children = copied.get("children")
-    if isinstance(children, list):
-        copied["children"] = [
-            _ensure_condition_binding_ids(child, seen) for child in children
-        ]
-        return copied
-
-    binding_id = copied.get("binding_id")
-    if (
-        not isinstance(binding_id, str)
-        or not _BINDING_ID_RE.fullmatch(binding_id)
-        or not binding_id.startswith("t_")
-        or binding_id in seen
-    ):
-        binding_id = _new_binding_id("t")
-    copied["binding_id"] = binding_id
-    seen.add(binding_id)
-    return copied
-
-
-def ensure_rule_binding_ids(rule: Dict[str, Any]) -> Dict[str, Any]:
-    """规范化一条规则中可产生/消费运行数据的节点身份"""
-    copied = dict(rule)
-    seen: set[str] = set()
-    if isinstance(copied.get("event"), dict):
-        copied["event"] = _ensure_condition_binding_ids(copied["event"], seen)
-    if isinstance(copied.get("condition"), dict):
-        copied["condition"] = _ensure_condition_binding_ids(
-            copied["condition"], seen
-        )
-
-    def normalize_items(items: Any, prefix: str, *, include_failures: bool) -> Any:
-        if not isinstance(items, list):
-            return items
-        normalized = []
-        for item in items:
-            if not isinstance(item, dict):
-                normalized.append(item)
-                continue
-            item_copy = dict(item)
-            binding_id = item_copy.get("binding_id")
-            if (
-                not isinstance(binding_id, str)
-                or not _BINDING_ID_RE.fullmatch(binding_id)
-                or not binding_id.startswith(f"{prefix}_")
-                or binding_id in seen
-            ):
-                binding_id = _new_binding_id(prefix)
-            item_copy["binding_id"] = binding_id
-            seen.add(binding_id)
-            if include_failures and "failure_actions" in item_copy:
-                item_copy["failure_actions"] = normalize_items(
-                    item_copy["failure_actions"], "a", include_failures=False
-                )
-            normalized.append(item_copy)
-        return normalized
-
-    for field, prefix in (("preconditions", "p"), ("actions", "a")):
-        items = copied.get(field)
-        if not isinstance(items, list):
-            continue
-        copied[field] = normalize_items(
-            items, prefix, include_failures=field == "actions"
-        )
-    return copied
 
 # 规则单独存放在 rules.json，这里只保留轻量设置。
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -157,31 +58,15 @@ def _secure_write_secret(path: str, data: bytes) -> None:
     fd = -1
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        if os.name == "nt":
+            from notmyfault.security.api_key_store import _restrict_key_file
+
+            _restrict_key_file(path)
         with os.fdopen(fd, "wb") as f:
             fd = -1
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        if os.name == "nt":
-            import subprocess as _sp
-
-            userdomain = os.environ.get("USERDOMAIN", "")
-            username = os.environ.get("USERNAME") or os.getlogin()
-            full_user = f"{userdomain}\\{username}" if userdomain else username
-            grant = _sp.run(
-                ["icacls", path, "/grant:r", f"{full_user}:F"],
-                capture_output=True,
-                timeout=5,
-            )
-            if grant.returncode != 0:
-                raise OSError("icacls 无法授予密钥文件权限")
-            inheritance = _sp.run(
-                ["icacls", path, "/inheritance:r"],
-                capture_output=True,
-                timeout=5,
-            )
-            if inheritance.returncode != 0:
-                raise OSError("icacls 无法移除密钥文件继承权限")
     except Exception:
         if fd >= 0:
             os.close(fd)
@@ -201,354 +86,76 @@ def _validate_secret_permissions(path: str) -> None:
             raise ConfigValidationError("配置签名密钥权限过宽")
         return
 
-    import subprocess as _sp
+    import pywintypes
+    import win32api
+    import win32con
+    import win32security
 
-    script = """
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$acl = [System.IO.File]::GetAccessControl($env:NMF_CONFIG_SECRET_PATH)
-$access = @($acl.GetAccessRules(
-    $true,
-    $true,
-    [System.Security.Principal.SecurityIdentifier]
-) | ForEach-Object {
-    [pscustomobject]@{
-        Sid = $_.IdentityReference.Value
-        Type = $_.AccessControlType.ToString()
-    }
-})
-[pscustomobject]@{
-    Current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    Owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
-    Access = $access
-} | ConvertTo-Json -Compress -Depth 4
-"""
-    command_env = os.environ.copy()
-    command_env["NMF_CONFIG_SECRET_PATH"] = path
-    import base64
-
-    encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
     try:
-        result = _sp.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-NonInteractive",
-                "-EncodedCommand",
-                encoded_script,
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=10,
-            env=command_env,
+        token = win32security.OpenProcessToken(
+            win32api.GetCurrentProcess(), win32con.TOKEN_QUERY
         )
-        if result.returncode != 0:
-            raise OSError("PowerShell ACL 检查失败")
-        acl = json.loads(result.stdout)
-    except (json.JSONDecodeError, OSError, _sp.SubprocessError) as error:
+        try:
+            current_sid = win32security.GetTokenInformation(
+                token, win32security.TokenUser
+            )[0]
+        finally:
+            token.Close()
+        allowed = {
+            win32security.ConvertSidToStringSid(current_sid),
+            "S-1-5-18",
+            "S-1-5-32-544",
+        }
+        descriptor = win32security.GetNamedSecurityInfo(
+            path,
+            win32security.SE_FILE_OBJECT,
+            win32security.OWNER_SECURITY_INFORMATION
+            | win32security.DACL_SECURITY_INFORMATION,
+        )
+        owner = descriptor.GetSecurityDescriptorOwner()
+        if owner is None or win32security.ConvertSidToStringSid(owner) not in allowed:
+            raise ConfigValidationError("配置签名密钥所有者无效")
+        dacl = descriptor.GetSecurityDescriptorDacl()
+        if dacl is None:
+            raise ConfigValidationError("配置签名密钥权限过宽")
+        for index in range(dacl.GetAceCount()):
+            ace = dacl.GetAce(index)
+            if ace[0][0] in (
+                win32security.ACCESS_ALLOWED_ACE_TYPE,
+                win32security.ACCESS_ALLOWED_OBJECT_ACE_TYPE,
+            ):
+                if win32security.ConvertSidToStringSid(ace[-1]) not in allowed:
+                    raise ConfigValidationError("配置签名密钥权限过宽")
+            elif ace[0][0] not in (
+                win32security.ACCESS_DENIED_ACE_TYPE,
+                win32security.ACCESS_DENIED_OBJECT_ACE_TYPE,
+            ):
+                raise ConfigValidationError("配置签名密钥权限无法验证")
+    except (pywintypes.error, NotImplementedError) as error:
         raise ConfigValidationError("配置签名密钥权限无法验证") from error
-    current_sid = acl.get("Current") if isinstance(acl, dict) else None
-    allowed = {current_sid, "S-1-5-18", "S-1-5-32-544"}
-    if not current_sid or acl.get("Owner") not in allowed:
-        raise ConfigValidationError("配置签名密钥所有者无效")
-    access = acl.get("Access", [])
-    if isinstance(access, dict):
-        access = [access]
-    if not isinstance(access, list) or any(
-        isinstance(entry, dict)
-        and entry.get("Type") == "Allow"
-        and entry.get("Sid") not in allowed
-        for entry in access
-    ):
-        raise ConfigValidationError("配置签名密钥权限过宽")
-
-
-def _validate_rules_safety(rules: list) -> tuple[list[str], list[str]]:
-    return [], []
-
-
-def validate_rules_safety(rules: list) -> tuple[list[str], list[str]]:
-    return _validate_rules_safety(rules)
-
-
-def normalize_rules(rules: Any) -> List[Dict[str, Any]]:
-    return _normalize_rules(rules)
 
 
 class ConfigValidationError(ValueError):
     """运行时配置未通过完整性或安全校验"""
 
+    def __init__(self, message: str, *, recoverable: bool = False):
+        super().__init__(message)
+        self.recoverable = recoverable
+
 
 def _validate_rules_for_runtime(rules: List[Dict[str, Any]]) -> None:
-    """打印安全提醒，并拒绝会在运行时执行的危险规则。"""
+    """拒绝不符合规则结构的运行时配置"""
     from notmyfault.core.rules import validate_rules_structure
 
-    structure_errors = validate_rules_structure(rules)
+    try:
+        shaped = [normalize_rule_shape(rule) if isinstance(rule, dict) else rule for rule in rules]
+        structure_errors = validate_rules_structure(shaped)
+    except ValueError as error:
+        structure_errors = [str(error)]
     if structure_errors:
         raise ConfigValidationError(
             "规则结构校验失败: " + "; ".join(structure_errors[:3])
         )
-    safety_warnings, safety_errors = _validate_rules_safety(rules)
-    for warning in safety_warnings:
-        print(f"[Config] [安全] {warning}", file=sys.stderr)
-    if safety_errors:
-        for error in safety_errors:
-            print(f"[Config] [安全-严重] {error}", file=sys.stderr)
-        raise ConfigValidationError(
-            "规则安全校验失败: " + "; ".join(safety_errors[:3])
-        )
-
-
-def _normalize_condition(condition: Any) -> Any:
-    """把旧条件树转换成统一的 op 和 children 格式"""
-    if not isinstance(condition, dict):
-        return condition
-
-    copied = dict(condition)
-    children = copied.get("children", copied.get("events"))
-    # 带 children 或 events 的节点是条件组，叶子的 type 字段必须保留
-    if not isinstance(children, list):
-        return copied
-
-    op = copied.get("op", copied.get("type", "any"))
-    copied["op"] = "all" if op in ("all", "and") else "any"
-    copied["children"] = [_normalize_condition(child) for child in children]
-    copied.pop("events", None)
-    copied.pop("type", None)
-    if copied["op"] == "any":
-        # any 条件组不使用 within_seconds，旧界面只隐藏过这个字段
-        copied.pop("within_seconds", None)
-    return copied
-
-
-def _unwrap_single_condition(condition: Any) -> Dict[str, Any] | None:
-    """从单分支条件组中取出事件，消除旧版重复字段"""
-    current = condition
-    while isinstance(current, dict):
-        children = current.get("children")
-        if isinstance(children, list):
-            if len(children) != 1:
-                return None
-            current = children[0]
-            continue
-        return current if isinstance(current.get("type"), str) else None
-    return None
-
-
-def _replace_step_references(value: Any, replacements: Dict[str, str]) -> Any:
-    if isinstance(value, str):
-        def replace(match: re.Match[str]) -> str:
-            parts = match.group(1).split(".")
-            if len(parts) >= 3 and parts[0] == "steps" and parts[1] in replacements:
-                parts[1] = replacements[parts[1]]
-                return match.group(0).replace(match.group(1), ".".join(parts), 1)
-            return match.group(0)
-
-        return _LEGACY_TEMPLATE_RE.sub(replace, value)
-    if isinstance(value, list):
-        return [_replace_step_references(item, replacements) for item in value]
-    if isinstance(value, dict):
-        if is_reference(value):
-            reference = dict(value["$ref"])
-            if reference.get("scope") == "step":
-                node = reference.get("node")
-                if node in replacements:
-                    reference["node"] = replacements[node]
-            return {"$ref": reference}
-        return {key: _replace_step_references(item, replacements) for key, item in value.items()}
-    return value
-
-
-def _normalize_rule_actions(actions: Any) -> Any:
-    """移除旧步骤 ID，并把能确定的旧引用改为自动步骤名"""
-    if not isinstance(actions, list):
-        return actions
-
-    ids: Dict[str, str] = {}
-    duplicate_ids = set()
-    for index, action in enumerate(actions):
-        if not isinstance(action, dict):
-            continue
-        old_id = action.get("id")
-        if not isinstance(old_id, str) or not old_id:
-            continue
-        generated = f"{action.get('type', 'action')}_{index + 1}"
-        if old_id in ids:
-            duplicate_ids.add(old_id)
-        else:
-            ids[old_id] = generated
-    replacements = {old: new for old, new in ids.items() if old not in duplicate_ids}
-
-    normalized = []
-    for action in actions:
-        if not isinstance(action, dict):
-            normalized.append(action)
-            continue
-        copied = dict(action)
-        copied.pop("id", None)
-        # display_control 的旧亮度动作在加载时转换为新参数，旧规则仍可执行
-        if copied.get("type") == "display_control":
-            params = copied.get("params")
-            if isinstance(params, dict):
-                legacy_action = params.get("action")
-                if legacy_action in ("low_brightness", "high_brightness"):
-                    copied_params = dict(params)
-                    copied_params["action"] = "set_brightness"
-                    copied_params["brightness"] = (
-                        10 if legacy_action == "low_brightness" else 90
-                    )
-                    copied["params"] = copied_params
-        normalized.append(_replace_step_references(copied, replacements))
-    return normalized
-
-
-def _legacy_template_ref(
-    dotted_path: str,
-    step_refs: Dict[str, str],
-) -> Dict[str, Any] | None:
-    """把旧模板路径解析为结构化 $ref，无法定位来源时返回 None"""
-    parts = dotted_path.split(".")
-    if len(parts) >= 3 and parts[:2] == ["event", "payload"]:
-        return {"scope": "event", "path": parts[2:]}
-    if len(parts) >= 4 and parts[0] == "steps" and parts[2] == "result":
-        new_id = step_refs.get(parts[1])
-        if new_id is None:
-            return None
-        return {"scope": "step", "node": new_id, "path": parts[3:]}
-    return None
-
-
-def _upgrade_legacy_templates(
-    value: Any,
-    step_refs: Dict[str, str],
-) -> Any:
-    """把纯模板字符串转换为结构化 $ref，并更新混合模板中的步骤 ID"""
-    if isinstance(value, str):
-        full = _LEGACY_TEMPLATE_RE.fullmatch(value)
-        if full:
-            reference = _legacy_template_ref(full.group(1), step_refs)
-            if reference is not None:
-                return {"$ref": reference}
-        # 混合模板需要更新旧步骤 ID 引用
-        return _replace_step_references(value, step_refs)
-    if isinstance(value, list):
-        return [_upgrade_legacy_templates(item, step_refs) for item in value]
-    if isinstance(value, dict):
-        if is_reference(value):
-            return _replace_step_references(value, step_refs)
-        return {
-            key: _upgrade_legacy_templates(item, step_refs)
-            for key, item in value.items()
-        }
-    return value
-
-
-def _upgrade_rule_templates(rule: Dict[str, Any]) -> Dict[str, Any]:
-    """升级规则动作和确认参数中的旧模板引用"""
-    step_refs: Dict[str, str] = {}
-    actions = rule.get("actions")
-    if isinstance(actions, list):
-        for index, action in enumerate(actions):
-            if not isinstance(action, dict):
-                continue
-            legacy_key = f"{action.get('type', 'action')}_{index + 1}"
-            step_refs[legacy_key] = action.get("binding_id", legacy_key)
-
-    copied = dict(rule)
-    for field in ("preconditions", "actions"):
-        items = copied.get(field)
-        if not isinstance(items, list):
-            continue
-        normalized = []
-        for item in items:
-            if not isinstance(item, dict):
-                normalized.append(item)
-                continue
-            item_copy = dict(item)
-            if isinstance(item_copy.get("params"), dict):
-                item_copy["params"] = _upgrade_legacy_templates(
-                    item_copy["params"], step_refs
-                )
-            normalized.append(item_copy)
-        copied[field] = normalized
-    return copied
-
-
-def _normalize_rules(rules: Any) -> List[Dict[str, Any]]:
-    """规范化规则列表并补齐规则和节点身份"""
-    if not isinstance(rules, list):
-        return []
-    normalized_rules = []
-    seen_rule_ids: set[str] = set()
-    for rule in rules:
-        if not isinstance(rule, dict):
-            continue
-        copied = dict(rule)
-        if "trigger" in copied:
-            if "event" not in copied:
-                copied["event"] = copied["trigger"]
-            copied.pop("trigger", None)
-        if "condition" in copied:
-            copied["condition"] = _normalize_condition(copied["condition"])
-            if "event" not in copied and isinstance(copied["condition"], dict):
-                if not isinstance(copied["condition"].get("children"), list):
-                    copied["event"] = copied.pop("condition")
-            elif isinstance(copied.get("event"), dict):
-                condition_event = _unwrap_single_condition(copied["condition"])
-                if condition_event == copied["event"]:
-                    copied.pop("condition", None)
-        if "actions" in copied:
-            copied["actions"] = _normalize_rule_actions(copied["actions"])
-        normalized = ensure_rule_id(copied, seen_rule_ids)
-        normalized = ensure_rule_binding_ids(normalized)
-        normalized_rules.append(_upgrade_rule_templates(normalized))
-    return normalized_rules
-
-
-def _extract_legacy_rules(config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """从旧 config 提取规则，兼容更早的进程列表格式"""
-    if isinstance(config.get("rules"), list):
-        return _normalize_rules(config["rules"])
-
-    processes = config.get("processes")
-    if not isinstance(processes, list):
-        return []
-
-    rules: List[Dict[str, Any]] = []
-    for process in processes:
-        if not isinstance(process, dict):
-            continue
-
-        process_name = process.get("process_name", "")
-        software_name = process.get("software_name", process_name)
-        volume_action = process.get("volume_action", "max")
-        notification = process.get("notification", {}) or {}
-
-        _rule = {
-                "name": f"{software_name} 音量规则",
-                "event": {
-                    "type": "process_state",
-                    "params": {
-                        "process_name": process_name,
-                        "state": "running"
-                    }
-                },
-                "actions": [
-                    {"type": "set_volume", "params": {"action": volume_action}},
-                    {
-                        "type": "notify",
-                        "params": {
-                            "title": notification.get("title", f"{software_name} 正在运行"),
-                            "message": notification.get("message", "")
-                        }
-                    }
-                ]
-            }
-        rules.append(_rule)
-
-    return _normalize_rules(rules)
 
 
 def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -583,6 +190,13 @@ class SignedConfigStore:
     def __init__(self, paths: ApplicationPaths) -> None:
         self.paths = paths
         self._secret_cache: bytes | None = None
+        self.rules_lock = threading.RLock()
+
+    def rules_revision(self) -> str:
+        try:
+            return hashlib.sha256(self.paths.rules_file.read_bytes()).hexdigest()
+        except FileNotFoundError:
+            return hashlib.sha256(b"").hexdigest()
 
     @property
     def config_path(self) -> str:
@@ -625,13 +239,19 @@ class SignedConfigStore:
 
     def _sign(self, data: Dict[str, Any]) -> str:
         content = json.dumps(data, sort_keys=True, ensure_ascii=False, default=str)
+        try:
+            encoded = content.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ConfigValidationError("配置包含无效的 Unicode 字符") from error
         return hmac.new(
             self._get_or_create_secret(),
-            content.encode("utf-8"),
+            encoded,
             hashlib.sha256,
         ).hexdigest()
 
     def _verify(self, data: Dict[str, Any], signature: str) -> bool:
+        if not isinstance(signature, str) or not signature.isascii():
+            return False
         return hmac.compare_digest(self._sign(data), signature)
 
     def _write_signed_json(
@@ -676,7 +296,7 @@ class SignedConfigStore:
                 atomic_write(backup_path, previous)
             atomic_write(path, content)
             return True
-        except OSError as error:
+        except (OSError, ConfigValidationError, UnicodeEncodeError) as error:
             print(
                 f"[Config] 写入 {os.path.basename(path)} 失败: {error}",
                 file=sys.stderr,
@@ -695,10 +315,19 @@ class SignedConfigStore:
         )
 
     def save_rules(self, rules: List[Dict[str, Any]]) -> bool:
+        with self.rules_lock:
+            return self._save_rules(rules)
+
+    def _save_rules(self, rules: List[Dict[str, Any]]) -> bool:
         if not isinstance(rules, list):
             print("[Config] 保存规则失败: rules 必须是列表", file=sys.stderr)
             return False
-        data = {"schema_version": 2, "rules": _normalize_rules(rules)}
+        try:
+            normalized = normalize_rules(rules)
+        except ValueError as error:
+            print(f"[Config] 保存规则失败: {error}", file=sys.stderr)
+            return False
+        data = {"schema_version": 2, "value_encoding": "typed-v1", "rules": encode_value(normalized)}
         return self._write_signed_json(
             self.rules_path,
             self.rules_path + ".bak",
@@ -709,10 +338,10 @@ class SignedConfigStore:
         try:
             with open(path, "r", encoding="utf-8") as file:
                 raw = json.load(file)
-        except (json.JSONDecodeError, OSError) as error:
-            raise ConfigValidationError(f"{label}文件无法解析: {error}") from error
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as error:
+            raise ConfigValidationError(f"{label}文件无法解析: {error}", recoverable=True) from error
         if not isinstance(raw, dict):
-            raise ConfigValidationError(f"{label}文件根节点必须是对象")
+            raise ConfigValidationError(f"{label}文件根节点必须是对象", recoverable=True)
         signature = raw.pop(_SIGNATURE_KEY, "")
         if not self.paths.config_secret_file.is_file():
             raise ConfigValidationError(f"{label}签名密钥缺失")
@@ -720,7 +349,19 @@ class SignedConfigStore:
             raise ConfigValidationError(f"{label}缺少签名")
         if not self._verify(raw, signature):
             raise ConfigValidationError(f"{label}签名校验失败")
-        return raw
+        return self._decode_rules_data(raw)
+
+    @staticmethod
+    def _decode_rules_data(data):
+        encoding = data.get("value_encoding")
+        if encoding is None:
+            return data
+        if encoding != "typed-v1":
+            raise ConfigValidationError("规则数据编码版本不受支持")
+        try:
+            return {**data, "rules": decode_value(data.get("rules"))}
+        except DataTypeError as error:
+            raise ConfigValidationError(str(error)) from error
 
     def load_verified_config(self) -> Dict[str, Any]:
         normalized = _normalize_config(self._read_signed(self.config_path, "配置"))
@@ -728,14 +369,23 @@ class SignedConfigStore:
             raise ConfigValidationError("规范化后的配置必须是对象")
         return normalized
 
-    def load_verified_rules(self) -> List[Dict[str, Any]]:
+    def load_verified_rules(self, *, for_editing: bool = False) -> List[Dict[str, Any]]:
         raw = self._read_signed(self.rules_path, "规则")
         rules = raw.get("rules")
         if not isinstance(rules, list):
             raise ConfigValidationError("rules 必须是列表")
-        _validate_rules_for_runtime(rules)
-        normalized = _normalize_rules(rules)
-        _validate_rules_for_runtime(normalized)
+        def validate(items):
+            if for_editing:
+                items = [
+                    {key: value for key, value in rule.items() if key != "preconditions"}
+                    if isinstance(rule, dict) else rule
+                    for rule in items
+                ]
+            _validate_rules_for_runtime(items)
+
+        validate(rules)
+        normalized = normalize_rules(rules)
+        validate(normalized)
         return normalized
 
     def _keep_premigration_backup(self) -> None:
@@ -833,7 +483,7 @@ class SignedConfigStore:
             return None
         if not signature or not self._verify(data, signature):
             return None
-        rules = _normalize_rules(data.get("rules", []))
+        rules = normalize_rules(self._decode_rules_data(data).get("rules", []))
         _validate_rules_for_runtime(rules)
         return rules if self.save_rules(rules) else None
 
@@ -846,14 +496,12 @@ class SignedConfigStore:
         try:
             config = self.load_verified_config()
         except ConfigValidationError as error:
-            if "无法解析" not in str(error):
+            if not error.recoverable:
                 raise
             recovered = self._recover_config()
             if recovered is not None:
                 return recovered
-            default = _default_v2_config()
-            self.save_config(default)
-            return default
+            raise
         self._migrate_rules_file()
         return config
 
@@ -866,21 +514,15 @@ class SignedConfigStore:
         try:
             rules = self.load_verified_rules()
         except ConfigValidationError as error:
-            if not any(
-                marker in str(error) for marker in ("无法解析", "根节点")
-            ):
+            if not error.recoverable:
                 raise
             recovered = self._recover_rules()
             if recovered is not None:
                 return recovered
-            self.save_rules([])
-            return []
+            raise
         return rules
 
-    def inspect_security(
-        self,
-        actions_meta: Dict[str, Dict[str, Any]] | None = None,
-    ) -> Dict[str, Any]:
+    def inspect_files(self) -> Dict[str, Any]:
         status: Dict[str, Any] = {"status": "ok", "reason": "", "summary": None}
         has_secret = self.paths.config_secret_file.is_file()
         if not has_secret:
@@ -926,71 +568,10 @@ class SignedConfigStore:
             if isinstance(loaded, list):
                 rules = loaded
 
-        from notmyfault.security.plugin_schema import requires_admin_rule_approval
-
-        action_schema = actions_meta or {}
-
-        def summarize_params(params: Any) -> Dict[str, Any]:
-            if not isinstance(params, dict):
-                return {}
-            return {
-                str(key): "***" if value not in (None, "") else ""
-                for key, value in params.items()
-            }
-
-        def summarize_item(item: Any) -> Dict[str, Any]:
-            if not isinstance(item, dict):
-                return {"type": "?", "high_risk": False, "params": {}}
-            action_type = item.get("type", "?")
-            summary = {
-                "type": action_type,
-                "high_risk": requires_admin_rule_approval(
-                    action_schema.get(action_type, {})
-                ),
-                "params": summarize_params(item.get("params")),
-            }
-            failures = item.get("failure_actions", [])
-            if isinstance(failures, list) and failures:
-                summary["failure_actions"] = [
-                    summarize_item(failure) for failure in failures
-                ]
-            return summary
-
-        status["summary"] = {
-            "rule_count": len(rules),
-            "rules": [
-                {
-                    "name": (
-                        rule.get("name", f"规则 #{index + 1}")
-                        if isinstance(rule, dict)
-                        else f"规则 #{index + 1}"
-                    ),
-                    "preconditions": (
-                        [
-                            summarize_item(item)
-                            for item in rule.get("preconditions", [])
-                        ]
-                        if isinstance(rule, dict)
-                        and isinstance(rule.get("preconditions", []), list)
-                        else []
-                    ),
-                    "actions": (
-                        [summarize_item(action) for action in rule.get("actions", [])]
-                        if isinstance(rule, dict)
-                        and isinstance(rule.get("actions", []), list)
-                        else []
-                    ),
-                }
-                for index, rule in enumerate(rules)
-            ],
-        }
+        status["rules"] = rules
         return status
 
-    def approve_current_files(
-        self,
-        schema: Dict[str, Dict[str, Dict[str, Any]]],
-        admin_key_password: str | None,
-    ) -> None:
+    def load_unsigned_files(self) -> tuple[dict, list[dict] | None]:
         try:
             with open(self.config_path, "r", encoding="utf-8") as file:
                 config = json.load(file)
@@ -1013,50 +594,11 @@ class SignedConfigStore:
             if not isinstance(rules_data, dict):
                 raise ConfigValidationError("规则文件根节点不是对象")
             rules_data.pop(_SIGNATURE_KEY, None)
+            rules_data = self._decode_rules_data(rules_data)
             rules = rules_data.get("rules", [])
             if not isinstance(rules, list):
-                rules = []
-            normalized_rules = _normalize_rules(rules)
+                raise ConfigValidationError("rules 必须是列表")
+            _validate_rules_for_runtime(rules)
+            normalized_rules = normalize_rules(rules)
             _validate_rules_for_runtime(normalized_rules)
-            from notmyfault.core.rules import (
-                validate_rule_bindings,
-                validate_rules_structure,
-            )
-
-            structure_errors = validate_rules_structure(normalized_rules)
-            if structure_errors:
-                raise ConfigValidationError(
-                    "规则包含结构无效的规则，拒绝重新签名: "
-                    + "; ".join(structure_errors[:3])
-                )
-            binding_errors = []
-            for index, rule in enumerate(normalized_rules):
-                for issue in validate_rule_bindings(
-                    rule,
-                    schema.get("triggers", {}),
-                    schema.get("actions", {}),
-                ):
-                    binding_errors.append(
-                        f"规则 #{index + 1} {issue.get('message', '数据绑定无效')}"
-                    )
-            if binding_errors:
-                raise ConfigValidationError(
-                    "规则数据绑定无效，拒绝重新签名: "
-                    + "; ".join(binding_errors[:3])
-                )
-
-            from notmyfault.security.rule_approval import (
-                require_admin_rule_approval,
-            )
-
-            require_admin_rule_approval(
-                [],
-                normalized_rules,
-                schema,
-                admin_key_password,
-            )
-
-        if not self.save_config(normalized_config):
-            raise ConfigValidationError("重新签名失败")
-        if normalized_rules is not None and not self.save_rules(normalized_rules):
-            raise ConfigValidationError("规则重新签名失败")
+        return normalized_config, normalized_rules

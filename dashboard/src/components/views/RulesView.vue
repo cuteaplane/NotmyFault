@@ -13,8 +13,12 @@ import RuleEditor from '../RuleEditor.vue'
 import QuickCreateDialog from '../QuickCreateDialog.vue'
 import TestRunDialog from '../TestRunDialog.vue'
 import BaseDialog from '../BaseDialog.vue'
+import LogsView from './LogsView.vue'
 
+const automationSection = ref(store.pendingAutomationSection || 'rules')
 const activeRuleIndex = ref(null)
+let editorAdminKeyPassword = ''
+let originalRuleSnapshot = ''
 const draftRule = ref(null)
 const baseline = ref('')
 const pendingRuleIndex = ref(null)
@@ -47,12 +51,20 @@ const showCreatePanel = ref(false)
 const showQuickCreate = ref(false)
 const quickCreateReturnFocus = ref(null)
 const createPanelVisible = computed(() => (
-  store.aiDrafting.enabled && (!store.configData.rules.length || showCreatePanel.value)
+  !store.configError && store.aiDrafting.enabled && (!store.configData.rules.length || showCreatePanel.value)
 ))
 
+const ruleQuery = ref('')
+const matchingRules = computed(() => {
+  const query = ruleQuery.value.trim().toLowerCase()
+  return store.configData.rules.map((rule, index) => ({ rule, index })).filter(({ rule }) =>
+    !query || [rule.name, rule.folder, triggerSummary(rule), ...(rule.actions || []).map(action => store.schema.actions[action.type]?.name || action.type)]
+      .some(value => String(value || '').toLowerCase().includes(query)),
+  )
+})
 const ruleFolders = computed(() => {
   const folders = new Map()
-  store.configData.rules.forEach((rule, index) => {
+  matchingRules.value.forEach(({ rule, index }) => {
     const name = String(rule.folder || '未分类')
     if (!folders.has(name)) folders.set(name, [])
     folders.get(name).push({ rule, index })
@@ -70,6 +82,8 @@ function visitRuleNodes(rule, visitor) {
   const visitAction = node => {
     if (!node || typeof node !== 'object') return
     visitor(node, 'action')
+    ;(node.then || []).forEach(visitAction)
+    ;(node.else || []).forEach(visitAction)
     ;(node.failure_actions || []).forEach(visitAction)
   }
   const visitCondition = node => {
@@ -77,9 +91,7 @@ function visitRuleNodes(rule, visitor) {
     if (node.type) visitor(node, 'trigger')
     ;(node.children || []).forEach(visitCondition)
   }
-  if (rule?.event) visitor(rule.event, 'trigger')
   visitCondition(rule?.condition)
-  ;(rule?.preconditions || []).forEach(visitAction)
   ;(rule?.actions || []).forEach(visitAction)
 }
 function sensitiveParamNames(node, kind) {
@@ -90,13 +102,31 @@ function sensitiveParamNames(node, kind) {
 }
 function sanitizedRuleForRecovery(rule) {
   const sanitized = clone(rule)
+  if (sanitized.preconditions?.length) sanitized.preconditions = [{}]
+  const sensitiveVariables = new Set((sanitized.variables || []).filter(item => item.sensitive).map(item => item.id))
+  for (const field of ['constants', 'variables']) {
+    for (const item of sanitized[field] || []) {
+      if (item.sensitive) { delete item.value; delete item.initial }
+    }
+  }
   visitRuleNodes(sanitized, (node, kind) => {
+    if (node.type === 'set_variable' && sensitiveVariables.has(node.variable)) delete node.value
     if (!node.params || typeof node.params !== 'object') return
     for (const name of sensitiveParamNames(node, kind)) delete node.params[name]
   })
   return sanitized
 }
 function restoreSensitiveParams(targetRule, currentRule) {
+  if (targetRule.preconditions?.length && currentRule.preconditions) targetRule.preconditions = clone(currentRule.preconditions)
+  for (const field of ['constants', 'variables']) {
+    const current = new Map((currentRule[field] || []).map(item => [item.id, item]))
+    for (const item of targetRule[field] || []) {
+      const saved = current.get(item.id)
+      if (item.sensitive && saved) {
+        for (const key of ['value', 'initial']) if (Object.hasOwn(saved, key)) item[key] = clone(saved[key])
+      }
+    }
+  }
   const currentNodes = new Map()
   visitRuleNodes(currentRule, (node, kind) => {
     if (node.binding_id) currentNodes.set(`${kind}:${node.binding_id}`, node)
@@ -104,6 +134,7 @@ function restoreSensitiveParams(targetRule, currentRule) {
   visitRuleNodes(targetRule, (node, kind) => {
     const current = node.binding_id ? currentNodes.get(`${kind}:${node.binding_id}`) : null
     if (!current || current.type !== node.type) return
+    if (node.type === 'set_variable' && targetRule.variables?.some(item => item.id === node.variable && item.sensitive) && Object.hasOwn(current, 'value')) node.value = clone(current.value)
     for (const name of sensitiveParamNames(node, kind)) {
       if (!Object.prototype.hasOwnProperty.call(current.params || {}, name)) continue
       if (!node.params || typeof node.params !== 'object') node.params = {}
@@ -203,13 +234,17 @@ async function restoreDraftRecovery(index) {
   }
   const restore = await confirmDialog(
     '恢复未保存的草稿吗？',
-    'NotmyFault 找到了这条规则上次关闭前的修改。',
+    'NotmyFault 找到了这条规则上次关闭前的修改。敏感值不保存在草稿中：已有节点使用规则已保存的值，新节点和复制节点需要重新输入敏感值。',
     '恢复草稿',
   )
   if (restore) {
-    const restored = ensureRuleBindingIds(normalizeRuleDraft(clone(recovery.draft)))
-    restoreSensitiveParams(restored, draftRule.value)
-    draftRule.value = restored
+    try {
+      const restored = ensureRuleBindingIds(normalizeRuleDraft(clone(recovery.draft)))
+      restoreSensitiveParams(restored, draftRule.value)
+      draftRule.value = restored
+    } catch (error) {
+      await alertDialog('草稿无法恢复', error.message)
+    }
   } else clearDraftRecovery()
 }
 function resetDraftHistory() {
@@ -255,24 +290,27 @@ function redoDraft() {
   if (draftHistoryIndex.value < draftHistory.value.length - 1) applyDraftHistory(draftHistoryIndex.value + 1)
 }
 async function openRule(index) {
+  let next
+  try { next = ensureRuleBindingIds(normalizeRuleDraft(clone(store.configData.rules[index]))) }
+  catch (error) { await alertDialog('规则无法编辑', error.message); return }
+  originalRuleSnapshot = JSON.stringify(store.configData.rules[index])
+  editorAdminKeyPassword = ''
   showCreatePanel.value = false
   activeRuleIndex.value = index
-  draftRule.value = ensureRuleBindingIds(
-    normalizeRuleDraft(clone(store.configData.rules[index])),
-  )
+  draftRule.value = next
   baseline.value = JSON.stringify(draftRule.value)
   await restoreDraftRecovery(index)
   resetDraftHistory()
 }
 async function addRule(seed = null) {
+  let next
+  try {
+    next = seed ? ensureRuleBindingIds(normalizeRuleDraft(clone(seed))) : ensureRuleBindingIds({ name: '新规则', folder: '未分类', actions: [] })
+  } catch (error) { await alertDialog('草稿无法打开', error.message); return }
+  editorAdminKeyPassword = ''
   showCreatePanel.value = false
   activeRuleIndex.value = -1
-  draftRule.value = seed ? ensureRuleBindingIds(normalizeRuleDraft(clone(seed))) : ensureRuleBindingIds({
-    name: '新规则',
-    folder: '未分类',
-    event: null,
-    actions: [],
-  })
+  draftRule.value = next
   baseline.value = JSON.stringify(draftRule.value)
   if (seed) clearDraftRecovery()
   else await restoreDraftRecovery(-1)
@@ -290,10 +328,16 @@ async function createWithAi() {
 async function leaveEditor() {
   if (isDirty.value && !await confirmDialog('要放弃这些修改吗？', `尚未保存：${draftChangeText.value}。`, '放弃')) return
   activeRuleIndex.value = null
+  editorAdminKeyPassword = ''
   draftRule.value = null
   baseline.value = ''
   clearDraftRecovery()
   resetDraftHistory()
+}
+
+function openConfigSecurity() {
+  store.pendingSettingsSection = 'security'
+  window.__nmf?.switchPage?.('settings')
 }
 
 function triggerCount(rule) {
@@ -302,27 +346,32 @@ function triggerCount(rule) {
     if (node.type && !node.children && !node.events) return 1
     return (node.children || node.events || []).reduce((sum, child) => sum + count(child), 0)
   }
-  return rule.condition ? count(rule.condition) : (rule.event ? 1 : 0)
+  return count(rule.condition)
 }
 function triggerSummary(rule) {
-  if (!rule.condition) return store.schema.triggers[rule.event?.type]?.name || rule.event?.type || '未配置触发条件'
+  if (!rule.condition) return '未配置触发条件'
+  if (rule.condition.type && !rule.condition.children) return store.schema.triggers[rule.condition.type]?.name || rule.condition.type
   const op = rule.condition.op || (rule.condition.type === 'and' ? 'all' : 'any')
+  if (op === 'not') return `未发生 · 等待 ${rule.condition.within_seconds} 秒`
   return `${op === 'all' ? '全部满足' : '满足任一'} · ${triggerCount(rule)} 个条件`
 }
 
-async function persistRules(nextRules, successMessage) {
-  const result = await saveRulesWithApproval(nextRules)
+async function persistRules(nextRules, successMessage, password = '') {
+  if (store.configError) throw new Error('规则文件尚未通过完整性检查，请先到安全与权限页面处理。')
+  const result = await saveRulesWithApproval(nextRules, password, store.configData.revision)
   if (result?.cancelled) return null
   if (!result?.ok) {
     const details = Array.isArray(result?.details) ? result.details.join(' · ') : ''
     throw new Error([result?.error || '未知错误', details].filter(Boolean).join('：'))
   }
   const savedRules = Array.isArray(result.rules) ? result.rules : nextRules
-  store.configData = { ...store.configData, rules: savedRules }
+  store.configData = { ...store.configData, rules: savedRules, revision: result.revision }
   snackbar(successMessage)
   return savedRules
 }
 async function doSave(runAfter = false) {
+  const password = editorAdminKeyPassword
+  editorAdminKeyPassword = ''
   try {
     const nextRules = clone(store.configData.rules)
     let savedIndex = activeRuleIndex.value
@@ -330,13 +379,18 @@ async function doSave(runAfter = false) {
       nextRules.unshift(clone(draftRule.value))
       savedIndex = 0
     } else {
+      savedIndex = nextRules.findIndex(rule => rule.rule_id === draftRule.value.rule_id)
+      if (savedIndex < 0) throw new Error('这条规则已被删除，请保留草稿并重新打开规则列表。')
+      if (JSON.stringify(nextRules[savedIndex]) !== originalRuleSnapshot) throw new Error('这条规则已在别处修改，请保留草稿并重新打开规则后合并修改。')
       nextRules[savedIndex] = clone(draftRule.value)
     }
     const savedRules = await persistRules(
       nextRules,
       runAfter ? '规则已保存，正在启动测试' : '规则已保存',
+      password,
     )
     if (!savedRules) return
+    originalRuleSnapshot = JSON.stringify(savedRules[savedIndex])
     activeRuleIndex.value = savedIndex
     draftRule.value = clone(savedRules[savedIndex])
     baseline.value = JSON.stringify(draftRule.value)
@@ -350,31 +404,41 @@ async function doSave(runAfter = false) {
   }
 }
 async function deleteRule(index) {
+  const target = store.configData.rules[index]
+  if (!target) return
+  const ruleId = target.rule_id
+  const snapshot = JSON.stringify(target)
   if (!await confirmDialog('删除这条规则吗？', '此操作将在保存后立即生效。', '删除')) return
   try {
     const nextRules = clone(store.configData.rules)
-    nextRules.splice(index, 1)
+    const currentIndex = nextRules.findIndex(rule => rule.rule_id === ruleId)
+    if (currentIndex < 0) throw new Error('这条规则已被删除。')
+    if (JSON.stringify(nextRules[currentIndex]) !== snapshot) throw new Error('这条规则已在别处修改，请重新确认后删除。')
+    nextRules.splice(currentIndex, 1)
     const savedRules = await persistRules(nextRules, '规则已删除')
     if (!savedRules) return
-    if (activeRuleIndex.value === index) leaveEditorAfterDelete()
+    if (draftRule.value?.rule_id === ruleId) leaveEditorAfterDelete()
   } catch (error) {
     alertDialog('删除失败', error.message)
   }
 }
 async function deleteActiveRule() {
   if (activeRuleIndex.value === -1) { leaveEditorAfterDelete(); return }
-  await deleteRule(activeRuleIndex.value)
+  const index = store.configData.rules.findIndex(rule => rule.rule_id === draftRule.value?.rule_id)
+  if (index < 0) { await alertDialog('删除失败', '这条规则已被删除。'); return }
+  await deleteRule(index)
 }
 function leaveEditorAfterDelete() {
+  editorAdminKeyPassword = ''
   activeRuleIndex.value = null
   draftRule.value = null
   baseline.value = ''
   clearDraftRecovery()
   resetDraftHistory()
 }
-async function runManualRule(index, ruleSnapshot = null) {
+async function runManualRule(index, ruleSnapshot) {
   if (runningRuleIndex.value !== null) return
-  const snapshot = ruleSnapshot ? clone(ruleSnapshot) : clone(store.configData.rules[index])
+  const snapshot = clone(ruleSnapshot)
   const fields = buildAllTestInputFields(snapshot, store.schema)
   testPreparation.value = {
     index,
@@ -493,16 +557,15 @@ function processTestEvents() {
     } else if (ev.name === 'error') {
       t.steps.push({ status: 'fail', type: ev.data.action_type || '', stepId: ev.data.step_id, detail: failText(ev.data.error) })
       finishTestWatch()
-    } else if (ev.name === 'workflow_deferred') {
-      t.steps.push({ status: 'deferred', type: '', detail: ev.data.reason || '前置条件未满足' })
-      t.note = '前置条件暂未满足，测试会在条件满足后继续。'
     } else if (ev.name === 'test_assertions_completed') {
       t.assertions = ev.data
     } else if (ev.name === 'workflow_completed') {
-      if (ev.data.status === 'cancelled') {
+      if (ev.data.recovered) {
+        t.note = '连接中断期间这次运行已结束，可到运行记录查看结果和完整步骤。'
+      } else if (ev.data.status === 'cancelled') {
         t.note = '测试已停止。'
       } else if (!t.expected && ev.data.status === 'succeeded') {
-        t.note = '这条规则没有动作，测试已验证触发与前置条件链路。'
+        t.note = '这条规则没有动作，测试已验证触发条件。'
       }
       finishTestWatch()
     }
@@ -539,10 +602,14 @@ async function stopTestRun() {
   }
 }
 
-function goLogs() {
+async function goLogs() {
+  if (activeRule.value) {
+    await leaveEditor()
+    if (activeRule.value) return
+  }
   if (testResult.value?.runId) store.pendingRunId = testResult.value.runId
   closeTestResult()
-  if (window.__nmf && window.__nmf.switchPage) window.__nmf.switchPage('logs')
+  automationSection.value = 'runs'
 }
 
 watch(() => store.engineEvents.length
@@ -550,6 +617,7 @@ watch(() => store.engineEvents.length
 onUnmounted(() => { if (testResult.value?.timer) clearTimeout(testResult.value.timer) })
 watch(draftRule, scheduleDraftHistory, { deep: true, flush: 'sync' })
 onUnmounted(() => {
+  editorAdminKeyPassword = ''
   if (draftHistoryTimer) commitDraftHistory()
   else persistDraftRecovery()
 })
@@ -585,9 +653,15 @@ const templates = computed(() => automationTemplates.map(template => ({
   availability: templateAvailability(template, store),
 })))
 async function openCandidateRule(rule) {
-  const approval = await approveRuleBeforeEditing(rule)
-  if (!approval?.ok) return
-  await addRule(rule)
+  try {
+    const approval = await approveRuleBeforeEditing(rule)
+    if (!approval?.ok) {
+      if (!approval?.cancelled && !approval?.notified) await alertDialog('草稿无法打开', approval?.error || '规则审批失败')
+      return
+    }
+    await addRule(rule)
+    editorAdminKeyPassword = approval.adminKeyPassword || ''
+  } catch (error) { await alertDialog('草稿无法打开', error.message || '无法连接后台服务') }
 }
 async function addTemplate(t) {
   if (!t.availability.available) {
@@ -627,8 +701,35 @@ async function openTestStep(step) {
   await openRule(ruleIndex)
 }
 
+function openPendingRule() {
+  if (!store.pendingRuleId && !store.pendingRuleName) return
+  const index = store.pendingRuleId
+    ? store.configData.rules.findIndex(r => r.rule_id === store.pendingRuleId)
+    : store.configData.rules.findIndex(r => r.name === store.pendingRuleName)
+  const stepId = store.pendingStepId
+  store.pendingRuleId = ''
+  store.pendingRuleName = ''
+  store.pendingStepId = ''
+  if (index >= 0) {
+    automationSection.value = 'rules'
+    pendingEditorNodeId.value = stepId ? `action-${stepId}` : ''
+    openRule(index)
+  }
+}
+
+watch(() => [store.pendingRuleId, store.pendingRuleName, store.pendingStepId], openPendingRule)
+watch(() => store.pendingAutomationSection, section => {
+  if (!['rules', 'runs'].includes(section)) return
+  automationSection.value = section
+  store.pendingAutomationSection = ''
+})
+
 onMounted(() => {
   if (!store.configData.rules) store.configData.rules = []
+  if (store.pendingAutomationSection) {
+    automationSection.value = store.pendingAutomationSection
+    store.pendingAutomationSection = ''
+  }
   if (store.pendingRuleDraft) {
     const draft = clone(store.pendingRuleDraft)
     store.pendingRuleDraft = null
@@ -639,25 +740,11 @@ onMounted(() => {
     store.pendingAutomationCreate = false
     createAutomation()
   }
-  // 起源彩蛋指定了待打开的规则，按名字定位后打开编辑器，用完清掉。
-  if (store.pendingRuleId || store.pendingRuleName) {
-    const index = store.pendingRuleId
-      ? store.configData.rules.findIndex(r => r.rule_id === store.pendingRuleId)
-      : store.configData.rules.findIndex(r => r.name === store.pendingRuleName)
-    const stepId = store.pendingStepId
-    store.pendingRuleId = ''
-    store.pendingRuleName = ''
-    store.pendingStepId = ''
-    if (index >= 0) {
-      pendingEditorNodeId.value = stepId ? `action-${stepId}` : ''
-      openRule(index)
-    }
-  }
+  openPendingRule()
 })
 </script>
 
 <template>
-  <!-- 外层套普通容器，避免本视图的切换动画与 App 的页面过渡叠在同一个元素上。 -->
   <div class="rules-view">
   <Transition name="rule-route" mode="out-in">
   <RuleEditor v-if="activeRule" key="editor" :rule="activeRule" :dirty="isDirty"
@@ -670,11 +757,28 @@ onMounted(() => {
 
   <section v-else key="library" class="page active rules-library">
     <div class="page-head">
-      <div><h2>自动化</h2><p class="page-subtitle">创建、测试和管理这台电脑上的自动化。</p></div>
-      <div class="actions">
+      <div><h2>自动化</h2><p class="page-subtitle">{{ automationSection === 'rules' ? '创建、测试和管理这台电脑上的自动化。' : '查看每一次自动化的执行过程和结果。' }}</p></div>
+      <div v-if="automationSection === 'rules' && !store.configError" class="actions">
         <button class="btn btn-filled" @click="createAutomation"><span class="material-symbols-outlined">add</span>创建自动化</button>
       </div>
     </div>
+    <div class="tabs automation-section-tabs" role="group" aria-label="自动化页面">
+      <button class="tab" :class="{ active: automationSection === 'rules' }" :aria-pressed="automationSection === 'rules'" @click="automationSection = 'rules'"><span class="material-symbols-outlined">account_tree</span>规则<span class="section-count">{{ store.configData.rules.length }}</span></button>
+      <button class="tab" :class="{ active: automationSection === 'runs' }" :aria-pressed="automationSection === 'runs'" @click="automationSection = 'runs'"><span class="material-symbols-outlined">history</span>运行记录</button>
+    </div>
+    <Transition name="automation-section" mode="out-in">
+    <div v-if="automationSection === 'rules'" key="rules" class="automation-rules-section">
+    <section v-if="store.configError" class="rules-integrity-error" role="alert">
+      <h3>规则文件未通过完整性检查</h3>
+      <p>{{ store.configError }}</p>
+      <p>当前无法读取和保存规则。请到安全与权限页面核对规则文件。</p>
+      <button class="btn btn-tonal" @click="openConfigSecurity">查看安全与权限</button>
+    </section>
+    <section v-if="!store.configError && !store.configData.rules.length && !createPanelVisible" class="automation-welcome">
+      <span class="material-symbols-outlined">account_tree</span><h3>从第一条自动化开始</h3><p>选择什么时候开始，再安排接下来要做的事。</p>
+      <div class="automation-welcome-path"><span>触发条件</span><span class="material-symbols-outlined">arrow_forward</span><span>执行动作</span><span class="material-symbols-outlined">arrow_forward</span><span>查看结果</span></div>
+      <button class="btn btn-tonal" @click="openQuickCreate">选择触发条件和动作</button>
+    </section>
     <section v-if="createPanelVisible" class="automation-create-panel">
       <header class="automation-create-head">
         <div>
@@ -702,11 +806,14 @@ onMounted(() => {
       </div>
     </section>
     <div v-if="store.configData.rules.length" class="rules-folders">
-      <h3 class="automation-list-title">已保存的自动化 <small>{{ store.configData.rules.length }}</small></h3>
+      <div class="automation-list-toolbar"><h3 class="automation-list-title">已保存的自动化 <small>{{ matchingRules.length }} / {{ store.configData.rules.length }}</small></h3>
+        <label class="automation-search"><span class="material-symbols-outlined">search</span><input v-model="ruleQuery" type="search" aria-label="搜索自动化" placeholder="搜索名称、文件夹或插件"><button v-if="ruleQuery" class="icon-btn" aria-label="清空自动化搜索" @click="ruleQuery = ''"><span class="material-symbols-outlined">close</span></button></label>
+      </div>
+      <div v-if="!matchingRules.length" class="empty-state"><span class="material-symbols-outlined">search_off</span><h3>没有匹配的自动化</h3><p>试试其他名称、文件夹或插件。</p><button class="btn btn-text" @click="ruleQuery = ''">清空搜索</button></div>
       <section v-for="([folder, entries]) in ruleFolders" :key="folder" class="rules-folder">
         <header><span class="material-symbols-outlined">folder_open</span><b>{{ folder }}</b><small>{{ entries.length }} 条规则</small></header>
         <article v-for="({ rule, index }) in entries" :key="rule.rule_id || rule" class="rule-library-row" @click="openRule(index)">
-          <div class="rule-library-row-main"><h3>{{ rule.name || '未命名规则' }}</h3><div class="rule-library-meta"><span><span class="material-symbols-outlined">bolt</span>当：{{ triggerSummary(rule) }}</span><span><span class="material-symbols-outlined">play_circle</span>然后：{{ rule.actions?.length || 0 }} 个动作</span></div></div>
+          <button class="rule-library-row-main" :aria-label="`编辑${rule.name || '未命名规则'}`" @click.stop="openRule(index)"><h3>{{ rule.name || '未命名规则' }}</h3><div class="rule-library-meta"><span><span class="material-symbols-outlined">bolt</span>当：{{ triggerSummary(rule) }}</span><span><span class="material-symbols-outlined">play_circle</span>然后：{{ rule.actions?.length || 0 }} 个动作</span></div></button>
           <div class="rule-library-actions">
             <button class="btn btn-text btn-sm rule-run-btn" :disabled="runningRuleIndex !== null"
               title="真实执行一次这条规则中的动作" @click.stop="runManualRule(index, rule)">
@@ -714,11 +821,14 @@ onMounted(() => {
               <span v-else class="material-symbols-outlined">experiment</span>
               {{ runningRuleIndex === index ? '测试中…' : '测试' }}
             </button>
-            <button class="icon-btn icon-btn-danger" title="删除规则" @click.stop="deleteRule(index)"><span class="material-symbols-outlined">delete</span></button>
+            <button class="icon-btn icon-btn-danger" :aria-label="`删除${rule.name || '未命名规则'}`" title="删除规则" @click.stop="deleteRule(index)"><span class="material-symbols-outlined">delete</span></button>
           </div>
         </article>
       </section>
     </div>
+    </div>
+    <LogsView v-else key="runs" embedded initial-tab="runs" :show-tabs="false" />
+    </Transition>
     <QuickCreateDialog :open="showQuickCreate" @close="closeQuickCreate" @create="createQuickAutomation" />
   </section>
   </Transition>

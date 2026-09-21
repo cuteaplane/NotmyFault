@@ -16,20 +16,27 @@ async function authHeaders() {
 }
 
 async function fetchAuthenticated(path, options = {}) {
+  const streaming = options.headers?.Accept === 'text/event-stream'
+  const timeoutController = streaming ? new AbortController() : null
+  const timer = streaming ? setTimeout(() => timeoutController.abort(new DOMException('请求超时，请重试', 'TimeoutError')), 30000) : null
+  const timeout = timeoutController?.signal || AbortSignal.timeout(30000)
+  const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout
   const request = async () => {
     const headers = { ...(options.headers || {}), ...await authHeaders() }
-    return await fetch((hasBridge() ? API : '') + path, { ...options, headers })
+    return await fetch((hasBridge() ? API : '') + path, { ...options, headers, signal })
   }
-  let res = await request()
-  // 认证返回 403 时重新从 bridge 读取内存 token 再重试一次，运行中的 engine 会在这里重新发布 token。
-  if (res.status === 403 && hasBridge()) res = await request()
-  return res
+  try {
+    let res = await request()
+    // 引擎重启后 bridge 会重新发布 API token。
+    if (res.status === 403 && hasBridge()) res = await request()
+    return res
+  } finally { if (timer) clearTimeout(timer) }
 }
 
 export { fetchAuthenticated }
 
 function bridgeResponse(data) {
-  const status = Number(data?.status || (data?.ok === false ? 400 : 200))
+  const status = Number.isInteger(data?.status) ? data.status : (data?.ok === false ? 400 : 200)
   return {
     ok: status >= 200 && status < 300 && data?.ok !== false,
     status,
@@ -39,7 +46,7 @@ function bridgeResponse(data) {
 
 async function bridgeRequest(path, method = 'GET', data = null) {
   if (!hasBridge()) throw new Error('Dashboard 桌面桥接尚未就绪')
-  const result = await window.pywebview.api.request_api(path, method, data)
+  const result = await window.pywebview.api.request_api(path, method, data, 'typed-v1')
   if (result?.status === 403) throw new Error('Dashboard 与后台服务认证不同步')
   return bridgeResponse(result)
 }
@@ -57,7 +64,7 @@ export async function apiWrite(path, method, body, isForm) {
     ? { method, body }
     : {
       method,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-NMF-Value-Encoding': 'typed-v1' },
       body: body == null ? null : JSON.stringify(body),
     }
   const res = await fetchAuthenticated(path, options)
@@ -76,15 +83,14 @@ export async function apiDownload(path, body) {
 }
 
 export async function loadConfig() {
-  if (hasBridge()) return await window.pywebview.api.get_config()
   return await (await apiRead('/api/rules')).json()
 }
 
-export async function saveConfig(rules, adminKeyPassword = '') {
-  if (hasBridge()) return await window.pywebview.api.save_config(rules, adminKeyPassword)
+export async function saveConfig(rules, adminKeyPassword = '', expectedRevision) {
   const response = await apiWrite('/api/rules', 'PUT', {
     rules,
     admin_key_password: adminKeyPassword,
+    expected_revision: expectedRevision,
   })
   return await response.json()
 }
@@ -112,6 +118,7 @@ export async function cancelRun(runId) {
 
 export async function getPluginExtensions() {
   const res = await apiRead('/api/plugins/extensions')
+  if (!res.ok) throw new Error('读取插件扩展失败')
   const data = await res.json()
   return {
     commands: Array.isArray(data?.commands) ? data.commands : [],
@@ -164,7 +171,9 @@ export async function closeExtensionSession(pluginId, sessionId) {
     `/api/plugins/${encodeURIComponent(pluginId)}/extensions/sessions/${encodeURIComponent(sessionId)}`,
     'DELETE',
   )
-  return await res.json()
+  const data = await res.json()
+  if (!res.ok || data?.ok === false) throw new Error(data?.error || '关闭插件会话失败')
+  return data
 }
 
 export async function validateRuleDraft(rule) {
@@ -194,7 +203,9 @@ function aiDraftRequestBody(messages, apiKey = '') {
 
 function dispatchAIDraftEvent(eventName, dataText, onEvent) {
   if (!AI_DRAFT_EVENT_TYPES.has(eventName) || !dataText) return
-  onEvent({ type: eventName, data: JSON.parse(dataText) })
+  let data
+  try { data = JSON.parse(dataText) } catch { throw new Error('连接已中断，收到的回复不完整，请重试') }
+  onEvent({ type: eventName, data })
 }
 
 export async function consumeAIDraftSSE(body, onEvent, signal) {
@@ -269,16 +280,14 @@ export async function streamRuleDraftWithAI(messages, {
 }
 
 export async function loadPlugins() {
-  try {
-    const r = await apiRead('/api/plugins/list')
-    return await r.json()
-  } catch (e) {
-    return { triggers: {}, actions: {} }
-  }
+  const r = await apiRead('/api/plugins/list')
+  if (!r.ok) throw new Error('读取插件列表失败')
+  return await r.json()
 }
 
 export async function getSchema() {
   const r = await apiRead('/api/plugins')
+  if (!r.ok) throw new Error('读取插件参数失败')
   return await r.json()
 }
 
@@ -332,27 +341,33 @@ export async function approveRuleDraft(rule, adminKeyPassword = '') {
   return await r.json()
 }
 
+async function readLogData(path, offline) {
+  const response = await apiRead(path)
+  if (response.status === 0 && hasBridge()) return await offline()
+  const data = await response.json()
+  if (!response.ok) throw new Error(data?.error || '读取日志失败')
+  return data
+}
+
 export async function readLogRaw(lines = 300) {
-  try { return await window.pywebview.api.read_log_raw(lines) }
-  catch (e) { return '读取日志失败: ' + e.message }
+  const data = await readLogData(`/api/engine/logs?lines=${lines}`,
+    async () => ({ raw: await window.pywebview.api.read_log_raw(lines) }))
+  return data.raw ?? (data.lines || []).join('\n')
 }
 
 export async function readLogEntries(lines = 600) {
-  try { return await window.pywebview.api.read_log_entries(lines) }
-  catch (e) { return [{ ts: '', level: 'ERROR', text: '读取日志失败: ' + e.message, data: null }] }
+  return await readLogData(`/api/engine/logs/entries?lines=${lines}`, () => window.pywebview.api.read_log_entries(lines))
 }
 
 export async function listLogFiles() {
-  try { return await window.pywebview.api.list_log_files() }
-  catch (e) { return [] }
+  return await readLogData('/api/engine/logs/files', () => window.pywebview.api.list_log_files())
 }
 
 export async function readLogFileEntries(name, lines = 600) {
-  try { return await window.pywebview.api.read_log_file_entries(name, lines) }
-  catch (e) { return [] }
+  return await readLogData(`/api/engine/logs/entries?lines=${lines}&name=${encodeURIComponent(name)}`, () => window.pywebview.api.read_log_file_entries(name, lines))
 }
 
-// 诊断优先从认证 HTTP 读取引擎实时数据，离线时读取 bridge 日志，因为日志只有 action_failed，无法统计成功次数。
+// 日志没有完整的动作成功记录，诊断计数来自引擎。
 export async function readDiagnostics() {
   try {
     const r = await apiRead('/api/engine/diagnostics')
@@ -379,13 +394,11 @@ export async function readDiagnostics() {
 }
 
 export async function listRuns(limit = 100) {
-  try {
-    const response = await apiRead(`/api/runs?limit=${limit}`)
-    const data = await response.json()
-    return Array.isArray(data?.runs) ? data.runs : []
-  } catch (e) {
-    return []
-  }
+  const response = await apiRead(`/api/runs?limit=${limit}`)
+  if (!response.ok) throw new Error('读取运行记录失败')
+  const data = await response.json()
+  if (!Array.isArray(data?.runs)) throw new Error('运行记录格式无效')
+  return data.runs
 }
 
 export async function getRun(runId) {

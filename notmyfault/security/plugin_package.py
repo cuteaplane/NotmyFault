@@ -25,6 +25,7 @@ def extract_nmfp(
         archive_path,
         mode="r",
         password=password or None,
+        max_extract_size=limits.max_uncompressed_bytes,
     ) as archive:
         listed_members = archive.list()
         raw_members = list(getattr(archive, "files", ()))
@@ -44,7 +45,10 @@ def extract_nmfp(
                 raise ValueError(
                     f"插件包条目过多（>{limits.max_entries}），疑似解压炸弹"
                 )
-            total_uncompressed += int(getattr(info, "uncompressed", 0) or 0)
+            size = getattr(info, "uncompressed", None)
+            if not isinstance(size, int) or size < 0:
+                raise ValueError("插件包包含无效的文件大小")
+            total_uncompressed += size
             if total_uncompressed > limits.max_uncompressed_bytes:
                 raise ValueError("插件包解压后体积过大，疑似解压炸弹")
             name = str(getattr(info, "filename", ""))

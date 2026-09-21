@@ -1,6 +1,7 @@
 """插件签名：密钥加载、文件清单与签名往返"""
 
 import hashlib
+import os
 
 import pytest
 from cryptography.exceptions import InvalidSignature
@@ -20,6 +21,43 @@ def make_key():
     return ed25519.Ed25519PrivateKey.generate()
 
 
+def test_private_key_replacement_preserves_previous_file_on_failure(tmp_path, monkeypatch):
+    import build
+
+    path = tmp_path / "key.pem"
+    old_key = make_key()
+    build._save_private_key(old_key, path)
+    previous = path.read_bytes()
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o600
+
+    def fail_replace(source, destination):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(build.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        build._save_private_key(make_key(), path)
+    assert path.read_bytes() == previous
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_file_signature_uses_valid_key_when_another_key_is_malformed(tmp_path, monkeypatch):
+    from notmyfault.security import signing_keys
+
+    key = make_key()
+    public = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    pem = key.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+    assert signing.load_public_key_bytes(pem) == public
+    assert signing.load_public_key_bytes(public) == public
+    path = tmp_path / "data"
+    path.write_bytes(b"signed content")
+    signing.sign_file(path, key)
+    monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [b"invalid", public])
+    assert signing.verify_file(path)
+    path.write_bytes(b"changed")
+    assert not signing.verify_file(path)
+
+
 class TestPluginFiles:
     def test_empty_dir(self, tmp_path):
         assert signing.plugin_files(tmp_path) == []
@@ -29,7 +67,6 @@ class TestPluginFiles:
         assert signing.plugin_files(tmp_path) == []
 
     def test_returns_all_regular_files_sorted(self, tmp_path):
-        # 二进制和其他资源都进签名清单，只排除签名产物和生成目录
         (tmp_path / "b.py").write_text("x = 1")
         (tmp_path / "a.json").write_text("{}")
         (tmp_path / "c.txt").write_text("included")
@@ -44,10 +81,15 @@ class TestPluginFiles:
         hidden = tmp_path / ".hidden"
         hidden.mkdir()
         (hidden / "e.py").write_text("VALUE = 1")
+        for directory in ("node_modules", "__pypackages__", "__pycache__"):
+            dependency = tmp_path / directory
+            dependency.mkdir()
+            (dependency / "helper.py").write_text("VALUE = 2")
         files = signing.plugin_files(tmp_path)
         rel = [f.relative_to(tmp_path).as_posix() for f in files]
         assert rel == [
-            ".hidden/e.py", "a.json", "b.py", "bin/tool.exe", "c.txt", "sub/d.json"
+            ".hidden/e.py", "__pypackages__/helper.py", "a.json", "b.py", "bin/tool.exe",
+            "c.txt", "node_modules/helper.py", "sub/d.json"
         ]
 
 

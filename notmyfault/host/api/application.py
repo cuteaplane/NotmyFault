@@ -73,6 +73,9 @@ class ApiApplication:
             title="NotmyFault Engine API",
             version=__version__,
             lifespan=self._lifespan,
+            docs_url=None,
+            redoc_url=None,
+            openapi_url=None,
         )
         install_api_middleware(self.app, self._token_store)
         self._setup_routes()
@@ -87,6 +90,8 @@ class ApiApplication:
             with suppress(asyncio.CancelledError):
                 await cleanup_task
             self._extension_sessions.drop_all()
+            await asyncio.to_thread(self._pending_previews.drop_all)
+            await asyncio.to_thread(self._run_history.flush)
 
     async def _cleanup_extension_sessions(self) -> None:
         while True:

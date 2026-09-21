@@ -5,12 +5,16 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 import functools
 import http.server
 import socketserver
 import socket
 import threading
 import secrets
+import re
+import shutil
+from pathlib import Path
 
 DASHBOARD_PORT = 19199
 DASHBOARD_CONTROL_PORT = 19197
@@ -22,12 +26,17 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-import webview
-from notmyfault.application_paths import ApplicationPaths
-from notmyfault.config import SignedConfigStore
-from notmyfault.host.api.auth import ApiTokenStore
-from notmyfault.platform.platform_support import launch_python_entry
-from notmyfault.security.plugin_schema import scan_plugins
+
+def _preload_webview() -> None:
+    """先加载 WebView 的 .NET 程序集，窗口创建只等这一步"""
+    # PYWEBVIEW_GUI 指定渲染后端时要等 initialize 导入，先导入 winforms 会把后端定死
+    if sys.platform != "win32" or os.environ.get("PYWEBVIEW_GUI"):
+        return
+    try:
+        from webview.platforms import winforms  # noqa: F401
+    except Exception:
+        pass
+
 
 def _patch_qt_permission_policy():
     try:
@@ -46,8 +55,8 @@ def _patch_qt_permission_policy():
 
     def handle_permission(self, url, requested_feature):
         local_page = url.scheme() == "http" and url.host() in {"127.0.0.1", "localhost"}
-        allowed = requested_feature in media_features or (
-            requested_feature == feature.ClipboardReadWrite and local_page
+        allowed = local_page and (
+            requested_feature in media_features or requested_feature == feature.ClipboardReadWrite
         )
         permission = (
             policy.PermissionGrantedByUser if allowed else policy.PermissionDeniedByUser
@@ -58,21 +67,6 @@ def _patch_qt_permission_policy():
 
 
 API = "http://127.0.0.1:19198"
-def _get_plugins_schema(paths: ApplicationPaths) -> dict:
-    base = str(paths.package_root)
-    result = {
-        "triggers": scan_plugins(base, "triggers", "trigger.json"),
-        "actions": scan_plugins(base, "actions", "action.json"),
-    }
-    user_dir = str(paths.user_plugins_dir)
-    if os.path.isdir(user_dir):
-        for plugin_type in ("triggers", "actions"):
-            filename = "trigger.json" if plugin_type == "triggers" else "action.json"
-            for plugin_id, meta in scan_plugins(
-                user_dir, plugin_type, filename,
-            ).items():
-                result[plugin_type].setdefault(plugin_id, meta)
-    return result
 
 
 def _read_control_secret(path) -> bytes:
@@ -110,6 +104,8 @@ def _remove_control_secret(path, expected: str) -> None:
 
 def _claim_dashboard_instance(control_token_path, port: int = DASHBOARD_CONTROL_PORT):
     """占用 Dashboard 控制端口，已有实例时通知它恢复到前台"""
+    from notmyfault.host.api.auth import ApiTokenStore
+
     show_requested = threading.Event()
     quit_requested = threading.Event()
     control_secret = secrets.token_hex(32)
@@ -172,7 +168,7 @@ def _claim_dashboard_instance(control_token_path, port: int = DASHBOARD_CONTROL_
         token_store.repair_file()
     except Exception as error:
         server.server_close()
-        raise RuntimeError("Dashboard 控制令牌无法安全写入") from error
+        raise RuntimeError(f"Dashboard 控制令牌无法安全写入: {error}") from error
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, show_requested, quit_requested, control_secret
 
@@ -182,11 +178,14 @@ class DashboardAPI:
 
     def __init__(
         self,
-        store: SignedConfigStore | None = None,
-        paths: ApplicationPaths | None = None,
+        paths: "ApplicationPaths | None" = None,
     ) -> None:
+        from notmyfault.application_paths import ApplicationPaths
+        from notmyfault.host.log_files import LogFiles
+
         self._paths = paths or ApplicationPaths.default()
-        self._store = store or SignedConfigStore(self._paths)
+
+        self._logs = LogFiles(str(self._paths.logs_dir))
         self._window = None
 
     def set_window_state(self, action: str) -> dict:
@@ -254,6 +253,8 @@ class DashboardAPI:
             if not os.path.exists(pyw):
                 return {"ok": False, "error": f"找不到 {pyw}"}
             try:
+                from notmyfault.platform.platform_support import launch_python_entry
+
                 launch_python_entry(pyw)
             except Exception as e:
                 return {"ok": False, "error": str(e)}
@@ -270,97 +271,12 @@ class DashboardAPI:
         return {"ok": False, "error": last_error or "后台服务启动超时"}
 
     def get_config(self) -> dict:
-        """有效规则先补齐身份，验签失败时保留原文供安全页核对"""
-        try:
-            if self._paths.rules_file.exists():
-                with open(self._paths.rules_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                rules = data.get("rules", []) if isinstance(data, dict) else []
-                rules = rules if isinstance(rules, list) else []
-                try:
-                    normalized = self._store.load_verified_rules()
-                    if normalized != rules:
-                        self._store.save_rules(normalized)
-                    return {"rules": normalized}
-                except Exception:
-                    return {"rules": rules}
-        except Exception as e:
-            return {"_error": str(e), "rules": []}
-        return {"rules": []}
+        return self.request_api("/api/rules", value_encoding="typed-v1")
 
-    def save_config(self, rules: list, admin_key_password: str = "") -> dict:
-        try:
-            from notmyfault.config import (
-                ConfigValidationError,
-                normalize_rules,
-                validate_rules_safety,
-            )
-            from notmyfault.core.rules import (
-                validate_rule_bindings,
-                validate_rules_structure,
-            )
-            normalized_rules = normalize_rules(rules)
-            structure_errors = validate_rules_structure(normalized_rules)
-            if structure_errors:
-                return {
-                    "ok": False,
-                    "error": "规则结构校验失败",
-                    "details": structure_errors[:10],
-                }
-            schema = _get_plugins_schema(self._paths)
-            binding_issues = []
-            for index, rule in enumerate(normalized_rules):
-                for issue in validate_rule_bindings(
-                    rule, schema["triggers"], schema["actions"],
-                ):
-                    binding_issues.append({
-                        "rule": rule.get("name", f"规则 #{index + 1}"),
-                        **issue,
-                    })
-            if binding_issues:
-                return {
-                    "ok": False,
-                    "error": "规则数据绑定无效",
-                    "details": binding_issues[:20],
-                }
-            _warnings, errors = validate_rules_safety(normalized_rules)
-            if errors:
-                return {
-                    "ok": False,
-                    "error": "规则安全校验失败",
-                    "details": errors[:10],
-                }
-            previous_rules = []
-            if self._paths.rules_file.exists():
-                try:
-                    previous_rules = self._store.load_verified_rules()
-                except ConfigValidationError as error:
-                    return {
-                        "ok": False,
-                        "error": f"现有规则未通过完整性校验: {error}",
-                    }
-            from notmyfault.security.rule_approval import (
-                AdminRuleApprovalError,
-                require_admin_rule_approval,
-            )
-            try:
-                require_admin_rule_approval(
-                    previous_rules,
-                    normalized_rules,
-                    schema,
-                    admin_key_password,
-                )
-            except AdminRuleApprovalError as error:
-                return {
-                    "ok": False,
-                    "code": error.code,
-                    "error": str(error),
-                    "plugins": error.plugins,
-                }
-            ok = self._store.save_rules(normalized_rules)
-            return {"ok": ok, "rules": normalized_rules if ok else None}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+    def save_config(self, rules: list, admin_key_password: str = "", value_encoding: str = "") -> dict:
+        return self.request_api("/api/rules", "PUT", {
+            "rules": rules, "admin_key_password": admin_key_password,
+        }, value_encoding=value_encoding)
 
     def _get_api_token(self) -> str:
         try:
@@ -375,6 +291,7 @@ class DashboardAPI:
         method: str = "POST",
         data: dict = None,
         timeout: float = 5,
+        value_encoding: str = "",
     ) -> dict:
         """发送带认证的 HTTP 请求，认证失败时重读令牌并重试一次"""
         last_error = ""
@@ -391,6 +308,8 @@ class DashboardAPI:
                     req.add_header("Authorization", f"Bearer {token}")
                 if data is not None:
                     req.add_header("Content-Type", "application/json")
+                if value_encoding:
+                    req.add_header("X-NMF-Value-Encoding", value_encoding)
                 return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", errors="replace")
@@ -420,12 +339,12 @@ class DashboardAPI:
                 }
         return {"ok": False, "error": last_error, "status": 403}
 
-    def request_api(self, path: str, method: str = "GET", data: dict = None) -> dict:
+    def request_api(self, path: str, method: str = "GET", data: dict = None, value_encoding: str = "") -> dict:
         """通过 pywebview bridge 转发 Dashboard 的 JSON API 请求"""
         if not isinstance(path, str) or not path.startswith("/api/"):
             return {"ok": False, "error": "无效的 API 路径", "status": 400}
         timeout = 30 if path == "/api/rules/draft/ai" else 5
-        return self._auth_request(path, method.upper(), data, timeout=timeout)
+        return self._auth_request(path, method.upper(), data, timeout=timeout, value_encoding=value_encoding)
 
     def get_engine_status(self) -> dict:
         result = self._auth_request("/api/engine/status", "GET")
@@ -441,11 +360,41 @@ class DashboardAPI:
     def get_api_token(self) -> str:
         return self._get_api_token()
 
+    def get_auto_start(self) -> dict:
+        try:
+            if sys.platform == "win32":
+                from notmyfault.host.tray import _is_auto_start_enabled
+                enabled = _is_auto_start_enabled()
+            else:
+                from notmyfault.platform.platform_support import linux_autostart_path
+                enabled = linux_autostart_path().exists()
+            return {"ok": True, "enabled": enabled}
+        except Exception as error:
+            return {"ok": False, "error": str(error)}
+
+    def set_auto_start(self, enabled: bool) -> dict:
+        if not isinstance(enabled, bool):
+            return {"ok": False, "error": "开机启动选项必须是布尔值"}
+        try:
+            if sys.platform == "win32":
+                from notmyfault.host.tray import _register_auto_start, _unregister_auto_start
+                saved = (_register_auto_start if enabled else _unregister_auto_start)()
+            else:
+                from notmyfault.platform.platform_support import set_linux_autostart
+                saved = set_linux_autostart(enabled, PROJECT_ROOT)
+            if not saved:
+                return {"ok": False, "error": "无法保存开机启动设置，请重试"}
+            return {"ok": True, "enabled": enabled}
+        except Exception as error:
+            return {"ok": False, "error": str(error)}
+
     def select_folder(self, initial_path: str = "") -> str:
         """通过桌面窗口选择本地目录并返回路径"""
         if self._window is None:
             return ""
         try:
+            import webview
+
             result = self._window.create_file_dialog(
                 webview.FOLDER_DIALOG,
                 directory=initial_path if os.path.isdir(initial_path) else "",
@@ -461,80 +410,26 @@ class DashboardAPI:
         """彻底退出引擎进程"""
         return self._auth_request("/api/engine/shutdown")
 
-    def _get_latest_log(self):
-        from notmyfault.core.logging import get_latest_log
-        return get_latest_log(str(self._paths.logs_dir))
-
     def read_log_entries(self, lines: int = 500) -> list:
-        """读取最新日志末尾 N 行，返回解析后的结构化条目列表"""
-        try:
-            from notmyfault.core.logging import read_log_entries as _read
-            log_path = self._get_latest_log()
-            if not log_path:
-                return [{"ts": "", "level": "INFO", "text": "还没有日志文件，请启动引擎", "data": None}]
-            return _read(log_path, lines=lines)
-        except Exception as e:
-            return [{"ts": "", "level": "ERROR", "text": f"读取日志失败: {e}", "data": None}]
-
-    def read_diagnostics(self) -> dict:
-        """从最新日志文件构建诊断摘要"""
-        try:
-            from notmyfault.core.logging import read_log_entries as _read, build_diagnostics
-            log_path = self._get_latest_log()
-            if not log_path:
-                return {"error_count": 0, "warn_count": 0, "last_errors": ["还没有日志文件，请启动引擎"]}
-            entries = _read(log_path, lines=500)
-            return build_diagnostics(entries)
-        except Exception as e:
-            return {"error_count": 1, "last_errors": [str(e)]}
+        return self._logs.entries(lines)
 
     def read_log_raw(self, lines: int = 300) -> str:
-        """读取最新日志文件原始文本，供日志查看器使用"""
-        try:
-            log_path = self._get_latest_log()
-            if not log_path:
-                return "(还没有日志文件)\n\n请先启动引擎。"
-            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                all_lines = f.readlines()
-            if not all_lines:
-                return f"(日志为空)\n{log_path}"
-            return "".join(all_lines[-lines:])
-        except Exception as e:
-            return f"读取日志失败: {e}"
+        return self._logs.raw(lines)
 
     def list_log_files(self) -> list:
-        """列出所有日志文件信息"""
-        try:
-            from notmyfault.core.logging import list_logs
-            return list_logs(self._LOG_DIR)
-        except Exception as e:
-            return []
+        return self._logs.list_files()
 
     def read_log_file_entries(self, name: str, lines: int = 600) -> list:
-        """读取指定历史日志文件末尾 N 行，返回解析后的结构化条目列表"""
-        try:
-            # 文件名只认 engine-*.log，堵住 ../ 之类构造出来的路径
-            if (
-                not isinstance(name, str)
-                or os.path.basename(name) != name
-                or not (name.startswith("engine-") and name.endswith(".log"))
-            ):
-                return []
-            log_path = os.path.join(self._LOG_DIR, name)
-            if not os.path.isfile(log_path):
-                return []
-            from notmyfault.core.logging import read_log_entries as _read
-            return _read(log_path, lines=lines)
-        except Exception as e:
-            return [{"ts": "", "level": "ERROR", "text": f"读取日志失败: {e}", "data": None}]
-
+        return self._logs.entries(lines, name)
 
 
 class _DashboardStaticHandler(http.server.SimpleHTTPRequestHandler):
     def end_headers(self):
-        self.send_header("Cache-Control", "no-store, max-age=0")
-        self.send_header("Pragma", "no-cache")
-        self.send_header("Expires", "0")
+        path = urllib.parse.urlsplit(self.path).path
+        if path.startswith("/assets/") and re.search(r"-[A-Za-z0-9_-]{8,}\.[^/]+$", path):
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        else:
+            self.send_header("Cache-Control", "no-store, max-age=0")
         super().end_headers()
 
 
@@ -543,7 +438,7 @@ def _start_static_server(directory, port=DASHBOARD_PORT):
     Handler = functools.partial(_DashboardStaticHandler, directory=directory)
     for p in range(port, port + 20):
         try:
-            httpd = socketserver.TCPServer(("127.0.0.1", p), Handler)
+            httpd = http.server.ThreadingHTTPServer(("127.0.0.1", p), Handler)
             httpd.daemon_threads = True
             threading.Thread(target=httpd.serve_forever, daemon=True).start()
             version = int(os.path.getmtime(os.path.join(directory, "index.html")))
@@ -554,18 +449,31 @@ def _start_static_server(directory, port=DASHBOARD_PORT):
 
 
 def _ensure_dashboard_build():
-    """构建产物不存在时运行 npm run build 并返回是否成功"""
-    dist = os.path.join(PROJECT_ROOT, "dashboard", "dist")
-    if os.path.isdir(dist) and os.path.exists(os.path.join(dist, "index.html")):
-        return True
+    """源码或构建配置比 index.html 新时重新构建，发行包直接使用随包产物。"""
+    root = Path(PROJECT_ROOT) / "dashboard"
+    index = root / "dist" / "index.html"
+    if index.is_file():
+        if getattr(sys, "frozen", False):
+            return True
+        inputs = [root / name for name in (
+            "index.html", "package.json", "package-lock.json", "vite.config.js",
+        )]
+        inputs.append(root.parent / "notmyfault" / "version.py")
+        for directory in (root / "src", root / "public"):
+            inputs.append(directory)
+            if directory.is_dir():
+                inputs.extend(directory.rglob("*"))
+        built_at = index.stat().st_mtime_ns
+        if all(path.stat().st_mtime_ns <= built_at for path in inputs if path.exists()):
+            return True
     npm = os.path.join(PROJECT_ROOT, "dashboard")
     if not os.path.exists(os.path.join(npm, "package.json")):
         return False
-    print("[Dashboard] 构建产物不存在，自动 npm run build...")
+    print("[Dashboard] 构建产物缺失或已过期，自动 npm run build...")
     try:
         import subprocess
         result = subprocess.run(
-            ["npm", "run", "build"],
+            [shutil.which("npm") or "npm", "run", "build"],
             cwd=npm,
             capture_output=True,
             text=True,
@@ -575,7 +483,7 @@ def _ensure_dashboard_build():
         )
         if result.returncode == 0:
             print("[Dashboard] npm run build 成功")
-            return True
+            return index.is_file()
         print(f"[Dashboard] npm run build 失败 (code={result.returncode}): {result.stderr.strip()[:200]}")
     except FileNotFoundError:
         print("[Dashboard] npm 未安装，无法自动构建")
@@ -589,8 +497,8 @@ def _ensure_dashboard_build():
 def _resolve_dashboard_url():
     """准备构建产物和静态服务器并返回 Dashboard 地址"""
     dist = os.path.join(PROJECT_ROOT, "dashboard", "dist")
-    if not (os.path.isdir(dist) and os.path.exists(os.path.join(dist, "index.html"))):
-        _ensure_dashboard_build()
+    if not _ensure_dashboard_build():
+        return None, None
     if os.path.isdir(dist) and os.path.exists(os.path.join(dist, "index.html")):
         httpd, url = _start_static_server(dist)
         if url:
@@ -598,8 +506,13 @@ def _resolve_dashboard_url():
     return None, None
 
 def main():
+    preload = threading.Thread(target=_preload_webview, name="webview-preload", daemon=True)
+    preload.start()
+
     if sys.platform.startswith("linux"):
         _patch_qt_permission_policy()
+
+    from notmyfault.application_paths import ApplicationPaths
 
     paths = ApplicationPaths.default()
     try:
@@ -637,9 +550,13 @@ def main():
         control_server.server_close()
         _remove_control_secret(paths.dashboard_control_token_file, control_secret)
         return
-    icon_path = os.path.join(PROJECT_ROOT, "logo.ico")
+    if "--first-run" in sys.argv:
+        dashboard_url += "&first_run=1"
 
-    api = DashboardAPI(SignedConfigStore(paths), paths)
+    preload.join()
+    import webview
+
+    api = DashboardAPI(paths)
 
     window = webview.create_window(
         title="NotmyFault",
@@ -669,13 +586,12 @@ def main():
         quit_requested.wait()
         try:
             window.destroy()
-        except Exception:
-            pass
+        except Exception as error:
+            print(f"[Dashboard] 关闭窗口失败: {error}", file=sys.stderr)
 
     threading.Thread(target=watch_quit_requests, daemon=True).start()
 
-    # Windows 进程需要设置应用图标
-    if os.name == "nt" and os.path.exists(icon_path):
+    if os.name == "nt":
         try:
             import ctypes
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
@@ -691,10 +607,14 @@ def main():
     window.events.closed += lambda: print("[Dashboard] 窗口已关闭")
 
     try:
+        webview_options = {
+            "private_mode": False,
+            "storage_path": str(paths.config_dir / "dashboard-webview"),
+        }
         if sys.platform.startswith("linux"):
-            webview.start(gui="qt")
+            webview.start(gui="qt", **webview_options)
         else:
-            webview.start()
+            webview.start(**webview_options)
     except KeyboardInterrupt:
         pass
     control_server.shutdown()

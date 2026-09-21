@@ -71,65 +71,28 @@ def owned_value_api():
     )
 
 
-def native_keyboard_api():
-    from notmyfault.native.keyboard import perform_key_event, validate_key_event
+def data_types_api():
+    from notmyfault.core.data_types import (
+        DataTypeError, copy_value, field_type, infer_type, normalize_type,
+        normalize_value, type_at_path, types_compatible,
+    )
+    from notmyfault.core.type_registry import TypeRegistry
+    from notmyfault.core.value_codec import decode_value, encode_value
+    from notmyfault.core.value_conversion import convert_value
 
     return SimpleNamespace(
-        perform_key_event=perform_key_event,
-        validate_key_event=validate_key_event,
-    )
-
-
-def native_mouse_api():
-    from notmyfault.native.mouse import (
-        current_virtual_screen,
-        perform_coordinate,
-    )
-
-    return SimpleNamespace(
-        current_virtual_screen=current_virtual_screen,
-        perform_coordinate=perform_coordinate,
-    )
-
-
-def native_uia_api():
-    from notmyfault.native.uia import (
-        DesktopElementError,
-        capture_element_at,
-        capture_element_under_cursor,
-        capture_foreground_window,
-        check_selector,
-        focus_selector_window,
-        focus_window_signature,
-        is_focused_password_control,
-        perform_selector,
-        read_selector_text,
-        validate_window_signature,
-        wait_for_selector,
-    )
-
-    return SimpleNamespace(
-        DesktopElementError=DesktopElementError,
-        capture_element_at=capture_element_at,
-        capture_element_under_cursor=capture_element_under_cursor,
-        capture_foreground_window=capture_foreground_window,
-        check_selector=check_selector,
-        focus_selector_window=focus_selector_window,
-        focus_window_signature=focus_window_signature,
-        is_focused_password_control=is_focused_password_control,
-        perform_selector=perform_selector,
-        read_selector_text=read_selector_text,
-        validate_window_signature=validate_window_signature,
-        wait_for_selector=wait_for_selector,
-    )
-
-
-def native_input_recorder_api():
-    from notmyfault.native.input_recorder import InputRecorder, build_macro_steps
-
-    return SimpleNamespace(
-        InputRecorder=InputRecorder,
-        build_macro_steps=build_macro_steps,
+        DataTypeError=DataTypeError,
+        TypeRegistry=TypeRegistry,
+        normalize_type=normalize_type,
+        normalize_value=normalize_value,
+        convert_value=convert_value,
+        types_compatible=types_compatible,
+        type_at_path=type_at_path,
+        field_type=field_type,
+        infer_type=infer_type,
+        copy_value=copy_value,
+        encode_value=encode_value,
+        decode_value=decode_value,
     )
 
 

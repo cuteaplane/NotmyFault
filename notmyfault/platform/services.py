@@ -5,6 +5,19 @@ import sys
 
 from notmyfault.plugin_api import CapabilityStatus, PlatformServiceError
 
+_SERVICE_BACKENDS = {
+    "linux": {
+        "clipboard.read": "ClipboardBackend",
+        "clipboard.write": "ClipboardBackend",
+        "input.send": "InputBackend",
+        "audio.control": "AudioBackend",
+        "audio.device_query": "AudioBackend",
+        "window.pin": "WindowBackend",
+        "display.brightness": "DisplayBackend",
+        "screen.capture": "ScreenshotBackend",
+    },
+}
+
 
 def _platform_name() -> str:
     if os.name == "nt":
@@ -17,44 +30,12 @@ def _platform_name() -> str:
 
 
 def _linux_backend(capability: str):
-    from notmyfault.platform.backends import (
-        AudioBackend,
-        ClipboardBackend,
-        DisplayBackend,
-        InputBackend,
-        ScreenshotBackend,
-        WindowBackend,
-        default_runner,
-    )
-    from notmyfault.platform.capabilities import (
-        AUDIO_CONTROL,
-        AUDIO_DEVICE_QUERY,
-        CLIPBOARD_READ,
-        CLIPBOARD_WRITE,
-        DISPLAY_BRIGHTNESS,
-        INPUT_SEND,
-        SCREEN_CAPTURE,
-        WINDOW_PIN,
-    )
+    from notmyfault.platform import backends
 
-    factories = {
-        CLIPBOARD_READ: lambda: ClipboardBackend(default_runner),
-        CLIPBOARD_WRITE: lambda: ClipboardBackend(default_runner),
-        INPUT_SEND: lambda: InputBackend(default_runner),
-        AUDIO_CONTROL: lambda: AudioBackend(default_runner),
-        AUDIO_DEVICE_QUERY: lambda: AudioBackend(default_runner),
-        WINDOW_PIN: lambda: WindowBackend(default_runner),
-        DISPLAY_BRIGHTNESS: lambda: DisplayBackend(default_runner),
-        SCREEN_CAPTURE: lambda: ScreenshotBackend(default_runner),
-    }
-    factory = factories.get(capability)
-    if factory is None:
-        raise PlatformServiceError(
-            capability,
-            "unsupported",
-            "当前宿主没有开放这个平台功能",
-        )
-    return factory()
+    name = _SERVICE_BACKENDS["linux"].get(capability)
+    if name is None:
+        raise PlatformServiceError(capability, "unsupported", "当前宿主没有开放这个平台功能")
+    return getattr(backends, name)(backends.default_runner)
 
 
 class PlatformServices:
@@ -63,7 +44,15 @@ class PlatformServices:
         return _platform_name()
 
     def capability(self, capability: str) -> CapabilityStatus:
-        from notmyfault.platform.capabilities import probe_capability
+        from notmyfault.platform.capabilities import CAPABILITY_IDS, probe_capability
+
+        if capability not in CAPABILITY_IDS:
+            raise PlatformServiceError(capability, "unsupported", f"未知能力 id: {capability!r}")
+        if capability not in _SERVICE_BACKENDS.get(self.platform, {}):
+            return CapabilityStatus(
+                id=capability, available=False, backend=None,
+                reason="当前宿主没有开放这个平台功能", degraded=False,
+            )
 
         try:
             value = probe_capability(capability)
@@ -84,18 +73,14 @@ class PlatformServices:
     def _call(self, capability: str, method: str, *args):
         from notmyfault.platform.backends import BackendError
 
+        if capability not in _SERVICE_BACKENDS.get(self.platform, {}):
+            raise PlatformServiceError(capability, "unsupported", "当前宿主没有开放这个平台功能")
         status = self.capability(capability)
         if not status.available:
             raise PlatformServiceError(
                 capability,
                 "unavailable",
                 status.reason or "当前系统不可用",
-            )
-        if self.platform != "linux":
-            raise PlatformServiceError(
-                capability,
-                "unsupported",
-                "当前宿主没有开放这个平台功能",
             )
         target = _linux_backend(capability)
         try:
@@ -106,9 +91,15 @@ class PlatformServices:
                 error.kind,
                 str(error),
             ) from error
+        except (OSError, RuntimeError) as error:
+            raise PlatformServiceError(
+                capability,
+                "permission_denied" if isinstance(error, PermissionError) else "backend_failed",
+                str(error),
+            ) from error
 
-    def read_clipboard(self) -> str | None:
-        return self._call("clipboard.read", "read_text")
+    def read_clipboard(self, max_chars: int | None = None) -> str | None:
+        return self._call("clipboard.read", "read_text", max_chars)
 
     def write_clipboard(self, text: str) -> None:
         self._call("clipboard.write", "write_text", text)

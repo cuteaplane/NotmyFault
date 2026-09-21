@@ -6,13 +6,24 @@
     "version": "1.0",
     "package_name": "io.github.notmyfault.open_url",
     "enabled": true,
-    "permissions": ["external_binary", "network"],
+    "idempotent": false,
+    "permissions": [
+        "external_binary",
+        "network"
+    ],
     "security": {
         "rule_approval": "admin_key",
-        "literal_only_params": ["urls"]
+        "literal_only_params": [
+            "urls"
+        ]
     },
     "outputs": [
-        {"name": "opened", "label": "成功打开数量", "type": "number"}
+        {
+            "name": "opened",
+            "label": "成功打开数量",
+            "type": "number",
+            "value_type": "int"
+        }
     ],
     "params": [
         {

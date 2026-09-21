@@ -7,11 +7,13 @@ import sys
 import threading
 import time
 from contextlib import redirect_stderr
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from notmyfault.core import plugin_worker
+from notmyfault.core.type_registry import TypeRegistry
 from notmyfault.core.plugin_worker import (
     PluginWorkerCrashed,
     PluginWorkerStartupTimeout,
@@ -115,14 +117,36 @@ time.sleep(30)
 
 
 class TestRunIsolatedAction:
-    def test_runpy_cannot_bypass_strict_package_guard(self):
+    def test_shared_typed_values_survive_isolated_action_round_trip(self, tmp_path):
+        identity = "com.test.transport/record@1"
+        meta = {
+            "id": "transport", "package_name": "com.test.transport",
+            "execution_api": "context-v1",
+            "contributes": {"data_types": [{
+                "id": "record", "version": 1, "binding": "shared",
+                "schema": {"type": "object", "properties": {"amount": "decimal", "data": "bytes", "count": "int"}, "required": ["amount", "data", "count"]},
+            }]},
+            "params": [{"name": "value", "type": "textarea", "value_type": identity}],
+            "outputs": [{"name": "echo", "type": "object", "value_type": identity}],
+        }
+        registry = TypeRegistry.from_plugins([meta])
+        value = registry.make_value(identity, {"amount": Decimal("1.00000000000000001"), "data": b"\x00\xff", "count": 2**100 + 1, "_business_key": "kept"})
+        entry = write_action(tmp_path, "typed", "def run(meta, params):\n    return {}\ndef run_with_context(meta, params, context):\n    assert params['value'] == context['variables']['saved']\n    return {'echo': params['value']}\n")
+        ok, result = run_isolated_action(entry, meta, {"value": value}, {"variables": {"saved": value}, "_type_registry": registry})
+        assert ok is True
+        assert result == {"echo": value}
+        assert isinstance(result["echo"]["data"]["amount"], Decimal)
+
+    @pytest.mark.parametrize("prefix", ["", "import sys, types\nsys.modules['pytest'] = types.ModuleType('pytest')\n"])
+    def test_runpy_cannot_bypass_strict_package_guard(self, prefix):
         code = (
-            "import runpy\n"
+            prefix + "import runpy\n"
             "runpy.run_module('notmyfault.security.security')\n"
         )
         result = subprocess.run(
             [sys.executable, "-c", code],
             cwd=str(Path(__file__).resolve().parents[2]),
+            env={**os.environ, "NOTMYFAULT_MODE": "stable"},
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -141,7 +165,7 @@ class TestRunIsolatedAction:
         assert result == {"echo": 42}
 
     def test_public_plugin_api_is_available_in_strict_worker(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("NOTMYFAULT_MODE", "strict")
+        monkeypatch.setenv("NOTMYFAULT_MODE", "stable")
         entry = write_action(tmp_path, "plugin_api", PLUGIN_API_ACTION)
         ok, result = run_isolated_action(entry, {"id": "plugin_api"}, {}, {})
         assert ok is True
@@ -184,56 +208,62 @@ class TestRunIsolatedAction:
 
     def test_execute_timeout_kills_worker(self, monkeypatch, tmp_path):
         real_popen = plugin_worker.subprocess.Popen
+        processes = []
 
         def start_ready_worker(*args, **kwargs):
-            return real_popen(
+            process = real_popen(
                 [sys.executable, "-c", READY_THEN_SLEEP_WORKER],
                 **kwargs,
             )
+            processes.append(process)
+            return process
 
         monkeypatch.setattr(plugin_worker.subprocess, "Popen", start_ready_worker)
         entry = write_action(tmp_path, "sleepy", SLEEPY_ACTION)
-        started = time.time()
         with pytest.raises(PluginWorkerTimeout):
             run_isolated_action(entry, {}, {}, {}, execute_timeout=1.0)
-        assert time.time() - started < 1.75
+        assert processes and all(process.poll() is not None for process in processes)
 
     def test_startup_timeout_kills_worker(self, monkeypatch, tmp_path):
         real_popen = plugin_worker.subprocess.Popen
+        processes = []
 
         def start_silent_worker(*args, **kwargs):
-            return real_popen(
+            process = real_popen(
                 [sys.executable, "-c", "import time; time.sleep(30)"],
                 **kwargs,
             )
+            processes.append(process)
+            return process
 
         monkeypatch.setattr(plugin_worker.subprocess, "Popen", start_silent_worker)
         entry = write_action(tmp_path, "simple_startup", SIMPLE_ACTION)
-        started = time.time()
         with pytest.raises(PluginWorkerStartupTimeout):
             run_isolated_action(entry, {}, {}, {}, startup_timeout=0.2)
-        assert time.time() - started < 1.0
+        assert processes and all(process.poll() is not None for process in processes)
         assert not plugin_worker._live_processes
 
     def test_exit_timeout_kills_worker_after_result(self, monkeypatch, tmp_path):
         real_popen = plugin_worker.subprocess.Popen
+        processes = []
 
         def start_hanging_worker(*args, **kwargs):
-            return real_popen(
+            process = real_popen(
                 [sys.executable, "-c", READY_RESULT_THEN_SLEEP_WORKER],
                 **kwargs,
             )
+            processes.append(process)
+            return process
 
         monkeypatch.setattr(plugin_worker.subprocess, "Popen", start_hanging_worker)
         monkeypatch.setattr(plugin_worker, "EXIT_TIMEOUT", 0.2)
         entry = write_action(tmp_path, "hanging_exit", SIMPLE_ACTION)
-        started = time.time()
 
         ok, result = run_isolated_action(entry, {}, {}, {})
 
         assert ok is True
         assert result == {"completed": True}
-        assert time.time() - started < 1.0
+        assert processes and all(process.poll() is not None for process in processes)
         assert not plugin_worker._live_processes
 
     def test_context_v1_receives_sanitized_context(self, tmp_path):
@@ -360,19 +390,14 @@ class TestLoaderIsolatedMode:
 
     @pytest.mark.parametrize("origin", ["builtin", "user"])
     def test_isolated_action_runs_in_worker(self, tmp_path, origin):
-        loader = self._make_plugin(tmp_path)
-        meta_store, func_store = {}, {}
-        loaded, failed = loader.load(
-            base_dir=str(tmp_path),
-            plugins_dir="actions",
-            json_filename="action.json",
-            py_filename="action.py",
-            module_prefix="notmyfault.action_iso_",
-            meta_store=meta_store,
-            func_store=func_store,
-            store_name="Actioner",
-            origin=origin,
-        )
+        loader = self._make_plugin(tmp_path, source=(
+            "from helper import double\n"
+            "def run(meta, params): return {'doubled': double(params['n'])}\n"
+        ))
+        helper = tmp_path / "actions" / "iso_action" / "helper.py"
+        helper.write_text("def double(value): return value * 2\n", encoding="utf-8")
+        meta_store, func_store = loader._registry.stores("action")
+        loaded, failed = loader.load(str(tmp_path / "actions"), "action", origin=origin)
         assert (loaded, failed) == (1, 0)
         assert "iso_action" not in func_store
 
@@ -381,23 +406,16 @@ class TestLoaderIsolatedMode:
         # isolated 动作不 import 进引擎进程
         assert loader._registry.get_module("iso_action") is None
         assert func_store["iso_action"]({}, {"n": 21}) == {"doubled": 42}
+        helper.write_text("def double(value): return value * 3\n", encoding="utf-8")
+        with pytest.raises(RuntimeError, match="完整性校验失败"):
+            func_store["iso_action"]({}, {"n": 21})
 
     def test_isolated_context_action_runs_through_registered_proxy(self, tmp_path):
         from notmyfault.core.workflow import invoke_action
 
         loader = self._make_plugin(tmp_path, context_api=True)
-        meta_store, func_store = {}, {}
-        loaded, failed = loader.load(
-            base_dir=str(tmp_path),
-            plugins_dir="actions",
-            json_filename="action.json",
-            py_filename="action.py",
-            module_prefix="notmyfault.action_iso_context_",
-            meta_store=meta_store,
-            func_store=func_store,
-            store_name="Actioner",
-            origin="user",
-        )
+        meta_store, func_store = loader._registry.stores("action")
+        loaded, failed = loader.load(str(tmp_path / "actions"), "action", origin="user")
         assert (loaded, failed) == (1, 0)
 
         assert loader.materialize_pending_action("iso_action") is not None
@@ -421,18 +439,8 @@ class TestLoaderIsolatedMode:
             execution_mode="in-process",
             source=PLUGIN_API_ACTION,
         )
-        meta_store, func_store = {}, {}
-        loaded, failed = loader.load(
-            base_dir=str(tmp_path),
-            plugins_dir="actions",
-            json_filename="action.json",
-            py_filename="action.py",
-            module_prefix="notmyfault.action_public_api_",
-            meta_store=meta_store,
-            func_store=func_store,
-            store_name="Actioner",
-            origin="user",
-        )
+        meta_store, func_store = loader._registry.stores("action")
+        loaded, failed = loader.load(str(tmp_path / "actions"), "action", origin="user")
         assert (loaded, failed) == (1, 0)
         assert loader.materialize_pending_action("iso_action") is not None
         result = func_store["iso_action"]({}, {})

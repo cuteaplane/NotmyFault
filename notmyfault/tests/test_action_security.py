@@ -1,4 +1,6 @@
 from pathlib import Path
+import io
+import tarfile
 from urllib.parse import urlparse
 
 import pytest
@@ -8,6 +10,25 @@ from notmyfault.actions.http_request import action as http_request
 from notmyfault.actions.kill_process import action as kill_process
 from notmyfault.actions.launch_program import action as launch_program
 from notmyfault.security import network
+from notmyfault.actions.file_operation import action as file_operation
+
+
+@pytest.mark.parametrize("member_type", [tarfile.FIFOTYPE, tarfile.CHRTYPE, tarfile.BLKTYPE, tarfile.SYMTYPE])
+def test_tar_rejects_special_members_before_extracting_any_file(tmp_path, member_type):
+    archive = tmp_path / "archive.tar"
+    with tarfile.open(archive, "w") as output:
+        normal = tarfile.TarInfo("first.txt")
+        normal.size = 2
+        output.addfile(normal, io.BytesIO(b"ok"))
+        special = tarfile.TarInfo("special")
+        special.type = member_type
+        special.linkname = "first.txt"
+        output.addfile(special)
+    target = tmp_path / "out"
+    target.mkdir()
+    with pytest.raises(ValueError):
+        file_operation.run({}, {"operation": "unpack", "source": str(archive), "destination": str(target)})
+    assert list(target.iterdir()) == []
 
 
 def test_network_validator_rejects_private_resolution(monkeypatch):
@@ -54,16 +75,22 @@ def test_http_action_rejects_transport_headers(monkeypatch):
         )
 
 
-def test_http_action_connects_to_the_validated_address(monkeypatch):
+@pytest.mark.parametrize("slow_body", [False, True])
+def test_http_action_connects_to_the_validated_address(monkeypatch, slow_body):
     captured = {}
+    now = [0.0]
+    monkeypatch.setattr(http_request.time, "monotonic", lambda: now[0])
 
     class Response:
         status = 200
         reason = "OK"
 
-        @staticmethod
-        def read(limit):
-            return b"done"
+        body = b"done"
+        def read1(self, limit):
+            if slow_body:
+                now[0] = 31
+            value, self.body = self.body[:limit], self.body[limit:]
+            return value
 
     class Connection:
         def __init__(self, host, addresses, **kwargs):
@@ -89,10 +116,11 @@ def test_http_action_connects_to_the_validated_address(monkeypatch):
     )
     monkeypatch.setattr(http_request, "_PinnedHTTPConnection", Connection)
 
-    result = http_request.run(
-        {},
-        {"url": "http://example.test/path?q=1"},
-    )
+    if slow_body:
+        with pytest.raises(RuntimeError, match="总时限"):
+            http_request.run({}, {"url": "http://example.test/path?q=1"})
+        return
+    result = http_request.run({}, {"url": "http://example.test/path?q=1"})
 
     assert result == {"status": 200, "body": "done", "truncated": False}
     assert captured["host"] == "example.test"
@@ -120,39 +148,68 @@ def test_pinned_socket_never_resolves_the_hostname_again(monkeypatch):
     )
 
     assert sock is not None
-    assert calls == [(('203.0.113.10', 443), 5, None)]
+    assert calls[0][0] == ('203.0.113.10', 443)
+    assert 0 < calls[0][1] <= 5
+    assert calls[0][2] is None
+    now = [0.0]
+    monkeypatch.setattr(http_request.time, "monotonic", lambda: now[0])
+    def slow_connection(address, timeout, source_address):
+        now[0] += 3
+        calls.append(timeout)
+        raise OSError("unreachable")
+    calls.clear()
+    monkeypatch.setattr(http_request.socket, "create_connection", slow_connection)
+    with pytest.raises(TimeoutError):
+        http_request._open_pinned_socket(("203.0.113.1", "203.0.113.2", "203.0.113.3"), 443, 5)
+    assert calls == [5, 2]
 
 
-def test_linux_shortcut_rejects_multiline_fields():
+def test_linux_shortcut_rejects_multiline_fields(monkeypatch):
+    monkeypatch.setattr(create_shortcut.sys, "platform", "linux")
     with pytest.raises(ValueError, match="换行"):
-        create_shortcut._run_linux(
+        create_shortcut.run(
             {},
             {
                 "name": "safe",
                 "target_path": "/usr/bin/tool\nX-GNOME-Autostart-enabled=true",
-                "location": "applications",
+                "location": "start_menu",
             },
         )
 
 
 def test_linux_shortcut_quotes_exec_tokens(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-    result = create_shortcut._run_linux(
+    monkeypatch.setattr(create_shortcut.sys, "platform", "linux")
+    result = create_shortcut.run(
         {},
         {
             "name": "safe",
             "target_path": "/opt/My Tool/tool",
-            "arguments": "--label 'two words'",
-            "location": "applications",
+            "arguments": "--label 'two words' --dollar '$HOME' --slash '\\part'",
+            "location": "start_menu",
+            "working_directory": "/tmp/work\\folder",
+            "icon_path": "/tmp/icon.png",
         },
     )
     content = Path(result["shortcut_path"]).read_text(encoding="utf-8")
+    assert "Path=/tmp/work\\\\folder\n" in content
+    assert "Icon=/tmp/icon.png\n" in content
     assert 'Exec="/opt/My Tool/tool" "--label" "two words"' in content
+    assert '"\\\\$HOME"' in content
+    assert '"\\\\\\\\part"' in content
 
 
 def test_launch_program_rejects_unbalanced_quotes():
     with pytest.raises(ValueError, match="引号"):
-        launch_program._split_args('"unfinished')
+        launch_program.run({}, {"path": "tool", "args": '"unfinished'})
+
+
+@pytest.mark.skipif(launch_program.sys.platform != "win32", reason="仅 Windows 参数规则")
+def test_launch_program_preserves_windows_path_backslashes(monkeypatch):
+    started = []
+    monkeypatch.setattr(launch_program.subprocess, "Popen", lambda args, **kwargs: started.append(args))
+    launch_program.run({}, {"path": "tool", "args": r'--config C:\Temp\a.txt --label "two words"'})
+    assert started == [["tool", "--config", r"C:\Temp\a.txt", "--label", "two words"]]
 
 
 def test_kill_process_rejects_critical_windows_process(monkeypatch):

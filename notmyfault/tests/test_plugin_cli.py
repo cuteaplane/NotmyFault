@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import py7zr
+from notmyfault.security import signing
 
 from notmyfault import plugin_cli
 
@@ -29,7 +30,10 @@ def write_action(root: Path, **overrides) -> Path:
     return root
 
 
-def test_check_reports_all_plugin_surfaces(tmp_path):
+def test_check_reports_all_plugin_surfaces(tmp_path, monkeypatch):
+    from notmyfault.security.security import SecurityMode
+
+    monkeypatch.setattr(plugin_cli, "detect_security_mode", lambda: SecurityMode.STRICT)
     root = write_action(
         tmp_path / "sample_action",
         contributes={
@@ -54,6 +58,9 @@ def test_check_reports_all_plugin_surfaces(tmp_path):
     assert report["permissions"]["items"] == []
     assert report["risks"] == []
     assert report["signature"] == "none"
+    assert report["checks"]["development"]["allowed"] is True
+    assert report["checks"]["load_policy"]["allowed"] is False
+    assert "签名无效" in report["checks"]["load_policy"]["errors"]
     assert report["entrypoints"]["selected"] == "action.py"
     assert set(report["contributions"]) == {
         "commands", "views", "parameter_editors", "data_types"
@@ -85,6 +92,9 @@ def test_check_reports_ast_risks(tmp_path):
 
 def test_pack_writes_installable_nmfp(tmp_path):
     root = write_action(tmp_path / "packed")
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    signing.self_sign_plugin(root, Ed25519PrivateKey.generate())
     output = tmp_path / "output"
 
     result = plugin_cli.main([
@@ -97,9 +107,13 @@ def test_pack_writes_installable_nmfp(tmp_path):
     with py7zr.SevenZipFile(archive) as package:
         assert "sample_action/action.json" in package.getnames()
         assert "sample_action/action.py" in package.getnames()
+        package.extractall(tmp_path / "unpacked")
+    from notmyfault.security.plugins import plugin_signature_kind
+
+    assert plugin_signature_kind(str(tmp_path / "unpacked" / "sample_action"), "user") == "author"
 
 
-def test_plugin_test_runs_pytest_in_plugin_directory(tmp_path):
+def test_plugin_test_runs_pytest_in_plugin_directory(tmp_path, capsys):
     root = write_action(tmp_path / "tested")
     (root / "test_action.py").write_text(
         "def test_plugin_template():\n    assert 2 + 2 == 4\n",
@@ -108,10 +122,12 @@ def test_plugin_test_runs_pytest_in_plugin_directory(tmp_path):
 
     result = plugin_cli.main(["plugin", "test", str(root), "-q"])
 
-    assert result == 0
+    captured = capsys.readouterr()
+    assert result == 0, captured.out + captured.err
+    assert "1 passed" in captured.out
 
 
-def test_create_action_and_trigger_templates(tmp_path):
+def test_create_action_and_trigger_templates(tmp_path, capsys):
     for kind in ("action", "trigger"):
         plugin_id = f"sample_{kind}"
         result = plugin_cli.main([
@@ -125,9 +141,14 @@ def test_create_action_and_trigger_templates(tmp_path):
         root = tmp_path / plugin_id
         assert result == 0
         assert plugin_cli.check_plugin(root)["ok"] is True
+        if kind == "trigger":
+            meta = json.loads((root / "trigger.json").read_text(encoding="utf-8"))
+            assert meta["trigger_api"] == "event-v2"
         assert (root / "test_plugin.py").is_file()
         assert (root / ".github" / "workflows" / "test.yml").is_file()
-        assert plugin_cli.main(["plugin", "test", str(root), "-q"]) == 0
+        test_result = plugin_cli.main(["plugin", "test", str(root), "-q"])
+        captured = capsys.readouterr()
+        assert test_result == 0, captured.out + captured.err
         assert plugin_cli.main([
             "plugin", "create", kind, plugin_id, "--output-dir", str(tmp_path)
         ]) == 1

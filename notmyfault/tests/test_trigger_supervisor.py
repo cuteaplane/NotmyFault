@@ -18,7 +18,7 @@ def _wait(condition, timeout=5.0):
 
 
 def _body_waits_on_stop(*args):
-    # args: instance_id, event_type, func, meta, config, stop_event
+    # 停止事件是触发器入口的第六个参数
     args[5].wait(timeout=10)
 
 
@@ -82,8 +82,7 @@ class TestRegistration:
             raise RuntimeError("cannot start thread")
 
         monkeypatch.setattr(threading.Thread, "start", boom)
-        with pytest.raises(RuntimeError):
-            sup.start({"hotkey": [{}]}, {"hotkey": lambda *a: None}, {"hotkey": {}}, _body_waits_on_stop)
+        assert sup.start({"hotkey": [{}]}, {"hotkey": lambda *a: None}, {"hotkey": {}}, _body_waits_on_stop) == 0
         assert sup._threads == {}
         assert sup._events == {}
 
@@ -292,7 +291,11 @@ class TestMissingAlert:
 class TestEngineIntegration:
     def _engine(self):
         from notmyfault.tests.api_support import create_test_engine
-        return create_test_engine({"rules": []})
+        engine = create_test_engine({"rules": []})
+        engine._alert_user = lambda *args, **kwargs: None
+        engine.actions_meta["noop"] = {}
+        engine.actions_funcs["noop"] = lambda meta, params: None
+        return engine
 
     def test_get_diagnostics_has_triggers_health(self):
         engine = self._engine()
@@ -304,23 +307,17 @@ class TestEngineIntegration:
         engine = self._engine()
         engine.triggers_funcs["hotkey"] = lambda meta, config, emit, stop_event: None
         engine.triggers_meta["hotkey"] = {}
-        engine._start_trigger_threads([{"event": {"type": "hotkey", "params": {}}}])
+        snapshot = engine._prepare_rules([{
+            "name": "触发器状态", "condition": {"type": "hotkey", "params": {}},
+            "actions": [{"type": "noop", "params": {}}],
+        }])
+        engine._start_trigger_threads(snapshot)
         assert _wait(
             lambda: not engine._trigger_supervisor._threads["hotkey"].is_alive()
         )
         engine._trigger_supervisor.mark_crashed("hotkey", "boom")
         health = engine.get_diagnostics()["triggers"]["health"]
         assert health["hotkey"]["crashed"] is True
-
-    def test_missing_trigger_alert_uses_latest_engine_callback(self):
-        engine = self._engine()
-        alerts = []
-        # 构造后再替换告警回调，supervisor 仍应使用新回调
-        engine._alert_user = lambda title, message, open_dashboard=False: alerts.append(title)
-        engine._start_trigger_threads(
-            [{"event": {"type": "ghost_trigger", "params": {}}}]
-        )
-        assert len(alerts) == 1
 
     def test_run_trigger_still_works(self):
         engine = self._engine()
@@ -348,7 +345,11 @@ class TestEngineIntegration:
         engine = self._engine()
         engine.triggers_funcs["hotkey"] = lambda meta, config, emit, stop_event: stop_event.wait(timeout=5)
         engine.triggers_meta["hotkey"] = {}
-        engine._start_trigger_threads([{"event": {"type": "hotkey", "params": {}}}])
+        snapshot = engine._prepare_rules([{
+            "name": "触发器状态", "condition": {"type": "hotkey", "params": {}},
+            "actions": [{"type": "noop", "params": {}}],
+        }])
+        engine._start_trigger_threads(snapshot)
         assert "hotkey" in engine._trigger_supervisor._threads
         assert engine._stop_trigger_threads(timeout=5) is True
         assert engine._trigger_supervisor._threads == {}

@@ -110,12 +110,15 @@ class TriggerSupervisor:
                         self._crash_errors.pop(instance_id, None)
                         try:
                             thread.start()
-                        except Exception:
+                        except Exception as error:
                             if self._threads.get(instance_id) is thread:
                                 self._configs.pop(instance_id, None)
                                 self._threads.pop(instance_id, None)
                                 self._events.pop(instance_id, None)
-                            raise
+                            print(f"[Engine] 触发器 {instance_id} 启动失败: {error}", file=sys.stderr)
+                            if self._alert_cb:
+                                self._alert_cb("触发器启动失败", f"{instance_id}: {type(error).__name__}")
+                            continue
                     count += 1
                     print(
                         f"[Engine] 已启动触发器线程: {instance_id}"
@@ -138,39 +141,39 @@ class TriggerSupervisor:
                 evt.set()
 
             deadline = time.monotonic() + timeout
-            for event_type, thread in threads:
+            for instance_id, thread in threads:
                 remaining = deadline - time.monotonic()
                 if remaining > 0:
                     thread.join(timeout=remaining)
                 if thread.is_alive():
                     # _stop_failures 的读写统一在 _lock 内，health() 也用它
                     with self._lock:
-                        failures = self._stop_failures.get(event_type, 0) + 1
-                        self._stop_failures[event_type] = failures
+                        failures = self._stop_failures.get(instance_id, 0) + 1
+                        self._stop_failures[instance_id] = failures
                     print(
-                        f"[Engine] [!!] 触发器线程 {event_type}"
+                        f"[Engine] [!!] 触发器线程 {instance_id}"
                         f" 未在 {timeout}s 内退出（连续 {failures} 次）",
                         file=sys.stderr,
                     )
                 else:
                     with self._lock:
-                        self._stop_failures.pop(event_type, None)
+                        self._stop_failures.pop(instance_id, None)
 
             alive = {et for et, thread in threads if thread.is_alive()}
             remaining_alive = set(alive)
             stopped_count = len(threads) - len(alive)
             with self._lock:
-                for event_type, thread in threads:
+                for instance_id, thread in threads:
                     # 只删除仍对应当前线程对象的条目
                     if (
-                        event_type not in alive
-                        and self._threads.get(event_type) is thread
+                        instance_id not in alive
+                        and self._threads.get(instance_id) is thread
                     ):
-                        self._threads.pop(event_type, None)
-                        self._events.pop(event_type, None)
-                        self._configs.pop(event_type, None)
-                        self._crash_errors.pop(event_type, None)
-                        self._stop_failures.pop(event_type, None)
+                        self._threads.pop(instance_id, None)
+                        self._events.pop(instance_id, None)
+                        self._configs.pop(instance_id, None)
+                        self._crash_errors.pop(instance_id, None)
+                        self._stop_failures.pop(instance_id, None)
             if stopped_count:
                 print(f"[Engine] 已停止 {stopped_count} 个触发器线程")
             return not remaining_alive

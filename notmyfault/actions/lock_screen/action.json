@@ -9,6 +9,8 @@
         "session.lock"
     ],
     "enabled": true,
+    "idempotent": true,
+    "platforms": ["windows", "linux"],
     "permissions": [
         "native_api",
         "external_binary"

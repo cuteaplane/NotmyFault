@@ -3,6 +3,8 @@ import json
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from notmyfault.core.value_codec import encode_value
+from notmyfault.host.api.value_transport import value_response
 
 from notmyfault.host.api.events import EventBroker
 from notmyfault.host.api.services.engine import EngineService, EngineServiceError
@@ -52,14 +54,14 @@ def create_engine_router(
 
     @router.get("/api/runs")
     async def runs_list(limit: int = 100):
-        return service.runs(limit)
+        return value_response(service.runs(limit))
 
     @router.get("/api/runs/{run_id}")
     async def run_detail(run_id: str):
         run = service.run_detail(run_id)
         if run is None:
             return JSONResponse({"detail": "运行记录不存在"}, status_code=404)
-        return run
+        return value_response(run)
 
     @router.post("/api/runs/{run_id}/cancel")
     async def run_cancel(run_id: str):
@@ -71,6 +73,17 @@ def create_engine_router(
     @router.get("/api/engine/logs")
     async def engine_logs(lines: int = 200):
         return service.logs(lines)
+
+    @router.get("/api/engine/logs/files")
+    async def engine_log_files():
+        return service.log_files()
+
+    @router.get("/api/engine/logs/entries")
+    async def engine_log_entries(lines: int = 600, name: str = ""):
+        try:
+            return service.log_entries(lines, name)
+        except ValueError as error:
+            return JSONResponse({"ok": False, "error": str(error)}, status_code=400)
 
     @router.get("/api/events")
     async def event_stream(request: Request):
@@ -90,7 +103,7 @@ def create_engine_router(
                         event_type = str(event["type"]).replace("\r", "").replace("\n", "")
                         yield f"event: {event_type}\n"
                         yield "data: " + json.dumps(
-                            event["data"],
+                            encode_value(event["data"]),
                             ensure_ascii=False,
                         ) + "\n\n"
                     except asyncio.TimeoutError:

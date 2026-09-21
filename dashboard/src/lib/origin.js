@@ -11,7 +11,7 @@ export const ORIGIN_STORY = {
 export const ORIGIN_RULES = [
   {
     name: '微信音量规则',
-    event: {
+    condition: {
       type: 'process_state',
       params: { process_name: 'WeChat.exe', state: 'running' },
     },
@@ -25,7 +25,7 @@ export const ORIGIN_RULES = [
   },
   {
     name: 'PPT音量规则',
-    event: {
+    condition: {
       type: 'process_state',
       params: { process_name: 'POWERPNT.EXE', state: 'running' },
     },
@@ -39,7 +39,7 @@ export const ORIGIN_RULES = [
   },
   {
     name: '媒体播放器规则',
-    event: {
+    condition: {
       type: 'process_state',
       params: { process_name: 'wmplayer.exe', state: 'running' },
     },
@@ -53,7 +53,7 @@ export const ORIGIN_RULES = [
   },
   {
     name: '微信退出-恢复音量',
-    event: {
+    condition: {
       type: 'process_state',
       params: { process_name: 'WeChat.exe', state: 'stopped' },
     },
@@ -67,7 +67,7 @@ export const ORIGIN_RULES = [
   },
   {
     name: 'PPT退出-恢复音量',
-    event: {
+    condition: {
       type: 'process_state',
       params: { process_name: 'POWERPNT.EXE', state: 'stopped' },
     },
@@ -81,7 +81,7 @@ export const ORIGIN_RULES = [
   },
   {
     name: '媒体播放器退出-恢复音量',
-    event: {
+    condition: {
       type: 'process_state',
       params: { process_name: 'wmplayer.exe', state: 'stopped' },
     },

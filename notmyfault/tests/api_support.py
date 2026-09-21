@@ -29,20 +29,24 @@ API_TOKEN = "a" * 64
 class StaticRulesStore:
     def __init__(self, rules: list[dict[str, Any]]) -> None:
         self._rules = rules
-        directory = Path(tempfile.mkdtemp(prefix="notmyfault-test-rules-"))
+        self._directory = tempfile.TemporaryDirectory(prefix="notmyfault-test-rules-")
+        directory = Path(self._directory.name)
         self.rules_path = str(directory / "rules.json")
         self.plugin_manifest_path = str(directory / "plugin_manifest.json")
 
     def load_verified_rules(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self._rules)
 
+    def close(self) -> None:
+        self._directory.cleanup()
+
 
 def create_test_engine(config, *args, **kwargs):
     from notmyfault.core.engine import AutomationEngine
 
-    rules_store = kwargs.pop(
-        "rules_store", StaticRulesStore(config.get("rules", []))
-    )
+    rules_store = kwargs.pop("rules_store", None)
+    if rules_store is None:
+        rules_store = StaticRulesStore(config.get("rules", []))
     return AutomationEngine(config, *args, rules_store=rules_store, **kwargs)
 
 

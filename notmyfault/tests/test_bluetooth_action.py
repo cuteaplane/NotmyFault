@@ -153,6 +153,17 @@ def test_linux_toggle_changes_and_confirms_state(monkeypatch):
         ["/usr/bin/bluetoothctl", "power", "off"],
         ["/usr/bin/bluetoothctl", "show"],
     ]
+    now = [0.0]
+    timeouts = []
+    def never_applied(command, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        now[0] += 7
+        return completed(stdout="Powered: yes\n")
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(module.subprocess, "run", never_applied)
+    with pytest.raises(RuntimeError, match="总时限"):
+        module._run_linux("off")
+    assert timeouts == [8, 8, 8, 8, 2]
 
 
 def test_linux_missing_controller_is_not_reported_as_off(monkeypatch):
@@ -169,6 +180,7 @@ def test_linux_missing_controller_is_not_reported_as_off(monkeypatch):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="仅 Windows 自带 Windows PowerShell")
+@pytest.mark.system_native
 def test_windows_helper_returns_structured_query_result():
     result = subprocess.run(
         [

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -22,6 +23,8 @@ EXPECTED_OPERATIONS = {
     ("GET", "/api/runs/{run_id}"),
     ("POST", "/api/runs/{run_id}/cancel"),
     ("GET", "/api/engine/logs"),
+    ("GET", "/api/engine/logs/files"),
+    ("GET", "/api/engine/logs/entries"),
     ("GET", "/api/events"),
     ("GET", "/api/plugins/extensions"),
     ("POST", "/api/plugins/{plugin_id}/extensions/commands/{command_id}/invoke"),
@@ -65,6 +68,12 @@ def concrete_path(path: str) -> str:
     )
 
 
+@pytest.mark.parametrize("path", ["/docs", "/redoc", "/openapi.json"])
+def test_docs_routes_are_disabled(tmp_path, path):
+    env = make_api_env(tmp_path)
+    assert env.client.get(path).status_code == 404
+
+
 def test_openapi_keeps_every_http_operation(tmp_path):
     env = make_api_env(tmp_path)
     actual = {
@@ -96,6 +105,37 @@ def test_security_approval_returns_parse_reason(tmp_path):
     body = response.json()
     assert body["ok"] is False
     assert body["error"].startswith("配置文件无法解析:")
+
+
+@pytest.mark.parametrize("mode_name", ["strict", "normal", "permissive"])
+def test_security_status_separates_installation_from_config_without_engine(
+    tmp_path, monkeypatch, mode_name
+):
+    from notmyfault.host.api.services import settings
+    from notmyfault.security.security import SecurityMode
+
+    package_root = tmp_path / "notmyfault"
+    plugin_dir = package_root / "actions" / "notify"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "action.json").write_text('{"id":"notify"}', encoding="utf-8")
+    env = make_api_env(tmp_path, package_root=package_root)
+    monkeypatch.setattr(settings, "detect_security_mode", lambda: SecurityMode(mode_name))
+    monkeypatch.setattr(settings, "verify_file", lambda path: True)
+    monkeypatch.setattr(settings, "verify_core_integrity", lambda: (True, []))
+
+    body = env.client.get("/api/config/security-status", headers=env.headers).json()
+    assert body["status"] == "ok"
+    assert body["security_mode"] == mode_name
+    assert body["installation"]["status"] == "invalid"
+    assert body["installation"]["issues"] == [
+        {"path": "actions/notify", "reason": "内置插件签名缺失或无效"}
+    ]
+
+    monkeypatch.setattr(settings, "inspect_signature", lambda *args: SimpleNamespace(kind="official"))
+    env.paths.config_file.write_text("{broken", encoding="utf-8")
+    body = env.client.get("/api/config/security-status", headers=env.headers).json()
+    assert body["installation"]["status"] == "ok"
+    assert body["status"] == "unreadable"
 
 
 def test_options_preflight_is_allowed_for_dashboard_port(tmp_path):
@@ -146,6 +186,10 @@ def test_token_store_creates_token_and_reapplies_file_permissions(tmp_path):
     )
     assert reloaded.token == store.token
     assert len(restricted) == 1
+    assert not reloaded.matches("无效令牌")
+    path.write_text("损坏令牌", encoding="utf-8")
+    reloaded.repair_file()
+    assert path.read_text(encoding="utf-8") == store.token
 
 
 def test_sse_rejects_query_token(tmp_path):
@@ -235,6 +279,53 @@ def test_rule_save_rejects_missing_binding_source(tmp_path):
     assert response.json()["error"] == "规则数据绑定无效"
     assert response.json()["details"]
 
+    from notmyfault.host.api.services.rules import RuleService, RuleServiceError
+    service = RuleService(env.store, lambda: {
+        "triggers": {"hotkey": {"params": []}},
+        "actions": {"notify": {"params": [{"name": "message", "type": "string", "required": True}]}},
+    })
+    rule = {"name": "必填参数", "event": {"type": "hotkey", "params": {}},
+            "actions": [{"type": "notify", "params": {}}]}
+    assert service.validate_draft(rule)["valid"] is False
+    with pytest.raises(RuleServiceError) as caught:
+        service.save([rule], None)
+    assert caught.value.status_code == 400
+    assert env.store.load_verified_rules() == []
+
+
+def test_rules_transport_preserves_typed_constants_and_literal_objects(tmp_path):
+    from decimal import Decimal
+    from notmyfault.core.value_codec import encode_value, decode_value
+
+    env = make_api_env(tmp_path)
+    values = {
+        "count": 9007199254740993, "amount": Decimal("0.1234567890123456789"),
+        "bytes": b"\x00\xff", "object": {"$nmf_value": {"type": "int", "data": "7"}},
+        "expression": {"$ref": {"scope": "step", "node": "a_literal", "path": ["x"]}},
+    }
+    rule = {"name": "保存精确数据", "event": {"type": "hotkey", "params": {"hotkey": "ctrl+k"}},
+            "constants": [{"id": "c_values01", "name": "数据", "value_type": "object", "value": {"$literal": values}}],
+            "variables": [{"id": "v_result01", "name": "结果", "value_type": "object"}],
+            "actions": [{"type": "set_variable", "variable": "v_result01", "value": {"$ref": {"scope": "constant", "node": "c_values01", "path": []}}}]}
+    response = env.client.put("/api/rules", headers={**env.headers, "X-NMF-Value-Encoding": "typed-v1"}, json=encode_value({"rules": [rule]}))
+    assert response.status_code == 200, response.text
+    stored = env.store.load_verified_rules()[0]
+    assert stored["constants"][0]["value"]["$literal"] == values
+    fetched = env.client.get("/api/rules", headers=env.headers)
+    assert decode_value(fetched.json())["rules"][0] == stored
+    saved_again = env.client.put("/api/rules", headers={**env.headers, "X-NMF-Value-Encoding": "typed-v1"}, json=fetched.json())
+    assert saved_again.status_code == 200, saved_again.text
+    assert env.store.load_verified_rules()[0] == stored
+    updated = decode_value(fetched.json())
+    updated["expected_revision"] = updated["revision"]
+    updated["rules"][0]["name"] = "新的规则名称"
+    accepted = env.client.put("/api/rules", headers={**env.headers, "X-NMF-Value-Encoding": "typed-v1"}, json=encode_value(updated))
+    assert accepted.status_code == 200
+    assert accepted.json()["revision"] != updated["expected_revision"]
+    stale = env.client.put("/api/rules", headers={**env.headers, "X-NMF-Value-Encoding": "typed-v1"}, json=encode_value(updated))
+    assert stale.status_code == 409
+    assert stale.json()["code"] == "rules_conflict"
+
 
 def test_engine_control_and_status_contract(tmp_path):
     env = make_api_env(tmp_path)
@@ -243,6 +334,7 @@ def test_engine_control_and_status_contract(tmp_path):
     assert started.json() == {
         "ok": True,
         "running": True,
+        "engine_running": True,
         "engine_state": "running",
         "api_alive": True,
     }
@@ -255,6 +347,7 @@ def test_engine_control_and_status_contract(tmp_path):
         "ok": True,
         "stopped": True,
         "stopping": False,
+        "engine_running": False,
         "engine_state": "stopped",
         "api_alive": True,
     }

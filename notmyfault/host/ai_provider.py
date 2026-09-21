@@ -7,6 +7,7 @@ import codecs
 import json
 import socket
 import ssl
+import threading
 from http.client import HTTPException, HTTPSConnection
 from typing import Any, Callable, Dict, Iterator
 from urllib import parse, request
@@ -140,7 +141,6 @@ def _catalog_prompt(schema: Dict[str, Any]) -> str:
         "目录里已有能满足需求的触发器和动作时调 propose_rule_draft。",
         "目录缺少能力时直接说明缺少的触发器或动作，并提示用户检查第三方插件。",
         "不要给出未经验证的插件名称、插件源码或安装操作。",
-        "用户明确提出执行前条件时，把条件动作填进 preconditions。",
         "需要澄清、解释或追问时直接用普通文字回复，不要调工具，让用户看到流式输出。",
         "一次只调一个工具。触发器 id、动作 id 和参数名只能用目录里的。",
         "用户没给的值不要编；有 default 的参数可以用 default，否则省略。",
@@ -429,6 +429,24 @@ class OpenAICompatibleDraftProvider:
         self._api_key = api_key
         self._request_host = parsed.hostname or ""
         self._opener = _build_request_opener(addresses)
+        self._response_lock = threading.Lock()
+        self._stream_response = None
+        self._cancelled = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+        with self._response_lock:
+            response = self._stream_response
+        if response is None:
+            return
+        raw = getattr(getattr(response, "fp", None), "raw", None)
+        connection = getattr(raw, "_sock", None)
+        if connection is not None:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        response.close()
 
     def __call__(
         self,
@@ -482,7 +500,7 @@ class OpenAICompatibleDraftProvider:
         try:
             # HTTPError、socket、SSL 报错都在 OSError 下；HTTPException 是读响应中途断线的报错。
             with self._opener.open(req, timeout=_REQUEST_TIMEOUT_SECONDS) as response:
-                raw = response.read()
+                raw = response.read(_MAX_RESPONSE_BYTES + 1)
         except (OSError, HTTPException) as error:
             raise AIProviderRequestError(_request_failure_message(error)) from error
         if len(raw) > _MAX_RESPONSE_BYTES:
@@ -524,10 +542,14 @@ class OpenAICompatibleDraftProvider:
         decoder = _SSEDecoder()
         total_bytes = 0
         finished = False
+        if self._cancelled.is_set() or (should_stop is not None and should_stop()):
+            return
         try:
             with self._opener.open(req, timeout=idle_timeout) as response:
+                with self._response_lock:
+                    self._stream_response = response
                 while True:
-                    if should_stop is not None and should_stop():
+                    if self._cancelled.is_set() or (should_stop is not None and should_stop()):
                         return
                     chunk = response.read(_STREAM_CHUNK_BYTES)
                     if not chunk:
@@ -553,6 +575,9 @@ class OpenAICompatibleDraftProvider:
             raise AIProviderIdleTimeoutError("AI 草稿请求超时") from error
         except (OSError, HTTPException) as error:
             raise AIProviderRequestError(_request_failure_message(error)) from error
+        finally:
+            with self._response_lock:
+                self._stream_response = None
 
         body = accumulator.body()
         if self._api_format == "responses":

@@ -8,6 +8,7 @@ from notmyfault.tests.api_support import create_test_engine
 from notmyfault.core.rules import (
     ConditionRuntime,
     get_rule_events,
+    normalize_rule_input,
     validate_rule_binding_ids,
     validate_rule_structure,
     validate_rules,
@@ -57,24 +58,80 @@ class TestCallNotmyfault:
         )
         register_action(engine, "noop", lambda meta, params: ran.append(1))
         engine.call_notmyfault({"trigger_id": "hotkey", "triggered_params": {}})
+        assert engine._rule_scheduler.wait_for_idle(timeout=5)
         assert ran == [1]
 
 
 class TestConditionRuntime:
-    def test_all_condition_respects_time_window(self):
+    @pytest.mark.parametrize("combined", [False, True])
+    def test_not_waits_for_absence_and_rearms_only_after_matching_event(self, combined):
+        runtime = ConditionRuntime()
+        absence = {"op": "not", "within_seconds": 10, "children": [{
+            "type": "signal", "binding_id": "t_signal01", "params": {"channel": "a"},
+        }]}
+        rule = {"condition": {"op": "all", "children": [
+            {"type": "start", "binding_id": "t_start01", "params": {}}, absence,
+        ]} if combined else absence}
+        assert runtime.poll_absences("r", rule, now=0) is None
+        if combined:
+            assert runtime.match_and_take("r", rule, "start", {}, now=1) is None
+        assert runtime.match_and_take("r", rule, "signal", {"channel": "a"}, now=9) is None
+        assert runtime.poll_absences("r", rule, now=10) is None
+        assert runtime.match_and_take("r", rule, "signal", {"channel": "b"}, now=18) is None
+        assert runtime.poll_absences("r", rule, now=19) is not None
+        assert runtime.poll_absences("r", rule, now=100) is None
+        assert runtime.match_and_take("r", rule, "signal", {}, now=101, instance={"config": {"channel": "a"}}) is None
+        if combined:
+            assert runtime.match_and_take("r", rule, "start", {}, now=102) is None
+        assert runtime.poll_absences("r", rule, now=111) is not None
+        runtime.reset()
+        assert runtime.poll_absences("r", rule, now=200) is None
+
+    def test_absence_event_is_dispatched_through_rule_scheduler(self, monkeypatch):
+        rule = {"name": "无事件", "condition": {"op": "not", "within_seconds": 10, "children": [
+            {"type": "signal", "params": {"channel": {"$ref": {"scope": "constant", "node": "c_channel01", "path": []}}}},
+        ]}, "actions": [], "constants": [{
+            "id": "c_channel01", "name": "通道", "value_type": "text", "value": "a",
+        }], "variables": [{
+            "id": "v_values01", "name": "值", "value_type": {"type": "array", "items": "int"}, "initial": [1],
+        }]}
+        engine = make_engine([rule])
+        engine.triggers_meta["signal"] = {"params": [{"name": "channel", "value_type": "text"}]}
+        dispatched = []
+        engine._event_bus._scheduler_submit_fn = lambda *args: dispatched.append(args)
+        engine._event_bus.poll_absences(now=0)
+        from notmyfault.core.type_registry import TypeRegistry
+        monkeypatch.setattr(TypeRegistry, "from_plugins", lambda *args, **kwargs: pytest.fail("运行中重新构建类型表"))
+        monkeypatch.setattr("notmyfault.core.condition_runtime.time.monotonic", lambda: 9)
+        engine.emit_event("signal", {"channel": "a"})
+        engine._event_bus.poll_absences(now=10)
+        assert dispatched == []
+        engine._event_bus.poll_absences(now=19)
+        assert len(dispatched) == 1
+        assert dispatched[0][3]["event"]["type"] == "absence"
+        assert dispatched[0][3]["triggers"] == {}
+        dispatched[0][3]["variables"]["v_values01"].append(2)
+        monkeypatch.setattr("notmyfault.core.condition_runtime.time.monotonic", lambda: 20)
+        engine.emit_event("signal", {"channel": "a"})
+        engine._event_bus.poll_absences(now=30)
+        assert dispatched[1][3]["variables"]["v_values01"] == [1]
+
+    @pytest.mark.parametrize("window", [10, 7200, None])
+    def test_all_condition_respects_time_window(self, window):
         runtime = ConditionRuntime()
         rule = {"condition": {
             "op": "all",
-            "within_seconds": 10,
             "children": [
                 {"type": "evt_a", "params": {}},
                 {"type": "evt_b", "params": {}},
             ],
         }}
+        if window is not None:
+            rule["condition"]["within_seconds"] = window
         assert runtime.match("r", rule, "evt_a", {}, now=0.0) is False
-        # 第二个事件超出时间窗口，组合不能成立
-        assert runtime.match("r", rule, "evt_b", {}, now=50.0) is False
-        assert runtime.match("r", rule, "evt_b", {}, now=5.0) is True
+        if window is not None:
+            assert runtime.match("r", rule, "evt_b", {}, now=window + 1) is False
+        assert runtime.match("r", rule, "evt_b", {}, now=window / 2 if window else 10000) is True
 
     def test_nested_events_are_aggregated(self):
         rule = {"condition": {
@@ -106,7 +163,7 @@ class TestConditionRuntime:
 
     def test_concurrent_match_returns_each_events_payload(self):
         runtime = ConditionRuntime()
-        rule = {"event": {"type": "evt", "params": {}}}
+        rule = {"condition": {"type": "evt", "params": {}}}
         gate = threading.Barrier(3)
         results = {}
 
@@ -270,6 +327,32 @@ class TestValidateAllRules:
             "actions": [{"type": action_type, "params": params or {}}],
         }
 
+    @pytest.mark.parametrize("failure", ["reference", "trigger"])
+    def test_prepared_rules_isolate_errors_with_duplicate_names(self, failure):
+        good = self._rule(params={"mode": "fast"})
+        broken = self._rule(params={"mode": "fast"})
+        if failure == "reference":
+            broken["actions"][0]["params"]["mode"] = {
+                "$ref": {"scope": "step", "node": "a_absent01", "path": ["value"]}
+            }
+        else:
+            broken["event"]["type"] = "unavailable"
+        engine, _ = self._engine_with_meta([broken, good], {"params": [{
+            "name": "mode", "type": "select", "options": ["fast", "slow"],
+        }]})
+        engine.triggers_funcs["hotkey"] = lambda *args: None
+        engine.triggers_meta["unavailable"] = {}
+        try:
+            prepared = engine._prepare_rules(engine.rules)
+            assert prepared.total == 2
+            assert len(prepared) == 1
+            assert prepared.rules[0]["actions"][0]["params"] == {"mode": "fast"}
+            assert set(prepared.trigger_params) == {"hotkey"}
+            assert len(prepared.contexts) == 1
+            assert prepared.issues and all(name == "r" for name, _ in prepared.issues)
+        finally:
+            engine.close()
+
     def test_select_param_invalid_value(self, capsys):
         meta = {"params": [{
             "name": "mode",
@@ -281,7 +364,7 @@ class TestValidateAllRules:
         )
         valid, total = engine._validate_all_rules()
         assert (valid, total) == (0, 1)
-        assert "不在可选项中" in capsys.readouterr().err
+        assert "数据不在允许的枚举值中" in capsys.readouterr().err
 
     def test_timeout_requires_action_cancellation_contract(self):
         rule = self._rule()
@@ -294,7 +377,7 @@ class TestValidateAllRules:
         assert alerts
         assert any(
             "不支持安全取消" in issue[1]
-            for issue in engine._diag_obj.data["rule_issues"]
+            for issue in engine._diag_obj.snapshot()["rule_issues"]
         )
 
     def test_timeout_accepts_action_cancellation_contract(self):
@@ -311,27 +394,10 @@ class TestValidateAllRules:
         assert engine._validate_all_rules() == (1, 1)
         assert alerts == []
 
-    def test_uia_selector_must_contain_window_and_target_identity(self):
-        meta = {"params": [{
-            "name": "target",
-            "type": "uia_selector",
-            "label": "屏幕控件",
-        }]}
-        engine, alerts = self._engine_with_meta(
-            [self._rule(params={"target": {}})], meta
-        )
-
-        assert engine._validate_all_rules() == (0, 1)
-        assert alerts
-        assert any(
-            "没有有效的屏幕控件" in issue[1]
-            for issue in engine._diag_obj.data["rule_issues"]
-        )
-
     def test_required_action_param_must_be_present(self):
         meta = {"params": [{
             "name": "target",
-            "type": "uia_selector",
+            "type": "string",
             "label": "屏幕控件",
             "required": True,
         }]}
@@ -341,29 +407,8 @@ class TestValidateAllRules:
         assert alerts
         assert any(
             "缺少必填参数: target" in issue[1]
-            for issue in engine._diag_obj.data["rule_issues"]
+            for issue in engine._diag_obj.snapshot()["rule_issues"]
         )
-
-    def test_uia_selector_accepts_recorded_identity(self):
-        meta = {"params": [{
-            "name": "target",
-            "type": "uia_selector",
-            "label": "屏幕控件",
-        }]}
-        selector = {
-            "version": 1,
-            "window": {"process": "notepad.exe"},
-            "target": {
-                "automation_id": "FileSave",
-                "control_type": 50000,
-            },
-        }
-        engine, alerts = self._engine_with_meta(
-            [self._rule(params={"target": selector})], meta
-        )
-
-        assert engine._validate_all_rules() == (1, 1)
-        assert alerts == []
 
     def test_plugin_data_requires_declared_owner_and_version(self):
         meta = {
@@ -510,6 +555,24 @@ def test_validate_rules_rejects_duplicate_or_invalid_step_ids():
     assert any("binding_id 无效" in error for error in errors)
     assert validate_rules_structure([invalid])
 
+    nested = {
+        "name": "分支",
+        "event": {"type": "hotkey", "params": {}},
+        "actions": [{
+            "type": "if",
+            "condition": {"op": "is_true", "left": True},
+            "then": [{"type": "noop", "binding_id": "a_existing01", "params": {}}],
+            "else": [],
+        }],
+    }
+    normalized = normalize_rule_input([nested])[0]
+    assert normalized["actions"][0]["then"][0]["binding_id"] == "a_existing01"
+    assert validate_rule_binding_ids(normalized) == []
+    for invalid_id in ("BAD ID", None):
+        nested["actions"][0]["then"][0]["binding_id"] = invalid_id
+        with pytest.raises(ValueError, match="binding_id 无效"):
+            normalize_rule_input([nested])
+
 
 def test_validate_rules_rejects_failure_action_id_reused_by_main_flow():
     rule = {
@@ -547,3 +610,28 @@ def test_validate_rules_rejects_invalid_or_duplicate_rule_ids():
     assert any("rule_id 无效" in error for error in validate_rules_structure([invalid]))
     errors = validate_rules_structure([duplicate, dict(duplicate)])
     assert any("rule_id 与其他规则重复" in error for error in errors)
+
+
+def test_control_flow_structure_and_normalization():
+    from notmyfault.config import normalize_rules
+    from notmyfault.core.rules import get_rule_admin_plugins
+    rule = {"name": "分支", "condition": {"op": "not", "within_seconds": 10, "children": [{"type": "signal", "params": {}}]}, "actions": [
+        {"type": "if", "condition": {"op": "eq", "left": 1, "right": 1}, "then": [{"type": "admin_action", "params": {}}], "else": []},
+    ]}
+    normalized = normalize_rules([rule])[0]
+    assert normalized["condition"]["op"] == "not"
+    assert validate_rule_structure(normalized) == []
+    assert validate_rule_binding_ids(normalized) == []
+    assert get_rule_admin_plugins(normalized, {"signal": {}}, {"admin_action": {"permissions": ["admin"]}}) == ["admin_action"]
+    normalized["preconditions"] = [{"type": "check"}]
+    assert any("运行前检查已移除" in error for error in validate_rule_structure(normalized))
+    del normalized["preconditions"]
+    normalized["condition"]["within_seconds"] = 0
+    assert validate_rule_structure(normalized)
+    for changes in (
+        {"name": 42},
+        {"condition": {"op": "all", "children": [{"type": "signal"}, 42]}},
+        {"condition": {"op": "invalid", "children": [{"type": "signal"}]}},
+        {"condition": {"op": "all", "within_seconds": float("nan"), "children": [{"type": "signal"}]}},
+    ):
+        assert validate_rule_structure(normalize_rules([{**rule, **changes}])[0])

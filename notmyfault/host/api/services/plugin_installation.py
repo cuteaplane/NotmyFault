@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
+import shlex
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict
@@ -25,19 +28,20 @@ from notmyfault.host.plugin_registry import (
 from notmyfault.host.api.ports import PluginRegistryPort
 from notmyfault.security.plugin_schema import (
     check_permissions_conform,
-    current_platform_name,
     get_permission_info,
     is_valid_plugin_id,
-    is_known_permission,
-    scan_plugin_security,
     validate_plugin_meta,
 )
 from notmyfault.security.plugin_package import PluginPackageLimits, extract_nmfp
-from notmyfault.security.plugins import plugin_signature_kind, scan_borrowed_privilege
-from notmyfault.security.security import SecurityMode, detect_security_mode
+from notmyfault.security.plugins import plugin_signature_kind
+from notmyfault.security.plugin_checks import (
+    inspect_plugin, inspection_report, is_plugin_platform_compatible,
+    validate_plugin_signature,
+)
+from notmyfault.security.security import detect_security_mode
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class PluginInstallationError(Exception):
     status_code: int
     body: Dict[str, Any]
@@ -48,6 +52,9 @@ class PluginDownload:
     content: bytes
     filename: str
     sha256: str
+
+
+_MANIFEST_LOCK = threading.RLock()
 
 
 class PluginInstallationService:
@@ -122,7 +129,7 @@ class PluginInstallationService:
         if plugin_kind not in ("triggers", "actions") or not plugin_id:
             self._fail(400, "需要 type (triggers/actions) 和 id")
         if not self._safe_plugin_id(plugin_id):
-            return {"ok": False, "error": "插件 id 含非法字符（禁止路径分隔符）"}
+            self._fail(400, "插件 id 含非法字符（禁止路径分隔符）")
         json_name = (
             "trigger.json" if plugin_kind == "triggers" else "action.json"
         )
@@ -137,7 +144,7 @@ class PluginInstallationService:
         elif builtin_json.exists():
             origin = "builtin"
         else:
-            return {"ok": False, "error": "插件不存在"}
+            self._fail(404, "插件不存在")
         try:
             config = self._load_config_for_update()
             disabled = config.get("disabled_plugins", {})
@@ -155,7 +162,7 @@ class PluginInstallationService:
             disabled[plugin_kind] = disabled_list
             config["disabled_plugins"] = disabled
             if not self._store.save_config(config):
-                return {"ok": False, "error": "无法保存配置"}
+                self._fail(500, "无法保存配置")
             return {
                 "ok": True,
                 "enabled": enabled,
@@ -163,35 +170,44 @@ class PluginInstallationService:
                 "restart_required": True,
             }
         except ConfigValidationError:
-            return {"ok": False, "error": "配置未通过完整性校验"}
+            self._fail(409, "配置未通过完整性校验")
+        except PluginInstallationError:
+            raise
         except Exception:
-            return {"ok": False, "error": "切换插件状态失败"}
+            self._fail(500, "切换插件状态失败")
 
     def uninstall(self, plugin_kind: str, plugin_id: str) -> Dict[str, Any]:
         if plugin_kind not in ("triggers", "actions"):
             self._fail(400, "type 必须为 triggers 或 actions")
         if not self._safe_plugin_id(plugin_id):
-            return {"ok": False, "error": "插件 id 含非法字符（禁止路径分隔符）"}
+            self._fail(400, "插件 id 含非法字符（禁止路径分隔符）")
         json_name = (
             "trigger.json" if plugin_kind == "triggers" else "action.json"
         )
         plugin_dir = self._paths.user_plugins_dir / plugin_kind / plugin_id
         if not (plugin_dir / json_name).exists():
-            return {"ok": False, "error": "只能卸载用户插件，或插件不存在"}
-        try:
-            meta = json.loads((plugin_dir / json_name).read_text(encoding="utf-8"))
-            package_name = meta.get("package_name") if isinstance(meta, dict) else None
-        except (OSError, ValueError):
-            package_name = None
+            self._fail(404, "只能卸载用户插件，或插件不存在")
         backups = {plugin_dir.with_name(plugin_dir.name + ".nmf-backup")}
-        if isinstance(package_name, str) and package_name:
-            backups.update(self._backups_for_package(package_name))
+        from notmyfault.security.plugins import load_plugin_manifest
+
+        try:
+            metadata = (plugin_dir / json_name).read_bytes()
+            installed = load_plugin_manifest(self._paths.plugin_manifest_file)
+            recorded = installed.get(plugin_id, {}) if isinstance(installed, dict) else {}
+            if isinstance(recorded, dict) and recorded.get(json_name) == hashlib.sha256(metadata).hexdigest():
+                meta = json.loads(metadata)
+                package_name = meta.get("package_name")
+                if isinstance(package_name, str) and package_name:
+                    backups.update(self._backups_for_package(package_name))
+        except (OSError, ValueError):
+            pass
         try:
             self._file_system.remove_tree(plugin_dir)
             for backup in backups:
                 self._file_system.remove_tree(backup)
         except OSError:
-            return {"ok": False, "error": "删除插件文件失败"}
+            self._fail(500, "删除插件文件失败")
+        self._forget_installed_hashes(plugin_id)
         return {"ok": True, "restart_required": True}
 
     def key_status(self) -> Dict[str, Any]:
@@ -210,8 +226,11 @@ class PluginInstallationService:
         root_path: str,
         json_name: str,
         meta: Dict[str, Any],
+        inspection=None,
     ) -> list[Dict[str, Any]]:
-        risks = scan_plugin_security(root_path)
+        kind = "trigger" if json_name == "trigger.json" else "action"
+        inspection = inspection or inspect_plugin(root_path, kind)
+        risks = list(inspection.risks)
         build = meta.get("build")
         if isinstance(build, dict) and (
             build.get("command") or build.get("outputs")
@@ -225,10 +244,7 @@ class PluginInstallationService:
                     "file": json_name,
                 }
             )
-        borrowed_findings = []
-        for py_file in sorted(Path(root_path).rglob("*.py")):
-            if py_file.is_file():
-                borrowed_findings.extend(scan_borrowed_privilege(str(py_file)))
+        borrowed_findings = inspection.borrowed
         if borrowed_findings:
             risks.append(
                 {
@@ -277,15 +293,12 @@ class PluginInstallationService:
             )
             root_path = self._plugin_root(extract_dir)
             plugin_kind, json_name = self._plugin_kind(root_path)
-            try:
-                meta = json.loads(
-                    (root_path / json_name).read_text(encoding="utf-8")
-                )
-            except (json.JSONDecodeError, OSError):
-                self._fail(400, "插件元数据 JSON 损坏或缺失")
+            meta = self._read_manifest(root_path / json_name)
             plugin_type = "trigger" if plugin_kind == "triggers" else "action"
-            schema_valid, schema_errors = validate_plugin_meta(meta, plugin_type)
-            risks = self.scan_install_risks(str(root_path), json_name, meta)
+            inspection = inspect_plugin(root_path, plugin_type)
+            schema_errors = inspection.errors + inspection.schema_errors
+            schema_valid = not schema_errors
+            risks = self.scan_install_risks(str(root_path), json_name, meta, inspection)
             permissions = []
             for permission in meta.get("permissions", []):
                 info = get_permission_info(permission)
@@ -351,6 +364,11 @@ class PluginInstallationService:
                 "risks": risks,
                 "schema_valid": schema_valid,
                 "schema_errors": schema_errors[:5] if schema_errors else [],
+                "checks": inspection_report(inspection, detect_security_mode()),
+                "installation": {
+                    "requires_confirmation": bool(risks),
+                    "required_risk_ids": [risk["id"] for risk in risks],
+                },
                 "update_diff": update_diff,
             }
         except PluginInstallationError:
@@ -432,6 +450,12 @@ class PluginInstallationService:
                             "required_risk_ids": ["build_hook"],
                         },
                     )
+                missing = current_risk_ids - confirmed
+                if missing:
+                    raise PluginInstallationError(400, {
+                        "ok": False, "code": "risk_confirmation_required",
+                        "error": "安装插件前需要确认列出的风险", "required_risk_ids": sorted(missing),
+                    })
                 self._previews.pop(preview_token)
                 preview_owned = True
             else:
@@ -487,18 +511,6 @@ class PluginInstallationService:
             if destination.parent != expected_parent:
                 self._fail(400, "插件路径越界")
 
-            permissions = meta.get("permissions", [])
-            permission_conform, _ = check_permissions_conform(permissions)
-            if detect_security_mode() == SecurityMode.STRICT and not permission_conform:
-                unknown = [
-                    item for item in permissions if not is_known_permission(item)
-                ]
-                self._fail(
-                    400,
-                    "严格模式下拒绝安装：插件请求了未知权限: "
-                    + ", ".join(unknown),
-                )
-
             collision = self._catalog.plugin_id_collision(plugin_kind, meta)
             if collision is not None:
                 self._fail(409, "插件 id 已被其他包使用")
@@ -548,13 +560,13 @@ class PluginInstallationService:
 
             def validate_staging(staging: Path) -> None:
                 written_meta = self._read_manifest(staging / json_name)
-                written_ok, written_errors = validate_plugin_meta(
-                    written_meta, plugin_type
-                )
+                inspection = inspect_plugin(staging, plugin_type)
+                written_errors = inspection.errors + inspection.schema_errors
+                written_ok = not written_errors
                 new_risks = [
                     risk
                     for risk in self.scan_install_risks(
-                        str(staging), json_name, written_meta
+                        str(staging), json_name, written_meta, inspection
                     )
                     if risk.get("id") not in accepted_risk_ids
                 ]
@@ -569,6 +581,9 @@ class PluginInstallationService:
                     )
                     error.risks = new_risks
                     raise error
+                validate_plugin_signature(
+                    staging, written_meta, "user", detect_security_mode(), inspection.signature.kind
+                )
 
             try:
                 backups = self._transaction.install_tree(
@@ -593,6 +608,10 @@ class PluginInstallationService:
                     500,
                     {"ok": False, "error": "安装失败，已恢复旧版本"},
                 ) from error
+            self._record_installed_hashes(destination, plugin_id)
+            if obsolete:
+                for old_destination in obsolete:
+                    self._forget_installed_hashes(old_destination.name)
             return {
                 "ok": True,
                 "id": plugin_id,
@@ -679,6 +698,37 @@ class PluginInstallationService:
             return "签名私钥密码错误或副签失败"
         return None
 
+    def _record_installed_hashes(self, plugin_dir: Path, plugin_id: str) -> None:
+        from notmyfault.security.plugin_checks import inspect_plugin_tree
+        from notmyfault.security.plugins import load_plugin_manifest, save_plugin_manifest
+
+        tree = inspect_plugin_tree(str(plugin_dir))
+        if tree is None:
+            return
+        with _MANIFEST_LOCK:
+            path = self._paths.plugin_manifest_file
+            manifest = load_plugin_manifest(path)
+            manifest[plugin_id] = tree.file_snapshot
+            save_plugin_manifest(manifest, path)
+
+    def _forget_installed_hashes(self, plugin_id: str) -> None:
+        from notmyfault.security.plugins import load_plugin_manifest, save_plugin_manifest
+
+        with _MANIFEST_LOCK:
+            path = self._paths.plugin_manifest_file
+            manifest = load_plugin_manifest(path)
+            if plugin_id not in manifest:
+                return
+            del manifest[plugin_id]
+            save_plugin_manifest(manifest, path)
+
+    @staticmethod
+    def _build_command_argv(command: str) -> list[str]:
+        argv = shlex.split(command, posix=(os.name != "nt"))
+        if not argv:
+            raise ValueError("插件构建命令为空")
+        return argv
+
     @staticmethod
     def _run_build_hook(root_path: Path, meta: Dict[str, Any]) -> None:
         build = meta.get("build")
@@ -688,11 +738,14 @@ class PluginInstallationService:
         outputs = build.get("outputs") or []
         if not commands and not outputs:
             return
+        if commands and plugin_signature_kind(str(root_path), "user") == "none":
+            raise ValueError("插件签名无效，拒绝执行构建命令")
         for command in commands:
+            argv = PluginInstallationService._build_command_argv(command)
             try:
                 result = subprocess.run(
-                    command,
-                    shell=True,
+                    argv,
+                    shell=False,
                     cwd=root_path,
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
@@ -712,11 +765,6 @@ class PluginInstallationService:
         for relative_output in outputs:
             if not (root_path / relative_output).exists():
                 raise ValueError("插件构建没有生成声明的产物")
-        for signature_name in ("signature.sig", "public_key.pem"):
-            try:
-                (root_path / signature_name).unlink()
-            except FileNotFoundError:
-                pass
 
     @staticmethod
     def _validate_generated_plugin(staging: Path, json_name: str) -> None:
@@ -812,11 +860,7 @@ class PluginInstallationService:
 
     @staticmethod
     def _platform_compatible(meta: Dict[str, Any]) -> bool:
-        entrypoints = meta.get("entrypoints", {})
-        if entrypoints:
-            return current_platform_name() in entrypoints
-        platforms = meta.get("platforms", [])
-        return not platforms or current_platform_name() in platforms
+        return is_plugin_platform_compatible(meta)
 
     @staticmethod
     def _list_diff(old_items: Any, new_items: Any) -> Dict[str, list[str]]:

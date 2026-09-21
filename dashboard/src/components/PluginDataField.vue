@@ -1,7 +1,6 @@
 <script setup>
-import { computed, nextTick, ref } from 'vue'
-import { invokeExtensionCommand } from '../lib/api'
-import { store } from '../lib/store'
+import { computed } from 'vue'
+import { useParameterEditor } from '../composables/useParameterEditor'
 import ExtensionViewPage from './ExtensionViewPage.vue'
 
 const props = defineProps({
@@ -10,68 +9,17 @@ const props = defineProps({
   sensitive: { type: Boolean, default: false },
 })
 const emit = defineEmits(['update:modelValue'])
-const opening = ref(false)
-const error = ref('')
-const viewOpen = ref(false)
-const sessionId = ref('')
-const viewId = ref('')
-const viewState = ref(null)
-const launcherRef = ref(null)
+const { busy: opening, error, viewOpen, sessionId, viewId, viewState, launcherRef, view, invokeEditor: openEditor, commit, closeView } = useParameterEditor(props, emit)
 
 const summary = computed(() => {
   if (!props.modelValue || typeof props.modelValue !== 'object') return ''
   return typeof props.modelValue.summary === 'string' ? props.modelValue.summary : ''
 })
-const view = computed(() => store.extensions.views.find(item => (
-  item.plugin_id === props.editor.plugin_id && item.id === viewId.value
-)) || null)
 const buttonText = computed(() => (
   (props.sensitive && summary.value ? '敏感数据已保存' : summary.value)
   || props.editor.ui?.empty_label || props.editor.title || '编辑'
 ))
 
-async function openEditor() {
-  if (opening.value) return
-  opening.value = true
-  error.value = ''
-  try {
-    const response = await invokeExtensionCommand(
-      props.editor.plugin_id,
-      props.editor.command,
-      {
-        sourceKind: 'parameter_editors',
-        sourceId: props.editor.id,
-        currentValue: props.modelValue,
-      },
-    )
-    if (!response?.ok) {
-      error.value = response?.error || '插件编辑器没有成功打开。'
-      return
-    }
-    if (response.value !== undefined) emit('update:modelValue', response.value)
-    if (response.view) {
-      sessionId.value = response.session_id || ''
-      viewId.value = response.view
-      viewState.value = response.state ?? null
-      viewOpen.value = true
-    }
-  } catch (reason) {
-    error.value = reason.message || '插件编辑器没有成功打开。'
-  } finally {
-    opening.value = false
-  }
-}
-
-function commit(value) {
-  emit('update:modelValue', value)
-  error.value = ''
-}
-
-async function closeView() {
-  viewOpen.value = false
-  await nextTick()
-  launcherRef.value?.focus()
-}
 </script>
 
 <template>

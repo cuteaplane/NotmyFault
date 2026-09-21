@@ -1,5 +1,5 @@
 """锁屏状态触发器：检测 Windows 锁屏和解锁
-Windows 用 PowerShell 读 LockApp/logonui 进程；Linux 用 loginctl 查 LockedHint
+Windows 用 psutil 读 LockApp/logonui 进程；Linux 用 loginctl 查 LockedHint
 """
 
 import os
@@ -7,10 +7,6 @@ import subprocess
 
 from notmyfault.triggers.base import PollingTrigger
 
-_POWERSHELL_QUERY = (
-    "$p = Get-Process -Name logonui, LockApp -ErrorAction SilentlyContinue; "
-    "if ($p) { Write-Output 'locked=True' } else { Write-Output 'locked=False' }"
-)
 
 
 def _is_locked() -> bool | None:
@@ -21,35 +17,14 @@ def _is_locked() -> bool | None:
 
 
 def _is_locked_windows() -> bool | None:
-    try:
-        result = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                _POWERSHELL_QUERY,
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=10,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("locked="):
-            value = line[len("locked="):].strip()
-            if value == "True":
+    import psutil
+    for process in psutil.process_iter(["name"]):
+        try:
+            if (process.info["name"] or "").casefold() in {"logonui.exe", "lockapp.exe"}:
                 return True
-            if value == "False":
-                return False
-    return None
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return False
 
 
 def _is_locked_linux() -> bool | None:
@@ -83,7 +58,7 @@ class SessionLockTrigger(PollingTrigger):
     """锁屏状态触发器，使用 event-v2 轮询"""
 
     interval: float = 5.0
-    native: bool = False  # 探测由 powershell 子进程执行
+    native: bool = False
 
     def validate(self) -> None:
         state = self.config.get("state", "locked")
@@ -98,8 +73,7 @@ class SessionLockTrigger(PollingTrigger):
     def poll(self) -> None:
         locked = _is_locked()
         if locked is None:
-            # 子进程查询失败：保持现状，下次再试
-            return
+            raise RuntimeError("无法查询会话锁屏状态，请检查登录会话和 loginctl")
         state = "locked" if locked else "unlocked"
         if self._last_state is None:
             # 第一轮只记录当前状态，不触发
@@ -112,11 +86,11 @@ class SessionLockTrigger(PollingTrigger):
         if self._pending == state:
             # 连续第二次采样仍为新状态：确认变化并上报
             previous = self._last_state
-            self._last_state = state
-            self._pending = None
             if self.target_state in ("any", state):
                 self.log(f"锁屏状态变化: {previous} -> {state}")
                 self.emit({"state": state, "previous_state": previous})
+            self._last_state = state
+            self._pending = None
         else:
             # 首次采到新状态时记录到 _pending，下一轮再次确认
             self._pending = state

@@ -23,7 +23,7 @@ def tool_schema(catalog):
 
 def test_rule_schema_tracks_catalog():
     schema = tool_schema(make_catalog())
-    assert schema["properties"]["event"]["properties"]["type"]["enum"] == [
+    assert schema["properties"]["condition"]["properties"]["type"]["enum"] == [
         "time_schedule",
         "usb_insert",
     ]
@@ -36,5 +36,5 @@ def test_rule_schema_tracks_catalog():
 def test_rule_schema_rejects_extra_fields():
     schema = tool_schema(make_catalog())
     assert schema["additionalProperties"] is False
-    assert schema["properties"]["event"]["additionalProperties"] is False
+    assert schema["properties"]["condition"]["additionalProperties"] is False
     assert schema["properties"]["actions"]["items"]["additionalProperties"] is False

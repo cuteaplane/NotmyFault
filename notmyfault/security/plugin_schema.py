@@ -1,4 +1,3 @@
-import ast
 import json
 import os
 import re
@@ -6,17 +5,22 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from notmyfault.core.data_types import (
+    BUILTIN_TYPES, TYPE_ALIASES, DataTypeError, field_type, normalize_type,
+    normalize_value,
+)
+
 _REQUIRED_META_FIELDS = {"id", "name", "description", "enabled", "version_code", "version", "package_name"}
 _TRIGGER_OPTIONAL_FIELDS = {
     "semantic", "params", "permissions", "origin", "trigger_api", "platforms",
     "entrypoints", "outputs", "build", "contributes",
-    "requires_capabilities", "engines", "security",
+    "requires_capabilities", "engines", "security", "author",
 }
 _ACTION_OPTIONAL_FIELDS = {
     "params", "permissions", "origin", "execution_api", "precondition_api",
     "outputs", "platforms", "entrypoints", "build", "idempotent",
     "cancellation_api", "contributes", "requires_capabilities",
-    "execution_mode", "engines", "security",
+    "execution_mode", "engines", "security", "author",
 }
 _ALLOWED_EXECUTION_MODES = {"in-process", "isolated"}
 _ACTION_SECURITY_FIELDS = {
@@ -26,9 +30,8 @@ _RULE_APPROVAL_MODES = {"admin_key"}
 _ALLOWED_SEMANTICS = {"state", "oneshot"}
 _ALLOWED_PARAM_TYPES = {
     "string", "number", "select", "bool", "time", "hotkey", "path",
-    "textarea", "uia_selector", "macro", "plugin_data",
+    "textarea", "macro", "plugin_data",
 }
-_ALLOWED_OUTPUT_TYPES = {"string", "number", "bool", "array", "object", "any"}
 _ALLOWED_SUMMARY_POLICIES = {"shape", "value", "hidden"}
 _REQUIRED_PARAM_FIELDS = {"name", "type", "label"}
 _REQUIRED_OUTPUT_FIELDS = {"name", "type", "label"}
@@ -40,7 +43,7 @@ _COMMAND_FIELDS = {"id", "title", "description", "handler"}
 _VIEW_FIELDS = {
     "id", "title", "description", "page", "commands", "window_controls",
 }
-_DATA_TYPE_FIELDS = {"id", "version", "binding"}
+_DATA_TYPE_FIELDS = {"id", "version", "binding", "schema", "label"}
 _PARAMETER_EDITOR_FIELDS = {
     "id", "parameter", "data_type", "value_type", "command", "view", "ui",
     "accepts_legacy",
@@ -48,13 +51,22 @@ _PARAMETER_EDITOR_FIELDS = {
 _PARAMETER_EDITOR_UI_FIELDS = {
     "control", "icon", "label", "busy_label", "empty_label", "description",
 }
-_DATA_BINDING_POLICIES = {"private"}
+_DATA_BINDING_POLICIES = {"private", "shared"}
 _EDITOR_CONTROLS = {"button"}
 # plugin id 只允许字母、数字、下划线和连字符，路径分隔符会把 id 变成路径。
 _PLUGIN_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 _COMPONENT_ID_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]*$")
 _PARAM_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]*$")
 _UNSAFE_PARAM_NAMES = {"__proto__", "constructor", "prototype"}
+
+
+def _validate_value_type(declaration, path, errors):
+    try:
+        normalize_type(declaration, location=path)
+        return True
+    except DataTypeError as error:
+        errors.append(f"{path} 无效: {error}")
+        return False
 
 
 def is_valid_plugin_id(plugin_id: str) -> bool:
@@ -185,135 +197,6 @@ def get_permission_info(perm: str) -> PermissionInfo | None:
 
 def is_known_permission(perm: str) -> bool:
     return perm in PERMISSION_REGISTRY
-
-
-_RISK_INFO = {
-    "code_injection": ("代码注入", PERM_RISK_HIGH),
-    "subprocess": ("子进程", PERM_RISK_HIGH),
-    "dynamic_import": ("动态导入", PERM_RISK_MEDIUM),
-    "file_write": ("文件写入", PERM_RISK_MEDIUM),
-    "network_request": ("网络请求", PERM_RISK_MEDIUM),
-    "registry_access": ("注册表访问", PERM_RISK_HIGH),
-    "native_call": ("原生调用", PERM_RISK_MEDIUM),
-}
-
-
-def _resolved_name(
-    node: ast.AST,
-    module_aliases: Dict[str, str],
-    imported_symbols: Dict[str, str],
-) -> str | None:
-    if isinstance(node, ast.Name):
-        return imported_symbols.get(node.id, module_aliases.get(node.id, node.id))
-    if isinstance(node, ast.Attribute):
-        owner = _resolved_name(node.value, module_aliases, imported_symbols)
-        if owner:
-            return owner + "." + node.attr
-    return None
-
-
-def _risk_ids_for_name(name: str, is_call: bool) -> List[str]:
-    risk_ids: List[str] = []
-    if is_call and name in {
-        "eval", "exec", "compile", "__import__",
-        "builtins.eval", "builtins.exec", "builtins.compile", "builtins.__import__",
-    }:
-        risk_ids.append("code_injection")
-    if name in {"__import__", "builtins.__import__"}:
-        if "code_injection" not in risk_ids:
-            risk_ids.append("code_injection")
-        risk_ids.append("dynamic_import")
-    if name.startswith("subprocess.") or name in {"os.system", "os.popen"}:
-        risk_ids.append("subprocess")
-    if name.startswith("importlib."):
-        risk_ids.append("dynamic_import")
-    if is_call and (
-        name in {"open", "builtins.open"}
-        or name.startswith("shutil.copy")
-        or name == "shutil.move"
-    ):
-        risk_ids.append("file_write")
-    if name.startswith(("requests.", "urllib.", "socket.")):
-        risk_ids.append("network_request")
-    if name.startswith(("winreg.", "_winreg.")):
-        risk_ids.append("registry_access")
-    if name.startswith("ctypes."):
-        risk_ids.append("native_call")
-    return risk_ids
-
-
-def scan_plugin_source_security(
-    source: str, filename: str = "plugin.py"
-) -> List[Dict[str, Any]]:
-    risks: List[Dict[str, Any]] = []
-    try:
-        tree = ast.parse(source, filename=filename)
-    except (SyntaxError, ValueError):
-        return risks
-
-    module_aliases: Dict[str, str] = {}
-    imported_symbols: Dict[str, str] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                local_name = alias.asname or alias.name.split(".")[0]
-                module_aliases[local_name] = (
-                    alias.name if alias.asname else alias.name.split(".")[0]
-                )
-        elif isinstance(node, ast.ImportFrom):
-            module_name = node.module or ""
-            for alias in node.names:
-                imported_symbols[alias.asname or alias.name] = (
-                    module_name + "." + alias.name
-                ).strip(".")
-
-    findings: Dict[str, str] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            name = _resolved_name(node.func, module_aliases, imported_symbols)
-            is_call = True
-        elif isinstance(node, ast.Attribute):
-            name = _resolved_name(node, module_aliases, imported_symbols)
-            is_call = False
-        elif isinstance(node, ast.Name) and node.id == "__import__":
-            name = _resolved_name(node, module_aliases, imported_symbols)
-            is_call = False
-        else:
-            continue
-        if not name:
-            continue
-        for risk_id in _risk_ids_for_name(name, is_call):
-            findings.setdefault(risk_id, name)
-
-    for risk_id, (label, level) in _RISK_INFO.items():
-        evidence = findings.get(risk_id)
-        if evidence is None:
-            continue
-        risks.append({
-            "id": risk_id,
-            "label": label,
-            "level": level,
-            "detail": f"文件 \"{filename}\" 中发现 \"{evidence}\"",
-            "file": filename,
-        })
-    return risks
-
-
-def scan_plugin_security(plugin_dir: str) -> List[Dict[str, Any]]:
-    """扫描插件目录下的 .py 文件，返回发现的风险列表"""
-    risks: List[Dict[str, Any]] = []
-    if not os.path.isdir(plugin_dir):
-        return risks
-    for fpath_obj in sorted(Path(plugin_dir).rglob("*.py")):
-        if not fpath_obj.is_file():
-            continue
-        fname = fpath_obj.relative_to(plugin_dir).as_posix()
-        try:
-            source = fpath_obj.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        risks.extend(scan_plugin_source_security(source, fname))
-    return risks
 
 
 def check_permissions_conform(
@@ -526,7 +409,13 @@ def _validate_contributes_field(
             errors.append(f"{prefix}.version 必须是大于 0 的整数")
         binding = data_type.get("binding", "private")
         if binding not in _DATA_BINDING_POLICIES:
-            errors.append(f"{prefix}.binding 目前仅支持 private")
+            errors.append(f"{prefix}.binding 必须为 private 或 shared")
+        if binding == "shared" and "schema" not in data_type:
+            errors.append(f"{prefix}.schema 是共享类型的必填字段")
+        if "schema" in data_type:
+            _validate_value_type(data_type["schema"], f"{prefix}.schema", errors)
+        if "label" in data_type and not isinstance(data_type["label"], str):
+            errors.append(f"{prefix}.label 必须是字符串")
     editor_params: set[str] = set()
     for index, editor in enumerate(editors):
         prefix = f"contributes.parameter_editors[{index}]"
@@ -561,8 +450,8 @@ def _validate_contributes_field(
                 errors.append(f"{prefix}.data_type 只能用于 plugin_data 参数")
             if not has_value_type:
                 errors.append(f"{prefix}.value_type 是普通参数编辑器的必填字段")
-            elif editor.get("value_type") not in _ALLOWED_OUTPUT_TYPES:
-                errors.append(f"{prefix}.value_type 无效: {editor.get('value_type')!r}")
+            elif not _validate_value_type(editor.get("value_type"), f"{prefix}.value_type", errors):
+                pass
             elif editor.get("value_type") != param.get("value_type"):
                 errors.append(
                     f"{prefix}.value_type 必须与参数 {parameter!r} 的 value_type 一致"
@@ -634,6 +523,8 @@ def validate_plugin_meta(
         errors.append(f"字段 'name' 必须是字符串")
     if "description" in meta and not isinstance(meta["description"], str):
         errors.append(f"字段 'description' 必须是字符串")
+    if "author" in meta and not isinstance(meta["author"], str):
+        errors.append("字段 'author' 必须是字符串")
     if "enabled" in meta and not isinstance(meta["enabled"], bool):
         errors.append(f"字段 'enabled' 必须为布尔值 (true/false)，实际: {type(meta['enabled']).__name__}")
     if "version_code" in meta:
@@ -866,11 +757,10 @@ def validate_plugin_meta(
                             errors.append(f"outputs[{i}] 缺少必填字段: {field}")
                     output_name = output.get("name")
                     output_type = output.get("type")
-                    if output_type and output_type not in _ALLOWED_OUTPUT_TYPES:
-                        errors.append(
-                            f"outputs[{i}].type 无效: '{output_type}'"
-                            f"（允许: {', '.join(sorted(_ALLOWED_OUTPUT_TYPES))}）"
-                        )
+                    if "type" in output:
+                        _validate_value_type(output_type, f"outputs[{i}].type", errors)
+                    if "value_type" in output:
+                        _validate_value_type(output["value_type"], f"outputs[{i}].value_type", errors)
                     for flag in ("required", "sensitive"):
                         if flag in output and not isinstance(output[flag], bool):
                             errors.append(f"outputs[{i}].{flag} 必须为布尔值")
@@ -881,12 +771,8 @@ def validate_plugin_meta(
                         errors.append(
                             f"outputs[{i}].summary 无效: {output['summary']!r}"
                         )
-                    if (
-                        output_type == "array"
-                        and "item_type" in output
-                        and output["item_type"] not in _ALLOWED_OUTPUT_TYPES - {"array"}
-                    ):
-                        errors.append(f"outputs[{i}].item_type 无效")
+                    if output_type == "array" and "item_type" in output:
+                        _validate_value_type(output["item_type"], f"outputs[{i}].item_type", errors)
                 else:
                     errors.append(f"outputs[{i}] 必须是字符串或对象")
                     continue
@@ -925,12 +811,8 @@ def validate_plugin_meta(
                         f"params[{i}].type 无效: '{ptype}'"
                         f"（允许: {', '.join(sorted(_ALLOWED_PARAM_TYPES))}）"
                     )
-                value_type = param.get("value_type")
-                if value_type is not None and value_type not in _ALLOWED_OUTPUT_TYPES:
-                    errors.append(
-                        f"params[{i}].value_type 无效: '{value_type}'"
-                        f"（允许: {', '.join(sorted(_ALLOWED_OUTPUT_TYPES))}）"
-                    )
+                if "value_type" in param:
+                    _validate_value_type(param["value_type"], f"params[{i}].value_type", errors)
                 if ptype == "plugin_data":
                     data_type = param.get("data_type")
                     if not isinstance(data_type, str) or not _COMPONENT_ID_RE.match(data_type):
@@ -978,8 +860,9 @@ def validate_plugin_meta(
 def check_payload_contract(
     outputs: Any,
     payload: Dict[str, Any],
+    registry=None,
 ) -> List[str]:
-    """按 outputs 声明检查 event-v2 payload，检查必填字段、未声明字段和 string、number、bool 的类型，旧插件未声明 outputs 时跳过检查。"""
+    """未声明 outputs 的旧插件仍跳过输出检查。"""
     declared: Dict[str, Dict[str, Any]] = {}
     if isinstance(outputs, list):
         for output in outputs:
@@ -997,7 +880,12 @@ def check_payload_contract(
         elif name in payload:
             value = payload[name]
             output_type = spec.get("type", "any")
-            if output_type == "string" and not isinstance(value, str):
+            if "value_type" in spec or output_type not in ("string", "number", "bool", "array", "object", "any"):
+                try:
+                    normalize_value(value, field_type(spec), registry, location=f"outputs.{name}")
+                except DataTypeError as error:
+                    problems.append(str(error))
+            elif output_type == "string" and not isinstance(value, str):
                 problems.append(
                     f"输出字段 {name} 应为 string，实际为 {type(value).__name__}"
                 )
@@ -1023,58 +911,20 @@ def scan_plugins(
     *,
     include_disabled: bool = False,
 ) -> Dict[str, Dict]:
+    from notmyfault.security.plugin_checks import (
+        inspect_plugin_metadata, is_plugin_platform_compatible, plugin_directories,
+    )
+
     result: Dict[str, Dict] = {}
-    root = os.path.join(base_dir, plugins_dir)
-    if not os.path.isdir(root):
-        return result
-
-    for folder_name in sorted(os.listdir(root)):
-        # 与加载器一致，跳过解释器和开发工具生成的目录；.nmf-backup 是更新时留下的旧版本备份
-        if folder_name.startswith(".") or folder_name in (
-            "__pycache__", "__pypackages__", "node_modules",
-        ) or folder_name.endswith(".nmf-backup"):
+    kind = "trigger" if json_filename == "trigger.json" else "action"
+    for folder in plugin_directories(Path(base_dir) / plugins_dir):
+        meta, errors, schema_errors = inspect_plugin_metadata(folder, kind)
+        if errors or schema_errors or (meta.get("enabled") is False and not include_disabled):
             continue
-        folder_path = os.path.join(root, folder_name)
-        if not os.path.isdir(folder_path):
-            continue
-
-        json_file = os.path.join(folder_path, json_filename)
-        if not os.path.exists(json_file):
-            continue
-
-        try:
-            with open(json_file, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-        except Exception:
-            continue
-
-        if not isinstance(meta, dict):
-            continue
-        plugin_id = meta.get("id")
-        if not plugin_id:
-            continue
-
-        if meta.get("enabled") is False and not include_disabled:
-            continue
-
-        plugin_type = "trigger" if json_filename == "trigger.json" else "action"
-        is_valid, _ = validate_plugin_meta(meta, plugin_type)
-        if not is_valid:
-            continue
-
-        current_platform = current_platform_name()
-        entrypoints = meta.get("entrypoints") or {}
-        platforms = meta.get("platforms") or list(entrypoints)
-        compatible = (
-            current_platform in entrypoints
-            if entrypoints
-            else not platforms or current_platform in platforms
-        )
-        result[plugin_id] = {
+        result[meta["id"]] = {
             **meta,
-            "platform_compatible": compatible,
-            "current_platform": current_platform,
-            "selected_entrypoint": entrypoints.get(current_platform),
+            "platform_compatible": is_plugin_platform_compatible(meta),
+            "current_platform": current_platform_name(),
+            "selected_entrypoint": (meta.get("entrypoints") or {}).get(current_platform_name()),
         }
-
     return result

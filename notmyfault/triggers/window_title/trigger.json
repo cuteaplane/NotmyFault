@@ -7,16 +7,35 @@
     "version_code": 2,
     "version": "1.1",
     "package_name": "io.github.notmyfault.window_title",
-    "requires_capabilities": ["window.enumerate"],
-    "platforms": ["windows", "linux"],
+    "requires_capabilities": [
+        "window.enumerate"
+    ],
+    "platforms": [
+        "windows",
+        "linux"
+    ],
     "enabled": true,
     "permissions": [
-        "native_api","external_binary"
+        "native_api",
+        "external_binary",
+        "screen_reader"
     ],
     "outputs": [
-        {"name": "title_pattern", "label": "匹配规则", "type": "string"},
-        {"name": "state", "label": "窗口状态", "type": "string"},
-        {"name": "matched_title", "label": "匹配标题", "type": "string"}
+        {
+            "name": "title_pattern",
+            "label": "匹配规则",
+            "type": "string"
+        },
+        {
+            "name": "state",
+            "label": "窗口状态",
+            "type": "string"
+        },
+        {
+            "name": "matched_title",
+            "label": "匹配标题",
+            "type": "string"
+        }
     ],
     "params": [
         {
@@ -24,7 +43,8 @@
             "label": "标题关键词",
             "type": "string",
             "default": "",
-            "placeholder": "匹配窗口标题包含的关键词"
+            "placeholder": "匹配窗口标题包含的关键词",
+            "required": true
         },
         {
             "name": "state",
@@ -32,8 +52,14 @@
             "type": "select",
             "default": "opened",
             "options": [
-                {"value": "opened", "label": "窗口已打开"},
-                {"value": "closed", "label": "窗口已关闭"}
+                {
+                    "value": "opened",
+                    "label": "窗口已打开"
+                },
+                {
+                    "value": "closed",
+                    "label": "窗口已关闭"
+                }
             ]
         }
     ]

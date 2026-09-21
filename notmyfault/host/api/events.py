@@ -30,7 +30,7 @@ class EventBroker:
             event_type = "message"
         packet = {"type": event_type, "data": data, "ts": time.time()}
         try:
-            self._history.record(packet)
+            self._history.record_async(packet)
         except (OSError, TypeError, ValueError):
             pass
         with self._lock:

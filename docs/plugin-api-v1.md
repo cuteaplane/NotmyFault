@@ -32,14 +32,17 @@ action 专属：
 | 字段 | 说明 |
 | --- | --- |
 | execution_api | 不写走 run()；写 "context-v1" 走 run_with_context() |
-| precondition_api | 写 "context-v1" 后可当开始前确认用 |
+| precondition_api | 旧清单字段，运行前检查已移除，宿主不再调用 check_precondition() |
 | cancellation_api | 写 "runtime-v1" 才允许规则配 timeout_seconds |
-| idempotent | 声明可安全重试 |
+| idempotent | true 表示可安全重试，false 表示重复执行可能产生额外结果 |
 | execution_mode | "isolated" 是实验字段，动作在子进程里跑（见下文） |
 
 trigger 专属：trigger_api（event-v1 / event-v2）、semantic（state / oneshot）。
 
 结构校验都在 `notmyfault/security/plugin_schema.py`，校验失败的原因会进诊断页。
+
+内置动作显式声明 `idempotent`。同一插件包含切换、追加等操作时，按整个插件的
+行为声明为 `false`。该字段用于重试提示，不阻止用户配置重试。触发器不使用此字段。
 
 ## 动作
 
@@ -53,6 +56,11 @@ def run(action_info, params):
 返回值会进规则上下文，供后续步骤 $ref 引用。抛异常表示失败。
 仓库例子：`notmyfault/actions/set_volume/action.py`。
 
+引擎在调用动作前解析常量、变量与其他步骤引用。两种动作入口都接收解析后的
+`params`，不需要在插件内再次解析表达式。参数和输出的 `value_type`、显式转换与
+自定义类型使用方法见 `data-types.md`；插件通过 `notmyfault.plugin_api.data_types_api()`
+访问类型校验和转换。
+
 ### execution_api=context-v1（稳定）
 
 ```python
@@ -65,32 +73,23 @@ context 是这次 run 独享的上下文，能读到 event payload、前面步�
 声明了 execution_api=context-v1 却没定义 run_with_context 会在执行时报
 TypeError，加载期不拦。仓库例子：`notmyfault/actions/append_text/action.py`。
 
-### precondition_api=context-v1（稳定）
+### 旧版 precondition_api（已移除）
 
-模块里定义 check_precondition 的动作可以被规则用作“开始前确认”：
+清单校验仍接受 `precondition_api: "context-v1"`，宿主不再调用
+`check_precondition()`，也不再根据 `retry_after_seconds` 延后工作流。
+新插件无需声明此字段或实现此入口。
 
-```python
-def check_precondition(action_info, params, context):
-    if window_is_ready():
-        return True
-    return {
-        "ok": False,
-        "reason": "窗口还没出现",
-        "retry_after_seconds": 30,
-    }
-```
-
-返回 `True` 表示可以执行。返回对象时，只有 `ok: true` 会通过；其他结果会阻止本次
-运行。`reason` 用于运行记录，`retry_after_seconds` 指定重试间隔；引擎会把间隔限制在
-5 到 3600 秒之间。仓库例子：`notmyfault/actions/document_quiescent/action.py`。
+非空 `preconditions` 会被规则校验拒绝。旧规则必须移除该字段中的检查；
+需要判断运行数据时使用 IF，需要监视事件未发生时使用 NOT 触发条件。
+两者的结构和适用条件见 [规则格式](rule-schema-v2.md)。
 
 ### cancellation_api=runtime-v1（稳定）
 
-声明后规则可以给这一步配 timeout_seconds。引擎把取消事件放进 context，
-动作里长循环要周期检查：
+声明后规则可以给这一步配 `timeout_seconds`。时限包含该动作的全部执行尝试和重试等待，
+到期后结束当前动作，不再发起重试。引擎把取消事件放进 context，动作里的长循环要周期检查：
 
 ```python
-cancel = context.get("cancellation")
+cancel = context.get("runtime", {}).get("cancellation")
 if cancel is not None:
     cancel.raise_if_cancelled()
 ```
@@ -128,12 +127,12 @@ def run(meta, config, emit_event, shutdown_event):
 
 ## 贡献（contributes，稳定）
 
-四种贡献都登记在 `notmyfault/extensions/registry.py`：
+四种贡献都保存在 `notmyfault/extensions/registry.py`：
 
 - commands：由参数编辑器或页面调用的处理函数
 - views：插件自带的 HTML 页面，路径必须位于插件目录内
 - parameter_editors：为普通参数或 `plugin_data` 参数提供编辑入口
-- data_types：插件自有数据的类型和版本
+- data_types：插件私有或共享数据的结构、类型和版本
 
 普通参数编辑器声明 `value_type`，命令用 `context.commit_value()` 提交新值。自有数据
 编辑器声明 `data_type`，命令用 `context.commit()` 提交带归属信息的值。完整协议见
@@ -156,9 +155,12 @@ def run(action_info, params):
 ```
 
 `capability()` 返回 `CapabilityStatus`，字段是 `id`、`available`、`backend`、
-`reason` 和 `degraded`。Linux 平台服务直接提供这些方法：
+`reason` 和 `degraded`。这里的 `available` 表示公开服务能够调用该能力，系统存在
+同类能力不等于宿主已提供对应公开方法。Windows 的内置插件仍使用系统能力探测；
+尚未开放的公开服务返回 `available=False`，调用时报 `unsupported`。
+Linux 平台服务直接提供这些方法：
 
-- clipboard.read：`read_clipboard()`
+- clipboard.read：`read_clipboard(max_chars=None)`；正整数 `max_chars` 限制返回字符数及命令输出读取量
 - clipboard.write：`write_clipboard(text)`
 - input.send：`type_text(text)`、`send_hotkey(parts)`
 - audio.control：`set_volume(percent)`、`set_mute(muted)`
@@ -186,15 +188,21 @@ def run(action_info, params):
 ## 隔离执行（execution_mode: isolated，experimental）
 
 manifest 写 `"execution_mode": "isolated"` 的动作不会在引擎进程中导入。每次执行会启动
-子进程调用 `run()` 或 `run_with_context()`；父子进程之间使用 JSON 标准输入和输出。
+子进程调用 `run()` 或 `run_with_context()`；父子进程之间使用 JSON 标准输入和输出，
+新宿主使用 `typed-v1` 编解码保留大整数、Decimal 和二进制等值。
 子进程先发 `{"type":"ready","protocol":1}`，父进程再发送 entry、action_info、
-params 和最小 context。执行结果的 `type` 是 `result`。
+params、最小 context 和整棵插件目录的文件快照。worker 每次运行前复核文件快照，
+入口、兄弟模块和扩展命令使用校验时读取的源码；目录内容变化时拒绝执行。
+执行结果的 `type` 是 `result`，无法通过数据编解码的返回值按动作失败处理。
 这只隔离崩溃，不是安全沙箱，也不限制文件、网络、进程或系统调用权限。worker 异常退出时，引擎发布
 `plugin_worker_crashed` 事件，规则中的该步骤失败。默认启动等待为 10 秒，动作执行等待为
 120 秒，进程退出等待为 5 秒。
-实现位于 `notmyfault/core/plugin_worker.py`。内置插件不能使用 `isolated`，且隔离模式
-不能声明 `cancellation_api`。调用原生库或 `ctypes` 的第三方动作优先使用此模式，
+实现位于 `notmyfault/core/plugin_worker.py`。内置和用户动作均可声明 `isolated`；
+隔离模式不能声明 `cancellation_api` 或 `admin` 权限。调用原生库或 `ctypes` 的第三方动作优先使用此模式，
 原生代码仍拥有当前用户的文件、网络和系统调用权限。
+
+内置 `set_volume` 使用 `isolated`，Windows 的 pycaw COM 调用在子进程中执行。
+该动作不声明 `cancellation_api`，规则不能为它配置协作取消超时。
 
 ## 允许 import 的模块
 
@@ -214,18 +222,62 @@ notmyfault.core.workflow_executor、notmyfault.host.*、notmyfault.platform.linu
 安全扫描目前只拦危险调用和动态导入，不检查 import 了哪些内部模块，
 越界引用不会被扫描器拦下来，但引擎改内部结构时插件会跟着坏。
 
+插件内的 Python 兄弟模块在各自插件的模块名称下加载。`import helper` 和包内相对
+导入可以使用；两个插件包含同名 `helper.py` 时分别取得自己的模块。插件目录不会
+加入全局 `sys.path`，卸载时清理该插件创建的模块。已验证插件的兄弟模块和扩展命令模块
+可使用该插件声明的管理员权限，授权检查绑定实际模块对象。
+
+`run_as_admin(..., wait=False)` 返回 `subprocess.Popen`，调用方可用 `poll()` 或 `wait()`
+检查提权启动程序的状态。`wait=True` 继续返回 `subprocess.CompletedProcess`。内置插件也使用包内相对导入，
+兄弟模块执行的是验签时读取的源码。直接导入 `notmyfault.actions.*` 或
+`notmyfault.triggers.*` 会作为跨插件引用报告。
+
+`plugin_resource` 绑定到当前插件的加载器，返回该加载器内已加载插件的资源路径；
+不同加载器使用相同插件 ID 时各自解析自己的目录。
+
+## 插件包签名与安装
+
+`pack_plugin.py` 保留 `signature.sig`、`public_key.pem` 和 `public_key.sig`。
+安装构建命令也保留这些文件，作者签名必须与构建后的文件内容相符。有构建命令时
+先校验插件签名，签名无效则不执行命令。安装端在替换旧版本前使用与加载器相同的
+签名规则校验暂存目录；strict 要求有效签名，作者自签的非管理员插件还需本地密钥
+副签，管理员插件仅接受 `official` 签名。
+
+签名覆盖插件源码、资源以及 `node_modules`、`__pypackages__` 内的文件，排除
+Python 的 `__pycache__` 缓存与签名材料本身。修改依赖内容也需要重新签名。
+动作与触发器共用插件 ID 空间，安装预览与安装会检查另一种类型中的同名 ID。
+插件文件上传上限为 64 MiB，归档实际解压字节总数上限为 500 MiB。
+安装预览返回 `installation.required_risk_ids`；安装的 `confirmed_risk_ids` 必须包含
+这些 ID，遗漏时返回 HTTP 400 和 `risk_confirmation_required`。构建命令遗漏确认时
+继续使用 `build_hook_confirmation_required`。
+签名来源与摘要格式分开记录，旧本地密钥签名可以使用当前摘要格式。用户插件继续
+核对已安装文件清单，旧摘要格式只在文件与已安装记录一致时接受。安装构建后的检查
+和延迟导入前的复查分别执行。
+
 ## 安全扫描的边界
 
-`scan_plugin_security`、能力扫描和借壳提权扫描用于提示风险和检查权限声明，
+`inspect_plugin` 汇总插件检查结果，源码由 `analyze_plugin_source` 解析。能力与风险
+使用同一次 AST 遍历，sudo 导入和借壳提权也检查同一棵 AST。这些检查用于提示风险和检查权限声明，
 不是 Python 安全沙箱。扫描器只看静态源码，字符串拼接、运行时生成代码和原生
-模块都可能超出它的判断范围。安装插件仍等于信任插件以当前用户身份运行；
-带 build 钩子的插件还会在安装时执行清单里的命令。隔离动作进程只隔开崩溃，
-不限制文件、网络、进程或系统调用权限。
+模块都可能超出它的判断范围。安装插件仍等于信任插件以当前用户身份运行。
+带 build 钩子且签名有效的插件才会在安装时执行清单里的命令，命令按参数列表执行，
+不经过 cmd 或 sh。隔离动作进程只隔开崩溃，不限制文件、网络、进程或系统调用权限。
 
 ## 启动、执行和停止
 
 - setup：trigger 加载后、启动前调一次，返回 False 拒绝启用（action 没有 setup）
 - 执行：动作按规则触发；isolated 动作在子进程
+- 参数校验：插件定义 `validate_params(action_info, params)` 时，返回错误列表或抛出异常都会拒绝执行本步
 - teardown：引擎停止时调用，插件在这里注销热键、关连接
 - 引擎停止：扩展会话一并关闭
 - isolated worker：引擎 shutdown 时 shutdown_all() 终止所有活着的子进程
+
+## 通用数据类型
+
+`data_types_api()` 提供类型声明、校验、转换、共享类型注册和传输编解码。
+参数通过 `value_type` 声明数据类型；输出也可使用此字段精化原有 `type`。
+`run(meta, params)`、`run_with_context(meta, params, context)` 和原触发协议继续可用。
+共享自定义类型由清单声明，宿主在执行前检查类型和依赖。运行上下文中的
+`constants` 与 `variables` 是传给插件的值副本，修改它们不会给规则变量赋值。
+隔离动作协议通过 `value_encoding: typed-v1` 保留大整数、精确小数和二进制等值。
+类型、转换和旧清单兼容规则见 [data-types.md](data-types.md)。

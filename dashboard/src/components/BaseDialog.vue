@@ -3,9 +3,7 @@ import { nextTick, ref, watch } from 'vue'
 
 const props = defineProps({
   open: Boolean,
-  // false 时禁止点遮罩和按 ESC 关闭，比如确认框和录制中控件选择
   closable: { type: Boolean, default: true },
-  // 盖在其他弹窗上面时用，比如桌面录制从插件弹窗里唤起
   layerTop: { type: Boolean, default: false },
 })
 const emit = defineEmits(['close'])
@@ -22,7 +20,7 @@ const focusableSelector = [
   '[tabindex]:not([tabindex="-1"])',
 ].join(',')
 
-// 焦点还在弹窗外才移到遮罩，保证 ESC 能冒泡到这里；内容组件自己聚焦了输入框就不抢。
+// 内容组件可以先聚焦自己的输入框。
 watch(() => props.open, async open => {
   if (!open) {
     await nextTick()
@@ -34,11 +32,21 @@ watch(() => props.open, async open => {
   await nextTick()
   if (!backdrop.value?.contains(document.activeElement)) {
     const target = backdrop.value?.querySelector('[autofocus]')
-      || backdrop.value?.querySelector(focusableSelector)
+      || [...(backdrop.value?.querySelectorAll(focusableSelector) || [])].find(isVisibleControl)
       || backdrop.value
     target?.focus({ preventScroll: true })
   }
 })
+
+function isVisibleControl(item) {
+  if (item.closest('[hidden], [inert], [aria-hidden="true"]')) return false
+  for (let element = item; element && element !== backdrop.value; element = element.parentElement) {
+    const style = getComputedStyle(element)
+    if (style.display === 'none' || style.visibility === 'hidden') return false
+    if (element.tagName === 'DETAILS' && !element.open && !element.querySelector('summary')?.contains(item)) return false
+  }
+  return true
+}
 
 function tryClose() {
   if (props.closable) emit('close')
@@ -51,7 +59,7 @@ function handleKeydown(event) {
   }
   if (event.key !== 'Tab' || !backdrop.value) return
   const items = [...backdrop.value.querySelectorAll(focusableSelector)]
-    .filter(item => !item.hidden && item.getAttribute('aria-hidden') !== 'true')
+    .filter(isVisibleControl)
   if (!items.length) {
     event.preventDefault()
     backdrop.value.focus()
@@ -72,7 +80,7 @@ function handleKeydown(event) {
 <template>
   <Transition name="nmf-dialog">
     <div v-if="open" ref="backdrop" class="nmf-dialog-backdrop" :class="{ 'layer-top': layerTop }"
-      tabindex="-1" @pointerdown.self="tryClose" @keydown="handleKeydown">
+      tabindex="-1" @pointerdown.self="tryClose" @keydown.stop="handleKeydown">
       <slot />
     </div>
   </Transition>

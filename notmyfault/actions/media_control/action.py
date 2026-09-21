@@ -8,11 +8,14 @@ import subprocess
 
 
 def _run_linux(command: str) -> None:
+    if command == "mute":
+        from notmyfault.plugin_api import platform_services
+        platform_services().set_mute(True)
+        return
     playerctl_map = {
         "play_pause": "play-pause", "stop": "stop",
         "next": "next", "previous": "previous",
         "volume_up": "volume 0.05+", "volume_down": "volume 0.05-",
-        "mute": "volume 0",
     }
     arg = playerctl_map.get(command)
     if arg is None:
@@ -38,7 +41,7 @@ if os.name == "nt":
     SMTO_ABORTIFHUNG = 0x0002
 
     _COMMANDS = {
-        "play_pause": 47, "stop": 13, "next": 11, "previous": 12,
+        "play_pause": 14, "stop": 13, "next": 11, "previous": 12,
         "volume_up": 10, "volume_down": 9, "mute": 8,
     }
 
@@ -50,23 +53,28 @@ if os.name == "nt":
         user32.FindWindowW.restype = wintypes.HWND
         user32.SendMessageTimeoutW.argtypes = [
             wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
-            wintypes.UINT, wintypes.UINT, ctypes.POINTER(wintypes.DWORD),
+            wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t),
         ]
         user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
         lparam = (command << 16) | 0
-        result = ctypes.c_ulong()
+        result = ctypes.c_size_t()
         hwnd = user32.GetForegroundWindow()
         if hwnd:
-            user32.SendMessageTimeoutW(
+            sent = user32.SendMessageTimeoutW(
                 hwnd, WM_APPCOMMAND, 0, lparam,
                 SMTO_ABORTIFHUNG, 1000, ctypes.byref(result),
             )
+            if sent:
+                return
         shell = user32.FindWindowW("Shell_TrayWnd", None)
         if shell:
-            user32.SendMessageTimeoutW(
+            sent = user32.SendMessageTimeoutW(
                 shell, WM_APPCOMMAND, 0, lparam,
                 SMTO_ABORTIFHUNG, 1000, ctypes.byref(result),
             )
+            if sent:
+                return
+        raise RuntimeError("没有窗口接受媒体命令")
 
 
 def run(action_info, params):
@@ -78,7 +86,14 @@ def run(action_info, params):
                 f"未知媒体命令: {command!r}（可选: {', '.join(_COMMANDS)}）"
             )
         with NATIVE_LOCK:
-            _send_appcommand(_COMMANDS[command])
+            if command == "mute":
+                from pycaw.pycaw import AudioUtilities
+                endpoint = AudioUtilities.GetSpeakers().EndpointVolume
+                endpoint.SetMute(True, None)
+                if not endpoint.GetMute():
+                    raise RuntimeError("Windows 拒绝设置静音状态")
+            else:
+                _send_appcommand(_COMMANDS[command])
     else:
         _run_linux(command)
     print(f"[Action:media_control] 已发送: {command}")

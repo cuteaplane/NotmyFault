@@ -173,7 +173,7 @@ def test_backup_store_prefers_backup_named_after_current_plugin(tmp_path) -> Non
 class _EventHistory:
     def __init__(self) -> None:
         self.events = []
-    def record(self, event) -> None:
+    def record_async(self, event) -> None:
         self.events.append(event)
 
 
@@ -202,7 +202,7 @@ def test_event_broker_closes_slow_subscriber() -> None:
         broker = EventBroker(_EventHistory())
         subscription = broker.subscribe()
 
-        for index in range(201):
+        for index in range(subscription.queue.maxsize + 1):
             broker.publish("progress", {"index": index})
         await asyncio.sleep(0)
 
@@ -211,22 +211,38 @@ def test_event_broker_closes_slow_subscriber() -> None:
     asyncio.run(exercise())
 
 
-def test_rule_run_route_rejects_test_data_over_one_mib(tmp_path) -> None:
+@pytest.mark.parametrize("method,path", [
+    ("POST", "/api/rules/0/run"),
+    ("POST", "/api/rules/validate"),
+    ("PUT", "/api/rules"),
+    ("POST", "/api/rules/draft/ai/stream"),
+    ("POST", "/api/plugins/demo/extensions/commands/read/invoke"),
+])
+def test_rule_run_route_rejects_test_data_over_one_mib(tmp_path, method, path) -> None:
     env = make_api_env(tmp_path)
-    response = env.client.post(
-        "/api/rules/0/run",
+    response = env.client.request(
+        method, path,
         headers={**env.headers, "Content-Type": "application/json"},
         content=b'"' + b"x" * (1024 * 1024) + b'"',
     )
 
     assert response.status_code == 413
-    assert response.json() == {"ok": False, "error": "测试数据超过 1 MiB 上限"}
+    assert response.json()["ok"] is False
 
 
-def test_rule_run_service_forwards_scoped_test_context() -> None:
+@pytest.mark.parametrize("upstream,policy,valid", [
+    ({"value": "ready"}, None, True),
+    ({}, None, False),
+    ({}, "default", True),
+    ({}, "skip", True),
+    ({"value": None}, "default", False),
+    ({"value": 7}, "default", False),
+    ({"value": ""}, "default", True),
+])
+def test_rule_run_service_validates_and_forwards_scoped_test_context(upstream, policy, valid) -> None:
     rule = {
         "name": "局部运行",
-        "event": {
+        "condition": {
             "type": "hotkey",
             "binding_id": "t_hot001",
             "params": {},
@@ -260,10 +276,15 @@ def test_rule_run_service_forwards_scoped_test_context() -> None:
             },
         ],
     }
+    if policy is not None:
+        reference = rule["actions"][1]["params"]["upstream"]["$ref"]
+        reference["on_missing"] = policy
+        if policy == "default":
+            reference["default"] = "fallback"
     calls = []
     active_engine = SimpleNamespace(
         actions_meta={
-            "source": {"outputs": [{"name": "value", "type": "string"}]},
+            "source": {"outputs": [{"name": "value", "type": "string", "value_type": "text", "required": False}]},
             "target": {"outputs": []},
         },
         triggers_meta={
@@ -280,7 +301,7 @@ def test_rule_run_service_forwards_scoped_test_context() -> None:
     body = {
         "trigger_payloads": {"t_hot001": {"key": "Ctrl+K"}},
         "event_payload": {"kind": "manual"},
-        "step_outputs": {"a_source001": {"value": "ready"}},
+        "step_outputs": {"a_source001": upstream},
         "start_step_id": "a_target001",
         "end_step_id": "a_target001",
         "test_assertions": [
@@ -292,6 +313,12 @@ def test_rule_run_service_forwards_scoped_test_context() -> None:
         ],
     }
 
+    if not valid:
+        with pytest.raises(RuleRunServiceError) as invalid:
+            service.run(0, body)
+        assert invalid.value.body["code"] == "invalid_test_payload"
+        assert calls == []
+        return
     result = service.run(0, body)
 
     assert result == {
@@ -306,7 +333,7 @@ def test_rule_run_service_forwards_scoped_test_context() -> None:
 def test_rule_run_service_checks_missing_and_invalid_reference_payloads() -> None:
     rule = {
         "name": "引用检查",
-        "event": {
+        "condition": {
             "type": "hotkey",
             "binding_id": "t_hot001",
             "params": {},

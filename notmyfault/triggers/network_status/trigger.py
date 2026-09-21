@@ -1,5 +1,7 @@
 import socket
-import time
+import math
+
+from notmyfault.triggers.base import PollingTrigger
 
 
 def _is_connected(host="8.8.8.8", port=53, timeout=2):
@@ -14,28 +16,40 @@ def _is_connected(host="8.8.8.8", port=53, timeout=2):
         s.close()
 
 
-def run(meta, config, emit_event, shutdown_event):
-    trigger_id = meta.get("id", "network_status")
-    target_state = config.get("state", "disconnected")
-    if target_state not in ("connected", "disconnected"):
-        raise ValueError(
-            f"无效的网络状态: {target_state!r}（可选: connected/disconnected）"
-        )
-    print(f"[Trigger:{trigger_id}] 开始监控网络状态，目标: {target_state}")
+class NetworkStatusTrigger(PollingTrigger):
+    interval = 5.0
 
-    last_connected = _is_connected()
-    print(f"[Trigger:{trigger_id}] 初始网络状态: {'已连接' if last_connected else '已断开'}")
-
-    while not shutdown_event.is_set():
+    def validate(self):
+        self.host = str(self.config.get("host", "8.8.8.8")).strip()
         try:
-            current = _is_connected()
-            if current != last_connected:
-                new_state = "connected" if current else "disconnected"
-                if new_state == target_state:
-                    print(f"[Trigger:{trigger_id}] 网络状态变化: {new_state}")
-                    emit_event({"state": new_state})
-                last_connected = current
-        except Exception as e:
-            print(f"[Trigger:{trigger_id}] 检查网络出错: {e}")
+            self.port = int(self.config.get("port", 53))
+            self.timeout = float(self.config.get("timeout", 2))
+        except (TypeError, ValueError):
+            raise ValueError("网络探测端口必须是整数，超时必须是数字") from None
+        if not self.host or not 1 <= self.port <= 65535:
+            raise ValueError("网络探测主机或端口无效")
+        if not math.isfinite(self.timeout) or not 0.1 <= self.timeout <= 10:
+            raise ValueError("网络探测超时必须在 0.1 到 10 秒之间")
+        self.target_state = self.config.get("state", "disconnected")
+        if self.target_state not in ("connected", "disconnected"):
+            raise ValueError(
+                f"无效的网络状态: {self.target_state!r}（可选: connected/disconnected）"
+            )
 
-        shutdown_event.wait(5)
+    def setup(self):
+        self._last_connected = _is_connected(self.host, self.port, self.timeout)
+        self.log(f"开始监控网络状态，目标: {self.target_state}")
+        self.log(f"初始网络状态: {'已连接' if self._last_connected else '已断开'}")
+
+    def poll(self):
+        current = _is_connected(self.host, self.port, self.timeout)
+        if current != self._last_connected:
+            new_state = "connected" if current else "disconnected"
+            if new_state == self.target_state:
+                self.log(f"网络状态变化: {new_state}")
+                self.emit({"state": new_state})
+            self._last_connected = current
+
+
+def run(meta, config, emit_event, shutdown_event):
+    NetworkStatusTrigger(meta, config, emit_event, shutdown_event).run()
