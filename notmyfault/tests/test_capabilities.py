@@ -128,6 +128,30 @@ class ProbeStructureTests(unittest.TestCase):
         self.assertFalse(result["available"])
         self.assertIn("xclip", result["reason"])
 
+
+    def test_linux_display_power_and_media_and_idle_probes(self):
+        def which(name):
+            return f"/usr/bin/{name}" if name in {"gdbus", "playerctl", "xprintidle"} else None
+
+        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"), \
+                patch("notmyfault.platform.linux_support.desktop_environment", return_value="gnome"), \
+                patch("notmyfault.platform.linux_support.shutil.which", side_effect=which):
+            power = capabilities._probe_linux(capabilities.DISPLAY_POWER)
+            media = capabilities._probe_linux(capabilities.MEDIA_CONTROL)
+            idle = capabilities._probe_linux(capabilities.IDLE_QUERY)
+        self.assertTrue(power["available"])
+        self.assertEqual(power["backend"], "gnome-ScreenSaver")
+        self.assertTrue(media["available"])
+        self.assertTrue(idle["available"])
+        self.assertIn("IdleMonitor", idle["backend"])
+
+        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"), \
+                patch("notmyfault.platform.linux_support.desktop_environment", return_value="unknown"), \
+                patch("notmyfault.platform.linux_support.shutil.which", side_effect=which):
+            power = capabilities._probe_linux(capabilities.DISPLAY_POWER)
+        self.assertFalse(power["available"])
+        self.assertIn("Wayland", power["reason"])
+
     def test_wayland_screen_capture_requires_portal_client(self):
         with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"), \
                 patch("importlib.util.find_spec", return_value=None), \

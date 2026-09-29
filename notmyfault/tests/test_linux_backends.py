@@ -38,8 +38,8 @@ class FakeRunner:
                 return self.paths[name]
         return None
 
-    def run(self, args, timeout=10, input=None):
-        self.calls.append({"args": args, "timeout": timeout, "input": input})
+    def run(self, args, timeout=10, input=None, env=None):
+        self.calls.append({"args": args, "timeout": timeout, "input": input, "env": env})
         if self.results:
             return self.results.pop(0)
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -109,6 +109,36 @@ class InputBackendTests(LinuxPathTest):
         self.assertEqual(
             runner.calls[0]["args"], ["/usr/bin/ydotool", "type", "--", "hi"]
         )
+
+    def test_ydotool_sets_socket_env_when_present(self):
+        runner = FakeRunner(paths={"ydotool": "/usr/bin/ydotool"})
+        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"), \
+                patch.dict(
+                    "os.environ",
+                    {"XDG_RUNTIME_DIR": "/run/user/1000", "YDOTOOL_SOCKET": ""},
+                    clear=False,
+                ), \
+                patch(
+                    "notmyfault.platform.backends.os.path.exists",
+                    side_effect=lambda p: p == "/run/user/1000/.ydotool_socket",
+                ):
+            InputBackend(runner).type_text("hi")
+        self.assertEqual(
+            runner.calls[0]["env"].get("YDOTOOL_SOCKET"),
+            "/run/user/1000/.ydotool_socket",
+        )
+
+    def test_ydotool_failure_mentions_socket(self):
+        runner = FakeRunner(
+            paths={"ydotool": "/usr/bin/ydotool"},
+            results=[ok(stderr="connect: No such file or directory", returncode=1)],
+        )
+        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"), \
+                patch.dict("os.environ", {"YDOTOOL_SOCKET": "/tmp/.ydotool_socket"}, clear=False):
+            with self.assertRaises(BackendFailedError) as ctx:
+                InputBackend(runner).type_text("hi")
+        self.assertIn("ydotoold", str(ctx.exception))
+        self.assertIn("/tmp/.ydotool_socket", str(ctx.exception))
 
     def test_hotkey_maps_keys_for_xdotool(self):
         runner = FakeRunner(paths={"xdotool": "/usr/bin/xdotool"})
@@ -222,7 +252,7 @@ class AudioBackendTests(LinuxPathTest):
             results=[BackendFailedError("命令超时")],
         )
 
-        def explode(args, timeout=10, input=None):
+        def explode(args, timeout=10, input=None, env=None):
             raise runner.results.pop(0)
 
         runner.run = explode
@@ -523,8 +553,8 @@ class DisplayBackendTests(LinuxPathTest):
             ["/usr/bin/xset", "dpms", "force", "on"],
         )
 
-    def test_wayland_non_gnome_power_rejected(self):
-        runner = FakeRunner(paths={"xset": "/usr/bin/xset"})
+    def test_kde_power_uses_screensaver(self):
+        runner = FakeRunner(paths={"gdbus": "/usr/bin/gdbus"})
         with patch(
             "notmyfault.platform.linux_support.desktop_environment",
             return_value="kde",
@@ -532,8 +562,23 @@ class DisplayBackendTests(LinuxPathTest):
             "notmyfault.platform.linux_support.session_type",
             return_value="wayland",
         ):
-            with self.assertRaises(BackendUnsupportedError):
+            DisplayBackend(runner).set_power("off")
+        self.assertIn("org.freedesktop.ScreenSaver.SetActive", runner.calls[0]["args"])
+        self.assertEqual(runner.calls[0]["args"][4], "org.kde.screensaver")
+        self.assertEqual(runner.calls[0]["args"][-1], "true")
+
+    def test_wayland_unknown_desktop_power_rejected(self):
+        runner = FakeRunner(paths={"xset": "/usr/bin/xset", "gdbus": "/usr/bin/gdbus"})
+        with patch(
+            "notmyfault.platform.linux_support.desktop_environment",
+            return_value="unknown",
+        ), patch(
+            "notmyfault.platform.linux_support.session_type",
+            return_value="wayland",
+        ):
+            with self.assertRaises(BackendUnsupportedError) as ctx:
                 DisplayBackend(runner).set_power("off")
+        self.assertIn("Wayland", str(ctx.exception))
 
     def test_missing_brightnessctl_raises(self):
         with self.assertRaises(BackendMissingError):
@@ -674,3 +719,36 @@ class PowerProfileBackendTests(LinuxPathTest):
         runner = FakeRunner(paths={"powerprofilesctl": "/usr/bin/powerprofilesctl"})
         with self.assertRaises(ValueError):
             PowerProfileBackend(runner).set_profile("custom")
+
+
+class LinuxSupportHelpersTests(unittest.TestCase):
+    def test_current_session_id_prefers_env(self):
+        from notmyfault.platform import linux_support
+
+        with patch.dict("os.environ", {"XDG_SESSION_ID": "42"}, clear=False):
+            self.assertEqual(linux_support.current_session_id(), "42")
+
+    def test_current_session_id_falls_back_to_loginctl_display(self):
+        from notmyfault.platform import linux_support
+
+        with patch.dict("os.environ", {"XDG_SESSION_ID": "", "USER": "alice"}, clear=False), \
+                patch("notmyfault.platform.linux_support.command_path", return_value="/bin/loginctl"), \
+                patch(
+                    "notmyfault.platform.linux_support.run_command",
+                    return_value=ok(stdout="Display=c2\n"),
+                ) as run:
+            self.assertEqual(linux_support.current_session_id(), "c2")
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/bin/loginctl", "show-user", "alice", "-p", "Display"],
+        )
+
+    def test_idle_probe_reports_kde_backend(self):
+        from notmyfault.platform import linux_support
+
+        with patch("notmyfault.platform.linux_support.desktop_environment", return_value="kde"), \
+                patch("notmyfault.platform.linux_support.command_path", side_effect=lambda *names: "/usr/bin/gdbus" if "gdbus" in names else None):
+            backend, reason = linux_support.idle_probe()
+        self.assertEqual(backend, "kde-ScreenSaver.GetSessionIdleTime")
+        self.assertIsNone(reason)
+
