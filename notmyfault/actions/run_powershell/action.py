@@ -70,18 +70,18 @@ def run_with_context(action_info, params, context):
             result["error"] = str(error)
         finally:
             stream.close()
+    if sys.platform != "win32":
+        raise RuntimeError("执行 PowerShell 仅支持 Windows，Linux 请使用 run_shell")
+
     try:
-        if sys.platform == "win32":
-            powershell = os.path.join(
-                os.environ.get("SystemRoot", r"C:\Windows"),
-                "System32",
-                "WindowsPowerShell",
-                "v1.0",
-                "powershell.exe",
-            )
-            args = [powershell, "-NoProfile", "-NonInteractive", "-Command", command]
-        else:
-            args = ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command]
+        powershell = os.path.join(
+            os.environ.get("SystemRoot", r"C:\Windows"),
+            "System32",
+            "WindowsPowerShell",
+            "v1.0",
+            "powershell.exe",
+        )
+        args = [powershell, "-NoProfile", "-NonInteractive", "-Command", command]
         process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         readers = [threading.Thread(target=read_output, args=(stream, result), daemon=True)

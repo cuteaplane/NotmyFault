@@ -1,9 +1,9 @@
 {
     "id": "run_powershell",
     "name": "执行 PowerShell",
-    "description": "执行一段 PowerShell 命令",
-    "version_code": 1,
-    "version": "1.0",
+    "description": "执行一段 Windows PowerShell 命令",
+    "version_code": 2,
+    "version": "1.1",
     "package_name": "io.github.notmyfault.run_powershell",
     "enabled": true,
     "idempotent": false,
@@ -52,5 +52,8 @@
             "placeholder": "要执行的 PowerShell 命令",
             "rows": 8
         }
+    ],
+    "platforms": [
+        "windows"
     ]
 }

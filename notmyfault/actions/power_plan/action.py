@@ -1,10 +1,15 @@
-"""电源计划切换动作：通过 powercfg 使用计划 GUID 切换 Windows 电源计划
-powercfg 在子进程中运行，并设置超时
-"""
+"""电源计划切换：Windows 用 powercfg GUID，Linux 用 powerprofilesctl"""
 
 import subprocess
-import uuid
 import sys
+import uuid
+
+from notmyfault.plugin_api import platform_backend_api
+
+_platform_backend = platform_backend_api()
+PowerProfileBackend = _platform_backend.PowerProfileBackend
+BackendError = _platform_backend.BackendError
+default_runner = _platform_backend.default_runner
 
 # Windows 电源计划 GUID 在不同语言系统上保持一致
 _PLANS = {
@@ -14,11 +19,7 @@ _PLANS = {
 }
 
 
-def run(action_info, params):
-    if sys.platform != "win32":
-        raise RuntimeError("电源计划切换仅支持 Windows")
-
-    plan = params.get("plan", "balanced")
+def _run_windows(plan: str, params: dict) -> dict:
     if plan == "custom":
         guid = str(params.get("custom_guid", "") or "").strip()
         if not guid:
@@ -57,3 +58,29 @@ def run(action_info, params):
 
     print(f"[Action:power_plan] 已切换到 {plan}")
     return {"plan": plan, "guid": guid}
+
+
+def _run_linux(plan: str, params: dict) -> dict:
+    if plan == "custom":
+        raise ValueError("Linux 不支持自定义 GUID 电源计划，请改用 balanced/high_performance/power_saver")
+    if plan not in _PLANS:
+        raise ValueError(
+            f"未知电源计划: {plan!r}"
+            "（可选: balanced/high_performance/power_saver）"
+        )
+    print(f"[Action:power_plan] 切换电源计划: {plan}")
+    try:
+        profile = PowerProfileBackend(default_runner).set_profile(plan)
+    except BackendError as error:
+        raise RuntimeError(str(error)) from error
+    print(f"[Action:power_plan] 已切换到 {plan}（{profile}）")
+    return {"plan": plan, "profile": profile}
+
+
+def run(action_info, params):
+    plan = params.get("plan", "balanced")
+    if sys.platform == "win32":
+        return _run_windows(plan, params)
+    if sys.platform.startswith("linux"):
+        return _run_linux(plan, params)
+    raise RuntimeError("电源计划切换仅支持 Windows 和 Linux")

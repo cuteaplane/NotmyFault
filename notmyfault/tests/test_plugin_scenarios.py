@@ -21,6 +21,7 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 @pytest.mark.parametrize("cancel", [False, True])
 def test_powershell_bounds_output_and_kills_cancelled_process(monkeypatch, cancel):
     module = load_plugin("actions", "run_powershell")
+    monkeypatch.setattr(module.sys, "platform", "win32")
     event = threading.Event()
     class Process:
         returncode = None if cancel else 0
@@ -352,9 +353,9 @@ def test_open_url_requires_input():
 # ---------------------------------------------------------------- power_plan
 
 
-@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 支持 powercfg")
 def test_power_plan_runs_powercfg(monkeypatch):
     mod = load_plugin("actions", "power_plan")
+    monkeypatch.setattr(mod.sys, "platform", "win32")
     captured = {}
 
     def fake_run(cmd, **kwargs):
@@ -368,16 +369,16 @@ def test_power_plan_runs_powercfg(monkeypatch):
     assert captured["cmd"][2] == result["guid"]
 
 
-@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 支持 powercfg")
-def test_power_plan_custom_guid_required():
+def test_power_plan_custom_guid_required(monkeypatch):
     mod = load_plugin("actions", "power_plan")
+    monkeypatch.setattr(mod.sys, "platform", "win32")
     with pytest.raises(ValueError, match="必须提供 GUID"):
         mod.run({}, {"plan": "custom"})
 
 
-@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 支持 powercfg")
 def test_power_plan_failure_raises(monkeypatch):
     mod = load_plugin("actions", "power_plan")
+    monkeypatch.setattr(mod.sys, "platform", "win32")
     monkeypatch.setattr(
         mod.subprocess,
         "run",
@@ -385,6 +386,69 @@ def test_power_plan_failure_raises(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="切换电源计划失败"):
         mod.run({}, {"plan": "balanced"})
+
+
+def test_power_plan_linux_uses_powerprofilesctl(monkeypatch):
+    mod = load_plugin("actions", "power_plan")
+    monkeypatch.setattr(mod.sys, "platform", "linux")
+    class FakeBackend:
+        def __init__(self, runner):
+            self.runner = runner
+        def set_profile(self, plan):
+            assert plan == "power_saver"
+            return "power-saver"
+    monkeypatch.setattr(mod, "PowerProfileBackend", FakeBackend)
+    result = mod.run({}, {"plan": "power_saver"})
+    assert result == {"plan": "power_saver", "profile": "power-saver"}
+
+
+def test_power_plan_linux_rejects_custom_guid(monkeypatch):
+    mod = load_plugin("actions", "power_plan")
+    monkeypatch.setattr(mod.sys, "platform", "linux")
+    with pytest.raises(ValueError, match="不支持自定义 GUID"):
+        mod.run({}, {"plan": "custom", "custom_guid": "381b4222-f694-41f0-9685-ff5bb260df2e"})
+
+
+# ------------------------------------------------------------------- run_shell
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_run_shell_bounds_output_and_kills_cancelled_process(monkeypatch, cancel):
+    module = load_plugin("actions", "run_shell")
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(module, "_shell_executable", lambda: "/bin/bash")
+    event = threading.Event()
+    class Process:
+        returncode = None if cancel else 0
+        stdout = io.BytesIO(b"x" * (module._MAX_OUTPUT + 8192))
+        stderr = io.BytesIO(b"")
+        killed = False
+        def poll(self):
+            return self.returncode
+        def kill(self):
+            self.killed = True
+            self.returncode = -1
+        def wait(self, timeout):
+            return self.returncode
+    process = Process()
+    def launch(*args, **kwargs):
+        if cancel:
+            event.set()
+        return process
+    monkeypatch.setattr(module.subprocess, "Popen", launch)
+    monkeypatch.setattr(module, "_read_available", lambda stream: stream.read1(4096))
+    if cancel:
+        with pytest.raises(ActionCancelled):
+            module.run_with_context(
+                {},
+                {"command": "ignored"},
+                {"runtime": {"cancellation": ActionCancellation(event)}},
+            )
+        assert process.killed
+    else:
+        result = module.run({}, {"command": "ignored"})
+        assert result["stdout"] == "x" * module._MAX_OUTPUT + "...（已截断）"
+        assert result["stderr"] == ""
 
 
 # ------------------------------------------------------------------ send_keys

@@ -514,6 +514,36 @@ class ScreenshotBackend:
         )
 
 
+_LINUX_POWER_PROFILES = {
+    "balanced": "balanced",
+    "high_performance": "performance",
+    "power_saver": "power-saver",
+}
+
+
+class PowerProfileBackend:
+    """powerprofilesctl 电源模式切换"""
+
+    def __init__(self, runner: CommandRunner | None = None) -> None:
+        self._runner = runner or default_runner
+
+    def set_profile(self, plan: str) -> str:
+        _require_linux()
+        profile = _LINUX_POWER_PROFILES.get(plan)
+        if profile is None:
+            raise ValueError(
+                f"未知电源计划: {plan!r}"
+                "（可选: balanced/high_performance/power_saver）"
+            )
+        path = self._runner.which("powerprofilesctl")
+        if not path:
+            raise BackendMissingError("依赖缺失：电源计划需要 powerprofilesctl")
+        result = self._runner.run([path, "set", profile], timeout=10)
+        if result.returncode != 0:
+            raise BackendFailedError(_failed_detail(result))
+        return profile
+
+
 class SleepResumeBackend:
     """监听 logind PrepareForSleep(False)，在睡眠恢复时置位"""
 

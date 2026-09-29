@@ -5,13 +5,14 @@
 
 ## 执行期限与取消
 
-`run_powershell`、`http_request`、`bluetooth_toggle`、`kill_process` 声明
+`run_powershell`、`run_shell`、`http_request`、`bluetooth_toggle`、`kill_process` 声明
 `execution_api: context-v1` 和 `cancellation_api: runtime-v1`，可以接收规则的
 协作取消信号。规则超时仍需等待插件退出正在执行的系统调用。
 
 | 动作 | 执行限制 | 取消行为 |
 | --- | --- | --- |
-| `run_powershell` | 命令执行最多 60 秒；stdout、stderr 各保留最多 100 KiB，超出部分丢弃并标注截断。 | 检查间隔最多约 0.1 秒，超时或取消时终止直接启动的 PowerShell 进程；正常退出后排空可用的尾部输出，未读完时标注截断。不会自动终止所有后代进程。 |
+| `run_powershell` | Windows；命令执行最多 60 秒；stdout、stderr 各保留最多 100 KiB，超出部分丢弃并标注截断。 | 检查间隔最多约 0.1 秒，超时或取消时终止直接启动的 PowerShell 进程；正常退出后排空可用的尾部输出，未读完时标注截断。不会自动终止所有后代进程。 |
+| `run_shell` | Linux；通过 bash 或 sh `-c` 执行，限制与 `run_powershell` 相同。 | 与 `run_powershell` 相同，终止的是直接启动的 shell 进程。 |
 | `http_request` | `timeout_seconds` 默认 30 秒，范围 1–300 秒。候选 IP 连接、请求和正文读取共用期限；正文最多 1 MiB。 | 取消或期限到达时中断活动 socket。同步 DNS 调用不能中途终止，返回后才检查期限。 |
 | `bluetooth_toggle` | Linux 的状态查询、修改和确认共用 30 秒期限，单次 bluetoothctl 命令最多 8 秒；Windows helper 最多 30 秒。 | 等待命令时每次最多约 0.1 秒检查取消，取消后终止并回收直接启动的辅助进程；状态确认等待也可取消。 |
 | `kill_process` | 全部匹配进程共用 10 秒期限，不会给每个进程重新分配 10 秒。 | 进程等待分成最多 0.1 秒的小段，段间检查取消。已经终止的进程不会恢复。 |

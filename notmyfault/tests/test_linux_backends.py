@@ -18,6 +18,7 @@ from notmyfault.platform.backends import (
     CommandRunner,
     DisplayBackend,
     InputBackend,
+    PowerProfileBackend,
     ScreenshotBackend,
     WindowBackend,
 )
@@ -500,3 +501,23 @@ class ScreenshotBackendTests(LinuxPathTest):
                     "fullscreen",
                     "png",
                 )
+
+
+class PowerProfileBackendTests(LinuxPathTest):
+    def test_set_profile_maps_plans(self):
+        runner = FakeRunner(paths={"powerprofilesctl": "/usr/bin/powerprofilesctl"})
+        profile = PowerProfileBackend(runner).set_profile("high_performance")
+        self.assertEqual(profile, "performance")
+        self.assertEqual(
+            runner.calls[0]["args"],
+            ["/usr/bin/powerprofilesctl", "set", "performance"],
+        )
+
+    def test_missing_powerprofilesctl_raises(self):
+        with self.assertRaises(BackendMissingError):
+            PowerProfileBackend(FakeRunner()).set_profile("balanced")
+
+    def test_custom_plan_rejected(self):
+        runner = FakeRunner(paths={"powerprofilesctl": "/usr/bin/powerprofilesctl"})
+        with self.assertRaises(ValueError):
+            PowerProfileBackend(runner).set_profile("custom")

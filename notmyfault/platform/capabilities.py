@@ -17,6 +17,7 @@ BLUETOOTH_CONTROL = "bluetooth.control"
 SESSION_LOCK = "session.lock"
 TTS = "tts"
 TRAY = "tray"
+POWER_PROFILE = "power.profile"
 
 CAPABILITY_IDS = frozenset({
     CLIPBOARD_READ,
@@ -33,6 +34,7 @@ CAPABILITY_IDS = frozenset({
     SESSION_LOCK,
     TTS,
     TRAY,
+    POWER_PROFILE,
 })
 
 
@@ -91,6 +93,10 @@ def _probe_windows(capability: str) -> dict:
         if not os.path.isfile(path):
             return _entry(False, None, "未安装 Windows PowerShell")
         return _windows_backend("WinRT", apis={"combase": ("RoGetActivationFactory",)}, reason="蓝牙设备和无线电权限在执行时检查")
+    if capability == POWER_PROFILE:
+        if shutil.which("powercfg"):
+            return _entry(True, "powercfg")
+        return _entry(False, None, "未找到 powercfg")
     probes = {
         CLIPBOARD_READ: lambda: _windows_backend("user32-clipboard", apis={"user32": ("OpenClipboard", "CloseClipboard", "GetClipboardData", "IsClipboardFormatAvailable"), "kernel32": ("GlobalLock", "GlobalUnlock", "GlobalSize")}),
         CLIPBOARD_WRITE: lambda: _windows_backend("user32-clipboard", apis={"user32": ("OpenClipboard", "CloseClipboard", "EmptyClipboard", "SetClipboardData"), "kernel32": ("GlobalAlloc", "GlobalLock", "GlobalUnlock", "GlobalFree")}),
@@ -183,6 +189,9 @@ def _probe_linux(capability: str) -> dict:
         return _entry(bool(path), path, reason)
     if capability == TTS:
         path, reason = _linux_command("spd-say")
+        return _entry(bool(path), path, reason)
+    if capability == POWER_PROFILE:
+        path, reason = _linux_command("powerprofilesctl")
         return _entry(bool(path), path, reason)
     if capability == TRAY:
         if wayland:

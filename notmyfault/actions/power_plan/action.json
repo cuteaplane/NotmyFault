@@ -1,14 +1,18 @@
 {
     "id": "power_plan",
     "name": "切换电源计划",
-    "description": "切换 Windows 平衡/高性能/节能电源计划",
-    "version_code": 1,
-    "version": "1.0",
+    "description": "切换平衡/高性能/节能电源计划（Windows 用 powercfg，Linux 用 powerprofilesctl）",
+    "version_code": 2,
+    "version": "1.1",
     "package_name": "io.github.notmyfault.power_plan",
+    "requires_capabilities": [
+        "power.profile"
+    ],
     "enabled": true,
     "idempotent": true,
     "platforms": [
-        "windows"
+        "windows",
+        "linux"
     ],
     "permissions": [
         "external_binary"
@@ -23,7 +27,14 @@
             "name": "guid",
             "label": "计划 GUID",
             "type": "string",
-            "value_type": "uuid"
+            "value_type": "uuid",
+            "required": false
+        },
+        {
+            "name": "profile",
+            "label": "Linux 电源模式",
+            "type": "string",
+            "required": false
         }
     ],
     "params": [
@@ -47,7 +58,7 @@
                 },
                 {
                     "value": "custom",
-                    "label": "自定义 GUID"
+                    "label": "自定义 GUID（仅 Windows）"
                 }
             ]
         },

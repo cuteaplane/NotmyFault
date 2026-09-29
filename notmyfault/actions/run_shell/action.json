@@ -1,0 +1,59 @@
+{
+    "id": "run_shell",
+    "name": "执行 Shell",
+    "description": "通过 bash 或 sh -c 执行一段 POSIX Shell 命令",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.run_shell",
+    "enabled": true,
+    "idempotent": false,
+    "execution_api": "context-v1",
+    "cancellation_api": "runtime-v1",
+    "platforms": [
+        "linux"
+    ],
+    "permissions": [
+        "external_binary",
+        "native_api"
+    ],
+    "security": {
+        "rule_approval": "admin_key",
+        "literal_only_params": [
+            "command"
+        ]
+    },
+    "outputs": [
+        {
+            "name": "returncode",
+            "label": "退出状态",
+            "type": "number",
+            "value_type": "int"
+        },
+        {
+            "name": "stdout",
+            "label": "标准输出",
+            "type": "string",
+            "sensitive": true,
+            "summary": "hidden"
+        },
+        {
+            "name": "stderr",
+            "label": "标准错误",
+            "type": "string",
+            "sensitive": true,
+            "summary": "hidden"
+        }
+    ],
+    "params": [
+        {
+            "name": "command",
+            "label": "Shell 命令",
+            "type": "textarea",
+            "default": "",
+            "sensitive": true,
+            "summary": "hidden",
+            "placeholder": "要执行的 Shell 命令",
+            "rows": 8
+        }
+    ]
+}
