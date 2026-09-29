@@ -1,0 +1,76 @@
+{
+    "id": "rule_finished",
+    "name": "当某个规则执行完毕",
+    "semantic": "oneshot",
+    "trigger_api": "event-v2",
+    "description": "监视指定规则的一次运行结束（成功、失败、取消或被丢弃时均可触发）",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.rule_finished",
+    "enabled": true,
+    "platforms": ["windows", "linux"],
+    "permissions": [],
+    "outputs": [
+        {
+            "name": "rule_id",
+            "label": "规则 ID",
+            "type": "string"
+        },
+        {
+            "name": "rule_name",
+            "label": "规则名称",
+            "type": "string"
+        },
+        {
+            "name": "run_id",
+            "label": "运行 ID",
+            "type": "string"
+        },
+        {
+            "name": "status",
+            "label": "结束状态",
+            "type": "string"
+        },
+        {
+            "name": "event_type",
+            "label": "引擎事件名",
+            "type": "string"
+        }
+    ],
+    "params": [
+        {
+            "name": "rule_id",
+            "label": "监视的规则",
+            "type": "string",
+            "default": "",
+            "placeholder": "选择要监视的规则",
+            "required": true
+        },
+        {
+            "name": "outcome",
+            "label": "结束状态",
+            "type": "select",
+            "default": "any",
+            "options": [
+                {"value": "any", "label": "任意结束"},
+                {"value": "succeeded", "label": "仅成功"},
+                {"value": "failed", "label": "仅失败"},
+                {"value": "cancelled", "label": "仅取消"},
+                {"value": "dropped", "label": "仅丢弃或被替换"}
+            ]
+        },
+        {
+            "name": "include_self",
+            "label": "允许监视本规则",
+            "type": "bool",
+            "default": false
+        },
+        {
+            "name": "owner_rule_id",
+            "label": "所属规则",
+            "type": "string",
+            "default": "",
+            "placeholder": "由编辑器自动填写"
+        }
+    ]
+}
