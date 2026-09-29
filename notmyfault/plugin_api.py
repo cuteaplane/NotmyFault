@@ -113,3 +113,13 @@ def engines_compatibility(meta: dict) -> tuple[bool, str]:
         False,
         f"插件要求宿主 API 版本 {required}，当前是 {HOST_API_VERSION}",
     )
+
+
+def engine_events_api():
+    from notmyfault.core import engine_events
+
+    return SimpleNamespace(
+        subscribe=engine_events.subscribe,
+        unsubscribe=engine_events.unsubscribe,
+        RULE_TERMINAL_EVENTS=engine_events.RULE_TERMINAL_EVENTS,
+    )

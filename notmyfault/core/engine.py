@@ -223,6 +223,16 @@ class AutomationEngine:
             scheduler = getattr(self, "_rule_scheduler", None)
             if scheduler is not None:
                 scheduler.on_run_event(event_type, payload.get("run_id"))
+        # 插件订阅与 Dashboard/SSE 并行，互不影响
+        try:
+            from notmyfault.core.engine_events import publish as publish_engine_event
+            publish_engine_event(event_type, payload)
+        except Exception:
+            err = traceback.format_exc()
+            print(f"[Engine] [!!] 引擎事件订阅分发异常 ({event_type}):", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            engine_error("engine_events_error", event_type=event_type, error=err[-500:])
+            self._diag_obj.record_error("engine_events", f"{event_type}: {err[-300:]}")
         if not self.on_event:
             return
         # UI 或 SSE 推送失败时记录错误并继续分发
@@ -835,6 +845,8 @@ class AutomationEngine:
                     engine_error(
                         "teardown_failed", plugin=plugin_id, error=traceback.format_exc()[-500:]
                     )
+        from notmyfault.core.engine_events import clear as clear_engine_events
+        clear_engine_events()
         self._plugin_registry.clear()
 
     def _wait_active_actions(self, timeout: float = 60.0) -> bool:
