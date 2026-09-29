@@ -71,6 +71,7 @@ class CommandRunner:
         args: list[str],
         timeout: float = 10,
         input: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess:
         try:
             return subprocess.run(
@@ -80,6 +81,7 @@ class CommandRunner:
                 errors="replace",
                 timeout=timeout,
                 input=input,
+                env=env,
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
@@ -116,9 +118,12 @@ _SPECIAL_KEYS = {
     "backspace": "BackSpace", "delete": "Delete", "escape": "Escape", "esc": "Escape",
     "home": "Home", "end": "End", "pgup": "Page_Up", "pgdn": "Page_Down",
     "up": "Up", "down": "Down", "left": "Left", "right": "Right",
-    "capslock": "Caps_Lock", "f1": "F1", "f2": "F2", "f3": "F3", "f4": "F4",
-    "f5": "F5", "f6": "F6", "f7": "F7", "f8": "F8", "f9": "F9", "f10": "F10",
-    "f11": "F11", "f12": "F12",
+    "capslock": "Caps_Lock", "insert": "Insert",
+    "minus": "minus", "equal": "equal", "comma": "comma", "dot": "period",
+    "slash": "slash", "semicolon": "semicolon", "apostrophe": "apostrophe",
+    "grave": "grave", "backslash": "backslash",
+    "leftbrace": "bracketleft", "rightbrace": "bracketright",
+    **{f"f{index}": f"F{index}" for index in range(1, 25)},
 }
 
 _EVDEV_KEYS = {
@@ -127,12 +132,51 @@ _EVDEV_KEYS = {
     "space": 57, "backspace": 14, "delete": 111, "insert": 110,
     "home": 102, "end": 107, "pgup": 104, "pgdn": 109,
     "up": 103, "down": 108, "left": 105, "right": 106, "capslock": 58,
+    "minus": 12, "equal": 13, "leftbrace": 26, "rightbrace": 27,
+    "semicolon": 39, "apostrophe": 40, "grave": 41, "backslash": 43,
+    "comma": 51, "dot": 52, "slash": 53,
     **dict(zip("1234567890", range(2, 12))),
     **dict(zip("qwertyuiop", range(16, 26))),
     **dict(zip("asdfghjkl", range(30, 39))),
     **dict(zip("zxcvbnm", range(44, 51))),
-    **{f"f{index}": 58 + index for index in range(1, 11)}, "f11": 87, "f12": 88,
+    **{f"f{index}": 58 + index for index in range(1, 11)},
+    "f11": 87, "f12": 88,
+    **{f"f{index}": 170 + index for index in range(13, 25)},
 }
+
+
+def _ydotool_env() -> dict[str, str]:
+    """补齐 YDOTOOL_SOCKET：未设置时尝试常见套接字路径"""
+    env = os.environ.copy()
+    current = (env.get("YDOTOOL_SOCKET") or "").strip()
+    if current:
+        return env
+    runtime = (env.get("XDG_RUNTIME_DIR") or "").rstrip("/")
+    candidates = []
+    if runtime:
+        candidates.extend(
+            (
+                f"{runtime}/.ydotool_socket",
+                f"{runtime}/ydotool.socket",
+            )
+        )
+    candidates.append("/tmp/.ydotool_socket")
+    for path in candidates:
+        if os.path.exists(path):
+            env["YDOTOOL_SOCKET"] = path
+            break
+    return env
+
+
+def _ydotool_failure_detail(result: subprocess.CompletedProcess, env: dict[str, str]) -> str:
+    detail = _failed_detail(result)
+    socket = env.get("YDOTOOL_SOCKET") or "(未设置)"
+    lower = detail.lower()
+    if any(token in lower for token in ("connect", "socket", "no such file", "connection refused", "找不到")):
+        return (
+            f"{detail}；请确认 ydotoold 已启动，YDOTOOL_SOCKET 当前为 {socket}"
+        )
+    return detail
 
 
 class InputBackend:
@@ -150,25 +194,32 @@ class InputBackend:
             raise BackendMissingError("依赖缺失：模拟按键需要 xdotool 或 ydotool")
         return path, os.path.basename(path)
 
+    def _run_input(self, args: list[str], name: str, timeout: float) -> None:
+        env = _ydotool_env() if name == "ydotool" else None
+        result = self._runner.run(args, timeout=timeout, env=env)
+        if result.returncode != 0:
+            if name == "ydotool":
+                raise BackendFailedError(_ydotool_failure_detail(result, env or {}))
+            raise BackendFailedError(_failed_detail(result))
+
     def type_text(self, text: str) -> None:
         tool, name = self._tool()
         if name == "xdotool":
             args = [tool, "type", "--clearmodifiers", "--", text]
         else:
             args = [tool, "type", "--", text]
-        result = self._runner.run(args, timeout=30)
-        if result.returncode != 0:
-            raise BackendFailedError(_failed_detail(result))
+        self._run_input(args, name, timeout=30)
 
     def send_hotkey(self, parts: Iterable[str]) -> None:
         tool, name = self._tool()
         parts = list(parts)
         mapped = []
         for part in parts:
-            if part in _SPECIAL_KEYS:
-                mapped.append(_SPECIAL_KEYS[part])
-            elif part in _MODIFIERS:
-                mapped.append(part.replace("win", "super"))
+            key = part.lower()
+            if key in _SPECIAL_KEYS:
+                mapped.append(_SPECIAL_KEYS[key])
+            elif key in _MODIFIERS:
+                mapped.append(key.replace("win", "super"))
             else:
                 mapped.append(part)
         combo = "+".join(mapped)
@@ -181,9 +232,7 @@ class InputBackend:
                 raise ValueError(f"ydotool 不支持此按键名称: {error.args[0]}") from None
             args = [tool, "key", *[f"{code}:1" for code in codes],
                     *[f"{code}:0" for code in reversed(codes)]]
-        result = self._runner.run(args, timeout=10)
-        if result.returncode != 0:
-            raise BackendFailedError(_failed_detail(result))
+        self._run_input(args, name, timeout=10)
 
 
 class AudioBackend:
@@ -719,35 +768,94 @@ class DisplayBackend:
         _require_linux()
         from notmyfault.platform.linux_support import desktop_environment, session_type
 
-        if desktop_environment() == "gnome":
+        if action not in ("on", "off"):
+            raise ValueError(f"不支持的显示器电源操作: {action}")
+
+        desktop = desktop_environment()
+        session = session_type()
+        active = "true" if action == "off" else "false"
+        errors: list[str] = []
+
+        def run_screensaver(dest: str, object_path: str, method: str) -> bool:
             executable = self._runner.which("gdbus")
             if not executable:
-                raise BackendMissingError("依赖缺失：显示器开关需要 gdbus")
-            args = [
-                executable,
-                "call",
-                "--session",
-                "--dest",
-                "org.gnome.ScreenSaver",
-                "--object-path",
-                "/org/gnome/ScreenSaver",
-                "--method",
-                "org.gnome.ScreenSaver.SetActive",
-                "true" if action == "off" else "false",
-            ]
-        elif session_type() == "wayland":
-            raise BackendUnsupportedError(
-                "当前桌面在 Wayland 下没有可用的显示器开关接口"
+                errors.append("未安装 gdbus")
+                return False
+            result = self._runner.run(
+                [
+                    executable,
+                    "call",
+                    "--session",
+                    "--dest",
+                    dest,
+                    "--object-path",
+                    object_path,
+                    "--method",
+                    method,
+                    active,
+                ],
+                timeout=5,
             )
-        else:
+            if result.returncode == 0:
+                return True
+            errors.append(f"{dest}: {_failed_detail(result)}")
+            return False
+
+        def run_xset() -> bool:
             executable = self._runner.which("xset")
             if not executable:
-                raise BackendMissingError("依赖缺失：显示器开关需要 xset")
-            args = [executable, "dpms", "force", action]
+                errors.append("未安装 xset")
+                return False
+            result = self._runner.run(
+                [executable, "dpms", "force", action],
+                timeout=5,
+            )
+            if result.returncode == 0:
+                return True
+            errors.append(f"xset: {_failed_detail(result)}")
+            return False
 
-        result = self._runner.run(args, timeout=5)
-        if result.returncode != 0:
-            raise BackendFailedError(_failed_detail(result))
+        if desktop == "gnome":
+            if run_screensaver(
+                "org.gnome.ScreenSaver",
+                "/org/gnome/ScreenSaver",
+                "org.gnome.ScreenSaver.SetActive",
+            ):
+                return
+            raise BackendFailedError(
+                "；".join(errors) or "GNOME 显示器开关失败"
+            )
+
+        if desktop == "kde":
+            for dest, object_path in (
+                ("org.kde.screensaver", "/ScreenSaver"),
+                ("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver"),
+            ):
+                if run_screensaver(
+                    dest,
+                    object_path,
+                    "org.freedesktop.ScreenSaver.SetActive",
+                ):
+                    return
+            if session != "wayland" and run_xset():
+                return
+            raise BackendFailedError(
+                "；".join(errors)
+                or "KDE 显示器开关失败，需要可用的 ScreenSaver 接口或 xset"
+            )
+
+        if session != "wayland" and run_xset():
+            return
+
+        if session == "wayland":
+            raise BackendUnsupportedError(
+                f"当前桌面（{desktop}）在 Wayland 下没有可用的显示器开关接口；"
+                "GNOME 走 org.gnome.ScreenSaver，KDE 走 org.kde.screensaver，"
+                "其他桌面请使用 X11 会话上的 xset"
+            )
+        raise BackendMissingError(
+            "；".join(errors) or "依赖缺失：显示器开关需要 xset"
+        )
 
 
 class ScreenshotBackend:

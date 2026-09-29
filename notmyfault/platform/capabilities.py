@@ -11,10 +11,13 @@ WINDOW_ENUMERATE = "window.enumerate"
 WINDOW_PIN = "window.pin"
 SCREEN_CAPTURE = "screen.capture"
 DISPLAY_BRIGHTNESS = "display.brightness"
+DISPLAY_POWER = "display.power"
 AUDIO_CONTROL = "audio.control"
 AUDIO_DEVICE_QUERY = "audio.device_query"
+MEDIA_CONTROL = "media.control"
 BLUETOOTH_CONTROL = "bluetooth.control"
 SESSION_LOCK = "session.lock"
+IDLE_QUERY = "idle.query"
 TTS = "tts"
 TRAY = "tray"
 POWER_PROFILE = "power.profile"
@@ -28,10 +31,13 @@ CAPABILITY_IDS = frozenset({
     WINDOW_PIN,
     SCREEN_CAPTURE,
     DISPLAY_BRIGHTNESS,
+    DISPLAY_POWER,
     AUDIO_CONTROL,
     AUDIO_DEVICE_QUERY,
+    MEDIA_CONTROL,
     BLUETOOTH_CONTROL,
     SESSION_LOCK,
+    IDLE_QUERY,
     TTS,
     TRAY,
     POWER_PROFILE,
@@ -105,8 +111,11 @@ def _probe_windows(capability: str) -> dict:
         WINDOW_ENUMERATE: lambda: _windows_backend("EnumWindows", apis={"user32": ("EnumWindows", "GetWindowTextW", "GetWindowTextLengthW", "IsWindowVisible")}),
         WINDOW_PIN: lambda: _windows_backend("SetWindowPos", apis={"user32": ("EnumWindows", "GetWindowTextW", "SetWindowPos")}),
         SCREEN_CAPTURE: lambda: _windows_backend("BitBlt", apis={"user32": ("GetDC", "ReleaseDC"), "gdi32": ("BitBlt", "CreateCompatibleDC", "CreateCompatibleBitmap", "SelectObject", "GetDIBits", "DeleteObject", "DeleteDC")}),
+        DISPLAY_POWER: lambda: _windows_backend("SendNotifyMessage", apis={"user32": ("SendNotifyMessageW",)}),
         AUDIO_CONTROL: lambda: _windows_backend("pycaw", modules=("pycaw", "comtypes"), reason="音频设备在执行时检查"),
+        MEDIA_CONTROL: lambda: _windows_backend("WM_APPCOMMAND", apis={"user32": ("GetForegroundWindow", "SendMessageTimeoutW")}),
         SESSION_LOCK: lambda: _windows_backend("LockWorkStation", apis={"user32": ("LockWorkStation",)}),
+        IDLE_QUERY: lambda: _windows_backend("GetLastInputInfo", apis={"user32": ("GetLastInputInfo",), "kernel32": ("GetTickCount",)}),
         TTS: lambda: _windows_backend("SAPI", modules=("pythoncom", "win32com.client"), reason="SAPI 语音服务在执行时检查"),
         TRAY: lambda: _windows_backend("explorer-tray", modules=("win32api", "win32con", "win32gui"), apis={"shell32": ("Shell_NotifyIconW",)}),
     }
@@ -175,11 +184,37 @@ def _probe_linux(capability: str) -> dict:
     if capability == DISPLAY_BRIGHTNESS:
         path, reason = _linux_command("brightnessctl")
         return _entry(bool(path), path, reason)
+    if capability == DISPLAY_POWER:
+        from notmyfault.platform.linux_support import desktop_environment
+
+        desktop = desktop_environment()
+        if desktop == "gnome":
+            path, reason = _linux_command("gdbus")
+            return _entry(bool(path), "gnome-ScreenSaver" if path else None, reason)
+        if desktop == "kde":
+            path, reason = _linux_command("gdbus")
+            if path:
+                return _entry(True, "kde-ScreenSaver")
+            if not wayland:
+                path, reason = _linux_command("xset")
+                return _entry(bool(path), path, reason)
+            return _entry(False, None, reason)
+        if wayland:
+            return _entry(
+                False,
+                None,
+                f"当前桌面（{desktop}）在 Wayland 下没有可用的显示器开关接口",
+            )
+        path, reason = _linux_command("xset")
+        return _entry(bool(path), path, reason)
     if capability == AUDIO_CONTROL:
         path, reason = _linux_command("wpctl")
         return _entry(bool(path), path, reason)
     if capability == AUDIO_DEVICE_QUERY:
         path, reason = _linux_command("wpctl", "pactl")
+        return _entry(bool(path), path, reason)
+    if capability == MEDIA_CONTROL:
+        path, reason = _linux_command("playerctl")
         return _entry(bool(path), path, reason)
     if capability == BLUETOOTH_CONTROL:
         path, reason = _linux_command("bluetoothctl")
@@ -187,6 +222,11 @@ def _probe_linux(capability: str) -> dict:
     if capability == SESSION_LOCK:
         path, reason = _linux_command("loginctl")
         return _entry(bool(path), path, reason)
+    if capability == IDLE_QUERY:
+        from notmyfault.platform.linux_support import idle_probe
+
+        backend, reason = idle_probe()
+        return _entry(bool(backend), backend, reason)
     if capability == TTS:
         path, reason = _linux_command("spd-say")
         return _entry(bool(path), path, reason)
