@@ -31,7 +31,9 @@ def _is_locked_linux() -> bool | None:
     import shutil
     if not shutil.which("loginctl"):
         return None
-    session_id = os.environ.get("XDG_SESSION_ID", "")
+    from notmyfault.platform.linux_support import current_session_id
+
+    session_id = current_session_id()
     if not session_id:
         return None
     try:

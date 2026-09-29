@@ -9,6 +9,7 @@
     "package_name": "io.github.notmyfault.session_lock",
     "enabled": true,
     "platforms": ["windows", "linux"],
+    "requires_capabilities": ["session.lock"],
     "permissions": ["external_binary"],
     "outputs": [
         {"name": "state", "label": "锁屏状态", "type": "string"},
