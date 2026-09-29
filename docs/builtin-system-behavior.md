@@ -163,7 +163,7 @@ tar 解包先检查完整成员列表，仅接受普通文件和目录，拒绝�
 失败，保留上次完整快照。恢复读取后再比较变化，不把读取错误当成所有文件被删除。
 
 Wi-Fi 的 disconnected 包括从指定网络直接切换到其他网络。电源状态查询失败
-或返回未知哨兵时不会触发状态变化；resume 仅接受 Windows 配置。低电量在 20%
+或返回未知哨兵时不会触发状态变化；resume 在 Windows 监听电源广播，在 Linux 监听 logind PrepareForSleep(False)。低电量在 20%
 及以下触发后，需要接通电源或电量超过 25% 才恢复下一次触发。
 
 Windows 默认音频设备使用 CoreAudio 查询，锁屏状态通过 psutil 读取 LockApp/logonui。

@@ -4,8 +4,8 @@
     "semantic": "state",
     "trigger_api": "event-v2",
     "description": "电源接入/电池/低电量/休眠恢复时触发",
-    "version_code": 2,
-    "version": "1.1",
+    "version_code": 3,
+    "version": "1.2",
     "package_name": "io.github.notmyfault.power_state",
     "enabled": true,
     "permissions": [
@@ -45,7 +45,7 @@
                 },
                 {
                     "value": "resume",
-                    "label": "从睡眠恢复（仅 Windows）"
+                    "label": "从睡眠恢复"
                 }
             ]
         }

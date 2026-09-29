@@ -42,6 +42,7 @@ def platform_backend_api():
         BackendMissingError,
         DisplayBackend,
         ScreenshotBackend,
+        SleepResumeBackend,
         WindowBackend,
         default_runner,
     )
@@ -51,6 +52,7 @@ def platform_backend_api():
         BackendMissingError=BackendMissingError,
         DisplayBackend=DisplayBackend,
         ScreenshotBackend=ScreenshotBackend,
+        SleepResumeBackend=SleepResumeBackend,
         WindowBackend=WindowBackend,
         default_runner=default_runner,
     )

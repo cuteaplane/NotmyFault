@@ -145,9 +145,32 @@ def test_power_state_creates_message_window_only_for_resume(monkeypatch):
     assert ac_trigger.power_window is None
     assert resume_trigger.power_window is window
     assert created == [True]
+    resume_trigger.validate()
+
+
+def test_power_state_resume_uses_linux_monitor(monkeypatch):
+    mod = load_plugin("triggers", "power_state")
+    monitor = MagicMock()
+    monitor.consume_resume.return_value = True
     monkeypatch.setattr(mod, "os", SimpleNamespace(name="posix"))
-    with pytest.raises(ValueError, match="仅支持 Windows"):
-        resume_trigger.validate()
+    monkeypatch.setattr(mod, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(mod, "_is_on_battery", lambda: (False, 88))
+    monkeypatch.setattr(mod, "_create_linux_resume_monitor", lambda: monitor)
+    events = []
+    trigger = mod.PowerStateTrigger(
+        {"id": "power_state"},
+        {"state": "resume"},
+        events.append,
+        threading.Event(),
+    )
+    trigger.validate()
+    trigger.setup()
+    assert trigger.power_window is None
+    assert trigger.resume_monitor is monitor
+    trigger.poll()
+    assert events == [{"state": "resume", "battery_percent": 88}]
+    trigger.teardown()
+    monitor.stop.assert_called_once()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 GetSystemPowerStatus")

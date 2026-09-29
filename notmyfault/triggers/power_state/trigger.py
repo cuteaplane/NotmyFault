@@ -1,9 +1,11 @@
-"""电源状态触发器：轮询交流、电池和低电量状态，并在 Windows 监听睡眠恢复消息
-resume 依赖隐藏窗口接收 WM_POWERBROADCAST，非 Windows 平台没有该事件
+"""电源状态触发器：轮询交流、电池和低电量状态
+Windows 用隐藏窗口收 WM_POWERBROADCAST；Linux 用 logind PrepareForSleep(False)
 """
 
 import ctypes
 import os
+import sys
+
 import psutil
 
 from notmyfault.plugin_api import native_lock
@@ -184,16 +186,26 @@ def _destroy_power_event_window(window) -> None:
         if wnd_proc in _WND_PROC_HOLD:
             _WND_PROC_HOLD.remove(wnd_proc)
 
+
+def _create_linux_resume_monitor():
+    from notmyfault.platform.backends import BackendError, SleepResumeBackend
+
+    monitor = SleepResumeBackend()
+    try:
+        monitor.start()
+    except BackendError as error:
+        raise RuntimeError(str(error)) from error
+    return monitor
+
+
 class PowerStateTrigger(PollingTrigger):
-    """电源状态监测：交流/电池/低电量轮询 + Windows 睡眠恢复事件监听"""
+    """电源状态监测：交流/电池/低电量轮询 + 睡眠恢复事件监听"""
 
     interval = 2.0
     native = False
 
     def validate(self):
         state = self.config.get("state", "ac")
-        if state == "resume" and os.name != "nt":
-            raise ValueError("睡眠恢复事件监听仅支持 Windows")
         if state not in ("ac", "battery", "low_battery", "resume"):
             raise ValueError(
                 f"无效的电源状态: {state!r}"
@@ -202,16 +214,19 @@ class PowerStateTrigger(PollingTrigger):
 
     def setup(self):
         self.power_window = None
+        self.resume_monitor = None
         self.target_state = self.config.get("state", "ac")
         self.log(f"开始监控电源状态，目标: {self.target_state}")
-        # resume 只在 Windows 上通过电源广播消息实现。
-        if os.name == "nt" and self.target_state == "resume":
-            with native_lock():
-                self.power_window = _create_power_event_window()
-        else:
-            self.power_window = None
-        if self.target_state == "resume" and self.power_window is None:
-            raise RuntimeError("无法创建睡眠恢复事件监听窗口")
+        if self.target_state == "resume":
+            if os.name == "nt":
+                with native_lock():
+                    self.power_window = _create_power_event_window()
+                if self.power_window is None:
+                    raise RuntimeError("无法创建睡眠恢复事件监听窗口")
+            elif sys.platform.startswith("linux"):
+                self.resume_monitor = _create_linux_resume_monitor()
+            else:
+                raise RuntimeError("当前平台不支持睡眠恢复监听")
         try:
             with native_lock():
                 on_battery, _ = _is_on_battery()
@@ -222,13 +237,16 @@ class PowerStateTrigger(PollingTrigger):
         self._low_battery_active = False
 
     def poll(self):
-        with native_lock():
-            resumed = _pump_power_messages(self.power_window)
-        if resumed:
-            if self.target_state == "resume":
-                self.log("系统从睡眠中恢复")
-                _, resume_pct = _is_on_battery()
-                self.emit({"state": "resume", "battery_percent": resume_pct})
+        resumed = False
+        if self.power_window is not None:
+            with native_lock():
+                resumed = _pump_power_messages(self.power_window)
+        elif self.resume_monitor is not None:
+            resumed = self.resume_monitor.consume_resume()
+        if resumed and self.target_state == "resume":
+            self.log("系统从睡眠中恢复")
+            _, resume_pct = _is_on_battery()
+            self.emit({"state": "resume", "battery_percent": resume_pct})
 
         on_battery, battery_pct = _is_on_battery()
         current = "battery" if on_battery else "ac"
@@ -255,6 +273,10 @@ class PowerStateTrigger(PollingTrigger):
     def teardown(self):
         with native_lock():
             _destroy_power_event_window(self.power_window)
+        monitor = getattr(self, "resume_monitor", None)
+        if monitor is not None:
+            monitor.stop()
+            self.resume_monitor = None
 
 
 def run(meta, config, emit_event, shutdown_event):
