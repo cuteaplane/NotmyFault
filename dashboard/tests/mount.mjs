@@ -1634,6 +1634,8 @@ objectNameField.dispatchEvent(new window.Event('input', { bubbles:true }))
 const objectTypeField = objectDefinition.querySelector('select[aria-label="数据类型"]')
 objectTypeField.value = 'any'
 objectTypeField.dispatchEvent(new window.Event('change', { bubbles:true }))
+objectDefinition.querySelector('.param-advanced').open = true
+await pause(20)
 objectDefinition.querySelector('.expression-editor').open = true
 await pause(20)
 const objectExpression = objectDefinition.querySelector('textarea[aria-label="参数表达式 JSON"]')

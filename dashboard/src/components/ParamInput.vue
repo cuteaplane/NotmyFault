@@ -28,7 +28,7 @@ const bindingType = computed(() => fieldType(props.def, true))
 const bindingOpen = ref(false)
 const optionsId = `param-options-${Math.random().toString(36).slice(2)}`
 const bound = computed(() => isExpression(props.modelValue))
-const advanced = ref(false), expressionText = ref(''), expressionError = ref('')
+const showAdvanced = ref(false), advanced = ref(false), expressionText = ref(''), expressionError = ref('')
 const expressionControl = ref(null)
 watch(expressionError, value => expressionControl.value?.setCustomValidity(value))
 let emittedExpression
@@ -132,11 +132,39 @@ async function pickFolder() {
     <ParameterEditorButton v-if="!bound && parameterEditor && !['plugin_data', 'hotkey'].includes(type)"
       :editor="parameterEditor" :model-value="props.modelValue"
       @update:model-value="emit('update:modelValue', $event)" />
-    <details v-if="allowBinding && type !== 'plugin_data'" class="expression-editor" @toggle="advanced = $event.target.open">
-      <summary>表达式 JSON</summary>
-      <textarea v-if="advanced" ref="expressionControl" :value="expressionText" class="text-field textarea-field" rows="5" aria-label="参数表达式 JSON" @input="setExpression($event.target.value)" />
-      <p v-if="expressionError" class="danger-text">{{ expressionError }}</p>
-      <p class="inspector-lead">可使用 $ref、$convert 和 $template；用 { "$literal": 值 } 保存包含表达式符号的原始数据。</p>
+    <details v-if="allowBinding && type !== 'plugin_data'" class="param-advanced" @toggle="showAdvanced = $event.target.open">
+      <summary>高级</summary>
+      <details class="expression-editor" @toggle="advanced = $event.target.open">
+        <summary>表达式 JSON</summary>
+        <textarea v-if="advanced" ref="expressionControl" :value="expressionText" class="text-field textarea-field" rows="5" aria-label="参数表达式 JSON" @input="setExpression($event.target.value)" />
+        <p v-if="expressionError" class="danger-text">{{ expressionError }}</p>
+        <p class="inspector-lead">可使用 $ref、$convert 和 $template；用 { "$literal": 值 } 保存包含表达式符号的原始数据。</p>
+      </details>
     </details>
   </div>
 </template>
+
+<style scoped>
+.param-advanced { margin-top: 4px; }
+.param-advanced > summary {
+  cursor: pointer;
+  font: var(--ts-label-s);
+  color: var(--md-on-surface-variant);
+  list-style: none;
+}
+.param-advanced > summary::-webkit-details-marker { display: none; }
+.param-advanced > summary::before {
+  content: '▸';
+  display: inline-block;
+  width: 1em;
+  color: var(--md-on-surface-variant);
+}
+.param-advanced[open] > summary::before { content: '▾'; }
+.expression-editor { margin-top: 8px; }
+.expression-editor > summary {
+  cursor: pointer;
+  font: var(--ts-label-s);
+  color: var(--md-on-surface-variant);
+}
+.expression-editor .inspector-lead { margin-top: 6px; margin-bottom: 0; }
+</style>
