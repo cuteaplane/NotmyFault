@@ -1,7 +1,15 @@
 import math
 import os
 import re
+import sys
 import time
+
+from notmyfault.plugin_api import platform_backend_api
+
+_platform_backend = platform_backend_api()
+BackendError = _platform_backend.BackendError
+WindowBackend = _platform_backend.WindowBackend
+default_runner = _platform_backend.default_runner
 
 
 _ACTIONS = {"list", "list_monitors", "get_info", "bring_to_front", "minimize", "maximize",
@@ -13,8 +21,10 @@ _LAYOUTS = {"left": (0, 0, 1, 2), "right": (1, 0, 2, 2), "top": (0, 0, 2, 1),
 
 
 def _backend():
-    from .win32 import Windows
-    return Windows()
+    if os.name == "nt":
+        from .win32 import Windows
+        return Windows()
+    return WindowBackend(default_runner)
 
 
 def _number(params, name, default, low, high, *, integer=False):
@@ -95,8 +105,11 @@ def _matches(info, options):
         return info["pid"] == options["pid"]
     text = options["text"]
     if target == "process":
-        name = text if text.lower().endswith(".exe") else text + ".exe"
-        return info["process_name"].casefold() == name.casefold()
+        actual = info["process_name"]
+        if os.name == "nt":
+            name = text if text.lower().endswith(".exe") else text + ".exe"
+            return actual.casefold() == name.casefold()
+        return actual.casefold() == text.casefold()
     value = info[target]
     if options["match_mode"] == "regex":
         return bool(options["pattern"].search(value))
@@ -211,35 +224,38 @@ def _operate(backend, before, options, deadline, cancellation):
 
 
 def run_with_context(_meta, params, context):
-    if os.name != "nt":
-        raise RuntimeError("window_control 仅支持 Windows")
+    if os.name != "nt" and not sys.platform.startswith("linux"):
+        raise RuntimeError("window_control 仅支持 Windows 和 Linux")
     options = _options(params)
     cancellation = context.get("runtime", {}).get("cancellation")
     if cancellation:
         cancellation.raise_if_cancelled()
-    backend = _backend()
-    action = options["action"]
-    if action == "list_monitors":
-        monitors = backend.monitors()
-        return {"action": action, "count": len(monitors), "hwnd": 0, "windows": [], "monitors": monitors}
-    selected = _select(backend, options)
-    if not selected and options["wait_seconds"]:
-        selected = _wait(lambda: _select(backend, options), time.monotonic() + options["wait_seconds"],
-                         cancellation, "等待窗口超时")
-    if not selected and action != "list":
-        raise RuntimeError("没有找到匹配的顶层窗口")
-    if action == "bring_to_front" and len(selected) > 1:
-        raise ValueError("前台激活只能选择一个窗口")
-    deadline = time.monotonic() + options["timeout_seconds"]
-    result = []
-    for info in selected:
-        if cancellation:
-            cancellation.raise_if_cancelled()
-        if time.monotonic() >= deadline:
-            raise RuntimeError(f"窗口操作超过总时限，已完成 {len(result)}/{len(selected)} 个窗口")
-        result.append(info if action == "list" else _operate(backend, info, options, deadline, cancellation))
-    return {"action": action, "count": len(result), "hwnd": result[0]["hwnd"] if len(result) == 1 else 0,
-            "windows": result, "monitors": []}
+    try:
+        backend = _backend()
+        action = options["action"]
+        if action == "list_monitors":
+            monitors = backend.monitors()
+            return {"action": action, "count": len(monitors), "hwnd": 0, "windows": [], "monitors": monitors}
+        selected = _select(backend, options)
+        if not selected and options["wait_seconds"]:
+            selected = _wait(lambda: _select(backend, options), time.monotonic() + options["wait_seconds"],
+                             cancellation, "等待窗口超时")
+        if not selected and action != "list":
+            raise RuntimeError("没有找到匹配的顶层窗口")
+        if action == "bring_to_front" and len(selected) > 1:
+            raise ValueError("前台激活只能选择一个窗口")
+        deadline = time.monotonic() + options["timeout_seconds"]
+        result = []
+        for info in selected:
+            if cancellation:
+                cancellation.raise_if_cancelled()
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"窗口操作超过总时限，已完成 {len(result)}/{len(selected)} 个窗口")
+            result.append(info if action == "list" else _operate(backend, info, options, deadline, cancellation))
+        return {"action": action, "count": len(result), "hwnd": result[0]["hwnd"] if len(result) == 1 else 0,
+                "windows": result, "monitors": []}
+    except BackendError as error:
+        raise RuntimeError(str(error)) from error
 
 
 def run(meta, params):

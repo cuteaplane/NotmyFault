@@ -569,6 +569,32 @@ def test_window_pin_linux_dispatches_wmctrl(monkeypatch):
     assert calls == [mod.default_runner, ("pin", "title", "记事本")]
 
 
+
+def test_window_control_linux_uses_window_backend(monkeypatch):
+    module = load_plugin("actions", "window_control")
+    calls = []
+
+    class FakeLinuxBackend:
+        def __init__(self, runner):
+            calls.append(("init", runner))
+
+        def monitors(self):
+            calls.append("monitors")
+            return [{"handle": 1, "device": "HDMI-1", "primary": True, "index": 1,
+                     "bounds": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+                     "work": {"x": 0, "y": 0, "width": 1920, "height": 1080}}]
+
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(module, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(module, "WindowBackend", FakeLinuxBackend)
+    meta = json.loads((PKG_ROOT / "actions/window_control/action.json").read_text(encoding="utf-8"))
+    assert "linux" in meta["platforms"]
+    result = invoke_action(module.run, module, meta, {"action": "list_monitors"}, {})
+    assert result["count"] == 1
+    assert result["monitors"][0]["device"] == "HDMI-1"
+    assert calls == [("init", module.default_runner), "monitors"]
+
+
 class WindowControlBackend:
     def __init__(self):
         self.windows = {
