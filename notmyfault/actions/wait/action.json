@@ -1,0 +1,49 @@
+{
+    "id": "wait",
+    "name": "等待",
+    "description": "暂停指定时长后再继续后续动作，运行中途可取消",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.wait",
+    "enabled": true,
+    "idempotent": true,
+    "execution_api": "context-v1",
+    "cancellation_api": "runtime-v1",
+    "platforms": ["windows", "linux"],
+    "permissions": [],
+    "outputs": [
+        {
+            "name": "waited_seconds",
+            "label": "实际等待秒数",
+            "type": "number",
+            "value_type": {
+                "type": "duration",
+                "unit": "seconds"
+            }
+        }
+    ],
+    "params": [
+        {
+            "name": "seconds",
+            "label": "等待秒数",
+            "type": "number",
+            "default": 1,
+            "placeholder": "例如 1.5",
+            "value_type": {
+                "type": "duration",
+                "unit": "seconds"
+            }
+        },
+        {
+            "name": "milliseconds",
+            "label": "额外毫秒",
+            "type": "number",
+            "default": 0,
+            "placeholder": "例如 500，可与秒叠加",
+            "value_type": {
+                "type": "duration",
+                "unit": "milliseconds"
+            }
+        }
+    ]
+}
