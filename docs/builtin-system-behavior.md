@@ -5,7 +5,7 @@
 
 ## 执行期限与取消
 
-`run_powershell`、`run_shell`、`http_request`、`bluetooth_toggle`、`kill_process` 声明
+`run_powershell`、`run_shell`、`http_request`、`bluetooth_toggle`、`kill_process`、`wait` 声明
 `execution_api: context-v1` 和 `cancellation_api: runtime-v1`，可以接收规则的
 协作取消信号。规则超时仍需等待插件退出正在执行的系统调用。
 
@@ -16,12 +16,19 @@
 | `http_request` | `timeout_seconds` 默认 30 秒，范围 1–300 秒。候选 IP 连接、请求和正文读取共用期限；正文最多 1 MiB。 | 取消或期限到达时中断活动 socket。同步 DNS 调用不能中途终止，返回后才检查期限。 |
 | `bluetooth_toggle` | Linux 的状态查询、修改和确认共用 30 秒期限，单次 bluetoothctl 命令最多 8 秒；Windows helper 最多 30 秒。 | 等待命令时每次最多约 0.1 秒检查取消，取消后终止并回收直接启动的辅助进程；状态确认等待也可取消。 |
 | `kill_process` | 全部匹配进程共用 10 秒期限，不会给每个进程重新分配 10 秒。 | 进程等待分成最多 0.1 秒的小段，段间检查取消。已经终止的进程不会恢复。 |
+| `wait` | `seconds` 与 `milliseconds` 叠加，合计 0–86400 秒；跨平台。 | 使用取消对象分段等待，规则停止或超时可中途结束。 |
 
 这些动作均声明 `idempotent: false`。请求取消或超时不会撤销此前已经发生的命令、
 HTTP 请求、蓝牙状态变更或进程终止。强杀后未在期限内确认退出的进程会明确报错。
 
 `http_request` 支持 GET、POST、PUT、DELETE、PATCH 和 HEAD，不跟随重定向，
 3xx 响应作为失败返回。无效或超出范围的超时参数会报错。
+
+## 等待
+
+`wait` 暂停当前规则运行指定时长，再继续后续动作。参数 `seconds` 与
+`milliseconds` 可同时填写并叠加。Dashboard 在工具栏提供独立的「等待」块，
+不出现在通用动作插件选择器中；执行仍走普通内置动作。
 
 ## Windows 系统资源
 
