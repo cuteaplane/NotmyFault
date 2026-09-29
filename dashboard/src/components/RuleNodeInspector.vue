@@ -101,7 +101,7 @@ function setWithinSeconds(value) {
               <template v-if="selectedConditionNode">
                 <p class="inspector-lead">{{ selectedConditionPath.length ? '此事件连接到所属逻辑组。' : '此事件是规则的触发条件。' }}</p>
                 <button v-if="selectedConditionParent?.op !== 'not'" class="btn btn-tonal btn-sm" @click="wrapConditionInNot()">未发生时（NOT）</button>
-                <TriggerForm :node="selectedConditionNode" :sources="constantSources"
+                <TriggerForm :node="selectedConditionNode" :rule="rule" :sources="constantSources"
                   @replace="openPluginPicker('trigger', { mode: 'replace-condition-trigger', path: selectedConditionPath, title: '更换触发方式' })" />
                 <div v-if="selectedConditionPath.length" class="inspector-action-row">
                   <button class="btn btn-text btn-sm" @click="moveSelectedCondition(-1)"><span class="material-symbols-outlined">arrow_upward</span>上移</button>

@@ -20,13 +20,21 @@ export function useRuleMutations(rule, selectedNodeId, selectedGraphNode) {
     for (const index of path.slice(0, -1)) parent = parent?.children?.[index]
     return parent
   })
+
+  function triggerParams(type) {
+    const params = buildDefaultParams(store.schema.triggers[type])
+    if (type === 'rule_finished' && rule.value?.rule_id) {
+      params.owner_rule_id = rule.value.rule_id
+    }
+    return params
+  }
   function setRootTrigger(type) {
     if (!type) return
     const bindingId = isConditionLeaf(rule.value.condition) ? rule.value.condition.binding_id : null
     rule.value.condition = {
       binding_id: bindingId || createBindingId('trigger'),
       type,
-      params: buildDefaultParams(store.schema.triggers[type]),
+      params: triggerParams(type),
     }
     selectedNodeId.value = conditionId([])
   }
@@ -213,7 +221,7 @@ export function useRuleMutations(rule, selectedNodeId, selectedGraphNode) {
     const event = {
       binding_id: createBindingId('trigger'),
       type,
-      params: buildDefaultParams(store.schema.triggers[type]),
+      params: triggerParams(type),
     }
     parent.children.push(group ? { op: 'any', children: [event] } : event)
     const eventPath = group
@@ -225,7 +233,7 @@ export function useRuleMutations(rule, selectedNodeId, selectedGraphNode) {
     const added = {
       binding_id: createBindingId('trigger'),
       type,
-      params: buildDefaultParams(store.schema.triggers[type]),
+      params: triggerParams(type),
     }
     rule.value.condition = { op, children: [...(rule.value.condition ? [rule.value.condition] : []), added] }
     selectedNodeId.value = conditionId([rule.value.condition.children.length - 1])
@@ -238,7 +246,7 @@ export function useRuleMutations(rule, selectedNodeId, selectedGraphNode) {
       const node = conditionAtPath(context.path)
       if (node?.type) {
         node.type = key
-        node.params = buildDefaultParams(store.schema.triggers[key])
+        node.params = triggerParams(key)
       }
     }
     else if (context.mode === 'action') addAction(key, context.index)

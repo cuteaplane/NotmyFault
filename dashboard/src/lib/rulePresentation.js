@@ -21,12 +21,24 @@ export function formatParamValue(value, def) {
   return String(value ?? '')
 }
 
+function formatRuleFinishedValue(value, def) {
+  if (def?.name === 'owner_rule_id') return ''
+  if (def?.name === 'rule_id') {
+    const rules = Array.isArray(store.configData?.rules) ? store.configData.rules : []
+    const matched = rules.find(rule => rule?.rule_id === value)
+    if (matched?.name) return matched.name
+  }
+  return formatParamValue(value, def)
+}
+
 export function describeItem(item, kind) {
   if (!item) return '需要配置'
   const meta = kind === 'trigger' ? store.schema.triggers[item.type] : store.schema.actions[item.type]
   const params = item.params || {}
+  const formatter = item.type === 'rule_finished' ? formatRuleFinishedValue : formatParamValue
   const details = getVisibleParamDefs(meta, params)
-    .map(def => [def.label || def.name, formatParamValue(params[def.name], def)])
+    .filter(def => !(item.type === 'rule_finished' && def.name === 'owner_rule_id'))
+    .map(def => [def.label || def.name, formatter(params[def.name], def)])
     .filter(([, value]) => value !== '')
     .slice(0, 2)
     .map(([label, value]) => `${label}: ${value}`)
