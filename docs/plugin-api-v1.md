@@ -173,6 +173,44 @@ Linux 平台服务直接提供这些方法：
 `kind` 会给出 `unavailable`、`unsupported`、`backend_missing`、`permission_denied`
 或 `backend_failed`。插件不需要 import 内部 backend 的类或异常类型。
 
+## 引擎事件订阅（稳定）
+
+插件可订阅引擎运行事件，不必轮询：
+
+```python
+from notmyfault.plugin_api import engine_events_api
+
+
+def run(meta, config, emit_event, shutdown_event):
+    api = engine_events_api()
+
+    def on_event(event_type, data):
+        if event_type == "workflow_completed":
+            emit_event({"status": data.get("status", "")})
+
+    token = api.subscribe(on_event)
+    try:
+        shutdown_event.wait()
+    finally:
+        api.unsubscribe(token)
+```
+
+`engine_events_api()` 提供 `subscribe(callback)`、`unsubscribe(token)` 和
+`RULE_TERMINAL_EVENTS`。回调签名是 `(event_type, data)`，在引擎发布线程里同步执行；
+回调异常只记日志，不会打断其他订阅者。引擎停止时会清空全部订阅。
+
+规则运行终态可依赖的事件名见 `RULE_TERMINAL_EVENTS`：
+
+| 事件 | 含义 |
+| --- | --- |
+| `workflow_completed` | 动作序列走完，`status` 为 succeeded / failed / cancelled |
+| `workflow_failed` | 引擎未能把 run 走下去，例如绑定解析失败 |
+| `run_dropped` | 本次触发被丢弃，未进入执行 |
+| `run_replaced` | 本次 run 被后来的触发替换 |
+
+实现位于 `notmyfault/core/engine_events.py`。仓库例子：
+`notmyfault/triggers/rule_finished/trigger.py`。
+
 ## 插件私有数据（plugin_data，稳定）
 
 参数 `type` 可以写 `plugin_data`。值由 `parameter_editor` 的命令提交。规则校验默认只接受
@@ -208,7 +246,7 @@ params、最小 context 和整棵插件目录的文件快照。worker 每次运�
 
 第三方插件可以 import：
 
-- notmyfault.plugin_api（平台服务、公开错误、能力状态、HOST_API_VERSION）
+- notmyfault.plugin_api（平台服务、引擎事件订阅、公开错误、能力状态、HOST_API_VERSION）
 - notmyfault.triggers.base（PollingTrigger）
 - notmyfault.core.workflow（ActionCancelled、ActionCancellation）
 - notmyfault.security.sudo（run_as_admin，需声明 admin 权限）
