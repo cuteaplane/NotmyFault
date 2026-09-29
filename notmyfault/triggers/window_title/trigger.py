@@ -1,15 +1,18 @@
 """窗口标题状态检测：目标窗口出现 / 关闭时触发
-Windows 用 EnumWindows；Linux 用 xdotool（仅 X11，Wayland 不可用）
+Windows 用 EnumWindows；Linux 用 WindowBackend 枚举（仅 X11）
 """
 
 import os
 import shutil
-import subprocess
 
 from notmyfault.plugin_api import platform_backend_api
 from notmyfault.triggers.base import PollingTrigger
 
-BackendMissingError = platform_backend_api().BackendMissingError
+_platform_backend = platform_backend_api()
+BackendError = _platform_backend.BackendError
+BackendMissingError = _platform_backend.BackendMissingError
+WindowBackend = _platform_backend.WindowBackend
+default_runner = _platform_backend.default_runner
 
 
 def _get_window_titles() -> dict:
@@ -39,23 +42,10 @@ def _get_window_titles_windows() -> dict:
 
 
 def _get_window_titles_linux() -> dict:
-    xdotool = shutil.which("xdotool")
-    if not xdotool:
-        raise BackendMissingError("依赖缺失：窗口标题监视需要 xdotool")
-    if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland" or not os.environ.get("DISPLAY"):
-        raise RuntimeError("窗口标题监视需要 X11 会话")
     try:
-        result = subprocess.run(
-            [xdotool, "search", "--name", "", "getwindowname", "%@"],
-            capture_output=True, text=True, errors="replace", timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        raise RuntimeError("窗口标题查询失败") from error
-    if result.returncode != 0:
-        if result.returncode == 1 and not result.stderr.strip() and not result.stdout.strip():
-            return {}
-        raise RuntimeError(f"窗口标题查询失败: {result.stderr.strip()}")
-    return {index: title for index, title in enumerate(result.stdout.splitlines()) if title.strip()}
+        return WindowBackend(default_runner).list_titles()
+    except BackendError as error:
+        raise RuntimeError(str(error)) from error
 
 
 class WindowTitleTrigger(PollingTrigger):
@@ -68,8 +58,9 @@ class WindowTitleTrigger(PollingTrigger):
         state = self.config.get("state", "opened")
         if state not in ("opened", "closed"):
             raise ValueError(f"无效的窗口状态: {state!r}（可选: opened/closed）")
-        if os.name != "nt" and not shutil.which("xdotool"):
-            raise BackendMissingError("依赖缺失：窗口标题监视需要 xdotool")
+        if os.name != "nt":
+            if not shutil.which("wmctrl") and not shutil.which("xdotool"):
+                raise BackendMissingError("依赖缺失：窗口标题监视需要 wmctrl 或 xdotool")
 
     def setup(self):
         self.pattern = str(self.config.get("title_pattern", "")).strip()
