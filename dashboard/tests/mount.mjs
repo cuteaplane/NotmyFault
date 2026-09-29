@@ -1634,9 +1634,14 @@ objectNameField.dispatchEvent(new window.Event('input', { bubbles:true }))
 const objectTypeField = objectDefinition.querySelector('select[aria-label="数据类型"]')
 objectTypeField.value = 'any'
 objectTypeField.dispatchEvent(new window.Event('change', { bubbles:true }))
-objectDefinition.querySelector('.param-advanced').open = true
-await pause(20)
-objectDefinition.querySelector('.expression-editor').open = true
+const advancedEditor = objectDefinition.querySelector('.param-advanced')
+const advancedHelp = advancedEditor?.querySelector('.inspector-lead')?.textContent || ''
+const advancedCollapsed = !!advancedEditor && !advancedEditor.open
+  && advancedEditor.querySelector('summary')?.textContent.trim() === '高级'
+  && !advancedEditor.querySelector('details')
+  && !objectDefinition.querySelector('textarea[aria-label="参数表达式 JSON"]')
+  && ['$ref', '$convert', '$template'].every(token => advancedHelp.includes(token))
+advancedEditor.open = true
 await pause(20)
 const objectExpression = objectDefinition.querySelector('textarea[aria-label="参数表达式 JSON"]')
 const businessObject = { $literal:'business label', content:'保留字段' }
@@ -1671,7 +1676,7 @@ const variableEditorOk = typedRule?.constants?.[0]?.value?.$nmf_value?.data === 
   && typedAssignment?.variable === typedRule.variables[0].id
   && typedAssignment?.value?.$ref?.node === typedRule.constants[0].id
   && invalidTypeKeptDraft && mixedObjectDisplayed
-  && expressionTextPreserved && typedTextPreserved
+  && advancedCollapsed && expressionTextPreserved && typedTextPreserved
   && typedRule.constants.find(item => item.name === '业务对象')?.value?.content === '已编辑字段'
   && typedRule.constants.find(item => item.name === '业务对象')?.value?.$literal === 'business label'
 console.log((variableEditorOk?'PASS':'FAIL')+' - variable editor saves precise constants and a bound assignment')
