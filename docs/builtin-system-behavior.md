@@ -42,10 +42,11 @@ Linux 注销要求 `XDG_SESSION_ID`，只终止该会话。Windows 关机权限�
 `media_control` 的“播放/暂停”切换播放状态；“静音”将静音设为开启，已经静音
 时保持静音。Linux 静音保留原音量。
 
-## Windows 窗口控制
+## 窗口控制
 
-`window_control` 通过 Windows 窗口接口操作顶层窗口，支持 Windows 10 1703 及以上版本。
-界面名称为“Windows 窗口控制”。
+`window_control` 在 Windows 上通过窗口接口操作顶层窗口，支持 Windows 10 1703 及以上版本；
+在 Linux 上通过 wmctrl、xprop、xdotool、xrandr 操作 X11 顶层窗口。Wayland 会话不可用，
+会明确报错。界面名称为“窗口控制”。
 
 | 操作 | `action` |
 | --- | --- |
@@ -111,9 +112,16 @@ Wayland 热键通过 ydotool 发送 Linux keycode 的按下和释放序列，需
 ydotool 服务及权限。X11 仍优先使用 xdotool。未支持的键名会在发送前报错。
 F1–F24 可用于 Linux 按键发送。
 
+`window_control` 在 Linux 上需要 wmctrl 和 xprop；列出显示器、居中和分屏还需要
+xrandr。隐藏窗口优先使用 xdotool 的 windowunmap。不透明度在 Linux 上不可用。
+进程名按 psutil 返回的名称匹配，不自动追加 `.exe`。显示器工作区目前等同于
+xrandr 给出的整屏矩形。
+
 `window_pin` 需要 wmctrl 和 xprop。活动窗口来自 `_NET_ACTIVE_WINDOW`；按标题
 查找只匹配标题字段。操作后读回置顶状态，最多等待 1 秒。Windows 成功结果包含
 `hwnd`，Linux 成功结果包含 `window_id`，规则应引用当前平台返回的字段。
+`window_title` 与 `window_pin` / `window_control` 共用 `WindowBackend` 枚举：
+优先 wmctrl，否则回退到 xdotool。
 
 Wayland Portal 截图在请求前监听响应，等待最多 120 秒。未完成的请求在超时、
 取消或错误时尝试关闭；用户拒绝授权会报告失败。能力报告中的 `degraded: true`
