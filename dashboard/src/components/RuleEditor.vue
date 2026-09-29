@@ -5,7 +5,7 @@ import RuleNodeInspector from './RuleNodeInspector.vue'
 import RuleValidationSummary from './RuleValidationSummary.vue'
 import { useRuleMutations } from '../composables/useRuleMutations'
 import { store } from '../lib/store'
-import { groupActionKeys, groupTriggerKeys, normalizeRuleDraft, pluginUnavailableReason as getPluginUnavailableReason } from '../lib/utils'
+import { groupActionKeys, groupTriggerKeys, isSpecialBlockAction, normalizeRuleDraft, pluginUnavailableReason as getPluginUnavailableReason } from '../lib/utils'
 
 import { ensureRuleBindingIds, variableBindingSources, expandBindingSources } from '../lib/bindings'
 
@@ -162,7 +162,7 @@ const triggerKeys = computed(() => Object.keys(store.schema.triggers).filter(
 ))
 const triggerGroups = computed(() => groupTriggerKeys(triggerKeys.value))
 const actionKeys = computed(() => Object.keys(store.schema.actions).filter(
-  key => !pluginUnavailableReason('actions', key)
+  key => !pluginUnavailableReason('actions', key) && !isSpecialBlockAction(key)
 ))
 const actionGroups = computed(() => groupActionKeys(actionKeys.value))
 watch(() => props.rule, rule => { normalizeRuleDraft(rule); ensureRuleBindingIds(rule) }, { immediate: true })
@@ -176,7 +176,7 @@ const selectedGraphNode = computed(() => layoutNodes.value.find(node => node.id 
 
 const mutations = useRuleMutations(toRef(props, 'rule'), selectedNodeId, selectedGraphNode)
 const {
-  conditionId, addAssignment, addIf, removeAction, moveAction,
+  conditionId, addAssignment, addIf, addWait, removeAction, moveAction,
   removeFailureAction, moveFailureAction,
   openPluginPicker, closePluginPicker, choosePlugin, requestConditionChild, picker,
 } = mutations
@@ -354,7 +354,7 @@ function onEditorKeydown(event) {
     <div class="editor-canvas-column">
     <RuleCanvas ref="canvasRef" :rule="rule" :layout="editorLayout"
       v-model:selected-node-id="selectedNodeId" @select-node="selectNode"
-      @add-if="addIf" @add-assignment="addAssignment" @open-picker="openPluginPicker"
+      @add-if="addIf" @add-assignment="addAssignment" @add-wait="addWait" @open-picker="openPluginPicker"
       @move-action="moveAction" @remove-action="removeAction"
       @move-failure-action="moveFailureAction" @remove-failure-action="removeFailureAction"
       @add-condition-child="requestConditionChild">

@@ -112,6 +112,9 @@ export function useRuleMutations(rule, selectedNodeId, selectedGraphNode) {
     rule.value.actions.push(action)
     selectedNodeId.value = `action-${action.binding_id}`
   }
+  function addWait() {
+    addAction('wait')
+  }
   function addAction(type, insertIndex = null) {
     if (!type) return
     if (!Array.isArray(rule.value.actions)) rule.value.actions = []
@@ -259,5 +262,5 @@ export function useRuleMutations(rule, selectedNodeId, selectedGraphNode) {
       title: group ? '添加条件组的第一个条件' : '添加条件',
     })
   }
-  return { setRootTrigger, useSingleCondition, wrapConditionInNot, unwrapNotEvent, conditionId, changeConditionOp, removeSelectedCondition, moveSelectedCondition, duplicateSelectedCondition, addAssignment, addIf, addAction, changeAction, removeAction, duplicateAction, moveAction, addFailureAction, removeFailureAction, moveFailureAction, requestAddFailureAction, requestReplaceFailureAction, openPluginPicker, closePluginPicker, conditionAtPath, addConditionFromPicker, appendRootCondition, choosePlugin, requestConditionChild, selectedConditionNode, selectedConditionPath, selectedConditionParent, picker }
+  return { setRootTrigger, useSingleCondition, wrapConditionInNot, unwrapNotEvent, conditionId, changeConditionOp, removeSelectedCondition, moveSelectedCondition, duplicateSelectedCondition, addAssignment, addIf, addWait, addAction, changeAction, removeAction, duplicateAction, moveAction, addFailureAction, removeFailureAction, moveFailureAction, requestAddFailureAction, requestReplaceFailureAction, openPluginPicker, closePluginPicker, conditionAtPath, addConditionFromPicker, appendRootCondition, choosePlugin, requestConditionChild, selectedConditionNode, selectedConditionPath, selectedConditionParent, picker }
 }

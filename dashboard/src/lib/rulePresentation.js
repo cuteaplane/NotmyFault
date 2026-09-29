@@ -6,7 +6,7 @@ export const isAdmin = (meta) => !!(meta?.permissions || []).includes('admin')
 
 export const eventName = (event) => store.schema.triggers[event?.type]?.name || event?.type || '未选择触发器'
 
-export const actionName = (action) => action?.type === 'if' ? 'IF 条件分支' : action?.type === 'set_variable' ? '变量赋值' : store.schema.actions[action?.type]?.name || action?.type || '未选择动作'
+export const actionName = (action) => action?.type === 'if' ? 'IF 条件分支' : action?.type === 'set_variable' ? '变量赋值' : action?.type === 'wait' ? (store.schema.actions.wait?.name || '等待') : store.schema.actions[action?.type]?.name || action?.type || '未选择动作'
 
 export function formatParamValue(value, def) {
   if (isReference(value)) return '运行数据'

@@ -3,14 +3,14 @@ import { computed, ref } from 'vue'
 import { store } from '../lib/store'
 import { createBindingId, actionOutputDefs, expandBindingSources } from '../lib/bindings'
 import { fieldType } from '../lib/valueTypes'
-import { buildDefaultParams, groupActionKeys, pluginUnavailableReason } from '../lib/utils'
+import { buildDefaultParams, groupActionKeys, isSpecialBlockAction, pluginUnavailableReason } from '../lib/utils'
 import PredicateEditor from './PredicateEditor.vue'
 import ActionForm from './ActionForm.vue'
 import PluginPicker from './PluginPicker.vue'
 
 defineOptions({ name: 'IfActionEditor' })
 const props = defineProps({ action: Object, rule: { type: Object, default: () => ({}) }, sources: { type: Array, default: () => [] } })
-const actionKeys = computed(() => Object.keys(store.schema.actions).filter(key => !pluginUnavailableReason(store.schema.actions[key])))
+const actionKeys = computed(() => Object.keys(store.schema.actions).filter(key => !pluginUnavailableReason(store.schema.actions[key]) && !isSpecialBlockAction(key)))
 const groups = computed(() => groupActionKeys(actionKeys.value))
 const pickerOpen = ref(false)
 let chooseAction = null
@@ -61,7 +61,7 @@ function replace(item, type) {
       <h3>{{ branch === 'then' ? '成立时 · THEN' : '否则 · ELSE' }}</h3>
       <p v-if="!action[branch]?.length" class="inspector-lead">此分支为空，继续后续动作。</p>
       <article v-for="(item, index) in action[branch]" :key="item.binding_id" class="if-branch-action">
-        <header><b>{{ index + 1 }}. {{ item.type === 'if' ? 'IF 条件分支' : item.type === 'set_variable' ? '变量赋值' : store.schema.actions[item.type]?.name || item.type }}</b>
+        <header><b>{{ index + 1 }}. {{ item.type === 'if' ? 'IF 条件分支' : item.type === 'set_variable' ? '变量赋值' : item.type === 'wait' ? (store.schema.actions.wait?.name || '等待') : store.schema.actions[item.type]?.name || item.type }}</b>
           <button class="icon-btn" title="上移" :disabled="index === 0" @click="move(action[branch], index, -1)"><span class="material-symbols-outlined">arrow_upward</span></button>
           <button class="icon-btn" title="下移" :disabled="index === action[branch].length - 1" @click="move(action[branch], index, 1)"><span class="material-symbols-outlined">arrow_downward</span></button>
           <button class="icon-btn danger-text" title="移除分支动作" @click="action[branch].splice(index, 1)"><span class="material-symbols-outlined">delete</span></button>
@@ -77,6 +77,7 @@ function replace(item, type) {
         <button class="btn btn-tonal btn-sm" @click="pick(type => (action[branch] ||= []).push(newAction(type)))">添加动作</button>
         <button class="btn btn-text btn-sm" @click="action[branch] ||= []; addIf(branch)">添加 IF</button>
         <button class="btn btn-text btn-sm" @click="(action[branch] ||= []).push({ type: 'set_variable', binding_id: createBindingId('action'), variable: '', value: '' })">变量赋值</button>
+        <button class="btn btn-text btn-sm" @click="(action[branch] ||= []).push(newAction('wait'))">等待</button>
       </div>
     </section>
     <PluginPicker :open="pickerOpen" kind="action" :keys="actionKeys" :groups="groups" title="选择分支动作" @close="pickerOpen = false; chooseAction = null" @select="select" />

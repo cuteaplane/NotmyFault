@@ -1,7 +1,7 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
 import { store } from '../lib/store'
-import { groupActionKeys, groupTriggerKeys, pluginUnavailableReason } from '../lib/utils'
+import { groupActionKeys, groupTriggerKeys, isSpecialBlockAction, pluginUnavailableReason } from '../lib/utils'
 import { recentPlugins, rememberPlugin } from '../lib/recentPlugins'
 import BaseDialog from './BaseDialog.vue'
 
@@ -16,6 +16,7 @@ const searchRef = ref(null)
 const schema = computed(() => step.value === 'trigger' ? store.schema.triggers : store.schema.actions)
 const availableKeys = computed(() => Object.keys(schema.value || {}).filter(key => {
   const meta = schema.value[key]
+  if (step.value === 'action' && isSpecialBlockAction(key)) return false
   return !pluginUnavailableReason(meta)
 }))
 

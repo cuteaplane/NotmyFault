@@ -12,6 +12,16 @@ export const FLOW_ROW_STEP = 220
 const LEFT = 52
 const TOP = 118
 
+
+function describeWait(item) {
+  const seconds = Number(item?.params?.seconds ?? 0) || 0
+  const milliseconds = Number(item?.params?.milliseconds ?? 0) || 0
+  if (seconds > 0 && milliseconds > 0) return `${seconds} 秒 + ${milliseconds} 毫秒`
+  if (milliseconds > 0) return `${milliseconds} 毫秒`
+  if (seconds > 0) return `${seconds} 秒`
+  return '时长未设置'
+}
+
 function isLeaf(node) {
   return !!node
     && typeof node === 'object'
@@ -158,10 +168,10 @@ export function buildFlowGraph({
       source: item,
       x,
       y: pipelineY,
-      icon: item.type === 'if' ? 'call_split' : 'play_arrow',
+      icon: item.type === 'if' ? 'call_split' : item.type === 'wait' ? 'hourglass_empty' : item.type === 'set_variable' ? 'edit_note' : 'play_arrow',
       kicker: `动作 ${index + 1}`,
       label: actionName(item),
-      meta: item.type === 'if' ? `成立 ${item.then?.length || 0} 步 · 否则 ${item.else?.length || 0} 步` : describeItem(item, 'action'),
+      meta: item.type === 'if' ? `成立 ${item.then?.length || 0} 步 · 否则 ${item.else?.length || 0} 步` : item.type === 'wait' ? describeWait(item) : describeItem(item, 'action'),
       admin: isAdmin(item, 'action'),
       hasInput: true,
       hasOutput: true,

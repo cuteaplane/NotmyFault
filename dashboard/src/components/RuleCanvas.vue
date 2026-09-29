@@ -8,7 +8,7 @@ import { typeLabel } from '../lib/valueTypes'
 import { isAdmin, eventName, actionName, describeItem } from '../lib/rulePresentation'
 
 const props = defineProps({ rule: Object, layout: { type: String, default: 'canvas' }, selectedNodeId: String })
-const emit = defineEmits(['update:selectedNodeId', 'select-node', 'add-if', 'add-assignment', 'open-picker', 'move-action', 'remove-action', 'move-failure-action', 'remove-failure-action', 'add-condition-child'])
+const emit = defineEmits(['update:selectedNodeId', 'select-node', 'add-if', 'add-assignment', 'add-wait', 'open-picker', 'move-action', 'remove-action', 'move-failure-action', 'remove-failure-action', 'add-condition-child'])
 const canvasLayout = computed(() => props.layout === 'canvas')
 const selectedNodeId = computed({ get: () => props.selectedNodeId, set: id => emit('update:selectedNodeId', id) })
 const conditionNode = computed(() => props.rule.condition || null)
@@ -585,6 +585,7 @@ defineExpose({ nodes: layoutNodes })
             <button class="btn btn-text btn-sm" @click="selectNode(conditionNodeId(rule.condition, []))"><span class="material-symbols-outlined">bolt</span>触发条件</button>
             <button class="btn btn-text btn-sm" @click="emit('add-if')"><span class="material-symbols-outlined">call_split</span>添加 IF</button>
             <button class="btn btn-text btn-sm" @click="emit('add-assignment')"><span class="material-symbols-outlined">edit_note</span>变量赋值</button>
+            <button class="btn btn-text btn-sm" @click="emit('add-wait')"><span class="material-symbols-outlined">hourglass_empty</span>等待</button>
             <button class="btn btn-text btn-sm" @click="selectNode('add-action')"><span class="material-symbols-outlined">add</span>添加动作</button>
           </div>
           <div v-if="canvasLayout" class="node-canvas-toolbar-side">

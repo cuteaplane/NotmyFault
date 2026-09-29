@@ -112,7 +112,15 @@ const actionCategoryMap = {
 }
 const actionCategoryOrder = ['程序', '文件与内容', '网络', '设备', '桌面', '通知与声音', '系统', '其他']
 
+// 画布专用块：插件仍走普通动作执行，但不进通用插件选择器
+export const SPECIAL_BLOCK_ACTIONS = Object.freeze(['wait'])
+
+export function isSpecialBlockAction(type) {
+  return SPECIAL_BLOCK_ACTIONS.includes(type)
+}
+
 export function groupActionKeys(keys) {
+
   const groups = new Map(actionCategoryOrder.map(name => [name, []]))
   keys.forEach(key => groups.get(actionCategoryMap[key] || '其他').push(key))
   return [...groups].filter(([, items]) => items.length)
