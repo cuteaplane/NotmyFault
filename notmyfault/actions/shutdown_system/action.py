@@ -129,7 +129,9 @@ def _execute(params, cancellation=None):
     if os.name != "nt":
         command = _LINUX_COMMANDS[action]
         if action == "logoff":
-            session = os.environ.get("XDG_SESSION_ID", "")
+            from notmyfault.platform.linux_support import current_session_id
+
+            session = current_session_id()
             if not session:
                 raise RuntimeError("当前系统无法获取会话 ID，不能注销")
             command = command + [session]

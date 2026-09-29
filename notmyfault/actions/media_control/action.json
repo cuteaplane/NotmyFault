@@ -8,6 +8,7 @@
     "enabled": true,
     "idempotent": false,
     "platforms": ["windows", "linux"],
+    "requires_capabilities": ["media.control"],
     "permissions": ["native_api","external_binary"],
     "outputs": [
         {"name": "command", "label": "媒体命令", "type": "string"}
