@@ -36,7 +36,7 @@ HTTP 请求、蓝牙状态变更或进程终止。强杀后未在期限内确认
 `shutdown_system.force` 用于 Windows 关机、重启或注销时强制关闭应用。
 睡眠和休眠不使用该选项：Windows 的 `SetSuspendState` 参数 bForce
 [没有实际作用](https://learn.microsoft.com/en-us/windows/win32/api/powrprof/nf-powrprof-setsuspendstate)。
-Linux 注销要求 `XDG_SESSION_ID`，只终止该会话。Windows 关机权限启用失败会
+Linux 注销优先使用 `XDG_SESSION_ID`，缺失时通过 loginctl 解析当前用户会话，只终止该会话。Windows 关机权限启用失败会
 直接报告原因。
 
 `media_control` 的“播放/暂停”切换播放状态；“静音”将静音设为开启，已经静音
@@ -109,8 +109,19 @@ Linux 注销要求 `XDG_SESSION_ID`，只终止该会话。Windows 关机权限�
 ## Linux 桌面后端
 
 Wayland 热键通过 ydotool 发送 Linux keycode 的按下和释放序列，需要可工作的
-ydotool 服务及权限。X11 仍优先使用 xdotool。未支持的键名会在发送前报错。
-F1–F24 可用于 Linux 按键发送。
+ydotoold 服务及权限。未设置 `YDOTOOL_SOCKET` 时会尝试 `$XDG_RUNTIME_DIR/.ydotool_socket`、
+`$XDG_RUNTIME_DIR/ydotool.socket` 和 `/tmp/.ydotool_socket`；连接失败的报错会带上当前套接字路径。
+X11 仍优先使用 xdotool。未支持的键名会在发送前报错。F1–F24 可用于 Linux 按键发送。
+
+显示器开关在 GNOME 走 `org.gnome.ScreenSaver.SetActive`，在 KDE 走
+`org.kde.screensaver` / `org.freedesktop.ScreenSaver.SetActive`，在 X11 其他桌面走
+`xset dpms force`。非 GNOME/KDE 的 Wayland 会话没有可用接口，能力探测与执行都会明确报错。
+
+空闲时间优先读 GNOME Mutter IdleMonitor，其次 KDE/freedesktop ScreenSaver 的
+`GetSessionIdleTime`，再回退到 X11 的 xprintidle。能力 id 为 `idle.query`。
+媒体控制能力 id 为 `media.control`，Linux 依赖 playerctl；静音仍走音频后端。
+
+Linux 锁屏状态与注销在缺少 `XDG_SESSION_ID` 时，会用 loginctl 查找当前用户的活动会话。
 
 `window_control` 在 Linux 上需要 wmctrl 和 xprop；列出显示器、居中和分屏还需要
 xrandr。隐藏窗口优先使用 xdotool 的 windowunmap。不透明度在 Linux 上不可用。
@@ -176,7 +187,7 @@ Wi-Fi 的 disconnected 包括从指定网络直接切换到其他网络。电源
 及以下触发后，需要接通电源或电量超过 25% 才恢复下一次触发。
 
 Windows 默认音频设备使用 CoreAudio 查询，锁屏状态通过 psutil 读取 LockApp/logonui。
-锁屏需连续两次采样确认变化，采样间隔为五秒。
+Linux 锁屏状态读取 loginctl LockedHint。锁屏需连续两次采样确认变化，采样间隔为五秒。
 
 剪贴板事件的 `text` 是完整内容，空闲事件的 `idle_seconds` 是本次测得的秒数。
 窗口标题事件保留配置原文，匹配忽略大小写；Linux 查询需要 X11，查询失败不会
