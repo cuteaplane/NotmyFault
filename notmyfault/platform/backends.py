@@ -333,43 +333,344 @@ class ClipboardBackend:
 
 
 class WindowBackend:
+    """X11 窗口枚举与控制，走 wmctrl / xprop / xdotool / xrandr"""
+
+    _SW_HIDE = 0
+    _SW_MAXIMIZE = 3
+    _SW_MINIMIZE = 6
+    _SW_SHOW = 8
+    _SW_RESTORE = 9
+
     def __init__(self, runner: CommandRunner | None = None) -> None:
         self._runner = runner or default_runner
 
-    def _wmctrl(self) -> str:
+    def _require_x11(self) -> None:
         _require_linux()
-        path = self._runner.which("wmctrl")
+        from notmyfault.platform.linux_support import session_type
+
+        if session_type() == "wayland":
+            raise BackendUnsupportedError(
+                "Wayland 下普通应用无法枚举或控制其他窗口"
+            )
+
+    def _tool(self, *names: str, purpose: str) -> str:
+        path = self._runner.which(*names)
         if not path:
-            raise BackendMissingError("依赖缺失：窗口置顶需要 wmctrl")
+            raise BackendMissingError(
+                f"依赖缺失：{purpose}需要 " + " 或 ".join(names)
+            )
         return path
 
-    def _find_window(self, wmctrl: str, target: str, title: str) -> str:
-        if target == "active":
-            xprop = self._runner.which("xprop")
-            if not xprop:
-                raise BackendMissingError("依赖缺失：读取活动窗口需要 xprop")
-            result = self._runner.run([xprop, "-root", "_NET_ACTIVE_WINDOW"], timeout=5)
-            if result.returncode != 0:
-                raise BackendFailedError(_failed_detail(result))
-            match = re.search(r"0x[0-9a-fA-F]+", result.stdout)
-            if not match or int(match[0], 16) == 0:
-                raise BackendFailedError("没有活动窗口")
-            return match[0]
-        result = self._runner.run([wmctrl, "-l"], timeout=5)
+    def _wmctrl(self) -> str:
+        return self._tool("wmctrl", purpose="窗口控制")
+
+    def _xprop(self) -> str:
+        return self._tool("xprop", purpose="读取窗口属性")
+
+    def _xrandr(self) -> str:
+        return self._tool("xrandr", purpose="读取显示器布局")
+
+    def _checked(self, args: list[str], timeout: float = 5) -> subprocess.CompletedProcess:
+        result = self._runner.run(args, timeout=timeout)
         if result.returncode != 0:
             raise BackendFailedError(_failed_detail(result))
+        return result
 
-        lines = result.stdout.strip().splitlines()
+    @staticmethod
+    def _hex_id(hwnd: int) -> str:
+        return hex(int(hwnd))
+
+    @staticmethod
+    def _parse_id(text: str) -> int:
+        return int(text, 16)
+
+    def _wm_state(self, hwnd: int) -> str:
+        result = self._checked(
+            [self._xprop(), "-id", self._hex_id(hwnd), "_NET_WM_STATE"],
+            timeout=5,
+        )
+        return result.stdout
+
+    def _enumerate(self) -> list[dict]:
+        self._require_x11()
+        result = self._checked([self._wmctrl(), "-lGpx"], timeout=5)
+        windows: list[dict] = []
+        for line in result.stdout.splitlines():
+            parts = line.split(None, 9)
+            if len(parts) < 9:
+                continue
+            wid, _desktop, pid_text, x_text, y_text, w_text, h_text, wm_class, _host = parts[:9]
+            title = parts[9] if len(parts) > 9 else ""
+            try:
+                hwnd = self._parse_id(wid)
+                pid = int(pid_text)
+                x, y = int(x_text), int(y_text)
+                width, height = int(w_text), int(h_text)
+            except ValueError:
+                continue
+            class_name = wm_class.rsplit(".", 1)[-1] if wm_class else ""
+            process_name = ""
+            if pid > 0:
+                try:
+                    import psutil
+
+                    process_name = psutil.Process(pid).name()
+                except Exception:
+                    process_name = ""
+            windows.append({
+                "hwnd": hwnd,
+                "title": title,
+                "class_name": class_name,
+                "pid": pid,
+                "process_name": process_name,
+                "x": x,
+                "y": y,
+                "width": width,
+                "height": height,
+                "visible": True,
+                "minimized": False,
+                "maximized": False,
+                "topmost": False,
+                "opacity": None,
+            })
+        return windows
+
+    def list_titles(self) -> dict[int, str]:
+        """窗口 id 到标题；优先 wmctrl，否则 xdotool"""
+        self._require_x11()
+        if self._runner.which("wmctrl"):
+            return {
+                item["hwnd"]: item["title"]
+                for item in self._enumerate()
+                if item["title"].strip()
+            }
+        xdotool = self._tool("xdotool", purpose="窗口标题枚举")
+        result = self._runner.run(
+            [xdotool, "search", "--name", "", "getwindowname", "%@"],
+            timeout=5,
+        )
+        if result.returncode != 0:
+            if result.returncode == 1 and not (result.stderr or "").strip() and not result.stdout.strip():
+                return {}
+            raise BackendFailedError(_failed_detail(result) or "窗口标题查询失败")
+        titles: dict[int, str] = {}
+        for index, title in enumerate(result.stdout.splitlines()):
+            if title.strip():
+                titles[index] = title
+        return titles
+
+    def foreground(self) -> int:
+        self._require_x11()
+        result = self._checked(
+            [self._xprop(), "-root", "_NET_ACTIVE_WINDOW"], timeout=5
+        )
+        match = re.search(r"0x[0-9a-fA-F]+", result.stdout)
+        if not match or int(match[0], 16) == 0:
+            return 0
+        return int(match[0], 16)
+
+    def exists(self, hwnd: int) -> bool:
+        self._require_x11()
+        result = self._runner.run(
+            [self._xprop(), "-id", self._hex_id(hwnd), "WM_CLASS"],
+            timeout=5,
+        )
+        return result.returncode == 0
+
+    def handles(self) -> list[int]:
+        return [item["hwnd"] for item in self._enumerate()]
+
+    def info(self, hwnd: int) -> dict | None:
+        self._require_x11()
+        base = next((item for item in self._enumerate() if item["hwnd"] == hwnd), None)
+        if base is None:
+            # windowunmap 后 wmctrl 列表没有它，但 xprop 还能读到
+            if not self.exists(hwnd):
+                return None
+            return {
+                "hwnd": int(hwnd),
+                "title": "",
+                "class_name": "",
+                "pid": 0,
+                "process_name": "",
+                "x": 0,
+                "y": 0,
+                "width": 0,
+                "height": 0,
+                "visible": False,
+                "minimized": False,
+                "maximized": False,
+                "topmost": False,
+                "opacity": None,
+            }
+        data = dict(base)
+        try:
+            state = self._wm_state(hwnd)
+        except BackendFailedError:
+            return None
+        data["minimized"] = "_NET_WM_STATE_HIDDEN" in state
+        data["maximized"] = (
+            "_NET_WM_STATE_MAXIMIZED_VERT" in state
+            and "_NET_WM_STATE_MAXIMIZED_HORZ" in state
+        )
+        data["topmost"] = "_NET_WM_STATE_ABOVE" in state
+        # wmctrl 列表里的窗口仍算可见，最小化只反映在 minimized
+        data["visible"] = True
+        data["opacity"] = None
+        return data
+
+    def monitors(self) -> list[dict]:
+        self._require_x11()
+        result = self._checked([self._xrandr(), "--listmonitors"], timeout=5)
+        monitors: list[dict] = []
+        pattern = re.compile(
+            r"^\s*(\d+):\s+\+?(\*)?(\S+)\s+(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)\s+(\S+)\s*$"
+        )
+        for line in result.stdout.splitlines():
+            match = pattern.match(line)
+            if not match:
+                continue
+            index = int(match.group(1)) + 1
+            primary = match.group(2) == "*"
+            width, height = int(match.group(4)), int(match.group(5))
+            x, y = int(match.group(6)), int(match.group(7))
+            device = match.group(8)
+            rect = {"x": x, "y": y, "width": width, "height": height}
+            # EWMH 工作区要逐显示器另查，这里先用整屏矩形
+            monitors.append({
+                "handle": index,
+                "device": device,
+                "primary": primary,
+                "index": index,
+                "bounds": dict(rect),
+                "work": dict(rect),
+            })
+        monitors.sort(key=lambda item: (not item["primary"], item["bounds"]["x"], item["bounds"]["y"]))
+        for index, monitor in enumerate(monitors, 1):
+            monitor["index"] = index
+            monitor["handle"] = index
+        return monitors
+
+    def monitor_for(self, hwnd: int) -> int:
+        data = self.info(hwnd)
+        monitors = self.monitors()
+        if not data or not monitors:
+            return monitors[0]["handle"] if monitors else 0
+        cx = data["x"] + data["width"] // 2
+        cy = data["y"] + data["height"] // 2
+        for monitor in monitors:
+            bounds = monitor["bounds"]
+            if (
+                bounds["x"] <= cx < bounds["x"] + bounds["width"]
+                and bounds["y"] <= cy < bounds["y"] + bounds["height"]
+            ):
+                return monitor["handle"]
+        primary = next((item for item in monitors if item["primary"]), monitors[0])
+        return primary["handle"]
+
+    def show(self, hwnd: int, command: int) -> None:
+        self._require_x11()
+        wmctrl = self._wmctrl()
+        wid = self._hex_id(hwnd)
+        if command == self._SW_MINIMIZE:
+            xdotool = self._runner.which("xdotool")
+            if xdotool:
+                self._checked([xdotool, "windowminimize", wid], timeout=5)
+            else:
+                self._checked(
+                    [wmctrl, "-i", "-r", wid, "-b", "add,hidden"], timeout=5
+                )
+            return
+        if command == self._SW_MAXIMIZE:
+            self._checked(
+                [wmctrl, "-i", "-r", wid, "-b", "add,maximized_vert,maximized_horz"],
+                timeout=5,
+            )
+            return
+        if command == self._SW_RESTORE:
+            self._checked(
+                [
+                    wmctrl,
+                    "-i",
+                    "-r",
+                    wid,
+                    "-b",
+                    "remove,hidden,maximized_vert,maximized_horz",
+                ],
+                timeout=5,
+            )
+            return
+        if command == self._SW_SHOW:
+            xdotool = self._runner.which("xdotool")
+            if xdotool:
+                self._checked([xdotool, "windowmap", wid], timeout=5)
+            else:
+                self._checked(
+                    [wmctrl, "-i", "-r", wid, "-b", "remove,hidden"], timeout=5
+                )
+            return
+        if command == self._SW_HIDE:
+            xdotool = self._runner.which("xdotool")
+            if not xdotool:
+                raise BackendUnsupportedError(
+                    "隐藏窗口需要 xdotool（windowunmap）"
+                )
+            self._checked([xdotool, "windowunmap", wid], timeout=5)
+            return
+        raise ValueError(f"不支持的窗口显示命令: {command}")
+
+    def activate(self, hwnd: int) -> None:
+        self._require_x11()
+        self._checked(
+            [self._wmctrl(), "-i", "-a", self._hex_id(hwnd)], timeout=5
+        )
+
+    def position(self, hwnd: int, rect: dict) -> None:
+        self._require_x11()
+        geometry = (
+            f"0,{rect['x']},{rect['y']},{rect['width']},{rect['height']}"
+        )
+        self._checked(
+            [self._wmctrl(), "-i", "-r", self._hex_id(hwnd), "-e", geometry],
+            timeout=5,
+        )
+
+    def pin(self, hwnd: int, enabled: bool) -> None:
+        self._require_x11()
+        change = "add,above" if enabled else "remove,above"
+        self._checked(
+            [self._wmctrl(), "-i", "-r", self._hex_id(hwnd), "-b", change],
+            timeout=5,
+        )
+
+    def opacity(self, hwnd: int, percent: int) -> None:
+        raise BackendUnsupportedError("当前 Linux 会话没有统一的窗口透明度接口")
+
+    def close(self, hwnd: int) -> None:
+        self._require_x11()
+        self._checked(
+            [self._wmctrl(), "-i", "-c", self._hex_id(hwnd)], timeout=5
+        )
+
+    def _find_window(self, target: str, title: str) -> int:
+        if target == "active":
+            hwnd = self.foreground()
+            if not hwnd:
+                raise BackendFailedError("没有活动窗口")
+            return hwnd
         if target == "title":
-            matches = [line for line in lines if len(line.split(None, 3)) == 4
-                       and title.lower() in line.split(None, 3)[3].lower()]
+            matches = [
+                item
+                for item in self._enumerate()
+                if title.lower() in item["title"].lower()
+            ]
             if not matches:
                 raise BackendFailedError(f'未找到标题包含 "{title}" 的窗口')
             if len(matches) > 1:
                 raise BackendFailedError(
                     f"标题匹配到 {len(matches)} 个窗口，请使用更精确的标题"
                 )
-            return matches[0].split()[0]
+            return matches[0]["hwnd"]
         raise ValueError(f"不支持的窗口目标: {target}")
 
     def set_pinned(self, action: str, target: str, title: str = "") -> dict[str, str]:
@@ -378,27 +679,15 @@ class WindowBackend:
         if action not in ("pin", "unpin", "toggle"):
             raise ValueError(f"不支持的置顶操作: {action}")
 
-        wmctrl = self._wmctrl()
-        window_id = self._find_window(wmctrl, target, title)
-        xprop = self._runner.which("xprop")
-        if not xprop:
-            raise BackendMissingError("依赖缺失：读取窗口置顶状态需要 xprop")
-        def is_pinned():
-            result = self._runner.run([xprop, "-id", window_id, "_NET_WM_STATE"], timeout=5)
-            if result.returncode != 0:
-                raise BackendFailedError(_failed_detail(result))
-            return "_NET_WM_STATE_ABOVE" in result.stdout
-        if action == "toggle":
-            pinned = is_pinned()
-            action = "unpin" if pinned else "pin"
+        self._require_x11()
+        hwnd = self._find_window(target, title)
 
-        change = "add,above" if action == "pin" else "remove,above"
-        result = self._runner.run(
-            [wmctrl, "-i", "-r", window_id, "-b", change],
-            timeout=5,
-        )
-        if result.returncode != 0:
-            raise BackendFailedError(_failed_detail(result))
+        def is_pinned() -> bool:
+            return "_NET_WM_STATE_ABOVE" in self._wm_state(hwnd)
+
+        if action == "toggle":
+            action = "unpin" if is_pinned() else "pin"
+        self.pin(hwnd, action == "pin")
         deadline = time.monotonic() + 1
         while is_pinned() != (action == "pin"):
             if time.monotonic() >= deadline:
@@ -406,7 +695,7 @@ class WindowBackend:
             time.sleep(0.05)
         return {
             "state": "pinned" if action == "pin" else "unpinned",
-            "window_id": window_id,
+            "window_id": self._hex_id(hwnd),
         }
 
 
@@ -428,7 +717,7 @@ class DisplayBackend:
 
     def set_power(self, action: str) -> None:
         _require_linux()
-        from notmyfault.platform.linux_support import desktop_environment
+        from notmyfault.platform.linux_support import desktop_environment, session_type
 
         if desktop_environment() == "gnome":
             executable = self._runner.which("gdbus")
@@ -446,6 +735,10 @@ class DisplayBackend:
                 "org.gnome.ScreenSaver.SetActive",
                 "true" if action == "off" else "false",
             ]
+        elif session_type() == "wayland":
+            raise BackendUnsupportedError(
+                "当前桌面在 Wayland 下没有可用的显示器开关接口"
+            )
         else:
             executable = self._runner.which("xset")
             if not executable:

@@ -148,7 +148,7 @@ def _probe_linux(capability: str) -> dict:
     if capability == WINDOW_ENUMERATE:
         if wayland:
             return _entry(False, None, "Wayland 不允许普通应用枚举其他应用窗口")
-        path, reason = _linux_command("xdotool")
+        path, reason = _linux_command("wmctrl", "xdotool")
         return _entry(bool(path), path, reason)
     if capability == WINDOW_PIN:
         if wayland:

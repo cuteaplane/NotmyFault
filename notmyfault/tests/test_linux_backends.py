@@ -300,16 +300,49 @@ class ClipboardBackendTests(LinuxPathTest):
 
 
 class WindowBackendTests(LinuxPathTest):
+    def setUp(self):
+        super().setUp()
+        patcher = patch(
+            "notmyfault.platform.linux_support.session_type",
+            return_value="x11",
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _window_line(
+        self,
+        wid="0x2",
+        pid=100,
+        x=10,
+        y=20,
+        w=800,
+        h=600,
+        wm_class="app.App",
+        host="host",
+        title="记事本",
+    ):
+        return f"{wid} 0 {pid} {x} {y} {w} {h} {wm_class} {host} {title}"
+
     def test_title_match_and_pin(self):
+        listing = (
+            self._window_line(wid="0x1", title="旧窗口")
+            + "\n"
+            + self._window_line(wid="0x2", title="记事本")
+            + "\n"
+        )
         runner = FakeRunner(
             paths={"wmctrl": "/usr/bin/wmctrl", "xprop": "/usr/bin/xprop"},
-            results=[ok(stdout="0x1 0 记事本 旧窗口\n0x2 0 host 记事本\n"), ok(), ok(stdout="_NET_WM_STATE_ABOVE")],
+            results=[
+                ok(stdout=listing),
+                ok(),
+                ok(stdout="_NET_WM_STATE_ABOVE"),
+            ],
         )
 
         result = WindowBackend(runner).set_pinned("pin", "title", "记事本")
 
         self.assertEqual(result, {"state": "pinned", "window_id": "0x2"})
-        self.assertEqual(runner.calls[0]["args"], ["/usr/bin/wmctrl", "-l"])
+        self.assertEqual(runner.calls[0]["args"], ["/usr/bin/wmctrl", "-lGpx"])
         self.assertEqual(
             runner.calls[1]["args"],
             ["/usr/bin/wmctrl", "-i", "-r", "0x2", "-b", "add,above"],
@@ -334,9 +367,114 @@ class WindowBackendTests(LinuxPathTest):
             ["/usr/bin/wmctrl", "-i", "-r", "0x2", "-b", "remove,above"],
         )
 
+    def test_list_and_info_use_wmctrl_geometry(self):
+        listing = self._window_line() + "\n"
+        runner = FakeRunner(
+            paths={"wmctrl": "/usr/bin/wmctrl", "xprop": "/usr/bin/xprop"},
+            results=[
+                ok(stdout=listing),
+                ok(stdout=listing),
+                ok(stdout="_NET_WM_STATE(ATOM) = _NET_WM_STATE_MAXIMIZED_VERT, _NET_WM_STATE_MAXIMIZED_HORZ"),
+            ],
+        )
+        with patch("psutil.Process") as process_cls:
+            process_cls.return_value.name.return_value = "app"
+            backend = WindowBackend(runner)
+            handles = backend.handles()
+            info = backend.info(0x2)
+
+        self.assertEqual(handles, [0x2])
+        self.assertEqual(info["title"], "记事本")
+        self.assertEqual(info["class_name"], "App")
+        self.assertEqual(info["process_name"], "app")
+        self.assertTrue(info["maximized"])
+        self.assertIsNone(info["opacity"])
+
+    def test_activate_move_close_commands(self):
+        runner = FakeRunner(paths={"wmctrl": "/usr/bin/wmctrl", "xprop": "/usr/bin/xprop"})
+        backend = WindowBackend(runner)
+        backend.activate(0x2)
+        backend.position(0x2, {"x": 1, "y": 2, "width": 300, "height": 400})
+        backend.close(0x2)
+        self.assertEqual(
+            [call["args"] for call in runner.calls],
+            [
+                ["/usr/bin/wmctrl", "-i", "-a", "0x2"],
+                ["/usr/bin/wmctrl", "-i", "-r", "0x2", "-e", "0,1,2,300,400"],
+                ["/usr/bin/wmctrl", "-i", "-c", "0x2"],
+            ],
+        )
+
+    def test_show_minimize_prefers_xdotool(self):
+        runner = FakeRunner(
+            paths={
+                "wmctrl": "/usr/bin/wmctrl",
+                "xprop": "/usr/bin/xprop",
+                "xdotool": "/usr/bin/xdotool",
+            }
+        )
+        WindowBackend(runner).show(0x2, 6)
+        self.assertEqual(
+            runner.calls[0]["args"],
+            ["/usr/bin/xdotool", "windowminimize", "0x2"],
+        )
+
+    def test_monitors_from_xrandr(self):
+        output = (
+            "Monitors: 2\n"
+            " 0: +*HDMI-1 1920/527x1080/296+0+0  HDMI-1\n"
+            " 1: +DP-1 1440/309x900/174+-1440+0  DP-1\n"
+        )
+        runner = FakeRunner(
+            paths={"xrandr": "/usr/bin/xrandr", "wmctrl": "/usr/bin/wmctrl", "xprop": "/usr/bin/xprop"},
+            results=[ok(stdout=output)],
+        )
+        monitors = WindowBackend(runner).monitors()
+        self.assertEqual(len(monitors), 2)
+        self.assertTrue(monitors[0]["primary"])
+        self.assertEqual(monitors[0]["bounds"]["width"], 1920)
+        self.assertEqual(monitors[1]["bounds"]["x"], -1440)
+
+    def test_list_titles_falls_back_to_xdotool(self):
+        runner = FakeRunner(
+            paths={"xdotool": "/usr/bin/xdotool"},
+            results=[ok(stdout="A\n\nB\n")],
+        )
+        titles = WindowBackend(runner).list_titles()
+        self.assertEqual(titles, {0: "A", 2: "B"})
+        self.assertEqual(
+            runner.calls[0]["args"],
+            ["/usr/bin/xdotool", "search", "--name", "", "getwindowname", "%@"],
+        )
+
+    def test_wayland_rejects_window_ops(self):
+        runner = FakeRunner(paths={"wmctrl": "/usr/bin/wmctrl", "xprop": "/usr/bin/xprop"})
+        with patch(
+            "notmyfault.platform.linux_support.session_type",
+            return_value="wayland",
+        ):
+            with self.assertRaises(BackendUnsupportedError):
+                WindowBackend(runner).handles()
+
+    def test_info_for_unmapped_window_is_hidden(self):
+        runner = FakeRunner(
+            paths={"wmctrl": "/usr/bin/wmctrl", "xprop": "/usr/bin/xprop"},
+            results=[
+                ok(stdout=""),
+                ok(stdout='WM_CLASS(STRING) = "a", "b"'),
+            ],
+        )
+        info = WindowBackend(runner).info(0x2)
+        self.assertEqual(info["hwnd"], 0x2)
+        self.assertFalse(info["visible"])
+
+    def test_opacity_unsupported(self):
+        with self.assertRaises(BackendUnsupportedError):
+            WindowBackend(FakeRunner()).opacity(1, 50)
+
     def test_missing_wmctrl_raises(self):
         with self.assertRaises(BackendMissingError):
-            WindowBackend(FakeRunner()).set_pinned("pin", "active")
+            WindowBackend(FakeRunner()).set_pinned("pin", "title", "记事本")
 
     def test_window_command_failure_raises(self):
         runner = FakeRunner(
@@ -374,6 +512,9 @@ class DisplayBackendTests(LinuxPathTest):
         with patch(
             "notmyfault.platform.linux_support.desktop_environment",
             return_value="unknown",
+        ), patch(
+            "notmyfault.platform.linux_support.session_type",
+            return_value="x11",
         ):
             DisplayBackend(runner).set_power("on")
 
@@ -381,6 +522,18 @@ class DisplayBackendTests(LinuxPathTest):
             runner.calls[0]["args"],
             ["/usr/bin/xset", "dpms", "force", "on"],
         )
+
+    def test_wayland_non_gnome_power_rejected(self):
+        runner = FakeRunner(paths={"xset": "/usr/bin/xset"})
+        with patch(
+            "notmyfault.platform.linux_support.desktop_environment",
+            return_value="kde",
+        ), patch(
+            "notmyfault.platform.linux_support.session_type",
+            return_value="wayland",
+        ):
+            with self.assertRaises(BackendUnsupportedError):
+                DisplayBackend(runner).set_power("off")
 
     def test_missing_brightnessctl_raises(self):
         with self.assertRaises(BackendMissingError):
