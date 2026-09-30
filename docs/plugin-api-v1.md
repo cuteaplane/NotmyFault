@@ -164,7 +164,7 @@ Linux 平台服务直接提供这些方法：
 - clipboard.write：`write_clipboard(text)`
 - input.send：`type_text(text)`、`send_hotkey(parts)`
 - audio.control：`set_volume(percent)`、`set_mute(muted)`
-- audio.device_query：`default_audio_devices()`
+- audio.device_query：`default_audio_devices()`、`set_default_audio_device(flow, device_id)`
 - window.pin：`set_window_pinned(action, target, title)`
 - display.brightness：`set_brightness(percent)`
 - screen.capture：`capture_screen(output_path, mode, fmt)`

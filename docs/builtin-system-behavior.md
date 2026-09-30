@@ -49,6 +49,18 @@ Linux 注销优先使用 `XDG_SESSION_ID`，缺失时通过 loginctl 解析当�
 `media_control` 的“播放/暂停”切换播放状态；“静音”将静音设为开启，已经静音
 时保持静音。Linux 静音保留原音量。
 
+## WiFi 连接与默认音频设备
+
+`wifi_connect` 连接或断开指定 SSID。Windows 使用 `netsh wlan`，只能连接系统里
+已经保存过的网络配置；Linux 使用 `nmcli`，已保存的连接走 `connection up`，新网络
+可附带密码调用 `device wifi connect`。连接和断开后都会回读当前 SSID，超时未达
+到目标状态则报错。密码参数在 Windows 上不会用来新建配置。
+
+`set_default_audio` 切换默认播放或录音设备。参数 `device` 可填设备 id 或友好名；
+Windows 通过 PolicyConfig 设置端点，Linux 通过平台服务调用 wpctl `set-default`
+或 pactl `set-default-sink` / `set-default-source`。设备 id 可与 `audio_device`
+触发器输出对应。设置后回读默认设备，不一致则报错。
+
 ## 窗口控制
 
 `window_control` 在 Windows 上通过窗口接口操作顶层窗口，支持 Windows 10 1703 及以上版本；
@@ -199,8 +211,8 @@ Wi-Fi 的 disconnected 包括从指定网络直接切换到其他网络。电源
 或返回未知哨兵时不会触发状态变化；resume 在 Windows 监听电源广播，在 Linux 监听 logind PrepareForSleep(False)。低电量在 20%
 及以下触发后，需要接通电源或电量超过 25% 才恢复下一次触发。
 
-Windows 默认音频设备使用 CoreAudio 查询，锁屏状态通过 psutil 读取 LockApp/logonui。
-Linux 锁屏状态读取 loginctl LockedHint。锁屏需连续两次采样确认变化，采样间隔为五秒。
+Windows 默认音频设备使用 CoreAudio 查询，设置默认端点走 PolicyConfig；锁屏状态通过 psutil 读取 LockApp/logonui。
+Linux 默认音频设备查询与切换走 wpctl 或 pactl；锁屏状态读取 loginctl LockedHint。锁屏需连续两次采样确认变化，采样间隔为五秒。
 
 剪贴板事件的 `text` 是完整内容，空闲事件的 `idle_seconds` 是本次测得的秒数。
 窗口标题事件保留配置原文，匹配忽略大小写；Linux 查询需要 X11，查询失败不会
