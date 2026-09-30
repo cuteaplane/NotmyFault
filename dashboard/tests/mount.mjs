@@ -84,6 +84,7 @@ const exportedFileNames = []
 const textEncoder = new TextEncoder()
 let engineEventController = null
 let engineConnections = 0
+let engineRequestHeaders = null
 let recoveredRun = null
 
 function pause(ms) {
@@ -398,6 +399,7 @@ window.fetch = async (url, options = {}) => {
   const u = String(url); const j = (o) => ({ json: async () => o, ok: true, status: 200 })
   if (u.endsWith('/api/events')) {
     engineConnections++
+    engineRequestHeaders = options.headers || {}
     return {
       ok: true,
       status: 200,
@@ -1858,6 +1860,10 @@ const signingPasswordUsesDedicatedField = pluginInstallForms.length === 1
   && !('password' in pluginInstallForms[0])
 console.log((signingPasswordUsesDedicatedField?'PASS':'FAIL')+' - author counter-signing uses the signing_password form field')
 if (!signingPasswordUsesDedicatedField) process.exitCode = 1
+
+const sseDeclaresEventStream = engineRequestHeaders?.Accept === 'text/event-stream'
+console.log((sseDeclaresEventStream?'PASS':'FAIL')+' - SSE 请求声明 text/event-stream，避开 30 秒通用超时')
+if (!sseDeclaresEventStream) process.exitCode = 1
 
 const connectionsBeforeUnmount = engineConnections
 document.getElementById('app').__vue_app__.unmount()

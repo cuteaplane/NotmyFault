@@ -178,7 +178,10 @@ async function connectSSE() {
   const abort = new AbortController()
   sseAbort = abort
   try {
-    const res = await fetchAuthenticated('/api/events', { signal: abort.signal })
+    const res = await fetchAuthenticated('/api/events', {
+      signal: abort.signal,
+      headers: { Accept: 'text/event-stream' },
+    })
     if (!res.ok || !res.body) throw new Error('SSE HTTP ' + res.status)
     if (disposed || generation !== sseGeneration) { abort.abort(); return }
     sseRetry = 0
