@@ -123,6 +123,9 @@ class PlatformServices:
     def mouse_button(self, button: str, pressed: bool) -> None:
         self._call("input.send", "mouse_button", button, pressed)
 
+    def get_mouse_position(self) -> tuple[int, int]:
+        return self._call("input.send", "get_mouse_position")
+
     def set_volume(self, percent: int) -> None:
         self._call("audio.control", "set_volume", percent)
 

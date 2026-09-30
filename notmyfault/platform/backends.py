@@ -295,6 +295,29 @@ class InputBackend:
             args = [tool, "click", f"0x{code:02X}"]
         self._run_input(args, name, timeout=10)
 
+    def get_mouse_position(self) -> tuple[int, int]:
+        """读取当前鼠标屏幕坐标；仅 xdotool 支持，ydotool 明确失败"""
+        tool, name = self._tool()
+        if name == "ydotool":
+            raise BackendFailedError(
+                "当前输入后端无法读取鼠标位置（需要 xdotool）"
+            )
+        result = self._runner.run(
+            [tool, "getmouselocation", "--shell"],
+            timeout=10,
+        )
+        if result.returncode != 0:
+            raise BackendFailedError(_failed_detail(result))
+        x = y = None
+        for line in (result.stdout or "").splitlines():
+            if line.startswith("X="):
+                x = int(line.split("=", 1)[1])
+            elif line.startswith("Y="):
+                y = int(line.split("=", 1)[1])
+        if x is None or y is None:
+            raise BackendFailedError("无法解析 xdotool 鼠标坐标输出")
+        return x, y
+
 
 class AudioBackend:
     """wpctl / pactl 音量控制、默认设备查询与切换"""
