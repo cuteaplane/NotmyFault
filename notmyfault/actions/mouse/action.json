@@ -1,0 +1,83 @@
+{
+    "id": "mouse",
+    "name": "鼠标操作",
+    "description": "移动鼠标到屏幕坐标，或单击、双击、按下、释放鼠标键",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.mouse",
+    "enabled": true,
+    "idempotent": false,
+    "requires_capabilities": ["input.send"],
+    "platforms": ["windows", "linux"],
+    "permissions": ["native_api", "external_binary"],
+    "outputs": [
+        {"name": "mode", "label": "操作方式", "type": "string"},
+        {"name": "button", "label": "鼠标按键", "type": "string", "required": false},
+        {"name": "x", "label": "横坐标", "type": "number", "required": false},
+        {"name": "y", "label": "纵坐标", "type": "number", "required": false}
+    ],
+    "params": [
+        {
+            "name": "mode",
+            "label": "操作方式",
+            "type": "select",
+            "default": "move",
+            "options": [
+                {"value": "move", "label": "移动到坐标"},
+                {"value": "move_relative", "label": "相对移动"},
+                {"value": "click", "label": "单击"},
+                {"value": "double_click", "label": "双击"},
+                {"value": "press", "label": "按下"},
+                {"value": "release", "label": "释放"}
+            ]
+        },
+        {
+            "name": "x",
+            "label": "横坐标",
+            "type": "number",
+            "value_type": {"type": "int"},
+            "default": 0,
+            "placeholder": "屏幕像素横坐标，允许多显示器负值",
+            "visible_when": {"mode": ["move"]}
+        },
+        {
+            "name": "y",
+            "label": "纵坐标",
+            "type": "number",
+            "value_type": {"type": "int"},
+            "default": 0,
+            "placeholder": "屏幕像素纵坐标，允许多显示器负值",
+            "visible_when": {"mode": ["move"]}
+        },
+        {
+            "name": "dx",
+            "label": "水平偏移",
+            "type": "number",
+            "value_type": {"type": "int"},
+            "default": 0,
+            "placeholder": "相对当前位置的水平像素，负数向左",
+            "visible_when": {"mode": ["move_relative"]}
+        },
+        {
+            "name": "dy",
+            "label": "垂直偏移",
+            "type": "number",
+            "value_type": {"type": "int"},
+            "default": 0,
+            "placeholder": "相对当前位置的垂直像素，负数向上",
+            "visible_when": {"mode": ["move_relative"]}
+        },
+        {
+            "name": "button",
+            "label": "鼠标按键",
+            "type": "select",
+            "default": "left",
+            "options": [
+                {"value": "left", "label": "左键"},
+                {"value": "right", "label": "右键"},
+                {"value": "middle", "label": "中键"}
+            ],
+            "visible_when": {"mode": ["click", "double_click", "press", "release"]}
+        }
+    ]
+}
