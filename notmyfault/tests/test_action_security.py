@@ -1,6 +1,7 @@
 from pathlib import Path
 import io
 import tarfile
+import zipfile
 from urllib.parse import urlparse
 
 import pytest
@@ -26,8 +27,39 @@ def test_tar_rejects_special_members_before_extracting_any_file(tmp_path, member
         output.addfile(special)
     target = tmp_path / "out"
     target.mkdir()
-    with pytest.raises(ValueError):
-        file_operation.run({}, {"operation": "unpack", "source": str(archive), "destination": str(target)})
+    with pytest.raises(ValueError, match="拒绝解压"):
+        file_operation.run({}, {"operation": "extract", "source": str(archive), "destination": str(target)})
+    assert list(target.iterdir()) == []
+
+
+def test_zip_rejects_archives_over_entry_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(file_operation, "_MAX_ENTRIES", 2)
+    archive = tmp_path / "many.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        for index in range(3):
+            output.writestr(f"{index}.txt", "x")
+    target = tmp_path / "out"
+    target.mkdir()
+
+    with pytest.raises(ValueError, match="条目过多"):
+        file_operation.run(
+            {}, {"operation": "extract", "source": str(archive), "destination": str(target)}
+        )
+    assert list(target.iterdir()) == []
+
+
+def test_zip_rejects_archives_over_size_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(file_operation, "_MAX_TOTAL_BYTES", 4)
+    archive = tmp_path / "big.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("big.txt", "0123456789")
+    target = tmp_path / "out"
+    target.mkdir()
+
+    with pytest.raises(ValueError, match="大小超过上限"):
+        file_operation.run(
+            {}, {"operation": "extract", "source": str(archive), "destination": str(target)}
+        )
     assert list(target.iterdir()) == []
 
 

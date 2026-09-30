@@ -7,6 +7,10 @@ import shutil
 import tarfile
 import zipfile
 
+# 解压前按声明的条目数和总大小设上限，避免一个压缩包把磁盘写满
+_MAX_ENTRIES = 20000
+_MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+
 
 def _safe_unpack(archive: str, target: str) -> None:
     """解压时检查成员路径和符号链接，非法成员抛 ValueError"""
@@ -23,14 +27,28 @@ def _safe_unpack(archive: str, target: str) -> None:
         if dest_real != target_real and not dest_real.startswith(target_real + os.sep):
             raise ValueError(f"归档成员越界: {name}")
 
+    def check_limits(count: int, total: int) -> None:
+        if count > _MAX_ENTRIES:
+            raise ValueError(f"归档条目过多（{count} > {_MAX_ENTRIES}）")
+        if total > _MAX_TOTAL_BYTES:
+            raise ValueError(f"解压后大小超过上限（{total} 字节）")
+
     if zipfile.is_zipfile(archive):
         with zipfile.ZipFile(archive) as zf:
-            for info in zf.infolist():
+            infos = zf.infolist()
+            check_limits(
+                len(infos), sum(info.file_size for info in infos if not info.is_dir())
+            )
+            for info in infos:
                 check_member(info.filename, False)
             zf.extractall(target)
     else:
         with tarfile.open(archive) as tf:
-            for member in tf.getmembers():
+            members = tf.getmembers()
+            check_limits(
+                len(members), sum(member.size for member in members if member.isfile())
+            )
+            for member in members:
                 check_member(member.name, member.issym() or member.islnk())
                 if not member.isfile() and not member.isdir():
                     raise ValueError(f"归档包含特殊文件，拒绝解压: {member.name}")
