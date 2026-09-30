@@ -12,6 +12,20 @@ from typing import Any
 
 _ACTIONS = frozenset({"connect", "disconnect"})
 _SSID_LINE_RE = re.compile(r"^\s*SSID\s*:\s*(.*)$", re.IGNORECASE)
+_password_warning_shown = False
+
+
+def _warn_password_in_argv() -> None:
+    """nmcli 没有别的免交互传密码方式，这一步只能把密码放进命令行"""
+    global _password_warning_shown
+    if _password_warning_shown:
+        return
+    _password_warning_shown = True
+    print(
+        "[Action:wifi_connect] 提醒：nmcli 的密码会出现在进程命令行中，"
+        "同机其他用户可以通过 /proc 看到；先手动连接一次该网络，之后密码留空即可",
+        file=sys.stderr,
+    )
 
 
 def _run_command(command: list[str], *, timeout: float, **kwargs) -> subprocess.CompletedProcess:
@@ -275,6 +289,7 @@ def _run_linux(action: str, ssid: str, password: str) -> dict[str, Any]:
     if _has_connection(executable, ssid):
         result = _run_nmcli(executable, "connection", "up", "id", ssid)
     elif password:
+        _warn_password_in_argv()
         result = _run_nmcli(
             executable, "device", "wifi", "connect", ssid, "password", password
         )

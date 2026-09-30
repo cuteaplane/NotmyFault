@@ -195,6 +195,29 @@ def test_linux_connect_with_password_for_new_network(monkeypatch):
     ]
 
 
+def test_linux_password_warning_printed_once(monkeypatch, capsys):
+    module = load_module()
+    states = ["", "", "NewNet", "", "", "NewNet"]
+
+    def fake_run(command, **kwargs):
+        return completed_text(stdout="Device 'wlan0' successfully activated\n")
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(module.shutil, "which", lambda name: "/usr/bin/nmcli")
+    monkeypatch.setattr(
+        module, "_current_ssid_linux", lambda: states.pop(0) if states else "NewNet"
+    )
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+
+    params = {"action": "connect", "ssid": "NewNet", "password": "secret"}
+    assert module.run({}, params)["ssid"] == "NewNet"
+    assert module.run({}, params)["ssid"] == "NewNet"
+
+    captured = capsys.readouterr()
+    assert captured.err.count("进程命令行") == 1
+
+
 def test_linux_disconnect_uses_wifi_device(monkeypatch):
     module = load_module()
     states = ["HomeWiFi", "HomeWiFi", ""]
