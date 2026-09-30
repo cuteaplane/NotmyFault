@@ -101,6 +101,30 @@ Wayland 走 xdg-desktop-portal 的 Screenshot，需要 dbus-next，执行时还�
 
 返回 `text` 和 `language`。
 
+## 屏幕找图
+
+`find_image` 在整个屏幕或指定矩形里查找与模板图片 RGB 像素完全一致的位置，输出模板左上角的屏幕坐标，供 `mouse` 移动使用。界面名称是“屏幕找图”。声明 `requires_capabilities: ["screen.capture"]`。支持协作取消（`execution_api: context-v1`，`cancellation_api: runtime-v1`）。
+
+当前只做像素级精确匹配：界面缩放、ClearType、抗锯齿或主题动画导致画面与模板不完全一致时会找不到。模板须为本机可读的 png / jpg / jpeg / bmp。
+
+| 参数 | 含义 |
+| --- | --- |
+| `template_path` | 模板图片路径 |
+| `mode` | `fullscreen` 整个屏幕，默认；`region` 指定区域 |
+| `x`、`y` | 区域左上角距这次截图左上角的像素，不能为负 |
+| `width`、`height` | 区域宽高，至少 1 像素 |
+| `timeout_seconds` | `0`（默认）只找一次；大于 0 则在时限内按间隔重复截屏查找，上限 86400 秒 |
+| `interval_seconds` | 两次查找之间的间隔，默认 0.5，范围 0.1～60 |
+| `if_not_found` | `error`（默认）找不到时报错；`empty` 返回 `found=false`，不抛错 |
+
+截图路径与 `screen_ocr` / `screenshot` 相同。Windows 全屏覆盖虚拟桌面；截图图上的 `(0,0)` 对应虚拟桌面左上角 `(virtual_left, virtual_top)`。指定区域时，匹配点再加上区域起点。最终屏幕坐标：
+
+`screen_x = virtual_left + region_x + match_x`（全屏时 `region_x` 为 0），`y` 同理。
+
+Linux 先按 `screenshot` 的全屏路径截图，再按区域裁剪。本动作把全屏截图的左上角当作屏幕 `(0,0)`；若 portal 只返回一块屏幕或用户框选画面，坐标可能对不上整块桌面，与 `screen_ocr` 相同限制。
+
+模板比查找区域大时直接报错。找到时输出 `found=true`，以及模板左上角 `x`/`y`、模板 `width`/`height`、中心 `center_x`/`center_y`。
+
 ## 鼠标操作
 
 `mouse` 移动光标、读取当前坐标，或单击、双击、按下、释放鼠标键，声明
