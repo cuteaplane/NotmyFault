@@ -1,0 +1,107 @@
+{
+    "id": "archive",
+    "name": "压缩与解压",
+    "description": "把文件夹或文件压成 ZIP，或把 ZIP 解压到指定目录；路径无效时返回失败结果而不中断异常",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.archive",
+    "enabled": true,
+    "idempotent": false,
+    "platforms": [
+        "windows",
+        "linux"
+    ],
+    "permissions": [
+        "filesystem"
+    ],
+    "security": {
+        "rule_approval": "admin_key",
+        "literal_only_params": [
+            "mode",
+            "destination"
+        ]
+    },
+    "outputs": [
+        {
+            "name": "ok",
+            "label": "是否成功",
+            "type": "bool",
+            "value_type": "bool"
+        },
+        {
+            "name": "mode",
+            "label": "操作方式",
+            "type": "string"
+        },
+        {
+            "name": "archive",
+            "label": "压缩包路径",
+            "type": "string",
+            "value_type": "path",
+            "required": false
+        },
+        {
+            "name": "source",
+            "label": "源路径",
+            "type": "string",
+            "value_type": "path",
+            "required": false
+        },
+        {
+            "name": "destination",
+            "label": "解压目录",
+            "type": "string",
+            "value_type": "path",
+            "required": false
+        },
+        {
+            "name": "file_count",
+            "label": "文件数量",
+            "type": "number",
+            "required": false
+        },
+        {
+            "name": "error",
+            "label": "错误说明",
+            "type": "string",
+            "required": false
+        }
+    ],
+    "params": [
+        {
+            "name": "mode",
+            "label": "操作方式",
+            "type": "select",
+            "default": "zip",
+            "options": [
+                {
+                    "value": "zip",
+                    "label": "压缩为 ZIP"
+                },
+                {
+                    "value": "unzip",
+                    "label": "解压 ZIP"
+                }
+            ]
+        },
+        {
+            "name": "source",
+            "label": "源路径",
+            "type": "string",
+            "default": "",
+            "placeholder": "压缩时填文件或文件夹；解压时填 .zip 路径",
+            "value_type": "path"
+        },
+        {
+            "name": "destination",
+            "label": "目标路径",
+            "type": "string",
+            "default": "",
+            "placeholder": "压缩时为 .zip 路径，解压时为目录；可留空用默认名",
+            "value_type": {
+                "type": "path",
+                "allow_empty": true
+            }
+        }
+    ]
+}
