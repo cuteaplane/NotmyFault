@@ -30,6 +30,20 @@ HTTP 请求、蓝牙状态变更或进程终止。强杀后未在期限内确认
 `milliseconds` 可同时填写并叠加。Dashboard 在工具栏提供独立的「等待」块，
 不出现在通用动作插件选择器中；执行仍走普通内置动作。
 
+## 环境变量
+
+`environment_variable` 只读写当前 NotmyFault 进程的环境变量，会影响本程序以及
+之后由本程序启动的子进程；不会写入系统或用户级永久配置。界面名称是“环境变量”。
+跨平台，不声明额外能力或权限。`idempotent` 为 false。
+
+| 操作 | `mode` | 说明 |
+| --- | --- | --- |
+| 读取 | `get` | 输出 `name`、`value`、`existed`。`missing` 为 `empty`（默认）时，不存在则 `value` 为空且 `existed` 为 false；为 `error` 时报“环境变量不存在”。 |
+| 设置 | `set` | 参数 `value` 可为空字符串。输出 `name`、`value`、`existed`（原先是否已有）。 |
+| 删除 | `unset` | 输出 `name`、`existed`（原先是否存在）。不存在时不报错。 |
+
+变量名不能为空，首尾不能有空格，也不能包含等号或空字符。
+
 ## Windows 系统资源
 
 `screenshot` 的全屏模式覆盖整个虚拟桌面，包括主屏左侧或上方显示器的负坐标；
