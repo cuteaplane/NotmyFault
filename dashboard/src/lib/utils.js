@@ -107,7 +107,7 @@ const actionCategoryMap = {
   launch_program: '程序', kill_process: '程序', run_powershell: '程序',
   file_operation: '文件与内容', archive: '文件与内容', document_quiescent: '文件与内容', clipboard_set: '文件与内容',
   http_request: '网络', bluetooth_toggle: '设备',
-  display_control: '桌面', screenshot: '桌面', screen_ocr: '桌面', mouse: '桌面', wallpaper: '桌面', lock_screen: '桌面',
+  display_control: '桌面', screenshot: '桌面', screen_ocr: '桌面', find_image: '桌面', mouse: '桌面', wallpaper: '桌面', lock_screen: '桌面',
   notify: '通知与声音', text_to_speech: '通知与声音', set_volume: '通知与声音',
   shutdown_system: '系统', environment_variable: '系统',
 }
