@@ -1,0 +1,112 @@
+{
+    "id": "find_image",
+    "name": "屏幕找图",
+    "description": "在屏幕（或指定区域）里查找与模板图片像素一致的位置，输出可供鼠标使用的屏幕坐标；可选在时限内重复查找直到出现。说明：当前为像素级精确匹配，界面缩放或抗锯齿导致不完全一致时会找不到。",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.find_image",
+    "enabled": true,
+    "idempotent": false,
+    "execution_api": "context-v1",
+    "cancellation_api": "runtime-v1",
+    "requires_capabilities": ["screen.capture"],
+    "platforms": ["windows", "linux"],
+    "permissions": ["screen_reader", "filesystem", "native_api", "external_binary"],
+    "outputs": [
+        {"name": "found", "label": "是否找到", "type": "bool", "value_type": "bool"},
+        {"name": "x", "label": "左上角横坐标", "type": "number", "required": false, "value_type": {"type": "int"}},
+        {"name": "y", "label": "左上角纵坐标", "type": "number", "required": false, "value_type": {"type": "int"}},
+        {"name": "width", "label": "模板宽度", "type": "number", "required": false, "value_type": {"type": "int"}},
+        {"name": "height", "label": "模板高度", "type": "number", "required": false, "value_type": {"type": "int"}},
+        {"name": "center_x", "label": "中心横坐标", "type": "number", "required": false, "value_type": {"type": "int"}},
+        {"name": "center_y", "label": "中心纵坐标", "type": "number", "required": false, "value_type": {"type": "int"}}
+    ],
+    "params": [
+        {
+            "name": "template_path",
+            "label": "模板图片路径",
+            "type": "string",
+            "default": "",
+            "placeholder": "png / jpg / jpeg / bmp，须存在且可读",
+            "value_type": "text"
+        },
+        {
+            "name": "mode",
+            "label": "查找范围",
+            "type": "select",
+            "default": "fullscreen",
+            "options": [
+                {"value": "fullscreen", "label": "整个屏幕"},
+                {"value": "region", "label": "指定区域"}
+            ]
+        },
+        {
+            "name": "x",
+            "label": "距左边",
+            "type": "number",
+            "value_type": {"type": "int"},
+            "default": 0,
+            "placeholder": "从截图左上角向右的像素，不能为负",
+            "visible_when": {"mode": ["region"]}
+        },
+        {
+            "name": "y",
+            "label": "距上边",
+            "type": "number",
+            "value_type": {"type": "int"},
+            "default": 0,
+            "placeholder": "从截图左上角向下的像素，不能为负",
+            "visible_when": {"mode": ["region"]}
+        },
+        {
+            "name": "width",
+            "label": "宽度",
+            "type": "number",
+            "value_type": {"type": "int"},
+            "default": 0,
+            "placeholder": "区域宽度，至少 1 像素",
+            "visible_when": {"mode": ["region"]}
+        },
+        {
+            "name": "height",
+            "label": "高度",
+            "type": "number",
+            "value_type": {"type": "int"},
+            "default": 0,
+            "placeholder": "区域高度，至少 1 像素",
+            "visible_when": {"mode": ["region"]}
+        },
+        {
+            "name": "timeout_seconds",
+            "label": "查找时限（秒）",
+            "type": "number",
+            "default": 0,
+            "placeholder": "0 只找一次；大于 0 则在时限内重复查找",
+            "value_type": {
+                "type": "duration",
+                "unit": "seconds"
+            }
+        },
+        {
+            "name": "interval_seconds",
+            "label": "重试间隔（秒）",
+            "type": "number",
+            "default": 0.5,
+            "placeholder": "时限大于 0 时两次截屏之间的间隔，0.1～60",
+            "value_type": {
+                "type": "duration",
+                "unit": "seconds"
+            }
+        },
+        {
+            "name": "if_not_found",
+            "label": "找不到时",
+            "type": "select",
+            "default": "error",
+            "options": [
+                {"value": "error", "label": "报错"},
+                {"value": "empty", "label": "返回未找到"}
+            ]
+        }
+    ]
+}
