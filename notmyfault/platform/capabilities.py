@@ -10,6 +10,7 @@ INPUT_GLOBAL_HOTKEY = "input.global_hotkey"
 WINDOW_ENUMERATE = "window.enumerate"
 WINDOW_PIN = "window.pin"
 SCREEN_CAPTURE = "screen.capture"
+SCREEN_OCR = "screen.ocr"
 DISPLAY_BRIGHTNESS = "display.brightness"
 DISPLAY_POWER = "display.power"
 AUDIO_CONTROL = "audio.control"
@@ -30,6 +31,7 @@ CAPABILITY_IDS = frozenset({
     WINDOW_ENUMERATE,
     WINDOW_PIN,
     SCREEN_CAPTURE,
+    SCREEN_OCR,
     DISPLAY_BRIGHTNESS,
     DISPLAY_POWER,
     AUDIO_CONTROL,
@@ -119,6 +121,13 @@ def _probe_windows(capability: str) -> dict:
         TTS: lambda: _windows_backend("SAPI", modules=("pythoncom", "win32com.client"), reason="SAPI 语音服务在执行时检查"),
         TRAY: lambda: _windows_backend("explorer-tray", modules=("win32api", "win32con", "win32gui"), apis={"shell32": ("Shell_NotifyIconW",)}),
     }
+    if capability == SCREEN_OCR:
+        if not shutil.which("tesseract"):
+            return _entry(False, None, "未安装 tesseract")
+        capture = _probe_windows(SCREEN_CAPTURE)
+        if not capture["available"]:
+            return _entry(False, None, capture["reason"])
+        return _entry(True, "tesseract")
     return probes[capability]()
 
 
@@ -181,6 +190,19 @@ def _probe_linux(capability: str) -> dict:
             return _entry(False, None, "未安装 dbus-next，无法调用截图 portal")
         path, reason = _linux_command("gnome-screenshot", "spectacle", "import")
         return _entry(bool(path), path, reason)
+    if capability == SCREEN_OCR:
+        path, reason = _linux_command("tesseract")
+        if not path:
+            return _entry(False, None, reason)
+        capture = _probe_linux(SCREEN_CAPTURE)
+        if not capture["available"]:
+            return _entry(False, None, capture["reason"])
+        return _entry(
+            True,
+            "tesseract",
+            capture["reason"] if capture["degraded"] else None,
+            degraded=bool(capture["degraded"]),
+        )
     if capability == DISPLAY_BRIGHTNESS:
         path, reason = _linux_command("brightnessctl")
         return _entry(bool(path), path, reason)

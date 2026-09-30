@@ -15,6 +15,10 @@ _SERVICE_BACKENDS = {
         "window.pin": "WindowBackend",
         "display.brightness": "DisplayBackend",
         "screen.capture": "ScreenshotBackend",
+        "screen.ocr": "OcrBackend",
+    },
+    "windows": {
+        "screen.ocr": "OcrBackend",
     },
 }
 
@@ -29,10 +33,10 @@ def _platform_name() -> str:
     return sys.platform
 
 
-def _linux_backend(capability: str):
+def _linux_backend(capability: str, platform: str = "linux"):
     from notmyfault.platform import backends
 
-    name = _SERVICE_BACKENDS["linux"].get(capability)
+    name = _SERVICE_BACKENDS.get(platform, {}).get(capability)
     if name is None:
         raise PlatformServiceError(capability, "unsupported", "当前宿主没有开放这个平台功能")
     return getattr(backends, name)(backends.default_runner)
@@ -82,7 +86,7 @@ class PlatformServices:
                 "unavailable",
                 status.reason or "当前系统不可用",
             )
-        target = _linux_backend(capability)
+        target = _linux_backend(capability, self.platform)
         try:
             return getattr(target, method)(*args)
         except BackendError as error:
@@ -144,3 +148,6 @@ class PlatformServices:
 
     def capture_screen(self, output_path: str, mode: str, fmt: str) -> str:
         return self._call("screen.capture", "capture", output_path, mode, fmt)
+
+    def recognize_image(self, image_path: str, language: str) -> str:
+        return self._call("screen.ocr", "recognize", image_path, language)

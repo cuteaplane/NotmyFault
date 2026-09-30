@@ -72,17 +72,21 @@ class CommandRunner:
         timeout: float = 10,
         input: str | None = None,
         env: dict[str, str] | None = None,
+        encoding: str | None = None,
+        creationflags: int = 0,
     ) -> subprocess.CompletedProcess:
         try:
             return subprocess.run(
                 args,
                 capture_output=True,
                 text=True,
+                encoding=encoding,
                 errors="replace",
                 timeout=timeout,
                 input=input,
                 env=env,
                 check=False,
+                creationflags=creationflags,
             )
         except subprocess.TimeoutExpired as exc:
             raise BackendFailedError(
@@ -997,6 +1001,38 @@ class ScreenshotBackend:
         raise BackendMissingError(
             "依赖缺失：屏幕截图需要 gnome-screenshot、spectacle 或 ImageMagick import"
         )
+
+
+_OCR_LANGUAGE_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9_]*(?:\+[A-Za-z][A-Za-z0-9_]*)*$"
+)
+
+
+class OcrBackend:
+    """用本机 tesseract 识别一张图片里的文字"""
+
+    def __init__(self, runner: CommandRunner | None = None) -> None:
+        self._runner = runner or default_runner
+
+    def recognize(self, image_path: str, language: str) -> str:
+        if not isinstance(image_path, str) or not image_path.strip():
+            raise ValueError("缺少图片路径")
+        if not isinstance(language, str) or not _OCR_LANGUAGE_RE.fullmatch(language):
+            raise ValueError(f"无法识别的语言代码: {language!r}")
+        executable = self._runner.which("tesseract")
+        if not executable:
+            raise BackendMissingError("依赖缺失：屏幕文字识别需要 tesseract")
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        result = self._runner.run(
+            [executable, image_path, "stdout", "-l", language],
+            timeout=60,
+            encoding="utf-8",
+            creationflags=flags,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise BackendFailedError(detail or f"tesseract 退出码 {result.returncode}")
+        return (result.stdout or "").lstrip("\ufeff").strip()
 
 
 _LINUX_POWER_PROFILES = {
