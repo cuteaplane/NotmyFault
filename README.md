@@ -76,10 +76,10 @@ cd ..
 ./.venv/bin/python dashboard.pyw
 ```
 
-根据桌面环境，剪贴板、截图、空闲检测、亮度、按键、鼠标和窗口功能还可能需要：
+根据桌面环境，剪贴板、截图、屏幕文字识别、空闲检测、亮度、按键、鼠标和窗口功能还可能需要：
 
 ```bash
-sudo apt install wl-clipboard xclip xdotool ydotool wmctrl xprop xrandr gnome-screenshot brightnessctl xprintidle
+sudo apt install wl-clipboard xclip xdotool ydotool wmctrl xprop xrandr gnome-screenshot brightnessctl xprintidle tesseract-ocr tesseract-ocr-chi-sim
 ```
 
 Wayland 默认禁止普通应用监听全局按键或枚举其他应用的窗口标题。NotmyFault

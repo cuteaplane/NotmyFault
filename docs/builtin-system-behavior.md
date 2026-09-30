@@ -61,6 +61,32 @@ Windows 通过 PolicyConfig 设置端点，Linux 通过平台服务调用 wpctl 
 或 pactl `set-default-sink` / `set-default-source`。设备 id 可与 `audio_device`
 触发器输出对应。设置后回读默认设备，不一致则报错。
 
+## 屏幕文字识别
+
+`screen_ocr` 截取整个屏幕或其中一块矩形，用本机 tesseract 把画面里的文字写成文本。
+界面名称是“屏幕文字识别”。声明 `requires_capabilities: ["screen.capture", "screen.ocr"]`。
+tesseract 不在 PATH 里时能力不可用，执行报“未安装 tesseract”。
+识别只调用本机 tesseract，不访问网络。单次识别最长等待 60 秒。
+
+| 参数 | 含义 |
+| --- | --- |
+| `mode` | `fullscreen` 整个屏幕，默认；`region` 指定区域 |
+| `x`、`y` | 区域左上角距这次截图左上角的像素，不能为负 |
+| `width`、`height` | 区域宽高，至少 1 像素 |
+| `language` | tesseract 语言代码，默认 `chi_sim+eng` |
+
+坐标原点是截图左上角，不是主屏原点。Windows 全屏图覆盖虚拟桌面，主屏左侧的显示器在图片左侧，`x`、`y` 从虚拟桌面左上角算起。
+区域超出画面就报错，不裁成交叉的那一块。
+
+Linux 先按 `screenshot` 的全屏路径截图，再裁剪。X11 使用 gnome-screenshot、spectacle 或 ImageMagick import。
+Wayland 走 xdg-desktop-portal 的 Screenshot，需要 dbus-next，执行时还要 portal 服务和用户授权。
+这个接口没有按坐标截取区域的参数，裁剪发生在 portal 返回的图片上。portal 若只给出一块屏幕或用户选中的画面，坐标对不上整块虚拟桌面。
+
+中文需要语言数据 `chi_sim`。Debian/Ubuntu 安装 `tesseract-ocr` 和 `tesseract-ocr-chi-sim`。
+语言数据缺失时动作失败，并带上 tesseract 的原始错误。空白画面返回空字符串。
+
+返回 `text` 和 `language`。
+
 ## 鼠标操作
 
 `mouse` 移动光标或单击、双击、按下、释放鼠标键，声明 `requires_capabilities: ["input.send"]`。

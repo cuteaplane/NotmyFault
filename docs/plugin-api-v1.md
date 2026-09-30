@@ -156,8 +156,7 @@ def run(action_info, params):
 
 `capability()` 返回 `CapabilityStatus`，字段是 `id`、`available`、`backend`、
 `reason` 和 `degraded`。这里的 `available` 表示公开服务能够调用该能力，系统存在
-同类能力不等于宿主已提供对应公开方法。Windows 的内置插件仍使用系统能力探测；
-尚未开放的公开服务返回 `available=False`，调用时报 `unsupported`。
+同类能力不等于宿主已提供对应公开方法。Windows 的内置插件仍使用系统能力探测。除 `screen.ocr` 外，尚未开放的公开服务返回 `available=False`，调用时报 `unsupported`。
 Linux 平台服务直接提供这些方法：
 
 - clipboard.read：`read_clipboard(max_chars=None)`；正整数 `max_chars` 限制返回字符数及命令输出读取量
@@ -168,6 +167,9 @@ Linux 平台服务直接提供这些方法：
 - window.pin：`set_window_pinned(action, target, title)`
 - display.brightness：`set_brightness(percent)`
 - screen.capture：`capture_screen(output_path, mode, fmt)`
+- screen.ocr：`recognize_image(image_path, language)`，Windows 也提供该方法
+
+`recognize_image` 调用本机 tesseract 识别已有图片，不负责截图。`language` 是 tesseract 语言代码，例如 `eng` 或 `chi_sim+eng`。tesseract 不在 PATH 上时为 `unavailable`。
 
 能力缺失、能力 id 不存在、权限拒绝或命令失败都会抛 `PlatformServiceError`。
 `kind` 会给出 `unavailable`、`unsupported`、`backend_missing`、`permission_denied`
