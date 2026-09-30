@@ -122,6 +122,7 @@ class AutomationEngine:
             safe_on_event=self._safe_on_event,
             execute_workflow_cb=self.execute_workflow,
             scheduler_submit_fn=lambda *args: self._rule_scheduler.submit(*args),
+            alert_fn=lambda title, message: self._alert_user(title, message),
         )
         self._workflow_executor = WorkflowExecutor(
             actions_meta=lambda: self.actions_meta,
@@ -156,6 +157,7 @@ class AutomationEngine:
             start_triggers_fn=self._start_trigger_threads,
             diagnostics=self._diag_obj,
             alert_cb=lambda title, message: self._alert_user(title, message),
+            current_rules_fn=lambda: self._get_runtime_snapshot(),
         )
 
     @property
@@ -328,7 +330,7 @@ class AutomationEngine:
                 reason=error_type,
             )
             self._diag_obj.record_trigger_crash(instance_id, error_type)
-            self._trigger_supervisor.mark_crashed(instance_id, error_type)
+            attempts = self._trigger_supervisor.mark_crashed(instance_id, error_type)
             self._safe_on_event(
                 "trigger_crashed",
                 {
@@ -340,11 +342,13 @@ class AutomationEngine:
                     },
                 },
             )
-            self._alert_user(
-                f"触发器 {instance_id} 崩溃",
-                "触发器异常退出，请查看诊断状态",
-                open_dashboard=False,
-            )
+            if attempts <= 1:
+                # 连续失败会按退避自动重启，只在第一次故障时打扰用户
+                self._alert_user(
+                    f"触发器 {instance_id} 崩溃",
+                    "触发器异常退出，引擎会按退避自动重启；连续失败会停止重试，请检查诊断状态",
+                    open_dashboard=False,
+                )
 
     def scheduler_stats(self) -> Dict[str, Dict[str, int]]:
         """每个规则当前的运行数和排队数，状态接口展示用"""
@@ -727,7 +731,14 @@ class AutomationEngine:
             previous = self._get_runtime_snapshot()
             self._prepared_rules = new_rules
             self._rules = new_rules.rules
-        self._report_rule_issues(new_rules)
+        try:
+            self._report_rule_issues(new_rules)
+        except Exception:
+            # 上报问题失败不能把已经换好的快照退回半截状态，热重载要能继续走下去
+            err = traceback.format_exc()
+            print("[Engine] [!!] 热重载后上报规则问题失败:", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            engine_error("hot_reload_report_failed", error=err[-500:])
         return previous
 
     def _accept_hot_reload_rules(self, previous: PreparedRules) -> None:
@@ -793,6 +804,7 @@ class AutomationEngine:
                     se.wait(1)
                     self._hot_reloader.check_once()
                     self._event_bus.poll_absences()
+                    self._trigger_supervisor.revive_crashed()
             except KeyboardInterrupt:
                 print("[Engine] 主程序收到中断，退出中...")
         finally:
