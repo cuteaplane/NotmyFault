@@ -248,6 +248,26 @@ class InputBackendTests(LinuxPathTest):
         with self.assertRaises(ValueError):
             backend.click_mouse("left", 0)
 
+    def test_get_mouse_position_xdotool_parses_shell_output(self):
+        runner = FakeRunner(
+            paths={"xdotool": "/usr/bin/xdotool"},
+            results=[ok(stdout="X=12\nY=34\nSCREEN=0\nWINDOW=4194305\n")],
+        )
+        self.assertEqual(InputBackend(runner).get_mouse_position(), (12, 34))
+        self.assertEqual(
+            runner.calls[0]["args"],
+            ["/usr/bin/xdotool", "getmouselocation", "--shell"],
+        )
+
+    def test_get_mouse_position_ydotool_raises(self):
+        runner = FakeRunner(paths={"ydotool": "/usr/bin/ydotool"})
+        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"):
+            with self.assertRaises(BackendFailedError) as ctx:
+                InputBackend(runner).get_mouse_position()
+        self.assertIn("当前输入后端无法读取鼠标位置", str(ctx.exception))
+        self.assertIn("xdotool", str(ctx.exception))
+        self.assertEqual(runner.calls, [])
+
 
 class AudioBackendTests(LinuxPathTest):
     def test_set_volume_and_mute_use_wpctl(self):

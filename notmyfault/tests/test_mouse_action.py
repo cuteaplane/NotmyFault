@@ -114,3 +114,19 @@ def test_accepts_integer_float_coords(monkeypatch):
     result = module.run({}, {"mode": "move", "x": 10.0, "y": 20.0})
     assert result == {"mode": "move", "x": 10, "y": 20}
     assert calls == [(10, 20, True)]
+
+def test_linux_get_position_returns_coords(monkeypatch):
+    module = load_module()
+
+    class FakeServices:
+        def get_mouse_position(self):
+            return (12, 34)
+
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(module, "platform_services", FakeServices)
+    assert module.run({}, {"mode": "get_position"}) == {
+        "mode": "get_position",
+        "x": 12,
+        "y": 34,
+    }
+
