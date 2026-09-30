@@ -119,6 +119,9 @@ class PlatformServices:
     def default_audio_devices(self) -> dict[str, str]:
         return self._call("audio.device_query", "default_devices")
 
+    def set_default_audio_device(self, flow: str, device_id: str) -> None:
+        self._call("audio.device_query", "set_default_device", flow, device_id)
+
     def set_window_pinned(
         self,
         action: str,

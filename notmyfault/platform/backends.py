@@ -236,7 +236,7 @@ class InputBackend:
 
 
 class AudioBackend:
-    """wpctl / pactl 音量控制和默认设备查询"""
+    """wpctl / pactl 音量控制、默认设备查询与切换"""
 
     def __init__(self, runner: CommandRunner | None = None) -> None:
         self._runner = runner or default_runner
@@ -265,6 +265,33 @@ class AudioBackend:
         )
         if result.returncode != 0:
             raise BackendFailedError(_failed_detail(result))
+
+    def set_default_device(self, flow: str, device_id: str) -> None:
+        """把默认播放或录音设备设为 device_id；flow 为 render 或 capture"""
+        _require_linux()
+        flow = str(flow or "").strip().lower()
+        if flow not in ("render", "capture"):
+            raise ValueError(f"无效的音频流向: {flow!r}（可选: render/capture）")
+        device_id = str(device_id or "").strip()
+        if not device_id:
+            raise ValueError("必须填写目标音频设备 id")
+        if self._runner.which("wpctl"):
+            wpctl = self._runner.which("wpctl") or "wpctl"
+            result = self._runner.run(
+                [wpctl, "set-default", device_id],
+                timeout=5,
+            )
+            if result.returncode != 0:
+                raise BackendFailedError(_failed_detail(result))
+            return
+        if self._runner.which("pactl"):
+            pactl = self._runner.which("pactl") or "pactl"
+            verb = "set-default-sink" if flow == "render" else "set-default-source"
+            result = self._runner.run([pactl, verb, device_id], timeout=5)
+            if result.returncode != 0:
+                raise BackendFailedError(_failed_detail(result))
+            return
+        raise BackendMissingError("依赖缺失：设置默认音频设备需要 wpctl 或 pactl")
 
     def default_devices(self) -> dict[str, str]:
         """默认播放 / 录音设备 id，命令缺失或查询失败返回空字典"""
