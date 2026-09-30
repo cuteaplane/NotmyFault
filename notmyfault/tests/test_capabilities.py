@@ -1,9 +1,12 @@
 """能力模型：探测结构、manifest 校验和兼容判断"""
 
+import ctypes
 import unittest
 from unittest.mock import patch
 
 from notmyfault.platform import capabilities
+
+# 测试会把 os.name 改成 nt，ctypes 得先在 posix 下加载，不然会找 FormatError
 from notmyfault.platform.linux_support import BackendMissingError, require_command
 from notmyfault.security.plugin_schema import validate_plugin_meta
 
@@ -159,6 +162,65 @@ class ProbeStructureTests(unittest.TestCase):
             result = capabilities._probe_linux(capabilities.SCREEN_CAPTURE)
         self.assertFalse(result["available"])
         self.assertIn("dbus-next", result["reason"])
+
+    def test_screen_ocr_needs_tesseract_and_a_capture_backend(self):
+        def which(name):
+            if name in {"tesseract", "gnome-screenshot"}:
+                return f"/usr/bin/{name}"
+            return None
+
+        with patch("notmyfault.platform.linux_support.session_type", return_value="x11"),                 patch("notmyfault.platform.linux_support.shutil.which", side_effect=which):
+            ready = capabilities._probe_linux(capabilities.SCREEN_OCR)
+        self.assertTrue(ready["available"])
+        self.assertEqual(ready["backend"], "tesseract")
+        self.assertFalse(ready["degraded"])
+
+        def only_screenshot(name):
+            return "/usr/bin/gnome-screenshot" if name == "gnome-screenshot" else None
+
+        with patch("notmyfault.platform.linux_support.session_type", return_value="x11"),                 patch("notmyfault.platform.linux_support.shutil.which", side_effect=only_screenshot):
+            missing_ocr = capabilities._probe_linux(capabilities.SCREEN_OCR)
+        self.assertFalse(missing_ocr["available"])
+        self.assertIn("tesseract", missing_ocr["reason"])
+
+        def only_tesseract(name):
+            return "/usr/bin/tesseract" if name == "tesseract" else None
+
+        with patch("notmyfault.platform.linux_support.session_type", return_value="x11"),                 patch("notmyfault.platform.linux_support.shutil.which", side_effect=only_tesseract):
+            missing_capture = capabilities._probe_linux(capabilities.SCREEN_OCR)
+        self.assertFalse(missing_capture["available"])
+        self.assertIn("gnome-screenshot", missing_capture["reason"])
+
+    def test_wayland_screen_ocr_stays_degraded_with_portal(self):
+        def which(name):
+            return "/usr/bin/tesseract" if name == "tesseract" else None
+
+        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"),                 patch("importlib.util.find_spec", return_value=object()),                 patch("notmyfault.platform.linux_support.shutil.which", side_effect=which):
+            result = capabilities._probe_linux(capabilities.SCREEN_OCR)
+        self.assertTrue(result["available"])
+        self.assertTrue(result["degraded"])
+        self.assertEqual(result["backend"], "tesseract")
+        self.assertIn("Portal", result["reason"])
+
+    def test_windows_screen_ocr_requires_tesseract_and_gdi(self):
+        with patch("notmyfault.platform.capabilities.os.name", "nt"),                 patch("shutil.which", return_value=None):
+            missing = capabilities.probe_capability(capabilities.SCREEN_OCR)
+        self.assertFalse(missing["available"])
+        self.assertIn("tesseract", missing["reason"])
+
+        def which(name):
+            return "tesseract.exe" if name == "tesseract" else "powershell.exe"
+
+        with patch("notmyfault.platform.capabilities.os.name", "nt"),                 patch("importlib.util.find_spec", return_value=object()),                 patch("ctypes.WinDLL", create=True),                 patch("shutil.which", side_effect=which),                 patch("os.path.isfile", return_value=True):
+            ready = capabilities.probe_capability(capabilities.SCREEN_OCR)
+        self.assertTrue(ready["available"])
+        self.assertEqual(ready["backend"], "tesseract")
+        self.assertFalse(ready["degraded"])
+
+        with patch("notmyfault.platform.capabilities.os.name", "nt"),                 patch("shutil.which", return_value="tesseract.exe"),                 patch("ctypes.WinDLL", side_effect=OSError("no gdi"), create=True):
+            broken = capabilities.probe_capability(capabilities.SCREEN_OCR)
+        self.assertFalse(broken["available"])
+        self.assertIn("接口不可用", broken["reason"])
 
 
 class CompatibilityTests(unittest.TestCase):

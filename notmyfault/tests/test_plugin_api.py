@@ -126,3 +126,39 @@ def test_service_reports_unavailable_when_only_system_capability_exists(platform
         with pytest.raises(PlatformServiceError) as caught:
             services.write_clipboard("hello")
         assert caught.value.kind == "unsupported"
+
+
+@pytest.mark.parametrize("platform", ["windows", "linux"])
+def test_recognize_image_uses_ocr_backend(platform):
+    calls = []
+
+    class Ocr:
+        def recognize(self, image_path, language):
+            calls.append((image_path, language))
+            return "文字"
+
+    with (
+        patch("notmyfault.platform.services._platform_name", return_value=platform),
+        patch("notmyfault.platform.capabilities.probe_capability", return_value=available("tesseract")),
+        patch("notmyfault.platform.services._linux_backend", return_value=Ocr()),
+    ):
+        assert platform_services().recognize_image("shot.png", "eng") == "文字"
+    assert calls == [("shot.png", "eng")]
+
+
+def test_recognize_image_reports_missing_tesseract():
+    value = {
+        "available": False,
+        "backend": None,
+        "reason": "未安装 tesseract",
+        "degraded": False,
+    }
+    with patch("notmyfault.platform.services._platform_name", return_value="linux"), patch(
+        "notmyfault.platform.capabilities.probe_capability",
+        return_value=value,
+    ):
+        with pytest.raises(PlatformServiceError) as caught:
+            platform_services().recognize_image("shot.png", "eng")
+    assert caught.value.capability == "screen.ocr"
+    assert caught.value.kind == "unavailable"
+    assert caught.value.reason == "未安装 tesseract"

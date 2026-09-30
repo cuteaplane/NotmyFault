@@ -19,6 +19,7 @@ from notmyfault.platform.backends import (
     DisplayBackend,
     InputBackend,
     PowerProfileBackend,
+    OcrBackend,
     ScreenshotBackend,
     WindowBackend,
 )
@@ -38,8 +39,15 @@ class FakeRunner:
                 return self.paths[name]
         return None
 
-    def run(self, args, timeout=10, input=None, env=None):
-        self.calls.append({"args": args, "timeout": timeout, "input": input, "env": env})
+    def run(self, args, timeout=10, input=None, env=None, encoding=None, creationflags=0):
+        self.calls.append({
+            "args": args,
+            "timeout": timeout,
+            "input": input,
+            "env": env,
+            "encoding": encoding,
+            "creationflags": creationflags,
+        })
         if self.results:
             return self.results.pop(0)
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -849,3 +857,38 @@ class LinuxSupportHelpersTests(unittest.TestCase):
         self.assertEqual(backend, "kde-ScreenSaver.GetSessionIdleTime")
         self.assertIsNone(reason)
 
+
+
+class OcrBackendTests(unittest.TestCase):
+    def test_missing_tesseract(self):
+        with self.assertRaises(BackendMissingError) as caught:
+            OcrBackend(FakeRunner()).recognize("screen.png", "eng")
+        self.assertIn("tesseract", str(caught.exception))
+
+    def test_rejects_language_that_is_not_a_tesseract_code(self):
+        runner = FakeRunner(paths={"tesseract": "/usr/bin/tesseract"})
+        with self.assertRaises(ValueError):
+            OcrBackend(runner).recognize("screen.png", "eng;rm")
+        self.assertEqual(runner.calls, [])
+
+    def test_reads_utf8_stdout_and_reports_tesseract_error(self):
+        runner = FakeRunner(
+            paths={"tesseract": "/usr/bin/tesseract"},
+            results=[ok("你好\n")],
+        )
+        text = OcrBackend(runner).recognize("/tmp/screen.png", "chi_sim+eng")
+        self.assertEqual(text, "你好")
+        self.assertEqual(
+            runner.calls[0]["args"],
+            ["/usr/bin/tesseract", "/tmp/screen.png", "stdout", "-l", "chi_sim+eng"],
+        )
+        self.assertEqual(runner.calls[0]["timeout"], 60)
+        self.assertEqual(runner.calls[0]["encoding"], "utf-8")
+
+        failed = FakeRunner(
+            paths={"tesseract": "/usr/bin/tesseract"},
+            results=[ok("", "Error opening data file chi_sim.traineddata", 1)],
+        )
+        with self.assertRaises(BackendFailedError) as caught:
+            OcrBackend(failed).recognize("screen.png", "chi_sim")
+        self.assertIn("traineddata", str(caught.exception))
