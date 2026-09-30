@@ -167,7 +167,15 @@ def inspect_plugin_metadata(root: str | Path, kind: PluginKind, *, contents=None
         meta = json.loads(data.decode("utf-8"))
     except (OSError, KeyError, UnicodeError, ValueError) as error:
         return {}, [f"JSON 解析失败: {error}"], []
-    _, schema_errors = validate_plugin_meta(meta, kind)
+    try:
+        _, schema_errors = validate_plugin_meta(meta, kind)
+    except Exception as error:
+        # 元数据来自插件作者，校验器自己出错也要算这个插件不合格
+        return (
+            meta if isinstance(meta, dict) else {},
+            [],
+            [f"schema 校验异常: {type(error).__name__}: {error}"],
+        )
     return meta if isinstance(meta, dict) else {}, [], schema_errors
 
 

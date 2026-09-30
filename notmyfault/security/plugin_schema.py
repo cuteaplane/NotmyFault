@@ -497,6 +497,12 @@ def _validate_contributes_field(
     return errors
 
 
+def _declared_permissions(meta: Dict[str, Any]) -> List[str]:
+    """permissions 类型不对时按空列表处理，类型错误由字段校验统一报"""
+    perms = meta.get("permissions")
+    return perms if isinstance(perms, list) else []
+
+
 def validate_plugin_meta(
     meta: Dict[str, Any], plugin_type: str
 ) -> Tuple[bool, List[str]]:
@@ -541,7 +547,10 @@ def validate_plugin_meta(
             errors.append(f"字段 'package_name' 格式无效: '{meta['package_name']}'（应类似 com.example.plugin）")
 
     if "semantic" in meta:
-        if meta["semantic"] not in _ALLOWED_SEMANTICS:
+        if (
+            not isinstance(meta["semantic"], str)
+            or meta["semantic"] not in _ALLOWED_SEMANTICS
+        ):
             errors.append(
                 f"字段 'semantic' 无效: '{meta['semantic']}'"
                 f"（允许: {', '.join(sorted(_ALLOWED_SEMANTICS))}）"
@@ -594,9 +603,14 @@ def validate_plugin_meta(
                     errors.append("security.literal_only_params 必须是非空字符串数组")
                 else:
                     seen_literal_params: set[str] = set()
+                    # params 不是列表时这里取不到名字，类型错误由下面的字段校验统一报
                     declared_params = {
                         param.get("name")
-                        for param in meta.get("params", [])
+                        for param in (
+                            meta.get("params")
+                            if isinstance(meta.get("params"), list)
+                            else []
+                        )
                         if isinstance(param, dict)
                     }
                     for name in literal_params:
@@ -638,12 +652,12 @@ def validate_plugin_meta(
                                 f"security.admin_executables 包含重复项: {executable!r}"
                             )
                         seen_executables.add(normalized)
-                if "admin" not in (meta.get("permissions") or []):
+                if "admin" not in _declared_permissions(meta):
                     errors.append(
                         "security.admin_executables 需要 permissions 包含 admin"
                     )
 
-    if "admin" in (meta.get("permissions") or []):
+    if "admin" in _declared_permissions(meta):
         if not admin_executables(meta):
             errors.append("admin 权限插件必须声明 security.admin_executables")
         if meta.get("execution_mode") == "isolated":
