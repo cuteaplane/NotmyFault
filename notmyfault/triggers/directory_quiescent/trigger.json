@@ -1,0 +1,107 @@
+{
+  "id": "directory_quiescent",
+  "name": "目录静默",
+  "description": "监控目录内文件的增删改；在设定时间内不再变化时触发。也可在静默被打断时触发。",
+  "version_code": 1,
+  "version": "1.0",
+  "package_name": "io.github.notmyfault.directory_quiescent",
+  "enabled": true,
+  "semantic": "state",
+  "trigger_api": "event-v2",
+  "permissions": [
+    "filesystem"
+  ],
+  "outputs": [
+    {
+      "name": "state",
+      "label": "目录状态",
+      "type": "string",
+      "value_type": "text"
+    },
+    {
+      "name": "folder",
+      "label": "监控目录",
+      "type": "string",
+      "format": "path",
+      "value_type": "path"
+    },
+    {
+      "name": "quiet_for_seconds",
+      "label": "已静默秒数",
+      "type": "number",
+      "value_type": {
+        "type": "duration",
+        "unit": "seconds"
+      }
+    },
+    {
+      "name": "file_count",
+      "label": "文件数量",
+      "type": "number",
+      "value_type": "number"
+    }
+  ],
+  "params": [
+    {
+      "name": "folder_path",
+      "label": "监控目录",
+      "type": "path",
+      "default": "",
+      "required": true,
+      "placeholder": "如 C:\\Users\\Me\\Downloads",
+      "value_type": "path"
+    },
+    {
+      "name": "quiet_seconds",
+      "label": "静默时长（秒）",
+      "type": "number",
+      "default": 30,
+      "min": 0,
+      "max": 86400,
+      "value_type": {
+        "type": "duration",
+        "unit": "seconds"
+      }
+    },
+    {
+      "name": "state",
+      "label": "触发时机",
+      "type": "select",
+      "default": "quiescent",
+      "options": [
+        {
+          "value": "quiescent",
+          "label": "进入静默"
+        },
+        {
+          "value": "active",
+          "label": "静默被打断"
+        },
+        {
+          "value": "changed",
+          "label": "进入或离开静默"
+        }
+      ]
+    },
+    {
+      "name": "file_pattern",
+      "label": "文件名过滤",
+      "type": "string",
+      "default": "*",
+      "placeholder": "如 *.pdf、*.zip（留空=全部）"
+    },
+    {
+      "name": "interval",
+      "label": "检查间隔（秒，0.2–3600）",
+      "type": "number",
+      "default": 2,
+      "min": 0.2,
+      "max": 3600,
+      "step": 0.1,
+      "value_type": {
+        "type": "duration",
+        "unit": "seconds"
+      }
+    }
+  ]
+}
