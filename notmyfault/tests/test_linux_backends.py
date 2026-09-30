@@ -174,6 +174,71 @@ class InputBackendTests(LinuxPathTest):
             with self.assertRaises(BackendUnsupportedError):
                 InputBackend(runner).type_text("hi")
 
+    def test_move_mouse_absolute_and_relative_xdotool(self):
+        runner = FakeRunner(paths={"xdotool": "/usr/bin/xdotool"})
+        backend = InputBackend(runner)
+        backend.move_mouse(100, -20, True)
+        backend.move_mouse(-5, 10, False)
+        self.assertEqual(
+            runner.calls[0]["args"],
+            ["/usr/bin/xdotool", "mousemove", "--", "100", "-20"],
+        )
+        self.assertEqual(
+            runner.calls[1]["args"],
+            ["/usr/bin/xdotool", "mousemove_relative", "--", "-5", "10"],
+        )
+
+    def test_move_mouse_absolute_and_relative_ydotool(self):
+        runner = FakeRunner(paths={"ydotool": "/usr/bin/ydotool"})
+        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"):
+            backend = InputBackend(runner)
+            backend.move_mouse(100, 200, True)
+            backend.move_mouse(-5, 10, False)
+        self.assertEqual(
+            runner.calls[0]["args"],
+            ["/usr/bin/ydotool", "mousemove", "--absolute", "-x", "100", "-y", "200"],
+        )
+        self.assertEqual(
+            runner.calls[1]["args"],
+            ["/usr/bin/ydotool", "mousemove", "-x", "-5", "-y", "10"],
+        )
+
+    def test_click_and_button_xdotool(self):
+        runner = FakeRunner(paths={"xdotool": "/usr/bin/xdotool"})
+        backend = InputBackend(runner)
+        backend.click_mouse("right", 2)
+        backend.mouse_button("middle", True)
+        backend.mouse_button("middle", False)
+        self.assertEqual(
+            runner.calls[0]["args"],
+            ["/usr/bin/xdotool", "click", "--repeat", "2", "3"],
+        )
+        self.assertEqual(runner.calls[1]["args"], ["/usr/bin/xdotool", "mousedown", "2"])
+        self.assertEqual(runner.calls[2]["args"], ["/usr/bin/xdotool", "mouseup", "2"])
+
+    def test_click_and_button_ydotool(self):
+        runner = FakeRunner(paths={"ydotool": "/usr/bin/ydotool"})
+        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"):
+            backend = InputBackend(runner)
+            backend.click_mouse("left", 1)
+            backend.mouse_button("right", True)
+            backend.mouse_button("right", False)
+        self.assertEqual(
+            runner.calls[0]["args"],
+            ["/usr/bin/ydotool", "click", "--repeat", "1", "0xC0"],
+        )
+        self.assertEqual(runner.calls[1]["args"], ["/usr/bin/ydotool", "click", "0x41"])
+        self.assertEqual(runner.calls[2]["args"], ["/usr/bin/ydotool", "click", "0x81"])
+
+    def test_mouse_rejects_invalid_button_and_coords(self):
+        runner = FakeRunner(paths={"xdotool": "/usr/bin/xdotool"})
+        backend = InputBackend(runner)
+        with self.assertRaises(ValueError):
+            backend.click_mouse("side")
+        with self.assertRaises(ValueError):
+            backend.move_mouse(1.5, 2)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            backend.click_mouse("left", 0)
 
 
 class AudioBackendTests(LinuxPathTest):
