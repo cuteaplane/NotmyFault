@@ -1,0 +1,78 @@
+{
+    "id": "environment_variable",
+    "name": "环境变量",
+    "description": "只改当前 NotmyFault 进程的环境变量，影响本程序及之后启动的子进程；不会写入系统或用户永久配置。",
+    "version_code": 1,
+    "version": "1.0",
+    "package_name": "io.github.notmyfault.environment_variable",
+    "enabled": true,
+    "idempotent": false,
+    "platforms": ["windows", "linux"],
+    "permissions": [],
+    "outputs": [
+        {
+            "name": "name",
+            "label": "变量名",
+            "type": "string",
+            "value_type": "text"
+        },
+        {
+            "name": "value",
+            "label": "变量值",
+            "type": "string",
+            "sensitive": true,
+            "summary": "hidden",
+            "required": false,
+            "value_type": "text"
+        },
+        {
+            "name": "existed",
+            "label": "原先已有",
+            "type": "bool",
+            "value_type": "bool"
+        }
+    ],
+    "params": [
+        {
+            "name": "mode",
+            "label": "操作",
+            "type": "select",
+            "default": "get",
+            "options": [
+                {"value": "get", "label": "读取"},
+                {"value": "set", "label": "设置"},
+                {"value": "unset", "label": "删除"}
+            ]
+        },
+        {
+            "name": "name",
+            "label": "变量名",
+            "type": "string",
+            "default": "",
+            "placeholder": "例如 PATH 或 MY_TOKEN",
+            "value_type": "text"
+        },
+        {
+            "name": "value",
+            "label": "变量值",
+            "type": "string",
+            "default": "",
+            "placeholder": "要写入的值，可留空",
+            "sensitive": true,
+            "summary": "hidden",
+            "value_type": "text",
+            "visible_when": {"mode": ["set"]}
+        },
+        {
+            "name": "missing",
+            "label": "变量不存在时",
+            "type": "select",
+            "default": "empty",
+            "options": [
+                {"value": "empty", "label": "当作空值"},
+                {"value": "error", "label": "报错"}
+            ],
+            "visible_when": {"mode": ["get"]}
+        }
+    ]
+}
