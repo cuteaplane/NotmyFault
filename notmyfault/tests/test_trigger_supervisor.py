@@ -386,7 +386,7 @@ class TestEngineIntegration:
 
 
 class TestDifferentialStart:
-    """按配置指纹对齐：没变的保留，变了或被删的停掉，新增的启动"""
+    """按配置指纹决定线程去留：没变的保留，变了或被删的停掉，新增的启动"""
 
     def test_unchanged_config_keeps_running_thread(self):
         sup = TriggerSupervisor()
