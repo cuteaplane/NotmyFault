@@ -123,6 +123,9 @@ class PlatformServices:
     def mouse_button(self, button: str, pressed: bool) -> None:
         self._call("input.send", "mouse_button", button, pressed)
 
+    def scroll_mouse(self, direction: str, amount: int = 3) -> None:
+        self._call("input.send", "scroll_mouse", direction, amount)
+
     def set_volume(self, percent: int) -> None:
         self._call("audio.control", "set_volume", percent)
 
