@@ -179,8 +179,27 @@ def _ydotool_failure_detail(result: subprocess.CompletedProcess, env: dict[str, 
     return detail
 
 
+_MOUSE_BUTTONS = frozenset({"left", "right", "middle"})
+_XDOT_MOUSE_BUTTON = {"left": "1", "middle": "2", "right": "3"}
+# ydotool：低 4 位是按键，0x40 按下，0x80 抬起，二者组合即单击
+_YDOT_MOUSE_BASE = {"left": 0x00, "right": 0x01, "middle": 0x02}
+
+
+def _require_int_coord(name: str, value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} 必须是整数")
+    return value
+
+
+def _normalize_mouse_button(button: str) -> str:
+    value = str(button or "").strip().lower()
+    if value not in _MOUSE_BUTTONS:
+        raise ValueError(f"不支持的鼠标按键: {button!r}（可选: left/right/middle）")
+    return value
+
+
 class InputBackend:
-    """xdotool / ydotool 键盘输入"""
+    """xdotool / ydotool 键盘与鼠标输入"""
 
     def __init__(self, runner: CommandRunner | None = None) -> None:
         self._runner = runner or default_runner
@@ -191,7 +210,7 @@ class InputBackend:
 
         path = self._runner.which(*(("ydotool",) if session_type() == "wayland" else ("xdotool", "ydotool")))
         if not path:
-            raise BackendMissingError("依赖缺失：模拟按键需要 xdotool 或 ydotool")
+            raise BackendMissingError("依赖缺失：模拟键鼠需要 xdotool 或 ydotool")
         return path, os.path.basename(path)
 
     def _run_input(self, args: list[str], name: str, timeout: float) -> None:
@@ -232,6 +251,44 @@ class InputBackend:
                 raise ValueError(f"ydotool 不支持此按键名称: {error.args[0]}") from None
             args = [tool, "key", *[f"{code}:1" for code in codes],
                     *[f"{code}:0" for code in reversed(codes)]]
+        self._run_input(args, name, timeout=10)
+
+    def move_mouse(self, x: int, y: int, absolute: bool = True) -> None:
+        x = _require_int_coord("横坐标", x)
+        y = _require_int_coord("纵坐标", y)
+        tool, name = self._tool()
+        if name == "xdotool":
+            verb = "mousemove" if absolute else "mousemove_relative"
+            args = [tool, verb, "--", str(x), str(y)]
+        elif absolute:
+            args = [tool, "mousemove", "--absolute", "-x", str(x), "-y", str(y)]
+        else:
+            args = [tool, "mousemove", "-x", str(x), "-y", str(y)]
+        self._run_input(args, name, timeout=10)
+
+    def click_mouse(self, button: str = "left", clicks: int = 1) -> None:
+        button = _normalize_mouse_button(button)
+        if isinstance(clicks, bool) or not isinstance(clicks, int) or clicks < 1:
+            raise ValueError("点击次数必须是不小于 1 的整数")
+        tool, name = self._tool()
+        if name == "xdotool":
+            args = [tool, "click", "--repeat", str(clicks), _XDOT_MOUSE_BUTTON[button]]
+        else:
+            code = 0xC0 | _YDOT_MOUSE_BASE[button]
+            args = [tool, "click", "--repeat", str(clicks), f"0x{code:02X}"]
+        self._run_input(args, name, timeout=10)
+
+    def mouse_button(self, button: str, pressed: bool) -> None:
+        """按下或抬起指定鼠标键；pressed 为 True 表示按下"""
+        button = _normalize_mouse_button(button)
+        tool, name = self._tool()
+        if name == "xdotool":
+            verb = "mousedown" if pressed else "mouseup"
+            args = [tool, verb, _XDOT_MOUSE_BUTTON[button]]
+        else:
+            mask = 0x40 if pressed else 0x80
+            code = mask | _YDOT_MOUSE_BASE[button]
+            args = [tool, "click", f"0x{code:02X}"]
         self._run_input(args, name, timeout=10)
 
 

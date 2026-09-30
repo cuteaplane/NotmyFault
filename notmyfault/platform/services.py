@@ -110,6 +110,15 @@ class PlatformServices:
     def send_hotkey(self, parts: list[str]) -> None:
         self._call("input.send", "send_hotkey", parts)
 
+    def move_mouse(self, x: int, y: int, absolute: bool = True) -> None:
+        self._call("input.send", "move_mouse", x, y, absolute)
+
+    def click_mouse(self, button: str = "left", clicks: int = 1) -> None:
+        self._call("input.send", "click_mouse", button, clicks)
+
+    def mouse_button(self, button: str, pressed: bool) -> None:
+        self._call("input.send", "mouse_button", button, pressed)
+
     def set_volume(self, percent: int) -> None:
         self._call("audio.control", "set_volume", percent)
 
