@@ -125,8 +125,9 @@ class RuntimeController:
                 print(f"[Engine] 引擎当前处于 {self._state}，拒绝重复启动")
                 return False
             if self._current_engine is not None:
-                self._last_error = "上一代引擎尚未完全停止"
-                return False
+                # 上一代线程已经退出但没收尾干净，留着的实例只用于报告，这里放行新一代
+                print("[Engine] 上一代引擎仍有未退出的触发器或动作，继续启动新一代")
+                self._current_engine = None
 
             self._shutdown_event = threading.Event()
             self._generation += 1
@@ -192,9 +193,10 @@ class RuntimeController:
                     if clean:
                         self._current_engine = None
                     else:
+                        # 线程已经结束，收不干净的原因记在 last_error 里给界面看，状态回到 stopped
                         self._last_error = "引擎仍有未退出的触发器或动作"
             if is_current_generation:
-                self._set_state("stopped" if clean else "stopping")
+                self._set_state("stopped")
 
     def request_stop(self) -> bool:
         """发出停止信号并返回当前是否存在运行线程"""
