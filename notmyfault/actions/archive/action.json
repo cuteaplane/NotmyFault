@@ -7,6 +7,8 @@
     "package_name": "io.github.notmyfault.archive",
     "enabled": true,
     "idempotent": false,
+    "execution_api": "context-v1",
+    "cancellation_api": "runtime-v1",
     "platforms": [
         "windows",
         "linux"
@@ -61,6 +63,12 @@
             "required": false
         },
         {
+            "name": "skipped",
+            "label": "跳过数量",
+            "type": "number",
+            "required": false
+        },
+        {
             "name": "error",
             "label": "错误说明",
             "type": "string",
@@ -102,6 +110,13 @@
                 "type": "path",
                 "allow_empty": true
             }
+        },
+        {
+            "name": "overwrite",
+            "label": "覆盖已存在文件",
+            "type": "bool",
+            "default": false,
+            "visible_when": {"mode": ["unzip"]}
         }
     ]
 }

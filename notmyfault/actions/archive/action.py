@@ -9,6 +9,10 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+# 解压前先按声明的条目数和总大小设上限，避免一个压缩包把磁盘写满
+_MAX_ENTRIES = 20000
+_MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+
 
 def _soft(error: str, **extra: Any) -> dict[str, Any]:
     result = {"ok": False, "error": error}
@@ -37,13 +41,17 @@ def _check_member(name: str, target_real: str) -> None:
         raise ValueError(f"归档成员越界: {name}")
 
 
-def _zip_sources(sources: list[Path], archive: Path) -> int:
+def _zip_sources(sources: list[Path], archive: Path, cancellation=None) -> int:
     count = 0
     archive.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for source in sources:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
             if source.is_dir():
                 for path in sorted(source.rglob("*")):
+                    if cancellation is not None:
+                        cancellation.raise_if_cancelled()
                     if path.is_symlink():
                         continue
                     if path.is_file():
@@ -61,24 +69,51 @@ def _zip_sources(sources: list[Path], archive: Path) -> int:
     return count
 
 
-def _unzip(archive: Path, target: Path) -> int:
+def _unzip(
+    archive: Path,
+    target: Path,
+    cancellation=None,
+    overwrite: bool = False,
+) -> tuple[int, int]:
     target.mkdir(parents=True, exist_ok=True)
     target_real = os.path.realpath(target)
-    count = 0
+    written = 0
+    skipped = 0
     with zipfile.ZipFile(archive) as zf:
-        for info in zf.infolist():
+        infos = zf.infolist()
+        if len(infos) > _MAX_ENTRIES:
+            raise ValueError(f"压缩包条目过多（{len(infos)} > {_MAX_ENTRIES}）")
+        declared = sum(info.file_size for info in infos if not info.is_dir())
+        if declared > _MAX_TOTAL_BYTES:
+            raise ValueError(f"解压后大小超过上限（{declared} 字节）")
+        destinations = {}
+        for info in infos:
             _check_member(info.filename, target_real)
-            # 跳过目录项本身的写出计数，只计文件
-            if not info.is_dir():
-                count += 1
-        zf.extractall(target)
-    return count
+            destinations[id(info)] = os.path.join(
+                target_real, os.path.normpath(info.filename)
+            )
+        # 逐个成员写出，中途取消时已经写出的文件保持原样
+        for info in infos:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
+            destination = destinations[id(info)]
+            if info.is_dir():
+                os.makedirs(destination, exist_ok=True)
+                continue
+            if not overwrite and os.path.exists(destination):
+                skipped += 1
+                continue
+            zf.extract(info, target)
+            written += 1
+    return written, skipped
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
+    cancellation = context.get("runtime", {}).get("cancellation")
     mode = str(params.get("mode", "zip") or "zip").strip().lower()
     if mode not in {"zip", "unzip"}:
         raise ValueError(f"未知模式: {mode!r}（可选: zip/unzip）")
+    overwrite = bool(params.get("overwrite", False))
 
     if mode == "zip":
         source_raw = _require_nonempty("源路径", params.get("source", ""))
@@ -108,7 +143,7 @@ def run(action_info, params):
             return _soft(f"无法解析路径: {error}", mode=mode, archive=str(archive))
 
         try:
-            file_count = _zip_sources([source], archive)
+            file_count = _zip_sources([source], archive, cancellation)
         except (OSError, FileNotFoundError, ValueError) as error:
             return _soft(str(error), mode=mode, archive=str(archive))
 
@@ -119,6 +154,7 @@ def run(action_info, params):
             "archive": str(archive.resolve()),
             "source": str(source.resolve()),
             "file_count": file_count,
+            "skipped": 0,
             "error": "",
         }
 
@@ -136,16 +172,24 @@ def run(action_info, params):
         return _soft(f"不是有效的 ZIP 文件: {archive}", mode=mode, archive=str(archive))
 
     try:
-        file_count = _unzip(archive, target)
+        written, skipped = _unzip(archive, target, cancellation, overwrite)
     except (OSError, ValueError, zipfile.BadZipFile) as error:
         return _soft(str(error), mode=mode, archive=str(archive), destination=str(target))
 
-    print(f"[Action:archive] 已解压: {archive} -> {target}（{file_count} 个文件）")
+    print(
+        f"[Action:archive] 已解压: {archive} -> {target}"
+        f"（{written} 个文件，跳过 {skipped} 个已存在文件）"
+    )
     return {
         "ok": True,
         "mode": mode,
         "archive": str(archive.resolve()),
         "destination": str(target.resolve()),
-        "file_count": file_count,
+        "file_count": written,
+        "skipped": skipped,
         "error": "",
     }
+
+
+def run(action_info, params):
+    return run_with_context(action_info, params, {})
