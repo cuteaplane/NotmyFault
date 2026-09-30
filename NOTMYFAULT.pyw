@@ -381,6 +381,10 @@ class EngineRunner:
         stopped = self._runtime.stop(timeout=5)
         if not stopped:
             print("[Cleanup] 引擎动作仍未退出，已安排强制终止", file=sys.stderr)
+            # 引擎线程收不干净时走不到它自己的 worker 清理，这里补上，别留下孤儿子进程
+            from notmyfault.core import plugin_worker
+
+            plugin_worker.shutdown_all()
             self.request_process_shutdown(force_after=5)
         if self._run_history is not None and not self._run_history.flush():
             print("[Cleanup] 运行历史写入超时", file=sys.stderr)
