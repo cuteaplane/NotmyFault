@@ -1,9 +1,9 @@
 {
     "id": "mouse",
     "name": "鼠标操作",
-    "description": "移动鼠标到屏幕坐标，或单击、双击、按下、释放鼠标键",
-    "version_code": 1,
-    "version": "1.0",
+    "description": "移动鼠标到屏幕坐标、读取当前坐标，或单击、双击、按下、释放鼠标键",
+    "version_code": 2,
+    "version": "1.1",
     "package_name": "io.github.notmyfault.mouse",
     "enabled": true,
     "idempotent": false,
@@ -25,6 +25,7 @@
             "options": [
                 {"value": "move", "label": "移动到坐标"},
                 {"value": "move_relative", "label": "相对移动"},
+                {"value": "get_position", "label": "读取当前坐标"},
                 {"value": "click", "label": "单击"},
                 {"value": "double_click", "label": "双击"},
                 {"value": "press", "label": "按下"},

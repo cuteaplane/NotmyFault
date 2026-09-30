@@ -1,5 +1,5 @@
-"""鼠标操作：移动光标或单击、双击、按下、释放鼠标键
-Windows 用 SetCursorPos / SendInput；Linux 走 InputBackend（xdotool 或 ydotool）
+"""鼠标操作：移动光标、读取当前坐标，或单击、双击、按下、释放鼠标键
+Windows 用 SetCursorPos / GetCursorPos / SendInput；Linux 走 InputBackend（xdotool 或 ydotool）
 """
 
 from __future__ import annotations
@@ -42,6 +42,10 @@ def _linux_click(button: str, clicks: int) -> None:
 
 def _linux_button(button: str, pressed: bool) -> None:
     platform_services().mouse_button(button, pressed)
+
+
+def _linux_get_position() -> tuple[int, int]:
+    return platform_services().get_mouse_position()
 
 
 if os.name == "nt":
@@ -165,14 +169,22 @@ if os.name == "nt":
 
 def run(action_info, params):
     mode = str(params.get("mode", "move") or "move").strip().lower()
-    if mode not in _MOVE_MODES | _CLICK_MODES:
+    if mode not in _MOVE_MODES | _CLICK_MODES | {"get_position"}:
         raise ValueError(
-            f"未知模式: {mode!r}（可选: move/move_relative/click/double_click/press/release）"
+            f"未知模式: {mode!r}（可选: move/move_relative/get_position/click/double_click/press/release）"
         )
 
     result: dict[str, Any] = {"mode": mode}
 
-    if mode == "move":
+    if mode == "get_position":
+        if os.name == "nt":
+            with NATIVE_LOCK:
+                x, y = _cursor_pos()
+        else:
+            x, y = _linux_get_position()
+        result["x"] = x
+        result["y"] = y
+    elif mode == "move":
         x = _require_int("横坐标", params.get("x", 0))
         y = _require_int("纵坐标", params.get("y", 0))
         if os.name == "nt":
