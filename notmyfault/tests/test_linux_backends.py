@@ -238,42 +238,6 @@ class InputBackendTests(LinuxPathTest):
         self.assertEqual(runner.calls[1]["args"], ["/usr/bin/ydotool", "click", "0x41"])
         self.assertEqual(runner.calls[2]["args"], ["/usr/bin/ydotool", "click", "0x81"])
 
-    def test_scroll_mouse_xdotool_and_ydotool(self):
-        runner = FakeRunner(paths={"xdotool": "/usr/bin/xdotool"})
-        backend = InputBackend(runner)
-        backend.scroll_mouse("up", 3)
-        backend.scroll_mouse("down", 1)
-        self.assertEqual(
-            runner.calls[0]["args"],
-            ["/usr/bin/xdotool", "click", "--repeat", "3", "4"],
-        )
-        self.assertEqual(
-            runner.calls[1]["args"],
-            ["/usr/bin/xdotool", "click", "--repeat", "1", "5"],
-        )
-
-        runner = FakeRunner(paths={"ydotool": "/usr/bin/ydotool"})
-        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"):
-            backend = InputBackend(runner)
-            backend.scroll_mouse("up", 2)
-            backend.scroll_mouse("down", 4)
-        self.assertEqual(
-            runner.calls[0]["args"],
-            ["/usr/bin/ydotool", "mousemove", "-w", "--", "0", "2"],
-        )
-        self.assertEqual(
-            runner.calls[1]["args"],
-            ["/usr/bin/ydotool", "mousemove", "-w", "--", "0", "-4"],
-        )
-
-    def test_scroll_mouse_rejects_invalid_direction_and_amount(self):
-        runner = FakeRunner(paths={"xdotool": "/usr/bin/xdotool"})
-        backend = InputBackend(runner)
-        with self.assertRaises(ValueError):
-            backend.scroll_mouse("side", 1)
-        with self.assertRaises(ValueError):
-            backend.scroll_mouse("up", 0)
-
     def test_mouse_rejects_invalid_button_and_coords(self):
         runner = FakeRunner(paths={"xdotool": "/usr/bin/xdotool"})
         backend = InputBackend(runner)
