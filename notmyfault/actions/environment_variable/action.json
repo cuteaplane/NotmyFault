@@ -9,6 +9,9 @@
     "idempotent": false,
     "platforms": ["windows", "linux"],
     "permissions": [],
+    "security": {
+        "rule_approval": "admin_key"
+    },
     "outputs": [
         {
             "name": "name",
