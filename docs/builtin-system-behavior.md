@@ -18,7 +18,7 @@
 | `kill_process` | 全部匹配进程共用 10 秒期限，不会给每个进程重新分配 10 秒。 | 进程等待分成最多 0.1 秒的小段，段间检查取消。已经终止的进程不会恢复。 |
 | `wait` | `seconds` 与 `milliseconds` 叠加，合计 0–86400 秒；跨平台。 | 使用取消对象分段等待，规则停止或超时可中途结束。 |
 
-这些动作均声明 `idempotent: false`。请求取消或超时不会撤销此前已经发生的命令、
+表中除 `wait`（`idempotent: true`）外均声明 `idempotent: false`。请求取消或超时不会撤销此前已经发生的命令、
 HTTP 请求、蓝牙状态变更或进程终止。强杀后未在期限内确认退出的进程会明确报错。
 
 `http_request` 支持 GET、POST、PUT、DELETE、PATCH 和 HEAD，不跟随重定向，
