@@ -59,6 +59,100 @@ def load_trigger(name):
     return module, meta
 
 
+@pytest.mark.parametrize("target", ["quiescent", "active", "changed"])
+def test_directory_quiescent_reports_selected_transitions(tmp_path, monkeypatch, target):
+    module, meta = load_trigger("directory_quiescent")
+    (tmp_path / "a.txt").write_text("ready", encoding="utf-8")
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock["t"])
+    events = []
+    trigger = module.DirectoryQuiescentTrigger(
+        meta,
+        {
+            "folder_path": str(tmp_path),
+            "quiet_seconds": 10,
+            "state": target,
+            "interval": 1,
+        },
+        events.append,
+        threading.Event(),
+    )
+    trigger.validate()
+    trigger.setup()
+    trigger.poll()
+    assert events == []
+    clock["t"] = 1010.0
+    trigger.poll()
+    (tmp_path / "b.txt").write_text("new", encoding="utf-8")
+    clock["t"] = 1011.0
+    trigger.poll()
+    clock["t"] = 1021.0
+    trigger.poll()
+    expected = [state for state in ["quiescent", "active", "quiescent"] if target in (state, "changed")]
+    assert [event["state"] for event in events] == expected
+    assert all(event["folder"] == str(tmp_path.resolve()) for event in events)
+    assert all(check_payload_contract(meta["outputs"], event) == [] for event in events)
+
+
+def test_directory_quiescent_ignores_non_matching_files(tmp_path, monkeypatch):
+    module, meta = load_trigger("directory_quiescent")
+    (tmp_path / "keep.pdf").write_text("a", encoding="utf-8")
+    clock = {"t": 100.0}
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock["t"])
+    events = []
+    trigger = module.DirectoryQuiescentTrigger(
+        meta,
+        {
+            "folder_path": str(tmp_path),
+            "quiet_seconds": 5,
+            "file_pattern": "*.pdf",
+            "state": "changed",
+        },
+        events.append,
+        threading.Event(),
+    )
+    trigger.validate()
+    trigger.setup()
+    (tmp_path / "noise.txt").write_text("ignore", encoding="utf-8")
+    clock["t"] = 101.0
+    trigger.poll()
+    clock["t"] = 105.0
+    trigger.poll()
+    assert [event["state"] for event in events] == ["quiescent"]
+    assert events[0]["file_count"] == 1
+
+
+def test_directory_read_error_keeps_the_last_complete_snapshot(tmp_path, monkeypatch):
+    module, meta = load_trigger("directory_quiescent")
+    path = tmp_path / "watched.txt"
+    path.write_text("x", encoding="utf-8")
+    clock = {"t": 50.0}
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock["t"])
+    events = []
+    trigger = module.DirectoryQuiescentTrigger(
+        meta,
+        {"folder_path": str(tmp_path), "quiet_seconds": 5, "state": "changed"},
+        events.append,
+        threading.Event(),
+    )
+    trigger.validate()
+    trigger.setup()
+    original_stat = module.os.stat
+
+    def failing_stat(target, *args, **kwargs):
+        if str(target) == str(path):
+            raise PermissionError("unreadable")
+        return original_stat(target, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module.os, "stat", failing_stat)
+        trigger.poll()
+    assert events == []
+    clock["t"] = 55.0
+    trigger.poll()
+    assert [event["state"] for event in events] == ["quiescent"]
+
+
 class PollSteps:
     def __init__(self, steps):
         self.steps = iter(steps)
@@ -221,12 +315,16 @@ def test_tcp_port_reports_local_service_transitions(target):
     ("path_exists", {"path": "watched.txt"}),
     ("file_content", {"path": "watched.txt", "text": "ready"}),
     ("tcp_port", {"host": "127.0.0.1", "port": 80}),
+    ("directory_quiescent", {"folder_path": "."}),
 ])
-def test_polling_wait_stops_promptly(name, config, monkeypatch):
+def test_polling_wait_stops_promptly(name, config, monkeypatch, tmp_path):
     module, meta = load_trigger(name)
+    if name == "directory_quiescent":
+        config = {**config, "folder_path": str(tmp_path)}
     trigger_class = {
         "path_exists": "PathExistsTrigger", "file_content": "FileContentTrigger",
         "tcp_port": "TcpPortTrigger",
+        "directory_quiescent": "DirectoryQuiescentTrigger",
     }[name]
     sampled = threading.Event()
     shutdown = threading.Event()
@@ -389,8 +487,12 @@ def test_tcp_pending_dns_can_stop_without_more_samples(monkeypatch):
     ("file_content", {"path": "watched.txt", "text": "ready", "max_kib": 16385}),
     ("tcp_port", {"host": "", "port": 80}),
     ("tcp_port", {"host": "127.0.0.1", "port": 65536}),
+    ("directory_quiescent", {"folder_path": ".", "quiet_seconds": -1}),
+    ("directory_quiescent", {"folder_path": ".", "interval": float("nan")}),
 ])
-def test_invalid_polling_configuration_is_rejected(name, config):
+def test_invalid_polling_configuration_is_rejected(name, config, tmp_path):
     module, meta = load_trigger(name)
+    if name == "directory_quiescent":
+        config = {**config, "folder_path": str(tmp_path)}
     with pytest.raises(ValueError):
         module.run(meta, config, lambda event: None, threading.Event())
