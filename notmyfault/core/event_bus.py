@@ -1,11 +1,19 @@
+import sys
+import threading
 import uuid
+from collections import deque
 from typing import Any, Callable, Dict, Optional
 
-from notmyfault.core.logging import engine_warn
+from notmyfault.core.logging import engine_error, engine_warn
 from notmyfault.core.bindings import BindingResolutionError
 from notmyfault.core.data_types import DataTypeError
 from notmyfault.core.workflow import build_context
 from notmyfault.core.runtime_rules import PreparedRules, rule_key
+
+# 两条规则互相监视会形成一条不会结束的触发链，链到这么深就丢弃这次运行
+_MAX_RUN_CHAIN = 16
+# 记住多少条已发起运行的深度，够覆盖同时在跑的链条
+_RUN_DEPTH_MEMORY = 512
 
 
 class EventBus:
@@ -21,6 +29,7 @@ class EventBus:
         safe_on_event: Callable[[str, Dict[str, Any]], None],
         execute_workflow_cb: Callable[..., None],
         scheduler_submit_fn: Callable[..., str] | None = None,
+        alert_fn: Callable[[str, str], None] | None = None,
     ) -> None:
         self._snapshot_fn = snapshot_fn
         self._rules_lock = rules_lock
@@ -31,6 +40,11 @@ class EventBus:
         self._execute_workflow_cb = execute_workflow_cb
         # 有调度器时先决定跑不跑，没有就直接执行，旧测试路径走这里
         self._scheduler_submit_fn = scheduler_submit_fn
+        self._alert_fn = alert_fn
+        self._run_depths: Dict[str, int] = {}
+        self._run_depth_order: deque = deque()
+        self._chain_alerts: set = set()
+        self._depth_lock = threading.Lock()
 
     def emit_event(
         self,
@@ -53,6 +67,7 @@ class EventBus:
         with self._rules_lock:
             snapshot = self._snapshot_fn()
 
+        depth = self._chain_depth(event_payload)
         for rule in snapshot.rules:
             key = rule_key(rule)
             matched_events = snapshot.runtime.match_and_take(
@@ -65,7 +80,60 @@ class EventBus:
             if matched_events is None:
                 continue
 
-            self._dispatch(snapshot, rule, key, event_type, event_payload, masked_payload, matched_events)
+            self._dispatch(
+                snapshot, rule, key, event_type, event_payload,
+                masked_payload, matched_events, depth,
+            )
+
+    def _chain_depth(self, event_payload: Dict[str, Any]) -> int:
+        """这次事件由哪次运行引起：0 表示不是链条里的下一环"""
+        if not isinstance(event_payload, dict):
+            return 0
+        run_id = str(event_payload.get("run_id", "") or "").strip()
+        if not run_id:
+            return 0
+        with self._depth_lock:
+            return self._run_depths.get(run_id, 0) + 1
+
+    def _remember_run_depth(self, run_id: str, depth: int) -> None:
+        with self._depth_lock:
+            if len(self._run_depth_order) >= _RUN_DEPTH_MEMORY:
+                self._run_depths.pop(self._run_depth_order.popleft(), None)
+            self._run_depth_order.append(run_id)
+            self._run_depths[run_id] = depth
+
+    def _drop_deep_chain(self, rule_id: str, rule_name: str, event_type: str, depth: int) -> None:
+        """链条过深时丢弃运行，并只提醒一次"""
+        engine_error(
+            "run_chain_limited",
+            rule=rule_name,
+            rule_id=rule_id,
+            event_type=event_type,
+            depth=depth,
+        )
+        print(
+            f"[EventBus] [!!] 规则 <{rule_name}> 的触发链已达 {depth} 层，"
+            "丢弃这次运行，请检查是否有规则互相监视",
+            file=sys.stderr,
+        )
+        self._safe_on_event(
+            "run_chain_limited",
+            {
+                "rule_id": rule_id,
+                "rule_name": rule_name,
+                "event_type": event_type,
+                "depth": depth,
+            },
+        )
+        with self._depth_lock:
+            first_time = rule_id not in self._chain_alerts
+            self._chain_alerts.add(rule_id)
+        if first_time and self._alert_fn is not None:
+            self._alert_fn(
+                "规则触发链过深",
+                f"规则「{rule_name}」已连续被触发 {depth} 层，可能是两条规则互相监视。"
+                "已丢弃这次运行，请在 Dashboard 检查规则。",
+            )
 
     def poll_absences(self, now=None):
         if self._is_shutdown_fn():
@@ -78,10 +146,14 @@ class EventBus:
             if matched is not None:
                 self._dispatch(snapshot, rule, key, "absence", {}, {}, matched)
 
-    def _dispatch(self, snapshot, rule, key, event_type, event_payload, masked_payload, matched_events):
+    def _dispatch(self, snapshot, rule, key, event_type, event_payload, masked_payload, matched_events, depth=0):
         rule_id = rule.get("rule_id", "")
         rule_name = rule.get("name", "未命名规则")
+        if depth > _MAX_RUN_CHAIN:
+            self._drop_deep_chain(rule_id, rule_name, event_type, depth)
+            return
         run_id = f"run_{uuid.uuid4().hex}"
+        self._remember_run_depth(run_id, depth)
         print(f"[EventBus] [OK] 匹配到规则: <{rule_name}>, 准备分发动作！")
         self._safe_on_event(
             "rule_triggered",

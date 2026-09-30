@@ -46,6 +46,25 @@ def rule_key(rule):
     return str(rule.get("rule_id") or rule.get("name", ""))
 
 
+def _fill_owner_rule_id(leaf, meta, rule):
+    """触发器声明了 owner_rule_id 就补上所属规则
+
+    这个参数用来挡掉"规则监视自己"的循环，手工写或接口写入的规则常常不带它。
+    """
+    declared = meta.get("params")
+    if not isinstance(declared, list) or not any(
+        isinstance(spec, dict) and spec.get("name") == "owner_rule_id"
+        for spec in declared
+    ):
+        return
+    params = leaf.get("params")
+    if not isinstance(params, dict):
+        return
+    if str(params.get("owner_rule_id", "") or "").strip():
+        return
+    params["owner_rule_id"] = rule_key(rule)
+
+
 def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_trigger=None):
     normalized = normalize_rule_input(rules) if validate else normalize_rules(rules)
     registry = TypeRegistry.from_plugins(triggers_meta, actions_meta)
@@ -66,6 +85,7 @@ def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_
                 leaf["params"] = normalize_fields(
                     leaf.get("params", {}), meta.get("params"), registry, parameters=True,
                 )
+                _fill_owner_rule_id(leaf, meta, resolved)
             context = {}
             prepare_binding_context(resolved, context, triggers_meta, actions_meta, registry=registry)
             if resolve_trigger is not None:
