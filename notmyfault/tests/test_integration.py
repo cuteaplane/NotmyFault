@@ -484,6 +484,67 @@ class TestHotReloadIntegration:
 
         assert active_rules == old_rules
 
+    def test_hot_reload_gives_up_after_repeated_stop_failures(self, monkeypatch):
+        """旧触发器一直停不下来时不能每秒重试，否则主循环一直被占住"""
+        from notmyfault.core.hot_reloader import (
+            _MAX_RESTORE_ATTEMPTS,
+            _RESTORE_RETRY_STOP_TIMEOUT,
+            _RESTORE_STOP_TIMEOUT,
+        )
+
+        old_rules = [{"name": "旧规则"}]
+        new_rules = [{"name": "新规则"}]
+        active_rules = list(old_rules)
+        stopped = []
+        alerts = []
+
+        def apply_rules(rules):
+            previous = list(active_rules)
+            active_rules[:] = rules
+            return previous
+
+        def start_triggers(rules):
+            if rules == new_rules:
+                raise RuntimeError("新触发器启动失败")
+            return 1
+
+        reloader = RulesHotReloader(
+            rules_path_fn=lambda: "rules.json",
+            load_rules_fn=lambda: new_rules,
+            stop_triggers_fn=lambda timeout: stopped.append(timeout) or False,
+            apply_rules_fn=apply_rules,
+            prepare_rules_fn=lambda rules: rules,
+            start_triggers_fn=start_triggers,
+            diagnostics=Diagnostics(),
+            alert_cb=lambda title, message: alerts.append((title, message)),
+        )
+        reloader._rules_mtime = 1.0
+        monkeypatch.setattr(reloader, "current_mtime", lambda: 2.0)
+
+        reloader.check_once()
+        assert stopped == [_RESTORE_STOP_TIMEOUT]
+        assert reloader._pending_restore is not None
+
+        for _ in range(_MAX_RESTORE_ATTEMPTS - 1):
+            reloader.check_once()
+        assert stopped == [_RESTORE_STOP_TIMEOUT] + [_RESTORE_RETRY_STOP_TIMEOUT] * (
+            _MAX_RESTORE_ATTEMPTS - 1
+        )
+        assert reloader._pending_restore is not None
+
+        # 试满次数后再调用一次就放弃：不再挂着待恢复状态，时间戳推进，等文件下次变化
+        reloader.check_once()
+        assert reloader._pending_restore is None
+        assert reloader._rules_mtime == 2.0
+        assert alerts[-1] == (
+            "规则恢复失败",
+            "热加载失败且旧触发器停不下来，已放弃恢复，请重启引擎",
+        )
+        assert len(stopped) == _MAX_RESTORE_ATTEMPTS
+
+        reloader.check_once()
+        assert len(stopped) == _MAX_RESTORE_ATTEMPTS
+
 
 class TestLoggingPipeline:
     def test_write_and_parse_roundtrip(self, tmp_path, monkeypatch):

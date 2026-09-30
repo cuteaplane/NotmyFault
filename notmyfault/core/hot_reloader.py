@@ -10,6 +10,12 @@ from typing import Any, Callable, List
 from notmyfault.config import ConfigValidationError
 from notmyfault.core.logging import engine_error
 
+# 恢复旧规则要先停掉新触发器：第一次给足时间，重试时缩短，免得主循环被一直占住
+_RESTORE_STOP_TIMEOUT = 30.0
+_RESTORE_RETRY_STOP_TIMEOUT = 2.0
+# 连续这么多次停不下来就放弃这次恢复，等用户重启引擎
+_MAX_RESTORE_ATTEMPTS = 3
+
 
 class RulesHotReloader:
     """盯 rules.json 修改时间，变了就按固定顺序重载"""
@@ -39,6 +45,7 @@ class RulesHotReloader:
         self._alert_cb = alert_cb
         self._rules_mtime = 0.0
         self._pending_restore: tuple[Any, float] | None = None
+        self._restore_attempts = 0
         # 同一类错误只弹一次告警，原来是 engine 的 _hot_reload_error_reported
         self._error_reported = False
 
@@ -51,13 +58,36 @@ class RulesHotReloader:
         # 热重载只盯 rules.json，开关插件等设置变更不再触发重载
         self._rules_mtime = self.current_mtime()
         self._error_reported = False
+        self._restore_attempts = 0
 
     def _restore_previous_rules(
         self, previous_rules: Any, new_mtime: float
     ) -> bool:
         self._pending_restore = (previous_rules, new_mtime)
+        self._restore_attempts += 1
+        if self._restore_attempts > _MAX_RESTORE_ATTEMPTS:
+            # 再试下去只是反复占住主循环，放弃这次恢复并推进时间戳，等文件下次变化
+            print(
+                f"[Engine] [!!] 旧触发器连续 {_MAX_RESTORE_ATTEMPTS} 次未能退出，"
+                "已放弃恢复旧规则",
+                file=sys.stderr,
+            )
+            engine_error("hot_reload_restore_giveup", attempts=_MAX_RESTORE_ATTEMPTS)
+            self._pending_restore = None
+            self._restore_attempts = 0
+            self._rules_mtime = new_mtime
+            self._alert_cb(
+                "规则恢复失败",
+                "热加载失败且旧触发器停不下来，已放弃恢复，请重启引擎",
+            )
+            return False
+        timeout = (
+            _RESTORE_STOP_TIMEOUT
+            if self._restore_attempts == 1
+            else _RESTORE_RETRY_STOP_TIMEOUT
+        )
         try:
-            if not self._stop_triggers_fn(timeout=30):
+            if not self._stop_triggers_fn(timeout=timeout):
                 engine_error("hot_reload_restore_error", error="新触发器尚未停止")
                 return False
             self._apply_rules_fn(previous_rules)
@@ -65,6 +95,7 @@ class RulesHotReloader:
             print(f"[Engine] 热加载失败，已恢复 {restored} 个旧触发器", file=sys.stderr)
             self._rules_mtime = new_mtime
             self._pending_restore = None
+            self._restore_attempts = 0
             return True
         except Exception as error:
             print(f"[Engine] 恢复旧规则失败: {error}", file=sys.stderr)
@@ -112,6 +143,7 @@ class RulesHotReloader:
                 if started == 0:
                     print("[Engine] 热加载后没有新启动的触发器，配置未变的实例继续运行")
                 self._rules_mtime = new_mtime
+                self._restore_attempts = 0
         except ConfigValidationError as e:
             restored = True
             if previous_rules is not None:
