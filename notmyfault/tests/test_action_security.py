@@ -1,4 +1,5 @@
 from pathlib import Path
+import ast
 import io
 import tarfile
 import zipfile
@@ -30,6 +31,30 @@ def test_tar_rejects_special_members_before_extracting_any_file(tmp_path, member
     with pytest.raises(ValueError, match="拒绝解压"):
         file_operation.run({}, {"operation": "extract", "source": str(archive), "destination": str(target)})
     assert list(target.iterdir()) == []
+
+
+def test_builtin_plugins_never_block_on_subprocess_without_timeout():
+    """插件里的阻塞式外部调用必须带 timeout，否则动作线程和关机收尾都会卡住"""
+    package = Path(__file__).resolve().parents[1]
+    blocking = {"run", "check_output", "check_call", "call"}
+    offenders = []
+    for root in ("actions", "triggers"):
+        for path in sorted((package / root).rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if not (
+                    isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "subprocess"
+                    and func.attr in blocking
+                ):
+                    continue
+                if not any(keyword.arg == "timeout" for keyword in node.keywords):
+                    offenders.append(f"{path.parent.name}:{node.lineno}")
+    assert offenders == [], f"这些调用没有 timeout: {offenders}"
 
 
 def test_zip_rejects_archives_over_entry_limit(tmp_path, monkeypatch):
