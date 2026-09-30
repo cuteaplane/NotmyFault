@@ -9,7 +9,7 @@
     "package_name": "io.github.notmyfault.wifi_network",
     "enabled": true,
     "platforms": ["windows", "linux"],
-    "permissions": ["external_binary"],
+    "permissions": ["external_binary", "native_api"],
     "outputs": [
         {"name": "ssid", "label": "当前网络", "type": "string"},
         {"name": "previous_ssid", "label": "上一个网络", "type": "string"},
