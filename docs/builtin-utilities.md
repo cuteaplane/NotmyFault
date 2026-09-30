@@ -1,6 +1,6 @@
 # 文件、数据处理与状态触发插件
 
-这 16 个内置插件位于 `notmyfault/actions/` 和 `notmyfault/triggers/`。
+这些内置插件位于 `notmyfault/actions/` 和 `notmyfault/triggers/`。
 在规则编辑器中选择对应的动作或触发条件，填写参数即可使用。数据动作返回的
 字段可以通过 `$ref` 传给后续动作，敏感文本不会显示在执行摘要中。
 
@@ -15,6 +15,7 @@
 | `create_directory` | 创建目录 | 创建缺少的父目录，返回 `path` 和 `created`；已有目录返回 `created=false`，同名文件报错。 |
 | `clipboard_read` | 读取剪贴板 | 返回 `text`、`length`、`has_text` 和 `truncated`。只读取文本，默认最多 1000000 字符。 |
 | `download_file` | 下载文件 | 从公网 HTTP/HTTPS 下载，返回 `file`、`bytes` 和 `status`。默认不覆盖，最多 100 MiB，下载总期限默认 15 秒。 |
+| `archive` | 压缩与解压 | `zip` 压缩文件或文件夹，`unzip` 解压 ZIP；返回 `ok`、`archive`、`file_count` 等。路径无效时 `ok=false`。 |
 
 文本文件读写支持 UTF-8、带 BOM 的 UTF-8、GBK 和 UTF-16。
 `list_files` 的通配符匹配相对路径，`*` 可以跨过目录分隔符；递归时不进入符号链接
