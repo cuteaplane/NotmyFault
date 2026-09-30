@@ -66,6 +66,9 @@ def test_linux_move_and_click_dispatch_platform_services(monkeypatch):
         def mouse_button(self, button, pressed):
             calls.append(("button", button, pressed))
 
+        def scroll_mouse(self, direction, amount=3):
+            calls.append(("scroll", direction, amount))
+
     monkeypatch.setattr(module, "os", SimpleNamespace(name="posix"))
     monkeypatch.setattr(module, "platform_services", FakeServices)
 
@@ -91,6 +94,11 @@ def test_linux_move_and_click_dispatch_platform_services(monkeypatch):
         "mode": "release",
         "button": "middle",
     }
+    assert module.run({}, {"mode": "scroll", "direction": "up", "amount": 2}) == {
+        "mode": "scroll",
+        "direction": "up",
+        "amount": 2,
+    }
 
     assert calls == [
         ("move", 100, -20, True),
@@ -98,7 +106,16 @@ def test_linux_move_and_click_dispatch_platform_services(monkeypatch):
         ("click", "right", 2),
         ("button", "middle", True),
         ("button", "middle", False),
+        ("scroll", "up", 2),
     ]
+
+
+def test_scroll_rejects_bad_direction_and_amount():
+    module = load_module()
+    with pytest.raises(ValueError, match="滚轮方向"):
+        module.run({}, {"mode": "scroll", "direction": "left"})
+    with pytest.raises(ValueError, match="滚轮格数"):
+        module.run({}, {"mode": "scroll", "direction": "down", "amount": 0})
 
 
 def test_accepts_integer_float_coords(monkeypatch):
