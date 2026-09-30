@@ -42,6 +42,8 @@
             "type": "string",
             "default": "",
             "placeholder": "已保存的网络可留空；Windows 需事先保存过该网络",
+            "sensitive": true,
+            "summary": "hidden",
             "visible_when": {"action": ["connect"]}
         }
     ]
