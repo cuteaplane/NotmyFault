@@ -25,6 +25,7 @@ class RulesHotReloader:
         diagnostics: Any,
         alert_cb: Callable[..., None],
         accept_rules_fn: Callable[[Any], None] | None = None,
+        current_rules_fn: Callable[[], Any] | None = None,
     ) -> None:
         self._rules_path_fn = rules_path_fn
         self._load_rules_fn = load_rules_fn
@@ -32,6 +33,7 @@ class RulesHotReloader:
         self._prepare_rules_fn = prepare_rules_fn
         self._apply_rules_fn = apply_rules_fn
         self._accept_rules_fn = accept_rules_fn or (lambda previous: None)
+        self._current_rules_fn = current_rules_fn
         self._start_triggers_fn = start_triggers_fn
         self._diagnostics = diagnostics
         self._alert_cb = alert_cb
@@ -70,6 +72,20 @@ class RulesHotReloader:
             engine_error("hot_reload_restore_error", error=str(error))
             return False
 
+    def _restart_current_triggers(self) -> bool:
+        """换快照时就抛了异常，旧触发器已经被停掉，这里按当前规则把它们拉回来"""
+        if self._current_rules_fn is None:
+            return False
+        try:
+            started = self._start_triggers_fn(self._current_rules_fn())
+            print(f"[Engine] 热加载失败，已按当前规则重启 {started} 个触发器", file=sys.stderr)
+            return True
+        except Exception as error:
+            print(f"[Engine] 按当前规则重启触发器失败: {error}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            engine_error("hot_reload_restart_error", error=str(error))
+            return False
+
     def check_once(self) -> None:
         """检查一次文件修改时间，变了就重载，主循环每秒调用"""
         if self._pending_restore is not None:
@@ -84,17 +100,7 @@ class RulesHotReloader:
                 # 文件写入中被读取时可能出现临时 JSON 错误，下一轮继续尝试
                 new_rules = self._prepare_rules_fn(self._load_rules_fn())
 
-                # 旧触发器仍在运行时先等待退出，再决定是否加载新配置
-                if not self._stop_triggers_fn(timeout=30):
-                    message = "旧触发器未能在 30 秒内退出，已拒绝应用新配置"
-                    if not self._error_reported:
-                        self._diagnostics.inc_hot_reload_error()
-                        engine_error("hot_reload_error", error=message)
-                        print(f"[Engine] [!!] {message}", file=sys.stderr)
-                        self._alert_cb("热重载被拒绝", message)
-                        self._error_reported = True
-                    return
-
+                # 触发器线程按配置指纹对齐：配置没变的实例留着继续跑，不重启
                 previous_rules = self._apply_rules_fn(new_rules)
 
                 started = self._start_triggers_fn(new_rules)
@@ -104,7 +110,7 @@ class RulesHotReloader:
                 )
                 self._error_reported = False
                 if started == 0:
-                    print("[Engine] 热加载后无可用触发器，保持Engine运行")
+                    print("[Engine] 热加载后没有新启动的触发器，配置未变的实例继续运行")
                 self._rules_mtime = new_mtime
         except ConfigValidationError as e:
             restored = True
@@ -135,7 +141,10 @@ class RulesHotReloader:
                 file=sys.stderr,
             )
             traceback.print_exc(file=sys.stderr)
-            restored = previous_rules is None or self._restore_previous_rules(previous_rules, new_mtime)
+            if previous_rules is None:
+                restored = self._restart_current_triggers()
+            else:
+                restored = self._restore_previous_rules(previous_rules, new_mtime)
             self._diagnostics.inc_hot_reload_error()
             engine_error("hot_reload_error", error=str(error))
             if not restored:

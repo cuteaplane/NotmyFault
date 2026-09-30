@@ -158,7 +158,7 @@ class ConditionRuntime:
             return self._record_match(rule_key, node, seen)
 
     def _record_match(self, rule_key, node, seen):
-        matched, signature = self._evaluate(node, seen)
+        matched, signature, _marks = self._evaluate(node, seen)
         if not matched or self._fired.get(rule_key) == signature:
             return False
         self._fired[rule_key] = signature
@@ -169,46 +169,52 @@ class ConditionRuntime:
         self,
         node: Dict[str, Any],
         seen: Dict[str, Dict[str, Any]],
-    ) -> tuple[bool, tuple[tuple[str, float], ...]]:
+    ) -> tuple[bool, tuple[tuple[str, float], ...], tuple[float, ...]]:
+        """返回是否命中、命中的键和各自时间戳、以及用于时间窗判断的命中时刻"""
         if _is_event_leaf(node):
-            key = _event_key(node)
-            entry = seen.get(key)
-            return (
-                entry is not None,
-                ((key, float(entry["timestamp"])),) if entry else (),
-            )
+            entry = seen.get(_event_key(node))
+            if entry is None:
+                return False, (), ()
+            timestamp = float(entry["timestamp"])
+            return True, ((_event_key(node), timestamp),), (timestamp,)
 
         children = _condition_children(node)
         if not children:
-            return False, ()
+            return False, (), ()
         if _condition_op(node) == "not":
             key = "not:" + _event_key(children[0])
             entry = seen.get(key)
-            return entry is not None, ((key, float(entry["timestamp"])),) if entry else ()
+            if entry is None:
+                return False, (), ()
+            timestamp = float(entry["timestamp"])
+            return True, ((key, timestamp),), (timestamp,)
         states = [self._evaluate(child, seen) for child in children]
         op = _condition_op(node)
         if op == "all":
-            if not all(ok for ok, _signature in states):
-                return False, ()
-            signature = tuple(item for _ok, part in states for item in part)
+            if not all(ok for ok, _signature, _marks in states):
+                return False, (), ()
+            signature = tuple(item for _ok, part, _marks in states for item in part)
+            marks = tuple(mark for _ok, _signature, part in states for mark in part)
             window = node.get("within_seconds")
             if window not in (None, ""):
                 try:
                     limit = float(window)
                 except (TypeError, ValueError):
-                    return False, ()
-                timestamps = [item[1] for item in signature]
-                if limit < 0 or (timestamps and max(timestamps) - min(timestamps) > limit):
-                    return False, ()
-            return True, tuple(sorted(signature))
+                    return False, (), ()
+                if limit < 0 or (marks and max(marks) - min(marks) > limit):
+                    return False, (), ()
+            return True, tuple(sorted(signature)), marks
 
-        # any 条件组选最近命中的分支，缓存顺序不再决定 OR 组合
-        matches = [signature for ok, signature in states if ok]
-        if matches:
-            latest = max(
-                matches,
-                key=lambda signature: max((item[1] for item in signature), default=float("-inf")),
-            )
-            return True, latest
-        return False, ()
+        # any 条件组把所有命中分支都记下来；只留最新一支的话，兄弟分支的旧状态会留到下一次触发
+        matched_keys: Dict[str, float] = {}
+        for ok, signature, _marks in states:
+            if not ok:
+                continue
+            for key, timestamp in signature:
+                if key not in matched_keys or timestamp > matched_keys[key]:
+                    matched_keys[key] = timestamp
+        if not matched_keys:
+            return False, (), ()
+        # any 组的命中时刻只看最新那一支，时间窗语义和以前一致
+        return True, tuple(sorted(matched_keys.items())), (max(matched_keys.values()),)
 

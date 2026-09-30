@@ -455,6 +455,18 @@ def validate_rules(
                     continue
                 if param_name not in event_params:
                     continue
+                # 必填参数只写空白等于没写，触发器启动时会报错退出
+                if (
+                    schema.get("required") is True
+                    and isinstance(event_params[param_name], str)
+                    and not event_params[param_name].strip()
+                ):
+                    issues.append((
+                        rule_name,
+                        f'trigger "{event_type}" 必填参数不能为空: {param_name}',
+                    ))
+                    all_events_valid = False
+                    continue
                 if schema.get("type") != "plugin_data":
                     continue
                 if is_reference(event_params[param_name]):
