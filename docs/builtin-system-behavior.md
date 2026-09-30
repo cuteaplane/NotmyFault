@@ -61,6 +61,21 @@ Windows 通过 PolicyConfig 设置端点，Linux 通过平台服务调用 wpctl 
 或 pactl `set-default-sink` / `set-default-source`。设备 id 可与 `audio_device`
 触发器输出对应。设置后回读默认设备，不一致则报错。
 
+## 鼠标操作
+
+`mouse` 移动光标或单击、双击、按下、释放鼠标键，声明 `requires_capabilities: ["input.send"]`。
+Windows 用 `SetCursorPos` 与 `SendInput`；Linux 走平台服务的 xdotool 或 ydotool，与
+`send_keys` 共用输入后端。Wayland 没有可用的 ydotoold 时能力探测与执行都会失败。
+
+| 操作 | `mode` |
+| --- | --- |
+| 移动到绝对屏幕坐标 | `move`（参数 `x`、`y`，物理像素，允许多显示器负坐标） |
+| 相对当前位置移动 | `move_relative`（参数 `dx`、`dy`） |
+| 单击 / 双击 | `click` / `double_click`（参数 `button`：left / right / middle） |
+| 按下 / 释放 | `press` / `release`（参数 `button`） |
+
+单击与双击在当前光标位置执行；需要先定位时，在工作流里先放 `move`。界面名称为“鼠标操作”。
+
 ## 窗口控制
 
 `window_control` 在 Windows 上通过窗口接口操作顶层窗口，支持 Windows 10 1703 及以上版本；
@@ -127,10 +142,11 @@ Windows 通过 PolicyConfig 设置端点，Linux 通过平台服务调用 wpctl 
 
 ## Linux 桌面后端
 
-Wayland 热键通过 ydotool 发送 Linux keycode 的按下和释放序列，需要可工作的
-ydotoold 服务及权限。未设置 `YDOTOOL_SOCKET` 时会尝试 `$XDG_RUNTIME_DIR/.ydotool_socket`、
+Wayland 热键与鼠标通过 ydotool 发送，需要可工作的 ydotoold 服务及权限。未设置
+`YDOTOOL_SOCKET` 时会尝试 `$XDG_RUNTIME_DIR/.ydotool_socket`、
 `$XDG_RUNTIME_DIR/ydotool.socket` 和 `/tmp/.ydotool_socket`；连接失败的报错会带上当前套接字路径。
 X11 仍优先使用 xdotool。未支持的键名会在发送前报错。F1–F24 可用于 Linux 按键发送。
+鼠标绝对移动在部分 Wayland 合成器上可能受加速或缩放影响。
 
 显示器开关在 GNOME 走 `org.gnome.ScreenSaver.SetActive`，在 KDE 走
 `org.kde.screensaver` / `org.freedesktop.ScreenSaver.SetActive`，在 X11 其他桌面走

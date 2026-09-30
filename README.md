@@ -76,7 +76,7 @@ cd ..
 ./.venv/bin/python dashboard.pyw
 ```
 
-根据桌面环境，剪贴板、截图、空闲检测、亮度、按键和窗口功能还可能需要：
+根据桌面环境，剪贴板、截图、空闲检测、亮度、按键、鼠标和窗口功能还可能需要：
 
 ```bash
 sudo apt install wl-clipboard xclip xdotool ydotool wmctrl xprop xrandr gnome-screenshot brightnessctl xprintidle

@@ -162,7 +162,7 @@ Linux 平台服务直接提供这些方法：
 
 - clipboard.read：`read_clipboard(max_chars=None)`；正整数 `max_chars` 限制返回字符数及命令输出读取量
 - clipboard.write：`write_clipboard(text)`
-- input.send：`type_text(text)`、`send_hotkey(parts)`
+- input.send：`type_text(text)`、`send_hotkey(parts)`、`move_mouse(x, y, absolute=True)`、`click_mouse(button="left", clicks=1)`、`mouse_button(button, pressed)`
 - audio.control：`set_volume(percent)`、`set_mute(muted)`
 - audio.device_query：`default_audio_devices()`、`set_default_audio_device(flow, device_id)`
 - window.pin：`set_window_pinned(action, target, title)`
