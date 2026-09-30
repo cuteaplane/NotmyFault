@@ -49,7 +49,7 @@ class TriggerSupervisor:
         *,
         stop_timeout: float = 5.0,
     ) -> int:
-        """按配置指纹对齐线程：配置没变的保留，变了或被删的停掉，缺的启动"""
+        """按配置指纹决定线程去留：配置没变的保留，变了或被删的停掉，缺的启动"""
         desired, counts, missing = self._desired_instances(
             aggregated, triggers_funcs, triggers_meta
         )
@@ -76,7 +76,7 @@ class TriggerSupervisor:
         triggers_funcs: Dict[str, Any],
         triggers_meta: Dict[str, Dict[str, Any]],
     ) -> Tuple[List[Tuple[str, Any, str, Dict[str, Any], Any]], Dict[str, int], List[str]]:
-        """算出这次要跑哪些实例，每项带配置指纹用于和已运行的线程对齐"""
+        """算出这次要跑哪些实例，每项带配置指纹，用来和已在运行的线程比对"""
         desired: List[Tuple[str, Any, str, Dict[str, Any], Any]] = []
         counts: Dict[str, int] = {}
         missing: List[str] = []

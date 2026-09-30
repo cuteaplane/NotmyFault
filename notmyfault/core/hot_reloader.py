@@ -100,7 +100,7 @@ class RulesHotReloader:
                 # 文件写入中被读取时可能出现临时 JSON 错误，下一轮继续尝试
                 new_rules = self._prepare_rules_fn(self._load_rules_fn())
 
-                # 触发器线程按配置指纹对齐：配置没变的实例留着继续跑，不重启
+                # 触发器线程按配置指纹决定去留：配置没变的实例留着继续跑，不重启
                 previous_rules = self._apply_rules_fn(new_rules)
 
                 started = self._start_triggers_fn(new_rules)
