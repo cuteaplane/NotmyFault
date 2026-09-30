@@ -6,20 +6,25 @@ from windows_toasts import InteractableWindowsToaster, Toast
 from winrt.runtime import ApartmentType, init_apartment, uninit_apartment
 
 
-def _show_toast_in_thread(toast, display_seconds, dismiss_event, shown):
-    try:
-        init_apartment(ApartmentType.MULTI_THREADED)
-    except Exception as error:
-        shown.set_exception(error)
-        return
+# 多个通知线程同时进 WinRT 会互相踩，创建和发送这一段串行执行
+_winrt_lock = threading.Lock()
 
+
+def _show_toast_in_thread(toast, display_seconds, dismiss_event, shown):
+    toaster = None
+    initialized = False
     try:
-        # 通知对象在创建它的 WinRT 线程中释放。
-        toaster = InteractableWindowsToaster('NotmyFault', 'cuteaplane.notmyfault.app')
-        toaster.show_toast(toast)
-        shown.set_result(None)
+        with _winrt_lock:
+            init_apartment(ApartmentType.MULTI_THREADED)
+            initialized = True
+            # 通知对象在创建它的 WinRT 线程中释放。
+            toaster = InteractableWindowsToaster('NotmyFault', 'cuteaplane.notmyfault.app')
+            toaster.show_toast(toast)
+            shown.set_result(None)
+
         dismiss_event.wait(display_seconds)
-        toaster.remove_toast(toast)
+        with _winrt_lock:
+            toaster.remove_toast(toast)
     except Exception as error:
         if not shown.done():
             shown.set_exception(error)
@@ -27,7 +32,8 @@ def _show_toast_in_thread(toast, display_seconds, dismiss_event, shown):
             print(f"[Notification] 移除 Windows 通知失败: {error}")
     finally:
         toaster = None
-        uninit_apartment()
+        if initialized:
+            uninit_apartment()
 
 
 def show_toast(toast, display_seconds=10, dismiss_event=None):
