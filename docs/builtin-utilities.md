@@ -1,6 +1,6 @@
 # 文件、数据处理与状态触发插件
 
-这 15 个内置插件位于 `notmyfault/actions/` 和 `notmyfault/triggers/`。
+这 16 个内置插件位于 `notmyfault/actions/` 和 `notmyfault/triggers/`。
 在规则编辑器中选择对应的动作或触发条件，填写参数即可使用。数据动作返回的
 字段可以通过 `$ref` 传给后续动作，敏感文本不会显示在执行摘要中。
 
@@ -69,15 +69,19 @@ JSON 文本数组，例如 `["a", "b"]`。`split` 的拆分结果位于 `lines`�
 | `path_exists` | 路径出现或消失 | `path` 指定路径；`kind` 可选文件、目录或任意类型；`state` 可选 `exists`、`missing`、`changed`。 |
 | `file_content` | 文件文本状态变化 | `path` 指定文本文件，`text` 指定查找内容；`state` 可选 `contains`、`absent`、`changed`，可设置大小写和编码。 |
 | `tcp_port` | TCP 端口状态变化 | `host` 支持主机名、IPv4 和 IPv6，`port` 指定端口；`state` 可选 `reachable`、`unreachable`、`changed`。 |
+| `directory_quiescent` | 目录静默 | `folder_path` 指定目录；`quiet_seconds` 为无变化时长；`state` 可选 `quiescent`、`active`、`changed`；可用 `file_pattern` 过滤文件名。 |
 
-三个触发器首次成功采样只记录状态，之后在所选状态变化时触发，相同状态不重复
-触发。`interval` 控制检查间隔，可设为 0.2–3600 秒。TCP 支持域名，只建立
-连接，不发送应用数据，连接超时可设为 0.1–10 秒。域名解析不受该连接超时限制，
-停止触发器后不再使用尚未返回的解析结果。
+前三个触发器首次成功采样只记录状态，之后在所选状态变化时触发，相同状态不重复
+触发。`directory_quiescent` 从启动起计时，目录在 `quiet_seconds` 内无匹配变化
+后进入静默；被变化打断后可再次进入静默。`interval` 控制检查间隔，可设为
+0.2–3600 秒。TCP 支持域名，只建立连接，不发送应用数据，连接超时可设为
+0.1–10 秒。域名解析不受该连接超时限制，停止触发器后不再使用尚未返回的解析结果。
 
 文件内容触发器默认最多读 1024 KiB，支持 UTF-8、带 BOM 的 UTF-16 和 GB18030。
 文件缺失、不可读、超限或编码错误时保留上次成功读取的状态；需要检测文件消失
-时使用 `path_exists`。
+时使用 `path_exists`。下载完成或复制结束后再处理文件，可以用
+`directory_quiescent`；需要同时确认文件未被占用和文档窗口已关闭时，用动作
+`document_quiescent` 做前置检查。
 
 ## 动作结果引用
 

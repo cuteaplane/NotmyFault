@@ -223,6 +223,14 @@ tar 解包先检查完整成员列表，仅接受普通文件和目录，拒绝�
 实际时间戳精度由文件系统决定。目录缺失、不可读或成员 stat 失败会使整次采样
 失败，保留上次完整快照。恢复读取后再比较变化，不把读取错误当成所有文件被删除。
 
+`directory_quiescent` 用同样的大小与纳秒修改时间快照监视目录；在设定的
+`quiet_seconds` 内没有匹配文件增删改时进入静默并触发。静默被新的变化打断时可
+再触发。`state` 可选 `quiescent`、`active`、`changed`，默认只报告进入静默。
+`file_pattern` 与 `folder_monitor` 相同，Windows 下不区分大小写。检查间隔
+`interval` 可设为 0.2–3600 秒，默认 2 秒。读取失败时保留上次完整快照与静默
+进度。与动作 `document_quiescent` 不同：本触发器不检查文件占用或文档编辑窗口。
+
+
 Wi-Fi 的 disconnected 包括从指定网络直接切换到其他网络。电源状态查询失败
 或返回未知哨兵时不会触发状态变化；resume 在 Windows 监听电源广播，在 Linux 监听 logind PrepareForSleep(False)。低电量在 20%
 及以下触发后，需要接通电源或电量超过 25% 才恢复下一次触发。
