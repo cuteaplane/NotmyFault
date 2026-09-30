@@ -89,7 +89,7 @@ Wayland 走 xdg-desktop-portal 的 Screenshot，需要 dbus-next，执行时还�
 
 ## 鼠标操作
 
-`mouse` 移动光标或单击、双击、按下、释放鼠标键，也可滚动滚轮，声明
+`mouse` 移动光标或单击、双击、按下、释放鼠标键，声明
 `requires_capabilities: ["input.send"]`。
 Windows 用 `SetCursorPos` 与 `SendInput`；Linux 走平台服务的 xdotool 或 ydotool，与
 `send_keys` 共用输入后端。Wayland 没有可用的 ydotoold 时能力探测与执行都会失败。
@@ -100,29 +100,8 @@ Windows 用 `SetCursorPos` 与 `SendInput`；Linux 走平台服务的 xdotool �
 | 相对当前位置移动 | `move_relative`（参数 `dx`、`dy`） |
 | 单击 / 双击 | `click` / `double_click`（参数 `button`：left / right / middle） |
 | 按下 / 释放 | `press` / `release`（参数 `button`） |
-| 滚动滚轮 | `scroll`（参数 `direction`：up / down，`amount`：格数，默认 3） |
 
-单击、双击与滚轮都在当前光标位置执行；需要先定位时，在工作流里先放 `move`。
-Windows 每格对应 `WHEEL_DELTA`（120）；Linux 的 xdotool 用按键 4/5，ydotool 用
-`mousemove -w`。界面名称为“鼠标操作”。
-
-## 询问用户
-
-`ask_user` 弹出系统原生对话框等待用户操作，界面名称为“询问用户”。
-
-| 模式 | `mode` | 行为 |
-| --- | --- | --- |
-| 消息框 | `message` | 显示标题与正文，仅“确定”；点过后继续 |
-| 输入框 | `input` | 显示输入框，确认后把文本写入输出 `text` |
-
-Windows 消息框用 `MessageBoxW`，输入框用 PowerShell 的 VisualBasic `InputBox`（取消与空输入
-都返回空串，动作里按未确认处理）。Linux 优先 `zenity`，其次 `kdialog`；两者都没有时
-`ok=false` 并写明原因，不抛异常。
-
-本动作在引擎进程内直接调用系统对话框，与 `notify` 同类。Dashboard 的页面内 `AppDialog`
-和 pywebview 桥接目前没有“引擎请求 → 宿主弹窗 → 回写结果”的协议，因此工作流不能复用
-Dashboard 弹窗。若以后要做 Dashboard 内嵌询问，需要新增 Host API 与 Dashboard 订阅。
-
+单击与双击在当前光标位置执行；需要先定位时，在工作流里先放 `move`。界面名称为“鼠标操作”。
 
 ## 窗口控制
 
