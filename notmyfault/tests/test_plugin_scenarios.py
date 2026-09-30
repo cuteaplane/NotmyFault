@@ -52,6 +52,33 @@ def test_powershell_bounds_output_and_kills_cancelled_process(monkeypatch, cance
         assert result["stderr"] == ""
 
 
+def test_powershell_reports_exit_code_and_stderr(monkeypatch):
+    module = load_plugin("actions", "run_powershell")
+    monkeypatch.setattr(module.sys, "platform", "win32")
+
+    class Process:
+        returncode = 3
+        stdout = io.BytesIO(b"")
+        stderr = io.BytesIO(b"boom\n")
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            raise AssertionError("命令已退出，不该再杀进程")
+
+        def wait(self, timeout):
+            return self.returncode
+
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr(module, "_read_available", lambda stream: stream.read1(4096))
+
+    with pytest.raises(RuntimeError) as caught:
+        module.run({}, {"command": "exit 3"})
+    assert "code=3" in str(caught.value)
+    assert "boom" in str(caught.value)
+
+
 # --------------------------------------------------------------- append_text
 
 

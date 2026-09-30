@@ -7,6 +7,8 @@ import locale
 
 # 命令输出会进规则上下文和日志，全量保留大输出会撑爆内存
 _MAX_OUTPUT = 100 * 1024
+# 报错时带上的 stderr 摘要长度，太长会把错误消息撑得没法看
+_MAX_ERROR_DETAIL = 500
 _PEEK_NAMED_PIPE = None
 
 
@@ -121,7 +123,15 @@ def run_with_context(action_info, params, context):
         raise RuntimeError(f"命令执行异常: {e}") from e
 
     if process.returncode != 0:
-        raise RuntimeError(f"命令执行失败 (code={process.returncode})")
+        stderr_text = bytes(streams[1]["data"]).decode(
+            locale.getpreferredencoding(False), errors="replace"
+        ).strip()
+        if len(stderr_text) > _MAX_ERROR_DETAIL:
+            stderr_text = "..." + stderr_text[-_MAX_ERROR_DETAIL:]
+        message = f"命令执行失败 (code={process.returncode})"
+        if stderr_text:
+            message = f"{message}: {stderr_text}"
+        raise RuntimeError(message)
     if cancellation:
         cancellation.raise_if_cancelled()
     print("[Action:run_powershell] 执行成功")
