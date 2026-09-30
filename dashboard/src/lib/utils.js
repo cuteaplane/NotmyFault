@@ -109,7 +109,7 @@ const actionCategoryMap = {
   http_request: '网络', bluetooth_toggle: '设备',
   display_control: '桌面', screenshot: '桌面', screen_ocr: '桌面', mouse: '桌面', wallpaper: '桌面', lock_screen: '桌面',
   notify: '通知与声音', text_to_speech: '通知与声音', set_volume: '通知与声音',
-  shutdown_system: '系统',
+  shutdown_system: '系统', environment_variable: '系统',
 }
 const actionCategoryOrder = ['程序', '文件与内容', '网络', '设备', '桌面', '通知与声音', '系统', '其他']
 
