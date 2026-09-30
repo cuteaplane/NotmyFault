@@ -258,6 +258,38 @@ class AudioBackendTests(LinuxPathTest):
         runner.run = explode
         self.assertEqual(AudioBackend(runner).default_devices(), {})
 
+    def test_set_default_device_uses_wpctl(self):
+        runner = FakeRunner(paths={"wpctl": "/usr/bin/wpctl", "pactl": "/usr/bin/pactl"})
+        AudioBackend(runner).set_default_device("render", "41")
+        self.assertEqual(
+            runner.calls[0]["args"],
+            ["/usr/bin/wpctl", "set-default", "41"],
+        )
+
+    def test_set_default_device_falls_back_to_pactl(self):
+        runner = FakeRunner(paths={"pactl": "/usr/bin/pactl"})
+        AudioBackend(runner).set_default_device("capture", "mic-1")
+        self.assertEqual(
+            runner.calls[0]["args"],
+            ["/usr/bin/pactl", "set-default-source", "mic-1"],
+        )
+        runner = FakeRunner(paths={"pactl": "/usr/bin/pactl"})
+        AudioBackend(runner).set_default_device("render", "sink-a")
+        self.assertEqual(
+            runner.calls[0]["args"],
+            ["/usr/bin/pactl", "set-default-sink", "sink-a"],
+        )
+
+    def test_set_default_device_missing_tools_raises(self):
+        with self.assertRaises(BackendMissingError):
+            AudioBackend(FakeRunner()).set_default_device("render", "41")
+
+    def test_set_default_device_rejects_bad_flow(self):
+        with self.assertRaises(ValueError):
+            AudioBackend(FakeRunner(paths={"wpctl": "/usr/bin/wpctl"})).set_default_device(
+                "output", "41"
+            )
+
 
 class ClipboardBackendTests(LinuxPathTest):
     def _wayland(self):
