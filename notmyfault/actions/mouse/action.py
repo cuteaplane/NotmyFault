@@ -1,4 +1,4 @@
-"""鼠标操作：移动光标或单击、双击、按下、释放鼠标键
+"""鼠标操作：移动光标、单击双击、按下释放，或滚动滚轮
 Windows 用 SetCursorPos / SendInput；Linux 走 InputBackend（xdotool 或 ydotool）
 """
 
@@ -13,7 +13,11 @@ NATIVE_LOCK = native_lock()
 
 _MOVE_MODES = frozenset({"move", "move_relative"})
 _CLICK_MODES = frozenset({"click", "double_click", "press", "release"})
+_SCROLL_MODES = frozenset({"scroll"})
+_ALL_MODES = _MOVE_MODES | _CLICK_MODES | _SCROLL_MODES
 _BUTTONS = frozenset({"left", "right", "middle"})
+_SCROLL_DIRECTIONS = frozenset({"up", "down"})
+_WHEEL_DELTA = 120
 
 
 def _require_int(name: str, value) -> int:
@@ -32,6 +36,13 @@ def _normalize_button(raw) -> str:
     return button
 
 
+def _normalize_direction(raw) -> str:
+    direction = str(raw or "down").strip().lower()
+    if direction not in _SCROLL_DIRECTIONS:
+        raise ValueError(f"不支持的滚轮方向: {raw!r}（可选: up/down）")
+    return direction
+
+
 def _linux_move(x: int, y: int, *, absolute: bool) -> None:
     platform_services().move_mouse(x, y, absolute)
 
@@ -42,6 +53,10 @@ def _linux_click(button: str, clicks: int) -> None:
 
 def _linux_button(button: str, pressed: bool) -> None:
     platform_services().mouse_button(button, pressed)
+
+
+def _linux_scroll(direction: str, amount: int) -> None:
+    platform_services().scroll_mouse(direction, amount)
 
 
 if os.name == "nt":
@@ -55,6 +70,7 @@ if os.name == "nt":
     MOUSEEVENTF_RIGHTUP = 0x0010
     MOUSEEVENTF_MIDDLEDOWN = 0x0020
     MOUSEEVENTF_MIDDLEUP = 0x0040
+    MOUSEEVENTF_WHEEL = 0x0800
 
     _DOWN = {
         "left": MOUSEEVENTF_LEFTDOWN,
@@ -84,16 +100,20 @@ if os.name == "nt":
         _anonymous_ = ("u",)
         _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
 
-    def _mouse_input(flags: int) -> INPUT:
+    def _mouse_input(flags: int, mouse_data: int = 0) -> INPUT:
         value = INPUT()
         value.type = INPUT_MOUSE
         value.mi.dwFlags = flags
+        value.mi.mouseData = mouse_data & 0xFFFFFFFF
         return value
 
-    def _send_mouse_flags(flags: list[int]) -> None:
+    def _send_mouse_flags(flags: list[int], mouse_data: int = 0) -> None:
         if not flags:
             return
-        array = (INPUT * len(flags))(*(_mouse_input(flag) for flag in flags))
+        array = (INPUT * len(flags))(*(
+            _mouse_input(flag, mouse_data if flag == MOUSEEVENTF_WHEEL else 0)
+            for flag in flags
+        ))
         user32 = ctypes.windll.user32
         user32.SendInput.argtypes = [
             wintypes.UINT,
@@ -162,12 +182,20 @@ if os.name == "nt":
         with NATIVE_LOCK:
             _send_mouse_flags([flag])
 
+    def _windows_scroll(direction: str, amount: int) -> None:
+        # WHEEL_DELTA=120，正数远离用户（向上），负数靠近用户（向下）
+        delta = _WHEEL_DELTA * amount
+        if direction == "down":
+            delta = -delta
+        with NATIVE_LOCK:
+            _send_mouse_flags([MOUSEEVENTF_WHEEL], mouse_data=delta)
+
 
 def run(action_info, params):
     mode = str(params.get("mode", "move") or "move").strip().lower()
-    if mode not in _MOVE_MODES | _CLICK_MODES:
+    if mode not in _ALL_MODES:
         raise ValueError(
-            f"未知模式: {mode!r}（可选: move/move_relative/click/double_click/press/release）"
+            f"未知模式: {mode!r}（可选: move/move_relative/click/double_click/press/release/scroll）"
         )
 
     result: dict[str, Any] = {"mode": mode}
@@ -190,6 +218,17 @@ def run(action_info, params):
             _linux_move(dx, dy, absolute=False)
         result["x"] = dx
         result["y"] = dy
+    elif mode == "scroll":
+        direction = _normalize_direction(params.get("direction", "down"))
+        amount = _require_int("滚轮格数", params.get("amount", 3))
+        if amount < 1:
+            raise ValueError("滚轮格数必须是不小于 1 的整数")
+        if os.name == "nt":
+            _windows_scroll(direction, amount)
+        else:
+            _linux_scroll(direction, amount)
+        result["direction"] = direction
+        result["amount"] = amount
     else:
         button = _normalize_button(params.get("button", "left"))
         result["button"] = button
@@ -214,8 +253,11 @@ def run(action_info, params):
             else:
                 _linux_button(button, False)
 
-    print(f"[Action:mouse] 已执行: mode={mode}" + (
-        f" button={result.get('button')}" if "button" in result else
-        f" x={result.get('x')} y={result.get('y')}"
-    ))
+    if mode == "scroll":
+        detail = f" direction={result.get('direction')} amount={result.get('amount')}"
+    elif "button" in result:
+        detail = f" button={result.get('button')}"
+    else:
+        detail = f" x={result.get('x')} y={result.get('y')}"
+    print(f"[Action:mouse] 已执行: mode={mode}{detail}")
     return result
