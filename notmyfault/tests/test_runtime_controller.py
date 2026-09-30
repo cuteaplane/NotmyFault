@@ -6,7 +6,7 @@ import runpy
 import signal
 from pathlib import Path
 
-from notmyfault.core.runtime_controller import RuntimeController
+from notmyfault.core.runtime_controller import RuntimeController, _STALE_CLEANUP_TIMEOUT
 from notmyfault.security.security import SecurityMode
 from notmyfault.tests.api_support import create_test_engine
 
@@ -112,6 +112,7 @@ def test_runtime_controller_rejects_restart_while_old_thread_is_stopping():
     class DirtyEngine(FakeEngine):
         _shutdown_clean = False
         hold = threading.Event()
+        stops = []
 
         def start(self, shutdown_event):
             self.shutdown_event = shutdown_event
@@ -119,6 +120,7 @@ def test_runtime_controller_rejects_restart_while_old_thread_is_stopping():
             self.hold.wait(timeout=10)
 
         def shutdown(self, timeout):
+            self.stops.append(timeout)
             self._shutdown_clean = not self.hold.is_set()
 
     engine = DirtyEngine()
@@ -133,12 +135,13 @@ def test_runtime_controller_rejects_restart_while_old_thread_is_stopping():
     assert controller.state == "stopping"
     assert controller.current_engine is engine
 
-    # 线程结束但没收干净：状态回到 stopped，新一代可以启动
+    # 线程结束但没收干净：状态回到 stopped，启动新一代之前先让上一代再收一次尾
     engine.hold.set()
     assert _wait(lambda: controller.state == "stopped")
     assert controller.current_engine is engine
     assert controller.status().last_error == "引擎仍有未退出的触发器或动作"
     assert controller.start() is True
+    assert engine.stops[-1] == _STALE_CLEANUP_TIMEOUT
     controller.stop()
 
 

@@ -16,6 +16,9 @@ EventSink = Callable[[str, dict[str, Any]], None]
 StateListener = Callable[[str], None]
 FailureListener = Callable[[Exception], None]
 
+# 上一代引擎没收干净时，启动新一代之前最多花这么久再收一次尾
+_STALE_CLEANUP_TIMEOUT = 5.0
+
 
 @dataclass(frozen=True)
 class RuntimeStatus:
@@ -125,8 +128,17 @@ class RuntimeController:
                 print(f"[Engine] 引擎当前处于 {self._state}，拒绝重复启动")
                 return False
             if self._current_engine is not None:
-                # 上一代线程已经退出但没收尾干净，留着的实例只用于报告，这里放行新一代
-                print("[Engine] 上一代引擎仍有未退出的触发器或动作，继续启动新一代")
+                # 上一代线程退出时没收干净，先让它再收一次尾：卡住的动作可能已经结束，
+                # 插件 teardown 跑完才不会和这一代共用热键、事件订阅这些全局资源
+                print("[Engine] 上一代引擎仍有未退出的触发器或动作，先尝试收尾")
+                try:
+                    self._current_engine.shutdown(timeout=_STALE_CLEANUP_TIMEOUT)
+                except Exception as exc:
+                    engine_error(
+                        "engine_stale_cleanup_failed",
+                        reason=str(exc),
+                        error_type=type(exc).__name__,
+                    )
                 self._current_engine = None
 
             self._shutdown_event = threading.Event()
