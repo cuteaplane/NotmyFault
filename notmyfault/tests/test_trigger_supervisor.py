@@ -353,3 +353,143 @@ class TestEngineIntegration:
         assert "hotkey" in engine._trigger_supervisor._threads
         assert engine._stop_trigger_threads(timeout=5) is True
         assert engine._trigger_supervisor._threads == {}
+
+    def test_main_loop_restarts_crashed_trigger(self):
+        engine = self._engine()
+        engine.rules = [{
+            "name": "崩溃重启",
+            "condition": {"type": "hotkey", "params": {}},
+            "actions": [{"type": "noop", "params": {}}],
+        }]
+        runs = []
+
+        def flaky(meta, config, emit, stop_event):
+            runs.append(1)
+            if len(runs) == 1:
+                raise RuntimeError("第一次就崩")
+            stop_event.wait(timeout=10)
+
+        engine.triggers_funcs["hotkey"] = flaky
+        engine.triggers_meta["hotkey"] = {}
+
+        shutdown = threading.Event()
+        thread = threading.Thread(target=engine.start, kwargs={"shutdown_event": shutdown})
+        thread.start()
+        try:
+            assert _wait(lambda: runs == [1], timeout=5)
+            assert _wait(lambda: len(runs) >= 2, timeout=10), "崩溃的触发器没有被主循环拉起来"
+            assert engine._trigger_supervisor.health()["hotkey"]["alive"] is True
+        finally:
+            shutdown.set()
+            thread.join(timeout=10)
+        assert not thread.is_alive()
+
+
+class TestDifferentialStart:
+    """按配置指纹对齐：没变的保留，变了或被删的停掉，新增的启动"""
+
+    def test_unchanged_config_keeps_running_thread(self):
+        sup = TriggerSupervisor()
+        started = []
+
+        def cb(instance_id, event_type, func, meta, config, stop_event):
+            started.append(instance_id)
+            stop_event.wait(timeout=10)
+
+        funcs = {"demo": lambda *a: None}
+        meta = {"demo": {"trigger_api": "event-v2"}}
+        configs = {"demo": [{"n": 1}]}
+        assert sup.start(configs, funcs, meta, cb) == 1
+        assert _wait(lambda: started == ["demo"])
+        thread = sup._threads["demo"]
+
+        assert sup.start(configs, funcs, meta, cb) == 0
+        assert sup._threads["demo"] is thread
+        assert started == ["demo"]
+        sup.stop(timeout=5)
+
+    def test_changed_config_replaces_thread(self):
+        sup = TriggerSupervisor()
+        started = []
+
+        def cb(instance_id, event_type, func, meta, config, stop_event):
+            started.append((instance_id, config))
+            stop_event.wait(timeout=10)
+
+        funcs = {"demo": lambda *a: None}
+        meta = {"demo": {"trigger_api": "event-v2"}}
+        assert sup.start({"demo": [{"n": 1}]}, funcs, meta, cb) == 1
+        first = sup._threads["demo"]
+
+        assert sup.start({"demo": [{"n": 2}]}, funcs, meta, cb) == 1
+        assert sup._threads["demo"] is not first
+        assert _wait(lambda: len(started) == 2)
+        assert started == [("demo", {"n": 1}), ("demo", {"n": 2})]
+        sup.stop(timeout=5)
+
+    def test_stuck_thread_does_not_block_new_config(self):
+        sup = TriggerSupervisor()
+        hold = threading.Event()
+        started = []
+
+        def cb(instance_id, event_type, func, meta, config, stop_event):
+            started.append((instance_id, config))
+            hold.wait(timeout=10)  # 不看停止事件，模拟卡住的线程
+
+        funcs = {"demo": lambda *a: None}
+        meta = {"demo": {"trigger_api": "event-v2"}}
+        assert sup.start({"demo": [{"n": 1}]}, funcs, meta, cb) == 1
+        assert sup.start({"demo": [{"n": 2}]}, funcs, meta, cb, stop_timeout=0.05) == 1
+        # 旧配置的线程还占着 demo，新配置换一个 ID 起来
+        assert _wait(lambda: len(started) == 2)
+        assert started == [("demo", {"n": 1}), ("demo:1", {"n": 2})]
+
+        sup.start({"demo": [{"n": 2}]}, funcs, meta, cb, stop_timeout=0.05)
+        health = sup.health()
+        assert health["demo"]["alive"] is True
+        assert health["demo"]["stuck"] is True
+        assert health["demo"]["config"] == {"n": 1}
+        assert health["demo:1"]["config"] == {"n": 2}
+
+        hold.set()
+        sup.stop(timeout=5)
+
+
+class TestCrashRestart:
+    """崩溃退出的实例按退避自动重启"""
+
+    def _sup(self, runs):
+        def cb(instance_id, event_type, func, meta, config, stop_event):
+            runs.append(instance_id)
+            # 直接返回，模拟立刻崩掉的触发器
+
+        sup = TriggerSupervisor()
+        funcs = {"demo": lambda *a: None}
+        meta = {"demo": {"trigger_api": "event-v2"}}
+        assert sup.start({"demo": [{"n": 1}]}, funcs, meta, cb) == 1
+        assert _wait(lambda: not sup._threads["demo"].is_alive())
+        return sup
+
+    def test_restarts_only_after_backoff(self):
+        runs = []
+        sup = self._sup(runs)
+        assert sup.mark_crashed("demo", "boom") == 1
+        moment = time.monotonic()
+
+        assert sup.revive_crashed(now=moment) == 0
+        assert len(runs) == 1
+
+        assert sup.revive_crashed(now=moment + 2.5) == 1
+        assert _wait(lambda: len(runs) == 2)
+        sup.stop(timeout=5)
+
+    def test_stops_restarting_after_max_attempts(self):
+        runs = []
+        sup = self._sup(runs)
+        for attempt in range(1, 6):
+            assert sup.mark_crashed("demo", "boom") == attempt
+
+        assert sup.revive_crashed(now=time.monotonic() + 3600) == 0
+        assert runs == ["demo"]
+        assert sup.health()["demo"]["crashed"] is True
+        sup.stop(timeout=5)

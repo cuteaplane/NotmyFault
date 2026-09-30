@@ -25,3 +25,21 @@ def close_static_rules_stores(monkeypatch):
     yield
     for store in stores:
         store.close()
+
+
+@pytest.fixture(autouse=True)
+def stub_desktop_alerts(monkeypatch):
+    """单元测试不弹真实系统通知：WinRT 并发时会偶发访问越界，直接把测试进程打死"""
+    import notmyfault.host.alert as alert_module
+    import notmyfault.platform.platform_support as platform_support
+
+    monkeypatch.setattr(
+        alert_module,
+        "alert_user",
+        lambda title, message, open_dashboard=True, display_seconds=15: None,
+    )
+    monkeypatch.setattr(
+        platform_support,
+        "show_notification",
+        lambda title, message: True,
+    )

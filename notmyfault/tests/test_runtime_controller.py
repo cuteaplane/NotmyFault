@@ -111,26 +111,33 @@ def test_desktop_runner_forwards_event_sink_to_engine_factory(monkeypatch, tmp_p
 def test_runtime_controller_rejects_restart_while_old_thread_is_stopping():
     class DirtyEngine(FakeEngine):
         _shutdown_clean = False
-        release = False
+        hold = threading.Event()
+
+        def start(self, shutdown_event):
+            self.shutdown_event = shutdown_event
+            self.started.set()
+            self.hold.wait(timeout=10)
 
         def shutdown(self, timeout):
-            self._shutdown_clean = self.release
+            self._shutdown_clean = not self.hold.is_set()
 
     engine = DirtyEngine()
     controller = RuntimeController(lambda on_event=None: engine)
     assert controller.start() is True
     assert _wait(lambda: controller.running)
 
-    # 只发出停止信号，线程仍在收尾时不允许启动新一代
+    # 线程还在收尾时不允许启动新一代
     assert controller.request_stop() is True
     assert controller.start() is False
-    assert controller.stop() is False
+    assert controller.stop(timeout=0.2) is False
     assert controller.state == "stopping"
     assert controller.current_engine is engine
-    assert controller.start() is False
-    engine.release = True
-    assert controller.stop() is True
-    assert controller.current_engine is None
+
+    # 线程结束但没收干净：状态回到 stopped，新一代可以启动
+    engine.hold.set()
+    assert _wait(lambda: controller.state == "stopped")
+    assert controller.current_engine is engine
+    assert controller.status().last_error == "引擎仍有未退出的触发器或动作"
     assert controller.start() is True
     controller.stop()
 

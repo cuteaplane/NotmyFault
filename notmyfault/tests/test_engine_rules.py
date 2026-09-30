@@ -5,6 +5,8 @@ import threading
 import pytest
 
 from notmyfault.tests.api_support import create_test_engine
+from notmyfault.core.event_bus import _MAX_RUN_CHAIN
+from notmyfault.core.runtime_rules import prepare_rules
 from notmyfault.core.rules import (
     ConditionRuntime,
     get_rule_events,
@@ -160,6 +162,26 @@ class TestConditionRuntime:
         assert runtime.match("r", rule, "evt_b", {"value": "b"}, now=2) is True
         assert len(runtime.take_last_match("r")) == 2
         assert runtime.match("r", rule, "evt_b", {"value": "new"}, now=3) is False
+
+    def test_nested_any_does_not_reuse_old_branch(self):
+        runtime = ConditionRuntime()
+        rule = {"condition": {
+            "op": "all",
+            "children": [
+                {"op": "any", "children": [
+                    {"type": "evt_x", "params": {}},
+                    {"type": "evt_y", "params": {}},
+                ]},
+                {"type": "evt_z", "params": {}},
+            ],
+        }}
+        assert runtime.match("r", rule, "evt_x", {}, now=1) is False
+        assert runtime.match("r", rule, "evt_y", {}, now=2) is False
+        assert runtime.match("r", rule, "evt_z", {}, now=3) is True
+        assert len(runtime.take_last_match("r")) == 3
+        # 命中过的 evt_y 不能留下来替下一次 evt_z 满足 any 分支
+        assert runtime.match("r", rule, "evt_z", {}, now=4) is False
+        assert runtime.take_last_match("r") == []
 
     def test_concurrent_match_returns_each_events_payload(self):
         runtime = ConditionRuntime()
@@ -522,6 +544,104 @@ def test_trigger_plugin_data_uses_the_trigger_owner():
     assert (valid, total) == (0, 1)
     assert issues
     assert warnings == []
+
+
+def test_required_trigger_param_rejects_blank_value():
+    trigger_meta = {
+        "params": [{"name": "rule_id", "type": "string", "required": True}],
+    }
+    rule = {
+        "name": "监视规则",
+        "event": {"type": "rule_finished", "params": {"rule_id": ""}},
+        "actions": [{"type": "noop", "params": {}}],
+    }
+    valid, total, issues, _warnings = validate_rules(
+        [rule], {"rule_finished": trigger_meta}, {"noop": {"params": []}}
+    )
+    assert (valid, total) == (0, 1)
+    assert any("必填参数不能为空" in message for _name, message in issues)
+
+
+def _prepare_self_watching(params):
+    triggers = {
+        "rule_finished": {
+            "trigger_api": "event-v2",
+            "params": [
+                {"name": "rule_id", "type": "string", "required": True},
+                {"name": "owner_rule_id", "type": "string"},
+            ],
+        }
+    }
+    prepared = prepare_rules(
+        [{
+            "name": "监视规则",
+            "event": {"type": "rule_finished", "params": params},
+            "actions": [{"type": "noop", "params": {}}],
+        }],
+        triggers,
+        {"noop": {"params": []}},
+    )
+    assert len(prepared) == 1, prepared.issues
+    return prepared.rules[0]
+
+
+def test_prepare_rules_fills_owner_rule_id():
+    rule = _prepare_self_watching({"rule_id": "r_target01"})
+
+    leaf = get_rule_events(rule)[0]
+    assert leaf["params"]["owner_rule_id"] == rule["rule_id"]
+
+
+def test_prepare_rules_keeps_explicit_owner_rule_id():
+    rule = _prepare_self_watching({"rule_id": "r_target01", "owner_rule_id": "r_other001"})
+
+    assert get_rule_events(rule)[0]["params"]["owner_rule_id"] == "r_other001"
+
+
+def test_prepare_rules_leaves_other_triggers_alone():
+    prepared = prepare_rules(
+        [{
+            "name": "热键",
+            "event": {"type": "hotkey", "params": {}},
+            "actions": [{"type": "noop", "params": {}}],
+        }],
+        {"hotkey": {"params": [{"name": "hotkey", "type": "string"}]}},
+        {"noop": {"params": []}},
+    )
+    assert len(prepared) == 1, prepared.issues
+    assert "owner_rule_id" not in get_rule_events(prepared.rules[0])[0]["params"]
+
+
+def test_run_chain_limit_drops_runs_beyond_limit():
+    events = []
+    engine = make_engine(
+        rules=[{
+            "name": "链式规则",
+            "event": {"type": "chain", "params": {}},
+            "actions": [{"type": "noop", "params": {}}],
+        }],
+        on_event=lambda event_type, data: events.append((event_type, data)),
+    )
+    register_action(engine, "noop", lambda meta, params: None)
+    engine.triggers_meta["chain"] = {}
+
+    run_id = ""
+    runs = 0
+    for _ in range(_MAX_RUN_CHAIN + 3):
+        events.clear()
+        engine.emit_event("chain", {"run_id": run_id} if run_id else {})
+        assert engine._rule_scheduler.wait_for_idle(timeout=5)
+        started = [data for event_type, data in events if event_type == "rule_triggered"]
+        if not started:
+            break
+        runs += 1
+        run_id = started[0]["run_id"]
+
+    # 链条到第 _MAX_RUN_CHAIN 层还能跑，再深就丢弃
+    assert runs == _MAX_RUN_CHAIN + 1
+    limits = [data for event_type, data in events if event_type == "run_chain_limited"]
+    assert limits and limits[0]["depth"] == _MAX_RUN_CHAIN + 1
+    assert limits[0]["rule_name"] == "链式规则"
 
 
 def test_validate_rules_ignores_legacy_step_ids():

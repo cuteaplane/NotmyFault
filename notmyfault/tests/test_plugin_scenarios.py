@@ -101,6 +101,93 @@ def test_file_operation_compresses_a_single_file(tmp_path):
         assert zipped.read("note.txt").decode("utf-8") == "内容"
 
 
+def test_archive_unzip_skips_existing_files_and_reports_them(tmp_path):
+    mod = load_plugin("actions", "archive")
+    source = tmp_path / "a.txt"
+    source.write_text("新内容", encoding="utf-8")
+    archive = tmp_path / "pack.zip"
+    assert mod.run({}, {"mode": "zip", "source": str(source), "destination": str(archive)})["ok"]
+
+    target = tmp_path / "out"
+    target.mkdir()
+    (target / "a.txt").write_text("原有内容", encoding="utf-8")
+
+    skipped = mod.run(
+        {}, {"mode": "unzip", "source": str(archive), "destination": str(target)}
+    )
+    assert skipped["ok"] is True
+    assert skipped["file_count"] == 0
+    assert skipped["skipped"] == 1
+    assert (target / "a.txt").read_text(encoding="utf-8") == "原有内容"
+
+    overwritten = mod.run(
+        {},
+        {
+            "mode": "unzip",
+            "source": str(archive),
+            "destination": str(target),
+            "overwrite": True,
+        },
+    )
+    assert overwritten["file_count"] == 1
+    assert overwritten["skipped"] == 0
+    assert (target / "a.txt").read_text(encoding="utf-8") == "新内容"
+
+
+def test_archive_unzip_rejects_archives_over_entry_limit(tmp_path, monkeypatch):
+    mod = load_plugin("actions", "archive")
+    monkeypatch.setattr(mod, "_MAX_ENTRIES", 2)
+    archive = tmp_path / "many.zip"
+    with zipfile.ZipFile(archive, "w") as zipped:
+        for index in range(3):
+            zipped.writestr(f"{index}.txt", "x")
+
+    result = mod.run(
+        {}, {"mode": "unzip", "source": str(archive), "destination": str(tmp_path / "out")}
+    )
+    assert result["ok"] is False
+    assert "条目过多" in result["error"]
+    assert not (tmp_path / "out" / "0.txt").exists()
+
+
+def test_archive_unzip_rejects_archives_over_size_limit(tmp_path, monkeypatch):
+    mod = load_plugin("actions", "archive")
+    monkeypatch.setattr(mod, "_MAX_TOTAL_BYTES", 4)
+    archive = tmp_path / "big.zip"
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("big.txt", "0123456789")
+
+    result = mod.run(
+        {}, {"mode": "unzip", "source": str(archive), "destination": str(tmp_path / "out")}
+    )
+    assert result["ok"] is False
+    assert "大小超过上限" in result["error"]
+
+
+def test_archive_unzip_honors_cancellation(tmp_path):
+    mod = load_plugin("actions", "archive")
+    archive = tmp_path / "pack.zip"
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("a.txt", "a")
+        zipped.writestr("b.txt", "b")
+
+    class Cancellation:
+        def raise_if_cancelled(self):
+            raise ActionCancelled("已取消")
+
+    with pytest.raises(ActionCancelled, match="已取消"):
+        mod.run_with_context(
+            {},
+            {
+                "mode": "unzip",
+                "source": str(archive),
+                "destination": str(tmp_path / "out"),
+            },
+            {"runtime": {"cancellation": Cancellation()}},
+        )
+    assert not (tmp_path / "out" / "a.txt").exists()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用文件关联")
 @pytest.mark.parametrize("directory", [r"C:\Work", "work"])
 def test_launch_program_association_preserves_arguments_and_directory(monkeypatch, directory):
@@ -449,6 +536,53 @@ def test_run_shell_bounds_output_and_kills_cancelled_process(monkeypatch, cancel
         result = module.run({}, {"command": "ignored"})
         assert result["stdout"] == "x" * module._MAX_OUTPUT + "...（已截断）"
         assert result["stderr"] == ""
+
+
+def test_run_shell_prefers_fixed_shell_path(monkeypatch):
+    module = load_plugin("actions", "run_shell")
+    monkeypatch.setattr(module.os.path, "isfile", lambda path: path == "/usr/bin/bash")
+    monkeypatch.setattr(module.os, "access", lambda path, mode: path == "/usr/bin/bash")
+    monkeypatch.setattr(module.shutil, "which", lambda name: f"/tmp/hijack/{name}")
+
+    assert module._shell_executable() == "/usr/bin/bash"
+
+
+def test_run_shell_falls_back_to_path_lookup(monkeypatch):
+    module = load_plugin("actions", "run_shell")
+    monkeypatch.setattr(module.os.path, "isfile", lambda path: False)
+    monkeypatch.setattr(
+        module.shutil, "which", lambda name: f"/opt/{name}" if name == "bash" else None
+    )
+
+    assert module._shell_executable() == "/opt/bash"
+
+
+def test_run_shell_reports_exit_code_and_stderr(monkeypatch):
+    module = load_plugin("actions", "run_shell")
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(module, "_shell_executable", lambda: "/bin/bash")
+
+    class Process:
+        returncode = 3
+        stdout = io.BytesIO(b"")
+        stderr = io.BytesIO(b"boom\n")
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            raise AssertionError("命令已退出，不该再杀进程")
+
+        def wait(self, timeout):
+            return self.returncode
+
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr(module, "_read_available", lambda stream: stream.read1(4096))
+
+    with pytest.raises(RuntimeError) as caught:
+        module.run({}, {"command": "false"})
+    assert "code=3" in str(caught.value)
+    assert "boom" in str(caught.value)
 
 
 # ------------------------------------------------------------------ send_keys

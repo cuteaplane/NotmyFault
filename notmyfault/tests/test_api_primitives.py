@@ -211,6 +211,30 @@ def test_event_broker_closes_slow_subscriber() -> None:
     asyncio.run(exercise())
 
 
+def test_event_broker_close_ends_open_subscribers() -> None:
+    async def exercise() -> None:
+        broker = EventBroker(_EventHistory())
+        subscription = broker.subscribe()
+
+        broker.close()
+
+        assert await asyncio.wait_for(subscription.queue.get(), timeout=1) is None
+
+    asyncio.run(exercise())
+
+
+def test_event_broker_subscribe_after_close_ends_immediately() -> None:
+    async def exercise() -> None:
+        broker = EventBroker(_EventHistory())
+        broker.close()
+
+        subscription = broker.subscribe()
+
+        assert subscription.queue.get_nowait() is None
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("method,path", [
     ("POST", "/api/rules/0/run"),
     ("POST", "/api/rules/validate"),

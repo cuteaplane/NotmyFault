@@ -37,6 +37,32 @@ def test_manifest_is_cross_platform_without_capabilities():
     assert meta["version_code"] == 1
 
 
+def test_manifest_requires_admin_approval_for_setting_variables():
+    meta = json.loads((PLUGIN_ROOT / "action.json").read_text(encoding="utf-8"))
+    assert meta["security"]["rule_approval"] == "admin_key"
+
+    from notmyfault.security import rule_approval
+
+    rule = {
+        "rule_id": "r_env0001",
+        "name": "改 PATH",
+        "event": {"type": "plain_trigger", "params": {}},
+        "actions": [
+            {
+                "type": "environment_variable",
+                "params": {"mode": "set", "name": "PATH", "value": "/tmp"},
+            }
+        ],
+    }
+    schema = {
+        "triggers": {"plain_trigger": {"permissions": []}},
+        "actions": {"environment_variable": meta},
+    }
+    assert rule_approval.changed_admin_plugins([], [rule], schema) == [
+        "environment_variable"
+    ]
+
+
 def test_get_existing(monkeypatch):
     module = load_module()
     monkeypatch.setenv("NMF_EV_TEST_EXISTING", "hello")

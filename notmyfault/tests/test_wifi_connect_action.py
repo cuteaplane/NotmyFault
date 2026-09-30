@@ -42,6 +42,8 @@ def test_manifest_is_valid_cross_platform_action():
     assert meta["platforms"] == ["windows", "linux"]
     assert "external_binary" in meta["permissions"]
     assert "security" not in meta
+    password = next(param for param in meta["params"] if param["name"] == "password")
+    assert password["sensitive"] is True
 
 
 def test_connect_requires_ssid():

@@ -5,8 +5,12 @@ from pathlib import Path
 
 import pytest
 
+from notmyfault.security.plugin_checks import inspect_plugin
 from notmyfault.security.plugin_schema import validate_plugin_meta
 from notmyfault.security.plugin_schema import check_payload_contract
+
+# 这两个能力在载入阶段就被否掉，不需要在 permissions 里声明
+FORBIDDEN_CAPABILITIES = frozenset({"self_elevation", "dynamic_exec"})
 
 
 def make_meta(**overrides):
@@ -31,6 +35,46 @@ def test_builtin_action_manifests_declare_retry_safety_and_valid_contracts():
         valid, errors = validate_plugin_meta(meta, "action")
         assert valid, f"{path.parent.name}: {errors}"
         assert isinstance(meta.get("idempotent"), bool), path.parent.name
+
+
+BAD_FIELD_VALUES = (None, 5, True, "x", [], {})
+
+
+def test_validate_plugin_meta_reports_instead_of_raising():
+    """元数据是插件作者写的，字段类型不对只能报错，不能让校验器自己抛异常。"""
+    fields = (
+        "id", "name", "description", "enabled", "version_code", "version",
+        "package_name", "platforms", "permissions", "params", "outputs",
+        "security", "contributes", "requires_capabilities", "engines",
+    )
+    for field in fields:
+        for value in BAD_FIELD_VALUES:
+            meta = make_meta(**{field: value})
+            valid, errors = validate_plugin_meta(meta, "action")
+            assert isinstance(valid, bool), (field, value)
+            assert isinstance(errors, list), (field, value)
+
+    valid, errors = validate_plugin_meta(
+        make_meta(params=None, security={"literal_only_params": ["p"]}), "action"
+    )
+    assert valid is False
+    assert errors
+
+
+@pytest.mark.parametrize(
+    "kind, json_name",
+    [("action", "action.json"), ("trigger", "trigger.json")],
+)
+def test_builtin_manifests_declare_every_capability_their_code_uses(kind, json_name):
+    plugin_root = Path(__file__).resolve().parents[1]
+    meta_paths = sorted((plugin_root / f"{kind}s").glob(f"*/{json_name}"))
+    assert meta_paths
+    for meta_path in meta_paths:
+        inspection = inspect_plugin(str(meta_path.parent), kind, "builtin")
+        detected = set(inspection.capabilities) - FORBIDDEN_CAPABILITIES
+        declared = set(inspection.meta.get("permissions") or [])
+        missing = sorted(detected - declared)
+        assert not missing, f"{meta_path.parent.name}: 代码用到但未声明的能力 {missing}"
 
 
 def test_shared_types_and_structured_ports_validate_through_plugin_metadata():

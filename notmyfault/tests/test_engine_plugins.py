@@ -181,6 +181,22 @@ class TestLoadPlugins:
         assert (loaded, failed) == (0, 1)
         assert any("schema 校验失败" in msg for _, _, msg in errors)
 
+    def test_malformed_metadata_does_not_stop_scan(self, tmp_path):
+        loader, registry, errors, _ = make_loader(tmp_path)
+        broken = make_meta(
+            plugin_id="broken",
+            params=None,
+            security={"literal_only_params": ["p"]},
+        )
+        write_plugin(tmp_path / "actions", "broken", broken, CLEAN_RUN)
+        write_plugin(
+            tmp_path / "actions", "healthy", make_meta(plugin_id="healthy"), CLEAN_RUN
+        )
+        loaded, failed, meta_store, _ = load_actions(loader, tmp_path)
+        assert (loaded, failed) == (1, 1)
+        assert "healthy" in meta_store
+        assert any(plugin == "broken" for _store, plugin, _msg in errors)
+
     def test_missing_run_function(self, tmp_path):
         loader, registry, errors, _ = make_loader(tmp_path)
         write_plugin(tmp_path / "actions", "no_run", make_meta(), "x = 1\n")

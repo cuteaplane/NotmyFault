@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import socket
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -361,3 +365,93 @@ def test_application_paths_keep_existing_physical_names(tmp_path):
     assert env.paths.api_token_file == env.paths.config_dir / ".api_token"
     assert env.paths.user_plugins_dir == env.paths.config_dir / "plugins"
     assert env.paths.private_dir == Path(tmp_path) / ".private"
+
+
+def test_api_server_stop_ends_event_streams(tmp_path):
+    async def exercise():
+        env = make_api_env(tmp_path)
+        subscription = env.event_broker.subscribe()
+
+        env.server.stop()
+
+        assert await asyncio.wait_for(subscription.queue.get(), timeout=1) is None
+
+    asyncio.run(exercise())
+
+
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+def _open_event_stream(port: int, token: str) -> socket.socket:
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            connection = socket.create_connection(("127.0.0.1", port), timeout=5)
+            break
+        except OSError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.05)
+    request = (
+        "GET /api/events HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{port}\r\n"
+        f"Authorization: Bearer {token}\r\n"
+        "Accept: text/event-stream\r\n"
+        "Connection: keep-alive\r\n\r\n"
+    )
+    connection.sendall(request.encode("ascii"))
+    connection.settimeout(10)
+    received = b""
+    while b"\r\n\r\n" not in received:
+        chunk = connection.recv(4096)
+        if not chunk:
+            connection.close()
+            raise AssertionError("事件流还没建立就断开了")
+        received += chunk
+    assert b" 200 " in received.split(b"\r\n", 1)[0], received[:120]
+    return connection
+
+
+def _read_until(connection: socket.socket, marker: bytes, timeout: float = 10.0) -> bytes:
+    connection.settimeout(timeout)
+    received = b""
+    while marker not in received:
+        chunk = connection.recv(4096)
+        if not chunk:
+            break
+        received += chunk
+    return received
+
+
+def test_api_server_shutdown_with_open_event_stream(tmp_path, monkeypatch):
+    """Dashboard 挂着事件流时点退出，服务要在几秒内收尾，不能靠强杀进程"""
+    flushes = []
+    env = make_api_env(tmp_path)
+    monkeypatch.setattr(
+        env.run_history, "flush", lambda timeout=5.0: flushes.append(timeout) or True
+    )
+    port = _free_port()
+    thread = threading.Thread(
+        target=env.server.serve,
+        kwargs={"host": "127.0.0.1", "port": port},
+        daemon=True,
+    )
+    thread.start()
+    connection = _open_event_stream(port, env.token_store.token)
+    try:
+        env.event_broker.publish("engine_state_changed", {"state": "running"})
+        assert b"engine_state_changed" in _read_until(connection, b"engine_state_changed")
+
+        started_at = time.monotonic()
+        env.server.stop()
+        thread.join(timeout=10)
+        elapsed = time.monotonic() - started_at
+
+        assert not thread.is_alive(), "事件流没结束，uvicorn 一直在等这条连接"
+        assert elapsed < 5, f"关闭用了 {elapsed:.1f}s，说明事件流没有主动结束"
+        assert flushes, "服务退出时没跑到运行历史落盘"
+    finally:
+        connection.close()

@@ -44,6 +44,14 @@ def test_plugin_api_exposes_terminal_events():
     assert "run_replaced" in api.RULE_TERMINAL_EVENTS
 
 
+def test_engine_shutdown_clears_subscribers():
+    engine_events.subscribe(lambda kind, data: None)
+    engine = create_test_engine({"rules": []})
+    assert engine_events.subscriber_count() == 1
+    engine._shutdown_plugins()
+    assert engine_events.subscriber_count() == 0
+
+
 def test_engine_safe_on_event_publishes_to_subscribers():
     seen = []
     engine_events.subscribe(lambda kind, data: seen.append((kind, data.get("run_id"))))

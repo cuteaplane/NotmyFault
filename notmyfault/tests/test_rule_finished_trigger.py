@@ -228,3 +228,32 @@ def test_missing_rule_id_raises():
         module.RuleFinishedTrigger(
             meta, {"rule_id": ""}, lambda payload: None, threading.Event()
         ).validate()
+
+
+def test_prepared_rule_suppresses_its_own_finish():
+    """规则自己没填 owner_rule_id 时要由引擎补上，否则运行结束会再次触发自己"""
+    from notmyfault.core.rules import aggregate_trigger_params
+    from notmyfault.core.runtime_rules import prepare_rules
+
+    meta, module = load_trigger()
+    prepared = prepare_rules(
+        [{
+            "name": "监视自己",
+            "rule_id": "r_self0001",
+            "event": {"type": "rule_finished", "params": {"rule_id": "r_self0001"}},
+            "actions": [{"type": "noop", "params": {}}],
+        }],
+        {"rule_finished": meta},
+        {"noop": {"params": []}},
+    )
+    assert len(prepared) == 1, prepared.issues
+    config = aggregate_trigger_params(prepared.rules)["rule_finished"][0]
+
+    trigger = module.RuleFinishedTrigger(meta, config, lambda payload: None, threading.Event())
+    trigger.validate()
+
+    assert trigger.owner_rule_id == "r_self0001"
+    assert trigger._should_emit(
+        "workflow_completed",
+        {"run_id": "run_self", "rule_id": "r_self0001", "status": "succeeded"},
+    ) is False

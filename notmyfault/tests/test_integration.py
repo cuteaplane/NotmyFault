@@ -256,6 +256,41 @@ class TestHotReloadIntegration:
             ("规则恢复失败", "热加载失败且原有规则恢复失败，请重启引擎")
         ]
 
+    def test_hot_reload_apply_failure_restarts_current_triggers(self, monkeypatch):
+        old_rules = [{"name": "旧规则"}]
+        new_rules = [{"name": "新规则"}]
+        active_rules = list(old_rules)
+        started = []
+        alerts = []
+
+        def apply_rules(_rules):
+            raise RuntimeError("换快照失败")
+
+        def start_triggers(rules):
+            started.append(list(rules))
+            return len(list(rules))
+
+        reloader = RulesHotReloader(
+            rules_path_fn=lambda: "rules.json",
+            load_rules_fn=lambda: new_rules,
+            stop_triggers_fn=lambda timeout: True,
+            apply_rules_fn=apply_rules,
+            prepare_rules_fn=lambda rules: rules,
+            start_triggers_fn=start_triggers,
+            diagnostics=Diagnostics(),
+            alert_cb=lambda title, message: alerts.append((title, message)),
+            current_rules_fn=lambda: list(active_rules),
+        )
+        reloader._rules_mtime = 1.0
+        monkeypatch.setattr(reloader, "current_mtime", lambda: 2.0)
+
+        reloader.check_once()
+
+        # 换快照前就抛异常，旧触发器已经被停掉，必须按仍生效的规则拉回来
+        assert started == [old_rules]
+        assert reloader._rules_mtime == 2.0
+        assert alerts == [("热加载失败", "新规则未能启动，已尝试恢复原有规则")]
+
     @pytest.mark.parametrize("initial_valid", [True, False])
     def test_hot_reload_picks_up_changes(self, monkeypatch, isolated_config, initial_valid):
         from notmyfault.platform import platform_support
@@ -335,6 +370,60 @@ class TestHotReloadIntegration:
             thread.join(timeout=10)
         assert not thread.is_alive()
 
+    def test_hot_reload_keeps_unchanged_trigger_threads(self, isolated_config):
+        def rule(name):
+            return {
+                "name": name,
+                "event": {"type": "hotkey", "params": {}},
+                "actions": [{"type": "noop", "params": {"name": name}}],
+            }
+
+        starts = []
+
+        def hotkey_trigger(meta, config, emit, stop):
+            starts.append(1)
+            stop.wait(30)
+
+        store = isolated_config.store
+        store.save_config({})
+        store.save_rules([rule("r1")])
+        config = store.load_verified_config()
+        config["rules"] = store.load_verified_rules()
+        engine = create_test_engine(config, rules_store=store)
+        engine._alert_user = lambda *a, **k: None
+        engine._security_mode = SecurityMode.PERMISSIVE
+        engine.triggers_funcs["hotkey"] = hotkey_trigger
+        engine.triggers_meta["hotkey"] = {"trigger_api": "event-v2"}
+        engine.actions_meta["noop"] = {"params": [{"name": "name", "type": "string"}]}
+        engine.actions_funcs["noop"] = lambda meta, params: None
+
+        shutdown = threading.Event()
+        thread = threading.Thread(target=engine.start, kwargs={"shutdown_event": shutdown})
+        thread.start()
+        try:
+            deadline = time.monotonic() + 5
+            while engine._hot_reloader._rules_mtime == 0:
+                if time.monotonic() > deadline:
+                    raise AssertionError("引擎未开始等待规则更新")
+                time.sleep(0.05)
+            assert starts == [1]
+            trigger_thread = engine._trigger_supervisor._threads["hotkey"]
+
+            # 新增一条规则但触发配置没变：同一个触发器线程要留着继续跑
+            store.save_rules([rule("r1"), rule("r2")])
+            deadline = time.monotonic() + 8
+            while len(engine.rules) < 2:
+                if time.monotonic() > deadline:
+                    raise AssertionError("热重载未生效")
+                time.sleep(0.05)
+
+            assert starts == [1], "配置没变的触发器被重启了"
+            assert engine._trigger_supervisor._threads["hotkey"] is trigger_thread
+        finally:
+            shutdown.set()
+            thread.join(timeout=10)
+        assert not thread.is_alive()
+
     @pytest.mark.parametrize("stop_immediately", [True, False])
     def test_hot_reload_restores_old_rules_after_trigger_start_failure(self, monkeypatch, stop_immediately):
         old_rules = [{"name": "旧规则"}]
@@ -355,10 +444,15 @@ class TestHotReloadIntegration:
                 raise RuntimeError("新触发器启动失败")
             return 1
 
+        # 恢复旧规则前仍然要停掉新配置的触发器：第一次可以失败，靠下一轮重试
+        def stop_triggers(timeout):
+            stopped.append(timeout)
+            return stop_immediately or len(stopped) > 1
+
         reloader = RulesHotReloader(
             rules_path_fn=lambda: "rules.json",
             load_rules_fn=lambda: new_rules,
-            stop_triggers_fn=lambda timeout: stopped.append(timeout) or len(stopped) != 2 or stop_immediately,
+            stop_triggers_fn=stop_triggers,
             apply_rules_fn=apply_rules,
             prepare_rules_fn=lambda rules: rules,
             start_triggers_fn=start_triggers,
@@ -370,17 +464,25 @@ class TestHotReloadIntegration:
 
         reloader.check_once()
 
-        if not stop_immediately:
+        if stop_immediately:
+            assert started == [new_rules, old_rules]
+            assert len(stopped) == 1
+            assert reloader._rules_mtime == 2.0
+            assert alerts == [("热加载失败", "新规则未能启动，已尝试恢复原有规则")]
+        else:
+            # 第一次停不掉，保留旧时间戳等下一轮重试
             assert active_rules == new_rules
             assert started == [new_rules]
             assert reloader._rules_mtime == 1.0
+            assert alerts == [
+                ("规则恢复失败", "热加载失败且原有规则恢复失败，请重启引擎")
+            ]
             reloader.check_once()
+            assert started == [new_rules, old_rules]
+            assert len(stopped) == 2
+            assert reloader._rules_mtime == 2.0
 
         assert active_rules == old_rules
-        assert started == [new_rules, old_rules]
-        assert len(stopped) == (2 if stop_immediately else 3)
-        assert reloader._rules_mtime == 2.0
-        assert alerts == ([("热加载失败", "新规则未能启动，已尝试恢复原有规则")] if stop_immediately else [("规则恢复失败", "热加载失败且原有规则恢复失败，请重启引擎")])
 
 
 class TestLoggingPipeline:
