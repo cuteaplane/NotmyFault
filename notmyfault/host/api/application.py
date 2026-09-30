@@ -101,6 +101,10 @@ class ApiApplication:
     def publish_event(self, event_type: str, data: Dict[str, Any]):
         self._events.publish(event_type, data)
 
+    def begin_shutdown(self) -> None:
+        """先结束事件流连接，uvicorn 才等得到连接清空并跑到 lifespan 收尾"""
+        self._events.close()
+
     def _setup_routes(self):
         plugin_catalog = self._plugin_catalog
         rule_service = RuleService(self._store, plugin_catalog.schema)

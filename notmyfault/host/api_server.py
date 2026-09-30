@@ -40,6 +40,8 @@ class ApiServer:
             port=port,
             access_log=False,
             log_level="warning",
+            # 事件流或长请求没结束时，最多等这么久就断开连接继续关闭
+            timeout_graceful_shutdown=10,
         )
         self._server = uvicorn.Server(config)
         try:
@@ -58,6 +60,8 @@ class ApiServer:
             print("\n[API] HTTP 服务已退出")
 
     def stop(self) -> None:
+        # 事件流不结束，uvicorn 会一直等这条连接，lifespan 收尾和 run() 的 finally 都跑不到
+        self._application.begin_shutdown()
         if self._server is not None:
             self._server.should_exit = True
 

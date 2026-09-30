@@ -24,6 +24,7 @@ class EventBroker:
         self._history = history
         self._subscriptions: list[EventSubscription] = []
         self._lock = threading.Lock()
+        self._closed = False
 
     def publish(self, event_type: str, data: Dict[str, Any]) -> None:
         if not isinstance(event_type, str) or not _EVENT_TYPE_RE.fullmatch(event_type):
@@ -51,13 +52,34 @@ class EventBroker:
             queue=asyncio.Queue(maxsize=200),
         )
         with self._lock:
-            self._subscriptions.append(subscription)
+            closed = self._closed
+            if not closed:
+                self._subscriptions.append(subscription)
+        if closed:
+            # 关闭后才连上来的客户端也要立刻收到流结束标记，否则服务端等它到超时
+            subscription.queue.put_nowait(None)
         return subscription
 
     def unsubscribe(self, subscription: EventSubscription) -> None:
         with self._lock:
             if subscription in self._subscriptions:
                 self._subscriptions.remove(subscription)
+
+    def close(self) -> None:
+        """结束所有事件流：uvicorn 要等连接清空，这些流不结束就关不掉服务"""
+        with self._lock:
+            self._closed = True
+            subscriptions = list(self._subscriptions)
+            self._subscriptions.clear()
+        for subscription in subscriptions:
+            try:
+                subscription.loop.call_soon_threadsafe(
+                    self._deliver,
+                    subscription,
+                    None,
+                )
+            except RuntimeError:
+                pass
 
     def _deliver(
         self,
