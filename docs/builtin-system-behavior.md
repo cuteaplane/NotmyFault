@@ -89,19 +89,22 @@ Wayland 走 xdg-desktop-portal 的 Screenshot，需要 dbus-next，执行时还�
 
 ## 鼠标操作
 
-`mouse` 移动光标或单击、双击、按下、释放鼠标键，声明
+`mouse` 移动光标、读取当前坐标，或单击、双击、按下、释放鼠标键，声明
 `requires_capabilities: ["input.send"]`。
-Windows 用 `SetCursorPos` 与 `SendInput`；Linux 走平台服务的 xdotool 或 ydotool，与
+Windows 用 `SetCursorPos`、`GetCursorPos` 与 `SendInput`；Linux 走平台服务的 xdotool 或 ydotool，与
 `send_keys` 共用输入后端。Wayland 没有可用的 ydotoold 时能力探测与执行都会失败。
 
 | 操作 | `mode` |
 | --- | --- |
 | 移动到绝对屏幕坐标 | `move`（参数 `x`、`y`，物理像素，允许多显示器负坐标） |
 | 相对当前位置移动 | `move_relative`（参数 `dx`、`dy`） |
+| 读取当前坐标 | `get_position`（无额外参数；输出 `x`、`y`） |
 | 单击 / 双击 | `click` / `double_click`（参数 `button`：left / right / middle） |
 | 按下 / 释放 | `press` / `release`（参数 `button`） |
 
-单击与双击在当前光标位置执行；需要先定位时，在工作流里先放 `move`。界面名称为“鼠标操作”。
+单击与双击在当前光标位置执行；需要先定位时，在工作流里先放 `move`。
+Linux 读取坐标需要 xdotool；当前后端为 ydotool（常见于 Wayland）时无法读取，会明确失败。
+界面名称为“鼠标操作”。
 
 ## 窗口控制
 

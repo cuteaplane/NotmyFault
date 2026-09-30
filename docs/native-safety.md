@@ -54,7 +54,7 @@ user32.GetClipboardData.restype = ctypes.c_void_p
 - `validate()`：配置校验，非法取值抛 ValueError
 - `setup()` / `poll()` / `teardown()`：初始化 / 单次轮询 / 资源清理
 
-除 `manual` 只等待退出外，20 个内置触发器均使用该基类，包括目录、空闲状态、
+除 `manual` 只等待退出外，21 个内置触发器均使用该基类，包括目录、空闲状态、
 网络、进程、系统资源、每日定时和 USB 监控。新增轮询触发器使用基类；托盘的
 窗口消息循环不使用该基类。
 
