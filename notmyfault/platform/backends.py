@@ -295,24 +295,6 @@ class InputBackend:
             args = [tool, "click", f"0x{code:02X}"]
         self._run_input(args, name, timeout=10)
 
-    def scroll_mouse(self, direction: str, amount: int = 3) -> None:
-        """滚动鼠标滚轮；direction 为 up 或 down，amount 为格数"""
-        direction = str(direction or "").strip().lower()
-        if direction not in {"up", "down"}:
-            raise ValueError(f"不支持的滚轮方向: {direction!r}（可选: up/down）")
-        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 1:
-            raise ValueError("滚轮格数必须是不小于 1 的整数")
-        tool, name = self._tool()
-        if name == "xdotool":
-            # X11：4 向上，5 向下
-            button = "4" if direction == "up" else "5"
-            args = [tool, "click", "--repeat", str(amount), button]
-        else:
-            # ydotool mousemove -w：第二个数为垂直滚动量，正向上负向下
-            delta = amount if direction == "up" else -amount
-            args = [tool, "mousemove", "-w", "--", "0", str(delta)]
-        self._run_input(args, name, timeout=10)
-
 
 class AudioBackend:
     """wpctl / pactl 音量控制、默认设备查询与切换"""
