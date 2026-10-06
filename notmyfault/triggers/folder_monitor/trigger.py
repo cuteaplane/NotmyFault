@@ -39,7 +39,7 @@ class FolderMonitorTrigger(PollingTrigger):
                 f"无效的事件类型: {self.event_type!r}"
                 "（可选: created/modified/deleted/all）"
             )
-        self.folder = self.config.get("folder_path", "").strip()
+        self.folder = self.config.get("folder_path", "")
         if not self.folder or not os.path.isdir(self.folder):
             raise FileNotFoundError(f"监控目录不存在或不可读: {self.folder}")
         self.pattern = self.config.get("file_pattern", "*")
@@ -66,6 +66,10 @@ class FolderMonitorTrigger(PollingTrigger):
             if self.event_type in (change, "all") and _file_matches(self.pattern, os.path.basename(changed_path)):
                 self.log(f"{change}: {changed_path}")
                 self.emit({"event": change, "path": changed_path, "folder": self.folder})
+            if change == "deleted":
+                self._snapshot.pop(changed_path, None)
+            else:
+                self._snapshot[changed_path] = new_snapshot[changed_path]
         self._snapshot = new_snapshot
 
 

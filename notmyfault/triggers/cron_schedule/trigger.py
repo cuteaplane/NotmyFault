@@ -1,8 +1,9 @@
 """计划任务触发器：按天、按周或固定分钟间隔触发
-daily 和 weekly 记录日期，interval 从触发器启动时刻开始计时
+daily 和 weekly 记录日期，interval 从首次轮询时刻开始计时
 """
 
 import re
+import time
 from datetime import datetime
 
 from notmyfault.triggers.base import PollingTrigger
@@ -48,7 +49,7 @@ class CronScheduleTrigger(PollingTrigger):
             if minutes < 1:
                 raise ValueError(f"interval_minutes 必须 >= 1，实际: {minutes}")
             self.interval_minutes = minutes
-            self._last_fired: datetime | None = None
+            self._last_fired: float | None = None
 
     @staticmethod
     def _parse_days(raw) -> list[int]:
@@ -101,15 +102,16 @@ class CronScheduleTrigger(PollingTrigger):
         self._fired_date = date_key
 
     def _poll_interval(self, now: datetime) -> None:
+        sampled_at = time.monotonic()
         if self._last_fired is None:
             # 首次轮询记录起点，间隔从这一刻开始计时
-            self._last_fired = now
+            self._last_fired = sampled_at
             return
-        elapsed = (now - self._last_fired).total_seconds()
+        elapsed = sampled_at - self._last_fired
         if elapsed < self.interval_minutes * 60:
             return
         self._emit(now, "interval")
-        self._last_fired = now
+        self._last_fired = sampled_at
 
     def _emit(self, now: datetime, mode: str) -> None:
         self.log(f"计划触发: mode={mode}, time={now.strftime('%H:%M')}")

@@ -8,7 +8,9 @@ class UsbInsertTrigger(PollingTrigger):
     interval = 3.0
 
     def validate(self):
-        self.expected_drive = self.config.get("drive_letter", "").strip()
+        self.expected_drive = self.config.get("drive_letter", "")
+        if os.name == "nt":
+            self.expected_drive = self.expected_drive.strip()
         if self.expected_drive.upper() == "ANY":
             self.expected_drive = "ANY"
         if self.expected_drive and self.expected_drive != "ANY":
@@ -42,12 +44,14 @@ class UsbInsertTrigger(PollingTrigger):
 
     def poll(self):
         current_drives = self._get_removable_drives()
+        self._last_drives.intersection_update(current_drives)
         for drive in sorted(current_drives - self._last_drives):
             if self._stop_event.is_set():
                 return
             self.log(f"检测到U盘插入: {drive}")
             if self.expected_drive in ("ANY", "") or self.expected_drive == drive:
                 self.emit({"drive_letter": self.expected_drive, "actual_drive": drive})
+            self._last_drives.add(drive)
         self._last_drives = current_drives
 
 

@@ -40,7 +40,7 @@ class DirectoryQuiescentTrigger(PollingTrigger):
     interval = 2.0
 
     def validate(self):
-        self.folder = str(self.config.get("folder_path", "")).strip()
+        self.folder = str(self.config.get("folder_path", ""))
         if not self.folder or "\x00" in self.folder:
             raise ValueError("监控目录不能为空，且不能包含空字符")
         self.folder = os.path.abspath(os.path.expanduser(self.folder))
@@ -74,7 +74,7 @@ class DirectoryQuiescentTrigger(PollingTrigger):
             f"(静默={self.quiet_seconds}s, 过滤={self.pattern})"
         )
 
-    def _emit_state(self, state: str, quiet_for: float):
+    def _emit_state(self, state: str, quiet_for: float, file_count: int):
         if self.target_state not in (state, "changed"):
             return
         if self._stop_event.is_set():
@@ -83,7 +83,7 @@ class DirectoryQuiescentTrigger(PollingTrigger):
             "state": state,
             "folder": self.folder,
             "quiet_for_seconds": quiet_for,
-            "file_count": len(self._snapshot),
+            "file_count": file_count,
         })
 
     def poll(self):
@@ -97,17 +97,17 @@ class DirectoryQuiescentTrigger(PollingTrigger):
         self._read_error = False
         now = time.monotonic()
         if new_snapshot != self._snapshot:
-            self._snapshot = new_snapshot
-            self._last_change = now
             if self._was_quiescent:
                 self.log(f"目录再次变化: {self.folder}")
-                self._emit_state("active", 0.0)
+                self._emit_state("active", 0.0, len(new_snapshot))
                 self._was_quiescent = False
+            self._snapshot = new_snapshot
+            self._last_change = now
             return
         quiet_for = now - self._last_change
         if quiet_for >= self.quiet_seconds and not self._was_quiescent:
             self.log(f"目录已静默 {int(quiet_for)} 秒: {self.folder}")
-            self._emit_state("quiescent", quiet_for)
+            self._emit_state("quiescent", quiet_for, len(self._snapshot))
             self._was_quiescent = True
 
 

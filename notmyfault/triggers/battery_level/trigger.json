@@ -29,6 +29,7 @@
             "name": "threshold",
             "label": "阈值 (%)",
             "type": "number",
+            "value_type": "number",
             "default": 20,
             "min": 0,
             "max": 100,

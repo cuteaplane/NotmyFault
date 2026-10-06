@@ -23,7 +23,7 @@ class SystemResourceTrigger(PollingTrigger):
     interval = 5.0
 
     def validate(self):
-        self.disk_path = str(self.config.get("disk_path", "")).strip() or None
+        self.disk_path = str(self.config.get("disk_path", "")) or None
         self.resource = self.config.get("resource", "cpu")
         self.direction = self.config.get("direction", "above")
         if self.resource not in ("cpu", "memory", "disk", "network"):

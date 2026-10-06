@@ -1,19 +1,16 @@
 import socket
 import math
+import threading
 
 from notmyfault.triggers.base import PollingTrigger
 
 
 def _is_connected(host="8.8.8.8", port=53, timeout=2):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        s.settimeout(timeout)
-        s.connect((host, port))
-        return True
-    except (socket.error, OSError):
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
         return False
-    finally:
-        s.close()
 
 
 class NetworkStatusTrigger(PollingTrigger):
@@ -37,18 +34,41 @@ class NetworkStatusTrigger(PollingTrigger):
             )
 
     def setup(self):
-        self._last_connected = _is_connected(self.host, self.port, self.timeout)
+        self._last_connected = None
         self.log(f"开始监控网络状态，目标: {self.target_state}")
-        self.log(f"初始网络状态: {'已连接' if self._last_connected else '已断开'}")
 
     def poll(self):
-        current = _is_connected(self.host, self.port, self.timeout)
-        if current != self._last_connected:
+        if self._stop_event.is_set():
+            return
+        completed = threading.Event()
+        result = []
+        errors = []
+
+        def sample():
+            try:
+                result.append(_is_connected(self.host, self.port, self.timeout))
+            except Exception as error:
+                errors.append(error)
+            finally:
+                completed.set()
+
+        threading.Thread(target=sample, daemon=True).start()
+        while not completed.wait(0.05):
+            if self._stop_event.is_set():
+                return
+        if self._stop_event.is_set():
+            return
+        if errors:
+            raise errors[0]
+        current = result[0]
+        if self._last_connected is None:
+            self.log(f"初始网络状态: {'已连接' if current else '已断开'}")
+        elif current != self._last_connected:
             new_state = "connected" if current else "disconnected"
-            if new_state == self.target_state:
+            if new_state == self.target_state and not self._stop_event.is_set():
                 self.log(f"网络状态变化: {new_state}")
                 self.emit({"state": new_state})
-            self._last_connected = current
+        self._last_connected = current
 
 
 def run(meta, config, emit_event, shutdown_event):

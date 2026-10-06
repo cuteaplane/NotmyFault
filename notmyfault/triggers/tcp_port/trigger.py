@@ -57,7 +57,6 @@ class TcpPortTrigger(PollingTrigger):
             return
         reachable = result[0]
         previous = self._previous
-        self._previous = reachable
         state = "reachable" if reachable else "unreachable"
         if (
             previous is not None
@@ -66,6 +65,7 @@ class TcpPortTrigger(PollingTrigger):
             and not self._stop_event.is_set()
         ):
             self.emit({"host": self.host, "port": self.port, "state": state, "reachable": reachable})
+        self._previous = reachable
 
 
 def run(meta, config, emit_event, shutdown_event):

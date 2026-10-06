@@ -1,27 +1,12 @@
 """WiFi 网络变化触发器：连上或断开指定 SSID 时发送事件
-Windows 用 netsh wlan show interfaces；Linux 用 nmcli -t -f ACTIVE,SSID dev wifi
+Windows 用 WLAN API；Linux 用 nmcli -t -f ACTIVE,SSID dev wifi
 """
 
 import os
 import re
 import subprocess
-import ctypes
 
 from notmyfault.triggers.base import PollingTrigger
-
-_SSID_LINE_RE = re.compile(r"^\s*SSID\s*:\s*(.*)$", re.IGNORECASE)
-
-
-def _decode_netsh(raw: bytes) -> str:
-    """netsh 使用当前控制台输出代码页，无控制台时使用系统 OEM 代码页。"""
-    from notmyfault.plugin_api import native_lock
-    with native_lock():
-        kernel32 = ctypes.WinDLL("kernel32")
-        kernel32.GetConsoleOutputCP.restype = ctypes.c_uint
-        kernel32.GetOEMCP.restype = ctypes.c_uint
-        codepage = kernel32.GetConsoleOutputCP() or kernel32.GetOEMCP()
-    return raw.decode(f"cp{codepage}", errors="replace")
-
 
 def _current_ssid() -> str | None:
     """返回当前 WiFi SSID，未连接返回空字符串，查询失败返回 None"""
@@ -31,23 +16,9 @@ def _current_ssid() -> str | None:
 
 
 def _current_ssid_windows() -> str | None:
-    try:
-        result = subprocess.run(
-            ["netsh", "wlan", "show", "interfaces"],
-            capture_output=True,
-            timeout=10,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    text = _decode_netsh(result.stdout)
-    for line in text.splitlines():
-        match = _SSID_LINE_RE.match(line)
-        if match:
-            return match.group(1).strip().strip('"')
-    return ""
+    from notmyfault.platform.windows_wifi import current_ssid
+
+    return current_ssid()
 
 
 def _current_ssid_linux() -> str | None:
@@ -60,6 +31,7 @@ def _current_ssid_linux() -> str | None:
             capture_output=True,
             text=True,
             errors="replace",
+            env={**os.environ, "LC_ALL": "C"},
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
@@ -76,7 +48,7 @@ class WifiNetworkTrigger(PollingTrigger):
     """WiFi 网络变化触发器，使用 event-v2 轮询"""
 
     interval: float = 10.0
-    native: bool = False  # 查询由 netsh 子进程执行
+    native: bool = os.name == "nt"
 
     def validate(self) -> None:
         direction = self.config.get("direction", "connected")
@@ -84,7 +56,7 @@ class WifiNetworkTrigger(PollingTrigger):
             raise ValueError(
                 f"无效的触发方向: {direction!r}（可选: connected/disconnected/any）"
             )
-        target = str(self.config.get("ssid", "") or "").strip()
+        target = str(self.config.get("ssid", "") or "")
         if direction in ("connected", "disconnected") and not target:
             raise ValueError("方向为 connected/disconnected 时必须填写目标 SSID")
         self.direction = direction
@@ -94,7 +66,7 @@ class WifiNetworkTrigger(PollingTrigger):
     def poll(self) -> None:
         current = _current_ssid()
         if current is None:
-            raise RuntimeError("Wi-Fi 查询失败，请检查无线服务及 netsh/nmcli")
+            raise RuntimeError("Wi-Fi 查询失败，请检查无线服务及 WLAN API/nmcli")
         if self._last_ssid is None:
             # 第一轮只记录当前状态，不触发
             self._last_ssid = current

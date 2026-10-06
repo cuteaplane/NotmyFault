@@ -1,10 +1,11 @@
 """监视指定规则的运行结束
 
 通过 plugin_api.engine_events_api() 订阅引擎终态事件。
-同一 run_id 只触发一次；默认不响应本规则自己的结束。
+最近 256 个成功发送的 run_id 用于去重；默认不响应本规则自己的结束。
 """
 
 from collections import deque
+from threading import Lock
 
 from notmyfault.plugin_api import engine_events_api
 
@@ -40,6 +41,8 @@ class RuleFinishedTrigger:
         self._token = None
         self._seen_runs = deque(maxlen=256)
         self._seen_run_set = set()
+        self._pending_runs = set()
+        self._runs_lock = Lock()
         self._api = engine_events_api()
 
     def log(self, message):
@@ -56,7 +59,9 @@ class RuleFinishedTrigger:
             )
         self.watch_rule_id = rule_id
         self.outcome = outcome
-        self.include_self = bool(self.config.get("include_self", False))
+        self.include_self = self.config.get("include_self", False)
+        if not isinstance(self.include_self, bool):
+            raise ValueError("允许监视本规则必须是布尔值")
         self.owner_rule_id = str(self.config.get("owner_rule_id", "") or "").strip()
 
     def _should_emit(self, event_type, data):
@@ -72,15 +77,6 @@ class RuleFinishedTrigger:
         status = _status_from_event(event_type, data)
         if status not in _OUTCOME_ALIASES[self.outcome]:
             return False
-        run_id = str(data.get("run_id", "") or "").strip()
-        if run_id:
-            if run_id in self._seen_run_set:
-                return False
-            if len(self._seen_runs) == self._seen_runs.maxlen:
-                dropped = self._seen_runs[0]
-                self._seen_run_set.discard(dropped)
-            self._seen_runs.append(run_id)
-            self._seen_run_set.add(run_id)
         return True
 
     def _on_engine_event(self, event_type, data):
@@ -100,11 +96,29 @@ class RuleFinishedTrigger:
             "status": status,
             "event_type": event_type,
         }
-        self.log(
-            f"规则 {payload['rule_name'] or payload['rule_id']} "
-            f"结束（{status}），触发后续动作"
-        )
-        self._emit_event(payload)
+        run_id = payload["run_id"].strip()
+        if run_id:
+            with self._runs_lock:
+                if run_id in self._seen_run_set or run_id in self._pending_runs:
+                    return
+                self._pending_runs.add(run_id)
+        sent = False
+        try:
+            self.log(
+                f"规则 {payload['rule_name'] or payload['rule_id']} "
+                f"结束（{status}），触发后续动作"
+            )
+            self._emit_event(payload)
+            sent = True
+        finally:
+            if run_id:
+                with self._runs_lock:
+                    self._pending_runs.discard(run_id)
+                    if sent:
+                        if len(self._seen_runs) == self._seen_runs.maxlen:
+                            self._seen_run_set.discard(self._seen_runs[0])
+                        self._seen_runs.append(run_id)
+                        self._seen_run_set.add(run_id)
 
     def run(self):
         self.validate()

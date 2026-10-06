@@ -9,7 +9,7 @@ from notmyfault.triggers.base import PollingTrigger
 class PathExistsTrigger(PollingTrigger):
     def validate(self):
         path = self.config.get("path", "")
-        if not isinstance(path, str) or not path.strip() or "\x00" in path:
+        if not isinstance(path, str) or not path or "\x00" in path:
             raise ValueError("监控路径不能为空，且不能包含空字符")
         self.path = Path(os.path.abspath(os.path.expanduser(path)))
         self.kind = self.config.get("kind", "any")
@@ -46,7 +46,6 @@ class PathExistsTrigger(PollingTrigger):
             return
         self._read_error = False
         previous = self._previous
-        self._previous = exists
         state = "exists" if exists else "missing"
         if (
             previous is not None
@@ -55,6 +54,7 @@ class PathExistsTrigger(PollingTrigger):
             and not self._stop_event.is_set()
         ):
             self.emit({"path": str(self.path), "state": state, "exists": exists})
+        self._previous = exists
 
 
 def run(meta, config, emit_event, shutdown_event):

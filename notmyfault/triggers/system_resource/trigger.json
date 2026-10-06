@@ -60,6 +60,7 @@
             "name": "threshold",
             "label": "阈值 (% 或 MB/s)",
             "type": "number",
+            "value_type": "number",
             "default": 90,
             "placeholder": "处理器/内存/磁盘用百分比，网络用 MB/s"
         },
@@ -83,7 +84,10 @@
             "name": "disk_path",
             "label": "磁盘路径",
             "type": "path",
-            "value_type": "path",
+            "value_type": {
+                "type": "path",
+                "allow_empty": true
+            },
             "default": "",
             "placeholder": "留空时 Windows 检查系统盘，Linux 检查 /",
             "visible_when": {

@@ -9,7 +9,7 @@ from notmyfault.triggers.base import PollingTrigger
 class FileContentTrigger(PollingTrigger):
     def validate(self):
         path = self.config.get("path", "")
-        if not isinstance(path, str) or not path.strip() or "\x00" in path:
+        if not isinstance(path, str) or not path or "\x00" in path:
             raise ValueError("文本文件路径不能为空，且不能包含空字符")
         self.path = Path(os.path.abspath(os.path.expanduser(path)))
         self.text = self.config.get("text", "")
@@ -65,7 +65,6 @@ class FileContentTrigger(PollingTrigger):
             else self.text.casefold() in content.casefold()
         )
         previous = self._previous
-        self._previous = contains
         state = "contains" if contains else "absent"
         if (
             previous is not None
@@ -74,6 +73,7 @@ class FileContentTrigger(PollingTrigger):
             and not self._stop_event.is_set()
         ):
             self.emit({"path": str(self.path), "state": state, "contains": contains})
+        self._previous = contains
 
 
 def run(meta, config, emit_event, shutdown_event):
