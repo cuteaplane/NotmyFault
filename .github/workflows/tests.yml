@@ -11,8 +11,12 @@ permissions:
 
 jobs:
   python:
-    name: Python tests
-    runs-on: windows-latest
+    name: Python tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
     timeout-minutes: 30
     env:
       PYTHONUTF8: '1'
