@@ -1,5 +1,18 @@
 # NotmyFault
 
+> [!WARNING]
+> ## 下一 Alpha 版本将包含大量破坏性更改
+>
+> NotmyFault 的下一个 Alpha 大版本 `alpha-0.16.x` 将迎来一次大规模的核心架构更改。
+>
+> 这次更新并不是普通的功能迭代，而是会对项目底层的运行方式进行较大调整，涉及规则执行、触发器生命周期、插件接口、事件系统以及部分内部数据结构。
+>
+> 因此，下一个 Alpha 版本**不可能兼容当前版本**。现有规则、插件、配置文件以及依赖旧接口的代码，都可能需要进行不同程度的调整。
+>
+> 部分旧接口、兼容层和历史遗留实现将在这一过程中被直接移除。
+>
+> 由于目前仍处于 Alpha 阶段，在重构完成之前，接口和行为仍可能继续变化。建议在升级前备份现有配置和规则，并留意后续版本说明。
+
 闲着没事儿写的自动化工具......
 
 NotmyFault 顾名思义是一个自动化（废话），由各种条件出发，以各种方式执行。
@@ -76,7 +89,7 @@ cd ..
 ./.venv/bin/python dashboard.pyw
 ```
 
-根据桌面环境，剪贴板、截图、屏幕文字识别、空闲检测、亮度、按键、鼠标和窗口功能还可能需要：
+根据桌面环境，剪贴板、截图、图片文字识别接口、空闲检测、亮度、按键、鼠标和窗口功能还可能需要：
 
 ```bash
 sudo apt install wl-clipboard xclip xdotool ydotool wmctrl xprop xrandr gnome-screenshot brightnessctl xprintidle tesseract-ocr tesseract-ocr-chi-sim
