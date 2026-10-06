@@ -192,11 +192,11 @@ class PluginLoader:
         plugin_id: str,
         prev: Optional[Tuple[Any, Any, Any]],
     ) -> None:
-        """覆盖加载失败时恢复旧插件，旧模块尚未执行 teardown 时可直接重新注册。"""
+        """覆盖加载失败时恢复旧插件。"""
         if not prev:
             return
         old_module, old_meta, old_run = prev
-        if old_module is None or old_meta is None or old_run is None:
+        if old_meta is None or old_run is None:
             return
         self._registry.register(plugin_type, plugin_id, old_meta, old_run, old_module)
 
@@ -243,6 +243,9 @@ class PluginLoader:
                 engine_info(f"plugin_platform_skipped: {plugin_id}")
                 continue
             if not inspection.entrypoint_exists and not meta.get("entrypoints"):
+                # 平台适用但入口文件不在：插件用不了，必须让用户看到原因
+                failed_count += 1
+                reject(plugin_id, "当前平台入口不存在")
                 continue
             decision = evaluate_plugin(inspection, self._security_mode)
             if not decision["allowed"]:
@@ -281,6 +284,7 @@ class PluginLoader:
             self._registry.plugin_kinds[plugin_id] = kind
             self._registry.extensions.register_manifest(plugin_id, kind, meta_with_origin, folder_path)
             old_module = self._registry.get_module(plugin_id)
+            old_run = func_store.get(plugin_id)
             entry = {
                 "kind": kind, "plugin_id": plugin_id,
                 "folder_path": folder_path, "entry_path": inspection.entrypoint,
@@ -289,9 +293,9 @@ class PluginLoader:
                 "file_snapshot": tree.file_snapshot,
                 "signature_kind": inspection.signature.kind,
                 "signature_format": inspection.signature.format,
-                "prev": (old_module, meta_store.get(plugin_id), func_store.get(plugin_id)) if old_module is not None else None,
+                "prev": (old_module, meta_store.get(plugin_id), old_run) if old_run is not None else None,
             }
-            if old_module is not None:
+            if old_run is not None:
                 if self.materialize_entry(entry, announce=kind == "action") is None:
                     failed_count += 1
                     continue
@@ -389,6 +393,8 @@ class PluginLoader:
                                 old_module,
                                 old_path,
                             )
+                        elif old_meta.get("execution_mode") == "isolated":
+                            self._register_isolated_extensions(plugin_id, _old_run)
                 else:
                     self._registry.pending.pop(plugin_id, None)
                     func_store.pop(plugin_id, None)
@@ -471,6 +477,39 @@ class PluginLoader:
                     return result
 
                 setattr(isolated_run, "run_with_context", isolated_run_with_context)
+
+                def check_isolated_load():
+                    ok, result = run_isolated_action(
+                        py_file, entry_hash, meta, {}, {},
+                        plugin_root=folder_path, file_snapshot=tree.file_snapshot,
+                        load_only=True,
+                    )
+                    if not ok:
+                        raise RuntimeError(f"isolated worker 导入失败: {result}")
+
+                setattr(isolated_run, "check_load", check_isolated_load)
+                extension_workers = {}
+
+                def isolated_command(context, payload, command_id):
+                    from notmyfault.core.plugin_worker import ExtensionWorker
+
+                    session_id = context.session.session_id
+                    worker = extension_workers.get(session_id)
+                    if worker is None:
+                        worker = ExtensionWorker(
+                            py_file, entry_hash, meta, folder_path, tree.file_snapshot, context,
+                        )
+                        extension_workers[session_id] = worker
+
+                        def close_worker():
+                            extension_workers.pop(session_id, None)
+                            worker.close()
+
+                        context.register_cleanup(close_worker)
+                    return worker.invoke(command_id, payload)
+
+                setattr(isolated_run, "extension_command", isolated_command)
+                self._register_isolated_extensions(plugin_id, isolated_run)
                 if prev is not None:
                     old_module = prev[0]
                     if old_module is not None and hasattr(old_module, "teardown"):
@@ -586,6 +625,16 @@ class PluginLoader:
                     f"{_version_info(meta)}{_perm_info(meta)}"
                 )
             return module
+
+    def _register_isolated_extensions(self, plugin_id, run):
+        plugin = self._registry.extensions.plugin(plugin_id)
+        if plugin is None:
+            return
+        for command_id in plugin["contributions"]["commands"]:
+            def handler(context, payload, _command_id=command_id):
+                return run.extension_command(context, payload, _command_id)
+
+            self._registry.extensions.register_command(plugin_id, command_id, handler, None)
 
     def _load_extensions(
         self,
