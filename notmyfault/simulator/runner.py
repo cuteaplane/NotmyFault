@@ -86,14 +86,16 @@ class SimulatedRunner:
                     self.engine.actions_funcs[action_type] = lambda meta, params: None
                     self.engine.actions_meta[action_type] = {}
 
-    def _on(self, et, data):
-        self.events.append({"type": et, "data": data})
+    def _on(self, event):
+        self.events.append(event.to_dict())
 
     def emit(self, tid, payload=None):
         if self.engine:
             self.engine.emit_event(tid, payload or {})
-            if not self.engine._rule_scheduler.wait_for_idle(timeout=5):
+            if not self.engine._run_manager.wait_for_idle(timeout=5):
                 raise TimeoutError("模拟动作未能在 5 秒内完成")
+            if not self.engine.events.flush():
+                raise TimeoutError("模拟事件未能在 5 秒内处理完毕")
 
     def step(self, seconds=1.0):
         self.env.time.advance(seconds)
@@ -110,7 +112,7 @@ class SimulatedRunner:
 
     def last_action(self):
         for ev in reversed(self.events):
-            if ev["type"] == "action_executed":
+            if ev["type"] == "run.step.succeeded":
                 return ev["data"]
         return None
 
