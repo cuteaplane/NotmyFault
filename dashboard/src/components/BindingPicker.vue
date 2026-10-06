@@ -28,7 +28,7 @@ const groups = computed(() => {
 const selectedSource = computed(() => (
   props.sources.find(item => JSON.stringify(item.value) === selected.value) || null
 ))
-watch(selectedSource, source => { pathText.value = '[]'; convert.value = false; fallback.value = defaultTypedValue(source?.type || 'text') })
+watch(selectedSource, () => { pathText.value = '[]'; convert.value = false })
 const selectedPath = computed(() => {
   try {
     const path = JSON.parse(pathText.value)
@@ -37,6 +37,7 @@ const selectedPath = computed(() => {
     return { path, ...typeAtPath(selectedSource.value?.type, path, catalog) }
   } catch (e) { return { error: e.message } }
 })
+watch(selectedPath, path => { if (path.type) fallback.value = defaultTypedValue(path.type) })
 const compatible = computed(() => !selectedPath.value.error && typesCompatible(selectedPath.value.type, props.targetType))
 const showPath = computed(() => ['array', 'object', 'union', 'any'].includes(typeSpec(selectedSource.value?.type).type) || typeSpec(selectedSource.value?.type).type.includes('/'))
 

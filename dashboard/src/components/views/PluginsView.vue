@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { store } from '../../lib/store'
 import { apiDownload, apiRead, apiWrite, loadPlugins, getSchema } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
@@ -33,13 +33,19 @@ const allPlugins = computed(() => [
 ].sort((left, right) => String(left.meta?.name || left.id).localeCompare(
   String(right.meta?.name || right.id), 'zh-CN',
 )))
+// 内置插件里当前平台用不了的不进列表也不计数，用户自己装的仍然显示
+function platformUnsupported(plugin) {
+  return plugin.origin === 'builtin' && plugin.meta?.platform_compatible === false
+}
+
+const visiblePlugins = computed(() => allPlugins.value.filter(plugin => !platformUnsupported(plugin)))
 const originCounts = computed(() => ({
-  builtin: allPlugins.value.filter(plugin => plugin.origin === 'builtin').length,
-  user: allPlugins.value.filter(plugin => plugin.origin === 'user').length,
+  builtin: visiblePlugins.value.filter(plugin => plugin.origin === 'builtin').length,
+  user: visiblePlugins.value.filter(plugin => plugin.origin === 'user').length,
 }))
 const filteredPlugins = computed(() => {
   const q = query.value.trim().toLowerCase()
-  return allPlugins.value.filter(plugin => (
+  return visiblePlugins.value.filter(plugin => (
     plugin.origin === originTab.value
     && (typeFilter.value === 'all' || plugin.kind === typeFilter.value)
     && (!q || [plugin.id, plugin.meta?.name, plugin.meta?.description, plugin.meta?.package_name]
@@ -55,6 +61,7 @@ const focusedPlugin = computed(() => allPlugins.value.find(plugin => (
   && (!focusedPluginKind.value || plugin.kind === focusedPluginKind.value)
 )))
 const focusedPluginMissing = computed(() => focusedPluginId.value && !focusedPlugin.value)
+const focusedPluginUnsupported = computed(() => Boolean(focusedPlugin.value && platformUnsupported(focusedPlugin.value)))
 const selectedPlugin = computed(() => allPlugins.value.find(
   plugin => `${plugin.kind}:${plugin.id}` === selectedPluginKey.value,
 ))
@@ -150,13 +157,18 @@ async function previewRegistryPlugin(entry) {
 }
 
 async function refresh() {
-  // 引擎离线时接口会失败，插件页保留上次数据。
-  const [plugins, sch] = await Promise.all([
-    loadPlugins().catch(() => store.pluginsData),
-    getSchema().catch(() => store.schema),
-  ])
-  store.pluginsData = plugins
-  store.schema = sch
+  try {
+    const [plugins, sch] = await Promise.all([
+      loadPlugins(),
+      getSchema().catch(() => store.schema),
+    ])
+    store.pluginsData = plugins
+    store.schema = sch
+    listError.value = ''
+  } catch (error) {
+    // 保留上次结果，但要让用户知道这次没读到
+    listError.value = error?.message || '读取失败'
+  }
 }
 
 // 插件变更要重启引擎才生效，直接问用户要不要现在重启。
@@ -185,9 +197,21 @@ function pluginIsAvailable(meta) {
   return meta?.platform_compatible !== false && meta?.availability !== 'unavailable'
 }
 
+function loadPolicy(meta) {
+  const policy = meta?.checks?.load_policy
+  return policy && typeof policy === 'object' ? policy : null
+}
+
+function pluginCheckFailure(meta) {
+  const policy = loadPolicy(meta)
+  return Boolean(policy && policy.allowed === false)
+}
+
 function pluginStatus(meta) {
+  if (meta?._unidentified) return '无法读取'
   if (meta?._error) return '加载失败'
   if (!pluginIsAvailable(meta)) return '当前不可用'
+  if (pluginCheckFailure(meta)) return '检查未通过'
   if (meta?.availability === 'partial') return '部分可用'
   if (meta?.enabled === false) return '已停用'
   return ''
@@ -199,9 +223,55 @@ function pluginHasProblem(meta) {
 
 function pluginStatusDetail(meta) {
   if (meta?._error) return String(meta._error)
-  const reasons = Array.isArray(meta?.unavailable_reasons) ? meta.unavailable_reasons : []
-  return reasons.join('；')
+  const unavailable = Array.isArray(meta?.unavailable_reasons) ? meta.unavailable_reasons : []
+  if (!pluginIsAvailable(meta) && unavailable.length) return unavailable.join('；')
+  const policy = loadPolicy(meta)
+  if (policy && policy.allowed === false && Array.isArray(policy.errors) && policy.errors.length) {
+    return policy.errors.join('；')
+  }
+  return unavailable.join('；')
 }
+
+const pluginRuntime = computed(() => store.pluginsData?.runtime || null)
+const listError = ref('')
+const sessionErrors = computed(() => pluginRuntime.value?.plugin_errors || [])
+const STORE_TYPE_LABELS = { trigger: '触发器', triggers: '触发器', action: '动作', actions: '动作' }
+
+function storeTypeLabel(store) {
+  return STORE_TYPE_LABELS[String(store || '').toLowerCase()] || ''
+}
+
+const sessionErrorNotice = computed(() => {
+  const runtime = pluginRuntime.value
+  if (!runtime) {
+    return { title: '还没有读到加载结果', detail: '刷新后显示本次引擎会话的插件检查结果。' }
+  }
+  if (runtime.diagnostics_available === false) {
+    return runtime.diagnostics_error
+      ? {
+          title: '插件错误读取失败',
+          detail: `读取本次会话的插件错误时出错（${runtime.diagnostics_error}），这不表示没有错误。`,
+        }
+      : {
+          title: '引擎未运行，加载结果未确认',
+          detail: '下面只是扫描到的插件；引擎启动后才能确认它们是否真的加载成功。',
+        }
+  }
+  if (runtime.engine_state !== 'running' && runtime.engine_state !== 'starting') {
+    // 引擎停止时对象会留在运行时里，它的错误属于上一次会话
+    return {
+      title: '引擎未运行，加载结果未确认',
+      detail: sessionErrors.value.length
+        ? `下面是上一次引擎会话留下的 ${sessionErrors.value.length} 条插件错误，重启后以新会话为准。`
+        : '下面只是扫描到的插件；引擎启动后才能确认它们是否真的加载成功。',
+    }
+  }
+  if (!sessionErrors.value.length) return null
+  return {
+    title: `本次引擎会话有 ${sessionErrors.value.length} 条插件错误`,
+    detail: '这些记录来自引擎加载过程；目录里没有对应条目时不会为它创建插件。',
+  }
+})
 
 const selectedProblemDetail = computed(() => {
   if (!selectedPlugin.value) return ''
@@ -231,6 +301,10 @@ async function closePlugin() {
 }
 
 async function togglePlugin(plugin) {
+  if (plugin.meta?._unidentified) {
+    snackbar('插件信息读不出来，不能启用或停用')
+    return
+  }
   try {
     const r = await apiWrite('/api/plugins/toggle', 'POST', { type: plugin.kind, id: plugin.id })
     const d = await r.json()
@@ -398,10 +472,24 @@ async function consumePluginFocus() {
   document.querySelector('.plugin-list-row.focused')?.scrollIntoView?.({ block: 'center' })
 }
 
+let refreshTimer = null
+
+// 插件加载失败会推 plugin_load_failed，App 收到后自增 refreshSignal
+watch(() => store.refreshSignal, () => { refresh() })
+
+// 引擎刚起来时插件可能还没加载完，隔一会儿再拉一次列表
+watch(() => store.engineStatus?.engine_state, (state, previous) => {
+  if (!state || state === previous) return
+  clearTimeout(refreshTimer)
+  refreshTimer = setTimeout(() => { refresh() }, state === 'running' ? 1500 : 300)
+})
+
 onMounted(async () => {
   await refresh()
   await consumePluginFocus()
 })
+
+onUnmounted(() => clearTimeout(refreshTimer))
 </script>
 
 <template>
@@ -462,6 +550,29 @@ onMounted(async () => {
           <span>当前列表有 {{ visibleProblemCount }} 个插件需要处理，已排在前面。</span>
         </div>
 
+        <div v-if="listError" class="plugin-session-errors">
+          <span class="material-symbols-outlined">sync_problem</span>
+          <div class="plugin-session-errors-copy">
+            <b>插件列表刷新失败，当前显示上次读取结果</b>
+            <p>{{ listError }}</p>
+          </div>
+          <button class="btn btn-text" @click="refresh()">重试</button>
+        </div>
+
+        <div v-if="sessionErrorNotice" class="plugin-session-errors">
+          <span class="material-symbols-outlined">error</span>
+          <div class="plugin-session-errors-copy">
+            <b>{{ sessionErrorNotice.title }}</b>
+            <p>{{ sessionErrorNotice.detail }}</p>
+            <ul v-if="sessionErrors.length">
+              <li v-for="item in sessionErrors" :key="`${item.store}:${item.plugin_id}:${item.reason}`">
+                <code>{{ item.plugin_id }}</code><template v-if="storeTypeLabel(item.store)">（{{ storeTypeLabel(item.store) }}）</template>：{{ item.reason }}
+              </li>
+            </ul>
+          </div>
+          <button class="btn btn-text" @click="refresh()">刷新</button>
+        </div>
+
         <div class="plugin-tools">
           <label class="plugin-search">
             <span class="material-symbols-outlined">search</span>
@@ -478,6 +589,10 @@ onMounted(async () => {
           <span class="material-symbols-outlined">extension_off</span>
           <div><b>未找到插件 {{ focusedPluginId }}</b><p>请安装对应的 .nmfp 插件包；安装完成后可以继续使用刚才的模板。</p></div>
           <button class="btn btn-filled" @click="openInstall"><span class="material-symbols-outlined">install_desktop</span>安装插件</button>
+        </div>
+        <div v-else-if="focusedPluginUnsupported" class="plugin-missing-callout">
+          <span class="material-symbols-outlined">block</span>
+          <div><b>{{ focusedPluginId }} 在当前平台不可用</b><p>它是内置插件，只支持其他平台，所以不在列表里显示。</p></div>
         </div>
 
         <Transition :name="originTab === 'user' ? 'plugin-list-next' : 'plugin-list-prev'" mode="out-in">
@@ -503,10 +618,10 @@ onMounted(async () => {
                   <small>{{ pluginKindLabel(plugin.kind) }} · v{{ pluginVersion(plugin.meta) }}</small>
                 </button>
                 <span v-if="pluginStatus(plugin.meta)" class="plugin-list-status" :class="{
-                  error: plugin.meta._error || !pluginIsAvailable(plugin.meta),
+                  error: plugin.meta._error || pluginCheckFailure(plugin.meta) || !pluginIsAvailable(plugin.meta),
                   muted: plugin.meta.enabled === false,
                 }">{{ pluginStatus(plugin.meta) }}</span>
-                <label class="switch plugin-list-switch" :class="{ 'is-disabled': !pluginIsAvailable(plugin.meta) }" @click.stop>
+                <label v-if="!plugin.meta._unidentified" class="switch plugin-list-switch" :class="{ 'is-disabled': !pluginIsAvailable(plugin.meta) }" @click.stop>
                   <input type="checkbox" :checked="plugin.meta.enabled !== false" :disabled="!pluginIsAvailable(plugin.meta)" :aria-label="`启用${plugin.meta.name || plugin.id}`" @change="togglePlugin(plugin)">
                   <span class="switch-track"><span class="switch-thumb"></span></span>
                 </label>
@@ -532,7 +647,7 @@ onMounted(async () => {
             <p>{{ pluginKindLabel(selectedPlugin.kind) }} · v{{ pluginVersion(selectedPlugin.meta) }}</p>
             <span>{{ selectedPlugin.meta.description || '没有插件说明' }}</span>
           </div>
-          <button v-if="selectedPlugin.origin === 'user'" type="button" class="btn btn-outlined plugin-uninstall-button" @click="uninstallPlugin(selectedPlugin)">
+          <button v-if="selectedPlugin.origin === 'user' && !selectedPlugin.meta._unidentified" type="button" class="btn btn-outlined plugin-uninstall-button" @click="uninstallPlugin(selectedPlugin)">
             <span class="material-symbols-outlined">delete</span>卸载插件
           </button>
         </section>
@@ -546,7 +661,7 @@ onMounted(async () => {
         <section class="plugin-detail-section">
           <h3>插件状态</h3>
           <div class="plugin-detail-group">
-            <label class="plugin-detail-row plugin-detail-toggle">
+            <label v-if="!selectedPlugin.meta._unidentified" class="plugin-detail-row plugin-detail-toggle">
               <span><b>启用插件</b><small>控制这个插件是否参与自动化</small></span>
               <span class="switch" :class="{ 'is-disabled': !pluginIsAvailable(selectedPlugin.meta) }">
                 <input type="checkbox" :checked="selectedPlugin.meta.enabled !== false" :disabled="!pluginIsAvailable(selectedPlugin.meta)" @change="togglePlugin(selectedPlugin)">

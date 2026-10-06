@@ -231,7 +231,8 @@ function dispatchSSEEvent(eventName, dataText) {
       engine_running: d.state === 'running',
     })
     if (d.state === 'running') refreshAll()
-  } else if (eventName === 'action_executed' || eventName === 'workflow_completed') {
+  } else if (eventName === 'action_executed' || eventName === 'workflow_completed' || eventName === 'plugin_load_failed') {
+    // 插件加载失败也要让插件页重新读取，不能只等引擎状态变化
     scheduleRefreshSignal()
   }
   if (RULE_EVENTS.includes(eventName)) {

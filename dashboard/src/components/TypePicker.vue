@@ -1,7 +1,7 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import { store } from '../lib/store'
-import { typeLabels, typeSpec } from '../lib/valueTypes'
+import { parseExactJson, typeLabels, typeSpec } from '../lib/valueTypes'
 const props = defineProps({ modelValue: { type: [String, Object], default: 'text' } })
 const emit = defineEmits(['update:modelValue'])
 const spec = computed(() => typeSpec(props.modelValue))
@@ -18,7 +18,7 @@ function choose(type) {
 }
 function editSchema(text) {
   schemaText.value = text
-  try { const value = JSON.parse(text); if (!value || typeof value !== 'object' || typeof value.type !== 'string' || !value.type) throw new Error(); emit('update:modelValue', value); error.value = '' }
+  try { const value = parseExactJson(text); if (!value || typeof value !== 'object' || typeof value.type !== 'string' || !value.type) throw new Error(); emit('update:modelValue', value); error.value = '' }
   catch { error.value = '请输入包含 type 的 JSON 类型声明' }
 }
 function setOption(key, value) { emit('update:modelValue', { ...spec.value, [key]: value }) }

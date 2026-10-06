@@ -1,4 +1,4 @@
-import { compatibleTypes, fieldType, typeSpec, typeLabel, typeAtPath, isOpaqueValue, isExpression, parseTypedInput, defaultTypedValue, formatTypedInput } from './valueTypes.js'
+import { compatibleTypes, fieldType, typeSpec, typeLabel, typeAtPath, isOpaqueValue, isExpression, parseExactJson, parseTypedInput, defaultTypedValue, formatTypedInput } from './valueTypes.js'
 import { normalizeRuleDraft } from './utils.js'
 
 function randomHex() {
@@ -450,7 +450,7 @@ function parseTestValue(raw, type) {
     return value
   }
   if (type === 'bool') return ['1', 'true', 'yes', '是'].includes(String(raw).toLowerCase())
-  if (type === 'array' || type === 'object') return JSON.parse(raw)
+  if (type === 'array' || type === 'object') return parseExactJson(raw)
   return raw
 }
 
@@ -614,7 +614,7 @@ function parsePreparedTestValue(raw, field) {
   const type = normalizedType(field.type)
   if (field.fullPayload || type === 'object' || type === 'array') {
     let value
-    try { value = typeof raw === 'string' ? JSON.parse(raw) : raw }
+    try { value = typeof raw === 'string' ? parseExactJson(raw) : raw }
     catch { throw new Error(type === 'array' ? '请输入有效的 JSON 数组' : '请输入有效的 JSON 对象') }
     if (field.fullPayload || type === 'object') {
       if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('请输入 JSON 对象')
@@ -704,7 +704,7 @@ export function requestTestContext(rule, schema, promptValue = globalThis.prompt
     if (fullPayload) {
       let payloadObject
       try {
-        payloadObject = JSON.parse(raw)
+        payloadObject = parseExactJson(raw)
       } catch (error) {
         throw new Error(`${sourceName} · ${label}：请输入有效 JSON`)
       }
@@ -744,7 +744,7 @@ export function requestTestContext(rule, schema, promptValue = globalThis.prompt
     let parsed = raw
     if (!path.length) {
       try {
-        parsed = JSON.parse(raw)
+        parsed = parseExactJson(raw)
       } catch (error) {
         throw new Error(`本次触发 · ${label}：请输入有效 JSON`)
       }

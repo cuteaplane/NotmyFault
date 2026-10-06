@@ -67,6 +67,9 @@ let mockAiDraftError = ''
 let mockAiStreamMode = 'normal'
 let mockEngineRunning = true
 let mockEngineState = 'running'
+let mockPluginListRuntime = null
+let mockPluginListExtraActions = null
+let mockPluginListFail = false
 let engineStatusReads = 0
 let configReads = 0
 let slowStopPolls = 0
@@ -377,7 +380,10 @@ window.pywebview = { api: {
     if (path === '/api/plugins/hotkey/extensions/commands/capture_hotkey/invoke' && method === 'POST') {
       return { ok:true, session_id:'s_hot', value:'Ctrl+Shift+M', close:true }
     }
-    if (path.includes('/api/plugins/list')) return { triggers: T, actions: A }
+    if (path.includes('/api/plugins/list')) {
+      if (mockPluginListFail) return { ok:false, status:500, error:'列表读取失败' }
+      return pluginListPayload()
+    }
     if (path.includes('/api/plugins')) return { triggers: T, actions: A }
     return { ok:true }
   },
@@ -395,6 +401,12 @@ const A = {
     { name:'macro', label:'操作宏', type:'plugin_data', data_type:'mouse_macro', value_type:'object', summary:'hidden' },
   ], outputs:[] },
 }
+// 插件列表的运行时字段用于验证"目录扫描结果"与"会话加载错误"的区分
+const pluginListPayload = () => ({
+  triggers: T,
+  actions: { ...A, ...(mockPluginListExtraActions || {}) },
+  ...(mockPluginListRuntime ? { runtime: mockPluginListRuntime } : {}),
+})
 window.fetch = async (url, options = {}) => {
   const u = String(url); const j = (o) => ({ json: async () => o, ok: true, status: 200 })
   if (u.endsWith('/api/events')) {
@@ -439,7 +451,10 @@ window.fetch = async (url, options = {}) => {
     pluginInstallForms.push(Object.fromEntries(options.body.entries()))
     return j({ ok:true, id:'author_signed', restart_required:true })
   }
-  if (u.includes('/api/plugins/list')) return j({ triggers: T, actions: A })
+  if (u.includes('/api/plugins/list')) {
+    if (mockPluginListFail) return { ok:false, status:500, json: async () => ({ ok:false, error:'列表读取失败' }) }
+    return j(pluginListPayload())
+  }
   if (u.includes('/api/plugins')) return j({ triggers: T, actions: A })
   if (u.includes('/api/engine/status')) return j({ running:true, engine_running:true, security_mode:'permissive', rules_count:1, triggers_count:1, actions_count:1, pid:1234 })
   if (u.includes('/api/rules')) return j({ rules: [] })
@@ -907,10 +922,14 @@ const ctxRule = {
     { binding_id:'a_2', type:'notify', params:{ message:{ $ref:{ scope:'event', path:[] } } } },
   ],
 }
-const promptInputs = ['{"matched_title":"记事本 - 无标题"}', '{"type":"window_title","payload":{}}']
+const promptInputs = ['{"matched_title":"记事本 - 无标题","count":9007199254740993}', '{"type":"window_title","payload":{}}']
 const testCtx = requestTestContext(ctxRule, ctxSchema, () => promptInputs.shift())
 const fullPayloadOk = testCtx?.trigger_payloads?.t_full01?.matched_title === '记事本 - 无标题'
   && testCtx?.event_payload?.type === 'window_title'
+  && testCtx?.trigger_payloads?.t_full01?.count?.$nmf_value?.data === '9007199254740993'
+  && ['{"limit":1e400}', '{"limit":000009007199254740993}'].every(text => {
+    try { requestTestContext(ctxRule, ctxSchema, () => text); return false } catch { return true }
+  })
 console.log((fullPayloadOk?'PASS':'FAIL')+' - requestTestContext writes full payload for empty path')
 if (!fullPayloadOk) process.exitCode = 1
 
@@ -920,7 +939,7 @@ const preparedContext = buildPreparedTestContext([
   { key:'meta', scope:'trigger', node:'t_full01', path:['meta'], type:'object', required:true },
   { key:'precise', scope:'variable', node:'v_precise01', path:[], valueType:'int', required:true },
   { key:'nested', scope:'step', node:'a_nested01', path:['rows', 0, '名称'], valueType:'text', required:true },
-], { count:'12.5', ready:true, meta:'{"source":"test"}', precise:'9007199254740993', nested:'条目' })
+], { count:'12.5', ready:true, meta:'{"source":"test","count":9007199254740993}', precise:'9007199254740993', nested:'条目' })
 let unsafeContextRejected = false
 try {
   buildPreparedTestContext([{ key:'unsafe', scope:'event', path:['__proto__', 'polluted'], type:'string' }], { unsafe:'yes' })
@@ -945,6 +964,23 @@ const encodedInputsOk = encodedInputCases.every(([declaration, kind, data]) => {
       JSON.stringify(parseTypedInput(formatTypedInput(value, type), type)) === JSON.stringify(value)
     ))
 })
+const hugeIntegerText = '9'.repeat(400)
+const exactJsonInputsOk = [
+  ['{"large":9007199254740993,"empty":null,"flag":false,"finite":1e3,"text":"1e400"}', { large:{ $nmf_value:{ type:'int', data:'9007199254740993' } }, empty:null, flag:false, finite:1000, text:'1e400' }],
+  [`{"huge":${hugeIntegerText}}`, { huge:{ $nmf_value:{ type:'int', data:hugeIntegerText } } }],
+].every(([text, expected]) => JSON.stringify(parseTypedInput(text, 'any')) === JSON.stringify(expected))
+  && ['1e400', '{"limit":-1e400}', '[1e400]', '[000009007199254740993]'].every(text => {
+    try { parseTypedInput(text, 'any'); return false } catch { return true }
+  })
+const fullPayloadField = { key:'payload', scope:'event', path:[], type:'object', required:true, fullPayload:true }
+const fullPayloadContext = buildPreparedTestContext([fullPayloadField], { payload:'{"count":9007199254740993}' })
+const preparedJsonInputsOk = fullPayloadContext.event_payload.count.$nmf_value.data === '9007199254740993'
+  && [fullPayloadField, { ...fullPayloadField, path:['value'], fullPayload:false }, { ...fullPayloadField, path:['value'], type:'array', fullPayload:false }].every(field => (
+    ['1e400', '000009007199254740993'].every(number => {
+      const text = field.type === 'array' ? `[${number}]` : `{"limit":${number}}`
+      try { buildPreparedTestContext([field], { payload:text }); return false } catch (error) { return error.fieldKey === field.key }
+    })
+  ))
 const ordinaryReference = { $ref:{ scope:'trigger', node:'t_full01', path:['matched_title'] } }
 const ordinaryObjects = [
   { $literal:'business label', content:ordinaryReference },
@@ -960,9 +996,10 @@ const ordinaryObjectsOk = ordinaryObjects.every(value => (
 const preparedTypesOk = preparedContext.event_payload.count === 12.5
   && preparedContext.event_payload.ready === true
   && preparedContext.trigger_payloads.t_full01.meta.source === 'test'
+  && preparedContext.trigger_payloads.t_full01.meta.count.$nmf_value.data === '9007199254740993'
   && preparedContext.variable_values.v_precise01.$nmf_value.data === '9007199254740993'
   && preparedContext.step_outputs.a_nested01.rows[0]['名称'] === '条目'
-  && unsafeContextRejected && !({}).polluted && encodedInputsOk && ordinaryObjectsOk
+  && unsafeContextRejected && !({}).polluted && encodedInputsOk && ordinaryObjectsOk && exactJsonInputsOk && preparedJsonInputsOk
 console.log((preparedTypesOk?'PASS':'FAIL')+' - prepared test data follows output types and expands full payload references')
 if (!preparedTypesOk) process.exitCode = 1
 
@@ -978,7 +1015,30 @@ const sharedIdentity = 'io.example.plugin/record@1'
 const sharedCatalog = [{ id:sharedIdentity, binding:'shared', schema:{ type:'object', properties:{ count:'int' }, required:['count'] } }]
 const sharedSources = [{ type:sharedIdentity, value:{ $ref:{ scope:'constant', node:'c_record01', path:[] } } }]
 const sharedPathCases = [[['$type'], 'text', false], [['summary'], 'text', true], [['data', 'count'], 'int', false]]
+const encodedEnumInteger = data => ({ $nmf_value:{ type:'int', data } })
+const enumCompatibilityCases = [
+  [[encodedEnumInteger('9007199254740993')], [encodedEnumInteger('9007199254740993')], true],
+  [[encodedEnumInteger('9007199254740993')], [encodedEnumInteger('9007199254740994')], false],
+  [[encodedEnumInteger('7')], [7], true],
+  [[7], [encodedEnumInteger('7')], true],
+  [[true], [1], false],
+  [['7'], [encodedEnumInteger('7')], false],
+  [[encodedEnumInteger('9007199254740993'), encodedEnumInteger('9007199254740994')], [encodedEnumInteger('9007199254740993')], false],
+]
+const objectPathsOk = ['toString', 'valueOf', 'hasOwnProperty'].every(key => {
+  const extra = typeAtPath({ type:'object', properties:{}, additional_properties:'text' }, [key])
+  const declared = typeAtPath({ type:'object', properties:{ [key]:'int' }, required:[key], additional_properties:false }, [key])
+  if (extra.type.type !== 'text' || !extra.optional || declared.type.type !== 'int' || declared.optional) return false
+  try { typeAtPath({ type:'object', properties:{}, additional_properties:false }, [key]); return false } catch { return true }
+})
+const invalidPaths = [[true], [-1], [1.5], [null], [{}], [[]], ['_private'], ['constructor'], ['prototype'], ['child', false]]
+const invalidPathsRejected = ['any', { type:'object' }, { type:'union', variants:['any', 'text'] }].every(type => (
+  invalidPaths.every(path => { try { typeAtPath(type, path); return false } catch { return true } })
+)) && invalidPaths.every(path => { try { typeAtPath({ type:'array', items:'any' }, [0, ...path]); return false } catch { return true } })
 const bindingTypesOk = objectCompatibilityCases.every(([source, target, expected]) => compatibleTypes(source, target) === expected)
+  && objectPathsOk && invalidPathsRejected
+  && [[], ['业务字段'], [0], ['业务字段', 0, '名称']].every(path => typeAtPath('any', path).type.type === 'any')
+  && enumCompatibilityCases.every(([source, target, expected]) => compatibleTypes({ type:'int', enum:source }, { type:'int', enum:target }) === expected)
   && typeAtPath({ type:'object', additional_properties:'text' }, ['extra']).type.type === 'text'
   && sharedPathCases.every(([path, type, optional]) => {
     const selected = typeAtPath(sharedIdentity, path, sharedCatalog)
@@ -1614,8 +1674,8 @@ for (const [buttonText, name] of [['添加常量', '批次号'], ['添加变量'
   nameField.dispatchEvent(new window.Event('input', { bubbles:true }))
   const typeField = definition.querySelector('select[aria-label="数据类型"]')
   const schemaField = definition.querySelector('textarea[aria-label="类型结构 JSON"]')
-  for (const invalidType of [123, {}]) {
-    schemaField.value = JSON.stringify({ type:invalidType })
+  for (const invalidSchema of ['{"type":123}', '{"type":{}}', '{"type":"int","max":1e400}']) {
+    schemaField.value = invalidSchema
     schemaField.dispatchEvent(new window.Event('input', { bubbles:true }))
     await pause(20)
     invalidTypeKeptDraft &&= typeField.value === 'text' && !!definition.querySelector('.type-picker .danger-text')
@@ -1623,6 +1683,11 @@ for (const [buttonText, name] of [['添加常量', '批次号'], ['添加变量'
   typeField.value = 'int'
   typeField.dispatchEvent(new window.Event('change', { bubbles:true }))
   await pause(20)
+  if (buttonText === '添加常量') {
+    schemaField.value = '{"type":"int","min":9007199254740993,"max":9007199254740993,"enum":[9007199254740993]}'
+    schemaField.dispatchEvent(new window.Event('input', { bubbles:true }))
+    await pause(20)
+  }
   const valueField = definition.querySelector('.typed-value-input input')
   valueField.value = buttonText === '添加常量' ? '9007199254740993' : '0'
   valueField.dispatchEvent(new window.Event('input', { bubbles:true }))
@@ -1653,10 +1718,34 @@ await pause(20)
 const expressionTextPreserved = objectExpression.value === JSON.stringify(businessObject)
 const objectValueField = objectDefinition.querySelector('.typed-value-input textarea')
 const mixedObjectDisplayed = JSON.parse(objectValueField.value).content === '保留字段'
+const savesBeforeInvalidJson = saveConfigCalls.length
+let invalidJsonBlocksSave = true
+for (const invalidText of ['{"limit":1e400}', '{"limit":000009007199254740993}']) {
+  objectValueField.value = invalidText
+  objectValueField.dispatchEvent(new window.Event('input', { bubbles:true }))
+  await pause(20)
+  invalidJsonBlocksSave &&= !objectValueField.checkValidity() && !!objectDefinition.querySelector('.typed-value-input .danger-text')
+  ;[...document.querySelectorAll('.rule-editor-actions button')].find(button => button.textContent.includes('保存规则')).click()
+  await pause(20)
+  invalidJsonBlocksSave &&= saveConfigCalls.length === savesBeforeInvalidJson
+}
 objectValueField.value = JSON.stringify({ ...businessObject, content:'已编辑字段' })
 objectValueField.dispatchEvent(new window.Event('input', { bubbles:true }))
 await pause(20)
 const typedTextPreserved = objectValueField.value === JSON.stringify({ ...businessObject, content:'已编辑字段' })
+;[...definitionsPanel.querySelectorAll('button')].find(button => button.textContent.includes('添加常量')).click()
+await pause(20)
+const fieldDefinition = [...definitionsPanel.querySelector('section').querySelectorAll('.variable-definition')].at(-1)
+const fieldName = fieldDefinition.querySelector('.variable-heading input')
+fieldName.value = '可选字段'
+fieldName.dispatchEvent(new window.Event('input', { bubbles:true }))
+const fieldSchema = fieldDefinition.querySelector('textarea[aria-label="类型结构 JSON"]')
+fieldSchema.value = JSON.stringify({ type:'object', properties:{ count:'int', flag:'bool', label:'text', items:{ type:'array', items:'text' } } })
+fieldSchema.dispatchEvent(new window.Event('input', { bubbles:true }))
+await pause(20)
+const fieldValue = fieldDefinition.querySelector('.typed-value-input textarea')
+fieldValue.value = '{}'
+fieldValue.dispatchEvent(new window.Event('input', { bubbles:true }))
 ;[...document.querySelectorAll('.node-canvas-tools button')].find(button => button.textContent.includes('变量赋值')).click()
 await pause(30)
 const assignmentEditor = [...document.querySelectorAll('.variable-assignment-editor')].at(-1)
@@ -1669,16 +1758,53 @@ sourcePicker.dispatchEvent(new window.Event('change', { bubbles:true }))
 await pause(20)
 assignmentEditor.querySelector('.binding-picker-actions button').click()
 await pause(20)
+;[...assignmentEditor.querySelectorAll('.binding-value button')].find(button => button.textContent === '更换').click()
+await pause(20)
+const fieldPicker = assignmentEditor.querySelector('.binding-picker')
+const fieldSources = fieldPicker.querySelector('select')
+fieldSources.value = [...fieldSources.options].find(option => option.textContent.includes('业务对象')).value
+fieldSources.dispatchEvent(new window.Event('change', { bubbles:true }))
+await pause(20)
+let invalidPathsBlockBinding = true
+for (const path of invalidPaths) {
+  const pathInput = fieldPicker.querySelector('input[aria-label="数据路径"]')
+  pathInput.value = JSON.stringify(path)
+  pathInput.dispatchEvent(new window.Event('input', { bubbles:true }))
+  await pause(20)
+  invalidPathsBlockBinding &&= fieldPicker.querySelector('.binding-picker-actions button').disabled && !!fieldPicker.querySelector('.danger-text')
+}
+fieldSources.value = [...fieldSources.options].find(option => option.textContent.includes('可选字段') && JSON.parse(option.value).$ref.path.length === 0).value
+fieldSources.dispatchEvent(new window.Event('change', { bubbles:true }))
+await pause(20)
+const missingPolicy = [...fieldPicker.querySelectorAll('select')].find(select => [...select.options].some(option => option.value === 'default'))
+missingPolicy.value = 'default'
+missingPolicy.dispatchEvent(new window.Event('change', { bubbles:true }))
+await pause(20)
+const dataPath = fieldPicker.querySelector('input[aria-label="数据路径"]')
+let fieldDefaultsOk = true
+for (const [key, expected] of [['count','0'], ['flag','false'], ['label',''], ['items','[]'], ['count','0']]) {
+  dataPath.value = JSON.stringify([key])
+  dataPath.dispatchEvent(new window.Event('input', { bubbles:true }))
+  await pause(20)
+  fieldDefaultsOk &&= fieldPicker.querySelector('[aria-label="缺失时的默认值"]').value === expected
+}
+fieldPicker.querySelector('.binding-picker-actions button').click()
+await pause(20)
 ;[...document.querySelectorAll('.rule-editor-actions button')].find(button => button.textContent.includes('保存规则')).click()
 await pause(60)
 const typedRule = savedRulesPayload?.find(rule => rule.rule_id === 'r_mount001')
 const typedAssignment = typedRule?.actions?.find(action => action.type === 'set_variable')
 const variableEditorOk = typedRule?.constants?.[0]?.value?.$nmf_value?.data === '9007199254740993'
+  && ['min', 'max'].every(bound => typedRule?.constants?.[0]?.value_type?.[bound]?.$nmf_value?.data === '9007199254740993')
+  && typedRule?.constants?.[0]?.value_type?.enum?.[0]?.$nmf_value?.data === '9007199254740993'
   && typedRule?.variables?.[0]?.value_type === 'int'
   && typedAssignment?.variable === typedRule.variables[0].id
-  && typedAssignment?.value?.$ref?.node === typedRule.constants[0].id
+  && typedAssignment?.value?.$ref?.node === typedRule.constants.find(item => item.name === '可选字段')?.id
+  && typedAssignment?.value?.$ref?.path?.join('|') === 'count'
+  && typedAssignment?.value?.$ref?.on_missing === 'default'
+  && typedAssignment?.value?.$ref?.default?.$literal === 0 && fieldDefaultsOk && invalidPathsBlockBinding
   && invalidTypeKeptDraft && mixedObjectDisplayed
-  && advancedCollapsed && expressionTextPreserved && typedTextPreserved
+  && advancedCollapsed && expressionTextPreserved && typedTextPreserved && invalidJsonBlocksSave
   && typedRule.constants.find(item => item.name === '业务对象')?.value?.content === '已编辑字段'
   && typedRule.constants.find(item => item.name === '业务对象')?.value?.$literal === 'business label'
 console.log((variableEditorOk?'PASS':'FAIL')+' - variable editor saves precise constants and a bound assignment')
@@ -1804,6 +1930,93 @@ await new Promise(r => setTimeout(r, 1800))
 const slowRestartOk = launchCalls === 1 && mockEngineState === 'running'
 console.log((slowRestartOk?'PASS':'FAIL')+' - plugin restart waits until stopping reaches stopped')
 if (!slowRestartOk) process.exitCode = 1
+
+// 插件页要把"目录扫描结果"和"本次引擎会话的加载错误"分开显示。
+mockPluginListRuntime = {
+  engine_state:'running', diagnostics_available:true, plugin_error_count:1,
+  plugin_errors:[{ store:'Action', plugin_id:'ghost_plugin', reason:'插件签名无效，拒绝加载' }],
+}
+mockPluginListExtraActions = {
+  broken_json: { id:'broken_json', name:'坏掉的插件', origin:'user', enabled:true, params:[], outputs:[],
+    _error:'JSON 解析失败: Expecting value', _unidentified:true },
+  blocked_plugin: { id:'blocked_plugin', name:'检查不过的插件', origin:'builtin', enabled:true, params:[], outputs:[],
+    checks:{ load_policy:{ mode:'permissive', allowed:false, errors:['签名校验失败'] } } },
+  linux_only_builtin: { id:'linux_only_builtin', name:'仅 Linux 的内置插件', origin:'builtin', enabled:true, params:[], outputs:[],
+    platform_compatible:false, availability:'unavailable', unavailable_reasons:['当前平台不支持'] },
+  linux_only_user: { id:'linux_only_user', name:'用户装的仅 Linux 插件', origin:'user', enabled:true, params:[], outputs:[],
+    platform_compatible:false, availability:'unavailable', unavailable_reasons:['当前平台不支持'],
+    checks:{ load_policy:{ mode:'permissive', allowed:false, errors:['当前平台入口不存在'] } } },
+}
+;[...document.querySelectorAll('.plugin-session-errors button')].find(
+  button => button.textContent.includes('刷新'),
+)?.click()
+await waitFor('.plugin-session-errors code')
+const pluginTypeFilter = document.querySelector('select.plugin-type-filter')
+if (pluginTypeFilter) {
+  pluginTypeFilter.value = 'all'
+  pluginTypeFilter.dispatchEvent(new window.Event('change', { bubbles:true }))
+}
+await new Promise(r => setTimeout(r, 60))
+const sessionErrorArea = document.querySelector('.plugin-session-errors')
+const sessionErrorShown = sessionErrorArea?.textContent.includes('ghost_plugin')
+  && sessionErrorArea?.textContent.includes('插件签名无效，拒绝加载')
+  && !document.querySelector('.plugin-list-row b')?.textContent.includes('ghost_plugin')
+const blockedRow = [...document.querySelectorAll('.plugin-list-row')].find(
+  row => row.textContent.includes('检查不过的插件'),
+)
+const blockedRowOk = blockedRow?.querySelector('.plugin-list-status')?.textContent.trim() === '检查未通过'
+const hiddenBuiltinOk = ![...document.querySelectorAll('.plugin-list-row')]
+  .some(row => row.textContent.includes('仅 Linux 的内置插件'))
+;[...document.querySelectorAll('.plugin-origin-switch button')].find(
+  button => button.textContent.includes('用户'),
+)?.click()
+await new Promise(r => setTimeout(r, 60))
+const brokenRow = [...document.querySelectorAll('.plugin-list-row')].find(
+  row => row.textContent.includes('坏掉的插件'),
+)
+const brokenRowOk = brokenRow?.querySelector('.plugin-list-status')?.textContent.trim() === '无法读取'
+  && !brokenRow?.querySelector('.switch input')
+const userUnavailableRow = [...document.querySelectorAll('.plugin-list-row')].find(
+  row => row.textContent.includes('用户装的仅 Linux 插件'),
+)
+const userUnavailableOk = userUnavailableRow?.querySelector('.plugin-list-status')?.textContent.trim() === '当前不可用'
+console.log((sessionErrorShown && brokenRowOk && blockedRowOk && hiddenBuiltinOk && userUnavailableOk?'PASS':'FAIL')+' - plugin page separates session load errors from the directory list')
+if (!sessionErrorShown || !brokenRowOk || !blockedRowOk || !hiddenBuiltinOk || !userUnavailableOk) process.exitCode = 1
+
+mockPluginListRuntime = {
+  engine_state:'stopped', diagnostics_available:true, plugin_error_count:1,
+  plugin_errors:[{ store:'Action', plugin_id:'ghost_plugin', reason:'插件签名无效，拒绝加载' }],
+}
+;[...document.querySelectorAll('.plugin-session-errors button')].find(
+  button => button.textContent.includes('刷新'),
+)?.click()
+await waitFor(() => document.querySelector('.plugin-session-errors')?.textContent.includes('加载结果未确认'))
+const unconfirmedShown = document.querySelector('.plugin-session-errors')?.textContent.includes('加载结果未确认')
+  && document.querySelector('.plugin-session-errors')?.textContent.includes('上一次引擎会话')
+  && !document.querySelector('.plugin-session-errors')?.textContent.includes('本次引擎会话有')
+console.log((unconfirmedShown?'PASS':'FAIL')+' - stopped engine shows the load result as unconfirmed')
+if (!unconfirmedShown) process.exitCode = 1
+
+// 整个列表请求失败时要说明当前显示的是上次结果，并保留重试
+mockPluginListFail = true
+;[...document.querySelectorAll('.plugin-session-errors button')].find(
+  button => button.textContent.includes('刷新'),
+)?.click()
+await waitFor(() => document.querySelector('.plugin-session-errors')?.textContent.includes('插件列表刷新失败'))
+const listFailureShown = document.querySelector('.plugin-session-errors')?.textContent.includes('插件列表刷新失败')
+  && Boolean([...document.querySelectorAll('.plugin-session-errors button')].find(button => button.textContent.includes('重试')))
+console.log((listFailureShown?'PASS':'FAIL')+' - plugin list refresh failure keeps the last result and offers retry')
+if (!listFailureShown) process.exitCode = 1
+mockPluginListFail = false
+;[...document.querySelectorAll('.plugin-session-errors button')].find(
+  button => button.textContent.includes('重试'),
+)?.click()
+await new Promise(r => setTimeout(r, 80))
+const listRetryCleared = !document.querySelector('.plugin-session-errors')?.textContent.includes('插件列表刷新失败')
+console.log((listRetryCleared?'PASS':'FAIL')+' - retrying the plugin list clears the failure notice')
+if (!listRetryCleared) process.exitCode = 1
+mockPluginListRuntime = null
+mockPluginListExtraActions = null
 
 // 删除最后一条自动化后，首页只显示一次去往自动化页的首次引导。
 rulesNav?.click()

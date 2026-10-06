@@ -25,6 +25,12 @@ export function typeLabel(value) {
   return label + (spec.nullable ? ' / 空值' : '')
 }
 
+function enumValue(value) {
+  if (isEncodedValue(value) && value.$nmf_value?.type === 'int') return { type: 'int', data: value.$nmf_value.data }
+  if (Number.isSafeInteger(value)) return { type: 'int', data: String(value) }
+  return { type: typeof value, data: value }
+}
+
 export function compatibleTypes(source, target) {
   const a = typeSpec(source), b = typeSpec(target)
   if (a.type === 'any' || b.type === 'any') return true
@@ -32,7 +38,13 @@ export function compatibleTypes(source, target) {
   if (a.nullable && !b.nullable) return compatibleTypes('null', b) && compatibleTypes({ ...a, nullable: false }, b)
   if (a.type === 'union') return a.variants.every(v => compatibleTypes(v, b))
   if (b.type === 'union') return b.variants.some(v => compatibleTypes(a, v))
-  if (b.enum && (!a.enum || !a.enum.every(v => b.enum.some(w => typeof w === typeof v && w === v)))) return false
+  if (b.enum && (!a.enum || !a.enum.every(v => {
+    const left = enumValue(v)
+    return b.enum.some(w => {
+      const right = enumValue(w)
+      return left.type === right.type && left.data === right.data
+    })
+  }))) return false
   if (a.type !== b.type) {
     if (a.type === 'text' && ['path', 'url', 'uuid', 'date', 'time', 'datetime'].includes(b.type)) return true
     if (a.type === 'number' && ['int', 'float', 'decimal', 'duration'].includes(b.type)) return true
@@ -67,6 +79,8 @@ export function compatibleTypes(source, target) {
 export function typeAtPath(value, path, catalog = []) {
   let spec = typeSpec(value), optional = false
   for (const segment of path) {
+    if (typeof segment !== 'string' && (!Number.isInteger(segment) || segment < 0)
+      || typeof segment === 'string' && (segment.startsWith('_') || ['constructor', 'prototype'].includes(segment))) throw new Error('路径必须由对象键和非负整数下标组成，且不能访问内部字段')
     optional ||= spec.nullable === true
     if (spec.type.includes('/')) {
       const definition = catalog.find(item => item.id === spec.type)
@@ -83,7 +97,7 @@ export function typeAtPath(value, path, catalog = []) {
     } else if (spec.type === 'object') {
       if (typeof segment !== 'string' || segment.startsWith('_') || ['constructor', 'prototype'].includes(segment)) throw new Error('对象路径字段无效')
       optional ||= !(spec.required || []).includes(segment)
-      if (spec.properties?.[segment]) spec = typeSpec(spec.properties[segment])
+      if (spec.properties && Object.hasOwn(spec.properties, segment)) spec = typeSpec(spec.properties[segment])
       else if (spec.additional_properties === false) throw new Error('类型中没有这个字段')
       else spec = typeSpec(spec.additional_properties === true || spec.additional_properties === undefined ? 'any' : spec.additional_properties)
     } else if (spec.type === 'union') {
@@ -120,11 +134,16 @@ export function isOpaqueValue(value) {
 }
 
 export function parseExactJson(text) {
-  const rewritten = String(text).replace(/"(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g, token => {
+  const source = String(text)
+  JSON.parse(source)
+  const rewritten = source.replace(/"(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g, token => {
     if (/^-?\d+$/.test(token) && !Number.isSafeInteger(Number(token))) return JSON.stringify({ $nmf_value: { type: 'int', data: token } })
     return token
   })
-  return JSON.parse(rewritten)
+  return JSON.parse(rewritten, (_key, value) => {
+    if (typeof value === 'number' && !Number.isFinite(value)) throw new Error('JSON 数字必须是有限值')
+    return value
+  })
 }
 
 export function parseTypedInput(raw, declaration) {

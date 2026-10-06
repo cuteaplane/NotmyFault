@@ -34,6 +34,14 @@
 .plugin-list-copy b{overflow:hidden;font:var(--ts-title-m);text-overflow:ellipsis;white-space:nowrap}
 .plugin-list-copy small{overflow:hidden;color:var(--md-on-surface-variant);font:var(--ts-body-s);text-overflow:ellipsis;white-space:nowrap}
 .plugin-list-status{color:var(--md-success);font:var(--ts-label-m);white-space:nowrap}
+.plugin-session-errors{display:flex;align-items:flex-start;gap:10px;margin:-4px 0 14px;padding:12px;border-radius:var(--r-sm);background:color-mix(in srgb,var(--md-error) 8%,var(--md-surface-c-lowest));color:var(--md-error)}
+.plugin-session-errors>.material-symbols-outlined{font-size:20px}
+.plugin-session-errors-copy{flex:1;min-width:0}
+.plugin-session-errors-copy b{font:var(--ts-title-s)}
+.plugin-session-errors-copy p{margin:4px 0 0;font:var(--ts-body-s)}
+.plugin-session-errors-copy ul{margin:8px 0 0;padding-left:18px;font:var(--ts-body-s)}
+.plugin-session-errors-copy li{margin:2px 0;word-break:break-word}
+.plugin-session-errors-copy code{font-family:var(--font-mono,monospace)}
 .plugin-list-status.muted{color:var(--md-on-surface-variant)}
 .plugin-list-status.error{color:var(--md-error)}
 .plugin-list-switch{width:54px;justify-content:center}
