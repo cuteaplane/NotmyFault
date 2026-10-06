@@ -1,10 +1,10 @@
 """整理事件、条件组合和步骤结果供插件使用"""
 import copy
 import threading
-import time
 from typing import Any, Callable, Dict
 
 from notmyfault.core.data_types import normalize_fields
+from notmyfault.core.clock import Clock, SystemClock
 
 
 class ActionCancelled(RuntimeError):
@@ -24,11 +24,14 @@ class ActionCancellation:
         run_event: threading.Event | None = None,
         shutdown_event: threading.Event | None = None,
         timeout_seconds: float | None = None,
+        *,
+        clock: Clock | None = None,
     ) -> None:
+        self._clock = clock or SystemClock()
         self._run_event = run_event
         self._shutdown_event = shutdown_event
         self._deadline = (
-            time.monotonic() + timeout_seconds
+            self._clock.monotonic() + timeout_seconds
             if timeout_seconds is not None
             else None
         )
@@ -39,7 +42,7 @@ class ActionCancellation:
             return "shutdown"
         if self._run_event is not None and self._run_event.is_set():
             return "cancelled"
-        if self._deadline is not None and time.monotonic() >= self._deadline:
+        if self._deadline is not None and self._clock.monotonic() >= self._deadline:
             return "timeout"
         return ""
 
@@ -52,19 +55,15 @@ class ActionCancellation:
             raise ActionCancelled(reason)
 
     def wait(self, timeout: float) -> bool:
-        deadline = time.monotonic() + max(float(timeout), 0.0)
+        deadline = self._clock.monotonic() + max(float(timeout), 0.0)
+        event = self._run_event or self._shutdown_event or threading.Event()
         while True:
             if self.is_cancelled():
                 return True
-            remaining = deadline - time.monotonic()
+            remaining = deadline - self._clock.monotonic()
             if remaining <= 0:
                 return False
-            if self._run_event is not None:
-                self._run_event.wait(min(remaining, 0.1))
-            elif self._shutdown_event is not None:
-                self._shutdown_event.wait(min(remaining, 0.1))
-            else:
-                time.sleep(min(remaining, 0.1))
+            self._clock.wait(event, min(remaining, 0.1))
 
 
 def build_context(

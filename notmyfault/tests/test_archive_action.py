@@ -7,11 +7,11 @@ import os
 import threading
 import zipfile
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from notmyfault.core import workflow
+from notmyfault.core.clock import FakeClock
 from notmyfault.core.workflow import ActionCancellation, ActionCancelled
 from notmyfault.security.plugin_schema import validate_plugin_meta
 
@@ -142,9 +142,10 @@ def test_archive_stops_during_single_file(tmp_path, monkeypatch, mode, reason):
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr(source.name, payload)
     run_event = threading.Event()
-    clock = [0.0]
-    monkeypatch.setattr(workflow, "time", SimpleNamespace(monotonic=lambda: clock[0]))
-    cancellation = ActionCancellation(run_event, timeout_seconds=1 if reason == "timeout" else None)
+    clock = FakeClock()
+    cancellation = ActionCancellation(
+        run_event, timeout_seconds=1 if reason == "timeout" else None, clock=clock,
+    )
     bytes_read = 0
 
     def after_read(data):
@@ -152,7 +153,7 @@ def test_archive_stops_during_single_file(tmp_path, monkeypatch, mode, reason):
         bytes_read += len(data)
         if data:
             if reason == "timeout":
-                clock[0] = 2.0
+                clock.advance(2)
             else:
                 run_event.set()
         return data

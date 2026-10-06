@@ -4,6 +4,9 @@ import threading
 
 import pytest
 
+from notmyfault.core.clock import FakeClock
+from notmyfault.core.workflow import ActionCancellation, ActionCancelled
+
 from notmyfault.tests.api_support import create_test_engine
 from notmyfault.core.event_bus import _MAX_RUN_CHAIN
 from notmyfault.core.runtime_rules import prepare_rules
@@ -65,6 +68,25 @@ class TestCallNotmyfault:
 
 
 class TestConditionRuntime:
+    def test_injected_clock_drives_absence_and_action_timeout(self):
+        clock = FakeClock(wall_time=100)
+        runtime = ConditionRuntime(clock=clock)
+        cancellation = ActionCancellation(timeout_seconds=10, clock=clock)
+        rule = {"condition": {"op": "not", "within_seconds": 10, "children": [
+            {"type": "signal", "binding_id": "t_signal01", "params": {}},
+        ]}}
+        assert runtime.poll_absences("r", rule) is None
+        clock.advance(9)
+        assert runtime.poll_absences("r", rule) is None
+        assert not cancellation.is_cancelled()
+        clock.advance(1)
+        assert runtime.poll_absences("r", rule) is not None
+        assert runtime.poll_absences("r", rule) is None
+        assert clock.time() == 110
+        with pytest.raises(ActionCancelled) as caught:
+            cancellation.raise_if_cancelled()
+        assert caught.value.reason == "timeout"
+
     @pytest.mark.parametrize("combined", [False, True])
     @pytest.mark.parametrize("channel,other", [
         ("a", "b"), (True, 1), ([False], [0]),

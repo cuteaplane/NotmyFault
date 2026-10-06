@@ -4,6 +4,8 @@ import threading
 import time
 from typing import Any, Dict, List
 
+from notmyfault.core.clock import Clock, SystemClock
+
 from notmyfault.core.conditions import (
     get_rule_condition, _absence_nodes, _positive_events, _event_key,
     iter_condition_events, _condition_op, _condition_children, _is_event_leaf,
@@ -14,7 +16,8 @@ from notmyfault.core.conditions import (
 class ConditionRuntime:
     """维护条件树的命中状态并判断新的组合"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Clock | None = None) -> None:
+        self._clock = clock or SystemClock()
         self._seen: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._fired: Dict[str, tuple[tuple[str, float], ...]] = {}
         self._last_matches: Dict[str, List[Dict[str, Any]]] = {}
@@ -29,7 +32,7 @@ class ConditionRuntime:
             self._absence_deadlines.clear()
 
     def poll_absences(self, rule_key, rule, now=None):
-        timestamp = time.monotonic() if now is None else now
+        timestamp = self._clock.monotonic() if now is None else now
         node = get_rule_condition(rule)
         with self._lock:
             deadlines = self._absence_deadlines.setdefault(rule_key, {})
@@ -111,7 +114,7 @@ class ConditionRuntime:
         node = get_rule_condition(rule)
         if node is None:
             return False
-        timestamp = time.monotonic() if now is None else now
+        timestamp = self._clock.monotonic() if now is None else now
         if instance is not None:
             fingerprint = config_fingerprint(instance.get("config"))
             matching_leaves = [
@@ -217,4 +220,3 @@ class ConditionRuntime:
             return False, (), ()
         # any 组的命中时刻只看最新那一支，时间窗语义和以前一致
         return True, tuple(sorted(matched_keys.items())), (max(matched_keys.values()),)
-
