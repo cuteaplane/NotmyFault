@@ -25,6 +25,11 @@ SELECTOR = {
 }
 
 
+@pytest.fixture(autouse=True)
+def stub_dpi_context(monkeypatch):
+    monkeypatch.setattr(input_recorder, "per_monitor_dpi_context", nullcontext)
+
+
 def test_signed_word_reads_mouse_wheel_delta():
     assert _signed_word(120 << 16) == 120
     assert _signed_word((0x10000 - 120) << 16) == -120
