@@ -129,6 +129,7 @@ def workflow(directory, count, *, payload_mb=0):
         ]
         engine.actions_meta["sink"] = metadata("sink", "action")
         engine.actions_funcs["sink"] = lambda meta, params: None
+    engine.rules = document
     rule = engine._get_runtime_snapshot().rules[0]
     downstream = []
     run_action = engine._workflow_executor.run_action
@@ -145,7 +146,9 @@ def workflow(directory, count, *, payload_mb=0):
     def execute():
         context = build_context(rule["name"], "signal_0", {}, [], rule["rule_id"], "run_bench")
         engine._get_runtime_snapshot().prepare_context(rule, context)
-        engine._workflow_executor.execute_workflow(rule["rule_id"], rule, rule["name"], context)
+        outcome = engine._workflow_executor.execute_workflow(rule["rule_id"], rule, rule["name"], context)
+        if outcome.status != "succeeded" or len(context["steps"]) != len(rule["actions"]):
+            raise RuntimeError("性能测量中的步骤数量不符")
         if any(step["status"] != "ok" for step in context["steps"].values()):
             raise RuntimeError("性能测量中的步骤未成功")
 
@@ -209,7 +212,7 @@ def idle(directory, seconds):
             elapsed = time.perf_counter() - start
             after = process.cpu_times()
             return {
-                "rules": 100, "trigger_instances": len(engine._trigger_supervisor.health()),
+                "rules": 100, "trigger_instances": len(engine._trigger_host.health()),
                 "threads": len(threading.enumerate()), "duration_seconds": elapsed,
                 "cpu_percent": max(0, 100 * ((after.user - before.user) + (after.system - before.system)) / elapsed),
                 "budget_cpu_percent": .5, "budget_threads": 10,
@@ -268,7 +271,7 @@ def reload_rules(directory, count):
     engine = make_engine(rules(100, 20, steps=1), directory)
     snapshot = engine._get_runtime_snapshot()
     engine._start_trigger_threads(snapshot)
-    original = dict(engine._trigger_supervisor._threads)
+    original = {key: item.thread for key, item in engine._trigger_host._instances.items()}
     changed = rules(100, 20, steps=1)
     revision = 0
 
@@ -276,15 +279,12 @@ def reload_rules(directory, count):
         nonlocal revision
         revision += 1
         changed[0]["name"] = f"修改后的名称_{revision}"
-        candidate = engine._prepare_rules(changed)
-        previous = engine._apply_hot_reload_rules(candidate)
-        engine._start_trigger_threads(candidate)
-        engine._accept_hot_reload_rules(previous)
+        engine.apply_rules(changed, "benchmark")
 
     try:
         result = measure(apply, count)
         result.update(rules=100, changed_rules=1, budget_ms=100,
-                      trigger_restarts=sum(engine._trigger_supervisor._threads.get(key) is not value
+                      trigger_restarts=sum(engine._trigger_host._instances[key].thread is not value
                                            for key, value in original.items()))
         return result
     finally:
@@ -335,6 +335,7 @@ def main():
     report = {"version": __version__, "python": platform.python_version(),
               "platform": platform.platform(), "quick": args.quick,
               "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+              "worktree_dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True)),
               "benchmarks": results}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
