@@ -140,8 +140,8 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
         assert client.get("/api/engine/status", headers=headers).json()[
             "engine_state"
         ] == "running"
-        assert wait_for(lambda: runner.current_engine._hot_reloader._rules_mtime > 0)
-        previous_mtime = runner.current_engine._hot_reloader._rules_mtime
+        assert wait_for(lambda: runner.current_engine._rule_watcher._thread is not None)
+        previous_mtime = runner.current_engine._rule_watcher._stamp.mtime_ns / 1e9
 
         response = client.put(
             "/api/rules",
@@ -181,3 +181,31 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
         assert wait_for(lambda: runner.engine_state == "stopped", timeout=15)
     finally:
         runner.stop_engine()
+
+
+def test_http_maps_binding_failure_without_changing_history_envelope():
+    from notmyfault.core.event_stream import EventStream
+
+    class History:
+        def __init__(self):
+            self.events = []
+
+        def record_async(self, event):
+            self.events.append(event)
+
+    async def receive():
+        history = History()
+        broker = EventBroker(history)
+        subscription = broker.subscribe()
+        stream = EventStream()
+        event = stream.publish("run.failed", {"run_id": "run_binding", "failure_kind": "binding", "error": {"code": "missing_binding_value", "message": "缺少运行数据"}})
+        broker.publish(event)
+        packet = await asyncio.wait_for(subscription.queue.get(), 1)
+        assert packet["type"] == "workflow_failed"
+        assert packet["data"]["error"]["code"] == "missing_binding_value"
+        assert history.events[0]["type"] == "run.failed"
+        assert history.events[0]["v"] == 1
+        broker.close()
+        stream.close()
+
+    asyncio.run(receive())

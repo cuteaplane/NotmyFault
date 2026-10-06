@@ -98,7 +98,7 @@ class ApiApplication:
             await asyncio.sleep(30)
             self._extension_sessions.cleanup_expired()
 
-    def publish_event(self, event_type: str, data: Dict[str, Any]):
+    def publish_event(self, event_type, data: Dict[str, Any] | None = None):
         self._events.publish(event_type, data)
 
     def begin_shutdown(self) -> None:
@@ -107,7 +107,12 @@ class ApiApplication:
 
     def _setup_routes(self):
         plugin_catalog = self._plugin_catalog
-        rule_service = RuleService(self._store, plugin_catalog.schema)
+        def apply_rules(document, source):
+            engine = self._engine.current_engine
+            if engine is not None:
+                engine.apply_rules(document, source)
+
+        rule_service = RuleService(self._store, plugin_catalog.schema, apply_rules)
         self.app.include_router(
             create_engine_router(
                 EngineService(

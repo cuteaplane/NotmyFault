@@ -25,7 +25,7 @@ class ApiServer:
         self._application = application
         self._server: uvicorn.Server | None = None
 
-    def publish_event(self, event_type: str, data: dict) -> None:
+    def publish_event(self, event_type, data: dict | None = None) -> None:
         self._application.publish_event(event_type, data)
 
     def serve(

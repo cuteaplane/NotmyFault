@@ -95,9 +95,10 @@ class RuleRunService:
             self._fail(400, "局部运行的起始动作不存在")
         if end_step_id and end_step_id not in action_ids:
             self._fail(400, "局部运行的结束动作不存在")
-        start_index = action_ids.index(start_step_id) if start_step_id else 0
+        step_index = {identity: index for index, identity in enumerate(action_ids)}
+        start_index = step_index.get(start_step_id, 0)
         end_index = (
-            action_ids.index(end_step_id) if end_step_id else len(actions) - 1
+            step_index.get(end_step_id, len(actions) - 1)
         )
         if actions and start_index > end_index:
             self._fail(400, "局部运行的起始动作不能晚于结束动作")

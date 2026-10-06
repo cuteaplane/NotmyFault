@@ -35,9 +35,11 @@ class RuleService:
         self,
         store: SignedConfigStore,
         plugin_schema: Callable[[], Dict[str, Any]],
+        apply_rules=None,
     ) -> None:
         self._store = store
         self._plugin_schema = plugin_schema
+        self._apply_rules = apply_rules
 
     def list_rules(self) -> Dict[str, Any]:
         try:
@@ -261,6 +263,11 @@ class RuleService:
                 500,
                 {"ok": False, "error": "写入规则文件失败"},
             )
+        if self._apply_rules is not None:
+            try:
+                self._apply_rules(normalized_rules, "api")
+            except Exception as error:
+                raise RuleServiceError(409, {"ok": False, "saved": True, "error": "规则已保存，但引擎更新失败，仍使用原规则", "details": str(error)}) from error
         return {"ok": True, "rules": normalized_rules, "revision": self._store.rules_revision()}
 
     @staticmethod

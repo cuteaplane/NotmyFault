@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, Optional
 
 from notmyfault.config import SignedConfigStore
 from notmyfault.core.engine import AutomationEngine
+from notmyfault.core.event_stream import Event
 from notmyfault.security.security import SecurityMode, detect_security_mode
 from notmyfault.host.api.plugin_installation import (
     PluginBackupStore,
@@ -160,13 +161,13 @@ def _plugin_check_needed(
 def _notify_plugin_recovery(
     restored: list[dict[str, Any]],
     failed: list[dict[str, Any]],
-    on_event: Optional[Callable[[str, Dict[str, Any]], None]],
+    on_event: Optional[Callable[[Event], None]],
 ) -> None:
     if restored:
         payload = {"plugins": restored}
         if on_event is not None:
             try:
-                on_event("plugin_update_rolled_back", payload)
+                on_event("plugin.update.rolled_back", payload)
             except Exception:
                 pass
         names = ", ".join(
@@ -185,7 +186,7 @@ def _notify_plugin_recovery(
             print("[Plugins] 无法发送插件恢复提示", file=sys.stderr)
     if failed and on_event is not None:
         try:
-            on_event("plugin_update_rollback_failed", {"plugins": failed})
+            on_event("plugin.update.rollback_failed", {"plugins": failed})
         except Exception:
             pass
 
@@ -195,7 +196,7 @@ def _recover_failed_plugin_updates(
     config: Dict[str, Any],
     store: SignedConfigStore,
     load_paths: list[tuple[str, str]],
-    on_event: Optional[Callable[[str, Dict[str, Any]], None]],
+    on_event: Optional[Callable[[Event], None]],
     file_system: PluginFileSystem,
 ) -> AutomationEngine:
     backups = PluginBackupStore(
@@ -228,7 +229,7 @@ def _recover_failed_plugin_updates(
         ):
             broken.append(backup)
     if not broken:
-        _notify_plugin_recovery([], unresolved, on_event)
+        _notify_plugin_recovery([], unresolved, engine._safe_on_event)
         return engine
 
     engine.shutdown()
@@ -305,13 +306,13 @@ def _recover_failed_plugin_updates(
                 }
             )
             restored = [item for item in restored if item.get("id") != plugin_id]
-    _notify_plugin_recovery(restored, unresolved, on_event)
+    _notify_plugin_recovery(restored, unresolved, replacement._safe_on_event)
     return replacement
 
 
 def create_engine(
     store: SignedConfigStore,
-    on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    on_event: Optional[Callable[[Event], None]] = None,
     plugin_file_system: PluginFileSystem | None = None,
 ) -> AutomationEngine:
     _ensure_first_run_build(str(store.paths.package_root))
@@ -334,7 +335,7 @@ def create_engine(
 def run(
     store: SignedConfigStore,
     shutdown_event: "threading.Event | None" = None,
-    on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    on_event: Optional[Callable[[Event], None]] = None,
 ) -> None:
     # 引擎以普通权限启动，插件提权通过 notmyfault.security.sudo 请求 UAC 授权。
     from notmyfault.security.security import is_admin_process
