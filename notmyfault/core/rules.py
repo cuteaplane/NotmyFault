@@ -85,7 +85,7 @@ def validate_rule_structure(rule: Any) -> List[str]:
         if not isinstance(concurrency, dict):
             errors.append("concurrency 必须是对象")
         else:
-            mode = concurrency.get("mode", "parallel")
+            mode = concurrency.get("mode", "single")
             if mode not in ("single", "queue", "replace", "parallel"):
                 errors.append(
                     "concurrency.mode 必须是 single / queue / replace / parallel"

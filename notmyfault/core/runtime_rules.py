@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
+from types import MappingProxyType
+
+from notmyfault.core.compiled_rules import CompiledRule, compile_rule, digest, freeze
+from notmyfault.core.rule_model import _RULE_ID_RE
 
 from notmyfault.core.binding_schema import output_type, prepare_binding_context
 from notmyfault.core.data_types import normalize_fields
@@ -24,6 +28,12 @@ class PreparedRules:
     trigger_params: dict[str, list[dict]]
     event_types: dict[str, dict]
     event_sensitive: dict[str, list[list[str]]]
+    compiled: dict[str, CompiledRule] = field(default_factory=dict)
+    event_index: dict[str, tuple[CompiledRule, ...]] = field(default_factory=dict)
+    absence_index: tuple[CompiledRule, ...] = ()
+    document_digest: str = ""
+    generation: object | None = None
+    plugins: object | None = None
     total: int = 0
     issues: list[tuple[str, str]] = field(default_factory=list)
     warnings: list[tuple[str, str]] = field(default_factory=list)
@@ -35,6 +45,10 @@ class PreparedRules:
     def prepare_context(self, rule, context):
         template = self.contexts[rule_key(rule)]
         context.update(copy.deepcopy(template, {id(self.registry): self.registry}))
+        compiled = self.compiled[rule_key(rule)]
+        context["_compiled_refs"] = compiled.references
+        context["_compiled_rule"] = compiled
+        context["_generation"] = self.generation
         event_type = context.get("event", {}).get("type", "")
         context["_binding_types"]["event"] = self.event_types.get(event_type, output_type({}))
         paths = self.event_sensitive.get(event_type)
@@ -43,7 +57,7 @@ class PreparedRules:
 
 
 def rule_key(rule):
-    return str(rule.get("rule_id") or rule.get("name", ""))
+    return rule["rule_id"]
 
 
 def _fill_owner_rule_id(leaf, meta, rule):
@@ -65,7 +79,18 @@ def _fill_owner_rule_id(leaf, meta, rule):
     params["owner_rule_id"] = rule_key(rule)
 
 
-def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_trigger=None):
+def validate_rule_identifiers(rules):
+    if not isinstance(rules, list):
+        raise ValueError("rules 必须是列表")
+    identifiers = [rule.get("rule_id") if isinstance(rule, dict) else None for rule in rules]
+    if any(not isinstance(identity, str) or not _RULE_ID_RE.fullmatch(identity) for identity in identifiers):
+        raise ValueError("编译规则必须提供有效的 rule_id")
+    if len(set(identifiers)) != len(identifiers):
+        raise ValueError("rule_id 与其他规则重复")
+
+
+def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_trigger=None, plugin_digests=None):
+    validate_rule_identifiers(rules)
     normalized = normalize_rule_input(rules) if validate else normalize_rules(rules)
     registry = TypeRegistry.from_plugins(triggers_meta, actions_meta)
     prepared, contexts = [], {}
@@ -102,7 +127,7 @@ def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_
             continue
         contexts[rule_key(resolved)] = context
         prepared.append(resolved)
-    return PreparedRules(
+    result = PreparedRules(
         rules=prepared,
         registry=registry,
         contexts=contexts,
@@ -114,6 +139,18 @@ def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_
             for name, meta in triggers_meta.items()
         },
         total=len(normalized),
+        document_digest=digest(normalized),
         issues=issues,
         warnings=warnings,
     )
+    compiled = {rule_key(rule): compile_rule(rule, contexts[rule_key(rule)], triggers_meta, actions_meta, result.event_types, registry, plugin_digests) for rule in prepared}
+    index = {}
+    for rule in compiled.values():
+        for event_type in rule.matcher_spec.leaves:
+            index.setdefault(event_type, []).append(rule)
+    result.compiled = MappingProxyType(compiled)
+    result.event_index = MappingProxyType({name: tuple(items) for name, items in index.items()})
+    result.rules = freeze([rule.source for rule in compiled.values()])
+    result.absence_index = tuple(rule for rule in compiled.values() if rule.matcher_spec.absences)
+    result.runtime.configure(compiled)
+    return result

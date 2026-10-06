@@ -13,22 +13,16 @@ def make_engine():
 
 
 def shorten_timeouts(engine, seconds=0.5):
-    supervisor_stop = engine._trigger_supervisor.stop
+    supervisor_stop = engine._trigger_host.stop
     engine._stop_trigger_threads = lambda timeout=30: supervisor_stop(seconds)
     wait_actions = engine._workflow_executor.wait_active_actions
     engine._wait_active_actions = lambda timeout=60: wait_actions(seconds)
 
 
 def start_trigger(engine, trigger_id, runner):
-    def run_trigger_cb(instance_id, event_type, func, meta, config, stop_event):
-        runner(stop_event)
-
-    engine._trigger_supervisor.start(
-        {trigger_id: [{}]},
-        {trigger_id: lambda meta, config, emit, stop: None},
-        {trigger_id: {}},
-        run_trigger_cb,
-    )
+    engine.triggers_funcs[trigger_id] = lambda meta, config, emit, stop: runner(stop)
+    engine.triggers_meta[trigger_id] = {"trigger_api": "event-v2"}
+    engine._generations.apply([{"rule_id": "r_fuzz0001", "name": "停止测试", "condition": {"type": trigger_id, "params": {}}, "actions": []}], "test", validate=False)
 
 
 class TestShutdownFuzz:
@@ -53,11 +47,14 @@ class TestShutdownFuzz:
         engine = make_engine()
         shorten_timeouts(engine)
         stuck = threading.Event()
+        entered = threading.Event()
 
         def runner(stop_event):
+            entered.set()
             stuck.wait(timeout=10)
 
         start_trigger(engine, "fuzz_stuck", runner)
+        assert entered.wait(1)
         engine.shutdown()
         stuck.set()
         assert engine._shutdown_clean is False

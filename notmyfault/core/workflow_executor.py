@@ -23,6 +23,7 @@ from notmyfault.core.variables import assign_variable, expression_is_sensitive
 from notmyfault.core.diagnostics import Diagnostics
 from notmyfault.core.predicates import evaluate_predicate, values_equal
 from notmyfault.core.logging import engine_error
+from notmyfault.core.run_manager import RunOutcome
 from notmyfault.core.run_summary import summarize_fields
 from notmyfault.core.workflow import (
     ActionCancellation,
@@ -199,11 +200,26 @@ class WorkflowExecutor:
         self._active_actions = 0
         self.action_lock = threading.Lock()
         self.action_done = threading.Condition(self.action_lock)
-        self._run_cancel_events: Dict[str, threading.Event] = {}
-        self._run_cancel_lock = threading.RLock()
 
-    def _resolve_action(self, action_type: Any) -> Optional[Callable[..., Any]]:
+    @staticmethod
+    def _plugins_for(context):
+        plugins = context.get("_plugins")
+        generation = context.get("_generation")
+        return plugins if plugins is not None else generation.plugins if generation is not None else None
+
+    def _action_metadata(self, context):
+        plugins = self._plugins_for(context)
+        return plugins.actions_meta if plugins is not None else self._actions_meta()
+
+    def _trigger_metadata(self, context):
+        plugins = self._plugins_for(context)
+        return plugins.triggers_meta if plugins is not None else self._triggers_meta()
+
+    def _resolve_action(self, action_type: Any, context) -> Optional[Callable[..., Any]]:
         """先查已装载缓存，查不到再交给注册表物化懒加载插件"""
+        plugins = self._plugins_for(context)
+        if plugins is not None:
+            return plugins.actions_funcs.get(action_type)
         run = self._actions_funcs().get(action_type)
         if run is not None:
             return run
@@ -218,50 +234,7 @@ class WorkflowExecutor:
         if not isinstance(event, threading.Event):
             event = threading.Event()
             context["_run_cancel_event"] = event
-        run_id = _run_id(context)
-        if run_id:
-            with self._run_cancel_lock:
-                self._run_cancel_events[run_id] = event
         return event
-
-    def prepare_run(self, context: Dict[str, Any]) -> None:
-        self._ensure_run_cancel_event(context)
-
-    def _finish_run(self, context: Dict[str, Any]) -> bool:
-        run_id = _run_id(context)
-        with self._run_cancel_lock:
-            if context.get("_run_finished") is True:
-                return False
-            context["_run_finished"] = True
-            if run_id:
-                self._run_cancel_events.pop(run_id, None)
-        return True
-
-    def _complete_cancelled(
-        self, context: Dict[str, Any], rule_name: str
-    ) -> None:
-        if not self._finish_run(context):
-            return
-        self._on_event(
-            "workflow_completed",
-            {
-                "run_id": _run_id(context),
-                "rule_id": context.get("rule", {}).get("id", ""),
-                "rule_name": rule_name,
-                "status": "cancelled",
-                "assertions_passed": 0,
-                "assertions_total": 0,
-                "failure_kind": "cancelled",
-            },
-        )
-
-    def cancel_run(self, run_id: str) -> bool:
-        with self._run_cancel_lock:
-            event = self._run_cancel_events.get(run_id)
-        if event is None:
-            return False
-        event.set()
-        return True
 
     @property
     def active_actions(self) -> int:
@@ -275,70 +248,44 @@ class WorkflowExecutor:
         return _mask_sensitive(value, hidden) if hidden else value
 
     def execute_workflow(
-        self,
-        workflow_key: str,
-        rule: Dict[str, Any],
-        rule_name: str,
-        context: Dict[str, Any],
-    ) -> None:
-        """执行规则工作流并记录运行结果"""
-        try:
-            if context.get("_run_finished") is True:
-                return
-            if not context.get("_variables_initialized"):
-                try:
-                    prepare_binding_context(rule, context, self._triggers_meta(), self._actions_meta())
-                except (DataTypeError, BindingResolutionError) as error:
-                    self._finish_run(context)
-                    self._on_event("workflow_failed", {
-                        "run_id": _run_id(context), "rule_id": rule.get("rule_id", ""),
-                        "rule_name": rule_name, "error": error.as_dict(),
-                    })
-                    return
-            run_cancel_event = self._ensure_run_cancel_event(context)
-            if run_cancel_event.is_set():
-                self._complete_cancelled(context, rule_name)
-                return
-            actions = rule.get("actions", [])
-            if not isinstance(actions, list):
-                actions = []
-            manual_test = context.get("manual_test")
-            if isinstance(manual_test, dict):
-                start_index = int(manual_test.get("start_index", 0) or 0)
-                end_index = int(manual_test.get("end_index", len(actions) - 1))
-                selected_actions = actions[start_index : end_index + 1]
-                manual_test["active_offset"] = start_index
-            else:
-                selected_actions = actions
-            succeeded = self.execute_actions(selected_actions, rule_name, context)
-            if run_cancel_event.is_set():
-                self._complete_cancelled(context, rule_name)
-                return
-            assertion_results = self.evaluate_test_assertions(context, rule_name)
-            if assertion_results is not None:
-                succeeded = succeeded and assertion_results["passed"] == assertion_results["total"]
-            if run_cancel_event.is_set():
-                self._complete_cancelled(context, rule_name)
-                return
-            if not self._finish_run(context):
-                return
-            self._on_event(
-                "workflow_completed",
-                {
-                    "run_id": _run_id(context),
-                    "rule_id": context.get("rule", {}).get("id", ""),
-                    "rule_name": rule_name,
-                    "status": "succeeded" if succeeded else "failed",
-                    "assertions_passed": assertion_results["passed"] if assertion_results else 0,
-                    "assertions_total": assertion_results["total"] if assertion_results else 0,
-                    "failure_kind": (
-                        "assertion" if assertion_results and assertion_results["passed"] < assertion_results["total"]
-                        else ""
-                    ),
-                },
-            )
-        finally:
-            self._finish_run(context)
+        self, workflow_key: str, rule: Dict[str, Any], rule_name: str, context: Dict[str, Any],
+    ) -> RunOutcome:
+        if context.get("_preparation_error"):
+            return RunOutcome("failed", {"failure_kind": "binding"}, context["_preparation_error"])
+        run_cancel_event = self._ensure_run_cancel_event(context)
+        if run_cancel_event.is_set():
+            return RunOutcome("cancelled")
+        if not context.get("_variables_initialized"):
+            try:
+                prepare_binding_context(rule, context, self._trigger_metadata(context), self._action_metadata(context))
+            except (DataTypeError, BindingResolutionError) as error:
+                return RunOutcome("failed", {"failure_kind": "binding"}, error.as_dict())
+        actions = rule.get("actions", [])
+        actions = actions if isinstance(actions, list) else []
+        manual_test = context.get("manual_test")
+        if isinstance(manual_test, dict):
+            start_index = int(manual_test.get("start_index", 0) or 0)
+            end_index = int(manual_test.get("end_index", len(actions) - 1))
+            selected_actions = actions[start_index:end_index + 1]
+            manual_test["active_offset"] = start_index
+        else:
+            selected_actions = actions
+        succeeded = self.execute_actions(selected_actions, rule_name, context)
+        if run_cancel_event.is_set():
+            return RunOutcome("cancelled", {"failure_kind": "cancelled"})
+        assertions = self.evaluate_test_assertions(context, rule_name)
+        assertion_failed = assertions is not None and assertions["passed"] < assertions["total"]
+        succeeded = succeeded and not assertion_failed
+        if run_cancel_event.is_set():
+            return RunOutcome("cancelled", {"failure_kind": "cancelled"})
+        timed_out = not succeeded and any(step.get("status") == "timed_out" for step in context.get("steps", {}).values())
+        status = "succeeded" if succeeded else "timed_out" if timed_out else "failed"
+        error = None if succeeded else {"code": "assertion_failed" if assertion_failed else "action_timeout" if timed_out else "action_failed", "message": "检查结果不符合预期" if assertion_failed else "动作执行超时" if timed_out else "动作执行失败"}
+        return RunOutcome(status, {
+            "assertions_passed": assertions["passed"] if assertions else 0,
+            "assertions_total": assertions["total"] if assertions else 0,
+            "failure_kind": "assertion" if assertion_failed else "",
+        }, error)
 
     def evaluate_test_assertions(
         self,
@@ -372,7 +319,7 @@ class WorkflowExecutor:
             "total": len(results),
             "results": results,
         }
-        self._on_event("test_assertions_completed", summary)
+        self._on_event("run.assertions.completed", summary)
         return summary
 
     def execute_actions(
@@ -448,7 +395,7 @@ class WorkflowExecutor:
                     "error": None,
                 }
                 self._on_event(
-                    "action_skipped",
+                    "run.step.skipped",
                     {
                         "action_type": action.get("type"),
                         "rule_id": context.get("rule", {}).get("id", ""),
@@ -508,9 +455,10 @@ class WorkflowExecutor:
             "run_id": _run_id(context), "rule_id": context.get("rule", {}).get("id", ""),
             "duration_ms": 0,
         }
+        self._on_event("run.step.started", event)
         if not references_available(action.get("value"), context):
             context["steps"][step_id] = {"type": "set_variable", "status": "skipped", "result": None, "error": None}
-            self._on_event("action_skipped", {**event, "reason": "赋值来源未参与本次运行"})
+            self._on_event("run.step.skipped", {**event, "reason": "赋值来源未参与本次运行"})
             return True
         try:
             value = assign_variable(action.get("variable"), action.get("value"), context)
@@ -519,12 +467,12 @@ class WorkflowExecutor:
             sensitive = bool(context.get("_sensitive_sources", {}).get("variable", {}).get(action.get("variable")))
             if sensitive:
                 context.setdefault("_sensitive_sources", {}).setdefault("step", {})[step_id] = [["value"]]
-            self._on_event("action_executed", {**event, "status": "ok", "result": {"value": "***"} if sensitive else result})
+            self._on_event("run.step.succeeded", {**event, "status": "ok", "result": {"value": "***"} if sensitive else result})
             return True
         except (DataTypeError, BindingResolutionError) as error:
             message = self._masked_event_value(str(error), context)
             context["steps"][step_id] = {"type": "set_variable", "status": "failed", "result": None, "error": message}
-            self._on_event("error", {**event, "error": {
+            self._on_event("run.step.failed", {**event, "error": {
                 "code": error.code, "location": error.location, "message": message,
             }, "status": "failed"})
             return False
@@ -535,6 +483,7 @@ class WorkflowExecutor:
             "action_type": "if", "step_id": step_id, "rule_name": rule_name,
             "rule_id": context.get("rule", {}).get("id", ""), "run_id": _run_id(context),
         }
+        self._on_event("run.step.started", event)
         try:
             matched = evaluate_predicate(action.get("condition"), context)
             branch = "then" if matched else "else"
@@ -548,7 +497,7 @@ class WorkflowExecutor:
                 "result": result if succeeded else None,
                 "error": None if succeeded else "分支动作执行失败",
             }
-            self._on_event("action_executed" if succeeded else "error", {
+            self._on_event("run.step.succeeded" if succeeded else "run.step.failed", {
                 **event, "status": "ok" if succeeded else "failed", "result": result,
                 "error": None if succeeded else {"code": "action_execution_failed", "message": "分支动作执行失败"},
                 "duration_ms": round((time.perf_counter() - started) * 1000),
@@ -559,7 +508,7 @@ class WorkflowExecutor:
             context["steps"][step_id] = {
                 "type": "if", "status": "failed", "result": None, "error": message,
             }
-            self._on_event("error", {**event, "error": {
+            self._on_event("run.step.failed", {**event, "error": {
                 "code": getattr(error, "code", "condition_evaluation_failed"), "message": message,
             }, "duration_ms": 0})
             return False
@@ -580,7 +529,7 @@ class WorkflowExecutor:
         action_type = action.get("type")
         dynamic_parameter_error = ""
         dynamic_parameter_name = ""
-        action_meta = self._actions_meta().get(action_type, {})
+        action_meta = self._action_metadata(context).get(action_type, {})
         raw_params = action.get("params", {})
         if isinstance(raw_params, dict):
             for param_name in sorted(literal_only_params(action_meta)):
@@ -600,7 +549,7 @@ class WorkflowExecutor:
                 error=dynamic_parameter_error,
             )
             self._on_event(
-                "error",
+                "run.step.failed",
                 {
                     "action_type": action_type,
                     "rule_id": context.get("rule", {}).get("id", ""),
@@ -636,7 +585,7 @@ class WorkflowExecutor:
         except BindingResolutionError as exc:
             self._diagnostics.inc_action_fail()
             self._on_event(
-                "error",
+                "run.step.failed",
                 {
                     "action_type": action_type,
                     "rule_id": context.get("rule", {}).get("id", ""),
@@ -654,7 +603,7 @@ class WorkflowExecutor:
         if not isinstance(params, dict):
             raise ActionPreparationError("action.params 必须是对象")
 
-        action_func = self._resolve_action(action_type)
+        action_func = self._resolve_action(action_type, context)
         if action_func is None:
             print(
                 f"[Engine] [?] 未知 action 类型或未装载模块: {action_type}",
@@ -662,7 +611,7 @@ class WorkflowExecutor:
             )
             raise ActionPreparationError(f"未知 action 类型: {action_type}")
 
-        actions_meta = self._actions_meta()
+        actions_meta = self._action_metadata(context)
         action_meta = actions_meta.get(action_type, {})
         timeout_seconds = None
         if action.get("timeout_seconds") is not None:
@@ -674,7 +623,8 @@ class WorkflowExecutor:
                 raise ActionPreparationError("timeout_seconds 必须是数字")
             if not 1 <= timeout_seconds <= 86400:
                 raise ActionPreparationError("timeout_seconds 必须在 1 到 86400 秒之间")
-        module = self._plugin_modules().get(action_type)
+        plugins = self._plugins_for(context)
+        module = (plugins.modules if plugins is not None else self._plugin_modules()).get(action_type)
         if module is not None and hasattr(module, "validate_params"):
             try:
                 validation_errors = module.validate_params(
@@ -688,7 +638,7 @@ class WorkflowExecutor:
                 message = "插件参数校验失败"
             if message:
                 self._diagnostics.inc_action_fail()
-                self._on_event("error", {
+                self._on_event("run.step.failed", {
                     "action_type": action_type,
                     "rule_id": context.get("rule", {}).get("id", ""),
                     "run_id": _run_id(context),
@@ -743,7 +693,7 @@ class WorkflowExecutor:
         if sensitive_params:
             output_definitions = [{"name": name, "sensitive": True, "summary": "hidden"} for name in result] if isinstance(result, dict) else []
         self._on_event(
-            "action_executed",
+            "run.step.succeeded",
             {
                 "action_type": action_type,
                 "params": event_params,
@@ -772,20 +722,20 @@ class WorkflowExecutor:
         if timed_out:
             self._diagnostics.inc_action_fail()
             engine_error(
-                "action_timed_out",
+                "run.step.timed_out",
                 action_type=action_type,
                 rule_name=rule_name,
                 error=str(exc),
             )
         self._on_event(
-            "action_timed_out" if timed_out else "action_cancelled",
+            "run.step.timed_out" if timed_out else "run.step.cancelled",
             {
                 "action_type": action_type,
                 "rule_id": context.get("rule", {}).get("id", ""),
                 "run_id": _run_id(context),
                 "rule_name": rule_name,
                 "step_id": action.get("binding_id") or action_type,
-                "error": str(exc),
+                "error": {"code": "action_timeout" if timed_out else "action_cancelled", "message": str(exc)},
                 "input_summary": input_summary,
                 "attempt": attempt + 1,
                 "duration_ms": round((time.perf_counter() - started) * 1000),
@@ -812,7 +762,7 @@ class WorkflowExecutor:
             reason=type(error).__name__,
         )
         self._on_event(
-            "error",
+            "run.step.failed",
             {
                 "action_type": action_type,
                 "rule_id": context.get("rule", {}).get("id", ""),
@@ -843,6 +793,7 @@ class WorkflowExecutor:
             print(f"[Engine] 正在关闭，跳过动作: {action.get('type', '?')}")
             return False, "引擎正在关闭"
 
+        self._on_event("run.step.started", {"run_id": _run_id(context), "rule_id": context.get("rule", {}).get("id", ""), "step_id": action.get("binding_id") or action.get("type"), "action_type": action.get("type"), "rule_name": rule_name})
         try:
             prepared = self._prepare_action(action, rule_name, context)
         except ActionPreparationError as error:

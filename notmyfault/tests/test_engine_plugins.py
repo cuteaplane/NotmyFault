@@ -156,7 +156,7 @@ class TestEngineStart:
         )
         engine._security_mode = SecurityMode.PERMISSIVE
         stopped = threading.Event()
-        monkeypatch.setattr(engine._hot_reloader, "begin", stopped.set)
+        monkeypatch.setattr(engine._rule_watcher, "start", stopped.set)
         engine.start(shutdown_event=stopped)
         assert engine.get_diagnostics()["rules"]["issue_count"] == 1
         assert alerts

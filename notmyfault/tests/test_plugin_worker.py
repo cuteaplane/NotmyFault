@@ -358,7 +358,7 @@ class TestRunIsolatedAction:
         finally:
             context.session.close()
             plugin_worker.set_crash_callback(None)
-        assert events and events[0][0] == "plugin_worker_crashed"
+        assert events and events[0][0] == "plugin.worker.crashed"
         assert events[0][1]["returncode"] == 3
 
     @pytest.mark.parametrize("load_only", [False, True])

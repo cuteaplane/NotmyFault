@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import copy
 import time
 from typing import Any, Dict, List
 
@@ -23,6 +24,23 @@ class ConditionRuntime:
         self._last_matches: Dict[str, List[Dict[str, Any]]] = {}
         self._absence_deadlines: Dict[str, Dict[str, tuple[float, bool]]] = {}
         self._lock = threading.RLock()
+        self._programs = {}
+        self._keys = {}
+
+    def configure(self, rules):
+        self._programs = {key: rule.matcher_spec for key, rule in rules.items()}
+        self._keys = {identity: value for spec in self._programs.values() for identity, value in spec.keys.items()}
+
+    def _key(self, leaf):
+        key = self._keys.get(id(leaf))
+        return key if key is not None else _event_key(leaf)
+
+    def migrate_from(self, previous, unchanged):
+        with previous._lock:
+            states = [{key: copy.deepcopy(value) for key, value in field.items() if key in unchanged}
+                      for field in (previous._seen, previous._fired, previous._last_matches, previous._absence_deadlines)]
+        with self._lock:
+            self._seen, self._fired, self._last_matches, self._absence_deadlines = states
 
     def reset(self) -> None:
         with self._lock:
@@ -33,17 +51,18 @@ class ConditionRuntime:
 
     def poll_absences(self, rule_key, rule, now=None):
         timestamp = self._clock.monotonic() if now is None else now
-        node = get_rule_condition(rule)
+        program = self._programs.get(rule_key)
+        node = program.node if program is not None else get_rule_condition(rule)
         with self._lock:
             deadlines = self._absence_deadlines.setdefault(rule_key, {})
             seen = self._seen.setdefault(rule_key, {})
             changed = False
-            for absence in _absence_nodes(node):
+            for absence in program.absences if program is not None else _absence_nodes(node):
                 children = _condition_children(absence)
                 if len(children) != 1 or not _is_event_leaf(children[0]):
                     continue
                 seconds = float(absence["within_seconds"])
-                key = "not:" + _event_key(children[0])
+                key = "not:" + self._key(children[0])
                 deadline, emitted = deadlines.setdefault(key, (timestamp + seconds, False))
                 if not emitted and timestamp >= deadline:
                     deadlines[key] = (deadline, True)
@@ -111,20 +130,21 @@ class ConditionRuntime:
         instance: Dict[str, Any] | None = None,
     ) -> bool:
         """记录事件并按 event-v1 或 event-v2 规则判断新的命中组合"""
-        node = get_rule_condition(rule)
+        program = self._programs.get(rule_key)
+        node = program.node if program is not None else get_rule_condition(rule)
         if node is None:
             return False
         timestamp = self._clock.monotonic() if now is None else now
         if instance is not None:
-            fingerprint = config_fingerprint(instance.get("config"))
+            fingerprint = instance.get("fingerprint") or config_fingerprint(instance.get("config"))
             matching_leaves = [
-                leaf for leaf in iter_condition_events(node)
+                leaf for leaf in (program.leaves.get(event_type, ()) if program is not None else iter_condition_events(node))
                 if leaf.get("type") == event_type
-                and config_fingerprint(leaf.get("params")) == fingerprint
+                and (program.fingerprints[id(leaf)] if program is not None else config_fingerprint(leaf.get("params"))) == fingerprint
             ]
         else:
             matching_leaves = [
-                leaf for leaf in iter_condition_events(node)
+                leaf for leaf in (program.leaves.get(event_type, ()) if program is not None else iter_condition_events(node))
                 if leaf.get("type") == event_type and check_event_params(leaf, event_payload)
             ]
         if not matching_leaves:
@@ -133,22 +153,22 @@ class ConditionRuntime:
         with self._lock:
             seen = self._seen.setdefault(rule_key, {})
             deadlines = self._absence_deadlines.setdefault(rule_key, {})
-            matching_keys = {_event_key(leaf) for leaf in matching_leaves}
-            for absence in _absence_nodes(node):
+            matching_keys = {self._key(leaf) for leaf in matching_leaves}
+            for absence in program.absences if program is not None else _absence_nodes(node):
                 children = _condition_children(absence)
-                if len(children) == 1 and _event_key(children[0]) in matching_keys:
-                    key = "not:" + _event_key(children[0])
+                if len(children) == 1 and self._key(children[0]) in matching_keys:
+                    key = "not:" + self._key(children[0])
                     deadlines[key] = (timestamp + float(absence["within_seconds"]), False)
                     seen.pop(key, None)
-            positive_keys = {_event_key(leaf) for leaf in _positive_events(node)}
-            matching_leaves = [leaf for leaf in matching_leaves if _event_key(leaf) in positive_keys]
+            positive_keys = program.positive_keys if program is not None else {self._key(leaf) for leaf in _positive_events(node)}
+            matching_leaves = [leaf for leaf in matching_leaves if self._key(leaf) in positive_keys]
             if not matching_leaves:
                 return False
             fired = self._fired.get(rule_key, ())
             if any(key not in seen for key, _fired_at in fired):
                 self._fired.pop(rule_key, None)
             for leaf in matching_leaves:
-                seen[_event_key(leaf)] = {
+                seen[self._key(leaf)] = {
                     "binding_id": leaf.get("binding_id"),
                     "event": {
                         "type": leaf.get("type", ""),
@@ -175,17 +195,17 @@ class ConditionRuntime:
     ) -> tuple[bool, tuple[tuple[str, float], ...], tuple[float, ...]]:
         """返回是否命中、命中的键和各自时间戳、以及用于时间窗判断的命中时刻"""
         if _is_event_leaf(node):
-            entry = seen.get(_event_key(node))
+            entry = seen.get(self._key(node))
             if entry is None:
                 return False, (), ()
             timestamp = float(entry["timestamp"])
-            return True, ((_event_key(node), timestamp),), (timestamp,)
+            return True, ((self._key(node), timestamp),), (timestamp,)
 
         children = _condition_children(node)
         if not children:
             return False, (), ()
         if _condition_op(node) == "not":
-            key = "not:" + _event_key(children[0])
+            key = "not:" + self._key(children[0])
             entry = seen.get(key)
             if entry is None:
                 return False, (), ()

@@ -9,6 +9,7 @@ from notmyfault.core.bindings import BindingResolutionError
 from notmyfault.core.data_types import DataTypeError
 from notmyfault.core.workflow import build_context
 from notmyfault.core.runtime_rules import PreparedRules, rule_key
+from notmyfault.core.conditions import config_fingerprint
 
 # 两条规则互相监视会形成一条不会结束的触发链，链到这么深就丢弃这次运行
 _MAX_RUN_CHAIN = 16
@@ -64,26 +65,27 @@ class EventBus:
             f"[EventBus] 收到广播事件: [{event_type}] ({semantic}) -> {masked_payload}"
         )
 
+        self._snapshot_fn()
+        depth = self._chain_depth(event_payload)
+        if instance is not None and not instance.get("fingerprint"):
+            instance = {**instance, "fingerprint": config_fingerprint(instance.get("config"))}
+        dispatches = []
         with self._rules_lock:
             snapshot = self._snapshot_fn()
-
-        depth = self._chain_depth(event_payload)
-        for rule in snapshot.rules:
-            key = rule_key(rule)
-            matched_events = snapshot.runtime.match_and_take(
-                key,
-                rule,
-                event_type,
-                event_payload,
-                instance=instance,
-            )
-            if matched_events is None:
-                continue
-
-            self._dispatch(
-                snapshot, rule, key, event_type, event_payload,
-                masked_payload, matched_events, depth,
-            )
+            for compiled in snapshot.event_index.get(event_type, ()):
+                matched_events = snapshot.runtime.match_and_take(
+                    compiled.rule_id, compiled.source, event_type, event_payload, instance=instance,
+                )
+                if matched_events is not None:
+                    dispatches.append((compiled.source, compiled.rule_id, matched_events))
+            if dispatches and snapshot.generation is not None:
+                snapshot.generation.retain()
+        try:
+            for rule, key, matched_events in dispatches:
+                self._dispatch(snapshot, rule, key, event_type, event_payload, masked_payload, matched_events, depth)
+        finally:
+            if dispatches and snapshot.generation is not None:
+                snapshot.generation.release()
 
     def _chain_depth(self, event_payload: Dict[str, Any]) -> int:
         """这次事件由哪次运行引起：0 表示不是链条里的下一环"""
@@ -105,7 +107,7 @@ class EventBus:
     def _drop_deep_chain(self, rule_id: str, rule_name: str, event_type: str, depth: int) -> None:
         """链条过深时丢弃运行，并只提醒一次"""
         engine_error(
-            "run_chain_limited",
+            "run.chain_limited",
             rule=rule_name,
             rule_id=rule_id,
             event_type=event_type,
@@ -117,7 +119,7 @@ class EventBus:
             file=sys.stderr,
         )
         self._safe_on_event(
-            "run_chain_limited",
+            "run.chain_limited",
             {
                 "rule_id": rule_id,
                 "rule_name": rule_name,
@@ -138,13 +140,23 @@ class EventBus:
     def poll_absences(self, now=None):
         if self._is_shutdown_fn():
             return
+        self._snapshot_fn()
+        dispatches = []
         with self._rules_lock:
             snapshot = self._snapshot_fn()
-        for rule in snapshot.rules:
-            key = rule_key(rule)
-            matched = snapshot.runtime.poll_absences(key, rule, now)
-            if matched is not None:
+            for compiled in snapshot.absence_index:
+                rule, key = compiled.source, compiled.rule_id
+                matched = snapshot.runtime.poll_absences(key, rule, now)
+                if matched is not None:
+                    dispatches.append((rule, key, matched))
+            if dispatches and snapshot.generation is not None:
+                snapshot.generation.retain()
+        try:
+            for rule, key, matched in dispatches:
                 self._dispatch(snapshot, rule, key, "absence", {}, {}, matched)
+        finally:
+            if dispatches and snapshot.generation is not None:
+                snapshot.generation.release()
 
     def _dispatch(self, snapshot, rule, key, event_type, event_payload, masked_payload, matched_events, depth=0):
         rule_id = rule.get("rule_id", "")
@@ -156,7 +168,7 @@ class EventBus:
         self._remember_run_depth(run_id, depth)
         print(f"[EventBus] [OK] 匹配到规则: <{rule_name}>, 准备分发动作！")
         self._safe_on_event(
-            "rule_triggered",
+            "run.triggered",
             {
                 "rule_id": rule_id,
                 "run_id": run_id,
@@ -177,8 +189,7 @@ class EventBus:
         try:
             snapshot.prepare_context(rule, context)
         except (DataTypeError, BindingResolutionError) as error:
-            self._safe_on_event("workflow_failed", {"run_id": run_id, "rule_id": rule_id, "rule_name": rule_name, "error": error.as_dict()})
-            return
+            context["_preparation_error"] = error.as_dict()
         if self._scheduler_submit_fn is not None:
             self._scheduler_submit_fn(key, rule, rule_name, context)
         else:
@@ -213,8 +224,10 @@ class EventBus:
 
     def _collect_sensitive_values(self, context: Dict[str, Any]) -> set:
         """收集上下文里声明 sensitive 的字段当前值，用于掩码动作参数"""
-        triggers_meta = self._triggers_meta_fn()
-        actions_meta = self._actions_meta_fn()
+        generation = context.get("_generation")
+        plugins = context.get("_plugins") or (generation.plugins if generation is not None else None)
+        triggers_meta = plugins.triggers_meta if plugins is not None else self._triggers_meta_fn()
+        actions_meta = plugins.actions_meta if plugins is not None else self._actions_meta_fn()
         values: set = set()
 
         def add_strings(value: Any) -> None:

@@ -19,7 +19,7 @@ def test_async_history_keeps_queries_current_and_flushes_batches(tmp_path, monke
     monkeypatch.setattr(history, "_write_batch", slow_write)
     try:
         for index in range(1100):
-            history.record_async({"type": "rule_triggered", "ts": index, "data": {"run_id": f"run_{index}"}})
+            history.record_async({"type": "run.triggered", "ts": index, "data": {"run_id": f"run_{index}"}})
         assert writing.wait(5)
         assert len(history.list_runs(1000)) == 1000
         assert history.get_run("run_1")["run_id"] == "run_1"
@@ -39,7 +39,7 @@ def test_run_history_builds_completed_run_with_steps(tmp_path):
     history = RunHistory(str(tmp_path / "runs.jsonl"))
     history.record(
         packet(
-            "rule_triggered",
+            "run.triggered",
             100.0,
             run_id="run_1",
             rule_id="r_rule001",
@@ -52,7 +52,7 @@ def test_run_history_builds_completed_run_with_steps(tmp_path):
     )
     history.record(
         packet(
-            "action_executed",
+            "run.step.succeeded",
             100.2,
             run_id="run_1",
             rule_id="r_rule001",
@@ -82,7 +82,7 @@ def test_run_history_builds_completed_run_with_steps(tmp_path):
     )
     history.record(
         packet(
-            "action_skipped",
+            "run.step.skipped",
             100.3,
             run_id="run_1",
             rule_id="r_rule001",
@@ -95,7 +95,7 @@ def test_run_history_builds_completed_run_with_steps(tmp_path):
     )
     history.record(
         packet(
-            "workflow_completed",
+            "run.succeeded",
             100.5,
             run_id="run_1",
             rule_id="r_rule001",
@@ -127,7 +127,7 @@ def test_run_history_recovers_from_broken_lines(tmp_path):
         "not-json\n{\"type\":\"rule_triggered\",\"data\":null}\n"
         + json.dumps(
             packet(
-                "rule_triggered",
+                "run.triggered",
                 10.0,
                 run_id="run_ok",
                 rule_name="幸存记录",
@@ -144,14 +144,14 @@ def test_run_history_recovers_from_broken_lines(tmp_path):
 
     assert len(runs) == 1
     assert runs[0]["run_id"] == "run_ok"
-    assert runs[0]["status"] == "running"
+    assert runs[0]["status"] == "queued"
     assert history.get_run("run_ok") == runs[0]
 
 
 def test_run_history_rejects_malformed_counts_and_timestamps(tmp_path):
     history = RunHistory(str(tmp_path / "runs.jsonl"))
     history.record(packet(
-        "rule_triggered",
+        "run.triggered",
         float("inf"),
         run_id="run_malformed",
         action_count={"bad": 1},
@@ -159,7 +159,7 @@ def test_run_history_rejects_malformed_counts_and_timestamps(tmp_path):
         assertion_count="1000001",
     ))
     history.record(packet(
-        "workflow_completed",
+        "run.succeeded",
         float("-inf"),
         run_id="run_malformed",
         status="succeeded",
@@ -180,7 +180,7 @@ def test_run_history_keeps_partial_scope_and_safe_assertion_summary(tmp_path):
     path = tmp_path / "runs.jsonl"
     history = RunHistory(str(path))
     history.record(packet(
-        "rule_triggered",
+        "run.triggered",
         10.0,
         run_id="run_partial",
         rule_name="局部运行",
@@ -191,7 +191,7 @@ def test_run_history_keeps_partial_scope_and_safe_assertion_summary(tmp_path):
         assertion_count=1,
     ))
     history.record(packet(
-        "test_assertions_completed",
+        "run.assertions.completed",
         10.2,
         run_id="run_partial",
         rule_name="局部运行",
@@ -208,7 +208,7 @@ def test_run_history_keeps_partial_scope_and_safe_assertion_summary(tmp_path):
         }],
     ))
     history.record(packet(
-        "workflow_completed",
+        "run.succeeded",
         10.3,
         run_id="run_partial",
         rule_name="局部运行",
@@ -233,7 +233,7 @@ def test_run_history_marks_binding_failure_terminal(tmp_path):
     history = RunHistory(str(tmp_path / "runs.jsonl"))
     history.record(
         packet(
-            "rule_triggered",
+            "run.triggered",
             50.0,
             run_id="run_failed",
             rule_name="失败规则",
@@ -242,7 +242,7 @@ def test_run_history_marks_binding_failure_terminal(tmp_path):
     )
     history.record(
         packet(
-            "workflow_failed",
+            "run.step.failed",
             50.25,
             run_id="run_failed",
             rule_name="失败规则",
@@ -257,6 +257,8 @@ def test_run_history_marks_binding_failure_terminal(tmp_path):
         )
     )
 
+    history.record(packet("run.failed", 50.25, run_id="run_failed", error={"code": "missing_reference", "location": "actions.a_one.params.url", "message": "找不到来源"}))
+
     run = history.get_run("run_failed")
 
     assert run["status"] == "failed"
@@ -270,6 +272,8 @@ def test_run_history_marks_binding_failure_terminal(tmp_path):
             "duration_ms": None,
             "attempt": None,
             "reason": None,
+            "input_summary": [],
+            "output_summary": [],
             "error": {
                 "code": "missing_reference",
                 "location": "actions.a_one.params.url",
@@ -287,7 +291,7 @@ def test_run_history_marks_binding_failure_terminal(tmp_path):
 def test_run_history_distinguishes_cancelled_and_timed_out_steps(tmp_path):
     history = RunHistory(str(tmp_path / "runs.jsonl"))
     history.record(packet(
-        "rule_triggered",
+        "run.triggered",
         80.0,
         run_id="run_cancelled",
         rule_name="可停止规则",
@@ -295,27 +299,27 @@ def test_run_history_distinguishes_cancelled_and_timed_out_steps(tmp_path):
         action_count=2,
     ))
     history.record(packet(
-        "action_timed_out",
+        "run.step.timed_out",
         80.2,
         run_id="run_cancelled",
         rule_name="可停止规则",
         action_type="waitable",
         step_id="a_timeout001",
-        error="动作运行超时",
+        error={"code": "action_timeout", "message": "动作运行超时"},
         duration_ms=200,
     ))
     history.record(packet(
-        "action_cancelled",
+        "run.step.cancelled",
         80.3,
         run_id="run_cancelled",
         rule_name="可停止规则",
         action_type="waitable",
         step_id="a_cancel001",
-        error="动作已取消",
+        error={"code": "action_cancelled", "message": "动作已取消"},
         duration_ms=100,
     ))
     history.record(packet(
-        "workflow_completed",
+        "run.cancelled",
         80.3,
         run_id="run_cancelled",
         rule_name="可停止规则",

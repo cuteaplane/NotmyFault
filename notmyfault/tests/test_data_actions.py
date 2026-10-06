@@ -7,7 +7,7 @@ import pytest
 
 from notmyfault.core.rules import validate_rule_bindings
 from notmyfault.core.workflow import build_context, invoke_action
-from notmyfault.tests.api_support import create_test_engine
+from notmyfault.tests.api_support import create_test_engine, event_fields
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1] / "actions"
@@ -243,7 +243,7 @@ def test_data_actions_bind_structured_values_and_keep_content_out_of_summaries()
     ]
     rule = {"name": "数据转换", "condition": {"type": "manual", "binding_id": "t_manual01", "params": {}}, "actions": actions}
     events = []
-    engine = create_test_engine({"rules": []}, on_event=lambda name, data: events.append((name, data)))
+    engine = create_test_engine({"rules": []}, on_event=lambda event: events.append((event.type, event_fields(event))))
     for plugin_id in {action["type"] for action in actions}:
         meta, module = load_action(plugin_id)
         engine.actions_meta[plugin_id] = meta
@@ -253,7 +253,9 @@ def test_data_actions_bind_structured_values_and_keep_content_out_of_summaries()
     context = build_context(rule["name"], "manual", {}, [])
     engine.execute_workflow("data_actions", rule, rule["name"], context)
     assert context["steps"]["a_text0001"]["result"]["text"] == "name,count\r\n甲,2"
-    executed = [data for name, data in events if name == "action_executed"]
+    assert engine.events.flush()
+    executed = [data for name, data in events if name == "run.step.succeeded"]
     assert len(executed) == 4
     assert all(data["status"] == "ok" for data in executed)
+    assert engine.events.flush()
     assert "甲" not in repr(events)

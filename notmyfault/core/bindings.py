@@ -108,10 +108,14 @@ def _reference_root(
     reference: Dict[str, Any],
     context: Dict[str, Any],
     location: str,
+    validated_path: tuple | None = None,
 ) -> tuple[Any, Tuple[str, ...]]:
     scope = reference.get("scope")
-    validate_reference_fields(reference, location)
-    path = validate_binding_path(reference.get("path", []), location, reference)
+    if validated_path is None:
+        validate_reference_fields(reference, location)
+        path = validate_binding_path(reference.get("path", []), location, reference)
+    else:
+        path = validated_path
     if scope == "event":
         return context.get("event", {}).get("payload", _MISSING), path
 
@@ -156,7 +160,8 @@ def _read_reference(
     *,
     location: str,
 ) -> Any:
-    current, path = _reference_root(reference, context, location)
+    accessor = context.get("_compiled_refs", {}).get(id(reference))
+    current, path = _reference_root(reference, context, location, accessor.path if accessor is not None else None)
     for segment in path:
         if isinstance(current, dict) and is_custom_type(current.get("$type")):
             registry = context.get("_type_registry")
@@ -194,6 +199,11 @@ def expression_type(value, context):
     if is_reference(value):
         reference = value["$ref"]
         scope = reference.get("scope")
+        accessor = context.get("_compiled_refs", {}).get(id(reference))
+        if accessor is not None:
+            if scope == "event":
+                return accessor.event_types.get(context.get("event", {}).get("type"), accessor.static_type)
+            return accessor.static_type
         sources = context.get("_binding_types", {}).get(scope, {})
         root = sources if scope == "event" else sources.get(reference.get("node"), {"type": "any"})
         if not root:

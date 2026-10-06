@@ -9,7 +9,7 @@ from decimal import Decimal
 
 import pytest
 
-from notmyfault.tests.api_support import create_test_engine
+from notmyfault.tests.api_support import create_test_engine, event_fields
 from notmyfault.core import workflow_executor as workflow_executor_module
 from notmyfault.core.workflow import ActionCancellation, build_context
 from notmyfault.core.run_history import RunHistory
@@ -35,7 +35,7 @@ def _context():
 
 def test_run_variables_follow_executed_branches_and_survive_failed_assignment(tmp_path):
     events, received = [], []
-    engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+    engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
 
     def consume(meta, params, context):
         received.append(list(params["rows"]))
@@ -73,8 +73,10 @@ def test_run_variables_follow_executed_branches_and_survive_failed_assignment(tm
     assert context["steps"]["a_invalid1"]["status"] == "failed"
     assert "a_assign02" not in context["steps"]
     assert context["steps"]["a_count001"]["result"] == {"value": 2}
-    assert next(data for name, data in events if name == "workflow_completed")["status"] == "failed"
+    assert engine.events.flush()
+    assert next(data for name, data in events if name in ("run.succeeded", "run.failed", "run.cancelled", "run.timed_out"))["status"] == "failed"
     history = RunHistory(str(tmp_path / "runs.jsonl"))
+    assert engine.events.flush()
     for timestamp, (name, data) in enumerate(events):
         history.record({"type": name, "data": data, "ts": timestamp})
     failed = next(step for step in history.get_run("run_variables")["steps"] if step["step_id"] == "a_invalid1")
@@ -85,7 +87,7 @@ def test_run_variables_follow_executed_branches_and_survive_failed_assignment(tm
 
 def test_sensitive_variable_values_and_derived_action_outputs_stay_hidden():
     events = []
-    engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+    engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
     register_action(engine, "derive", lambda meta, params: {"derived": params["value"] + "!"}, meta={
         "params": [{"name": "value", "type": "string"}],
         "outputs": [{"name": "derived", "type": "string"}],
@@ -104,6 +106,7 @@ def test_sensitive_variable_values_and_derived_action_outputs_stay_hidden():
     context = _context()
     engine.execute_workflow("rule", rule, "规则", context)
     assert context["steps"]["a_derive01"]["result"] == {"derived": "secret-input!"}
+    assert engine.events.flush()
     assert "secret-input" not in repr(events)
 
 
@@ -142,7 +145,7 @@ class TestExecuteAction:
 
     def test_action_event_carries_stable_rule_and_step_ids(self):
         events = []
-        engine = make_engine(on_event=lambda t, p: events.append((t, p)))
+        engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
         register_action(engine, "noop", lambda meta, params: "done")
         context = build_context("规则A", "hotkey", {}, [], "r_rule001")
 
@@ -152,13 +155,14 @@ class TestExecuteAction:
             context,
         )
 
-        executed = [payload for name, payload in events if name == "action_executed"]
+        assert engine.events.flush()
+        executed = [payload for name, payload in events if name == "run.step.succeeded"]
         assert executed[0]["rule_id"] == "r_rule001"
         assert executed[0]["step_id"] == "a_step001"
 
     def test_workflow_events_carry_run_status_and_duration(self):
         events = []
-        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
         register_action(engine, "noop", lambda meta, params: "done")
         context = build_context(
             "规则A", "manual", {}, [], "r_rule001", "run_test001"
@@ -179,8 +183,10 @@ class TestExecuteAction:
             context,
         )
 
-        executed = [data for name, data in events if name == "action_executed"]
-        completed = [data for name, data in events if name == "workflow_completed"]
+        assert engine.events.flush()
+        executed = [data for name, data in events if name == "run.step.succeeded"]
+        assert engine.events.flush()
+        completed = [data for name, data in events if name in ("run.succeeded", "run.failed", "run.cancelled", "run.timed_out")]
         assert executed[0]["run_id"] == "run_test001"
         assert executed[0]["duration_ms"] >= 0
         assert len(completed) == 1
@@ -191,7 +197,7 @@ class TestExecuteAction:
 
     def test_manual_run_returns_the_same_run_id_used_by_events(self):
         events = []
-        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
         register_action(engine, "noop", lambda meta, params: "done")
 
         ok, message, run_id = engine.run_manual_rule_snapshot(
@@ -208,20 +214,22 @@ class TestExecuteAction:
             },
             0,
         )
-        assert engine._rule_scheduler.wait_for_idle(timeout=5)
+        assert engine._run_manager.wait_for_idle(timeout=5)
 
         assert ok is True
         assert message == "已开始执行"
         assert run_id.startswith("run_")
+        assert engine.events.flush()
         run_events = [data for _name, data in events if data.get("run_id") == run_id]
         assert {data.get("rule_id") for data in run_events} == {"r_rule001"}
-        assert any(name == "workflow_completed" for name, data in events if data.get("run_id") == run_id)
+        assert engine.events.flush()
+        assert any(name in ("run.succeeded", "run.failed", "run.cancelled", "run.timed_out") for name, data in events if data.get("run_id") == run_id)
 
     @pytest.mark.parametrize("count", [2, Decimal("2.0000000000000000001")])
     def test_manual_run_can_continue_from_step_with_supplied_upstream_result(self, count):
         events = []
         received = []
-        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
         register_action(engine, "first", lambda meta, params: pytest.fail("skipped action ran"))
         register_action(
             engine,
@@ -261,15 +269,18 @@ class TestExecuteAction:
                 "expected": 2,
             }],
         )
-        assert engine._rule_scheduler.wait_for_idle(timeout=5)
+        assert engine._run_manager.wait_for_idle(timeout=5)
 
         assert ok is True
         assert received == [{"value": "provided"}]
-        triggered = [data for name, data in events if name == "rule_triggered"]
+        assert engine.events.flush()
+        triggered = [data for name, data in events if name == "run.triggered"]
         assert triggered[0]["action_count"] == 1
-        assertion_event = [data for name, data in events if name == "test_assertions_completed"]
+        assert engine.events.flush()
+        assertion_event = [data for name, data in events if name == "run.assertions.completed"]
         assert assertion_event[0]["passed"] == 1
-        completed = [data for name, data in events if name == "workflow_completed"]
+        assert engine.events.flush()
+        completed = [data for name, data in events if name in ("run.succeeded", "run.failed", "run.cancelled", "run.timed_out")]
         assert completed[0]["run_id"] == run_id
         assert completed[0]["status"] == "succeeded"
 
@@ -299,7 +310,7 @@ class TestExecuteAction:
         assert first[0] is True
         assert second[0] is False
         release.set()
-        assert engine._rule_scheduler.wait_for_idle(timeout=5)
+        assert engine._run_manager.wait_for_idle(timeout=5)
 
     @pytest.mark.parametrize("actual,expected,operator,passed", [
         ("actual-secret", "expected-secret", "equals", False),
@@ -321,7 +332,7 @@ class TestExecuteAction:
     ])
     def test_manual_assertions_report_workflow_status_without_exposing_values(self, actual, expected, operator, passed):
         events = []
-        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
         register_action(engine, "result", lambda meta, params: {"token": actual})
         context = build_context(
             "结果检查测试", "manual", {}, [], "r_assert001", "run_assert001"
@@ -344,8 +355,10 @@ class TestExecuteAction:
             context,
         )
 
-        assertion_event = [data for name, data in events if name == "test_assertions_completed"][0]
-        completed = [data for name, data in events if name == "workflow_completed"][0]
+        assert engine.events.flush()
+        assertion_event = [data for name, data in events if name == "run.assertions.completed"][0]
+        assert engine.events.flush()
+        completed = [data for name, data in events if name in ("run.succeeded", "run.failed", "run.cancelled", "run.timed_out")][0]
         assert assertion_event["passed"] == int(passed)
         assert assertion_event["results"][0]["passed"] is passed
         assert "actual-secret" not in repr(assertion_event)
@@ -355,7 +368,7 @@ class TestExecuteAction:
 
     def test_sensitive_action_result_is_masked_in_event(self):
         events = []
-        engine = make_engine(on_event=lambda t, p: events.append((t, p)))
+        engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
         register_action(
             engine,
             "secret",
@@ -374,12 +387,13 @@ class TestExecuteAction:
 
         assert ok is True
         assert result["token"] == "TOP_SECRET"
-        executed = [p for t, p in events if t == "action_executed"]
+        assert engine.events.flush()
+        executed = [p for t, p in events if t == "run.step.succeeded"]
         assert executed[0]["result"] == {"token": "***", "ok": True}
 
     def test_sensitive_action_param_is_masked_in_failure_without_context_binding(self):
         events = []
-        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
 
         def fail(meta, params):
             raise RuntimeError(f"拒绝令牌 {params['token']}")
@@ -404,7 +418,8 @@ class TestExecuteAction:
             _context(),
         )
 
-        event = next(data for name, data in events if name == "error")
+        assert engine.events.flush()
+        event = next(data for name, data in events if name == "run.step.failed")
         assert ok is False
         assert "DIRECT_SECRET" not in result
         assert "DIRECT_SECRET" not in event["error"]
@@ -412,7 +427,7 @@ class TestExecuteAction:
 
     def test_sensitive_value_is_masked_in_action_errors_and_logs(self, capsys):
         events = []
-        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
         engine.triggers_meta["clipboard"] = {
             "outputs": [
                 {"name": "text", "type": "string", "sensitive": True},
@@ -444,7 +459,8 @@ class TestExecuteAction:
         )
 
         output = capsys.readouterr()
-        error_event = next(data for name, data in events if name == "error")
+        assert engine.events.flush()
+        error_event = next(data for name, data in events if name == "run.step.failed")
         assert ok is False
         assert "TOP_SECRET" not in str(result)
         assert "TOP_SECRET" not in str(error_event["error"])
@@ -582,7 +598,7 @@ class TestExecuteAction:
         events = []
         started = threading.Event()
         recovered = []
-        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
 
         def run_with_context(meta, params, context):
             started.set()
@@ -633,7 +649,8 @@ class TestExecuteAction:
         assert thread.is_alive() is False
         assert recovered == []
         assert context["steps"]["a_wait001"]["status"] == "cancelled"
-        completed = [data for name, data in events if name == "workflow_completed"]
+        assert engine.events.flush()
+        completed = [data for name, data in events if name in ("run.succeeded", "run.failed", "run.cancelled", "run.timed_out")]
         assert completed[-1]["status"] == "cancelled"
         assert engine.cancel_run("run_cancel001") is False
 
@@ -642,7 +659,7 @@ class TestExecuteAction:
     ):
         events = []
         attempts = []
-        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
 
         def short_cancellation(run_event=None, shutdown_event=None, timeout_seconds=None):
             return ActionCancellation(
@@ -687,13 +704,14 @@ class TestExecuteAction:
 
         assert context["steps"]["a_wait001"]["status"] == "timed_out"
         assert len(attempts) == 1
-        assert any(name == "action_timed_out" for name, _data in events)
+        assert engine.events.flush()
+        assert any(name == "run.step.timed_out" for name, _data in events)
 
     def test_cancel_run_interrupts_retry_wait(self):
         events = []
         attempted = threading.Event()
         attempts = []
-        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
 
         def broken(meta, params):
             attempts.append(1)
@@ -727,14 +745,16 @@ class TestExecuteAction:
 
         assert thread.is_alive() is False
         assert attempts == [1]
-        assert any(name == "action_cancelled" for name, _data in events)
-        completed = [data for name, data in events if name == "workflow_completed"]
+        assert engine.events.flush()
+        assert any(name == "run.step.cancelled" for name, _data in events)
+        assert engine.events.flush()
+        completed = [data for name, data in events if name in ("run.succeeded", "run.failed", "run.cancelled", "run.timed_out")]
         assert completed[-1]["status"] == "cancelled"
 
     def test_engine_shutdown_marks_cooperative_action_cancelled(self):
         events = []
         started = threading.Event()
-        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
         engine._shutdown_flag = threading.Event()
 
         def run_with_context(meta, params, context):
@@ -775,7 +795,8 @@ class TestExecuteAction:
         thread.join(timeout=2)
 
         assert thread.is_alive() is False
-        completed = [data for name, data in events if name == "workflow_completed"]
+        assert engine.events.flush()
+        completed = [data for name, data in events if name in ("run.succeeded", "run.failed", "run.cancelled", "run.timed_out")]
         assert completed[-1]["status"] == "cancelled"
 
     def test_admin_rejection_is_not_retried(self):
@@ -807,7 +828,7 @@ class TestExecuteAction:
         self, source, boolean_op, value, present, expected, tmp_path
     ):
         events = []
-        engine = make_engine(on_event=lambda name, data: events.append((name, data)))
+        engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
         called = []
         register_action(engine, "record", lambda meta, params: called.append(params["label"]))
         context = build_context("规则", "hotkey", {}, [], run_id="run_branch")
@@ -832,6 +853,7 @@ class TestExecuteAction:
         assert called == expected
         assert context["steps"]["a_branch01"]["status"] == ("ok" if succeeded else "failed")
         history = RunHistory(str(tmp_path / "runs.jsonl"))
+        assert engine.events.flush()
         for timestamp, (name, data) in enumerate(events):
             history.record({"type": name, "data": data, "ts": timestamp})
         saved = next(step for step in history.get_run("run_branch")["steps"] if step["step_id"] == "a_branch01")
@@ -992,40 +1014,28 @@ class TestExecuteAction:
 
 
 class TestErrorIsolation:
-    @pytest.mark.parametrize("exit_mode", ["crash", "return", "stopped"])
-    def test_run_trigger_isolates_crash(self, exit_mode):
-        engine = make_engine()
-        alerts = []
-        engine._alert_user = lambda title, message, open_dashboard=False: alerts.append(title)
-
-        def broken(meta, config, emit, stop_event):
-            if exit_mode == "crash":
-                raise RuntimeError("触发器炸了")
-            if exit_mode == "stopped":
-                stop_event.set()
-
-        engine._run_trigger("hotkey", "hotkey", broken, {}, {}, threading.Event())
-        assert engine._diag_obj.snapshot()["trigger_crashes"] == (exit_mode == "crash")
-        assert len(alerts) == (exit_mode != "stopped")
 
 
     def test_stop_trigger_threads_keeps_unstoppable_thread_registered(self):
         engine = make_engine()
         hold = threading.Event()
+        entered = threading.Event()
 
         def stubborn(meta, config, emit, stop_event):
+            entered.set()
             hold.wait(timeout=10)
 
         engine.triggers_funcs["hotkey"] = stubborn
-        engine.triggers_meta["hotkey"] = {}
+        engine.triggers_meta["hotkey"] = {"trigger_api": "event-v2"}
         register_action(engine, "noop", lambda meta, params: None)
         snapshot = engine._prepare_rules([{
-            "name": "等待停止", "condition": {"type": "hotkey", "params": {}},
+            "name": "等待停止", "rule_id": "r_stop0001", "condition": {"type": "hotkey", "params": {}},
             "actions": [{"type": "noop", "params": {}}],
         }])
         engine._start_trigger_threads(snapshot)
+        assert entered.wait(1)
         assert engine._stop_trigger_threads(timeout=0.1) is False
-        assert "hotkey" in engine._trigger_supervisor._threads
+        assert any(item["trigger_id"] == "hotkey" for item in engine._trigger_host.health().values())
         hold.set()
         engine._stop_trigger_threads(timeout=5)
 
@@ -1092,11 +1102,11 @@ class TestErrorIsolation:
             stopped.set()
 
         engine.triggers_funcs["hotkey"] = trigger
-        engine.triggers_meta["hotkey"] = {}
+        engine.triggers_meta["hotkey"] = {"trigger_api": "event-v2"}
         start_triggers = engine._start_trigger_threads
 
-        def fail_after_start():
-            assert start_triggers() == 1
+        def fail_after_start(snapshot):
+            assert start_triggers(snapshot) == 1
             assert started.wait(timeout=1)
             raise RuntimeError("startup failed")
 
@@ -1105,7 +1115,7 @@ class TestErrorIsolation:
             engine.start(shutdown_event=threading.Event())
 
         assert stopped.wait(timeout=1)
-        assert engine._trigger_supervisor.health() == {}
+        assert engine._trigger_host.health() == {}
         assert engine._runtime_cleaned is True
 
     def test_hot_reload_start_failure_cleans_plugins(self, monkeypatch):
@@ -1118,10 +1128,10 @@ class TestErrorIsolation:
         engine._plugin_modules["sample"] = types.SimpleNamespace(
             teardown=lambda: cleaned.append(True)
         )
-        monkeypatch.setattr(engine, "_start_trigger_threads", lambda: 1)
+        monkeypatch.setattr(engine, "_start_trigger_threads", lambda snapshot: 1)
         monkeypatch.setattr(
-            engine._hot_reloader,
-            "begin",
+            engine._rule_watcher,
+            "start",
             lambda: (_ for _ in ()).throw(RuntimeError("reload failed")),
         )
 

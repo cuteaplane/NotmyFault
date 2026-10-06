@@ -9,10 +9,11 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from notmyfault.core.logging import engine_error, engine_info
+from notmyfault.core.event_stream import Event, EventStream
 
 
 EngineFactory = Callable[..., Any]
-EventSink = Callable[[str, dict[str, Any]], None]
+EventSink = Callable[[Event], None]
 StateListener = Callable[[str], None]
 FailureListener = Callable[[Exception], None]
 
@@ -111,11 +112,11 @@ class RuntimeController:
             except Exception:
                 traceback.print_exc()
 
-    def _emit_event(self, event_type: str, data: dict[str, Any]) -> None:
+    def _emit_event(self, event: Event) -> None:
         with self._lifecycle_lock:
             sink = self._event_sink
         if sink is not None:
-            sink(event_type, data)
+            sink(event)
 
     def start(self) -> bool:
         """创建并启动新一代引擎，已有线程运行时返回 False"""
@@ -139,6 +140,8 @@ class RuntimeController:
                         reason=str(exc),
                         error_type=type(exc).__name__,
                     )
+                if not getattr(self._current_engine, "_shutdown_clean", True):
+                    return False
                 self._current_engine = None
 
             self._shutdown_event = threading.Event()
@@ -191,7 +194,11 @@ class RuntimeController:
             )
             print(f"[Engine] 引擎错误: {exc}")
             traceback.print_exc()
-            self._emit_event("error", {"error": str(exc)})
+            stream = EventStream()
+            stream.subscribe(self._emit_event)
+            stream.publish("engine.failed", {"error": {"code": "engine_start_failed", "message": str(exc)}})
+            stream.flush()
+            stream.close()
             if self._failure_listener is not None:
                 try:
                     self._failure_listener(exc)

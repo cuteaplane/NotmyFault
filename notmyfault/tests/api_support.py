@@ -41,13 +41,22 @@ class StaticRulesStore:
         self._directory.cleanup()
 
 
+def event_fields(event):
+    packet = event.to_dict()
+    return {**packet["data"], **{key: packet[key] for key in ("run_id", "rule_id", "step_id", "error") if packet[key] is not None}}
+
+
 def create_test_engine(config, *args, **kwargs):
     from notmyfault.core.engine import AutomationEngine
 
+    from notmyfault.core.rule_model import normalize_rules
+
+    config["rules"] = normalize_rules(config.get("rules", []))
     rules_store = kwargs.pop("rules_store", None)
+    callback = kwargs.pop("on_event", None)
     if rules_store is None:
         rules_store = StaticRulesStore(config.get("rules", []))
-    return AutomationEngine(config, *args, rules_store=rules_store, **kwargs)
+    return AutomationEngine(config, *args, on_event=callback, rules_store=rules_store, **kwargs)
 
 
 class FakeRunner:

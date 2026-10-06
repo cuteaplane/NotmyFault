@@ -14,22 +14,11 @@ from typing import Any, Dict, Iterable
 from notmyfault.core import run_lifecycle as lifecycle
 
 
-_RUN_EVENT_TYPES = frozenset(
-    {
-        "rule_triggered",
-        "workflow_failed",
-        "workflow_completed",
-        "action_executed",
-        "action_skipped",
-        "action_cancelled",
-        "action_timed_out",
-        "test_assertions_completed",
-        "error",
-        "run_queued",
-        "run_dropped",
-        "run_replaced",
-    }
-)
+_RUN_EVENT_TYPES = frozenset({
+    "run.triggered", "run.queued", "run.started", "run.succeeded", "run.failed",
+    "run.cancelled", "run.timed_out", "run.dropped", "run.step.started", "run.step.succeeded",
+    "run.step.failed", "run.step.skipped", "run.step.cancelled", "run.step.timed_out", "run.assertions.completed",
+})
 
 
 def _duration_ms(started_at: Any, finished_at: Any) -> int | None:
@@ -80,8 +69,8 @@ def _safe_event(packet: Dict[str, Any]) -> Dict[str, Any] | None:
     data = packet.get("data")
     if event_type not in _RUN_EVENT_TYPES or not isinstance(data, dict):
         return None
-    # 比当前版本新的事件格式读不懂，整条丢弃，等引擎升级后再解释
-    schema = packet.get("schema")
+    data = {**data, **{key: packet[key] for key in ("run_id", "rule_id", "step_id", "error") if packet.get(key) is not None}}
+    schema = packet.get("v", packet.get("schema"))
     if isinstance(schema, int) and schema > lifecycle.RUN_EVENT_SCHEMA_VERSION:
         return None
     run_id = data.get("run_id")
@@ -121,16 +110,13 @@ def _safe_event(packet: Dict[str, Any]) -> Dict[str, Any] | None:
             if key in error
         }
     elif error is not None:
-        kept["error"] = {
-            "code": "run_error",
-            "message": "运行失败",
-        }
+        return None
     if event_type in {
-        "action_executed", "action_cancelled", "action_timed_out", "error"
+        "run.step.succeeded", "run.step.cancelled", "run.step.timed_out", "run.step.failed"
     }:
         kept["input_summary"] = _safe_summary(data.get("input_summary"))
         kept["output_summary"] = _safe_summary(data.get("output_summary"))
-    if event_type == "test_assertions_completed":
+    if event_type == "run.assertions.completed":
         kept["passed"] = _safe_count(data.get("passed"))
         kept["total"] = _safe_count(data.get("total"))
         raw_results = data.get("results", [])
@@ -161,7 +147,7 @@ def _new_run(data: Dict[str, Any], timestamp: Any) -> Dict[str, Any]:
         "rule_id": data.get("rule_id", ""),
         "rule_name": data.get("rule_name", "未命名规则"),
         "event_type": data.get("event_type", ""),
-        "status": "running",
+        "status": "queued",
         "started_at": timestamp,
         "finished_at": None,
         "duration_ms": None,
@@ -175,8 +161,6 @@ def _new_run(data: Dict[str, Any], timestamp: Any) -> Dict[str, Any]:
         "failure_kind": "",
         "steps": [],
         "error": None,
-        "deferred_reason": None,
-        "retry_after_seconds": None,
         "replayable": False,
     }
 
@@ -192,11 +176,9 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
     event_type = packet["type"]
     data = packet["data"]
     timestamp = packet.get("ts")
-    # 到终点的 run 不再吃任何事件。重复 complete / cancel / resume 在写入侧
-    # 被 _finish_run 挡掉，迟到的在这里跳过
     if lifecycle.is_terminal(run["status"]):
         return
-    if event_type == "rule_triggered":
+    if event_type == "run.triggered":
         run.update(
             rule_id=data.get("rule_id", run["rule_id"]),
             rule_name=data.get("rule_name", run["rule_name"]),
@@ -215,19 +197,19 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
         )
         return
 
-    if event_type == "test_assertions_completed":
+    if event_type == "run.assertions.completed":
         run["assertions_passed"] = _safe_count(data.get("passed"))
         run["assertions_total"] = _safe_count(data.get("total"))
         run["assertion_results"] = data.get("results", [])
         return
 
     if event_type in {
-        "action_executed",
-        "action_skipped",
-        "action_cancelled",
-        "action_timed_out",
-        "error",
-        "workflow_failed",
+        "run.step.succeeded",
+        "run.step.skipped",
+        "run.step.cancelled",
+        "run.step.timed_out",
+        "run.step.failed",
+        "run.step.started",
     }:
         step_id = str(data.get("step_id") or "")
         if step_id:
@@ -244,15 +226,18 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
                     "error": None,
                 }
                 run["steps"].append(step)
-            if event_type == "action_executed":
+            if event_type == "run.step.started":
+                step["status"] = "running"
+                step["started_at"] = timestamp
+            elif event_type == "run.step.succeeded":
                 step["status"] = "succeeded"
-            elif event_type == "action_skipped":
+            elif event_type == "run.step.skipped":
                 step["status"] = "skipped"
                 step["reason"] = data.get("reason")
-            elif event_type == "action_cancelled":
+            elif event_type == "run.step.cancelled":
                 step["status"] = "cancelled"
                 step["reason"] = data.get("error") or "动作已取消"
-            elif event_type == "action_timed_out":
+            elif event_type == "run.step.timed_out":
                 step["status"] = "timed_out"
                 step["error"] = data.get("error")
             else:
@@ -266,27 +251,19 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
             if "output_summary" in data:
                 step["output_summary"] = data["output_summary"]
 
-    current = "queued" if run["status"] == "deferred" else run["status"]
+    current = run["status"]
     new_status = lifecycle.status_after(event_type, data, current)
-    if event_type == "workflow_deferred":
-        run["status"] = "deferred"
-        run["deferred_reason"] = data.get("reason")
-        run["retry_after_seconds"] = data.get("retry_after_seconds")
-    elif event_type == "run_queued":
+    if event_type == "run.queued":
         run["status"] = new_status or run["status"]
         run["queued_reason"] = data.get("reason")
-    elif event_type in ("run_dropped", "run_replaced"):
+    elif event_type == "run.dropped":
         run["status"] = new_status or run["status"]
         run["drop_reason"] = data.get("reason")
         run["finished_at"] = timestamp
         run["duration_ms"] = _duration_ms(run["started_at"], timestamp)
-    elif event_type == "workflow_failed":
+    elif event_type in {f"run.{status}" for status in lifecycle.TERMINAL_STATUSES}:
         run["status"] = new_status or run["status"]
         run["error"] = data.get("error")
-        run["finished_at"] = timestamp
-        run["duration_ms"] = _duration_ms(run["started_at"], timestamp)
-    elif event_type == "workflow_completed":
-        run["status"] = new_status or run["status"]
         run["assertions_passed"] = _safe_count(
             data.get("assertions_passed"), run["assertions_passed"]
         )

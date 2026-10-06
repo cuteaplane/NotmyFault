@@ -405,8 +405,9 @@ def _report_crash(process, reason: str) -> None:
         returncode = process.poll()
     try:
         callback(
-            "plugin_worker_crashed",
-            {"pid": process.pid, "returncode": returncode, "reason": reason},
+            "plugin.worker.crashed",
+            {"pid": process.pid, "returncode": returncode, "reason": reason,
+             "error": {"code": "isolated_worker_crashed", "message": "隔离插件进程异常退出"}},
         )
     except Exception:
         pass

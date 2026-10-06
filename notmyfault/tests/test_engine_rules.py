@@ -7,7 +7,7 @@ import pytest
 from notmyfault.core.clock import FakeClock
 from notmyfault.core.workflow import ActionCancellation, ActionCancelled
 
-from notmyfault.tests.api_support import create_test_engine
+from notmyfault.tests.api_support import create_test_engine, event_fields
 from notmyfault.core.event_bus import _MAX_RUN_CHAIN
 from notmyfault.core.runtime_rules import prepare_rules
 from notmyfault.core.rules import (
@@ -34,7 +34,7 @@ def register_action(engine, action_type, func, meta=None):
 
 def emit_and_wait(engine, event_type, payload):
     engine.emit_event(event_type, payload)
-    assert engine._rule_scheduler.wait_for_idle(timeout=5)
+    assert engine._run_manager.wait_for_idle(timeout=5)
 
 
 class TestCallNotmyfault:
@@ -63,7 +63,7 @@ class TestCallNotmyfault:
         )
         register_action(engine, "noop", lambda meta, params: ran.append(1))
         engine.call_notmyfault({"trigger_id": "hotkey", "triggered_params": {}})
-        assert engine._rule_scheduler.wait_for_idle(timeout=5)
+        assert engine._run_manager.wait_for_idle(timeout=5)
         assert ran == [1]
 
 
@@ -115,7 +115,7 @@ class TestConditionRuntime:
         runtime.reset()
         assert runtime.poll_absences("r", rule, now=200) is None
 
-    def test_absence_event_is_dispatched_through_rule_scheduler(self, monkeypatch):
+    def test_absence_event_is_dispatched_through_run_manager(self, monkeypatch):
         rule = {"name": "无事件", "condition": {"op": "not", "within_seconds": 10, "children": [
             {"type": "signal", "params": {"channel": {"$ref": {"scope": "constant", "node": "c_channel01", "path": []}}}},
         ]}, "actions": [], "constants": [{
@@ -601,7 +601,7 @@ def test_required_trigger_param_rejects_blank_value():
         "params": [{"name": "rule_id", "type": "string", "required": True}],
     }
     rule = {
-        "name": "监视规则",
+        "name": "监视规则", "rule_id": "r_watched1",
         "event": {"type": "rule_finished", "params": {"rule_id": ""}},
         "actions": [{"type": "noop", "params": {}}],
     }
@@ -624,7 +624,7 @@ def _prepare_self_watching(params):
     }
     prepared = prepare_rules(
         [{
-            "name": "监视规则",
+            "name": "监视规则", "rule_id": "r_watched1",
             "event": {"type": "rule_finished", "params": params},
             "actions": [{"type": "noop", "params": {}}],
         }],
@@ -651,7 +651,7 @@ def test_prepare_rules_keeps_explicit_owner_rule_id():
 def test_prepare_rules_leaves_other_triggers_alone():
     prepared = prepare_rules(
         [{
-            "name": "热键",
+            "name": "热键", "rule_id": "r_hotkey01",
             "event": {"type": "hotkey", "params": {}},
             "actions": [{"type": "noop", "params": {}}],
         }],
@@ -670,18 +670,20 @@ def test_run_chain_limit_drops_runs_beyond_limit():
             "event": {"type": "chain", "params": {}},
             "actions": [{"type": "noop", "params": {}}],
         }],
-        on_event=lambda event_type, data: events.append((event_type, data)),
+        on_event=lambda event: events.append((event.type, event_fields(event))),
     )
     register_action(engine, "noop", lambda meta, params: None)
     engine.triggers_meta["chain"] = {}
 
     run_id = ""
     runs = 0
+    assert engine.events.flush()
     for _ in range(_MAX_RUN_CHAIN + 3):
         events.clear()
         engine.emit_event("chain", {"run_id": run_id} if run_id else {})
-        assert engine._rule_scheduler.wait_for_idle(timeout=5)
-        started = [data for event_type, data in events if event_type == "rule_triggered"]
+        assert engine._run_manager.wait_for_idle(timeout=5)
+        assert engine.events.flush()
+        started = [data for event_type, data in events if event_type == "run.triggered"]
         if not started:
             break
         runs += 1
@@ -689,7 +691,8 @@ def test_run_chain_limit_drops_runs_beyond_limit():
 
     # 链条到第 _MAX_RUN_CHAIN 层还能跑，再深就丢弃
     assert runs == _MAX_RUN_CHAIN + 1
-    limits = [data for event_type, data in events if event_type == "run_chain_limited"]
+    assert engine.events.flush()
+    limits = [data for event_type, data in events if event_type == "run.chain_limited"]
     assert limits and limits[0]["depth"] == _MAX_RUN_CHAIN + 1
     assert limits[0]["rule_name"] == "链式规则"
 
