@@ -27,6 +27,8 @@ def test_partial_trigger_setup_releases_resources():
 
 
 def test_folder_read_error_keeps_the_last_complete_snapshot(tmp_path, monkeypatch):
+    tmp_path = tmp_path / " watched\u3000"
+    tmp_path.mkdir()
     module, meta = load_trigger("folder_monitor")
     path = tmp_path / "watched.txt"
     path.touch()
@@ -59,37 +61,105 @@ def load_trigger(name):
     return module, meta
 
 
+@pytest.mark.parametrize("event_type", ["created", "deleted", "modified", "all"])
+@pytest.mark.parametrize("fail_at", [1, 2])
+def test_folder_reports_each_change_once_after_delivery_failure(tmp_path, event_type, fail_at):
+    module, meta = load_trigger("folder_monitor")
+    old_files = {}
+    for change in ("deleted", "modified"):
+        for name in ("a", "b"):
+            path = tmp_path / f"{change}-{name}.txt"
+            path.write_text("old", encoding="utf-8")
+            old_files[(change, str(path))] = path
+    events = []
+    attempts = 0
+
+    def emit(payload):
+        nonlocal attempts
+        attempts += 1
+        if attempts == fail_at:
+            raise RuntimeError("事件提交失败")
+        events.append(payload)
+
+    trigger = module.FolderMonitorTrigger(
+        meta, {"folder_path": str(tmp_path), "event_type": event_type}, emit, threading.Event(),
+    )
+    trigger.validate()
+    trigger.setup()
+    changes = set(old_files)
+    for (change, _), path in old_files.items():
+        if change == "deleted":
+            path.unlink()
+        else:
+            path.write_text("updated", encoding="utf-8")
+    for name in ("a", "b"):
+        path = tmp_path / f"created-{name}.txt"
+        path.write_text("new", encoding="utf-8")
+        changes.add(("created", str(path)))
+    with pytest.raises(RuntimeError):
+        trigger.poll()
+    assert len(events) == fail_at - 1
+    trigger.poll()
+    trigger.poll()
+    expected = {item for item in changes if event_type in (item[0], "all")}
+    assert {(event["event"], event["path"]) for event in events} == expected
+    assert len(events) == len(expected)
+    assert all(check_payload_contract(meta["outputs"], event) == [] for event in events)
+
+
 @pytest.mark.parametrize("target", ["quiescent", "active", "changed"])
-def test_directory_quiescent_reports_selected_transitions(tmp_path, monkeypatch, target):
+@pytest.mark.parametrize("fail_delivery", [False, True])
+def test_directory_quiescent_reports_selected_transitions(tmp_path, monkeypatch, target, fail_delivery):
+    monkeypatch.chdir(tmp_path)
+    tmp_path = tmp_path / "\u3000"
+    tmp_path.mkdir()
     module, meta = load_trigger("directory_quiescent")
     (tmp_path / "a.txt").write_text("ready", encoding="utf-8")
     clock = {"t": 1000.0}
     monkeypatch.setattr(module.time, "monotonic", lambda: clock["t"])
     events = []
+    failed_states = set()
+
+    def emit(payload):
+        if fail_delivery and payload["state"] not in failed_states:
+            failed_states.add(payload["state"])
+            raise RuntimeError("事件提交失败")
+        events.append(payload)
+
     trigger = module.DirectoryQuiescentTrigger(
         meta,
         {
-            "folder_path": str(tmp_path),
+            "folder_path": tmp_path.name,
             "quiet_seconds": 10,
             "state": target,
             "interval": 1,
         },
-        events.append,
+        emit,
         threading.Event(),
     )
     trigger.validate()
     trigger.setup()
+
+    def poll_with_retry():
+        try:
+            trigger.poll()
+        except RuntimeError:
+            assert fail_delivery
+        trigger.poll()
+
     trigger.poll()
     assert events == []
     clock["t"] = 1010.0
-    trigger.poll()
+    poll_with_retry()
     (tmp_path / "b.txt").write_text("new", encoding="utf-8")
     clock["t"] = 1011.0
-    trigger.poll()
+    poll_with_retry()
     clock["t"] = 1021.0
-    trigger.poll()
+    poll_with_retry()
     expected = [state for state in ["quiescent", "active", "quiescent"] if target in (state, "changed")]
     assert [event["state"] for event in events] == expected
+    counts = [count for state, count in [("quiescent", 1), ("active", 2), ("quiescent", 2)] if target in (state, "changed")]
+    assert [event["file_count"] for event in events] == counts
     assert all(event["folder"] == str(tmp_path.resolve()) for event in events)
     assert all(check_payload_contract(meta["outputs"], event) == [] for event in events)
 
@@ -173,18 +243,34 @@ class PollSteps:
         return self.stopped
 
 
+def recording_emitter(events, fail_first):
+    failed = False
+
+    def emit(payload):
+        nonlocal failed
+        if fail_first and not failed:
+            failed = True
+            raise RuntimeError("事件提交失败")
+        events.append(payload)
+
+    return emit
+
+
 @pytest.mark.parametrize("kind", ["file", "directory", "any"])
 @pytest.mark.parametrize("target", ["exists", "missing", "changed"])
-def test_path_reports_only_selected_transitions(tmp_path, kind, target):
+@pytest.mark.parametrize("fail_first", [False, True])
+@pytest.mark.parametrize("name", ["watched", "\u3000"])
+def test_path_reports_only_selected_transitions(tmp_path, monkeypatch, kind, target, fail_first, name):
+    monkeypatch.chdir(tmp_path)
     module, meta = load_trigger("path_exists")
-    path = tmp_path / "watched"
+    path = tmp_path / name
     create = path.mkdir if kind == "directory" else path.touch
     remove = path.rmdir if kind == "directory" else path.unlink
     create()
     events = []
     steps = PollSteps([lambda: None, remove, lambda: None, create, lambda: None])
 
-    module.run(meta, {"path": str(path), "kind": kind, "state": target}, events.append, steps)
+    module.run(meta, {"path": name, "kind": kind, "state": target}, recording_emitter(events, fail_first), steps)
 
     expected = [state for state in ["missing", "exists"] if target in (state, "changed")]
     assert [event["state"] for event in events] == expected
@@ -221,11 +307,14 @@ def test_path_read_failure_keeps_the_last_successful_state(tmp_path, monkeypatch
     ("gb18030", True, "ready"),
 ])
 @pytest.mark.parametrize("target", ["contains", "absent", "changed"])
+@pytest.mark.parametrize("fail_first", [False, True])
+@pytest.mark.parametrize("name", ["status.txt", "\u3000"])
 def test_file_content_reports_selected_text_transitions(
-    tmp_path, encoding, case_sensitive, text, target
+    tmp_path, monkeypatch, encoding, case_sensitive, text, target, fail_first, name
 ):
+    monkeypatch.chdir(tmp_path)
     module, meta = load_trigger("file_content")
-    path = tmp_path / "status.txt"
+    path = tmp_path / name
     path.write_text("准备 ready", encoding=encoding)
     events = []
     steps = PollSteps([
@@ -237,9 +326,9 @@ def test_file_content_reports_selected_text_transitions(
     ])
 
     module.run(meta, {
-        "path": str(path), "text": text, "state": target,
+        "path": name, "text": text, "state": target,
         "encoding": encoding, "case_sensitive": case_sensitive,
-    }, events.append, steps)
+    }, recording_emitter(events, fail_first), steps)
 
     expected = [state for state in ["absent", "contains"] if target in (state, "changed")]
     assert [event["state"] for event in events] == expected
@@ -289,25 +378,35 @@ def test_file_first_successful_read_records_state_without_firing(tmp_path):
     assert [event["state"] for event in events] == ["absent"]
 
 
-@pytest.mark.parametrize("target", ["reachable", "unreachable", "changed"])
-def test_tcp_port_reports_local_service_transitions(target):
-    module, meta = load_trigger("tcp_port")
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.bind(("127.0.0.1", 0))
+@pytest.mark.parametrize("plugin_id,target", [
+    ("tcp_port", "reachable"), ("tcp_port", "unreachable"), ("tcp_port", "changed"),
+    ("network_status", "connected"), ("network_status", "disconnected"),
+])
+@pytest.mark.parametrize("family,host", [
+    (socket.AF_INET, "127.0.0.1"),
+    pytest.param(socket.AF_INET6, "::1", marks=pytest.mark.skipif(not socket.has_ipv6, reason="系统未提供 IPv6 socket")),
+])
+@pytest.mark.parametrize("fail_first", [False, True])
+def test_tcp_probes_report_local_service_transitions(plugin_id, target, family, host, fail_first):
+    module, meta = load_trigger(plugin_id)
+    listener = socket.socket(family, socket.SOCK_STREAM)
+    listener.bind((host, 0))
     port = listener.getsockname()[1]
     events = []
-    steps = PollSteps([lambda: None, lambda: listener.listen(8), lambda: None, listener.close])
+    steps = PollSteps([lambda: None, lambda: listener.listen(8), lambda: None, listener.close, lambda: None])
 
     try:
         module.run(meta, {
-            "host": "localhost", "port": port, "state": target, "timeout": 0.1,
-        }, events.append, steps)
+            "host": host, "port": port, "state": target, "timeout": 0.1,
+        }, recording_emitter(events, fail_first), steps)
     finally:
         listener.close()
 
-    expected = [state for state in ["reachable", "unreachable"] if target in (state, "changed")]
+    transitions = ["reachable", "unreachable"] if plugin_id == "tcp_port" else ["connected", "disconnected"]
+    expected = [state for state in transitions if target in (state, "changed")]
     assert [event["state"] for event in events] == expected
-    assert all(event["reachable"] == (event["state"] == "reachable") for event in events)
+    if plugin_id == "tcp_port":
+        assert all(event["reachable"] == (event["state"] == "reachable") for event in events)
     assert all(check_payload_contract(meta["outputs"], event) == [] for event in events)
 
 
@@ -343,8 +442,9 @@ def test_polling_wait_stops_promptly(name, config, monkeypatch, tmp_path):
         worker.join(2)
 
 
-def test_tcp_stop_during_connect_does_not_emit_a_late_event(monkeypatch):
-    module, meta = load_trigger("tcp_port")
+@pytest.mark.parametrize("plugin_id", ["tcp_port", "network_status"])
+def test_tcp_stop_during_connect_does_not_emit_a_late_event(monkeypatch, plugin_id):
+    module, meta = load_trigger(plugin_id)
     shutdown = PollSteps([lambda: None])
     attempts = []
     events = []
@@ -365,19 +465,22 @@ def test_tcp_stop_during_connect_does_not_emit_a_late_event(monkeypatch):
         return Connection()
 
     monkeypatch.setattr(module.socket, "create_connection", connect)
-    module.run(meta, {"timeout": 0.1}, events.append, shutdown)
+    module.run(meta, {
+        "timeout": 0.1, "state": "reachable" if plugin_id == "tcp_port" else "connected",
+    }, events.append, shutdown)
 
     assert len(attempts) == 2
     assert events == []
 
 
+@pytest.mark.parametrize("plugin_id", ["tcp_port", "network_status"])
 @pytest.mark.parametrize("host", ["service.example", "localhost"])
 @pytest.mark.parametrize("families", [
     (socket.AF_INET6, socket.AF_INET),
     (socket.AF_INET, socket.AF_INET6),
 ])
-def test_tcp_hostname_tries_both_address_families(monkeypatch, host, families):
-    module, meta = load_trigger("tcp_port")
+def test_tcp_hostname_tries_both_address_families(monkeypatch, plugin_id, host, families):
+    module, meta = load_trigger(plugin_id)
     resolutions = []
     attempts = []
     closed = []
@@ -416,16 +519,22 @@ def test_tcp_hostname_tries_both_address_families(monkeypatch, host, families):
     monkeypatch.setattr(module.socket, "socket", Connection)
     module.run(meta, {
         "host": host, "port": 8080, "timeout": 0.1,
+        "state": "reachable" if plugin_id == "tcp_port" else "connected",
     }, events.append, PollSteps([lambda: None]))
 
     assert resolutions == [(host, 8080), (host, 8080)]
     assert [family for family, address in attempts] == list(families) * 2
     assert closed == list(families) * 2
-    assert events == [{"host": host, "port": 8080, "state": "reachable", "reachable": True}]
+    expected = {"host": host, "port": 8080, "state": "reachable", "reachable": True} if plugin_id == "tcp_port" else {"state": "connected"}
+    assert events == [expected]
 
 
-def test_tcp_pending_dns_can_stop_without_more_samples(monkeypatch):
-    module, meta = load_trigger("tcp_port")
+@pytest.mark.parametrize("plugin_id", ["tcp_port", "network_status"])
+@pytest.mark.parametrize("blocking_call", [1, 2])
+def test_tcp_pending_dns_can_stop_without_more_samples(monkeypatch, plugin_id, blocking_call):
+    module, meta = load_trigger(plugin_id)
+    if plugin_id == "network_status":
+        monkeypatch.setattr(module.NetworkStatusTrigger, "interval", 0.2)
     resolving = threading.Event()
     release = threading.Event()
     resolved = threading.Event()
@@ -451,7 +560,7 @@ def test_tcp_pending_dns_can_stop_without_more_samples(monkeypatch):
 
     def resolve(host, port, family, kind):
         resolutions.append(host)
-        if len(resolutions) == 1:
+        if len(resolutions) < blocking_call:
             return [(socket.AF_INET, kind, 6, "", address)]
         resolving.set()
         release.wait(5)
@@ -460,19 +569,20 @@ def test_tcp_pending_dns_can_stop_without_more_samples(monkeypatch):
 
     monkeypatch.setattr(module.socket, "getaddrinfo", resolve)
     worker = threading.Thread(target=module.run, args=(
-        meta, {"host": "service.example", "interval": 0.2, "state": "changed"},
+        meta, {"host": "service.example", "interval": 0.2,
+               "state": "changed" if plugin_id == "tcp_port" else "disconnected"},
         events.append, shutdown,
     ))
     worker.start()
     try:
         assert resolving.wait(2)
         assert checked_pending.wait(3)
-        assert len(resolutions) == 2
+        assert len(resolutions) == blocking_call
         assert events == []
         shutdown.set()
         worker.join(1)
         assert not worker.is_alive()
-        assert resolutions == ["service.example", "service.example"]
+        assert resolutions == ["service.example"] * blocking_call
         assert events == []
     finally:
         shutdown.set()
@@ -480,6 +590,8 @@ def test_tcp_pending_dns_can_stop_without_more_samples(monkeypatch):
         worker.join(2)
         listener.close()
         assert resolved.wait(2)
+    assert resolutions == ["service.example"] * blocking_call
+    assert events == []
 
 
 @pytest.mark.parametrize("name,config", [

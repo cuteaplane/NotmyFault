@@ -66,10 +66,14 @@ class TestCallNotmyfault:
 
 class TestConditionRuntime:
     @pytest.mark.parametrize("combined", [False, True])
-    def test_not_waits_for_absence_and_rearms_only_after_matching_event(self, combined):
+    @pytest.mark.parametrize("channel,other", [
+        ("a", "b"), (True, 1), ([False], [0]),
+        ({"ready": [True]}, {"ready": [1]}),
+    ])
+    def test_not_waits_for_absence_and_rearms_only_after_matching_event(self, combined, channel, other):
         runtime = ConditionRuntime()
         absence = {"op": "not", "within_seconds": 10, "children": [{
-            "type": "signal", "binding_id": "t_signal01", "params": {"channel": "a"},
+            "type": "signal", "binding_id": "t_signal01", "params": {"channel": channel},
         }]}
         rule = {"condition": {"op": "all", "children": [
             {"type": "start", "binding_id": "t_start01", "params": {}}, absence,
@@ -77,12 +81,12 @@ class TestConditionRuntime:
         assert runtime.poll_absences("r", rule, now=0) is None
         if combined:
             assert runtime.match_and_take("r", rule, "start", {}, now=1) is None
-        assert runtime.match_and_take("r", rule, "signal", {"channel": "a"}, now=9) is None
+        assert runtime.match_and_take("r", rule, "signal", {"channel": channel}, now=9) is None
         assert runtime.poll_absences("r", rule, now=10) is None
-        assert runtime.match_and_take("r", rule, "signal", {"channel": "b"}, now=18) is None
+        assert runtime.match_and_take("r", rule, "signal", {"channel": other}, now=18) is None
         assert runtime.poll_absences("r", rule, now=19) is not None
         assert runtime.poll_absences("r", rule, now=100) is None
-        assert runtime.match_and_take("r", rule, "signal", {}, now=101, instance={"config": {"channel": "a"}}) is None
+        assert runtime.match_and_take("r", rule, "signal", {}, now=101, instance={"config": {"channel": channel}}) is None
         if combined:
             assert runtime.match_and_take("r", rule, "start", {}, now=102) is None
         assert runtime.poll_absences("r", rule, now=111) is not None
@@ -273,6 +277,18 @@ class TestRuleStructureValidation:
                 "actions 至少需要一个动作",
                 id="rule2-actions 至少需要一个动作",
             ),
+            *[
+                pytest.param(
+                    {
+                        "name": "r",
+                        "condition": {"op": op, "within_seconds": 10**1000,
+                                      "children": [{"type": "hotkey", "params": {}}]},
+                        "actions": [{"type": "noop"}],
+                    },
+                    "within_seconds", id=f"{op}-oversized-window",
+                )
+                for op in ("all", "not")
+            ],
         ],
     )
     def test_invalid_rule(self, rule, expected):
@@ -285,19 +301,31 @@ class TestRuleStructureValidation:
             ("on_error", "skip", "on_error 必须是 stop 或 continue"),
             ("retry", 4, "retry 必须是 0 到 3 的整数"),
             ("retry", 1.5, "retry 必须是 0 到 3 的整数"),
+            ("retry", "²", "retry 必须是 0 到 3 的整数"),
+            pytest.param("retry", "9" * 5000, "retry 必须是 0 到 3 的整数", id="retry-oversized-text"),
             ("retry_delay_seconds", -1, "retry_delay_seconds 必须是 0 到 3600"),
             ("retry_delay_seconds", "later", "retry_delay_seconds 必须是 0 到 3600"),
+            pytest.param("retry_delay_seconds", 10**1000, "retry_delay_seconds 必须是 0 到 3600", id="delay-oversized-integer"),
             ("retry_backoff", "random", "retry_backoff 必须是 fixed 或 exponential"),
             ("timeout_seconds", 0, "timeout_seconds 必须是 1 到 86400"),
             ("timeout_seconds", "later", "timeout_seconds 必须是 1 到 86400"),
+            pytest.param("timeout_seconds", 10**1000, "timeout_seconds 必须是 1 到 86400", id="timeout-oversized-integer"),
         ],
     )
-    def test_invalid_action_failure_settings(self, field, value, expected):
+    @pytest.mark.parametrize("placement", ["ordinary", "then", "else", "failure_actions"])
+    def test_invalid_action_failure_settings(self, field, value, expected, placement):
         rule = {
             "name": "r",
             "event": {"type": "hotkey", "params": {}},
             "actions": [{"type": "noop", "params": {}, field: value}],
         }
+        if placement in ("then", "else"):
+            rule["actions"] = [{
+                "type": "if", "condition": {"op": "is_true", "left": True},
+                placement: rule["actions"],
+            }]
+        elif placement == "failure_actions":
+            rule["actions"] = [{"type": "noop", "failure_actions": rule["actions"]}]
 
         assert any(expected in error for error in validate_rule_structure(rule))
 

@@ -39,11 +39,13 @@ def install_response(monkeypatch, response):
     return connection
 
 
-def test_download_publishes_complete_file_and_preserves_existing_target(tmp_path, monkeypatch):
-    destination = tmp_path / "report.csv"
+@pytest.mark.parametrize("name", ["report.csv", " report.csv", "report.csv\u3000"])
+def test_download_publishes_complete_file_and_preserves_existing_target(tmp_path, monkeypatch, name):
+    monkeypatch.chdir(tmp_path)
+    destination = tmp_path / name
     content = "name,total\n报告,12\n".encode()
     connection = install_response(monkeypatch, Response(content, {"Content-Length": str(len(content))}))
-    params = {"url": "https://example.com/report.csv", "file_path": str(destination)}
+    params = {"url": "https://example.com/report.csv", "file_path": name}
     result = download.run_with_context({}, params, {})
 
     assert destination.read_bytes() == content
@@ -76,7 +78,8 @@ def test_failed_download_keeps_existing_file_and_removes_partial_data(tmp_path, 
     assert list(tmp_path.iterdir()) == [destination]
 
 
-def test_cancelled_download_never_publishes_partial_file(tmp_path, monkeypatch):
+@pytest.mark.parametrize("existing", [False, True])
+def test_cancelled_download_never_publishes_partial_file(tmp_path, monkeypatch, existing):
     cancelled = threading.Event()
 
     class CancellingResponse(Response):
@@ -87,12 +90,17 @@ def test_cancelled_download_never_publishes_partial_file(tmp_path, monkeypatch):
 
     install_response(monkeypatch, CancellingResponse(b"data"))
     destination = tmp_path / "report.txt"
+    if existing:
+        destination.write_bytes(b"original")
     context = {"runtime": {"cancellation": ActionCancellation(run_event=cancelled)}}
     with pytest.raises(ActionCancelled):
         download.run_with_context({}, {
             "url": "https://example.com/report.txt", "file_path": str(destination),
+            "overwrite": existing,
         }, context)
-    assert list(tmp_path.iterdir()) == []
+    assert list(tmp_path.iterdir()) == ([destination] if existing else [])
+    if existing:
+        assert destination.read_bytes() == b"original"
 
 
 def test_download_revalidates_redirect_before_connecting(monkeypatch):
@@ -136,6 +144,9 @@ def test_download_connects_only_to_previously_checked_addresses(monkeypatch, sch
     response = Response(b"content")
 
     class Socket:
+        def do_handshake(self):
+            pass
+
         def sendall(self, data):
             requests.append(data)
 
@@ -143,7 +154,8 @@ def test_download_connects_only_to_previously_checked_addresses(monkeypatch, sch
             pass
 
     class TLSContext:
-        def wrap_socket(self, sock, *, server_hostname):
+        def wrap_socket(self, sock, *, server_hostname, do_handshake_on_connect):
+            assert do_handshake_on_connect is False
             server_names.append(server_hostname)
             return sock
 

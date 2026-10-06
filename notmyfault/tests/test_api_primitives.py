@@ -1,7 +1,9 @@
 from pathlib import Path
+from decimal import Decimal
 from types import SimpleNamespace
 import asyncio
 import json
+import sys
 import threading
 
 import pytest
@@ -10,10 +12,13 @@ from notmyfault.host.api.plugin_installation import (
     PendingPreviewStore,
     PluginBackupStore,
     PluginFileSystem,
+    PluginInstallCleanupError,
+    PluginInstallRollbackError,
     PluginInstallTransaction,
 )
 from notmyfault.host.api.events import EventBroker
 from notmyfault.host.api.services.rule_runs import RuleRunService, RuleRunServiceError
+from notmyfault.core.value_codec import encode_value
 from notmyfault.security.api_key_store import KeyStoreStatus
 from notmyfault.tests.api_support import make_api_env
 
@@ -53,46 +58,142 @@ def test_pending_preview_store_discard_cleans_directory() -> None:
     assert removed == [Path("preview-directory")]
 
 
-def test_plugin_install_transaction_restores_replaced_directory() -> None:
-    class FailingFileSystem:
-        def __init__(self) -> None:
-            self.replacements: list[tuple[Path, Path]] = []
-            self.removals: list[Path] = []
+@pytest.mark.parametrize("failure_stage", ["replace", "commit"])
+@pytest.mark.parametrize("installation", ["new", "update", "renamed"])
+def test_plugin_install_transaction_restores_replaced_directory(
+    tmp_path, failure_stage, installation,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "version.txt").write_text("new", encoding="utf-8")
+    root = tmp_path / "plugins"
+    root.mkdir()
+    destination = root / "demo"
+    old_destination = root / ("old_demo" if installation == "renamed" else "demo")
+    old_backup = old_destination.with_name(old_destination.name + ".nmf-backup")
+    if installation != "new":
+        old_destination.mkdir()
+        (old_destination / "version.txt").write_text("old", encoding="utf-8")
+        old_backup.mkdir()
+        (old_backup / "version.txt").write_text("older", encoding="utf-8")
 
-        def make_dirs(self, path: Path) -> None:
-            return None
-
-        def remove_tree(self, path: Path) -> None:
-            self.removals.append(path)
-
-        def discard_tree(self, path: Path) -> None:
-            self.removals.append(path)
-
-        def copy_tree(self, source: Path, destination: Path) -> None:
-            return None
-
-        def exists(self, path: Path) -> bool:
-            return path == Path("plugins/demo")
-
+    class FailingFileSystem(PluginFileSystem):
         def replace(self, source: Path, destination: Path) -> None:
-            self.replacements.append((source, destination))
-            if source.name.startswith(".demo-staging"):
+            if failure_stage == "replace" and source.name.startswith(".demo-staging"):
                 raise OSError("injected replace failure")
+            super().replace(source, destination)
+
+    commits = []
+
+    def commit(path: Path) -> None:
+        commits.append(path)
+        assert (path / "version.txt").read_text(encoding="utf-8") == "new"
+        raise OSError("injected commit failure")
 
     file_system = FailingFileSystem()
     transaction = PluginInstallTransaction(file_system)
 
-    with pytest.raises(OSError, match="injected replace failure"):
-        transaction.install_tree(Path("source"), Path("plugins/demo"))
+    with pytest.raises(OSError, match=f"injected {failure_stage} failure"):
+        transaction.install_tree(
+            source,
+            destination,
+            obsolete_destinations=(old_destination,) if installation == "renamed" else (),
+            commit=commit,
+        )
 
-    backup = Path("plugins/demo.nmf-backup")
-    assert file_system.replacements[0] == (Path("plugins/demo"), backup)
-    assert file_system.replacements[-1] == (backup, Path("plugins/demo"))
+    assert commits == ([destination] if failure_stage == "commit" else [])
+    if installation != "new":
+        assert (old_destination / "version.txt").read_text(encoding="utf-8") == "old"
+        assert (old_backup / "version.txt").read_text(encoding="utf-8") == "older"
+    if installation != "update":
+        assert not destination.exists()
+    assert list(root.glob("*.nmf-backup")) == ([old_backup] if installation != "new" else [])
+    assert list(root.glob(".*-staging-*")) == []
+    assert list(root.glob(".*-retained-*")) == []
 
 
-def test_plugin_install_transaction_restores_retained_backup(tmp_path) -> None:
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_plugin_install_transaction_commits_before_old_backup_cleanup(tmp_path, cleanup_failure) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "plugins" / "demo"
+    backup = destination.with_name("demo.nmf-backup")
+    source.mkdir()
+    destination.mkdir(parents=True)
+    backup.mkdir()
+    (source / "version.txt").write_text("new", encoding="utf-8")
+    (destination / "version.txt").write_text("old", encoding="utf-8")
+    (backup / "version.txt").write_text("older", encoding="utf-8")
+    commits = []
+
+    class CleanupFileSystem(PluginFileSystem):
+        def remove_tree(self, path: Path) -> None:
+            if "-retained-" in path.name:
+                assert commits == [destination]
+                if cleanup_failure:
+                    raise PermissionError("injected cleanup failure")
+            super().remove_tree(path)
+
+    transaction = PluginInstallTransaction(CleanupFileSystem())
+    if cleanup_failure:
+        with pytest.raises(PluginInstallCleanupError, match="injected cleanup failure"):
+            transaction.install_tree(source, destination, commit=commits.append)
+    else:
+        assert transaction.install_tree(source, destination, commit=commits.append) == (backup,)
+
+    assert commits == [destination]
+    assert (destination / "version.txt").read_text(encoding="utf-8") == "new"
+    assert (backup / "version.txt").read_text(encoding="utf-8") == "old"
+    retained = list(destination.parent.glob(".*-retained-*"))
+    assert len(retained) == (1 if cleanup_failure else 0)
+    if retained:
+        assert (retained[0] / "version.txt").read_text(encoding="utf-8") == "older"
+
+
+@pytest.mark.parametrize("rollback_failure", ["remove", "restore"])
+def test_plugin_install_transaction_reports_failed_restore(tmp_path, rollback_failure) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "plugins" / "demo"
+    backup = destination.with_name("demo.nmf-backup")
+    source.mkdir()
+    destination.mkdir(parents=True)
+    (source / "version.txt").write_text("new", encoding="utf-8")
+    (destination / "version.txt").write_text("old", encoding="utf-8")
+
+    class FailingRestoreFileSystem(PluginFileSystem):
+        def remove_tree(self, path: Path) -> None:
+            if rollback_failure == "remove" and path == destination:
+                raise PermissionError("injected remove failure")
+            super().remove_tree(path)
+
+        def replace(self, source: Path, target: Path) -> None:
+            if rollback_failure == "restore" and source == backup:
+                raise OSError("injected restore failure")
+            super().replace(source, target)
+
+    def commit(path: Path) -> None:
+        raise OSError("injected commit failure")
+
+    transaction = PluginInstallTransaction(FailingRestoreFileSystem())
+
+    with pytest.raises(PluginInstallRollbackError, match=f"injected {rollback_failure} failure") as excinfo:
+        transaction.install_tree(source, destination, commit=commit)
+
+    assert str(excinfo.value.__cause__) == "injected commit failure"
+    assert (backup / "version.txt").read_text(encoding="utf-8") == "old"
+    if rollback_failure == "remove":
+        assert (destination / "version.txt").read_text(encoding="utf-8") == "new"
+    else:
+        assert not destination.exists()
+    assert list(destination.parent.glob(".*-staging-*")) == []
+
+
+@pytest.mark.parametrize("same_id", [False, True])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_plugin_install_transaction_restores_retained_backup(
+    tmp_path, same_id, cleanup_fails,
+) -> None:
     root = tmp_path / "plugins"
-    active = root / "new_id"
+    active = root / ("old_id" if same_id else "new_id")
     backup = root / "old_id.nmf-backup"
     destination = root / "old_id"
     active.mkdir(parents=True)
@@ -100,15 +201,29 @@ def test_plugin_install_transaction_restores_retained_backup(tmp_path) -> None:
     (active / "version.txt").write_text("new", encoding="utf-8")
     (backup / "version.txt").write_text("old", encoding="utf-8")
 
-    restored = PluginInstallTransaction(PluginFileSystem()).restore_backup(
-        backup,
-        destination,
-        active,
-    )
+    class CleanupFileSystem(PluginFileSystem):
+        def remove_tree(self, path: Path) -> None:
+            if cleanup_fails and "-failed-" in path.name and path.exists():
+                raise OSError("injected cleanup failure")
+            super().remove_tree(path)
 
-    assert restored == destination
+    committed = []
+    transaction = PluginInstallTransaction(CleanupFileSystem())
+    if cleanup_fails:
+        with pytest.raises(PluginInstallCleanupError, match="旧版已恢复"):
+            transaction.restore_backup(backup, destination, active, commit=committed.append)
+        retained = list(root.glob(".*-failed-*"))
+        assert len(retained) == 1
+        assert (retained[0] / "version.txt").read_text(encoding="utf-8") == "new"
+    else:
+        assert transaction.restore_backup(
+            backup, destination, active, commit=committed.append,
+        ) == destination
+        assert list(root.glob(".*-failed-*")) == []
+    assert committed == [destination]
     assert (destination / "version.txt").read_text(encoding="utf-8") == "old"
-    assert not active.exists()
+    if not same_id:
+        assert not active.exists()
     assert not backup.exists()
 
 
@@ -352,6 +467,72 @@ def test_rule_run_service_validates_and_forwards_scoped_test_context(upstream, p
         "action_count": 1,
     }
     assert calls[0][1] == body
+
+
+@pytest.mark.parametrize("typed", [False, True])
+@pytest.mark.parametrize("field,value", [
+    ("step_id", []), ("step_id", {}), ("step_id", 1),
+    ("operator", []), ("operator", {}), ("operator", True),
+    ("expected", float("nan")), ("expected", float("inf")),
+    ("expected", float("-inf")), ("expected", {"nested": [float("nan")]}),
+    ("expected", "deep-array"),
+    ("expected", "parser-integer"),
+])
+def test_rule_run_route_rejects_invalid_assertions_before_execution(tmp_path, typed, field, value):
+    env = make_api_env(tmp_path)
+    rule = {
+        "name": "测试检查项",
+        "condition": {"type": "manual", "binding_id": "t_manual01", "params": {}},
+        "actions": [{"type": "target", "binding_id": "a_target001", "params": {}}],
+    }
+    assert env.store.save_rules([rule])
+    calls = []
+    env.runner.current_engine = SimpleNamespace(
+        actions_meta={"target": {"outputs": []}},
+        triggers_meta={"manual": {"outputs": []}},
+        run_manual_rule_snapshot=lambda *args, **kwargs: (
+            calls.append((args, kwargs)) or (True, "已执行", "run-test")
+        ),
+    )
+    headers = {**env.headers, **({"X-NMF-Value-Encoding": "typed-v1"} if typed else {})}
+    if field == "expected" and value == "deep-array":
+        value = None
+        for _ in range(200):
+            value = [value]
+    assertion = {
+        "step_id": "a_target001",
+        "operator": "equals" if field == "expected" else "exists",
+        "path": [], field: value,
+    }
+    raw_body = json.dumps({"test_assertions": [assertion]})
+    if field == "expected" and value == "parser-integer":
+        digit_limit = sys.get_int_max_str_digits()
+        if not digit_limit:
+            pytest.skip("当前 Python 未启用整数文本转换上限")
+        raw_body = raw_body.replace(json.dumps(value), "9" * (digit_limit + 1))
+    response = env.client.post(
+        "/api/rules/0/run", headers={**headers, "Content-Type": "application/json"},
+        content=raw_body,
+    )
+    assert response.status_code == 400
+    assert response.json()["ok"] is False
+    assert calls == []
+    expected = {
+        "flag": True, "number": 1.25, "integer": 2**80,
+        "nested": [None, {"text": "保留数据"}],
+        **({"decimal": Decimal("1.234567890123456789")} if typed else {}),
+    }
+    valid_body = {"test_assertions": [
+        {"step_id": "a_target001", "operator": "exists", "path": []},
+        {"step_id": "a_target001", "operator": "equals", "path": [], "expected": expected},
+    ]}
+    response = env.client.post(
+        "/api/rules/0/run", headers=headers,
+        json=encode_value(valid_body) if typed else valid_body,
+    )
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0][1]["test_assertions"] == valid_body["test_assertions"]
 
 
 def test_rule_run_service_checks_missing_and_invalid_reference_payloads() -> None:

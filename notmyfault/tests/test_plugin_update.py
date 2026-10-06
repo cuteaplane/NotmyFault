@@ -103,13 +103,35 @@ def test_changed_package_id_is_backed_up_and_uninstall_removes_backup(tmp_path, 
     assert other_backup.is_dir()
 
 
-def test_update_after_id_change_keeps_only_latest_backup(tmp_path):
+def test_update_after_id_change_keeps_only_latest_backup(tmp_path, monkeypatch):
+    from notmyfault.security import plugins as security_plugins
+
     env = make_api_env(tmp_path)
     first = build_nmfp(tmp_path, make_meta("actions"), "actions", "first-id")
     assert post_archive(env, "/api/plugins/install", first).status_code == 200
+    unrelated = build_nmfp(
+        tmp_path,
+        make_meta("actions", id="unrelated", package_name="com.test.unrelated"),
+        "actions",
+        "unrelated",
+    )
+    assert post_archive(env, "/api/plugins/install", unrelated).status_code == 200
+    manifest_path = env.paths.plugin_manifest_file
+    unrelated_hashes = security_plugins.load_plugin_manifest(manifest_path)["unrelated"]
+    save_manifest = security_plugins.save_plugin_manifest
+    writes = []
+
+    def record_save(manifest, path):
+        writes.append(json.loads(json.dumps(manifest)))
+        return save_manifest(manifest, path)
+
+    monkeypatch.setattr(security_plugins, "save_plugin_manifest", record_save)
     renamed_meta = make_meta("actions", id="new_id", version_code=2)
     second = build_nmfp(tmp_path, renamed_meta, "actions", "second-id")
     assert post_archive(env, "/api/plugins/install", second).status_code == 200
+    assert len(writes) == 1
+    assert set(writes[0]) == {"new_id", "unrelated"}
+    assert writes[0]["unrelated"] == unrelated_hashes
     third = build_nmfp(
         tmp_path,
         make_meta("actions", id="new_id", version_code=3),
@@ -118,6 +140,10 @@ def test_update_after_id_change_keeps_only_latest_backup(tmp_path):
     )
 
     assert post_archive(env, "/api/plugins/install", third).status_code == 200
+    assert len(writes) == 2
+    assert set(writes[1]) == {"new_id", "unrelated"}
+    assert writes[1]["unrelated"] == unrelated_hashes
+    assert security_plugins.load_plugin_manifest(manifest_path) == writes[1]
 
     action_root = env.paths.user_plugins_dir / "actions"
     backups = sorted(action_root.glob("*.nmf-backup"))
@@ -126,6 +152,83 @@ def test_update_after_id_change_keeps_only_latest_backup(tmp_path):
         (backups[0] / "action.json").read_text(encoding="utf-8")
     )
     assert backup_meta["version_code"] == 2
+
+
+@pytest.mark.parametrize("mode", ["strict", "normal", "permissive"])
+@pytest.mark.parametrize("operation", ["install", "update", "change_id"])
+def test_manifest_save_failure_preserves_plugins_and_backups(
+    tmp_path, monkeypatch, mode, operation,
+):
+    import py7zr
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    from notmyfault.host.api.services import plugin_installation
+    from notmyfault.security import plugins as security_plugins, signing, signing_keys
+    from notmyfault.security.security import SecurityMode
+
+    key = Ed25519PrivateKey.generate()
+    monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [
+        key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    ])
+    monkeypatch.setattr(
+        plugin_installation, "detect_security_mode", lambda: SecurityMode(mode)
+    )
+    env = make_api_env(tmp_path)
+
+    def signed_archive(meta, tag):
+        archive = build_nmfp(tmp_path, meta, "actions", tag)
+        root = tmp_path / f"source-{tag}" / f"plugin-{tag}"
+        signing.sign_plugin(root, "action.json", private_key=key)
+        with py7zr.SevenZipFile(archive, "w") as output:
+            for path in sorted(root.rglob("*")):
+                if path.is_file():
+                    output.write(path, f"plugin-{tag}/{path.relative_to(root).as_posix()}")
+        return archive
+
+    unrelated = signed_archive(
+        make_meta("actions", id="unrelated", package_name="com.test.unrelated"),
+        "unrelated",
+    )
+    assert post_archive(env, "/api/plugins/install", unrelated).status_code == 200
+    if operation != "install":
+        for version in (1, 2):
+            archive = signed_archive(
+                make_meta("actions", version_code=version), f"version-{version}"
+            )
+            assert post_archive(env, "/api/plugins/install", archive).status_code == 200
+
+    action_root = env.paths.user_plugins_dir / "actions"
+    manifest_path = env.paths.plugin_manifest_file
+    manifest_before = manifest_path.read_bytes()
+    files_before = {
+        path.relative_to(action_root).as_posix(): path.read_bytes()
+        for path in action_root.rglob("*") if path.is_file()
+    }
+    plugin_id = "new_id" if operation == "change_id" else "demo_actions"
+    candidate = signed_archive(
+        make_meta("actions", id=plugin_id, version_code=3), "candidate"
+    )
+    writes = []
+
+    def reject_save(manifest, path):
+        writes.append(manifest)
+        return False
+
+    monkeypatch.setattr(security_plugins, "save_plugin_manifest", reject_save)
+    response = post_archive(env, "/api/plugins/install", candidate)
+
+    assert response.status_code == 500
+    assert response.json()["ok"] is False
+    assert len(writes) == 1
+    assert manifest_path.read_bytes() == manifest_before
+    assert {
+        path.relative_to(action_root).as_posix(): path.read_bytes()
+        for path in action_root.rglob("*") if path.is_file()
+    } == files_before
+    if operation in ("install", "change_id"):
+        assert not (action_root / plugin_id).exists()
+    if operation != "install":
+        assert (action_root / "demo_actions.nmf-backup").is_dir()
 
 
 def test_preview_reports_permission_and_version_differences(tmp_path):
@@ -193,12 +296,15 @@ def _write_action(
     plugin_id: str,
     version_code: int,
     source: str,
+    *,
+    execution_mode: str = "in-process",
 ) -> None:
     path.mkdir(parents=True)
     meta = make_meta(
         "actions",
         id=plugin_id,
         package_name="com.test.restart_restore",
+        execution_mode=execution_mode,
         version_code=version_code,
         version=f"{version_code}.0",
     )
@@ -232,26 +338,70 @@ def _prepare_engine_recovery(monkeypatch, tmp_path):
     return app, paths, store, alerts
 
 
+@pytest.mark.parametrize("mode,recovery_failure", [
+    ("strict", None), ("normal", None), ("permissive", None),
+    ("strict", "save"), ("normal", "save"), ("permissive", "save"),
+    ("strict", "signature"), ("strict", "import"),
+])
+@pytest.mark.parametrize("new_id", ["old_id", "new_id"])
+@pytest.mark.parametrize("execution_mode", ["in-process", "isolated"])
 def test_engine_start_restores_backup_when_updated_plugin_cannot_import(
     monkeypatch,
     tmp_path,
+    mode,
+    recovery_failure,
+    new_id,
+    execution_mode,
 ):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    from notmyfault.security import plugins, signing, signing_keys
+    from notmyfault.security.plugin_checks import inspect_plugin_tree
+    from notmyfault.security.security import SecurityMode
+
     app, paths, store, alerts = _prepare_engine_recovery(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "notmyfault.core.engine._detect_security_mode", lambda: SecurityMode(mode)
+    )
+    key = Ed25519PrivateKey.generate()
+    monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [
+        key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    ])
     action_root = paths.user_plugins_dir / "actions"
     old_backup = action_root / "old_id.nmf-backup"
-    new_plugin = action_root / "new_id"
+    new_plugin = action_root / new_id
     _write_action(
         old_backup,
         "old_id",
         1,
+        "no_run = True\n" if recovery_failure == "import" else
         "def run(meta, params):\n    return {'version': 1}\n",
+        execution_mode=execution_mode,
     )
     _write_action(
         new_plugin,
-        "new_id",
+        new_id,
         2,
         "raise RuntimeError('broken update')\n",
+        execution_mode=execution_mode,
     )
+    for folder in (old_backup, new_plugin):
+        signing.sign_plugin(folder, "action.json", private_key=key)
+    old_snapshot = inspect_plugin_tree(str(old_backup)).file_snapshot
+    new_snapshot = inspect_plugin_tree(str(new_plugin)).file_snapshot
+    unrelated = {"action.py": "a" * 64}
+    assert plugins.save_plugin_manifest(
+        {new_id: new_snapshot, "unrelated": unrelated}, paths.plugin_manifest_file
+    )
+    if recovery_failure == "signature":
+        (old_backup / "action.py").write_text("no_run = True\n", encoding="utf-8")
+    files_before = {
+        path.relative_to(action_root).as_posix(): path.read_bytes()
+        for path in action_root.rglob("*") if path.is_file()
+    }
+    manifest_before = paths.plugin_manifest_file.read_bytes()
+    if recovery_failure == "save":
+        monkeypatch.setattr(plugins, "save_plugin_manifest", lambda *_args: False)
     events = []
 
     engine = app.create_engine(
@@ -260,49 +410,82 @@ def test_engine_start_restores_backup_when_updated_plugin_cannot_import(
     )
     try:
         restored = action_root / "old_id"
-        assert restored.is_dir()
-        assert not old_backup.exists()
-        assert not new_plugin.exists()
+        if recovery_failure in ("save", "signature"):
+            assert {
+                path.relative_to(action_root).as_posix(): path.read_bytes()
+                for path in action_root.rglob("*") if path.is_file()
+            } == files_before
+            assert paths.plugin_manifest_file.read_bytes() == manifest_before
+        else:
+            assert restored.is_dir()
+            assert not old_backup.exists()
+            if new_id != "old_id":
+                assert not new_plugin.exists()
+            assert plugins.load_plugin_manifest(paths.plugin_manifest_file) == {
+                "old_id": old_snapshot, "unrelated": unrelated,
+            }
+        if recovery_failure:
+            assert "old_id" not in engine.actions_funcs
+            assert [name for name, _data in events if name != "plugin_load_failed"] == [
+                "plugin_update_rollback_failed"
+            ]
+            assert alerts == []
+            return
         restored_meta = json.loads(
             (restored / "action.json").read_text(encoding="utf-8")
         )
         assert restored_meta["version_code"] == 1
         assert engine.actions_funcs["old_id"]({}, {}) == {"version": 1}
-        assert events == [
-            (
-                "plugin_update_rolled_back",
-                {
-                    "plugins": [
-                        {
-                            "id": "old_id",
-                            "package_name": "com.test.restart_restore",
-                            "version_code": 1,
-                        }
-                    ]
-                },
-            )
+        # 更新失败会先推一条插件加载失败，回退事件不变
+        assert [name for name, _data in events if name != "plugin_load_failed"] == [
+            "plugin_update_rolled_back"
         ]
+        assert events[-1] == (
+            "plugin_update_rolled_back",
+            {
+                "plugins": [
+                    {
+                        "id": "old_id",
+                        "package_name": "com.test.restart_restore",
+                        "version_code": 1,
+                    }
+                ]
+            },
+        )
+        assert any(
+            name == "plugin_load_failed" and data["plugin_id"] == new_id
+            for name, data in events
+        )
         assert len(alerts) == 1
     finally:
         engine.shutdown()
 
 
-def test_engine_start_keeps_loadable_update_and_backup(monkeypatch, tmp_path):
+@pytest.mark.parametrize("execution_mode", ["in-process", "isolated"])
+def test_engine_start_keeps_loadable_update_and_backup(
+    monkeypatch, tmp_path, execution_mode,
+):
     app, paths, store, alerts = _prepare_engine_recovery(monkeypatch, tmp_path)
     action_root = paths.user_plugins_dir / "actions"
     backup = action_root / "demo.nmf-backup"
     current = action_root / "demo"
+    marker = tmp_path / "action-ran.txt"
     _write_action(
         backup,
         "demo",
         1,
         "def run(meta, params):\n    return {'version': 1}\n",
+        execution_mode=execution_mode,
     )
     _write_action(
         current,
         "demo",
         2,
-        "def run(meta, params):\n    return {'version': 2}\n",
+        "from pathlib import Path\n"
+        "def run(meta, params):\n"
+        f"    Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n"
+        "    return {'version': 2}\n",
+        execution_mode=execution_mode,
     )
     events = []
 
@@ -313,7 +496,9 @@ def test_engine_start_keeps_loadable_update_and_backup(monkeypatch, tmp_path):
     try:
         assert current.is_dir()
         assert backup.is_dir()
+        assert not marker.exists()
         assert engine.actions_funcs["demo"]({}, {}) == {"version": 2}
+        assert marker.read_text(encoding="utf-8") == "ran"
         assert events == []
         assert alerts == []
     finally:

@@ -301,10 +301,28 @@ class TestExecuteAction:
         release.set()
         assert engine._rule_scheduler.wait_for_idle(timeout=5)
 
-    def test_failed_manual_assertion_marks_workflow_failed_without_exposing_values(self):
+    @pytest.mark.parametrize("actual,expected,operator,passed", [
+        ("actual-secret", "expected-secret", "equals", False),
+        (True, 1, "equals", False),
+        ([True], [1], "equals", False),
+        ({"flag": [False]}, {"flag": [0]}, "equals", False),
+        ([True], 1, "contains", False),
+        ([1], True, "contains", False),
+        ([[1, 2]], [1, 2], "contains", True),
+        ([1, 2], [1, 2], "contains", False),
+        ([{"flag": [True]}], {"flag": [1]}, "contains", False),
+        ({"flag": True, "extra": "actual-secret"}, {"flag": 1}, "contains", False),
+        ({"flag": [True]}, {"flag": [1]}, "contains", False),
+        ({"flag": [False], "extra": "actual-secret"}, {"flag": [False]}, "contains", True),
+        ([True], [True], "equals", True),
+        ({"value": [Decimal("1"), 1.0]}, {"value": [1, 1]}, "equals", True),
+        ("任务已完成", "已完成", "contains", True),
+        (None, None, "exists", True),
+    ])
+    def test_manual_assertions_report_workflow_status_without_exposing_values(self, actual, expected, operator, passed):
         events = []
         engine = make_engine(on_event=lambda name, data: events.append((name, data)))
-        register_action(engine, "result", lambda meta, params: {"token": "actual-secret"})
+        register_action(engine, "result", lambda meta, params: {"token": actual})
         context = build_context(
             "结果检查测试", "manual", {}, [], "r_assert001", "run_assert001"
         )
@@ -314,8 +332,8 @@ class TestExecuteAction:
             "assertions": [{
                 "step_id": "a_result001",
                 "path": ["token"],
-                "operator": "equals",
-                "expected": "expected-secret",
+                "operator": operator,
+                "expected": expected,
             }],
         }
 
@@ -328,11 +346,12 @@ class TestExecuteAction:
 
         assertion_event = [data for name, data in events if name == "test_assertions_completed"][0]
         completed = [data for name, data in events if name == "workflow_completed"][0]
-        assert assertion_event["passed"] == 0
+        assert assertion_event["passed"] == int(passed)
+        assert assertion_event["results"][0]["passed"] is passed
         assert "actual-secret" not in repr(assertion_event)
         assert "expected-secret" not in repr(assertion_event)
-        assert completed["status"] == "failed"
-        assert completed["failure_kind"] == "assertion"
+        assert completed["status"] == ("succeeded" if passed else "failed")
+        assert completed["failure_kind"] == ("" if passed else "assertion")
 
     def test_sensitive_action_result_is_masked_in_event(self):
         events = []
@@ -778,60 +797,98 @@ class TestExecuteAction:
         assert attempts == [1]
 
     @pytest.mark.parametrize("source", ["event", "step"])
-    @pytest.mark.parametrize("value, expected", [(True, ["else", "after"]), (False, ["then", "after"]), (None, [])])
-    def test_if_selects_one_branch_and_stops_on_missing_data(self, source, value, expected, tmp_path):
+    @pytest.mark.parametrize("boolean_op", ["is_true", "is_false"])
+    @pytest.mark.parametrize("value,present,expected", [
+        (True, True, ["else", "after"]), (False, True, ["then", "after"]),
+        (None, False, []), (None, True, []),
+        (1, True, []), ("false", True, []), ([], True, []),
+    ])
+    def test_if_selects_one_branch_and_stops_on_invalid_data(
+        self, source, boolean_op, value, present, expected, tmp_path
+    ):
         events = []
         engine = make_engine(on_event=lambda name, data: events.append((name, data)))
         called = []
         register_action(engine, "record", lambda meta, params: called.append(params["label"]))
         context = build_context("规则", "hotkey", {}, [], run_id="run_branch")
-        if value is not None:
+        if present:
             context["event"]["payload"]["ready"] = value
-        context["steps"]["a_source01"] = {"status": "failed" if value is None else "ok", "result": value}
+        context["steps"]["a_source01"] = {"status": "ok" if present else "failed", "result": value}
         reference = {"scope": "event", "path": ["ready"]} if source == "event" else {"scope": "step", "node": "a_source01", "path": []}
         def action(label):
             return {"type": "record", "binding_id": f"a_{label}001", "params": {"label": label}}
         branch = {
             "type": "if", "binding_id": "a_branch01",
             "condition": {"op": "not", "children": [{
-                "op": "is_true", "left": {"$ref": reference},
+                "op": boolean_op, "left": {"$ref": reference},
             }]},
             "then": [action("then")], "else": [action("else")],
         }
+        if boolean_op == "is_false":
+            expected = [{"then": "else", "else": "then"}.get(label, label) for label in expected]
+        succeeded = isinstance(value, bool)
         result = engine.execute_actions([branch, action("after")], "规则", context)
-        assert result is (value is not None)
+        assert result is succeeded
         assert called == expected
-        assert context["steps"]["a_branch01"]["status"] == ("failed" if value is None else "ok")
+        assert context["steps"]["a_branch01"]["status"] == ("ok" if succeeded else "failed")
         history = RunHistory(str(tmp_path / "runs.jsonl"))
         for timestamp, (name, data) in enumerate(events):
             history.record({"type": name, "data": data, "ts": timestamp})
         saved = next(step for step in history.get_run("run_branch")["steps"] if step["step_id"] == "a_branch01")
-        assert saved["status"] == ("failed" if value is None else "succeeded")
-        if value is None:
-            assert saved["error"]["code"] == "missing_binding_value"
+        assert saved["status"] == ("succeeded" if succeeded else "failed")
+        if not succeeded:
+            assert saved["error"]["code"] == (
+                "condition_evaluation_failed" if present else "missing_binding_value"
+            )
 
-    @pytest.mark.parametrize("count, threshold", [(2, 1), (Decimal("2.0000000000000000001"), Decimal("2.0000000000000000000"))])
-    def test_if_nested_branch_uses_previous_results_and_propagates_failure(self, count, threshold):
+    @pytest.mark.parametrize("wrapper", ["direct", "not", "all", "any"])
+    @pytest.mark.parametrize("count,threshold,left,right,operator,matched", [
+        (2, 1, 2, 2, "eq", True),
+        (Decimal("2.0000000000000000001"), Decimal("2.0000000000000000000"), Decimal("2.0000000000000000001"), Decimal("2.0000000000000000001"), "eq", True),
+        (2, 1, True, 1, "eq", False),
+        (2, 1, [True], [1], "eq", False),
+        (2, 1, [False], [0], "ne", True),
+        (2, 1, {"ready": [True]}, {"ready": [1]}, "eq", False),
+        (2, 1, {"ready": [False]}, {"ready": [0]}, "ne", True),
+        (2, 1, [True], 1, "contains", False),
+        (2, 1, [1], True, "contains", False),
+        (2, 1, [{"ready": [True]}], {"ready": [1]}, "contains", False),
+        (2, 1, [{"ready": [False]}], {"ready": [False]}, "contains", True),
+        (2, 1, "任务已完成", "已完成", "contains", True),
+        (2, 1, "任务未完成", "已完成", "contains", False),
+        (2, 1, {"values": [Decimal("1"), 1.0]}, {"values": [1, 1]}, "eq", True),
+    ])
+    def test_if_nested_branch_uses_previous_results_and_propagates_failure(
+        self, count, threshold, left, right, operator, matched, wrapper
+    ):
         engine = make_engine()
         called = []
-        register_action(engine, "query", lambda meta, params: {"count": count})
+        register_action(engine, "query", lambda meta, params: {"count": count, "value": left})
         register_action(engine, "record", lambda meta, params: called.append(params["count"]))
         def fail(meta, params):
             raise RuntimeError("动作失败")
         register_action(engine, "fail", fail)
         source = {"$ref": {"scope": "step", "node": "a_query01", "path": ["count"]}}
+        condition = {"op": operator, "left": {"$ref": {"scope": "step", "node": "a_query01", "path": ["value"]}}, "right": right}
+        if wrapper == "not":
+            condition = {"op": "not", "children": [condition]}
+            matched = not matched
+        elif wrapper in ("all", "any"):
+            condition = {"op": wrapper, "children": [{"op": "is_true", "left": wrapper == "all"}, condition]}
         actions = [
             {"type": "query", "binding_id": "a_query01", "params": {}},
             {"type": "if", "binding_id": "a_outer01", "condition": {"op": "gt", "left": source, "right": threshold}, "then": [
-                {"type": "if", "binding_id": "a_inner01", "condition": {"op": "eq", "left": source, "right": count}, "then": [
+                {"type": "if", "binding_id": "a_inner01", "condition": condition, "then": [
                     {"type": "record", "binding_id": "a_record01", "params": {"count": source}},
                     {"type": "fail", "binding_id": "a_failed01", "params": {}},
                 ], "else": []},
             ], "else": []},
             {"type": "record", "params": {"count": 99}},
         ]
-        assert engine.execute_actions(actions, "规则", _context()) is False
-        assert called == [count]
+        context = _context()
+        assert engine.execute_actions(actions, "规则", context) is (not matched)
+        assert called == ([count] if matched else [99])
+        assert context["steps"]["a_inner01"]["status"] == ("failed" if matched else "ok")
 
     @pytest.mark.parametrize("validation", [[], ["参数无效"], RuntimeError("校验异常")])
     def test_validate_params_called(self, validation):
@@ -853,7 +910,13 @@ class TestExecuteAction:
         assert bool(called) is (validation == [])
 
 
-    def test_document_quiescent_requires_observation_then_allows(self, tmp_path):
+    @pytest.mark.parametrize("sample_failure", [None, "walk", "stat", "nan", "inf"] + [
+        (field, value) for field in ("check_file_locks", "check_document_windows")
+        for value in ("false", "true", "", 0, 1, None, [], {})
+    ])
+    def test_document_quiescent_requires_observation_then_allows(self, tmp_path, monkeypatch, sample_failure):
+        tmp_path = tmp_path / "documents\u3000"
+        tmp_path.mkdir()
         doc_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "actions", "document_quiescent", "action.py",
@@ -873,9 +936,56 @@ class TestExecuteAction:
         # 第一次检查只记录当前状态，不触发动作
         first = mod.check_precondition({}, params, {})
         assert first["ok"] is False
+        previous = dict(mod._observations)
+        if sample_failure is not None:
+            with monkeypatch.context() as patcher:
+                if isinstance(sample_failure, tuple):
+                    patcher.setitem(params, *sample_failure)
+                    patcher.setattr(mod, "_can_open_exclusively", lambda path: False)
+                    patcher.setattr(mod, "_visible_editing_windows", lambda: ["editing.docx"])
+                elif sample_failure == "walk":
+                    walk = mod.os.walk
+
+                    def unreadable_directory(*args, **kwargs):
+                        for row in walk(*args, **kwargs):
+                            yield row
+                            if kwargs.get("onerror") is not None:
+                                kwargs["onerror"](PermissionError("子目录不可读"))
+                            return
+
+                    patcher.setattr(mod.os, "walk", unreadable_directory)
+                elif sample_failure == "stat":
+                    stat = mod.Path.stat
+
+                    def unreadable_file(path, *args, **kwargs):
+                        if path == tmp_path / "a.txt":
+                            raise PermissionError("文件状态不可读")
+                        return stat(path, *args, **kwargs)
+
+                    patcher.setattr(mod.Path, "stat", unreadable_file)
+                else:
+                    patcher.setitem(params, "quiet_seconds", float(sample_failure))
+                for _ in range(2):
+                    failed = mod.check_precondition({}, params, {})
+                    assert failed["ok"] is False
+                    assert ("布尔" if isinstance(sample_failure, tuple) else "无法确认目录状态") in failed["reason"]
+                assert mod._observations == previous
+                if isinstance(sample_failure, tuple):
+                    with pytest.raises(RuntimeError, match="布尔"):
+                        mod.run({}, params)
         second = mod.check_precondition({}, params, {})
         assert second == {"ok": True}
         assert mod.run({}, params) == {"ok": True}
+        if sample_failure is None:
+            checked = []
+            monkeypatch.setattr(mod, "_can_open_exclusively", lambda path: checked.append("file") or True)
+            monkeypatch.setattr(mod, "_visible_editing_windows", lambda: checked.append("window") or [])
+            for file_locks, document_windows in ((False, False), (False, True), (True, False), (True, True)):
+                checked.clear()
+                assert mod.check_precondition({}, {
+                    **params, "check_file_locks": file_locks, "check_document_windows": document_windows,
+                }, {}) == {"ok": True}
+                assert checked == (["file"] if file_locks else []) + (["window"] if document_windows else [])
         mod._observations.clear()
         with pytest.raises(RuntimeError):
             mod.run({}, params)

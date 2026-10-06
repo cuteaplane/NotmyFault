@@ -1,18 +1,24 @@
 from pathlib import Path
 import ast
 import io
+import os
 import tarfile
 import zipfile
+from types import SimpleNamespace
+from threading import Event
 from urllib.parse import urlparse
 
 import pytest
 
 from notmyfault.actions.create_shortcut import action as create_shortcut
 from notmyfault.actions.http_request import action as http_request
+from notmyfault.actions.download_file import action as download_file
+from notmyfault.core.workflow import ActionCancellation, ActionCancelled
 from notmyfault.actions.kill_process import action as kill_process
 from notmyfault.actions.launch_program import action as launch_program
 from notmyfault.security import network
 from notmyfault.actions.file_operation import action as file_operation
+from notmyfault.actions.archive import action as archive_action
 
 
 @pytest.mark.parametrize("member_type", [tarfile.FIFOTYPE, tarfile.CHRTYPE, tarfile.BLKTYPE, tarfile.SYMTYPE])
@@ -88,6 +94,98 @@ def test_zip_rejects_archives_over_size_limit(tmp_path, monkeypatch):
     assert list(target.iterdir()) == []
 
 
+@pytest.mark.parametrize("path_kind", [
+    "parent", "absolute", "link", "windows_alias", "dot_alias", "removed_parent", "empty",
+])
+def test_zip_checks_extracted_paths_before_writing_members(tmp_path, path_kind):
+    archive = tmp_path / "unsafe.zip"
+    target = tmp_path / "target"
+    outside = tmp_path / "outside"
+    target.mkdir()
+    outside.mkdir()
+    link = None
+    if path_kind == "parent":
+        member = "../outside/escape.txt"
+    elif path_kind == "absolute":
+        member = str(outside / "escape.txt")
+    elif path_kind == "empty":
+        member = "."
+    else:
+        raw_directory = {
+            "link": "linked", "windows_alias": "linked?", "dot_alias": "linked.",
+            "removed_parent": "safe/../linked",
+        }[path_kind]
+        member = f"{raw_directory}/escape.txt"
+        directory = "safe/linked" if path_kind == "removed_parent" else raw_directory
+        if os.name == "nt":
+            directory = directory.replace("?", "_").rstrip(".")
+        link = target / directory
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            import _winapi
+            _winapi.CreateJunction(str(outside), str(link))
+        else:
+            link.symlink_to(outside, target_is_directory=True)
+    try:
+        with zipfile.ZipFile(archive, "w") as output:
+            output.writestr("first.txt", "normal")
+            output.writestr(member, "escaped")
+        with pytest.raises(ValueError, match="非法|越界"):
+            file_operation.run({}, {
+                "operation": "extract", "source": str(archive), "destination": str(target),
+            })
+        assert not (target / "first.txt").exists()
+        assert list(outside.iterdir()) == []
+    finally:
+        if link is not None:
+            link.rmdir() if os.name == "nt" else link.unlink()
+
+
+@pytest.mark.parametrize("operation", ["copy", "move", "compress"])
+@pytest.mark.parametrize("root_source", [False, True])
+def test_file_operations_reject_destinations_inside_root_and_regular_sources(
+    tmp_path, monkeypatch, operation, root_source,
+):
+    source = Path(tmp_path.anchor) if root_source else tmp_path / "source"
+    if not root_source:
+        source.mkdir()
+    destination = tmp_path / "child" if root_source else source / "child"
+
+    def forbidden_operation(*args, **kwargs):
+        pytest.fail("目标在源路径内时仍开始文件操作")
+
+    for name in ("copytree", "move", "make_archive"):
+        monkeypatch.setattr(file_operation.shutil, name, forbidden_operation)
+    with pytest.raises(ValueError, match="内部"):
+        file_operation.run({}, {
+            "operation": operation, "source": str(source), "destination": str(destination),
+            "overwrite": True,
+        })
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("format", ["zip", "tar", "archive"])
+def test_archive_checks_accept_members_under_filesystem_roots(tmp_path, monkeypatch, format):
+    root = tmp_path.anchor
+    extracted = []
+    if format == "archive":
+        assert archive_action._member_destination("child.txt", root) == os.path.join(root, "child.txt")
+        return
+    archive = tmp_path / f"archive.{format}"
+    if format == "zip":
+        with zipfile.ZipFile(archive, "w") as output:
+            output.writestr("child.txt", "content")
+        monkeypatch.setattr(zipfile.ZipFile, "extractall", lambda self, path: extracted.append(path))
+    else:
+        with tarfile.open(archive, "w") as output:
+            member = tarfile.TarInfo("child.txt")
+            member.size = 7
+            output.addfile(member, io.BytesIO(b"content"))
+        monkeypatch.setattr(tarfile.TarFile, "extractall", lambda self, path, **kwargs: extracted.append(path))
+    file_operation._safe_unpack(str(archive), root)
+    assert extracted == [root]
+
+
 def test_network_validator_rejects_private_resolution(monkeypatch):
     monkeypatch.setattr(
         network.socket,
@@ -132,22 +230,50 @@ def test_http_action_rejects_transport_headers(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("slow_body", [False, True])
-def test_http_action_connects_to_the_validated_address(monkeypatch, slow_body):
+@pytest.mark.parametrize("scheme", ["http", "https"])
+@pytest.mark.parametrize("method,status,headers,payload,expected,outcome", [
+    ("GET", 200, b"Content-Length: 4\r\n", b"done", "done", None),
+    ("GET", 200, b"Content-Length: 12\r\n", b"short", None, "正文长度"),
+    ("GET", 200, b"Content-Length: 12\r\n", b"12345678", None, "正文长度"),
+    ("GET", 200, b"Content-Length: 1\r\n", b"", None, "正文长度"),
+    ("GET", 200, b"Content-Length: 0\r\n", b"", "", None),
+    ("GET", 200, b"Transfer-Encoding: chunked\r\n", b"4\r\ndone\r\n0\r\n\r\n", "done", None),
+    ("GET", 200, b"Transfer-Encoding: chunked\r\n", b"4\r\ndo", None, "请求异常"),
+    ("GET", 200, b"Transfer-Encoding: chunked\r\n", b"4\r\ndone\r\n", None, "请求异常"),
+    ("GET", 200, b"", b"done", "done", None),
+    ("HEAD", 200, b"Content-Length: 12\r\n", b"", "", None),
+    ("GET", 204, b"Content-Length: 12\r\n", b"", "", None),
+    ("GET", 200, b"Content-Length: 11\r\n", b"01234567890", "01234567", "truncated"),
+    ("GET", 200, b"Content-Length: 4\r\n", b"done", None, "总时限"),
+    ("GET", 200, b"Content-Length: 4\r\n", b"done", None, "已取消"),
+    ("GET", 200, b"Content-Length: 12\r\n", b"", None, "已取消"),
+    ("GET", 200, b"Content-Length: 12\r\n", b"", None, "总时限"),
+])
+def test_http_action_preserves_url_and_validates_response(
+    monkeypatch, scheme, method, status, headers, payload, expected, outcome,
+):
     captured = {}
     now = [0.0]
+    cancelled = Event()
+    context = {"runtime": {"cancellation": ActionCancellation(run_event=cancelled)}}
     monkeypatch.setattr(http_request.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(http_request, "_MAX_RESPONSE_BYTES", 8)
+    wire = f"HTTP/1.1 {status} OK\r\n".encode() + headers + b"\r\n" + payload
+    response = http_request.http.client.HTTPResponse(
+        SimpleNamespace(makefile=lambda *args: io.BytesIO(wire)), method=method,
+    )
+    response.begin()
+    read1 = response.read1
 
-    class Response:
-        status = 200
-        reason = "OK"
+    def read_response(limit):
+        value = read1(limit)
+        if outcome == "总时限":
+            now[0] = 31
+        elif outcome == "已取消":
+            cancelled.set()
+        return value
 
-        body = b"done"
-        def read1(self, limit):
-            if slow_body:
-                now[0] = 31
-            value, self.body = self.body[:limit], self.body[limit:]
-            return value
+    response.read1 = read_response
 
     class Connection:
         def __init__(self, host, addresses, **kwargs):
@@ -160,11 +286,12 @@ def test_http_action_connects_to_the_validated_address(monkeypatch, slow_body):
 
         @staticmethod
         def getresponse():
-            return Response()
+            return response
 
         @staticmethod
         def close():
-            return None
+            captured["closed"] = True
+            response.close()
 
     monkeypatch.setattr(
         http_request,
@@ -172,17 +299,124 @@ def test_http_action_connects_to_the_validated_address(monkeypatch, slow_body):
         lambda url: (urlparse(url), ("203.0.113.10",)),
     )
     monkeypatch.setattr(http_request, "_PinnedHTTPConnection", Connection)
+    monkeypatch.setattr(http_request, "_PinnedHTTPSConnection", Connection)
 
-    if slow_body:
-        with pytest.raises(RuntimeError, match="总时限"):
-            http_request.run({}, {"url": "http://example.test/path?q=1"})
-        return
-    result = http_request.run({}, {"url": "http://example.test/path?q=1"})
-
-    assert result == {"status": 200, "body": "done", "truncated": False}
+    params = {"url": f"{scheme}://example.test/path;version=2?q=1#fragment", "method": method}
+    if outcome not in (None, "truncated"):
+        expected_error = ActionCancelled if outcome == "已取消" else RuntimeError
+        with pytest.raises(expected_error, match=outcome):
+            http_request.run_with_context({}, params, context)
+    else:
+        result = http_request.run_with_context({}, params, context)
+        assert result == {"status": status, "body": expected, "truncated": outcome == "truncated"}
     assert captured["host"] == "example.test"
     assert captured["addresses"] == ("203.0.113.10",)
-    assert captured["request"][:2] == ("GET", "/path?q=1")
+    assert captured["request"][:2] == (method, "/path;version=2?q=1")
+    assert captured["closed"]
+
+
+@pytest.mark.parametrize("module", [http_request, download_file], ids=["http_request", "download_file"])
+@pytest.mark.parametrize("interruption", ["cancel", "deadline"])
+def test_https_actions_interrupt_blocked_handshake(monkeypatch, module, interruption):
+    cancelled = Event()
+    interrupted = Event()
+    clock = [0.0]
+
+    class RawSocket:
+        detached = False
+        closed = False
+
+        def shutdown(self, how):
+            if self.detached:
+                raise OSError("socket 已转交 TLS")
+            interrupted.set()
+
+        def close(self):
+            self.closed = True
+
+    class TLSSocket:
+        closed = False
+
+        def do_handshake(self):
+            if interruption == "cancel":
+                cancelled.set()
+            else:
+                clock[0] = 31
+            if not interrupted.wait(0.5):
+                pytest.fail("取消线程未中断 TLS 握手")
+            raise OSError("TLS 握手已中断")
+
+        def shutdown(self, how):
+            interrupted.set()
+
+        def sendall(self, data):
+            pytest.fail("中断握手后仍发送 HTTP 请求")
+
+        def close(self):
+            self.closed = True
+
+    raw = RawSocket()
+    tls = TLSSocket()
+
+    class TLSContext:
+        def wrap_socket(self, sock, *, server_hostname, do_handshake_on_connect=True):
+            assert sock is raw and server_hostname == "example.test"
+            raw.detached = True
+            if do_handshake_on_connect:
+                try:
+                    tls.do_handshake()
+                except BaseException:
+                    tls.close()
+                    raise
+            return tls
+
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    connector = "_open_pinned_socket" if module is http_request else "_connect"
+    monkeypatch.setattr(module, connector, lambda *args: raw)
+    monkeypatch.setattr(module.ssl, "create_default_context", TLSContext)
+    monkeypatch.setattr(module, "resolve_public_http_url", lambda url: (urlparse(url), ("203.0.113.10",)))
+    params = {"url": "https://example.test/file", "timeout_seconds": 30}
+    if module is download_file:
+        destination = SimpleNamespace(
+            parent=SimpleNamespace(is_dir=lambda: True),
+            is_symlink=lambda: False, is_dir=lambda: False, exists=lambda: True,
+        )
+        path = SimpleNamespace(expanduser=lambda: SimpleNamespace(absolute=lambda: destination))
+        monkeypatch.setattr(module, "Path", lambda value: path)
+        monkeypatch.setattr(module.tempfile, "NamedTemporaryFile", lambda **kwargs: pytest.fail("中断握手后仍创建下载文件"))
+        params.update(file_path="existing.txt", overwrite=True)
+    context = {"runtime": {"cancellation": ActionCancellation(run_event=cancelled)}}
+    expected = ActionCancelled if interruption == "cancel" else RuntimeError
+    with pytest.raises(expected, match="已取消" if interruption == "cancel" else "总时限"):
+        module.run_with_context({}, params, context)
+    assert interrupted.is_set()
+    assert raw.closed and tls.closed
+
+
+@pytest.mark.parametrize("module", [http_request, download_file], ids=["http_request", "download_file"])
+def test_network_actions_stop_after_dns_cancellation(tmp_path, monkeypatch, module):
+    cancelled = Event()
+    destination = tmp_path / "download.txt"
+    destination.write_bytes(b"original")
+
+    def resolve(url):
+        cancelled.set()
+        return urlparse(url), ("203.0.113.10",)
+
+    def open_connection(*args, **kwargs):
+        pytest.fail("收到取消信号后仍开始连接")
+
+    monkeypatch.setattr(module, "resolve_public_http_url", resolve)
+    connection_name = "_PinnedHTTPConnection" if module is http_request else "_HTTPConnection"
+    monkeypatch.setattr(module, connection_name, open_connection)
+    context = {"runtime": {"cancellation": ActionCancellation(run_event=cancelled)}}
+    with pytest.raises(ActionCancelled):
+        module.run_with_context({}, {
+            "url": "http://example.test/download", "method": "POST", "body": "data",
+            "file_path": str(destination), "overwrite": True,
+        }, context)
+    assert destination.read_bytes() == b"original"
+    assert list(tmp_path.iterdir()) == [destination]
 
 
 def test_pinned_socket_never_resolves_the_hostname_again(monkeypatch):
@@ -234,26 +468,28 @@ def test_linux_shortcut_rejects_multiline_fields(monkeypatch):
         )
 
 
-def test_linux_shortcut_quotes_exec_tokens(tmp_path, monkeypatch):
+@pytest.mark.parametrize("prefix,escaped_prefix", [("", ""), (" ", r"\s"), ("\t", r"\t")])
+def test_linux_shortcut_quotes_exec_tokens(tmp_path, monkeypatch, prefix, escaped_prefix):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     monkeypatch.setattr(create_shortcut.sys, "platform", "linux")
     result = create_shortcut.run(
         {},
         {
             "name": "safe",
-            "target_path": "/opt/My Tool/tool",
-            "arguments": "--label 'two words' --dollar '$HOME' --slash '\\part'",
+            "target_path": " ./My Tool/tool\u3000",
+            "arguments": "--label 'two words' --dollar '$HOME' --slash '\\part' --tab 'a\tb'",
             "location": "start_menu",
-            "working_directory": "/tmp/work\\folder",
-            "icon_path": "/tmp/icon.png",
+            "working_directory": prefix + "/tmp/work\\folder ",
+            "icon_path": prefix + "/tmp/icon.png ",
         },
     )
     content = Path(result["shortcut_path"]).read_text(encoding="utf-8")
-    assert "Path=/tmp/work\\\\folder\n" in content
-    assert "Icon=/tmp/icon.png\n" in content
-    assert 'Exec="/opt/My Tool/tool" "--label" "two words"' in content
+    assert f"Path={escaped_prefix}/tmp/work\\\\folder\\s\n" in content
+    assert f"Icon={escaped_prefix}/tmp/icon.png\\s\n" in content
+    assert 'Exec=" ./My Tool/tool\u3000" "--label" "two words"' in content
     assert '"\\\\$HOME"' in content
     assert '"\\\\\\\\part"' in content
+    assert r'"a\tb"' in content
 
 
 def test_launch_program_rejects_unbalanced_quotes():
@@ -261,12 +497,27 @@ def test_launch_program_rejects_unbalanced_quotes():
         launch_program.run({}, {"path": "tool", "args": '"unfinished'})
 
 
-@pytest.mark.skipif(launch_program.sys.platform != "win32", reason="仅 Windows 参数规则")
-def test_launch_program_preserves_windows_path_backslashes(monkeypatch):
+@pytest.mark.parametrize("platform", [
+    "linux",
+    pytest.param("win32", marks=pytest.mark.skipif(os.name != "nt", reason="Windows 参数解析需要原生接口")),
+])
+@pytest.mark.parametrize("path,directory", [
+    ("tool", ""), (" tool", " work"), ("./tool ", "./work "), (" tools/tool", " work/space "),
+])
+def test_launch_program_preserves_paths_and_platform_arguments(monkeypatch, platform, path, directory):
     started = []
-    monkeypatch.setattr(launch_program.subprocess, "Popen", lambda args, **kwargs: started.append(args))
-    launch_program.run({}, {"path": "tool", "args": r'--config C:\Temp\a.txt --label "two words"'})
-    assert started == [["tool", "--config", r"C:\Temp\a.txt", "--label", "two words"]]
+    monkeypatch.setattr(launch_program.sys, "platform", platform)
+    monkeypatch.setattr(launch_program.subprocess, "Popen", lambda args, **kwargs: started.append((args, kwargs)))
+    if platform == "win32":
+        arguments = r'--config C:\Temp\a.txt --label "two words" --empty ""'
+        expected = [path, "--config", r"C:\Temp\a.txt", "--label", "two words", "--empty", ""]
+    else:
+        arguments = '--config "/tmp/a b.txt" --label "two words" --empty ""'
+        expected = [path, "--config", "/tmp/a b.txt", "--label", "two words", "--empty", ""]
+    launch_program.run({}, {"path": path, "args": arguments, "working_directory": directory})
+    assert len(started) == 1
+    assert started[0][0] == expected
+    assert started[0][1]["cwd"] == (directory or None)
 
 
 def test_kill_process_rejects_critical_windows_process(monkeypatch):

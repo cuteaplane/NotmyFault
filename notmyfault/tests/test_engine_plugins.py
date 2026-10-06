@@ -172,6 +172,92 @@ class TestLoadPlugins:
         assert (loaded, failed) == (0, 1)
         assert any("JSON 解析失败" in msg for _, _, msg in errors)
 
+    def test_missing_entrypoint_is_recorded(self, tmp_path):
+        # 平台适用但入口文件不在：以前是静默跳过，用户看不到插件为什么用不了
+        loader, registry, errors, _ = make_loader(tmp_path)
+        folder = tmp_path / "actions" / "no_code"
+        folder.mkdir(parents=True)
+        (folder / "action.json").write_text(json.dumps(make_meta()), encoding="utf-8")
+
+        loaded, failed, _, _ = load_actions(loader, tmp_path)
+        assert (loaded, failed) == (0, 1)
+        assert any("当前平台入口不存在" in msg for _, _, msg in errors)
+
+    def test_diagnostics_returns_every_retained_plugin_error(self):
+        engine = make_engine()
+        for index in range(25):
+            engine._diag_obj.record_plugin_error("Action", f"p{index}", "boom")
+
+        plugins = engine.get_diagnostics()["plugins"]
+        assert plugins["error_count"] == 25
+        assert len(plugins["errors"]) == 25
+
+    @pytest.mark.parametrize("mode", list(SecurityMode))
+    @pytest.mark.parametrize("kind,execution_mode", [("action", "in-process"), ("action", "isolated"), ("trigger", "in-process")])
+    @pytest.mark.parametrize("retained_errors", [0, 200])
+    @pytest.mark.parametrize("command_ready", [False, True])
+    def test_plugin_load_check_requires_registered_commands(
+        self, tmp_path, monkeypatch, mode, kind, execution_mode, retained_errors, command_ready
+    ):
+        from notmyfault.extensions.session import ExtensionContext, ExtensionSession
+
+        monkeypatch.setattr("notmyfault.core.engine._detect_security_mode", lambda: mode)
+        engine = make_engine()
+        plugin_id = "with_command"
+        meta = make_meta(plugin_id, contributes={"commands": [{
+            "id": "perform", "title": "执行", "handler": "command.py:perform",
+        }]})
+        if kind == "trigger":
+            meta["trigger_api"] = "event-v2"
+        else:
+            meta["execution_mode"] = execution_mode
+        source = CLEAN_RUN if kind == "action" else (
+            "def run(meta, config, emit, stop_event):\n    pass\n"
+        )
+        root = tmp_path / (kind + "s")
+        folder = write_plugin(
+            root, plugin_id, meta, source,
+            json_name=f"{kind}.json", py_name=f"{kind}.py",
+        )
+        command_file = folder / "command.py"
+        command_source = "def perform(context, payload):\n    return payload\n"
+        command_file.write_text(command_source if command_ready else "x = 1\n", encoding="utf-8")
+        sign_with_test_key(folder, monkeypatch)
+
+        def invoke(value):
+            session = ExtensionSession(
+                plugin_id=plugin_id, command_id="perform", plugin_meta=meta,
+                source_kind="parameter_editors", source_id="editor",
+                allowed_commands=("perform",), data_type=None, current_value=None,
+                value_type="object",
+            )
+            try:
+                return session.invoke(
+                    engine.extensions.handler(plugin_id, "perform"),
+                    ExtensionContext(session, engine.extensions), {"value": value},
+                )
+            finally:
+                session.close()
+
+        try:
+            assert engine._plugin_loader.load(str(root), kind) == (1, 0)
+            for index in range(retained_errors):
+                previous_id = plugin_id if index == 0 else f"other_{index}"
+                engine._diag_obj.record_plugin_error("plugin", previous_id, "old error")
+            assert engine.check_plugin_load(kind, plugin_id, str(folder)) is command_ready
+            assert engine.check_plugin_load(kind, plugin_id, str(folder)) is command_ready
+            if command_ready:
+                assert invoke(1) == {"value": 1}
+            else:
+                assert engine.extensions.handler(plugin_id, "perform") is None
+                command_file.write_text(command_source, encoding="utf-8")
+                sign_with_test_key(folder, monkeypatch)
+                assert engine._plugin_loader.load(str(root), kind) == (1, 0)
+                assert engine.check_plugin_load(kind, plugin_id, str(folder)) is True
+                assert invoke(2) == {"value": 2}
+        finally:
+            engine.shutdown()
+
     def test_schema_validation_failure(self, tmp_path):
         loader, registry, errors, _ = make_loader(tmp_path)
         meta = make_meta()
@@ -303,6 +389,94 @@ class TestLoadPlugins:
         assert (loaded, failed) == (1, 0)
         assert sudo.calls == [("authorize", "adminp"), ("deauthorize", "adminp")]
         assert meta_store["adminp"]["origin"] == "user"
+
+    @pytest.mark.parametrize("mode", list(SecurityMode))
+    @pytest.mark.parametrize(
+        "old_mode,new_mode,valid",
+        [
+            ("isolated", "isolated", True),
+            ("isolated", "in-process", True),
+            ("in-process", "isolated", True),
+            ("in-process", "in-process", True),
+            ("isolated", "in-process", False),
+            ("in-process", "in-process", False),
+        ],
+    )
+    def test_replace_materialized_action(
+        self, tmp_path, monkeypatch, mode, old_mode, new_mode, valid
+    ):
+        from notmyfault.extensions.session import ExtensionContext, ExtensionSession
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        from notmyfault.security import signing, signing_keys
+
+        key = ed25519.Ed25519PrivateKey.generate()
+        public_bytes = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [public_bytes])
+        loader, registry, errors, _sudo = make_loader(tmp_path, mode=mode)
+        source = "from helper import value\ndef run(meta, params): return value\n"
+        contributes = {"commands": [{"id": "value", "title": "读取", "handler": "command.py:read_value"}]}
+        command_source = "from helper import value\ndef read_value(context, payload): return context.result(value)\n"
+        old_folder = write_plugin(
+            tmp_path / "builtin" / "actions", "plug_a",
+            make_meta(execution_mode=old_mode, contributes=contributes), source,
+        )
+        (old_folder / "command.py").write_text(command_source, encoding="utf-8")
+        (old_folder / "helper.py").write_text("value = 1\n", encoding="utf-8")
+        (old_folder / "version.txt").write_text("1", encoding="utf-8")
+        signing.sign_plugin(old_folder, "action.json", private_key=key)
+
+        try:
+            assert load_actions(loader, tmp_path / "builtin")[:2] == (1, 0)
+            old_run = registry.resolve_action("plug_a")
+            assert old_run(registry.actions_meta["plug_a"], {}) == 1
+            old_meta = registry.actions_meta["plug_a"]
+
+            new_folder = write_plugin(
+                tmp_path / "user" / "actions", "plug_a",
+                make_meta(execution_mode=new_mode, version_code=2, version="2.0", contributes=contributes),
+                source if valid else "from helper import value\n",
+            )
+            (new_folder / "helper.py").write_text("value = 2\n", encoding="utf-8")
+            (new_folder / "command.py").write_text(command_source, encoding="utf-8")
+            (new_folder / "version.txt").write_text("2", encoding="utf-8")
+            signing.sign_plugin(new_folder, "action.json", private_key=key)
+
+            loaded, failed, meta_store, _func_store = load_actions(
+                loader, tmp_path / "user", origin="user"
+            )
+            run = registry.resolve_action("plug_a")
+            if valid:
+                assert (loaded, failed) == (1, 0)
+                assert run is not old_run
+                assert run(meta_store["plug_a"], {}) == 2
+                assert meta_store["plug_a"]["version_code"] == 2
+                assert meta_store["plug_a"]["origin"] == "user"
+                assert Path(registry.resource("plug_a", "version.txt")).read_text() == "2"
+                assert errors == []
+            else:
+                assert (loaded, failed) == (0, 1)
+                assert run is old_run
+                assert meta_store["plug_a"] is old_meta
+                assert run(meta_store["plug_a"], {}) == 1
+                assert Path(registry.resource("plug_a", "version.txt")).read_text() == "1"
+                assert any("缺少 run() 函数" in msg for _, _, msg in errors)
+            session = ExtensionSession(
+                plugin_id="plug_a", command_id="value", plugin_meta=meta_store["plug_a"],
+                source_kind="parameter_editors", source_id="editor",
+                allowed_commands=("value",), data_type=None, current_value=None, value_type="int",
+            )
+            try:
+                result = session.invoke(
+                    registry.extensions.handler("plug_a", "value"),
+                    ExtensionContext(session, registry.extensions), {},
+                )
+                assert result["data"] == (2 if valid else 1)
+            finally:
+                session.close()
+            assert "plug_a" not in registry.pending
+        finally:
+            registry.clear()
 
 
 class TestSecurityScanIntegration:

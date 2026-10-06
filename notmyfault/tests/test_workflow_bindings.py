@@ -433,6 +433,60 @@ def test_constant_dependencies_are_checked_before_run_initialization():
         initialize_variables(rule, {})
 
 
+@pytest.mark.parametrize("kind,plugin_id,parameter", [
+    ("triggers", "battery_level", "threshold"),
+    ("triggers", "system_resource", "threshold"),
+    ("actions", "text_to_speech", "rate"),
+    ("actions", "text_to_speech", "volume"),
+])
+@pytest.mark.parametrize("value", [True, False, "0.5", None, [], {}, 0, 0.5])
+def test_builtin_numeric_parameters_validate_resolved_constants(kind, plugin_id, parameter, value):
+    from notmyfault.core.runtime_rules import prepare_rules
+    from notmyfault.core.workflow import invoke_action
+
+    folder = Path(__file__).resolve().parents[1] / kind / plugin_id
+    filename = "trigger.json" if kind == "triggers" else "action.json"
+    meta = json.loads((folder / filename).read_text(encoding="utf-8"))
+    params = {parameter: _ref("constant", "c_value001", [])}
+    if plugin_id == "system_resource":
+        params["disk_path"] = "."
+    if kind == "actions":
+        params["text"] = "播报内容"
+    rule = {
+        "name": "数字参数",
+        "rule_id": "r_numeric1",
+        "constants": [{"id": "c_value001", "name": "参数值", "value_type": "any", "value": value}],
+        "condition": {"type": plugin_id if kind == "triggers" else "signal", "params": params if kind == "triggers" else {}},
+        "actions": [{"type": plugin_id if kind == "actions" else "noop", "params": params if kind == "actions" else {}}],
+    }
+    valid = not isinstance(value, bool) and isinstance(value, (int, float))
+    prepared = prepare_rules(
+        [rule], {plugin_id: meta} if kind == "triggers" else {"signal": {"params": []}},
+        {plugin_id: meta} if kind == "actions" else {"noop": {"params": []}},
+    )
+    if kind == "triggers":
+        assert len(prepared) == int(valid), prepared.issues
+        if valid:
+            actual = prepared.trigger_params[plugin_id][0][parameter]
+            assert actual == value and type(actual) is type(value)
+        else:
+            assert any(parameter in issue for _name, issue in prepared.issues)
+        return
+    assert len(prepared) == 1, prepared.issues
+    context = build_context(rule["name"], "signal", {}, [])
+    prepared.prepare_context(prepared.rules[0], context)
+    resolved = resolve_value(params, context)
+    calls = []
+    if valid:
+        invoke_action(lambda info, actual: calls.append(actual), None, meta, resolved, context)
+        assert len(calls) == 1
+        assert calls[0][parameter] == value and type(calls[0][parameter]) is type(value)
+    else:
+        with pytest.raises(DataTypeError, match=parameter):
+            invoke_action(lambda info, actual: calls.append(actual), None, meta, resolved, context)
+        assert calls == []
+
+
 def test_typed_nested_bindings_conversion_and_optional_policy_are_checked_on_save():
     actions_meta = {
         "source": {"outputs": [{"name": "rows", "type": "array", "value_type": {"type": "array", "items": {"type": "object", "properties": {"count": "int"}, "required": ["count"], "additional_properties": False}}}]},

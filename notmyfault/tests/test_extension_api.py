@@ -154,6 +154,24 @@ def make_client(tmp_path, engine=None):
     return env.client, env.headers
 
 
+def make_isolated_engine(tmp_path, meta, source, request):
+    from notmyfault.tests.api_support import create_test_engine
+
+    root = tmp_path / "plugins"
+    folder = root / meta["id"]
+    folder.mkdir(parents=True)
+    meta = {**meta, "execution_mode": "isolated"}
+    (folder / "action.json").write_text(json.dumps(meta), encoding="utf-8")
+    (folder / "action.py").write_text("def run(meta, params):\n    pass\n", encoding="utf-8")
+    (folder / "extension.py").write_text(source, encoding="utf-8")
+    (folder / "editor.html").write_text("<h1>插件页面</h1>", encoding="utf-8")
+    engine = create_test_engine({})
+    request.addfinalizer(engine.shutdown)
+    engine._plugin_loader._security_mode = SecurityMode.PERMISSIVE
+    assert engine._plugin_loader.load(str(root), "action") == (1, 0)
+    return engine
+
+
 def test_owned_value_round_trip_and_owner_check():
     value = make_owned_value(
         "com.example.sample", "document", 2, {"text": "你好"}, "文档 · 2 字"
@@ -227,25 +245,47 @@ def test_public_registry_does_not_expose_handler_path(tmp_path):
     assert command["loaded"] is False
 
 
-def test_action_extension_commands_follow_lazy_loading(tmp_path):
+@pytest.mark.parametrize("execution_mode", ["in-process", "isolated"])
+@pytest.mark.parametrize("mode", list(SecurityMode))
+@pytest.mark.parametrize("command_file", ["extension.py", "action.py"])
+def test_action_extension_commands_follow_lazy_loading(tmp_path, monkeypatch, execution_mode, mode, command_file):
+    import os
+    from decimal import Decimal
+    from notmyfault.extensions.session import ExtensionContext, ExtensionSession
+    from notmyfault.tests.test_engine_plugins import sign_with_test_key
+
     plugin_root = tmp_path / "actions" / "sample"
     plugin_root.mkdir(parents=True)
+    meta = extension_meta()
+    meta["execution_mode"] = execution_mode
+    for command in meta["contributes"]["commands"]:
+        command["handler"] = command["handler"].replace("extension.py", command_file)
     (plugin_root / "action.json").write_text(
-        json.dumps(extension_meta(), ensure_ascii=False), encoding="utf-8"
+        json.dumps(meta, ensure_ascii=False), encoding="utf-8"
     )
-    (plugin_root / "action.py").write_text(
-        "def run(meta, params):\n    return {'ok': True}\n", encoding="utf-8"
-    )
-    (plugin_root / "extension.py").write_text(
+    cleanup_file = tmp_path / "cleaned.txt"
+    source = (
+        "import os\nimport threading\nfrom pathlib import Path\n"
         "def open_editor(context, payload):\n"
-        "    return context.open_view('editor', {})\n"
+        "    context.session.data['event'] = threading.Event()\n"
+        "    context.session.data['text'] = payload['text']\n"
+        f"    context.register_cleanup(lambda: Path({str(cleanup_file)!r}).write_text('closed'))\n"
+        "    context.session.set_status('编辑中')\n"
+        "    return context.open_view('editor', {'pid': os.getpid(), 'value': context.current_value})\n"
         "def save(context, payload):\n"
-        "    return context.result(payload)\n"
+        "    assert not context.session.data['event'].is_set()\n"
+        "    return context.commit({'text': context.session.data['text'] + payload['text'], 'values': payload['values']}, '文档')\n"
         "def hidden(context, payload):\n"
-        "    return context.result(payload)\n",
-        encoding="utf-8",
+        "    return context.result(payload)\n"
     )
+    run_source = "def run(meta, params):\n    return {'ok': True}\n"
+    (plugin_root / "action.py").write_text(
+        run_source + (source if command_file == "action.py" else ""), encoding="utf-8"
+    )
+    if command_file != "action.py":
+        (plugin_root / command_file).write_text(source, encoding="utf-8")
     (plugin_root / "editor.html").write_text("<h1>编辑器</h1>", encoding="utf-8")
+    sign_with_test_key(plugin_root, monkeypatch)
     registry = PluginRegistry()
     diagnostics = SimpleNamespace(record_plugin_error=lambda *args: None)
     sudo = SimpleNamespace(
@@ -256,21 +296,80 @@ def test_action_extension_commands_follow_lazy_loading(tmp_path):
         registry=registry,
         config={},
         diagnostics=diagnostics,
-        security_mode=SecurityMode.PERMISSIVE,
+        security_mode=mode,
         sudo=sudo,
         engine_token="token",
         integrity_errors=[],
         plugin_manifest_path=str(tmp_path / "manifest.json"),
     )
-    loaded, failed = loader.load(str(tmp_path / "actions"), "action", origin="builtin")
-    assert (loaded, failed) == (1, 0)
-    assert registry.extensions.handler("sample", "open") is None
-    assert registry.resolve_action("sample") is not None
-    assert callable(registry.extensions.handler("sample", "open"))
+    sessions = []
+    try:
+        loaded, failed = loader.load(str(tmp_path / "actions"), "action", origin="builtin")
+        assert (loaded, failed) == (1, 0)
+        assert registry.extensions.handler("sample", "open") is None
+        run = registry.resolve_action("sample")
+        assert run is not None
+        if execution_mode == "isolated":
+            run.check_load()
+            assert registry.get_module("sample") is None
+            assert "sample" not in registry.importers
+        assert callable(registry.extensions.handler("sample", "open"))
+        for text in ("第一", "第二"):
+            session = ExtensionSession(
+                plugin_id="sample", command_id="open", plugin_meta=meta,
+                source_kind="parameter_editors", source_id="document_editor",
+                allowed_commands=("open", "save"), data_type=meta["contributes"]["data_types"][0],
+                current_value={"text": "原文"},
+            )
+            sessions.append(session)
+            context = ExtensionContext(session, registry.extensions)
+            opened = session.invoke(registry.extensions.handler("sample", "open"), context, {"text": text})
+            assert opened["view"] == "editor"
+            assert opened["state"]["value"] == {"text": "原文"}
+            assert (opened["state"]["pid"] == os.getpid()) is (execution_mode == "in-process")
+            assert session.status == "编辑中"
+        for session, text in zip(sessions, ("第一", "第二")):
+            context = ExtensionContext(session, registry.extensions)
+            values = {"count": 2**100 + 1, "amount": Decimal("1.00000000000000001"), "data": b"\x00\xff"}
+            saved = session.invoke(registry.extensions.handler("sample", "save"), context, {"text": "份", "values": values})
+            assert saved["value"]["data"] == {"text": text + "份", "values": values}
+            assert saved["value"]["$type"] == "com.example.sample/document@2"
+            assert session.current_value == {"text": text + "份", "values": values}
+            session.close()
+            assert cleanup_file.read_text() == "closed"
+            cleanup_file.unlink()
+        if execution_mode == "isolated":
+            session = ExtensionSession(
+                plugin_id="sample", command_id="open", plugin_meta=meta,
+                source_kind="parameter_editors", source_id="document_editor",
+                allowed_commands=("open", "save"), data_type=meta["contributes"]["data_types"][0],
+                current_value=None,
+            )
+            sessions.append(session)
+            context = ExtensionContext(session, registry.extensions)
+            session.invoke(registry.extensions.handler("sample", "open"), context, {"text": "第三"})
+            (plugin_root / command_file).write_text(source + "\nx = 1\n", encoding="utf-8")
+            with pytest.raises(RuntimeError, match="完整性校验失败"):
+                session.invoke(registry.extensions.handler("sample", "save"), context, {"text": "份"})
+            assert cleanup_file.read_text() == "closed"
+    finally:
+        for session in sessions:
+            session.close()
+        registry.clear()
 
 
-def test_extension_command_session_and_private_value(tmp_path):
-    client, headers = make_client(tmp_path)
+@pytest.mark.parametrize("isolated", [False, True])
+def test_extension_command_session_and_private_value(tmp_path, isolated, request):
+    engine = make_isolated_engine(tmp_path, extension_meta(), (
+        "def open_editor(context, payload):\n"
+        "    context.session.data['opened'] = True\n"
+        "    return context.open_view('editor', {'text': 'old'})\n"
+        "def save(context, payload):\n"
+        "    assert context.session.data['opened']\n"
+        "    return context.commit({'text': payload['text']}, '文档')\n"
+        "def hidden(context, payload):\n    return context.result({})\n"
+    ), request) if isolated else ExtensionEngine(tmp_path)
+    client, headers = make_client(tmp_path, engine)
     opened = client.post(
         "/api/plugins/sample/extensions/commands/open/invoke",
         headers=headers,
@@ -311,8 +410,14 @@ def test_extension_command_session_and_private_value(tmp_path):
     assert expired.status_code == 404
 
 
-def test_extension_command_commits_native_value(tmp_path):
-    client, headers = make_client(tmp_path, NativeEditorEngine(tmp_path))
+@pytest.mark.parametrize("isolated", [False, True])
+def test_extension_command_commits_native_value(tmp_path, isolated, request):
+    engine = make_isolated_engine(tmp_path, native_editor_meta(), (
+        "def capture(context, payload):\n"
+        "    assert context.current_value == 'Ctrl+A'\n"
+        "    return context.commit_value('Ctrl+Shift+K')\n"
+    ), request) if isolated else NativeEditorEngine(tmp_path)
+    client, headers = make_client(tmp_path, engine)
     response = client.post(
         "/api/plugins/native_sample/extensions/commands/capture/invoke",
         headers=headers,
@@ -413,9 +518,22 @@ def test_extension_view_rejects_page_outside_plugin_root(tmp_path):
 
 
 @pytest.mark.parametrize("result_kind", ["exception", "json", "size", "error"])
-def test_extension_exception_is_logged_but_not_returned(tmp_path, result_kind):
-    engine = ExtensionEngine(tmp_path)
+@pytest.mark.parametrize("isolated", [False, True])
+def test_extension_exception_is_logged_but_not_returned(tmp_path, result_kind, isolated, request):
     cleaned = []
+    cleanup_file = tmp_path / "cleaned.txt"
+    engine = make_isolated_engine(tmp_path, extension_meta(), (
+        "from pathlib import Path\n"
+        "def open_editor(context, payload):\n"
+        f"    context.register_cleanup(lambda: Path({str(cleanup_file)!r}).write_text('closed'))\n"
+        "    kind = payload['kind']\n"
+        "    if kind == 'exception':\n        raise RuntimeError('unit-test-secret-extension-detail')\n"
+        "    if kind == 'json':\n        return {'data': object()}\n"
+        "    if kind == 'size':\n        return {'data': 'x' * (1024 * 1024 + 1)}\n"
+        "    return context.error('操作失败')\n"
+        "def save(context, payload):\n    pass\n"
+        "def hidden(context, payload):\n    pass\n"
+    ), request) if isolated else ExtensionEngine(tmp_path)
 
     def fail(_context, _payload):
         _context.register_cleanup(lambda: cleaned.append(True))
@@ -427,7 +545,8 @@ def test_extension_exception_is_logged_but_not_returned(tmp_path, result_kind):
             return {"data": "x" * (1024 * 1024 + 1)}
         return {"ok": False, "error": "操作失败"}
 
-    engine.extensions.register_command("sample", "open", fail, engine)
+    if not isolated:
+        engine.extensions.register_command("sample", "open", fail, engine)
     client, headers = make_client(tmp_path, engine)
     response = client.post(
         "/api/plugins/sample/extensions/commands/open/invoke",
@@ -435,14 +554,17 @@ def test_extension_exception_is_logged_but_not_returned(tmp_path, result_kind):
         json={
             "source_kind": "parameter_editors",
             "source_id": "document_editor",
-            "payload": {},
+            "payload": {"kind": result_kind},
         },
     )
 
     assert response.status_code == (413 if result_kind == "size" else 400)
     assert response.json()["ok"] is False
     assert "unit-test-secret-extension-detail" not in response.text
-    assert cleaned == [True]
+    if isolated:
+        assert cleanup_file.read_text() == "closed"
+    else:
+        assert cleaned == [True]
 
 
 def test_extension_session_manager_drop_all_runs_cleanup():
@@ -486,7 +608,11 @@ def test_extension_session_manager_expires_without_new_lookup():
     assert cleaned == [True]
 
 
-def test_extension_session_can_close_while_handler_is_running():
+@pytest.mark.parametrize("isolated,close_engine", [(False, False), (True, False), (True, True)])
+def test_extension_session_can_close_while_handler_is_running(tmp_path, isolated, close_engine, request):
+    from notmyfault.extensions.session import ExtensionContext
+    from notmyfault.core import plugin_worker
+
     manager = ExtensionSessionManager()
     session = manager.create(
         plugin_id="sample",
@@ -500,24 +626,56 @@ def test_extension_session_can_close_while_handler_is_running():
     )
     started = threading.Event()
     cancelled = threading.Event()
-    session.add_cleanup(cancelled.set)
+    cleanup_file = tmp_path / "cleaned.txt"
+    if isolated:
+        engine = make_isolated_engine(tmp_path, extension_meta(), (
+            "import threading\nfrom pathlib import Path\n"
+            "def open_editor(context, payload):\n"
+            "    cancelled = threading.Event()\n"
+            "    context.register_cleanup(cancelled.set)\n"
+            f"    context.register_cleanup(lambda: Path({str(cleanup_file)!r}).write_text('closed'))\n"
+            "    context.session.set_status('started')\n"
+            "    assert cancelled.wait(10)\n"
+            "    return context.result({})\n"
+            "def save(context, payload):\n    pass\n"
+            "def hidden(context, payload):\n    pass\n"
+        ), request)
+        set_status = session.set_status
 
-    def handler(context, payload):
-        started.set()
-        cancelled.wait(timeout=2)
+        def signal_started(text):
+            set_status(text)
+            started.set()
+
+        session.set_status = signal_started
+        handler = engine.extension_handler("sample", "open")
+        context = ExtensionContext(session, engine.extensions)
+    else:
+        session.add_cleanup(cancelled.set)
+
+        def handler(context, payload):
+            started.set()
+            cancelled.wait(timeout=2)
+
+        context = object()
 
     invoke_thread = threading.Thread(
         target=session.invoke,
-        args=(handler, object(), None),
+        args=(handler, context, None),
     )
     invoke_thread.start()
-    assert started.wait(timeout=1)
+    assert started.wait(timeout=5)
 
-    drop_thread = threading.Thread(target=manager.drop, args=(session.session_id,))
+    drop_thread = threading.Thread(target=engine.shutdown) if close_engine else threading.Thread(
+        target=manager.drop, args=(session.session_id,),
+    )
     drop_thread.start()
     drop_thread.join(timeout=1)
     invoke_thread.join(timeout=1)
 
     assert not drop_thread.is_alive()
     assert not invoke_thread.is_alive()
-    assert cancelled.is_set()
+    if isolated:
+        assert cleanup_file.read_text() == "closed"
+        assert not plugin_worker._live_extension_workers
+    else:
+        assert cancelled.is_set()

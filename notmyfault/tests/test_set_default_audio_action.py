@@ -1,7 +1,9 @@
-"""set_default_audio 动作的参数与 Linux 平台服务测试。"""
+"""set_default_audio 动作的参数、默认设备设置与回读。"""
 
 import importlib.util
 import json
+import sys
+from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -135,3 +137,46 @@ def test_linux_rejects_when_readback_mismatches(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="回读为"):
         module.run({}, {"device_type": "render", "device": "41"})
+
+
+@pytest.mark.parametrize("device_type", ["render", "capture"])
+@pytest.mark.parametrize("initial_mask,failed_role", [(7, None), *product(range(7), (None, 0, 1, 2))])
+def test_windows_sets_and_verifies_every_default_device_role(monkeypatch, device_type, initial_mask, failed_role):
+    module = load_module()
+    defaults = {role: "target" if initial_mask & (1 << role) else "old" for role in (0, 1, 2)}
+    previous = defaults[0]
+    calls, queries, initialized = [], [], []
+
+    def default_endpoint(flow, role):
+        assert flow == (0 if device_type == "render" else 1)
+        queries.append(role)
+        return SimpleNamespace(GetId=lambda: defaults[role])
+
+    enumerator = SimpleNamespace(GetDefaultAudioEndpoint=default_endpoint)
+    utilities = SimpleNamespace(GetDeviceEnumerator=lambda: enumerator)
+    monkeypatch.setitem(sys.modules, "comtypes", SimpleNamespace(
+        CoInitialize=lambda: initialized.append(True),
+        CoUninitialize=lambda: initialized.pop(), COMError=RuntimeError,
+    ))
+    monkeypatch.setitem(sys.modules, "pycaw.pycaw", SimpleNamespace(AudioUtilities=utilities))
+    monkeypatch.setattr(module.sys, "platform", "win32")
+    monkeypatch.setattr(module, "_resolve_windows_device", lambda flow, target: (target, "目标设备"))
+
+    def set_default(target):
+        calls.append(target)
+        for role in defaults:
+            defaults[role] = "unapplied" if role == failed_role else target
+
+    monkeypatch.setattr(module, "_set_windows_default", set_default)
+    if failed_role is not None:
+        with pytest.raises(RuntimeError, match="回读为"):
+            module.run({}, {"device_type": device_type, "device": "target"})
+    else:
+        result = module.run({}, {"device_type": device_type, "device": "target"})
+        assert result["changed"] is (initial_mask != 7)
+        assert result["device_id"] == "target"
+        assert result["previous_device_id"] == previous
+        assert set(defaults.values()) == {"target"}
+    assert calls == ([] if initial_mask == 7 else ["target"])
+    assert set(queries) == {0, 1, 2}
+    assert initialized == []

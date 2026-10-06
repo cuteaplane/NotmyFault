@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import py7zr
 import pytest
@@ -18,6 +19,22 @@ def normal_plugin_installation_mode(monkeypatch):
     monkeypatch.setattr(
         plugin_installation, "detect_security_mode", lambda: SecurityMode.NORMAL
     )
+
+
+def test_unsupported_platform_package_is_rejected(tmp_path):
+    env = make_api_env(tmp_path)
+    other_platform = "linux" if os.name == "nt" else "windows"
+    archive = build_nmfp(
+        tmp_path, make_meta("actions", platforms=[other_platform]), "actions"
+    )
+
+    preview = post_archive(env, "/api/plugins/preview", archive)
+    assert preview.status_code == 400
+    assert "当前平台" in preview.json()["error"]
+
+    install = post_archive(env, "/api/plugins/install", archive)
+    assert install.status_code == 400
+    assert not (env.paths.user_plugins_dir / "actions" / "demo_actions").exists()
 
 
 def test_safe_nmfp_installs_to_injected_user_plugin_path(tmp_path):
@@ -383,7 +400,107 @@ def test_plugin_list_contract_has_both_kinds(tmp_path):
     env = make_api_env(tmp_path)
     response = env.client.get("/api/plugins/list", headers=env.headers)
     assert response.status_code == 200
-    assert set(response.json()) == {"triggers", "actions"}
+    payload = response.json()
+    assert set(payload) == {"triggers", "actions", "runtime"}
+    runtime = payload["runtime"]
+    assert set(runtime) == {
+        "engine_state",
+        "diagnostics_available",
+        "plugin_errors",
+        "plugin_error_count",
+    }
+    # 没有引擎对象时不能假装加载成功，也不能显示成零错误
+    assert runtime["diagnostics_available"] is False
+    assert runtime["plugin_errors"] == []
+    assert runtime["engine_state"] == "stopped"
+
+
+class _DiagnosticsEngine:
+    """只用于目录接口的会话诊断：返回给定错误或直接抛异常"""
+
+    def __init__(self, errors=None, raises=None):
+        self._errors = errors or []
+        self._raises = raises
+
+    def get_diagnostics(self):
+        if self._raises is not None:
+            raise self._raises
+        return {"plugins": {"errors": self._errors, "error_count": len(self._errors)}}
+
+
+def test_plugin_list_separates_directory_from_session_errors(tmp_path):
+    env = make_api_env(tmp_path)
+    env.runner.engine_state = "running"
+    env.runner.current_engine = _DiagnosticsEngine([
+        ("Action", "notify", "插件加载失败: RuntimeError"),
+        ("Action", "ghost_plugin", "签名无效，拒绝加载"),
+        ("plugin", "weird_plugin", "扩展命令入口缺失"),
+    ])
+    payload = env.client.get("/api/plugins/list", headers=env.headers).json()
+
+    # 目录里有的插件挂上失败原因
+    assert payload["actions"]["notify"]["_error"] == "插件加载失败: RuntimeError"
+    # 目录里没有的记录不合成插件条目
+    assert "ghost_plugin" not in payload["actions"]
+    assert "weird_plugin" not in payload["actions"]
+
+    runtime = payload["runtime"]
+    assert runtime["engine_state"] == "running"
+    assert runtime["diagnostics_available"] is True
+    assert runtime["plugin_error_count"] == 3
+    assert [item["plugin_id"] for item in runtime["plugin_errors"]] == [
+        "notify", "ghost_plugin", "weird_plugin",
+    ]
+    assert runtime["plugin_errors"][2]["store"] == "plugin"
+
+
+def test_plugin_list_does_not_claim_errors_for_shadowed_ids(tmp_path):
+    env = make_api_env(tmp_path)
+    # 用户插件的目录名和声明的 id 不同，诊断里的 notify 是哪一份无从确认
+    shadow = env.paths.user_plugins_dir / "actions" / "user_copy_of_notify"
+    shadow.mkdir(parents=True)
+    (shadow / "action.json").write_text(
+        json.dumps({
+            "id": "notify", "name": "用户版通知", "enabled": True,
+            "platforms": ["windows", "linux"], "permissions": [],
+            "params": [], "outputs": [],
+        }),
+        encoding="utf-8",
+    )
+    env.runner.engine_state = "running"
+    env.runner.current_engine = _DiagnosticsEngine(
+        [("Action", "notify", "插件加载失败: RuntimeError")]
+    )
+
+    payload = env.client.get("/api/plugins/list", headers=env.headers).json()
+
+    assert "_error" not in payload["actions"]["notify"]
+    assert payload["runtime"]["plugin_errors"][0]["plugin_id"] == "notify"
+
+
+def test_plugin_list_reports_diagnostics_read_failure(tmp_path):
+    env = make_api_env(tmp_path)
+    env.runner.current_engine = _DiagnosticsEngine(raises=RuntimeError("boom"))
+    runtime = env.client.get("/api/plugins/list", headers=env.headers).json()["runtime"]
+
+    assert runtime["diagnostics_available"] is False
+    assert runtime["diagnostics_error"] == "RuntimeError"
+    assert runtime["plugin_errors"] == []
+
+
+def test_plugin_list_shows_unreadable_manifest_as_broken(tmp_path):
+    env = make_api_env(tmp_path)
+    plugin = env.paths.user_plugins_dir / "actions" / "broken_json"
+    plugin.mkdir(parents=True)
+    (plugin / "action.json").write_text("{ 不是 JSON", encoding="utf-8")
+
+    listed = env.client.get("/api/plugins/list", headers=env.headers)
+    assert listed.status_code == 200
+    entry = listed.json()["actions"]["broken_json"]
+    # 身份无法确认：只按目录名展示错误，界面不给启禁和卸载
+    assert entry["_unidentified"] is True
+    assert entry["origin"] == "user"
+    assert "JSON 解析失败" in entry["_error"]
 
 
 def test_plugin_list_probes_capabilities_once(monkeypatch, tmp_path):

@@ -160,6 +160,41 @@ class TriggerConfigBindingTests:
 
 
 class V2ConfigValidationTests:
+    @pytest.mark.parametrize("resource", ["cpu", "memory", "disk", "network"])
+    @pytest.mark.parametrize("disk_path", ["omitted", "", " provided\u3000", "\x00", None, 7])
+    def test_system_resource_optional_disk_path(self, monkeypatch, resource, disk_path):
+        from types import SimpleNamespace
+        from notmyfault.core.runtime_rules import prepare_rules
+
+        module = load_trigger_module("system_resource")
+        meta = load_meta("system_resource")
+        params = {"resource": resource}
+        if disk_path != "omitted":
+            params["disk_path"] = disk_path
+        rule = {
+            "name": "资源监控", "rule_id": "r_resource1",
+            "event": {"type": "system_resource", "params": params},
+            "actions": [{"type": "noop", "params": {}}],
+        }
+        prepared = prepare_rules([rule], {"system_resource": meta}, {"noop": {"params": []}})
+        valid = isinstance(disk_path, str) and "\x00" not in disk_path
+        assert len(prepared) == int(valid), prepared.issues
+        if not valid:
+            assert any("disk_path" in issue for _name, issue in prepared.issues)
+            return
+        config = prepared.trigger_params["system_resource"][0]
+        trigger = module.SystemResourceTrigger(meta, config, lambda payload: None, threading.Event())
+        trigger.validate()
+        expected = None if disk_path in ("omitted", "") else disk_path
+        assert trigger.disk_path == expected
+        if resource == "disk":
+            calls = []
+            monkeypatch.setattr(module.psutil, "disk_usage", lambda path: calls.append(path) or SimpleNamespace(percent=95))
+            trigger.setup()
+            trigger.poll()
+            default = module.os.environ.get("SystemDrive", "C:") + module.os.sep if module.os.name == "nt" else "/"
+            assert calls == [expected if expected is not None else default]
+
     def test_invalid_folder_event_type_raises(self):
         module = load_trigger_module("folder_monitor")
         with pytest.raises(ValueError, match="无效的事件类型"):
@@ -334,48 +369,60 @@ class V2MatchingTests:
         )
         assert matched is False
 
-    def test_v1_payload_filtering_still_works(self):
+    @pytest.mark.parametrize("expected,actual,matched", [
+        ("running", "running", True), ("running", "stopped", False),
+        (True, True, True), (False, False, True),
+        (True, 1, False), (False, 0, False),
+        ([True], [1], False), ({"ready": [False]}, {"ready": [0]}, False),
+        ({"ready": [False]}, {"ready": [False]}, True),
+        (1, 1.0, True), (Decimal("1.0"), 1, True), (None, None, True),
+    ])
+    def test_v1_payload_filtering_still_works(self, expected, actual, matched):
         rule = {
             "name": "v1 过滤",
             "condition": {
                 "type": "process_state",
                 "binding_id": "t_proc001",
-                "params": {"process_name": "WeChat.exe", "state": "running"},
+                "params": {"process_name": "WeChat.exe", "state": expected},
             },
             "actions": [],
         }
         runtime = ConditionRuntime()
         assert runtime.match(
             "rule:1", rule, "process_state",
-            {"process_name": "WeChat.exe", "state": "running"},
-        ) is True
+            {"process_name": "WeChat.exe", "state": actual},
+        ) is matched
 
         runtime = ConditionRuntime()
         assert runtime.match(
             "rule:2", rule, "process_state",
-            {"process_name": "WeChat.exe", "state": "stopped"},
+            {"process_name": "Other.exe", "state": actual},
         ) is False
 
         engine = make_engine(rule)
         engine.triggers_meta["process_state"] = {
             "trigger_api": "event-v1",
-            "outputs": [{"name": name, "type": "string"} for name in ("process_name", "state")],
+            "outputs": [
+                {"name": "process_name", "type": "string"},
+                {"name": "state", "value_type": "any"},
+            ],
         }
         dispatched = []
         engine._event_bus._scheduler_submit_fn = lambda *args: dispatched.append(args)
 
         def trigger(meta, configs, emit, stop):
             assert configs == [rule["condition"]["params"]]
-            emit("process_state", {"process_name": "WeChat.exe", "state": "stopped"})
-            emit("process_state", {"process_name": "WeChat.exe", "state": "running"})
+            emit("process_state", {"process_name": "Other.exe", "state": actual})
+            emit("process_state", {"process_name": "WeChat.exe", "state": actual})
             stop.set()
 
         engine._run_trigger(
             "process_state", "process_state", trigger,
             engine.triggers_meta["process_state"], [rule["condition"]["params"]], threading.Event(),
         )
-        assert len(dispatched) == 1
-        assert dispatched[0][3]["event"]["payload"]["state"] == "running"
+        assert len(dispatched) == int(matched)
+        if matched:
+            assert dispatched[0][3]["event"]["payload"]["state"] == actual
 
     def test_v2_and_v1_semantics_coexist_in_one_rule(self):
         rule = {

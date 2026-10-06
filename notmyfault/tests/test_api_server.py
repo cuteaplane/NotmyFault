@@ -311,10 +311,14 @@ def test_rules_transport_preserves_typed_constants_and_literal_objects(tmp_path)
             "constants": [{"id": "c_values01", "name": "数据", "value_type": "object", "value": {"$literal": values}}],
             "variables": [{"id": "v_result01", "name": "结果", "value_type": "object"}],
             "actions": [{"type": "set_variable", "variable": "v_result01", "value": {"$ref": {"scope": "constant", "node": "c_values01", "path": []}}}]}
+    constraint = {"type": "int", "min": values["count"], "max": values["count"], "enum": [values["count"]]}
+    rule["constants"].append({"id": "c_limits01", "name": "精确约束", "value_type": constraint, "value": values["count"]})
     response = env.client.put("/api/rules", headers={**env.headers, "X-NMF-Value-Encoding": "typed-v1"}, json=encode_value({"rules": [rule]}))
     assert response.status_code == 200, response.text
     stored = env.store.load_verified_rules()[0]
     assert stored["constants"][0]["value"]["$literal"] == values
+    assert stored["constants"][1]["value_type"] == constraint
+    assert stored["constants"][1]["value"] == values["count"]
     fetched = env.client.get("/api/rules", headers=env.headers)
     assert decode_value(fetched.json())["rules"][0] == stored
     saved_again = env.client.put("/api/rules", headers={**env.headers, "X-NMF-Value-Encoding": "typed-v1"}, json=fetched.json())

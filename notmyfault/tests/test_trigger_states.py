@@ -1,5 +1,8 @@
 import ctypes
 import os
+import ntpath
+import posixpath
+import shutil
 import threading
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -37,29 +40,97 @@ def set_battery(monkeypatch, mod, percent, plugged):
     )
 
 
-def test_audio_device_emits_only_on_change(monkeypatch):
+@pytest.mark.parametrize("device_type,fail_at", [("render", 0), ("capture", 0), ("any", 0), ("any", 1), ("any", 2)])
+def test_audio_device_emits_only_on_change(monkeypatch, device_type, fail_at):
     mod = load_plugin("triggers", "audio_device")
-    scripted(
-        monkeypatch,
-        mod,
-        "_query_default_devices",
-        [
-            {"render": "A", "capture": "C"},
-            {"render": "A", "capture": "C"},
-            {"render": "B", "capture": "C"},
-        ],
+    devices = {"render": "A", "capture": "C"}
+    monkeypatch.setattr(mod, "_query_default_devices", lambda: dict(devices))
+    events = []
+    attempts = 0
+
+    def emit(payload):
+        nonlocal attempts
+        attempts += 1
+        if attempts == fail_at:
+            raise RuntimeError("事件提交失败")
+        events.append(payload)
+
+    trigger = mod.AudioDeviceTrigger(
+        {"id": "audio_device"}, {"device_type": device_type}, emit, threading.Event(),
     )
-    trigger, events = make_trigger(
-        mod, "AudioDeviceTrigger", {"device_type": "render"}
-    )
+    trigger.validate()
     trigger.poll()
     trigger.poll()
     assert events == []
+    devices.update(render="B", capture="D")
+    if fail_at:
+        with pytest.raises(RuntimeError):
+            trigger.poll()
     trigger.poll()
-    assert len(events) == 1
-    assert events[0]["device_type"] == "render"
-    assert events[0]["device_id"] == "B"
-    assert events[0]["previous_device_id"] == "A"
+    trigger.poll()
+    selected = [flow for flow in ("render", "capture") if device_type in (flow, "any")]
+    assert [event["device_type"] for event in events] == selected
+    assert [event["device_id"] for event in events] == [devices[flow] for flow in selected]
+    assert [event["previous_device_id"] for event in events] == [{"render": "A", "capture": "C"}[flow] for flow in selected]
+
+
+@pytest.mark.parametrize("platform", ["nt", "posix"])
+@pytest.mark.parametrize("target,fail_at", [("ANY", 0), ("ANY", 1), ("ANY", 2), ("first", 0), ("first", 1), ("second", 0), ("second", 1)])
+def test_usb_reports_new_devices_once_and_detects_reinsertion(monkeypatch, platform, target, fail_at):
+    mod = load_plugin("triggers", "usb_insert")
+    monkeypatch.setattr(mod, "os", SimpleNamespace(name=platform, path=ntpath if platform == "nt" else posixpath))
+    old, first, second = ("D:", "E:", "F:") if platform == "nt" else ("/media/old", "/media/first ", "/media/second\u3000")
+    expected_drive = {"ANY": "ANY", "first": first, "second": second}[target]
+    sample = {"drives": {old}}
+
+    def read_drives():
+        if isinstance(sample["drives"], Exception):
+            raise sample["drives"]
+        return set(sample["drives"])
+
+    monkeypatch.setattr(mod.UsbInsertTrigger, "_get_removable_drives", staticmethod(read_drives))
+    events = []
+    attempts = 0
+
+    def emit(payload):
+        nonlocal attempts
+        attempts += 1
+        if attempts == fail_at:
+            raise RuntimeError("事件提交失败")
+        events.append(payload)
+
+    trigger = mod.UsbInsertTrigger(
+        {"id": "usb_insert"}, {"drive_letter": expected_drive}, emit, threading.Event(),
+    )
+    trigger.validate()
+    trigger.setup()
+    trigger.poll()
+    assert events == []
+    sample["drives"] = {first, second}
+    if fail_at:
+        with pytest.raises(RuntimeError):
+            trigger.poll()
+    else:
+        trigger.poll()
+    accepted = len(events)
+    sample["drives"] = PermissionError("设备状态读取失败")
+    with pytest.raises(PermissionError):
+        trigger.poll()
+    assert len(events) == accepted
+    sample["drives"] = {old, first, second}
+    trigger.poll()
+    trigger.poll()
+    selected = {old, first, second} if target == "ANY" else {expected_drive}
+    assert len({event["actual_drive"] for event in events}) == len(events)
+    assert {event["actual_drive"] for event in events} == selected
+    assert len(events) == len(selected)
+    assert all(event["drive_letter"] == expected_drive for event in events)
+    sample["drives"] = set()
+    trigger.poll()
+    sample["drives"] = {first, second}
+    trigger.poll()
+    trigger.poll()
+    assert len(events) == len(selected) + (2 if target == "ANY" else 1)
 
 
 def test_battery_level_fires_once_with_hysteresis(monkeypatch):
@@ -250,25 +321,44 @@ def test_cron_schedule_daily_fires_once_per_day(monkeypatch):
     assert all(e["mode"] == "daily" for e in events)
 
 
-def test_cron_schedule_interval_fires_every_n_minutes(monkeypatch):
+@pytest.mark.parametrize("interval_minutes", [1, 30, 1440])
+@pytest.mark.parametrize("wall_shift", [timedelta(), timedelta(hours=1), timedelta(hours=-1), timedelta(days=1), timedelta(days=-1)])
+def test_cron_schedule_interval_fires_every_n_minutes(monkeypatch, interval_minutes, wall_shift):
     mod = load_plugin("triggers", "cron_schedule")
     start = datetime(2026, 1, 1, 0, 0)
     clock = FakeClock(start)
     monkeypatch.setattr(mod, "datetime", clock)
+    elapsed = {"seconds": 0.0}
+    monkeypatch.setattr(mod, "time", SimpleNamespace(monotonic=lambda: 1000.0 + elapsed["seconds"]))
     trigger, events = make_trigger(
-        mod, "CronScheduleTrigger", {"mode": "interval", "interval_minutes": 30}
+        mod, "CronScheduleTrigger", {"mode": "interval", "interval_minutes": interval_minutes}
     )
     trigger.poll()
     assert events == []
-    clock.moment = start + timedelta(minutes=29)
+    elapsed["seconds"] = interval_minutes * 60 - 1
+    clock.moment = start + timedelta(seconds=elapsed["seconds"]) + wall_shift
     trigger.poll()
     assert events == []
-    clock.moment = start + timedelta(minutes=31)
+    elapsed["seconds"] += 1
+    clock.moment = start + timedelta(seconds=elapsed["seconds"]) + wall_shift
     trigger.poll()
     assert len(events) == 1
-    clock.moment = start + timedelta(minutes=62)
+    assert events[0] == {"mode": "interval", "triggered_at": clock.moment.strftime("%Y-%m-%d %H:%M:%S")}
+    trigger.poll()
+    assert len(events) == 1
+    elapsed["seconds"] += interval_minutes * 60 - 1
+    clock.moment = start + timedelta(seconds=elapsed["seconds"]) - wall_shift
+    trigger.poll()
+    assert len(events) == 1
+    elapsed["seconds"] += 1
+    clock.moment = start + timedelta(seconds=elapsed["seconds"]) - wall_shift
     trigger.poll()
     assert len(events) == 2
+    elapsed["seconds"] += interval_minutes * 60 * 3
+    clock.moment = start + timedelta(seconds=elapsed["seconds"])
+    trigger.poll()
+    trigger.poll()
+    assert len(events) == 3
 
 
 def test_cron_schedule_weekly_respects_weekdays(monkeypatch):
@@ -341,17 +431,48 @@ def test_system_startup_fires_once_after_delay(monkeypatch):
     assert events[0]["delay_seconds"] == 5.0
 
 
-def test_wifi_network_emits_on_target_connect(monkeypatch):
+@pytest.mark.parametrize("platform", ["nt", "posix"])
+@pytest.mark.parametrize("ssid", ["Home", '"家中:WiFi"', r"Lab\WiFi", "Cafe:WiFi", 'Home"', " Home ", " ", "\u3000Home\u3000"])
+@pytest.mark.parametrize("locale_env", [
+    {"LANG": "C", "LC_ALL": "C"}, {"LANG": "zh_CN.UTF-8"},
+    {"LANG": "C", "LC_ALL": "zh_CN.UTF-8"},
+])
+def test_wifi_network_emits_on_target_connect(monkeypatch, platform, ssid, locale_env):
+    from notmyfault.platform import windows_wifi
+
     mod = load_plugin("triggers", "wifi_network")
-    scripted(monkeypatch, mod, "_current_ssid", ["", "Home"])
+    monkeypatch.delenv("LC_ALL", raising=False)
+    monkeypatch.delenv("LC_MESSAGES", raising=False)
+    for key, value in locale_env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+    monkeypatch.setattr(mod, "os", SimpleNamespace(name=platform, environ=os.environ))
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/nmcli")
+    states = iter(["", ssid])
+    monkeypatch.setattr(windows_wifi, "current_ssid", lambda: next(states))
+
+    def query(*args, **kwargs):
+        assert platform == "posix"
+        current = next(states)
+        encoded = current.replace("\\", "\\\\").replace(":", "\\:")
+        environment = kwargs.get("env", os.environ)
+        english = (environment.get("LC_ALL") or environment.get("LANG")) == "C"
+        active = "yes" if english else "是"
+        inactive = "no" if english else "否"
+        output = f"{active}:{encoded}\n" if current else f"{inactive}:Other\n"
+        assert environment["DBUS_SESSION_BUS_ADDRESS"] == os.environ["DBUS_SESSION_BUS_ADDRESS"]
+        return SimpleNamespace(returncode=0, stdout=output)
+
+    monkeypatch.setattr(mod.subprocess, "run", query)
     trigger, events = make_trigger(
-        mod, "WifiNetworkTrigger", {"direction": "connected", "ssid": "Home"}
+        mod, "WifiNetworkTrigger", {"direction": "connected", "ssid": ssid}
     )
     trigger.poll()
     trigger.poll()
     assert events == [
-        {"ssid": "Home", "previous_ssid": "", "connected": True, "target": "Home"}
+        {"ssid": ssid, "previous_ssid": "", "connected": True, "target": ssid}
     ]
+    assert dict(os.environ).get("LC_ALL") == locale_env.get("LC_ALL")
 
 
 @pytest.mark.parametrize("next_ssid", ["", "Office"])

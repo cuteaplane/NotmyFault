@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import psutil
+
 from notmyfault.platform.backends import (
     AudioBackend,
     BackendFailedError,
@@ -446,7 +448,7 @@ class WindowBackendTests(LinuxPathTest):
                 ok(stdout="_NET_WM_STATE(ATOM) = _NET_WM_STATE_MAXIMIZED_VERT, _NET_WM_STATE_MAXIMIZED_HORZ"),
             ],
         )
-        with patch("psutil.Process") as process_cls:
+        with patch.object(psutil, "Process") as process_cls:
             process_cls.return_value.name.return_value = "app"
             backend = WindowBackend(runner)
             handles = backend.handles()

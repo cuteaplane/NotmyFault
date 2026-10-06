@@ -1,6 +1,6 @@
 import json
-from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
+from decimal import Decimal, Inexact, localcontext
 from pathlib import PurePosixPath, PureWindowsPath
 from uuid import UUID
 
@@ -120,7 +120,8 @@ def test_explicit_conversion_never_uses_python_truthiness_or_silent_truncation()
     assert types.convert_value(encoded, "bytes", options={"encoding": "base64"}) == b"\x00\xff"
 
 
-def test_time_conversions_require_units_and_timezone_and_preserve_instants():
+@pytest.mark.parametrize(("decimal_precision", "trap_inexact"), [(28, False), (4, False), (4, True)])
+def test_time_conversions_require_units_and_timezone_and_preserve_instants(decimal_precision, trap_inexact):
     seconds = {"type": "timestamp", "unit": "seconds"}
     milliseconds = {"type": "timestamp", "unit": "milliseconds"}
     iso = "2024-02-29T23:30:00+08:00"
@@ -144,6 +145,46 @@ def test_time_conversions_require_units_and_timezone_and_preserve_instants():
     assert types.normalize_value("15:30:00+08:00", {"type": "time", "timezone": "aware"}) == "15:30:00+08:00"
     assert types.normalize_value("15:30", "time") == "15:30"
     assert types.convert_value(iso, "datetime", source="datetime", options={"timezone": "utc"}) == "2024-02-29T15:30:00+00:00"
+    with localcontext() as decimal_context:
+        decimal_context.prec = decimal_precision
+        decimal_context.traps[Inexact] = trap_inexact
+        for kind in ("timestamp", "duration"):
+            source = {"type": kind, "unit": "seconds"}
+            target = {"type": kind, "unit": "milliseconds"}
+            for amount in (0, -7, 123456, 10**30 + 1):
+                converted = types.convert_value(amount, target, source=source)
+                assert converted == amount * 1000
+                assert isinstance(converted, int)
+                assert types.convert_value(converted, source, source=target) == amount
+            assert types.convert_value(1.25, target, source=source) == 1250
+            assert types.convert_value(1500, source, source=target) == 1.5
+
+
+@pytest.mark.parametrize("month,expected", [(1, "07:00:00-05:00"), (7, "08:00:00-04:00")])
+@pytest.mark.parametrize("source_kind", ["timestamp", "datetime"])
+@pytest.mark.parametrize("target_zone", ["any", "aware"])
+def test_time_conversion_keeps_offset_for_date_dependent_zones(monkeypatch, month, expected, source_kind, target_zone):
+    import zoneinfo
+
+    class SeasonalZone(tzinfo):
+        def utcoffset(self, moment):
+            return None if moment is None else timedelta(hours=-5) + self.dst(moment)
+
+        def dst(self, moment):
+            return None if moment is None else timedelta(hours=1 if 4 <= moment.month <= 9 else 0)
+
+    monkeypatch.setattr(zoneinfo, "ZoneInfo", lambda name: SeasonalZone())
+    moment = datetime(2026, month, 1, 12, tzinfo=timezone.utc)
+    source = {"type": "timestamp", "unit": "seconds"} if source_kind == "timestamp" else "datetime"
+    value = moment.timestamp() if source_kind == "timestamp" else moment.isoformat()
+    result = types.convert_value(value, {"type": "time", "timezone": target_zone}, source=source, options={"timezone": "Test/Seasonal"})
+    assert result == expected
+    assert time.fromisoformat(result).utcoffset() is not None
+    assert types.convert_value(moment.isoformat(), "time", source="datetime", options={"timezone": "utc"}) == "12:00:00+00:00"
+    naive = moment.replace(tzinfo=None).isoformat()
+    assert types.convert_value(naive, "time", source="datetime", options={"timezone": "preserve"}) == "12:00:00"
+    with pytest.raises(types.DataTypeError):
+        types.convert_value(naive, {"type": "time", "timezone": "aware"}, source="datetime", options={"timezone": "preserve"})
 
 
 def test_paths_urls_and_identifiers_validate_semantics_without_io():

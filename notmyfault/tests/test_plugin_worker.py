@@ -39,6 +39,18 @@ def run_isolated_action(entry, action_info, params, context, **kwargs):
     )
 
 
+def extension_context(meta):
+    from notmyfault.extensions.registry import ExtensionRegistry
+    from notmyfault.extensions.session import ExtensionContext, ExtensionSession
+
+    session = ExtensionSession(
+        plugin_id=meta["id"], command_id="crash", plugin_meta=meta,
+        source_kind="parameter_editors", source_id="editor", allowed_commands=("crash",),
+        data_type=None, current_value=None, value_type="object",
+    )
+    return ExtensionContext(session, ExtensionRegistry())
+
+
 SIMPLE_ACTION = """
 def run(action_info, params):
     print("动作里的 print 进日志")
@@ -200,13 +212,18 @@ class TestRunIsolatedAction:
         assert result == {"completed": True}
         assert len(logs.getvalue()) >= 262144
 
-    def test_raising_action_reports_error(self, tmp_path):
+    @pytest.mark.parametrize("load_only", [False, True])
+    def test_raising_action_reports_error(self, tmp_path, load_only):
         entry = write_action(tmp_path, "raising", RAISING_ACTION)
-        ok, error = run_isolated_action(entry, {}, {}, {})
-        assert ok is False
-        assert "动作故意失败" in error
+        ok, result = run_isolated_action(entry, {}, {}, {}, load_only=load_only)
+        assert ok is load_only
+        if load_only:
+            assert result is None
+        else:
+            assert "动作故意失败" in result
 
-    def test_execute_timeout_kills_worker(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("extension", [False, True])
+    def test_execute_timeout_kills_worker(self, monkeypatch, tmp_path, extension):
         real_popen = plugin_worker.subprocess.Popen
         processes = []
 
@@ -220,11 +237,21 @@ class TestRunIsolatedAction:
 
         monkeypatch.setattr(plugin_worker.subprocess, "Popen", start_ready_worker)
         entry = write_action(tmp_path, "sleepy", SLEEPY_ACTION)
-        with pytest.raises(PluginWorkerTimeout):
-            run_isolated_action(entry, {}, {}, {}, execute_timeout=1.0)
+        context = extension_context({"id": "sleepy"})
+        monkeypatch.setattr(plugin_worker, "EXECUTE_TIMEOUT", 1.0)
+        try:
+            with pytest.raises(PluginWorkerTimeout):
+                if extension:
+                    plugin_worker.ExtensionWorker(entry, "digest", {"id": "sleepy"}, str(tmp_path), {}, context)
+                else:
+                    run_isolated_action(entry, {}, {}, {}, execute_timeout=1.0)
+        finally:
+            context.session.close()
         assert processes and all(process.poll() is not None for process in processes)
+        assert not plugin_worker._live_extension_workers
 
-    def test_startup_timeout_kills_worker(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("extension", [False, True])
+    def test_startup_timeout_kills_worker(self, monkeypatch, tmp_path, extension):
         real_popen = plugin_worker.subprocess.Popen
         processes = []
 
@@ -238,10 +265,19 @@ class TestRunIsolatedAction:
 
         monkeypatch.setattr(plugin_worker.subprocess, "Popen", start_silent_worker)
         entry = write_action(tmp_path, "simple_startup", SIMPLE_ACTION)
-        with pytest.raises(PluginWorkerStartupTimeout):
-            run_isolated_action(entry, {}, {}, {}, startup_timeout=0.2)
+        context = extension_context({"id": "simple_startup"})
+        monkeypatch.setattr(plugin_worker, "STARTUP_TIMEOUT", 0.2)
+        try:
+            with pytest.raises(PluginWorkerStartupTimeout):
+                if extension:
+                    plugin_worker.ExtensionWorker(entry, "digest", {"id": "simple_startup"}, str(tmp_path), {}, context)
+                else:
+                    run_isolated_action(entry, {}, {}, {}, startup_timeout=0.2)
+        finally:
+            context.session.close()
         assert processes and all(process.poll() is not None for process in processes)
         assert not plugin_worker._live_processes
+        assert not plugin_worker._live_extension_workers
 
     def test_exit_timeout_kills_worker_after_result(self, monkeypatch, tmp_path):
         real_popen = plugin_worker.subprocess.Popen
@@ -266,8 +302,18 @@ class TestRunIsolatedAction:
         assert processes and all(process.poll() is not None for process in processes)
         assert not plugin_worker._live_processes
 
-    def test_context_v1_receives_sanitized_context(self, tmp_path):
-        entry = write_action(tmp_path, "context", CONTEXT_ACTION)
+    @pytest.mark.parametrize("load_only", [False, True])
+    @pytest.mark.parametrize("entry_contract", ["valid", "missing_context", "bad_signature"])
+    def test_context_v1_receives_sanitized_context(self, tmp_path, load_only, entry_contract):
+        source = CONTEXT_ACTION
+        if entry_contract == "missing_context":
+            source = source.replace("def run_with_context(", "def missing_context(")
+        elif entry_contract == "bad_signature":
+            source = source.replace(
+                "def run_with_context(action_info, params, context):",
+                "def run_with_context(action_info):",
+            )
+        entry = write_action(tmp_path, "context", source)
         context = {
             "run": {"id": "run_context_1"},
             "event": {"payload": {"value": 42}},
@@ -278,28 +324,48 @@ class TestRunIsolatedAction:
             {"id": "context", "execution_api": "context-v1"},
             {},
             context,
+            load_only=load_only,
         )
-        assert ok is True
-        assert result == {"run_id": "run_context_1", "event_value": 42}
+        assert ok is (entry_contract == "valid")
+        if entry_contract != "valid":
+            assert "TypeError" in result
+        else:
+            assert result == (None if load_only else {"run_id": "run_context_1", "event_value": 42})
 
-    def test_crash_raises_and_emits_event(self, tmp_path):
+    @pytest.mark.parametrize("extension", [False, True])
+    def test_crash_raises_and_emits_event(self, tmp_path, extension):
+        from notmyfault.security.plugin_checks import inspect_plugin_tree
+
         events = []
         plugin_worker.set_crash_callback(
             lambda kind, data: events.append((kind, data))
         )
+        meta = {"id": "crashing", "contributes": {"commands": [{
+            "id": "crash", "handler": "crashing.py:crash",
+        }]}}
+        context = extension_context(meta)
         try:
-            entry = write_action(tmp_path, "crashing", CRASHING_ACTION)
+            entry = write_action(tmp_path, "crashing", CRASHING_ACTION + "\ndef crash(context, payload):\n    os._exit(3)\n")
             with pytest.raises(PluginWorkerCrashed):
-                run_isolated_action(entry, {}, {}, {})
+                if extension:
+                    tree = inspect_plugin_tree(str(tmp_path))
+                    worker = plugin_worker.ExtensionWorker(
+                        entry, tree.file_snapshot["crashing.py"], meta, str(tmp_path), tree.file_snapshot, context,
+                    )
+                    worker.invoke("crash", {})
+                else:
+                    run_isolated_action(entry, {}, {}, {})
         finally:
+            context.session.close()
             plugin_worker.set_crash_callback(None)
         assert events and events[0][0] == "plugin_worker_crashed"
         assert events[0][1]["returncode"] == 3
 
-    def test_import_crash_is_action_failure_not_worker_crash(self, tmp_path):
+    @pytest.mark.parametrize("load_only", [False, True])
+    def test_import_crash_is_action_failure_not_worker_crash(self, tmp_path, load_only):
         # import 阶段的异常在 worker 里被抓住，按动作失败回报，引擎不当作崩溃
         entry = write_action(tmp_path, "importcrash", IMPORT_CRASH_ACTION)
-        ok, error = run_isolated_action(entry, {}, {}, {})
+        ok, error = run_isolated_action(entry, {}, {}, {}, load_only=load_only)
         assert ok is False
         assert "模块 import 阶段就崩" in error
 

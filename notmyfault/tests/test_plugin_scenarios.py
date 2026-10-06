@@ -1,4 +1,6 @@
+import codecs
 import ctypes
+import getopt
 import io
 import json
 import os
@@ -18,14 +20,61 @@ from notmyfault.tests.plugin_support import load_plugin
 PKG_ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize("platform", ["nt", "posix"])
+@pytest.mark.parametrize("text", ["中文 café😀", "-1", "--version", "--help", "--", "-C"])
+@pytest.mark.parametrize("rate,volume,voice", [(0, 100, ""), (2, 50, "en-US"), (-10, 0, "Microsoft Xiaoxiao")])
+def test_speech_passes_text_and_controls_to_platform_backend(monkeypatch, platform, text, rate, volume, voice):
+    from notmyfault.platform import linux_support
+
+    module = load_plugin("actions", "text_to_speech")
+    meta = json.loads((PKG_ROOT / "actions" / "text_to_speech" / "action.json").read_text(encoding="utf-8"))
+    monkeypatch.setattr(module, "os", SimpleNamespace(name=platform))
+    monkeypatch.setattr(linux_support, "require_command", lambda *args: "/usr/bin/spd-say")
+    calls = []
+
+    def speak(command, **kwargs):
+        calls.append(command)
+        if platform == "nt":
+            assert command[:2] == [module.sys.executable, "-c"]
+            assert json.loads(kwargs["input"].decode("utf-8")) == {
+                "text": text, "rate": rate, "volume": volume, "voice": voice,
+            }
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        assert command[0] == "/usr/bin/spd-say"
+        options, messages = getopt.gnu_getopt(
+            command[1:], "wr:i:l:vhCS",
+            ["wait", "rate=", "volume=", "language=", "version", "help", "cancel", "stop"],
+        )
+        assert messages == [text]
+        expected = [("--wait", "")]
+        if rate:
+            expected.append(("--rate", str(rate * 10)))
+        if volume != 100:
+            expected.append(("--volume", str(volume - 100)))
+        if voice == "en-US":
+            expected.append(("--language", voice))
+        assert options == expected
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", speak)
+    invoke_action(module.run, module, meta, {"text": text, "rate": rate, "volume": volume, "voice": voice}, {})
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("cancel", [False, True])
-def test_powershell_bounds_output_and_kills_cancelled_process(monkeypatch, cancel):
+@pytest.mark.parametrize("encoding", [
+    "utf-8", "gb18030", "utf-16-le",
+    pytest.param("oem", marks=pytest.mark.skipif(os.name != "nt", reason="OEM 编码仅 Windows 提供")),
+])
+def test_powershell_bounds_output_and_kills_cancelled_process(monkeypatch, cancel, encoding):
     module = load_plugin("actions", "run_powershell")
     monkeypatch.setattr(module.sys, "platform", "win32")
     event = threading.Event()
+    output = ("完成 café\n" + "x" * (module._MAX_OUTPUT + 8192)).encode(encoding, errors="replace")
     class Process:
         returncode = None if cancel else 0
-        stdout = io.BytesIO(b"x" * (module._MAX_OUTPUT + 8192))
+        stdout = io.BytesIO(output)
         stderr = io.BytesIO(b"")
         killed = False
         def poll(self):
@@ -36,30 +85,45 @@ def test_powershell_bounds_output_and_kills_cancelled_process(monkeypatch, cance
         def wait(self, timeout):
             return self.returncode
     process = Process()
+    command = " \nWrite-Output value` "
     def launch(*args, **kwargs):
+        assert args[0][-1] == command
         if cancel:
             event.set()
         return process
     monkeypatch.setattr(module.subprocess, "Popen", launch)
     monkeypatch.setattr(module, "_read_available", lambda stream: stream.read1(4096))
+    params = {"command": command}
+    if encoding != "oem":
+        params["encoding"] = encoding
     if cancel:
         with pytest.raises(ActionCancelled):
-            module.run_with_context({}, {"command": "ignored"}, {"runtime": {"cancellation": ActionCancellation(event)}})
+            module.run_with_context({}, params, {"runtime": {"cancellation": ActionCancellation(event)}})
         assert process.killed
     else:
-        result = module.run({}, {"command": "ignored"})
-        assert result["stdout"] == "x" * module._MAX_OUTPUT + "...（已截断）"
+        result = module.run({}, params)
+        assert result["stdout"] == output[:module._MAX_OUTPUT].decode(encoding, errors="replace") + "...（已截断）"
         assert result["stderr"] == ""
 
 
-def test_powershell_reports_exit_code_and_stderr(monkeypatch):
+@pytest.mark.parametrize("encoding", [
+    "utf-8", "gb18030", "utf-16-le", "not-a-codec", "base64_codec", "rot_13",
+    pytest.param("oem", marks=pytest.mark.skipif(os.name != "nt", reason="OEM 编码仅 Windows 提供")),
+])
+def test_powershell_reports_exit_code_and_stderr(monkeypatch, encoding):
     module = load_plugin("actions", "run_powershell")
     monkeypatch.setattr(module.sys, "platform", "win32")
+    if encoding in ("not-a-codec", "base64_codec", "rot_13"):
+        monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("编码无效时不应启动命令"))
+        with pytest.raises(ValueError, match="编码"):
+            module.run({}, {"command": "exit 3", "encoding": encoding})
+        return
+    error_bytes = "失败：café\n".encode(encoding, errors="replace")
 
     class Process:
         returncode = 3
         stdout = io.BytesIO(b"")
-        stderr = io.BytesIO(b"boom\n")
+        stderr = io.BytesIO(error_bytes)
 
         def poll(self):
             return self.returncode
@@ -73,23 +137,59 @@ def test_powershell_reports_exit_code_and_stderr(monkeypatch):
     monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: Process())
     monkeypatch.setattr(module, "_read_available", lambda stream: stream.read1(4096))
 
+    params = {"command": "exit 3"}
+    if encoding != "oem":
+        params["encoding"] = encoding
     with pytest.raises(RuntimeError) as caught:
-        module.run({}, {"command": "exit 3"})
+        module.run({}, params)
     assert "code=3" in str(caught.value)
-    assert "boom" in str(caught.value)
+    assert error_bytes.decode(encoding, errors="replace").strip() in str(caught.value)
 
 
 # --------------------------------------------------------------- append_text
 
 
-def test_append_text_appends_without_overwriting(tmp_path):
+@pytest.mark.parametrize("initial_state", ["missing", "empty", "content"])
+@pytest.mark.parametrize("encoding,byte_encoding,bom", [
+    ("utf-8", "utf-8", b""),
+    ("utf-8-sig", "utf-8", codecs.BOM_UTF8),
+    ("gb18030", "gb18030", b""),
+    ("utf-16", "utf-16-le", codecs.BOM_UTF16_LE),
+    ("utf-16", "utf-16-be", codecs.BOM_UTF16_BE),
+    ("utf_16", "utf-16-be", codecs.BOM_UTF16_BE),
+    ("utf-32", "utf-32-le", codecs.BOM_UTF32_LE),
+    ("utf-32", "utf-32-be", codecs.BOM_UTF32_BE),
+    ("UTF32", "utf-32-be", codecs.BOM_UTF32_BE),
+])
+def test_append_text_appends_without_overwriting(tmp_path, monkeypatch, initial_state, encoding, byte_encoding, bom):
+    monkeypatch.chdir(tmp_path)
     mod = load_plugin("actions", "append_text")
-    target = tmp_path / "log.txt"
-    target.write_text("旧内容\n", encoding="utf-8")
-    mod.run_with_context(
-        {}, {"file_path": str(target), "text": "新内容", "add_timestamp": False}, {}
-    )
-    assert target.read_text(encoding="utf-8") == "旧内容\n新内容\n"
+    reader = load_plugin("actions", "read_text")
+    target = tmp_path / " log.txt\u3000"
+    original = "旧内容\n" if initial_state == "content" else ""
+    original_bytes = bom + original.encode(byte_encoding) if original else b""
+    if initial_state != "missing":
+        target.write_bytes(original_bytes)
+    params = {"file_path": target.name, "text": "新内容", "add_timestamp": False, "encoding": encoding}
+    meta = json.loads((PKG_ROOT / "actions/append_text/action.json").read_text(encoding="utf-8"))
+    result = invoke_action(mod.run, mod, meta, params, {})
+    expected_bytes = original_bytes + "新内容\n".encode(byte_encoding if original else encoding)
+    assert target.read_bytes() == expected_bytes
+    assert result == {"file": str(target), "lines": 1, "written": "新内容"}
+    loaded = reader.run_with_context({}, {"file_path": str(target), "encoding": encoding}, {})
+    assert loaded["text"] == original + "新内容\n"
+    invoke_action(mod.run, mod, meta, {**params, "text": "末尾"}, {})
+    assert target.read_bytes().startswith(expected_bytes)
+    assert reader.run_with_context({}, {"file_path": str(target), "encoding": encoding}, {})["text"] == original + "新内容\n末尾\n"
+    if initial_state == "content" and codecs.lookup(encoding).name in ("utf-16", "utf-32"):
+        unmarked = "旧内容\n".encode(byte_encoding)
+        target.write_bytes(unmarked)
+        with pytest.raises(ValueError, match="BOM"):
+            invoke_action(mod.run, mod, meta, params, {})
+        assert target.read_bytes() == unmarked
+        invoke_action(mod.run, mod, meta, {**params, "encoding": byte_encoding}, {})
+        assert target.read_bytes() == unmarked + "新内容\n".encode(byte_encoding)
+        assert reader.run_with_context({}, {"file_path": str(target), "encoding": byte_encoding}, {})["text"] == "旧内容\n新内容\n"
 
 
 @pytest.mark.parametrize("encoding", ["utf-8", "utf-16", "gb18030"])
@@ -108,11 +208,14 @@ def test_append_text_writes_timestamped_lines(tmp_path, encoding):
     assert lines[3] == "[2024-01-01 12:00:00] 已带时间"
 
 
-def test_file_operation_compresses_a_single_file(tmp_path):
+@pytest.mark.parametrize("directory", [False, True])
+def test_file_operation_compresses_sources_without_overwriting_them(tmp_path, directory):
     mod = load_plugin("actions", "file_operation")
-    source = tmp_path / "note.txt"
+    source = tmp_path / "source" if directory else tmp_path / "note.txt"
+    source_file = source / "nested" / "note.txt" if directory else source
+    source_file.parent.mkdir(parents=True, exist_ok=True)
     archive = tmp_path / "note.zip"
-    source.write_text("内容", encoding="utf-8")
+    source_file.write_text("内容", encoding="utf-8")
 
     mod.run(
         {},
@@ -124,20 +227,32 @@ def test_file_operation_compresses_a_single_file(tmp_path):
     )
 
     with zipfile.ZipFile(archive) as zipped:
-        assert zipped.namelist() == ["note.txt"]
-        assert zipped.read("note.txt").decode("utf-8") == "内容"
+        member = "nested/note.txt" if directory else "note.txt"
+        assert zipped.read(member).decode("utf-8") == "内容"
+    alias = tmp_path / "source-alias.zip"
+    os.link(source_file, alias)
+    with pytest.raises(ValueError):
+        mod.run({}, {"operation": "compress", "source": str(source), "destination": str(alias)})
+    assert source_file.read_text(encoding="utf-8") == alias.read_text(encoding="utf-8") == "内容"
 
 
-def test_archive_unzip_skips_existing_files_and_reports_them(tmp_path):
+@pytest.mark.parametrize("entry_name", ["a.txt", "a?.txt", "folder?/a.txt", "folder./a.txt"])
+def test_archive_unzip_skips_existing_files_and_reports_them(tmp_path, entry_name):
     mod = load_plugin("actions", "archive")
     source = tmp_path / "a.txt"
     source.write_text("新内容", encoding="utf-8")
     archive = tmp_path / "pack.zip"
     assert mod.run({}, {"mode": "zip", "source": str(source), "destination": str(archive)})["ok"]
+    if entry_name != "a.txt":
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr(entry_name, source.read_bytes())
 
     target = tmp_path / "out"
     target.mkdir()
-    (target / "a.txt").write_text("原有内容", encoding="utf-8")
+    output_name = entry_name.replace("?", "_").replace("./", "/") if os.name == "nt" else entry_name
+    output = target / output_name
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("原有内容", encoding="utf-8")
 
     skipped = mod.run(
         {}, {"mode": "unzip", "source": str(archive), "destination": str(target)}
@@ -145,7 +260,7 @@ def test_archive_unzip_skips_existing_files_and_reports_them(tmp_path):
     assert skipped["ok"] is True
     assert skipped["file_count"] == 0
     assert skipped["skipped"] == 1
-    assert (target / "a.txt").read_text(encoding="utf-8") == "原有内容"
+    assert output.read_text(encoding="utf-8") == "原有内容"
 
     overwritten = mod.run(
         {},
@@ -158,7 +273,7 @@ def test_archive_unzip_skips_existing_files_and_reports_them(tmp_path):
     )
     assert overwritten["file_count"] == 1
     assert overwritten["skipped"] == 0
-    assert (target / "a.txt").read_text(encoding="utf-8") == "新内容"
+    assert output.read_text(encoding="utf-8") == "新内容"
 
 
 def test_archive_unzip_rejects_archives_over_entry_limit(tmp_path, monkeypatch):
@@ -216,8 +331,9 @@ def test_archive_unzip_honors_cancellation(tmp_path):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用文件关联")
-@pytest.mark.parametrize("directory", [r"C:\Work", "work"])
-def test_launch_program_association_preserves_arguments_and_directory(monkeypatch, directory):
+@pytest.mark.parametrize("directory", [r"C:\Work", "work", " work", " work "])
+@pytest.mark.parametrize("path", ["task.py", " task.py"])
+def test_launch_program_association_preserves_arguments_and_directory(monkeypatch, directory, path):
     mod = load_plugin("actions", "launch_program")
     arguments = r'--profile "work folder" --output "C:\Reports\new.txt"'
     popen = MagicMock(side_effect=OSError(193, "不是有效的可执行程序"))
@@ -226,13 +342,14 @@ def test_launch_program_association_preserves_arguments_and_directory(monkeypatc
     monkeypatch.setattr(mod.os.path, "isfile", lambda path: True)
     monkeypatch.setattr(mod.os, "startfile", startfile)
 
-    mod.run({}, {"path": "task.py", "args": arguments, "working_directory": directory})
+    mod.run({}, {"path": path, "args": arguments, "working_directory": directory})
 
     startfile.assert_called_once_with(
-        os.path.abspath(os.path.join(directory, "task.py")),
+        os.path.abspath(os.path.join(directory, path)),
         arguments=arguments,
         cwd=directory,
     )
+    assert popen.call_args.args[0][0] == path
     assert popen.call_args.kwargs["cwd"] == directory
 
 
@@ -301,30 +418,42 @@ def test_clipboard_clear_windows_flow(monkeypatch):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="仅 Windows 创建 lnk")
-def test_create_shortcut_passes_values_via_env(monkeypatch):
+@pytest.mark.parametrize("target", ["C:\\x.exe", " relative.exe", "C:\\x.exe\u3000"])
+def test_create_shortcut_preserves_values_and_unicode_result(tmp_path, monkeypatch, target):
     mod = load_plugin("actions", "create_shortcut")
     captured = {}
+    destination = tmp_path / "桌面😀"
+    destination.mkdir()
+    original_run = mod.subprocess.run
 
     def fake_run(cmd, **kwargs):
         captured["env"] = kwargs["env"]
-        return SimpleNamespace(returncode=0, stdout="C:\\桌面\\t.lnk\n", stderr="")
+        env = {**kwargs["env"], "NMF_TEST_LINK_ROOT": str(destination)}
+        script = cmd[-1]
+        for folder in ("StartMenu", "Desktop"):
+            expression = f"[Environment]::GetFolderPath('{folder}')"
+            assert expression in script
+            script = script.replace(expression, "$env:NMF_TEST_LINK_ROOT")
+        return original_run([*cmd[:-1], script], **{**kwargs, "env": env})
 
     monkeypatch.setattr(mod.subprocess, "run", fake_run)
     result = mod.run(
         {},
         {
             "name": "快捷",
-            "target_path": "C:\\x.exe",
+            "target_path": target,
             "arguments": "--fast",
             "working_directory": "C:\\",
             "icon_path": "C:\\i.ico",
             "location": "start_menu",
         },
     )
-    assert result == {"shortcut_path": "C:\\桌面\\t.lnk"}
+    expected = destination / "快捷.lnk"
+    assert result == {"shortcut_path": str(expected)}
+    assert expected.is_file()
     env = captured["env"]
     assert env["NMF_LNK_NAME"] == "快捷"
-    assert env["NMF_LNK_TARGET"] == "C:\\x.exe"
+    assert env["NMF_LNK_TARGET"] == target
     assert env["NMF_LNK_ARGS"] == "--fast"
     assert env["NMF_LNK_WORKDIR"] == "C:\\"
     assert env["NMF_LNK_ICON"] == "C:\\i.ico"
@@ -380,6 +509,7 @@ def test_media_control_rejects_unknown_command():
 def test_screenshot_deselects_active_window_bitmap_before_reading(
     tmp_path, monkeypatch, mode
 ):
+    monkeypatch.chdir(tmp_path)
     mod = load_plugin("actions", "screenshot")
     user32 = MagicMock()
     gdi32 = MagicMock()
@@ -421,14 +551,14 @@ def test_screenshot_deselects_active_window_bitmap_before_reading(
     gdi32.GetDIBits.side_effect = get_dibits
     monkeypatch.setattr(mod, "user32", user32)
     monkeypatch.setattr(mod, "gdi32", gdi32)
-    target = tmp_path / "active.bmp"
+    target = tmp_path / " active.bmp\u3000"
 
     meta = json.loads((PKG_ROOT / "actions/screenshot/action.json").read_text(encoding="utf-8"))
     assert invoke_action(
         mod.run, mod, meta,
-        {"mode": mode, "output_path": str(target), "format": "bmp"},
+        {"mode": mode, "output_path": target.name, "format": "bmp"},
         {},
-    ) == {"file": str(target)}
+    ) == {"file": target.name}
     gdi32.CreateCompatibleBitmap.assert_called_once_with(201, 320, 180)
     if mode == "active_window":
         user32.PrintWindow.assert_called_once_with(101, 202, 0)
@@ -441,15 +571,23 @@ def test_screenshot_deselects_active_window_bitmap_before_reading(
 # ------------------------------------------------------------------ open_url
 
 
-def test_open_url_prepends_https_and_opens_all(monkeypatch):
+@pytest.mark.parametrize("new_window", [False, True, "false", "true", 0, 1, None, [], {}])
+def test_open_url_prepends_https_and_opens_all(monkeypatch, new_window):
     mod = load_plugin("actions", "open_url")
+    meta = json.loads((PKG_ROOT / "actions" / "open_url" / "action.json").read_text(encoding="utf-8"))
     opened = []
     monkeypatch.setattr(
-        mod.webbrowser, "open", lambda url, new=0: opened.append(url) or True
+        mod.webbrowser, "open", lambda url, new=0: opened.append((url, new)) or True
     )
-    result = mod.run({}, {"urls": "example.com\nhttps://foo.bar"})
+    params = {"urls": "example.com\nhttps://foo.bar", "new_window": new_window}
+    if not isinstance(new_window, bool):
+        with pytest.raises(ValueError, match="布尔"):
+            invoke_action(mod.run, mod, meta, params, {})
+        assert opened == []
+        return
+    result = invoke_action(mod.run, mod, meta, params, {})
     assert result == {"opened": 2}
-    assert opened == ["https://example.com", "https://foo.bar"]
+    assert opened == [("https://example.com", int(new_window)), ("https://foo.bar", int(new_window))]
     opened.clear()
     with pytest.raises(ValueError, match="只支持"):
         mod.run({}, {"urls": "https://example.com\nfile:///bad"})
@@ -545,7 +683,9 @@ def test_run_shell_bounds_output_and_kills_cancelled_process(monkeypatch, cancel
         def wait(self, timeout):
             return self.returncode
     process = Process()
+    command = " \nprintf '%s' value\\\t"
     def launch(*args, **kwargs):
+        assert args[0][-1] == command
         if cancel:
             event.set()
         return process
@@ -555,12 +695,12 @@ def test_run_shell_bounds_output_and_kills_cancelled_process(monkeypatch, cancel
         with pytest.raises(ActionCancelled):
             module.run_with_context(
                 {},
-                {"command": "ignored"},
+                {"command": command},
                 {"runtime": {"cancellation": ActionCancellation(event)}},
             )
         assert process.killed
     else:
-        result = module.run({}, {"command": "ignored"})
+        result = module.run({}, {"command": command})
         assert result["stdout"] == "x" * module._MAX_OUTPUT + "...（已截断）"
         assert result["stderr"] == ""
 

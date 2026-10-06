@@ -93,24 +93,51 @@ def test_json_serialization_rejects_values_that_would_lose_types(value):
         execute("json_data", {"operation": "stringify", "value": value})
 
 
-def test_csv_object_records_round_trip_quoted_multiline_and_empty_cells():
-    records = [{"姓名": "甲,乙", "内容": '第一行\n"第二行"', "数量": 2}, {"姓名": "丙", "内容": "", "数量": None}]
+@pytest.mark.parametrize("header_prefix", ["", "\ufeff", "\ufeff\ufeff"])
+@pytest.mark.parametrize("input_bom", ["", "\ufeff"])
+@pytest.mark.parametrize("content_length", [0, 131073])
+def test_csv_object_records_round_trip_quoted_multiline_and_empty_cells(header_prefix, input_bom, content_length, tmp_path):
+    name_column = header_prefix + "姓名"
+    content = '第一行\n"第二行"' + "文" * content_length
+    records = [{name_column: "甲,乙", "内容": content, "数量": 2}, {name_column: "丙", "内容": "", "数量": None}]
     serialized = execute("csv_data", {"operation": "stringify", "value": records})
-    assert serialized["columns"] == ["姓名", "内容", "数量"]
-    parsed = execute("csv_data", {"value": "\ufeff" + serialized["text"]})
-    assert parsed["records"] == [{"姓名": "甲,乙", "内容": '第一行\n"第二行"', "数量": "2"}, {"姓名": "丙", "内容": "", "数量": ""}]
+    assert serialized["columns"] == [name_column, "内容", "数量"]
+    parsed = execute("csv_data", {"value": input_bom + serialized["text"]})
+    assert parsed["records"] == [{name_column: "甲,乙", "内容": content, "数量": "2"}, {name_column: "丙", "内容": "", "数量": ""}]
     assert parsed["row_count"] == 2
+    file_path = tmp_path / "quoted.csv"
+    file_path.write_bytes((input_bom + serialized["text"]).encode("utf-8"))
+    loaded = execute("read_text", {"file_path": str(file_path)})
+    assert execute("csv_data", {"value": loaded["text"]})["records"] == parsed["records"]
     header_only = execute("csv_data", {"operation": "stringify", "value": [], "columns": parsed["columns"]})
     assert execute("csv_data", {"value": header_only["text"]})["columns"] == parsed["columns"]
 
 
-def test_csv_arrays_support_custom_delimiters_and_explicit_columns():
-    params = {"operation": "stringify", "value": '[["01",true],["02",false]]', "has_header": False, "delimiter": ";"}
+@pytest.mark.parametrize("cell_prefix", ["", "\ufeff", "\ufeff\ufeff"])
+@pytest.mark.parametrize("input_bom", ["", "\ufeff"])
+@pytest.mark.parametrize("cell_text", ["01", ""])
+@pytest.mark.parametrize("delimiter", [";", "\ufeff"])
+@pytest.mark.parametrize("row_count", [1, 2])
+def test_csv_arrays_support_custom_delimiters_and_explicit_columns(cell_prefix, input_bom, cell_text, delimiter, row_count, tmp_path):
+    first_cell = cell_prefix + cell_text
+    records = [[first_cell, True], ["02", False]][:row_count]
+    params = {"operation": "stringify", "value": json.dumps(records), "has_header": False, "delimiter": delimiter}
     serialized = execute("csv_data", params)
-    assert serialized["text"] == "01;true\r\n02;false\r\n"
-    assert execute("csv_data", {"value": serialized["text"], "has_header": False, "delimiter": ";"})["records"] == [["01", "true"], ["02", "false"]]
+    if not cell_prefix and cell_text == "01" and delimiter == ";" and row_count == 2:
+        assert serialized["text"] == "01;true\r\n02;false\r\n"
+    expected = [[first_cell, "true"], ["02", "false"]][:row_count]
+    assert execute("csv_data", {"value": input_bom + serialized["text"], "has_header": False, "delimiter": delimiter})["records"] == expected
+    file_path = tmp_path / "records.csv"
+    file_path.write_bytes((input_bom + serialized["text"]).encode("utf-8"))
+    loaded = execute("read_text", {"file_path": str(file_path)})
+    assert execute("csv_data", {"value": loaded["text"], "has_header": False, "delimiter": delimiter})["records"] == expected
+    if input_bom and cell_prefix and delimiter != "\ufeff":
+        unquoted = input_bom + first_cell + delimiter + "true\r\n"
+        if row_count == 2:
+            unquoted += "02" + delimiter + "false\r\n"
+        assert execute("csv_data", {"value": unquoted, "has_header": False, "delimiter": delimiter})["records"] == expected
     serialized = execute("csv_data", {**params, "has_header": True, "columns": '["id","active"]'})
-    assert execute("csv_data", {"value": serialized["text"], "delimiter": ";"})["records"] == [{"id": "01", "active": "true"}, {"id": "02", "active": "false"}]
+    assert execute("csv_data", {"value": input_bom + serialized["text"], "delimiter": delimiter})["records"] == [{"id": first_cell, "active": "true"}, {"id": "02", "active": "false"}][:row_count]
 
 
 @pytest.mark.parametrize(
@@ -163,20 +190,48 @@ def test_url_encoding_round_trips_unicode_spaces_and_literal_plus(form_mode):
     assert decoded["text"] == value
 
 
-def test_url_query_generation_and_parsing_keep_repeated_and_empty_values():
+@pytest.mark.parametrize(
+    ("path", "fragment", "encoded_path", "encoded_fragment"),
+    [
+        ("/a%2Fb", "part", "/a%2Fb", "part"),
+        ("/a!$&'()*+,;=:@%2f", "part/?:@!$&'()*+,;=%23", "/a!$&'()*+,;=:@%2f", "part/?:@!$&'()*+,;=%23"),
+        ("/reports?final.csv", "part", "/reports%3Ffinal.csv", "part"),
+        ("/a#b", "part", "/a%23b", "part"),
+        ("/甲 乙\t\n\r丙", "part", "/%E7%94%B2%20%E4%B9%99%09%0A%0D%E4%B8%99", "part"),
+        ("/a%2Fb", "part 甲\n?#tail", "/a%2Fb", "part%20%E7%94%B2%0A?%23tail"),
+        ("/report:final.txt", "part", "/report:final.txt", "part"),
+        ("/a:b/c:d", "part", "/a:b/c:d", "part"),
+    ],
+)
+def test_url_query_generation_and_parsing_keep_repeated_and_empty_values(path, fragment, encoded_path, encoded_fragment):
     query = {"tag": ["甲 乙", "a+b"], "empty": None, "active": True, "page": 2}
     encoded = execute("url_codec", {"operation": "query_encode", "value": query})
-    parsed = execute("url_codec", {"operation": "parse", "value": "https://example.com:8443/a%2Fb?" + encoded["text"] + "#part"})
+    parsed = execute("url_codec", {"operation": "parse", "value": "https://example.com:8443" + encoded_path + "?" + encoded["text"] + "#" + encoded_fragment})
     assert parsed["query"] == {"tag": ["甲 乙", "a+b"], "empty": [""], "active": ["true"], "page": ["2"]}
     assert parsed["scheme"] == "https"
     assert parsed["hostname"] == "example.com"
     assert parsed["port"] == 8443
-    assert parsed["path"] == "/a%2Fb"
-    assert parsed["fragment"] == "part"
+    assert parsed["path"] == encoded_path
+    assert parsed["fragment"] == encoded_fragment
     composed = execute("url_codec", {"operation": "compose", "value": parsed})
     assert composed == parsed
+    from_parts = execute("url_codec", {"operation": "compose", "value": {**parsed, "path": path, "fragment": fragment}})
+    assert from_parts == parsed
     ipv6 = execute("url_codec", {"operation": "compose", "value": {**parsed, "hostname": "::1"}})
     assert ipv6["hostname"] == "::1" and ipv6["port"] == 8443
+    first, separator, rest = encoded_path.lstrip("/").partition("/")
+    relative_path = first.replace(":", "%3A") + separator + rest
+    relative_value = {"path": path.lstrip("/"), "query": query, "fragment": fragment}
+    for value in (relative_value, json.dumps(relative_value)):
+        relative = execute("url_codec", {"operation": "compose", "value": value})
+        assert relative == {**parsed, "scheme": "", "hostname": "", "port": None, "path": relative_path,
+                            "text": relative_path + "?" + encoded["text"] + "#" + encoded_fragment}
+        assert execute("url_codec", {"operation": "compose", "value": relative}) == relative
+    opaque = execute("url_codec", {"operation": "compose", "value": {"scheme": "URN", "path": "example:animal:ferret"}})
+    assert opaque["scheme"] == "urn" and opaque["path"] == "example:animal:ferret"
+    for scheme in ("invalid scheme", "1https", "http:", "http/", "http_", "中文", "http\n", "http\0"):
+        with pytest.raises(ValueError):
+            execute("url_codec", {"operation": "compose", "value": {**parsed, "scheme": scheme}})
 
 
 def test_data_actions_bind_structured_values_and_keep_content_out_of_summaries():

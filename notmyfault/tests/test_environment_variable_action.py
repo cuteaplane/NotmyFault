@@ -2,6 +2,10 @@
 
 import importlib.util
 import json
+import os
+import subprocess
+import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -28,7 +32,7 @@ def test_manifest_is_cross_platform_without_capabilities():
     assert meta["id"] == "environment_variable"
     assert meta["name"] == "环境变量"
     assert meta["platforms"] == ["windows", "linux"]
-    assert meta["permissions"] == []
+    assert meta["permissions"] == ["native_api"]
     assert "requires_capabilities" not in meta
     assert meta["idempotent"] is False
     assert meta["enabled"] is True
@@ -139,6 +143,12 @@ def test_set_allows_empty_value(monkeypatch):
         "value": "",
         "existed": True,
     }
+    child = "import json, os; print(json.dumps(os.environ.get('NMF_EV_TEST_EMPTY')))"
+    try:
+        assert json.loads(subprocess.check_output([sys.executable, "-c", child], text=True)) == ""
+    finally:
+        module.run({}, {"mode": "unset", "name": "NMF_EV_TEST_EMPTY"})
+    assert json.loads(subprocess.check_output([sys.executable, "-c", child], text=True)) is None
 
 
 def test_unset_present_and_absent(monkeypatch):
@@ -148,6 +158,49 @@ def test_unset_present_and_absent(monkeypatch):
     assert present == {"name": "NMF_EV_TEST_UNSET", "existed": True}
     absent = module.run({}, {"mode": "unset", "name": "NMF_EV_TEST_UNSET"})
     assert absent == {"name": "NMF_EV_TEST_UNSET", "existed": False}
+
+
+@pytest.mark.parametrize("mode,method", [("get", "__getitem__"), ("unset", "__delitem__")])
+def test_read_and_unset_tolerate_concurrent_removal(monkeypatch, mode, method):
+    module = load_module()
+    name = "NMF_EV_TEST_CONCURRENT"
+    monkeypatch.setenv(name, "original")
+    ready = threading.Event()
+    resume = threading.Event()
+    results = []
+    errors = []
+
+    def first_operation():
+        try:
+            results.append(module.run({}, {"mode": mode, "name": name}))
+        except Exception as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=first_operation, daemon=True)
+    original = getattr(type(os.environ), method)
+
+    def overlap(environment, key):
+        if method == "__getitem__":
+            value = original(environment, key)
+        if key == name and threading.current_thread() is worker:
+            ready.set()
+            if not resume.wait(2):
+                raise RuntimeError("并发操作未继续")
+        return original(environment, key) if method == "__delitem__" else value
+
+    monkeypatch.setattr(type(os.environ), method, overlap)
+    worker.start()
+    try:
+        assert ready.wait(2)
+        del os.environ[name]
+    finally:
+        resume.set()
+        worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert errors == []
+    expected = {"name": name, "existed": False} if mode == "unset" else {"name": name, "value": "original", "existed": True}
+    assert results == [expected]
+    assert name not in os.environ
 
 
 def test_reject_bad_names():
