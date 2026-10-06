@@ -53,5 +53,29 @@
     "platforms": [
         "windows",
         "linux"
-    ]
+    ],
+    "state_key": "state",
+    "state_filter": {
+        "default": {
+            "state": {
+                "config": "state"
+            }
+        }
+    },
+    "state_untracked": [
+        "resume"
+    ],
+    "state_hysteresis": {
+        "value": "battery_percent",
+        "threshold": 20,
+        "direction": "below",
+        "margin": 5,
+        "active_value": "low_battery",
+        "when": {
+            "state": "low_battery"
+        },
+        "guard": {
+            "state": "battery"
+        }
+    }
 }

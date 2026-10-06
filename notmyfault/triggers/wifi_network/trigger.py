@@ -61,38 +61,12 @@ class WifiNetworkTrigger(PollingTrigger):
             raise ValueError("方向为 connected/disconnected 时必须填写目标 SSID")
         self.direction = direction
         self.target = target
-        self._last_ssid: str | None = None
 
     def poll(self) -> None:
         current = _current_ssid()
         if current is None:
             raise RuntimeError("Wi-Fi 查询失败，请检查无线服务及 WLAN API/nmcli")
-        if self._last_ssid is None:
-            # 第一轮只记录当前状态，不触发
-            self._last_ssid = current
-            return
-        if current == self._last_ssid:
-            return
-        previous = self._last_ssid
-
-        if self.direction == "connected":
-            hit = bool(current) and current == self.target
-        elif self.direction == "disconnected":
-            hit = previous == self.target and current != self.target
-        else:
-            hit = True  # any：任意变化都算命中
-        if not hit:
-            self._last_ssid = current
-            return
-
-        self.log(f"WiFi 变化: {previous!r} -> {current!r}")
-        self.emit({
-            "ssid": current,
-            "previous_ssid": previous,
-            "connected": bool(current),
-            "target": self.target,
-        })
-        self._last_ssid = current
+        self.emit({"ssid": current, "previous_ssid": current, "connected": bool(current), "target": self.target})
 
 
 def run(meta, config, emit_event, shutdown_event):

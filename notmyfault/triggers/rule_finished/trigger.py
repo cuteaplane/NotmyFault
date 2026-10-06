@@ -10,25 +10,16 @@ from threading import Lock
 from notmyfault.plugin_api import engine_events_api
 
 _OUTCOME_ALIASES = {
-    "any": frozenset({"succeeded", "failed", "cancelled", "dropped", "replaced"}),
+    "any": frozenset({"succeeded", "failed", "cancelled", "dropped", "timed_out"}),
     "succeeded": frozenset({"succeeded"}),
-    "failed": frozenset({"failed"}),
+    "failed": frozenset({"failed", "timed_out"}),
     "cancelled": frozenset({"cancelled"}),
-    "dropped": frozenset({"dropped", "replaced"}),
+    "dropped": frozenset({"dropped"}),
 }
 
 
 def _status_from_event(event_type, data):
-    if event_type == "workflow_completed":
-        status = data.get("status", "succeeded")
-        return status if isinstance(status, str) else "succeeded"
-    if event_type == "workflow_failed":
-        return "failed"
-    if event_type == "run_dropped":
-        return "dropped"
-    if event_type == "run_replaced":
-        return "replaced"
-    return ""
+    return event_type.removeprefix("run.")
 
 
 class RuleFinishedTrigger:
@@ -79,7 +70,9 @@ class RuleFinishedTrigger:
             return False
         return True
 
-    def _on_engine_event(self, event_type, data):
+    def _on_engine_event(self, event):
+        event_type = event.type
+        data = {**event.data, "run_id": event.run_id, "rule_id": event.rule_id}
         if self._stop_event.is_set():
             return
         if event_type not in self._api.RULE_TERMINAL_EVENTS:
@@ -122,7 +115,7 @@ class RuleFinishedTrigger:
 
     def run(self):
         self.validate()
-        self._token = self._api.subscribe(self._on_engine_event)
+        self._token = self._api.subscribe(self._on_engine_event, capacity=512, overflow="drop_oldest")
         self.log(f"开始监视规则: {self.watch_rule_id}")
         try:
             self._stop_event.wait()

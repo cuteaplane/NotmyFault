@@ -32,9 +32,6 @@ class TcpPortTrigger(PollingTrigger):
         if self.target_state not in ("reachable", "unreachable", "changed"):
             raise ValueError("目标状态必须为 reachable、unreachable 或 changed")
 
-    def setup(self):
-        self._previous = None
-
     def poll(self):
         completed = threading.Event()
         result = []
@@ -56,16 +53,8 @@ class TcpPortTrigger(PollingTrigger):
         if self._stop_event.is_set() or not result:
             return
         reachable = result[0]
-        previous = self._previous
         state = "reachable" if reachable else "unreachable"
-        if (
-            previous is not None
-            and reachable != previous
-            and self.target_state in (state, "changed")
-            and not self._stop_event.is_set()
-        ):
-            self.emit({"host": self.host, "port": self.port, "state": state, "reachable": reachable})
-        self._previous = reachable
+        self.emit({"host": self.host, "port": self.port, "state": state, "reachable": reachable})
 
 
 def run(meta, config, emit_event, shutdown_event):

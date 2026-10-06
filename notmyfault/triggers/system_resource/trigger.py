@@ -44,7 +44,6 @@ class SystemResourceTrigger(PollingTrigger):
             raise ValueError("threshold 必须是有限数字")
 
     def setup(self):
-        self._last_triggered = False
         self._net_prev = None
         self._net_rate = 0.0
         self._first_sample = True
@@ -72,19 +71,8 @@ class SystemResourceTrigger(PollingTrigger):
         triggered = (self.direction == "above" and value >= self.threshold) or (
             self.direction == "below" and value <= self.threshold
         )
-        if triggered and not self._last_triggered:
-            unit = "MB/s" if self.resource == "network" else "%"
-            self.log(
-                f"{self.resource} {self.direction} "
-                f"{self.threshold}{unit} (当前: {value:.1f})"
-            )
-            self.emit({
-                "resource": self.resource,
-                "value": round(value, 1),
-                "threshold": self.threshold,
-                "direction": self.direction,
-            })
-        self._last_triggered = triggered
+        self.emit({"resource": self.resource, "value": round(value, 1), "threshold": self.threshold,
+                   "direction": self.direction, "matched": triggered})
 
 
 def run(meta, config, emit_event, shutdown_event):

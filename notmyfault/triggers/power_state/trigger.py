@@ -227,15 +227,6 @@ class PowerStateTrigger(PollingTrigger):
                 self.resume_monitor = _create_linux_resume_monitor()
             else:
                 raise RuntimeError("当前平台不支持睡眠恢复监听")
-        try:
-            with native_lock():
-                on_battery, _ = _is_on_battery()
-        except Exception as e:
-            self.log(f"初始电源状态读取失败: {e}")
-            on_battery = None
-        self._last_state = None if on_battery is None else ("battery" if on_battery else "ac")
-        self._low_battery_active = False
-
     def poll(self):
         resumed = False
         if self.power_window is not None:
@@ -251,24 +242,7 @@ class PowerStateTrigger(PollingTrigger):
         on_battery, battery_pct = _is_on_battery()
         current = "battery" if on_battery else "ac"
 
-        if self._last_state is None:
-            self._last_state = current
-            return
-
-        if current != self._last_state:
-            if current == self.target_state:
-                self.log(f"电源状态变化: {current}")
-                self.emit({"state": current, "battery_percent": battery_pct})
-            self._last_state = current
-
-        # 低电量首次进入时发送事件，离开阈值后重置标志
-        is_low = on_battery and battery_pct <= 20
-        if is_low and not self._low_battery_active and self.target_state == "low_battery":
-            self.log(f"低电量: {battery_pct}%")
-            self.emit({"state": "low_battery", "battery_percent": battery_pct})
-            self._low_battery_active = True
-        elif not on_battery or battery_pct > 25:
-            self._low_battery_active = False
+        self.emit({"state": current, "battery_percent": battery_pct})
 
     def teardown(self):
         with native_lock():

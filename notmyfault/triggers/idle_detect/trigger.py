@@ -51,19 +51,12 @@ class IdleDetectTrigger(PollingTrigger):
             raise ValueError("空闲阈值必须是非负有限秒数")
 
     def setup(self):
-        self._was_idle = False
         self.log(f"开始监视空闲状态，阈值: {self.threshold} 秒")
 
     def poll(self):
         idle_secs = _get_idle_seconds()
         idle = idle_secs >= self.threshold
-        if idle and not self._was_idle:
-            self.log(f"用户进入空闲状态 ({int(idle_secs)}s >= {self.threshold}s)")
-            self.emit({"state": "idle", "idle_seconds": idle_secs})
-        elif not idle and self._was_idle:
-            self.log(f"用户恢复活动 (阈值 {self.threshold}s)")
-            self.emit({"state": "active", "idle_seconds": idle_secs})
-        self._was_idle = idle
+        self.emit({"state": "idle" if idle else "active", "idle_seconds": idle_secs})
 
 
 def run(meta, config, emit_event, shutdown_event):

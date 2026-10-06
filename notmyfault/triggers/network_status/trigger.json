@@ -26,5 +26,13 @@
                 {"value": "disconnected", "label": "网络已断开"}
             ]
         }
-    ]
+    ],
+    "state_key": "state",
+    "state_filter": {
+        "default": {
+            "state": {
+                "config": "state"
+            }
+        }
+    }
 }

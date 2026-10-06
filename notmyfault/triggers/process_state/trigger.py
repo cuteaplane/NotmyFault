@@ -36,16 +36,11 @@ class ProcessStateTrigger(PollingTrigger):
         return "stopped"
 
     def setup(self):
-        self._last_state = self._current_state()
         self.log(f"开始监听进程: {self.raw_name}")
 
     def poll(self):
         current_state = self._current_state()
-        if current_state != self._last_state:
-            if current_state == self.target_state:
-                self.log(f"{self.raw_name} 状态变化: {current_state}")
-                self.emit({"process_name": self.raw_name, "state": current_state})
-            self._last_state = current_state
+        self.emit({"process_name": self.raw_name, "state": current_state})
 
 
 def run(meta, config, emit_event, shutdown_event):

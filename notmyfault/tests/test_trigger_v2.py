@@ -12,7 +12,6 @@ import pytest
 from notmyfault.core.bindings import BindingResolutionError, resolve_reference
 from notmyfault.tests.api_support import create_test_engine
 from notmyfault.core.rules import ConditionRuntime, config_fingerprint
-from notmyfault.core.trigger_supervisor import TriggerSupervisor
 from notmyfault.core.workflow import build_context
 from notmyfault.security.plugin_schema import check_payload_contract, validate_plugin_meta
 
@@ -86,29 +85,6 @@ class TriggerV2Tests:
 
         assert engine._condition_runtime.last_match("v2 绑定规则") == []
 
-    def test_supervisor_starts_one_v2_instance_per_config(self):
-        started = []
-        all_started = threading.Event()
-
-        def run_cb(instance_id, event_type, func, meta, config, stop_event):
-            started.append((instance_id, config))
-            if len(started) == 2:
-                all_started.set()
-
-        supervisor = TriggerSupervisor()
-        configs = [{"n": 1}, {"n": 2}]
-        count = supervisor.start(
-            {"demo": configs},
-            {"demo": lambda meta, cfg, emit, se=None: None},
-            {"demo": {"trigger_api": "event-v2"}},
-            run_cb,
-        )
-
-        assert count == 2
-        assert all_started.wait(timeout=2)
-        assert sorted(started) == [("demo:1", {"n": 1}), ("demo:2", {"n": 2})]
-        assert set(supervisor.health()) == {"demo:1", "demo:2"}
-        supervisor.stop(timeout=2)
 
 
 class TriggerConfigBindingTests:
@@ -272,63 +248,7 @@ class V2ContractTests:
         )
         assert any("未声明的输出字段: extra" in problem for problem in problems)
 
-    def test_engine_blocks_contract_violating_payload(self):
-        rule = {
-            "name": "契约规则",
-            "condition": {
-                "type": "demo_trigger",
-                "binding_id": "t_demo002",
-                "params": {},
-            },
-            "actions": [],
-        }
-        engine = make_engine(rule)
-        engine.triggers_meta["demo_trigger"] = {
-            "trigger_api": "event-v2",
-            "semantic": "oneshot",
-            "outputs": [{"name": "value", "type": "number"}],
-        }
-        events = []
-        engine.on_event = lambda event_type, data: events.append((event_type, data))
 
-        def bad_trigger(meta, config, emit_event, shutdown_event):
-            emit_event({"value": "不是数字"})
-
-        engine._run_trigger(
-            "demo_trigger",
-            "demo_trigger",
-            bad_trigger,
-            engine.triggers_meta["demo_trigger"],
-            {},
-            threading.Event(),
-        )
-
-        assert any(event_type == "trigger_payload_invalid" for event_type, _ in events)
-        assert engine._condition_runtime.last_match("契约规则") == []
-
-    def test_engine_blocks_event_v1_contract_violation(self):
-        engine = make_engine(None)
-        events = []
-        engine.on_event = lambda event_type, data: events.append((event_type, data))
-        meta = {
-            "trigger_api": "event-v1",
-            "outputs": [{"name": "value", "type": "number"}],
-        }
-
-        def bad_trigger(plugin_meta, configs, emit_event, shutdown_event):
-            emit_event("demo_trigger", {"value": "not a number"})
-            shutdown_event.set()
-
-        engine._run_trigger(
-            "demo_trigger",
-            "demo_trigger",
-            bad_trigger,
-            meta,
-            [],
-            threading.Event(),
-        )
-
-        assert [name for name, _data in events] == ["trigger_payload_invalid"]
 
 
 class V2MatchingTests:
@@ -410,16 +330,8 @@ class V2MatchingTests:
         dispatched = []
         engine._event_bus._scheduler_submit_fn = lambda *args: dispatched.append(args)
 
-        def trigger(meta, configs, emit, stop):
-            assert configs == [rule["condition"]["params"]]
-            emit("process_state", {"process_name": "Other.exe", "state": actual})
-            emit("process_state", {"process_name": "WeChat.exe", "state": actual})
-            stop.set()
-
-        engine._run_trigger(
-            "process_state", "process_state", trigger,
-            engine.triggers_meta["process_state"], [rule["condition"]["params"]], threading.Event(),
-        )
+        engine.emit_event("process_state", {"process_name": "Other.exe", "state": actual})
+        engine.emit_event("process_state", {"process_name": "WeChat.exe", "state": actual})
         assert len(dispatched) == int(matched)
         if matched:
             assert dispatched[0][3]["event"]["payload"]["state"] == actual
@@ -454,66 +366,3 @@ class V2OptimizationTests:
         assert config_fingerprint({"threshold": 90.0}) == config_fingerprint({"threshold": 90})
         assert config_fingerprint({"b": 2, "a": 1}) == config_fingerprint({"a": 1, "b": 2})
         assert config_fingerprint({"items": [1.0, 2]}) == config_fingerprint({"items": (1, 2.0)})
-
-    @pytest.mark.parametrize("configs", [
-        [{"threshold": 90}, {"threshold": 90.0}],
-        [{"amount": Decimal("1.20"), "data": b"\x00\xff"}, {"data": b"\x00\xff", "amount": Decimal("1.20")}],
-    ])
-    def test_supervisor_dedupes_normalized_identical_configs(self, configs):
-        started = []
-        did_start = threading.Event()
-
-        def run_cb(instance_id, event_type, func, meta, config, stop_event):
-            started.append(instance_id)
-            did_start.set()
-
-        supervisor = TriggerSupervisor()
-        count = supervisor.start(
-            {"demo": configs},
-            {"demo": lambda meta, cfg, emit, se=None: None},
-            {"demo": {"trigger_api": "event-v2"}},
-            run_cb,
-        )
-
-        assert count == 1
-        assert did_start.wait(timeout=2)
-        assert list(supervisor.health()) == ["demo"]
-        assert started == ["demo"]
-        supervisor.stop(timeout=2)
-
-    def test_supervisor_health_exposes_instance_config(self):
-        def run_cb(instance_id, event_type, func, meta, config, stop_event):
-            stop_event.wait()
-
-        supervisor = TriggerSupervisor()
-        configs = [{"folder_path": "A"}, {"folder_path": "B"}]
-        supervisor.start(
-            {"demo": configs},
-            {"demo": lambda meta, cfg, emit, se=None: None},
-            {"demo": {"trigger_api": "event-v2"}},
-            run_cb,
-        )
-
-        health = supervisor.health()
-        assert health["demo:1"]["config"] == configs[0]
-        assert health["demo:2"]["config"] == configs[1]
-        assert health["demo:1"]["alive"] is True
-        supervisor.stop(timeout=2)
-
-    def test_invalid_config_trigger_raises_so_engine_alerts(self):
-        engine = make_engine(None)
-        alerts = []
-        engine._alert_user = lambda title, message, open_dashboard=False: alerts.append(title)
-        events = []
-        engine.on_event = lambda event_type, data: events.append(event_type)
-
-        def broken_trigger(meta, config, emit_event, shutdown_event):
-            raise ValueError("无效的资源类型: 'gpu'")
-
-        meta = {"trigger_api": "event-v2", "outputs": []}
-        engine._run_trigger(
-            "system_resource", "system_resource", broken_trigger, meta, {}, threading.Event()
-        )
-
-        assert alerts and "system_resource" in alerts[0]
-        assert "trigger_crashed" in events

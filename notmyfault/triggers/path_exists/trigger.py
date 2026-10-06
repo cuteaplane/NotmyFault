@@ -26,7 +26,6 @@ class PathExistsTrigger(PollingTrigger):
             raise ValueError("检查间隔必须是 0.2 到 3600 秒之间的数字")
 
     def setup(self):
-        self._previous = None
         self._read_error = False
 
     def poll(self):
@@ -45,16 +44,9 @@ class PathExistsTrigger(PollingTrigger):
             self._read_error = True
             return
         self._read_error = False
-        previous = self._previous
         state = "exists" if exists else "missing"
-        if (
-            previous is not None
-            and exists != previous
-            and self.target_state in (state, "changed")
-            and not self._stop_event.is_set()
-        ):
+        if not self._stop_event.is_set():
             self.emit({"path": str(self.path), "state": state, "exists": exists})
-        self._previous = exists
 
 
 def run(meta, config, emit_event, shutdown_event):

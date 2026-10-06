@@ -103,5 +103,18 @@
         "unit": "seconds"
       }
     }
-  ]
+  ],
+  "state_key": "state",
+  "state_initial_value": "active",
+  "state_filter": {
+    "param": "state",
+    "cases": {
+      "changed": {}
+    },
+    "default": {
+      "state": {
+        "config": "state"
+      }
+    }
+  }
 }

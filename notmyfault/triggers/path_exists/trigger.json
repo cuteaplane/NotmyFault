@@ -97,5 +97,18 @@
         "unit": "seconds"
       }
     }
-  ]
+  ],
+  "state_key": "state",
+  "state_filter": {
+    "default": {
+      "state": {
+        "config": "state"
+      }
+    },
+    "param": "state",
+    "cases": {
+      "changed": {},
+      "any": {}
+    }
+  }
 }

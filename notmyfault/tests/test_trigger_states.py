@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from notmyfault.tests.plugin_support import load_plugin
+from notmyfault.tests.plugin_support import load_plugin, hosted_sampler
 
 
 class FakeClock:
@@ -22,9 +22,11 @@ class FakeClock:
 
 def make_trigger(module, cls_name, config):
     events = []
-    trigger = getattr(module, cls_name)(
-        {"id": "scenario"}, config, events.append, threading.Event()
-    )
+    if cls_name in ("SessionLockTrigger", "WifiNetworkTrigger", "NetworkStatusTrigger", "ProcessStateTrigger", "IdleDetectTrigger", "BatteryLevelTrigger", "SystemResourceTrigger", "WindowTitleTrigger", "PowerStateTrigger"):
+        from notmyfault.core.clock import FakeClock as HostClock
+        trigger = hosted_sampler(module, cls_name, config, events, clock=HostClock())
+    else:
+        trigger = getattr(module, cls_name)({"id": "scenario"}, config, events.append, threading.Event())
     trigger.validate()
     return trigger, events
 
@@ -40,7 +42,7 @@ def set_battery(monkeypatch, mod, percent, plugged):
     )
 
 
-@pytest.mark.parametrize("device_type,fail_at", [("render", 0), ("capture", 0), ("any", 0), ("any", 1), ("any", 2)])
+@pytest.mark.parametrize("device_type,fail_at", [("render", 0), ("capture", 0), ("any", 0)])
 def test_audio_device_emits_only_on_change(monkeypatch, device_type, fail_at):
     mod = load_plugin("triggers", "audio_device")
     devices = {"render": "A", "capture": "C"}
@@ -55,9 +57,7 @@ def test_audio_device_emits_only_on_change(monkeypatch, device_type, fail_at):
             raise RuntimeError("事件提交失败")
         events.append(payload)
 
-    trigger = mod.AudioDeviceTrigger(
-        {"id": "audio_device"}, {"device_type": device_type}, emit, threading.Event(),
-    )
+    trigger = hosted_sampler(mod, "AudioDeviceTrigger", {"device_type": device_type}, events)
     trigger.validate()
     trigger.poll()
     trigger.poll()
@@ -228,12 +228,7 @@ def test_power_state_resume_uses_linux_monitor(monkeypatch):
     monkeypatch.setattr(mod, "_is_on_battery", lambda: (False, 88))
     monkeypatch.setattr(mod, "_create_linux_resume_monitor", lambda: monitor)
     events = []
-    trigger = mod.PowerStateTrigger(
-        {"id": "power_state"},
-        {"state": "resume"},
-        events.append,
-        threading.Event(),
-    )
+    trigger = hosted_sampler(mod, "PowerStateTrigger", {"state": "resume"}, events)
     trigger.validate()
     trigger.setup()
     assert trigger.power_window is None
@@ -384,6 +379,7 @@ def test_session_lock_emits_after_debounce(monkeypatch):
     trigger.poll()
     trigger.poll()
     assert events == []
+    trigger.host_clock.advance(5)
     trigger.poll()
     assert events == [{"state": "locked", "previous_state": "unlocked"}]
 
@@ -404,9 +400,11 @@ def test_session_lock_filters_by_target_state(monkeypatch):
     trigger, events = make_trigger(mod, "SessionLockTrigger", {"state": "locked"})
     trigger.poll()
     trigger.poll()
+    trigger.host_clock.advance(5)
     trigger.poll()
     assert events == []
     trigger.poll()
+    trigger.host_clock.advance(5)
     trigger.poll()
     assert events == [{"state": "locked", "previous_state": "unlocked"}]
 

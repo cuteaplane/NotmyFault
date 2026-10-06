@@ -67,7 +67,6 @@ class DirectoryQuiescentTrigger(PollingTrigger):
     def setup(self):
         self._snapshot = _dir_snapshot(self.folder, self.pattern)
         self._last_change = time.monotonic()
-        self._was_quiescent = False
         self._read_error = False
         self.log(
             f"开始监视目录静默: {self.folder} "
@@ -75,8 +74,6 @@ class DirectoryQuiescentTrigger(PollingTrigger):
         )
 
     def _emit_state(self, state: str, quiet_for: float, file_count: int):
-        if self.target_state not in (state, "changed"):
-            return
         if self._stop_event.is_set():
             return
         self.emit({
@@ -97,18 +94,11 @@ class DirectoryQuiescentTrigger(PollingTrigger):
         self._read_error = False
         now = time.monotonic()
         if new_snapshot != self._snapshot:
-            if self._was_quiescent:
-                self.log(f"目录再次变化: {self.folder}")
-                self._emit_state("active", 0.0, len(new_snapshot))
-                self._was_quiescent = False
             self._snapshot = new_snapshot
             self._last_change = now
-            return
         quiet_for = now - self._last_change
-        if quiet_for >= self.quiet_seconds and not self._was_quiescent:
-            self.log(f"目录已静默 {int(quiet_for)} 秒: {self.folder}")
-            self._emit_state("quiescent", quiet_for, len(self._snapshot))
-            self._was_quiescent = True
+        state = "quiescent" if quiet_for >= self.quiet_seconds else "active"
+        self._emit_state(state, quiet_for, len(self._snapshot))
 
 
 def run(meta, config, emit_event, shutdown_event):

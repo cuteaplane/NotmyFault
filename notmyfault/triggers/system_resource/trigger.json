@@ -29,7 +29,8 @@
             "name": "direction",
             "label": "触发方向",
             "type": "string"
-        }
+        },
+        {"name": "matched", "label": "达到阈值", "type": "bool"}
     ],
     "params": [
         {
@@ -96,5 +97,12 @@
                 ]
             }
         }
-    ]
+    ],
+    "state_key": "matched",
+    "state_initial_value": false,
+    "state_filter": {
+        "default": {
+            "matched": true
+        }
+    }
 }

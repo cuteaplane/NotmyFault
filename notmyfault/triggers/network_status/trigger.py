@@ -34,7 +34,6 @@ class NetworkStatusTrigger(PollingTrigger):
             )
 
     def setup(self):
-        self._last_connected = None
         self.log(f"开始监控网络状态，目标: {self.target_state}")
 
     def poll(self):
@@ -61,14 +60,7 @@ class NetworkStatusTrigger(PollingTrigger):
         if errors:
             raise errors[0]
         current = result[0]
-        if self._last_connected is None:
-            self.log(f"初始网络状态: {'已连接' if current else '已断开'}")
-        elif current != self._last_connected:
-            new_state = "connected" if current else "disconnected"
-            if new_state == self.target_state and not self._stop_event.is_set():
-                self.log(f"网络状态变化: {new_state}")
-                self.emit({"state": new_state})
-        self._last_connected = current
+        self.emit({"state": "connected" if current else "disconnected"})
 
 
 def run(meta, config, emit_event, shutdown_event):

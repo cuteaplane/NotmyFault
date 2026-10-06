@@ -125,5 +125,17 @@
       "max": 16384,
       "value_type": "number"
     }
-  ]
+  ],
+  "state_key": "state",
+  "state_filter": {
+    "param": "state",
+    "cases": {
+      "changed": {}
+    },
+    "default": {
+      "state": {
+        "config": "state"
+      }
+    }
+  }
 }

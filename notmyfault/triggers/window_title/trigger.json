@@ -62,5 +62,14 @@
                 }
             ]
         }
-    ]
+    ],
+    "state_key": "state",
+    "state_initial_value": "closed",
+    "state_filter": {
+        "default": {
+            "state": {
+                "config": "state"
+            }
+        }
+    }
 }

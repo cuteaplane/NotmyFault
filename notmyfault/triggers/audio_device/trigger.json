@@ -29,5 +29,8 @@
                 {"value": "any", "label": "任意变化"}
             ]
         }
-    ]
+    ],
+    "state_key": "device_id",
+    "state_partition_key": "device_type",
+    "previous_state_output": "previous_device_id"
 }

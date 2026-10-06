@@ -42,5 +42,7 @@
                 "unit": "seconds"
             }
         }
-    ]
+    ],
+    "state_key": "state",
+    "state_initial_value": "active"
 }

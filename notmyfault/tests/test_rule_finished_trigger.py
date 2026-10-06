@@ -64,7 +64,7 @@ def test_emits_when_watched_rule_finishes():
             stop.wait(0.01)
         assert engine_events.subscriber_count() >= 1
         engine_events.publish(
-            "workflow_completed",
+            "run.succeeded",
             {
                 "run_id": "run_ok",
                 "rule_id": "rule_target",
@@ -73,7 +73,7 @@ def test_emits_when_watched_rule_finishes():
             },
         )
         engine_events.publish(
-            "workflow_completed",
+            "run.succeeded",
             {
                 "run_id": "run_other",
                 "rule_id": "rule_other",
@@ -81,10 +81,15 @@ def test_emits_when_watched_rule_finishes():
                 "status": "succeeded",
             },
         )
+        assert engine_events.flush()
         assert len(events) == 1
+        assert engine_events.flush()
         assert events[0]["rule_id"] == "rule_target"
+        assert engine_events.flush()
         assert events[0]["status"] == "succeeded"
+        assert engine_events.flush()
         assert events[0]["run_id"] == "run_ok"
+        assert engine_events.flush()
         assert check_payload_contract(meta["outputs"], events[0]) == []
     finally:
         stop.set()
@@ -128,7 +133,7 @@ def test_filters_outcome_and_skips_duplicate_run_id(reject_first):
             stop.wait(0.01)
         assert engine_events.subscriber_count() == 1
         engine_events.publish(
-            "workflow_completed",
+            "run.succeeded",
             {
                 "run_id": "run_1",
                 "rule_id": "rule_target",
@@ -137,18 +142,20 @@ def test_filters_outcome_and_skips_duplicate_run_id(reject_first):
             },
         )
         engine_events.publish(
-            "workflow_failed",
+            "run.failed",
             {"run_id": "run_2", "rule_id": "rule_target", "rule_name": "目标"},
         )
         engine_events.publish(
-            "workflow_failed",
+            "run.failed",
             {"run_id": "run_2", "rule_id": "rule_target", "rule_name": "目标"},
         )
         engine_events.publish(
-            "workflow_failed",
+            "run.failed",
             {"run_id": "run_2", "rule_id": "rule_target", "rule_name": "目标"},
         )
+        assert engine_events.flush()
         assert [item["status"] for item in events] == ["failed"]
+        assert engine_events.flush()
         assert events[0]["run_id"] == "run_2"
         assert len(attempts) == 1 + int(reject_first)
     finally:
@@ -183,7 +190,7 @@ def test_exclude_self_skips_owner_rule_finish():
                 break
             stop.wait(0.01)
         engine_events.publish(
-            "workflow_completed",
+            "run.succeeded",
             {
                 "run_id": "run_self",
                 "rule_id": "rule_self",
@@ -191,6 +198,7 @@ def test_exclude_self_skips_owner_rule_finish():
                 "status": "succeeded",
             },
         )
+        assert engine_events.flush()
         assert events == []
     finally:
         stop.set()
@@ -223,7 +231,7 @@ def test_include_self_allows_owner_rule_finish():
                 break
             stop.wait(0.01)
         engine_events.publish(
-            "workflow_completed",
+            "run.cancelled",
             {
                 "run_id": "run_self",
                 "rule_id": "rule_self",
@@ -231,7 +239,9 @@ def test_include_self_allows_owner_rule_finish():
                 "status": "cancelled",
             },
         )
+        assert engine_events.flush()
         assert len(events) == 1
+        assert engine_events.flush()
         assert events[0]["status"] == "cancelled"
     finally:
         stop.set()
@@ -288,6 +298,7 @@ def test_prepared_rule_suppresses_its_own_finish(monkeypatch, include_self, bind
         with pytest.raises(ValueError, match="布尔"):
             trigger.run()
         assert engine_events.subscriber_count() == 0
+        assert engine_events.flush()
         assert events == []
         return
 
@@ -302,11 +313,15 @@ def test_prepared_rule_suppresses_its_own_finish(monkeypatch, include_self, bind
         assert trigger.owner_rule_id == "r_self0001"
         payload = {"run_id": "run_self", "rule_id": "r_self0001", "status": "succeeded"}
         for _ in range(2):
-            engine_events.publish("workflow_completed", payload)
+            engine_events.publish("run.succeeded", payload)
+        assert engine_events.flush()
         assert len(events) == int(include_self is True)
         if events:
+            assert engine_events.flush()
             assert events[0]["rule_id"] == "r_self0001"
+            assert engine_events.flush()
             assert events[0]["run_id"] == "run_self"
+            assert engine_events.flush()
             assert events[0]["status"] == "succeeded"
     finally:
         stop.set()
@@ -329,7 +344,7 @@ def test_duplicate_notifications_during_delivery(other_runs):
     def receive(item):
         attempts.append(item["run_id"])
         if item["run_id"] == "run_pending" and attempts.count("run_pending") == 1:
-            engine_events.publish("workflow_failed", payload)
+            engine_events.publish("run.failed", payload)
             entered.set()
             if not release.wait(5):
                 errors.append("接收未恢复")
@@ -339,7 +354,7 @@ def test_duplicate_notifications_during_delivery(other_runs):
     trigger = module.RuleFinishedTrigger(meta, {"rule_id": "rule_target"}, receive, stop)
     thread = threading.Thread(target=trigger.run, daemon=True)
     publisher = threading.Thread(
-        target=engine_events.publish, args=("workflow_failed", payload), daemon=True
+        target=engine_events.publish, args=("run.failed", payload), daemon=True
     )
     thread.start()
     try:
@@ -352,17 +367,21 @@ def test_duplicate_notifications_during_delivery(other_runs):
         assert entered.wait(2)
         for index in range(other_runs):
             engine_events.publish(
-                "workflow_failed", {"run_id": f"run_other_{index}", "rule_id": "rule_target"}
+                "run.failed", {"run_id": f"run_other_{index}", "rule_id": "rule_target"}
             )
-        engine_events.publish("workflow_failed", payload)
+        engine_events.publish("run.failed", payload)
         assert attempts.count("run_pending") == 1
-        assert len(events) == other_runs
+        assert len(events) == 0
         release.set()
         publisher.join(timeout=2)
         assert not publisher.is_alive()
-        engine_events.publish("workflow_failed", payload)
-        assert attempts.count("run_pending") == 1
-        assert len(events) == other_runs + 1
+        assert engine_events.flush()
+        engine_events.publish("run.failed", payload)
+        assert engine_events.flush()
+        expected_pending = 1 if other_runs < 256 else 2
+        assert attempts.count("run_pending") == expected_pending
+        assert len(events) == other_runs + expected_pending
+        assert len(trigger._seen_run_set) <= 256
         assert errors == []
     finally:
         release.set()

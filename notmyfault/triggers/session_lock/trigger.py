@@ -69,33 +69,12 @@ class SessionLockTrigger(PollingTrigger):
                 f"无效的目标状态: {state!r}（可选: locked/unlocked/any）"
             )
         self.target_state = state
-        self._last_state: str | None = None
-        self._pending: str | None = None
-
     def poll(self) -> None:
         locked = _is_locked()
         if locked is None:
             raise RuntimeError("无法查询会话锁屏状态，请检查登录会话和 loginctl")
         state = "locked" if locked else "unlocked"
-        if self._last_state is None:
-            # 第一轮只记录当前状态，不触发
-            self._last_state = state
-            return
-        if state == self._last_state:
-            self._pending = None
-            return
-
-        if self._pending == state:
-            # 连续第二次采样仍为新状态：确认变化并上报
-            previous = self._last_state
-            if self.target_state in ("any", state):
-                self.log(f"锁屏状态变化: {previous} -> {state}")
-                self.emit({"state": state, "previous_state": previous})
-            self._last_state = state
-            self._pending = None
-        else:
-            # 首次采到新状态时记录到 _pending，下一轮再次确认
-            self._pending = state
+        self.emit({"state": state, "previous_state": state})
 
 
 def run(meta, config, emit_event, shutdown_event):

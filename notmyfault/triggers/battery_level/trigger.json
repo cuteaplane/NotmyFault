@@ -12,7 +12,8 @@
         {"name": "battery_percent", "label": "电量百分比", "type": "number", "value_type": "int"},
         {"name": "state", "label": "电源状态", "type": "string"},
         {"name": "threshold", "label": "配置阈值", "type": "number"},
-        {"name": "direction", "label": "触发方向", "type": "string"}
+        {"name": "direction", "label": "触发方向", "type": "string"},
+        {"name": "matched", "label": "达到阈值", "type": "bool"}
     ],
     "params": [
         {
@@ -46,5 +47,18 @@
                 {"value": "discharging", "label": "仅用电池时"}
             ]
         }
-    ]
+    ],
+    "state_key": "matched",
+    "state_initial_value": false,
+    "state_filter": {
+        "default": {
+            "matched": true
+        }
+    },
+    "state_hysteresis": {
+        "value": "battery_percent",
+        "threshold_param": "threshold",
+        "direction_param": "direction",
+        "margin": 5
+    }
 }

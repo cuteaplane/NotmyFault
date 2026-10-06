@@ -35,5 +35,24 @@
             "default": "",
             "placeholder": "如 MyHomeWiFi（方向为 any 时可留空）"
         }
-    ]
+    ],
+    "state_key": "ssid",
+    "previous_state_output": "previous_ssid",
+    "state_filter": {
+        "param": "direction",
+        "cases": {
+            "connected": {
+                "ssid": {
+                    "config": "ssid"
+                },
+                "connected": true
+            },
+            "disconnected": {
+                "previous_ssid": {
+                    "config": "ssid"
+                }
+            },
+            "any": {}
+        }
+    }
 }

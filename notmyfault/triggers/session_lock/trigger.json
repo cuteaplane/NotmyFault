@@ -27,5 +27,20 @@
                 {"value": "any", "label": "任意变化"}
             ]
         }
-    ]
+    ],
+    "state_key": "state",
+    "state_filter": {
+        "default": {
+            "state": {
+                "config": "state"
+            }
+        },
+        "param": "state",
+        "cases": {
+            "changed": {},
+            "any": {}
+        }
+    },
+    "debounce_seconds": 5,
+    "previous_state_output": "previous_state"
 }

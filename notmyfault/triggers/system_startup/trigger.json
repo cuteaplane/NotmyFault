@@ -3,7 +3,7 @@
     "name": "引擎启动",
     "semantic": "oneshot",
     "trigger_api": "event-v2",
-    "description": "此触发器启动后延迟指定秒数触发一次；重启引擎或重新启用触发器后重新计时",
+    "description": "系统启动后延迟指定秒数触发一次；同一配置在同一次系统启动中只触发一次",
     "version_code": 1,
     "version": "1.0",
     "package_name": "io.github.notmyfault.system_startup",
@@ -43,5 +43,6 @@
                 "unit": "seconds"
             }
         }
-    ]
+    ],
+    "lifecycle": "one_shot"
 }
