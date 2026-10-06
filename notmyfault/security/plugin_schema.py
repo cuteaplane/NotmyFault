@@ -15,6 +15,9 @@ _TRIGGER_OPTIONAL_FIELDS = {
     "semantic", "params", "permissions", "origin", "trigger_api", "platforms",
     "entrypoints", "outputs", "build", "contributes",
     "requires_capabilities", "engines", "security", "author",
+    "lifecycle", "state_key", "state_filter", "previous_state_output",
+    "debounce_seconds", "event_queue_size", "overflow", "coalesce_key",
+    "state_mode", "state_initial_value", "state_partition_key", "state_untracked", "state_hysteresis",
 }
 _ACTION_OPTIONAL_FIELDS = {
     "params", "permissions", "origin", "execution_api", "precondition_api",
@@ -558,6 +561,72 @@ def validate_plugin_meta(
 
     if "trigger_api" in meta and meta["trigger_api"] not in ("legacy", "event-v1", "event-v2"):
         errors.append("trigger_api 必须为 legacy、event-v1 或 event-v2")
+
+    if plugin_type in ("trigger", "triggers"):
+        if meta.get("lifecycle", "continuous") not in ("continuous", "one_shot"):
+            errors.append("lifecycle 必须为 continuous 或 one_shot")
+        if meta.get("overflow", "drop_oldest") not in ("drop_oldest", "coalesce"):
+            errors.append("overflow 必须为 drop_oldest 或 coalesce")
+        if meta.get("overflow") == "coalesce" and not meta.get("coalesce_key"):
+            errors.append("coalesce 必须声明 coalesce_key")
+        capacity = meta.get("event_queue_size", 200)
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or not 1 <= capacity <= 10000:
+            errors.append("event_queue_size 必须为 1 到 10000 之间的整数")
+        delay = meta.get("debounce_seconds", 0)
+        if isinstance(delay, bool) or not isinstance(delay, (float, int)) or not 0 <= delay <= 3600:
+            errors.append("debounce_seconds 必须为 0 到 3600 之间的秒数")
+        names = {item.get("name") for item in meta.get("outputs", []) if isinstance(item, dict) and isinstance(item.get("name"), str)}
+        for key in ("state_key", "state_partition_key", "previous_state_output", "coalesce_key"):
+            if key in meta and (not isinstance(meta[key], str) or meta[key] not in names):
+                errors.append(f"{key} 必须引用已声明的输出字段")
+        if meta.get("state_mode", "edge") not in ("edge", "level"):
+            errors.append("state_mode 必须为 edge 或 level")
+        if meta.get("semantic") == "state" and not meta.get("state_key"):
+            errors.append("state 触发器必须声明 state_key")
+        if "state_untracked" in meta and not isinstance(meta["state_untracked"], list):
+            errors.append("state_untracked 必须为数组")
+        hysteresis = meta.get("state_hysteresis")
+        if hysteresis is not None:
+            parameters = {item.get("name") for item in meta.get("params", []) if isinstance(item, dict)}
+            allowed = {"value", "threshold_param", "direction_param", "margin", "threshold", "direction", "active_value", "when", "guard"}
+            if not isinstance(hysteresis, dict) or set(hysteresis) - allowed or not {"value", "margin"}.issubset(hysteresis):
+                errors.append("state_hysteresis 必须声明 value 和 margin")
+            else:
+                if not isinstance(hysteresis["value"], str) or hysteresis["value"] not in names:
+                    errors.append("state_hysteresis.value 必须引用已声明的输出字段")
+                for key in ("threshold", "direction"):
+                    if (key in hysteresis) == (key + "_param" in hysteresis):
+                        errors.append(f"state_hysteresis 必须声明 {key} 或 {key}_param 中的一项")
+                    if key + "_param" in hysteresis and (not isinstance(hysteresis[key + "_param"], str) or hysteresis[key + "_param"] not in parameters):
+                        errors.append(f"state_hysteresis.{key}_param 必须引用已声明的参数")
+                margin = hysteresis["margin"]
+                if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not 0 <= margin <= 100:
+                    errors.append("state_hysteresis.margin 必须为 0 到 100 之间的数字")
+                if "threshold" in hysteresis and (isinstance(hysteresis["threshold"], bool) or not isinstance(hysteresis["threshold"], (float, int))):
+                    errors.append("state_hysteresis.threshold 必须为数字")
+                if "direction" in hysteresis and hysteresis["direction"] not in ("above", "below"):
+                    errors.append("state_hysteresis.direction 必须为 above 或 below")
+                for key, available in (("when", parameters), ("guard", names)):
+                    if key in hysteresis and (not isinstance(hysteresis[key], dict) or any(name not in available for name in hysteresis[key])):
+                        errors.append(f"state_hysteresis.{key} 必须引用已声明的字段")
+        state_filter = meta.get("state_filter", {})
+        if not isinstance(state_filter, dict) or set(state_filter) - {"param", "cases", "default"}:
+            errors.append("state_filter 必须是包含 param、cases、default 的对象")
+        else:
+            cases = state_filter.get("cases", {})
+            if not isinstance(cases, dict):
+                errors.append("state_filter.cases 必须为对象")
+            else:
+                parameters = {item.get("name") for item in meta.get("params", []) if isinstance(item, dict)}
+                if "param" in state_filter and (not isinstance(state_filter["param"], str) or state_filter["param"] not in parameters):
+                    errors.append("state_filter.param 必须引用已声明的参数")
+                for conditions in [*cases.values(), state_filter.get("default", {})]:
+                    if not isinstance(conditions, dict) or any(key not in names for key in conditions):
+                        errors.append("state_filter 条件必须引用已声明的输出字段")
+                        continue
+                    for expected in conditions.values():
+                        if isinstance(expected, dict) and (set(expected) != {"config"} or not isinstance(expected["config"], str) or expected["config"] not in parameters):
+                            errors.append("state_filter.config 必须引用已声明的参数")
 
     if "permissions" in meta:
         perms = meta["permissions"]

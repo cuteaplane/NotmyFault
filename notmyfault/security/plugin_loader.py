@@ -1,6 +1,8 @@
 """插件校验后再导入，使用调用方传入的注册表、诊断对象和提权模块。"""
 
 import inspect
+import hashlib
+import json
 import os
 import sys
 import threading
@@ -56,6 +58,7 @@ class PluginRegistry:
         self.actions_funcs: Dict[str, Callable[..., Any]] = {}
         # 模块表按 plugin id 存储模块，trigger 和 action 不能使用同一个 id。
         self.modules: Dict[str, Any] = {}
+        self.source_digests: Dict[str, str] = {}
         # 已发现但还没导入的动作插件，第一次执行时才导入。
         self.pending: Dict[str, Dict[str, Any]] = {}
         # 插件根目录，plugin_resource 靠它定位插件自带的二进制和资源。
@@ -114,12 +117,14 @@ class PluginRegistry:
         meta: Dict[str, Any],
         run: Callable[..., Any],
         module: Any,
+        *, source_digest: str = "",
     ) -> None:
         # 注册项必须同时保存元数据、入口函数和模块对象。
         meta_store, func_store = self.stores(kind)
         func_store[plugin_id] = run
         meta_store[plugin_id] = meta
         self.modules[plugin_id] = module
+        self.source_digests[plugin_id] = source_digest
         self.plugin_kinds[plugin_id] = kind
 
     def unregister(self, kind: PluginKind, plugin_id: str) -> None:
@@ -128,6 +133,7 @@ class PluginRegistry:
         func_store.pop(plugin_id, None)
         meta_store.pop(plugin_id, None)
         module = self.modules.pop(plugin_id, None)
+        self.source_digests.pop(plugin_id, None)
         if module is not None:
             sys.modules.pop(getattr(module, "__name__", ""), None)
         self.pending.pop(plugin_id, None)
@@ -147,6 +153,7 @@ class PluginRegistry:
         self.actions_meta.clear()
         self.actions_funcs.clear()
         self.modules.clear()
+        self.source_digests.clear()
         self.pending.clear()
         self.plugin_roots.clear()
         self.plugin_kinds.clear()
@@ -191,6 +198,7 @@ class PluginLoader:
         plugin_type: PluginKind,
         plugin_id: str,
         prev: Optional[Tuple[Any, Any, Any]],
+        source_digest: str = "",
     ) -> None:
         """覆盖加载失败时恢复旧插件。"""
         if not prev:
@@ -198,7 +206,7 @@ class PluginLoader:
         old_module, old_meta, old_run = prev
         if old_meta is None or old_run is None:
             return
-        self._registry.register(plugin_type, plugin_id, old_meta, old_run, old_module)
+        self._registry.register(plugin_type, plugin_id, old_meta, old_run, old_module, source_digest=source_digest)
 
     def load(
         self, base_dir: str, kind: PluginKind, origin: str = "builtin"
@@ -339,6 +347,7 @@ class PluginLoader:
         previous_root = entry.get("previous_root")
 
         with self._materialize_lock:
+            previous_digest = self._registry.source_digests.get(plugin_id, "")
             if prev is None and plugin_id in func_store:
                 return func_store[plugin_id]
 
@@ -371,7 +380,7 @@ class PluginLoader:
                 self._registry.plugin_kinds.pop(plugin_id, None)
                 if prev is not None:
                     self._restore_override(
-                        plugin_type, plugin_id, prev
+                        plugin_type, plugin_id, prev, previous_digest
                     )
                     if previous_importer is not None:
                         self._registry.importers[plugin_id] = previous_importer
@@ -520,7 +529,7 @@ class PluginLoader:
                     self._sudo.deauthorize_plugin(plugin_id, self._engine_token)
                 if previous_importer is not None:
                     previous_importer.close()
-                self._registry.register(plugin_type, plugin_id, meta, isolated_run, None)
+                self._registry.register(plugin_type, plugin_id, meta, isolated_run, None, source_digest=hashlib.sha256(json.dumps(tree.file_snapshot, sort_keys=True).encode()).hexdigest())
                 self._registry.pending.pop(plugin_id, None)
                 return meta
 
@@ -558,7 +567,8 @@ class PluginLoader:
                     return None
 
             self._registry.register(
-                plugin_type, plugin_id, meta, getattr(module, "run"), module
+                plugin_type, plugin_id, meta, getattr(module, "run"), module,
+                source_digest=hashlib.sha256(json.dumps(tree.file_snapshot, sort_keys=True).encode()).hexdigest(),
             )
             self._registry.pending.pop(plugin_id, None)
 

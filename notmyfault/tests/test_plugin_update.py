@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from notmyfault.tests.api_support import event_fields
+
 import json
 import sys
 import types
@@ -406,7 +408,7 @@ def test_engine_start_restores_backup_when_updated_plugin_cannot_import(
 
     engine = app.create_engine(
         store,
-        on_event=lambda event_type, data: events.append((event_type, data)),
+        on_event=lambda event: events.append((event.type, event_fields(event))),
     )
     try:
         restored = action_root / "old_id"
@@ -426,8 +428,9 @@ def test_engine_start_restores_backup_when_updated_plugin_cannot_import(
             }
         if recovery_failure:
             assert "old_id" not in engine.actions_funcs
-            assert [name for name, _data in events if name != "plugin_load_failed"] == [
-                "plugin_update_rollback_failed"
+            assert engine.events.flush()
+            assert [name for name, _data in events if name != "plugin.load_failed"] == [
+                "plugin.update.rollback_failed"
             ]
             assert alerts == []
             return
@@ -437,11 +440,13 @@ def test_engine_start_restores_backup_when_updated_plugin_cannot_import(
         assert restored_meta["version_code"] == 1
         assert engine.actions_funcs["old_id"]({}, {}) == {"version": 1}
         # 更新失败会先推一条插件加载失败，回退事件不变
-        assert [name for name, _data in events if name != "plugin_load_failed"] == [
-            "plugin_update_rolled_back"
+        assert engine.events.flush()
+        assert [name for name, _data in events if name != "plugin.load_failed"] == [
+            "plugin.update.rolled_back"
         ]
+        assert engine.events.flush()
         assert events[-1] == (
-            "plugin_update_rolled_back",
+            "plugin.update.rolled_back",
             {
                 "plugins": [
                     {
@@ -452,8 +457,9 @@ def test_engine_start_restores_backup_when_updated_plugin_cannot_import(
                 ]
             },
         )
+        assert engine.events.flush()
         assert any(
-            name == "plugin_load_failed" and data["plugin_id"] == new_id
+            name == "plugin.load_failed" and data["plugin_id"] == new_id
             for name, data in events
         )
         assert len(alerts) == 1
@@ -491,7 +497,7 @@ def test_engine_start_keeps_loadable_update_and_backup(
 
     engine = app.create_engine(
         store,
-        on_event=lambda event_type, data: events.append((event_type, data)),
+        on_event=lambda event: events.append((event.type, event_fields(event))),
     )
     try:
         assert current.is_dir()
@@ -499,6 +505,7 @@ def test_engine_start_keeps_loadable_update_and_backup(
         assert not marker.exists()
         assert engine.actions_funcs["demo"]({}, {}) == {"version": 2}
         assert marker.read_text(encoding="utf-8") == "ran"
+        assert engine.events.flush()
         assert events == []
         assert alerts == []
     finally:
@@ -529,12 +536,13 @@ def test_engine_start_does_not_check_disabled_update(monkeypatch, tmp_path):
 
     engine = app.create_engine(
         store,
-        on_event=lambda event_type, data: events.append((event_type, data)),
+        on_event=lambda event: events.append((event.type, event_fields(event))),
     )
     try:
         assert current.is_dir()
         assert backup.is_dir()
         assert "demo" not in engine.actions_funcs
+        assert engine.events.flush()
         assert events == []
         assert alerts == []
     finally:
