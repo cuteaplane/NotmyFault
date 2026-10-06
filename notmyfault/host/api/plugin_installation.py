@@ -14,6 +14,28 @@ from pathlib import Path
 from typing import Any, Callable
 
 
+_MANIFEST_LOCK = threading.RLock()
+
+
+def record_plugin_hashes(
+    manifest_path: Path,
+    plugin_id: str,
+    file_snapshot: dict[str, str],
+    *,
+    obsolete_plugin_ids: tuple[str, ...] = (),
+) -> None:
+    from notmyfault.security.plugins import load_plugin_manifest, save_plugin_manifest
+
+    with _MANIFEST_LOCK:
+        manifest = load_plugin_manifest(manifest_path)
+        manifest[plugin_id] = dict(file_snapshot)
+        for old_id in obsolete_plugin_ids:
+            if old_id != plugin_id:
+                manifest.pop(old_id, None)
+        if not save_plugin_manifest(manifest, manifest_path):
+            raise OSError("无法保存插件完整性清单")
+
+
 class PluginFileSystem:
     def replace(self, source: Path, destination: Path) -> None:
         os.replace(source, destination)
@@ -61,6 +83,14 @@ class PluginTemporaryStorage:
             pass
 
 
+class PluginInstallRollbackError(OSError):
+    pass
+
+
+class PluginInstallCleanupError(OSError):
+    pass
+
+
 class PluginInstallTransaction:
     def __init__(self, file_system: PluginFileSystem) -> None:
         self._file_system = file_system
@@ -72,12 +102,15 @@ class PluginInstallTransaction:
         validate: Callable[[Path], None] | None = None,
         keep_backup: bool = True,
         obsolete_destinations: tuple[Path, ...] = (),
+        commit: Callable[[Path], None] | None = None,
     ) -> tuple[Path, ...]:
         self._file_system.make_dirs(destination.parent)
         staging = destination.parent / (
             f".{destination.name}-staging-{secrets.token_hex(8)}"
         )
         displaced: list[tuple[Path, Path]] = []
+        retained: list[tuple[Path, Path]] = []
+        installed = False
         self._file_system.remove_tree(staging)
         try:
             self._file_system.copy_tree(source, staging)
@@ -89,24 +122,55 @@ class PluginInstallTransaction:
                 if not self._file_system.exists(current):
                     continue
                 backup = current.with_name(current.name + ".nmf-backup")
-                self._file_system.remove_tree(backup)
+                if self._file_system.exists(backup):
+                    saved_backup = backup.with_name(
+                        f".{backup.name}-retained-{secrets.token_hex(8)}"
+                    )
+                    self._file_system.replace(backup, saved_backup)
+                    retained.append((backup, saved_backup))
                 self._file_system.replace(current, backup)
                 displaced.append((current, backup))
-            try:
-                self._file_system.replace(staging, destination)
-            except Exception:
-                for current, backup in reversed(displaced):
-                    self._file_system.replace(backup, current)
-                displaced.clear()
-                raise
-        except Exception:
+            self._file_system.replace(staging, destination)
+            installed = True
+            if commit is not None:
+                commit(destination)
+        except Exception as error:
+            rollback_errors: list[str] = []
+            if installed:
+                try:
+                    self._file_system.remove_tree(destination)
+                except Exception as rollback_error:
+                    rollback_errors.append(f"删除 {destination}: {rollback_error}")
             for current, backup in reversed(displaced):
-                if self._file_system.exists(backup):
+                try:
                     self._file_system.replace(backup, current)
+                except Exception as rollback_error:
+                    rollback_errors.append(f"恢复 {current}: {rollback_error}")
+            for backup, saved_backup in reversed(retained):
+                try:
+                    self._file_system.replace(saved_backup, backup)
+                except Exception as rollback_error:
+                    rollback_errors.append(
+                        f"恢复备份 {saved_backup} 到 {backup}: {rollback_error}"
+                    )
+            if rollback_errors:
+                raise PluginInstallRollbackError(
+                    "安装失败，恢复插件目录失败: " + "; ".join(rollback_errors)
+                ) from error
             displaced.clear()
             raise
         finally:
             self._file_system.discard_tree(staging)
+        cleanup_errors: list[str] = []
+        for _backup, saved_backup in retained:
+            try:
+                self._file_system.remove_tree(saved_backup)
+            except Exception as cleanup_error:
+                cleanup_errors.append(f"删除 {saved_backup}: {cleanup_error}")
+        if cleanup_errors:
+            raise PluginInstallCleanupError(
+                "插件已安装，但清理旧备份失败: " + "; ".join(cleanup_errors)
+            )
         backups = tuple(backup for _current, backup in displaced)
         if not keep_backup:
             for backup in backups:
@@ -119,6 +183,7 @@ class PluginInstallTransaction:
         backup: Path,
         destination: Path,
         active: Path | None,
+        commit: Callable[[Path], None] | None = None,
     ) -> Path:
         if not self._file_system.exists(backup):
             raise OSError(f"插件备份不存在: {backup}")
@@ -129,21 +194,44 @@ class PluginInstallTransaction:
             )
             self._file_system.remove_tree(failed)
             self._file_system.replace(active, failed)
+        restored = False
         try:
             if self._file_system.exists(destination):
                 raise OSError(f"旧插件目录仍然存在: {destination}")
             self._file_system.replace(backup, destination)
-        except Exception:
+            restored = True
+            if commit is not None:
+                commit(destination)
+        except Exception as error:
+            rollback_errors: list[str] = []
+            if restored:
+                try:
+                    self._file_system.replace(destination, backup)
+                except Exception as rollback_error:
+                    rollback_errors.append(f"恢复备份 {backup}: {rollback_error}")
             if (
                 failed is not None
                 and self._file_system.exists(failed)
                 and active is not None
-                and not self._file_system.exists(active)
             ):
-                self._file_system.replace(failed, active)
+                try:
+                    if self._file_system.exists(active):
+                        raise OSError(f"更新版目录仍被占用: {active}")
+                    self._file_system.replace(failed, active)
+                except Exception as rollback_error:
+                    rollback_errors.append(f"恢复更新版 {active}: {rollback_error}")
+            if rollback_errors:
+                raise PluginInstallRollbackError(
+                    "撤回更新失败，恢复原目录失败: " + "; ".join(rollback_errors)
+                ) from error
             raise
         if failed is not None:
-            self._file_system.remove_tree(failed)
+            try:
+                self._file_system.remove_tree(failed)
+            except OSError as error:
+                raise PluginInstallCleanupError(
+                    f"旧版已恢复，但清理更新版目录失败: {failed}"
+                ) from error
         return destination
 
 
@@ -297,13 +385,18 @@ class PluginBackupStore:
             )
         return tuple(selected)
 
-    def restore(self, backup: RetainedPluginBackup) -> Path:
+    def restore(
+        self,
+        backup: RetainedPluginBackup,
+        commit: Callable[[Path], None] | None = None,
+    ) -> Path:
         if backup.problem:
             raise OSError(backup.problem)
         return self._transaction.restore_backup(
             backup.backup_path,
             backup.destination,
             backup.active_path,
+            commit=commit,
         )
 
 

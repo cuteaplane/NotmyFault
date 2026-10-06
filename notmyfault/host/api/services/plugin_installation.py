@@ -6,7 +6,6 @@ import os
 import re
 import shlex
 import subprocess
-import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict
@@ -18,8 +17,12 @@ from notmyfault.host.api.plugin_installation import (
     PendingPreviewStore,
     PluginFileSystem,
     PluginInstallTransaction,
+    PluginInstallRollbackError,
+    PluginInstallCleanupError,
     PluginTemporaryStorage,
     snapshot_plugin_directory,
+    record_plugin_hashes,
+    _MANIFEST_LOCK,
 )
 from notmyfault.host.api.services.plugin_catalog import PluginCatalogService
 from notmyfault.host.plugin_registry import (
@@ -36,6 +39,7 @@ from notmyfault.security.plugin_package import PluginPackageLimits, extract_nmfp
 from notmyfault.security.plugins import plugin_signature_kind
 from notmyfault.security.plugin_checks import (
     inspect_plugin, inspection_report, is_plugin_platform_compatible,
+    current_platform_name,
     validate_plugin_signature,
 )
 from notmyfault.security.security import detect_security_mode
@@ -52,9 +56,6 @@ class PluginDownload:
     content: bytes
     filename: str
     sha256: str
-
-
-_MANIFEST_LOCK = threading.RLock()
 
 
 class PluginInstallationService:
@@ -298,6 +299,8 @@ class PluginInstallationService:
             inspection = inspect_plugin(root_path, plugin_type)
             schema_errors = inspection.errors + inspection.schema_errors
             schema_valid = not schema_errors
+            if schema_valid:
+                self._reject_unsupported_platform(meta)
             risks = self.scan_install_risks(str(root_path), json_name, meta, inspection)
             permissions = []
             for permission in meta.get("permissions", []):
@@ -490,6 +493,7 @@ class PluginInstallationService:
                 valid, errors = validate_plugin_meta(meta, plugin_type)
                 if not valid:
                     self._fail(400, "schema 校验失败: " + "; ".join(errors[:3]))
+                self._reject_unsupported_platform(meta)
                 risks = self.scan_install_risks(str(root_path), json_name, meta)
                 if risks:
                     raise PluginInstallationError(
@@ -558,6 +562,8 @@ class PluginInstallationService:
                 if counter_error:
                     self._fail(400, counter_error)
 
+            installed_hashes: dict[str, str] = {}
+
             def validate_staging(staging: Path) -> None:
                 written_meta = self._read_manifest(staging / json_name)
                 inspection = inspect_plugin(staging, plugin_type)
@@ -584,6 +590,7 @@ class PluginInstallationService:
                 validate_plugin_signature(
                     staging, written_meta, "user", detect_security_mode(), inspection.signature.kind
                 )
+                installed_hashes.update(inspection.tree.file_snapshot)
 
             try:
                 backups = self._transaction.install_tree(
@@ -592,26 +599,45 @@ class PluginInstallationService:
                     validate=validate_staging,
                     keep_backup=True,
                     obsolete_destinations=obsolete,
+                    commit=lambda _destination: self._record_installed_hashes(
+                        plugin_id,
+                        installed_hashes,
+                        obsolete_plugin_ids=tuple(path.name for path in obsolete),
+                    ),
                 )
-                kept_backups = set(backups)
-                for old_backup in self._backups_for_package(package_name):
-                    if old_backup not in kept_backups:
-                        self._file_system.remove_tree(old_backup)
             except ValueError as error:
                 body: Dict[str, Any] = {"ok": False, "error": str(error)}
                 risks = getattr(error, "risks", None)
                 if risks is not None:
                     body["risks"] = risks
                 raise PluginInstallationError(400, body) from error
+            except PluginInstallCleanupError as error:
+                self._log_exception("install_cleanup", error)
+                raise PluginInstallationError(
+                    500,
+                    {"ok": False, "error": "插件已安装，但清理旧备份失败，请检查备份目录"},
+                ) from error
+            except PluginInstallRollbackError as error:
+                self._log_exception("install_rollback", error)
+                raise PluginInstallationError(
+                    500,
+                    {"ok": False, "error": "安装失败，旧版本未能完全恢复，请检查插件目录和备份"},
+                ) from error
             except OSError as error:
                 raise PluginInstallationError(
                     500,
-                    {"ok": False, "error": "安装失败，已恢复旧版本"},
+                    {"ok": False, "error": "安装失败，插件目录已恢复到安装前状态"},
                 ) from error
-            self._record_installed_hashes(destination, plugin_id)
-            if obsolete:
-                for old_destination in obsolete:
-                    self._forget_installed_hashes(old_destination.name)
+            try:
+                kept_backups = set(backups)
+                for old_backup in self._backups_for_package(package_name):
+                    if old_backup not in kept_backups:
+                        self._file_system.remove_tree(old_backup)
+            except OSError as error:
+                raise PluginInstallationError(
+                    500,
+                    {"ok": False, "error": "插件已安装，但清理旧备份失败，请检查备份目录"},
+                ) from error
             return {
                 "ok": True,
                 "id": plugin_id,
@@ -698,18 +724,19 @@ class PluginInstallationService:
             return "签名私钥密码错误或副签失败"
         return None
 
-    def _record_installed_hashes(self, plugin_dir: Path, plugin_id: str) -> None:
-        from notmyfault.security.plugin_checks import inspect_plugin_tree
-        from notmyfault.security.plugins import load_plugin_manifest, save_plugin_manifest
-
-        tree = inspect_plugin_tree(str(plugin_dir))
-        if tree is None:
-            return
-        with _MANIFEST_LOCK:
-            path = self._paths.plugin_manifest_file
-            manifest = load_plugin_manifest(path)
-            manifest[plugin_id] = tree.file_snapshot
-            save_plugin_manifest(manifest, path)
+    def _record_installed_hashes(
+        self,
+        plugin_id: str,
+        file_snapshot: dict[str, str],
+        *,
+        obsolete_plugin_ids: tuple[str, ...] = (),
+    ) -> None:
+        record_plugin_hashes(
+            self._paths.plugin_manifest_file,
+            plugin_id,
+            file_snapshot,
+            obsolete_plugin_ids=obsolete_plugin_ids,
+        )
 
     def _forget_installed_hashes(self, plugin_id: str) -> None:
         from notmyfault.security.plugins import load_plugin_manifest, save_plugin_manifest
@@ -861,6 +888,18 @@ class PluginInstallationService:
     @staticmethod
     def _platform_compatible(meta: Dict[str, Any]) -> bool:
         return is_plugin_platform_compatible(meta)
+
+    @staticmethod
+    def _reject_unsupported_platform(meta: Dict[str, Any]) -> None:
+        """用户插件声明的平台不含当前平台时直接拒绝，不让它装进来当摆设"""
+        if PluginInstallationService._platform_compatible(meta):
+            return
+        platforms = meta.get("platforms") or []
+        declared = "、".join(str(item) for item in platforms) or "未声明"
+        PluginInstallationService._fail(
+            400,
+            f"插件只支持 {declared}，当前平台是 {current_platform_name()}，不能安装",
+        )
 
     @staticmethod
     def _list_diff(old_items: Any, new_items: Any) -> Dict[str, list[str]]:

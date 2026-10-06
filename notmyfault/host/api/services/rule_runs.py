@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 
 from notmyfault.config import ConfigValidationError, SignedConfigStore
 from notmyfault.core.bindings import BindingResolutionError, validate_binding_path, iter_legacy_event_payload_paths, iter_references, resolve_reference
-from notmyfault.core.data_types import DataTypeError
+from notmyfault.core.data_types import DataTypeError, copy_value
 from notmyfault.core.type_registry import TypeRegistry
 from notmyfault.core.variables import initialize_variables
 from notmyfault.core.rules import get_rule_events, validate_rules_structure
@@ -299,7 +299,9 @@ class RuleRunService:
             except BindingResolutionError:
                 self._fail(400, f"检查项 #{index + 1} 的数据路径无效")
             if (
-                step_id not in selected_ids
+                not isinstance(step_id, str)
+                or not isinstance(operator, str)
+                or step_id not in selected_ids
                 or operator not in _TEST_ASSERTION_OPERATORS
                 or not isinstance(path, list)
             ):
@@ -308,7 +310,15 @@ class RuleRunService:
             if operator != "exists":
                 if "expected" not in assertion:
                     self._fail(400, f"检查项 #{index + 1} 缺少期望值")
-                normalized["expected"] = assertion["expected"]
+                try:
+                    normalized["expected"] = copy_value(
+                        assertion["expected"],
+                        location=f"test_assertions[{index}].expected",
+                    )
+                except DataTypeError as error:
+                    raise RuleRunServiceError(
+                        400, {"ok": False, "error": str(error)},
+                    ) from error
             normalized_assertions.append(normalized)
         return normalized_assertions
 

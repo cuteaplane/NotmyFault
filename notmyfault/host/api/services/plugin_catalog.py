@@ -17,6 +17,14 @@ from notmyfault.security.security import detect_security_mode
 from notmyfault.security.plugins import load_plugin_manifest
 from notmyfault.security.plugin_schema import scan_plugins
 
+# 诊断里的存储名对应哪个目录分组
+_STORE_CATEGORIES = {
+    "trigger": "triggers",
+    "triggers": "triggers",
+    "action": "actions",
+    "actions": "actions",
+}
+
 
 class PluginCatalogService:
     def __init__(
@@ -50,6 +58,8 @@ class PluginCatalogService:
             disabled = {"triggers": [], "actions": []}
 
         result: Dict[str, Dict[str, Any]] = {"triggers": {}, "actions": {}}
+        # (分组, 插件 id) -> 这次扫描见过它的来源，用来判断诊断里的 id 能不能认领
+        origins: Dict[tuple, set] = {}
         for plugin_kind in ("triggers", "actions"):
             json_name = (
                 "trigger.json" if plugin_kind == "triggers" else "action.json"
@@ -62,6 +72,7 @@ class PluginCatalogService:
             ).items():
                 meta["origin"] = "builtin"
                 result[plugin_kind][plugin_id] = meta
+                origins.setdefault((plugin_kind, plugin_id), set()).add("builtin")
             if include_checks:
                 self._include_unscannable_plugins(
                     result[plugin_kind],
@@ -70,6 +81,7 @@ class PluginCatalogService:
                     "builtin",
                     plugin_kind,
                     capability_report,
+                    origins,
                 )
             if os.path.isdir(user_dir):
                 for plugin_id, meta in scan_plugins(
@@ -81,6 +93,7 @@ class PluginCatalogService:
                     meta["origin"] = "user"
                     if plugin_id not in result[plugin_kind]:
                         result[plugin_kind][plugin_id] = meta
+                    origins.setdefault((plugin_kind, plugin_id), set()).add("user")
                 if include_checks:
                     self._include_unscannable_plugins(
                         result[plugin_kind],
@@ -89,6 +102,7 @@ class PluginCatalogService:
                         "user",
                         plugin_kind,
                         capability_report,
+                        origins,
                     )
             for plugin_id in disabled_set:
                 if plugin_id in result[plugin_kind]:
@@ -101,20 +115,17 @@ class PluginCatalogService:
             for meta in result[plugin_kind].values():
                 if isinstance(meta, dict):
                     self._annotate_availability(meta, capability_report)
-        current_engine = self._engine.current_engine
-        if current_engine is not None:
-            errors = (
-                current_engine.get_diagnostics()
-                .get("plugins", {})
-                .get("errors", [])
-            )
-            for error in errors:
-                if len(error) < 3:
+        if include_checks:
+            runtime = self._runtime_state()
+            result["runtime"] = runtime
+            for item in runtime["plugin_errors"]:
+                category = _STORE_CATEGORIES.get(item["store"].lower())
+                if category is None:
+                    # 存储名不认识，只留在会话错误里，不往插件条目上挂
                     continue
-                category = "triggers" if error[0] == "Trigger" else "actions"
-                plugin_id = error[1]
-                if plugin_id in result[category]:
-                    result[category][plugin_id]["_error"] = error[2]
+                entry = self._error_target(result, origins, category, item["plugin_id"])
+                if entry is not None:
+                    entry["_error"] = item["reason"]
         if config.get("config_error"):
             result["config_error"] = config["config_error"]
             for plugin_kind in ("triggers", "actions"):
@@ -122,6 +133,56 @@ class PluginCatalogService:
                     meta["enabled"] = False
                     meta["_error"] = config["config_error"]
         return result
+
+    def _error_target(self, result: Dict[str, Any], origins: Dict[tuple, set], category: str, plugin_id: str):
+        """诊断只带 id；同一个 id 这次扫描在内置和用户目录都出现过时不认领"""
+        entry = result[category].get(plugin_id)
+        if entry is None:
+            return None
+        if len(origins.get((category, plugin_id), ())) > 1:
+            return None
+        return entry
+
+    def _runtime_state(self) -> Dict[str, Any]:
+        """本次引擎会话的插件错误；目录条目只表示扫描结果"""
+        try:
+            state = str(self._engine.engine_state or "stopped")
+        except Exception:
+            state = "stopped"
+        engine = self._engine.current_engine
+        if engine is None:
+            return {
+                "engine_state": state,
+                "diagnostics_available": False,
+                "plugin_errors": [],
+                "plugin_error_count": 0,
+            }
+        try:
+            raw = engine.get_diagnostics().get("plugins", {}).get("errors", []) or []
+        except Exception as error:
+            # 读不到诊断时不能显示成"零错误"
+            return {
+                "engine_state": state,
+                "diagnostics_available": False,
+                "diagnostics_error": type(error).__name__,
+                "plugin_errors": [],
+                "plugin_error_count": 0,
+            }
+        errors = []
+        for item in raw:
+            if not isinstance(item, (list, tuple)) or len(item) < 3:
+                continue
+            errors.append({
+                "store": str(item[0]),
+                "plugin_id": str(item[1]),
+                "reason": str(item[2]),
+            })
+        return {
+            "engine_state": state,
+            "diagnostics_available": True,
+            "plugin_errors": errors,
+            "plugin_error_count": len(errors),
+        }
 
     def find_user_plugin_by_package(self, package_name: str):
         if not package_name:
@@ -227,6 +288,7 @@ class PluginCatalogService:
         origin: str,
         plugin_kind: str,
         capability_report: Dict[str, Dict[str, Any]],
+        origins: Dict[tuple, set],
     ) -> None:
         kind = "trigger" if plugin_kind == "triggers" else "action"
         mode = detect_security_mode()
@@ -236,16 +298,28 @@ class PluginCatalogService:
                 continue
             meta, errors, schema_errors = inspect_plugin_metadata(folder, kind)
             if errors:
+                # JSON 读不出来或解析失败：身份无法确认，只按目录名展示，界面不给启禁和卸载
+                result.setdefault(folder.name, {
+                    "id": folder.name,
+                    "name": folder.name,
+                    "origin": origin,
+                    "_error": "; ".join(str(item) for item in errors[:2]),
+                    "_unidentified": True,
+                })
+                origins.setdefault((plugin_kind, folder.name), set()).add(origin)
                 continue
             plugin_id = meta.get("id", folder.name)
             existing = result.get(plugin_id)
             if existing is not None and existing.get("origin") != origin:
+                origins.setdefault((plugin_kind, plugin_id), set()).add(origin)
                 continue
             if schema_errors:
                 result.setdefault(plugin_id, {
                     **meta, "id": plugin_id, "origin": origin,
                     "_error": "schema: " + "; ".join(schema_errors[:2]),
                 })
+                origins.setdefault((plugin_kind, plugin_id), set()).add(origin)
                 continue
             inspection = inspect_plugin(folder, kind, origin, capability_report=capability_report, installed_manifest=installed)
             result.setdefault(plugin_id, {**meta, "origin": origin})["checks"] = inspection_report(inspection, mode)
+            origins.setdefault((plugin_kind, plugin_id), set()).add(origin)

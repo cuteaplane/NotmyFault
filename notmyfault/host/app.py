@@ -12,6 +12,8 @@ from notmyfault.host.api.plugin_installation import (
     PluginBackupStore,
     PluginFileSystem,
     RetainedPluginBackup,
+    PluginInstallCleanupError,
+    record_plugin_hashes,
 )
 def _notify_build_required(detail: str) -> None:
     try:
@@ -230,10 +232,33 @@ def _recover_failed_plugin_updates(
         return engine
 
     engine.shutdown()
+    from notmyfault.security.plugin_checks import inspect_plugin, evaluate_plugin
+
     restored: list[dict[str, Any]] = []
     for backup in broken:
         try:
-            backups.restore(backup)
+            inspection = inspect_plugin(backup.backup_path, backup.kind, "user")
+            decision = evaluate_plugin(inspection, engine._security_mode)
+            if not decision["allowed"]:
+                raise OSError("备份校验失败: " + "; ".join(decision["errors"]))
+            if inspection.meta != backup.backup_meta:
+                raise OSError("备份元数据在恢复前发生变化")
+            old_id = inspection.meta["id"]
+            active_id = (backup.active_meta or {}).get("id")
+            obsolete_ids = (active_id,) if isinstance(active_id, str) else ()
+            backups.restore(
+                backup,
+                commit=lambda _destination: record_plugin_hashes(
+                    store.paths.plugin_manifest_file,
+                    old_id,
+                    inspection.tree.file_snapshot,
+                    obsolete_plugin_ids=obsolete_ids,
+                ),
+            )
+        except PluginInstallCleanupError as error:
+            unresolved.append(
+                {"backup": str(backup.destination), "error": str(error)}
+            )
         except OSError as error:
             unresolved.append(
                 {
@@ -279,6 +304,7 @@ def _recover_failed_plugin_updates(
                     "error": "旧版插件仍然无法加载",
                 }
             )
+            restored = [item for item in restored if item.get("id") != plugin_id]
     _notify_plugin_recovery(restored, unresolved, on_event)
     return replacement
 

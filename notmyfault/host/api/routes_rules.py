@@ -8,7 +8,6 @@ from notmyfault.host.api.services.rule_runs import (
     RuleRunServiceError,
 )
 from notmyfault.host.api.services.rules import RuleService, RuleServiceError
-from notmyfault.core.data_types import DataTypeError
 from notmyfault.host.api.value_transport import decode_request, read_value_json, value_response
 
 
@@ -94,7 +93,7 @@ def create_rules_router(
         if raw_body:
             try:
                 body = decode_request(request, json.loads(raw_body))
-            except (json.JSONDecodeError, UnicodeDecodeError, DataTypeError):
+            except ValueError:
                 return JSONResponse(
                     {"ok": False, "error": "无效的 JSON 请求体"},
                     status_code=400,
