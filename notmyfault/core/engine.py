@@ -50,6 +50,24 @@ class RulesStorePort(Protocol):
     def load_verified_rules(self) -> List[Dict[str, Any]]: ...
 
 
+class _PluginErrorReporter:
+    """插件错误记进诊断的同时发给 Dashboard，页面不用等下次轮询"""
+
+    def __init__(self, diagnostics: Any, emit: Callable[..., None]) -> None:
+        self._diagnostics = diagnostics
+        self._emit = emit
+
+    def record_plugin_error(self, store: str, plugin_id: str, reason: str) -> None:
+        self._diagnostics.record_plugin_error(store, plugin_id, reason)
+        self._emit(
+            "plugin_load_failed",
+            {"store": store, "plugin_id": plugin_id, "reason": reason},
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._diagnostics, name)
+
+
 class AutomationEngine:
     """加载插件、匹配规则并执行动作"""
 
@@ -103,7 +121,7 @@ class AutomationEngine:
         self._plugin_loader = PluginLoader(
             registry=self._plugin_registry,
             config=self.config,
-            diagnostics=self._diag_obj,
+            diagnostics=_PluginErrorReporter(self._diag_obj, self._safe_on_event),
             security_mode=self._security_mode,
             sudo=self._sudo,
             engine_token=self._engine_token,
@@ -364,7 +382,7 @@ class AutomationEngine:
             "plugins": {
                 "actions_loaded": len(self.actions_funcs),
                 "triggers_loaded": len(self.triggers_funcs),
-                "errors": snap["plugin_errors"][-20:],
+                "errors": snap["plugin_errors"],
                 "error_count": len(snap["plugin_errors"]),
                 "admin_plugins": self._sudo.get_authorized_plugins(),
                 "integrity_errors": self._plugin_integrity_errors[-10:],
@@ -459,24 +477,33 @@ class AutomationEngine:
             folder_path
         ):
             return False
-        before = len(self._diag_obj.snapshot()["plugin_errors"])
         try:
             if plugin_kind == "trigger":
                 entry = self._plugin_registry.resolve_trigger(plugin_id)
             elif plugin_kind == "action":
                 entry = self._plugin_registry.resolve_action(plugin_id)
+                if entry is not None and self.actions_meta.get(plugin_id, {}).get("execution_mode") == "isolated":
+                    entry.check_load()
             else:
                 raise ValueError(f"未知插件类型: {plugin_kind}")
         except Exception as error:
-            self._diag_obj.record_plugin_error(
-                plugin_kind,
+            if plugin_kind == "action" and self.actions_meta.get(plugin_id, {}).get("execution_mode") == "isolated":
+                self._plugin_registry.unregister("action", plugin_id)
+            _PluginErrorReporter(self._diag_obj, self._safe_on_event).record_plugin_error(
+                plugin_kind.title(),
                 plugin_id,
                 f"插件导入异常: {error}",
             )
             return False
-        errors = self._diag_obj.snapshot()["plugin_errors"][before:]
-        return entry is not None and not any(
-            len(item) >= 2 and item[1] == plugin_id for item in errors
+        if entry is None:
+            return False
+        meta_store, _func_store = self._plugin_registry.stores(plugin_kind)
+        contributes = meta_store.get(plugin_id, {}).get("contributes")
+        if not isinstance(contributes, dict):
+            return True
+        return all(
+            callable(self.extensions.handler(plugin_id, command["id"]))
+            for command in contributes.get("commands", [])
         )
 
     def _validate_all_rules(self) -> Tuple[int, int]:

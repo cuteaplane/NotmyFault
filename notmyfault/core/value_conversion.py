@@ -8,6 +8,7 @@ import json
 import math
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from fractions import Fraction
 
 from notmyfault.core.data_types import (
     TIME_UNITS,
@@ -56,9 +57,9 @@ def convert_value(value, target, registry=None, *, source=None, options=None, lo
     try:
         if kind in ("timestamp", "duration") and source_kind == kind:
             value = normalize_value(value, source, registry, location=location)
-            ratio = Decimal(str(TIME_UNITS[source["unit"]])) / Decimal(str(TIME_UNITS[target["unit"]]))
-            converted = Decimal(str(value)) * ratio
-            value = int(converted) if converted == converted.to_integral_value() else float(converted)
+            ratio = Fraction(str(TIME_UNITS[source["unit"]])) / Fraction(str(TIME_UNITS[target["unit"]]))
+            converted = Fraction(value if isinstance(value, int) else str(value)) * ratio
+            value = converted.numerator if converted.denominator == 1 else float(converted)
         elif kind == "timestamp":
             if source_kind not in ("text", "datetime"):
                 invalid("生成时间戳需要日期时间；数字必须先声明时间戳单位")
@@ -76,10 +77,10 @@ def convert_value(value, target, registry=None, *, source=None, options=None, lo
                 stamp = normalize_value(value, source, registry, location=location)
                 moment = datetime.fromtimestamp(stamp * TIME_UNITS[source["unit"]], timezone.utc)
                 moment = _with_zone(moment, options.get("timezone", "utc"), location)
-                value = moment.date() if kind == "date" else moment.timetz() if kind == "time" else moment
+                value = moment.date() if kind == "date" else _time_with_offset(moment) if kind == "time" else moment
             elif source_kind == "datetime" or isinstance(value, datetime):
                 moment = _datetime(value, options, location, require_zone=False)
-                value = moment.date() if kind == "date" else moment.timetz() if kind == "time" else moment
+                value = moment.date() if kind == "date" else _time_with_offset(moment) if kind == "time" else moment
             elif kind == "datetime" and source_kind == "date":
                 day = date.fromisoformat(value) if isinstance(value, str) else value
                 value = _with_zone(datetime.combine(day, time()), options.get("timezone"), location)
@@ -147,6 +148,12 @@ def convert_value(value, target, registry=None, *, source=None, options=None, lo
             raise
         invalid(f"不能转换为 {kind}")
     return normalize_value(value, target, registry, location=location)
+
+
+def _time_with_offset(moment):
+    result = moment.timetz()
+    offset = moment.utcoffset()
+    return result.replace(tzinfo=timezone(offset)) if offset is not None else result
 
 
 def _with_zone(moment, zone, location):

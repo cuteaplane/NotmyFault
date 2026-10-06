@@ -5,6 +5,7 @@ import math
 from typing import Any, Dict, Iterable, List
 
 from notmyfault.core.value_codec import encode_value
+from notmyfault.core.predicates import values_equal
 
 
 def get_rule_condition(rule: Dict[str, Any]) -> Dict[str, Any] | None:
@@ -68,7 +69,7 @@ def validate_condition_tree(node: Dict[str, Any] | None) -> List[str]:
                 seconds = float(current["within_seconds"])
                 if isinstance(current["within_seconds"], bool) or not math.isfinite(seconds) or seconds <= 0:
                     errors.append(f"{path}.within_seconds 必须大于 0")
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 errors.append(f"{path}.within_seconds 必须是数字")
 
     visit(node, "condition")
@@ -79,7 +80,7 @@ def check_event_params(event_def: Dict[str, Any], event_payload: Dict[str, Any])
     expected_params = event_def.get("params", {})
     for key, expected_val in expected_params.items():
         # 缺少字段时不算命中
-        if key not in event_payload or event_payload[key] != expected_val:
+        if key not in event_payload or not values_equal(event_payload[key], expected_val):
             return False
     return True
 

@@ -9,6 +9,24 @@ from notmyfault.core.bindings import BindingResolutionError, references_availabl
 COMPARISON_OPERATORS = {"eq", "ne", "gt", "gte", "lt", "lte", "contains", "is_true", "is_false"}
 
 
+def values_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left is right
+    if isinstance(left, list) or isinstance(right, list):
+        return (
+            isinstance(left, list) and isinstance(right, list)
+            and len(left) == len(right)
+            and all(values_equal(a, b) for a, b in zip(left, right))
+        )
+    if isinstance(left, dict) or isinstance(right, dict):
+        return (
+            isinstance(left, dict) and isinstance(right, dict)
+            and left.keys() == right.keys()
+            and all(values_equal(value, right[key]) for key, value in left.items())
+        )
+    return left == right
+
+
 def validate_predicate(node: Any, path: str = "condition") -> list[str]:
     if not isinstance(node, dict):
         return [f"{path} 必须是对象"]
@@ -53,19 +71,21 @@ def evaluate_predicate(node: dict, context: dict, path: str = "condition") -> bo
         return resolve_value(value, context, location=f"{path}.{key}")
 
     left = operand("left")
+    if op in ("is_true", "is_false") and not isinstance(left, bool):
+        raise ValueError(f"{path} 的布尔判断需要布尔值")
     if op == "is_true":
         return left is True
     if op == "is_false":
         return left is False
     right = operand("right")
     if op in ("eq", "ne"):
-        equal = left == right and isinstance(left, bool) == isinstance(right, bool)
+        equal = values_equal(left, right)
         return equal if op == "eq" else not equal
     if op == "contains":
         if isinstance(left, str) and isinstance(right, str):
             return right in left
         if isinstance(left, list):
-            return right in left
+            return any(values_equal(item, right) for item in left)
         raise ValueError(f"{path} 的包含比较需要文本或数组")
     if any(isinstance(value, bool) or not isinstance(value, (int, float, Decimal)) for value in (left, right)):
         raise ValueError(f"{path} 的大小比较需要数字")

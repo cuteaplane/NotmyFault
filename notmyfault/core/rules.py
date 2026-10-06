@@ -160,13 +160,17 @@ def validate_rule_structure(rule: Any) -> List[str]:
                     or isinstance(retry, str) and retry.strip().isdigit()
                 )
             )
-            if not valid_integer or not 0 <= int(retry) <= 3:
+            try:
+                valid_retry = valid_integer and 0 <= int(retry) <= 3
+            except (ValueError, OverflowError):
+                valid_retry = False
+            if not valid_retry:
                 errors.append(f"{path}.retry 必须是 0 到 3 的整数")
         if "retry_delay_seconds" in action:
             delay = action["retry_delay_seconds"]
             try:
                 delay_number = float(delay)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 delay_number = -1
             if (
                 isinstance(delay, bool)
@@ -180,7 +184,7 @@ def validate_rule_structure(rule: Any) -> List[str]:
             timeout = action["timeout_seconds"]
             try:
                 timeout_number = float(timeout)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 timeout_number = 0
             if (
                 isinstance(timeout, bool)

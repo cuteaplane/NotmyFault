@@ -15,6 +15,7 @@ EXECUTE_TIMEOUT = 120.0
 EXIT_TIMEOUT = 5.0
 PROTOCOL_VERSION = 1
 MAX_PROTOCOL_LINE = 1024 * 1024
+MAX_EXTENSION_PROTOCOL_LINE = 4 * MAX_PROTOCOL_LINE
 MAX_STDERR_CHUNK = 64 * 1024
 _WORKER_MAIN = Path(__file__).resolve().with_name("plugin_worker_main.py")
 _PROJECT_ROOT = _WORKER_MAIN.parents[2]
@@ -34,6 +35,7 @@ class PluginWorkerStartupTimeout(PluginWorkerTimeout):
 
 _lock = threading.Lock()
 _live_processes: set[subprocess.Popen] = set()
+_live_extension_workers: set = set()
 _on_crash = None
 _PROTOCOL_EOF = object()
 _PROTOCOL_OVERSIZE = object()
@@ -104,13 +106,13 @@ def _drain_stderr(stream) -> None:
         stream.close()
 
 
-def _read_protocol(stream, messages: queue.Queue) -> None:
+def _read_protocol(stream, messages: queue.Queue, max_line: int = MAX_PROTOCOL_LINE) -> None:
     try:
         while True:
-            line = stream.readline(MAX_PROTOCOL_LINE + 1)
+            line = stream.readline(max_line + 1)
             if not line:
                 break
-            if len(line) > MAX_PROTOCOL_LINE:
+            if len(line) > max_line:
                 messages.put(_PROTOCOL_OVERSIZE)
                 return
             messages.put(line)
@@ -130,6 +132,7 @@ def run_isolated_action(
     *,
     plugin_root: str | None = None,
     file_snapshot: dict[str, str] | None = None,
+    load_only: bool = False,
 ):
     from notmyfault.security.plugin_checks import inspect_plugin_tree
 
@@ -142,6 +145,7 @@ def run_isolated_action(
         "entry_sha256": entry_sha256,
         "plugin_root": plugin_root,
         "file_snapshot": file_snapshot,
+        "load_only": load_only,
         "action_info": action_info,
         "params": params,
         "context": _sanitize_context(context),
@@ -211,6 +215,124 @@ def _wait_until_ready(process, messages, startup_timeout):
         or payload.get("protocol") != PROTOCOL_VERSION
     ):
         _fail_protocol(process, "worker 启动结果不符合协议")
+
+
+class ExtensionWorker:
+    """一个扩展会话使用一个子进程，关闭会话时调用子进程里的清理函数。"""
+
+    def __init__(self, entry, entry_sha256, meta, plugin_root, file_snapshot, context):
+        self._context = context
+        self._closed = False
+        self._write_lock = threading.Lock()
+        self._process = subprocess.Popen(
+            [sys.executable, "-X", "utf8", str(_WORKER_MAIN)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", cwd=str(_PROJECT_ROOT),
+        )
+        self._messages = queue.Queue()
+        self._stdout_thread = threading.Thread(
+            target=_read_protocol,
+            args=(self._process.stdout, self._messages, MAX_EXTENSION_PROTOCOL_LINE), daemon=True,
+        )
+        self._stderr_thread = threading.Thread(
+            target=_drain_stderr, args=(self._process.stderr,), daemon=True,
+        )
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+        with _lock:
+            _live_extension_workers.add(self)
+        context.register_cleanup(self.close)
+        session = context.session
+        try:
+            _wait_until_ready(self._process, self._messages, STARTUP_TIMEOUT)
+            self._send({
+                "entry": entry, "entry_sha256": entry_sha256,
+                "plugin_root": plugin_root, "file_snapshot": file_snapshot,
+                "action_info": meta, "extension_session": {
+                    "plugin_id": session.plugin_id, "command_id": session.command_id,
+                    "plugin_meta": session.plugin_meta,
+                    "source_kind": session.source_kind, "source_id": session.source_id,
+                    "allowed_commands": list(session.allowed_commands),
+                    "data_type": session.data_type, "value_type": session.value_type,
+                    "current_value": session.current_value,
+                },
+                "session_id": session.session_id,
+                "data_types": session.type_registry.snapshot() if session.type_registry else {},
+                "value_encoding": "typed-v1",
+            })
+            self._receive()
+        except BaseException:
+            self.close()
+            raise
+
+    def _send(self, request):
+        line = json.dumps(encode_value(request), ensure_ascii=False, allow_nan=False) + "\n"
+        if len(line) > MAX_EXTENSION_PROTOCOL_LINE:
+            raise ValueError("扩展 worker 请求超过大小限制")
+        with self._write_lock:
+            if self._process.stdin is None or self._process.stdin.closed:
+                raise PluginWorkerCrashed("扩展 worker 已经关闭")
+            try:
+                self._process.stdin.write(line)
+                self._process.stdin.flush()
+            except (OSError, ValueError) as error:
+                raise PluginWorkerCrashed("无法向扩展 worker 写入请求") from error
+
+    def _receive(self):
+        deadline = time.monotonic() + EXECUTE_TIMEOUT
+        while True:
+            payload = _receive_payload(
+                self._process, self._messages, max(0.0, deadline - time.monotonic()),
+                PluginWorkerTimeout("扩展 worker 执行超时，已终止"),
+                "扩展 worker 没有返回结果就退出了",
+            )
+            if payload.get("type") == "status":
+                self._context.session.set_status(payload.get("status", ""))
+                continue
+            if payload.get("type") != "result":
+                _fail_protocol(self._process, "扩展 worker 执行结果不符合协议")
+            if payload.get("ok") is not True:
+                raise RuntimeError(payload.get("error") or "扩展命令执行失败")
+            try:
+                result = decode_value(payload.get("result"))
+                if "current_value" in payload:
+                    self._context.session.current_value = decode_value(payload["current_value"])
+            except DataTypeError:
+                _fail_protocol(self._process, "扩展 worker 返回的数据编码无效")
+            return result
+
+    def invoke(self, command_id, payload):
+        if self._closed:
+            raise RuntimeError("扩展 worker 已经关闭")
+        try:
+            self._send({"command": command_id, "payload": payload})
+            return self._receive()
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        with self._write_lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            if self._process.poll() is None:
+                try:
+                    self._send({"close": True})
+                except (OSError, ValueError, PluginWorkerCrashed):
+                    pass
+                _wait_for_exit(self._process)
+        finally:
+            try:
+                if self._process.stdin is not None and not self._process.stdin.closed:
+                    self._process.stdin.close()
+            except OSError:
+                pass
+            with _lock:
+                _live_extension_workers.discard(self)
+            self._stdout_thread.join(timeout=EXIT_TIMEOUT)
+            self._stderr_thread.join(timeout=EXIT_TIMEOUT)
 
 
 def _drive(process, messages, request, execute_timeout):
@@ -293,6 +415,9 @@ def _report_crash(process, reason: str) -> None:
 def shutdown_all() -> None:
     """引擎关闭时结束所有还活着的 worker 子进程"""
     with _lock:
+        extension_workers = list(_live_extension_workers)
         processes = list(_live_processes)
+    for worker in extension_workers:
+        worker.close()
     for process in processes:
         _stop_process(process)

@@ -21,7 +21,7 @@ from notmyfault.core.binding_schema import prepare_binding_context
 from notmyfault.core.data_types import DataTypeError
 from notmyfault.core.variables import assign_variable, expression_is_sensitive
 from notmyfault.core.diagnostics import Diagnostics
-from notmyfault.core.predicates import evaluate_predicate
+from notmyfault.core.predicates import evaluate_predicate, values_equal
 from notmyfault.core.logging import engine_error
 from notmyfault.core.run_summary import summarize_fields
 from notmyfault.core.workflow import (
@@ -130,17 +130,15 @@ def _assertion_matches(actual: Any, operator: str, expected: Any) -> bool:
     if actual is _MISSING:
         return False
     if operator == "equals":
-        return actual == expected
+        return values_equal(actual, expected)
     if operator == "contains":
         if isinstance(actual, str) and isinstance(expected, str):
             return expected in actual
         if isinstance(actual, list):
-            if isinstance(expected, list):
-                return all(item in actual for item in expected)
-            return expected in actual
+            return any(values_equal(item, expected) for item in actual)
         if isinstance(actual, dict):
             if isinstance(expected, dict):
-                return all(actual.get(key, _MISSING) == value for key, value in expected.items())
+                return all(key in actual and values_equal(actual[key], value) for key, value in expected.items())
             return isinstance(expected, str) and expected in actual
         return False
     if operator in {"gt", "gte", "lt", "lte"}:
