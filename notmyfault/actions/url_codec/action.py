@@ -1,5 +1,6 @@
 import json
 import math
+import re
 from urllib.parse import parse_qs, quote, quote_plus, unquote, unquote_plus, urlencode, urlsplit, urlunsplit
 
 
@@ -37,6 +38,8 @@ def run_with_context(action_info, params, context):
         path, fragment = value.get("path", ""), value.get("fragment", "")
         if any(not isinstance(item, str) for item in (scheme, host, path, fragment)):
             raise ValueError("协议、主机、路径和片段必须是文本")
+        if scheme and re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*", scheme) is None:
+            raise ValueError("协议名须以英文字母开头，后续只允许英文字母、数字、+、- 和 .")
         port = value.get("port")
         if port is not None and (isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535):
             raise ValueError("端口必须是 0 到 65535 的整数或 null")
@@ -49,6 +52,11 @@ def run_with_context(action_info, params, context):
             if not authority:
                 raise ValueError("指定端口时必须提供主机名")
             authority += f":{port}"
+        path = quote(path, safe="/%:@!$&'()*+,;=")
+        if not scheme and not authority:
+            first, separator, rest = path.partition("/")
+            path = first.replace(":", "%3A") + separator + rest
+        fragment = quote(fragment, safe="/%?:@!$&'()*+,;=")
         assembled = urlunsplit((scheme, authority, path, query_text, fragment))
         return run_with_context(action_info, {"operation": "parse", "value": assembled}, context)
     if operation == "query_encode":

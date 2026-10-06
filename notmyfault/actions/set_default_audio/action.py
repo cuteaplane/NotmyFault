@@ -8,6 +8,7 @@ from typing import Any
 
 _FLOWS = frozenset({"render", "capture"})
 _FLOW_LABEL = {"render": "播放", "capture": "录音"}
+_ROLE_LABEL = {0: "通用", 1: "多媒体", 2: "通信"}
 
 
 def _windows_endpoints(device_type: str) -> list[tuple[str, str]]:
@@ -162,7 +163,7 @@ def _set_windows_default(device_id: str) -> None:
         CoUninitialize()
 
 
-def _query_default_windows(device_type: str) -> str:
+def _query_default_windows(device_type: str, role: int = 0) -> str:
     from comtypes import CoInitialize, CoUninitialize, COMError
     from pycaw.pycaw import AudioUtilities
 
@@ -171,7 +172,7 @@ def _query_default_windows(device_type: str) -> str:
     try:
         enumerator = AudioUtilities.GetDeviceEnumerator()
         try:
-            return enumerator.GetDefaultAudioEndpoint(flow, 0).GetId()
+            return enumerator.GetDefaultAudioEndpoint(flow, role).GetId()
         except COMError as error:
             if error.hresult & 0xffffffff == 0x80070490:
                 return ""
@@ -181,9 +182,10 @@ def _query_default_windows(device_type: str) -> str:
 
 
 def _run_windows(device_type: str, target: str) -> dict[str, Any]:
-    previous = _query_default_windows(device_type)
+    defaults = {role: _query_default_windows(device_type, role) for role in _ROLE_LABEL}
+    previous = defaults[0]
     device_id, device_name = _resolve_windows_device(device_type, target)
-    if previous == device_id:
+    if all(current == device_id for current in defaults.values()):
         return {
             "device_type": device_type,
             "device_id": device_id,
@@ -193,11 +195,13 @@ def _run_windows(device_type: str, target: str) -> dict[str, Any]:
             "method": "PolicyConfig",
         }
     _set_windows_default(device_id)
-    actual = _query_default_windows(device_type)
-    if actual != device_id:
-        raise RuntimeError(
-            f"请求将默认{_FLOW_LABEL[device_type]}设备设为 {device_name!r}，回读为 {actual!r}"
-        )
+    actual = {role: _query_default_windows(device_type, role) for role in _ROLE_LABEL}
+    for role, current in actual.items():
+        if current != device_id:
+            raise RuntimeError(
+                f"请求将默认{_FLOW_LABEL[device_type]}设备设为 {device_name!r}，"
+                f"{_ROLE_LABEL[role]}角色回读为 {current!r}"
+            )
     return {
         "device_type": device_type,
         "device_id": device_id,

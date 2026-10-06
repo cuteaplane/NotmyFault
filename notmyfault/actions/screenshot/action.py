@@ -65,7 +65,7 @@ if os.name == "nt":
 
 def run(action_info, params):
     mode = params.get("mode", "fullscreen")
-    output_path = params.get("output_path", "").strip()
+    output_path = params.get("output_path", "")
     fmt = str(params.get("format", "png")).lower()
     if fmt not in ("png", "jpg", "jpeg", "bmp"):
         raise ValueError("截图格式必须为 png、jpg、jpeg 或 bmp")

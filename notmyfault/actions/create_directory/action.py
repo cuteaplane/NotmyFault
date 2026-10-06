@@ -6,7 +6,7 @@ def run(action_info, params):
 
 
 def run_with_context(action_info, params, context):
-    directory = str(params.get("directory", "") or "").strip()
+    directory = str(params.get("directory", "") or "")
     if not directory:
         raise ValueError("未指定目录路径")
     path = Path(directory).expanduser().absolute()

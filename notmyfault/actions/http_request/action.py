@@ -83,11 +83,16 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         )
         self._active_socket = raw_socket
         try:
-            self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+            self.sock = self._context.wrap_socket(
+                raw_socket, server_hostname=self.host, do_handshake_on_connect=False,
+            )
+            self._active_socket = self.sock
+            self.sock.do_handshake()
         except BaseException:
+            if self.sock is not None:
+                self.sock.close()
             raw_socket.close()
             raise
-        self._active_socket = self.sock
 
 
 def _redact_url(url: str) -> str:
@@ -119,6 +124,8 @@ def run_with_context(action_info, params, context):
         cancellation.raise_if_cancelled()
     deadline = time.monotonic() + timeout
     parsed, addresses = resolve_public_http_url(url)
+    if cancellation:
+        cancellation.raise_if_cancelled()
     timeout = deadline - time.monotonic()
     if timeout <= 0:
         raise RuntimeError("请求超过总时限")
@@ -154,6 +161,8 @@ def run_with_context(action_info, params, context):
 
     port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
     target = parsed.path or "/"
+    if parsed.params:
+        target += ";" + parsed.params
     if parsed.query:
         target += "?" + parsed.query
     if parsed.scheme.lower() == "https":
@@ -204,6 +213,9 @@ def run_with_context(action_info, params, context):
         if time.monotonic() >= deadline:
             raise TimeoutError("请求超过总时限")
         truncated = len(raw_body) > _MAX_RESPONSE_BYTES
+        # read1 在提前断流时保留未读长度，但不抛出 IncompleteRead。
+        if not truncated and response.length:
+            raise RuntimeError("HTTP 响应中断，正文长度与服务器声明不符")
         resp_body = raw_body[:_MAX_RESPONSE_BYTES].decode(
             "utf-8", errors="replace"
         )

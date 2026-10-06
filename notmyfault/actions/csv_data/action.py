@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import math
+import sys
 
 
 def _load_json(value):
@@ -49,8 +50,13 @@ def run_with_context(action_info, params, context):
     if operation == "parse":
         if not isinstance(value, str):
             raise ValueError("解析 CSV 时输入必须是文本")
+        # csv 的字段上限由当前进程共享，各次解析使用相同的最大值。
         try:
-            rows = list(csv.reader(io.StringIO(value.lstrip("\ufeff"), newline=""), delimiter=delimiter, strict=True))
+            csv.field_size_limit(sys.maxsize)
+        except OverflowError:
+            csv.field_size_limit(2**31 - 1)
+        try:
+            rows = list(csv.reader(io.StringIO(value.removeprefix("\ufeff"), newline=""), delimiter=delimiter, strict=True))
         except csv.Error as exc:
             raise ValueError(f"CSV 格式错误: {exc}") from None
         columns = _columns(rows.pop(0)) if has_header and rows else []
@@ -92,6 +98,11 @@ def run_with_context(action_info, params, context):
     stream = io.StringIO(newline="")
     writer = csv.writer(stream, delimiter=delimiter, lineterminator="\r\n")
     if has_header and columns:
-        writer.writerow(columns)
+        rows.insert(0, columns)
+    if rows and rows[0] and (
+        rows[0][0].startswith("\ufeff") or (not rows[0][0] and delimiter == "\ufeff")
+    ):
+        # 文件开头的 U+FEFF 会被 UTF-8 签名解码器当作 BOM。
+        csv.writer(stream, delimiter=delimiter, lineterminator="\r\n", quoting=csv.QUOTE_ALL).writerow(rows.pop(0))
     writer.writerows(rows)
     return {"records": records, "columns": columns, "text": stream.getvalue(), "row_count": len(records)}

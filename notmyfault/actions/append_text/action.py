@@ -2,7 +2,9 @@
 支持给每行加时间标记，编码使用 Python 文本编码名称
 """
 
+import codecs
 from datetime import datetime
+import io
 import re
 from pathlib import Path
 
@@ -15,7 +17,7 @@ def run(action_info, params):
 
 
 def run_with_context(action_info, params, context):
-    file_path = str(params.get("file_path", "") or "").strip()
+    file_path = str(params.get("file_path", "") or "")
     if not file_path:
         raise ValueError("未指定日志文件路径")
     text = str(params.get("text", "") or "")
@@ -43,8 +45,21 @@ def run_with_context(action_info, params, context):
         else:
             payload.append(line)
 
-    with open(file_path, "a", encoding=encoding, newline="") as fh:
-        fh.write("\n".join(payload) + "\n")
+    encoding_name = codecs.lookup(encoding).name
+    byte_orders = {
+        "utf-16": ((codecs.BOM_UTF16_LE, "utf-16-le"), (codecs.BOM_UTF16_BE, "utf-16-be")),
+        "utf-32": ((codecs.BOM_UTF32_LE, "utf-32-le"), (codecs.BOM_UTF32_BE, "utf-32-be")),
+    }.get(encoding_name, ())
+    with open(file_path, "a+b" if byte_orders else "ab") as raw:
+        if byte_orders and raw.tell():
+            raw.seek(0)
+            prefix = raw.read(4)
+            encoding = next((name for bom, name in byte_orders if prefix.startswith(bom)), None)
+            if encoding is None:
+                raise ValueError(f"已有文件缺少 {encoding_name} BOM，请显式指定字节序编码")
+            raw.seek(0, 2)
+        with io.TextIOWrapper(raw, encoding=encoding, newline="") as fh:
+            fh.write("\n".join(payload) + "\n")
 
     print(f"[Action:append_text] 已追加 {len(payload)} 行 -> {file_path}")
     return {

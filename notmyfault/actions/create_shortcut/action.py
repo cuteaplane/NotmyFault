@@ -1,5 +1,5 @@
 """创建快捷方式动作
-Windows 用 PowerShell WScript.Shell 创建 .lnk；Linux 创建 .desktop 文件
+Windows 用 PowerShell 调用 Unicode ShellLink 接口创建 .lnk；Linux 创建 .desktop 文件
 """
 
 import os
@@ -9,6 +9,65 @@ import sys
 
 # 脚本只从环境变量读值；路径拼接也全部在 PowerShell 里做
 _POWERSHELL_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+using System.Text;
+
+public static class NotmyFaultLink
+{
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+    private class ShellLink { }
+
+    [ComImport, Guid("000214F9-0000-0000-C000-000000000046"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IShellLinkW
+    {
+        // 方法顺序对应 IShellLinkW 的 COM 槽位，未使用的方法也占据槽位
+        void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path,
+                     int length, IntPtr findData, uint flags);
+        void GetIDList(out IntPtr itemList);
+        void SetIDList(IntPtr itemList);
+        void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder text, int length);
+        void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string text);
+        void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int length);
+        void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string path);
+        void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder arguments, int length);
+        void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string arguments);
+        void GetHotkey(out short hotkey);
+        void SetHotkey(short hotkey);
+        void GetShowCmd(out int showCommand);
+        void SetShowCmd(int showCommand);
+        void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int length, out int index);
+        void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string path, int index);
+        void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string path, uint reserved);
+        void Resolve(IntPtr window, uint flags);
+        void SetPath([MarshalAs(UnmanagedType.LPWStr)] string path);
+    }
+
+    public static void Save(string path, string target, string arguments, string directory, string icon)
+    {
+        object instance = new ShellLink();
+        try
+        {
+            IShellLinkW link = (IShellLinkW)instance;
+            link.SetPath(target);
+            if (!String.IsNullOrEmpty(arguments)) link.SetArguments(arguments);
+            if (!String.IsNullOrEmpty(directory)) link.SetWorkingDirectory(directory);
+            if (!String.IsNullOrEmpty(icon)) link.SetIconLocation(icon, 0);
+            link.SetShowCmd(1);
+            ((IPersistFile)instance).Save(path, true);
+        }
+        finally
+        {
+            Marshal.FinalReleaseComObject(instance);
+        }
+    }
+}
+'@
 $name = $env:NMF_LNK_NAME
 $target = $env:NMF_LNK_TARGET
 if (-not $name -or -not $target) { throw "缺少快捷方式名称或目标路径" }
@@ -18,13 +77,7 @@ if ($env:NMF_LNK_LOCATION -eq 'start_menu') {
     $base = [Environment]::GetFolderPath('Desktop')
 }
 $path = Join-Path $base ($name + '.lnk')
-$ws = New-Object -ComObject WScript.Shell
-$sc = $ws.CreateShortcut($path)
-$sc.TargetPath = $target
-if ($env:NMF_LNK_ARGS) { $sc.Arguments = $env:NMF_LNK_ARGS }
-if ($env:NMF_LNK_WORKDIR) { $sc.WorkingDirectory = $env:NMF_LNK_WORKDIR }
-if ($env:NMF_LNK_ICON) { $sc.IconLocation = $env:NMF_LNK_ICON }
-$sc.Save()
+[NotmyFaultLink]::Save($path, $target, $env:NMF_LNK_ARGS, $env:NMF_LNK_WORKDIR, $env:NMF_LNK_ICON)
 Write-Output $path
 """
 
@@ -37,7 +90,7 @@ def run(action_info, params):
 
 def _validate_common(params) -> tuple[str, str, str]:
     name = str(params.get("name", "") or "").strip()
-    target = str(params.get("target_path", "") or "").strip()
+    target = str(params.get("target_path", "") or "")
     if not name:
         raise ValueError("未指定快捷方式名称")
     if (
@@ -75,10 +128,10 @@ def _run_linux(action_info, params):
         for char in ('"', "`", "$"):
             escaped = escaped.replace(char, "\\\\" + char)
         escaped = escaped.replace("%", "%%")
-        return f'"{escaped}"'
+        return f'"{escaped}"'.replace("\t", "\\t")
 
     def desktop_value(value: str) -> str:
-        return value.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+        return value.replace("\\", "\\\\").replace(" ", "\\s").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 
     exec_line = " ".join(desktop_token(item) for item in (target, *argument_parts))
     desktop_entry = (

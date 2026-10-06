@@ -19,7 +19,7 @@ _WALLPAPER_STYLES = {
 
 
 def run(action_info, params):
-    image_path = params.get("image_path", "").strip()
+    image_path = params.get("image_path", "")
     style = params.get("style", "fill")
     if style not in _WALLPAPER_STYLES:
         raise ValueError(f"未知壁纸样式: {style}")

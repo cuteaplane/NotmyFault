@@ -61,12 +61,12 @@ def _split_args(raw: str) -> list:
 
 
 def run(action_info, params):
-    path = params.get("path", "").strip()
+    path = params.get("path", "")
     if not path:
         raise ValueError("未指定程序路径")
 
     raw_args = params.get("args", "").strip()
-    working_directory = params.get("working_directory", "").strip() or None
+    working_directory = params.get("working_directory", "") or None
     print(f"[Action:launch_program] 启动: {path} (参数 {len(raw_args)} 字符)")
 
     args = [path] + _split_args(raw_args) if raw_args else [path]

@@ -3,7 +3,6 @@ import subprocess
 import sys
 import threading
 import time
-import locale
 
 # 命令输出会进规则上下文和日志，全量保留大输出会撑爆内存
 _MAX_OUTPUT = 100 * 1024
@@ -43,7 +42,6 @@ def run_with_context(action_info, params, context):
     if not isinstance(command, str) or not command.strip():
         raise ValueError("未指定命令")
 
-    command = command.strip()
     cancellation = context.get("runtime", {}).get("cancellation")
     if cancellation:
         cancellation.raise_if_cancelled()
@@ -74,6 +72,12 @@ def run_with_context(action_info, params, context):
             stream.close()
     if sys.platform != "win32":
         raise RuntimeError("执行 PowerShell 仅支持 Windows，Linux 请使用 run_shell")
+
+    encoding = params.get("encoding", "oem")
+    try:
+        b"\0".decode(encoding, errors="replace")
+    except (LookupError, TypeError, UnicodeError):
+        raise ValueError("命令输出编码必须是可用的文本编码，例如 oem、utf-8 或 gb18030") from None
 
     try:
         powershell = os.path.join(
@@ -124,7 +128,7 @@ def run_with_context(action_info, params, context):
 
     if process.returncode != 0:
         stderr_text = bytes(streams[1]["data"]).decode(
-            locale.getpreferredencoding(False), errors="replace"
+            encoding, errors="replace"
         ).strip()
         if len(stderr_text) > _MAX_ERROR_DETAIL:
             stderr_text = "..." + stderr_text[-_MAX_ERROR_DETAIL:]
@@ -137,7 +141,7 @@ def run_with_context(action_info, params, context):
     print("[Action:run_powershell] 执行成功")
     return {
         "returncode": 0,
-        **{name: bytes(result["data"]).decode(locale.getpreferredencoding(False), errors="replace")
+        **{name: bytes(result["data"]).decode(encoding, errors="replace")
            + ("...（已截断）" if result["truncated"] else "")
            for name, result in zip(("stdout", "stderr"), streams)},
     }

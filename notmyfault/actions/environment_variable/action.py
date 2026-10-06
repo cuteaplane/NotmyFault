@@ -4,6 +4,25 @@
 
 import os
 
+from notmyfault.plugin_api import native_lock
+
+_ERROR_ENVVAR_NOT_FOUND = 203
+
+
+def _sync_windows_environment(name, value):
+    if os.name != "nt":
+        return
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    setter = kernel32.SetEnvironmentVariableW
+    setter.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+    setter.restype = ctypes.c_int
+    if not setter(name, value):
+        error = ctypes.get_last_error()
+        if value is not None or error != _ERROR_ENVVAR_NOT_FOUND:
+            raise ctypes.WinError(error)
+
 
 def _require_name(params):
     raw = params.get("name", "")
@@ -24,12 +43,13 @@ def _get(name, params):
     missing = params.get("missing", "empty")
     if missing not in ("empty", "error"):
         raise ValueError("变量不存在时只能选择当作空值或报错")
-    existed = name in os.environ
-    if not existed:
+    try:
+        value = os.environ[name]
+    except KeyError:
         if missing == "error":
-            raise ValueError("环境变量不存在")
+            raise ValueError("环境变量不存在") from None
         return {"name": name, "value": "", "existed": False}
-    return {"name": name, "value": os.environ[name], "existed": True}
+    return {"name": name, "value": value, "existed": True}
 
 
 def _set(name, params):
@@ -38,15 +58,22 @@ def _set(name, params):
         value = ""
     if not isinstance(value, str):
         raise ValueError("变量值必须是文本")
-    existed = name in os.environ
-    os.environ[name] = value
+    with native_lock():
+        existed = name in os.environ
+        os.environ[name] = value
+        _sync_windows_environment(name, value)
     return {"name": name, "value": value, "existed": existed}
 
 
 def _unset(name):
-    existed = name in os.environ
-    if existed:
-        del os.environ[name]
+    with native_lock():
+        try:
+            del os.environ[name]
+        except KeyError:
+            existed = False
+        else:
+            existed = True
+        _sync_windows_environment(name, None)
     return {"name": name, "existed": existed}
 
 

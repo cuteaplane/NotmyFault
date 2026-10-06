@@ -92,7 +92,7 @@ def run(action_info, params):
         # spd-say 的 --language 只认 BCP 47 语言代码；Windows 声音名传过去只会报错
         if voice_name and re.fullmatch(r"[a-z]{2,3}(-[A-Za-z0-9]{2,8})*", str(voice_name)):
             command.extend(["--language", str(voice_name)])
-        command.append(text)
+        command.extend(["--", text])
         result = subprocess.run(
             command,
             capture_output=True,

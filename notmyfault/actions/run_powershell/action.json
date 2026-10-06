@@ -51,6 +51,21 @@
             "summary": "hidden",
             "placeholder": "要执行的 PowerShell 命令",
             "rows": 8
+        },
+        {
+            "name": "encoding",
+            "label": "命令输出编码",
+            "type": "string",
+            "value_type": "text",
+            "default": "oem",
+            "placeholder": "默认 oem；命令使用 UTF-8 输出时填 utf-8",
+            "options": [
+                {"value": "oem", "label": "系统 OEM 编码"},
+                {"value": "utf-8", "label": "UTF-8"},
+                {"value": "utf-8-sig", "label": "UTF-8，去除 BOM"},
+                {"value": "gb18030", "label": "GB18030"},
+                {"value": "utf-16-le", "label": "UTF-16 LE"}
+            ]
         }
     ],
     "platforms": [

@@ -39,7 +39,6 @@ def run_with_context(action_info, params, context):
     if not isinstance(command, str) or not command.strip():
         raise ValueError("未指定命令")
 
-    command = command.strip()
     cancellation = context.get("runtime", {}).get("cancellation")
     if cancellation:
         cancellation.raise_if_cancelled()

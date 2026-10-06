@@ -48,9 +48,14 @@ class _HTTPSConnection(http.client.HTTPSConnection):
         raw = _connect(self.addresses, self.port, self.timeout)
         self._active_socket = raw
         try:
-            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+            self.sock = self._context.wrap_socket(
+                raw, server_hostname=self.host, do_handshake_on_connect=False,
+            )
             self._active_socket = self.sock
+            self.sock.do_handshake()
         except BaseException:
+            if self.sock is not None:
+                self.sock.close()
             raw.close()
             raise
 
@@ -61,6 +66,8 @@ def _open_response(url, timeout, cancellation, on_connection=None):
         if cancellation:
             cancellation.raise_if_cancelled()
         parsed, addresses = resolve_public_http_url(url)
+        if cancellation:
+            cancellation.raise_if_cancelled()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("下载超过总时限")
@@ -103,7 +110,7 @@ def run(action_info, params):
 
 def run_with_context(action_info, params, context):
     url = str(params.get("url", "")).strip()
-    raw_path = str(params.get("file_path", "")).strip()
+    raw_path = str(params.get("file_path", ""))
     if not url or not raw_path:
         raise ValueError("请指定下载地址和保存文件路径")
     timeout = float(params.get("timeout_seconds", 15))

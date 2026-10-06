@@ -1,5 +1,6 @@
-"""工作流前置条件：确认目录在指定时间内未变化，文件未被占用且没有文档编辑窗口"""
+"""文档归档前的目录变化、文件读取和编辑窗口检查"""
 import ctypes
+import math
 import os
 import time
 import threading
@@ -31,13 +32,14 @@ _DOCUMENT_EXTENSIONS = {
 
 def _snapshot(folder: Path) -> Tuple[Tuple[str, int, int], ...]:
     files: List[Tuple[str, int, int]] = []
-    for root, _dirs, names in os.walk(folder):
+
+    def unreadable_directory(error):
+        raise error
+
+    for root, _dirs, names in os.walk(folder, onerror=unreadable_directory):
         for name in names:
             path = Path(root, name)
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
+            stat = path.stat()
             files.append((str(path), stat.st_size, stat.st_mtime_ns))
             if len(files) > _MAX_FILES:
                 raise RuntimeError(f"目录文件数超过 {_MAX_FILES}，请缩小待归档范围")
@@ -143,14 +145,20 @@ def _visible_editing_windows() -> Iterable[str]:
 
 def check_precondition(_meta: Dict[str, Any], params: Dict[str, Any], _context: Dict[str, Any]):
     """返回包含 ok、reason 和 retry_after_seconds 的前置检查结果，未知状态返回 ok=False"""
-    raw_folder = str(params.get("source_folder", "")).strip()
+    for name, label in (("check_file_locks", "检查文件占用"), ("check_document_windows", "检查可见编辑窗口")):
+        if not isinstance(params.get(name, True), bool):
+            return {"ok": False, "reason": f"{label}必须是布尔值", "retry_after_seconds": 300}
+    raw_folder = str(params.get("source_folder", ""))
     if not raw_folder:
         return {"ok": False, "reason": "未配置待归档目录", "retry_after_seconds": 300}
-    folder = Path(raw_folder).expanduser()
-    if not folder.is_dir():
-        return {"ok": False, "reason": f"待归档目录不可用: {folder}", "retry_after_seconds": 300}
     try:
-        quiet_seconds = max(float(params.get("quiet_seconds", 120) or 0), 0)
+        folder = Path(raw_folder).expanduser()
+        if not folder.is_dir():
+            return {"ok": False, "reason": f"待归档目录不可用: {folder}", "retry_after_seconds": 300}
+        quiet_seconds = float(params.get("quiet_seconds", 120) or 0)
+        if not math.isfinite(quiet_seconds):
+            raise ValueError("文件静默时长必须是有限数字")
+        quiet_seconds = max(quiet_seconds, 0)
         with _observations_lock:
             snapshot = _snapshot(folder)
             key = os.path.normcase(str(folder.resolve()))

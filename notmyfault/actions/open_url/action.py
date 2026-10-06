@@ -14,7 +14,9 @@ def run(action_info, params):
     if not urls:
         raise ValueError("没有可打开的链接")
 
-    new_window = bool(params.get("new_window", False))
+    new_window = params.get("new_window", False)
+    if not isinstance(new_window, bool):
+        raise ValueError("新窗口打开必须是布尔值")
     normalized = []
     for url in urls:
         if not _SCHEME_RE.match(url):

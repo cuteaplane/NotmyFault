@@ -4,6 +4,7 @@
 
 import os
 import shutil
+import stat
 import tarfile
 import zipfile
 
@@ -24,7 +25,7 @@ def _safe_unpack(archive: str, target: str) -> None:
             raise ValueError(f"归档包含非法路径: {name}")
         dest = os.path.join(target_real, normalized)
         dest_real = os.path.realpath(dest)
-        if dest_real != target_real and not dest_real.startswith(target_real + os.sep):
+        if dest_real != target_real and not dest_real.startswith(os.path.join(target_real, "")):
             raise ValueError(f"归档成员越界: {name}")
 
     def check_limits(count: int, total: int) -> None:
@@ -41,6 +42,19 @@ def _safe_unpack(archive: str, target: str) -> None:
             )
             for info in infos:
                 check_member(info.filename, False)
+                name = info.filename.replace("/", os.sep)
+                if os.path.altsep:
+                    name = name.replace(os.path.altsep, os.sep)
+                name = os.path.splitdrive(name)[1]
+                parts = [part for part in name.split(os.sep) if part not in ("", os.curdir, os.pardir)]
+                if os.name == "nt":
+                    translation = str.maketrans(':<>|"?*', "_______")
+                    parts = [part.translate(translation).rstrip(".") for part in parts]
+                    parts = [part for part in parts if part]
+                extracted_name = os.sep.join(parts)
+                if not extracted_name and not info.is_dir():
+                    raise ValueError(f"归档包含非法路径: {info.filename}")
+                check_member(extracted_name, False)
             zf.extractall(target)
     else:
         with tarfile.open(archive) as tf:
@@ -63,14 +77,55 @@ def _ensure_copy_safe(source: str, dest: str) -> None:
     dst_real = os.path.realpath(dest)
     if dst_real == src_real:
         raise ValueError(f"目标不能与源相同: {source}")
-    if dst_real.startswith(src_real + os.sep):
+    if dst_real.startswith(os.path.join(src_real, "")):
         raise ValueError(f"目标位于源目录内部，会导致无限递归复制: {dest}")
+
+
+def _ensure_compress_safe(source: str, dest: str) -> None:
+    _ensure_copy_safe(source, dest)
+    if not os.path.exists(dest):
+        return
+
+    def check_file(path):
+        if os.path.samefile(path, dest):
+            raise ValueError(f"压缩包与源文件指向同一文件: {path}")
+
+    if not os.path.isdir(source):
+        check_file(source)
+        return
+
+    def raise_walk_error(error):
+        raise error
+
+    for current, _, filenames in os.walk(source, followlinks=False, onerror=raise_walk_error):
+        for name in filenames:
+            path = os.path.join(current, name)
+            if os.path.isfile(path):
+                check_file(path)
+
+
+def _move_to_target(source: str, dest: str, overwrite: bool) -> None:
+    _ensure_copy_safe(source, dest)
+    if not overwrite and os.path.lexists(dest):
+        raise FileExistsError("目标已存在，请更换路径或允许覆盖")
+    plain_directory = os.path.isdir(source) and not os.path.islink(source)
+    if plain_directory and os.name == "nt":
+        plain_directory = os.lstat(source).st_reparse_tag != stat.IO_REPARSE_TAG_MOUNT_POINT
+    if plain_directory and os.path.isdir(dest):
+        with os.scandir(source) as entries:
+            for entry in entries:
+                _move_to_target(entry.path, os.path.join(dest, entry.name), overwrite)
+        os.rmdir(source)
+    elif os.path.isdir(dest):
+        raise IsADirectoryError(f"目标是目录，不能用文件或链接覆盖: {dest}")
+    else:
+        shutil.move(source, dest)
 
 
 def run(action_info, params):
     operation = params.get("operation", "copy")
-    source = params.get("source", "").strip()
-    dest = params.get("destination", "").strip()
+    source = params.get("source", "")
+    dest = params.get("destination", "")
     overwrite = params.get("overwrite", False)
     if not isinstance(overwrite, bool):
         raise ValueError("允许覆盖必须是布尔值")
@@ -100,11 +155,11 @@ def run(action_info, params):
         print(f"[Action:file_operation] 复制完成")
 
     elif operation == "move":
-        _ensure_copy_safe(source, dest)
+        _ensure_copy_safe(source, actual_dest)
         parent = os.path.dirname(dest)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        shutil.move(source, dest)
+        _move_to_target(source, actual_dest, overwrite)
         print(f"[Action:file_operation] 移动完成")
 
     elif operation == "delete":
@@ -120,8 +175,9 @@ def run(action_info, params):
         # make_archive 只会产出 base + ".zip"，目标名不带 .zip 时产物会换名字
         if not dest.lower().endswith(".zip"):
             dest += ".zip"
-        _ensure_copy_safe(source, dest)
         base = os.path.splitext(dest)[0]
+        dest = base + ".zip"
+        _ensure_compress_safe(source, dest)
         if os.path.isdir(source):
             shutil.make_archive(base, "zip", root_dir=source)
         else:

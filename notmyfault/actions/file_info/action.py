@@ -8,7 +8,7 @@ def run(action_info, params):
 
 
 def run_with_context(action_info, params, context):
-    file_path = str(params.get("file_path", "") or "").strip()
+    file_path = str(params.get("file_path", "") or "")
     if not file_path:
         raise ValueError("未指定文件或目录路径")
     path = Path(file_path).expanduser().absolute()
