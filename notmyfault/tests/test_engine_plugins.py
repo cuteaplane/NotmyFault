@@ -163,6 +163,24 @@ class TestEngineStart:
 
 
 class TestLoadPlugins:
+    @pytest.mark.parametrize("factory,valid", [
+        ("", False),
+        ("def create_sampler(context, required):\n    pass\n", False),
+        ("def create_sampler(context):\n    return object()\n", True),
+    ])
+    def test_sampled_trigger_requires_context_factory(self, tmp_path, factory, valid):
+        loader, registry, errors, _ = make_loader(tmp_path)
+        meta = make_meta(trigger_api="event-v2", sampling_api="poll-v1")
+        write_plugin(tmp_path / "triggers", "plug_a", meta,
+                     "def run(meta, config, emit, stop):\n    pass\n" + factory,
+                     json_name="trigger.json", py_name="trigger.py")
+        loaded, failed, _, _ = load_triggers(loader, tmp_path)
+        assert (loaded, failed) == (1, 0)
+        assert (registry.resolve_trigger("plug_a") is not None) is valid
+        assert ("plug_a" in registry.triggers_funcs) is valid
+        if not valid:
+            assert any("create_sampler(context)" in message for _, _, message in errors)
+
     def test_json_parse_error(self, tmp_path):
         loader, registry, errors, _ = make_loader(tmp_path)
         folder = tmp_path / "actions" / "bad"

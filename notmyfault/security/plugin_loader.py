@@ -486,6 +486,7 @@ class PluginLoader:
                     return result
 
                 setattr(isolated_run, "run_with_context", isolated_run_with_context)
+                setattr(isolated_run, "_isolated_proxy", True)
 
                 def check_isolated_load():
                     ok, result = run_isolated_action(
@@ -553,6 +554,13 @@ class PluginLoader:
                 )
                 fail("缺少 run() 函数")
                 return None
+
+            if plugin_type == "trigger" and meta.get("sampling_api") == "poll-v1":
+                try:
+                    inspect.signature(module.create_sampler).bind(None)
+                except (AttributeError, TypeError, ValueError):
+                    fail("poll-v1 触发器必须提供 create_sampler(context)")
+                    return None
 
             # event-v1 接收配置列表，event-v2 为每条规则使用独立配置，启动线程前先验证入口。
             if plugin_type == "trigger" and meta.get("trigger_api") in ("event-v1", "event-v2"):

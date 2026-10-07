@@ -97,6 +97,17 @@ def test_shared_types_and_structured_ports_validate_through_plugin_metadata():
     assert validate_plugin_meta(meta, "action")[0] is False
 
 
+@pytest.mark.parametrize("sampling_api,trigger_api,valid", [
+    ("poll-v1", "event-v2", True),
+    ("poll-v1", "event-v1", False),
+    ("poll-v2", "event-v2", False),
+])
+def test_sampling_api_requires_supported_event_contract(sampling_api, trigger_api, valid):
+    result, errors = validate_plugin_meta(make_meta(sampling_api=sampling_api, trigger_api=trigger_api), "trigger")
+    assert result is valid
+    assert bool(errors) is not valid
+
+
 class TestValidatePluginMetaPermissions:
     @pytest.mark.parametrize("editor_type", ["unknown_editor", "uia_selector"])
     def test_param_rejects_invalid_editor_type(self, editor_type):

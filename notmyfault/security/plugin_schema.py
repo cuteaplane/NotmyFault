@@ -18,6 +18,7 @@ _TRIGGER_OPTIONAL_FIELDS = {
     "lifecycle", "state_key", "state_filter", "previous_state_output",
     "debounce_seconds", "event_queue_size", "overflow", "coalesce_key",
     "state_mode", "state_initial_value", "state_partition_key", "state_untracked", "state_hysteresis",
+    "sampling_api",
 }
 _ACTION_OPTIONAL_FIELDS = {
     "params", "permissions", "origin", "execution_api", "precondition_api",
@@ -563,6 +564,8 @@ def validate_plugin_meta(
         errors.append("trigger_api 必须为 legacy、event-v1 或 event-v2")
 
     if plugin_type in ("trigger", "triggers"):
+        if "sampling_api" in meta and (meta["sampling_api"] != "poll-v1" or meta.get("trigger_api") != "event-v2"):
+            errors.append("sampling_api 必须为 poll-v1，且 trigger_api 必须为 event-v2")
         if meta.get("lifecycle", "continuous") not in ("continuous", "one_shot"):
             errors.append("lifecycle 必须为 continuous 或 one_shot")
         if meta.get("overflow", "drop_oldest") not in ("drop_oldest", "coalesce"):
@@ -944,6 +947,8 @@ def check_payload_contract(
     outputs: Any,
     payload: Dict[str, Any],
     registry=None,
+    *,
+    normalized=None,
 ) -> List[str]:
     """未声明 outputs 的旧插件仍跳过输出检查。"""
     declared: Dict[str, Dict[str, Any]] = {}
@@ -965,7 +970,9 @@ def check_payload_contract(
             output_type = spec.get("type", "any")
             if "value_type" in spec or output_type not in ("string", "number", "bool", "array", "object", "any"):
                 try:
-                    normalize_value(value, field_type(spec), registry, location=f"outputs.{name}")
+                    result = normalize_value(value, field_type(spec), registry, location=f"outputs.{name}")
+                    if normalized is not None:
+                        normalized[name] = result
                 except DataTypeError as error:
                     problems.append(str(error))
             elif output_type == "string" and not isinstance(value, str):
