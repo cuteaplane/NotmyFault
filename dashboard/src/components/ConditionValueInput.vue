@@ -1,0 +1,56 @@
+<script setup>
+import { computed, ref, watch } from 'vue'
+import { isLiteralValue, isEncodedValue, typeLabel } from '../lib/valueTypes'
+import ParamInput from './ParamInput.vue'
+const props = defineProps({ modelValue: null, sources: { type: Array, default: () => [] }, label: String })
+const emit = defineEmits(['update:modelValue'])
+const categories = [['trigger', '本流程触发器输出'], ['step', '前序动作输出'], ['variable', '运行变量'], ['constant', '规则常量'], ['trigger_config', '触发器配置'], ['literal', '固定值']]
+const category = ref(props.modelValue?.$ref?.scope || 'literal')
+watch(() => props.modelValue, value => { category.value = value?.$ref?.scope || 'literal' })
+const matching = computed(() => props.sources.filter(source => source.value.$ref.scope === category.value))
+const referenceKey = source => JSON.stringify({ scope: source.value.$ref.scope, node: source.value.$ref.node, path: source.value.$ref.path })
+const selected = computed(() => matching.value.find(source => referenceKey(source) === JSON.stringify(props.modelValue?.$ref && { scope: props.modelValue.$ref.scope, node: props.modelValue.$ref.node, path: props.modelValue.$ref.path })))
+const literalType = computed(() => {
+  const value = isLiteralValue(props.modelValue) ? props.modelValue.$literal : props.modelValue
+  if (isEncodedValue(value)) return value.$nmf_value.type
+  return typeof value === 'boolean' ? 'bool' : typeof value === 'number' ? 'number' : Array.isArray(value) ? 'array' : value && typeof value === 'object' ? 'object' : 'string'
+})
+function sourceValue(source) {
+  const value = JSON.parse(JSON.stringify(source.value))
+  if (source.optional || source.conditional) value.$ref.on_missing = 'error'
+  return value
+}
+function changeSource() {
+  const value = category.value === 'literal' ? '' : matching.value[0] ? sourceValue(matching.value[0]) : undefined
+  emit('update:modelValue', value === undefined ? { $ref: { scope: category.value, node: '', path: [] } } : JSON.parse(JSON.stringify(value)))
+}
+function selectField(key) {
+  const source = matching.value.find(item => referenceKey(item) === key)
+  if (source) emit('update:modelValue', sourceValue(source))
+}
+function setType(type) { emit('update:modelValue', type === 'number' ? 0 : type === 'bool' ? false : type === 'object' ? {} : type === 'array' ? [] : '') }
+</script>
+<template>
+  <div class="condition-value-input">
+    <label class="field"><span class="field-label">{{ label }}来源</span>
+      <select v-model="category" class="select" @change="changeSource"><option v-for="[value, name] in categories" :key="value" :value="value">{{ name }}</option></select>
+    </label>
+    <template v-if="category !== 'literal'">
+      <label class="field"><span class="field-label">{{ category === 'variable' || category === 'constant' ? '名称' : '输出字段' }}</span>
+        <select class="select" :value="selected ? referenceKey(selected) : ''" @change="selectField($event.target.value)">
+          <option value="" disabled>选择{{ label }}</option><option v-for="source in matching" :key="referenceKey(source)" :value="referenceKey(source)">{{ source.label }} · {{ typeLabel(source.type) }}</option>
+        </select>
+      </label>
+      <p v-if="!matching.length" class="inspector-lead">没有可用数据。请先添加对应的触发器、前序动作或变量。</p>
+      <p v-if="category === 'trigger'" class="inspector-lead">读取本次运行收到的触发器数据；未命中的触发器可能没有数据。</p>
+      <p v-if="selected?.optional || selected?.conditional" class="inspector-lead">此字段可能缺失，可先使用“存在”判断。</p>
+    </template>
+    <template v-else>
+      <label class="field"><span class="field-label">固定值类型</span><select class="select" :value="literalType" @change="setType($event.target.value)"><option v-if="!['string', 'number', 'bool', 'object', 'array'].includes(literalType)" :value="literalType">{{ typeLabel(literalType) }}</option><option value="string">文本</option><option value="number">数字</option><option value="bool">布尔值</option><option value="object">对象</option><option value="array">数组</option></select></label>
+      <ParamInput :def="{ name: label, label, type: literalType, value_type: ['string', 'number', 'bool'].includes(literalType) ? 'any' : literalType }" :model-value="modelValue" @update:model-value="emit('update:modelValue', $event)" />
+    </template>
+  </div>
+</template>
+<style scoped>
+.condition-value-input { display: grid; gap: 10px; }
+</style>

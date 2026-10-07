@@ -101,6 +101,8 @@ export function ensureRuleBindingIds(rule) {
       if (item.type === 'if') {
         item.then ||= []
         item.else ||= []
+        item.elif ||= []
+        item.elif.forEach(branch => { branch.then ||= []; ensureActions(branch.then) })
         ensureActions(item.then)
         ensureActions(item.else)
       } else if (!item.params || typeof item.params !== 'object') item.params = {}
@@ -124,6 +126,7 @@ export function regenerateBindingIds(node, kind = 'trigger') {
     if (previous) replacements.set(previous, item.binding_id)
     if (itemKind === 'action') {
       for (const field of ['then', 'else', 'failure_actions']) (item[field] || []).forEach(child => visit(child, 'action'))
+      for (const branch of item.elif || []) (branch.then || []).forEach(child => visit(child, 'action'))
     }
   }
   visit(node, kind)

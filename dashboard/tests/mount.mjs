@@ -1706,14 +1706,86 @@ const ifEditorOk = ifBranches.length === 2
 console.log((ifEditorOk?'PASS':'FAIL')+' - IF edits separate THEN and ELSE action lists')
 if (!ifEditorOk) process.exitCode = 1
 
+;[...document.querySelectorAll('.if-action-editor > button')].find(button => button.textContent.includes('添加 ELIF'))?.click()
+await pause(30)
+const elifForm = [...document.querySelectorAll('.if-action-editor > .if-branch')].find(branch => branch.textContent.includes('ELIF 1'))
+const elifOperator = elifForm?.querySelector('.predicate-editor select')
+if (elifOperator) {
+  elifOperator.value = 'run_status'
+  elifOperator.dispatchEvent(new window.Event('change', { bubbles: true }))
+}
+await pause(30)
+const elifStatus = [...(elifForm?.querySelectorAll('select') || [])].find(select => [...select.options].some(option => option.value === 'queued'))
+if (elifStatus) { elifStatus.value = 'queued'; elifStatus.dispatchEvent(new window.Event('change', { bubbles: true })) }
+elifForm?.querySelector('.flow-add-row button')?.click()
+await pause(20)
+document.querySelector('.plugin-picker-item')?.click()
+await pause(30)
+const elifFormOk = !!elifForm?.querySelector('.if-branch-action') && elifForm.textContent.includes('本次引擎启动后')
+console.log((elifFormOk ? 'PASS' : 'FAIL') + ' - ELIF 编辑自动化排队状态与独立分支动作，说明最近结果范围')
+if (!elifFormOk) process.exitCode = 1
+;[...document.querySelectorAll('.editor-mode-switch button')].find(button => button.textContent.includes('节点编辑'))?.click()
+await pause(30)
+;[...document.querySelectorAll('.graph-node-action')].find(node => node.textContent.includes('IF 条件分支'))?.click()
+await pause(40)
+const ifSubflowOpened = !!document.querySelector('.if-subflow-editor .graph-node-predicate') && !!document.querySelector('.subflow-navigation')
+const elifPredicateCard = [...document.querySelectorAll('.if-subflow-editor .graph-node-predicate')].find(node => node.textContent.includes('ELIF 1'))
+elifPredicateCard?.click()
+await pause(30)
+const subflowStatus = [...document.querySelectorAll('.if-subflow-editor .node-inspector select')].find(select => [...select.options].some(option => option.value === 'running'))
+if (subflowStatus) { subflowStatus.value = 'running'; subflowStatus.dispatchEvent(new window.Event('change', { bubbles: true })) }
+await pause(30)
+const coordinatedIf = ifSubflowOpened && !!subflowStatus && !!document.querySelector('.if-subflow-editor .graph-node-if-merge')
+const thenAddCard = [...document.querySelectorAll('.if-subflow-editor .graph-node-if-branch')].find(node => node.textContent.includes('IF 成立') && node.textContent.includes('添加分支动作'))
+thenAddCard?.click()
+await pause(25)
+;[...document.querySelectorAll('.if-subflow-editor .node-inspector button')].find(button => button.textContent.includes('添加 IF'))?.click()
+await pause(35)
+const nestedOpened = document.querySelectorAll('.subflow-navigation button[aria-current="page"]').length === 1 && document.querySelector('.subflow-navigation')?.textContent.includes('IF 2')
+;[...document.querySelectorAll('.if-subflow-editor .graph-node-if-branch')].find(node => node.textContent.includes('IF 成立') && node.textContent.includes('添加分支动作'))?.click()
+await pause(20)
+;[...document.querySelectorAll('.if-subflow-editor .node-inspector button')].find(button => button.textContent.trim() === '等待')?.click()
+await pause(30)
+;[...document.querySelectorAll('.subflow-navigation button')].find(button => button.textContent.includes('返回上层'))?.click()
+await pause(30)
+const nestedSummary = [...document.querySelectorAll('.if-subflow-editor .graph-node-action')].find(node => node.textContent.includes('IF 条件分支'))
+const nestedReturned = !!nestedSummary && !document.querySelector('.subflow-navigation')?.textContent.includes('IF 2')
+nestedSummary?.querySelector('button[title="删除动作"]')?.click()
+await pause(20)
+console.log((nestedOpened && nestedReturned ? 'PASS' : 'FAIL') + ' - 嵌套 IF 子图添加动作，返回父图后显示摘要并可删除')
+if (!nestedOpened || !nestedReturned) process.exitCode = 1
+const branchAction = [...document.querySelectorAll('.if-subflow-editor .graph-node-action')].find(node => node.textContent.includes('IF 成立'))
+branchAction?.click()
+await pause(25)
+document.querySelector('.if-subflow-editor .failure-action-add')?.click()
+await pause(20)
+document.querySelector('.plugin-picker-item')?.click()
+await pause(30)
+document.querySelector('.if-subflow-editor .graph-node-failure-action')?.click()
+await pause(20)
+const recoveryNoNestedActions = !document.querySelector('.if-subflow-editor .failure-action-add')
+;[...document.querySelectorAll('.if-subflow-editor .inspector-action-row button')].find(button => button.textContent.trim() === '复制')?.click()
+await pause(25)
+const recoveryCopySelected = document.querySelectorAll('.if-subflow-editor .graph-node-failure-action').length === 2 && document.querySelector('.if-subflow-editor .graph-node-failure-action.selected') !== null
+for (const recovery of [...document.querySelectorAll('.if-subflow-editor .graph-node-failure-action')]) { recovery.querySelector('button[title="删除补救动作"]')?.click(); await pause(20) }
+const recoveryCleared = document.querySelectorAll('.if-subflow-editor .graph-node-failure-action').length === 0
+console.log((recoveryNoNestedActions && recoveryCopySelected && recoveryCleared ? 'PASS' : 'FAIL') + ' - 子图补救动作复制后保持选中，删除后清理空列表且不允许嵌套补救')
+if (!recoveryNoNestedActions || !recoveryCopySelected || !recoveryCleared) process.exitCode = 1
+;[...document.querySelectorAll('.subflow-navigation button')].find(button => button.textContent.includes('主流程'))?.click()
+await pause(30)
+const returnedToMain = !document.querySelector('.if-subflow-editor') && !!document.querySelector('.graph-node-action')
+console.log((coordinatedIf && returnedToMain ? 'PASS' : 'FAIL') + ' - IF 摘要进入条件子图，ELIF 修改共享规则并返回主图')
+if (!coordinatedIf || !returnedToMain) process.exitCode = 1
+
 const saveMacroBaseline = [...document.querySelectorAll('.rule-editor-actions button')].find(
   button => button.textContent.includes('保存规则'),
 )
 saveMacroBaseline?.click()
 await new Promise(r => setTimeout(r, 50))
 const savedIf = savedRulesPayload?.find(rule => rule.rule_id === 'r_mount001')?.actions?.find(action => action.type === 'if')
-const ifSavedOk = savedIf?.then?.length === 1 && savedIf?.else?.length === 1
+const ifSavedOk = savedIf?.then?.length === 1 && savedIf?.else?.length === 1 && !Object.hasOwn(savedIf.then[0], 'failure_actions')
   && savedIf.condition?.op === 'is_true' && !Object.hasOwn(savedIf, 'params')
+  && savedIf.elif?.[0]?.condition?.op === 'run_status' && savedIf.elif[0].condition.status === 'running' && savedIf.elif[0].then.length === 1
 console.log((ifSavedOk?'PASS':'FAIL')+' - saving preserves IF branches and predicate data')
 if (!ifSavedOk) process.exitCode = 1
 

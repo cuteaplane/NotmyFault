@@ -1,6 +1,8 @@
 <script setup>
 import { computed, nextTick, ref, toRef, watch, onMounted, onUnmounted } from 'vue'
 import RuleCanvas from './RuleCanvas.vue'
+import IfSubflowEditor from './IfSubflowEditor.vue'
+import { findWorkflowAction } from '../lib/workflowConditions'
 import RuleNodeInspector from './RuleNodeInspector.vue'
 import RuleValidationSummary from './RuleValidationSummary.vue'
 import { useRuleMutations } from '../composables/useRuleMutations'
@@ -76,10 +78,7 @@ const hasSidePanels = computed(() => (
 function onAiDraft(draft) {
   emit('ai-draft', draft)
 }
-function highlightNodeById(nodeId) {
-  if (!nodeId) return
-  selectedNodeId.value = nodeId
-}
+function highlightNodeById(nodeId) { focusInitialNode(nodeId) }
 function newAiConversation() {
   aiPanelRef.value?.requestNewConversation?.()
 }
@@ -169,6 +168,21 @@ watch(() => props.rule, rule => { normalizeRuleDraft(rule); ensureRuleBindingIds
 
 const constantSources = computed(() => expandBindingSources(variableBindingSources(props.rule, { constantsOnly: true }), store.schema.data_types?.custom))
 
+const subflowIds = ref([])
+const subflowInitialNode = ref('')
+const activeIf = computed(() => findWorkflowAction(props.rule, subflowIds.value.at(-1))?.action || null)
+const subflowRef = ref(null)
+const subflowTrail = computed(() => subflowIds.value.map(id => findWorkflowAction(props.rule, id)?.action).filter(Boolean))
+function openIf(action) {
+  const hit = findWorkflowAction(props.rule, action.binding_id)
+  if (!hit) return
+  subflowIds.value = [...hit.trail.filter(parent => parent.action.type === 'if').map(parent => parent.action.binding_id), action.binding_id]
+  subflowInitialNode.value = ''
+}
+function returnToFlow(depth) { subflowIds.value = subflowIds.value.slice(0, depth); subflowInitialNode.value = '' }
+watch(() => props.rule, () => {
+  subflowIds.value = subflowIds.value.filter(id => findWorkflowAction(props.rule, id)?.action.type === 'if')
+})
 const canvasRef = ref(null)
 const inspectorRef = ref(null)
 const layoutNodes = computed(() => canvasRef.value?.nodes || [])
@@ -219,7 +233,11 @@ function selectNode(id) {
 function focusInitialNode(id) {
   if (!id) return
   nextTick(() => {
-    if (layoutNodes.value.some(node => node.id === id)) selectNode(id)
+    const bindingId = id.replace(/^(?:failure-action|action)-/, '')
+    const hit = findWorkflowAction(props.rule, bindingId)
+    const parents = hit?.trail.filter(parent => parent.action.type === 'if') || []
+    if (parents.length) { subflowIds.value = parents.map(parent => parent.action.binding_id); subflowInitialNode.value = id; nextTick(() => subflowRef.value?.selectNode(id)) }
+    else { subflowIds.value = []; if (layoutNodes.value.some(node => node.id === id)) selectNode(id) }
   })
 }
 watch([() => props.initialNodeId, canvasRef], ([id]) => focusInitialNode(id), { immediate: true })
@@ -250,6 +268,7 @@ onUnmounted(() => {
   stopAiPanelResize()
 })
 function onEditorKeydown(event) {
+  if (event.defaultPrevented) return
   if (document.querySelector('.nmf-dialog-backdrop, .extension-page-layer')) return
   const target = event.target
   const editingText = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement
@@ -269,6 +288,7 @@ function onEditorKeydown(event) {
   if (picker.value.open) closePluginPicker()
   else if (folderPickerOpen.value) folderPickerOpen.value = false
   else if (editingRuleName.value) finishRuleNameEdit()
+  else if (activeIf.value) returnToFlow(subflowIds.value.length - 1)
   else selectedNodeId.value = null
 }
 </script>
@@ -352,9 +372,11 @@ function onEditorKeydown(event) {
     </div>
     <div class="rule-editor-main-grid">
     <div class="editor-canvas-column">
-    <RuleCanvas ref="canvasRef" :rule="rule" :layout="editorLayout"
+    <nav v-if="activeIf" class="subflow-navigation" aria-label="流程位置"><button class="btn btn-text btn-sm" @click="returnToFlow(0)">主流程</button><template v-for="(item, index) in subflowTrail" :key="item.binding_id"><span>›</span><button class="btn btn-text btn-sm" :aria-current="index === subflowTrail.length - 1 ? 'page' : undefined" @click="returnToFlow(index + 1)">IF {{ index + 1 }}</button></template><button class="btn btn-outlined btn-sm" @click="returnToFlow(subflowIds.length - 1)">返回上层</button></nav>
+    <IfSubflowEditor v-if="activeIf" ref="subflowRef" :rule="rule" :action="activeIf" :layout="editorLayout" :initial-node-id="subflowInitialNode" @open-if="openIf" />
+    <RuleCanvas v-show="!activeIf" ref="canvasRef" :rule="rule" :layout="editorLayout"
       v-model:selected-node-id="selectedNodeId" @select-node="selectNode"
-      @add-if="addIf" @add-assignment="addAssignment" @add-wait="addWait" @open-picker="openPluginPicker"
+      @open-if="openIf" @add-if="addIf" @add-assignment="addAssignment" @add-wait="addWait" @open-picker="openPluginPicker"
       @move-action="moveAction" @remove-action="removeAction"
       @move-failure-action="moveFailureAction" @remove-failure-action="removeFailureAction"
       @add-condition-child="requestConditionChild">
@@ -408,3 +430,8 @@ function onEditorKeydown(event) {
       @close="folderPickerOpen = false" @select="chooseFolder" />
   </section>
 </template>
+
+<style scoped>
+.subflow-navigation { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+.subflow-navigation button[aria-current="page"] { color: var(--md-primary); font-weight: 700; }
+</style>

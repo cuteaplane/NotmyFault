@@ -1,3 +1,7 @@
+<script>
+const canvasViews = new WeakMap()
+</script>
+
 <script setup>
 import { computed, nextTick, ref, watch, onMounted, onUnmounted } from 'vue'
 import { store } from '../lib/store'
@@ -7,8 +11,8 @@ import { buildNodeDataPorts, deriveDataEdges, typesCompatible } from '../lib/bin
 import { typeLabel } from '../lib/valueTypes'
 import { isAdmin, eventName, actionName, describeItem } from '../lib/rulePresentation'
 
-const props = defineProps({ rule: Object, layout: { type: String, default: 'canvas' }, selectedNodeId: String })
-const emit = defineEmits(['update:selectedNodeId', 'select-node', 'add-if', 'add-assignment', 'add-wait', 'open-picker', 'move-action', 'remove-action', 'move-failure-action', 'remove-failure-action', 'add-condition-child'])
+const props = defineProps({ rule: Object, layout: { type: String, default: 'canvas' }, selectedNodeId: String, graphOverride: Object, viewKey: { type: String, default: 'main' } })
+const emit = defineEmits(['update:selectedNodeId', 'select-node', 'add-if', 'add-assignment', 'add-wait', 'open-picker', 'move-action', 'remove-action', 'move-failure-action', 'remove-failure-action', 'add-condition-child', 'open-if', 'predicate-select', 'branch-add', 'branch-remove'])
 const canvasLayout = computed(() => props.layout === 'canvas')
 const selectedNodeId = computed({ get: () => props.selectedNodeId, set: id => emit('update:selectedNodeId', id) })
 const conditionNode = computed(() => props.rule.condition || null)
@@ -23,6 +27,7 @@ const dataDrag = ref(null)
 const dataDropTarget = ref(null)
 
 let dragState = null
+const connectionPositions = ref(null)
 
 function sideExpanded(nodeId, side) {
   return !!portExpansion.value[nodeId]?.[side]
@@ -61,8 +66,10 @@ function resolveNodeCollisions(nodes) {
 }
 
 const graph = computed(() => {
-  const controlGraph = buildFlowGraph({
+  const controlGraph = props.graphOverride || buildFlowGraph({
     rule: props.rule,
+    schema: store.schema,
+    rules: store.configData.rules,
     condition: conditionNode.value,
     eventName,
     actionName,
@@ -71,8 +78,13 @@ const graph = computed(() => {
       kind === 'trigger' ? store.schema.triggers[item?.type] : store.schema.actions[item?.type],
     ),
   })
-  const fullNodes = controlGraph.nodes.map(node => buildNodeDataPorts(node, store.schema, props.rule))
-  const dataEdges = deriveDataEdges(props.rule, fullNodes, typeCatalog.value)
+  const fullNodes = controlGraph.nodes.map(node => {
+    const built = buildNodeDataPorts(node, store.schema, props.rule)
+    return { ...built, dataInputs: node.dataInputs ?? built.dataInputs, dataOutputs: node.dataOutputs ?? built.dataOutputs }
+  })
+  const suppliedDataEdges = controlGraph.edges.filter(edge => edge.channel === 'data')
+  const suppliedIds = new Set(suppliedDataEdges.map(edge => edge.id))
+  const dataEdges = [...suppliedDataEdges, ...deriveDataEdges(props.rule, fullNodes, typeCatalog.value).filter(edge => !suppliedIds.has(edge.id))]
   const usedInputs = new Map()
   const usedOutputs = new Map()
   for (const edge of dataEdges) {
@@ -102,7 +114,7 @@ const graph = computed(() => {
     const contentExtraHeight = node.admin ? FLOW_NODE_ADMIN_EXTRA_HEIGHT : 0
     const dataStartY = FLOW_NODE_BASE_HEIGHT + contentExtraHeight
       + (hasDataPorts ? FLOW_DATA_SUMMARY_HEIGHT : 0)
-    const footerHeight = ['action', 'failure-action'].includes(node.kind) ? 34 : node.kind === 'condition' ? 40 : 0
+    const footerHeight = !node.readOnly && ['action', 'failure-action'].includes(node.kind) ? 34 : node.kind === 'condition' ? 40 : 0
     return {
       ...node,
       visibleDataInputs,
@@ -120,14 +132,14 @@ const graph = computed(() => {
   })
   return {
     nodes,
-    edges: [...controlGraph.edges, ...dataEdges],
+    edges: [...controlGraph.edges.filter(edge => edge.channel !== 'data'), ...dataEdges],
   }
 })
 
 const layoutNodes = computed(() => resolveNodeCollisions(graph.value.nodes.map(node => ({
   ...node,
-  ...(nodePositions.value[node.id] || {}),
-  manuallyPlaced: !!nodePositions.value[node.id],
+  ...(connectionPositions.value?.[node.id] || nodePositions.value[node.id] || {}),
+  manuallyPlaced: !!(connectionPositions.value?.[node.id] || nodePositions.value[node.id]),
 }))))
 
 const graphEdges = computed(() => {
@@ -141,9 +153,18 @@ watch(layoutNodes, nodes => {
     && !nodes.some(node => node.id === selectedNodeId.value)
   ) selectedNodeId.value = null
 })
-function selectNode(id) {
+function selectNode(id, reveal = false) {
   if (suppressNodeClickId === id) { suppressNodeClickId = null; return }
-  emit('select-node', id)
+  pointerSelectionId = reveal ? null : id
+  const node = layoutNodes.value.find(item => item.id === id)
+  if (node?.readOnly) return
+  if (canvasLayout.value && node?.kind === 'action' && node.source?.type === 'if') emit('open-if', node.source)
+  else if (node?.kind === 'predicate') { emit('select-node', id); emit('predicate-select', node) }
+  else if (node?.kind === 'if-branch' && node.addBranch) emit('branch-add', node)
+  else emit('select-node', id)
+}
+function focusNode(node) {
+  if (keyboardNavigation && canvasLayout.value && !dataDrag.value && !dragState) centerOnNode(node)
 }
 
 // 画布相机只改变 0×0 容器的 translate 和 scale，节点、连线都用同一逻辑坐标。
@@ -164,6 +185,15 @@ let fittedOnce = false
 let camAnimTimer = null
 let suppressNodeClickId = null
 let suppressNodeClickTimer = null
+let pointerSelectionId = null
+let keyboardNavigation = false
+let edgePanFrame = null
+let edgePanTime = null
+let gesturePointer = null
+let captureTarget = null
+let capturePointerId = null
+let activeView = props.viewKey
+let activeRule = props.rule
 
 function clampZoom(value) { return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, value)) }
 function animateCamera() {
@@ -186,6 +216,7 @@ function onCanvasWheel(event) {
   if (!canvasLayout.value) return
   if (!viewportRef.value) return
   event.preventDefault()
+  if (dataDrag.value || dragState) return
   const rect = viewportRef.value.getBoundingClientRect()
   const factor = event.deltaY < 0 ? 1.12 : 1 / 1.12
   zoomAt(zoom.value * factor, event.clientX - rect.left, event.clientY - rect.top)
@@ -205,7 +236,8 @@ function startPan(event) {
   if (event.button !== 0) return
   if (event.target.closest('.graph-node') || event.target.closest('button')) return
   selectedNodeId.value = null
-  panState = { startX: event.clientX, startY: event.clientY, x: pan.value.x, y: pan.value.y }
+  stopCameraAnimation()
+  panState = { startX: event.clientX, startY: event.clientY, x: pan.value.x, y: pan.value.y, target: event.currentTarget, pointerId: event.pointerId }
   isPanning.value = true
   event.currentTarget.setPointerCapture?.(event.pointerId)
 }
@@ -217,6 +249,7 @@ function movePan(event) {
   }
 }
 function endPan() {
+  if (panState?.target.hasPointerCapture?.(panState.pointerId)) panState.target.releasePointerCapture(panState.pointerId)
   panState = null
   isPanning.value = false
 }
@@ -234,24 +267,27 @@ function dataReference(node, port) {
 function canConnectDataPorts(sourceNode, sourcePort, targetNode, targetPort) {
   if (!typesCompatible(sourcePort.type, targetPort.type)) return false
   if (['action', 'failure-action'].includes(sourceNode.kind)) {
-    return ['action', 'failure-action'].includes(targetNode.kind)
+    return !targetNode.readOnly && ['action', 'failure-action', 'predicate'].includes(targetNode.kind)
       && (targetNode.availableStepIds || []).includes(sourceNode.source.binding_id)
   }
   if (sourceNode.kind !== 'trigger') return false
 
-  return ['action', 'failure-action'].includes(targetNode.kind)
+  return !targetNode.readOnly && ['action', 'failure-action', 'predicate'].includes(targetNode.kind)
 }
 function inputPortAt(event) {
-  const target = event.target?.closest?.('[data-input-node][data-input-port]')
-    || document.elementFromPoint?.(event.clientX, event.clientY)?.closest?.('[data-input-node][data-input-port]')
+  const target = document.elementFromPoint?.(event.clientX, event.clientY)?.closest?.('[data-input-node][data-input-port]')
+    || event.target?.closest?.('[data-input-node][data-input-port]')
   if (!target) return null
   const node = layoutNodes.value.find(item => item.id === target.dataset.inputNode)
   const port = node?.dataInputs.find(item => item.name === target.dataset.inputPort)
   return node && port ? { node, port } : null
 }
 function updateDataDropTarget(event) {
-  if (!dataDrag.value) return
-  dataDrag.value = { ...dataDrag.value, clientX: event.clientX, clientY: event.clientY }
+  if (!dataDrag.value || !matchesGesture(event)) return
+  dataDrag.value = { ...dataDrag.value, clientX: event.clientX, clientY: event.clientY,
+    moved: dataDrag.value.moved || Math.hypot(event.clientX - dataDrag.value.startX, event.clientY - dataDrag.value.startY) >= 5 }
+  gesturePointer = { clientX: event.clientX, clientY: event.clientY }
+  if (dataDrag.value.moved) scheduleEdgePan()
   const target = inputPortAt(event)
   const source = layoutNodes.value.find(node => node.id === dataDrag.value.sourceNodeId)
   const sourcePort = source?.dataOutputs.find(port => port.name === dataDrag.value.sourcePortName)
@@ -260,26 +296,31 @@ function updateDataDropTarget(event) {
     : null
 }
 function startDataDrag(event, node, port) {
-  if (!canvasLayout.value) return
+  if (!canvasLayout.value || dataDrag.value || dragState) return
   if (event.button !== 0) return
+  event.preventDefault()
   event.stopPropagation()
+  stopCameraAnimation()
+  connectionPositions.value = Object.fromEntries(layoutNodes.value.map(item => [item.id, { x: item.x, y: item.y }]))
   dataDrag.value = {
     sourceNodeId: node.id,
     sourcePortName: port.name,
+    startX: event.clientX, startY: event.clientY, moved: false,
     clientX: event.clientX,
     clientY: event.clientY,
   }
   dataDropTarget.value = null
-  event.currentTarget.setPointerCapture?.(event.pointerId)
+  captureGesture(event)
 }
 function endDataDrag(event) {
-  if (!dataDrag.value) return
+  if (!dataDrag.value || !matchesGesture(event)) return
   updateDataDropTarget(event)
   const source = layoutNodes.value.find(node => node.id === dataDrag.value.sourceNodeId)
   const sourcePort = source?.dataOutputs.find(port => port.name === dataDrag.value.sourcePortName)
   const target = dataDropTarget.value
   if (source && sourcePort && target && canConnectDataPorts(source, sourcePort, target.node, target.port)) {
-    if (target.node.source.type === 'set_variable') target.node.source.value = dataReference(source, sourcePort)
+    if (target.node.kind === 'predicate') target.node.source[target.port.name] = dataReference(source, sourcePort)
+    else if (target.node.source.type === 'set_variable') target.node.source.value = dataReference(source, sourcePort)
     else {
       target.node.source.params ||= {}
       target.node.source.params[target.port.name] = dataReference(source, sourcePort)
@@ -287,10 +328,14 @@ function endDataDrag(event) {
   }
   dataDrag.value = null
   dataDropTarget.value = null
+  connectionPositions.value = null
+  finishGesture()
 }
 function cancelDataDrag() {
   dataDrag.value = null
   dataDropTarget.value = null
+  connectionPositions.value = null
+  finishGesture()
 }
 function dataInputDropState(node, port) {
   if (!dataDrag.value) return ''
@@ -398,7 +443,8 @@ function centerOnNode(node) {
 }
 // 工具栏或添加节点触发选中时先把目标移到视野内，手动点击的节点直接保留原位。
 watch(selectedGraphNode, (node, previous) => {
-  if (node && node.id !== previous?.id && canvasLayout.value) centerOnNode(node)
+  if (node && node.id !== previous?.id && canvasLayout.value && !dataDrag.value && !dragState && pointerSelectionId !== node.id) centerOnNode(node)
+  pointerSelectionId = null
 })
 
 // 小地图显示整张内容和当前视口，点击或拖动后跳到对应位置。
@@ -444,6 +490,7 @@ function startMinimapDrag(event) {
 }
 function moveMinimapDrag(event) { if (minimapDragging) jumpMinimap(event) }
 function handleCanvasKey(event) {
+  if (dataDrag.value || dragState) return
   const movement = { ArrowLeft: [80, 0], ArrowRight: [-80, 0], ArrowUp: [0, 80], ArrowDown: [0, -80] }[event.key]
   if (movement) { event.preventDefault(); pan.value = { x: pan.value.x + movement[0], y: pan.value.y + movement[1] }; return }
   if (['+', '=', '-'].includes(event.key)) { event.preventDefault(); zoomStep(event.key === '-' ? 1 / 1.25 : 1.25) }
@@ -506,8 +553,10 @@ function resetLayout() {
 }
 
 function startNodeDrag(event, node) {
-  if (!canvasLayout.value) return
+  if (!canvasLayout.value || dataDrag.value || dragState) return
   if (event.button !== 0) return
+  event.preventDefault()
+  stopCameraAnimation()
   const current = nodePositions.value[node.id] || { x: node.x, y: node.y }
   dragState = {
     id: node.id,
@@ -516,11 +565,12 @@ function startNodeDrag(event, node) {
     x: current.x,
     y: current.y,
     moved: false,
+    panX: pan.value.x, panY: pan.value.y,
   }
-  event.currentTarget.setPointerCapture?.(event.pointerId)
+  captureGesture(event)
 }
 function dragNode(event) {
-  if (!dragState) return
+  if (!dragState || !matchesGesture(event)) return
   const deltaX = event.clientX - dragState.startX
   const deltaY = event.clientY - dragState.startY
   if (!dragState.moved) {
@@ -529,16 +579,18 @@ function dragNode(event) {
     // 开始拖动节点时关闭设置抽屉，并清除当前选中节点。
     selectedNodeId.value = null
   }
-  // 屏幕像素换算为逻辑坐标时除以当前缩放。
+  gesturePointer = { clientX: event.clientX, clientY: event.clientY }
+  scheduleEdgePan()
   nodePositions.value = {
     ...nodePositions.value,
     [dragState.id]: {
-      x: Math.max(24, dragState.x + deltaX / zoom.value),
-      y: Math.max(24, dragState.y + deltaY / zoom.value),
+      x: Math.max(24, dragState.x + (deltaX + dragState.panX - pan.value.x) / zoom.value),
+      y: Math.max(24, dragState.y + (deltaY + dragState.panY - pan.value.y) / zoom.value),
     },
   }
 }
 function endNodeDrag(event) {
+  if (event && !matchesGesture(event)) return
   if (dragState?.moved && event?.type !== 'pointercancel') {
     // pointerup 后浏览器会补发 click，这里只屏蔽当前节点的一次点击。
     suppressNodeClickId = dragState.id
@@ -549,6 +601,7 @@ function endNodeDrag(event) {
     }, 0)
   }
   dragState = null
+  finishGesture()
 }
 
 function observeViewport() {
@@ -568,12 +621,113 @@ function observeViewport() {
 }
 
 
-onMounted(() => { if (canvasLayout.value) observeViewport() })
+onMounted(() => {
+  restoreView()
+  if (canvasLayout.value) observeViewport()
+  window.addEventListener('pointermove', moveGesture)
+  window.addEventListener('pointerup', endGesture)
+  window.addEventListener('pointercancel', cancelGesture)
+  window.addEventListener('blur', cancelGesture)
+  window.addEventListener('keydown', trackKeyboard, true)
+  window.addEventListener('pointerdown', trackPointer, true)
+})
 onUnmounted(() => {
+  saveView()
+  cancelGesture()
+  window.removeEventListener('pointermove', moveGesture)
+  window.removeEventListener('pointerup', endGesture)
+  window.removeEventListener('pointercancel', cancelGesture)
+  window.removeEventListener('blur', cancelGesture)
+  window.removeEventListener('keydown', trackKeyboard, true)
+  window.removeEventListener('pointerdown', trackPointer, true)
   resizeObserver?.disconnect()
   if (camAnimTimer) clearTimeout(camAnimTimer)
   if (suppressNodeClickTimer) clearTimeout(suppressNodeClickTimer)
 })
+function stopCameraAnimation() {
+  if (camAnimTimer) clearTimeout(camAnimTimer)
+  camAnim.value = false
+}
+function captureGesture(event) {
+  captureTarget = event.currentTarget
+  capturePointerId = event.pointerId
+  captureTarget.setPointerCapture?.(capturePointerId)
+  gesturePointer = { clientX: event.clientX, clientY: event.clientY }
+}
+function finishGesture() {
+  if (edgePanFrame !== null) cancelAnimationFrame(edgePanFrame)
+  edgePanFrame = null
+  edgePanTime = null
+  gesturePointer = null
+  if (captureTarget?.hasPointerCapture?.(capturePointerId)) captureTarget.releasePointerCapture(capturePointerId)
+  captureTarget = null
+  capturePointerId = null
+}
+function scheduleEdgePan() {
+  if (edgePanFrame === null) edgePanFrame = requestAnimationFrame(autoPan)
+}
+function autoPan(time) {
+  edgePanFrame = null
+  if (!gesturePointer || !(dataDrag.value?.moved || dragState?.moved) || !viewportRef.value) return
+  const rect = viewportRef.value.getBoundingClientRect()
+  const band = Math.min(56, rect.width / 4, rect.height / 4)
+  if (band <= 0) return
+  const velocity = (position, start, end) => position < start + band
+    ? Math.min(1, Math.max(0, (start + band - position) / band)) * 600
+    : position > end - band ? -Math.min(1, Math.max(0, (position - end + band) / band)) * 600 : 0
+  const seconds = Math.min(32, edgePanTime === null ? 16 : time - edgePanTime) / 1000
+  edgePanTime = time
+  const dx = velocity(gesturePointer.clientX, rect.left, rect.right) * seconds
+  const dy = velocity(gesturePointer.clientY, rect.top, rect.bottom) * seconds
+  if (dx || dy) {
+    pan.value = { x: pan.value.x + dx, y: pan.value.y + dy }
+    if (dragState?.moved) dragNode(gesturePointer)
+    if (dataDrag.value) nextTick(() => { if (dataDrag.value && gesturePointer) updateDataDropTarget(gesturePointer) })
+  }
+  scheduleEdgePan()
+}
+function matchesGesture(event) { return capturePointerId === null || event.pointerId === undefined || event.pointerId === capturePointerId }
+function moveGesture(event) {
+  if (capturePointerId !== null && event.pointerId !== capturePointerId) return
+  if (dataDrag.value) updateDataDropTarget(event)
+  if (dragState) dragNode(event)
+}
+function endGesture(event) {
+  if (capturePointerId !== null && event.pointerId !== capturePointerId) return
+  if (dataDrag.value) endDataDrag(event)
+  if (dragState) endNodeDrag(event)
+}
+function cancelGesture() { cancelDataDrag(); endNodeDrag({ type: 'pointercancel' }); endPan() }
+function trackKeyboard(event) {
+  if (event.key === 'Tab') keyboardNavigation = true
+  if (event.key === 'Escape' && (dataDrag.value || dragState)) { event.preventDefault(); cancelGesture() }
+}
+function trackPointer() { keyboardNavigation = false }
+function saveView() {
+  if (!activeRule) return
+  let views = canvasViews.get(activeRule)
+  if (!views) { views = new Map(); canvasViews.set(activeRule, views) }
+  views.set(activeView, { pan: { ...pan.value }, zoom: zoom.value,
+    positions: { ...nodePositions.value }, ports: { ...portExpansion.value }, fitted: fittedOnce })
+}
+function restoreView() {
+  const saved = canvasViews.get(activeRule)?.get(activeView)
+  pan.value = saved?.pan || { x: 0, y: 0 }
+  zoom.value = saved?.zoom || 1
+  nodePositions.value = saved?.positions || {}
+  portExpansion.value = saved?.ports || {}
+  fittedOnce = saved?.fitted || false
+  stopCameraAnimation()
+}
+watch(() => [props.rule, props.viewKey], async () => {
+  saveView()
+  cancelGesture()
+  activeRule = props.rule
+  activeView = props.viewKey
+  restoreView()
+  await nextTick()
+  if (!fittedOnce && viewportSize.value.w) { fittedOnce = true; fitView({ readable: true }) }
+}, { flush: 'sync' })
 defineExpose({ nodes: layoutNodes })
 </script>
 
@@ -581,12 +735,12 @@ defineExpose({ nodes: layoutNodes })
     <main class="node-editor-workspace editor-mode-active" :class="{ 'form-layout': !canvasLayout, 'with-inspector': canvasLayout && selectedNodeId }">
       <section class="node-canvas-panel" :aria-label="canvasLayout ? '规则节点画布' : '规则步骤'">
         <div class="node-canvas-toolbar">
-          <div class="node-canvas-tools">
-            <button class="btn btn-text btn-sm" @click="selectNode(conditionNodeId(rule.condition, []))"><span class="material-symbols-outlined">bolt</span>触发条件</button>
+          <div v-if="!graphOverride" class="node-canvas-tools">
+            <button class="btn btn-text btn-sm" @click="selectNode(conditionNodeId(rule.condition, []), true)"><span class="material-symbols-outlined">bolt</span>触发条件</button>
             <button class="btn btn-text btn-sm" @click="emit('add-if')"><span class="material-symbols-outlined">call_split</span>添加 IF</button>
             <button class="btn btn-text btn-sm" @click="emit('add-assignment')"><span class="material-symbols-outlined">edit_note</span>变量赋值</button>
             <button class="btn btn-text btn-sm" @click="emit('add-wait')"><span class="material-symbols-outlined">hourglass_empty</span>等待</button>
-            <button class="btn btn-text btn-sm" @click="selectNode('add-action')"><span class="material-symbols-outlined">add</span>添加动作</button>
+            <button class="btn btn-text btn-sm" @click="selectNode('add-action', true)"><span class="material-symbols-outlined">add</span>添加动作</button>
           </div>
           <div v-if="canvasLayout" class="node-canvas-toolbar-side">
             <div class="node-canvas-zoom">
@@ -603,7 +757,7 @@ defineExpose({ nodes: layoutNodes })
         </div>
         <div ref="viewportRef" class="node-canvas-viewport" :class="{ panning: isPanning }" :style="canvasLayout ? gridStyle : null"
           @pointerdown="startPan" @pointermove="dataDrag ? updateDataDropTarget($event) : movePan($event)"
-          @pointerup="dataDrag ? endDataDrag($event) : endPan()" @pointercancel="dataDrag ? cancelDataDrag() : endPan()"
+          @pointerup="dataDrag ? endDataDrag($event) : endPan()" @pointercancel="cancelGesture" @lostpointercapture="cancelGesture"
           @wheel="onCanvasWheel" tabindex="0" aria-label="规则画布，可用方向键平移，加减号缩放" @keydown.self="handleCanvasKey">
           <div class="node-canvas" :class="{ 'cam-anim': camAnim }" :style="canvasLayout ? cameraStyle : null">
             <!-- 画布和 SVG 共用逻辑像素坐标，overflow:visible 让连线绘制到容器外，设置 viewBox 会让端口错位。 -->
@@ -623,7 +777,7 @@ defineExpose({ nodes: layoutNodes })
                <path v-if="pendingDataEdge" class="node-link node-link-data node-link-pending" :d="pendingDataEdge.d" />
             </svg>
 
-            <button v-for="edge in graphEdges.filter(item => canvasLayout && Number.isInteger(item.insertActionIndex) && item.to !== 'add-action')"
+            <button v-for="edge in graphEdges.filter(item => !graphOverride && canvasLayout && Number.isInteger(item.insertActionIndex) && item.to !== 'add-action')"
               :key="`insert-${edge.id}`" class="canvas-edge-add" :style="{ left: `${edge.labelX}px`, top: `${edge.labelY + 9}px` }"
               :title="`在第 ${edge.insertActionIndex + 1} 步插入动作`"
               @click.stop="emit('open-picker', 'action', { mode: 'action', index: edge.insertActionIndex, title: '插入动作' })">
@@ -634,7 +788,7 @@ defineExpose({ nodes: layoutNodes })
             <article
               class="graph-node" :class="[`graph-node-${node.kind}`, { selected: selectedNodeId === node.id, dimmed: nodeDimmed(node.id), 'data-incompatible': nodeDataIncompatible(node) }]"
               :style="canvasLayout ? { left: `${node.x}px`, top: `${node.y}px`, height: `${node.height}px` } : null"
-              role="button" tabindex="0" @click="selectNode(node.id)" @keydown.enter.self.prevent="selectNode(node.id)" @keydown.space.self.prevent="selectNode(node.id)" @focus="canvasLayout && centerOnNode(node)"
+              role="button" tabindex="0" @click="selectNode(node.id)" @keydown.enter.self.prevent="selectNode(node.id)" @keydown.space.self.prevent="selectNode(node.id)" @focus="focusNode(node)"
               @pointerenter="hoverNodeId = node.id" @pointerleave="hoverNodeId = null">
               <span v-if="canvasLayout && node.hasInput" class="node-port node-port-in"></span>
               <header class="graph-node-head" @pointerdown.stop="startNodeDrag($event, node)"
@@ -673,15 +827,15 @@ defineExpose({ nodes: layoutNodes })
                    </span>
                 </div>
               </div>
-              <footer v-if="node.kind === 'action'" class="graph-node-actions">
-                <button class="icon-btn" :disabled="node.index === 0" title="提前执行" @click.stop="emit('move-action', node.index, -1)"><span class="material-symbols-outlined">arrow_back</span></button>
-                <button class="icon-btn" :disabled="node.index === rule.actions.length - 1" title="稍后执行" @click.stop="emit('move-action', node.index, 1)"><span class="material-symbols-outlined">arrow_forward</span></button>
-                <button class="icon-btn icon-btn-danger" title="删除动作" @click.stop="emit('remove-action', node.index)"><span class="material-symbols-outlined">delete</span></button>
+              <footer v-if="node.kind === 'action' && !node.readOnly" class="graph-node-actions">
+                <button class="icon-btn" :disabled="node.index === 0" title="提前执行" @click.stop="emit('move-action', node.index, -1, node)"><span class="material-symbols-outlined">arrow_back</span></button>
+                <button class="icon-btn" :disabled="node.index === (graphOverride ? layoutNodes.filter(item => item.kind === 'action' && !item.readOnly && item.branchKey === node.branchKey).length : rule.actions.length) - 1" title="稍后执行" @click.stop="emit('move-action', node.index, 1, node)"><span class="material-symbols-outlined">arrow_forward</span></button>
+                <button class="icon-btn icon-btn-danger" title="删除动作" @click.stop="emit('remove-action', node.index, node)"><span class="material-symbols-outlined">delete</span></button>
               </footer>
-              <footer v-else-if="node.kind === 'failure-action'" class="graph-node-actions">
-                <button class="icon-btn" :disabled="node.index === 0" title="上移" @click.stop="emit('move-failure-action', node.parentIndex, node.index, -1)"><span class="material-symbols-outlined">arrow_back</span></button>
-                <button class="icon-btn" :disabled="node.index === rule.actions[node.parentIndex].failure_actions.length - 1" title="下移" @click.stop="emit('move-failure-action', node.parentIndex, node.index, 1)"><span class="material-symbols-outlined">arrow_forward</span></button>
-                <button class="icon-btn icon-btn-danger" title="删除补救动作" @click.stop="emit('remove-failure-action', node.parentIndex, node.index)"><span class="material-symbols-outlined">delete</span></button>
+              <footer v-else-if="node.kind === 'failure-action' && !node.readOnly" class="graph-node-actions">
+                <button class="icon-btn" :disabled="node.index === 0" title="上移" @click.stop="emit('move-failure-action', node.parentIndex, node.index, -1, node)"><span class="material-symbols-outlined">arrow_back</span></button>
+                <button class="icon-btn" :disabled="node.index === (node.owner || rule.actions[node.parentIndex]).failure_actions.length - 1" title="下移" @click.stop="emit('move-failure-action', node.parentIndex, node.index, 1, node)"><span class="material-symbols-outlined">arrow_forward</span></button>
+                <button class="icon-btn icon-btn-danger" title="删除补救动作" @click.stop="emit('remove-failure-action', node.parentIndex, node.index, node)"><span class="material-symbols-outlined">delete</span></button>
               </footer>
               <footer v-else-if="node.kind === 'condition'" class="graph-node-logic-actions">
                 <button @click.stop="emit('add-condition-child', node, false)"><span class="material-symbols-outlined">add</span>条件</button>

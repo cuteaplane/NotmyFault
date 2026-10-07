@@ -1,8 +1,8 @@
 <script setup>
 import { computed, ref } from 'vue'
 import { store } from '../lib/store'
-import { createBindingId, actionOutputDefs, expandBindingSources } from '../lib/bindings'
-import { fieldType } from '../lib/valueTypes'
+import { createBindingId } from '../lib/bindings'
+import { ifBranches, appendActionSources } from '../lib/workflowConditions'
 import { buildDefaultParams, groupActionKeys, isSpecialBlockAction, pluginUnavailableReason } from '../lib/utils'
 import PredicateEditor from './PredicateEditor.vue'
 import ActionForm from './ActionForm.vue'
@@ -20,28 +20,18 @@ function newAction(type) {
   return { binding_id: createBindingId('action'), type, params: buildDefaultParams(store.schema.actions[type]) }
 }
 function addIf(branch) {
-  props.action[branch].push({ binding_id: createBindingId('action'), type: 'if', condition: { op: 'is_true', left: false }, then: [], else: [] })
+  branchItems(branch).push({ binding_id: createBindingId('action'), type: 'if', condition: { op: 'is_true', left: false }, then: [], elif: [], else: [] })
 }
+const branches = computed(() => ifBranches(props.action))
+function branchItems(key) { return branches.value.find(branch => branch.key === key)?.actions || [] }
+function addElif() { (props.action.elif ||= []).push({ condition: { op: 'eq', left: '', right: '' }, then: [] }) }
 function branchSources(branch, index) {
-  const result = [...props.sources]
-  props.action[branch].slice(0, index).forEach(item => {
-    if (item.type === 'if') return
-    actionOutputDefs(item, store.schema, props.rule).forEach(output => result.push({
-      group: '当前分支的前序动作', label: `${store.schema.actions[item.type]?.name || item.type} · ${output.label || output.name}`,
-      type: fieldType(output), optional: output.required === false, sensitive: output.sensitive, value: { $ref: { scope: 'step', node: item.binding_id, path: [output.name] } },
-    }))
-  })
-  return expandBindingSources(result, store.schema.data_types?.custom)
+  return appendActionSources(props.sources, branchItems(branch).slice(0, index), props.rule, store.schema)
 }
 function failureSources(branch, index, failureIndex) {
-  const result = branchSources(branch, index)
-  const failures = props.action[branch][index].failure_actions || []
-  failures.slice(0, failureIndex).forEach(item => actionOutputDefs(item, store.schema, props.rule).forEach(output => result.push({
-    group: '之前的补救动作', label: `${item.type} · ${output.label || output.name}`, type: fieldType(output), optional: output.required === false, sensitive: output.sensitive,
-    value: { $ref: { scope: 'step', node: item.binding_id, path: [output.name] } },
-  })))
-  return result
+  return appendActionSources(branchSources(branch, index), (branchItems(branch)[index].failure_actions || []).slice(0, failureIndex), props.rule, store.schema)
 }
+
 function move(items, index, offset) {
   if (index + offset < 0 || index + offset >= items.length) return
   const [item] = items.splice(index, 1)
@@ -56,17 +46,19 @@ function replace(item, type) {
 
 <template>
   <div class="if-action-editor">
-    <PredicateEditor :node="action.condition" :sources="sources" />
-    <section v-for="branch in ['then', 'else']" :key="branch" class="if-branch">
-      <h3>{{ branch === 'then' ? '成立时 · THEN' : '否则 · ELSE' }}</h3>
-      <p v-if="!action[branch]?.length" class="inspector-lead">此分支为空，继续后续动作。</p>
-      <article v-for="(item, index) in action[branch]" :key="item.binding_id" class="if-branch-action">
+    <PredicateEditor :node="action.condition" :sources="sources" :rule="rule" />
+    <p class="inspector-lead">按 IF、ELIF 的顺序判断，只执行第一个成立分支；全部不成立才执行 ELSE。</p>
+    <section v-for="entry in branches" :key="entry.key" class="if-branch">
+      <h3>{{ entry.label }}</h3>
+      <template v-if="entry.branch"><PredicateEditor :node="entry.condition" :sources="sources" :rule="rule" /><button class="btn btn-text btn-sm danger-text" @click="action.elif.splice(entry.index, 1)">删除 ELIF</button></template>
+      <p v-if="!branchItems(entry.key)?.length" class="inspector-lead">此分支为空，继续后续动作。</p>
+      <article v-for="(item, index) in branchItems(entry.key)" :key="item.binding_id" class="if-branch-action">
         <header><b>{{ index + 1 }}. {{ item.type === 'if' ? 'IF 条件分支' : item.type === 'set_variable' ? '变量赋值' : item.type === 'wait' ? (store.schema.actions.wait?.name || '等待') : store.schema.actions[item.type]?.name || item.type }}</b>
-          <button class="icon-btn" title="上移" :disabled="index === 0" @click="move(action[branch], index, -1)"><span class="material-symbols-outlined">arrow_upward</span></button>
-          <button class="icon-btn" title="下移" :disabled="index === action[branch].length - 1" @click="move(action[branch], index, 1)"><span class="material-symbols-outlined">arrow_downward</span></button>
-          <button class="icon-btn danger-text" title="移除分支动作" @click="action[branch].splice(index, 1)"><span class="material-symbols-outlined">delete</span></button>
+          <button class="icon-btn" title="上移" :disabled="index === 0" @click="move(branchItems(entry.key), index, -1)"><span class="material-symbols-outlined">arrow_upward</span></button>
+          <button class="icon-btn" title="下移" :disabled="index === branchItems(entry.key).length - 1" @click="move(branchItems(entry.key), index, 1)"><span class="material-symbols-outlined">arrow_downward</span></button>
+          <button class="icon-btn danger-text" title="移除分支动作" @click="branchItems(entry.key).splice(index, 1)"><span class="material-symbols-outlined">delete</span></button>
         </header>
-        <ActionForm :action="item" :rule="rule" :index="index" :binding-sources="branchSources(branch, index)" :failure-binding-sources="failureIndex => failureSources(branch, index, failureIndex)"
+        <ActionForm :action="item" :rule="rule" :index="index" :binding-sources="branchSources(entry.key, index)" :failure-binding-sources="failureIndex => failureSources(entry.key, index, failureIndex)"
           @replace="pick(type => replace(item, type))"
           @add-failure-action="pick(type => (item.failure_actions ||= []).push(newAction(type)))"
           @replace-failure-action="failureIndex => pick(type => replace(item.failure_actions[failureIndex], type))"
@@ -74,12 +66,13 @@ function replace(item, type) {
           @move-failure-action="(failureIndex, offset) => move(item.failure_actions, failureIndex, offset)" />
       </article>
       <div class="flow-add-row">
-        <button class="btn btn-tonal btn-sm" @click="pick(type => (action[branch] ||= []).push(newAction(type)))">添加动作</button>
-        <button class="btn btn-text btn-sm" @click="action[branch] ||= []; addIf(branch)">添加 IF</button>
-        <button class="btn btn-text btn-sm" @click="(action[branch] ||= []).push({ type: 'set_variable', binding_id: createBindingId('action'), variable: '', value: '' })">变量赋值</button>
-        <button class="btn btn-text btn-sm" @click="(action[branch] ||= []).push(newAction('wait'))">等待</button>
+        <button class="btn btn-tonal btn-sm" @click="pick(type => branchItems(entry.key).push(newAction(type)))">添加动作</button>
+        <button class="btn btn-text btn-sm" @click=" addIf(entry.key)">添加 IF</button>
+        <button class="btn btn-text btn-sm" @click="branchItems(entry.key).push({ type: 'set_variable', binding_id: createBindingId('action'), variable: '', value: '' })">变量赋值</button>
+        <button class="btn btn-text btn-sm" @click="branchItems(entry.key).push(newAction('wait'))">等待</button>
       </div>
     </section>
+    <button class="btn btn-tonal btn-sm" @click="addElif">添加 ELIF</button>
     <PluginPicker :open="pickerOpen" kind="action" :keys="actionKeys" :groups="groups" title="选择分支动作" @close="pickerOpen = false; chooseAction = null" @select="select" />
   </div>
 </template>

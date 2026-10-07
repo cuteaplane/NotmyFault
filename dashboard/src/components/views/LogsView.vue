@@ -129,10 +129,9 @@ function walkActions(actions, visit, trail = []) {
   ;(actions || []).forEach((action, index) => {
     visit(action, index, trail)
     for (const field of ['then', 'else', 'failure_actions']) {
-      if (Array.isArray(action?.[field]) && action[field].length) {
-        walkActions(action[field], visit, [...trail, { action, field, index }])
-      }
+      walkActions(action[field], visit, [...trail, { action, field, index }])
     }
+    ;(action.elif || []).forEach((branch, branchIndex) => walkActions(branch.then, visit, [...trail, { action, field: `elif[${branchIndex}]`, index }]))
   })
 }
 
@@ -159,7 +158,7 @@ function stepNumber(run, step, fallback) {
   if (!found) return fallback
   if (!found.trail.length) return found.index + 1
   const parent = found.trail[0]
-  const branch = parent.field === 'then' ? 'THEN' : parent.field === 'else' ? 'ELSE' : '失败处理'
+  const branch = parent.field === 'then' ? 'THEN' : parent.field === 'else' ? 'ELSE' : parent.field.startsWith('elif[') ? `ELIF ${Number(parent.field.slice(5, -1)) + 1}` : '失败处理'
   return `${parent.index + 1}.${branch}.${found.index + 1}`
 }
 
@@ -173,12 +172,19 @@ function stepContext(run, step) {
       label: `“${actionName(failureParent.action.type)}”的失败处理`,
     }
   }
-  if (found.trail.some(item => item.field === 'then' || item.field === 'else')) {
+  if (found.trail.some(item => item.field === 'then' || item.field === 'else' || item.field.startsWith('elif['))) {
     const parent = found.trail[0]
-    const branch = parent.field === 'then' ? '成立时' : '否则'
+    const branch = parent.field === 'then' ? '成立时' : parent.field.startsWith('elif[') ? `ELIF ${Number(parent.field.slice(5, -1)) + 1} 成立时` : '否则'
     return { kind: 'action', label: `“${actionName(parent.action.type)}”${branch}` }
   }
   return { kind: 'action', label: '' }
+}
+
+function ifBranchLabel(branch) {
+  if (branch === 'then') return 'IF 成立'
+  if (branch === 'else') return 'ELSE'
+  const match = /^elif\[(\d+)\]$/.exec(branch || '')
+  return match ? `ELIF ${Number(match[1]) + 1} 成立` : ''
 }
 
 function hasPreconditions(run) {
@@ -524,6 +530,8 @@ onUnmounted(() => {
                   <small v-else-if="step.status === 'cancelled'">已安全停止</small>
                   <small v-else-if="step.status === 'timed_out'">超过允许的运行时间</small>
                   <small v-else>{{ formatDuration(step.duration_ms) }}<template v-if="step.attempt > 1"> · 共尝试 {{ step.attempt }} 次</template></small>
+                  <small v-if="stepContext(run, step).label && stepContext(run, step).kind !== 'failure'">{{ stepContext(run, step).label }}</small>
+                  <small v-if="ifBranchLabel(step.branch)">执行分支 · {{ ifBranchLabel(step.branch) }}</small>
                   <code class="run-step-binding">{{ step.step_id }}</code>
                   <div v-if="step.input_summary?.length || step.output_summary?.length" class="step-summary-strip run-step-summary">
                     <div v-if="step.input_summary?.length" class="step-summary-side">

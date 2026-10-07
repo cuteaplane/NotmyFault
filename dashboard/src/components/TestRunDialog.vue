@@ -3,6 +3,7 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { actionOutputDefs, buildAllTestInputFields, buildPreparedTestContext, buildTestInputFields } from '../lib/bindings'
 import { fieldType, typeLabel, typeAtPath, typeSpec, parseExactJson } from '../lib/valueTypes'
 import BaseDialog from './BaseDialog.vue'
+import { walkWorkflowActions } from '../lib/workflowConditions'
 
 const props = defineProps({
   open: Boolean,
@@ -58,22 +59,18 @@ const groups = computed(() => {
   return result
 })
 const sensitiveCount = computed(() => fields.value.filter(field => field.sensitive).length)
-const assertionSources = computed(() => actions.value
-  .slice(startIndex.value, endIndex.value + 1)
-  .flatMap((action, localIndex) => {
-    const actionIndex = startIndex.value + localIndex
+const assertionSources = computed(() => {
+  const result = []
+  walkWorkflowActions(actions.value.slice(startIndex.value, endIndex.value + 1), (action, index, trail) => {
     const meta = props.schema.actions?.[action.type]
-    return actionOutputDefs(action, props.schema, props.rule)
-      .filter(output => output.sensitive !== true)
-      .map(output => ({
-        key: `${action.binding_id}:${output.name}`,
-        stepId: action.binding_id,
-        path: [output.name],
-        type: fieldType(output).type,
-        valueType: fieldType(output),
-        label: `动作 ${actionIndex + 1}：${meta?.name || action.type} · ${output.label || output.name}`,
-      }))
-  }))
+    const location = trail.map(parent => parent.field === 'then' ? 'IF' : parent.field === 'else' ? 'ELSE' : parent.field.startsWith('elif[') ? `ELIF ${Number(parent.field.slice(5, -1)) + 1}` : '失败处理').join(' → ')
+    result.push(...actionOutputDefs(action, props.schema, props.rule).filter(output => output.sensitive !== true).map(output => ({
+      key: `${action.binding_id}:${output.name}`, stepId: action.binding_id, path: [output.name], type: fieldType(output).type, valueType: fieldType(output),
+      label: `${location ? `${location} · ` : ''}动作 ${index + 1}：${meta?.name || action.type} · ${output.label || output.name}`,
+    })))
+  })
+  return result
+})
 
 function sourceForAssertion(assertion) {
   return assertionSources.value.find(source => source.key === assertion.sourceKey)

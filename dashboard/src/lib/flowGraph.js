@@ -1,3 +1,4 @@
+import { ifBranches, predicateSummary, precedingSources } from './workflowConditions.js'
 export const FLOW_NODE_WIDTH = 228
 export const FLOW_NODE_PORT_Y = 58
 export const FLOW_NODE_BASE_HEIGHT = 116
@@ -48,6 +49,8 @@ export function buildFlowGraph({
   actionName,
   describeItem,
   isAdmin,
+  schema,
+  rules = [],
 }) {
   const nodes = []
   const edges = []
@@ -171,7 +174,7 @@ export function buildFlowGraph({
       icon: item.type === 'if' ? 'call_split' : item.type === 'wait' ? 'hourglass_empty' : item.type === 'set_variable' ? 'edit_note' : 'play_arrow',
       kicker: `动作 ${index + 1}`,
       label: actionName(item),
-      meta: item.type === 'if' ? `成立 ${item.then?.length || 0} 步 · 否则 ${item.else?.length || 0} 步` : item.type === 'wait' ? describeWait(item) : describeItem(item, 'action'),
+      meta: item.type === 'if' ? `${predicateSummary(item.condition, schema ? precedingSources(rule, item, schema) : [], rules)} · ${ifBranches(item).length} 个出口` : item.type === 'wait' ? describeWait(item) : describeItem(item, 'action'),
       admin: isAdmin(item, 'action'),
       hasInput: true,
       hasOutput: true,
@@ -303,4 +306,84 @@ export function routeFlowEdge(edge, nodesById) {
     labelY: (y1 + y2) / 2 - 9,
     reversed: true,
   }
+}
+
+export function buildIfSubflowGraph({ rule, action, schema, sources, rules, actionName, describeItem }) {
+  const nodes = []
+  const edges = []
+  const branches = ifBranches(action)
+  const groupOps = ['all', 'any', 'not']
+  let row = 0
+  const sourceNodes = new Map()
+  const addEdge = (from, to, label = '', kind = 'pipeline') => edges.push({ id: `${from}-${to}`, from, to, label, kind, channel: 'control' })
+  const depthOf = node => groupOps.includes(node?.op) ? 1 + Math.max(0, ...(node.children || []).map(depthOf)) : 0
+  const maxDepth = Math.max(0, ...branches.filter(branch => branch.condition).map(branch => depthOf(branch.condition)))
+  const decisionX = LEFT + (maxDepth + 2) * FLOW_COLUMN_STEP
+  const availableStepIds = sources.filter(source => source.value.$ref.scope === 'step').map(source => source.value.$ref.node)
+  function visit(node, branch, path = [], depth = 0) {
+    const id = `predicate-${action.binding_id}-${branch.key}-${path.join('-') || 'root'}`
+    const grouped = groupOps.includes(node?.op)
+    const children = grouped ? (node.children || []).map((child, index) => visit(child, branch, [...path, index], depth + 1)) : []
+    const y = children.length ? children.reduce((sum, child) => sum + child.y, 0) / children.length : TOP + row++ * FLOW_ROW_STEP
+    const ports = grouped || node?.op === 'run_status' ? [] : ['left', ...(['is_true', 'is_false', 'exists', 'not_exists'].includes(node?.op) ? [] : ['right'])].map((key, index) => ({ id: `input:${key}`, name: key, index, label: key === 'left' ? '判断数据' : '比较目标', type: { type: 'any' } }))
+    nodes.push({ id, kind: 'predicate', source: node, predicatePath: path, branchKey: branch.key, x: LEFT + (maxDepth - depth + 1) * FLOW_COLUMN_STEP, y, icon: grouped ? 'account_tree' : 'rule', kicker: branch.label, label: grouped ? { all: '全部满足 · AND', any: '满足任一 · OR', not: '取反 · NOT' }[node.op] : '条件判断', meta: grouped ? `${children.length} 个子条件` : predicateSummary(node, sources, rules), hasInput: grouped && children.length > 0, hasOutput: true, availableStepIds, dataInputs: ports, dataOutputs: [] })
+    children.forEach(child => addEdge(child.id, id, node.op === 'not' ? '取反' : node.op === 'all' ? '并且' : '或者', 'condition'))
+    ports.forEach(port => {
+      const reference = node[port.name]?.$ref
+      if (!reference || !['trigger', 'step'].includes(reference.scope)) return
+      const source = sources.find(item => item.value.$ref.scope === reference.scope && item.value.$ref.node === reference.node && item.value.$ref.path[0] === reference.path[0])
+      if (!source) return
+      const sourceId = `${reference.scope === 'trigger' ? 'trigger' : 'action'}-${reference.node}`
+      if (!sourceNodes.has(sourceId)) {
+        const original = reference.scope === 'step' ? findActionSource(rule.actions, reference.node) : findTriggerSource(rule.condition, reference.node)
+        sourceNodes.set(sourceId, { id: sourceId, kind: reference.scope === 'trigger' ? 'trigger' : 'action', source: original, readOnly: true, x: LEFT, y: TOP + sourceNodes.size * FLOW_ROW_STEP, icon: reference.scope === 'trigger' ? 'bolt' : 'output', kicker: reference.scope === 'trigger' ? '本次触发数据' : '前序动作输出', label: source.label.split(' · ')[0], meta: '读取本次运行的数据', hasInput: false, hasOutput: false, availableStepIds: [], dataInputs: [] })
+      }
+      const sourceOutput = sourceNodes.get(sourceId)
+      const outputs = sourceOutput.dataOutputs ||= []
+      if (!outputs.some(item => item.name === reference.path[0])) outputs.push({ id: `output:${reference.path[0]}`, name: reference.path[0], label: reference.path[0], type: source.type, required: !source.optional, index: outputs.length })
+      edges.push({ id: `data-${sourceId}-${id}-${port.name}`, from: sourceId, to: id, channel: 'data', kind: 'data', sourcePortName: reference.path[0], sourcePortIndex: outputs.findIndex(item => item.name === reference.path[0]), targetPortName: port.name, targetPortIndex: port.index, label: port.label, valid: true })
+    })
+    return { id, y }
+  }
+  const conditionRoots = branches.filter(branch => branch.condition).map(branch => ({ branch, ...visit(branch.condition, branch) }))
+  const gateId = `if-decision-${action.binding_id}`
+  const gateY = conditionRoots[0]?.y || TOP
+  nodes.push({ id: gateId, kind: 'if-branch', source: action, x: decisionX, y: gateY, icon: 'call_split', kicker: 'IF / ELIF / ELSE', label: '按顺序选择一个分支', meta: '首个成立出口执行；否则走 ELSE', hasInput: true, hasOutput: true })
+  conditionRoots.forEach(root => addEdge(root.id, gateId, root.branch.label, 'condition'))
+  const maxActions = Math.max(1, ...branches.map(branch => branch.actions.length))
+  const mergeId = `if-merge-${action.binding_id}`
+  branches.forEach((branch, branchIndex) => {
+    let previous = gateId
+    const y = TOP + branchIndex * FLOW_ROW_STEP
+    branch.actions.forEach((item, index) => {
+      const id = `action-${item.binding_id}`
+      nodes.push({ id, kind: 'action', source: item, branchKey: branch.key, index, x: decisionX + (index + 1) * FLOW_COLUMN_STEP, y, icon: item.type === 'if' ? 'call_split' : 'play_arrow', kicker: `${branch.label} · ${index + 1}`, label: actionName(item), meta: item.type === 'if' ? predicateSummary(item.condition, precedingSources(rule, item, schema), rules) : describeItem(item, 'action'), hasInput: true, hasOutput: true, availableStepIds: precedingSources(rule, item, schema).filter(source => source.value.$ref.scope === 'step').map(source => source.value.$ref.node) })
+      addEdge(previous, id, index === 0 ? branch.label : '然后')
+      let failurePrevious = id
+      ;(item.failure_actions || []).forEach((failure, failureIndex) => {
+        const failureId = `failure-action-${failure.binding_id}`
+        nodes.push({ id: failureId, kind: 'failure-action', source: failure, owner: item, branchKey: branch.key, index: failureIndex, x: decisionX + (index + failureIndex + 2) * FLOW_COLUMN_STEP, y: y + FLOW_ROW_STEP / 2, icon: 'build', kicker: `${branch.label} · 补救 ${failureIndex + 1}`, label: actionName(failure), meta: describeItem(failure, 'action'), hasInput: true, hasOutput: true, availableStepIds: precedingSources(rule, failure, schema).filter(source => source.value.$ref.scope === 'step').map(source => source.value.$ref.node) })
+        addEdge(failurePrevious, failureId, failureIndex ? '然后' : '失败时', 'failure')
+        failurePrevious = failureId
+      })
+      previous = id
+    })
+    const addId = `branch-add-${action.binding_id}-${branch.key}`
+    nodes.push({ id: addId, kind: 'if-branch', branchKey: branch.key, addBranch: true, source: action, x: decisionX + (branch.actions.length + 1) * FLOW_COLUMN_STEP, y, icon: 'add', kicker: branch.label, label: '添加分支动作', meta: branch.actions.length ? '继续此分支' : '空分支继续后续流程', hasInput: true, hasOutput: true })
+    addEdge(previous, addId, branch.actions.length ? '' : branch.label)
+    addEdge(addId, mergeId, '继续')
+  })
+  nodes.push({ id: mergeId, kind: 'if-merge', source: action, x: decisionX + (maxActions + 2) * FLOW_COLUMN_STEP, y: gateY, icon: 'merge', kicker: '分支结束', label: '返回公共后续流程', meta: '只执行一次后续动作', hasInput: true, hasOutput: false })
+  return { nodes: [...sourceNodes.values(), ...nodes], edges }
+}
+function findActionSource(actions, id) {
+  for (const action of actions || []) {
+    if (action.binding_id === id) return action
+    for (const branch of ifBranches(action)) { const found = findActionSource(branch.actions, id); if (found) return found }
+    const failure = findActionSource(action.failure_actions, id); if (failure) return failure
+  }
+}
+function findTriggerSource(node, id) {
+  if (node?.binding_id === id) return node
+  for (const child of node?.children || []) { const found = findTriggerSource(child, id); if (found) return found }
 }

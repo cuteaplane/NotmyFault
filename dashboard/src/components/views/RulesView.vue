@@ -84,6 +84,7 @@ function visitRuleNodes(rule, visitor) {
     visitor(node, 'action')
     ;(node.then || []).forEach(visitAction)
     ;(node.else || []).forEach(visitAction)
+    ;(node.elif || []).forEach(branch => (branch.then || []).forEach(visitAction))
     ;(node.failure_actions || []).forEach(visitAction)
   }
   const visitCondition = node => {

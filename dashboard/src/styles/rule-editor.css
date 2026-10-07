@@ -100,8 +100,8 @@
 .node-minimap svg{width:100%;height:100%;display:block}
 .mm-node{fill:var(--md-surface-c-highest)}
 .mm-trigger{fill:var(--md-primary-container)}
-.mm-condition{fill:var(--md-secondary-container)}
-.mm-action{fill:var(--md-tertiary-container)}
+.mm-condition,.mm-predicate{fill:var(--md-secondary-container)}
+.mm-action,.mm-if-branch,.mm-if-merge{fill:var(--md-tertiary-container)}
 .mm-failure-action{fill:var(--md-error-container)}
 .mm-precondition{fill:color-mix(in srgb,var(--md-warn) 30%,var(--md-surface-c-high))}
 .mm-invalid{fill:var(--md-error-container)}
@@ -146,6 +146,11 @@
 .graph-node-condition{--graph-node-outline:var(--flow-condition);--graph-node-outline-width:2px;border-radius:var(--r-md);background:color-mix(in srgb,var(--flow-condition-container) 18%,var(--md-surface-c-lowest))}
 .graph-node-condition .graph-node-head{border-radius:calc(var(--r-md) - 2px) calc(var(--r-md) - 2px) 0 0;background:var(--flow-condition-container);color:var(--flow-on-condition-container)}
 .graph-node-condition .graph-node-body b{font-size:15px}
+.graph-node-predicate{--graph-node-outline:var(--flow-condition);--graph-node-outline-width:2px;background:color-mix(in srgb,var(--flow-condition-container) 18%,var(--md-surface-c-lowest))}
+.graph-node-predicate .graph-node-head{background:var(--flow-condition-container);color:var(--flow-on-condition-container)}
+.graph-node-if-branch,.graph-node-if-merge{--graph-node-outline:var(--flow-action);--graph-node-outline-width:2px;border-radius:var(--r-md)}
+.graph-node-if-branch .graph-node-head,.graph-node-if-merge .graph-node-head{background:var(--flow-action-container);color:var(--flow-on-action-container)}
+.graph-node-if-merge{background:color-mix(in srgb,var(--flow-action-container) 16%,var(--md-surface-c-lowest))}
 .graph-node-invalid{--graph-node-outline:var(--md-error)}
 .graph-node-invalid .graph-node-head{background:var(--md-error-container);color:var(--md-on-error-container)}
 .graph-node-action{--graph-node-outline:var(--flow-action)}

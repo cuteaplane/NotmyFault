@@ -1,9 +1,10 @@
 import { computed, ref, watch, onUnmounted } from 'vue'
 import { store } from '../lib/store'
 import { getVisibleParamDefs, pluginUnavailableReason as unavailableReason } from '../lib/utils'
-import { actionOutputDefs, bindingSourceFor, buildBindingSources, expandBindingSources,
+import { actionOutputDefs, bindingSourceFor, buildBindingSources,
   isReference, typesCompatible } from '../lib/bindings'
-import { fieldType } from '../lib/valueTypes'
+import { ifBranches, RUN_STATUS_OPTIONS, appendActionSources } from '../lib/workflowConditions'
+import { fieldType, typeSpec, isEncodedValue, isLiteralValue } from '../lib/valueTypes'
 import { validateRuleDraft } from '../lib/api'
 
 export function useRuleValidation(rule) {
@@ -56,19 +57,43 @@ export function useRuleValidation(rule) {
       }
     }
     function branchSources(base, siblings, index) {
-      const result = [...base]
-      siblings.slice(0, index).forEach(item => {
-        if (item?.type === 'if') return
-        actionOutputDefs(item, store.schema, rule.value).forEach(output => result.push({
-          group: '当前分支的前序动作',
-          label: `${store.schema.actions[item.type]?.name || item.type} · ${output.label || output.name}`,
-          type: fieldType(output),
-          optional: output.required === false,
-          sensitive: output.sensitive,
-          value: { $ref: { scope: 'step', node: item.binding_id, path: [output.name] } },
-        }))
-      })
-      return expandBindingSources(result, store.schema.data_types?.custom)
+      return appendActionSources(base, siblings.slice(0, index), rule.value, store.schema)
+    }
+
+    function validatePredicate(node, label, nodeId, sources) {
+      if (!node || typeof node !== 'object') { add(`${label}条件格式无效`, nodeId); return }
+      if (['all', 'any', 'not'].includes(node.op)) {
+        if (!Array.isArray(node.children) || !node.children.length) add(`${label}条件组不能为空`, nodeId)
+        if (node.op === 'not' && node.children?.length !== 1) add(`${label}取反需要一个条件或条件组`, nodeId)
+        ;(node.children || []).forEach((child, index) => validatePredicate(child, `${label} ${index + 1}`, nodeId, sources))
+        return
+      }
+      if (node.op === 'run_status') {
+        if (![...store.configData.rules, rule.value].some(item => item.rule_id === node.rule_id)) add(`${label}自动化不存在`, nodeId)
+        if (!RUN_STATUS_OPTIONS.some(([status]) => status === node.status)) add(`${label}自动化状态无效`, nodeId)
+        if (!['eq', 'ne'].includes(node.comparison === undefined ? 'eq' : node.comparison)) add(`${label}状态比较方式无效`, nodeId)
+        return
+      }
+      if (!['eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'contains', 'is_true', 'is_false', 'exists', 'not_exists'].includes(node.op)) add(`${label}判断方式无效`, nodeId)
+      if (['exists', 'not_exists'].includes(node.op) && !isReference(node.left)) add(`${label}存在判断需要选择数据引用`, nodeId)
+      for (const key of ['left', ...(['is_true', 'is_false', 'exists', 'not_exists'].includes(node.op) ? [] : ['right'])]) {
+        if (!Object.hasOwn(node, key)) add(`${label}缺少${key === 'left' ? '判断数据' : '比较目标'}`, nodeId)
+        const value = node[key]
+        if (isReference(value) && !bindingSourceFor(value.$ref, sources, typeCatalog.value)) add(`${label}${key === 'left' ? '判断数据' : '比较目标'}引用了不可用数据`, nodeId)
+      }
+      function operandType(value) {
+        if (isReference(value)) return typeSpec(bindingSourceFor(value.$ref, sources, typeCatalog.value)?.type || 'any').type
+        if (isLiteralValue(value)) value = value.$literal
+        if (isEncodedValue(value)) return value.$nmf_value.type
+        return typeof value === 'boolean' ? 'bool' : typeof value === 'number' ? 'number' : typeof value === 'string' ? 'text' : Array.isArray(value) ? 'array' : value && typeof value === 'object' ? 'object' : 'any'
+      }
+      const leftType = operandType(node.left)
+      const rightType = operandType(node.right)
+      const numeric = type => ['number', 'int', 'float', 'decimal', 'any', 'union'].includes(type)
+      if (['gt', 'gte', 'lt', 'lte'].includes(node.op) && (!numeric(leftType) || !numeric(rightType))) add(`${label}的大小比较需要数字，请调整字段或固定值类型`, nodeId)
+      if (['is_true', 'is_false'].includes(node.op) && !['bool', 'boolean', 'any', 'union'].includes(leftType)) add(`${label}的真假判断需要布尔值`, nodeId)
+      if (node.op === 'contains' && !['text', 'string', 'array', 'any', 'union'].includes(leftType)) add(`${label}的包含判断需要文本或数组`, nodeId)
+
     }
     function validateActionNode(action, label, nodeId, sources) {
       if (action?.type === 'set_variable') {
@@ -76,13 +101,12 @@ export function useRuleValidation(rule) {
         return
       }
       if (action?.type === 'if') {
-        if (!action.then?.length && !action.else?.length) add(`${label} 需要至少一个分支动作`, nodeId)
-        ;(action.then || []).forEach((item, index) => {
-          validateActionNode(item, `${label} THEN ${index + 1}`, nodeId, branchSources(sources, action.then, index))
-        })
-        ;(action.else || []).forEach((item, index) => {
-          validateActionNode(item, `${label} ELSE ${index + 1}`, nodeId, branchSources(sources, action.else, index))
-        })
+        const branches = ifBranches(action)
+        if (!branches.some(branch => branch.actions.length)) add(`${label} 需要至少一个分支动作`, nodeId)
+        for (const branch of branches) {
+          if (branch.condition) validatePredicate(branch.condition, `${label} ${branch.label}`, nodeId, sources)
+          branch.actions.forEach((item, index) => validateActionNode(item, `${label} ${branch.label} ${index + 1}`, nodeId, branchSources(sources, branch.actions, index)))
+        }
         return
       }
       const actionReason = pluginUnavailableReason('actions', action?.type)

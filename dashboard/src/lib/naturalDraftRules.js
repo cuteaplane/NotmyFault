@@ -14,6 +14,7 @@ function actionNodes(actions) {
   return (actions || []).flatMap(node => [
     node,
     ...['then', 'else', 'failure_actions'].flatMap(field => actionNodes(node[field])),
+    ...(node.elif || []).flatMap(branch => actionNodes(branch.then)),
   ])
 }
 
