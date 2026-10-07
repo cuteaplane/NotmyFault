@@ -3,7 +3,6 @@ daily 和 weekly 记录日期，interval 从首次轮询时刻开始计时
 """
 
 import re
-import time
 from datetime import datetime
 
 from notmyfault.triggers.base import PollingTrigger
@@ -21,7 +20,7 @@ class CronScheduleTrigger(PollingTrigger):
     native: bool = False
 
     def validate(self) -> None:
-        self._started_at = datetime.now()
+        self._started_at = datetime.fromtimestamp(self.clock.time())
         mode = self.config.get("mode", "daily")
         if mode not in ("daily", "weekly", "interval"):
             raise ValueError(
@@ -67,7 +66,7 @@ class CronScheduleTrigger(PollingTrigger):
         return days
 
     def poll(self) -> None:
-        now = datetime.now()
+        now = datetime.fromtimestamp(self.clock.time())
         if self.mode == "daily":
             self._poll_daily(now)
         elif self.mode == "weekly":
@@ -102,7 +101,7 @@ class CronScheduleTrigger(PollingTrigger):
         self._fired_date = date_key
 
     def _poll_interval(self, now: datetime) -> None:
-        sampled_at = time.monotonic()
+        sampled_at = self.clock.monotonic()
         if self._last_fired is None:
             # 首次轮询记录起点，间隔从这一刻开始计时
             self._last_fired = sampled_at

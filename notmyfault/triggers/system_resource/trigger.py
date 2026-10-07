@@ -1,6 +1,5 @@
 import math
 import os
-import time
 import psutil
 
 from notmyfault.triggers.base import PollingTrigger
@@ -53,7 +52,7 @@ class SystemResourceTrigger(PollingTrigger):
         if self.resource == "network":
             net = psutil.net_io_counters()
             total = net.bytes_sent + net.bytes_recv
-            now = time.monotonic()
+            now = self.clock.monotonic()
             if self._net_prev is not None:
                 elapsed = now - self._net_prev[0]
                 if elapsed > 0:

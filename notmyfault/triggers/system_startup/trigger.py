@@ -3,7 +3,6 @@
 """
 
 from datetime import datetime
-import time
 
 from notmyfault.triggers.base import PollingTrigger
 
@@ -22,15 +21,15 @@ class SystemStartupTrigger(PollingTrigger):
         if not 0 <= delay <= 300:
             raise ValueError(f"delay_seconds 必须在 0-300 之间，实际: {delay}")
         self.delay_seconds = delay
-        self._started_at = datetime.now()
-        self._deadline = time.monotonic() + delay
+        self._started_at = datetime.fromtimestamp(self.clock.time())
+        self._deadline = self.clock.monotonic() + delay
         self._fired = bool(self.state is not None and self.state.get("fired_boot") == self.boot_id)
         self.completed = self._fired
 
     def poll(self) -> None:
         if self._fired:
             return
-        if time.monotonic() < self._deadline:
+        if self.clock.monotonic() < self._deadline:
             return
         started_at = self._started_at.strftime("%Y-%m-%d %H:%M:%S")
         self.log(f"引擎已启动，触发开机任务（延迟 {self.delay_seconds}s）")

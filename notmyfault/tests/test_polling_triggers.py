@@ -117,7 +117,7 @@ def test_directory_quiescent_reports_selected_transitions(tmp_path, monkeypatch,
     module, meta = load_trigger("directory_quiescent")
     (tmp_path / "a.txt").write_text("ready", encoding="utf-8")
     clock = {"t": 1000.0}
-    monkeypatch.setattr(module.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr("notmyfault.core.clock.time.monotonic", lambda: clock["t"])
     events = []
     failed_states = set()
 
@@ -164,7 +164,7 @@ def test_directory_quiescent_ignores_non_matching_files(tmp_path, monkeypatch):
     module, meta = load_trigger("directory_quiescent")
     (tmp_path / "keep.pdf").write_text("a", encoding="utf-8")
     clock = {"t": 100.0}
-    monkeypatch.setattr(module.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr("notmyfault.core.clock.time.monotonic", lambda: clock["t"])
     events = []
     trigger = hosted_sampler(module, "DirectoryQuiescentTrigger", {
             "folder_path": str(tmp_path),
@@ -188,7 +188,7 @@ def test_directory_read_error_keeps_the_last_complete_snapshot(tmp_path, monkeyp
     path = tmp_path / "watched.txt"
     path.write_text("x", encoding="utf-8")
     clock = {"t": 50.0}
-    monkeypatch.setattr(module.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr("notmyfault.core.clock.time.monotonic", lambda: clock["t"])
     events = []
     trigger = hosted_sampler(module, "DirectoryQuiescentTrigger", {"folder_path": str(tmp_path), "quiet_seconds": 5, "state": "changed"}, events.append, meta=meta, stopping=threading.Event())
     trigger.validate()

@@ -294,3 +294,122 @@ def test_system_startup_keeps_boot_marker_across_engine_restart():
         first.shutdown(2)
         if second is not None:
             second.shutdown(2)
+
+
+def test_startup_delay_uses_context_clock_and_completes_with_virtual_time():
+    from notmyfault.core.state_store import TriggerState
+    from notmyfault.plugin_api import TriggerContext, use_trigger_context
+    from notmyfault.tests.plugin_support import load_plugin
+
+    clock = FakeClock()
+    host_engine = create_test_engine({"rules": []})
+    emitted = []
+    stopping = threading.Event()
+    instance_state = TriggerState(host_engine._get_state_store, "startup_clock")
+    context = TriggerContext({}, {"delay_seconds": 5}, emitted.append, stopping,
+                             instance_state, "test_boot", 0, clock)
+    module = load_plugin("triggers", "system_startup")
+    with use_trigger_context(context):
+        trigger = module.SystemStartupTrigger({}, {"delay_seconds": 5}, emitted.append, stopping)
+    try:
+        trigger.validate()
+        trigger.poll()
+        assert emitted == []
+        clock.advance(5)
+        trigger.poll()
+        trigger.poll()
+        assert len(emitted) == 1
+        assert trigger.completed
+        assert instance_state.get("fired_boot") == "test_boot"
+    finally:
+        host_engine.shutdown(2)
+
+
+def test_polling_loop_waits_on_context_clock_and_stops_without_clock_advance():
+    import queue
+    from notmyfault.plugin_api import TriggerContext, use_trigger_context
+    from notmyfault.triggers.base import PollingTrigger
+
+    class ObservedClock(FakeClock):
+        def __init__(self):
+            super().__init__()
+            self.waits = queue.Queue()
+
+        def wait(self, event, timeout):
+            with self._changed:
+                self.waits.put(timeout)
+                return super().wait(event, timeout)
+
+    clock = ObservedClock()
+    samples = []
+    stopping = threading.Event()
+    context = TriggerContext({}, {}, lambda _: True, stopping, None, "test_boot", 0, clock)
+
+    class Sampler(PollingTrigger):
+        interval = 5
+
+        def poll(self):
+            samples.append(clock.monotonic())
+
+    with use_trigger_context(context):
+        trigger = Sampler({}, {}, context.emit, stopping)
+    worker = threading.Thread(target=trigger.run)
+    worker.start()
+    try:
+        assert clock.waits.get(timeout=2) == 5
+        assert samples == [0]
+        clock.advance(5)
+        assert clock.waits.get(timeout=2) == 5
+        assert samples == [0, 5]
+    finally:
+        stopping.set()
+        worker.join(2)
+    assert not worker.is_alive()
+
+
+def test_engine_injected_clock_drives_startup_rule_and_event_timestamps():
+    import json
+    import queue
+    from pathlib import Path
+    from notmyfault.tests.plugin_support import load_plugin
+
+    class ObservedClock(FakeClock):
+        def __init__(self):
+            super().__init__(wall_time=100)
+            self.waits = queue.Queue()
+
+        def wait(self, event, timeout):
+            with self._changed:
+                self.waits.put((threading.current_thread().name, timeout))
+                return super().wait(event, timeout)
+
+    clock = ObservedClock()
+    module = load_plugin("triggers", "system_startup")
+    meta = json.loads(Path(module.__file__).with_name("trigger.json").read_text())
+    succeeded = threading.Event()
+    received = []
+
+    def sink(event):
+        received.append(event)
+        if event.type == "run.succeeded":
+            succeeded.set()
+
+    engine = create_test_engine({"rules": []}, on_event=sink, clock=clock)
+    engine.triggers_meta["system_startup"] = meta
+    engine.triggers_funcs["system_startup"] = module.run
+    try:
+        apply(engine, [rule(trigger="system_startup", config={"delay_seconds": 5})])
+        while True:
+            name, timeout = clock.waits.get(timeout=2)
+            if name.startswith("Trigger-"):
+                assert timeout == 1
+                break
+        assert not succeeded.is_set()
+        clock.advance(5)
+        assert succeeded.wait(2)
+        assert engine._run_manager.wait_for_idle(2)
+        assert engine.events.flush()
+        assert len([event for event in received if event.type == "run.succeeded"]) == 1
+        assert next(event for event in received if event.type == "run.succeeded").ts == 105
+    finally:
+        engine.shutdown(2)

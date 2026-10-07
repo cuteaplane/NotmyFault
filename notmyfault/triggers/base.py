@@ -3,10 +3,9 @@
 子类实现 validate()、setup()、poll()、teardown()，文件末尾的 run() 包装函数转发到基类
 """
 import threading
-import time
 from typing import Any, Dict
 
-from notmyfault.plugin_api import native_lock, trigger_context
+from notmyfault.plugin_api import native_lock, system_clock, trigger_context
 
 NATIVE_LOCK = native_lock()
 
@@ -20,9 +19,10 @@ class PollingTrigger:
     def __init__(self, meta: Dict[str, Any], config: Any,
                  emit_event: Any, shutdown_event: threading.Event) -> None:
         self.ctx = trigger_context()
+        self.clock = self.ctx.clock if self.ctx is not None else system_clock()
         self.state = self.ctx.state if self.ctx is not None else None
         self.boot_id = self.ctx.boot_id if self.ctx is not None else ""
-        self.engine_started_at = self.ctx.engine_started_at if self.ctx is not None else time.time()
+        self.engine_started_at = self.ctx.engine_started_at if self.ctx is not None else self.clock.time()
         self.stopping = shutdown_event
         self.meta = meta
         self.config = config
@@ -61,6 +61,6 @@ class PollingTrigger:
                 else:
                     self.poll()
                 if not self.completed:
-                    self._stop_event.wait(self.interval)
+                    self.clock.wait(self._stop_event, self.interval)
         finally:
             self.teardown()

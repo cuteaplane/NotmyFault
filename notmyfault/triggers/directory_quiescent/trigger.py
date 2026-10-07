@@ -3,7 +3,6 @@ import fnmatch
 import math
 import os
 import re
-import time
 
 from notmyfault.triggers.base import PollingTrigger
 
@@ -66,7 +65,7 @@ class DirectoryQuiescentTrigger(PollingTrigger):
 
     def setup(self):
         self._snapshot = _dir_snapshot(self.folder, self.pattern)
-        self._last_change = time.monotonic()
+        self._last_change = self.clock.monotonic()
         self._read_error = False
         self.log(
             f"开始监视目录静默: {self.folder} "
@@ -92,7 +91,7 @@ class DirectoryQuiescentTrigger(PollingTrigger):
             self._read_error = True
             return
         self._read_error = False
-        now = time.monotonic()
+        now = self.clock.monotonic()
         if new_snapshot != self._snapshot:
             self._snapshot = new_snapshot
             self._last_change = now

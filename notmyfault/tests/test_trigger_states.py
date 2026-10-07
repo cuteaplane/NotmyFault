@@ -17,16 +17,21 @@ class FakeClock:
     def __init__(self, moment):
         self.moment = moment
 
-    def now(self):
-        return self.moment
+    def time(self):
+        return self.moment.timestamp()
 
-def make_trigger(module, cls_name, config):
+    def monotonic(self):
+        return 0.0
+
+def make_trigger(module, cls_name, config, *, clock=None):
     events = []
     if cls_name in ("SessionLockTrigger", "WifiNetworkTrigger", "NetworkStatusTrigger", "ProcessStateTrigger", "IdleDetectTrigger", "BatteryLevelTrigger", "SystemResourceTrigger", "WindowTitleTrigger", "PowerStateTrigger"):
         from notmyfault.core.clock import FakeClock as HostClock
         trigger = hosted_sampler(module, cls_name, config, events, clock=HostClock())
     else:
         trigger = getattr(module, cls_name)({"id": "scenario"}, config, events.append, threading.Event())
+    if clock is not None:
+        trigger.clock = clock
     trigger.validate()
     return trigger, events
 
@@ -300,9 +305,8 @@ def test_power_state_keeps_native_callback_until_window_is_destroyed(monkeypatch
 def test_cron_schedule_daily_fires_once_per_day(monkeypatch):
     mod = load_plugin("triggers", "cron_schedule")
     clock = FakeClock(datetime(2026, 1, 1, 7, 59))
-    monkeypatch.setattr(mod, "datetime", clock)
     trigger, events = make_trigger(
-        mod, "CronScheduleTrigger", {"mode": "daily", "time": "08:00"}
+        mod, "CronScheduleTrigger", {"mode": "daily", "time": "08:00"}, clock=clock
     )
     trigger.poll()
     assert events == []
@@ -322,11 +326,10 @@ def test_cron_schedule_interval_fires_every_n_minutes(monkeypatch, interval_minu
     mod = load_plugin("triggers", "cron_schedule")
     start = datetime(2026, 1, 1, 0, 0)
     clock = FakeClock(start)
-    monkeypatch.setattr(mod, "datetime", clock)
     elapsed = {"seconds": 0.0}
-    monkeypatch.setattr(mod, "time", SimpleNamespace(monotonic=lambda: 1000.0 + elapsed["seconds"]))
+    clock.monotonic = lambda: 1000.0 + elapsed["seconds"]
     trigger, events = make_trigger(
-        mod, "CronScheduleTrigger", {"mode": "interval", "interval_minutes": interval_minutes}
+        mod, "CronScheduleTrigger", {"mode": "interval", "interval_minutes": interval_minutes}, clock=clock
     )
     trigger.poll()
     assert events == []
@@ -360,9 +363,8 @@ def test_cron_schedule_weekly_respects_weekdays(monkeypatch):
     mod = load_plugin("triggers", "cron_schedule")
     # 2026-01-06 是周二，2026-01-12 是周一；days="1" 只允许周一
     clock = FakeClock(datetime(2026, 1, 6, 9, 0))
-    monkeypatch.setattr(mod, "datetime", clock)
     trigger, events = make_trigger(
-        mod, "CronScheduleTrigger", {"mode": "weekly", "time": "00:00", "days": "1"}
+        mod, "CronScheduleTrigger", {"mode": "weekly", "time": "00:00", "days": "1"}, clock=clock
     )
     trigger.poll()
     assert events == []
@@ -413,10 +415,9 @@ def test_system_startup_fires_once_after_delay(monkeypatch):
     mod = load_plugin("triggers", "system_startup")
     start = datetime(2026, 1, 1, 0, 0, 0)
     clock = FakeClock(start)
-    monkeypatch.setattr(mod, "datetime", clock)
     ticks = [0]
-    monkeypatch.setattr(mod.time, "monotonic", lambda: ticks[0])
-    trigger, events = make_trigger(mod, "SystemStartupTrigger", {"delay_seconds": 5})
+    clock.monotonic = lambda: ticks[0]
+    trigger, events = make_trigger(mod, "SystemStartupTrigger", {"delay_seconds": 5}, clock=clock)
     clock.moment = start + timedelta(seconds=4)
     ticks[0] = 4
     trigger.poll()
