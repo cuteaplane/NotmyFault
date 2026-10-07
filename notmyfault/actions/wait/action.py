@@ -1,6 +1,7 @@
 """等待一段时间后再继续后续动作
 秒与毫秒叠加；有取消对象时分段等待
 """
+from notmyfault.plugin_api import action_values
 
 import time
 
@@ -44,9 +45,10 @@ def run(action_info, params):
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     total = _total_seconds(params)
-    runtime = context.get("runtime", {}) if isinstance(context, dict) else {}
-    cancellation = runtime.get("cancellation") if isinstance(runtime, dict) else None
+    runtime = context.get("runtime", {})
+    cancellation = runtime.get("cancellation")
     waited = _sleep(total, cancellation)
     print(f"[Action:wait] 等待 {waited:.3f}s（请求 {total:.3f}s）")
     return {"waited_seconds": waited}

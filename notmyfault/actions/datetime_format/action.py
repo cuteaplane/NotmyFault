@@ -1,3 +1,4 @@
+from notmyfault.plugin_api import action_values
 import math
 from datetime import date, datetime, timedelta, timezone
 from notmyfault.plugin_api import data_types_api
@@ -8,6 +9,7 @@ def run(action_info, params):
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     source = params.get("value", "")
     input_type = params.get("input_type", "iso")
     if input_type == "timestamp":

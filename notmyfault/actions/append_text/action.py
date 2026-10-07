@@ -1,6 +1,7 @@
 """追加文本动作：把内容写到本地文件末尾并保留已有内容
 支持给每行加时间标记，编码使用 Python 文本编码名称
 """
+from notmyfault.plugin_api import action_values
 
 import codecs
 from datetime import datetime
@@ -17,6 +18,7 @@ def run(action_info, params):
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     file_path = str(params.get("file_path", "") or "")
     if not file_path:
         raise ValueError("未指定日志文件路径")

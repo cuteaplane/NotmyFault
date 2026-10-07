@@ -1,3 +1,4 @@
+from notmyfault.plugin_api import action_values
 import csv
 import io
 import json
@@ -41,6 +42,7 @@ def run(action_info, params):
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     operation = params.get("operation", "parse")
     delimiter = params.get("delimiter", ",")
     if not isinstance(delimiter, str) or len(delimiter) != 1 or delimiter in '\r\n"\x00':

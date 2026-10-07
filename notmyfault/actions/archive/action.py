@@ -3,6 +3,7 @@
 """
 
 from __future__ import annotations
+from notmyfault.plugin_api import action_values
 
 import os
 import stat
@@ -164,6 +165,7 @@ def _unzip(
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     cancellation = context.get("runtime", {}).get("cancellation")
     mode = str(params.get("mode", "zip") or "zip").strip().lower()
     if mode not in {"zip", "unzip"}:

@@ -1,3 +1,4 @@
+from notmyfault.plugin_api import action_values
 import http.client
 import math
 import os
@@ -109,6 +110,7 @@ def run(action_info, params):
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     url = str(params.get("url", "")).strip()
     raw_path = str(params.get("file_path", ""))
     if not url or not raw_path:

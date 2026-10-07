@@ -8,6 +8,7 @@ import pytest
 from notmyfault.core.rules import validate_rule_bindings
 from notmyfault.core.workflow import build_context, invoke_action
 from notmyfault.tests.api_support import create_test_engine, event_fields
+from notmyfault.values import plain_value
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1] / "actions"
@@ -24,7 +25,7 @@ def load_action(plugin_id):
 
 def execute(plugin_id, params):
     meta, module = load_action(plugin_id)
-    return invoke_action(module.run, module, meta, params, {})
+    return plain_value(invoke_action(module.run, module, meta, params, {}))
 
 
 @pytest.mark.parametrize(
@@ -176,7 +177,7 @@ def test_datetime_empty_input_uses_current_time(monkeypatch):
             return cls(2026, 9, 5, 10, 15, tzinfo=timezone.utc)
 
     monkeypatch.setattr(module, "datetime", Clock)
-    result = invoke_action(module.run, module, meta, {"timezone": "utc"}, {})
+    result = plain_value(invoke_action(module.run, module, meta, {"timezone": "utc"}, {}))
     assert result["iso"] == "2026-09-05T10:15:00+00:00"
 
 
@@ -252,7 +253,7 @@ def test_data_actions_bind_structured_values_and_keep_content_out_of_summaries()
     assert validate_rule_bindings(rule, {"manual": {"params": [], "outputs": []}}, engine.actions_meta) == []
     context = build_context(rule["name"], "manual", {}, [])
     engine.execute_workflow("data_actions", rule, rule["name"], context)
-    assert context["steps"]["a_text0001"]["result"]["text"] == "name,count\r\n甲,2"
+    assert plain_value(context["steps"]["a_text0001"]["result"])["text"] == "name,count\r\n甲,2"
     assert engine.events.flush()
     executed = [data for name, data in events if name == "run.step.succeeded"]
     assert len(executed) == 4

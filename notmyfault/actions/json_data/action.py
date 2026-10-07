@@ -1,3 +1,4 @@
+from notmyfault.plugin_api import action_values
 import json
 import math
 
@@ -68,6 +69,7 @@ def run(action_info, params):
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     try:
         return _execute(params)
     except RecursionError:

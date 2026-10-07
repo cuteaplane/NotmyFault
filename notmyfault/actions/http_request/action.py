@@ -1,4 +1,5 @@
 """HTTP 请求动作，仅接受 http 和 https URL"""
+from notmyfault.plugin_api import action_values
 
 import http.client
 import math
@@ -104,6 +105,7 @@ def _redact_url(url: str) -> str:
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     method = str(params.get("method", "GET")).upper()
     url = str(params.get("url", "")).strip()
     body = params.get("body", "")

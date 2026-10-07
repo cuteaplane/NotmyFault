@@ -1,3 +1,4 @@
+from notmyfault.plugin_api import action_values
 import os
 import time
 import psutil
@@ -25,6 +26,7 @@ def _target_name(process_name: str) -> str:
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     process_name = params.get("process_name", "").strip()
     if not process_name:
         raise ValueError("未指定进程名")

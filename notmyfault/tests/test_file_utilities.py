@@ -17,6 +17,7 @@ from notmyfault.actions.write_text.action import run_with_context as write_text
 from notmyfault.core.workflow import ActionCancellation, ActionCancelled, build_context
 from notmyfault.core.rules import validate_rule_bindings
 from notmyfault.tests.api_support import create_test_engine
+from notmyfault.values import plain_value
 
 
 @pytest.mark.parametrize("operation", ["copy", "move"])
@@ -275,7 +276,8 @@ def test_file_actions_use_paths_and_content_from_trigger_data(tmp_path, monkeypa
     context = build_context(rule["name"], "manual", payload, [])
     engine.execute_workflow("file_actions", rule, rule["name"], context)
     assert [context["steps"][action["binding_id"]]["status"] for action in actions] == ["ok"] * 3
-    result = context["steps"]["a_readtext"]["result"]
+
+    result = plain_value(context["steps"]["a_readtext"]["result"])
     assert result["text"] == payload["text"]
     assert result["file"] == str((tmp_path / payload["file"]).absolute())
     assert Path(result["file"]).read_text(encoding="utf-8") == payload["text"]

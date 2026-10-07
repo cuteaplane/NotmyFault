@@ -1,3 +1,4 @@
+from notmyfault.plugin_api import action_values
 import os
 import select
 import shutil
@@ -32,6 +33,7 @@ def _shell_executable():
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     if not sys.platform.startswith("linux"):
         raise RuntimeError("执行 Shell 仅支持 Linux，Windows 请使用 run_powershell")
 

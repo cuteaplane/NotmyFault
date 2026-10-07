@@ -1,3 +1,4 @@
+from notmyfault.plugin_api import action_values
 import fnmatch
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ def run(action_info, params):
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     directory = str(params.get("directory", "") or "")
     if not directory:
         raise ValueError("未指定目录")

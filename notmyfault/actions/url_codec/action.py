@@ -1,3 +1,4 @@
+from notmyfault.plugin_api import action_values
 import json
 import math
 import re
@@ -23,6 +24,7 @@ def run(action_info, params):
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     operation = params.get("operation", "encode")
     value = params.get("value", "")
     result = {"text": "", "scheme": "", "hostname": "", "port": None, "path": "", "query": {}, "fragment": ""}

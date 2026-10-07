@@ -1,3 +1,4 @@
+from notmyfault.plugin_api import action_values
 import math
 import os
 import re
@@ -224,6 +225,7 @@ def _operate(backend, before, options, deadline, cancellation):
 
 
 def run_with_context(_meta, params, context):
+    params = action_values(params)
     if os.name != "nt" and not sys.platform.startswith("linux"):
         raise RuntimeError("window_control 仅支持 Windows 和 Linux")
     options = _options(params)

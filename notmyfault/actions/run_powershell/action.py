@@ -1,3 +1,4 @@
+from notmyfault.plugin_api import action_values
 import os
 import subprocess
 import sys
@@ -38,6 +39,7 @@ def _read_available(stream):
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     command = params.get("command", "")
     if not isinstance(command, str) or not command.strip():
         raise ValueError("未指定命令")

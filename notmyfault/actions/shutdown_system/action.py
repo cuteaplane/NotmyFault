@@ -1,6 +1,7 @@
 """系统关机、重启、注销、休眠和睡眠动作
 force 默认关闭，params.confirm 必须为 true，执行失败时抛异常
 """
+from notmyfault.plugin_api import action_values
 
 import ctypes
 import os
@@ -182,8 +183,9 @@ def run(action_info, params):
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     runtime = context.get("runtime", {})
-    cancellation = runtime.get("cancellation") if isinstance(runtime, dict) else None
+    cancellation = runtime.get("cancellation")
     if cancellation is None:
         raise RuntimeError("shutdown_system 缺少 runtime-v1 取消对象")
     return _execute(params, cancellation)
