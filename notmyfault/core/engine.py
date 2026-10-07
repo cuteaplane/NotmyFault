@@ -28,7 +28,6 @@ from notmyfault.core.rules import (
 )
 from notmyfault.core.rule_model import normalize_rules
 from notmyfault.core.runtime_rules import PreparedRules, rule_key
-from notmyfault.core.compiled_rules import compile_rule
 from notmyfault.security.plugin_schema import check_payload_contract
 from notmyfault.security.security import (
     SecurityMode,
@@ -44,7 +43,6 @@ from notmyfault.core.binding_schema import prepare_binding_context
 from notmyfault.core.bindings import BindingResolutionError
 from notmyfault.core.data_types import DataTypeError, normalize_fields
 from notmyfault.core.type_registry import TypeRegistry
-from notmyfault.core.variables import resolve_trigger_constants
 from notmyfault.core.workflow_executor import WorkflowExecutor
 
 
@@ -463,8 +461,12 @@ class AutomationEngine:
             if rule_index < 0 or rule_index >= len(self.rules):
                 return False, "规则不存在或已被重新加载"
             rule = copy.deepcopy(self.rules[rule_index])
-
-        return self.run_manual_rule_snapshot(rule, rule_index)
+            generation = self._get_runtime_snapshot().generation
+            generation.retain()
+        try:
+            return self.run_manual_rule_snapshot(rule, rule_index, _generation=generation)
+        finally:
+            generation.release()
 
     def run_manual_rule_snapshot(
         self,
@@ -477,105 +479,117 @@ class AutomationEngine:
         end_step_id: str = "",
         test_assertions: Optional[List[Dict[str, Any]]] = None,
         variable_values: Optional[Dict[str, Any]] = None,
+        _generation=None,
     ) -> tuple[bool, str, str]:
         """执行调用方传入的规则快照"""
         rule = normalize_rules([rule])[0]
 
         rule_name = rule.get("name", f"规则 #{rule_index + 1}")
         rule_id = rule.get("rule_id", "")
-        run_id = f"run_{uuid.uuid4().hex}"
-        manual_payload = (
-            dict(event_payload)
-            if isinstance(event_payload, dict)
-            else {"source": "dashboard", "rule_index": rule_index}
-        )
-        context = build_context(
-            rule_name,
-            "manual",
-            manual_payload,
-            [],
-            rule_id,
-            run_id,
-        )
-        actions = rule.get("actions", [])
-        if not isinstance(actions, list):
-            actions = []
-        plugins = self._plugins.snapshot([rule])
-        index_context = {}
-        prepare_binding_context(rule, index_context, plugins.triggers_meta, plugins.actions_meta)
-        compiled = compile_rule(rule, index_context, plugins.triggers_meta, plugins.actions_meta, {}, TypeRegistry.from_plugins(plugins.triggers_meta, plugins.actions_meta), plugins.digests)
-        rule = compiled.source
-        start_index = compiled.top_level_index.get(start_step_id, 0)
-        end_index = compiled.top_level_index.get(end_step_id, len(actions) - 1)
-        context["_plugins"] = plugins
-        context["_compiled_rule"] = compiled
-        context["_compiled_refs"] = compiled.references
-        selected_count = max(0, end_index - start_index + 1) if actions else 0
-        context["manual_test"] = {
-            "start_step_id": start_step_id,
-            "end_step_id": end_step_id,
-            "start_index": start_index,
-            "end_index": end_index,
-            "assertions": copy.deepcopy(test_assertions or []),
-        }
-        if isinstance(step_outputs, dict):
-            for action_index, action in enumerate(actions[:start_index]):
-                if not isinstance(action, dict):
-                    continue
-                step_id = action.get("binding_id")
-                if not isinstance(step_id, str) or step_id not in step_outputs:
-                    continue
-                record = {
-                    "type": action.get("type", "action"),
-                    "status": "ok",
-                    "result": copy.deepcopy(step_outputs[step_id]),
-                    "error": None,
-                    "provided": True,
-                }
-                context["steps"][step_id] = record
-        supplied_trigger_payloads = trigger_payloads if isinstance(trigger_payloads, dict) else {}
-        context["triggers"] = {
-            event.get("binding_id"): {
-                "type": event.get("type", ""),
-                "payload": copy.deepcopy(
-                    supplied_trigger_payloads.get(event.get("binding_id"), {})
-                ),
-                "config": copy.deepcopy(event.get("params", {})),
-            }
-            for event in get_rule_events(rule)
-            if isinstance(event.get("binding_id"), str)
-        }
-        context["manual_test"]["variable_values"] = variable_values
+        with self._rules_lock:
+            generation = _generation or self._generations.current
+            if generation is not None and rule_id in generation.snapshot.compiled:
+                generation.retain()
+            else:
+                if generation is not None and rule_index >= 0:
+                    return False, "规则不存在或已被重新加载", f"run_{uuid.uuid4().hex}"
+                generation = None
         try:
-            prepared_rule = resolve_trigger_constants(rule, TypeRegistry.from_plugins(self.triggers_meta, self.actions_meta))
-            configs = {event.get("binding_id"): event.get("params", {}) for event in get_rule_events(prepared_rule)}
-            for identity, trigger in context["triggers"].items():
-                trigger["config"] = configs.get(identity, trigger["config"])
-            prepare_binding_context(rule, context, self.triggers_meta, self.actions_meta)
-        except (DataTypeError, BindingResolutionError) as error:
-            return False, str(error), run_id
-        self._safe_on_event("run.triggered", {
-            "rule_id": rule_id,
-            "run_id": run_id,
-            "rule_name": rule_name,
-            "event_type": "manual",
-            "action_count": selected_count,
-            "start_step_id": start_step_id,
-            "end_step_id": end_step_id,
-            "assertion_count": len(test_assertions or []),
-            "event_payload": manual_payload,
-        })
-        decision = self._run_manager.submit(
-            rule_id,
-            rule,
-            rule_name,
-            context,
-        )
-        if decision == "queued":
-            return True, "已加入队列", run_id
-        if decision == "dropped":
-            return False, "当前规则不允许新的运行", run_id
-        return True, "已开始执行", run_id
+            run_id = f"run_{uuid.uuid4().hex}"
+            manual_payload = (
+                dict(event_payload)
+                if isinstance(event_payload, dict)
+                else {"source": "dashboard", "rule_index": rule_index}
+            )
+            context = build_context(
+                rule_name,
+                "manual",
+                manual_payload,
+                [],
+                rule_id,
+                run_id,
+            )
+            actions = rule.get("actions", [])
+            if not isinstance(actions, list):
+                actions = []
+            try:
+                prepared = self._generations.prepare([rule], validate=False)
+            except (DataTypeError, BindingResolutionError, ValueError) as error:
+                return False, str(error), run_id
+            plugins = prepared.plugins
+            compiled = prepared.compiled[rule_id]
+            rule = compiled.source
+            start_index = compiled.top_level_index.get(start_step_id, 0)
+            end_index = compiled.top_level_index.get(end_step_id, len(actions) - 1)
+            context["_plugins"] = plugins
+            context["_compiled_rule"] = compiled
+            context["_compiled_refs"] = compiled.references
+            selected_count = max(0, end_index - start_index + 1) if actions else 0
+            context["manual_test"] = {
+                "start_step_id": start_step_id,
+                "end_step_id": end_step_id,
+                "start_index": start_index,
+                "end_index": end_index,
+                "assertions": copy.deepcopy(test_assertions or []),
+            }
+            if isinstance(step_outputs, dict):
+                for action_index, action in enumerate(actions[:start_index]):
+                    if not isinstance(action, dict):
+                        continue
+                    step_id = action.get("binding_id")
+                    if not isinstance(step_id, str) or step_id not in step_outputs:
+                        continue
+                    record = {
+                        "type": action.get("type", "action"),
+                        "status": "ok",
+                        "result": copy.deepcopy(step_outputs[step_id]),
+                        "error": None,
+                        "provided": True,
+                    }
+                    context["steps"][step_id] = record
+            supplied_trigger_payloads = trigger_payloads if isinstance(trigger_payloads, dict) else {}
+            context["triggers"] = {
+                event.get("binding_id"): {
+                    "type": event.get("type", ""),
+                    "payload": copy.deepcopy(
+                        supplied_trigger_payloads.get(event.get("binding_id"), {})
+                    ),
+                    "config": copy.deepcopy(event.get("params", {})),
+                }
+                for event in get_rule_events(rule)
+                if isinstance(event.get("binding_id"), str)
+            }
+            context["manual_test"]["variable_values"] = variable_values
+            try:
+                prepare_binding_context(rule, context, plugins.triggers_meta, plugins.actions_meta)
+            except (DataTypeError, BindingResolutionError) as error:
+                return False, str(error), run_id
+            if generation is not None:
+                if generation.snapshot.compiled[rule_id].digest != compiled.digest:
+                    return False, "规则运行版本已变化，请刷新后重试", run_id
+                context["_generation"] = generation
+            else:
+                context["_standalone_snapshot"] = True
+            self._safe_on_event("run.triggered", {
+                "rule_id": rule_id,
+                "run_id": run_id,
+                "rule_name": rule_name,
+                "event_type": "manual",
+                "action_count": selected_count,
+                "start_step_id": start_step_id,
+                "end_step_id": end_step_id,
+                "assertion_count": len(test_assertions or []),
+                "event_payload": manual_payload,
+            })
+            decision = self._run_manager.submit(rule_id, rule, rule_name, context)
+            if decision == "queued":
+                return True, "已加入队列", run_id
+            if decision == "dropped":
+                return False, "当前规则不允许新的运行", run_id
+            return True, "已开始执行", run_id
+        finally:
+            if generation is not None:
+                generation.release()
 
     def execute_workflow(
         self,

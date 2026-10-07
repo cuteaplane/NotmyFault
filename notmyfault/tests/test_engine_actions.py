@@ -1285,3 +1285,103 @@ def test_tianyi_upload_emits_only_new_files():
     engine.execute_workflow("wf", rule, "规则", _context())
     # 上传动作只拿到增量文件列表
     assert uploaded["files"] == ["doc1.txt"]
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_manual_rule_with_trigger_constants_runs_selected_actions(partial):
+    received = []
+    engine = make_engine()
+    engine.triggers_meta["demo"] = {"params": [{"name": "path", "type": "text"}]}
+    engine.triggers_funcs["demo"] = lambda *args: None
+    register_action(engine, "record", lambda *args: None, meta={
+        "execution_api": "context-v1", "params": [{"name": "value", "type": "text"}],
+    }, module=types.SimpleNamespace(run_with_context=lambda meta, params, context: received.append(
+        (params["value"], context["triggers"]["t_manual01"]["config"]["path"]))))
+    rule = {"rule_id": "r_manual01", "name": "手动运行", "constants": [
+        {"id": "c_folder01", "name": "目录", "value_type": "text", "value": "folder"}],
+        "condition": {"type": "demo", "binding_id": "t_manual01", "params": {"path": {
+            "$ref": {"scope": "constant", "node": "c_folder01", "path": []}}}},
+        "actions": [
+            {"type": "record", "binding_id": "a_first001", "params": {"value": "first"}},
+            {"type": "record", "binding_id": "a_last0001", "params": {"value": {
+                "$ref": {"scope": "trigger_config", "node": "t_manual01", "path": ["path"]}}}},
+        ]}
+    try:
+        ok, _, run_id = engine.run_manual_rule_snapshot(rule, start_step_id="a_last0001" if partial else "")
+        assert ok
+        assert engine._run_manager.wait_for_idle(2)
+        assert engine._run_manager.state(run_id) == "succeeded"
+        assert received == ([("folder", "folder")] if partial else [("first", "folder"), ("folder", "folder")])
+        assert "$ref" in rule["condition"]["params"]["path"]
+    finally:
+        engine.shutdown(2)
+
+
+@pytest.mark.parametrize("change", ["rename", "modify", "delete"])
+def test_saved_manual_queue_obeys_rule_generation_changes(change):
+    import copy
+
+    entered, release = threading.Event(), threading.Event()
+    received = []
+    source = {"rule_id": "r_manual02", "name": "排队运行", "condition": {
+        "type": "demo", "binding_id": "t_manual02", "params": {}},
+        "concurrency": {"mode": "queue"}, "actions": [{
+            "type": "record", "binding_id": "a_record01", "params": {"value": "old"}}]}
+    engine = make_engine([source])
+    engine.triggers_meta["demo"] = {}
+    engine.triggers_funcs["demo"] = lambda *args: None
+
+    def record(meta, params):
+        received.append(params["value"])
+        if len(received) == 1:
+            entered.set()
+            release.wait(3)
+
+    register_action(engine, "record", record, meta={"params": [{"name": "value", "type": "text"}]})
+    generation = engine._get_runtime_snapshot().generation
+    try:
+        assert engine.run_manual_rule(0)[0]
+        assert entered.wait(2)
+        ok, _, queued_id = engine.run_manual_rule(0)
+        assert ok and engine._run_manager.state(queued_id) == "queued"
+        changed = copy.deepcopy(source)
+        changed["name"] = "新名称"
+        if change == "modify":
+            changed["actions"][0]["params"]["value"] = "new"
+        engine._generations.apply([] if change == "delete" else [changed], "test", activate=False, validate=False)
+        assert engine._run_manager.state(queued_id) == ("queued" if change == "rename" else "dropped")
+        release.set()
+        assert engine._run_manager.wait_for_idle(2)
+        assert received == (["old", "old"] if change == "rename" else ["old"])
+        assert generation.references.count == 0
+    finally:
+        release.set()
+        engine.shutdown(2)
+
+
+def test_manual_admission_drops_rule_deleted_during_preparation(monkeypatch):
+    source = {"rule_id": "r_manual03", "name": "手动运行", "condition": {"type": "demo", "params": {}},
+              "actions": [{"type": "record", "params": {}}]}
+    engine = make_engine([source])
+    engine.triggers_meta["demo"] = {}
+    engine.triggers_funcs["demo"] = lambda *args: None
+    received = []
+    register_action(engine, "record", lambda *args: received.append("ran"))
+    generation = engine._get_runtime_snapshot().generation
+    prepare = engine._generations.prepare
+
+    def prepare_then_delete(document, **kwargs):
+        candidate = prepare(document, **kwargs)
+        monkeypatch.setattr(engine._generations, "prepare", prepare)
+        engine._generations.apply([], "test", activate=False, validate=False)
+        return candidate
+
+    monkeypatch.setattr(engine._generations, "prepare", prepare_then_delete)
+    try:
+        ok, _, run_id = engine.run_manual_rule(0)
+        assert not ok
+        assert engine._run_manager.state(run_id) == "dropped"
+        assert received == []
+        assert generation.references.count == 0
+    finally:
+        engine.shutdown(2)

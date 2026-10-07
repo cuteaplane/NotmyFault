@@ -165,9 +165,10 @@ class RunManager:
 
     @staticmethod
     def _generation_drop_reason(run, generation):
-        if run.generation is None or generation is None:
+        if generation is None or run.context.get("_standalone_snapshot"):
             return None
-        previous = run.generation.snapshot.compiled.get(run.key)
+        previous = (run.generation.snapshot.compiled.get(run.key) if run.generation is not None else
+                    run.context.get("_compiled_rule"))
         if previous is None:
             return None
         current = generation.snapshot.compiled.get(run.key)
