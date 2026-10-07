@@ -231,3 +231,49 @@ def test_runtime_controller_serializes_concurrent_start_requests():
     assert results.count(True) == 1
     assert len(created) == 1
     controller.stop()
+
+
+def test_state_notifications_allow_status_queries_and_keep_transition_order():
+    controller = RuntimeController(lambda **kwargs: FakeEngine())
+    seen, lock_owned, completed = [], [], []
+    workers = []
+
+    def listener(state):
+        seen.append(state)
+        lock_owned.append(controller._lifecycle_lock._is_owned())
+        queried = threading.Event()
+        worker = threading.Thread(target=lambda: (controller.status(), queried.set()))
+        workers.append(worker)
+        worker.start()
+        completed.append(queried.wait(1))
+
+    controller.add_state_listener(listener)
+    try:
+        assert controller.start()
+        assert _wait(lambda: "running" in seen)
+        assert controller.stop(2)
+        assert _wait(lambda: "stopped" in seen)
+        assert seen == ["starting", "running", "stopping", "stopped"]
+        assert not any(lock_owned)
+        assert all(completed)
+    finally:
+        controller.stop(2)
+        for worker in workers:
+            worker.join(2)
+
+
+
+def test_listener_can_request_stop_and_receive_all_transitions():
+    controller = RuntimeController(lambda **kwargs: FakeEngine())
+    seen = []
+
+    def listener(state):
+        seen.append(state)
+        if state == "running":
+            controller.request_stop()
+
+    controller.add_state_listener(listener)
+    assert controller.start()
+    assert _wait(lambda: controller.state == "stopped")
+    controller._engine_thread.join(2)
+    assert seen == ["starting", "running", "stopping", "stopped"]
