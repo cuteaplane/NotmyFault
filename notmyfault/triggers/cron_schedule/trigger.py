@@ -120,5 +120,8 @@ class CronScheduleTrigger(PollingTrigger):
         })
 
 
+create_sampler = CronScheduleTrigger.from_context
+
+
 def run(meta, config, emit_event, shutdown_event):
     CronScheduleTrigger(meta, config, emit_event, shutdown_event).run()

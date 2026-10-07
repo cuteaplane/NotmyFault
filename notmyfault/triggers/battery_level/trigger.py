@@ -54,5 +54,8 @@ class BatteryLevelTrigger(PollingTrigger):
                    "matched": percent <= self.threshold if self.direction == "below" else percent >= self.threshold})
 
 
+create_sampler = BatteryLevelTrigger.from_context
+
+
 def run(meta, config, emit_event, shutdown_event):
     BatteryLevelTrigger(meta, config, emit_event, shutdown_event).run()

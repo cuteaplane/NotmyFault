@@ -49,17 +49,24 @@ class PollingTrigger:
     def teardown(self) -> None:
         """退出时释放资源，子类可注销热键或销毁窗口"""
 
+    @classmethod
+    def from_context(cls, context):
+        return cls(context.meta, dict(context.config), context.emit, context.stopping)
+
+    def sample(self):
+        if self.native:
+            with NATIVE_LOCK:
+                self.poll()
+        else:
+            self.poll()
+
     def run(self) -> None:
         self.completed = False
         self.validate()
         try:
             self.setup()
             while not self._stop_event.is_set() and not self.completed:
-                if self.native:
-                    with NATIVE_LOCK:
-                        self.poll()
-                else:
-                    self.poll()
+                self.sample()
                 if not self.completed:
                     self.clock.wait(self._stop_event, self.interval)
         finally:

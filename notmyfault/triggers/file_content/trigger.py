@@ -68,5 +68,8 @@ class FileContentTrigger(PollingTrigger):
             self.emit({"path": str(self.path), "state": state, "contains": contains})
 
 
+create_sampler = FileContentTrigger.from_context
+
+
 def run(meta, config, emit_event, shutdown_event):
     FileContentTrigger(meta, config, emit_event, shutdown_event).run()

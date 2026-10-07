@@ -100,5 +100,8 @@ class DirectoryQuiescentTrigger(PollingTrigger):
         self._emit_state(state, quiet_for, len(self._snapshot))
 
 
+create_sampler = DirectoryQuiescentTrigger.from_context
+
+
 def run(meta, config, emit_event, shutdown_event):
     DirectoryQuiescentTrigger(meta, config, emit_event, shutdown_event).run()

@@ -8,6 +8,7 @@
   "enabled": true,
   "semantic": "state",
   "trigger_api": "event-v2",
+  "sampling_api": "poll-v1",
   "permissions": [
     "filesystem"
   ],

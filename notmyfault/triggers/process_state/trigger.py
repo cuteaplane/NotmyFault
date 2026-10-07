@@ -43,5 +43,8 @@ class ProcessStateTrigger(PollingTrigger):
         self.emit({"process_name": self.raw_name, "state": current_state})
 
 
+create_sampler = ProcessStateTrigger.from_context
+
+
 def run(meta, config, emit_event, shutdown_event):
     ProcessStateTrigger(meta, config, emit_event, shutdown_event).run()

@@ -3,6 +3,7 @@
     "name": "计划任务",
     "semantic": "oneshot",
     "trigger_api": "event-v2",
+  "sampling_api": "poll-v1",
     "description": "每天/每周定时触发，或每隔 N 分钟触发一次",
     "version_code": 1,
     "version": "1.0",

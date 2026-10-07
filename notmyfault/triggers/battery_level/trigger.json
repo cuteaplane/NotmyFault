@@ -3,6 +3,7 @@
     "name": "电量阈值",
     "semantic": "state",
     "trigger_api": "event-v2",
+  "sampling_api": "poll-v1",
     "description": "电池电量跨过指定阈值（低于/高于）时触发",
     "version_code": 1,
     "version": "1.0",

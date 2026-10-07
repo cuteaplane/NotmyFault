@@ -46,5 +46,8 @@ class TimeScheduleTrigger(PollingTrigger):
         self._previous_poll = now
 
 
+create_sampler = TimeScheduleTrigger.from_context
+
+
 def run(meta, config, emit_event, shutdown_event):
     TimeScheduleTrigger(meta, config, emit_event, shutdown_event).run()

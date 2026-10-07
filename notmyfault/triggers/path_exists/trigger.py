@@ -49,5 +49,8 @@ class PathExistsTrigger(PollingTrigger):
             self.emit({"path": str(self.path), "state": state, "exists": exists})
 
 
+create_sampler = PathExistsTrigger.from_context
+
+
 def run(meta, config, emit_event, shutdown_event):
     PathExistsTrigger(meta, config, emit_event, shutdown_event).run()

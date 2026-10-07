@@ -46,10 +46,21 @@ class SystemResourceTrigger(PollingTrigger):
         self._net_prev = None
         self._net_rate = 0.0
         self._first_sample = True
+        self._cpu_prev = None
         self.log(f"开始监控系统资源: {self.resource} {self.direction}")
 
     def poll(self):
-        if self.resource == "network":
+        if self.resource == "cpu":
+            times = psutil.cpu_times()
+            total = sum(times) - getattr(times, "guest", 0) - getattr(times, "guest_nice", 0)
+            busy = total - times.idle - getattr(times, "iowait", 0)
+            value = 0.0
+            if self._cpu_prev is not None:
+                elapsed = total - self._cpu_prev[0]
+                if elapsed > 0:
+                    value = min(100.0, max(0.0, 100 * (busy - self._cpu_prev[1]) / elapsed))
+            self._cpu_prev = (total, busy)
+        elif self.resource == "network":
             net = psutil.net_io_counters()
             total = net.bytes_sent + net.bytes_recv
             now = self.clock.monotonic()
@@ -63,7 +74,7 @@ class SystemResourceTrigger(PollingTrigger):
             value = _get_usage(self.resource, self.disk_path) if self.resource == "disk" else _get_usage(self.resource)
 
         if self._first_sample:
-            # cpu_percent 首次调用返回 0，network 首轮还没有速率值，首轮只记录状态
+            # CPU 和网络速率需要两次采样，首轮只记录状态
             self._first_sample = False
             return
 
@@ -72,6 +83,9 @@ class SystemResourceTrigger(PollingTrigger):
         )
         self.emit({"resource": self.resource, "value": round(value, 1), "threshold": self.threshold,
                    "direction": self.direction, "matched": triggered})
+
+
+create_sampler = SystemResourceTrigger.from_context
 
 
 def run(meta, config, emit_event, shutdown_event):
