@@ -148,3 +148,47 @@ def test_watcher_start_keeps_stamp_captured_before_initial_rule_load(tmp_path):
         assert calls == ["new"]
     finally:
         assert watcher.stop(1)
+
+
+@pytest.mark.parametrize("replace", [False, True])
+def test_watcher_detects_content_change_with_preserved_mtime_and_size(tmp_path, replace):
+    import os
+
+    path = tmp_path / "rules.json"
+    path.write_text('[1]')
+    original = path.stat()
+    clock = FakeClock()
+    calls = []
+    watcher = RuleWatcher(lambda: path, path.read_text, lambda doc, source: calls.append(doc), clock=clock)
+    watcher.acknowledge()
+    target = tmp_path / "replacement.json" if replace else path
+    target.write_text('[2]')
+    os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
+    if replace:
+        os.replace(target, path)
+    watcher.check_once()
+    clock.advance(1)
+    watcher.check_once()
+    clock.advance(0.3)
+    watcher.check_once()
+    assert calls == ['[2]']
+
+
+def test_watcher_periodically_rechecks_content_when_stat_fields_are_unchanged(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    path = tmp_path / "rules.json"
+    path.write_text('[1]')
+    original = path.stat()
+    clock = FakeClock()
+    calls = []
+    watcher = RuleWatcher(lambda: path, path.read_text, lambda doc, source: calls.append(doc), clock=clock)
+    watcher.acknowledge()
+    path.write_text('[2]')
+    monkeypatch.setattr(Path, "stat", lambda self, **kwargs: original)
+    assert not watcher.check_once()
+    clock.advance(1)
+    assert not watcher.check_once()
+    clock.advance(0.3)
+    assert watcher.check_once()
+    assert calls == ['[2]']

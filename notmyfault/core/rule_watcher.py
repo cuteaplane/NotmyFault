@@ -17,7 +17,8 @@ class FileStamp:
 
 class RuleWatcher:
     def __init__(self, path, load, apply, *, clock: Clock | None = None,
-                 debounce: float = 0.3, poll_interval: float = 0.1, on_error=None) -> None:
+                 debounce: float = 0.3, poll_interval: float = 0.1, on_error=None,
+                 verify_interval: float = 1.0) -> None:
         self._path = path
         self._load = load
         self._apply = apply
@@ -31,6 +32,8 @@ class RuleWatcher:
         self._has_pending = False
         self._read_cache = None
         self._read_lock = threading.Lock()
+        self._verify_interval = verify_interval
+        self._verified_at = float("-inf")
         self._deadline = 0.0
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -42,18 +45,20 @@ class RuleWatcher:
         with self._read_lock:
             try:
                 stat = path.stat()
-                key = (str(path), stat.st_mtime_ns, stat.st_size)
-                if self._read_cache is not None and self._read_cache[0] == key:
+                key = (str(path), stat.st_dev, stat.st_ino, stat.st_ctime_ns, stat.st_mtime_ns, stat.st_size)
+                now = self._clock.monotonic()
+                if self._read_cache is not None and self._read_cache[0] == key and now - self._verified_at < self._verify_interval:
                     return self._read_cache[1]
                 data = path.read_bytes()
                 after = path.stat()
             except FileNotFoundError:
                 self._read_cache = None
                 return None
-            if (stat.st_mtime_ns, stat.st_size) != (after.st_mtime_ns, after.st_size) or len(data) != after.st_size:
+            if (stat.st_dev, stat.st_ino, stat.st_ctime_ns, stat.st_mtime_ns, stat.st_size) != (after.st_dev, after.st_ino, after.st_ctime_ns, after.st_mtime_ns, after.st_size) or len(data) != after.st_size:
                 raise OSError("规则文件仍在写入")
             stamp = FileStamp(after.st_mtime_ns, after.st_size, hashlib.sha256(data).hexdigest())
             self._read_cache = (key, stamp)
+            self._verified_at = now
             return stamp
 
     def acknowledge(self) -> None:
