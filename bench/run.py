@@ -25,6 +25,7 @@ from notmyfault.core.plugin_worker import run_isolated_action
 from notmyfault.core.runtime_rules import prepare_rules
 from notmyfault.core.workflow import build_context
 from notmyfault.security.security import SecurityMode
+from notmyfault.plugin_api import Blob, RunContext
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -113,15 +114,19 @@ def dispatch(count):
     return result
 
 
-def workflow(directory, count, *, payload_mb=0):
+def workflow(directory, count, *, payload_mb=0, blob_kind=None):
     document = rules(1, 1)
     engine = make_engine(document, directory)
     if payload_mb:
         engine.actions_meta["noop"]["outputs"] = [{
-            "name": "data", "type": "array", "label": "数据",
-            "value_type": {"type": "array", "items": "text"},
+            "name": "data", "type": blob_kind or "array", "label": "数据",
+            "value_type": blob_kind or {"type": "array", "items": "text"},
         }]
         payload = [f"{index:05}" + "x" * 1019 for index in range(payload_mb * 1024)]
+        if blob_kind:
+            payload = "x" * (payload_mb * 1024 * 1024)
+            if blob_kind == "bytes":
+                payload = payload.encode("utf-8")
         engine.actions_funcs["noop"] = lambda meta, params: {"data": payload}
         document[0]["actions"] = document[0]["actions"][:1] + [
             {"type": "sink", "params": {}, "binding_id": f"a_sink{index:06}"}
@@ -129,6 +134,23 @@ def workflow(directory, count, *, payload_mb=0):
         ]
         engine.actions_meta["sink"] = metadata("sink", "action")
         engine.actions_funcs["sink"] = lambda meta, params: None
+        if payload_mb:
+            reference = {"$ref": {"scope": "step", "node": "a_bench000000", "path": ["data"]}}
+            for action in document[0]["actions"][1:]:
+                action["params"] = {"data": reference}
+            engine.actions_meta["sink"].update(
+                execution_api="context-v1", params=[{"name": "data", "type": "any", "value_type": "any"}],
+            )
+
+            def consume(meta, params, context):
+                value = params["data"]
+                if (not isinstance(context, RunContext)
+                        or value is not context["steps"]["a_bench000000"]["result"]["data"]
+                        or blob_kind and (not isinstance(value, Blob) or value.size != payload_mb * 1024 * 1024)
+                        or not blob_kind and (not isinstance(value, list) or len(value) != payload_mb * 1024)):
+                    raise RuntimeError("步骤引用没有共用已保存的结果")
+
+            engine._plugin_modules["sink"] = SimpleNamespace(run_with_context=consume)
     engine.rules = document
     rule = engine._get_runtime_snapshot().rules[0]
     downstream = []
@@ -158,6 +180,7 @@ def workflow(directory, count, *, payload_mb=0):
         result = measure(execute, count)
         if payload_mb:
             result.update(payload_bytes=payload_mb * 1024 * 1024,
+                          payload_kind=blob_kind or "text_array",
                           downstream_step=summary(downstream), target_downstream_scaling="constant")
             tracemalloc.start()
             try:
@@ -175,20 +198,25 @@ def workflow(directory, count, *, payload_mb=0):
 
 
 def idle(directory, seconds):
-    engine = make_engine(rules(100, 30, steps=1), directory)
+    from notmyfault.triggers.path_exists.trigger import create_sampler
+
+    document = rules(100, 30, steps=1)
+    for rule in document:
+        rule["condition"]["params"] = {"path": str(directory / rule["condition"]["type"]), "interval": 1}
+    engine = make_engine(document, directory)
     ready = threading.Event()
     shutdown = threading.Event()
     lock = threading.Lock()
     started = 0
     errors = []
 
-    def trigger(meta, config, emit, stop):
+    def factory(context):
         nonlocal started
         with lock:
             started += 1
             if started == 30:
                 ready.set()
-        stop.wait()
+        return create_sampler(context)
 
     def drive():
         try:
@@ -198,13 +226,24 @@ def idle(directory, seconds):
             ready.set()
 
     for identity in engine.triggers_funcs:
-        engine.triggers_funcs[identity] = trigger
+        meta = json.loads((ROOT / "notmyfault/triggers/path_exists/trigger.json").read_text(encoding="utf-8"))
+        meta.update(id=identity, name=identity, package_name=f"io.notmyfault.bench.{identity}")
+        engine.triggers_meta[identity] = meta
+        engine._plugin_modules[identity] = SimpleNamespace(create_sampler=factory)
     thread = threading.Thread(target=drive, name="BenchmarkEngine")
     with patch("notmyfault.platform.platform_support.show_notification", lambda *args: True):
         try:
             thread.start()
             if not ready.wait(5) or errors:
                 raise RuntimeError(f"引擎未能进入空闲运行: {errors}")
+            deadline = time.monotonic() + 5
+            while (len(engine._trigger_host._instances) != 30
+                   or any(item.sample_future is None or not item.sample_future.done()
+                          for item in engine._trigger_host._instances.values())
+                   or engine._get_state_store()._writes.unfinished_tasks):
+                if time.monotonic() >= deadline or errors:
+                    raise RuntimeError("初次采样和状态写入未完成")
+                shutdown.wait(.005)
             process = psutil.Process()
             before = process.cpu_times()
             start = time.perf_counter()
@@ -216,6 +255,8 @@ def idle(directory, seconds):
                 "threads": len(threading.enumerate()), "duration_seconds": elapsed,
                 "cpu_percent": max(0, 100 * ((after.user - before.user) + (after.system - before.system)) / elapsed),
                 "budget_cpu_percent": .5, "budget_threads": 10,
+                "sampling": "path_exists", "sampling_workers": 4,
+                "initial_samples_complete": True,
             }
         finally:
             shutdown.set()
@@ -278,7 +319,7 @@ def reload_rules(directory, count):
     def apply():
         nonlocal revision
         revision += 1
-        changed[0]["name"] = f"修改后的名称_{revision}"
+        changed[0]["concurrency"] = {"mode": "queue", "queue_limit": revision}
         engine.apply_rules(changed, "benchmark")
 
     try:
@@ -326,9 +367,14 @@ def main():
                     f"{size}_mb": workflow(directory, 3 if args.quick else 20, payload_mb=size)
                     for size in (1, 5, 10)
                 },
-                "idle": idle(directory, 1 if args.quick else 10),
+                "blob_payload": {
+                    kind: {f"{size}_mb": workflow(directory, 3 if args.quick else 20, payload_mb=size, blob_kind=kind)
+                           for size in (1, 5, 10)}
+                    for kind in ("text", "bytes")
+                },
+                "idle": idle(directory, 1 if args.quick else 30),
                 "startup": startup(directory, 1 if args.quick else 5),
-                "reload": reload_rules(directory, 3 if args.quick else 20),
+                "reload": reload_rules(directory, 3 if args.quick else 100),
                 "isolated": isolated(directory, 3 if args.quick else 100),
             }
     from notmyfault.version import __version__
