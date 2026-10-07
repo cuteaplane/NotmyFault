@@ -103,6 +103,15 @@ class SettingsService:
                 if isinstance(children, list) and (children or field in ("then", "else")):
                     summary[field] = [summarize_item(child) for child in children]
                     summary["high_risk"] |= any(child["high_risk"] for child in summary[field])
+            if action_type == "if" and isinstance(item.get("elif"), list):
+                summary["elif"] = [
+                    {"then": [summarize_item(child) for child in alternative.get("then", [])]}
+                    for alternative in item["elif"]
+                    if isinstance(alternative, dict) and isinstance(alternative.get("then", []), list)
+                ]
+                summary["high_risk"] |= any(
+                    child["high_risk"] for alternative in summary["elif"] for child in alternative["then"]
+                )
             return summary
 
         status["summary"] = {
@@ -133,9 +142,13 @@ class SettingsService:
             from notmyfault.core.rules import (
                 validate_rule_bindings,
                 validate_rules_structure,
+                validate_automation_references,
             )
 
             structure_errors = validate_rules_structure(normalized_rules)
+            known_rule_ids = {rule.get("rule_id") for rule in normalized_rules if isinstance(rule, dict)}
+            structure_errors.extend(error for rule in normalized_rules if isinstance(rule, dict)
+                                    for error in validate_automation_references(rule, known_rule_ids))
             if structure_errors:
                 raise ConfigValidationError(
                     "规则包含结构无效的规则，拒绝重新签名: "

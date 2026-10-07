@@ -75,10 +75,16 @@ class RuleService:
         else:
             normalized = normalize_rules([rule])[0]
             schema = self._plugin_schema()
+            known_rule_ids = {normalized["rule_id"]}
+            try:
+                known_rule_ids.update(item.get("rule_id") for item in self._store.load_verified_rules(for_editing=True))
+            except ConfigValidationError as error:
+                add("error", "rules_unverified", str(error))
             _valid, _total, plugin_errors, plugin_warnings = validate_rules(
                 [normalized],
                 schema["triggers"],
                 schema["actions"],
+                known_rule_ids=known_rule_ids,
             )
             for _rule_name, message in plugin_errors:
                 add("error", "plugin_parameter", message)

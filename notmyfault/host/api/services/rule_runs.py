@@ -9,7 +9,7 @@ from notmyfault.core.bindings import BindingResolutionError, validate_binding_pa
 from notmyfault.core.data_types import DataTypeError, copy_value
 from notmyfault.core.type_registry import TypeRegistry
 from notmyfault.core.variables import initialize_variables
-from notmyfault.core.rules import get_rule_events, validate_rules_structure
+from notmyfault.core.rules import get_rule_events, iter_action_nodes, validate_automation_references, validate_rules_structure
 from notmyfault.core.rule_model import normalize_rule_shape
 from notmyfault.host.api.ports import EngineControlPort
 from notmyfault.security.plugin_schema import check_payload_contract
@@ -77,6 +77,11 @@ class RuleRunService:
             has_snapshot,
             rule_snapshot,
         )
+        reference_errors = validate_automation_references(
+            candidate_rule, {rule.get("rule_id") for rule in verified_rules} | {candidate_rule.get("rule_id")}
+        )
+        if reference_errors:
+            self._fail(400, "；".join(reference_errors))
         try:
             registry = TypeRegistry.from_plugins(engine.triggers_meta, engine.actions_meta)
             initialize_variables(candidate_rule, {}, registry, overrides=variable_values)
@@ -103,7 +108,7 @@ class RuleRunService:
         if actions and start_index > end_index:
             self._fail(400, "局部运行的起始动作不能晚于结束动作")
         selected_actions = actions[start_index : end_index + 1] if actions else []
-        selected_ids = set(action_ids[start_index : end_index + 1])
+        selected_ids = {action.get("binding_id") for action, _path in iter_action_nodes(selected_actions)}
         skipped_upstream_ids = set(action_ids[:start_index])
 
         if not isinstance(step_outputs, dict):

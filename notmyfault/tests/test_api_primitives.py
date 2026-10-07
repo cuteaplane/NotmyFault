@@ -535,6 +535,22 @@ def test_rule_run_route_rejects_invalid_assertions_before_execution(tmp_path, ty
     assert calls[0][1]["test_assertions"] == valid_body["test_assertions"]
 
 
+def test_rule_run_service_allows_assertions_in_selected_elif_but_not_starting_inside_it():
+    rule = {"rule_id": "r_target01", "name": "ELIF检查", "condition": {"type": "signal", "binding_id": "t_signal01", "params": {}},
+            "actions": [{"type": "if", "binding_id": "a_branch01", "condition": {"op": "is_true", "left": False}, "then": [], "else": [],
+                         "elif": [{"condition": {"op": "is_true", "left": True}, "then": [{"type": "target", "binding_id": "a_target01", "params": {}}]}]}]}
+    calls = []
+    engine = SimpleNamespace(actions_meta={"target": {"outputs": []}}, triggers_meta={"signal": {"outputs": []}},
+                             run_manual_rule_snapshot=lambda *args, **kwargs: (calls.append(kwargs) or (True, "已执行", "run_branch")))
+    service = RuleRunService(SimpleNamespace(current_engine=engine), SimpleNamespace(load_verified_rules=lambda: [rule]))
+    body = {"test_assertions": [{"step_id": "a_target01", "path": [], "operator": "exists"}]}
+    assert service.run(0, body)["ok"]
+    assert calls[0]["test_assertions"] == body["test_assertions"]
+    with pytest.raises(RuleRunServiceError) as invalid:
+        service.run(0, {"start_step_id": "a_target01"})
+    assert invalid.value.status_code == 400
+
+
 def test_rule_run_service_checks_missing_and_invalid_reference_payloads() -> None:
     rule = {
         "name": "引用检查",

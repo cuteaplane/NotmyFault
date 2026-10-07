@@ -303,6 +303,8 @@ def test_security_inspection_summarizes_rules_and_detects_tamper(tmp_path):
             "then": [],
             "else": [{"type": "shutdown_system", "params": {}}],
         }],
+        "elif": [{"condition": {"op": "eq", "left": "private-condition", "right": "private-condition"},
+                  "then": [{"type": "shutdown_system", "params": {"reason": "private-elif-message"}}]}],
     })
     assert store.save_rules([rule])
     status = SettingsService(store, lambda: {"actions": {
@@ -315,6 +317,8 @@ def test_security_inspection_summarizes_rules_and_detects_tamper(tmp_path):
     assert "top-secret-token" not in summary_text
     assert "private-failure-message" not in summary_text
     assert "private-branch-message" not in summary_text
+    assert "private-elif-message" not in summary_text
+    assert "private-condition" not in summary_text
     assert status["summary"]["rules"][0]["actions"][0]["params"] == {
         "token": "***"
     }
@@ -326,6 +330,8 @@ def test_security_inspection_summarizes_rules_and_detects_tamper(tmp_path):
     assert branch["else"][0]["high_risk"] is True
     assert branch["else"][0]["then"] == []
     assert branch["else"][0]["else"][0]["type"] == "shutdown_system"
+    assert branch["elif"][0]["then"][0]["type"] == "shutdown_system"
+    assert branch["elif"][0]["then"][0]["high_risk"] is True
     raw = json.loads(paths.rules_file.read_text(encoding="utf-8"))
     raw["rules"][0]["name"] = "篡改"
     paths.rules_file.write_text(json.dumps(raw), encoding="utf-8")
