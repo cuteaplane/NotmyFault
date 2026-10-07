@@ -144,6 +144,12 @@ class TriggerClock(Protocol):
     def wait(self, event: Event, timeout: float | None) -> bool: ...
 
 
+def system_clock() -> TriggerClock:
+    from notmyfault.core.clock import SystemClock
+
+    return SystemClock()
+
+
 @dataclass(frozen=True, slots=True)
 class TriggerContext:
     meta: Mapping[str, Any]
