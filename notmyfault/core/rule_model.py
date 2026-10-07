@@ -125,6 +125,13 @@ def _normalize_condition(condition: Any) -> Any:
     if copied["op"] == "any":
         # any 条件组不使用 within_seconds，旧界面只隐藏过这个字段
         copied.pop("within_seconds", None)
+        copied.setdefault("pick", "latest")
+    elif copied["op"] == "all":
+        copied.setdefault("consume", "matched")
+        if "within_seconds" not in copied:
+            copied.setdefault("ttl_seconds", 3600)
+    elif copied["op"] == "not":
+        copied.setdefault("repeat", "once_until_seen")
     return copied
 
 def _unwrap_single_condition(condition: Any) -> Dict[str, Any] | None:

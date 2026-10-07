@@ -67,6 +67,11 @@ class TestCallNotmyfault:
         assert ran == [1]
 
 
+def poll_runtime_timers(runtime, key, rule, now=None):
+    runtime.register_rule(key, rule, now)
+    return dict(runtime.take_due(now)).get(key)
+
+
 class TestConditionRuntime:
     def test_injected_clock_drives_absence_and_action_timeout(self):
         clock = FakeClock(wall_time=100)
@@ -75,13 +80,13 @@ class TestConditionRuntime:
         rule = {"condition": {"op": "not", "within_seconds": 10, "children": [
             {"type": "signal", "binding_id": "t_signal01", "params": {}},
         ]}}
-        assert runtime.poll_absences("r", rule) is None
+        assert poll_runtime_timers(runtime, "r", rule) is None
         clock.advance(9)
-        assert runtime.poll_absences("r", rule) is None
+        assert poll_runtime_timers(runtime, "r", rule) is None
         assert not cancellation.is_cancelled()
         clock.advance(1)
-        assert runtime.poll_absences("r", rule) is not None
-        assert runtime.poll_absences("r", rule) is None
+        assert poll_runtime_timers(runtime, "r", rule) is not None
+        assert poll_runtime_timers(runtime, "r", rule) is None
         assert clock.time() == 110
         with pytest.raises(ActionCancelled) as caught:
             cancellation.raise_if_cancelled()
@@ -100,20 +105,20 @@ class TestConditionRuntime:
         rule = {"condition": {"op": "all", "children": [
             {"type": "start", "binding_id": "t_start01", "params": {}}, absence,
         ]} if combined else absence}
-        assert runtime.poll_absences("r", rule, now=0) is None
+        assert poll_runtime_timers(runtime, "r", rule, now=0) is None
         if combined:
             assert runtime.match_and_take("r", rule, "start", {}, now=1) is None
         assert runtime.match_and_take("r", rule, "signal", {"channel": channel}, now=9) is None
-        assert runtime.poll_absences("r", rule, now=10) is None
+        assert poll_runtime_timers(runtime, "r", rule, now=10) is None
         assert runtime.match_and_take("r", rule, "signal", {"channel": other}, now=18) is None
-        assert runtime.poll_absences("r", rule, now=19) is not None
-        assert runtime.poll_absences("r", rule, now=100) is None
+        assert poll_runtime_timers(runtime, "r", rule, now=19) is not None
+        assert poll_runtime_timers(runtime, "r", rule, now=100) is None
         assert runtime.match_and_take("r", rule, "signal", {}, now=101, instance={"config": {"channel": channel}}) is None
         if combined:
             assert runtime.match_and_take("r", rule, "start", {}, now=102) is None
-        assert runtime.poll_absences("r", rule, now=111) is not None
+        assert poll_runtime_timers(runtime, "r", rule, now=111) is not None
         runtime.reset()
-        assert runtime.poll_absences("r", rule, now=200) is None
+        assert poll_runtime_timers(runtime, "r", rule, now=200) is None
 
     def test_absence_event_is_dispatched_through_run_manager(self, monkeypatch):
         rule = {"name": "无事件", "condition": {"op": "not", "within_seconds": 10, "children": [
@@ -127,21 +132,21 @@ class TestConditionRuntime:
         engine.triggers_meta["signal"] = {"params": [{"name": "channel", "value_type": "text"}]}
         dispatched = []
         engine._event_bus._scheduler_submit_fn = lambda *args: dispatched.append(args)
-        engine._event_bus.poll_absences(now=0)
+        engine._event_bus.process_timers(now=0)
         from notmyfault.core.type_registry import TypeRegistry
         monkeypatch.setattr(TypeRegistry, "from_plugins", lambda *args, **kwargs: pytest.fail("运行中重新构建类型表"))
-        monkeypatch.setattr("notmyfault.core.condition_runtime.time.monotonic", lambda: 9)
+        monkeypatch.setattr("notmyfault.core.clock.time.monotonic", lambda: 9)
         engine.emit_event("signal", {"channel": "a"})
-        engine._event_bus.poll_absences(now=10)
+        engine._event_bus.process_timers(now=10)
         assert dispatched == []
-        engine._event_bus.poll_absences(now=19)
+        engine._event_bus.process_timers(now=19)
         assert len(dispatched) == 1
         assert dispatched[0][3]["event"]["type"] == "absence"
         assert dispatched[0][3]["triggers"] == {}
         dispatched[0][3]["variables"]["v_values01"].append(2)
-        monkeypatch.setattr("notmyfault.core.condition_runtime.time.monotonic", lambda: 20)
+        monkeypatch.setattr("notmyfault.core.clock.time.monotonic", lambda: 20)
         engine.emit_event("signal", {"channel": "a"})
-        engine._event_bus.poll_absences(now=30)
+        engine._event_bus.process_timers(now=30)
         assert dispatched[1][3]["variables"]["v_values01"] == [1]
 
     @pytest.mark.parametrize("window", [10, 7200, None])
@@ -159,7 +164,11 @@ class TestConditionRuntime:
         assert runtime.match("r", rule, "evt_a", {}, now=0.0) is False
         if window is not None:
             assert runtime.match("r", rule, "evt_b", {}, now=window + 1) is False
-        assert runtime.match("r", rule, "evt_b", {}, now=window / 2 if window else 10000) is True
+        else:
+            assert runtime.match("r", rule, "evt_b", {}, now=1) is True
+            runtime.take_last_match("r")
+            assert runtime.match("r", rule, "evt_b", {}, now=2) is False
+        assert runtime.match("r", rule, "evt_a", {}, now=window + 2 if window else 3) is True
 
     def test_nested_events_are_aggregated(self):
         rule = {"condition": {
@@ -193,6 +202,7 @@ class TestConditionRuntime:
         runtime = ConditionRuntime()
         rule = {"condition": {
             "op": "all",
+            "consume": "all",
             "children": [
                 {"op": "any", "children": [
                     {"type": "evt_x", "params": {}},
@@ -204,7 +214,7 @@ class TestConditionRuntime:
         assert runtime.match("r", rule, "evt_x", {}, now=1) is False
         assert runtime.match("r", rule, "evt_y", {}, now=2) is False
         assert runtime.match("r", rule, "evt_z", {}, now=3) is True
-        assert len(runtime.take_last_match("r")) == 3
+        assert len(runtime.take_last_match("r")) == 2
         # 命中过的 evt_y 不能留下来替下一次 evt_z 满足 any 分支
         assert runtime.match("r", rule, "evt_z", {}, now=4) is False
         assert runtime.take_last_match("r") == []

@@ -49,11 +49,12 @@ class Generation:
 
 class GenerationManager:
     def __init__(self, plugins, runs, events, *, reconcile: Callable[[Generation], Any] | None = None,
-                 clock: Clock | None = None, lock=None) -> None:
+                 clock: Clock | None = None, lock=None, on_change=None) -> None:
         self._plugins = plugins
         self._runs = runs
         self._events = events
         self._reconcile = reconcile
+        self._on_change = on_change or (lambda: None)
         self._clock = clock or SystemClock()
         self._apply_lock = threading.RLock()
         self._lock = lock or threading.RLock()
@@ -76,7 +77,7 @@ class GenerationManager:
         plugins = self._plugins.snapshot(normalized)
         snapshot = prepare_rules(normalized, plugins.triggers_meta, plugins.actions_meta, validate=validate,
                                  resolve_trigger=plugins.triggers_funcs.get if validate else None,
-                                 plugin_digests=plugins.digests)
+                                 plugin_digests=plugins.digests, clock=self._clock)
         snapshot.plugins = plugins
         return snapshot
 
@@ -105,6 +106,9 @@ class GenerationManager:
                 with self._lock:
                     if previous is not None:
                         snapshot.runtime.migrate_from(previous.snapshot.runtime, unchanged)
+                    snapshot.runtime.set_waker(self._on_change)
+                    if activate:
+                        snapshot.runtime.activate()
                     self._runs.activate_generation(candidate)
                     self._current = candidate
             except Exception:
@@ -117,6 +121,7 @@ class GenerationManager:
             if previous is not None:
                 previous.release()
             self._runs.flush_events()
+            self._on_change()
             self._events.publish("rules.applied", {"generation": candidate.id, "source": source, "rules": len(snapshot),
                                                   "unchanged": len(unchanged), "issues": snapshot.issues})
             return candidate

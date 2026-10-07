@@ -72,17 +72,19 @@ class EventBus:
         dispatches = []
         with self._rules_lock:
             snapshot = self._snapshot_fn()
-            for compiled in snapshot.event_index.get(event_type, ()):
-                matched_events = snapshot.runtime.match_and_take(
-                    compiled.rule_id, compiled.source, event_type, event_payload, instance=instance,
-                )
-                if matched_events is not None:
-                    dispatches.append((compiled.source, compiled.rule_id, matched_events))
+            due, matches = snapshot.runtime.process_event(
+                ((compiled.rule_id, compiled.source) for compiled in snapshot.event_index.get(event_type, ())),
+                event_type, event_payload, instance=instance,
+            )
+            for key, events in due:
+                dispatches.append((snapshot.compiled[key].source, key, events, "absence", {}, {}, 0))
+            for key, events in matches:
+                dispatches.append((snapshot.compiled[key].source, key, events, event_type, event_payload, masked_payload, depth))
             if dispatches and snapshot.generation is not None:
                 snapshot.generation.retain()
         try:
-            for rule, key, matched_events in dispatches:
-                self._dispatch(snapshot, rule, key, event_type, event_payload, masked_payload, matched_events, depth)
+            for rule, key, matched_events, kind, payload, masked, run_depth in dispatches:
+                self._dispatch(snapshot, rule, key, kind, payload, masked, matched_events, run_depth)
         finally:
             if dispatches and snapshot.generation is not None:
                 snapshot.generation.release()
@@ -137,18 +139,15 @@ class EventBus:
                 "已丢弃这次运行，请在 Dashboard 检查规则。",
             )
 
-    def poll_absences(self, now=None):
+    def process_timers(self, now=None):
         if self._is_shutdown_fn():
             return
         self._snapshot_fn()
         dispatches = []
         with self._rules_lock:
             snapshot = self._snapshot_fn()
-            for compiled in snapshot.absence_index:
-                rule, key = compiled.source, compiled.rule_id
-                matched = snapshot.runtime.poll_absences(key, rule, now)
-                if matched is not None:
-                    dispatches.append((rule, key, matched))
+            for key, matched in snapshot.runtime.take_due(now):
+                dispatches.append((snapshot.compiled[key].source, key, matched))
             if dispatches and snapshot.generation is not None:
                 snapshot.generation.retain()
         try:

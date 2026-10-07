@@ -130,6 +130,7 @@ class AutomationEngine:
             on_failure=self._diag_obj.record_trigger_crash,
         )
         self._condition_stop = threading.Event()
+        self._condition_wake = threading.Event()
         self._condition_thread = None
 
         self._start_time: float = 0.0
@@ -175,7 +176,8 @@ class AutomationEngine:
             execute_fn=self._workflow_executor.execute_workflow,
             on_event=self._safe_on_event,
         )
-        self._generations = GenerationManager(self._plugins, self._run_manager, self.events, lock=self._rules_lock, reconcile=self._trigger_host.reconcile)
+        self._generations = GenerationManager(self._plugins, self._run_manager, self.events, lock=self._rules_lock,
+                                              reconcile=self._trigger_host.reconcile, on_change=self._condition_wake.set)
         # isolated 动作崩了通过这个回调推 plugin_worker_crashed 事件
         plugin_worker.set_crash_callback(self._safe_on_event)
         # 旧扩展和测试仍直接读取这些同步对象
@@ -701,8 +703,14 @@ class AutomationEngine:
 
     def _wait_conditions(self):
         while not self._condition_stop.is_set():
-            self._event_bus.poll_absences()
-            self._condition_stop.wait(0.1)
+            self._condition_wake.clear()
+            self._event_bus.process_timers()
+            with self._rules_lock:
+                runtime = self._get_runtime_snapshot().runtime
+                deadline = runtime.next_deadline()
+                timeout = min(threading.TIMEOUT_MAX, max(0, deadline - runtime.clock.monotonic())) if deadline is not None else None
+            if not self._condition_stop.is_set():
+                runtime.clock.wait(self._condition_wake, timeout)
 
     def _cleanup_runtime(self, timeout: float = 90.0) -> None:
         with self._runtime_cleanup_lock:
@@ -712,6 +720,7 @@ class AutomationEngine:
 
             cancel_pending_admin_requests()
             self._condition_stop.set()
+            self._condition_wake.set()
             self._rule_watcher.stop()
             if self._condition_thread is not None and self._condition_thread is not threading.current_thread():
                 self._condition_thread.join(2)

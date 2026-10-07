@@ -10,9 +10,10 @@ from typing import Any, Mapping
 
 from notmyfault.core.bindings import iter_references, validate_binding_path, validate_reference_fields
 from notmyfault.core.conditions import (
-    _absence_nodes, _event_key, _positive_events, config_fingerprint, get_rule_condition, get_rule_events,
+    get_rule_condition, get_rule_events,
 )
 from notmyfault.core.data_types import DataTypeError, type_at_path
+from notmyfault.core.condition_program import MatcherSpec, build_matcher
 from notmyfault.core.rules import iter_action_nodes
 from notmyfault.core.value_codec import encode_value
 
@@ -75,16 +76,6 @@ class ReferenceAccessor:
 
 
 @dataclass(frozen=True, slots=True)
-class MatcherSpec:
-    node: FrozenDict | None
-    leaves: Mapping[str, tuple[FrozenDict, ...]]
-    fingerprints: Mapping[int, str]
-    keys: Mapping[int, str]
-    positive_keys: frozenset[str]
-    absences: tuple[FrozenDict, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class Step:
     id: str
     index: int
@@ -121,17 +112,11 @@ def compile_rule(rule, template, triggers_meta, actions_meta, event_types, regis
     leaves = get_rule_events(source)
     by_event = defaultdict(list)
     subscriptions = []
-    fingerprints, keys = {}, {}
+    matcher = build_matcher(get_rule_condition(source))
     for leaf in leaves:
         by_event[leaf["type"]].append(leaf)
-        fingerprint = config_fingerprint(leaf.get("params", {}))
-        fingerprints[id(leaf)] = fingerprint
-        keys[id(leaf)] = _event_key(leaf)
+        fingerprint = matcher.fingerprints[id(leaf)]
         subscriptions.append(SubscriptionSpec(leaf["type"], fingerprint, leaf["binding_id"]))
-    matcher = MatcherSpec(get_rule_condition(source), MappingProxyType({key: tuple(items) for key, items in by_event.items()}),
-                          MappingProxyType(fingerprints), MappingProxyType(keys),
-                          frozenset(_event_key(leaf) for leaf in _positive_events(get_rule_condition(source))),
-                          tuple(_absence_nodes(get_rule_condition(source))))
     references = {}
     for usage in iter_references(source):
         ref = usage.reference

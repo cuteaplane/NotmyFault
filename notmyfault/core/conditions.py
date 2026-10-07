@@ -64,6 +64,20 @@ def validate_condition_tree(node: Dict[str, Any] | None) -> List[str]:
                 errors.append(f"{path} 的 NOT 必须包含一个事件条件")
             if "within_seconds" not in current:
                 errors.append(f"{path} 的 NOT 必须设置等待时长 within_seconds")
+        for option, owner, allowed in (
+            ("consume", "all", ("matched", "all", "none")),
+            ("pick", "any", ("latest", "first")),
+            ("repeat", "not", ("once_until_seen", "every_window")),
+        ):
+            if option in current and (op != owner or current[option] not in allowed):
+                errors.append(f"{path}.{option} 只用于 {owner}，可选值为 {' / '.join(allowed)}")
+        if "ttl_seconds" in current:
+            try:
+                ttl = float(current["ttl_seconds"])
+                if op != "all" or isinstance(current["ttl_seconds"], bool) or not math.isfinite(ttl) or ttl <= 0:
+                    errors.append(f"{path}.ttl_seconds 只用于 all，必须是大于 0 的有限秒数")
+            except (TypeError, ValueError, OverflowError):
+                errors.append(f"{path}.ttl_seconds 必须是数字")
         if "within_seconds" in current:
             try:
                 seconds = float(current["within_seconds"])

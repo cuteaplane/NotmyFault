@@ -30,7 +30,6 @@ class PreparedRules:
     event_sensitive: dict[str, list[list[str]]]
     compiled: dict[str, CompiledRule] = field(default_factory=dict)
     event_index: dict[str, tuple[CompiledRule, ...]] = field(default_factory=dict)
-    absence_index: tuple[CompiledRule, ...] = ()
     document_digest: str = ""
     generation: object | None = None
     plugins: object | None = None
@@ -89,7 +88,7 @@ def validate_rule_identifiers(rules):
         raise ValueError("rule_id 与其他规则重复")
 
 
-def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_trigger=None, plugin_digests=None):
+def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_trigger=None, plugin_digests=None, clock=None):
     validate_rule_identifiers(rules)
     normalized = normalize_rule_input(rules) if validate else normalize_rules(rules)
     registry = TypeRegistry.from_plugins(triggers_meta, actions_meta)
@@ -142,6 +141,7 @@ def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_
         document_digest=digest(normalized),
         issues=issues,
         warnings=warnings,
+        runtime=ConditionRuntime(clock=clock),
     )
     compiled = {rule_key(rule): compile_rule(rule, contexts[rule_key(rule)], triggers_meta, actions_meta, result.event_types, registry, plugin_digests) for rule in prepared}
     index = {}
@@ -151,6 +151,5 @@ def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_
     result.compiled = MappingProxyType(compiled)
     result.event_index = MappingProxyType({name: tuple(items) for name, items in index.items()})
     result.rules = freeze([rule.source for rule in compiled.values()])
-    result.absence_index = tuple(rule for rule in compiled.values() if rule.matcher_spec.absences)
     result.runtime.configure(compiled)
     return result
