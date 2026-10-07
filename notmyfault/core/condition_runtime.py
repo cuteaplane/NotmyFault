@@ -237,6 +237,19 @@ class ConditionRuntime:
 
     def match_and_take(self, rule_key, rule, event_type, event_payload, now=None, instance=None):
         with self._lock:
+            program = self._programs.get(rule_key)
+            if program is not None and _is_event_leaf(program.node) and rule_key not in self._states:
+                leaf = program.node
+                if leaf["type"] != event_type:
+                    return None
+                if instance is not None:
+                    fingerprint = instance.get("fingerprint") or config_fingerprint(instance.get("config"))
+                    if program.fingerprints[id(leaf)] != fingerprint:
+                        return None
+                elif not check_event_params(leaf, event_payload):
+                    return None
+                return [{"binding_id": leaf.get("binding_id"), "event": {"type": event_type, "params": leaf.get("params", {})},
+                         "timestamp": self._timestamp(now), "payload": event_payload}]
             if not self.match(rule_key, rule, event_type, event_payload, now=now, instance=instance):
                 return None
             return self.take_last_match(rule_key)

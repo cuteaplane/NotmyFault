@@ -1,10 +1,11 @@
 """整理事件、条件组合和步骤结果供插件使用"""
-import copy
 import threading
 from typing import Any, Callable, Dict
 
-from notmyfault.core.data_types import normalize_fields
+from notmyfault.core.data_types import DataTypeError, normalize_fields
 from notmyfault.core.clock import Clock, SystemClock
+from notmyfault.core.run_context import RunState, run_view
+from notmyfault.values import action_values, allow_secrets, contains_secret, hold_value, protect
 
 
 class ActionCancelled(RuntimeError):
@@ -73,7 +74,7 @@ def build_context(
     condition_events: list[Dict[str, Any]],
     rule_id: str = "",
     run_id: str = "",
-) -> Dict[str, Any]:
+) -> RunState:
     """创建一次规则运行独享的上下文"""
     rule_context = {"name": rule_name}
     if rule_id:
@@ -86,24 +87,24 @@ def build_context(
             continue
         triggers[binding_id] = {
             "type": event.get("type", ""),
-            "payload": copy.deepcopy(item.get("payload", {})),
+            "payload": hold_value(item.get("payload", {})),
             # v2 事件叶子的 params 是触发器配置，供 $ref scope=trigger_config 使用
-            "config": copy.deepcopy(event.get("params", {})),
+            "config": hold_value(event.get("params", {})),
         }
     context = {
         "context_version": 2,
         "rule": rule_context,
         "event": {
             "type": event_type,
-            "payload": copy.deepcopy(event_payload),
+            "payload": hold_value(event_payload),
         },
         "triggers": triggers,
-        "condition_events": copy.deepcopy(condition_events),
+        "condition_events": hold_value(condition_events),
         "steps": {},
     }
     if run_id:
         context["run"] = {"id": run_id}
-    return context
+    return RunState(context)
 
 
 def invoke_action(
@@ -115,14 +116,25 @@ def invoke_action(
 ) -> Any:
     """按插件元数据调用新旧动作 API，兼容 run 和 run_with_context"""
     registry = context.get("_type_registry")
-    params = normalize_fields(params, action_meta.get("params"), registry, parameters=True, location="params")
-    if action_meta.get("execution_api") == "context-v1":
-        context_runner = getattr(module, "run_with_context", None)
-        if not callable(context_runner):
-            context_runner = getattr(action_func, "run_with_context", None)
-        if not callable(context_runner):
-            raise TypeError("execution_api=context-v1 的插件必须定义 run_with_context()")
-        result = context_runner(action_meta, params, context)
-    else:
-        result = action_func(action_meta, params)
-    return normalize_fields(result, action_meta.get("outputs"), registry, location="outputs")
+    params = normalize_fields(params, action_meta.get("params"), registry, parameters=True, location="params", wrap_sensitive=True)
+    declared = {field.get("name") if isinstance(field, dict) else field for field in action_meta.get("params", [])}
+    with allow_secrets({name: value for name, value in params.items() if name in declared}):
+        if action_meta.get("execution_api") == "context-v1":
+            context_runner = getattr(module, "run_with_context", None)
+            if not callable(context_runner):
+                context_runner = getattr(action_func, "run_with_context", None)
+            if not callable(context_runner):
+                raise TypeError("execution_api=context-v1 的插件必须定义 run_with_context()")
+            view = context if getattr(action_func, "_isolated_proxy", False) else run_view(context, context.get("runtime", {}).get("cancellation"))
+            result = context_runner(action_meta, params, view)
+        else:
+            result = action_func(action_meta, action_values(params))
+    result = normalize_fields(result, action_meta.get("outputs"), registry, location="outputs", wrap_sensitive=True)
+    result = protect(result) if contains_secret(params) else hold_value(result)
+    if registry is not None:
+        try:
+            result = registry.binding_value(result)
+        except DataTypeError:
+            # 动作结果可含插件私有类型，跨步骤引用时再检查共享声明
+            pass
+    return result

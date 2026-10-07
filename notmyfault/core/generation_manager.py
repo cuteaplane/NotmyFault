@@ -75,9 +75,11 @@ class GenerationManager:
         validate_rule_identifiers(document)
         normalized = normalize_rule_input(document) if validate else normalize_rules(document)
         plugins = self._plugins.snapshot(normalized)
+        current = self.current
         snapshot = prepare_rules(normalized, plugins.triggers_meta, plugins.actions_meta, validate=validate,
                                  resolve_trigger=plugins.triggers_funcs.get if validate else None,
-                                 plugin_digests=plugins.digests, clock=self._clock)
+                                 plugin_digests=plugins.digests, clock=self._clock,
+                                 previous=current.snapshot if current is not None else None)
         snapshot.plugins = plugins
         return snapshot
 

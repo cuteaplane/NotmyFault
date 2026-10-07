@@ -12,6 +12,7 @@ import pytest
 from notmyfault.tests.api_support import create_test_engine, event_fields
 from notmyfault.core import workflow_executor as workflow_executor_module
 from notmyfault.core.workflow import ActionCancellation, build_context
+from notmyfault.core.clock import FakeClock
 from notmyfault.core.run_history import RunHistory
 from notmyfault.security.errors import AdminExecutionBlocked
 
@@ -33,6 +34,54 @@ def _context():
     return build_context("规则", "hotkey", {}, [])
 
 
+def test_engine_action_timeout_uses_injected_clock():
+    clock = FakeClock()
+    engine = create_test_engine({"rules": []}, clock=clock)
+
+    def advance(meta, params, context):
+        cancellation = context["runtime"]["cancellation"]
+        assert cancellation._clock is clock
+        clock.advance(2)
+        cancellation.raise_if_cancelled()
+
+    register_action(engine, "advance", lambda *args: None,
+                    {"execution_api": "context-v1", "cancellation_api": "runtime-v1"},
+                    types.SimpleNamespace(run_with_context=advance))
+    try:
+        outcome = engine.execute_workflow("r_clock001", {"actions": [{
+            "type": "advance", "binding_id": "a_clock001", "params": {}, "timeout_seconds": 1,
+        }]}, "规则", _context())
+        assert outcome.status == "timed_out"
+    finally:
+        engine.shutdown(2)
+
+
+def test_engine_retry_wait_uses_injected_clock():
+    class AdvancingClock(FakeClock):
+        def wait(self, event, timeout):
+            self.advance(timeout)
+            return event.is_set()
+
+    clock = AdvancingClock()
+    engine = create_test_engine({"rules": []}, clock=clock)
+    attempts = []
+
+    def retry(meta, params):
+        attempts.append(clock.monotonic())
+        if len(attempts) == 1:
+            raise ValueError("重试")
+
+    register_action(engine, "retry", retry)
+    try:
+        outcome = engine.execute_workflow("r_clock002", {"actions": [{
+            "type": "retry", "binding_id": "a_clock002", "params": {}, "retry": 1, "retry_delay_seconds": 2,
+        }]}, "规则", _context())
+        assert outcome.status == "succeeded"
+        assert attempts[0] == 0 and attempts[1] >= 2
+    finally:
+        engine.shutdown(2)
+
+
 def test_run_variables_follow_executed_branches_and_survive_failed_assignment(tmp_path):
     events, received = [], []
     engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
@@ -40,8 +89,10 @@ def test_run_variables_follow_executed_branches_and_survive_failed_assignment(tm
     def consume(meta, params, context):
         received.append(list(params["rows"]))
         params["rows"].append(99)
-        context["variables"]["v_rows0001"].append(88)
-        context["constants"]["c_rows0001"].append(77)
+        with pytest.raises(TypeError):
+            context["variables"]["v_rows0001"].append(88)
+        with pytest.raises(TypeError):
+            context["constants"]["c_rows0001"].append(77)
         return {"count": len(received[-1])}
 
     register_action(engine, "consume", lambda meta, params: None, meta={
@@ -661,11 +712,12 @@ class TestExecuteAction:
         attempts = []
         engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
 
-        def short_cancellation(run_event=None, shutdown_event=None, timeout_seconds=None):
+        def short_cancellation(run_event=None, shutdown_event=None, timeout_seconds=None, *, clock=None):
             return ActionCancellation(
                 run_event,
                 shutdown_event,
                 0.01 if timeout_seconds is not None else None,
+                clock=clock,
             )
 
         def run_with_context(meta, params, context):
@@ -833,7 +885,7 @@ class TestExecuteAction:
         register_action(engine, "record", lambda meta, params: called.append(params["label"]))
         context = build_context("规则", "hotkey", {}, [], run_id="run_branch")
         if present:
-            context["event"]["payload"]["ready"] = value
+            context["event"]["payload"] = {"ready": value}
         context["steps"]["a_source01"] = {"status": "ok" if present else "failed", "result": value}
         reference = {"scope": "event", "path": ["ready"]} if source == "event" else {"scope": "step", "node": "a_source01", "path": []}
         def action(label):

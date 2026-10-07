@@ -43,6 +43,65 @@ def test_dispatch_visits_only_subscribers():
         engine.shutdown()
 
 
+def test_reload_reuses_unchanged_programs_and_rebuilds_changed_rules(monkeypatch):
+    from notmyfault.core import runtime_rules
+
+    checked = []
+    validate = runtime_rules.validate_rules
+
+    def validate_with_warning(rules, *args, **kwargs):
+        checked.append(rules[0]["rule_id"])
+        valid, counts, issues, warnings = validate(rules, *args, **kwargs)
+        if rules[0]["rule_id"] == "r_reuse002":
+            warnings.append((rules[0]["name"], "检查提示"))
+        return valid, counts, issues, warnings
+
+    monkeypatch.setattr(runtime_rules, "validate_rules", validate_with_warning)
+    document = [rule("r_reuse001"), rule("r_reuse002")]
+    engine = create_test_engine({"rules": []})
+    engine.triggers_meta["demo"] = {"trigger_api": "event-v2", "outputs": []}
+    engine.triggers_funcs["demo"] = lambda *args: None
+    engine.actions_meta["noop"] = {}
+    engine.actions_funcs["noop"] = lambda *args: None
+    for source in document:
+        source["condition"]["binding_id"] = "t_" + source["rule_id"][2:]
+        source["actions"] = [{"type": "noop", "params": {}, "binding_id": "a_" + source["rule_id"][2:]}]
+    try:
+        old = engine._generations.apply(document, "test", activate=False)
+        document[0]["concurrency"] = {"mode": "queue", "queue_limit": 2}
+        new = engine._generations.apply(document, "test", activate=False)
+        assert new.snapshot.compiled["r_reuse002"] is old.snapshot.compiled["r_reuse002"]
+        assert new.snapshot.contexts["r_reuse002"] is old.snapshot.contexts["r_reuse002"]
+        assert new.snapshot.registry is old.snapshot.registry
+        assert new.snapshot.compiled["r_reuse001"] is not old.snapshot.compiled["r_reuse001"]
+        assert new.snapshot.warnings == old.snapshot.warnings
+        assert checked == ["r_reuse001", "r_reuse002", "r_reuse001"]
+        engine.triggers_meta["demo"]["outputs"] = [{"name": "token", "type": "text", "sensitive": True}]
+        changed = engine._generations.apply(document, "test", activate=False)
+        assert changed.snapshot.registry is not new.snapshot.registry
+        assert all(changed.snapshot.compiled[key] is not value for key, value in new.snapshot.compiled.items())
+    finally:
+        engine.shutdown()
+
+
+def test_validated_reload_does_not_reuse_unvalidated_rules():
+    source = rule()
+    engine = create_test_engine({"rules": []})
+    engine.triggers_meta["demo"] = {"trigger_api": "event-v2", "outputs": []}
+    engine.triggers_funcs["demo"] = lambda *args: None
+    source["condition"]["binding_id"] = "t_compile1"
+    source["actions"] = [{"type": "noop", "params": {}, "binding_id": "a_compile1"}]
+    engine.actions_meta["noop"] = {}
+    engine.actions_funcs["noop"] = lambda *args: None
+    try:
+        old = engine._generations.apply([source], "test", activate=False, validate=False)
+        new = engine._generations.apply([source], "test", activate=False)
+        assert new.snapshot.validated
+        assert new.snapshot.compiled[source["rule_id"]] is not old.snapshot.compiled[source["rule_id"]]
+    finally:
+        engine.shutdown()
+
+
 def test_running_workflow_uses_old_plugin_snapshot_after_swap():
     entered, release = threading.Event(), threading.Event()
     values = []

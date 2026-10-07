@@ -199,12 +199,11 @@ def test_timer_thread_waits_and_reload_wakes_it_for_an_earlier_deadline():
         "op": "not", "within_seconds": 10, "children": [leaf("a")],
     }, "actions": []}
     finished = threading.Event()
-    engine = create_test_engine({"rules": [rule]}, on_event=lambda event: finished.set() if event.type == "run.succeeded" else None)
-    engine.triggers_meta["a"] = {"trigger_api": "event-v2"}
     clock = ObservedClock()
-    engine._get_runtime_snapshot().runtime._clock = clock
-    engine._condition_thread = threading.Thread(target=engine._wait_conditions)
-    engine._condition_thread.start()
+    engine = create_test_engine({"rules": [rule]}, clock=clock, on_event=lambda event: finished.set() if event.type == "run.succeeded" else None)
+    engine.triggers_meta["a"] = {"trigger_api": "event-v2"}
+    engine._get_runtime_snapshot()
+    engine._trigger_host.start()
     try:
         assert clock.waits.get(timeout=2) == 10
         changed = copy.deepcopy(rule)
@@ -217,7 +216,7 @@ def test_timer_thread_waits_and_reload_wakes_it_for_an_earlier_deadline():
         assert clock.waits.get(timeout=2) is None
     finally:
         engine.shutdown(timeout=3)
-    assert not engine._condition_thread.is_alive()
+    assert not engine._trigger_host._timer.is_alive()
 
 
 @pytest.mark.parametrize("timer_first", [False, True])

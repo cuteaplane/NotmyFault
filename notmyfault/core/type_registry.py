@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from notmyfault.values import FrozenDict, FrozenList, Secret, hold_value, protect, secret_value
+
 import copy
+import weakref
 
 from notmyfault.core.data_types import (
     BUILTIN_TYPES,
@@ -17,6 +20,7 @@ from notmyfault.core.data_types import (
 class TypeRegistry:
     def __init__(self, definitions=None):
         self._definitions = copy.deepcopy(definitions or {})
+        self._binding_values = {}
         for identity, definition in self._definitions.items():
             if not is_custom_type(identity):
                 raise DataTypeError("自定义类型必须使用完整包名、类型名和版本", code="invalid_type")
@@ -115,14 +119,37 @@ class TypeRegistry:
             self.require_shared(child)
 
     def binding_value(self, value):
+        if isinstance(value, Secret):
+            result = self.binding_value(secret_value(value))
+            return value if result is secret_value(value) else protect(result)
+        frozen = isinstance(value, (FrozenDict, FrozenList))
+        if frozen:
+            previous = self._binding_values.get(id(value))
+            if previous is not None and previous[0]() is value:
+                return value if previous[1] is None else previous[1]
+        source = value
         if isinstance(value, list):
-            return [self.binding_value(item) for item in value]
-        if isinstance(value, dict):
+            children = [self.binding_value(item) for item in value]
+            result = value if frozen and all(left is right for left, right in zip(children, value)) else children
+        elif isinstance(value, dict):
             if is_custom_type(value.get("$type")):
                 self.require_shared(value["$type"])
                 value = normalize_value(value, value["$type"], self)
-            return {key: self.binding_value(item) for key, item in value.items()}
-        return value
+            children = {key: self.binding_value(item) for key, item in value.items()}
+            result = source if frozen and value is source and all(children[key] is item for key, item in value.items()) else children
+        else:
+            return value
+        if frozen:
+            result = hold_value(result)
+            identity = id(source)
+
+            def discard(reference):
+                cached = self._binding_values.get(identity)
+                if cached is not None and cached[0] is reference:
+                    self._binding_values.pop(identity, None)
+
+            self._binding_values[identity] = (weakref.ref(source, discard), None if result is source else result)
+        return result
 
     def snapshot(self):
         return copy.deepcopy(self._definitions)

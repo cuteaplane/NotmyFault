@@ -1,15 +1,14 @@
-"""准备触发器配置和每次运行独立复制的初始值"""
+"""准备触发器配置和每次运行的常量、变量与引用类型"""
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
 from notmyfault.core.compiled_rules import CompiledRule, compile_rule, digest, freeze
 from notmyfault.core.rule_model import _RULE_ID_RE
 
-from notmyfault.core.binding_schema import output_type, prepare_binding_context
+from notmyfault.core.binding_schema import output_type, prepare_binding_context, protect_context_inputs
 from notmyfault.core.data_types import normalize_fields
 from notmyfault.core.rule_model import normalize_rules
 from notmyfault.core.rules import (
@@ -18,6 +17,7 @@ from notmyfault.core.rules import (
 )
 from notmyfault.core.type_registry import TypeRegistry
 from notmyfault.core.variables import resolve_trigger_constants
+from notmyfault.values import hold_value
 
 
 @dataclass
@@ -27,7 +27,6 @@ class PreparedRules:
     contexts: dict[str, dict]
     trigger_params: dict[str, list[dict]]
     event_types: dict[str, dict]
-    event_sensitive: dict[str, list[list[str]]]
     compiled: dict[str, CompiledRule] = field(default_factory=dict)
     event_index: dict[str, tuple[CompiledRule, ...]] = field(default_factory=dict)
     document_digest: str = ""
@@ -37,22 +36,26 @@ class PreparedRules:
     issues: list[tuple[str, str]] = field(default_factory=list)
     warnings: list[tuple[str, str]] = field(default_factory=list)
     runtime: ConditionRuntime = field(default_factory=ConditionRuntime)
+    trigger_metadata: dict = field(default_factory=dict)
+    input_digests: dict[str, str] = field(default_factory=dict)
+    rule_warnings: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
+    validated: bool = False
 
     def __len__(self):
         return len(self.rules)
 
     def prepare_context(self, rule, context):
         template = self.contexts[rule_key(rule)]
-        context.update(copy.deepcopy(template, {id(self.registry): self.registry}))
+        context.update(template)
+        context["variables"] = dict(template["variables"])
+        context["_binding_types"] = dict(template["_binding_types"])
         compiled = self.compiled[rule_key(rule)]
         context["_compiled_refs"] = compiled.references
         context["_compiled_rule"] = compiled
         context["_generation"] = self.generation
         event_type = context.get("event", {}).get("type", "")
         context["_binding_types"]["event"] = self.event_types.get(event_type, output_type({}))
-        paths = self.event_sensitive.get(event_type)
-        if paths:
-            context["_sensitive_sources"]["event"] = {"": paths}
+        protect_context_inputs(context, self.plugins.triggers_meta if self.plugins is not None else self.trigger_metadata, self.registry)
 
 
 def rule_key(rule):
@@ -88,29 +91,54 @@ def validate_rule_identifiers(rules):
         raise ValueError("rule_id 与其他规则重复")
 
 
-def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_trigger=None, plugin_digests=None, clock=None):
+def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_trigger=None, plugin_digests=None, clock=None,
+                  previous=None):
     validate_rule_identifiers(rules)
     normalized = normalize_rule_input(rules) if validate else normalize_rules(rules)
-    registry = TypeRegistry.from_plugins(triggers_meta, actions_meta)
+    reuse = (previous is not None and previous.plugins is not None
+             and previous.plugins.digests == plugin_digests and (previous.validated or not validate))
+    registry = previous.registry if reuse else TypeRegistry.from_plugins(triggers_meta, actions_meta)
     prepared, contexts = [], {}
+    input_digests, reused, cached_warnings = {}, {}, {}
     issues, warnings = [], []
     trigger_ready = {}
     for rule in normalized:
+        identity = rule_key(rule)
+        input_digests[identity] = digest(rule)
+        if (reuse and identity in previous.compiled
+                and previous.input_digests.get(identity) == input_digests[identity]
+                and (resolve_trigger is None or all(resolve_trigger(leaf["type"]) is not None
+                                                   for leaf in get_rule_events(rule)))):
+            compiled = previous.compiled[identity]
+            contexts[identity] = previous.contexts[identity]
+            prepared.append(compiled.source)
+            reused[identity] = compiled
+            cached_warnings[identity] = previous.rule_warnings.get(identity, [])
+            if validate:
+                warnings.extend(cached_warnings[identity])
+            continue
         if validate:
             valid, _, rule_issues, rule_warnings = validate_rules([rule], triggers_meta, actions_meta)
             issues.extend(rule_issues)
             warnings.extend(rule_warnings)
+            cached_warnings[identity] = rule_warnings
             if not valid:
                 continue
         try:
-            resolved = resolve_trigger_constants(rule, registry)
+            protected_configs = {}
+            resolved = resolve_trigger_constants(rule, registry, protected_configs=protected_configs)
             for leaf in get_rule_events(resolved):
                 meta = triggers_meta.get(leaf.get("type"), {})
                 leaf["params"] = normalize_fields(
                     leaf.get("params", {}), meta.get("params"), registry, parameters=True,
                 )
                 _fill_owner_rule_id(leaf, meta, resolved)
-            context = {}
+                protected_leaf = {**leaf, "params": normalize_fields(
+                    protected_configs[leaf["binding_id"]], meta.get("params"), registry, parameters=True,
+                )}
+                _fill_owner_rule_id(protected_leaf, meta, resolved)
+                protected_configs[leaf["binding_id"]] = hold_value(protected_leaf["params"])
+            context = {"_trigger_configs": hold_value(protected_configs)}
             prepare_binding_context(resolved, context, triggers_meta, actions_meta, registry=registry)
             if resolve_trigger is not None:
                 for leaf in get_rule_events(resolved):
@@ -124,7 +152,8 @@ def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_
                 raise
             issues.append((rule["name"], str(error)))
             continue
-        contexts[rule_key(resolved)] = context
+        contexts[rule_key(resolved)] = {key: value if key == "_type_registry" else hold_value(value, blobs=False)
+                                      for key, value in context.items()}
         prepared.append(resolved)
     result = PreparedRules(
         rules=prepared,
@@ -132,18 +161,19 @@ def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_
         contexts=contexts,
         trigger_params=aggregate_trigger_params(prepared),
         event_types={name: output_type(meta) for name, meta in triggers_meta.items()},
-        event_sensitive={
-            name: [[spec["name"]] for spec in meta.get("outputs", [])
-                   if isinstance(spec, dict) and spec.get("sensitive")]
-            for name, meta in triggers_meta.items()
-        },
         total=len(normalized),
         document_digest=digest(normalized),
         issues=issues,
         warnings=warnings,
         runtime=ConditionRuntime(clock=clock),
+        trigger_metadata=triggers_meta,
+        input_digests=input_digests,
+        rule_warnings=cached_warnings,
+        validated=validate,
     )
-    compiled = {rule_key(rule): compile_rule(rule, contexts[rule_key(rule)], triggers_meta, actions_meta, result.event_types, registry, plugin_digests) for rule in prepared}
+    compiled = {rule_key(rule): reused[rule_key(rule)] if rule_key(rule) in reused else
+                compile_rule(rule, contexts[rule_key(rule)], triggers_meta, actions_meta, result.event_types, registry, plugin_digests)
+                for rule in prepared}
     index = {}
     for rule in compiled.values():
         for event_type in rule.matcher_spec.leaves:

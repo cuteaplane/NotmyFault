@@ -16,6 +16,8 @@ from notmyfault.core.data_types import DataTypeError, type_at_path
 from notmyfault.core.condition_program import MatcherSpec, build_matcher
 from notmyfault.core.rules import iter_action_nodes
 from notmyfault.core.value_codec import encode_value
+from notmyfault.values import plain_value
+from notmyfault.core.run_context import context_sources
 
 
 def _immutable(*args, **kwargs):
@@ -55,7 +57,7 @@ def thaw(value):
 
 
 def digest(value) -> str:
-    encoded = json.dumps(encode_value(value), sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    encoded = json.dumps(encode_value(plain_value(value)), sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -81,7 +83,7 @@ class Step:
     index: int
     location: str
     action: FrozenDict
-    needs_sensitive_tracking: bool
+    context_sources: tuple[tuple[str, str | None], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,8 +130,7 @@ def compile_rule(rule, template, triggers_meta, actions_meta, event_types, regis
         static_type = _reference_type(root, path, registry)
         variants = {name: _reference_type(schema, path, registry) for name, schema in event_types.items() if name in by_event} if scope == "event" else {}
         references[id(ref)] = ReferenceAccessor(scope, node, path, freeze(static_type), MappingProxyType(variants))
-    plan = tuple(Step(action["binding_id"], index, location, action,
-                      bool(template.get("_sensitive_sources")) or any(field.get("sensitive") for field in actions_meta.get(action["type"], {}).get("outputs", []) if isinstance(field, dict)))
+    plan = tuple(Step(action["binding_id"], index, location, action, context_sources(action.get("params", {})))
                  for index, (action, location) in enumerate(iter_action_nodes(source.get("actions", []))))
     plugin_ids = {("trigger", leaf["type"]) for leaf in leaves} | {("action", step.action["type"]) for step in plan if step.action["type"] not in {"if", "set_variable"}}
     plugins = {kind + ":" + name: ((plugin_digests or {}).get(kind + ":" + name) or digest((triggers_meta if kind == "trigger" else actions_meta).get(name, {}))) for kind, name in plugin_ids}

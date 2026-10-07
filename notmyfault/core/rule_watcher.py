@@ -17,7 +17,7 @@ class FileStamp:
 
 class RuleWatcher:
     def __init__(self, path, load, apply, *, clock: Clock | None = None,
-                 debounce: float = 0.3, poll_interval: float = 0.1, on_error=None,
+                 debounce: float = 0.3, poll_interval: float = 0.25, on_error=None,
                  verify_interval: float = 1.0) -> None:
         self._path = path
         self._load = load

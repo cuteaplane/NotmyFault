@@ -143,7 +143,7 @@ class TestConditionRuntime:
         assert len(dispatched) == 1
         assert dispatched[0][3]["event"]["type"] == "absence"
         assert dispatched[0][3]["triggers"] == {}
-        dispatched[0][3]["variables"]["v_values01"].append(2)
+        dispatched[0][3]["variables"]["v_values01"] = [1, 2]
         monkeypatch.setattr("notmyfault.core.clock.time.monotonic", lambda: 20)
         engine.emit_event("signal", {"channel": "a"})
         engine._event_bus.process_timers(now=30)

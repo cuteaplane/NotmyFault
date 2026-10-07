@@ -5,10 +5,12 @@ from __future__ import annotations
 import copy
 import re
 from dataclasses import dataclass
+from collections.abc import Mapping
 from typing import Any, Dict, Iterable, Tuple
 
 from notmyfault.core.data_types import DataTypeError, infer_type, is_custom_type, normalize_type, type_at_path
 from notmyfault.core.value_conversion import convert_value
+from notmyfault.values import Blob, Secret, contains_secret, hold_value, plain_value, protect, secret_value
 
 
 _LEGACY_TEMPLATE = re.compile(r"{{\s*([a-zA-Z_][\w.]*)\s*}}")
@@ -162,7 +164,11 @@ def _read_reference(
 ) -> Any:
     accessor = context.get("_compiled_refs", {}).get(id(reference))
     current, path = _reference_root(reference, context, location, accessor.path if accessor is not None else None)
+    sensitive = False
     for segment in path:
+        if isinstance(current, Secret):
+            sensitive = True
+            current = secret_value(current)
         if isinstance(current, dict) and is_custom_type(current.get("$type")):
             registry = context.get("_type_registry")
             definition = registry.definition(current["$type"]) if registry is not None else None
@@ -174,7 +180,7 @@ def _read_reference(
             current = current[segment]
         else:
             return _MISSING
-    return current
+    return protect(current) if sensitive and current is not _MISSING else current
 
 
 def resolve_reference(reference, context, *, location):
@@ -192,7 +198,7 @@ def resolve_reference(reference, context, *, location):
             current = registry.binding_value(current)
         except DataTypeError as error:
             raise BindingResolutionError(error.code, location, reference, str(error)) from error
-    return copy.deepcopy(current)
+    return hold_value(current)
 
 
 def expression_type(value, context):
@@ -220,16 +226,20 @@ def expression_type(value, context):
 
 def _lookup_legacy(context: Dict[str, Any], dotted_path: str) -> Any:
     current: Any = context
+    sensitive = False
     for segment in dotted_path.split("."):
+        if isinstance(current, Secret):
+            sensitive = True
+            current = secret_value(current)
         if (
             not _SEGMENT_RE.fullmatch(segment)
             or segment.startswith("_")
-            or not isinstance(current, dict)
+            or not isinstance(current, Mapping)
             or segment not in current
         ):
             return _MISSING
         current = current[segment]
-    return current
+    return protect(current) if sensitive else current
 
 
 def resolve_value(
@@ -251,11 +261,13 @@ def resolve_value(
             raise BindingResolutionError("invalid_conversion", location, None, "$convert 需要 value 和 to")
         try:
             source = conversion.get("from") or expression_type(conversion["value"], context)
-            return convert_value(
-                resolve_value(conversion["value"], context, location=f"{location}.$convert.value"),
+            resolved = resolve_value(conversion["value"], context, location=f"{location}.$convert.value")
+            converted = convert_value(
+                plain_value(resolved),
                 conversion["to"], context.get("_type_registry"), source=source,
                 options=conversion.get("options"), location=location,
             )
+            return protect(converted) if contains_secret(resolved) else converted
         except DataTypeError as error:
             raise BindingResolutionError(error.code, error.location, None, str(error)) from error
     if isinstance(value, dict) and set(value) == {"$template"}:
@@ -263,12 +275,17 @@ def resolve_value(
         if not isinstance(parts, list):
             raise BindingResolutionError("invalid_template", location, None, "$template 必须是文本和数据引用组成的数组")
         text = []
+        sensitive = False
         for index, part in enumerate(parts):
             resolved = resolve_value(part, context, location=f"{location}.$template[{index}]")
+            sensitive = sensitive or isinstance(resolved, Secret)
+            resolved = secret_value(resolved)
+            if isinstance(resolved, Blob) and resolved.type == "text":
+                resolved = resolved.text()
             if not isinstance(resolved, str):
                 raise BindingResolutionError("binding_type_mismatch", location, None, "拼接项必须为文本，其他类型需要显式转换")
             text.append(resolved)
-        return "".join(text)
+        return protect("".join(text)) if sensitive else "".join(text)
     if isinstance(value, dict):
         return {
             key: resolve_value(item, context, location=f"{location}.{key}")
@@ -292,9 +309,12 @@ def resolve_value(
                 {"legacy": full.group(1)},
                 f"运行数据不存在: {full.group(1)}",
             )
-        return copy.deepcopy(resolved)
+        return hold_value(resolved)
+
+    sensitive = False
 
     def replace(match: re.Match[str]) -> str:
+        nonlocal sensitive
         resolved = _lookup_legacy(context, match.group(1))
         if resolved is _MISSING:
             raise BindingResolutionError(
@@ -303,9 +323,12 @@ def resolve_value(
                 {"legacy": match.group(1)},
                 f"运行数据不存在: {match.group(1)}",
             )
-        return str(resolved)
+        sensitive = sensitive or isinstance(resolved, Secret)
+        resolved = secret_value(resolved)
+        return resolved.text() if isinstance(resolved, Blob) and resolved.type == "text" else str(resolved)
 
-    return _LEGACY_TEMPLATE.sub(replace, value)
+    text = _LEGACY_TEMPLATE.sub(replace, value)
+    return protect(text) if sensitive else text
 
 
 def iter_references(value: Any, *, location: str = "$") -> Iterable[BindingUsage]:

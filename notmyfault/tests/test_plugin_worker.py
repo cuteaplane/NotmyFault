@@ -511,3 +511,40 @@ class TestLoaderIsolatedMode:
         assert loader.materialize_pending_action("iso_action") is not None
         result = func_store["iso_action"]({}, {})
         assert result["platform"] in {"windows", "linux", "macos"}
+
+
+def test_isolated_worker_keeps_wrappers_and_hides_private_context(tmp_path):
+    from notmyfault.values import Blob, Secret, plain_value
+    from notmyfault.core.workflow import invoke_action
+
+    entry = write_action(tmp_path, "wrapped_values", """
+from notmyfault.plugin_api import Blob, Secret
+
+def run(meta, params):
+    raise RuntimeError("需要上下文入口")
+
+def run_with_context(meta, params, context):
+    assert isinstance(params['token'], Secret)
+    assert isinstance(params['body'], Blob)
+    assert not any(key.startswith('_') for key in context)
+    assert 'manual_test' not in context
+    return {'value': params['token'].reveal(), 'size': params['body'].size}
+""")
+    meta = {'execution_api': 'context-v1', 'execution_mode': 'isolated', 'params': [
+        {'name': 'token', 'type': 'text', 'sensitive': True}, {'name': 'body', 'type': 'bytes'}],
+        'outputs': [{'name': 'value', 'type': 'text'}, {'name': 'size', 'type': 'int'}]}
+
+    def proxy(meta, params):
+        pytest.fail("需要上下文入口")
+
+    def context_proxy(meta, params, context):
+        ok, result = run_isolated_action(entry, meta, params, context)
+        assert ok
+        return result
+
+    proxy._isolated_proxy = True
+    proxy.run_with_context = context_proxy
+    result = invoke_action(proxy, None, meta, {'token': Secret('token-value'), 'body': Blob(b'x' * (2 * 1024 * 1024))},
+                           {'run': {'id': 'run_worker_wrapped'}, '_hidden': 'private', 'manual_test': {'assertions': []}})
+    assert isinstance(result, Secret)
+    assert plain_value(result) == {'value': 'token-value', 'size': 2 * 1024 * 1024}

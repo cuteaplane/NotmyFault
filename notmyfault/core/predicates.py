@@ -4,12 +4,14 @@ from decimal import Decimal
 from typing import Any
 
 from notmyfault.core.bindings import BindingResolutionError, references_available, resolve_value
+from notmyfault.values import plain_value
 
 
 COMPARISON_OPERATORS = {"eq", "ne", "gt", "gte", "lt", "lte", "contains", "is_true", "is_false"}
 
 
 def values_equal(left: Any, right: Any) -> bool:
+    left, right = plain_value(left), plain_value(right)
     if isinstance(left, bool) or isinstance(right, bool):
         return isinstance(left, bool) and isinstance(right, bool) and left is right
     if isinstance(left, list) or isinstance(right, list):
@@ -68,7 +70,7 @@ def evaluate_predicate(node: dict, context: dict, path: str = "condition") -> bo
         value = node[key]
         if not references_available(value, context):
             raise BindingResolutionError("missing_binding_value", f"{path}.{key}", value, "判断条件引用的数据未参与本次运行")
-        return resolve_value(value, context, location=f"{path}.{key}")
+        return plain_value(resolve_value(value, context, location=f"{path}.{key}"))
 
     left = operand("left")
     if op in ("is_true", "is_false") and not isinstance(left, bool):

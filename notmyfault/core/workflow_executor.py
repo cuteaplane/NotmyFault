@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import sys
 import threading
 import time
@@ -18,9 +17,10 @@ from notmyfault.core.bindings import (
     unavailable_references,
 )
 from notmyfault.core.binding_schema import prepare_binding_context
-from notmyfault.core.data_types import DataTypeError
-from notmyfault.core.variables import assign_variable, expression_is_sensitive
+from notmyfault.core.data_types import DataTypeError, normalize_fields
+from notmyfault.core.variables import assign_variable
 from notmyfault.core.diagnostics import Diagnostics
+from notmyfault.core.clock import SystemClock
 from notmyfault.core.predicates import evaluate_predicate, values_equal
 from notmyfault.core.logging import engine_error
 from notmyfault.core.run_manager import RunOutcome
@@ -31,6 +31,8 @@ from notmyfault.core.workflow import (
     build_context,
     invoke_action,
 )
+from notmyfault.values import allow_secrets, action_values, contains_secret, hold_value, plain_value, secret_value
+from notmyfault.core.run_context import RunState, referenced_context
 from notmyfault.security.errors import AdminExecutionBlocked
 from notmyfault.security.plugin_schema import literal_only_params
 
@@ -39,75 +41,9 @@ MappingProvider = Callable[[], Dict[str, Any]]
 ActionResolver = Callable[[str], Optional[Callable[..., Any]]]
 ShutdownProvider = Callable[[], "threading.Event | None"]
 EventSink = Callable[[str, Dict[str, Any]], None]
-SensitiveProvider = Callable[[Dict[str, Any]], set]
 _MISSING = object()
 def _run_id(context: Dict[str, Any]) -> str:
     return str(context.get("run", {}).get("id", ""))
-
-
-def _mask_sensitive(value: Any, sensitive_values: set) -> Any:
-    """把结构里的敏感字符串换成掩码，只用于事件推送"""
-    if isinstance(value, str):
-        masked = value
-        for secret in sorted(sensitive_values, key=len, reverse=True):
-            if secret:
-                masked = masked.replace(secret, "***")
-        return masked
-    if isinstance(value, dict):
-        return {
-            key: _mask_sensitive(item, sensitive_values)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_mask_sensitive(item, sensitive_values) for item in value]
-    return value
-
-
-def _mask_declared_outputs(result: Any, outputs: Any) -> Any:
-    """把插件声明为 sensitive 的顶层输出换成掩码"""
-    if not isinstance(result, dict) or not isinstance(outputs, list):
-        return result
-    sensitive_names = {
-        output.get("name")
-        for output in outputs
-        if isinstance(output, dict) and output.get("sensitive") is True
-    }
-    if not sensitive_names:
-        return result
-    masked = dict(result)
-    for name in sensitive_names:
-        if name in masked:
-            masked[name] = "***"
-    return masked
-
-
-def _string_values(value: Any) -> set[str]:
-    if isinstance(value, str):
-        return {value} if value else set()
-    if isinstance(value, dict):
-        result = set()
-        for item in value.values():
-            result.update(_string_values(item))
-        return result
-    if isinstance(value, list):
-        result = set()
-        for item in value:
-            result.update(_string_values(item))
-        return result
-    return set()
-
-
-def _declared_sensitive_values(value: Any, definitions: Any) -> set[str]:
-    if not isinstance(value, dict) or not isinstance(definitions, list):
-        return set()
-    result = set()
-    for spec in definitions:
-        if not isinstance(spec, dict) or spec.get("sensitive") is not True:
-            continue
-        name = spec.get("name")
-        if isinstance(name, str) and name in value:
-            result.update(_string_values(value[name]))
-    return result
 
 
 def _assertion_value(context: Dict[str, Any], assertion: Dict[str, Any]) -> Any:
@@ -116,6 +52,7 @@ def _assertion_value(context: Dict[str, Any], assertion: Dict[str, Any]) -> Any:
         return _MISSING
     current = step.get("result", _MISSING)
     for segment in assertion.get("path", []):
+        current = secret_value(current)
         if isinstance(current, list) and isinstance(segment, int) and not isinstance(segment, bool) and 0 <= segment < len(current):
             current = current[segment]
             continue
@@ -130,6 +67,7 @@ def _assertion_matches(actual: Any, operator: str, expected: Any) -> bool:
         return actual is not _MISSING
     if actual is _MISSING:
         return False
+    actual, expected = plain_value(actual), plain_value(expected)
     if operator == "equals":
         return values_equal(actual, expected)
     if operator == "contains":
@@ -169,6 +107,7 @@ class PreparedAction:
     params: dict
     module: Any
     timeout_seconds: float | None
+    context_sources: tuple | None = None
 
 
 class WorkflowExecutor:
@@ -184,8 +123,8 @@ class WorkflowExecutor:
         shutdown_event: ShutdownProvider,
         on_event: EventSink,
         action_resolver: Optional[ActionResolver] = None,
-        sensitive_values: Optional[SensitiveProvider] = None,
         triggers_meta: Optional[MappingProvider] = None,
+        clock=None,
     ) -> None:
         self._actions_meta = actions_meta
         self._triggers_meta = triggers_meta or (lambda: {})
@@ -195,7 +134,7 @@ class WorkflowExecutor:
         self._diagnostics = diagnostics
         self._shutdown_event = shutdown_event
         self._on_event = on_event
-        self._sensitive_values = sensitive_values
+        self._clock = clock or SystemClock()
 
         self._active_actions = 0
         self.action_lock = threading.Lock()
@@ -241,15 +180,11 @@ class WorkflowExecutor:
         with self.action_lock:
             return self._active_actions
 
-    def _masked_event_value(self, value: Any, context: Dict[str, Any]) -> Any:
-        if self._sensitive_values is None:
-            return value
-        hidden = self._sensitive_values(context)
-        return _mask_sensitive(value, hidden) if hidden else value
-
     def execute_workflow(
         self, workflow_key: str, rule: Dict[str, Any], rule_name: str, context: Dict[str, Any],
     ) -> RunOutcome:
+        if isinstance(context, RunState):
+            context.prepare()
         if context.get("_preparation_error"):
             return RunOutcome("failed", {"failure_kind": "binding"}, context["_preparation_error"])
         run_cancel_event = self._ensure_run_cancel_event(context)
@@ -429,7 +364,7 @@ class WorkflowExecutor:
                     and result.reason != "timeout"
                 ):
                     run_cancel_event.set()
-            context["steps"][step_id] = record
+            context["steps"][step_id] = hold_value(record)
             if (
                 not ok
                 and run_failure_actions
@@ -464,13 +399,10 @@ class WorkflowExecutor:
             value = assign_variable(action.get("variable"), action.get("value"), context)
             result = {"value": value}
             context["steps"][step_id] = {"type": "set_variable", "status": "ok", "result": result, "error": None}
-            sensitive = bool(context.get("_sensitive_sources", {}).get("variable", {}).get(action.get("variable")))
-            if sensitive:
-                context.setdefault("_sensitive_sources", {}).setdefault("step", {})[step_id] = [["value"]]
-            self._on_event("run.step.succeeded", {**event, "status": "ok", "result": {"value": "***"} if sensitive else result})
+            self._on_event("run.step.succeeded", {**event, "status": "ok", "result": result})
             return True
         except (DataTypeError, BindingResolutionError) as error:
-            message = self._masked_event_value(str(error), context)
+            message = str(error)
             context["steps"][step_id] = {"type": "set_variable", "status": "failed", "result": None, "error": message}
             self._on_event("run.step.failed", {**event, "error": {
                 "code": error.code, "location": error.location, "message": message,
@@ -504,7 +436,7 @@ class WorkflowExecutor:
             })
             return succeeded
         except (BindingResolutionError, ValueError, TypeError) as error:
-            message = self._masked_event_value(str(error), context)
+            message = str(error)
             context["steps"][step_id] = {
                 "type": "if", "status": "failed", "result": None, "error": message,
             }
@@ -613,6 +545,10 @@ class WorkflowExecutor:
 
         actions_meta = self._action_metadata(context)
         action_meta = actions_meta.get(action_type, {})
+        try:
+            params = hold_value(normalize_fields(params, action_meta.get("params"), context.get("_type_registry"), parameters=True, wrap_sensitive=True))
+        except DataTypeError as error:
+            raise ActionPreparationError(str(error)) from error
         timeout_seconds = None
         if action.get("timeout_seconds") is not None:
             if action_meta.get("cancellation_api") != "runtime-v1":
@@ -627,11 +563,13 @@ class WorkflowExecutor:
         module = (plugins.modules if plugins is not None else self._plugin_modules()).get(action_type)
         if module is not None and hasattr(module, "validate_params"):
             try:
-                validation_errors = module.validate_params(
-                    actions_meta.get(action_type, {}), params
-                )
+                declared = {field.get("name") if isinstance(field, dict) else field for field in action_meta.get("params", [])}
+                with allow_secrets({name: value for name, value in params.items() if name in declared}):
+                    validation_errors = module.validate_params(
+                        actions_meta.get(action_type, {}), action_values(params)
+                    )
                 if validation_errors:
-                    message = self._masked_event_value("; ".join(map(str, validation_errors)), context)
+                    message = "插件参数校验失败" if contains_secret(params) else "; ".join(map(str, validation_errors))
                 else:
                     message = ""
             except Exception:
@@ -648,17 +586,18 @@ class WorkflowExecutor:
                 })
                 raise ActionPreparationError(message)
 
+        compiled = context.get("_compiled_rule")
+        index = compiled.step_index.get(action.get("binding_id")) if compiled is not None else None
+        sources = compiled.plan[index].context_sources if index is not None else None
         return PreparedAction(
             action_type, action_func, action_meta, raw_params, params, module, timeout_seconds,
+            sources,
         )
 
     def _invoke_action_once(self, prepared, context, cancellation):
         cancellation.raise_if_cancelled()
-        action_context = {key: copy.deepcopy(value) for key, value in context.items() if not key.startswith("_")}
-        action_context["_type_registry"] = context.get("_type_registry")
-        runtime = dict(action_context.get("runtime", {}))
-        runtime["cancellation"] = cancellation
-        action_context["runtime"] = runtime
+        context["runtime"] = {"cancellation": cancellation}
+        action_context = referenced_context(context, prepared.raw_params, sources=prepared.context_sources) if prepared.meta.get("execution_mode") == "isolated" else context
         result = invoke_action(
             prepared.action_func, prepared.module, prepared.meta, prepared.params, action_context
         )
@@ -667,54 +606,19 @@ class WorkflowExecutor:
 
     def _record_action_success(
         self, prepared, action, rule_name, context, result,
-        sensitive_params, input_summary, attempt, started,
+        input_summary, attempt, started,
     ):
-        action_type = prepared.action_type
-        action_meta = prepared.meta
-        params = prepared.params
-        if sensitive_params:
-            context.setdefault("_sensitive_sources", {}).setdefault("step", {})[action.get("binding_id") or action_type] = [[]]
         self._diagnostics.inc_action_ok()
-        if self._sensitive_values is not None:
-            hidden = self._sensitive_values(context)
-            hidden.update(
-                _declared_sensitive_values(
-                    params, action_meta.get("params")
-                )
-            )
-            event_params = (
-                _mask_sensitive(params, hidden) if hidden else params
-            )
-        else:
-            event_params = params
-        if sensitive_params:
-            event_params = {name: "***" if name in sensitive_params else value for name, value in event_params.items()}
-        output_definitions = action_meta.get("outputs")
-        if sensitive_params:
-            output_definitions = [{"name": name, "sensitive": True, "summary": "hidden"} for name in result] if isinstance(result, dict) else []
-        self._on_event(
-            "run.step.succeeded",
-            {
-                "action_type": action_type,
-                "params": event_params,
-                "rule_id": context.get("rule", {}).get("id", ""),
-                "run_id": _run_id(context),
-                "rule_name": rule_name,
-                "step_id": action.get("binding_id") or action_type,
-                "status": "ok",
-                "input_summary": input_summary,
-                "output_summary": summarize_fields(
-                    result, output_definitions
-                ),
-                "result": "***" if sensitive_params else _mask_declared_outputs(
-                    result, action_meta.get("outputs")
-                ),
-                "attempt": attempt + 1,
-                "duration_ms": round(
-                    (time.perf_counter() - started) * 1000
-                ),
-            },
-        )
+        self._on_event("run.step.succeeded", {
+            "action_type": prepared.action_type, "params": prepared.params,
+            "rule_id": context.get("rule", {}).get("id", ""),
+            "run_id": _run_id(context), "rule_name": rule_name,
+            "step_id": action.get("binding_id") or prepared.action_type,
+            "status": "ok", "input_summary": input_summary,
+            "output_summary": summarize_fields(result, prepared.meta.get("outputs")),
+            "result": result, "attempt": attempt + 1,
+            "duration_ms": round((time.perf_counter() - started) * 1000),
+        })
 
     def _record_action_cancelled(self, action, rule_name, context, exc, input_summary, attempt, started):
         action_type = action.get("type")
@@ -812,25 +716,20 @@ class WorkflowExecutor:
 
         attempt = 0
         try:
-            sensitive_params = {name for name, value in raw_params.items() if expression_is_sensitive(value, context)}
-            input_definitions = [
-                {**field, "sensitive": True, "summary": "hidden"} if isinstance(field, dict) and field.get("name") in sensitive_params else field
-                for field in action_meta.get("params", [])
-            ]
-            input_summary = summarize_fields(params, input_definitions)
+            input_summary = summarize_fields(params, action_meta.get("params"))
             retries = min(max(int(action.get("retry", 0) or 0), 0), 3)
             delay = min(
                 max(float(action.get("retry_delay_seconds", 0) or 0), 0),
                 3600,
             )
             backoff = action.get("retry_backoff", "fixed")
-            cancellation = ActionCancellation(self._ensure_run_cancel_event(context), self._shutdown_event(), prepared.timeout_seconds)
+            cancellation = ActionCancellation(self._ensure_run_cancel_event(context), self._shutdown_event(), prepared.timeout_seconds, clock=self._clock)
             for attempt in range(retries + 1):
                 try:
                     result = self._invoke_action_once(prepared, context, cancellation)
                     self._record_action_success(
                         prepared, action, rule_name, context, result,
-                        sensitive_params, input_summary, attempt, started,
+                        input_summary, attempt, started,
                     )
                     return True, result
                 except AdminExecutionBlocked:

@@ -397,7 +397,7 @@ def test_constants_and_run_variables_have_independent_values_and_atomic_assignme
     initialize_variables(rule, second)
     assert resolve_trigger_constants(rule)["condition"]["params"]["path"] == "D:/results"
     assert "$ref" in rule["condition"]["params"]["path"]
-    value = resolve_value(_ref("variable", "v_values01", []), first)
+    value = list(resolve_value(_ref("variable", "v_values01", []), first))
     value.append(2)
     assign_variable("v_values01", value, first)
     assert first["variables"]["v_values01"] == [1, 2]

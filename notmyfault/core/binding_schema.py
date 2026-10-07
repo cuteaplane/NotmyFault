@@ -8,9 +8,10 @@ from notmyfault.core.bindings import (
 )
 from notmyfault.core.data_types import (
     DataTypeError, field_type, infer_type, normalize_type,
-    normalize_value, type_at_path, types_compatible,
+    normalize_value, normalize_fields, type_at_path, types_compatible,
 )
 from notmyfault.core.type_registry import TypeRegistry
+from notmyfault.values import hold_value
 from notmyfault.core.variables import initialize_variables, variable_definitions
 from notmyfault.security.plugin_schema import literal_only_params
 
@@ -65,18 +66,27 @@ def prepare_binding_context(rule, context, triggers_meta, actions_meta, *, regis
     sources["event"] = output_type(triggers_meta.get(context.get("event", {}).get("type"), {}))
     context["_binding_types"].update(sources)
 
-    def mark(scope, identity, fields):
-        paths = [[field["name"]] for field in fields or [] if isinstance(field, dict) and field.get("sensitive")]
-        if paths:
-            context["_sensitive_sources"].setdefault(scope, {})[identity] = paths
+    protect_context_inputs(context, triggers_meta, registry)
 
-    mark("event", "", triggers_meta.get(context.get("event", {}).get("type"), {}).get("outputs"))
-    for leaf in get_rule_events(rule):
-        meta = triggers_meta.get(leaf.get("type"), {})
-        mark("trigger", leaf.get("binding_id"), meta.get("outputs"))
-        mark("trigger_config", leaf.get("binding_id"), meta.get("params"))
-    for action, _location in iter_action_nodes(rule.get("actions", [])):
-        mark("step", action.get("binding_id"), actions_meta.get(action.get("type"), {}).get("outputs"))
+
+def protect_context_inputs(context, triggers_meta, registry=None):
+    event = context.get("event", {})
+    manual = context.get("manual_test")
+    fields = triggers_meta.get(event.get("type"), {}).get("outputs")
+    if manual is not None:
+        names = {field["name"] for trigger in context.get("triggers", {}).values()
+                 for field in triggers_meta.get(trigger.get("type"), {}).get("outputs", [])
+                 if isinstance(field, dict) and field.get("sensitive") and "name" in field}
+        fields = [{"name": name, "type": "any", "sensitive": True} for name in names]
+    event["payload"] = hold_value(normalize_fields(event.get("payload", {}), fields, registry, wrap_sensitive=True, partial=manual is not None))
+    for identity, trigger in context.get("triggers", {}).items():
+        meta = triggers_meta.get(trigger.get("type"), {})
+        fields = meta.get("outputs")
+        if manual is not None and identity not in manual.get("provided_trigger_ids", ()):
+            fields = []
+        trigger["payload"] = hold_value(normalize_fields(trigger.get("payload", {}), fields, registry, wrap_sensitive=True))
+        config = context.get("_trigger_configs", {}).get(identity, trigger.get("config", {}))
+        trigger["config"] = hold_value(normalize_fields(config, meta.get("params"), registry, parameters=True, wrap_sensitive=True))
 
 
 def check_rule_bindings(rule, triggers_meta, actions_meta):

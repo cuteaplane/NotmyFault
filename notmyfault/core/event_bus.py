@@ -1,4 +1,5 @@
 import sys
+import logging
 import threading
 import uuid
 from collections import deque
@@ -6,8 +7,10 @@ from typing import Any, Callable, Dict, Optional
 
 from notmyfault.core.logging import engine_error, engine_warn
 from notmyfault.core.bindings import BindingResolutionError
-from notmyfault.core.data_types import DataTypeError
+from notmyfault.values import hold_value
+from notmyfault.core.data_types import DataTypeError, normalize_fields
 from notmyfault.core.workflow import build_context
+from notmyfault.core.run_context import RunState
 from notmyfault.core.runtime_rules import PreparedRules, rule_key
 from notmyfault.core.conditions import config_fingerprint
 
@@ -15,6 +18,7 @@ from notmyfault.core.conditions import config_fingerprint
 _MAX_RUN_CHAIN = 16
 # 记住多少条已发起运行的深度，够覆盖同时在跑的链条
 _RUN_DEPTH_MEMORY = 512
+_logger = logging.getLogger(__name__)
 
 
 class EventBus:
@@ -58,14 +62,15 @@ class EventBus:
             print(f"[EventBus] Engine正在关闭，忽略事件: [{event_type}]")
             return
 
-        semantic = self._triggers_meta_fn().get(event_type, {}).get("semantic", "oneshot")
-        # 声明 sensitive 的输出字段不写明文，日志和事件推送都用掉过掩码的副本
-        masked_payload = self._mask_event_payload(event_type, event_payload)
-        print(
-            f"[EventBus] 收到广播事件: [{event_type}] ({semantic}) -> {masked_payload}"
-        )
+        initial_snapshot = self._snapshot_fn()
+        meta = self._triggers_meta_fn().get(event_type, {})
+        semantic = meta.get("semantic", "oneshot")
+        event_payload = hold_value(normalize_fields(
+            event_payload, meta.get("outputs"), initial_snapshot.registry, wrap_sensitive=True,
+        ))
+        masked_payload = event_payload
+        _logger.debug("收到事件 %s (%s): %r", event_type, semantic, masked_payload)
 
-        self._snapshot_fn()
         depth = self._chain_depth(event_payload)
         if instance is not None and not instance.get("fingerprint"):
             instance = {**instance, "fingerprint": config_fingerprint(instance.get("config"))}
@@ -165,7 +170,7 @@ class EventBus:
             return
         run_id = f"run_{uuid.uuid4().hex}"
         self._remember_run_depth(run_id, depth)
-        print(f"[EventBus] [OK] 匹配到规则: <{rule_name}>, 准备分发动作！")
+        _logger.debug("匹配规则 %s", rule_name)
         self._safe_on_event(
             "run.triggered",
             {
@@ -177,18 +182,17 @@ class EventBus:
                 "event_payload": masked_payload,
             },
         )
-        context = build_context(
-            rule_name,
-            event_type,
-            event_payload,
-            matched_events,
-            rule_id,
-            run_id,
-        )
-        try:
-            snapshot.prepare_context(rule, context)
-        except (DataTypeError, BindingResolutionError) as error:
-            context["_preparation_error"] = error.as_dict()
+        context = RunState({"rule": {"id": rule_id, "name": rule_name}, "run": {"id": run_id},
+                            "_generation": snapshot.generation, "_compiled_rule": snapshot.compiled[key]})
+
+        def prepare(state):
+            state.update(build_context(rule_name, event_type, event_payload, matched_events, rule_id, run_id))
+            try:
+                snapshot.prepare_context(rule, state)
+            except (DataTypeError, BindingResolutionError) as error:
+                state["_preparation_error"] = error.as_dict()
+
+        context.defer_preparation(prepare)
         if self._scheduler_submit_fn is not None:
             self._scheduler_submit_fn(key, rule, rule_name, context)
         else:
@@ -202,74 +206,3 @@ class EventBus:
             engine_warn("忽略格式无效的外部事件")
             return
         self.emit_event(event_type, event_payload)
-
-    def _mask_event_payload(
-        self, event_type: str, payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """把触发器 outputs 声明 sensitive 的字段换成掩码再对外输出"""
-        outputs = self._triggers_meta_fn().get(event_type, {}).get("outputs") or []
-        sensitive_names = {
-            output.get("name")
-            for output in outputs
-            if isinstance(output, dict) and output.get("sensitive") is True
-        }
-        if not sensitive_names or not isinstance(payload, dict):
-            return payload
-        masked = dict(payload)
-        for name in sensitive_names:
-            if name in masked:
-                masked[name] = "***"
-        return masked
-
-    def _collect_sensitive_values(self, context: Dict[str, Any]) -> set:
-        """收集上下文里声明 sensitive 的字段当前值，用于掩码动作参数"""
-        generation = context.get("_generation")
-        plugins = context.get("_plugins") or (generation.plugins if generation is not None else None)
-        triggers_meta = plugins.triggers_meta if plugins is not None else self._triggers_meta_fn()
-        actions_meta = plugins.actions_meta if plugins is not None else self._actions_meta_fn()
-        values: set = set()
-
-        def add_strings(value: Any) -> None:
-            if isinstance(value, str):
-                if value:
-                    values.add(value)
-            elif isinstance(value, dict):
-                for item in value.values():
-                    add_strings(item)
-            elif isinstance(value, list):
-                for item in value:
-                    add_strings(item)
-
-        def collect(meta: Dict[str, Any], payload: Any) -> None:
-            if not isinstance(payload, dict):
-                return
-            for output in meta.get("outputs") or []:
-                if not isinstance(output, dict) or output.get("sensitive") is not True:
-                    continue
-                value = payload.get(output.get("name"))
-                add_strings(value)
-
-        event = context.get("event") or {}
-        collect(
-            triggers_meta.get(event.get("type", ""), {}),
-            event.get("payload"),
-        )
-        for trigger in (context.get("triggers") or {}).values():
-            if isinstance(trigger, dict):
-                collect(
-                    triggers_meta.get(trigger.get("type", ""), {}),
-                    trigger.get("payload"),
-                )
-        for step in (context.get("steps") or {}).values():
-            if isinstance(step, dict):
-                collect(
-                    actions_meta.get(step.get("type", ""), {}),
-                    step.get("result"),
-                )
-        for scope, bucket in (("constant", "constants"), ("variable", "variables")):
-            marked = context.get("_sensitive_sources", {}).get(scope, {})
-            for identity in marked:
-                add_strings(context.get(bucket, {}).get(identity))
-        for identity in context.get("_sensitive_sources", {}).get("step", {}):
-            add_strings(context.get("steps", {}).get(identity, {}).get("result"))
-        return values

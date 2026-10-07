@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from collections.abc import Mapping
 
 from notmyfault.core.data_types import DataTypeError, copy_value
 from notmyfault.core.value_codec import decode_value, encode_value
@@ -14,8 +15,8 @@ STARTUP_TIMEOUT = 10.0
 EXECUTE_TIMEOUT = 120.0
 EXIT_TIMEOUT = 5.0
 PROTOCOL_VERSION = 1
-MAX_PROTOCOL_LINE = 1024 * 1024
-MAX_EXTENSION_PROTOCOL_LINE = 4 * MAX_PROTOCOL_LINE
+MAX_PROTOCOL_LINE = 32 * 1024 * 1024
+MAX_EXTENSION_PROTOCOL_LINE = 4 * 1024 * 1024
 MAX_STDERR_CHUNK = 64 * 1024
 _WORKER_MAIN = Path(__file__).resolve().with_name("plugin_worker_main.py")
 _PROJECT_ROOT = _WORKER_MAIN.parents[2]
@@ -50,7 +51,7 @@ def set_crash_callback(callback) -> None:
 def _sanitize_context(context):
     """上下文顶层的内部键不进入 worker，业务对象保留原字段名。"""
     def clean(value):
-        if isinstance(value, dict):
+        if isinstance(value, Mapping):
             return {
                 key: clean(item)
                 for key, item in value.items()
@@ -62,7 +63,7 @@ def _sanitize_context(context):
         except DataTypeError:
             return repr(value)
 
-    return clean({key: value for key, value in context.items() if not str(key).startswith("_")})
+    return clean({key: value for key, value in context.items() if not str(key).startswith("_") and key not in {"manual_test", "runtime"}})
 
 
 def _stop_process(process: subprocess.Popen) -> None:
@@ -339,8 +340,11 @@ def _drive(process, messages, request, execute_timeout):
     try:
         if process.stdin is None:
             raise OSError("stdin unavailable")
-        wire_request = encode_value(request) if request.get("value_encoding") == "typed-v1" else request
-        process.stdin.write(json.dumps(wire_request, ensure_ascii=False, allow_nan=False) + "\n")
+        wire_request = encode_value(request, _transport=True) if request.get("value_encoding") == "typed-v1" else request
+        line = json.dumps(wire_request, ensure_ascii=False, allow_nan=False) + "\n"
+        if len(line) > MAX_PROTOCOL_LINE:
+            raise ValueError("worker 请求超过大小限制")
+        process.stdin.write(line)
         process.stdin.flush()
         process.stdin.close()
     except (OSError, ValueError):
@@ -359,7 +363,7 @@ def _drive(process, messages, request, execute_timeout):
         result = payload.get("result")
         if payload.get("value_encoding") == "typed-v1":
             try:
-                result = decode_value(result)
+                result = decode_value(result, _transport=True)
             except DataTypeError:
                 _fail_protocol(process, "worker 返回的数据编码无效")
         return True, result

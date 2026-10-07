@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -10,6 +11,11 @@ from types import MappingProxyType
 from typing import Any, Callable
 
 from notmyfault.core.clock import Clock, SystemClock
+from notmyfault.values import Blob, FrozenDict, FrozenList, Secret
+
+
+_frozen_values = {}
+_frozen_values_lock = threading.RLock()
 
 
 class EventType(StrEnum):
@@ -52,6 +58,27 @@ RUN_TERMINAL_EVENTS = frozenset({EventType.RUN_SUCCEEDED, EventType.RUN_FAILED,
 
 
 def _freeze(value: Any) -> Any:
+    if isinstance(value, Secret):
+        return "***"
+    if isinstance(value, Blob):
+        return _freeze(value.descriptor())
+    if isinstance(value, (FrozenDict, FrozenList)):
+        identity = id(value)
+        with _frozen_values_lock:
+            cached = _frozen_values.get(identity)
+            if cached is not None and cached[0]() is value:
+                return cached[1]
+            result = (MappingProxyType({str(key): _freeze(item) for key, item in value.items()})
+                      if isinstance(value, FrozenDict) else tuple(_freeze(item) for item in value))
+
+            def discard(reference):
+                with _frozen_values_lock:
+                    previous = _frozen_values.get(identity)
+                    if previous is not None and previous[0] is reference:
+                        _frozen_values.pop(identity, None)
+
+            _frozen_values[identity] = (weakref.ref(value, discard), result)
+            return result
     if isinstance(value, Mapping):
         return MappingProxyType({str(key): _freeze(item) for key, item in value.items()})
     if isinstance(value, (list, tuple, set, frozenset)):

@@ -45,6 +45,7 @@ from notmyfault.core.bindings import BindingResolutionError
 from notmyfault.core.data_types import DataTypeError, normalize_fields
 from notmyfault.core.type_registry import TypeRegistry
 from notmyfault.core.workflow_executor import WorkflowExecutor
+from notmyfault.values import hold_value
 
 
 class RulesStorePort(Protocol):
@@ -134,9 +135,6 @@ class AutomationEngine:
             boot_id=boot_id(), engine_started_at=self.clock.time(),
             on_failure=self._diag_obj.record_trigger_crash,
         )
-        self._condition_stop = threading.Event()
-        self._condition_wake = threading.Event()
-        self._condition_thread = None
 
         self._start_time: float = 0.0
 
@@ -174,7 +172,7 @@ class AutomationEngine:
             shutdown_event=lambda: self._shutdown_flag,
             on_event=self._safe_on_event,
             action_resolver=self._plugin_registry.resolve_action,
-            sensitive_values=self._collect_sensitive_values,
+            clock=self.clock,
         )
         # 同一规则反复触发时先到这里决定丢弃、排队还是直接跑
         self._run_manager = RunManager(
@@ -182,8 +180,10 @@ class AutomationEngine:
             on_event=self._safe_on_event,
         )
         self._generations = GenerationManager(self._plugins, self._run_manager, self.events, lock=self._rules_lock,
-                                              reconcile=self._trigger_host.reconcile, on_change=self._condition_wake.set,
+                                              reconcile=self._trigger_host.reconcile, on_change=self._trigger_host._wake.set,
                                               clock=self.clock)
+        self._trigger_host.timer_callback = self._event_bus.process_timers
+        self._trigger_host.deadline_callback = self._condition_deadline
         # isolated 动作崩了通过这个回调推 plugin_worker_crashed 事件
         plugin_worker.set_crash_callback(self._safe_on_event)
         # 旧扩展和测试仍直接读取这些同步对象
@@ -462,14 +462,6 @@ class AutomationEngine:
     def call_notmyfault(self, event_data: Dict[str, Any]) -> None:
         self._event_bus.call_notmyfault(event_data)
 
-    def _mask_event_payload(
-        self, event_type: str, payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        return self._event_bus._mask_event_payload(event_type, payload)
-
-    def _collect_sensitive_values(self, context: Dict[str, Any]) -> set:
-        return self._event_bus._collect_sensitive_values(context)
-
     def run_manual_rule(self, rule_index: int) -> tuple[bool, str] | tuple[bool, str, str]:
         """从 Dashboard 立即执行指定规则"""
         with self._rules_lock:
@@ -539,6 +531,7 @@ class AutomationEngine:
             context["_plugins"] = plugins
             context["_compiled_rule"] = compiled
             context["_compiled_refs"] = compiled.references
+            context["_trigger_configs"] = prepared.contexts[rule_id]["_trigger_configs"]
             selected_count = max(0, end_index - start_index + 1) if actions else 0
             context["manual_test"] = {
                 "start_step_id": start_step_id,
@@ -546,6 +539,7 @@ class AutomationEngine:
                 "start_index": start_index,
                 "end_index": end_index,
                 "assertions": copy.deepcopy(test_assertions or []),
+                "provided_trigger_ids": tuple(trigger_payloads or {}),
             }
             if isinstance(step_outputs, dict):
                 for action_index, action in enumerate(actions[:start_index]):
@@ -554,14 +548,21 @@ class AutomationEngine:
                     step_id = action.get("binding_id")
                     if not isinstance(step_id, str) or step_id not in step_outputs:
                         continue
+                    try:
+                        provided = normalize_fields(
+                            step_outputs[step_id], plugins.actions_meta.get(action.get("type"), {}).get("outputs"),
+                            prepared.registry, wrap_sensitive=True, partial=True,
+                        )
+                    except DataTypeError as error:
+                        return False, str(error), run_id
                     record = {
                         "type": action.get("type", "action"),
                         "status": "ok",
-                        "result": copy.deepcopy(step_outputs[step_id]),
+                        "result": provided,
                         "error": None,
                         "provided": True,
                     }
-                    context["steps"][step_id] = record
+                    context["steps"][step_id] = hold_value(record)
             supplied_trigger_payloads = trigger_payloads if isinstance(trigger_payloads, dict) else {}
             context["triggers"] = {
                 event.get("binding_id"): {
@@ -594,7 +595,7 @@ class AutomationEngine:
                 "start_step_id": start_step_id,
                 "end_step_id": end_step_id,
                 "assertion_count": len(test_assertions or []),
-                "event_payload": manual_payload,
+                "event_payload": context["event"]["payload"],
             })
             decision = self._run_manager.submit(rule_id, rule, rule_name, context)
             if decision == "queued":
@@ -720,9 +721,6 @@ class AutomationEngine:
 
             se = self._shutdown_flag
             self._rule_watcher.start()
-            self._condition_stop.clear()
-            self._condition_thread = threading.Thread(target=self._wait_conditions, name="ConditionDeadlines", daemon=True)
-            self._condition_thread.start()
             try:
                 se.wait()
             except KeyboardInterrupt:
@@ -730,16 +728,9 @@ class AutomationEngine:
         finally:
             self._cleanup_runtime()
 
-    def _wait_conditions(self):
-        while not self._condition_stop.is_set():
-            self._condition_wake.clear()
-            self._event_bus.process_timers()
-            with self._rules_lock:
-                runtime = self._get_runtime_snapshot().runtime
-                deadline = runtime.next_deadline()
-                timeout = min(threading.TIMEOUT_MAX, max(0, deadline - runtime.clock.monotonic())) if deadline is not None else None
-            if not self._condition_stop.is_set():
-                runtime.clock.wait(self._condition_wake, timeout)
+    def _condition_deadline(self):
+        with self._rules_lock:
+            return self._get_runtime_snapshot().runtime.next_deadline()
 
     def _cleanup_runtime(self, timeout: float = 90.0) -> None:
         with self._runtime_cleanup_lock:
@@ -748,11 +739,7 @@ class AutomationEngine:
             from notmyfault.security.admin_prompt import cancel_pending_admin_requests
 
             cancel_pending_admin_requests()
-            self._condition_stop.set()
-            self._condition_wake.set()
             self._rule_watcher.stop()
-            if self._condition_thread is not None and self._condition_thread is not threading.current_thread():
-                self._condition_thread.join(2)
             self._run_manager.shutdown()
             self._trigger_host.request_stop_all()
             deadline = time.monotonic() + max(0.0, timeout)

@@ -98,3 +98,23 @@ def test_existing_all_and_absence_semantics_agree_with_previous_runtime(node, ac
             payload = {"channel": channel, "value": index}
             instance = {"config": {"channel": channel}} if by_instance else None
             assert runtime.match_and_take("r", rule, kind, payload, instance=instance) == previous.match_and_take("r", rule, kind, payload, instance=instance)
+
+
+@settings(max_examples=250, deadline=None, database=None)
+@given(st.sampled_from(["any", "all"]), st.integers(1, 10), operations)
+def test_existing_any_and_window_semantics_agree_with_previous_runtime(op, window, actions):
+    node = {"op": op, "children": [{"type": kind, "params": {"channel": 0}} for kind in ("a", "b", "c")]}
+    if op == "all":
+        node["within_seconds"] = window
+    rule = {"condition": identify(node)}
+    clock = FakeClock()
+    runtime = ConditionRuntime(clock=clock)
+    previous = PreviousConditionRuntime(clock=clock)
+    runtime.register_rule("r", rule)
+    for index, (delta, kind, channel, by_instance, timer_first, migrate_first) in enumerate(actions):
+        clock.advance(delta)
+        assert dict(runtime.take_due()).get("r") == previous.poll_absences("r", rule)
+        if kind != "poll":
+            payload = {"channel": channel, "value": index}
+            instance = {"config": {"channel": channel}} if by_instance else None
+            assert runtime.match_and_take("r", rule, kind, payload, instance=instance) == previous.match_and_take("r", rule, kind, payload, instance=instance)
