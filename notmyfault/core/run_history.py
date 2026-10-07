@@ -103,6 +103,12 @@ def _safe_event(packet: Dict[str, Any]) -> Dict[str, Any] | None:
         if key in data
     }
     error = data.get("error")
+    branch = data.get("branch")
+    if isinstance(branch, str) and (branch in ("then", "else") or (
+        branch.startswith("elif[") and branch.endswith("]") and branch[5:-1].isascii()
+        and branch[5:-1].isdecimal() and len(branch) <= 16
+    )):
+        kept["branch"] = branch
     if isinstance(error, dict):
         kept["error"] = {
             key: str(error[key])[:240]
@@ -246,6 +252,8 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
             step["finished_at"] = timestamp
             step["duration_ms"] = data.get("duration_ms", step.get("duration_ms"))
             step["attempt"] = data.get("attempt", step.get("attempt"))
+            if "branch" in data:
+                step["branch"] = data["branch"]
             if "input_summary" in data:
                 step["input_summary"] = data["input_summary"]
             if "output_summary" in data:

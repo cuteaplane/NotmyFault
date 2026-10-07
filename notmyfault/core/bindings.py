@@ -183,6 +183,19 @@ def _read_reference(
     return protect(current) if sensitive and current is not _MISSING else current
 
 
+def reference_exists(reference, context, *, location):
+    value = _read_reference(reference, context, location=location)
+    if value is _MISSING:
+        return False
+    registry = context.get("_type_registry")
+    if registry is not None:
+        try:
+            registry.binding_value(value)
+        except DataTypeError as error:
+            raise BindingResolutionError(error.code, location, reference, str(error)) from error
+    return True
+
+
 def resolve_reference(reference, context, *, location):
     current = _read_reference(reference, context, location=location)
     if current is _MISSING:

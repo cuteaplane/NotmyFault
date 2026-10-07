@@ -170,6 +170,60 @@ def test_if_bindings_cannot_cross_branches_or_reference_later_actions():
     assert [issue["code"] for issue in validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META)] == ["forward_reference"]
 
 
+def test_elif_bindings_use_only_previous_path_and_keep_unique_ids():
+    from notmyfault.core.rule_model import normalize_rules
+    from notmyfault.core.rules import iter_action_nodes, validate_rule_binding_ids, get_rule_admin_plugins
+    from notmyfault.core.runtime_rules import prepare_rules
+
+    source = {"type": "open_url", "binding_id": "a_source01", "params": {"url": "https://example.com"}}
+    consumer = {"type": "notify", "binding_id": "a_consume1", "params": {"message": _ref("step", "a_source01", ["status"])}}
+    branch = {"type": "if", "condition": {"op": "is_true", "left": False}, "then": [], "else": [],
+              "elif": [{"condition": {"op": "is_true", "left": True}, "then": [source, consumer]}]}
+    rule = normalize_rules([_rule(_leaf("usb_insert", "t_usb001"), [branch])])[0]
+    assert validate_rule_binding_ids(rule) == []
+    assert validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META) == []
+    prepared = prepare_rules([rule], TRIGGERS_META, ACTIONS_META)
+    assert len(prepared) == 1, prepared.issues
+    assert "a_consume1" in prepared.compiled[rule["rule_id"]].step_index
+    assert get_rule_admin_plugins(rule, TRIGGERS_META, {"open_url": {"permissions": ["admin"]}}) == ["open_url"]
+    assert len(list(iter_action_nodes(rule["actions"]))) == 3
+    rule["actions"][0]["elif"].append({"condition": {"op": "eq", "left": _ref("step", "a_source01", ["status"]), "right": "ok"}, "then": []})
+    assert [issue["code"] for issue in validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META)] == ["forward_reference"]
+
+
+def test_exists_accepts_optional_field_but_checks_source_path_and_comparison_type():
+    meta = {"optional": {"outputs": [{"name": "state", "type": "string", "required": False}]}}
+    ref = _ref("trigger", "t_option1", ["state"])
+    branch = {"type": "if", "binding_id": "a_branch01", "condition": {"op": "exists", "left": ref},
+              "then": [{"type": "notify", "params": {"message": "present"}}], "else": []}
+    rule = _rule(_leaf("optional", "t_option1"), [branch])
+    assert validate_rule_bindings(rule, meta, ACTIONS_META) == []
+    ref["$ref"]["path"] = ["unknown"]
+    assert [issue["code"] for issue in validate_rule_bindings(rule, meta, ACTIONS_META)] == ["unknown_output"]
+    ref["$ref"]["path"] = ["state"]
+    ref["$ref"]["on_missing"] = "error"
+    branch["condition"] = {"op": "gt", "left": ref, "right": 1}
+    assert [issue["code"] for issue in validate_rule_bindings(rule, meta, ACTIONS_META)] == ["binding_type_mismatch"]
+
+
+def test_run_status_references_are_checked_across_rules_and_on_target_removal():
+    from notmyfault.core.rules import normalize_rule_input, RuleStructureError, validate_rules
+    from notmyfault.core.runtime_rules import prepare_rules
+
+    rule = {"rule_id": "r_observer", **_rule(_leaf("hotkey", "t_hot001"), [{
+        "type": "if", "binding_id": "a_branch01", "condition": {"op": "is_true", "left": False}, "then": [], "else": [],
+        "elif": [{"condition": {"op": "run_status", "rule_id": "r_target01", "status": "succeeded"},
+                  "then": [{"type": "notify", "params": {"message": "done"}}]}],
+    }])}
+    target = {"rule_id": "r_target01", **_rule(_leaf("hotkey", "t_target01"), [{"type": "notify", "params": {"message": "target"}}])}
+    rules = normalize_rule_input([rule, target])
+    assert validate_rules(rules, TRIGGERS_META, ACTIONS_META)[0] == 2
+    assert len(prepare_rules(rules, TRIGGERS_META, ACTIONS_META)) == 2
+    with pytest.raises(RuleStructureError, match="引用的自动化不存在"):
+        normalize_rule_input([rules[0]])
+    assert validate_rules([rules[0]], TRIGGERS_META, ACTIONS_META, known_rule_ids={"r_target01", "r_observer"})[0] == 1
+
+
 def test_event_reference_and_legacy_template_remain_supported():
     rule = _rule(
         _leaf("usb_insert", "t_usb001"),

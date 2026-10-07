@@ -63,6 +63,7 @@ def test_run_history_builds_completed_run_with_steps(tmp_path):
             attempt=1,
             params={"token": "不能落盘"},
             result={"token": "不能落盘"},
+            branch="不能落盘",
             input_summary=[{
                 "name": "message",
                 "label": "消息",

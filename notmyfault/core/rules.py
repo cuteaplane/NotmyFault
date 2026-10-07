@@ -36,6 +36,13 @@ def iter_action_nodes(actions: Any, path: str = "actions", *, include_invalid: b
         yield action, location
         for field in ("then", "else", "failure_actions"):
             yield from iter_action_nodes(action.get(field), f"{location}.{field}", include_invalid=include_invalid)
+        alternatives = action.get("elif", [])
+        if isinstance(alternatives, list):
+            for branch_index, alternative in enumerate(alternatives):
+                if isinstance(alternative, dict):
+                    yield from iter_action_nodes(
+                        alternative.get("then"), f"{location}.elif[{branch_index}].then", include_invalid=include_invalid
+                    )
 
 
 def get_rule_admin_plugins(
@@ -137,7 +144,27 @@ def validate_rule_structure(rule: Any) -> List[str]:
                     continue
                 for index, item in enumerate(items):
                     validate_action(item, f"{path}.{branch}[{index}]", allow_failure_actions=allow_failure_actions)
-            if not action.get("then") and not action.get("else"):
+            alternatives = action.get("elif", [])
+            if not isinstance(alternatives, list):
+                errors.append(f"{path}.elif 必须是条件分支列表")
+                alternatives = []
+            for branch_index, alternative in enumerate(alternatives):
+                branch_path = f"{path}.elif[{branch_index}]"
+                if not isinstance(alternative, dict):
+                    errors.append(f"{branch_path} 必须是对象")
+                    continue
+                if set(alternative) - {"condition", "then"}:
+                    errors.append(f"{branch_path} 包含未知字段")
+                errors.extend(validate_predicate(alternative.get("condition"), f"{branch_path}.condition"))
+                items = alternative.get("then", [])
+                if not isinstance(items, list):
+                    errors.append(f"{branch_path}.then 必须是动作列表")
+                    continue
+                for index, item in enumerate(items):
+                    validate_action(item, f"{branch_path}.then[{index}]", allow_failure_actions=allow_failure_actions)
+            if not action.get("then") and not action.get("else") and not any(
+                isinstance(item, dict) and item.get("then") for item in alternatives
+            ):
                 errors.append(f"{path} 至少需要一个分支动作")
             for field in ("params", "retry", "retry_delay_seconds", "retry_backoff", "timeout_seconds", "failure_actions"):
                 if field in action:
@@ -313,6 +340,30 @@ class RuleStructureError(ValueError):
         super().__init__("；".join(errors))
 
 
+def validate_automation_references(rule, known_rule_ids):
+    errors = []
+
+    def condition(node, path):
+        if not isinstance(node, dict):
+            return
+        if node.get("op") == "run_status" and (
+            not isinstance(node.get("rule_id"), str) or node["rule_id"] not in known_rule_ids
+        ):
+            errors.append(f"{path}.rule_id 引用的自动化不存在")
+        children = node.get("children", [])
+        for index, child in enumerate(children if isinstance(children, list) else []):
+            condition(child, f"{path}.children[{index}]")
+
+    for action, path in iter_action_nodes(rule.get("actions", [])):
+        if action.get("type") != "if":
+            continue
+        condition(action.get("condition"), f"{path}.condition")
+        for index, alternative in enumerate(action.get("elif", [])):
+            if isinstance(alternative, dict):
+                condition(alternative.get("condition"), f"{path}.elif[{index}].condition")
+    return errors
+
+
 def normalize_rule_input(rules: Any) -> List[Dict[str, Any]]:
     try:
         shaped = [normalize_rule_shape(rule) if isinstance(rule, dict) else rule for rule in rules] if isinstance(rules, list) else rules
@@ -323,6 +374,13 @@ def normalize_rule_input(rules: Any) -> List[Dict[str, Any]]:
         errors = validate_rules_structure(normalized)
         if errors:
             raise RuleStructureError(errors)
+        known_rule_ids = {rule["rule_id"] for rule in normalized}
+        reference_errors = [
+            f"规则 {rule['name']}: {error}" for rule in normalized
+            for error in validate_automation_references(rule, known_rule_ids)
+        ]
+        if reference_errors:
+            raise RuleStructureError(reference_errors)
         return normalized
     except RuleStructureError:
         raise
@@ -416,11 +474,14 @@ def validate_rules(
     rules: List[Dict[str, Any]],
     triggers_meta: Dict[str, Dict[str, Any]],
     actions_meta: Dict[str, Dict[str, Any]],
+    *, known_rule_ids=None,
 ) -> Tuple[int, int, List[Tuple[str, str]], List[Tuple[str, str]]]:
     """校验所有规则的插件引用和参数并返回统计结果"""
     issues: List[Tuple[str, str]] = []
     warnings: List[Tuple[str, str]] = []
     valid_count = 0
+    if known_rule_ids is None:
+        known_rule_ids = {rule.get("rule_id") for rule in rules if isinstance(rule, dict)}
 
     for i, rule in enumerate(rules):
         rule_name = rule.get("name", f"规则 #{i+1}")
@@ -431,6 +492,7 @@ def validate_rules(
             continue
 
         condition_errors = validate_condition_tree(get_rule_condition(rule))
+        condition_errors.extend(validate_automation_references(rule, known_rule_ids))
         if condition_errors:
             issues.extend((rule_name, error) for error in condition_errors)
             continue

@@ -125,6 +125,7 @@ class WorkflowExecutor:
         action_resolver: Optional[ActionResolver] = None,
         triggers_meta: Optional[MappingProvider] = None,
         clock=None,
+        status_lookup=None,
     ) -> None:
         self._actions_meta = actions_meta
         self._triggers_meta = triggers_meta or (lambda: {})
@@ -135,6 +136,7 @@ class WorkflowExecutor:
         self._shutdown_event = shutdown_event
         self._on_event = on_event
         self._clock = clock or SystemClock()
+        self._status_lookup = status_lookup
 
         self._active_actions = 0
         self.action_lock = threading.Lock()
@@ -417,21 +419,40 @@ class WorkflowExecutor:
         }
         self._on_event("run.step.started", event)
         try:
-            matched = evaluate_predicate(action.get("condition"), context)
+            statuses = {}
+            def status_lookup(rule_id):
+                if self._status_lookup is None:
+                    raise ValueError("当前执行环境不提供自动化运行状态")
+                if rule_id not in statuses:
+                    statuses[rule_id] = self._status_lookup(rule_id)
+                return statuses[rule_id]
+
+            matched = evaluate_predicate(action.get("condition"), context, status_lookup=status_lookup)
             branch = "then" if matched else "else"
+            actions = action.get(branch, [])
+            if not matched:
+                for index, alternative in enumerate(action.get("elif", [])):
+                    if evaluate_predicate(alternative.get("condition"), context, f"elif[{index}].condition", status_lookup=status_lookup):
+                        matched = True
+                        branch = f"elif[{index}]"
+                        actions = alternative.get("then", [])
+                        break
             succeeded = self._execute_action_sequence(
-                action.get(branch, []), rule_name, context,
+                actions, rule_name, context,
                 legacy_prefix=f"{step_id}_{branch}_", run_failure_actions=run_failure_actions,
             )
             result = {"matched": matched, "branch": branch}
+            cancelled = self._ensure_run_cancel_event(context).is_set()
+            status = "ok" if succeeded else "cancelled" if cancelled else "failed"
+            error = None if succeeded else "运行已取消" if cancelled else "分支动作执行失败"
             context["steps"][step_id] = {
-                "type": "if", "status": "ok" if succeeded else "failed",
+                "type": "if", "status": status,
                 "result": result if succeeded else None,
-                "error": None if succeeded else "分支动作执行失败",
+                "error": error,
             }
-            self._on_event("run.step.succeeded" if succeeded else "run.step.failed", {
-                **event, "status": "ok" if succeeded else "failed", "result": result,
-                "error": None if succeeded else {"code": "action_execution_failed", "message": "分支动作执行失败"},
+            self._on_event("run.step.succeeded" if succeeded else "run.step.cancelled" if cancelled else "run.step.failed", {
+                **event, "status": status, "result": result, "branch": branch,
+                "error": None if succeeded else {"code": "action_cancelled" if cancelled else "action_execution_failed", "message": error},
                 "duration_ms": round((time.perf_counter() - started) * 1000),
             })
             return succeeded
@@ -442,7 +463,7 @@ class WorkflowExecutor:
             }
             self._on_event("run.step.failed", {**event, "error": {
                 "code": getattr(error, "code", "condition_evaluation_failed"), "message": message,
-            }, "duration_ms": 0})
+            }, "status": "failed", "duration_ms": round((time.perf_counter() - started) * 1000)})
             return False
 
     def execute_action(

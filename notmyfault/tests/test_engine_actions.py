@@ -34,6 +34,139 @@ def _context():
     return build_context("规则", "hotkey", {}, [])
 
 
+@pytest.mark.parametrize("steam,downloading,latency,connected,expected", [
+    ("running", True, 180, True, ["pause", "after"]),
+    ("stopped", False, 100, False, ["pause", "after"]),
+    ("running", True, 180, False, ["pause", "after"]),
+    ("running", True, 150, True, ["after"]),
+    ("stopped", True, 180, True, ["after"]),
+    ("running", False, 180, True, ["after"]),
+])
+def test_if_trigger_automation_and_previous_output_group(steam, downloading, latency, connected, expected):
+    engine = make_engine()
+    called = []
+    register_action(engine, "speed", lambda meta, params: {"latency_us": latency, "connected": connected})
+    register_action(engine, "record", lambda meta, params: called.append(params["label"]))
+    engine._workflow_executor._status_lookup = lambda identity: {"running": int(downloading), "queued": 0, "last_status": "succeeded"}
+    ref = lambda scope, node, path: {"$ref": {"scope": scope, "node": node, "path": path}}
+    condition = {"op": "any", "children": [
+        {"op": "all", "children": [
+            {"op": "eq", "left": ref("trigger", "t_steam01", ["state"]), "right": "running"},
+            {"op": "run_status", "rule_id": "r_gamedown", "status": "running"},
+            {"op": "not", "children": [{"op": "lte", "left": ref("step", "a_speed01", ["latency_us"]), "right": ref("variable", "v_latency", [])}]},
+        ]},
+        {"op": "eq", "left": ref("step", "a_speed01", ["connected"]), "right": False},
+    ]}
+    context = _context()
+    context["variables"] = {"v_latency": 150}
+    context["triggers"] = {"t_steam01": {"payload": {"state": steam}}}
+    actions = [
+        {"type": "speed", "binding_id": "a_speed01", "params": {}},
+        {"type": "if", "binding_id": "a_branch01", "condition": condition,
+         "then": [{"type": "record", "params": {"label": "pause"}}], "else": []},
+        {"type": "record", "params": {"label": "after"}},
+    ]
+    try:
+        assert engine.execute_actions(actions, "规则", context)
+        assert called == expected
+    finally:
+        engine.shutdown(2)
+
+
+@pytest.mark.parametrize("first,second,expected", [(True, True, "then"), (False, True, "elif[0]"), (False, False, "else")])
+def test_elif_selects_first_match_and_history_keeps_branch(first, second, expected, tmp_path):
+    events, called = [], []
+    engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
+    register_action(engine, "record", lambda meta, params: called.append(params["label"]))
+    action = lambda label: {"type": "record", "params": {"label": label}}
+    branch = {"type": "if", "binding_id": "a_branch01", "condition": {"op": "is_true", "left": first},
+              "then": [action("then")], "else": [action("else")],
+              "elif": [{"condition": {"op": "is_true", "left": second}, "then": [action("elif[0]")]},
+                       {"condition": {"op": "is_true", "left": False}, "then": [action("elif[1]")]}]}
+    if first or second:
+        branch["elif"][1]["condition"] = {"op": "is_true", "left": {"$ref": {"scope": "event", "path": ["missing"]}}}
+    context = build_context("规则", "hotkey", {}, [], run_id="run_elif")
+    try:
+        assert engine.execute_actions([branch, action("after")], "规则", context)
+        assert called == [expected, "after"]
+        assert context["steps"]["a_branch01"]["result"]["branch"] == expected
+        assert engine.events.flush()
+        history = RunHistory(str(tmp_path / "runs.jsonl"))
+        for timestamp, (name, data) in enumerate(events):
+            history.record({"type": name, "data": data, "ts": timestamp})
+        saved = next(step for step in history.get_run("run_elif")["steps"] if step["step_id"] == "a_branch01")
+        assert saved["branch"] == expected
+        assert saved["status"] == "succeeded"
+    finally:
+        engine.shutdown(2)
+
+
+def test_if_missing_trigger_needs_exists_and_does_not_take_elif_on_error():
+    engine = make_engine()
+    called = []
+    register_action(engine, "record", lambda meta, params: called.append(params["label"]))
+    source = {"$ref": {"scope": "trigger", "node": "t_steam01", "path": ["state"]}}
+    branch = {"type": "if", "binding_id": "a_branch01", "condition": {"op": "not", "children": [{"op": "eq", "left": source, "right": "running"}]},
+              "then": [{"type": "record", "params": {"label": "pause"}}], "else": [],
+              "elif": [{"condition": {"op": "is_true", "left": True}, "then": [{"type": "record", "params": {"label": "elif"}}]}]}
+    try:
+        context = _context()
+        assert not engine.execute_actions([branch], "规则", context)
+        assert called == []
+        assert context["steps"]["a_branch01"]["status"] == "failed"
+        branch["condition"] = {"op": "all", "children": [{"op": "exists", "left": source}, branch["condition"]]}
+        branch["elif"] = []
+        assert engine.execute_actions([branch], "规则", _context())
+        assert called == []
+    finally:
+        engine.shutdown(2)
+
+
+def test_automation_state_is_sampled_once_per_if_and_again_at_next_if():
+    engine = make_engine()
+    lookups, called = [], []
+    def status(identity):
+        lookups.append(identity)
+        return {"running": int(len(lookups) == 1), "queued": 0, "last_status": "succeeded"}
+    engine._workflow_executor._status_lookup = status
+    register_action(engine, "record", lambda meta, params: called.append(params["label"]))
+    predicate = {"op": "run_status", "rule_id": "r_gamedown", "status": "running"}
+    def branch(identity):
+        return {"type": "if", "binding_id": identity, "condition": {"op": "all", "children": [predicate, predicate]},
+                "then": [{"type": "record", "params": {"label": "then"}}], "else": [{"type": "record", "params": {"label": "else"}}]}
+    try:
+        assert engine.execute_actions([branch("a_first01"), branch("a_second01")], "规则", _context())
+        assert called == ["then", "else"]
+        assert lookups == ["r_gamedown", "r_gamedown"]
+    finally:
+        engine.shutdown(2)
+
+
+@pytest.mark.parametrize("failure", ["failed", "cancelled"])
+def test_selected_elif_propagates_failure_or_cancellation_without_else(failure):
+    from notmyfault.core.workflow import ActionCancelled
+
+    events, called = [], []
+    engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
+    def stop(meta, params):
+        raise ActionCancelled("cancelled") if failure == "cancelled" else RuntimeError("动作失败")
+    register_action(engine, "stop", stop)
+    register_action(engine, "record", lambda meta, params: called.append(params["label"]))
+    branch = {"type": "if", "binding_id": "a_branch01", "condition": {"op": "is_true", "left": False}, "then": [],
+              "elif": [{"condition": {"op": "is_true", "left": True}, "then": [{"type": "stop", "params": {}}]}],
+              "else": [{"type": "record", "params": {"label": "else"}}]}
+    context = _context()
+    try:
+        assert not engine.execute_actions([branch, {"type": "record", "params": {"label": "after"}}], "规则", context)
+        assert called == []
+        assert context["steps"]["a_branch01"]["status"] == failure
+        assert engine.events.flush()
+        result = next(data for name, data in events if name == f"run.step.{failure}" and data.get("step_id") == "a_branch01")
+        assert result["branch"] == "elif[0]"
+    finally:
+        engine.shutdown(2)
+
+
 def test_engine_action_timeout_uses_injected_clock():
     clock = FakeClock()
     engine = create_test_engine({"rules": []}, clock=clock)

@@ -84,6 +84,7 @@ class RunManager:
         self._idle = threading.Condition(self._lock)
         self._runs: dict[str, _Run] = {}
         self._finished: OrderedDict[str, str] = OrderedDict()
+        self._last_results: dict[str, str] = {}
         self._active: dict[str, set[str]] = {}
         self._queues: dict[str, deque[_Run]] = {}
         self._ready: deque[str] = deque()
@@ -106,6 +107,15 @@ class RunManager:
         with self._lock:
             run = self._runs.get(run_id)
             return run.state if run is not None else self._finished.get(run_id)
+
+    def rule_status(self, rule_id: str) -> dict:
+        with self._lock:
+            counts = {"running": 0, "queued": 0}
+            for run in self._runs.values():
+                identity = run.rule.get("rule_id", run.context.get("rule", {}).get("id", run.key))
+                if identity == rule_id and run.state in counts:
+                    counts[run.state] += 1
+            return {**counts, "last_status": self._last_results.get(rule_id)}
 
     def submit(self, rule_key: str, rule: dict, rule_name: str, context: dict) -> str:
         run, decision = self._admit(rule_key, rule, rule_name, context)
@@ -257,6 +267,8 @@ class RunManager:
         if run.state in TERMINAL_STATES:
             return
         run.state = status
+        rule_id = run.rule.get("rule_id", run.context.get("rule", {}).get("id", run.key))
+        self._last_results[rule_id] = status
         if status != "dropped":
             run.outcome = RunOutcome(status, data or {}, error)
         self._event_locked(f"run.{status}", run, data, error)

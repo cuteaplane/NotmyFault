@@ -85,6 +85,42 @@ def wait_until(predicate, timeout=5, message="条件超时"):
     assert predicate(), message
 
 
+@pytest.mark.parametrize("terminal", ["succeeded", "failed", "cancelled", "timed_out"])
+def test_rule_status_counts_current_runs_and_keeps_latest_terminal(terminal):
+    from notmyfault.core.run_manager import RunOutcome
+    from notmyfault.core.predicates import evaluate_predicate
+
+    entered, release = threading.Event(), threading.Event()
+    def execute(key, rule, name, context):
+        entered.set()
+        assert release.wait(5)
+        return RunOutcome(terminal)
+    manager = RunManager(execute, max_workers=1)
+    rule = {"rule_id": "r_target01", "concurrency": {"mode": "queue", "queue_limit": 1}}
+    status = lambda expected: evaluate_predicate({"op": "run_status", "rule_id": "r_target01", "status": expected}, {}, status_lookup=manager.rule_status)
+    try:
+        assert status("never_run")
+        assert manager.submit("key", rule, "规则", make_context(run_id="run_status1")) == "started"
+        assert entered.wait(5)
+        assert manager.submit("key", rule, "规则", make_context(run_id="run_status2")) == "queued"
+        assert manager.rule_status("r_target01") == {"running": 1, "queued": 1, "last_status": None}
+        assert status("running") and status("queued") and not status("never_run")
+        assert manager.submit("key", rule, "规则", make_context(run_id="run_status3")) == "dropped"
+        assert manager.rule_status("r_target01") == {"running": 1, "queued": 1, "last_status": "dropped"}
+        assert status("dropped") and status("running")
+        assert manager.cancel_run("run_status2")
+        assert manager.rule_status("r_target01") == {"running": 1, "queued": 0, "last_status": "cancelled"}
+        assert status("running") and status("cancelled")
+        release.set()
+        assert manager.wait_for_idle(5)
+        assert manager.rule_status("r_target01") == {"running": 0, "queued": 0, "last_status": terminal}
+        assert status(terminal) and not status("never_run")
+    finally:
+        release.set()
+        manager.shutdown()
+        manager.wait_for_idle(5)
+
+
 class TestSingleMode:
     def test_started_run_does_not_block_submitter(self):
         entered = threading.Event()

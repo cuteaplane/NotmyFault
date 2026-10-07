@@ -73,6 +73,18 @@ def test_changed_admin_plugins_finds_failure_action():
     assert rule_approval.changed_admin_plugins([], [rule], SCHEMA) == ["admin_action"]
 
 
+def test_admin_approval_includes_nested_elif_actions():
+    rule = plain_rule()
+    rule["actions"] = [{"type": "if", "condition": {"op": "is_true", "left": False}, "then": [], "else": [],
+                        "elif": [{"condition": {"op": "is_true", "left": True}, "then": [
+                            {"type": "if", "condition": {"op": "is_true", "left": False}, "then": [], "else": [],
+                             "elif": [{"condition": {"op": "is_true", "left": True}, "then": [
+                                 {"type": "admin_action", "params": {}}, {"type": "kill_process", "params": {}}
+                             ]}]}
+                        ]}]}]
+    assert rule_approval.changed_admin_plugins([], [rule], SCHEMA) == ["admin_action", "kill_process"]
+
+
 def test_changed_admin_plugins_finds_manifest_restricted_action():
     assert rule_approval.changed_admin_plugins(
         [], [high_risk_rule()], SCHEMA,

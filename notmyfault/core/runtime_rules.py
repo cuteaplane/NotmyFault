@@ -118,7 +118,9 @@ def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_
                 warnings.extend(cached_warnings[identity])
             continue
         if validate:
-            valid, _, rule_issues, rule_warnings = validate_rules([rule], triggers_meta, actions_meta)
+            valid, _, rule_issues, rule_warnings = validate_rules(
+                [rule], triggers_meta, actions_meta, known_rule_ids={item["rule_id"] for item in normalized}
+            )
             issues.extend(rule_issues)
             warnings.extend(rule_warnings)
             cached_warnings[identity] = rule_warnings

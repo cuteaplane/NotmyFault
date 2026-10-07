@@ -111,7 +111,7 @@ def check_rule_bindings(rule, triggers_meta, actions_meta):
     leaves_by_id = {leaf.get("binding_id"): leaf for leaf in leaves}
     all_actions = {action.get("binding_id") for action, _path in iter_action_nodes(rule.get("actions", []))}
 
-    def reference_type(reference, location, available):
+    def reference_type(reference, location, available, *, allow_missing=False):
         scope = reference.get("scope")
         node = reference.get("node")
         path = reference.get("path")
@@ -158,7 +158,7 @@ def check_rule_bindings(rule, triggers_meta, actions_meta):
         except DataTypeError as error:
             add(error.code, location, str(error), reference)
             return None
-        if optional and policy is None:
+        if optional and policy is None and not allow_missing:
             add("optional_output", location, "该字段可能不存在，请选择报错、跳过或默认值", reference)
             return None
         if policy == "default":
@@ -250,6 +250,26 @@ def check_rule_bindings(rule, triggers_meta, actions_meta):
                     target = {**target, "enum": [option["value"] if isinstance(option, dict) else option for option in field["options"]]}
                 check(value, target, path, available, strict=bool(field) and field.get("type") != "plugin_data")
 
+    def predicate(node, location, available):
+        if not isinstance(node, dict):
+            return
+        op = node.get("op")
+        if op in ("all", "any", "not"):
+            for index, child in enumerate(node.get("children", [])):
+                predicate(child, f"{location}.children[{index}]", available)
+        elif op in ("exists", "not_exists") and is_reference(node.get("left")):
+            reference_type(node["left"]["$ref"], f"{location}.left", available, allow_missing=True)
+        elif op != "run_status":
+            target = "any"
+            if op in ("is_true", "is_false"):
+                target = "bool"
+            elif op in ("gt", "gte", "lt", "lte"):
+                target = "number"
+            if "left" in node:
+                check(node["left"], target, f"{location}.left", available, strict=True)
+            if "right" in node:
+                check(node["right"], target, f"{location}.right", available, strict=True)
+
     def sequence(items, location, previous):
         available = set(previous)
         for index, action in enumerate(items):
@@ -257,9 +277,12 @@ def check_rule_bindings(rule, triggers_meta, actions_meta):
                 continue
             path = f"{location}[{index}]"
             if action.get("type") == "if":
-                check(action.get("condition"), "any", f"{path}.condition", available)
+                predicate(action.get("condition"), f"{path}.condition", available)
                 for branch in ("then", "else"):
                     sequence(action.get(branch, []), f"{path}.{branch}", available)
+                for branch_index, alternative in enumerate(action.get("elif", [])):
+                    predicate(alternative.get("condition"), f"{path}.elif[{branch_index}].condition", available)
+                    sequence(alternative.get("then", []), f"{path}.elif[{branch_index}].then", available)
             elif action.get("type") == "set_variable":
                 identity = action.get("variable")
                 if identity not in sources["variable"]:

@@ -173,6 +173,7 @@ class AutomationEngine:
             on_event=self._safe_on_event,
             action_resolver=self._plugin_registry.resolve_action,
             clock=self.clock,
+            status_lookup=lambda rule_id: self._run_manager.rule_status(rule_id),
         )
         # 同一规则反复触发时先到这里决定丢弃、排队还是直接跑
         self._run_manager = RunManager(

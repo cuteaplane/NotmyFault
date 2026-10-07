@@ -99,6 +99,13 @@ def ensure_rule_binding_ids(rule: Dict[str, Any]) -> Dict[str, Any]:
                         item_copy[branch] = normalize_items(
                             item_copy[branch], "a", include_failures=include_failures
                         )
+                if isinstance(item_copy.get("elif"), list):
+                    item_copy["elif"] = [
+                        {**branch, "then": normalize_items(
+                            branch.get("then", []), "a", include_failures=include_failures
+                        )} if isinstance(branch, dict) else branch
+                        for branch in item_copy["elif"]
+                    ]
             normalized.append(item_copy)
         return normalized
 
@@ -229,6 +236,11 @@ def _normalize_rule_actions(actions: Any) -> Any:
         for branch in ("then", "else", "failure_actions"):
             if branch in copied:
                 copied[branch] = _normalize_rule_actions(copied[branch])
+        if isinstance(copied.get("elif"), list):
+            copied["elif"] = [
+                {**branch, "then": _normalize_rule_actions(branch.get("then", []))}
+                if isinstance(branch, dict) else branch for branch in copied["elif"]
+            ]
         # display_control 的旧亮度动作在加载时转换为新参数，旧规则仍可执行
         if copied.get("type") == "display_control":
             params = copied.get("params")
@@ -316,6 +328,18 @@ def _upgrade_rule_templates(
                     {"actions": item_copy[branch]}, inherited=step_refs,
                     prefix=f"{prefix}{item.get('type', 'action')}_{index + 1}_{branch}_"
                 )["actions"]
+        if isinstance(item_copy.get("elif"), list):
+            item_copy["elif"] = [
+                {
+                    **branch,
+                    "condition": _upgrade_legacy_templates(branch.get("condition"), step_refs),
+                    "then": _upgrade_rule_templates(
+                        {"actions": branch.get("then", [])}, inherited=step_refs,
+                        prefix=f"{prefix}{item.get('type', 'action')}_{index + 1}_elif_{branch_index}_"
+                    )["actions"],
+                } if isinstance(branch, dict) else branch
+                for branch_index, branch in enumerate(item_copy["elif"])
+            ]
         normalized.append(item_copy)
     copied["actions"] = normalized
     return copied
