@@ -90,8 +90,11 @@ class AutomationEngine:
         self._rules_lock = threading.RLock()
         self.rules: List[Dict[str, Any]] = config.get("rules", [])
         self.events = EventStream()
+        self._event_subscription = None
         if on_event is not None:
-            self.events.subscribe(on_event)
+            self._event_subscription = self.events.subscribe(
+                on_event, overflow="drop_oldest", on_overflow=self._report_event_overflow,
+            )
 
         self._plugin_registry = PluginRegistry()
         # 旧插件、Dashboard 和测试仍直接读取这些注册表对象
@@ -266,6 +269,11 @@ class AutomationEngine:
     def _safe_on_event(self, event_type: str, payload: Dict[str, Any]) -> None:
         self.events.publish(event_type, payload)
 
+    def _report_event_overflow(self, count: int) -> None:
+        message = f"宿主事件队列已满，丢弃 {count} 个旧事件，订阅继续接收后续事件"
+        self._diag_obj.record_error("event_queue_full", message)
+        engine_warn(message)
+
     def scheduler_stats(self) -> Dict[str, Dict[str, int]]:
         """每个规则当前的运行数和排队数，状态接口展示用"""
         return self._run_manager.stats()
@@ -302,6 +310,7 @@ class AutomationEngine:
                 "health": self._trigger_host.health(),
             },
             "errors": snap["errors"][-20:],
+            "event_delivery": self._event_subscription.stats() if self._event_subscription is not None else None,
         }
 
     def auto_load(self, load_paths) -> None:

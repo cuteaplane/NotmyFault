@@ -88,7 +88,8 @@ class Event:
 
 
 class Subscription:
-    def __init__(self, callback: Callable[[Event], None] | None, capacity: int, overflow: str) -> None:
+    def __init__(self, callback: Callable[[Event], None] | None, capacity: int, overflow: str,
+                 on_overflow: Callable[[int], None] | None = None) -> None:
         if capacity < 1 or overflow not in {"disconnect", "drop_oldest", "drop_newest"}:
             raise ValueError("订阅队列大小或丢弃方式无效")
         self.queue: queue.Queue[Event | None] = queue.Queue(capacity)
@@ -97,6 +98,8 @@ class Subscription:
         self.closed = False
         self._lock = threading.Lock()
         self._thread = None
+        self._on_overflow = on_overflow
+        self._reported_dropped = 0
         if callback is not None:
             self._thread = threading.Thread(target=self._consume, args=(callback,), name="EventSubscriber", daemon=True)
             self._thread.start()
@@ -129,6 +132,16 @@ class Subscription:
             try:
                 if event is None:
                     return
+                with self._lock:
+                    dropped = self.dropped - self._reported_dropped
+                    self._reported_dropped = self.dropped
+                if dropped and self._on_overflow is not None:
+                    try:
+                        self._on_overflow(dropped)
+                    except Exception as error:
+                        from notmyfault.core.logging import engine_error
+
+                        engine_error("event_overflow_callback_failed", error=str(error))
                 callback(event)
             except Exception as error:
                 from notmyfault.core.logging import engine_error
@@ -136,6 +149,11 @@ class Subscription:
                 engine_error("event_subscriber_failed", error=str(error))
             finally:
                 self.queue.task_done()
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {"capacity": self.queue.maxsize, "queued": self.queue.qsize(),
+                    "dropped": self.dropped, "closed": self.closed, "overflow": self.overflow}
 
     def flush(self, timeout: float = 5.0) -> bool:
         if self._thread is threading.current_thread():
@@ -176,8 +194,8 @@ class EventStream:
         self._closed = False
 
     def subscribe(self, callback: Callable[[Event], None] | None = None, *, capacity: int = 200,
-                  overflow: str = "disconnect") -> Subscription:
-        subscription = Subscription(callback, capacity, overflow)
+                  overflow: str = "disconnect", on_overflow: Callable[[int], None] | None = None) -> Subscription:
+        subscription = Subscription(callback, capacity, overflow, on_overflow)
         with self._lock:
             closed = self._closed
             if not closed:

@@ -108,3 +108,63 @@ def test_plugin_api_captures_engine_stream_and_shutdown_closes_only_that_engine(
     assert subscription.closed
     assert second.events.publish("run.started") is not None
     second._shutdown_plugins()
+
+
+def test_host_overflow_keeps_subscription_and_reports_loss_after_resume():
+    entered, release = threading.Event(), threading.Event()
+    seen = []
+
+    def sink(event):
+        seen.append(event.run_id)
+        entered.set()
+        release.wait(3)
+
+    engine = create_test_engine({"rules": []}, on_event=sink)
+    try:
+        engine.events.publish("run.started", {"run_id": "first"})
+        assert entered.wait(2)
+        for index in range(201):
+            engine.events.publish("run.queued", {"run_id": f"burst_{index}"})
+        assert engine.events.subscriber_count() == 1
+        assert engine._event_subscription.stats()["dropped"] == 1
+        assert not engine._event_subscription.closed
+        release.set()
+        assert engine.events.flush()
+        engine.events.publish("run.succeeded", {"run_id": "after_overflow"})
+        assert engine.events.flush()
+        assert seen[-1] == "after_overflow"
+        diagnostics = engine.get_diagnostics()
+        assert diagnostics["event_delivery"]["dropped"] == 1
+        assert any(kind == "event_queue_full" for kind, _ in diagnostics["errors"])
+    finally:
+        release.set()
+        engine.shutdown(2)
+
+
+def test_overflow_callback_runs_on_consumer_and_can_publish():
+    stream = EventStream()
+    entered, release = threading.Event(), threading.Event()
+    reported = []
+    publisher = threading.get_ident()
+
+    def sink(event):
+        entered.set()
+        release.wait(2)
+
+    def overflow(count):
+        reported.append((count, threading.get_ident()))
+        stream.publish("run.failed")
+
+    subscription = stream.subscribe(sink, capacity=2, overflow="drop_oldest", on_overflow=overflow)
+    try:
+        stream.publish("run.started")
+        assert entered.wait(2)
+        for _ in range(3):
+            stream.publish("run.started")
+        release.set()
+        assert stream.flush()
+        assert reported == [(1, subscription._thread.ident)]
+        assert reported[0][1] != publisher
+    finally:
+        release.set()
+        stream.close()
