@@ -8,6 +8,7 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 from notmyfault.core.diagnostics import Diagnostics
+from notmyfault.core.clock import Clock, SystemClock
 from notmyfault.config import ConfigValidationError
 from notmyfault.core.event_bus import EventBus
 from notmyfault.core.rule_watcher import RuleWatcher
@@ -83,13 +84,15 @@ class AutomationEngine:
         on_event: Optional[Callable[[Event], None]] = None,
         *,
         rules_store: RulesStorePort,
+        clock: Clock | None = None,
     ) -> None:
         # 热重载只替换 rules，构造函数传入的 config 保持原对象
         self.config = config
+        self.clock = clock or SystemClock()
         self._rules_store = rules_store
         self._rules_lock = threading.RLock()
         self.rules: List[Dict[str, Any]] = config.get("rules", [])
-        self.events = EventStream()
+        self.events = EventStream(clock=self.clock)
         self._event_subscription = None
         if on_event is not None:
             self._event_subscription = self.events.subscribe(
@@ -126,8 +129,9 @@ class AutomationEngine:
         self._state_store_lock = threading.Lock()
         self._trigger_host = TriggerHost(
             self.emit_event, self.events, self._get_state_store,
+            clock=self.clock,
             alert=lambda title, message: self._alert_user(title, message),
-            boot_id=boot_id(), engine_started_at=time.time(),
+            boot_id=boot_id(), engine_started_at=self.clock.time(),
             on_failure=self._diag_obj.record_trigger_crash,
         )
         self._condition_stop = threading.Event()
@@ -178,7 +182,8 @@ class AutomationEngine:
             on_event=self._safe_on_event,
         )
         self._generations = GenerationManager(self._plugins, self._run_manager, self.events, lock=self._rules_lock,
-                                              reconcile=self._trigger_host.reconcile, on_change=self._condition_wake.set)
+                                              reconcile=self._trigger_host.reconcile, on_change=self._condition_wake.set,
+                                              clock=self.clock)
         # isolated 动作崩了通过这个回调推 plugin_worker_crashed 事件
         plugin_worker.set_crash_callback(self._safe_on_event)
         # 旧扩展和测试仍直接读取这些同步对象
@@ -187,6 +192,7 @@ class AutomationEngine:
         self._rule_watcher = RuleWatcher(
             lambda: self._rules_store.rules_path, self._rules_store.load_verified_rules,
             self.apply_rules, on_error=self._watcher_error,
+            clock=self.clock,
         )
 
     def _get_state_store(self):
@@ -280,7 +286,7 @@ class AutomationEngine:
 
     def get_diagnostics(self) -> Dict[str, Any]:
         """返回当前诊断数据供 Dashboard 展示"""
-        uptime = time.time() - self._start_time if self._start_time > 0 else 0
+        uptime = self.clock.time() - self._start_time if self._start_time > 0 else 0
         snap = self._diag_obj.snapshot()
         total_actions = snap["action_ok"] + snap["action_fail"]
         return {
@@ -670,7 +676,7 @@ class AutomationEngine:
     def _run(
         self, shutdown_event: "threading.Event | None" = None
     ) -> None:
-        self._start_time = time.time()
+        self._start_time = self.clock.time()
         self._shutdown_flag = shutdown_event or threading.Event()
         try:
             if self._security_mode == SecurityMode.STRICT and not getattr(sys, "frozen", False):
