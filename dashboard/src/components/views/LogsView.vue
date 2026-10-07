@@ -40,12 +40,16 @@ const levelMeta = {
   INFO: { label: '信息', cls: 'log-info' },
 }
 const runStatusMeta = {
-  running: { label: '运行中', icon: 'progress_activity', cls: 'running' },
-  deferred: { label: '等待重试', icon: 'schedule', cls: 'deferred' },
-  succeeded: { label: '成功', icon: 'check_circle', cls: 'succeeded' },
-  failed: { label: '失败', icon: 'error', cls: 'failed' },
-  cancelled: { label: '已停止', icon: 'stop_circle', cls: 'cancelled' },
+  queued: { label: '排队中', icon: 'schedule', cls: 'deferred', group: 'pending' },
+  running: { label: '运行中', icon: 'progress_activity', cls: 'running', group: 'pending' },
+  deferred: { label: '等待重试', icon: 'schedule', cls: 'deferred', group: 'pending' },
+  succeeded: { label: '成功', icon: 'check_circle', cls: 'succeeded', group: 'succeeded' },
+  failed: { label: '失败', icon: 'error', cls: 'failed', group: 'failed' },
+  timed_out: { label: '已超时', icon: 'timer_off', cls: 'failed', group: 'failed' },
+  cancelled: { label: '已停止', icon: 'stop_circle', cls: 'cancelled', group: 'cancelled' },
+  dropped: { label: '已丢弃', icon: 'block', cls: 'cancelled', group: 'cancelled' },
 }
+const unknownRunMeta = { label: '未知状态', icon: 'help', cls: 'unknown', group: null }
 
 const levelCounts = computed(() => {
   const counts = { ERROR: 0, WARN: 0, INFO: 0 }
@@ -56,9 +60,10 @@ const levelCounts = computed(() => {
 })
 
 const runCounts = computed(() => {
-  const counts = { succeeded: 0, failed: 0, cancelled: 0, running: 0, deferred: 0 }
+  const counts = { succeeded: 0, failed: 0, cancelled: 0, pending: 0 }
   runs.value.forEach(run => {
-    if (counts[run.status] !== undefined) counts[run.status]++
+    const group = runMeta(run.status).group
+    if (counts[group] !== undefined) counts[group]++
   })
   return counts
 })
@@ -77,8 +82,7 @@ const filteredRuns = computed(() => {
   const rangeSeconds = { '24h': 86400, '7d': 604800, '30d': 2592000 }[timeFilter.value] || 0
   const cutoff = rangeSeconds ? Date.now() / 1000 - rangeSeconds : 0
   return runs.value.filter(run => {
-    if (statusFilter.value === 'pending' && !['running', 'deferred'].includes(run.status)) return false
-    if (!['all', 'pending'].includes(statusFilter.value) && run.status !== statusFilter.value) return false
+    if (statusFilter.value !== 'all' && runMeta(run.status).group !== statusFilter.value) return false
     if (cutoff && Number(run.started_at || 0) < cutoff) return false
     if (actionFilter.value !== 'all'
       && !(run.steps || []).some(step => step.action_type === actionFilter.value)) return false
@@ -103,7 +107,7 @@ const filteredEntries = computed(() => {
 })
 
 function runMeta(status) {
-  return runStatusMeta[status] || runStatusMeta.running
+  return Object.hasOwn(runStatusMeta, status) ? runStatusMeta[status] : unknownRunMeta
 }
 
 function actionName(type) {
@@ -425,7 +429,7 @@ onUnmounted(() => {
           <span>已停止</span><strong>{{ runCounts.cancelled }}</strong>
         </button>
         <button class="run-summary-card pending" :class="{ active: statusFilter === 'pending' }" :aria-pressed="statusFilter === 'pending'" @click="statusFilter = 'pending'">
-          <span>进行中</span><strong>{{ runCounts.running + runCounts.deferred }}</strong>
+          <span>进行中</span><strong>{{ runCounts.pending }}</strong>
         </button>
       </div>
 

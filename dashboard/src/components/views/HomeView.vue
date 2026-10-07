@@ -53,15 +53,19 @@ const engineDescription = computed(() => {
 })
 
 const runStatusMeta = {
+  queued: { label: '排队中', icon: 'schedule' },
   running: { label: '运行中', icon: 'progress_activity' },
   deferred: { label: '等待重试', icon: 'schedule' },
   succeeded: { label: '成功', icon: 'check_circle' },
   failed: { label: '失败', icon: 'error' },
+  timed_out: { label: '已超时', icon: 'timer_off' },
   cancelled: { label: '已停止', icon: 'stop_circle' },
+  dropped: { label: '已丢弃', icon: 'block' },
 }
+const unknownRunMeta = { label: '未知状态', icon: 'help' }
 
 function runMeta(status) {
-  return runStatusMeta[status] || runStatusMeta.running
+  return Object.hasOwn(runStatusMeta, status) ? runStatusMeta[status] : unknownRunMeta
 }
 
 function formatRunTime(timestamp) {

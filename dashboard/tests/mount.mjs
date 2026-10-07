@@ -89,6 +89,7 @@ let engineEventController = null
 let engineConnections = 0
 let engineRequestHeaders = null
 let recoveredRun = null
+let additionalRuns = []
 
 function pause(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -326,7 +327,7 @@ window.pywebview = { api: {
         input_summary:[{ name:'message', label:'消息', type:'string', display:'文本 · 12 字符', redacted:false }],
         output_summary:[{ name:'delivered', label:'已送达', type:'bool', display:'布尔值', redacted:false }],
       }],
-    }] }
+    }, ...additionalRuns].slice(0, Number(new URLSearchParams(path.split('?')[1]).get('limit')) || 100) }
     if (path === '/api/runs/run_test001') return recoveredRun || { run_id:'run_test001', status:'running' }
     if (path === '/api/plugins/toggle') return { ok:true, restart_required:true }
     if (path === '/api/plugins/key-status') return { exists:true, encrypted:true }
@@ -1487,12 +1488,32 @@ await new Promise(r => setTimeout(r, 30))
 ;[...document.querySelectorAll('.app-dialog button')].find(button => button.textContent.trim() === '删除')?.click()
 await new Promise(r => setTimeout(r, 80))
 
+additionalRuns = ['queued', 'timed_out', 'dropped', 'toString', 'running', 'succeeded'].map((status, index) => ({
+  run_id:`run_status_${index}`, rule_name:`状态测试 ${status}`, event_type:'manual', status,
+  started_at:1723000000, finished_at:['timed_out', 'dropped', 'succeeded'].includes(status) ? 1723000000.2 : null,
+  duration_ms:['timed_out', 'dropped', 'succeeded'].includes(status) ? 200 : null,
+  action_count:0, steps:[],
+}))
 rulesNav?.click()
 await waitFor('.rules-library')
 ;[...document.querySelectorAll('.automation-section-tabs button')].find(
   button => button.textContent.includes('运行记录'),
 )?.click()
-await waitFor('.run-center-page')
+await waitFor(() => document.querySelectorAll('.run-card').length === 7)
+const runLabels = [...document.querySelectorAll('.run-card .run-status-label')].map(label => label.textContent)
+const runLabelsOk = runLabels.join('|') === '失败|排队中|已超时|已丢弃|未知状态|运行中|成功'
+const runSummaryOk = [...document.querySelectorAll('.run-summary-card strong')].map(value => value.textContent).join('|') === '7|1|2|1|2'
+let runFiltersOk = true
+for (const [filter, expected] of [['failed', 2], ['cancelled', 1], ['pending', 2]]) {
+  document.querySelector(`.run-summary-card.${filter}`)?.click()
+  await pause(20)
+  runFiltersOk &&= document.querySelectorAll('.run-card').length === expected
+}
+document.querySelector('.run-summary-card')?.click()
+await pause(20)
+runFiltersOk &&= document.querySelectorAll('.run-card').length === 7
+console.log((runLabelsOk && runSummaryOk && runFiltersOk ? 'PASS' : 'FAIL') + ' - 运行记录按新状态显示、统计和筛选，未知状态不显示运行中')
+if (!runLabelsOk || !runSummaryOk || !runFiltersOk) process.exitCode = 1
 document.querySelector('.run-export-btn')?.click()
 await new Promise(r => setTimeout(r, 20))
 const runExportConfirmOk = document.querySelector('.app-dialog')?.textContent.includes('不包含触发输入、动作参数、动作返回值或测试期望值')
@@ -1925,6 +1946,9 @@ await waitFor('.home-run-row')
 const homeReloadedRuns = document.querySelector('.home-run-row')?.textContent.includes('挂载测试规则')
 console.log((homeReloadedRuns?'PASS':'FAIL')+' - returning home loads recent runs without waiting for polling')
 if (!homeReloadedRuns) process.exitCode = 1
+const homeRunStatusesOk = [...document.querySelectorAll('.home-run-status')].map(label => label.textContent).join('|') === '失败|排队中|已超时|已丢弃|未知状态'
+console.log((homeRunStatusesOk ? 'PASS' : 'FAIL') + ' - 首页显示排队、超时、丢弃和未知状态')
+if (!homeRunStatusesOk) process.exitCode = 1
 
 // 创建入口和用途示例只在自动化页出现，缺少插件时定向到插件页。
 rulesNav?.click()
