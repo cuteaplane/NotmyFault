@@ -51,6 +51,10 @@ function setWithinSeconds(value) {
   if (value.trim() === '') delete selectedConditionNode.value.within_seconds
   else selectedConditionNode.value.within_seconds = Number(value)
 }
+function setTtlSeconds(value) {
+  if (value.trim() === '') delete selectedConditionNode.value.ttl_seconds
+  else selectedConditionNode.value.ttl_seconds = Number(value)
+}
 </script>
 
 <template>
@@ -80,9 +84,36 @@ function setWithinSeconds(value) {
                 </select>
               </label>
               <label v-if="['all', 'not'].includes(selectedConditionNode.op)" class="field"><span class="field-label">{{ selectedConditionNode.op === 'not' ? '等待时长（秒）' : '完成时间窗口（秒，可选）' }}</span>
-                <input :value="selectedConditionNode.within_seconds ?? ''" @input="setWithinSeconds($event.target.value)" type="number" min="1" class="text-field" placeholder="不限制">
+                <input :value="selectedConditionNode.within_seconds ?? ''" @input="setWithinSeconds($event.target.value)" type="number" min="0.001" step="any" class="text-field" placeholder="不限制">
               </label>
-              <p v-if="selectedConditionNode.op === 'not'" class="inspector-lead">只放一个事件。等待期间收到事件会重新计时；超时触发一次。</p>
+              <template v-if="selectedConditionNode.op === 'all'">
+                <label class="field"><span class="field-label">满足后保留哪些事件</span>
+                  <select v-model="selectedConditionNode.consume" class="select">
+                    <option value="matched">移除本次使用的事件</option>
+                    <option value="all">移除组内已收到的事件</option>
+                    <option value="none">保留，供后续组合使用</option>
+                  </select>
+                </label>
+                <label class="field"><span class="field-label">事件保留时长（秒）</span>
+                  <input :value="selectedConditionNode.ttl_seconds ?? ''" @input="setTtlSeconds($event.target.value)" type="number" min="0.001" step="any" class="text-field" :placeholder="selectedConditionNode.within_seconds ? '使用完成时间窗口' : '3600'">
+                </label>
+                <p class="inspector-lead">过期事件不参与后续组合。没有时间窗口时默认保留一小时。</p>
+              </template>
+              <label v-if="selectedConditionNode.op === 'any'" class="field"><span class="field-label">多条分支满足时</span>
+                <select v-model="selectedConditionNode.pick" class="select">
+                  <option value="latest">使用最新满足的分支</option>
+                  <option value="first">使用列表中第一条满足的分支</option>
+                </select>
+              </label>
+              <template v-if="selectedConditionNode.op === 'not'">
+                <label class="field"><span class="field-label">持续没有事件时</span>
+                  <select v-model="selectedConditionNode.repeat" class="select">
+                    <option value="once_until_seen">触发一次，收到事件后重新计时</option>
+                    <option value="every_window">每个等待窗口触发一次</option>
+                  </select>
+                </label>
+                <p class="inspector-lead">只放一个事件。等待期间收到事件会重新计时。</p>
+              </template>
               <button v-if="selectedConditionNode.op === 'not'" class="btn btn-text btn-sm" @click="unwrapNotEvent">改为事件发生时</button>
               <div v-if="selectedConditionNode.op !== 'not' || !selectedConditionNode.children?.length" class="inspector-add-grid">
                 <button class="btn btn-tonal btn-sm" :disabled="!hasTriggers" @click="requestConditionChild(selectedGraphNode, false)"><span class="material-symbols-outlined">add</span>添加条件</button>

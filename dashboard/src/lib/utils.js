@@ -165,6 +165,12 @@ export function normalizeConditionTree(node) {
   const op = node.op || node.type || 'any'
   node.op = ({ and: 'all', or: 'any' })[op] || op
   if (node.op === 'any') delete node.within_seconds
+  if (node.op === 'any') node.pick ??= 'latest'
+  if (node.op === 'all') {
+    node.consume ??= 'matched'
+    if (!Object.hasOwn(node, 'within_seconds')) node.ttl_seconds ??= 3600
+  }
+  if (node.op === 'not') node.repeat ??= 'once_until_seen'
   delete node.events
   delete node.type
   node.children.forEach(normalizeConditionTree)

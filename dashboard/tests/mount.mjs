@@ -1576,6 +1576,40 @@ const absenceEditorOk = [...document.querySelectorAll('.graph-node-condition')].
   && !document.querySelector('.stage-check')
 console.log((absenceEditorOk?'PASS':'FAIL')+' - NOT exposes an absence timer and replaces pre-run checks')
 if (!absenceEditorOk) process.exitCode = 1
+const notInspector = document.querySelector('.node-inspector')
+const repeatSelect = [...notInspector.querySelectorAll('select')].find(select => [...select.options].some(option => option.value === 'every_window'))
+repeatSelect.value = 'every_window'
+repeatSelect.dispatchEvent(new window.Event('change', { bubbles: true }))
+await pause(30)
+let conditionPoliciesOk = repeatSelect.value === 'every_window'
+const operationSelect = [...notInspector.querySelectorAll('select')].find(select => [...select.options].some(option => option.value === 'all'))
+operationSelect.value = 'all'
+operationSelect.dispatchEvent(new window.Event('change', { bubbles: true }))
+await pause(30)
+const allInspector = document.querySelector('.node-inspector')
+const consumeSelect = [...allInspector.querySelectorAll('select')].find(select => [...select.options].some(option => option.value === 'matched'))
+const ttlField = [...allInspector.querySelectorAll('label')].find(label => label.textContent.includes('事件保留时长'))?.querySelector('input')
+consumeSelect.value = 'none'
+consumeSelect.dispatchEvent(new window.Event('change', { bubbles: true }))
+ttlField.value = '15'
+ttlField.dispatchEvent(new window.Event('input', { bubbles: true }))
+await pause(30)
+conditionPoliciesOk &&= consumeSelect.value === 'none' && ttlField.value === '15'
+operationSelect.value = 'any'
+operationSelect.dispatchEvent(new window.Event('change', { bubbles: true }))
+await pause(30)
+const pickSelect = [...document.querySelectorAll('.node-inspector select')].find(select => [...select.options].some(option => option.value === 'latest'))
+pickSelect.value = 'first'
+pickSelect.dispatchEvent(new window.Event('change', { bubbles: true }))
+await pause(30)
+conditionPoliciesOk &&= pickSelect.value === 'first' && !document.querySelector('.node-inspector')?.textContent.includes('事件保留时长')
+operationSelect.value = 'not'
+operationSelect.dispatchEvent(new window.Event('change', { bubbles: true }))
+await pause(30)
+const restoredRepeat = [...document.querySelectorAll('.node-inspector select')].find(select => [...select.options].some(option => option.value === 'once_until_seen'))
+conditionPoliciesOk &&= restoredRepeat.value === 'once_until_seen'
+console.log((conditionPoliciesOk ? 'PASS' : 'FAIL') + ' - 条件组可设置消费、保留时长、分支选择和重复等待，切换组合方式清除旧选项')
+if (!conditionPoliciesOk) process.exitCode = 1
 ;[...document.querySelectorAll('.node-inspector button')].find(button => button.textContent.includes('改为事件发生时'))?.click()
 await new Promise(r => setTimeout(r, 30))
 

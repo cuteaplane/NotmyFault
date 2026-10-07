@@ -78,6 +78,15 @@ export function useRuleMutations(rule, selectedNodeId, selectedGraphNode) {
   function changeConditionOp() {
     const node = selectedConditionNode.value
     if (!node || selectedKind.value !== 'condition') return
+    if (node.op !== 'all') {
+      delete node.consume
+      delete node.ttl_seconds
+    }
+    if (node.op !== 'any') delete node.pick
+    if (node.op !== 'not') delete node.repeat
+    if (node.op === 'all') node.consume ??= 'matched'
+    if (node.op === 'any') node.pick ??= 'latest'
+    if (node.op === 'not') node.repeat ??= 'once_until_seen'
     if (node.op === 'not') node.within_seconds ||= 60
     else if (node.op !== 'all') delete node.within_seconds
   }
