@@ -55,3 +55,33 @@ assert(!main.nodes.some(node => node.source === inner))
 assert(main.nodes.find(node => node.source === conditional).meta.includes('游戏下载'))
 assert(main.nodes.find(node => node.source === conditional).meta.includes('可接受延迟'))
 console.log('Workflow condition groups, ELIF references, path sources, summary and subflow graph: PASS')
+
+const { workflowEventChoices } = await import('../src/lib/workflowConditions.js')
+const { buildTestInputFields, buildPreparedTestContext } = await import('../src/lib/bindings.js')
+const triggerSchema = { triggers: { hotkey: { name: '全局热键', outputs: [] } }, actions: { pause: { params: [], outputs: [] } } }
+const fired = { op: 'event_occurred', trigger_id: 't_hotkey01', expected: false }
+const firedAction = { type: 'if', binding_id: 'a_branch01', condition: fired, then: [{ type: 'pause', binding_id: 'a_pause01', params: {} }], else: [] }
+const firedRule = { condition: { type: 'hotkey', binding_id: 't_hotkey01', params: {} }, actions: [firedAction] }
+const choices = workflowEventChoices(firedRule, triggerSchema)
+assert.equal(choices[0].label, '触发 1 · 全局热键')
+assert(predicateSummary(fired, [], [], choices).includes('未发生'))
+const firedGraph = buildIfSubflowGraph({ rule: firedRule, action: firedAction, schema: triggerSchema, sources: [], rules: [], actionName: action => action.type, describeItem: () => '' })
+assert(firedGraph.nodes.some(node => node.kind === 'trigger' && node.source === firedRule.condition))
+assert.deepEqual(firedGraph.nodes.find(node => node.kind === 'predicate').dataInputs, [])
+assert(firedGraph.edges.some(edge => edge.label === '事件发生记录'))
+const firedFields = buildTestInputFields(firedRule, triggerSchema)
+assert.equal(firedFields.length, 1)
+assert.equal(firedFields[0].scope, 'event_occurrence')
+assert.deepEqual(JSON.parse(JSON.stringify(buildPreparedTestContext(firedFields, { [firedFields[0].key]: true }).trigger_payloads)), { t_hotkey01: {} })
+assert.deepEqual(JSON.parse(JSON.stringify(buildPreparedTestContext(firedFields, { [firedFields[0].key]: false }).trigger_payloads)), {})
+triggerSchema.triggers.hotkey.outputs = [{ name: 'count', type: 'number' }]
+firedAction.condition = { op: 'all', children: [
+  { op: 'eq', left: { $ref: { scope: 'trigger', node: 't_hotkey01', path: ['count'], on_missing: 'default', default: 0 } }, right: 0 }, fired,
+] }
+const suppliedFields = buildTestInputFields(firedRule, triggerSchema)
+const countField = suppliedFields.find(field => field.scope === 'trigger')
+assert.equal(countField.required, true)
+assert.equal(countField.defaultValue, 0)
+const suppliedValues = Object.fromEntries(suppliedFields.map(field => [field.key, field.defaultValue]))
+assert.equal(buildPreparedTestContext(suppliedFields, suppliedValues).trigger_payloads.t_hotkey01.count, 0)
+console.log('无输出字段的事件判断、条件图和手动测试事件记录：通过')

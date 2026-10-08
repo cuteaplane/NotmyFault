@@ -1706,6 +1706,26 @@ const ifEditorOk = ifBranches.length === 2
 console.log((ifEditorOk?'PASS':'FAIL')+' - IF edits separate THEN and ELSE action lists')
 if (!ifEditorOk) process.exitCode = 1
 
+const mainPredicate = ifCard.querySelector('.if-action-editor > .predicate-editor')
+const predicateOperator = mainPredicate?.querySelector('select')
+predicateOperator.value = 'is_true'
+predicateOperator.dispatchEvent(new window.Event('change', { bubbles: true }))
+await pause(20)
+const predicateSource = mainPredicate.querySelector('.condition-value-input select')
+predicateSource.value = 'trigger'; predicateSource.dispatchEvent(new window.Event('change', { bubbles: true }))
+await pause(20)
+const booleanSourceChoices = [...mainPredicate.querySelectorAll('.condition-value-input select')].at(-1)
+const booleanFiltersText = [...booleanSourceChoices.options].filter(option => option.value).every(option => !option.textContent.includes(' · 文本'))
+predicateOperator.value = 'event_occurred'; predicateOperator.dispatchEvent(new window.Event('change', { bubbles: true }))
+await pause(20)
+const triggerChooser = mainPredicate.querySelectorAll('select')[1]
+const firedChoice = mainPredicate.querySelectorAll('select')[2]
+firedChoice.value = 'false'; firedChoice.dispatchEvent(new window.Event('change', { bubbles: true }))
+await pause(20)
+const triggerDirectChoice = /^t_/.test(triggerChooser.value) && [...triggerChooser.options].some(option => /^t_/.test(option.value)) && !mainPredicate.querySelector('.condition-value-input') && firedChoice.options[firedChoice.selectedIndex].textContent === '未发生'
+console.log((booleanFiltersText && triggerDirectChoice ? 'PASS' : 'FAIL') + ' - 真假判断过滤文本，直接选择事件来源及已发生或未发生')
+if (!booleanFiltersText || !triggerDirectChoice) process.exitCode = 1
+
 ;[...document.querySelectorAll('.if-action-editor > button')].find(button => button.textContent.includes('添加 ELIF'))?.click()
 await pause(30)
 const elifForm = [...document.querySelectorAll('.if-action-editor > .if-branch')].find(branch => branch.textContent.includes('ELIF 1'))
@@ -1784,7 +1804,7 @@ saveMacroBaseline?.click()
 await new Promise(r => setTimeout(r, 50))
 const savedIf = savedRulesPayload?.find(rule => rule.rule_id === 'r_mount001')?.actions?.find(action => action.type === 'if')
 const ifSavedOk = savedIf?.then?.length === 1 && savedIf?.else?.length === 1 && !Object.hasOwn(savedIf.then[0], 'failure_actions')
-  && savedIf.condition?.op === 'is_true' && !Object.hasOwn(savedIf, 'params')
+  && savedIf.condition?.op === 'event_occurred' && savedIf.condition.expected === false && /^t_/.test(savedIf.condition.trigger_id) && !Object.hasOwn(savedIf, 'params')
   && savedIf.elif?.[0]?.condition?.op === 'run_status' && savedIf.elif[0].condition.status === 'running' && savedIf.elif[0].then.length === 1
 console.log((ifSavedOk?'PASS':'FAIL')+' - saving preserves IF branches and predicate data')
 if (!ifSavedOk) process.exitCode = 1

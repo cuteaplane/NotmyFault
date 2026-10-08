@@ -42,7 +42,7 @@ const endIndex = computed(() => rangeMode.value === 'until' ? selectedIndex.valu
 const fields = computed(() => props.rule ? buildTestInputFields(props.rule, props.schema, {
   startStepId: startStepId.value,
   endStepId: endStepId.value,
-}) : [])
+}).filter(field => field.scope !== 'trigger' || values.value[`event_occurrence:${field.node}:[]`] !== false) : [])
 const selectedActionCount = computed(() => Math.max(0, endIndex.value - startIndex.value + 1))
 
 const groups = computed(() => {

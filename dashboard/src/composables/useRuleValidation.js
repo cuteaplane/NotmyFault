@@ -3,7 +3,7 @@ import { store } from '../lib/store'
 import { getVisibleParamDefs, pluginUnavailableReason as unavailableReason } from '../lib/utils'
 import { actionOutputDefs, bindingSourceFor, buildBindingSources,
   isReference, typesCompatible } from '../lib/bindings'
-import { ifBranches, RUN_STATUS_OPTIONS, appendActionSources } from '../lib/workflowConditions'
+import { ifBranches, RUN_STATUS_OPTIONS, appendActionSources, workflowEventChoices } from '../lib/workflowConditions'
 import { fieldType, typeSpec, isEncodedValue, isLiteralValue } from '../lib/valueTypes'
 import { validateRuleDraft } from '../lib/api'
 
@@ -66,6 +66,11 @@ export function useRuleValidation(rule) {
         if (!Array.isArray(node.children) || !node.children.length) add(`${label}条件组不能为空`, nodeId)
         if (node.op === 'not' && node.children?.length !== 1) add(`${label}取反需要一个条件或条件组`, nodeId)
         ;(node.children || []).forEach((child, index) => validatePredicate(child, `${label} ${index + 1}`, nodeId, sources))
+        return
+      }
+      if (node.op === 'event_occurred') {
+        if (!workflowEventChoices(rule.value, store.schema).some(trigger => trigger.id === node.trigger_id)) add(`${label}选择的触发器未添加到本流程`, nodeId)
+        if (node.expected !== undefined && typeof node.expected !== 'boolean') add(`${label}事件判断必须是已发生或未发生`, nodeId)
         return
       }
       if (node.op === 'run_status') {

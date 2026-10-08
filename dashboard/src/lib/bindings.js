@@ -581,6 +581,40 @@ export function buildTestInputFields(rule, schema, { startStepId = '', endStepId
     })
   }
 
+  function eventCheck(node) {
+    if (!node || typeof node !== 'object') return
+    if (node.op === 'event_occurred') {
+      const leaf = leavesById.get(node.trigger_id)
+      if (!leaf) return
+      const meta = schema.triggers?.[leaf.type]
+      const name = `触发 ${leaves.indexOf(leaf) + 1} · ${meta?.name || leaf.type}`
+      addTestField(fields, { scope: 'event_occurrence', node: node.trigger_id, path: [], sourceName: name,
+        label: '模拟事件已发生', type: 'bool', valueType: 'bool', defaultValue: true })
+      addOutputFields({ scope: 'trigger', node: node.trigger_id }, { name }, outputDefs(meta))
+      for (const field of fields.values()) {
+        if (field.scope === 'trigger' && field.node === node.trigger_id) field.sourceName = name
+      }
+      for (const output of outputDefs(meta)) {
+        if (output.required === false) continue
+        const field = fields.get(testFieldKey('trigger', node.trigger_id, [output.name]))
+        field.required = true
+        field.defaultValue = testDefaultValue(output)
+      }
+    }
+    ;(node.children || []).forEach(eventCheck)
+  }
+  function actionChecks(items) {
+    for (const action of items || []) {
+      if (action.type === 'if') {
+        eventCheck(action.condition)
+        actionChecks(action.then); actionChecks(action.else)
+        for (const branch of action.elif || []) { eventCheck(branch.condition); actionChecks(branch.then) }
+      }
+      actionChecks(action.failure_actions)
+    }
+  }
+  actionChecks(selectedActions)
+
   for (const variable of rule.variables || []) {
     addTestField(fields, { scope: 'variable', node: variable.id, path: [], sourceName: '运行变量（留空使用规则初始值）', label: variable.name, type: normalizedType(variable.value_type), valueType: variable.value_type, required: false, sensitive: variable.sensitive === true, defaultValue: '' })
   }
@@ -643,6 +677,7 @@ export function buildPreparedTestContext(fields, values) {
     variable_values: contextRecord(),
   }
   let hasEvent = false
+  const absentTriggers = new Set()
   for (const field of fields) {
     let value
     try { value = parsePreparedTestValue(values[field.key], field) }
@@ -651,6 +686,11 @@ export function buildPreparedTestContext(fields, values) {
       throw error
     }
     if (value === undefined) continue
+    if (field.scope === 'event_occurrence') {
+      if (value === true) contextBucket(context.trigger_payloads, field.node)
+      else absentTriggers.add(field.node)
+      continue
+    }
     if (field.scope === 'variable') { context.variable_values[field.node] = safeContextValue(value); continue }
     const target = field.scope === 'event'
       ? context.event_payload
@@ -661,6 +701,7 @@ export function buildPreparedTestContext(fields, values) {
     else setPath(target, field.path, value)
     if (field.scope === 'event') hasEvent = true
   }
+  for (const node of absentTriggers) delete context.trigger_payloads[node]
   if (!hasEvent) delete context.event_payload
   if (!Object.keys(context.step_outputs).length) delete context.step_outputs
   if (!Object.keys(context.variable_values).length) delete context.variable_values

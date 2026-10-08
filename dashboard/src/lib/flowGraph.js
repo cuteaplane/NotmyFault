@@ -1,4 +1,4 @@
-import { ifBranches, predicateSummary, precedingSources } from './workflowConditions.js'
+import { ifBranches, predicateSummary, precedingSources, workflowEventChoices } from './workflowConditions.js'
 export const FLOW_NODE_WIDTH = 228
 export const FLOW_NODE_PORT_Y = 58
 export const FLOW_NODE_BASE_HEIGHT = 116
@@ -174,7 +174,7 @@ export function buildFlowGraph({
       icon: item.type === 'if' ? 'call_split' : item.type === 'wait' ? 'hourglass_empty' : item.type === 'set_variable' ? 'edit_note' : 'play_arrow',
       kicker: `动作 ${index + 1}`,
       label: actionName(item),
-      meta: item.type === 'if' ? `${predicateSummary(item.condition, schema ? precedingSources(rule, item, schema) : [], rules)} · ${ifBranches(item).length} 个出口` : item.type === 'wait' ? describeWait(item) : describeItem(item, 'action'),
+      meta: item.type === 'if' ? `${predicateSummary(item.condition, schema ? precedingSources(rule, item, schema) : [], rules, workflowEventChoices(rule, schema))} · ${ifBranches(item).length} 个出口` : item.type === 'wait' ? describeWait(item) : describeItem(item, 'action'),
       admin: isAdmin(item, 'action'),
       hasInput: true,
       hasOutput: true,
@@ -325,9 +325,18 @@ export function buildIfSubflowGraph({ rule, action, schema, sources, rules, acti
     const grouped = groupOps.includes(node?.op)
     const children = grouped ? (node.children || []).map((child, index) => visit(child, branch, [...path, index], depth + 1)) : []
     const y = children.length ? children.reduce((sum, child) => sum + child.y, 0) / children.length : TOP + row++ * FLOW_ROW_STEP
-    const ports = grouped || node?.op === 'run_status' ? [] : ['left', ...(['is_true', 'is_false', 'exists', 'not_exists'].includes(node?.op) ? [] : ['right'])].map((key, index) => ({ id: `input:${key}`, name: key, index, label: key === 'left' ? '判断数据' : '比较目标', type: { type: 'any' } }))
-    nodes.push({ id, kind: 'predicate', source: node, predicatePath: path, branchKey: branch.key, x: LEFT + (maxDepth - depth + 1) * FLOW_COLUMN_STEP, y, icon: grouped ? 'account_tree' : 'rule', kicker: branch.label, label: grouped ? { all: '全部满足 · AND', any: '满足任一 · OR', not: '取反 · NOT' }[node.op] : '条件判断', meta: grouped ? `${children.length} 个子条件` : predicateSummary(node, sources, rules), hasInput: grouped && children.length > 0, hasOutput: true, availableStepIds, dataInputs: ports, dataOutputs: [] })
+    const ports = grouped || ['run_status', 'event_occurred'].includes(node?.op) ? [] : ['left', ...(['is_true', 'is_false', 'exists', 'not_exists'].includes(node?.op) ? [] : ['right'])].map((key, index) => ({ id: `input:${key}`, name: key, index, label: key === 'left' ? '判断数据' : '比较目标', type: { type: ['is_true', 'is_false'].includes(node?.op) ? 'bool' : ['gt', 'gte', 'lt', 'lte'].includes(node?.op) ? 'number' : 'any' } }))
+    nodes.push({ id, kind: 'predicate', source: node, predicatePath: path, branchKey: branch.key, x: LEFT + (maxDepth - depth + 1) * FLOW_COLUMN_STEP, y, icon: grouped ? 'account_tree' : 'rule', kicker: branch.label, label: grouped ? { all: '全部满足 · AND', any: '满足任一 · OR', not: '取反 · NOT' }[node.op] : '条件判断', meta: grouped ? `${children.length} 个子条件` : predicateSummary(node, sources, rules, workflowEventChoices(rule, schema)), hasInput: grouped && children.length > 0 || node?.op === 'event_occurred', hasOutput: true, availableStepIds, dataInputs: ports, dataOutputs: [] })
     children.forEach(child => addEdge(child.id, id, node.op === 'not' ? '取反' : node.op === 'all' ? '并且' : '或者', 'condition'))
+    if (node?.op === 'event_occurred') {
+      const trigger = workflowEventChoices(rule, schema).find(item => item.id === node.trigger_id)
+      if (trigger) {
+        const sourceId = `trigger-${trigger.id}`
+        if (!sourceNodes.has(sourceId)) sourceNodes.set(sourceId, { id: sourceId, kind: 'trigger', source: trigger.source, readOnly: true, x: LEFT, y: TOP + sourceNodes.size * FLOW_ROW_STEP, icon: 'bolt', kicker: '本流程触发器', label: trigger.label, meta: '记录流程开始至条件执行时收到的事件', hasInput: false, hasOutput: true, dataInputs: [], dataOutputs: [] })
+        sourceNodes.get(sourceId).hasOutput = true
+        addEdge(sourceId, id, '事件发生记录', 'condition')
+      }
+    }
     ports.forEach(port => {
       const reference = node[port.name]?.$ref
       if (!reference || !['trigger', 'step'].includes(reference.scope)) return
@@ -357,7 +366,7 @@ export function buildIfSubflowGraph({ rule, action, schema, sources, rules, acti
     const y = TOP + branchIndex * FLOW_ROW_STEP
     branch.actions.forEach((item, index) => {
       const id = `action-${item.binding_id}`
-      nodes.push({ id, kind: 'action', source: item, branchKey: branch.key, index, x: decisionX + (index + 1) * FLOW_COLUMN_STEP, y, icon: item.type === 'if' ? 'call_split' : 'play_arrow', kicker: `${branch.label} · ${index + 1}`, label: actionName(item), meta: item.type === 'if' ? predicateSummary(item.condition, precedingSources(rule, item, schema), rules) : describeItem(item, 'action'), hasInput: true, hasOutput: true, availableStepIds: precedingSources(rule, item, schema).filter(source => source.value.$ref.scope === 'step').map(source => source.value.$ref.node) })
+      nodes.push({ id, kind: 'action', source: item, branchKey: branch.key, index, x: decisionX + (index + 1) * FLOW_COLUMN_STEP, y, icon: item.type === 'if' ? 'call_split' : 'play_arrow', kicker: `${branch.label} · ${index + 1}`, label: actionName(item), meta: item.type === 'if' ? predicateSummary(item.condition, precedingSources(rule, item, schema), rules, workflowEventChoices(rule, schema)) : describeItem(item, 'action'), hasInput: true, hasOutput: true, availableStepIds: precedingSources(rule, item, schema).filter(source => source.value.$ref.scope === 'step').map(source => source.value.$ref.node) })
       addEdge(previous, id, index === 0 ? branch.label : '然后')
       let failurePrevious = id
       ;(item.failure_actions || []).forEach((failure, failureIndex) => {
