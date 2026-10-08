@@ -257,6 +257,10 @@ def check_rule_bindings(rule, triggers_meta, actions_meta):
         if op in ("all", "any", "not"):
             for index, child in enumerate(node.get("children", [])):
                 predicate(child, f"{location}.children[{index}]", available)
+        elif op == "event_occurred":
+            identity = node.get("trigger_id")
+            if not isinstance(identity, str) or not any(event.get("binding_id") == identity for event in get_rule_events(rule)):
+                add("unknown_source", f"{location}.trigger_id", "选择的触发器未添加到本流程")
         elif op in ("exists", "not_exists") and is_reference(node.get("left")):
             reference_type(node["left"]["$ref"], f"{location}.left", available, allow_missing=True)
         elif op != "run_status":

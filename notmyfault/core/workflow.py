@@ -100,6 +100,7 @@ def build_context(
         },
         "triggers": triggers,
         "condition_events": hold_value(condition_events),
+        "_event_occurrences": frozenset(triggers),
         "steps": {},
     }
     if run_id:

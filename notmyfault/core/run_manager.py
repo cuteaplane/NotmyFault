@@ -267,6 +267,9 @@ class RunManager:
         if run.state in TERMINAL_STATES:
             return
         run.state = status
+        observation = run.context.get("_event_observation")
+        if observation is not None:
+            observation.close()
         rule_id = run.rule.get("rule_id", run.context.get("rule", {}).get("id", run.key))
         self._last_results[rule_id] = status
         if status != "dropped":

@@ -1570,3 +1570,195 @@ def test_manual_admission_drops_rule_deleted_during_preparation(monkeypatch):
         assert generation.references.count == 0
     finally:
         engine.shutdown(2)
+
+
+@pytest.mark.parametrize("fired", [True, False])
+def test_if_event_occurrence_selects_branch_from_starting_events(fired):
+    engine = make_engine()
+    calls = []
+    register_action(engine, "record", lambda meta, params: calls.append(params["label"]))
+    records = [{"binding_id": "t_hot001", "event": {"type": "hotkey"}, "payload": {}}] if fired else []
+    context = build_context("规则", "hotkey", {"hotkey": "Shift+Q"}, records)
+    item = {"type": "if", "binding_id": "a_branch01", "condition": {"op": "event_occurred", "trigger_id": "t_hot001"},
+            "then": [{"type": "record", "params": {"label": "then"}}],
+            "else": [{"type": "record", "params": {"label": "else"}}]}
+    try:
+        assert engine.execute_actions([item], "规则", context)
+        assert calls == ["then" if fired else "else"]
+    finally:
+        engine.shutdown(2)
+
+
+@pytest.mark.parametrize("fired", [True, False])
+def test_manual_if_event_occurrence_starts_with_supplied_events(fired):
+    engine = make_engine()
+    engine.triggers_meta["hotkey"] = {"params": [], "outputs": []}
+    engine.triggers_funcs["hotkey"] = lambda *args: None
+    calls = []
+    register_action(engine, "record", lambda meta, params: calls.append(params["label"]))
+    rule = {"rule_id": "r_rule001", "name": "规则", "condition": {"type": "hotkey", "binding_id": "t_hot001", "params": {}},
+            "actions": [{"type": "if", "binding_id": "a_branch01", "condition": {"op": "event_occurred", "trigger_id": "t_hot001"},
+                         "then": [{"type": "record", "params": {"label": "then"}}],
+                         "else": [{"type": "record", "params": {"label": "else"}}]}]}
+    try:
+        ok, message, _ = engine.run_manual_rule_snapshot(rule, trigger_payloads={"t_hot001": {}} if fired else {})
+        assert ok, message
+        assert engine._run_manager.wait_for_idle(timeout=5)
+        assert calls == ["then" if fired else "else"]
+    finally:
+        engine.shutdown(2)
+
+
+@pytest.mark.parametrize("received", ["none", "other_config", "steam"])
+def test_if_receives_events_during_wait_and_stops_observing_after_finish(received):
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    engine = make_engine()
+    engine.triggers_meta.update({"hotkey": {"params": [], "outputs": []}, "process_state": {"params": [], "outputs": []}})
+    engine.triggers_funcs.update({"hotkey": lambda *args: None, "process_state": lambda *args: None})
+
+    def barrier(meta, params):
+        entered.set()
+        assert release.wait(3)
+
+    register_action(engine, "barrier", barrier)
+    register_action(engine, "record", lambda meta, params: calls.append(params["label"]))
+    rule = {"rule_id": "r_wait001", "name": "等待事件", "condition": {"op": "any", "children": [
+        {"type": "hotkey", "binding_id": "t_hot001", "params": {}},
+        {"type": "process_state", "binding_id": "t_steam01", "params": {"process_name": "steam", "state": "running"}},
+    ]}, "actions": [{"type": "barrier", "binding_id": "a_wait001", "params": {}},
+        {"type": "if", "binding_id": "a_branch01", "condition": {"op": "event_occurred", "trigger_id": "t_steam01"},
+         "then": [{"type": "record", "params": {"label": "occurred"}}],
+         "else": [{"type": "record", "params": {"label": "absent"}}]}]}
+    engine._generations.apply([rule], "test", activate=False, validate=False)
+    try:
+        engine.emit_event("hotkey", {}, instance={"config": {}})
+        assert entered.wait(3)
+        observation = next(iter(engine._event_bus._observations))
+        assert observation.snapshot() == {"t_hot001"}
+        if received != "none":
+            engine.emit_event("process_state", {}, instance={"config": {"process_name": "steam" if received == "steam" else "other", "state": "running"}})
+        release.set()
+        assert engine._run_manager.wait_for_idle(timeout=3)
+        assert calls == ["occurred" if received == "steam" else "absent"]
+        finished = observation.snapshot()
+        engine.emit_event("process_state", {}, instance={"config": {"process_name": "steam", "state": "running"}})
+        assert engine._run_manager.wait_for_idle(timeout=3)
+        assert observation.snapshot() == finished
+        entered.clear()
+        calls.clear()
+        engine.emit_event("hotkey", {}, instance={"config": {}})
+        assert engine._run_manager.wait_for_idle(timeout=3)
+        assert calls == ["absent"]
+    finally:
+        release.set()
+        engine.shutdown(2)
+
+
+def test_queued_runs_receive_events_before_reaching_if():
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    engine = make_engine()
+    engine.triggers_meta.update({"hotkey": {"params": [], "outputs": []}, "steam": {"params": [], "outputs": []}})
+    engine.triggers_funcs.update({"hotkey": lambda *args: None, "steam": lambda *args: None})
+
+    def barrier(meta, params):
+        entered.set()
+        assert release.wait(3)
+
+    register_action(engine, "barrier", barrier)
+    register_action(engine, "record", lambda meta, params: calls.append(params["label"]))
+    rule = {"rule_id": "r_queue01", "name": "排队事件", "concurrency": {"mode": "queue"},
+            "condition": {"op": "any", "children": [{"type": "hotkey", "binding_id": "t_hot001", "params": {}},
+                                                       {"type": "steam", "binding_id": "t_steam01", "params": {}}]},
+            "actions": [{"type": "barrier", "binding_id": "a_wait001", "params": {}},
+                        {"type": "if", "binding_id": "a_branch01", "condition": {"op": "event_occurred", "trigger_id": "t_steam01"},
+                         "then": [{"type": "record", "params": {"label": "occurred"}}],
+                         "else": [{"type": "record", "params": {"label": "absent"}}]}]}
+    engine._generations.apply([rule], "test", activate=False, validate=False)
+    try:
+        engine.emit_event("hotkey", {})
+        assert entered.wait(3)
+        engine.emit_event("hotkey", {})
+        assert engine._run_manager.rule_status("r_queue01")["queued"] == 1
+        engine.emit_event("steam", {})
+        release.set()
+        assert engine._run_manager.wait_for_idle(timeout=3)
+        assert calls == ["occurred"] * 3
+    finally:
+        release.set()
+        engine.shutdown(2)
+
+
+def test_event_group_uses_one_snapshot_and_later_if_reads_new_events():
+    from notmyfault.core.predicates import evaluate_predicate
+
+    class Observation:
+        def __init__(self):
+            self.reads = 0
+
+        def snapshot(self):
+            self.reads += 1
+            return frozenset() if self.reads == 1 else frozenset({"t_steam01"})
+
+    observation = Observation()
+    event = {"op": "event_occurred", "trigger_id": "t_steam01"}
+    group = {"op": "all", "children": [{"op": "not", "children": [event]}, {**event, "expected": False}]}
+    context = {"_event_observation": observation}
+    assert evaluate_predicate(group, context)
+    assert observation.reads == 1
+    assert evaluate_predicate(event, context)
+    assert observation.reads == 2
+
+
+
+def test_if_and_elif_share_event_records_and_next_if_refreshes_them():
+    class Observation:
+        def __init__(self):
+            self.reads = 0
+
+        def snapshot(self):
+            self.reads += 1
+            return frozenset() if self.reads == 1 else frozenset({"t_steam01"})
+
+    engine = make_engine()
+    calls = []
+    register_action(engine, "record", lambda meta, params: calls.append(params["label"]))
+    event = {"op": "event_occurred", "trigger_id": "t_steam01"}
+    action = lambda label: {"type": "record", "params": {"label": label}}
+    branch = {"type": "if", "binding_id": "a_branch01", "condition": event, "then": [action("early")],
+              "elif": [{"condition": {**event, "expected": False}, "then": [action("absent")]}], "else": [action("inconsistent")]}
+    next_branch = {"type": "if", "binding_id": "a_branch02", "condition": event, "then": [action("new_event")], "else": [action("stale")]}
+    context = _context()
+    context["_event_observation"] = observation = Observation()
+    try:
+        assert engine.execute_actions([branch, next_branch], "规则", context)
+        assert calls == ["absent", "new_event"]
+        assert observation.reads == 2
+    finally:
+        engine.shutdown(2)
+
+
+
+def test_absence_flow_records_event_arriving_before_its_if():
+    calls = []
+    engine = make_engine()
+    engine.triggers_meta["hotkey"] = {"params": [], "outputs": []}
+    engine.triggers_funcs["hotkey"] = lambda *args: None
+    register_action(engine, "record", lambda meta, params: calls.append(params["label"]))
+    rule = {"rule_id": "r_timer01", "name": "未发生事件", "condition": {"op": "not", "within_seconds": 10, "children": [
+        {"type": "hotkey", "binding_id": "t_hot001", "params": {}},
+    ]}, "actions": [{"type": "if", "binding_id": "a_branch01", "condition": {"op": "event_occurred", "trigger_id": "t_hot001"},
+                    "then": [{"type": "record", "params": {"label": "occurred"}}],
+                    "else": [{"type": "record", "params": {"label": "absent"}}]}]}
+    engine._generations.apply([rule], "test", activate=False, validate=False)
+    clock = FakeClock()
+    engine._condition_runtime._clock = clock
+    try:
+        engine._event_bus.process_timers()
+        clock.advance(10)
+        engine.emit_event("hotkey", {})
+        assert engine._run_manager.wait_for_idle(timeout=3)
+        assert calls == ["occurred"]
+    finally:
+        engine.shutdown(2)

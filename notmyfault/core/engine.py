@@ -587,6 +587,7 @@ class AutomationEngine:
                 context["_generation"] = generation
             else:
                 context["_standalone_snapshot"] = True
+            context["_event_observation"] = self._event_bus.observe_events(compiled, trigger_payloads or {})
             self._safe_on_event("run.triggered", {
                 "rule_id": rule_id,
                 "run_id": run_id,

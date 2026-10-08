@@ -2,6 +2,7 @@ import sys
 import logging
 import threading
 import uuid
+import weakref
 from collections import deque
 from typing import Any, Callable, Dict, Optional
 
@@ -13,6 +14,7 @@ from notmyfault.core.workflow import build_context
 from notmyfault.core.run_context import RunState
 from notmyfault.core.runtime_rules import PreparedRules, rule_key
 from notmyfault.core.conditions import config_fingerprint
+from notmyfault.core.event_observation import RunEventObservation, has_event_predicate
 
 # 两条规则互相监视会形成一条不会结束的触发链，链到这么深就丢弃这次运行
 _MAX_RUN_CHAIN = 16
@@ -50,6 +52,17 @@ class EventBus:
         self._run_depth_order: deque = deque()
         self._chain_alerts: set = set()
         self._depth_lock = threading.Lock()
+        self._observations = weakref.WeakSet()
+
+    def observe_events(self, compiled, occurred=()):
+        if not any(has_event_predicate(step.action.get("condition")) or
+                   any(has_event_predicate(branch.get("condition")) for branch in (step.action.get("elif") or ()) if isinstance(branch, dict))
+                   for step in compiled.plan if step.action.get("type") == "if"):
+            return None
+        observation = RunEventObservation(compiled, occurred)
+        with self._rules_lock:
+            self._observations.add(observation)
+        return observation
 
     def emit_event(
         self,
@@ -77,6 +90,8 @@ class EventBus:
         dispatches = []
         with self._rules_lock:
             snapshot = self._snapshot_fn()
+            for observation in tuple(self._observations):
+                observation.record(event_type, event_payload, instance)
             due, matches = snapshot.runtime.process_event(
                 ((compiled.rule_id, compiled.source) for compiled in snapshot.event_index.get(event_type, ())),
                 event_type, event_payload, instance=instance,
@@ -85,11 +100,16 @@ class EventBus:
                 dispatches.append((snapshot.compiled[key].source, key, events, "absence", {}, {}, 0))
             for key, events in matches:
                 dispatches.append((snapshot.compiled[key].source, key, events, event_type, event_payload, masked_payload, depth))
+            dispatches = [(item, self.observe_events(snapshot.compiled[item[1]],
+                          (event.get("binding_id") for event in item[2]))) for item in dispatches]
+            for _item, observation in dispatches:
+                if observation is not None:
+                    observation.record(event_type, event_payload, instance)
             if dispatches and snapshot.generation is not None:
                 snapshot.generation.retain()
         try:
-            for rule, key, matched_events, kind, payload, masked, run_depth in dispatches:
-                self._dispatch(snapshot, rule, key, kind, payload, masked, matched_events, run_depth)
+            for (rule, key, matched_events, kind, payload, masked, run_depth), observation in dispatches:
+                self._dispatch(snapshot, rule, key, kind, payload, masked, matched_events, run_depth, observation)
         finally:
             if dispatches and snapshot.generation is not None:
                 snapshot.generation.release()
@@ -152,17 +172,18 @@ class EventBus:
         with self._rules_lock:
             snapshot = self._snapshot_fn()
             for key, matched in snapshot.runtime.take_due(now):
-                dispatches.append((snapshot.compiled[key].source, key, matched))
+                observation = self.observe_events(snapshot.compiled[key], (event.get("binding_id") for event in matched))
+                dispatches.append((snapshot.compiled[key].source, key, matched, observation))
             if dispatches and snapshot.generation is not None:
                 snapshot.generation.retain()
         try:
-            for rule, key, matched in dispatches:
-                self._dispatch(snapshot, rule, key, "absence", {}, {}, matched)
+            for rule, key, matched, observation in dispatches:
+                self._dispatch(snapshot, rule, key, "absence", {}, {}, matched, observation=observation)
         finally:
             if dispatches and snapshot.generation is not None:
                 snapshot.generation.release()
 
-    def _dispatch(self, snapshot, rule, key, event_type, event_payload, masked_payload, matched_events, depth=0):
+    def _dispatch(self, snapshot, rule, key, event_type, event_payload, masked_payload, matched_events, depth=0, observation=None):
         rule_id = rule.get("rule_id", "")
         rule_name = rule.get("name", "未命名规则")
         if depth > _MAX_RUN_CHAIN:
@@ -183,7 +204,8 @@ class EventBus:
             },
         )
         context = RunState({"rule": {"id": rule_id, "name": rule_name}, "run": {"id": run_id},
-                            "_generation": snapshot.generation, "_compiled_rule": snapshot.compiled[key]})
+                            "_generation": snapshot.generation, "_compiled_rule": snapshot.compiled[key],
+                            "_event_observation": observation})
 
         def prepare(state):
             state.update(build_context(rule_name, event_type, event_payload, matched_events, rule_id, run_id))

@@ -558,3 +558,23 @@ def test_typed_nested_bindings_conversion_and_optional_policy_are_checked_on_sav
     assert validate_rule_bindings(rule, TRIGGERS_META, actions_meta) == []
     reference["$ref"].pop("on_missing")
     assert [issue["code"] for issue in validate_rule_bindings(rule, TRIGGERS_META, actions_meta)] == ["optional_output"]
+
+
+def test_event_occurred_checks_workflow_identity_without_requiring_outputs():
+    from notmyfault.core.predicates import evaluate_predicate, validate_predicate
+    source = {"op": "event_occurred", "trigger_id": "t_hot001"}
+    rule = _rule(_leaf("hotkey", "t_hot001"), [{"type": "if", "binding_id": "a_branch01", "condition": source,
+                 "then": [{"type": "notify", "binding_id": "a_notify01", "params": {}}], "else": []}])
+    assert validate_rule_bindings(rule, {"hotkey": {"outputs": []}}, ACTIONS_META) == []
+    matched = build_context("规则", "hotkey", {}, [{"binding_id": "t_hot001", "event": {"type": "hotkey"}, "payload": {}}])
+    assert evaluate_predicate(source, matched)
+    assert not evaluate_predicate(source, build_context("规则", "other", {}, []))
+    assert evaluate_predicate({**source, "expected": False}, build_context("规则", "other", {}, []))
+    matched["manual_test"] = {"provided_trigger_ids": ()}
+    assert not evaluate_predicate(source, matched)
+    matched["manual_test"]["provided_trigger_ids"] = ("t_hot001",)
+    assert evaluate_predicate(source, matched)
+    source["trigger_id"] = "t_unknown1"
+    assert [issue["code"] for issue in validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META)] == ["unknown_source"]
+    assert validate_predicate({"op": "event_occurred", "trigger_id": "a_action1"})
+    assert validate_predicate({"op": "event_occurred", "trigger_id": "t_hot001", "expected": "false"})

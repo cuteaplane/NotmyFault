@@ -21,7 +21,7 @@ from notmyfault.core.data_types import DataTypeError, normalize_fields
 from notmyfault.core.variables import assign_variable
 from notmyfault.core.diagnostics import Diagnostics
 from notmyfault.core.clock import SystemClock
-from notmyfault.core.predicates import evaluate_predicate, values_equal
+from notmyfault.core.predicates import evaluate_predicate, event_occurrences, values_equal
 from notmyfault.core.logging import engine_error
 from notmyfault.core.run_manager import RunOutcome
 from notmyfault.core.run_summary import summarize_fields
@@ -427,12 +427,13 @@ class WorkflowExecutor:
                     statuses[rule_id] = self._status_lookup(rule_id)
                 return statuses[rule_id]
 
-            matched = evaluate_predicate(action.get("condition"), context, status_lookup=status_lookup)
+            occurred = event_occurrences(context)
+            matched = evaluate_predicate(action.get("condition"), context, status_lookup=status_lookup, _event_occurrences=occurred)
             branch = "then" if matched else "else"
             actions = action.get(branch, [])
             if not matched:
                 for index, alternative in enumerate(action.get("elif", [])):
-                    if evaluate_predicate(alternative.get("condition"), context, f"elif[{index}].condition", status_lookup=status_lookup):
+                    if evaluate_predicate(alternative.get("condition"), context, f"elif[{index}].condition", status_lookup=status_lookup, _event_occurrences=occurred):
                         matched = True
                         branch = f"elif[{index}]"
                         actions = alternative.get("then", [])

@@ -4,7 +4,7 @@ from decimal import Decimal
 from typing import Any
 
 from notmyfault.core.bindings import BindingResolutionError, is_reference, reference_exists, references_available, resolve_value
-from notmyfault.core.rule_model import _RULE_ID_RE
+from notmyfault.core.rule_model import _RULE_ID_RE, _BINDING_ID_RE
 from notmyfault.values import plain_value
 
 
@@ -35,6 +35,14 @@ def validate_predicate(node: Any, path: str = "condition") -> list[str]:
     if not isinstance(node, dict):
         return [f"{path} 必须是对象"]
     op = node.get("op")
+    if op == "event_occurred":
+        identity = node.get("trigger_id")
+        errors = []
+        if not isinstance(identity, str) or not identity.startswith("t_") or not _BINDING_ID_RE.fullmatch(identity):
+            errors.append(f"{path}.trigger_id 必须是本流程触发器的节点 ID")
+        if not isinstance(node.get("expected", True), bool):
+            errors.append(f"{path}.expected 必须是布尔值")
+        return errors
     if op == "run_status":
         errors = []
         if not isinstance(node.get("rule_id"), str) or not _RULE_ID_RE.fullmatch(node["rule_id"]):
@@ -66,11 +74,23 @@ def validate_predicate(node: Any, path: str = "condition") -> list[str]:
     return errors
 
 
-def evaluate_predicate(node: dict, context: dict, path: str = "condition", *, status_lookup=None) -> bool:
+def event_occurrences(context):
+    observation = context.get("_event_observation")
+    manual = context.get("manual_test")
+    return observation.snapshot() if observation is not None else frozenset(
+        manual.get("provided_trigger_ids", ()) if isinstance(manual, dict) else context.get("_event_occurrences", ())
+    )
+
+
+def evaluate_predicate(node: dict, context: dict, path: str = "condition", *, status_lookup=None, _event_occurrences=None) -> bool:
     errors = validate_predicate(node, path)
     if errors:
         raise ValueError("；".join(errors))
     op = node["op"]
+    if _event_occurrences is None:
+        _event_occurrences = event_occurrences(context)
+    if op == "event_occurred":
+        return (node["trigger_id"] in _event_occurrences) == node.get("expected", True)
     if op == "run_status":
         if status_lookup is None:
             raise ValueError("当前执行环境不提供自动化运行状态")
@@ -84,10 +104,10 @@ def evaluate_predicate(node: dict, context: dict, path: str = "condition", *, st
             matched = state["last_status"] == expected
         return matched if node.get("comparison", "eq") == "eq" else not matched
     if op == "not":
-        return not evaluate_predicate(node["children"][0], context, f"{path}.children[0]", status_lookup=status_lookup)
+        return not evaluate_predicate(node["children"][0], context, f"{path}.children[0]", status_lookup=status_lookup, _event_occurrences=_event_occurrences)
     if op in ("all", "any"):
         values = (
-            evaluate_predicate(child, context, f"{path}.children[{index}]", status_lookup=status_lookup)
+            evaluate_predicate(child, context, f"{path}.children[{index}]", status_lookup=status_lookup, _event_occurrences=_event_occurrences)
             for index, child in enumerate(node["children"])
         )
         return all(values) if op == "all" else any(values)

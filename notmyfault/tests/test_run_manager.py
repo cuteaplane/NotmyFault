@@ -609,3 +609,28 @@ def test_pending_rules_take_turns_and_callbacks_can_read_from_another_thread():
     assert blocked_callbacks == []
     assert manager.wait_for_idle(1)
     manager.shutdown()
+
+
+
+@pytest.mark.parametrize("terminal", ["succeeded", "failed", "cancelled", "timed_out", "dropped"])
+def test_terminal_runs_stop_accepting_events(terminal):
+    from types import SimpleNamespace
+    from notmyfault.core.condition_program import build_matcher
+    from notmyfault.core.event_observation import RunEventObservation
+    from notmyfault.core.run_manager import RunOutcome
+
+    compiled = SimpleNamespace(matcher_spec=build_matcher({"type": "hotkey", "binding_id": "t_hot001", "params": {}}))
+    observation = RunEventObservation(compiled)
+    context = make_context()
+    context["_event_observation"] = observation
+    manager = RunManager(lambda *args: RunOutcome(terminal))
+    try:
+        if terminal == "dropped":
+            manager.shutdown()
+        manager.submit("r1", {"name": "规则"}, "规则", context)
+        assert manager.wait_for_idle(3)
+        assert manager.state(context["run"]["id"]) == terminal
+        observation.record("hotkey", {})
+        assert observation.snapshot() == frozenset()
+    finally:
+        manager.shutdown()
