@@ -2,22 +2,24 @@
 import { computed, watch, unref } from 'vue'
 import { store } from '../lib/store'
 import { ensureParams, getVisibleParamDefs } from '../lib/utils'
-import { buildFailureBindingSources, parameterAllowsBinding } from '../lib/bindings'
+import { parameterAllowsBinding } from '../lib/bindings'
 import { actionName } from '../lib/rulePresentation'
 import ActionForm from './ActionForm.vue'
+import ActionRunLimits from './ActionRunLimits.vue'
+import { precedingSources, ifBranches } from '../lib/workflowConditions'
 import TriggerForm from './TriggerForm.vue'
 import ParamInput from './ParamInput.vue'
 
-const props = defineProps({ rule: Object, node: Object, mutations: Object, constantSources: Array, hasTriggers: Boolean })
-const emit = defineEmits(['select-node'])
+const props = defineProps({ rule: Object, node: Object, mutations: Object, constantSources: Array, hasTriggers: Boolean, layout: String })
+const emit = defineEmits(['select-node', 'open-if'])
 const selectedGraphNode = computed(() => props.node)
 const selectedKind = computed(() => {
   return selectedGraphNode.value?.kind || 'trigger'
 })
 const selectedIndex = computed(() => selectedGraphNode.value?.index ?? -1)
-const selectedAction = computed(() => selectedKind.value === 'action' ? props.rule.actions?.[selectedIndex.value] : null)
+const selectedAction = computed(() => selectedKind.value === 'action' ? selectedGraphNode.value.source : null)
 const selectedFailureAction = computed(() => selectedKind.value === 'failure-action'
-  ? props.rule.actions?.[selectedGraphNode.value?.parentIndex]?.failure_actions?.[selectedIndex.value]
+  ? selectedGraphNode.value.source
   : null)
 watch(selectedFailureAction, action => { if (action) ensureParams(action) }, { immediate: true })
 const actionParams = (action) => getVisibleParamDefs(store.schema.actions[action.type], action.params || {})
@@ -25,9 +27,13 @@ const actionParamAllowsBinding = (action, param) => parameterAllowsBinding(
   store.schema.actions[action?.type],
   param.name,
 )
-function failureActionBindingSources(actionIndex, failureIndex) {
-  return buildFailureBindingSources(props.rule, actionIndex, failureIndex, store.schema)
-}
+const selectedFailureOwner = computed(() => selectedGraphNode.value?.owner)
+const selectedActionItems = computed(() => selectedGraphNode.value?.items || props.rule.actions)
+const selectedBranch = computed(() => selectedKind.value === 'if-branch' ? ifBranches(selectedGraphNode.value.source).find(branch => branch.key === selectedGraphNode.value.branchKey) : null)
+const actionSources = computed(() => {
+  const action = selectedAction.value || selectedFailureAction.value
+  return action ? precedingSources(props.rule, action, store.schema) : []
+})
 const useSingleCondition = (...args) => props.mutations.useSingleCondition(...args)
 const wrapConditionInNot = (...args) => props.mutations.wrapConditionInNot(...args)
 const unwrapNotEvent = (...args) => props.mutations.unwrapNotEvent(...args)
@@ -39,6 +45,7 @@ const removeAction = (...args) => props.mutations.removeAction(...args)
 const duplicateAction = (...args) => props.mutations.duplicateAction(...args)
 const moveAction = (...args) => props.mutations.moveAction(...args)
 const removeFailureAction = (...args) => props.mutations.removeFailureAction(...args)
+const duplicateFailureAction = (...args) => props.mutations.duplicateFailureAction(...args)
 const moveFailureAction = (...args) => props.mutations.moveFailureAction(...args)
 const requestAddFailureAction = (...args) => props.mutations.requestAddFailureAction(...args)
 const requestReplaceFailureAction = (...args) => props.mutations.requestReplaceFailureAction(...args)
@@ -64,7 +71,7 @@ function setTtlSeconds(value) {
               {{ selectedKind === 'invalid' ? 'error' : selectedKind === 'condition' ? 'alt_route' : selectedKind === 'trigger' ? 'bolt' : selectedKind === 'failure-action' ? 'build' : selectedKind === 'action' ? 'play_arrow' : 'add' }}
             </span>
             <div><small>节点设置</small><h2>
-              {{ selectedKind === 'invalid' ? '无效条件' : selectedKind === 'condition' ? '逻辑组' : selectedKind === 'trigger' ? '触发条件' : selectedKind === 'failure-action' ? `补救动作 ${selectedIndex + 1}` : selectedKind === 'action' ? `动作 ${selectedIndex + 1}` : '添加动作' }}
+              {{ selectedKind === 'invalid' ? '无效条件' : selectedKind === 'condition' ? '逻辑组' : selectedKind === 'trigger' ? '触发条件' : selectedKind === 'failure-action' ? `补救动作 ${selectedIndex + 1}` : selectedKind === 'action' ? `动作 ${selectedIndex + 1}` : ['if-branch', 'if-merge'].includes(selectedKind) ? selectedGraphNode.kicker : '添加动作' }}
             </h2></div>
             <button class="icon-btn node-inspector-close" title="关闭设置" @click="emit('select-node', null)"><span class="material-symbols-outlined">close</span></button>
           </header>
@@ -151,16 +158,36 @@ function setTtlSeconds(value) {
               </template>
             </template>
 
+            <template v-else-if="selectedKind === 'if-branch' && selectedBranch">
+              <h3>{{ selectedBranch.label }}</h3>
+              <p class="inspector-lead">{{ selectedBranch.actions.length ? '动作按连线顺序执行，结束后接回公共后续流程。' : '此分支为空，直接接回公共后续流程。' }}</p>
+              <button v-if="selectedBranch.condition" class="btn btn-text btn-sm" @click="emit('open-if', selectedGraphNode.source, selectedBranch.key)">编辑分支条件</button>
+              <div class="flow-add-row">
+                <button class="btn btn-tonal btn-sm" @click="mutations.requestBranchAction(selectedGraphNode)">添加动作</button>
+                <button class="btn btn-text btn-sm" @click="mutations.addBranchAction(selectedGraphNode, 'if')">添加 IF</button>
+                <button class="btn btn-text btn-sm" @click="mutations.addBranchAction(selectedGraphNode, 'set_variable')">变量赋值</button>
+                <button class="btn btn-text btn-sm" @click="mutations.addBranchAction(selectedGraphNode, 'wait')">等待</button>
+              </div>
+            </template>
+            <template v-else-if="selectedKind === 'if-merge'">
+              <p class="inspector-lead">IF、ELIF、ELSE 中执行的分支在这里接回公共后续流程。</p>
+            </template>
+
             <template v-else-if="selectedKind === 'action' && selectedAction">
-              <ActionForm :action="selectedAction" :rule="rule" :index="selectedIndex"
-                @replace="openPluginPicker('action', { mode: 'replace-action', index: selectedIndex, title: '更换动作类型' })"
+              <template v-if="selectedAction.type === 'if' && layout === 'canvas'">
+                <p class="inspector-lead">{{ selectedGraphNode.meta }}</p>
+                <button class="btn btn-tonal btn-sm" @click="emit('open-if', selectedAction)">编辑条件子图</button>
+              </template>
+              <ActionForm v-else :action="selectedAction" :rule="rule" :index="selectedIndex" :binding-sources="actionSources"
+                :failure-binding-sources="index => precedingSources(rule, selectedAction.failure_actions[index], store.schema)"
+                @replace="openPluginPicker('action', { mode: 'replace-action', actionId: selectedAction.binding_id, index: selectedIndex, title: '更换动作类型' })"
                 @add-failure-action="requestAddFailureAction(selectedIndex)"
                 @replace-failure-action="failureIndex => requestReplaceFailureAction(selectedIndex, failureIndex)"
                 @remove-failure-action="failureIndex => removeFailureAction(selectedIndex, failureIndex)"
                 @move-failure-action="(failureIndex, offset) => moveFailureAction(selectedIndex, failureIndex, offset)" />
               <div class="inspector-action-row">
                 <button class="btn btn-text btn-sm" :disabled="selectedIndex === 0" @click="moveAction(selectedIndex, -1)"><span class="material-symbols-outlined">arrow_back</span>提前</button>
-                <button class="btn btn-text btn-sm" :disabled="selectedIndex === rule.actions.length - 1" @click="moveAction(selectedIndex, 1)">稍后<span class="material-symbols-outlined">arrow_forward</span></button>
+                <button class="btn btn-text btn-sm" :disabled="selectedIndex === selectedActionItems.length - 1" @click="moveAction(selectedIndex, 1)">稍后<span class="material-symbols-outlined">arrow_forward</span></button>
                 <button class="btn btn-text btn-sm" @click="duplicateAction(selectedIndex)"><span class="material-symbols-outlined">content_copy</span>复制</button>
                 <button class="btn btn-text btn-sm danger-text" @click="removeAction(selectedIndex)"><span class="material-symbols-outlined">delete</span>删除</button>
               </div>
@@ -176,12 +203,15 @@ function setTtlSeconds(value) {
                   <span class="material-symbols-outlined">arrow_forward</span>
                 </button>
               </div>
-              <div class="param-grid"><ParamInput v-for="param in actionParams(selectedFailureAction)" :key="param.name" :def="param" :plugin-id="selectedFailureAction.type" v-model="selectedFailureAction.params[param.name]" :allow-binding="actionParamAllowsBinding(selectedFailureAction, param)" :binding-sources="failureActionBindingSources(selectedGraphNode.parentIndex, selectedIndex)" /></div>
+              <div class="param-grid"><ParamInput v-for="param in actionParams(selectedFailureAction)" :key="param.name" :def="param" :plugin-id="selectedFailureAction.type" v-model="selectedFailureAction.params[param.name]" :allow-binding="actionParamAllowsBinding(selectedFailureAction, param)" :binding-sources="actionSources" /></div>
+              <label class="field"><span class="field-label">这个补救动作也失败时</span><select class="select" :value="selectedFailureAction.on_error === 'continue' ? 'continue' : 'stop'" @change="selectedFailureAction.on_error = $event.target.value"><option value="stop">停止剩余补救动作</option><option value="continue">继续执行剩余补救动作</option></select></label>
+              <ActionRunLimits :action="selectedFailureAction" :meta="store.schema.actions[selectedFailureAction.type]" />
               <p class="failure-action-note">{{ selectedFailureAction.on_error === 'continue' ? '如果它也失败，会继续执行剩余补救动作。' : '如果它也失败，会停止剩余补救动作。' }}</p>
-              <button class="btn btn-tonal btn-sm" @click="emit('select-node', `action-${rule.actions[selectedGraphNode.parentIndex].binding_id}`)"><span class="material-symbols-outlined">tune</span>设置重试和失败处理</button>
+              <button class="btn btn-tonal btn-sm" @click="emit('select-node', `action-${selectedFailureOwner.binding_id}`)"><span class="material-symbols-outlined">tune</span>设置重试和失败处理</button>
               <div class="inspector-action-row">
                 <button class="btn btn-text btn-sm" :disabled="selectedIndex === 0" @click="moveFailureAction(selectedGraphNode.parentIndex, selectedIndex, -1)"><span class="material-symbols-outlined">arrow_back</span>提前</button>
-                <button class="btn btn-text btn-sm" :disabled="selectedIndex === rule.actions[selectedGraphNode.parentIndex].failure_actions.length - 1" @click="moveFailureAction(selectedGraphNode.parentIndex, selectedIndex, 1)">稍后<span class="material-symbols-outlined">arrow_forward</span></button>
+                <button class="btn btn-text btn-sm" :disabled="selectedIndex === selectedFailureOwner.failure_actions.length - 1" @click="moveFailureAction(selectedGraphNode.parentIndex, selectedIndex, 1)">稍后<span class="material-symbols-outlined">arrow_forward</span></button>
+                <button class="btn btn-text btn-sm" @click="duplicateFailureAction(selectedGraphNode.parentIndex, selectedIndex)"><span class="material-symbols-outlined">content_copy</span>复制</button>
                 <button class="btn btn-text btn-sm danger-text" @click="removeFailureAction(selectedGraphNode.parentIndex, selectedIndex)"><span class="material-symbols-outlined">delete</span>删除</button>
               </div>
             </template>

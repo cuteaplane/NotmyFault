@@ -1,3 +1,4 @@
+import { walkGraphActions } from './workflowGraph.js'
 import { getParamDefs } from './utils.js'
 
 function comparable(value) {
@@ -57,6 +58,7 @@ export function summarizeRuleChanges(before, after) {
     const name = action?.type || `动作 ${index + 1}`
     changes.push(...describeList(previous.failure_actions, action.failure_actions, `${name} 的补救动作`))
   })
+  if (!equal(before.workflow, after.workflow)) changes.push('流程节点、组或连接已改')
   if (!changes.length && !equal(before, after)) changes.push('规则设置已改')
   return changes
 }
@@ -135,6 +137,17 @@ export function computeChangeSet(before, after, schema) {
   }
   if (!equal(before?.preconditions, after.preconditions)) {
     items.push({ op: after.preconditions?.length ? 'modify' : 'delete', target: 'rule', label: '旧版 preconditions 配置', detail: after.preconditions?.length ? '已变更' : '已删除' })
+  }
+  if (after.workflow || before?.workflow) {
+    const flatten = workflow => { const nodes = []; walkGraphActions(workflow, action => nodes.push(action)); return nodes }
+    const previous = new Map(flatten(before?.workflow).map(node => [node.binding_id, node]))
+    const current = new Map(flatten(after.workflow).map(node => [node.binding_id, node]))
+    for (const [id, node] of current) {
+      const old = previous.get(id)
+      if (!old || !equal(old, node)) items.push({ op: old ? 'modify' : 'add', target: 'graph-node', node_id: id, label: node.name || schema?.actions?.[node.type]?.name || node.type, detail: old ? '节点内容已变更' : '新增节点' })
+    }
+    for (const [id, node] of previous) if (!current.has(id)) items.push({ op: 'delete', target: 'graph-node', node_id: id, label: node.name || node.type })
+    if (!equal(before?.workflow?.edges, after.workflow?.edges)) items.push({ op: 'modify', target: 'rule', label: '控制连接', detail: '执行路径已变更' })
   }
   diffList(before?.actions, after.actions, '动作', 'action', { transform: withoutFailureActions })
   const previousActions = new Map((before?.actions || []).map((item, index) => [item?.binding_id || `idx:${index}`, item]))

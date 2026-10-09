@@ -1,4 +1,5 @@
 <script setup>
+import { findGraphNode } from '../../lib/workflowGraph'
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { listRuns, readLogEntries, readLogFileEntries, listLogFiles } from '../../lib/api'
 import { store } from '../../lib/store'
@@ -154,16 +155,19 @@ function runScope(run) {
 }
 
 function stepNumber(run, step, fallback) {
-  const found = findAction(matchingRule(run)?.actions || [], step.step_id)
+  const rule = matchingRule(run)
+  const found = rule?.workflow ? findGraphNode(rule, step.step_id) : findAction(rule?.actions || [], step.step_id)
   if (!found) return fallback
   if (!found.trail.length) return found.index + 1
+  if (rule?.workflow) return [...found.trail.map(parent => parent.index + 1), found.index + 1].join('.')
   const parent = found.trail[0]
   const branch = parent.field === 'then' ? 'THEN' : parent.field === 'else' ? 'ELSE' : parent.field.startsWith('elif[') ? `ELIF ${Number(parent.field.slice(5, -1)) + 1}` : '失败处理'
   return `${parent.index + 1}.${branch}.${found.index + 1}`
 }
 
 function stepContext(run, step) {
-  const found = findAction(matchingRule(run)?.actions || [], step.step_id)
+  const rule = matchingRule(run)
+  const found = rule?.workflow ? findGraphNode(rule, step.step_id) : findAction(rule?.actions || [], step.step_id)
   if (!found) return { kind: 'action', label: '' }
   const failureParent = found.trail.find(item => item.field === 'failure_actions')
   if (failureParent) {
@@ -177,14 +181,21 @@ function stepContext(run, step) {
     const branch = parent.field === 'then' ? '成立时' : parent.field.startsWith('elif[') ? `ELIF ${Number(parent.field.slice(5, -1)) + 1} 成立时` : '否则'
     return { kind: 'action', label: `“${actionName(parent.action.type)}”${branch}` }
   }
+  if (rule?.workflow && found.trail.length) return { kind: 'action', label: found.trail.filter(parent => parent.field === 'workflow').map(parent => parent.action.name || '动作组').join(' → ') }
   return { kind: 'action', label: '' }
 }
 
-function ifBranchLabel(branch) {
+function ifBranchLabel(branch, run, step) {
+  if (run && step) { const node = findGraphNode(matchingRule(run) || {}, step.step_id)?.action; const index = node?.branches?.findIndex(item => item.id === branch); if (index >= 0) return node.branches[index].label || (node.branches[index].else ? 'ELSE' : index ? `ELIF ${index}` : 'IF') }
   if (branch === 'then') return 'IF 成立'
   if (branch === 'else') return 'ELSE'
   const match = /^elif\[(\d+)\]$/.exec(branch || '')
   return match ? `ELIF ${Number(match[1]) + 1} 成立` : ''
+}
+
+function evaluationResult(value) {
+  if (value.error) return `判断出错 · ${value.error.code || '未知错误'}`
+  return value.result === true ? '成立' : value.result === false ? '不成立' : '未收到判断结果'
 }
 
 function hasPreconditions(run) {
@@ -525,13 +536,24 @@ onUnmounted(() => {
                 <span class="run-step-copy">
                   <strong>{{ actionName(step.action_type) }}</strong>
                   <small v-if="stepContext(run, step).kind === 'failure'">失败处理 · {{ stepContext(run, step).label }}</small>
-                  <small v-if="step.status === 'skipped'">{{ step.reason || '已跳过' }}</small>
+                  <small v-if="step.status === 'waiting'">{{ step.reason || '等待事件组合' }}</small><small v-else-if="step.status === 'running'">正在执行</small><small v-else-if="step.status === 'skipped'">{{ step.reason || '已跳过' }}</small>
                   <small v-else-if="step.status === 'failed'">{{ errorText(step.error) || '执行失败' }}</small>
                   <small v-else-if="step.status === 'cancelled'">已安全停止</small>
                   <small v-else-if="step.status === 'timed_out'">超过允许的运行时间</small>
                   <small v-else>{{ formatDuration(step.duration_ms) }}<template v-if="step.attempt > 1"> · 共尝试 {{ step.attempt }} 次</template></small>
                   <small v-if="stepContext(run, step).label && stepContext(run, step).kind !== 'failure'">{{ stepContext(run, step).label }}</small>
-                  <small v-if="ifBranchLabel(step.branch)">执行分支 · {{ ifBranchLabel(step.branch) }}</small>
+                  <small v-if="ifBranchLabel(step.branch, run, step)">执行分支 · {{ ifBranchLabel(step.branch, run, step) }}</small>
+                  <details v-if="step.evaluated_branches?.length" class="run-condition-results">
+                    <summary>条件判断 · {{ step.evaluated_branches.length }} 个分支</summary>
+                    <div v-for="(evaluation, evaluationIndex) in step.evaluated_branches" :key="evaluation.branch_id" class="run-condition-branch">
+                      <small><b>{{ evaluationIndex ? `ELIF ${evaluationIndex}` : 'IF' }}</b> · {{ evaluationResult(evaluation) }}</small>
+                      <code class="run-step-binding">{{ evaluation.branch_id }}</code>
+                      <small v-for="(predicate, predicateIndex) in evaluation.predicates" :key="predicateIndex" class="run-condition-predicate">
+                        {{ predicate.op }} · {{ evaluationResult(predicate) }}
+                        <code class="run-step-binding">{{ predicate.node_id || predicate.path }}</code>
+                      </small>
+                    </div>
+                  </details>
                   <code class="run-step-binding">{{ step.step_id }}</code>
                   <div v-if="step.input_summary?.length || step.output_summary?.length" class="step-summary-strip run-step-summary">
                     <div v-if="step.input_summary?.length" class="step-summary-side">
@@ -546,7 +568,7 @@ onUnmounted(() => {
                   </div>
                 </span>
                 <span class="run-step-actions">
-                  <span class="material-symbols-outlined run-step-state">{{ step.status === 'succeeded' ? 'check' : step.status === 'skipped' ? 'skip_next' : step.status === 'cancelled' ? 'stop' : step.status === 'timed_out' ? 'timer_off' : 'close' }}</span>
+                  <span class="material-symbols-outlined run-step-state">{{ step.status === 'waiting' ? 'hourglass_empty' : step.status === 'running' ? 'pending' : step.status === 'succeeded' ? 'check' : step.status === 'skipped' ? 'skip_next' : step.status === 'cancelled' ? 'stop' : step.status === 'timed_out' ? 'timer_off' : 'close' }}</span>
                   <button v-if="step.status === 'failed'" class="btn btn-text btn-sm run-step-open" @click="jumpToStep(run, step)">编辑这一步</button>
                 </span>
               </div>
@@ -611,3 +633,13 @@ onUnmounted(() => {
     </template>
   </section>
 </template>
+
+<style scoped>
+.run-condition-results { margin-block: 8px; padding: 10px 12px; border: 1px solid var(--md-outline-variant); border-radius: 12px; background: var(--md-surface-c); }
+.run-condition-results summary { cursor: pointer; color: var(--md-on-surface-variant); font-size: 12px; }
+.run-condition-results summary:focus-visible { outline: 2px solid var(--md-primary); outline-offset: 4px; }
+.run-condition-branch { padding-block: 8px; }
+.run-condition-branch + .run-condition-branch { border-top: 1px solid var(--md-outline-variant); }
+.run-condition-predicate { display: block; margin: 6px 0 0 12px; }
+.run-condition-predicate code { display: block; }
+</style>

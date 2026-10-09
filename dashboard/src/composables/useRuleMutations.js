@@ -3,6 +3,7 @@ import { store } from '../lib/store'
 import { buildDefaultParams, isConditionLeaf } from '../lib/utils'
 import { createBindingId, regenerateBindingIds } from '../lib/bindings'
 import { conditionNodeId } from '../lib/flowGraph'
+import { findWorkflowAction, ifBranches } from '../lib/workflowConditions'
 
 export function useRuleMutations(rule, selectedNodeId, selectedGraphNode) {
   const selectedKind = computed(() => selectedGraphNode.value?.kind || 'trigger')
@@ -151,59 +152,94 @@ export function useRuleMutations(rule, selectedNodeId, selectedGraphNode) {
     action.params = buildDefaultParams(store.schema.actions[type])
     if (store.schema.actions[type]?.cancellation_api !== 'runtime-v1') delete action.timeout_seconds
   }
-  function removeAction(index) {
-    rule.value.actions.splice(index, 1)
-    selectedNodeId.value = rule.value.actions.length
-      ? `action-${rule.value.actions[Math.min(index, rule.value.actions.length - 1)].binding_id}`
-      : null
+  function actionItems(node = selectedGraphNode.value) {
+    return node?.kind === 'action' ? node.items || rule.value.actions : rule.value.actions
   }
-  function duplicateAction(index) {
-    const source = rule.value.actions?.[index]
+  function failureOwner(actionIndex, node = selectedGraphNode.value) {
+    return node?.kind === 'failure-action' ? node.owner : node?.kind === 'action' ? node.source : rule.value.actions?.[actionIndex]
+  }
+  function branchItems(ownerId, key) {
+    const owner = findWorkflowAction(rule.value, ownerId)?.action
+    if (owner?.type !== 'if') return null
+    const branch = ifBranches(owner).find(branch => branch.key === key)
+    if (!branch) return null
+    return branch.branch ? (branch.branch.then ||= []) : (owner[key] ||= [])
+  }
+  function createAction(type) {
+    return { binding_id: createBindingId('action'), type,
+      ...(type === 'if' ? { condition: { op: 'is_true', left: false }, then: [], else: [] }
+        : type === 'set_variable' ? { variable: rule.value.variables?.[0]?.id || '', value: '' }
+          : { params: buildDefaultParams(store.schema.actions[type]) }),
+    }
+  }
+  function addBranchAction(node, type, index = null) {
+    const items = branchItems(node.source.binding_id, node.branchKey)
+    if (!items) return
+    const action = createAction(type)
+    items.splice(index == null ? items.length : index, 0, action)
+    selectedNodeId.value = `action-${action.binding_id}`
+  }
+  function requestBranchAction(node) {
+    openPluginPicker('action', { mode: 'branch-action', ownerId: node.source.binding_id, branchKey: node.branchKey, title: '添加分支动作' })
+  }
+  function removeAction(index, node = selectedGraphNode.value) {
+    const items = actionItems(node)
+    items.splice(index, 1)
+    selectedNodeId.value = items.length ? `action-${items[Math.min(index, items.length - 1)].binding_id}`
+      : node?.parentIf ? `branch-add-${node.parentIf.binding_id}-${node.branchKey}` : null
+  }
+  function duplicateAction(index, node = selectedGraphNode.value) {
+    const items = actionItems(node)
+    const source = items?.[index]
     if (!source) return
     const copy = JSON.parse(JSON.stringify(source))
     regenerateBindingIds(copy, 'action')
-    rule.value.actions.splice(index + 1, 0, copy)
+    items.splice(index + 1, 0, copy)
     selectedNodeId.value = `action-${copy.binding_id}`
   }
-  function moveAction(index, offset) {
+  function moveAction(index, offset, node = selectedGraphNode.value) {
+    const items = actionItems(node)
     const target = index + offset
-    if (target < 0 || target >= rule.value.actions.length) return
-    const [action] = rule.value.actions.splice(index, 1)
-    rule.value.actions.splice(target, 0, action)
+    if (target < 0 || target >= items.length) return
+    const [action] = items.splice(index, 1)
+    items.splice(target, 0, action)
     selectedNodeId.value = `action-${action.binding_id}`
   }
-  function addFailureAction(actionIndex, type) {
-    const action = rule.value.actions?.[actionIndex]
-    if (!action || !type) return
-    if (!Array.isArray(action.failure_actions)) action.failure_actions = []
-    const failureAction = {
-      binding_id: createBindingId('action'),
-      type,
-      params: buildDefaultParams(store.schema.actions[type]),
-    }
-    action.failure_actions.push(failureAction)
-    selectedNodeId.value = `failure-action-${failureAction.binding_id}`
+  function addFailureAction(actionIndex, type, owner = failureOwner(actionIndex)) {
+    if (!owner || !type) return
+    const action = createAction(type)
+    ;(owner.failure_actions ||= []).push(action)
+    selectedNodeId.value = `failure-action-${action.binding_id}`
   }
-  function removeFailureAction(actionIndex, failureIndex) {
-    const failureActions = rule.value.actions?.[actionIndex]?.failure_actions
-    if (!Array.isArray(failureActions)) return
-    failureActions.splice(failureIndex, 1)
-    if (!failureActions.length) delete rule.value.actions[actionIndex].failure_actions
-    selectedNodeId.value = `action-${rule.value.actions[actionIndex].binding_id}`
+  function removeFailureAction(actionIndex, failureIndex, node = selectedGraphNode.value) {
+    const owner = failureOwner(actionIndex, node)
+    if (!owner?.failure_actions) return
+    owner.failure_actions.splice(failureIndex, 1)
+    if (!owner.failure_actions.length) delete owner.failure_actions
+    selectedNodeId.value = `action-${owner.binding_id}`
   }
-  function moveFailureAction(actionIndex, failureIndex, offset) {
-    const failureActions = rule.value.actions?.[actionIndex]?.failure_actions
+  function duplicateFailureAction(actionIndex, failureIndex) {
+    const owner = failureOwner(actionIndex)
+    const source = owner?.failure_actions?.[failureIndex]
+    if (!source) return
+    const copy = JSON.parse(JSON.stringify(source))
+    regenerateBindingIds(copy, 'action')
+    owner.failure_actions.splice(failureIndex + 1, 0, copy)
+    selectedNodeId.value = `failure-action-${copy.binding_id}`
+  }
+  function moveFailureAction(actionIndex, failureIndex, offset, node = selectedGraphNode.value) {
+    const items = failureOwner(actionIndex, node)?.failure_actions
     const target = failureIndex + offset
-    if (!Array.isArray(failureActions) || target < 0 || target >= failureActions.length) return
-    const [failureAction] = failureActions.splice(failureIndex, 1)
-    failureActions.splice(target, 0, failureAction)
-    selectedNodeId.value = `failure-action-${failureAction.binding_id}`
+    if (!items || target < 0 || target >= items.length) return
+    const [action] = items.splice(failureIndex, 1)
+    items.splice(target, 0, action)
+    selectedNodeId.value = `failure-action-${action.binding_id}`
   }
   function requestAddFailureAction(actionIndex) {
-    openPluginPicker('action', { mode: 'failure-action', parentIndex: actionIndex, title: '添加补救动作' })
+    openPluginPicker('action', { mode: 'failure-action', ownerId: failureOwner(actionIndex)?.binding_id, title: '添加补救动作' })
   }
   function requestReplaceFailureAction(actionIndex, failureIndex) {
-    openPluginPicker('action', { mode: 'replace-failure-action', parentIndex: actionIndex, failureIndex, title: '更换补救动作' })
+    openPluginPicker('action', { mode: 'replace-failure-action', ownerId: failureOwner(actionIndex)?.binding_id, failureIndex, title: '更换补救动作' })
   }
   function openPluginPicker(kind, options = {}) {
     picker.value = {
@@ -211,6 +247,9 @@ export function useRuleMutations(rule, selectedNodeId, selectedGraphNode) {
       kind,
       mode: options.mode || kind,
       index: options.index ?? null,
+      ownerId: options.ownerId ?? null,
+      actionId: options.actionId ?? null,
+      branchKey: options.branchKey ?? null,
       parentIndex: options.parentIndex ?? null,
       failureIndex: options.failureIndex ?? null,
       path: options.path || [],
@@ -258,14 +297,18 @@ export function useRuleMutations(rule, selectedNodeId, selectedGraphNode) {
         node.params = triggerParams(key)
       }
     }
+    else if (context.mode === 'branch-action' || context.mode === 'action' && context.ownerId) {
+      const owner = findWorkflowAction(rule.value, context.ownerId)?.action
+      if (owner) addBranchAction({ source: owner, branchKey: context.branchKey }, key, context.index)
+    }
     else if (context.mode === 'action') addAction(key, context.index)
     else if (context.mode === 'replace-action') {
-      const action = rule.value.actions?.[context.index]
+      const action = context.actionId ? findWorkflowAction(rule.value, context.actionId)?.action : rule.value.actions?.[context.index]
       if (action) changeAction(action, key)
     }
-    else if (context.mode === 'failure-action') addFailureAction(context.parentIndex, key)
+    else if (context.mode === 'failure-action') addFailureAction(context.parentIndex, key, findWorkflowAction(rule.value, context.ownerId)?.action)
     else if (context.mode === 'replace-failure-action') {
-      const action = rule.value.actions?.[context.parentIndex]?.failure_actions?.[context.failureIndex]
+      const action = findWorkflowAction(rule.value, context.ownerId)?.action.failure_actions?.[context.failureIndex]
       if (action) changeAction(action, key)
     }
     else if (context.mode === 'condition-child') addConditionFromPicker(key, { path: context.path })
@@ -279,5 +322,5 @@ export function useRuleMutations(rule, selectedNodeId, selectedGraphNode) {
       title: group ? '添加条件组的第一个条件' : '添加条件',
     })
   }
-  return { setRootTrigger, useSingleCondition, wrapConditionInNot, unwrapNotEvent, conditionId, changeConditionOp, removeSelectedCondition, moveSelectedCondition, duplicateSelectedCondition, addAssignment, addIf, addWait, addAction, changeAction, removeAction, duplicateAction, moveAction, addFailureAction, removeFailureAction, moveFailureAction, requestAddFailureAction, requestReplaceFailureAction, openPluginPicker, closePluginPicker, conditionAtPath, addConditionFromPicker, appendRootCondition, choosePlugin, requestConditionChild, selectedConditionNode, selectedConditionPath, selectedConditionParent, picker }
+  return { addBranchAction, requestBranchAction, duplicateFailureAction, setRootTrigger, useSingleCondition, wrapConditionInNot, unwrapNotEvent, conditionId, changeConditionOp, removeSelectedCondition, moveSelectedCondition, duplicateSelectedCondition, addAssignment, addIf, addWait, addAction, changeAction, removeAction, duplicateAction, moveAction, addFailureAction, removeFailureAction, moveFailureAction, requestAddFailureAction, requestReplaceFailureAction, openPluginPicker, closePluginPicker, conditionAtPath, addConditionFromPicker, appendRootCondition, choosePlugin, requestConditionChild, selectedConditionNode, selectedConditionPath, selectedConditionParent, picker }
 }

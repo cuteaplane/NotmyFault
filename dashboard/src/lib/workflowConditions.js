@@ -1,4 +1,5 @@
-import { actionOutputDefs, collectTriggerLeaves, buildBindingSources, expandBindingSources, referenceLabel } from './bindings.js'
+import { findGraphNode, walkGraphActions } from './workflowGraph.js'
+import { actionOutputDefs, collectTriggerLeaves, buildBindingSources, expandBindingSources, referenceLabel, graphBindingSources } from './bindings.js'
 import { fieldType } from './valueTypes.js'
 
 export const RUN_STATUS_OPTIONS = [
@@ -32,6 +33,7 @@ export function walkWorkflowActions(actions, visit, trail = []) {
   })
 }
 export function findWorkflowAction(rule, bindingId) {
+  if (rule.workflow) return findGraphNode(rule, bindingId)
   let found = null
   walkWorkflowActions(rule.actions, (action, index, trail) => {
     if (action.binding_id === bindingId) found = { action, index, trail }
@@ -39,6 +41,7 @@ export function findWorkflowAction(rule, bindingId) {
   return found
 }
 export function precedingSources(rule, action, schema) {
+  if (rule.workflow) return graphBindingSources(rule, action, schema)
   const hit = findWorkflowAction(rule, action.binding_id)
   if (!hit) return []
   const rootIndex = hit.trail[0]?.index ?? hit.index

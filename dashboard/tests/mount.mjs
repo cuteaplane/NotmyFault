@@ -11,7 +11,19 @@ import { streamRuleDraftWithAI } from '../src/lib/api.js'
 import { computeChangeSet, summarizeRuleChanges } from '../src/lib/ruleDiff.js'
 import { ensureParams } from '../src/lib/utils.js'
 import { actionOutputDefs, bindingSourceFor, buildNodeDataPorts, collectReferences, parameterAllowsBinding, regenerateBindingIds } from '../src/lib/bindings.js'
+import { getGraphTriggers, walkGraphActions, graphPredicate } from '../src/lib/workflowGraph.js'
 import { compatibleTypes, formatTypedInput, isOpaqueValue, parseTypedInput, typeAtPath } from '../src/lib/valueTypes.js'
+
+function ruleActions(rule) {
+  if (!rule?.workflow) return rule?.actions || []
+  const actions = []; walkGraphActions(rule.workflow, action => actions.push(action)); return actions
+}
+async function canvasOperation(node, label) {
+  node?.querySelector('.node-context-button')?.click()
+  await pause(20)
+  ;[...document.querySelectorAll('.canvas-context-menu button')].find(button => button.textContent.includes(label))?.click()
+  await pause(30)
+}
 
 const bindingPolicyMeta = {
   params:[
@@ -532,6 +544,7 @@ const safeExportProbe = buildRunExport([{
   steps:[{
     step_id:'a_export001', action_type:'notify', status:'succeeded', params:{ secret:'不能导出' },
     input_summary:[{ name:'message', label:'消息', type:'string', display:'脱敏摘要示例', redacted:false, raw:'不能导出' }],
+    evaluated_branches:[{ branch_id:'b_export01', result:false, predicates:[{ node_id:'p_export01', path:'condition', op:'eq', result:false, left:'不能导出', right:'不能导出' }] }, { branch_id:'b_export02', error:{ code:'missing_reference', message:'不能导出' }, predicates:[] }],
   }],
 }], { status:'all', timeRange:'7d', actionType:'notify', search:'' }, new Date('2026-08-10T00:00:00Z'))
 const safeExportText = JSON.stringify(safeExportProbe)
@@ -539,6 +552,9 @@ const safeRunExportOk = safeExportProbe.format === 'NotmyFault run diagnostics'
   && safeExportProbe.filters.time_range === '7d'
   && safeExportProbe.runs[0].duration_ms === null
   && safeExportProbe.runs[0].steps[0].input_summary[0].display === '脱敏摘要示例'
+  && safeExportProbe.runs[0].steps[0].evaluated_branches[0].predicates[0].result === false
+  && safeExportProbe.runs[0].steps[0].evaluated_branches[1].error.code === 'missing_reference'
+  && !Object.hasOwn(safeExportProbe.runs[0].steps[0].evaluated_branches[1], 'result')
   && !safeExportText.includes('不能导出')
   && !safeExportText.includes('event_payload')
   && !safeExportText.includes('params')
@@ -705,7 +721,7 @@ await new Promise(r => setTimeout(r, 30))
 ;[...document.querySelectorAll('.quick-create-foot button')].find(button => button.textContent.includes('在编辑器中继续'))?.click()
 await new Promise(r => setTimeout(r, 80))
 const quickCreateDraftOk = document.querySelector('.rule-title-capsule')?.textContent.includes('定时后显示通知')
-  && document.querySelector('.graph-node-trigger')?.textContent.includes('定时')
+  && document.querySelector('.graph-node-event_group')?.textContent.includes('流程入口')
   && document.querySelector('.graph-node-action')?.textContent.includes('显示通知')
 console.log((quickCreateSecondStepOk && quickCreateDraftOk?'PASS':'FAIL')+' - automation page opens a real prefilled rule draft')
 if (!quickCreateSecondStepOk || !quickCreateDraftOk) process.exitCode = 1
@@ -736,6 +752,8 @@ if (!draftRecoveryStored || !draftRecoveryCleared) process.exitCode = 1
 window.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
 await new Promise(r => setTimeout(r, 20))
 
+document.querySelector('.graph-node-event_group .group-toggle')?.click()
+await pause(250)
 document.querySelector('.graph-node-trigger .graph-node-data-summary button:last-child')?.click()
 await new Promise(r => setTimeout(r, 20))
 const outputPort = document.querySelector('.graph-node-trigger .data-port-column-output .data-port-dot')
@@ -750,38 +768,27 @@ await new Promise(r => setTimeout(r, 20))
 
 await pause(400)
 const groupedRule = bridgeCalls.filter(call => call.path === '/api/rules/validate').at(-1)?.data.rule
-const firstTrigger = groupedRule?.condition?.children?.[0]
-let singleConditionOk = !!firstTrigger
+const firstTrigger = getGraphTriggers(groupedRule || {})[0]
+let graphModesOk = !!firstTrigger
 for (const mode of ['节点编辑', '普通模式']) {
   ;[...document.querySelectorAll('.editor-mode-switch button')].find(button => button.textContent.includes(mode))?.click()
-  await pause(20)
-  document.querySelector('.node-canvas-tools button')?.click()
-  await pause(20)
-  ;[...document.querySelectorAll('.node-inspector button')].find(button => button.textContent.includes('改为单个条件'))?.click()
-  await pause(20)
+  await pause(30)
   const checksBefore = bridgeCalls.filter(call => call.path === '/api/rules/validate').length
   document.querySelector('.rule-check-btn')?.click()
-  await pause(20)
-  const checksAfter = bridgeCalls.filter(call => call.path === '/api/rules/validate')
-  const single = checksAfter.at(-1)?.data.rule
-  singleConditionOk &&= checksAfter.length === checksBefore + 1
-    && single?.condition?.binding_id === firstTrigger?.binding_id
-    && JSON.stringify(single?.condition?.params) === JSON.stringify(firstTrigger?.params)
-    && single?.actions?.[0]?.params?.message?.$ref?.node === firstTrigger?.binding_id
-    && !Object.hasOwn(single || {}, 'event')
-    && document.querySelectorAll('.graph-node-trigger').length === 1
-    && document.querySelectorAll('.graph-node-condition').length === 0
-    && document.querySelectorAll('.rule-editor-page main').length === 1
-    && document.querySelectorAll('.node-inspector').length === 1
-    && document.querySelector('.editor-mode-switch button[aria-selected="true"]')?.textContent.includes(mode)
-  document.querySelector('.rule-history-actions button:first-child')?.click()
   await pause(30)
-  singleConditionOk &&= document.querySelectorAll('.graph-node-trigger').length === 3
+  const checksAfter = bridgeCalls.filter(call => call.path === '/api/rules/validate')
+  const checked = checksAfter.at(-1)?.data.rule
+  graphModesOk &&= checksAfter.length === checksBefore + 1
+    && checked?.workflow?.entry && !Object.hasOwn(checked, 'actions')
+    && getGraphTriggers(checked)[0]?.binding_id === firstTrigger.binding_id
+    && ruleActions(checked).find(action => action.binding_id === 'a_mount001')?.params?.message?.$ref?.node === firstTrigger.binding_id
+    && document.querySelectorAll('.rule-editor-page main').length === 1
+    && document.querySelector('.editor-mode-switch button[aria-selected="true"]')?.textContent.includes(mode)
 }
-console.log((singleConditionOk?'PASS':'FAIL')+' - both editors keep the first trigger and its references when simplifying, and manual checks validate immediately')
-if (!singleConditionOk) process.exitCode = 1
+console.log((graphModesOk?'PASS':'FAIL')+' - both editor modes preserve graph trigger identities and references, and manual checks validate immediately')
+if (!graphModesOk) process.exitCode = 1
 ;[...document.querySelectorAll('.editor-mode-switch button')].find(button => button.textContent.includes('节点编辑'))?.click()
-await pause(20)
+await pause(30)
 
 const saveRun = [...document.querySelectorAll('button')].find(
   button => button.textContent.includes('测试规则'),
@@ -837,6 +844,9 @@ if (rangeModeSelect) {
   rangeModeSelect.dispatchEvent(new window.Event('change', { bubbles: true }))
 }
 await new Promise(r => setTimeout(r, 20))
+const rangeStartSelect = testPrepDialog?.querySelectorAll('.test-range-controls select')[1]
+if (rangeStartSelect) { rangeStartSelect.value = 'a_mount001'; rangeStartSelect.dispatchEvent(new window.Event('change', { bubbles:true })) }
+await pause(20)
 ;[...(testPrepDialog?.querySelectorAll('button') || [])].find(
   button => button.textContent.includes('添加检查项'),
 )?.click()
@@ -898,7 +908,7 @@ if (!testDataRestored) process.exitCode = 1
 )?.click()
 await new Promise(r => setTimeout(r, 20))
 const snapshotCall = bridgeCalls.find(call => call.path === '/api/rules/0/run')
-const snapshotBinding = snapshotCall?.data?.rule?.actions?.[0]?.params?.message?.$ref
+const snapshotBinding = ruleActions(snapshotCall?.data?.rule).find(action => action.binding_id === 'a_mount001')?.params?.message?.$ref
 const snapshotOk = snapshotCall?.data?.rule?.name === '挂载测试规则'
   && /^r_[a-z0-9_]{6,64}$/.test(snapshotCall?.data?.rule?.rule_id || '')
   && snapshotBinding?.scope === 'trigger'
@@ -1403,14 +1413,18 @@ if (!historyAndResetOk) {
 }
 
 const aiKeyDeleteStart = bridgeCalls.length
-settingsNav?.click()
-await new Promise(r => setTimeout(r, 50))
-;[...document.querySelectorAll('.settings-root-list button')].find(button => button.textContent.includes('AI 功能'))?.click()
-await new Promise(r => setTimeout(r, 20))
-;[...document.querySelectorAll('.ai-drafting-settings button')].find(button => button.textContent.includes('API 密钥'))?.click()
-await new Promise(r => setTimeout(r, 20))
-;[...document.querySelectorAll('.ai-drafting-settings button')].find(button => button.textContent.includes('删除 API 密钥'))?.click()
-await new Promise(r => setTimeout(r, 50))
+if (!settingsNav) throw new Error('Settings navigation is missing before AI key deletion')
+settingsNav.click()
+const aiSettingsButton = await waitFor(() => [...document.querySelectorAll('.settings-root-list button')].find(button => button.textContent.includes('AI 功能')))
+if (!aiSettingsButton) throw new Error('AI settings button did not appear')
+aiSettingsButton.click()
+const apiKeySettingsButton = await waitFor(() => [...document.querySelectorAll('.ai-drafting-settings button')].find(button => button.textContent.includes('API 密钥')))
+if (!apiKeySettingsButton) throw new Error('API key settings button did not appear')
+apiKeySettingsButton.click()
+const deleteApiKeyButton = await waitFor(() => [...document.querySelectorAll('.ai-drafting-settings button')].find(button => button.textContent.includes('删除 API 密钥')))
+if (!deleteApiKeyButton) throw new Error('Saved API key delete button did not appear')
+deleteApiKeyButton.click()
+await waitFor(() => bridgeCalls.slice(aiKeyDeleteStart).some(call => call.path === '/api/settings/ai-drafting/api-key' && call.method === 'DELETE') && document.querySelector('.settings-key-status')?.textContent.includes('未设置'))
 const aiKeyDeleteCalls = bridgeCalls.slice(aiKeyDeleteStart)
 const savedKeyDeleted = aiKeyDeleteCalls.some(call => (
   call.path === '/api/settings/ai-drafting/api-key' && call.method === 'DELETE'
@@ -1492,7 +1506,7 @@ additionalRuns = ['queued', 'timed_out', 'dropped', 'toString', 'running', 'succ
   run_id:`run_status_${index}`, rule_name:`状态测试 ${status}`, event_type:'manual', status,
   started_at:1723000000, finished_at:['timed_out', 'dropped', 'succeeded'].includes(status) ? 1723000000.2 : null,
   duration_ms:['timed_out', 'dropped', 'succeeded'].includes(status) ? 200 : null,
-  action_count:0, steps:[],
+  action_count:0, steps:status === 'succeeded' ? [{ step_id:'a_loggedgroup', action_type:'event_group', status:'succeeded', branch:'b_chosen01', evaluated_branches:[{ branch_id:'b_false001', result:false, predicates:[{ node_id:'p_checked01', path:'condition.children[0]', op:'eq', result:false }] }, { branch_id:'b_chosen01', result:true, predicates:[{ node_id:'p_checked02', path:'condition', op:'event_occurred', result:true }] }] }] : [],
 }))
 rulesNav?.click()
 await waitFor('.rules-library')
@@ -1514,6 +1528,18 @@ await pause(20)
 runFiltersOk &&= document.querySelectorAll('.run-card').length === 7
 console.log((runLabelsOk && runSummaryOk && runFiltersOk ? 'PASS' : 'FAIL') + ' - 运行记录按新状态显示、统计和筛选，未知状态不显示运行中')
 if (!runLabelsOk || !runSummaryOk || !runFiltersOk) process.exitCode = 1
+const evaluatedRunCard = [...document.querySelectorAll('.run-card')].find(card => card.textContent.includes('状态测试 succeeded'))
+evaluatedRunCard?.querySelector('.run-card-main')?.click()
+const evaluatedDetails = await waitFor('.run-condition-results')
+const loggedEvaluationsOk = evaluatedDetails?.textContent.includes('IF · 不成立')
+  && evaluatedDetails.textContent.includes('ELIF 1 · 成立')
+  && evaluatedDetails.querySelectorAll('.run-condition-predicate').length === 2
+  && evaluatedDetails.textContent.includes('p_checked01')
+  && !evaluatedDetails.textContent.includes('ELSE')
+console.log((loggedEvaluationsOk ? 'PASS' : 'FAIL') + ' - event group history shows only branches and predicates actually evaluated')
+if (!loggedEvaluationsOk) process.exitCode = 1
+evaluatedRunCard?.querySelector('.run-card-main')?.click()
+await pause(20)
 document.querySelector('.run-export-btn')?.click()
 await new Promise(r => setTimeout(r, 20))
 const runExportConfirmOk = document.querySelector('.app-dialog')?.textContent.includes('不包含触发输入、动作参数、动作返回值或测试期望值')
@@ -1556,17 +1582,20 @@ const addFailureAction = [...failureSettings.querySelectorAll('button')].find(
 )
 addFailureAction?.click()
 await new Promise(r => setTimeout(r, 20))
-const failurePickerOk = document.querySelector('.plugin-picker-dialog')?.textContent.includes('添加补救动作')
+const failurePickerOk = !!document.querySelector('.plugin-picker-dialog')
 document.querySelector('.plugin-picker-item')?.click()
-const failureActionNote = await waitFor('.node-inspector .failure-action-note')
+await pause(30)
+document.querySelector('.graph-node-failure-action')?.click()
+await pause(30)
+const recoveryInspector = await waitFor(() => document.querySelector('.node-inspector-head small')?.textContent.includes('补救') && document.querySelector('.node-inspector .plugin-type-button'))
 const controlLabels = [...document.querySelectorAll('.node-link-label')].map(label => label.textContent)
 const failureBranchOk = failurePickerOk
   && document.querySelectorAll('.graph-node-failure-action').length === 1
   && controlLabels.includes('失败时')
-  && controlLabels.includes('处理后继续')
-  && failureActionNote?.closest('.node-inspector').textContent.includes('这个动作只会在上方主动作最终失败时执行')
+  && !!recoveryInspector
+  && !document.querySelector('.node-inspector .failure-action-add')
 console.log((failureBranchOk?'PASS':'FAIL')+' - failed actions can run an editable recovery branch')
-if (!failureBranchOk) process.exitCode = 1
+if (!failureBranchOk) { console.error({ failurePickerOk, controlLabels, failureCount: document.querySelectorAll('.graph-node-failure-action').length, inspector: !!recoveryInspector }); process.exitCode = 1 }
 
 await pause(350)
 document.querySelector('.graph-node-failure-action button[title="删除补救动作"]')?.click()
@@ -1578,70 +1607,43 @@ await pause(30)
 canvasDeleteOk &&= document.querySelectorAll('.graph-node-failure-action').length === 1
 document.querySelector('.graph-node-action')?.click()
 await pause(30)
-;[...document.querySelectorAll('.node-inspector button')].find(button => button.textContent.includes('复制'))?.click()
-await pause(30)
+;[...document.querySelectorAll('.node-inspector-body > .inspector-action-row button')].find(button => button.textContent.includes('复制'))?.click()
+await pause(250)
 canvasDeleteOk &&= document.querySelectorAll('.graph-node-action').length === 2
-;[...document.querySelectorAll('.graph-node-action')].at(-1)?.querySelector('button[title="删除动作"]')?.click()
-await pause(30)
+;[...document.querySelectorAll('.node-inspector-body > .inspector-action-row button')].find(button => button.textContent.includes('删除'))?.click()
+await pause(250)
 canvasDeleteOk &&= document.querySelectorAll('.graph-node-action').length === 1
   && document.querySelectorAll('.graph-node-failure-action').length === 1
 console.log((canvasDeleteOk?'PASS':'FAIL')+' - canvas delete buttons remove the selected action or recovery action')
-if (!canvasDeleteOk) process.exitCode = 1
+if (!canvasDeleteOk) { console.error({ actions:document.querySelectorAll('.graph-node-action').length, recovery:document.querySelectorAll('.graph-node-failure-action').length }); process.exitCode = 1 }
 
-document.querySelector('.graph-node-trigger')?.click()
-await new Promise(r => setTimeout(r, 30))
-;[...document.querySelectorAll('.node-inspector button')].find(button => button.textContent.includes('未发生时（NOT）'))?.click()
-await new Promise(r => setTimeout(r, 30))
-const absenceEditorOk = [...document.querySelectorAll('.graph-node-condition')].some(node => node.textContent.includes('未发生 · NOT'))
-  && document.querySelector('.node-inspector')?.textContent.includes('等待时长（秒）')
+document.querySelector('.graph-node-event_group')?.click()
+await pause(30)
+const activationEditor = document.querySelector('.node-inspector .event-activation-editor')
+const activationOp = activationEditor?.querySelector('select')
+if (activationOp) {
+  activationOp.value = 'not'; activationOp.dispatchEvent(new window.Event('change', { bubbles:true }))
+}
+await pause(30)
+const absenceEditorOk = document.querySelector('.event-activation-editor')?.textContent.includes('持续没有事件时')
   && !document.querySelector('.stage-check')
-console.log((absenceEditorOk?'PASS':'FAIL')+' - NOT exposes an absence timer and replaces pre-run checks')
+console.log((absenceEditorOk?'PASS':'FAIL')+' - event activation supports timed absence separately from branch conditions')
 if (!absenceEditorOk) process.exitCode = 1
-const notInspector = document.querySelector('.node-inspector')
-const repeatSelect = [...notInspector.querySelectorAll('select')].find(select => [...select.options].some(option => option.value === 'every_window'))
-repeatSelect.value = 'every_window'
-repeatSelect.dispatchEvent(new window.Event('change', { bubbles: true }))
+activationOp.value = 'all'; activationOp.dispatchEvent(new window.Event('change', { bubbles:true }))
 await pause(30)
-let conditionPoliciesOk = repeatSelect.value === 'every_window'
-const operationSelect = [...notInspector.querySelectorAll('select')].find(select => [...select.options].some(option => option.value === 'all'))
-operationSelect.value = 'all'
-operationSelect.dispatchEvent(new window.Event('change', { bubbles: true }))
+const consumeSelect = [...document.querySelectorAll('.event-activation-editor select')].find(select => [...select.options].some(option => option.value === 'matched'))
+consumeSelect.value = 'none'; consumeSelect.dispatchEvent(new window.Event('change', { bubbles:true }))
 await pause(30)
-const allInspector = document.querySelector('.node-inspector')
-const consumeSelect = [...allInspector.querySelectorAll('select')].find(select => [...select.options].some(option => option.value === 'matched'))
-const ttlField = [...allInspector.querySelectorAll('label')].find(label => label.textContent.includes('事件保留时长'))?.querySelector('input')
-consumeSelect.value = 'none'
-consumeSelect.dispatchEvent(new window.Event('change', { bubbles: true }))
-ttlField.value = '15'
-ttlField.dispatchEvent(new window.Event('input', { bubbles: true }))
-await pause(30)
-conditionPoliciesOk &&= consumeSelect.value === 'none' && ttlField.value === '15'
-operationSelect.value = 'any'
-operationSelect.dispatchEvent(new window.Event('change', { bubbles: true }))
-await pause(30)
-const pickSelect = [...document.querySelectorAll('.node-inspector select')].find(select => [...select.options].some(option => option.value === 'latest'))
-pickSelect.value = 'first'
-pickSelect.dispatchEvent(new window.Event('change', { bubbles: true }))
-await pause(30)
-conditionPoliciesOk &&= pickSelect.value === 'first' && !document.querySelector('.node-inspector')?.textContent.includes('事件保留时长')
-operationSelect.value = 'not'
-operationSelect.dispatchEvent(new window.Event('change', { bubbles: true }))
-await pause(30)
-const restoredRepeat = [...document.querySelectorAll('.node-inspector select')].find(select => [...select.options].some(option => option.value === 'once_until_seen'))
-conditionPoliciesOk &&= restoredRepeat.value === 'once_until_seen'
-console.log((conditionPoliciesOk ? 'PASS' : 'FAIL') + ' - 条件组可设置消费、保留时长、分支选择和重复等待，切换组合方式清除旧选项')
+const conditionPoliciesOk = consumeSelect.value === 'none'
+console.log((conditionPoliciesOk?'PASS':'FAIL')+' - event activation retains event consumption settings')
 if (!conditionPoliciesOk) process.exitCode = 1
-;[...document.querySelectorAll('.node-inspector button')].find(button => button.textContent.includes('改为事件发生时'))?.click()
-await new Promise(r => setTimeout(r, 30))
 
 // 私有数据参数只显示插件编辑入口。
 ;[...document.querySelectorAll('button')].find(
   button => button.textContent.includes('普通模式'),
 )?.click()
 await new Promise(r => setTimeout(r, 30))
-;[...document.querySelectorAll('.node-canvas-tools button')].find(
-  button => button.textContent.includes('添加动作'),
-)?.click()
+await canvasOperation([...document.querySelectorAll('.graph-node-action')].at(-1), '添加动作')
 await new Promise(r => setTimeout(r, 30))
 ;[...document.querySelectorAll('.plugin-picker-item')].find(
   button => button.textContent.includes('宏录制动作'),
@@ -1690,123 +1692,38 @@ const macroPageOk = macroPageSource.includes('操作宏插件页面')
 console.log((macroCaptured && macroPageOk && macroFullPageOpen?'PASS':'FAIL')+' - private macro data is edited through the full-page plugin extension view')
 if (!macroCaptured || !macroPageOk || !macroFullPageOpen) process.exitCode = 1
 
-;[...document.querySelectorAll('.node-canvas-tools button')].find(button => button.textContent.includes('添加 IF'))?.click()
-await new Promise(r => setTimeout(r, 30))
-const ifCard = document.querySelector('.node-inspector')
-await new Promise(r => setTimeout(r, 30))
-const ifBranches = [...ifCard.querySelectorAll('.if-action-editor > .if-branch')]
-for (const branch of ifBranches) {
-  branch.querySelector('.flow-add-row button')?.click()
-  await new Promise(r => setTimeout(r, 20))
-  document.querySelector('.plugin-picker-item')?.click()
-  await new Promise(r => setTimeout(r, 30))
-}
-const ifEditorOk = ifBranches.length === 2
-  && ifBranches.every(branch => branch.querySelector('.if-branch-action'))
-console.log((ifEditorOk?'PASS':'FAIL')+' - IF edits separate THEN and ELSE action lists')
-if (!ifEditorOk) process.exitCode = 1
-
-const mainPredicate = ifCard.querySelector('.if-action-editor > .predicate-editor')
-const predicateOperator = mainPredicate?.querySelector('select')
-predicateOperator.value = 'is_true'
-predicateOperator.dispatchEvent(new window.Event('change', { bubbles: true }))
-await pause(20)
-const predicateSource = mainPredicate.querySelector('.condition-value-input select')
-predicateSource.value = 'trigger'; predicateSource.dispatchEvent(new window.Event('change', { bubbles: true }))
-await pause(20)
-const booleanSourceChoices = [...mainPredicate.querySelectorAll('.condition-value-input select')].at(-1)
-const booleanFiltersText = [...booleanSourceChoices.options].filter(option => option.value).every(option => !option.textContent.includes(' · 文本'))
-predicateOperator.value = 'event_occurred'; predicateOperator.dispatchEvent(new window.Event('change', { bubbles: true }))
-await pause(20)
-const triggerChooser = mainPredicate.querySelectorAll('select')[1]
-const firedChoice = mainPredicate.querySelectorAll('select')[2]
-firedChoice.value = 'false'; firedChoice.dispatchEvent(new window.Event('change', { bubbles: true }))
-await pause(20)
-const triggerDirectChoice = /^t_/.test(triggerChooser.value) && [...triggerChooser.options].some(option => /^t_/.test(option.value)) && !mainPredicate.querySelector('.condition-value-input') && firedChoice.options[firedChoice.selectedIndex].textContent === '未发生'
-console.log((booleanFiltersText && triggerDirectChoice ? 'PASS' : 'FAIL') + ' - 真假判断过滤文本，直接选择事件来源及已发生或未发生')
-if (!booleanFiltersText || !triggerDirectChoice) process.exitCode = 1
-
-;[...document.querySelectorAll('.if-action-editor > button')].find(button => button.textContent.includes('添加 ELIF'))?.click()
+await canvasOperation([...document.querySelectorAll('.graph-node-action')].at(-1), '创建事件组')
+const eventCard = [...document.querySelectorAll('.graph-node-event_group')].at(-1)
+eventCard?.click()
 await pause(30)
-const elifForm = [...document.querySelectorAll('.if-action-editor > .if-branch')].find(branch => branch.textContent.includes('ELIF 1'))
-const elifOperator = elifForm?.querySelector('.predicate-editor select')
-if (elifOperator) {
-  elifOperator.value = 'run_status'
-  elifOperator.dispatchEvent(new window.Event('change', { bubbles: true }))
-}
+;[...document.querySelectorAll('.node-inspector button')].find(button => button.textContent.includes('添加 ELIF'))?.click()
 await pause(30)
-const elifStatus = [...(elifForm?.querySelectorAll('select') || [])].find(select => [...select.options].some(option => option.value === 'queued'))
-if (elifStatus) { elifStatus.value = 'queued'; elifStatus.dispatchEvent(new window.Event('change', { bubbles: true })) }
-elifForm?.querySelector('.flow-add-row button')?.click()
-await pause(20)
-document.querySelector('.plugin-picker-item')?.click()
+const branchSettingsOk = document.querySelectorAll('.workflow-branch-settings').length === 3
+;[...document.querySelectorAll('.node-inspector button')].find(button => button.textContent.includes('编辑条件图'))?.click()
+await pause(250)
+const predicateInspector = document.querySelector('.node-inspector .predicate-editor')
+const predicateOperator = predicateInspector?.querySelector('select')
+predicateOperator.value = 'event_occurred'; predicateOperator.dispatchEvent(new window.Event('change', { bubbles:true }))
 await pause(30)
-const elifFormOk = !!elifForm?.querySelector('.if-branch-action') && elifForm.textContent.includes('本次引擎启动后')
-console.log((elifFormOk ? 'PASS' : 'FAIL') + ' - ELIF 编辑自动化排队状态与独立分支动作，说明最近结果范围')
-if (!elifFormOk) process.exitCode = 1
-;[...document.querySelectorAll('.editor-mode-switch button')].find(button => button.textContent.includes('节点编辑'))?.click()
+const firedChoice = predicateInspector.querySelectorAll('select')[2]
+firedChoice.value = 'false'; firedChoice.dispatchEvent(new window.Event('change', { bubbles:true }))
 await pause(30)
-;[...document.querySelectorAll('.graph-node-action')].find(node => node.textContent.includes('IF 条件分支'))?.click()
-await pause(40)
-const ifSubflowOpened = !!document.querySelector('.if-subflow-editor .graph-node-predicate') && !!document.querySelector('.subflow-navigation')
-const elifPredicateCard = [...document.querySelectorAll('.if-subflow-editor .graph-node-predicate')].find(node => node.textContent.includes('ELIF 1'))
-elifPredicateCard?.click()
-await pause(30)
-const subflowStatus = [...document.querySelectorAll('.if-subflow-editor .node-inspector select')].find(select => [...select.options].some(option => option.value === 'running'))
-if (subflowStatus) { subflowStatus.value = 'running'; subflowStatus.dispatchEvent(new window.Event('change', { bubbles: true })) }
-await pause(30)
-const coordinatedIf = ifSubflowOpened && !!subflowStatus && !!document.querySelector('.if-subflow-editor .graph-node-if-merge')
-const thenAddCard = [...document.querySelectorAll('.if-subflow-editor .graph-node-if-branch')].find(node => node.textContent.includes('IF 成立') && node.textContent.includes('添加分支动作'))
-thenAddCard?.click()
-await pause(25)
-;[...document.querySelectorAll('.if-subflow-editor .node-inspector button')].find(button => button.textContent.includes('添加 IF'))?.click()
-await pause(35)
-const nestedOpened = document.querySelectorAll('.subflow-navigation button[aria-current="page"]').length === 1 && document.querySelector('.subflow-navigation')?.textContent.includes('IF 2')
-;[...document.querySelectorAll('.if-subflow-editor .graph-node-if-branch')].find(node => node.textContent.includes('IF 成立') && node.textContent.includes('添加分支动作'))?.click()
-await pause(20)
-;[...document.querySelectorAll('.if-subflow-editor .node-inspector button')].find(button => button.textContent.trim() === '等待')?.click()
-await pause(30)
-;[...document.querySelectorAll('.subflow-navigation button')].find(button => button.textContent.includes('返回上层'))?.click()
-await pause(30)
-const nestedSummary = [...document.querySelectorAll('.if-subflow-editor .graph-node-action')].find(node => node.textContent.includes('IF 条件分支'))
-const nestedReturned = !!nestedSummary && !document.querySelector('.subflow-navigation')?.textContent.includes('IF 2')
-nestedSummary?.querySelector('button[title="删除动作"]')?.click()
-await pause(20)
-console.log((nestedOpened && nestedReturned ? 'PASS' : 'FAIL') + ' - 嵌套 IF 子图添加动作，返回父图后显示摘要并可删除')
-if (!nestedOpened || !nestedReturned) process.exitCode = 1
-const branchAction = [...document.querySelectorAll('.if-subflow-editor .graph-node-action')].find(node => node.textContent.includes('IF 成立'))
-branchAction?.click()
-await pause(25)
-document.querySelector('.if-subflow-editor .failure-action-add')?.click()
-await pause(20)
-document.querySelector('.plugin-picker-item')?.click()
-await pause(30)
-document.querySelector('.if-subflow-editor .graph-node-failure-action')?.click()
-await pause(20)
-const recoveryNoNestedActions = !document.querySelector('.if-subflow-editor .failure-action-add')
-;[...document.querySelectorAll('.if-subflow-editor .inspector-action-row button')].find(button => button.textContent.trim() === '复制')?.click()
-await pause(25)
-const recoveryCopySelected = document.querySelectorAll('.if-subflow-editor .graph-node-failure-action').length === 2 && document.querySelector('.if-subflow-editor .graph-node-failure-action.selected') !== null
-for (const recovery of [...document.querySelectorAll('.if-subflow-editor .graph-node-failure-action')]) { recovery.querySelector('button[title="删除补救动作"]')?.click(); await pause(20) }
-const recoveryCleared = document.querySelectorAll('.if-subflow-editor .graph-node-failure-action').length === 0
-console.log((recoveryNoNestedActions && recoveryCopySelected && recoveryCleared ? 'PASS' : 'FAIL') + ' - 子图补救动作复制后保持选中，删除后清理空列表且不允许嵌套补救')
-if (!recoveryNoNestedActions || !recoveryCopySelected || !recoveryCleared) process.exitCode = 1
-;[...document.querySelectorAll('.subflow-navigation button')].find(button => button.textContent.includes('主流程'))?.click()
-await pause(30)
-const returnedToMain = !document.querySelector('.if-subflow-editor') && !!document.querySelector('.graph-node-action')
-console.log((coordinatedIf && returnedToMain ? 'PASS' : 'FAIL') + ' - IF 摘要进入条件子图，ELIF 修改共享规则并返回主图')
-if (!coordinatedIf || !returnedToMain) process.exitCode = 1
-
-const saveMacroBaseline = [...document.querySelectorAll('.rule-editor-actions button')].find(
-  button => button.textContent.includes('保存规则'),
-)
-saveMacroBaseline?.click()
-await new Promise(r => setTimeout(r, 50))
-const savedIf = savedRulesPayload?.find(rule => rule.rule_id === 'r_mount001')?.actions?.find(action => action.type === 'if')
-const ifSavedOk = savedIf?.then?.length === 1 && savedIf?.else?.length === 1 && !Object.hasOwn(savedIf.then[0], 'failure_actions')
-  && savedIf.condition?.op === 'event_occurred' && savedIf.condition.expected === false && /^t_/.test(savedIf.condition.trigger_id) && !Object.hasOwn(savedIf, 'params')
-  && savedIf.elif?.[0]?.condition?.op === 'run_status' && savedIf.elif[0].condition.status === 'running' && savedIf.elif[0].then.length === 1
-console.log((ifSavedOk?'PASS':'FAIL')+' - saving preserves IF branches and predicate data')
+const triggerDirectChoice = [...predicateInspector.querySelectorAll('select')[1].options].some(option => /^t_/.test(option.value))
+  && firedChoice.options[firedChoice.selectedIndex].textContent === '未发生'
+const inlineGroupOk = !!document.querySelector('.graph-node-event_group.graph-group-frame')
+  && !!document.querySelector('.graph-node-predicate') && !document.querySelector('.subflow-navigation')
+console.log((branchSettingsOk && triggerDirectChoice && inlineGroupOk?'PASS':'FAIL')+' - inline event groups edit stable IF, ELIF and ELSE outlets and event occurrence conditions')
+if (!branchSettingsOk || !triggerDirectChoice || !inlineGroupOk) process.exitCode = 1
+;[...document.querySelectorAll('.rule-editor-actions button')].find(button => button.textContent.includes('保存规则'))?.click()
+await pause(80)
+const savedGraph = savedRulesPayload?.find(rule => rule.rule_id === 'r_mount001')?.workflow
+const savedEventGroup = savedGraph?.nodes.filter(action => action.type === 'event_group').at(-1)
+const savedPredicate = graphPredicate(savedEventGroup?.branches?.[0]?.condition_graph)
+const ifSavedOk = savedEventGroup?.branches.length === 3 && savedEventGroup.branches.at(-1).else
+  && savedEventGroup.branches.every(branch => savedGraph.edges.some(edge => edge.source === savedEventGroup.binding_id && edge.port === branch.id))
+  && savedPredicate.op === 'event_occurred' && savedPredicate.expected === false && /^t_/.test(savedPredicate.trigger_id)
+  && !Object.hasOwn(savedRulesPayload.find(rule => rule.rule_id === 'r_mount001'), 'actions')
+console.log((ifSavedOk?'PASS':'FAIL')+' - saving keeps condition graphs and control outlet connections as the execution model')
 if (!ifSavedOk) process.exitCode = 1
 
 const definitionsPanel = document.querySelector('.variables-editor')
@@ -1893,9 +1810,13 @@ await pause(20)
 const fieldValue = fieldDefinition.querySelector('.typed-value-input textarea')
 fieldValue.value = '{}'
 fieldValue.dispatchEvent(new window.Event('input', { bubbles:true }))
-;[...document.querySelectorAll('.node-canvas-tools button')].find(button => button.textContent.includes('变量赋值')).click()
+await canvasOperation([...document.querySelectorAll('.graph-node-action')].at(-1), '变量赋值')
 await pause(30)
 const assignmentEditor = [...document.querySelectorAll('.variable-assignment-editor')].at(-1)
+const assignmentTarget = assignmentEditor.querySelector('select[aria-label="赋值目标变量"]')
+assignmentTarget.value = [...assignmentTarget.options].find(option => option.value).value
+assignmentTarget.dispatchEvent(new window.Event('change', { bubbles:true }))
+await pause(20)
 assignmentEditor.querySelector('.field-binding-button')?.click()
 await pause(20)
 const sourcePicker = assignmentEditor.querySelector('.binding-picker > select')
@@ -1940,7 +1861,7 @@ await pause(20)
 ;[...document.querySelectorAll('.rule-editor-actions button')].find(button => button.textContent.includes('保存规则')).click()
 await pause(60)
 const typedRule = savedRulesPayload?.find(rule => rule.rule_id === 'r_mount001')
-const typedAssignment = typedRule?.actions?.find(action => action.type === 'set_variable')
+const typedAssignment = ruleActions(typedRule).find(action => action.type === 'set_variable')
 const variableEditorOk = typedRule?.constants?.[0]?.value?.$nmf_value?.data === '9007199254740993'
   && ['min', 'max'].every(bound => typedRule?.constants?.[0]?.value_type?.[bound]?.$nmf_value?.data === '9007199254740993')
   && typedRule?.constants?.[0]?.value_type?.enum?.[0]?.$nmf_value?.data === '9007199254740993'
@@ -1955,7 +1876,7 @@ const variableEditorOk = typedRule?.constants?.[0]?.value?.$nmf_value?.data === 
   && typedRule.constants.find(item => item.name === '业务对象')?.value?.content === '已编辑字段'
   && typedRule.constants.find(item => item.name === '业务对象')?.value?.$literal === 'business label'
 console.log((variableEditorOk?'PASS':'FAIL')+' - variable editor saves precise constants and a bound assignment')
-if (!variableEditorOk) process.exitCode = 1
+if (!variableEditorOk) { console.error({ assignmentTarget: typedAssignment?.variable, actualVariables: typedRule?.variables?.map(value => value.id), fieldDefaultsOk, invalidPathsBlockBinding, invalidTypeKeptDraft, mixedObjectDisplayed, advancedCollapsed, expressionTextPreserved, typedTextPreserved, invalidJsonBlocksSave, validation:document.querySelector('.rule-validation')?.textContent, saves:saveConfigCalls.length }); process.exitCode = 1 }
 
 ;[...document.querySelectorAll('.graph-node-action')].find(node => node.textContent.includes('宏录制动作'))?.click()
 await pause(30)
@@ -2008,8 +1929,7 @@ const testReplacedMacro = [...document.querySelectorAll('.rule-editor-actions bu
 )
 testReplacedMacro?.click()
 await new Promise(r => setTimeout(r, 60))
-const savedMacroSteps = savedRulesPayload?.find(rule => rule.rule_id === 'r_mount001')
-  ?.actions?.find(action => action.type === 'macro_run')?.params?.macro?.data?.steps
+const savedMacroSteps = ruleActions(savedRulesPayload?.find(rule => rule.rule_id === 'r_mount001')).find(action => action.type === 'macro_run')?.params?.macro?.data?.steps
 const replacedMacroSavedBeforeTest = savedMacroSteps?.length === 2
 console.log((replacedMacroSavedBeforeTest?'PASS':'FAIL')+' - testing a replaced macro persists the current draft first')
 if (!replacedMacroSavedBeforeTest) process.exitCode = 1
@@ -2018,8 +1938,7 @@ if (!replacedMacroSavedBeforeTest) process.exitCode = 1
 )?.click()
 await new Promise(r => setTimeout(r, 80))
 const replacedMacroRunCall = [...bridgeCalls].reverse().find(call => call.path === '/api/rules/0/run')
-const testedMacroSteps = replacedMacroRunCall?.data?.rule?.actions
-  ?.find(action => action.type === 'macro_run')?.params?.macro?.data?.steps
+const testedMacroSteps = ruleActions(replacedMacroRunCall?.data?.rule).find(action => action.type === 'macro_run')?.params?.macro?.data?.steps
 const replacedMacroRunsCurrentDraft = testedMacroSteps?.length === 2
 console.log((replacedMacroRunsCurrentDraft?'PASS':'FAIL')+' - testing a replaced macro executes the current steps')
 if (!replacedMacroRunsCurrentDraft) process.exitCode = 1

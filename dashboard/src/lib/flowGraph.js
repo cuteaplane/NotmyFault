@@ -51,6 +51,7 @@ export function buildFlowGraph({
   isAdmin,
   schema,
   rules = [],
+  expandBranches = true,
 }) {
   const nodes = []
   const edges = []
@@ -156,118 +157,93 @@ export function buildFlowGraph({
   }
 
   const conditionExitNode = nodes.find(node => node.id === conditionExit.id)
-  let previousId = conditionExit.id
-  let x = conditionExitNode.x + FLOW_COLUMN_STEP
-  const pipelineY = conditionExit.y
-
-  const actions = Array.isArray(rule.actions) ? rule.actions : []
-  const actionNodes = []
-  actions.forEach((item, index) => {
-    const id = `action-${item.binding_id || index}`
-    const actionNode = {
-      id,
-      kind: 'action',
-      index,
-      source: item,
-      x,
-      y: pipelineY,
-      icon: item.type === 'if' ? 'call_split' : item.type === 'wait' ? 'hourglass_empty' : item.type === 'set_variable' ? 'edit_note' : 'play_arrow',
-      kicker: `动作 ${index + 1}`,
-      label: actionName(item),
-      meta: item.type === 'if' ? `${predicateSummary(item.condition, schema ? precedingSources(rule, item, schema) : [], rules, workflowEventChoices(rule, schema))} · ${ifBranches(item).length} 个出口` : item.type === 'wait' ? describeWait(item) : describeItem(item, 'action'),
-      admin: isAdmin(item, 'action'),
-      hasInput: true,
-      hasOutput: true,
-      availableStepIds: actions.slice(0, index).map(action => action.binding_id).filter(Boolean),
-    }
-    nodes.push(actionNode)
-    actionNodes.push(actionNode)
-    const previousAction = actions[index - 1]
-    edges.push({
-      id: `${previousId}-${id}`,
-      from: previousId,
-      to: id,
-      kind: 'pipeline',
-      channel: 'control',
-      label: previousAction?.failure_actions?.length
-        ? '成功后'
-        : (index ? '然后' : '执行'),
-      insertActionIndex: index,
-    })
-    previousId = id
-    x += FLOW_COLUMN_STEP
+  const stepIds = item => schema ? precedingSources(rule, item, schema)
+    .filter(source => source.value.$ref.scope === 'step').map(source => source.value.$ref.node) : []
+  const connect = (from, to, label = '', kind = 'pipeline', extra = {}) => edges.push({
+    id: `${from}-${to}`, from, to, label, kind, channel: 'control', ...extra,
   })
 
-  nodes.push({
-    id: 'add-action',
-    kind: 'add',
-    x,
-    y: pipelineY,
-    icon: 'add',
-    kicker: '下一步',
-    label: '添加动作',
-    meta: '继续这条规则',
-    hasInput: true,
-    hasOutput: false,
-  })
-  edges.push({
-    id: `${previousId}-add-action`,
-    from: previousId,
-    to: 'add-action',
-    kind: 'add',
-    channel: 'control',
-    label: actions.at(-1)?.failure_actions?.length ? '成功后' : '',
-    insertActionIndex: actions.length,
-  })
-
-  actions.forEach((action, actionIndex) => {
-    const failureActions = Array.isArray(action.failure_actions) ? action.failure_actions : []
-    if (!failureActions.length) return
-    const parentNode = actionNodes[actionIndex]
-    const availableStepIds = actions.slice(0, actionIndex).map(item => item.binding_id).filter(Boolean)
-    let branchPreviousId = parentNode.id
-    failureActions.forEach((failureAction, failureIndex) => {
-      const id = `failure-action-${failureAction.binding_id || `${actionIndex}-${failureIndex}`}`
-      const node = {
-        id,
-        kind: 'failure-action',
-        index: failureIndex,
-        parentIndex: actionIndex,
-        source: failureAction,
-        x: parentNode.x + (failureIndex + 1) * FLOW_COLUMN_STEP,
-        y: pipelineY + FLOW_ROW_STEP,
-        icon: 'build',
-        kicker: `补救 ${failureIndex + 1}`,
-        label: actionName(failureAction),
-        meta: describeItem(failureAction, 'action'),
-        admin: isAdmin(failureAction, 'action'),
-        hasInput: true,
-        hasOutput: true,
-        availableStepIds: [...availableStepIds],
+  function sequence(items, startId, startX, y, end, scope = {}) {
+    let previous = startId
+    let x = startX
+    let bottom = y
+    let recoveryTail = null
+    let previousAction = null
+    items.forEach((item, index) => {
+      const id = `action-${item.binding_id}`
+      nodes.push({
+        id, kind: 'action', index, items, source: item, ...scope, x, y,
+        icon: item.type === 'if' ? 'call_split' : item.type === 'wait' ? 'hourglass_empty' : item.type === 'set_variable' ? 'edit_note' : 'play_arrow',
+        kicker: scope.branchLabel ? `${scope.branchLabel} · ${index + 1}` : `动作 ${index + 1}`,
+        label: actionName(item),
+        meta: item.type === 'if' ? `${predicateSummary(item.condition, schema ? precedingSources(rule, item, schema) : [], rules, workflowEventChoices(rule, schema))} · ${ifBranches(item).length} 个出口` : item.type === 'wait' ? describeWait(item) : describeItem(item, 'action'),
+        admin: isAdmin(item, 'action'), hasInput: true, hasOutput: true, availableStepIds: stepIds(item),
+      })
+      connect(previous, id, index === 0 ? (scope.branchLabel || '执行') : previousAction?.failure_actions?.length ? '成功后' : '然后', 'pipeline', {
+        insertActionIndex: index, ownerId: scope.parentIf?.binding_id, branchKey: scope.branchKey, branchLabel: scope.branchLabel,
+      })
+      if (recoveryTail) connect(recoveryTail, id, '处理后继续', 'failure-continue')
+      recoveryTail = null
+      let exit = id
+      let nextX = x + FLOW_COLUMN_STEP
+      let blockBottom = y
+      if (item.type === 'if' && expandBranches) {
+        const mergeId = `if-merge-${item.binding_id}`
+        let branchY = y
+        let mergeX = nextX
+        for (const branch of ifBranches(item)) {
+          const addId = `branch-add-${item.binding_id}-${branch.key}`
+          const branchLayout = sequence(branch.actions, id, x + FLOW_COLUMN_STEP, branchY, {
+            id: addId, kind: 'if-branch', branchKey: branch.key, addBranch: true,
+            source: item, icon: 'add', kicker: branch.label, label: '添加分支动作',
+            meta: branch.actions.length ? '继续此分支' : '空分支继续后续流程', hasOutput: true,
+          }, { parentIf: item, branchKey: branch.key, branchLabel: branch.label })
+          mergeX = Math.max(mergeX, branchLayout.nextX)
+          blockBottom = Math.max(blockBottom, branchLayout.bottom)
+          branchY = branchLayout.bottom + FLOW_ROW_STEP
+          connect(addId, mergeId, '继续')
+        }
+        nodes.push({ id: mergeId, kind: 'if-merge', source: item, x: mergeX, y,
+          icon: 'merge', kicker: '分支结束', label: '返回公共后续流程',
+          meta: '只执行一次后续动作', hasInput: true, hasOutput: true, dataInputs: [], dataOutputs: [],
+        })
+        exit = mergeId
+        nextX = mergeX + FLOW_COLUMN_STEP
       }
-      nodes.push(node)
-      edges.push({
-        id: `${branchPreviousId}-${id}`,
-        from: branchPreviousId,
-        to: id,
-        kind: 'failure',
-        channel: 'control',
-        label: failureIndex ? '然后' : '失败时',
+      const failures = item.failure_actions || []
+      let failurePrevious = id
+      failures.forEach((failure, failureIndex) => {
+        const failureId = `failure-action-${failure.binding_id}`
+        nodes.push({ id: failureId, kind: 'failure-action', source: failure, owner: item,
+          index: failureIndex, parentIndex: index, items: failures, ...scope,
+          x: x + (failureIndex + 1) * FLOW_COLUMN_STEP, y: blockBottom + FLOW_ROW_STEP,
+          icon: 'build', kicker: `补救 ${failureIndex + 1}`, label: actionName(failure),
+          meta: describeItem(failure, 'action'), admin: isAdmin(failure, 'action'),
+          hasInput: true, hasOutput: true, availableStepIds: stepIds(failure),
+        })
+        connect(failurePrevious, failureId, failureIndex ? '然后' : '失败时', 'failure')
+        failurePrevious = failureId
       })
-      if (failureAction.binding_id) availableStepIds.push(failureAction.binding_id)
-      branchPreviousId = id
+      if (failures.length) {
+        blockBottom += FLOW_ROW_STEP
+        nextX = Math.max(nextX, x + (failures.length + 1) * FLOW_COLUMN_STEP)
+        if (item.on_error === 'continue') recoveryTail = failurePrevious
+      }
+      bottom = Math.max(bottom, blockBottom)
+      previous = exit
+      previousAction = item
+      x = nextX
     })
-    if (action.on_error === 'continue') {
-      const nextId = actionNodes[actionIndex + 1]?.id || 'add-action'
-      edges.push({
-        id: `${branchPreviousId}-${nextId}-recover`,
-        from: branchPreviousId,
-        to: nextId,
-        kind: 'failure-continue',
-        channel: 'control',
-        label: '处理后继续',
-      })
-    }
+    nodes.push({ ...end, x, y, hasInput: true })
+    connect(previous, end.id, items.length ? (previousAction?.failure_actions?.length ? '成功后' : '') : scope.branchLabel || '', 'add', {
+      insertActionIndex: items.length, ownerId: scope.parentIf?.binding_id, branchKey: scope.branchKey, branchLabel: scope.branchLabel,
+    })
+    if (recoveryTail) connect(recoveryTail, end.id, '处理后继续', 'failure-continue')
+    return { nextX: x + FLOW_COLUMN_STEP, bottom }
+  }
+  sequence(rule.actions || [], conditionExit.id, conditionExitNode.x + FLOW_COLUMN_STEP, conditionExit.y, {
+    id: 'add-action', kind: 'add', icon: 'add', kicker: '下一步', label: '添加动作',
+    meta: '继续这条规则', hasOutput: false,
   })
 
   return { nodes, edges }
@@ -278,16 +254,22 @@ export function routeFlowEdge(edge, nodesById) {
   const target = nodesById.get(edge.to)
   if (!source || !target) return null
 
-  const x1 = source.x + FLOW_NODE_WIDTH
+  const x1 = source.x + (edge.sourceSide === 'left' ? 0 : source.width || FLOW_NODE_WIDTH)
   const sourceDataY = source.dataOutputY?.[edge.sourcePortName]
     ?? FLOW_DATA_PORT_Y + edge.sourcePortIndex * FLOW_DATA_PORT_STEP
   const targetDataY = target.dataInputY?.[edge.targetPortName]
     ?? FLOW_DATA_PORT_Y + edge.targetPortIndex * FLOW_DATA_PORT_STEP
-  const y1 = source.y + (edge.channel === 'data' ? sourceDataY : FLOW_NODE_PORT_Y)
-  const x2 = target.x
-  const y2 = target.y + (edge.channel === 'data' ? targetDataY : FLOW_NODE_PORT_Y)
+  const y1 = source.y + (edge.channel === 'data' ? sourceDataY : edge.sourceInput ? source.inputY ?? FLOW_NODE_PORT_Y : (source.outputs || source.outputAnchors)?.find(port => port.id === edge.sourcePort)?.y ?? FLOW_NODE_PORT_Y)
+  const x2 = target.x + (edge.targetPort ? target.width || FLOW_NODE_WIDTH : 0)
+  const y2 = target.y + (edge.channel === 'data' ? targetDataY : edge.targetPort ? target.outputs?.find(port => port.id === edge.targetPort)?.y ?? FLOW_NODE_PORT_Y : target.inputY ?? FLOW_NODE_PORT_Y)
 
-  if (x2 - x1 >= 24) {
+  if (x2 >= x1) {
+    const outlet = source.outputs?.findIndex(port => port.id === edge.sourcePort) ?? -1
+    if (source.kind === 'event_group' && edge.channel !== 'data' && !edge.targetPort && outlet >= 0 && y2 - y1 > 64 && x2 - x1 > 48) {
+      const rail = x1 + (x2 - x1) * (source.outputs.length - outlet) / (source.outputs.length + 1)
+      const radius = Math.min(12, (rail - x1) / 2, (x2 - rail) / 2)
+      return { ...edge, d: `M ${x1} ${y1} H ${rail - radius} Q ${rail} ${y1}, ${rail} ${y1 + radius} V ${y2 - radius} Q ${rail} ${y2}, ${rail + radius} ${y2} H ${x2}`, labelX: rail, labelY: (y1 + y2) / 2 - 9 }
+    }
     const middle = (x1 + x2) / 2
     return {
       ...edge,
@@ -298,7 +280,7 @@ export function routeFlowEdge(edge, nodesById) {
   }
 
   // 目标节点在来源左侧时，连线从两节点右侧绕行。
-  const routeX = Math.max(x1, target.x + FLOW_NODE_WIDTH) + 58
+  const routeX = Math.max(x1, target.x + (target.width || FLOW_NODE_WIDTH)) + 58
   return {
     ...edge,
     d: `M ${x1} ${y1} L ${routeX} ${y1} L ${routeX} ${y2} L ${x2} ${y2}`,
@@ -308,7 +290,7 @@ export function routeFlowEdge(edge, nodesById) {
   }
 }
 
-export function buildIfSubflowGraph({ rule, action, schema, sources, rules, actionName, describeItem }) {
+export function buildIfSubflowGraph({ rule, action, schema, sources, rules }) {
   const nodes = []
   const edges = []
   const branches = ifBranches(action)
@@ -357,32 +339,8 @@ export function buildIfSubflowGraph({ rule, action, schema, sources, rules, acti
   const conditionRoots = branches.filter(branch => branch.condition).map(branch => ({ branch, ...visit(branch.condition, branch) }))
   const gateId = `if-decision-${action.binding_id}`
   const gateY = conditionRoots[0]?.y || TOP
-  nodes.push({ id: gateId, kind: 'if-branch', source: action, x: decisionX, y: gateY, icon: 'call_split', kicker: 'IF / ELIF / ELSE', label: '按顺序选择一个分支', meta: '首个成立出口执行；否则走 ELSE', hasInput: true, hasOutput: true })
+  nodes.push({ id: gateId, kind: 'if-branch', source: action, x: decisionX, y: gateY, icon: 'call_split', kicker: 'IF / ELIF / ELSE', label: '按顺序选择一个分支', meta: '分支动作在主流程图中编辑', hasInput: true, hasOutput: false })
   conditionRoots.forEach(root => addEdge(root.id, gateId, root.branch.label, 'condition'))
-  const maxActions = Math.max(1, ...branches.map(branch => branch.actions.length))
-  const mergeId = `if-merge-${action.binding_id}`
-  branches.forEach((branch, branchIndex) => {
-    let previous = gateId
-    const y = TOP + branchIndex * FLOW_ROW_STEP
-    branch.actions.forEach((item, index) => {
-      const id = `action-${item.binding_id}`
-      nodes.push({ id, kind: 'action', source: item, branchKey: branch.key, index, x: decisionX + (index + 1) * FLOW_COLUMN_STEP, y, icon: item.type === 'if' ? 'call_split' : 'play_arrow', kicker: `${branch.label} · ${index + 1}`, label: actionName(item), meta: item.type === 'if' ? predicateSummary(item.condition, precedingSources(rule, item, schema), rules, workflowEventChoices(rule, schema)) : describeItem(item, 'action'), hasInput: true, hasOutput: true, availableStepIds: precedingSources(rule, item, schema).filter(source => source.value.$ref.scope === 'step').map(source => source.value.$ref.node) })
-      addEdge(previous, id, index === 0 ? branch.label : '然后')
-      let failurePrevious = id
-      ;(item.failure_actions || []).forEach((failure, failureIndex) => {
-        const failureId = `failure-action-${failure.binding_id}`
-        nodes.push({ id: failureId, kind: 'failure-action', source: failure, owner: item, branchKey: branch.key, index: failureIndex, x: decisionX + (index + failureIndex + 2) * FLOW_COLUMN_STEP, y: y + FLOW_ROW_STEP / 2, icon: 'build', kicker: `${branch.label} · 补救 ${failureIndex + 1}`, label: actionName(failure), meta: describeItem(failure, 'action'), hasInput: true, hasOutput: true, availableStepIds: precedingSources(rule, failure, schema).filter(source => source.value.$ref.scope === 'step').map(source => source.value.$ref.node) })
-        addEdge(failurePrevious, failureId, failureIndex ? '然后' : '失败时', 'failure')
-        failurePrevious = failureId
-      })
-      previous = id
-    })
-    const addId = `branch-add-${action.binding_id}-${branch.key}`
-    nodes.push({ id: addId, kind: 'if-branch', branchKey: branch.key, addBranch: true, source: action, x: decisionX + (branch.actions.length + 1) * FLOW_COLUMN_STEP, y, icon: 'add', kicker: branch.label, label: '添加分支动作', meta: branch.actions.length ? '继续此分支' : '空分支继续后续流程', hasInput: true, hasOutput: true })
-    addEdge(previous, addId, branch.actions.length ? '' : branch.label)
-    addEdge(addId, mergeId, '继续')
-  })
-  nodes.push({ id: mergeId, kind: 'if-merge', source: action, x: decisionX + (maxActions + 2) * FLOW_COLUMN_STEP, y: gateY, icon: 'merge', kicker: '分支结束', label: '返回公共后续流程', meta: '只执行一次后续动作', hasInput: true, hasOutput: false })
   return { nodes: [...sourceNodes.values(), ...nodes], edges }
 }
 function findActionSource(actions, id) {
