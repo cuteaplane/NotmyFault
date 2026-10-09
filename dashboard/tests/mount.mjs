@@ -481,7 +481,8 @@ for (const key of Object.getOwnPropertyNames(window)) {
   if (!(key in global)) { try { global[key] = window[key] } catch (e) {} }
 }
 Object.defineProperty(global, 'navigator', { value: window.navigator, configurable: true })
-global.requestAnimationFrame = (cb) => setTimeout(cb, 0)
+let animationFrameTime = 0
+global.requestAnimationFrame = (cb) => setTimeout(() => cb(performance.now() + (animationFrameTime += 16)), 0)
 global.cancelAnimationFrame = (id) => clearTimeout(id)
 global.fetch = window.fetch  // 覆盖 node 原生 fetch，确保用 mock
 const appendToHead = window.document.head.appendChild.bind(window.document.head)
@@ -721,7 +722,7 @@ await new Promise(r => setTimeout(r, 30))
 ;[...document.querySelectorAll('.quick-create-foot button')].find(button => button.textContent.includes('在编辑器中继续'))?.click()
 await new Promise(r => setTimeout(r, 80))
 const quickCreateDraftOk = document.querySelector('.rule-title-capsule')?.textContent.includes('定时后显示通知')
-  && document.querySelector('.graph-node-event_group')?.textContent.includes('流程入口')
+  && document.querySelector('.graph-node-event_group .graph-node-head-title')?.textContent === '事件组'
   && document.querySelector('.graph-node-action')?.textContent.includes('显示通知')
 console.log((quickCreateSecondStepOk && quickCreateDraftOk?'PASS':'FAIL')+' - automation page opens a real prefilled rule draft')
 if (!quickCreateSecondStepOk || !quickCreateDraftOk) process.exitCode = 1
@@ -1599,19 +1600,21 @@ if (!failureBranchOk) { console.error({ failurePickerOk, controlLabels, failureC
 
 await pause(350)
 document.querySelector('.graph-node-failure-action button[title="删除补救动作"]')?.click()
-await pause(30)
+await pause(350)
 let canvasDeleteOk = document.querySelectorAll('.graph-node-failure-action').length === 0
   && document.querySelectorAll('.graph-node-action').length === 1
 document.querySelector('.rule-history-actions button:first-child')?.click()
-await pause(30)
+await pause(350)
 canvasDeleteOk &&= document.querySelectorAll('.graph-node-failure-action').length === 1
-document.querySelector('.graph-node-action')?.click()
+document.querySelector('.graph-node-action')?.dispatchEvent(new window.MouseEvent('contextmenu', { bubbles:true, cancelable:true, button:2 }))
 await pause(30)
 ;[...document.querySelectorAll('.node-inspector-body > .inspector-action-row button')].find(button => button.textContent.includes('复制'))?.click()
-await pause(250)
+await pause(350)
 canvasDeleteOk &&= document.querySelectorAll('.graph-node-action').length === 2
-;[...document.querySelectorAll('.node-inspector-body > .inspector-action-row button')].find(button => button.textContent.includes('删除'))?.click()
-await pause(250)
+const copiedActionNode = [...document.querySelectorAll('.graph-node-action')].at(-1)
+copiedActionNode?.focus()
+copiedActionNode?.dispatchEvent(new window.KeyboardEvent('keydown', { key:'Delete', bubbles:true, cancelable:true }))
+await pause(350)
 canvasDeleteOk &&= document.querySelectorAll('.graph-node-action').length === 1
   && document.querySelectorAll('.graph-node-failure-action').length === 1
 console.log((canvasDeleteOk?'PASS':'FAIL')+' - canvas delete buttons remove the selected action or recovery action')
@@ -1699,21 +1702,31 @@ await pause(30)
 ;[...document.querySelectorAll('.node-inspector button')].find(button => button.textContent.includes('添加 ELIF'))?.click()
 await pause(30)
 const branchSettingsOk = document.querySelectorAll('.workflow-branch-settings').length === 3
+const emptyBranchBlocksSave = [...document.querySelectorAll('.rule-editor-actions button')].find(button => button.textContent.includes('保存规则'))?.disabled
+;[...document.querySelectorAll('.node-inspector button')].filter(button => button.textContent.includes('编辑条件图'))[1]?.click()
+await pause(350)
+const newBranchEditor = document.querySelector('.predicate-editor')
+const newBranchIsEvent = newBranchEditor?.querySelector('select')?.value === 'event_occurred'
+const newBranchEvent = newBranchEditor?.querySelectorAll('select')[1]
+newBranchEvent.value = [...newBranchEvent.options].find(option => option.value)?.value || ''
+newBranchEvent.dispatchEvent(new window.Event('change', { bubbles:true }))
+eventCard?.click()
+await pause(30)
 ;[...document.querySelectorAll('.node-inspector button')].find(button => button.textContent.includes('编辑条件图'))?.click()
-await pause(250)
+await pause(350)
 const predicateInspector = document.querySelector('.node-inspector .predicate-editor')
 const predicateOperator = predicateInspector?.querySelector('select')
 predicateOperator.value = 'event_occurred'; predicateOperator.dispatchEvent(new window.Event('change', { bubbles:true }))
-await pause(30)
+await pause(350)
 const firedChoice = predicateInspector.querySelectorAll('select')[2]
 firedChoice.value = 'false'; firedChoice.dispatchEvent(new window.Event('change', { bubbles:true }))
-await pause(30)
+await pause(350)
 const triggerDirectChoice = [...predicateInspector.querySelectorAll('select')[1].options].some(option => /^t_/.test(option.value))
   && firedChoice.options[firedChoice.selectedIndex].textContent === '未发生'
 const inlineGroupOk = !!document.querySelector('.graph-node-event_group.graph-group-frame')
-  && !!document.querySelector('.graph-node-predicate') && !document.querySelector('.subflow-navigation')
-console.log((branchSettingsOk && triggerDirectChoice && inlineGroupOk?'PASS':'FAIL')+' - inline event groups edit stable IF, ELIF and ELSE outlets and event occurrence conditions')
-if (!branchSettingsOk || !triggerDirectChoice || !inlineGroupOk) process.exitCode = 1
+  && !!document.querySelector('.node-inspector .predicate-editor') && !document.querySelector('[data-node-id^="dispatch-"]') && !document.querySelector('.subflow-navigation')
+console.log((branchSettingsOk && triggerDirectChoice && inlineGroupOk && emptyBranchBlocksSave && newBranchIsEvent?'PASS':'FAIL')+' - inline event groups require real event sources and edit stable IF, ELIF and ELSE outlets')
+if (!branchSettingsOk || !triggerDirectChoice || !inlineGroupOk || !emptyBranchBlocksSave || !newBranchIsEvent) process.exitCode = 1
 ;[...document.querySelectorAll('.rule-editor-actions button')].find(button => button.textContent.includes('保存规则'))?.click()
 await pause(80)
 const savedGraph = savedRulesPayload?.find(rule => rule.rule_id === 'r_mount001')?.workflow

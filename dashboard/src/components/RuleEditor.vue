@@ -191,7 +191,13 @@ watch(() => props.rule, () => {
 const canvasRef = ref(null)
 const inspectorRef = ref(null)
 const layoutNodes = computed(() => canvasRef.value?.nodes || [])
-const selectedGraphNode = computed(() => layoutNodes.value.find(node => node.id === selectedNodeId.value) || null)
+const selectedGraphNode = computed(() => (canvasRef.value?.inspectionNodes || layoutNodes.value).find(node => node.id === selectedNodeId.value) || null)
+async function deleteCanvasNode(node) {
+  if (!props.rule.workflow) return
+  selectNode(node.activationNode ? `action-${node.groupOwner.binding_id}` : node.id)
+  await nextTick()
+  inspectorRef.value?.requestDelete?.(node)
+}
 
 const mutations = useRuleMutations(toRef(props, 'rule'), selectedNodeId, selectedGraphNode)
 const {
@@ -243,6 +249,7 @@ function operate(context) {
   if (context.action) { insertOperation(context, context.action); return }
   if (context.kind === 'branch-condition') {
     const owner = context.node.source
+    if (!context.branch.condition_graph.root) Object.assign(context.branch.condition_graph, predicateToGraph())
     if (!context.node.open) canvasRef.value?.toggleGroup(owner.binding_id)
     nextTick(() => selectNode(`predicate-${owner.binding_id}-${context.branch.condition_graph.root}`)); return
   }
@@ -254,10 +261,10 @@ function operate(context) {
     const id = graphId('p'), op = context.operation
     const target = graph.nodes.find(node => node.id === selected)
     if (op === 'condition' && target?.op && target.op !== 'not') {
-      graph.nodes.push({ id, predicate: { op: 'eq', left: '', right: '' } }); graph.edges.push({ source: id, target: selected, order: graph.edges.filter(edge => edge.target === selected).length })
+      graph.nodes.push({ id, predicate: { op: 'event_occurred', trigger_id: '', expected: true } }); graph.edges.push({ source: id, target: selected, order: graph.edges.filter(edge => edge.target === selected).length })
     } else {
       graph.nodes.push({ id, op: op === 'condition' ? 'all' : op }); graph.edges.filter(edge => edge.source === selected).forEach(edge => edge.source = id); graph.edges.push({ source: selected, target: id, order: 0 }); if (graph.root === selected) graph.root = id
-      if (op !== 'not') { const child = graphId('p'); graph.nodes.push({ id: child, predicate: { op: 'eq', left: '', right: '' } }); graph.edges.push({ source: child, target: id, order: 1 }) }
+      if (op !== 'not') { const child = graphId('p'); graph.nodes.push({ id: child, predicate: { op: 'event_occurred', trigger_id: '', expected: true } }); graph.edges.push({ source: child, target: id, order: 1 }) }
     }
     return
   }
@@ -465,6 +472,7 @@ function onEditorKeydown(event) {
     <IfSubflowEditor v-if="activeIf" ref="subflowRef" :rule="rule" :action="activeIf" :layout="editorLayout" :initial-node-id="subflowInitialNode" @show-main="showMainBranch" />
     <RuleCanvas v-show="!activeIf" ref="canvasRef" :rule="rule" :layout="editorLayout"
       v-model:selected-node-id="selectedNodeId" @select-node="selectNode"
+      @delete-node="deleteCanvasNode"
       @operation="operate" @branch-add="node => selectNode(node.id)" @open-if="openIf" @add-if="addIf" @add-assignment="addAssignment" @add-wait="addWait" @open-picker="openPluginPicker"
       @move-action="moveAction" @remove-action="removeAction"
       @move-failure-action="moveFailureAction" @remove-failure-action="removeFailureAction"

@@ -26,9 +26,9 @@ for (const expanded of [new Set(), new Set([fork.binding_id]), new Set([fork.bin
     assert(to.x + (edge.targetPort ? to.width : 0) > from.x + from.width, '条件及出口按依赖从左向右连接')
     assert(!routeFlowEdge(edge, byId).reversed, '组内部连线不绕出组右侧')
     if (edge.targetPort) {
-      const y1 = from.y + from.outputAnchors.find(port => port.id === edge.sourcePort).y
+      const y1 = from.y + ((from.outputs || from.outputAnchors)?.find(port => port.id === edge.sourcePort)?.y ?? 58)
       const y2 = to.y + to.outputs.find(port => port.id === edge.targetPort).y
-      assert.equal(y1, y2, '分支选择出口与组边界端口处于同一高度')
+      assert(y2 >= y1, '组出口按分支顺序排列')
       assert.equal(edge.label, '', '边界短线不重复显示分支名称')
     }
   }
@@ -87,3 +87,10 @@ for (const frame of measured.nodes.filter(node => node.frame)) {
 }
 assert.equal(measured.nodes.find(node => node.id === 'action-a_nested01').fixedHeight, 194, '展开的数据行参与动作组布局')
 console.log('Workflow layout: forward conditions, aligned outlets, containment, readable labels and export wires: PASS')
+
+const boundarySource = { id: 'event-leaf', x: 30, y: 80, width: 228, fixedHeight: 116, groupOwner: fork }
+const boundaryObstacle = { id: 'and-root', x: 358, y: 80, width: 228, fixedHeight: 116, groupOwner: fork }
+const boundaryFrame = { id: 'group-frame', x: 0, y: 0, width: 690, fixedHeight: 224, source: fork, frame: true, outputs: [{ id: 'b_if', y: 138 }] }
+const boundaryRoute = routeFlowEdge({ from: boundarySource.id, to: boundaryFrame.id, targetPort: 'b_if', channel: 'control' }, new Map([boundarySource, boundaryObstacle, boundaryFrame].map(node => [node.id, node])))
+assert(boundaryRoute.d.includes(' V ') && boundaryRoute.d.includes(' Q '), '跨列出口连线从卡片下方绕行并保留圆角')
+assert(!boundaryRoute.reversed, '出口连线保持向右')

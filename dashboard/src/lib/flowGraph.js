@@ -264,6 +264,15 @@ export function routeFlowEdge(edge, nodesById) {
   const y2 = target.y + (edge.channel === 'data' ? targetDataY : edge.targetPort ? target.outputs?.find(port => port.id === edge.targetPort)?.y ?? FLOW_NODE_PORT_Y : target.inputY ?? FLOW_NODE_PORT_Y)
 
   if (x2 >= x1) {
+    if (edge.targetPort && target.frame && source.groupOwner === target.source) {
+      const obstacles = [...nodesById.values()].filter(node => node !== source && !node.frame && node.groupOwner === target.source && node.x >= x1 && node.x < x2)
+      if (obstacles.some(node => node.y < Math.max(y1, y2) + 10 && node.y + (node.height || node.fixedHeight || FLOW_NODE_BASE_HEIGHT) > Math.min(y1, y2) - 10)) {
+        const outlet = target.outputs.findIndex(port => port.id === edge.targetPort)
+        const bottom = target.y + (target.height || target.fixedHeight) - 6 - 16 * (outlet + 1) / (target.outputs.length + 1)
+        const left = x1 + 28, right = x2 - 24
+        return { ...edge, d: `M ${x1} ${y1} H ${left - 8} Q ${left} ${y1}, ${left} ${y1 + 8} V ${bottom - 8} Q ${left} ${bottom}, ${left + 8} ${bottom} H ${right - 8} Q ${right} ${bottom}, ${right} ${bottom - 8} V ${y2 + 8} Q ${right} ${y2}, ${right + 8} ${y2} H ${x2}`, labelX: x1 + 50, labelY: y1 + 30 }
+      }
+    }
     const outlet = source.outputs?.findIndex(port => port.id === edge.sourcePort) ?? -1
     if (source.kind === 'event_group' && edge.channel !== 'data' && !edge.targetPort && outlet >= 0 && y2 - y1 > 64 && x2 - x1 > 48) {
       const rail = x1 + (x2 - x1) * (source.outputs.length - outlet) / (source.outputs.length + 1)

@@ -323,7 +323,10 @@ body.ai-panel-resizing{cursor:col-resize;user-select:none}
 .graph-node-event_group{border-color:var(--flow-condition)}
 .graph-node-event_group .graph-node-head{background:var(--flow-condition-container);color:var(--flow-on-condition-container)}
 .graph-node-action_group .graph-node-head{background:var(--flow-action-container);color:var(--flow-on-action-container)}
-.group-toggle{color:inherit}
+.graph-node-head .group-toggle{width:28px;height:28px;color:inherit}
+.graph-node-head-actions{position:absolute;right:8px;top:-36px;display:flex;gap:2px;padding:2px;border:1px solid var(--md-outline-variant);border-radius:var(--r-sm);background:var(--md-surface-c-high);box-shadow:var(--md-elev2);opacity:0;transform:translateY(4px);pointer-events:none;transition:opacity .14s ease,transform .14s ease}
+.graph-node-head-actions .icon-btn{width:28px;height:28px}
+.graph-node:hover .graph-node-head-actions,.graph-node:focus-within .graph-node-head-actions{opacity:1;transform:none;pointer-events:auto}
 .node-context-button{opacity:0;color:inherit;transition:opacity .14s ease}
 .graph-node:hover .node-context-button,.graph-node:focus-within .node-context-button{opacity:1}
 .node-link-hit{fill:none;stroke:transparent;stroke-width:22px;pointer-events:stroke;cursor:pointer}

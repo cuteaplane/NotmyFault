@@ -3,6 +3,7 @@ import { computed } from 'vue'
 import { store } from '../lib/store'
 import { PREDICATE_LABELS, RUN_STATUS_OPTIONS, workflowEventChoices } from '../lib/workflowConditions'
 import ConditionValueInput from './ConditionValueInput.vue'
+import { typesCompatible } from '../lib/bindings'
 defineOptions({ name: 'PredicateEditor' })
 const props = defineProps({ node: Object, sources: { type: Array, default: () => [] }, rule: Object, shallow: Boolean, leafOnly: Boolean })
 const group = computed(() => ['all', 'any', 'not'].includes(props.node.op))
@@ -29,10 +30,14 @@ function changeOperator(op) {
     delete props.node.children; delete props.node.left; delete props.node.right
   } else {
     props.node.left ??= ''; props.node.right ??= ''
-    if (['is_true', 'is_false'].includes(props.node.op) && !props.node.left?.$ref && typeof props.node.left !== 'boolean') props.node.left = false
+    const source = props.sources.find(source => typesCompatible(source.type, operandType.value))
+    if (!props.node.left?.$ref || !props.sources.some(source => ['scope', 'node', 'path'].every(key => JSON.stringify(source.value.$ref[key]) === JSON.stringify(props.node.left.$ref[key])) && typesCompatible(source.type, operandType.value))) {
+      props.node.left = JSON.parse(JSON.stringify(source?.value || { $ref: { scope: 'step', node: '', path: [] } }))
+      if (source?.optional || source?.conditional) props.node.left.$ref.on_missing = 'error'
+    }
     delete props.node.children
+    if (unary.value) delete props.node.right
     if (['exists', 'not_exists'].includes(props.node.op)) {
-      delete props.node.right
       if (!props.node.left?.$ref) {
         props.node.left = JSON.parse(JSON.stringify(props.sources[0]?.value || { $ref: { scope: 'trigger', node: '', path: [] } }))
         if (props.sources[0]?.optional || props.sources[0]?.conditional) props.node.left.$ref.on_missing = 'error'
@@ -61,7 +66,7 @@ const rules = computed(() => [...store.configData.rules.filter(rule => rule.rule
       <button v-if="node.op !== 'not'" class="btn btn-text btn-sm" @click="node.children.push({ op: 'all', children: [{ op: 'eq', left: '', right: '' }] })">添加条件组</button>
     </template>
     <template v-else-if="node.op === 'event_occurred'">
-      <label class="field"><span class="field-label">事件来源</span><select v-model="node.trigger_id" class="select"><option value="" disabled>选择事件来源</option><option v-for="trigger in triggers" :key="trigger.id" :value="trigger.id">{{ trigger.label }}</option></select></label>
+      <label class="field"><span class="field-label">事件来源</span><select v-model="node.trigger_id" class="select" required><option value="" disabled>选择事件来源</option><option v-for="trigger in triggers" :key="trigger.id" :value="trigger.id">{{ trigger.label }}</option></select></label>
       <label class="field"><span class="field-label">事件判断</span><select v-model="occurredExpected" class="select"><option :value="true">已发生</option><option :value="false">未发生</option></select></label>
       <p class="inspector-lead">判断本次流程收到的事件；执行到此条件前收到的新事件也计入。</p>
       <p v-if="!triggers.length" class="inspector-lead">请先在主流程添加触发器。</p>
@@ -73,9 +78,9 @@ const rules = computed(() => [...store.configData.rules.filter(rule => rule.rule
       <p class="inspector-lead">正在运行与排队判断当前任务。最近一次结果只包含本次引擎启动后的记录。</p>
     </template>
     <template v-else>
-      <ConditionValueInput v-model="node.left" :sources="sources" :target-type="operandType" label="判断数据" />
+      <ConditionValueInput v-model="node.left" :sources="sources" :target-type="operandType" :allow-literal="false" label="判断数据" />
       <ConditionValueInput v-if="!unary" v-model="node.right" :sources="sources" :target-type="operandType" label="比较目标" />
-      <p class="inspector-lead">比较引用的数据缺失时，本次运行会报错。可先使用“存在”判断，再用 AND 连接比较条件；“缺失”可单独判断数据是否可读。</p>
+      <p v-if="node.left?.$ref && !['exists', 'not_exists'].includes(node.op)" class="inspector-lead">判断引用的数据缺失时，本次运行会报错。可先使用“存在”判断，再用 AND 连接比较条件。</p>
     </template>
   </div>
 </template>

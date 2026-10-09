@@ -112,6 +112,41 @@ export function removeWorkflowNode(rule, workflow, node, { port } = {}) {
   workflow.edges = impact.edges
   return true
 }
+export function removeEventSource(rule, group, value) {
+  const references = removalReferences(rule, [value])
+  if (references.length) return references
+  function prune(node) {
+    if (node === value) return null
+    if (!node?.children) return node
+    const children = node.children.map(prune).filter(Boolean)
+    if (children.length === node.children.length && children.every((child, index) => child === node.children[index])) return node
+    if (!children.length) return null
+    if (children.length === 1 && node.op !== 'not') return children[0]
+    node.children = children
+    return node
+  }
+  if (group.activation) {
+    const activation = prune(group.activation)
+    if (activation) group.activation = activation
+    else delete group.activation
+  }
+  group.triggers = (group.triggers || []).filter(trigger => trigger !== value)
+  return []
+}
+export function removeConditionNode(graph, id) {
+  graph.nodes = graph.nodes.filter(node => node.id !== id)
+  graph.edges = graph.edges.filter(edge => edge.source !== id && edge.target !== id)
+  if (graph.root === id) graph.root = null
+  const remaining = new Set()
+  function visit(id) {
+    if (!id || remaining.has(id)) return
+    remaining.add(id)
+    graph.edges.filter(edge => edge.target === id).forEach(edge => visit(edge.source))
+  }
+  visit(graph.root)
+  graph.nodes = graph.nodes.filter(node => remaining.has(node.id))
+  graph.edges = graph.edges.filter(edge => remaining.has(edge.source) && remaining.has(edge.target))
+}
 export function connectActivationNode(group, sourceValue, targetValue) {
   const root = group?.activation
   if (!root || !sourceValue || !targetValue) return '没有可连接的触发组合。'

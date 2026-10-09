@@ -168,7 +168,10 @@ export function useRuleValidation(rule) {
         if (action.type === 'event_group') {
           if (action.activation) validateCondition(action.activation, '事件组合')
           if (!action.branches?.length) add('事件组需要出口', nodeId)
-          for (const branch of action.branches || []) if (!branch.else) validatePredicate(graphPredicate(branch.condition_graph), '分支', nodeId, graphBindingSources(rule.value, action, store.schema))
+          for (const branch of action.branches || []) if (!branch.else) {
+            if (!branch.condition_graph?.root) add('分支需要设置判断条件', nodeId)
+            else validatePredicate(graphPredicate(branch.condition_graph), '分支', nodeId, graphBindingSources(rule.value, action, store.schema))
+          }
         } else if (action.type !== 'action_group') validateActionNode(action, `动作 ${index + 1}`, nodeId, graphBindingSources(rule.value, action, store.schema))
       })
       for (const trigger of getGraphTriggers(rule.value)) validateCondition(trigger)

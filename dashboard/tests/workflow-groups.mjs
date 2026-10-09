@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { normalizeWorkflow, createGraphAction, insertGraphNode, connectGraph, copyGraphNode, predicateToGraph, graphPredicate, getGraphTriggers, buildWorkflowGraph, removeGraphNode, graphExecutionActions } from '../src/lib/workflowGraph.js'
+import { normalizeWorkflow, createGraphAction, insertGraphNode, connectGraph, copyGraphNode, predicateToGraph, graphPredicate, getGraphTriggers, buildWorkflowGraph, removeGraphNode, graphExecutionActions, connectTriggerCondition } from '../src/lib/workflowGraph.js'
 import { collectTriggerLeaves, buildTestInputFields, graphBindingSources, actionOutputDefs } from '../src/lib/bindings.js'
 const schema = { triggers: { process: { name: '进程事件', outputs: [{ name: 'state', value_type: 'text', required: true }] } }, actions: { measure: { outputs: [{ name: 'latency', value_type: 'number', required: true }] }, log: { params: [{ name: 'text', value_type: 'text', type: 'string' }] } }, data_types: { custom: {} } }
 const predicate = { op: 'all', children: [{ op: 'event_occurred', trigger_id: 't_process01', expected: true }, { op: 'not', children: [{ op: 'lte', left: { $ref: { scope: 'step', node: 'a_measure01', path: ['latency'] } }, right: 80000 }] }] }
@@ -52,7 +52,7 @@ assert.equal(outputs.find(output => output.name === 'speed').value_type.type, 'n
 assert.equal(outputs.find(output => output.name === 'token').sensitive, true)
 assert.equal(outputs.find(output => output.name === 'token').required, false)
 assert.deepEqual(graphExecutionActions(exportRule, { startStepId: 'a_selected' }).map(node => node.binding_id), ['a_selected'])
-assert(drawn.nodes.some(node => node.id === `dispatch-${entry.binding_id}`))
+assert(!drawn.nodes.some(node => node.id.startsWith('dispatch-')), '事件组不显示内部调度卡片')
 assert(drawn.edges.some(edge => edge.from === 'trigger-t_process01' && edge.kind === 'activation'))
 
 const { branchRemovalImpact, hasExternalRemovalReferences, removeWorkflowBranch } = await import('../src/lib/workflowInspectorOps.js')
@@ -124,3 +124,54 @@ assert.equal(notEvents.children[0], eventA); assert.equal(notEvents.repeat, 'eve
 refusedMove(eventC, notEvents)
 refusedMove(sourceEvents, notEvents)
 console.log('Activation connections preserve original objects and matcher settings; invalid moves leave the tree unchanged: PASS')
+
+const { removeEventSource, removeConditionNode } = await import('../src/lib/workflowInspectorOps.js')
+const removableEvent = { type: 'process', binding_id: 't_remove01', params: {} }, keptEvent = { type: 'process', binding_id: 't_keep001', params: {} }
+const removableGroup = { type: 'event_group', binding_id: 'a_remove01', activation: { op: 'all', children: [removableEvent, keptEvent] }, triggers: [], branches: [] }
+const eventRule = { workflow: { nodes: [removableGroup], edges: [] } }
+assert.deepEqual(removeEventSource(eventRule, removableGroup, removableEvent), [])
+assert.equal(removableGroup.activation, keptEvent)
+removableGroup.branches.push({ condition_graph: predicateToGraph({ op: 'event_occurred', trigger_id: keptEvent.binding_id }) })
+const eventBefore = JSON.stringify(eventRule)
+assert.equal(removeEventSource(eventRule, removableGroup, keptEvent).length, 1)
+assert.equal(JSON.stringify(eventRule), eventBefore)
+removableGroup.branches = []
+assert.deepEqual(removeEventSource(eventRule, removableGroup, keptEvent), [])
+assert(!removableGroup.activation)
+const sharedCondition = { root: 'p_root01', nodes: [{ id: 'p_root01', op: 'any' }, { id: 'p_left01', op: 'all' }, { id: 'p_right1', op: 'not' }, { id: 'p_shared', predicate: { op: 'event_occurred', trigger_id: 't_keep001' } }], edges: [{ source: 'p_left01', target: 'p_root01', order: 0 }, { source: 'p_right1', target: 'p_root01', order: 1 }, { source: 'p_shared', target: 'p_left01', order: 0 }, { source: 'p_shared', target: 'p_right1', order: 0 }] }
+removeConditionNode(sharedCondition, 'p_left01')
+assert(sharedCondition.nodes.some(node => node.id === 'p_shared'))
+assert.equal(sharedCondition.edges.length, 2)
+removeConditionNode(sharedCondition, sharedCondition.root)
+assert.deepEqual(sharedCondition, { root: null, nodes: [], edges: [] })
+assert.equal(graphPredicate(predicateToGraph()).op, 'event_occurred')
+console.log('Event source deletion checks references, preserves remaining events and shared conditions; empty graphs require a new condition: PASS')
+
+const directGroup = { binding_id: 'a_direct001', type: 'event_group', mode: 'immediate', activation: { binding_id: 't_start001', type: 'process', params: {} }, triggers: [{ binding_id: 't_steam002', type: 'process', params: {} }], branches: [{ id: 'b_if', condition_graph: predicateToGraph({ op: 'all', children: [{ op: 'eq', left: { $ref: { scope: 'variable', node: 'v_limit001', path: [] } }, right: 80 }] }) }, { id: 'b_else', else: true }] }
+const directGraph = directGroup.branches[0].condition_graph, activationBefore = JSON.stringify(directGroup.activation)
+assert.equal(connectTriggerCondition(directGraph, 't_steam002', directGraph.root), '')
+const savedDirect = JSON.stringify(directGraph)
+assert.equal(connectTriggerCondition(directGraph, 't_steam002', directGraph.root), '')
+assert.equal(JSON.stringify(directGraph), savedDirect, '重复连接事件不新增节点')
+assert.equal(JSON.stringify(directGroup.activation), activationBefore, '分支事件连接不修改启动条件')
+const directRule = { workflow: { entry: directGroup.binding_id, nodes: [directGroup], edges: [] } }
+const directDrawing = buildWorkflowGraph(directRule, new Set([directGroup.binding_id]), schema, present)
+const eventEdge = directDrawing.edges.find(edge => edge.from === 'trigger-t_steam002' && edge.kind === 'condition')
+assert(eventEdge && eventEdge.to === `predicate-${directGroup.binding_id}-${directGraph.root}`, '事件直接连接 AND')
+assert(directDrawing.inspectionNodes.some(node => node.id === eventEdge.inspectionId), '直接连线保留事件判断编辑入口')
+assert(!directDrawing.nodes.some(node => node.source?.op === 'event_occurred'), '已选事件来源不重复显示判断卡片')
+assert(directDrawing.nodes.filter(node => node.conditionGraph).every(node => node.kicker !== 'IF'), '内部节点按用途命名')
+assert(directDrawing.edges.some(edge => edge.from === eventEdge.to && edge.targetPort === 'b_if'), '条件结果直接连接组出口')
+const directNot = { root: 'p_not', nodes: [{ id: 'p_not', op: 'not' }], edges: [] }
+assert.equal(connectTriggerCondition(directNot, 't_steam002', 'p_not'), '')
+const notBefore = JSON.stringify(directNot)
+assert(connectTriggerCondition(directNot, 't_start001', 'p_not'), 'NOT 拒绝第二个事件')
+assert.equal(JSON.stringify(directNot), notBefore, '拒绝连接保留原图')
+assert(connectTriggerCondition(directGraph, 't_start001', directGraph.nodes.find(node => node.predicate?.op === 'eq').id), '事件不能连接数据判断输入')
+console.log('Direct event connections, editable event wires, branch outlets and unchanged activation: PASS')
+
+const pendingEvents = predicateToGraph({ op: 'all', children: [{ op: 'event_occurred', trigger_id: '', expected: true }, { op: 'event_occurred', trigger_id: '', expected: true }] })
+assert.equal(connectTriggerCondition(pendingEvents, 't_steam002', pendingEvents.root), '')
+assert.equal(connectTriggerCondition(pendingEvents, 't_start001', pendingEvents.root), '')
+assert.equal(pendingEvents.nodes.length, 3, '拖入事件填充未配置的事件输入')
+assert(pendingEvents.nodes.filter(node => node.predicate).every(node => node.predicate.trigger_id), '填充后的组合没有空事件来源')

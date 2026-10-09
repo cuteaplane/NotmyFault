@@ -1,6 +1,6 @@
 const clone = value => JSON.parse(JSON.stringify(value))
 export const graphId = (prefix = 'a') => `${prefix}_${globalThis.crypto?.randomUUID?.().replaceAll('-', '').slice(0, 12) || Math.random().toString(16).slice(2).padEnd(12, '0')}`
-export function predicateToGraph(predicate = { op: 'is_true', left: false }) {
+export function predicateToGraph(predicate = { op: 'event_occurred', trigger_id: '', expected: true }) {
   const graph = { root: null, nodes: [], edges: [] }
   function visit(value) {
     const id = graphId('p')
@@ -157,6 +157,19 @@ export function connectConditionGraph(graph, source, target) {
   graph.edges = edges; graph.root = roots[0].id
   return ''
 }
+export function connectTriggerCondition(graph, triggerId, target) {
+  const to = graph.nodes.find(node => node.id === target)
+  if (!['all', 'any', 'not'].includes(to?.op)) return '事件只能连接到 AND、OR 或 NOT 条件组'
+  const existing = graph.nodes.find(node => node.predicate?.op === 'event_occurred' && node.predicate.trigger_id === triggerId && node.predicate.expected !== false && graph.edges.some(edge => edge.source === node.id && edge.target === target))
+  if (existing) return ''
+  const pending = graph.nodes.find(node => node.predicate?.op === 'event_occurred' && !node.predicate.trigger_id && graph.edges.some(edge => edge.source === node.id && edge.target === target) && graph.edges.filter(edge => edge.source === node.id).length === 1)
+  if (pending) { pending.predicate.trigger_id = triggerId; pending.predicate.expected = true; return '' }
+  if (to.op === 'not' && graph.edges.some(edge => edge.target === target)) return 'NOT 只能包含一个条件'
+  const id = graphId('p')
+  graph.nodes.push({ id, predicate: { op: 'event_occurred', trigger_id: triggerId, expected: true } })
+  graph.edges.push({ source: id, target, order: 1 + Math.max(-1, ...graph.edges.filter(edge => edge.target === target).map(edge => edge.order ?? 0)) })
+  return ''
+}
 export function graphPredecessors(workflow, id) {
   const result = new Set()
   function visit(target) { for (const edge of workflow?.edges || []) if (edge.target === target && !result.has(edge.source)) { result.add(edge.source); visit(edge.source) } }
@@ -180,7 +193,7 @@ export function copyGraphNode(node) {
   return copy
 }
 export function buildWorkflowGraph(rule, expanded, schema, presentation, layoutCache = new Map()) {
-  const nodes = [], edges = []
+  const nodes = [], edges = [], inspectionNodes = []
   const width = 228, gap = 100, row = 164
   const cardHeight = node => {
     const ports = node.outputs || node.outputAnchors || []
@@ -192,14 +205,20 @@ export function buildWorkflowGraph(rule, expanded, schema, presentation, layoutC
   const branchLabel = (source, branch) => branch.label || (branch.else ? 'ELSE' : source.branches.indexOf(branch) ? `ELIF ${source.branches.indexOf(branch)}` : 'IF')
   function eventContent(source) {
     if (layoutCache.has(source)) return layoutCache.get(source)
-    const innerNodes = [], innerEdges = []
-    const dispatchId = `dispatch-${source.binding_id}`
+    const innerNodes = [], innerEdges = [], inspectors = []
     const triggerList = getGraphTriggers({ workflow: { nodes: [source] } })
-    for (const trigger of triggerList) innerNodes.push({ id: `trigger-${trigger.binding_id}`, source: trigger, kind: 'trigger', label: eventName(trigger), kicker: '事件来源', meta: describeItem(trigger, 'trigger'), icon: 'bolt', hasInput: false, hasOutput: false })
+    let entry = rule.workflow.nodes.find(node => node.binding_id === rule.workflow.entry)
+    while (entry?.type === 'action_group') entry = entry.workflow.nodes.find(node => node.binding_id === entry.workflow.entry)
+    const activationLabel = source.mode === 'wait' ? '等待事件' : entry === source ? '启动事件' : '事件来源'
+    const eventSources = new Map(triggerList.map(trigger => [trigger.binding_id, `trigger-${trigger.binding_id}`]))
+    const referenced = new Set(source.branches.flatMap(branch => (branch.condition_graph?.nodes || []).map(node => node.predicate?.trigger_id).filter(Boolean)))
+    const external = getGraphTriggers(rule).filter(trigger => referenced.has(trigger.binding_id) && !eventSources.has(trigger.binding_id))
+    for (const trigger of external) eventSources.set(trigger.binding_id, `event-source-${source.binding_id}-${trigger.binding_id}`)
+    for (const trigger of [...triggerList, ...external]) innerNodes.push({ id: eventSources.get(trigger.binding_id), source: trigger, kind: 'trigger', label: eventName(trigger), kicker: '事件来源', meta: describeItem(trigger, 'trigger'), icon: 'bolt', hasInput: false, hasOutput: true, outputs: [{ id: 'event', label: '事件', y: 58 }], readOnly: external.includes(trigger), ...(external.includes(trigger) ? { dataInputs: [], dataOutputs: [] } : {}) })
     function activationNode(value, path = []) {
       if (value.type) {
         const id = `trigger-${value.binding_id}`
-        Object.assign(innerNodes.find(node => node.id === id), { activationValue: value, activationOwner: source, hasOutput: true, outputs: [{ id: 'activation', label: '事件组合', y: 58 }] })
+        Object.assign(innerNodes.find(node => node.id === id), { activationValue: value, activationOwner: source, kicker: activationLabel, hasOutput: true, outputs: [{ id: 'activation', label: '事件', y: 58 }] })
         return id
       }
       const id = `activation-${source.binding_id}-${path.join('-') || 'root'}`
@@ -208,16 +227,30 @@ export function buildWorkflowGraph(rule, expanded, schema, presentation, layoutC
       for (const child of children) innerEdges.push({ id: `activation:${child}:${id}`, from: child, to: id, activationOwner: source, activationTarget: value, kind: 'activation', channel: 'control', label: value.op === 'all' ? '并且' : value.op === 'any' ? '或者' : '未发生' })
       return id
     }
-    if (source.activation) innerEdges.push({ id: `activation:root:${source.binding_id}`, from: activationNode(source.activation), to: dispatchId, activationOwner: source, activationTarget: source.activation, kind: 'activation', channel: 'control', label: '事件组合成立' })
+    const activationRoot = source.activation ? activationNode(source.activation) : null
+    const branchRoots = new Map()
     for (const branch of source.branches) {
       if (!branch.condition_graph) continue
-      for (const condition of branch.condition_graph.nodes) innerNodes.push({ id: `predicate-${source.binding_id}-${condition.id}`, source: condition.predicate || condition, graphCondition: condition, conditionGraph: branch.condition_graph, branch, kind: condition.predicate ? 'predicate' : 'condition-expression', label: condition.predicate ? '条件判断' : condition.op === 'all' ? '全部满足 · AND' : condition.op === 'any' ? '满足任一 · OR' : '取反 · NOT', kicker: branchLabel(source, branch), meta: condition.predicate ? predicateSummary(condition.predicate, source) : '组合子条件', icon: condition.predicate ? 'rule' : 'account_tree', hasInput: true, hasOutput: true, dataInputs: condition.predicate ? ['left', 'right'].filter(name => Object.hasOwn(condition.predicate, name)).map((name, index) => ({ id: name, index, name, label: name === 'left' ? '判断数据' : '比较目标', type: 'any' })) : [], dataOutputs: [] })
-      for (const condition of branch.condition_graph.nodes) if (condition.predicate?.op === 'event_occurred') innerEdges.push({ id: `event:${source.binding_id}:${condition.id}`, from: `trigger-${condition.predicate.trigger_id}`, to: `predicate-${source.binding_id}-${condition.id}`, kind: 'condition', channel: 'control', label: condition.predicate.expected === false ? '事件未发生' : '事件已发生' })
-      innerEdges.push({ id: `branch:${source.binding_id}:${branch.id}`, from: `predicate-${source.binding_id}-${branch.condition_graph.root}`, to: dispatchId, kind: 'activation', channel: 'control', label: branchLabel(source, branch) })
-      for (const edge of [...branch.condition_graph.edges].sort((a, b) => a.order - b.order)) innerEdges.push({ id: `condition:${source.binding_id}:${edge.source}:${edge.target}`, from: `predicate-${source.binding_id}-${edge.source}`, to: `predicate-${source.binding_id}-${edge.target}`, channel: 'control', kind: 'condition', conditionGraph: branch.condition_graph, rawEdge: edge, label: '' })
+      const conditionGraph = branch.condition_graph
+      const conditionId = condition => `predicate-${source.binding_id}-${condition.id}`
+      const eventSource = condition => condition?.predicate?.op === 'event_occurred' && eventSources.get(condition.predicate.trigger_id)
+      const displayId = id => { const condition = conditionGraph.nodes.find(node => node.id === id); return eventSource(condition) || (condition && conditionId(condition)) }
+      for (const condition of conditionGraph.nodes) {
+        const descriptor = { id: conditionId(condition), source: condition.predicate || condition, graphCondition: condition, conditionGraph, branch, kind: condition.predicate ? 'predicate' : 'condition-expression', label: condition.predicate ? '条件判断' : condition.op === 'all' ? '全部满足 · AND' : condition.op === 'any' ? '满足任一 · OR' : '取反 · NOT', kicker: condition.predicate ? condition.predicate.op === 'event_occurred' ? '事件判断' : condition.predicate.op === 'run_status' ? '自动化状态' : '数据判断' : '条件组', meta: condition.predicate ? predicateSummary(condition.predicate, source) : '组合子条件', icon: condition.predicate ? 'rule' : 'account_tree', hasInput: true, hasOutput: true, dataInputs: condition.predicate ? ['left', 'right'].filter(name => Object.hasOwn(condition.predicate, name)).map((name, index) => ({ id: name, index, name, label: name === 'left' ? '判断数据' : '比较目标', type: 'any' })) : [], dataOutputs: [] }
+        if (eventSource(condition)) inspectors.push(descriptor)
+        else innerNodes.push(descriptor)
+      }
+      branchRoots.set(branch.id, displayId(conditionGraph.root))
+      for (const edge of [...conditionGraph.edges].sort((a, b) => a.order - b.order)) {
+        const condition = conditionGraph.nodes.find(node => node.id === edge.source)
+        innerEdges.push({ id: `condition:${source.binding_id}:${branch.id}:${edge.source}:${edge.target}`, from: displayId(edge.source), to: displayId(edge.target), channel: 'control', kind: 'condition', conditionGraph, rawEdge: edge, inspectionId: eventSource(condition) ? conditionId(condition) : null, label: eventSource(condition) ? condition.predicate.expected === false ? '事件未发生' : '事件已发生' : '' })
+      }
     }
-    const anchors = source.branches.map(branch => ({ id: branch.id, label: branchLabel(source, branch), y: 103 + source.branches.indexOf(branch) * 28 }))
-    innerNodes.push({ id: dispatchId, source, activationNode: true, kind: 'activation', label: '选择第一个成立出口', kicker: 'IF / ELIF / ELSE', meta: '按顺序判断；全部不成立走 ELSE', icon: 'call_split', hasInput: false, hasOutput: false, outputAnchors: anchors, fixedHeight: 90 + anchors.length * 28 })
+    if (activationRoot && !source.branches.some(branch => branch.condition_graph)) branchRoots.set(source.branches[0]?.id, activationRoot)
+    else if (activationRoot) {
+      const root = innerNodes.find(node => node.id === activationRoot)
+      root.meta = `${root.meta} · ${source.mode === 'wait' ? '等待条件成立后判断分支' : entry === source ? '启动后判断分支' : '进入本组时立即判断分支'}`
+    }
     innerNodes.forEach(node => { node.fixedHeight = cardHeight(node) })
     const byId = new Map(innerNodes.map(node => [node.id, node])), incoming = new Map()
     for (const edge of innerEdges) if (byId.has(edge.from)) {
@@ -245,7 +278,7 @@ export function buildWorkflowGraph(rule, expanded, schema, presentation, layoutC
       positions.set(id, value)
       return value
     }
-    position(dispatchId); innerNodes.forEach(node => position(node.id))
+    innerNodes.forEach(node => position(node.id))
     for (const layer of [...new Set(ranks.values())].sort((a, b) => a - b)) {
       let bottom = 80
       for (const node of innerNodes.filter(node => ranks.get(node.id) === layer).sort((a, b) => positions.get(a.id) - positions.get(b.id))) {
@@ -255,11 +288,23 @@ export function buildWorkflowGraph(rule, expanded, schema, presentation, layoutC
         positions.set(node.id, node.y); bottom = node.y + (node.fixedHeight || 116) + 32
       }
     }
-    const dispatch = byId.get(dispatchId)
-    const outputs = anchors.map(port => ({ ...port, y: dispatch.y + port.y }))
-    const w = dispatch.x + width + 80, h = Math.max(...innerNodes.map(node => node.y + (node.fixedHeight || 116))) + 28
-    for (const branch of source.branches) innerEdges.push({ id: `dispatch:${source.binding_id}:${branch.id}`, from: dispatchId, to: `action-${source.binding_id}`, sourcePort: branch.id, targetPort: branch.id, kind: 'activation', channel: 'control', label: '' })
-    const content = { nodes: innerNodes, edges: innerEdges, w, h, inputY: dispatch.y + 58, outputs }
+    let outletY = 80
+    const outputs = source.branches.map(branch => {
+      const root = byId.get(branchRoots.get(branch.id))
+      const y = Math.max(outletY, root ? root.y + 58 : outletY)
+      outletY = y + 48
+      return { id: branch.id, label: branchLabel(source, branch), y }
+    })
+    const w = Math.max(360, ...innerNodes.map(node => node.x + width + 104))
+    const h = Math.max(144, outletY - 20, ...innerNodes.map(node => node.y + (node.fixedHeight || 116))) + 28
+    for (const branch of source.branches) {
+      const from = branchRoots.get(branch.id)
+      if (!from) continue
+      const condition = branch.condition_graph?.nodes.find(node => node.id === branch.condition_graph.root)
+      const event = condition?.predicate?.op === 'event_occurred'
+      innerEdges.push({ id: `branch:${source.binding_id}:${branch.id}`, from, to: `action-${source.binding_id}`, targetPort: branch.id, kind: branch.condition_graph ? 'condition' : 'activation', channel: 'control', conditionGraph: branch.condition_graph, inspectionId: event ? `predicate-${source.binding_id}-${condition.id}` : null, ...(branch.condition_graph ? {} : { activationOwner: source, activationTarget: source.activation }), label: event ? condition.predicate.expected === false ? '事件未发生' : '事件已发生' : '' })
+    }
+    const content = { nodes: innerNodes, inspectionNodes: inspectors, edges: innerEdges, w, h, inputY: outputs[0]?.y ?? 80, outputs }
     layoutCache.set(source, content)
     return content
   }
@@ -329,6 +374,7 @@ export function buildWorkflowGraph(rule, expanded, schema, presentation, layoutC
       if (open && source.type === 'event_group') {
         const content = sizes.get(source.binding_id).content
         nodes.push(...content.nodes.map(inner => ({ ...inner, groupOwner: source, workflow, ancestry, width, fixedHeight: inner.fixedHeight, x: node.x + inner.x, y: node.y + inner.y, availableStepIds: node.availableStepIds })))
+        inspectionNodes.push(...content.inspectionNodes.map(inner => ({ ...inner, groupOwner: source, workflow, ancestry, availableStepIds: node.availableStepIds })))
         edges.push(...content.edges)
       }
     }
@@ -347,5 +393,5 @@ export function buildWorkflowGraph(rule, expanded, schema, presentation, layoutC
     if (!workflow.entry) nodes.push({ id: `empty-${ancestry.at(-1)?.source.binding_id || 'root'}`, workflow, kind: 'empty', ancestry, x, y, width, fixedHeight: 120, icon: 'start', kicker: '空流程', label: '选择起始操作', meta: '点击选择动作或事件组', hasInput: false, hasOutput: true })
   }
   graphLayout(rule.workflow, 52, 118)
-  return { nodes, edges }
+  return { nodes, edges, inspectionNodes }
 }
