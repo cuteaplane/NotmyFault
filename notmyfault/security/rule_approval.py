@@ -2,7 +2,8 @@
 
 from typing import Any, Dict, List
 
-from notmyfault.core.rules import get_rule_admin_plugins, iter_action_nodes
+from notmyfault.core.rules import get_rule_admin_plugins
+from notmyfault.core.workflow_graph import iter_rule_actions
 from notmyfault.security.plugin_schema import requires_admin_rule_approval
 from notmyfault.security.security import SecurityMode, detect_security_mode
 from notmyfault.security.signing import (
@@ -26,7 +27,7 @@ def _rule_approval_plugins(
     triggers_meta = schema.get("triggers", {})
     actions_meta = schema.get("actions", {})
     required = set(get_rule_admin_plugins(rule, triggers_meta, actions_meta))
-    for item, _location in iter_action_nodes(rule.get("actions"), "actions"):
+    for item, _location in iter_rule_actions(rule):
         plugin_id = item.get("type")
         if requires_admin_rule_approval(actions_meta.get(plugin_id, {})):
             required.add(plugin_id)
