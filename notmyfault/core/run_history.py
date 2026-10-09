@@ -6,6 +6,7 @@ import copy
 import json
 import math
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -17,7 +18,8 @@ from notmyfault.core import run_lifecycle as lifecycle
 _RUN_EVENT_TYPES = frozenset({
     "run.triggered", "run.queued", "run.started", "run.succeeded", "run.failed",
     "run.cancelled", "run.timed_out", "run.dropped", "run.step.started", "run.step.succeeded",
-    "run.step.failed", "run.step.skipped", "run.step.cancelled", "run.step.timed_out", "run.assertions.completed",
+    "run.step.failed", "run.step.skipped", "run.step.cancelled", "run.step.timed_out", "run.step.waiting",
+    "run.step.resumed", "run.assertions.completed",
 })
 
 
@@ -64,6 +66,41 @@ def _safe_summary(value: Any) -> list[Dict[str, Any]]:
     return result
 
 
+def _safe_evaluated_branches(value):
+    from notmyfault.core.predicates import COMPARISON_OPERATORS
+    if not isinstance(value, list):
+        return []
+    def outcome(item):
+        if isinstance(item.get('result'), bool):
+            return {'result': item['result']}
+        error = item.get('error')
+        code = error.get('code') if isinstance(error, dict) else None
+        return {'error': {'code': code}} if isinstance(code, str) and re.fullmatch(r'[a-z_]{1,80}', code) else None
+    result = []
+    for branch in value[:256]:
+        if not isinstance(branch, dict) or not isinstance(branch.get('branch_id'), str) or not re.fullmatch(r'b_[a-z0-9_]{1,64}', branch['branch_id']):
+            continue
+        evaluated = outcome(branch)
+        if evaluated is None:
+            continue
+        record = {'branch_id': branch['branch_id'], **evaluated, 'predicates': []}
+        predicates = branch.get('predicates', [])
+        for item in predicates[:1024] if isinstance(predicates, list) else []:
+            if not isinstance(item, dict) or not isinstance(item.get('op'), str) or item['op'] not in COMPARISON_OPERATORS | {'all', 'any', 'not', 'event_occurred', 'run_status'}:
+                continue
+            path = item.get('path')
+            state = outcome(item)
+            if state is None or not isinstance(path, str) or len(path) > 1024 or not re.fullmatch(r'condition(?:\.children\[[0-9]+\])*', path):
+                continue
+            predicate = {'path': path, 'op': item['op'], **state}
+            node_id = item.get('node_id')
+            if isinstance(node_id, str) and re.fullmatch(r'p_[a-z0-9_]{1,64}', node_id):
+                predicate['node_id'] = node_id
+            record['predicates'].append(predicate)
+        result.append(record)
+    return result
+
+
 def _safe_event(packet: Dict[str, Any]) -> Dict[str, Any] | None:
     event_type = packet.get("type")
     data = packet.get("data")
@@ -104,11 +141,18 @@ def _safe_event(packet: Dict[str, Any]) -> Dict[str, Any] | None:
     }
     error = data.get("error")
     branch = data.get("branch")
-    if isinstance(branch, str) and (branch in ("then", "else") or (
+    if isinstance(branch, str) and (re.fullmatch(r"b_[a-z0-9_]{1,64}", branch) or branch in ("then", "else") or (
         branch.startswith("elif[") and branch.endswith("]") and branch[5:-1].isascii()
         and branch[5:-1].isdecimal() and len(branch) <= 16
     )):
         kept["branch"] = branch
+    group_path = data.get("group_path")
+    if isinstance(group_path, (list, tuple)) and len(group_path) <= 64 and all(
+        isinstance(identity, str) and re.fullmatch(r"a_[a-z0-9_]{6,64}", identity) for identity in group_path
+    ):
+        kept["group_path"] = list(group_path)
+    if 'evaluated_branches' in data:
+        kept['evaluated_branches'] = _safe_evaluated_branches(data['evaluated_branches'])
     if isinstance(error, dict):
         kept["error"] = {
             key: str(error[key])[:240]
@@ -216,6 +260,8 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
         "run.step.timed_out",
         "run.step.failed",
         "run.step.started",
+        "run.step.waiting",
+        "run.step.resumed",
     }:
         step_id = str(data.get("step_id") or "")
         if step_id:
@@ -225,7 +271,7 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
                     "step_id": step_id,
                     "action_type": data.get("action_type", ""),
                     "status": "running",
-                    "finished_at": timestamp,
+                    "finished_at": None,
                     "duration_ms": data.get("duration_ms"),
                     "attempt": data.get("attempt"),
                     "reason": None,
@@ -235,6 +281,12 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
             if event_type == "run.step.started":
                 step["status"] = "running"
                 step["started_at"] = timestamp
+            elif event_type == "run.step.waiting":
+                step["status"] = "waiting"
+                step["reason"] = data.get("reason")
+            elif event_type == "run.step.resumed":
+                step["status"] = "running"
+                step["reason"] = None
             elif event_type == "run.step.succeeded":
                 step["status"] = "succeeded"
             elif event_type == "run.step.skipped":
@@ -249,11 +301,18 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
             else:
                 step["status"] = "failed"
                 step["error"] = data.get("error")
-            step["finished_at"] = timestamp
+            if event_type in {"run.step.started", "run.step.waiting", "run.step.resumed"}:
+                step["finished_at"] = None
+            else:
+                step["finished_at"] = timestamp
             step["duration_ms"] = data.get("duration_ms", step.get("duration_ms"))
             step["attempt"] = data.get("attempt", step.get("attempt"))
             if "branch" in data:
                 step["branch"] = data["branch"]
+            if "group_path" in data:
+                step["group_path"] = data["group_path"]
+            if 'evaluated_branches' in data:
+                step['evaluated_branches'] = data['evaluated_branches']
             if "input_summary" in data:
                 step["input_summary"] = data["input_summary"]
             if "output_summary" in data:

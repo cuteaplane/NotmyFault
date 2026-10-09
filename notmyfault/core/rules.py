@@ -12,6 +12,9 @@ from notmyfault.core.data_types import DataTypeError
 from notmyfault.core.variables import variable_definitions
 from notmyfault.extensions.protocol import owned_value_identity
 from notmyfault.core.predicates import validate_predicate
+from notmyfault.core.workflow_graph import (
+    NATIVE_NODES, iter_rule_actions, get_all_rule_events, iter_rule_event_nodes, validate_workflow_graph, branch_predicate, entry_event_group,
+)
 from notmyfault.core.rule_model import normalize_rule_shape, normalize_rules, _BINDING_ID_RE, _RULE_ID_RE
 from notmyfault.core.condition_runtime import ConditionRuntime
 from notmyfault.core.conditions import (
@@ -52,12 +55,12 @@ def get_rule_admin_plugins(
 ) -> List[str]:
     """返回规则引用的管理员插件，包含失败后动作。"""
     required = set()
-    for event in get_rule_events(rule):
+    for event in get_all_rule_events(rule):
         plugin_id = event.get("type")
         if "admin" in (triggers_meta.get(plugin_id, {}).get("permissions") or []):
             required.add(plugin_id)
 
-    for item, _location in iter_action_nodes(rule.get("actions"), "actions"):
+    for item, _location in iter_rule_actions(rule):
         plugin_id = item.get("type")
         if "admin" in (actions_meta.get(plugin_id, {}).get("permissions") or []):
             required.add(plugin_id)
@@ -113,14 +116,16 @@ def validate_rule_structure(rule: Any) -> List[str]:
                         f"concurrency.{field} 必须是 1 到 {ceiling} 的整数"
                     )
 
-    if "condition" not in rule:
-        errors.append("必须配置 condition")
+    if get_rule_condition(rule) is None:
+        errors.append("必须配置 condition 或入口事件组的 activation")
     else:
         errors.extend(validate_condition_tree(get_rule_condition(rule)))
 
     def validate_action(action: Any, path: str, *, allow_failure_actions: bool) -> None:
         if not isinstance(action, dict):
             errors.append(f"{path} 必须是对象")
+            return
+        if action.get("type") in ("event_group", "action_group", "merge", "end"):
             return
         if action.get("type") == "set_variable":
             if not isinstance(action.get("variable"), str):
@@ -245,7 +250,16 @@ def validate_rule_structure(rule: Any) -> List[str]:
                 )
 
     actions = rule.get("actions")
-    if not isinstance(actions, list) or not actions:
+    if "workflow" in rule:
+        errors.extend(validate_workflow_graph(rule["workflow"]))
+        if "actions" in rule:
+            errors.append("workflow 与 actions 不能同时保存")
+        graph = rule.get("workflow", {})
+        if isinstance(graph, dict) and "condition" in rule and entry_event_group(graph) is not None:
+            errors.append("condition 与入口事件组 activation 不能同时保存")
+        for node, path in iter_rule_actions(rule):
+            validate_action(node, path, allow_failure_actions=True)
+    elif not isinstance(actions, list) or not actions:
         errors.append("actions 至少需要一个动作")
     else:
         for index, action in enumerate(actions):
@@ -301,8 +315,24 @@ def validate_rule_binding_ids(rule: Dict[str, Any], *, allow_missing: bool = Fal
     condition = get_rule_condition(rule)
     if condition is not None:
         visit(condition, "condition")
-    for item, location in iter_action_nodes(rule.get("actions"), "actions"):
-        check(item, "a", location)
+    if "workflow" in rule:
+        trigger_ids = {}
+        for event in iter_rule_event_nodes(rule):
+            identity = event.get("binding_id")
+            if not isinstance(identity, str):
+                check(event, "t", "workflow.triggers")
+                continue
+            if identity not in trigger_ids:
+                if identity not in seen:
+                    check(event, "t", "workflow.triggers")
+                trigger_ids[identity] = event
+            elif event != trigger_ids[identity]:
+                errors.append("同一触发器 binding_id 的配置不一致")
+        for item, location in iter_rule_actions(rule):
+            check(item, "a", location)
+    else:
+        for item, location in iter_action_nodes(rule.get("actions"), "actions"):
+            check(item, "a", location)
     return errors
 
 
@@ -354,7 +384,14 @@ def validate_automation_references(rule, known_rule_ids):
         for index, child in enumerate(children if isinstance(children, list) else []):
             condition(child, f"{path}.children[{index}]")
 
-    for action, path in iter_action_nodes(rule.get("actions", [])):
+    for action, path in iter_rule_actions(rule):
+        if action.get("type") == "event_group":
+            for index, branch in enumerate(action.get("branches", [])):
+                try:
+                    condition(branch_predicate(branch), f"{path}.branches[{index}]")
+                except ValueError as error:
+                    errors.append(str(error))
+            continue
         if action.get("type") != "if":
             continue
         condition(action.get("condition"), f"{path}.condition")
@@ -392,7 +429,7 @@ def aggregate_trigger_params(rules: List[Dict[str, Any]]) -> Dict[str, List[Dict
     """把同一 trigger 的参数聚合成列表，并复制字典隔离规则配置"""
     aggregated: Dict[str, List[Dict[str, Any]]] = {}
     for rule in rules:
-        for event_def in get_rule_events(rule):
+        for event_def in get_all_rule_events(rule):
             event_type = event_def.get("type")
             if not event_type:
                 continue
@@ -496,7 +533,7 @@ def validate_rules(
         if condition_errors:
             issues.extend((rule_name, error) for error in condition_errors)
             continue
-        rule_events = get_rule_events(rule)
+        rule_events = get_all_rule_events(rule)
         all_events_valid = True
         for event_def in rule_events:
             event_type = event_def.get("type", "")
@@ -553,12 +590,12 @@ def validate_rules(
             continue
 
         rule_ok = True
-        for action, action_path in iter_action_nodes(rule.get("actions", []), include_invalid=True):
+        for action, action_path in iter_rule_actions(rule, include_invalid=True):
             if not isinstance(action, dict):
                 issues.append((rule_name, f"{action_path} 必须是对象"))
                 rule_ok = False
                 continue
-            if action.get("type") in ("if", "set_variable"):
+            if action.get("type") in NATIVE_NODES:
                 continue
             action_type = action.get("type", "")
             if not action_type:

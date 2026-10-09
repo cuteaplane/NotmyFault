@@ -44,6 +44,11 @@ class RunOutcome:
             raise ValueError(f"无效的运行结果：{self.status}")
 
 
+@dataclass(frozen=True)
+class RunSuspension:
+    wait: Any
+
+
 @dataclass
 class _Run:
     id: str
@@ -56,6 +61,8 @@ class _Run:
     done: threading.Event = field(default_factory=threading.Event)
     state: str = "queued"
     outcome: RunOutcome | None = None
+    suspension: RunSuspension | None = None
+    resume_pending: bool = False
 
 
 class RunManager:
@@ -87,6 +94,7 @@ class RunManager:
         self._last_results: dict[str, str] = {}
         self._active: dict[str, set[str]] = {}
         self._queues: dict[str, deque[_Run]] = {}
+        self._resumable: deque[_Run] = deque()
         self._ready: deque[str] = deque()
         self._ready_set: set[str] = set()
         self._removed: set[str] = set()
@@ -156,7 +164,10 @@ class RunManager:
                 return run, "dropped"
             if config["mode"] == "replace":
                 for old_id in active:
-                    self._runs[old_id].cancel.set()
+                    previous = self._runs[old_id]
+                    previous.cancel.set()
+                    if previous.suspension is not None:
+                        self._queue_resume_locked(previous)
                 while queue:
                     self._finish_locked(queue.popleft(), "dropped", {"reason": "被新触发的 run 替换"})
             can_start = not queue and self._worker_count < self._max_workers and len(active) < (1 if config["mode"] == "replace" else config.get("max_concurrency", self._max_workers))
@@ -171,6 +182,7 @@ class RunManager:
                 return run, "dropped"
             queue.append(run)
             self._mark_ready_locked(key)
+            self._dispatch_locked()
             return run, "queued"
 
     @staticmethod
@@ -191,6 +203,10 @@ class RunManager:
     def activate_generation(self, generation):
         with self._lock:
             self._generation = generation
+            for run in tuple(self._runs.values()):
+                if run.suspension is not None and self._generation_drop_reason(run, generation):
+                    run.cancel.set()
+                    self._queue_resume_locked(run)
             for queue in self._queues.values():
                 retained = []
                 while queue:
@@ -201,6 +217,7 @@ class RunManager:
                     else:
                         retained.append(run)
                 queue.extend(retained)
+            self._dispatch_locked()
 
     def flush_events(self):
         self._flush_effects()
@@ -211,6 +228,9 @@ class RunManager:
             if run is None or run.state in TERMINAL_STATES:
                 return False
             run.cancel.set()
+            if run.suspension is not None:
+                self._queue_resume_locked(run)
+                self._dispatch_locked()
             if run.state == "queued":
                 self._queues[run.key].remove(run)
                 self._finish_locked(run, "cancelled", {"reason": "运行已取消"})
@@ -225,6 +245,12 @@ class RunManager:
             count = len(queue)
             while queue:
                 self._finish_locked(queue.popleft(), "dropped", {"reason": reason})
+            for run in tuple(self._runs.values()):
+                if run.key == rule_key and run.suspension is not None:
+                    count += 1
+                    run.cancel.set()
+                    self._queue_resume_locked(run)
+            self._dispatch_locked()
             self._prune_locked(rule_key)
         self._flush_effects()
         return count
@@ -235,8 +261,12 @@ class RunManager:
             for queue in self._queues.values():
                 while queue:
                     self._finish_locked(queue.popleft(), "dropped", {"reason": "引擎关闭"})
-            for run in self._runs.values():
+            for run in tuple(self._runs.values()):
                 run.cancel.set()
+                if run.suspension is not None:
+                    self._active[run.key].discard(run.id)
+                    self._finish_locked(run, "cancelled", {"reason": "引擎关闭"})
+            self._resumable.clear()
             self._ready.clear()
             self._ready_set.clear()
             if self._executor is not None:
@@ -246,7 +276,7 @@ class RunManager:
     def wait_for_idle(self, timeout: float = 60.0) -> bool:
         deadline = time.monotonic() + timeout
         with self._idle:
-            while self._worker_count:
+            while self._worker_count or any(run.suspension is not None for run in self._runs.values()):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
@@ -267,6 +297,15 @@ class RunManager:
         if run.state in TERMINAL_STATES:
             return
         run.state = status
+        if run.suspension is not None:
+            run.suspension.wait.close()
+            run.suspension = None
+        callback = run.context.pop("_cancel_graph", None)
+        if callback is not None and status == "cancelled":
+            callback()
+        execution = run.context.pop("_graph_execution", None)
+        if execution is not None:
+            execution.close()
         observation = run.context.get("_event_observation")
         if observation is not None:
             observation.close()
@@ -303,7 +342,7 @@ class RunManager:
                 outcome = RunOutcome("cancelled")
             else:
                 result = self._execute(run.key, run.rule, run.name, run.context)
-                if result is not None and not isinstance(result, RunOutcome):
+                if result is not None and not isinstance(result, (RunOutcome, RunSuspension)):
                     raise TypeError("工作流必须返回 RunOutcome")
                 outcome = result or RunOutcome()
         except Exception:
@@ -314,13 +353,36 @@ class RunManager:
     def _return_worker(self, run: _Run, outcome: RunOutcome) -> None:
         with self._idle:
             self._worker_count -= 1
-            self._active[run.key].discard(run.id)
-            if run.cancel.is_set():
-                outcome = RunOutcome("cancelled", {"failure_kind": "cancelled"})
-            self._finish_locked(run, outcome.status, outcome.data, outcome.error)
+            if isinstance(outcome, RunSuspension) and not run.cancel.is_set() and not self._closed:
+                run.suspension = outcome
+                self._effects.append(lambda: outcome.wait.arm(lambda: self._resume(run.id)))
+                self._dispatch_locked()
+                self._idle.notify_all()
+            else:
+                self._complete_worker_locked(run, outcome)
+        self._flush_effects()
+
+    def _complete_worker_locked(self, run, outcome):
+        self._active[run.key].discard(run.id)
+        if run.cancel.is_set():
+            outcome = RunOutcome("cancelled", {"failure_kind": "cancelled"})
+        self._finish_locked(run, outcome.status, outcome.data, outcome.error)
+        self._dispatch_locked()
+        self._prune_locked(run.key)
+        self._idle.notify_all()
+
+    def _queue_resume_locked(self, run):
+        if run.suspension is not None and not run.resume_pending:
+            run.resume_pending = True
+            self._resumable.append(run)
+
+    def _resume(self, run_id):
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None or run.suspension is None:
+                return
+            self._queue_resume_locked(run)
             self._dispatch_locked()
-            self._prune_locked(run.key)
-            self._idle.notify_all()
         self._flush_effects()
 
     def _prune_locked(self, key: str) -> None:
@@ -335,6 +397,14 @@ class RunManager:
             self._ready_set.add(key)
 
     def _dispatch_locked(self) -> None:
+        while not self._closed and self._resumable and self._worker_count < self._max_workers:
+            run = self._resumable.popleft()
+            if run.id not in self._runs or not run.resume_pending:
+                continue
+            run.resume_pending = False
+            run.suspension = None
+            self._worker_count += 1
+            self._effects.append(lambda run=run: self._launch(run))
         stalled = 0
         while not self._closed and self._ready and self._worker_count < self._max_workers:
             key = self._ready.popleft()

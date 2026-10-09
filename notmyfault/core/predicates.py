@@ -82,7 +82,20 @@ def event_occurrences(context):
     )
 
 
-def evaluate_predicate(node: dict, context: dict, path: str = "condition", *, status_lookup=None, _event_occurrences=None) -> bool:
+def evaluate_predicate(node: dict, context: dict, path: str = "condition", *, status_lookup=None, _event_occurrences=None, _on_result=None) -> bool:
+    try:
+        result = _evaluate_predicate(node, context, path, status_lookup=status_lookup,
+            _event_occurrences=_event_occurrences, _on_result=_on_result)
+    except (ValueError, TypeError) as error:
+        if _on_result is not None:
+            _on_result(node, path, None, error)
+        raise
+    if _on_result is not None:
+        _on_result(node, path, result, None)
+    return result
+
+
+def _evaluate_predicate(node: dict, context: dict, path: str, *, status_lookup, _event_occurrences, _on_result) -> bool:
     errors = validate_predicate(node, path)
     if errors:
         raise ValueError("；".join(errors))
@@ -104,10 +117,10 @@ def evaluate_predicate(node: dict, context: dict, path: str = "condition", *, st
             matched = state["last_status"] == expected
         return matched if node.get("comparison", "eq") == "eq" else not matched
     if op == "not":
-        return not evaluate_predicate(node["children"][0], context, f"{path}.children[0]", status_lookup=status_lookup, _event_occurrences=_event_occurrences)
+        return not evaluate_predicate(node["children"][0], context, f"{path}.children[0]", status_lookup=status_lookup, _event_occurrences=_event_occurrences, _on_result=_on_result)
     if op in ("all", "any"):
         values = (
-            evaluate_predicate(child, context, f"{path}.children[{index}]", status_lookup=status_lookup, _event_occurrences=_event_occurrences)
+            evaluate_predicate(child, context, f"{path}.children[{index}]", status_lookup=status_lookup, _event_occurrences=_event_occurrences, _on_result=_on_result)
             for index, child in enumerate(node["children"])
         )
         return all(values) if op == "all" else any(values)

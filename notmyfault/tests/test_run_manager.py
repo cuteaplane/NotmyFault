@@ -619,7 +619,8 @@ def test_terminal_runs_stop_accepting_events(terminal):
     from notmyfault.core.event_observation import RunEventObservation
     from notmyfault.core.run_manager import RunOutcome
 
-    compiled = SimpleNamespace(matcher_spec=build_matcher({"type": "hotkey", "binding_id": "t_hot001", "params": {}}))
+    condition = {"type": "hotkey", "binding_id": "t_hot001", "params": {}}
+    compiled = SimpleNamespace(source={"condition": condition}, matcher_spec=build_matcher(condition))
     observation = RunEventObservation(compiled)
     context = make_context()
     context["_event_observation"] = observation

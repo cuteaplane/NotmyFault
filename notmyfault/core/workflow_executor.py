@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from notmyfault.core.bindings import (
     BindingResolutionError,
+    BindingSkip,
     contains_dynamic_value,
     references_available,
     resolve_value,
@@ -23,7 +24,8 @@ from notmyfault.core.diagnostics import Diagnostics
 from notmyfault.core.clock import SystemClock
 from notmyfault.core.predicates import evaluate_predicate, event_occurrences, values_equal
 from notmyfault.core.logging import engine_error
-from notmyfault.core.run_manager import RunOutcome
+from notmyfault.core.run_manager import RunOutcome, RunSuspension
+from notmyfault.core.workflow_graph import branch_predicate, graph_index, graph_successors, find_graph_scope, evaluate_group_branches, entry_event_group
 from notmyfault.core.run_summary import summarize_fields
 from notmyfault.core.workflow import (
     ActionCancellation,
@@ -188,9 +190,23 @@ class WorkflowExecutor:
         if isinstance(context, RunState):
             context.prepare()
         if context.get("_preparation_error"):
+            if '_entry_evaluated_branches' in context:
+                entry = entry_event_group(rule.get('workflow'))
+                if entry is not None:
+                    scope = find_graph_scope(rule['workflow'], entry['binding_id'])
+                    context['_group_path'] = list(scope['group_path'])
+                    self._group_event('run.group.entered', entry, rule_name, context)
+                    context['steps'][entry['binding_id']] = {'type': 'event_group', 'status': 'failed', 'result': None, 'error': context['_preparation_error']['message']}
+                    self._group_event('run.group.failed', entry, rule_name, context, evaluated_branches=context['_entry_evaluated_branches'], error=context['_preparation_error'])
             return RunOutcome("failed", {"failure_kind": "binding"}, context["_preparation_error"])
         run_cancel_event = self._ensure_run_cancel_event(context)
         if run_cancel_event.is_set():
+            callback = context.pop("_cancel_graph", None)
+            if callback is not None:
+                callback()
+            execution = context.pop("_graph_execution", None)
+            if execution is not None:
+                execution.close()
             return RunOutcome("cancelled")
         if not context.get("_variables_initialized"):
             try:
@@ -207,7 +223,32 @@ class WorkflowExecutor:
             manual_test["active_offset"] = start_index
         else:
             selected_actions = actions
-        succeeded = self.execute_actions(selected_actions, rule_name, context)
+        if isinstance(rule.get("workflow"), dict):
+            execution = context.get("_graph_execution")
+            if execution is None:
+                graph = rule["workflow"]
+                start_id = manual_test.get("start_step_id") if isinstance(manual_test, dict) else None
+                end_id = manual_test.get("end_step_id") if isinstance(manual_test, dict) else None
+                if start_id:
+                    found = find_graph_scope(graph, start_id)
+                    if found is None:
+                        return RunOutcome("failed", error={"code": "unknown_source", "message": "测试入口节点不存在"})
+                    graph = found["graph"]
+                    context["_group_path"] = list(found["group_path"])
+                execution = self._execute_graph(graph, rule_name, context, start_id=start_id, end_id=end_id)
+                context["_graph_execution"] = execution
+                context["_cancel_graph"] = lambda: self._cancel_graph_groups(rule_name, context)
+            try:
+                waiter = next(execution)
+                return RunSuspension(waiter)
+            except StopIteration as result:
+                succeeded = result.value
+                context.pop("_graph_execution", None)
+            except (ValueError, TypeError, BindingResolutionError) as error:
+                context.pop("_graph_execution", None)
+                return RunOutcome("failed", error={"code": getattr(error, "code", "workflow_failed"), "message": str(error)})
+        else:
+            succeeded = self.execute_actions(selected_actions, rule_name, context)
         if run_cancel_event.is_set():
             return RunOutcome("cancelled", {"failure_kind": "cancelled"})
         assertions = self.evaluate_test_assertions(context, rule_name)
@@ -223,6 +264,135 @@ class WorkflowExecutor:
             "assertions_total": assertions["total"] if assertions else 0,
             "failure_kind": "assertion" if assertion_failed else "",
         }, error)
+
+    def _cancel_graph_groups(self, rule_name, context):
+        for node, started, path in reversed(list(context.get("_open_groups", []))):
+            context["steps"][node["binding_id"]] = {"type": node["type"], "status": "cancelled", "result": None, "error": "运行已取消"}
+            self._group_event("run.group.failed", node, rule_name, context, status="cancelled", group_path=path,
+                error={"code": "action_cancelled", "message": "运行已取消"}, duration_ms=round((self._clock.monotonic() - started) * 1000))
+
+    def _group_event(self, kind, node, rule_name, context, **data):
+        opened = context.setdefault("_open_groups", [])
+        if kind == "run.group.entered":
+            opened.append((node, self._clock.monotonic(), list(context.get("_group_path", []))))
+        elif kind in ("run.group.completed", "run.group.failed", "run.group.skipped"):
+            opened[:] = [item for item in opened if item[0]["binding_id"] != node["binding_id"]]
+        payload = {"step_id": node["binding_id"], "action_type": node["type"],
+            "rule_name": rule_name, "rule_id": context.get("rule", {}).get("id", ""),
+            "run_id": _run_id(context), "group_path": list(context.get("_group_path", [])), **data}
+        self._on_event(kind, payload)
+        step_kind = {"run.group.entered": "run.step.started", "run.group.waiting": "run.step.waiting",
+            "run.group.awakened": "run.step.resumed", "run.group.completed": "run.step.succeeded",
+            "run.group.skipped": "run.step.skipped",
+            "run.group.failed": "run.step.timed_out" if data.get("status") == "timed_out" else "run.step.cancelled" if data.get("status") == "cancelled" else "run.step.failed"}.get(kind)
+        if step_kind is not None:
+            self._on_event(step_kind, payload)
+
+    def _select_group_branch(self, node, context):
+        fixed = context.get("_entry_branch")
+        if fixed is not None and fixed[0] == node["binding_id"]:
+            context['_group_evaluated_branches'] = context.get('_entry_evaluated_branches', [])
+            return fixed[1]
+        observation = context.get("_event_observation")
+        if observation is not None:
+            occurred = observation.apply_snapshot(context)
+        else:
+            occurred = event_occurrences(context)
+        statuses = {}
+        def lookup(identity):
+            if self._status_lookup is None:
+                raise ValueError("当前执行环境不提供自动化运行状态")
+            if identity not in statuses:
+                statuses[identity] = self._status_lookup(identity)
+            return statuses[identity]
+        evaluated = context['_group_evaluated_branches'] = []
+        return evaluate_group_branches(node, context, evaluated, status_lookup=lookup, occurred=occurred)
+
+    def _execute_graph(self, graph, rule_name, context, *, start_id=None, end_id=None):
+        nodes, successors = graph_index(graph), graph_successors(graph)
+        current = start_id or graph.get("entry")
+        succeeded = True
+        cancel = self._ensure_run_cancel_event(context)
+        while current is not None:
+            if cancel.is_set():
+                return False
+            observation = context.get("_event_observation")
+            if observation is not None:
+                observation.apply_snapshot(context)
+            node = nodes[current]
+            kind, port = node["type"], "next"
+            started = self._clock.monotonic()
+            if kind == "event_group":
+                self._group_event("run.group.entered", node, rule_name, context)
+                fixed = context.get("_entry_branch")
+                if node.get("mode") == "wait" and (fixed is None or fixed[0] != current):
+                    observation = context.get("_event_observation")
+                    if observation is None:
+                        raise ValueError("等待事件组需要当前运行的事件观察")
+                    waiter = observation.wait_for(current, node["activation"], node.get("timeout_seconds"))
+                    if not waiter.ready:
+                        self._group_event("run.group.waiting", node, rule_name, context, reason="等待事件组合成立")
+                        yield waiter
+                    waiter.close()
+                    if cancel.is_set():
+                        context["steps"][current] = {"type": kind, "status": "cancelled", "result": None, "error": "运行已取消"}
+                        self._group_event("run.group.failed", node, rule_name, context, status="cancelled", error={"code": "action_cancelled", "message": "运行已取消"}, duration_ms=round((self._clock.monotonic() - started) * 1000))
+                        return False
+                    if waiter.timed_out:
+                        context["steps"][current] = {"type": kind, "status": "timed_out", "result": None, "error": "等待事件超时"}
+                        self._group_event("run.group.failed", node, rule_name, context, status="timed_out", error={"code": "event_wait_timeout", "message": "等待事件超时"}, duration_ms=round((self._clock.monotonic() - started) * 1000))
+                        return False
+                    self._group_event("run.group.awakened", node, rule_name, context)
+                try:
+                    port = self._select_group_branch(node, context)
+                except (ValueError, TypeError, BindingResolutionError) as error:
+                    context["steps"][current] = {"type": kind, "status": "failed", "result": None, "error": str(error)}
+                    self._group_event("run.group.failed", node, rule_name, context, evaluated_branches=context.get('_group_evaluated_branches', []), error={"code": getattr(error, "code", "condition_evaluation_failed"), "message": str(error)})
+                    return False
+                result = {"branch": port}
+                context["steps"][current] = {"type": kind, "status": "ok", "result": result, "error": None}
+                evaluated = context.get('_group_evaluated_branches', [])
+                self._group_event("run.group.selected", node, rule_name, context, branch=port, result=result, evaluated_branches=evaluated)
+                self._group_event("run.group.completed", node, rule_name, context, branch=port, status="ok", result=result, evaluated_branches=evaluated, duration_ms=round((self._clock.monotonic() - started) * 1000))
+            elif kind == "action_group":
+                self._group_event("run.group.entered", node, rule_name, context)
+                parents = list(context.get("_group_path", []))
+                context["_group_path"] = parents + [current]
+                try:
+                    ok = yield from self._execute_graph(node["workflow"], rule_name, context)
+                finally:
+                    context["_group_path"] = parents
+                message = None if ok else "组内动作失败"
+                try:
+                    result = {name: resolve_value(expression, context, location=f"{current}.exports.{name}") for name, expression in node.get("exports", {}).items()} if ok else None
+                except BindingSkip as error:
+                    context['steps'][current] = {'type': kind, 'status': 'skipped', 'result': None, 'error': None}
+                    self._group_event('run.group.skipped', node, rule_name, context, status='skipped', reason=str(error),
+                        duration_ms=round((self._clock.monotonic() - started) * 1000))
+                    if current == end_id:
+                        break
+                    current = successors.get((current, port))
+                    continue
+                except (BindingResolutionError, ValueError, TypeError) as error:
+                    result, ok, message = None, False, str(error)
+                status = "ok" if ok else "cancelled" if cancel.is_set() else "timed_out" if any(step.get("status") == "timed_out" for step in context["steps"].values()) else "failed"
+                context["steps"][current] = {"type": kind, "status": status, "result": hold_value(result), "error": message}
+                self._group_event("run.group.completed" if ok else "run.group.failed", node, rule_name, context, result=result, status=status,
+                    error=None if ok else {"code": "action_cancelled" if status == "cancelled" else "action_timeout" if status == "timed_out" else "action_execution_failed", "message": message}, duration_ms=round((self._clock.monotonic() - started) * 1000))
+                succeeded = succeeded and ok
+                if not ok and node.get("on_error", "stop") != "continue":
+                    return False
+            elif kind == "end":
+                return succeeded
+            elif kind != "merge":
+                ok = self._execute_action_sequence([node], rule_name, context, run_failure_actions=True)
+                succeeded = succeeded and ok
+                if not ok and node.get("on_error", "stop") != "continue":
+                    return False
+            if current == end_id:
+                break
+            current = successors.get((current, port))
+        return succeeded
 
     def evaluate_test_assertions(
         self,
@@ -249,7 +419,7 @@ class WorkflowExecutor:
                 ),
             })
         summary = {
-            "run_id": _run_id(context),
+            "run_id": _run_id(context), "group_path": list(context.get("_group_path", [])),
             "rule_id": context.get("rule", {}).get("id", ""),
             "rule_name": rule_name,
             "passed": sum(1 for result in results if result["passed"]),
@@ -336,7 +506,7 @@ class WorkflowExecutor:
                     {
                         "action_type": action.get("type"),
                         "rule_id": context.get("rule", {}).get("id", ""),
-                        "run_id": _run_id(context),
+                        "run_id": _run_id(context), "group_path": list(context.get("_group_path", [])),
                         "rule_name": rule_name,
                         "step_id": step_id,
                         "reason": skip_reason,
@@ -389,7 +559,7 @@ class WorkflowExecutor:
     def _execute_assignment(self, action, step_id, rule_name, context):
         event = {
             "action_type": "set_variable", "step_id": step_id, "rule_name": rule_name,
-            "run_id": _run_id(context), "rule_id": context.get("rule", {}).get("id", ""),
+            "run_id": _run_id(context), "group_path": list(context.get("_group_path", [])), "rule_id": context.get("rule", {}).get("id", ""),
             "duration_ms": 0,
         }
         self._on_event("run.step.started", event)
@@ -415,7 +585,7 @@ class WorkflowExecutor:
         started = time.perf_counter()
         event = {
             "action_type": "if", "step_id": step_id, "rule_name": rule_name,
-            "rule_id": context.get("rule", {}).get("id", ""), "run_id": _run_id(context),
+            "rule_id": context.get("rule", {}).get("id", ""), "run_id": _run_id(context), "group_path": list(context.get("_group_path", [])),
         }
         self._on_event("run.step.started", event)
         try:
@@ -507,7 +677,7 @@ class WorkflowExecutor:
                 {
                     "action_type": action_type,
                     "rule_id": context.get("rule", {}).get("id", ""),
-                    "run_id": _run_id(context),
+                    "run_id": _run_id(context), "group_path": list(context.get("_group_path", [])),
                     "rule_name": rule_name,
                     "step_id": action.get("binding_id") or action_type,
                     "error": {
@@ -543,7 +713,7 @@ class WorkflowExecutor:
                 {
                     "action_type": action_type,
                     "rule_id": context.get("rule", {}).get("id", ""),
-                    "run_id": _run_id(context),
+                    "run_id": _run_id(context), "group_path": list(context.get("_group_path", [])),
                     "rule_name": rule_name,
                     "step_id": action.get("binding_id") or action_type,
                     "error": exc.as_dict(),
@@ -601,7 +771,7 @@ class WorkflowExecutor:
                 self._on_event("run.step.failed", {
                     "action_type": action_type,
                     "rule_id": context.get("rule", {}).get("id", ""),
-                    "run_id": _run_id(context),
+                    "run_id": _run_id(context), "group_path": list(context.get("_group_path", [])),
                     "rule_name": rule_name,
                     "step_id": action.get("binding_id") or action_type,
                     "error": {"code": "invalid_action_params", "message": message},
@@ -634,7 +804,7 @@ class WorkflowExecutor:
         self._on_event("run.step.succeeded", {
             "action_type": prepared.action_type, "params": prepared.params,
             "rule_id": context.get("rule", {}).get("id", ""),
-            "run_id": _run_id(context), "rule_name": rule_name,
+            "run_id": _run_id(context), "group_path": list(context.get("_group_path", [])), "rule_name": rule_name,
             "step_id": action.get("binding_id") or prepared.action_type,
             "status": "ok", "input_summary": input_summary,
             "output_summary": summarize_fields(result, prepared.meta.get("outputs")),
@@ -658,7 +828,7 @@ class WorkflowExecutor:
             {
                 "action_type": action_type,
                 "rule_id": context.get("rule", {}).get("id", ""),
-                "run_id": _run_id(context),
+                "run_id": _run_id(context), "group_path": list(context.get("_group_path", [])),
                 "rule_name": rule_name,
                 "step_id": action.get("binding_id") or action_type,
                 "error": {"code": "action_timeout" if timed_out else "action_cancelled", "message": str(exc)},
@@ -692,7 +862,7 @@ class WorkflowExecutor:
             {
                 "action_type": action_type,
                 "rule_id": context.get("rule", {}).get("id", ""),
-                "run_id": _run_id(context),
+                "run_id": _run_id(context), "group_path": list(context.get("_group_path", [])),
                 "rule_name": rule_name,
                 "step_id": action.get("binding_id") or action_type,
                 "error": {
@@ -719,7 +889,7 @@ class WorkflowExecutor:
             print(f"[Engine] 正在关闭，跳过动作: {action.get('type', '?')}")
             return False, "引擎正在关闭"
 
-        self._on_event("run.step.started", {"run_id": _run_id(context), "rule_id": context.get("rule", {}).get("id", ""), "step_id": action.get("binding_id") or action.get("type"), "action_type": action.get("type"), "rule_name": rule_name})
+        self._on_event("run.step.started", {"run_id": _run_id(context), "group_path": list(context.get("_group_path", [])), "rule_id": context.get("rule", {}).get("id", ""), "step_id": action.get("binding_id") or action.get("type"), "action_type": action.get("type"), "rule_name": rule_name})
         try:
             prepared = self._prepare_action(action, rule_name, context)
         except ActionPreparationError as error:

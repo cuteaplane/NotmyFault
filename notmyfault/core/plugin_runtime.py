@@ -5,7 +5,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from notmyfault.core.compiled_rules import digest, freeze
-from notmyfault.core.rules import get_rule_events, iter_action_nodes
+from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions, NATIVE_NODES
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,12 +24,12 @@ class PluginRuntime:
         self.loader = loader
 
     def snapshot(self, rules) -> PluginSnapshot:
-        triggers = {leaf["type"] for rule in rules for leaf in get_rule_events(rule)}
-        actions = {action["type"] for rule in rules for action, _ in iter_action_nodes(rule.get("actions", []))}
+        triggers = {leaf["type"] for rule in rules for leaf in get_all_rule_events(rule)}
+        actions = {action["type"] for rule in rules for action, _ in iter_rule_actions(rule)}
         for plugin_id in sorted(triggers):
             if plugin_id not in self.registry.triggers_funcs:
                 self.registry.resolve_trigger(plugin_id)
-        for plugin_id in sorted(actions - {"if", "set_variable"}):
+        for plugin_id in sorted(actions - NATIVE_NODES):
             if plugin_id not in self.registry.actions_funcs:
                 self.registry.resolve_action(plugin_id)
         triggers_meta = freeze(self.registry.triggers_meta)

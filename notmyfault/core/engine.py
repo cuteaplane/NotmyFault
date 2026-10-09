@@ -24,11 +24,11 @@ from notmyfault.core.run_manager import RunManager
 from notmyfault.core.event_stream import Event, EventStream
 from notmyfault.core.engine_events import use_stream
 from notmyfault.core.rules import (
-    get_rule_events,
     validate_rules,
 )
 from notmyfault.core.rule_model import normalize_rules
 from notmyfault.core.runtime_rules import PreparedRules, rule_key
+from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions, find_graph_node, find_graph_scope, NATIVE_NODES
 from notmyfault.security.plugin_schema import check_payload_contract
 from notmyfault.security.security import (
     SecurityMode,
@@ -40,7 +40,7 @@ from notmyfault.core.state_store import StateStore
 from pathlib import Path
 from notmyfault.platform.boot_identity import boot_id
 from notmyfault.core.workflow import build_context
-from notmyfault.core.binding_schema import prepare_binding_context
+from notmyfault.core.binding_schema import prepare_binding_context, rule_step_output_fields
 from notmyfault.core.bindings import BindingResolutionError
 from notmyfault.core.data_types import DataTypeError, normalize_fields
 from notmyfault.core.type_registry import TypeRegistry
@@ -180,6 +180,7 @@ class AutomationEngine:
             execute_fn=self._workflow_executor.execute_workflow,
             on_event=self._safe_on_event,
         )
+        self._event_bus._status_lookup = self._run_manager.rule_status
         self._generations = GenerationManager(self._plugins, self._run_manager, self.events, lock=self._rules_lock,
                                               reconcile=self._trigger_host.reconcile, on_change=self._trigger_host._wake.set,
                                               clock=self.clock)
@@ -534,6 +535,13 @@ class AutomationEngine:
             context["_compiled_refs"] = compiled.references
             context["_trigger_configs"] = prepared.contexts[rule_id]["_trigger_configs"]
             selected_count = max(0, end_index - start_index + 1) if actions else 0
+            if "workflow" in rule:
+                actions = [node for node, _path in iter_rule_actions(rule)]
+                selected_count = sum(node["type"] not in NATIVE_NODES - {"set_variable"} for node in actions)
+                if start_step_id and find_graph_node(rule["workflow"], start_step_id) is None:
+                    return False, "测试入口节点不存在", run_id
+                if end_step_id and find_graph_node(rule["workflow"], end_step_id) is None:
+                    return False, "测试结束节点不存在", run_id
             context["manual_test"] = {
                 "start_step_id": start_step_id,
                 "end_step_id": end_step_id,
@@ -543,7 +551,13 @@ class AutomationEngine:
                 "provided_trigger_ids": tuple(trigger_payloads or {}),
             }
             if isinstance(step_outputs, dict):
-                for action_index, action in enumerate(actions[:start_index]):
+                provided_actions = actions[:start_index]
+                native_fields = rule_step_output_fields(rule, plugins.triggers_meta, plugins.actions_meta)
+                if "workflow" in rule and start_step_id:
+                    found = find_graph_scope(rule["workflow"], start_step_id)
+                    available = found["possible"]
+                    provided_actions = [action for action in actions if action["binding_id"] in available]
+                for action_index, action in enumerate(provided_actions):
                     if not isinstance(action, dict):
                         continue
                     step_id = action.get("binding_id")
@@ -551,7 +565,7 @@ class AutomationEngine:
                         continue
                     try:
                         provided = normalize_fields(
-                            step_outputs[step_id], plugins.actions_meta.get(action.get("type"), {}).get("outputs"),
+                            step_outputs[step_id], native_fields.get(step_id) if action.get('type') in NATIVE_NODES else plugins.actions_meta.get(action.get("type"), {}).get("outputs"),
                             prepared.registry, wrap_sensitive=True, partial=True,
                         )
                     except DataTypeError as error:
@@ -573,7 +587,7 @@ class AutomationEngine:
                     ),
                     "config": copy.deepcopy(event.get("params", {})),
                 }
-                for event in get_rule_events(rule)
+                for event in get_all_rule_events(rule)
                 if isinstance(event.get("binding_id"), str)
             }
             context["manual_test"]["variable_values"] = variable_values
@@ -588,6 +602,12 @@ class AutomationEngine:
             else:
                 context["_standalone_snapshot"] = True
             context["_event_observation"] = self._event_bus.observe_events(compiled, trigger_payloads or {})
+            if context["_event_observation"] is not None:
+                timestamp = context["_event_observation"].clock.monotonic()
+                context["_event_observation"].seed([
+                    {"binding_id": identity, "event": {"type": trigger["type"], "params": trigger.get("config", {})}, "payload": trigger["payload"], "timestamp": timestamp}
+                    for identity, trigger in context["triggers"].items() if identity in supplied_trigger_payloads
+                ])
             self._safe_on_event("run.triggered", {
                 "rule_id": rule_id,
                 "run_id": run_id,
@@ -732,7 +752,8 @@ class AutomationEngine:
 
     def _condition_deadline(self):
         with self._rules_lock:
-            return self._get_runtime_snapshot().runtime.next_deadline()
+            values = [value for value in (self._get_runtime_snapshot().runtime.next_deadline(), self._event_bus.next_observation_deadline()) if value is not None]
+            return min(values) if values else None
 
     def _cleanup_runtime(self, timeout: float = 90.0) -> None:
         with self._runtime_cleanup_lock:
