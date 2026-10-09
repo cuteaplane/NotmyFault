@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, Protocol
 from notmyfault.application_paths import ApplicationPaths
 from notmyfault.config import ConfigValidationError, SignedConfigStore
 from notmyfault.host.log_files import LogFiles
-from notmyfault.core.rules import get_rule_events
+from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions
 from notmyfault.core.run_history import RunHistory
 from notmyfault.host.api.ports import EngineControlPort
 from notmyfault.security.security import detect_security_mode
@@ -104,19 +104,16 @@ class EngineService:
             event.get("type")
             for rule in rules
             if isinstance(rule, dict)
-            for event in get_rule_events(rule)
+            for event in get_all_rule_events(rule)
             if event.get("type")
         }
         action_types: set[str] = set()
         for rule in rules:
             if not isinstance(rule, dict):
                 continue
-            actions = rule.get("actions", [])
-            if not isinstance(actions, list):
-                continue
             action_types.update(
                 action.get("type")
-                for action in actions
+                for action, _location in iter_rule_actions(rule)
                 if isinstance(action, dict) and action.get("type")
             )
         return {

@@ -86,9 +86,13 @@ def test_dashboard_save_config_writes_signed_rules(dashboard, tmp_path):
     assert result.get("ok") is True, result
     loaded = store.load_verified_rules()
     assert loaded[0]["name"] == "提醒"
-    assert loaded[0]["actions"][0]["type"] == "notify"
+    workflow = loaded[0]["workflow"]
+    entry = next(node for node in workflow["nodes"] if node["binding_id"] == workflow["entry"])
+    target = next(edge["target"] for edge in workflow["edges"] if edge["source"] == entry["binding_id"])
+    assert next(node for node in workflow["nodes"] if node["binding_id"] == target)["type"] == "notify"
     assert "event" not in loaded[0]
-    assert loaded[0]["condition"]["type"] == "time_schedule"
+    assert "actions" not in loaded[0] and "condition" not in loaded[0]
+    assert entry["activation"]["type"] == "time_schedule"
     saved = paths.rules_file.read_bytes()
     for invalid in (None, {}, [None], [rule, None]):
         result = api.save_config(invalid, "", "typed-v1")

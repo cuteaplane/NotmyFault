@@ -11,13 +11,12 @@ from notmyfault.config import (
 from notmyfault.core.rule_model import normalize_rule_shape, normalize_rules
 from notmyfault.core.rules import (
     RuleStructureError,
-    get_rule_events,
-    iter_action_nodes,
     normalize_rule_input,
     validate_rule_bindings,
     validate_rules,
     validate_rules_structure,
 )
+from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions, normalize_workflow_rule, NATIVE_NODES
 from notmyfault.security.rule_approval import (
     AdminRuleApprovalError,
     require_admin_rule_approval,
@@ -48,7 +47,7 @@ class RuleService:
                 revision = self._store.rules_revision()
         except ConfigValidationError as error:
             return {"ok": False, "rules": None, "config_error": str(error)}
-        return {"rules": rules, "revision": revision}
+        return {"rules": [normalize_workflow_rule(rule) for rule in rules], "revision": revision}
 
     def validate_draft(self, rule: Any) -> Dict[str, Any]:
         issues: List[Dict[str, Any]] = []
@@ -91,7 +90,7 @@ class RuleService:
             for _rule_name, message in plugin_warnings:
                 add("warning", "plugin_parameter", message)
 
-            for event in get_rule_events(normalized):
+            for event in get_all_rule_events(normalized):
                 plugin = schema["triggers"].get(event.get("type", ""))
                 self._add_plugin_availability_issue(
                     add,
@@ -101,8 +100,8 @@ class RuleService:
                     "event",
                 )
 
-            for action_item, location in iter_action_nodes(normalized.get("actions", [])):
-                if action_item.get("type") in ("if", "set_variable"):
+            for action_item, location in iter_rule_actions(normalized):
+                if action_item.get("type") in NATIVE_NODES:
                     continue
                 item_label = f"动作 {location}"
                 plugin = schema["actions"].get(
@@ -146,8 +145,31 @@ class RuleService:
                 )
 
         unique_issues: list[Dict[str, Any]] = []
+        node_locations = []
+
+        def collect_nodes(graph, path="workflow", group_path=()):
+            if not isinstance(graph, dict) or not isinstance(graph.get("nodes"), list):
+                return
+            for index, node in enumerate(graph["nodes"]):
+                if not isinstance(node, dict):
+                    continue
+                location = f"{path}.nodes[{index}]"
+                identity = node.get("binding_id")
+                if isinstance(identity, str):
+                    node_locations.append((location, identity, list(group_path)))
+                if node.get("type") == "action_group":
+                    collect_nodes(node.get("workflow"), f"{location}.workflow", (*group_path, identity))
+
+        if isinstance(rule, dict):
+            collect_nodes(rule.get("workflow"))
+        node_locations.sort(key=lambda item: len(item[0]), reverse=True)
         seen: set[tuple[Any, ...]] = set()
         for issue in issues:
+            detail = issue.get("location", "") or issue["message"]
+            for location, identity, group_path in node_locations:
+                if location in detail:
+                    issue.update(node_id=identity, group_path=group_path)
+                    break
             key = (issue["severity"], issue["message"], issue.get("location", ""))
             if key not in seen:
                 seen.add(key)
@@ -279,7 +301,7 @@ class RuleService:
     @staticmethod
     def _normalize_input(rules: Any) -> List[Dict[str, Any]]:
         try:
-            return normalize_rule_input(rules)
+            return [normalize_workflow_rule(rule) for rule in normalize_rule_input(rules)]
         except RuleStructureError as error:
             errors = error.errors
         raise RuleServiceError(400, {
