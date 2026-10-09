@@ -60,7 +60,7 @@ class SimulatedRunner:
 
     def start(self, config=None):
         from notmyfault.core.engine import AutomationEngine
-        from notmyfault.core.rules import get_rule_events, iter_action_nodes
+        from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions, NATIVE_NODES
 
         self.stop()
         if config is None:
@@ -78,11 +78,11 @@ class SimulatedRunner:
         self.engine._alert_user = lambda *a, **kw: None
         self.engine._workflow_executor._action_resolver = None
         for rule in config.get("rules", []):
-            for event in get_rule_events(rule):
+            for event in get_all_rule_events(rule):
                 self.engine.triggers_meta[event["type"]] = {"semantic": "state"}
-            for action, _path in iter_action_nodes(rule.get("actions", [])):
+            for action, _path in iter_rule_actions(rule):
                 action_type = action.get("type")
-                if action_type not in ("if", "set_variable"):
+                if action_type not in NATIVE_NODES:
                     self.engine.actions_funcs[action_type] = lambda meta, params: None
                     self.engine.actions_meta[action_type] = {}
 
