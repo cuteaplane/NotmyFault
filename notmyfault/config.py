@@ -327,7 +327,7 @@ class SignedConfigStore:
         except ValueError as error:
             print(f"[Config] 保存规则失败: {error}", file=sys.stderr)
             return False
-        data = {"schema_version": 2, "value_encoding": "typed-v1", "rules": encode_value(normalized)}
+        data = {"schema_version": "2.1", "value_encoding": "typed-v1", "rules": encode_value(normalized)}
         return self._write_signed_json(
             self.rules_path,
             self.rules_path + ".bak",

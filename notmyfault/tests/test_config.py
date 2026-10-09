@@ -102,6 +102,7 @@ def test_round_trip_uses_the_existing_files_and_json_shape(tmp_path):
     rules_on_disk = json.loads(paths.rules_file.read_text(encoding="utf-8"))
     assert len(config_on_disk["_signature"]) == 64
     assert set(rules_on_disk) == {"schema_version", "rules", "_signature", "value_encoding"}
+    assert rules_on_disk["schema_version"] == "2.1"
     assert rules_on_disk["value_encoding"] == "typed-v1"
     assert store.load_verified_config()["custom"] == "value"
     restored = store.load_verified_rules()[0]
