@@ -66,7 +66,7 @@ let sseReconnectTimer = null
 let sseEventSeq = 0
 let refreshSignalTimer = null
 // 规则测试回显只关心这几类执行事件。
-const RULE_EVENTS = ['action_executed', 'action_skipped', 'action_cancelled', 'action_timed_out', 'workflow_failed', 'workflow_completed', 'test_assertions_completed', 'error', 'run_dropped', 'run_replaced']
+const RULE_EVENTS = ['run.step.waiting', 'run.step.resumed', 'action_executed', 'action_skipped', 'action_cancelled', 'action_timed_out', 'workflow_failed', 'workflow_completed', 'test_assertions_completed', 'error', 'run_dropped', 'run_replaced']
 const timers = []
 function setTracked(fn, ms) { const id = setInterval(fn, ms); timers.push(id); return id }
 

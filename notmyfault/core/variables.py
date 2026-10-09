@@ -144,7 +144,7 @@ def assign_variable(identity, expression, context):
 
 
 def resolve_trigger_constants(rule, registry=None, *, protected_configs=None):
-    from notmyfault.core.rules import get_rule_events
+    from notmyfault.core.workflow_graph import iter_rule_event_nodes
 
     context, _definitions = constant_context(rule, registry)
     resolved = copy.deepcopy(rule)
@@ -161,7 +161,7 @@ def resolve_trigger_constants(rule, registry=None, *, protected_configs=None):
             return [resolve_config(child, f"{location}[{index}]") for index, child in enumerate(value)]
         return copy.deepcopy(value)
 
-    for index, event in enumerate(get_rule_events(resolved)):
+    for index, event in enumerate(iter_rule_event_nodes(resolved)):
         params = event.get("params", {})
         config = resolve_config(params, f"condition[{index}].params")
         if protected_configs is not None:

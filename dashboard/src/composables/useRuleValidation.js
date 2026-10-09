@@ -1,8 +1,9 @@
+import { walkGraphActions, graphPredicate, getGraphTriggers } from '../lib/workflowGraph.js'
 import { computed, ref, watch, onUnmounted } from 'vue'
 import { store } from '../lib/store'
 import { getVisibleParamDefs, pluginUnavailableReason as unavailableReason } from '../lib/utils'
 import { actionOutputDefs, bindingSourceFor, buildBindingSources,
-  isReference, typesCompatible } from '../lib/bindings'
+  isReference, typesCompatible, graphBindingSources } from '../lib/bindings'
 import { ifBranches, RUN_STATUS_OPTIONS, appendActionSources, workflowEventChoices } from '../lib/workflowConditions'
 import { fieldType, typeSpec, isEncodedValue, isLiteralValue } from '../lib/valueTypes'
 import { validateRuleDraft } from '../lib/api'
@@ -40,11 +41,11 @@ export function useRuleValidation(rule) {
       node.children.forEach((child, index) => validateCondition(child, `${path} ${index + 1}`))
     }
     if (!String(rule.value.name || '').trim()) add('请填写规则名称', 'name')
-    if (!rule.value.condition) add('请选择至少一个触发条件', 'trigger')
+    if (!rule.value.workflow && !rule.value.condition) add('请选择至少一个触发条件', 'trigger')
     if (rule.value.condition) validateCondition(rule.value.condition)
     const actions = Array.isArray(rule.value.actions) ? rule.value.actions : []
-    if (!Array.isArray(rule.value.actions)) add('动作列表格式无效', 'actions')
-    if (!actions.length) add('请添加至少一个执行动作', 'actions')
+    if (!rule.value.workflow && !Array.isArray(rule.value.actions)) add('动作列表格式无效', 'actions')
+    if (!rule.value.workflow && !actions.length) add('请添加至少一个执行动作', 'actions')
     function validateTimeout(action, label, nodeId) {
       if (action?.timeout_seconds == null) return
       const seconds = Number(action.timeout_seconds)
@@ -157,6 +158,21 @@ export function useRuleValidation(rule) {
         }
       })
     }
+    if (rule.value.workflow) {
+      if (!rule.value.workflow.entry) add('请选择流程入口', 'actions')
+      const known = new Set()
+      walkGraphActions(rule.value.workflow, (action, index, trail, workflow) => {
+        const nodeId = `node:${action.binding_id}`
+        if (known.has(action.binding_id)) add('节点身份重复', nodeId)
+        known.add(action.binding_id)
+        if (action.type === 'event_group') {
+          if (action.activation) validateCondition(action.activation, '事件组合')
+          if (!action.branches?.length) add('事件组需要出口', nodeId)
+          for (const branch of action.branches || []) if (!branch.else) validatePredicate(graphPredicate(branch.condition_graph), '分支', nodeId, graphBindingSources(rule.value, action, store.schema))
+        } else if (action.type !== 'action_group') validateActionNode(action, `动作 ${index + 1}`, nodeId, graphBindingSources(rule.value, action, store.schema))
+      })
+      for (const trigger of getGraphTriggers(rule.value)) validateCondition(trigger)
+    }
     actions.forEach((action, index) => {
       validateActionNode(
         action,
@@ -176,6 +192,7 @@ export function useRuleValidation(rule) {
   let checkerSequence = 0
 
   function issueTarget(issue) {
+    if (issue.node_id) return `node:${issue.node_id}`
     const text = `${issue.location || ''} ${issue.message || ''}`
     const action = text.match(/actions\[(\d+)\]/)
     if (action) return `action:${action[1]}`

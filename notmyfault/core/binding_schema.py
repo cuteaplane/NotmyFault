@@ -14,6 +14,9 @@ from notmyfault.core.type_registry import TypeRegistry
 from notmyfault.values import hold_value
 from notmyfault.core.variables import initialize_variables, variable_definitions
 from notmyfault.security.plugin_schema import literal_only_params
+from notmyfault.core.workflow_graph import (
+    iter_rule_actions, get_all_rule_events, branch_predicate, graph_available_steps, graph_index, graph_possible_steps,
+)
 
 
 def output_type(meta, *, parameters=False):
@@ -28,35 +31,85 @@ def output_type(meta, *, parameters=False):
     return normalize_type({"type": "object", "properties": properties, "required": required, "additional_properties": False})
 
 
-def rule_binding_types(rule, triggers_meta, actions_meta):
-    from notmyfault.core.rules import get_rule_events, iter_action_nodes
+def expression_type(value, sources, registry):
+    if is_literal(value):
+        return infer_type(value["$literal"])
+    if is_reference(value):
+        reference = value["$ref"]
+        root = sources.get(reference.get("scope"), {}).get(reference.get("node"), {"type": "any"})
+        return type_at_path(root, reference.get("path", []), registry)[0]
+    if is_typed_value(value):
+        return infer_type(value)
+    if isinstance(value, dict):
+        if set(value) == {"$convert"}:
+            return normalize_type(value["$convert"]["to"])
+        if set(value) == {"$template"}:
+            return {"type": "text"}
+        return normalize_type({"type": "object", "properties": {name: expression_type(item, sources, registry) for name, item in value.items()},
+            "required": list(value), "additional_properties": False})
+    if isinstance(value, list):
+        variants = []
+        for item in value:
+            schema = expression_type(item, sources, registry)
+            if schema not in variants:
+                variants.append(schema)
+        items = variants[0] if len(variants) == 1 else {"type": "union", "variants": variants} if variants else {"type": "any"}
+        return normalize_type({"type": "array", "items": items})
+    return infer_type(value)
 
+
+def rule_binding_types(rule, triggers_meta, actions_meta):
     definitions = variable_definitions(rule)
     result = {"trigger": {}, "trigger_config": {}, "step": {}}
     for scope, items in definitions.items():
         result[scope] = {identity: definition["value_type"] for identity, definition in items.items()}
-    for leaf in get_rule_events(rule):
+    for leaf in get_all_rule_events(rule):
         identity = leaf.get("binding_id")
         if not identity:
             continue
         meta = triggers_meta.get(leaf.get("type"), {})
         result["trigger"][identity] = output_type(meta)
         result["trigger_config"][identity] = output_type(meta, parameters=True)
-    for action, _location in iter_action_nodes(rule.get("actions", [])):
+    for action, _location in iter_rule_actions(rule):
         identity = action.get("binding_id")
         if not identity:
             continue
         if action.get("type") == "set_variable":
             schema = result["variable"].get(action.get("variable"), {"type": "any"})
             result["step"][identity] = output_type({"outputs": [{"name": "value", "type": schema}]})
+        elif action.get("type") in ("action_group", "event_group"):
+            result["step"][identity] = {"type": "object", "properties": {}, "required": [], "additional_properties": True}
         else:
             result["step"][identity] = output_type(actions_meta.get(action.get("type"), {}))
+    registry = TypeRegistry.from_plugins(triggers_meta, actions_meta)
+    groups = {action["binding_id"]: action for action, _location in iter_rule_actions(rule) if action.get("type") == "action_group"}
+    pending, finished = set(), set()
+    def exports(identity):
+        if identity in finished:
+            return
+        if identity in pending:
+            raise DataTypeError("动作组导出存在循环引用", location=f"{identity}.exports", code="cyclic_reference")
+        pending.add(identity)
+        action = groups[identity]
+        for usage in iter_references(action.get("exports", {})):
+            reference = usage.reference
+            if reference.get("scope") == "step" and reference.get("node") in groups:
+                exports(reference["node"])
+        fields = {}
+        for name, expression in action.get("exports", {}).items():
+            try:
+                fields[name] = expression_type(expression, result, registry)
+            except (DataTypeError, KeyError, TypeError):
+                fields[name] = {"type": "any"}
+        result["step"][identity] = normalize_type({"type": "object", "properties": fields, "required": list(fields), "additional_properties": False})
+        pending.remove(identity)
+        finished.add(identity)
+    for identity in groups:
+        exports(identity)
     return result
 
 
 def prepare_binding_context(rule, context, triggers_meta, actions_meta, *, registry=None):
-    from notmyfault.core.rules import get_rule_events, iter_action_nodes
-
     if context.get("_variables_initialized"):
         return
     if registry is None:
@@ -67,6 +120,48 @@ def prepare_binding_context(rule, context, triggers_meta, actions_meta, *, regis
     context["_binding_types"].update(sources)
 
     protect_context_inputs(context, triggers_meta, registry)
+
+
+def rule_step_output_fields(rule, triggers_meta, actions_meta):
+    sources = rule_binding_types(rule, triggers_meta, actions_meta)
+    definitions = variable_definitions(rule)
+    actions = {node['binding_id']: node for node, _path in iter_rule_actions(rule)}
+    triggers = {node['binding_id']: node for node in get_all_rule_events(rule)}
+
+    def sensitive_expression(value, visiting):
+        return any(sensitive_reference(usage.reference, visiting) for usage in iter_references(value))
+
+    def sensitive_reference(reference, visiting):
+        scope, identity = reference.get('scope'), reference.get('node')
+        key = (scope, identity)
+        if key in visiting:
+            return False
+        visiting = visiting | {key}
+        if scope in definitions:
+            declaration = definitions[scope].get(identity, {})
+            return declaration.get('sensitive', False) or sensitive_expression(declaration.get('value' if scope == 'constant' else 'initial'), visiting)
+        path = reference.get('path', [])
+        field = path[0] if path else None
+        if scope == 'step':
+            node = actions.get(identity, {})
+            if node.get('type') == 'set_variable':
+                return sensitive_reference({'scope': 'variable', 'node': node.get('variable')}, visiting) or sensitive_expression(node.get('value'), visiting)
+            if node.get('type') == 'action_group':
+                exports = node.get('exports', {})
+                values = [exports.get(field)] if field is not None else exports.values()
+                return any(sensitive_expression(value, visiting) for value in values)
+            meta, fields_key = actions_meta.get(node.get('type'), {}), 'outputs'
+        elif scope in ('trigger', 'trigger_config'):
+            meta = triggers_meta.get(triggers.get(identity, {}).get('type'), {})
+            fields_key = 'params' if scope == 'trigger_config' else 'outputs'
+        else:
+            return False
+        return any(isinstance(item, dict) and item.get('sensitive') and (field is None or item.get('name') == field) for item in meta.get(fields_key, []))
+
+    return {identity: [{'name': name, 'type': schema, 'sensitive': sensitive_reference(
+                {'scope': 'step', 'node': identity, 'path': [name]}, set())}
+            for name, schema in declaration.get('properties', {}).items()]
+            for identity, declaration in sources['step'].items()}
 
 
 def protect_context_inputs(context, triggers_meta, registry=None):
@@ -91,11 +186,11 @@ def protect_context_inputs(context, triggers_meta, registry=None):
 
 def check_rule_bindings(rule, triggers_meta, actions_meta):
     from notmyfault.core.rules import (
-        _absence_nodes, _positive_events, get_rule_condition, get_rule_events,
-        iter_action_nodes,
+        _absence_nodes, _positive_events, get_rule_condition,
     )
 
     issues = []
+    conditional_steps = set()
 
     def add(code, location, message, reference=None):
         issues.append({"code": code, "location": location, "reference": reference, "message": message})
@@ -107,9 +202,9 @@ def check_rule_bindings(rule, triggers_meta, actions_meta):
     except (DataTypeError, BindingResolutionError) as error:
         add(error.code, error.location, str(error))
         return issues
-    leaves = list(_positive_events(get_rule_condition(rule)))
+    leaves = get_all_rule_events(rule) if "workflow" in rule else list(_positive_events(get_rule_condition(rule)))
     leaves_by_id = {leaf.get("binding_id"): leaf for leaf in leaves}
-    all_actions = {action.get("binding_id") for action, _path in iter_action_nodes(rule.get("actions", []))}
+    all_actions = {action.get("binding_id") for action, _path in iter_rule_actions(rule)}
 
     def reference_type(reference, location, available, *, allow_missing=False):
         scope = reference.get("scope")
@@ -137,8 +232,12 @@ def check_rule_bindings(rule, triggers_meta, actions_meta):
                 add("unknown_source", location, "引用的动作步骤不存在", reference)
                 return None
             if node not in available:
-                add("forward_reference", location, "只能引用当前路径中已经完成的动作", reference)
-                return None
+                if node not in conditional_steps:
+                    add("forward_reference", location, "只能引用当前路径中已经完成的动作", reference)
+                    return None
+                if policy is None and not allow_missing:
+                    add("conditional_source", location, "来源动作可能未参与本次运行，请设置缺失值处理", reference)
+                    return None
             root = sources[scope][node]
         elif scope == "event":
             if list(_absence_nodes(get_rule_condition(rule))):
@@ -259,7 +358,7 @@ def check_rule_bindings(rule, triggers_meta, actions_meta):
                 predicate(child, f"{location}.children[{index}]", available)
         elif op == "event_occurred":
             identity = node.get("trigger_id")
-            if not isinstance(identity, str) or not any(event.get("binding_id") == identity for event in get_rule_events(rule)):
+            if not isinstance(identity, str) or not any(event.get("binding_id") == identity for event in get_all_rule_events(rule)):
                 add("unknown_source", f"{location}.trigger_id", "选择的触发器未添加到本流程")
         elif op in ("exists", "not_exists") and is_reference(node.get("left")):
             reference_type(node["left"]["$ref"], f"{location}.left", available, allow_missing=True)
@@ -299,10 +398,57 @@ def check_rule_bindings(rule, triggers_meta, actions_meta):
                 sequence(action.get("failure_actions", []), f"{path}.failure_actions", available)
                 available.add(action.get("binding_id"))
 
-    for index, event in enumerate(get_rule_events(rule)):
+    for index, event in enumerate(get_all_rule_events(rule)):
         params(event, triggers_meta.get(event.get("type"), {}), f"condition[{index}]", set())
         for usage in iter_references(event.get("params", {})):
             if usage.reference.get("scope") != "constant":
                 add("invalid_reference", f"condition[{index}].params", "触发器配置只能引用规则常量", usage.reference)
-    sequence(rule.get("actions", []), "actions", set())
+    def graph_bindings(graph, location, inherited, inherited_possible=None):
+        nonlocal conditional_steps
+        try:
+            available_by_id = graph_available_steps(graph, inherited)
+            possible_by_id = graph_possible_steps(graph, inherited if inherited_possible is None else inherited_possible)
+        except (KeyError, RecursionError):
+            add("invalid_workflow", location, "工作流控制关系无效")
+            return
+        nodes = graph_index(graph)
+        for index, action in enumerate(graph.get("nodes", [])):
+            path = f"{location}.nodes[{index}]"
+            available = available_by_id.get(action.get("binding_id"), set(inherited))
+            conditional_steps = possible_by_id.get(action.get("binding_id"), set(inherited)) - available
+            kind = action.get("type")
+            if kind == "event_group":
+                for branch_index, branch in enumerate(action.get("branches", [])):
+                    if branch.get("else"):
+                        continue
+                    try:
+                        predicate(branch_predicate(branch), f"{path}.branches[{branch_index}]", available)
+                    except ValueError as error:
+                        add("invalid_condition_graph", path, str(error))
+            elif kind == "action_group":
+                inner = action.get("workflow", {})
+                possible = possible_by_id.get(action.get('binding_id'), set(available))
+                graph_bindings(inner, f"{path}.workflow", available, possible)
+                inner_available = graph_available_steps(inner, available)
+                inner_possible = graph_possible_steps(inner, possible)
+                terminal_ids = {edge['source'] for edge in inner.get('edges', []) if edge.get('target') is None}
+                terminal_ids.update(identity for identity, node in graph_index(inner).items() if node.get('type') == 'end')
+                exits = [inner_available[identity] | {identity} for identity in terminal_ids]
+                exported = set.intersection(*exits) if exits else set(available)
+                conditional_steps = set().union(*(inner_possible[identity] | {identity} for identity in graph_index(inner))) - exported
+                for name, value in action.get("exports", {}).items():
+                    check(value, "any", f"{path}.exports.{name}", exported)
+            elif kind == "set_variable":
+                target = sources["variable"].get(action.get("variable"))
+                if target is None:
+                    add("unknown_source", path, "赋值目标必须是已声明的运行变量")
+                else:
+                    check(action.get("value"), target, f"{path}.value", available, strict=True)
+            elif kind not in ("merge", "end"):
+                params(action, actions_meta.get(kind, {}), path, available)
+                sequence(action.get("failure_actions", []), f"{path}.failure_actions", available)
+    if "workflow" in rule:
+        graph_bindings(rule["workflow"], "workflow", set())
+    else:
+        sequence(rule.get("actions", []), "actions", set())
     return issues

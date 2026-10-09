@@ -35,6 +35,50 @@ def packet(name, timestamp, **data):
     return {"type": name, "ts": timestamp, "data": data}
 
 
+def test_waiting_group_resumes_and_keeps_the_stable_branch_and_parent(tmp_path):
+    path = str(tmp_path / "runs.jsonl")
+    history = RunHistory(path)
+    common = {"run_id": "run_group001", "step_id": "a_wait0001", "action_type": "event_group", "group_path": ["a_group001"]}
+    history.record(packet("run.triggered", 10, run_id="run_group001"))
+    history.record(packet("run.step.started", 11, **common))
+    history.record(packet("run.step.waiting", 12, **common, reason="等待退出事件"))
+    waiting = history.get_run("run_group001")
+    assert waiting["status"] == "running"
+    assert waiting["steps"][0]["status"] == "waiting"
+    assert waiting["steps"][0]["finished_at"] is None
+    assert waiting["steps"][0]["reason"] == "等待退出事件"
+    history.record(packet("run.step.resumed", 20, **common))
+    resumed = history.get_run("run_group001")["steps"][0]
+    assert resumed["started_at"] == 11
+    assert resumed["status"] == "running"
+    assert resumed["reason"] is None
+    history.record(packet("run.step.succeeded", 21, **common, branch="b_recover01"))
+    history.record(packet("run.succeeded", 22, run_id="run_group001"))
+    history.flush()
+    restored = RunHistory(path).get_run("run_group001")
+    assert restored["status"] == "succeeded"
+    assert len(restored["steps"]) == 1
+    assert restored["steps"][0]["branch"] == "b_recover01"
+    assert restored["steps"][0]["group_path"] == ["a_group001"]
+
+
+def test_history_keeps_only_condition_results_and_drops_operands_and_invalid_trace(tmp_path):
+    history = RunHistory(str(tmp_path / 'runs.jsonl'))
+    history.record(packet('run.triggered', 1, run_id='run_trace'))
+    history.record(packet('run.step.failed', 2, run_id='run_trace', step_id='a_group001', action_type='event_group', evaluated_branches=[
+        {'branch_id': 'b_first01', 'result': False, 'left': '不能保存', 'predicates': [
+            {'node_id': 'p_first01', 'path': 'condition', 'op': 'eq', 'result': False, 'left': '不能保存'},
+            {'node_id': '不能保存', 'path': 'condition', 'op': {}, 'result': True}]},
+        {'branch_id': 'b_second1', 'error': {'code': 'missing_binding_value', 'message': '不能保存'}, 'predicates': []},
+        {'branch_id': 'b_third01', 'result': '不能保存'}]))
+    history.flush()
+    restored = RunHistory(history.path).get_run('run_trace')['steps'][0]['evaluated_branches']
+    assert restored == [
+        {'branch_id': 'b_first01', 'result': False, 'predicates': [{'node_id': 'p_first01', 'path': 'condition', 'op': 'eq', 'result': False}]},
+        {'branch_id': 'b_second1', 'error': {'code': 'missing_binding_value'}, 'predicates': []}]
+    assert '不能保存' not in (tmp_path / 'runs.jsonl').read_text()
+
+
 def test_run_history_builds_completed_run_with_steps(tmp_path):
     history = RunHistory(str(tmp_path / "runs.jsonl"))
     history.record(

@@ -9,12 +9,10 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from notmyfault.core.bindings import iter_references, validate_binding_path, validate_reference_fields
-from notmyfault.core.conditions import (
-    get_rule_condition, get_rule_events,
-)
+from notmyfault.core.conditions import get_rule_condition, config_fingerprint
 from notmyfault.core.data_types import DataTypeError, type_at_path
 from notmyfault.core.condition_program import MatcherSpec, build_matcher
-from notmyfault.core.rules import iter_action_nodes
+from notmyfault.core.workflow_graph import iter_rule_actions, get_all_rule_events, NATIVE_NODES
 from notmyfault.core.value_codec import encode_value
 from notmyfault.values import plain_value
 from notmyfault.core.run_context import context_sources
@@ -111,13 +109,13 @@ def _reference_type(schema, path, registry):
 
 def compile_rule(rule, template, triggers_meta, actions_meta, event_types, registry, plugin_digests=None) -> CompiledRule:
     source = freeze(rule)
-    leaves = get_rule_events(source)
+    leaves = get_all_rule_events(source)
     by_event = defaultdict(list)
     subscriptions = []
     matcher = build_matcher(get_rule_condition(source))
     for leaf in leaves:
         by_event[leaf["type"]].append(leaf)
-        fingerprint = matcher.fingerprints[id(leaf)]
+        fingerprint = config_fingerprint(leaf.get("params", {}))
         subscriptions.append(SubscriptionSpec(leaf["type"], fingerprint, leaf["binding_id"]))
     references = {}
     for usage in iter_references(source):
@@ -131,8 +129,8 @@ def compile_rule(rule, template, triggers_meta, actions_meta, event_types, regis
         variants = {name: _reference_type(schema, path, registry) for name, schema in event_types.items() if name in by_event} if scope == "event" else {}
         references[id(ref)] = ReferenceAccessor(scope, node, path, freeze(static_type), MappingProxyType(variants))
     plan = tuple(Step(action["binding_id"], index, location, action, context_sources(action.get("params", {})))
-                 for index, (action, location) in enumerate(iter_action_nodes(source.get("actions", []))))
-    plugin_ids = {("trigger", leaf["type"]) for leaf in leaves} | {("action", step.action["type"]) for step in plan if step.action["type"] not in {"if", "set_variable"}}
+                 for index, (action, location) in enumerate(iter_rule_actions(source)))
+    plugin_ids = {("trigger", leaf["type"]) for leaf in leaves} | {("action", step.action["type"]) for step in plan if step.action["type"] not in NATIVE_NODES}
     plugins = {kind + ":" + name: ((plugin_digests or {}).get(kind + ":" + name) or digest((triggers_meta if kind == "trigger" else actions_meta).get(name, {}))) for kind, name in plugin_ids}
     semantic_rule = {key: value for key, value in source.items() if key != "name"}
     concurrency = {"mode": "single", **source.get("concurrency", {})}

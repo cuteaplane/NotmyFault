@@ -112,6 +112,9 @@ class SettingsService:
                 summary["high_risk"] |= any(
                     child["high_risk"] for alternative in summary["elif"] for child in alternative["then"]
                 )
+            if action_type == "action_group" and isinstance(item.get("workflow"), dict):
+                summary["actions"] = [summarize_item(child) for child in item["workflow"].get("nodes", [])]
+                summary["high_risk"] |= any(child["high_risk"] for child in summary["actions"])
             return summary
 
         status["summary"] = {
@@ -124,9 +127,11 @@ class SettingsService:
                         else f"规则 #{index + 1}"
                     ),
                     "actions": (
-                        [summarize_item(action) for action in rule.get("actions", [])]
+                        [summarize_item(action) for action in (
+                            rule["workflow"].get("nodes", []) if isinstance(rule.get("workflow"), dict)
+                            else rule.get("actions", [])
+                        )]
                         if isinstance(rule, dict)
-                        and isinstance(rule.get("actions", []), list)
                         else []
                     ),
                 }

@@ -7,12 +7,13 @@ from types import MappingProxyType
 
 from notmyfault.core.compiled_rules import CompiledRule, compile_rule, digest, freeze
 from notmyfault.core.rule_model import _RULE_ID_RE
+from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_event_nodes
 
 from notmyfault.core.binding_schema import output_type, prepare_binding_context, protect_context_inputs
 from notmyfault.core.data_types import normalize_fields
 from notmyfault.core.rule_model import normalize_rules
 from notmyfault.core.rules import (
-    ConditionRuntime, aggregate_trigger_params, get_rule_events,
+    ConditionRuntime, aggregate_trigger_params,
     normalize_rule_input, validate_rules,
 )
 from notmyfault.core.type_registry import TypeRegistry
@@ -108,7 +109,7 @@ def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_
         if (reuse and identity in previous.compiled
                 and previous.input_digests.get(identity) == input_digests[identity]
                 and (resolve_trigger is None or all(resolve_trigger(leaf["type"]) is not None
-                                                   for leaf in get_rule_events(rule)))):
+                                                   for leaf in get_all_rule_events(rule)))):
             compiled = previous.compiled[identity]
             contexts[identity] = previous.contexts[identity]
             prepared.append(compiled.source)
@@ -129,7 +130,7 @@ def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_
         try:
             protected_configs = {}
             resolved = resolve_trigger_constants(rule, registry, protected_configs=protected_configs)
-            for leaf in get_rule_events(resolved):
+            for leaf in iter_rule_event_nodes(resolved):
                 meta = triggers_meta.get(leaf.get("type"), {})
                 leaf["params"] = normalize_fields(
                     leaf.get("params", {}), meta.get("params"), registry, parameters=True,
@@ -143,7 +144,7 @@ def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_
             context = {"_trigger_configs": hold_value(protected_configs)}
             prepare_binding_context(resolved, context, triggers_meta, actions_meta, registry=registry)
             if resolve_trigger is not None:
-                for leaf in get_rule_events(resolved):
+                for leaf in iter_rule_event_nodes(resolved):
                     trigger_id = leaf["type"]
                     if trigger_id not in trigger_ready:
                         trigger_ready[trigger_id] = resolve_trigger(trigger_id) is not None

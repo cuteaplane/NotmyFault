@@ -6,10 +6,12 @@ from typing import Any, Dict, List
 
 from notmyfault.config import ConfigValidationError, SignedConfigStore
 from notmyfault.core.bindings import BindingResolutionError, validate_binding_path, iter_legacy_event_payload_paths, iter_references, resolve_reference
+from notmyfault.core.binding_schema import rule_step_output_fields
 from notmyfault.core.data_types import DataTypeError, copy_value
 from notmyfault.core.type_registry import TypeRegistry
 from notmyfault.core.variables import initialize_variables
-from notmyfault.core.rules import get_rule_events, iter_action_nodes, validate_automation_references, validate_rules_structure
+from notmyfault.core.rules import iter_action_nodes, validate_automation_references, validate_rules_structure
+from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions, normalize_workflow_rule, find_graph_scope
 from notmyfault.core.rule_model import normalize_rule_shape
 from notmyfault.host.api.ports import EngineControlPort
 from notmyfault.security.plugin_schema import check_payload_contract
@@ -87,29 +89,29 @@ class RuleRunService:
             initialize_variables(candidate_rule, {}, registry, overrides=variable_values)
         except (DataTypeError, BindingResolutionError) as error:
             raise RuleRunServiceError(400, {"ok": False, "code": "invalid_test_payload", "error": str(error)}) from error
-        actions = candidate_rule.get("actions", [])
-        if not isinstance(actions, list):
-            actions = []
-        action_ids = [
-            action.get("binding_id", "") if isinstance(action, dict) else ""
-            for action in actions
-        ]
         if not isinstance(start_step_id, str) or not isinstance(end_step_id, str):
             self._fail(400, "局部运行步骤 ID 必须是字符串")
-        if start_step_id and start_step_id not in action_ids:
-            self._fail(400, "局部运行的起始动作不存在")
-        if end_step_id and end_step_id not in action_ids:
-            self._fail(400, "局部运行的结束动作不存在")
-        step_index = {identity: index for index, identity in enumerate(action_ids)}
-        start_index = step_index.get(start_step_id, 0)
-        end_index = (
-            step_index.get(end_step_id, len(actions) - 1)
-        )
-        if actions and start_index > end_index:
-            self._fail(400, "局部运行的起始动作不能晚于结束动作")
-        selected_actions = actions[start_index : end_index + 1] if actions else []
-        selected_ids = {action.get("binding_id") for action, _path in iter_action_nodes(selected_actions)}
-        skipped_upstream_ids = set(action_ids[:start_index])
+        if isinstance(candidate_rule.get("workflow"), dict):
+            actions, selected_actions, selected_ids, skipped_upstream_ids = self._select_graph_actions(
+                candidate_rule, start_step_id, end_step_id,
+            )
+        else:
+            actions = candidate_rule.get("actions", [])
+            if not isinstance(actions, list):
+                actions = []
+            action_ids = [action.get("binding_id", "") for action in actions if isinstance(action, dict)]
+            if start_step_id and start_step_id not in action_ids:
+                self._fail(400, "局部运行的起始动作不存在")
+            if end_step_id and end_step_id not in action_ids:
+                self._fail(400, "局部运行的结束动作不存在")
+            step_index = {identity: index for index, identity in enumerate(action_ids)}
+            start_index = step_index.get(start_step_id, 0)
+            end_index = step_index.get(end_step_id, len(actions) - 1)
+            if actions and start_index > end_index:
+                self._fail(400, "局部运行的起始动作不能晚于结束动作")
+            selected_actions = actions[start_index : end_index + 1] if actions else []
+            selected_ids = {action.get("binding_id") for action, _path in iter_action_nodes(selected_actions)}
+            skipped_upstream_ids = set(action_ids[:start_index])
 
         if not isinstance(step_outputs, dict):
             self._fail(400, "上游动作结果必须是 JSON 对象")
@@ -164,6 +166,7 @@ class RuleRunService:
             skipped_upstream_ids,
             step_outputs,
             registry,
+            rule_step_output_fields(candidate_rule, engine.triggers_meta, engine.actions_meta),
         )
         if upstream_issues:
             raise RuleRunServiceError(
@@ -253,6 +256,42 @@ class RuleRunService:
             "action_count": len(selected_actions),
         }
 
+    def _select_graph_actions(self, rule, start_id, end_id):
+        def reachable(graph, identity, stop=None):
+            adjacent = {}
+            for edge in graph.get("edges", []):
+                source, target = edge.get("source"), edge.get("target")
+                if source and target:
+                    adjacent.setdefault(source, []).append(target)
+            found, pending = set(), [identity] if identity else []
+            while pending:
+                current = pending.pop()
+                if current in found:
+                    continue
+                found.add(current)
+                if current != stop:
+                    pending.extend(adjacent.get(current, []))
+            return found
+
+        root = rule["workflow"]
+        start_id = start_id or root.get("entry")
+        scope = find_graph_scope(root, start_id) if start_id else None
+        if start_id and scope is None:
+            self._fail(400, "局部运行的起始动作不存在")
+        graph = scope["graph"] if scope else root
+        if end_id and not any(node.get("binding_id") == end_id for node in graph.get("nodes", [])):
+            self._fail(400, "局部运行的结束动作必须与起始动作位于同一流程组")
+        selected_roots = reachable(graph, start_id, end_id or None)
+        if end_id and end_id not in selected_roots:
+            self._fail(400, "局部运行的结束动作不能从起始动作到达")
+        selected_nodes = [node for node in graph.get("nodes", []) if node.get("binding_id") in selected_roots]
+        selected = [node for node, _path in iter_rule_actions({"workflow": {"nodes": selected_nodes}})]
+        selected_ids = {node["binding_id"] for node in selected}
+        upstream = scope["possible"] if scope else frozenset()
+        actions = [node for node, _path in iter_rule_actions(rule)]
+        skipped = {node["binding_id"] for node in actions if node.get("binding_id") in upstream} - selected_ids
+        return actions, selected, selected_ids, skipped
+
     def _select_rule(
         self,
         rules: list[Dict[str, Any]],
@@ -278,7 +317,7 @@ class RuleRunService:
             if (
                 rule_index < 0
                 or rule_index >= len(rules)
-                or rules[rule_index] != snapshot
+                or normalize_workflow_rule(rules[rule_index]) != normalize_workflow_rule(snapshot)
             ):
                 self._fail(409, "规则保存版本已变化，请刷新后重试")
             return snapshot
@@ -336,6 +375,7 @@ class RuleRunService:
         skipped_ids: set[str],
         step_outputs: Dict[str, Any],
         registry=None,
+        step_fields=None,
     ) -> List[str]:
         issues: List[str] = []
         actions_by_id = {
@@ -361,6 +401,8 @@ class RuleRunService:
             source_action = actions_by_id.get(step_id, {})
             source_meta = actions_meta.get(source_action.get("type", ""), {})
             outputs = source_meta.get("outputs", [])
+            if source_action.get("type") in {"action_group", "set_variable", "event_group"}:
+                outputs = (step_fields or {}).get(step_id, [])
             output = (
                 next(
                     (
@@ -398,7 +440,7 @@ class RuleRunService:
     ) -> List[str]:
         leaves_by_id = {
             leaf.get("binding_id"): leaf
-            for leaf in get_rule_events(rule)
+            for leaf in get_all_rule_events(rule)
             if isinstance(leaf.get("binding_id"), str)
         }
         unknown_ids = sorted(set(trigger_payloads) - set(leaves_by_id))

@@ -1,6 +1,11 @@
 <script setup>
+import { connectActivationNode } from '../lib/workflowInspectorOps'
 import { computed, nextTick, ref, toRef, watch, onMounted, onUnmounted } from 'vue'
 import RuleCanvas from './RuleCanvas.vue'
+import WorkflowNodeInspector from './WorkflowNodeInspector.vue'
+import { normalizeWorkflow, createGraphAction, insertGraphNode, findGraphNode, graphId, predicateToGraph } from '../lib/workflowGraph'
+import { buildDefaultParams } from '../lib/utils'
+import { defaultTypedValue } from '../lib/valueTypes'
 import IfSubflowEditor from './IfSubflowEditor.vue'
 import { findWorkflowAction } from '../lib/workflowConditions'
 import RuleNodeInspector from './RuleNodeInspector.vue'
@@ -164,7 +169,7 @@ const actionKeys = computed(() => Object.keys(store.schema.actions).filter(
   key => !pluginUnavailableReason('actions', key) && !isSpecialBlockAction(key)
 ))
 const actionGroups = computed(() => groupActionKeys(actionKeys.value))
-watch(() => props.rule, rule => { normalizeRuleDraft(rule); ensureRuleBindingIds(rule) }, { immediate: true })
+watch(() => props.rule, rule => { normalizeRuleDraft(rule); ensureRuleBindingIds(rule); normalizeWorkflow(rule) }, { immediate: true })
 
 const constantSources = computed(() => expandBindingSources(variableBindingSources(props.rule, { constantsOnly: true }), store.schema.data_types?.custom))
 
@@ -173,11 +178,11 @@ const subflowInitialNode = ref('')
 const activeIf = computed(() => findWorkflowAction(props.rule, subflowIds.value.at(-1))?.action || null)
 const subflowRef = ref(null)
 const subflowTrail = computed(() => subflowIds.value.map(id => findWorkflowAction(props.rule, id)?.action).filter(Boolean))
-function openIf(action) {
+function openIf(action, branchKey) {
   const hit = findWorkflowAction(props.rule, action.binding_id)
   if (!hit) return
   subflowIds.value = [...hit.trail.filter(parent => parent.action.type === 'if').map(parent => parent.action.binding_id), action.binding_id]
-  subflowInitialNode.value = ''
+  subflowInitialNode.value = branchKey ? `predicate-${action.binding_id}-${branchKey}-root` : ''
 }
 function returnToFlow(depth) { subflowIds.value = subflowIds.value.slice(0, depth); subflowInitialNode.value = '' }
 watch(() => props.rule, () => {
@@ -195,12 +200,92 @@ const {
   openPluginPicker, closePluginPicker, choosePlugin, requestConditionChild, picker,
 } = mutations
 
+const graphPickerContext = ref(null)
+const branchOperation = ref(null)
+function graphPicker(context) {
+  graphPickerContext.value = context
+  openPluginPicker(context.kind || 'action', { title: context.kind === 'trigger' ? '选择事件来源' : '选择动作' })
+}
+function chooseEditorPlugin(type) {
+  const context = graphPickerContext.value
+  if (!context) { choosePlugin(type); return }
+  graphPickerContext.value = null; closePluginPicker()
+  if (context.kind === 'trigger') {
+    const trigger = { binding_id: graphId('t'), type, params: buildDefaultParams(store.schema.triggers[type]) }
+    if (context.mode === 'graph-activation') context.owner.activation = trigger
+    else if (context.mode === 'graph-observer') (context.owner.triggers ||= []).push(trigger)
+    else if (context.target?.op) context.target.children.push(trigger)
+    else if (context.target) { context.target.type = type; context.target.params = trigger.params }
+    return
+  }
+  if (context.mode === 'graph-replace') { context.action.type = type; context.action.params = buildDefaultParams(store.schema.actions[type]) }
+  else if (context.mode === 'graph-failure') { const action = createGraphAction(type, buildDefaultParams(store.schema.actions[type])); (context.owner.failure_actions ||= []).push(action); selectedNodeId.value = `failure-action-${action.binding_id}` }
+  else insertOperation(context, createGraphAction(type, buildDefaultParams(store.schema.actions[type])))
+}
+function controlLocation(context) {
+  const original = context.node || layoutNodes.value.find(node => node.id === context.edge?.from)
+  const node = original?.kind === 'trigger' || original?.activationNode ? layoutNodes.value.find(node => node.source === original.groupOwner) : original
+  return { workflow: context.edge?.workflow || node?.workflow || props.rule.workflow, source: context.edge?.rawEdge?.source || (node?.kind === 'empty' ? null : node?.source?.binding_id), port: context.edge?.rawEdge?.port || context.outlet || node?.outputs?.[0]?.id || 'next', node }
+}
+function insertOperation(context, action) {
+  const location = controlLocation(context)
+  if (location.node?.source?.type === 'event_group' && !context.outlet && !context.edge && location.node.source.branches.length > 1) { branchOperation.value = { context, action, branches: location.node.source.branches }; return }
+  if (context.pendingVariable) (props.rule.variables ||= []).push(context.pendingVariable)
+  insertGraphNode(location.workflow, action, location.source, location.port)
+  selectedNodeId.value = `action-${action.binding_id}`
+}
+function chooseInsertBranch(branch) { const pending = branchOperation.value; branchOperation.value = null; insertOperation({ ...pending.context, outlet: branch.id }, pending.action) }
+function activationConnect({ group, source, target }) { const error = connectActivationNode(group, source, target); if (error) alertDialog('无法修改触发连接', error) }
+function operate(context) {
+  if (context.operation === 'connection-error') { alertDialog('无法连接', context.error); return }
+  if (context.operation === 'activation-connect') { activationConnect(context); return }
+  if (context.operation === 'edit-activation') { selectNode(`action-${context.group.binding_id}`); return }
+  if (context.action) { insertOperation(context, context.action); return }
+  if (context.kind === 'branch-condition') {
+    const owner = context.node.source
+    if (!context.node.open) canvasRef.value?.toggleGroup(owner.binding_id)
+    nextTick(() => selectNode(`predicate-${owner.binding_id}-${context.branch.condition_graph.root}`)); return
+  }
+  if (context.kind === 'condition-child') context = { ...context, kind: 'condition', operation: 'condition' }
+  if (context.kind === 'condition') {
+    const graph = context.node?.conditionGraph || context.edge?.conditionGraph
+    if (!graph) return
+    const selected = context.node?.graphCondition?.id || context.edge?.rawEdge?.source || graph.root
+    const id = graphId('p'), op = context.operation
+    const target = graph.nodes.find(node => node.id === selected)
+    if (op === 'condition' && target?.op && target.op !== 'not') {
+      graph.nodes.push({ id, predicate: { op: 'eq', left: '', right: '' } }); graph.edges.push({ source: id, target: selected, order: graph.edges.filter(edge => edge.target === selected).length })
+    } else {
+      graph.nodes.push({ id, op: op === 'condition' ? 'all' : op }); graph.edges.filter(edge => edge.source === selected).forEach(edge => edge.source = id); graph.edges.push({ source: selected, target: id, order: 0 }); if (graph.root === selected) graph.root = id
+      if (op !== 'not') { const child = graphId('p'); graph.nodes.push({ id: child, predicate: { op: 'eq', left: '', right: '' } }); graph.edges.push({ source: child, target: id, order: 1 }) }
+    }
+    return
+  }
+  if (['data', 'data-edge'].includes(context.kind)) {
+    const node = context.node || layoutNodes.value.find(node => node.id === context.edge?.from)
+    const port = context.port || node?.dataOutputs.find(port => port.name === context.edge?.sourcePortName)
+    if (!node || !port) return
+    const value = { $ref: { scope: node.kind === 'trigger' ? 'trigger' : 'step', node: node.source.binding_id, path: [port.name], ...(!port.required ? { on_missing: 'error' } : {}) } }
+    const owner = node.kind === 'trigger' ? layoutNodes.value.find(item => item.source === node.groupOwner) : node
+    if (context.operation === 'compare') { const group = createGraphAction('event_group'); group.branches[0].condition_graph = predicateToGraph({ op: 'eq', left: value, right: '' }); insertOperation({ node: owner }, group); return }
+    const assignment = createGraphAction('set_variable'); assignment.value = value
+    let pendingVariable
+    if (context.operation === 'create-variable') { pendingVariable = { id: graphId('v'), name: port.label || port.name, value_type: port.type, initial: defaultTypedValue(port.type) }; assignment.variable = pendingVariable.id }
+    else assignment.variable = props.rule.variables?.[0]?.id || ''
+    insertOperation({ node: owner, pendingVariable }, assignment); return
+  }
+  if (context.operation === 'action') { graphPicker({ ...context, kind: 'action', mode: 'graph-insert' }); return }
+  insertOperation(context, createGraphAction(context.operation || 'event_group', buildDefaultParams(store.schema.actions[context.operation])))
+}
+
 const { validationIssues, validationErrorCount, validationWarningCount, checkingRule, checkerError, runRuleCheck } = useRuleValidation(toRef(props, 'rule'))
 
 function focusValidationIssue(issue) {
   if (issue.target === 'name') { startRuleNameEdit(); return }
   nextTick(() => {
-    if (issue.target === 'trigger') selectNode(conditionId([]))
+    if (issue.target?.startsWith('node:')) { focusInitialNode(`action-${issue.target.slice(5)}`); return }
+    if (issue.node_id) { focusInitialNode(`action-${issue.node_id}`); return }
+    if (issue.target === 'trigger') selectNode(props.rule.workflow ? `action-${props.rule.workflow.entry}` : conditionId([]))
     else if (issue.target === 'actions') selectNode('add-action')
     else if (issue.target?.startsWith('action:')) {
       const action = props.rule.actions?.[Number(issue.target.split(':')[1])]
@@ -218,7 +303,7 @@ function saveFromEditor(event, run = false) {
 
 function selectNode(id) {
 
-  if (id === 'add-action') {
+  if (id === 'add-action' && !props.rule.workflow) {
     openPluginPicker('action', { mode: 'action', index: props.rule.actions?.length || 0, title: '添加下一步' })
     return
   }
@@ -232,13 +317,17 @@ function selectNode(id) {
 
 function focusInitialNode(id) {
   if (!id) return
-  nextTick(() => {
-    const bindingId = id.replace(/^(?:failure-action|action)-/, '')
-    const hit = findWorkflowAction(props.rule, bindingId)
-    const parents = hit?.trail.filter(parent => parent.action.type === 'if') || []
-    if (parents.length) { subflowIds.value = parents.map(parent => parent.action.binding_id); subflowInitialNode.value = id; nextTick(() => subflowRef.value?.selectNode(id)) }
-    else { subflowIds.value = []; if (layoutNodes.value.some(node => node.id === id)) selectNode(id) }
-  })
+  subflowIds.value = []
+  if (props.rule.workflow) { const hit = findGraphNode(props.rule, id.replace(/^(?:failure-action|action)-/, '')); for (const parent of hit?.trail || []) if (!layoutNodes.value.some(node => node.source === hit.action)) canvasRef.value?.toggleGroup?.(parent.action.binding_id) }
+  const hit = findWorkflowAction(props.rule, id.replace(/^(?:failure-action|action)-/, ''))
+  if (hit?.trail.some(parent => parent.action.type === 'if')) editorLayout.value = 'canvas'
+  nextTick(() => { if (layoutNodes.value.some(node => node.id === id)) selectNode(id) })
+}
+function showMainBranch(key) {
+  const id = `branch-add-${activeIf.value.binding_id}-${key}`
+  returnToFlow(0)
+  editorLayout.value = 'canvas'
+  nextTick(() => selectNode(id))
 }
 watch([() => props.initialNodeId, canvasRef], ([id]) => focusInitialNode(id), { immediate: true })
 
@@ -373,17 +462,18 @@ function onEditorKeydown(event) {
     <div class="rule-editor-main-grid">
     <div class="editor-canvas-column">
     <nav v-if="activeIf" class="subflow-navigation" aria-label="流程位置"><button class="btn btn-text btn-sm" @click="returnToFlow(0)">主流程</button><template v-for="(item, index) in subflowTrail" :key="item.binding_id"><span>›</span><button class="btn btn-text btn-sm" :aria-current="index === subflowTrail.length - 1 ? 'page' : undefined" @click="returnToFlow(index + 1)">IF {{ index + 1 }}</button></template><button class="btn btn-outlined btn-sm" @click="returnToFlow(subflowIds.length - 1)">返回上层</button></nav>
-    <IfSubflowEditor v-if="activeIf" ref="subflowRef" :rule="rule" :action="activeIf" :layout="editorLayout" :initial-node-id="subflowInitialNode" @open-if="openIf" />
+    <IfSubflowEditor v-if="activeIf" ref="subflowRef" :rule="rule" :action="activeIf" :layout="editorLayout" :initial-node-id="subflowInitialNode" @show-main="showMainBranch" />
     <RuleCanvas v-show="!activeIf" ref="canvasRef" :rule="rule" :layout="editorLayout"
       v-model:selected-node-id="selectedNodeId" @select-node="selectNode"
-      @open-if="openIf" @add-if="addIf" @add-assignment="addAssignment" @add-wait="addWait" @open-picker="openPluginPicker"
+      @operation="operate" @branch-add="node => selectNode(node.id)" @open-if="openIf" @add-if="addIf" @add-assignment="addAssignment" @add-wait="addWait" @open-picker="openPluginPicker"
       @move-action="moveAction" @remove-action="removeAction"
       @move-failure-action="moveFailureAction" @remove-failure-action="removeFailureAction"
       @add-condition-child="requestConditionChild">
       <template #inspector>
-        <RuleNodeInspector ref="inspectorRef" v-if="selectedNodeId" :key="selectedNodeId"
-          :rule="rule" :node="selectedGraphNode" :mutations="mutations" :constant-sources="constantSources"
-          :has-triggers="!!triggerKeys.length" @select-node="selectNode" />
+        <WorkflowNodeInspector v-if="rule.workflow && selectedGraphNode" ref="inspectorRef" :rule="rule" :node="selectedGraphNode" :mutations="mutations" @select-node="selectNode" @toggle-group="id => canvasRef.toggleGroup(id)" @pick="graphPicker" @operation="operate" />
+        <RuleNodeInspector ref="inspectorRef" v-else-if="selectedNodeId" :key="selectedNodeId"
+          :rule="rule" :node="selectedGraphNode" :layout="editorLayout" :mutations="mutations" :constant-sources="constantSources"
+          :has-triggers="!!triggerKeys.length" @select-node="selectNode" @open-if="openIf" />
       </template>
     </RuleCanvas>
 
@@ -425,7 +515,8 @@ function onEditorKeydown(event) {
     <PluginPicker :open="picker.open" :kind="picker.kind"
       :keys="picker.kind === 'trigger' ? triggerKeys : actionKeys"
       :groups="picker.kind === 'trigger' ? triggerGroups : actionGroups"
-      :title="picker.title" @close="closePluginPicker" @select="choosePlugin" />
+      :title="picker.title" @close="closePluginPicker" @select="chooseEditorPlugin" />
+    <div v-if="branchOperation" class="canvas-branch-dialog" role="dialog" aria-modal="true" aria-label="选择出口"><div><h3>选择操作接入的出口</h3><button v-for="(branch, index) in branchOperation.branches" :key="branch.id" class="btn btn-tonal" @click="chooseInsertBranch(branch)">{{ branch.label || (branch.else ? 'ELSE' : index ? `ELIF ${index}` : 'IF') }}</button><button class="btn btn-text" @click="branchOperation = null">取消</button></div></div>
     <FolderPicker :open="folderPickerOpen" :folders="folders" :current="currentFolderName"
       @close="folderPickerOpen = false" @select="chooseFolder" />
   </section>

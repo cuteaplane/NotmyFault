@@ -9,7 +9,7 @@ import VariableAssignmentEditor from './VariableAssignmentEditor.vue'
 import WaitActionEditor from './WaitActionEditor.vue'
 import ActionFailureSettings from './ActionFailureSettings.vue'
 
-const props = defineProps({ action: { type: Object, required: true }, rule: { type: Object, required: true }, index: { type: Number, required: true }, bindingSources: { type: Array, default: null }, failureBindingSources: { type: Function, default: null } })
+const props = defineProps({ action: { type: Object, required: true }, rule: { type: Object, required: true }, index: { type: Number, required: true }, bindingSources: { type: Array, default: null }, failureBindingSources: { type: Function, default: null }, allowFailureActions: { type: Boolean, default: true } })
 const emit = defineEmits(['replace', 'add-failure-action', 'replace-failure-action', 'remove-failure-action', 'move-failure-action'])
 const meta = computed(() => store.schema.actions[props.action.type])
 watch(() => props.action, action => {
@@ -36,7 +36,7 @@ const failureSources = index => props.failureBindingSources ? props.failureBindi
     <div class="param-grid"><ParamInput v-for="param in params" :key="param.name" :def="param" :plugin-id="action.type"
       v-model="action.params[param.name]" :allow-binding="parameterAllowsBinding(meta, param.name)" :binding-sources="sources" /></div>
     <div v-if="outputHint" class="workflow-output-hint">后续步骤可引用：<code>{{ outputHint }}</code></div>
-    <ActionFailureSettings :action="action" :meta="meta" :schema="store.schema.actions" :binding-sources="failureSources"
+    <ActionFailureSettings v-if="allowFailureActions" :action="action" :meta="meta" :schema="store.schema.actions" :binding-sources="failureSources"
       @add-failure-action="emit('add-failure-action')"
       @replace-failure-action="index => emit('replace-failure-action', index)"
       @remove-failure-action="index => emit('remove-failure-action', index)"

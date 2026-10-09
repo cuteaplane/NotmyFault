@@ -15,6 +15,7 @@ from notmyfault.core.run_context import RunState
 from notmyfault.core.runtime_rules import PreparedRules, rule_key
 from notmyfault.core.conditions import config_fingerprint
 from notmyfault.core.event_observation import RunEventObservation, has_event_predicate
+from notmyfault.core.workflow_graph import iter_rule_actions, NATIVE_NODES, entry_event_group
 
 # 两条规则互相监视会形成一条不会结束的触发链，链到这么深就丢弃这次运行
 _MAX_RUN_CHAIN = 16
@@ -53,13 +54,15 @@ class EventBus:
         self._chain_alerts: set = set()
         self._depth_lock = threading.Lock()
         self._observations = weakref.WeakSet()
+        self._status_lookup = lambda identity: {"running": 0, "queued": 0, "last_status": None}
 
     def observe_events(self, compiled, occurred=()):
-        if not any(has_event_predicate(step.action.get("condition")) or
+        if "workflow" not in compiled.source and not any(has_event_predicate(step.action.get("condition")) or
                    any(has_event_predicate(branch.get("condition")) for branch in (step.action.get("elif") or ()) if isinstance(branch, dict))
                    for step in compiled.plan if step.action.get("type") == "if"):
             return None
-        observation = RunEventObservation(compiled, occurred)
+        snapshot = self._snapshot_fn()
+        observation = RunEventObservation(compiled, occurred, clock=snapshot.runtime.clock, wake=snapshot.runtime._wake)
         with self._rules_lock:
             self._observations.add(observation)
         return observation
@@ -104,6 +107,7 @@ class EventBus:
                           (event.get("binding_id") for event in item[2]))) for item in dispatches]
             for _item, observation in dispatches:
                 if observation is not None:
+                    observation.seed(_item[2])
                     observation.record(event_type, event_payload, instance)
             if dispatches and snapshot.generation is not None:
                 snapshot.generation.retain()
@@ -171,8 +175,12 @@ class EventBus:
         dispatches = []
         with self._rules_lock:
             snapshot = self._snapshot_fn()
+            for observation in tuple(self._observations):
+                observation.process_timers(now)
             for key, matched in snapshot.runtime.take_due(now):
                 observation = self.observe_events(snapshot.compiled[key], (event.get("binding_id") for event in matched))
+                if observation is not None:
+                    observation.seed(matched)
                 dispatches.append((snapshot.compiled[key].source, key, matched, observation))
             if dispatches and snapshot.generation is not None:
                 snapshot.generation.retain()
@@ -182,6 +190,11 @@ class EventBus:
         finally:
             if dispatches and snapshot.generation is not None:
                 snapshot.generation.release()
+
+    def next_observation_deadline(self):
+        with self._rules_lock:
+            values = [deadline for observation in tuple(self._observations) if (deadline := observation.next_deadline()) is not None]
+            return min(values) if values else None
 
     def _dispatch(self, snapshot, rule, key, event_type, event_payload, masked_payload, matched_events, depth=0, observation=None):
         rule_id = rule.get("rule_id", "")
@@ -199,7 +212,7 @@ class EventBus:
                 "run_id": run_id,
                 "rule_name": rule_name,
                 "event_type": event_type,
-                "action_count": len(rule.get("actions", [])),
+                "action_count": sum(node["type"] not in NATIVE_NODES - {"set_variable"} for node, _path in iter_rule_actions(rule)),
                 "event_payload": masked_payload,
             },
         )
@@ -214,7 +227,29 @@ class EventBus:
             except (DataTypeError, BindingResolutionError) as error:
                 state["_preparation_error"] = error.as_dict()
 
-        context.defer_preparation(prepare)
+        if "workflow" in rule:
+            graph = rule["workflow"]
+            entry = entry_event_group(graph)
+            if entry is not None and entry.get("type") == "event_group" and "activation" in entry:
+                prepare(context)
+                if not context.get("_preparation_error"):
+                    from notmyfault.core.workflow_graph import evaluate_group_branches
+                    occurred = observation.apply_snapshot(context) if observation is not None else frozenset(event.get("binding_id") for event in matched_events)
+                    statuses = {}
+                    def lookup(identity):
+                        if identity not in statuses:
+                            statuses[identity] = self._status_lookup(identity)
+                        return statuses[identity]
+                    try:
+                        evaluated = context['_entry_evaluated_branches'] = []
+                        selected = evaluate_group_branches(entry, context, evaluated, status_lookup=lookup, occurred=occurred)
+                        context["_entry_branch"] = (entry["binding_id"], selected)
+                    except (ValueError, TypeError) as error:
+                        context["_preparation_error"] = {"code": "condition_evaluation_failed", "message": str(error)}
+            else:
+                context.defer_preparation(prepare)
+        else:
+            context.defer_preparation(prepare)
         if self._scheduler_submit_fn is not None:
             self._scheduler_submit_fn(key, rule, rule_name, context)
         else:

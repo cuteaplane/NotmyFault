@@ -1,3 +1,4 @@
+import { getGraphTriggers, graphExecutionActions, walkGraphActions, findGraphNode, graphPredecessors, graphPredicate } from './workflowGraph.js'
 import { compatibleTypes, fieldType, typeSpec, typeLabel, typeAtPath, isOpaqueValue, isExpression, parseExactJson, parseTypedInput, defaultTypedValue, formatTypedInput } from './valueTypes.js'
 import { normalizeRuleDraft } from './utils.js'
 
@@ -61,6 +62,7 @@ export function collectTriggerLeaves(rule, includeAbsence = true) {
     ;(node.children || node.events || []).forEach(visit)
   }
   visit(rule.condition)
+  if (rule.workflow) return getGraphTriggers(rule)
   return leaves
 }
 
@@ -110,6 +112,7 @@ export function ensureRuleBindingIds(rule) {
     }
   }
   ensureActions(rule.actions)
+  if (rule.workflow) walkGraphActions(rule.workflow, item => { if (!item.binding_id) item.binding_id = createBindingId('action'); ensureNode(item.activation); (item.triggers || []).forEach(ensureNode) })
   return rule
 }
 
@@ -168,7 +171,37 @@ export function variableBindingSources(rule, { constantsOnly = false } = {}) {
   ))
 }
 
-export function actionOutputDefs(action, schema, rule = {}) {
+export function actionOutputDefs(action, schema, rule = {}, seen = new Set()) {
+  if (action?.type === 'action_group') {
+    if (seen.has(action.binding_id)) return []
+    const nextSeen = new Set([...seen, action.binding_id])
+    const catalog = Object.entries(schema.data_types?.custom || {}).map(([id, definition]) => ({ id, ...definition }))
+    function info(value) {
+      if (isReference(value)) {
+        const ref = value.$ref, path = ref.path || []
+        let output, root
+        if (['constant', 'variable'].includes(ref.scope)) {
+          const definition = rule[ref.scope === 'constant' ? 'constants' : 'variables']?.find(item => item.id === ref.node)
+          output = definition; root = definition?.value_type || 'any'
+        } else {
+          const source = ref.scope === 'step' ? findGraphNode(rule, ref.node)?.action : collectTriggerLeaves(rule).find(item => item.binding_id === ref.node)
+          const definitions = ref.scope === 'step' ? actionOutputDefs(source, schema, rule, nextSeen) : ref.scope === 'trigger_config' ? schema.triggers?.[source?.type]?.params || [] : outputDefs(schema.triggers?.[source?.type])
+          output = definitions.find(item => item.name === path[0])
+          if (path.length) root = fieldType(output, ref.scope === 'trigger_config')
+          else { root = { type: 'object', properties: Object.fromEntries(definitions.map(output => [output.name, fieldType(output)])), required: definitions.filter(output => output.required !== false).map(output => output.name) }; output = { sensitive: definitions.some(output => output.sensitive === true) } }
+        }
+        let selected = root
+        try { selected = typeAtPath(root, ['constant', 'variable'].includes(ref.scope) ? path : path.slice(1), catalog).type } catch { selected = 'any' }
+        return { type: selected || 'any', sensitive: output?.sensitive === true, required: ref.on_missing !== 'skip' }
+      }
+      if (value?.$convert) return { ...info(value.$convert.value), type: typeSpec(value.$convert.to) }
+      if (value?.$template) return { type: 'text', sensitive: collectReferences(value).some(reference => info({ $ref: reference }).sensitive), required: true }
+      if (value?.$nmf_value) return { type: value.$nmf_value.type, sensitive: false, required: true }
+      if (value && Object.hasOwn(value, '$literal')) return info(value.$literal)
+      return { type: value === null ? 'null' : Array.isArray(value) ? { type: 'array', items: 'any' } : typeof value === 'boolean' ? 'bool' : typeof value === 'number' ? 'number' : typeof value === 'string' ? 'text' : 'object', sensitive: false, required: true }
+    }
+    return Object.entries(action.exports || {}).map(([name, expression]) => { const output = info(expression); return { name, label: name, value_type: output.type, required: output.required, sensitive: output.sensitive } })
+  }
   if (action?.type === 'set_variable') {
     const variable = rule.variables?.find(item => item.id === action.variable)
     return [{ name: 'value', label: '赋值结果', value_type: variable?.value_type || 'any', required: true, sensitive: variable?.sensitive === true }]
@@ -193,6 +226,20 @@ export function expandBindingSources(sources, catalog = {}) {
   }
   sources.forEach(source => visit(source, 0))
   return result
+}
+
+export function graphBindingSources(rule, action, schema) {
+  const hit = findGraphNode(rule, action?.binding_id)
+  const result = buildBindingSources({ ...rule, actions: [], workflow: rule.workflow }, 0, schema, { allowSteps: false })
+  const scopes = hit ? [...hit.trail.filter(parent => parent.field === 'workflow').map(parent => ({ ...findGraphNode(rule, parent.action.binding_id), action: parent.action })), hit] : []
+  for (const scope of scopes) {
+    for (const id of graphPredecessors(scope.workflow, scope.action.binding_id)) {
+      const previous = scope.workflow.nodes.find(node => node.binding_id === id)
+      if (!previous) continue
+      for (const output of actionOutputDefs(previous, schema, rule)) result.push(sourceItem('前序动作输出', `${schema.actions[previous.type]?.name || previous.name || previous.type} · ${output.label || output.name}`, output, { scope: 'step', node: id, path: [output.name] }, true))
+    }
+  }
+  return expandBindingSources([...new Map(result.map(source => [JSON.stringify(source.value.$ref), source])).values()], schema.data_types?.custom)
 }
 
 export function buildBindingSources(
@@ -271,7 +318,7 @@ export function parameterAllowsBinding(meta, paramName) {
 }
 
 export function buildNodeDataPorts(node, schema, rule = {}) {
-  const meta = node.source?.type === 'set_variable'
+  const meta = node.source?.type === 'action_group' ? { outputs: actionOutputDefs(node.source, schema, rule) } : node.source?.type === 'set_variable'
     ? { params: [{ name: 'value', label: '赋值内容', type: 'string', value_type: rule.variables?.find(item => item.id === node.source.variable)?.value_type || 'any' }], outputs: actionOutputDefs(node.source, schema, rule) }
     : node.kind === 'trigger'
     ? schema.triggers[node.source?.type]
@@ -288,7 +335,7 @@ export function buildNodeDataPorts(node, schema, rule = {}) {
         format: param.format,
       }))
     : []
-  const dataOutputs = !node.negated && ['trigger', 'action', 'failure-action'].includes(node.kind)
+  const dataOutputs = !node.negated && ['trigger', 'action', 'failure-action', 'action_group'].includes(node.kind)
     ? outputDefs(meta).map((output, index) => ({
         id: `output:${output.name}`,
         index,
@@ -311,12 +358,12 @@ export function buildNodeDataPorts(node, schema, rule = {}) {
 export function deriveDataEdges(rule, nodes, catalog = []) {
   const nodesByBindingId = new Map(
     nodes
-      .filter(node => node.source?.binding_id)
+      .filter(node => node.source?.binding_id && node.dataOutputs?.length)
       .map(node => [node.source.binding_id, node]),
   )
   const edges = []
-  for (const target of nodes.filter(node => ['action', 'failure-action'].includes(node.kind))) {
-    const params = target.source?.type === 'set_variable' ? { value: target.source.value } : target.source?.params || {}
+  for (const target of nodes.filter(node => ['action', 'failure-action', 'predicate'].includes(node.kind))) {
+    const params = target.kind === 'predicate' ? Object.fromEntries(['left', 'right'].filter(key => Object.hasOwn(target.source, key)).map(key => [key, target.source[key]])) : target.source?.type === 'set_variable' ? { value: target.source.value } : target.source?.params || {}
     for (const [paramName, value] of Object.entries(params)) {
       const targetPort = target.dataInputs.find(port => port.name === paramName)
       for (const [referenceIndex, reference] of collectReferences(value).entries()) {
@@ -325,7 +372,7 @@ export function deriveDataEdges(rule, nodes, catalog = []) {
         const outputName = Array.isArray(reference.path) ? reference.path[0] : null
         const sourcePort = source?.dataOutputs.find(port => port.name === outputName)
         if (!source || !sourcePort || !targetPort) continue
-        const sourceIsAction = ['action', 'failure-action'].includes(source.kind)
+        const sourceIsAction = ['action', 'failure-action', 'action_group'].includes(source.kind)
         const validOrder = !sourceIsAction
           || (target.availableStepIds || []).includes(source.source.binding_id)
         let selectedType = sourcePort.type
@@ -492,11 +539,11 @@ function addTestField(fields, field) {
 export function buildTestInputFields(rule, schema, { startStepId = '', endStepId = '' } = {}) {
   const leaves = collectTriggerLeaves(rule)
   const leavesById = new Map(leaves.map(leaf => [leaf.binding_id, leaf]))
-  const actions = rule.actions || []
+  const actions = rule.workflow ? (() => { const result = []; walkGraphActions(rule.workflow, action => result.push(action)); return result })() : rule.actions || []
   const startIndex = Math.max(0, actions.findIndex(action => action.binding_id === startStepId))
   const rawEndIndex = actions.findIndex(action => action.binding_id === endStepId)
   const endIndex = rawEndIndex >= 0 ? rawEndIndex : actions.length - 1
-  const selectedActions = actions.slice(startIndex, endIndex + 1)
+  const selectedActions = rule.workflow ? graphExecutionActions(rule, { startStepId, endStepId }) : actions.slice(startIndex, endIndex + 1)
   const executionSource = { actions: selectedActions }
   const references = [...new Map(
     collectReferences(executionSource)
@@ -554,7 +601,7 @@ export function buildTestInputFields(rule, schema, { startStepId = '', endStepId
   for (const reference of references) {
     const path = Array.isArray(reference.path) ? reference.path : []
     const source = sourceFor(reference)
-    if (reference.scope === 'step' && (source.actionIndex < 0 || source.actionIndex >= startIndex)) continue
+    if (reference.scope === 'step' && (source.actionIndex < 0 || (rule.workflow ? selectedActions.some(action => action.binding_id === reference.node) : source.actionIndex >= startIndex))) continue
     const outputs = reference.scope === 'step' ? actionOutputDefs(source.action, schema, rule) : outputDefs(source.meta)
     if (reference.scope === 'trigger' && outputs.length) {
       addOutputFields(reference, source, outputs)
@@ -605,6 +652,7 @@ export function buildTestInputFields(rule, schema, { startStepId = '', endStepId
   }
   function actionChecks(items) {
     for (const action of items || []) {
+      if (action.type === 'event_group') for (const branch of action.branches || []) if (branch.condition_graph) eventCheck(graphPredicate(branch.condition_graph))
       if (action.type === 'if') {
         eventCheck(action.condition)
         actionChecks(action.then); actionChecks(action.else)
@@ -636,7 +684,7 @@ export function buildTestInputFields(rule, schema, { startStepId = '', endStepId
 
 export function buildAllTestInputFields(rule, schema) {
   const fields = new Map()
-  const starts = ['', ...(rule.actions || []).map(action => action.binding_id).filter(Boolean)]
+  const starts = ['']; if (rule.workflow) walkGraphActions(rule.workflow, action => starts.push(action.binding_id)); else starts.push(...(rule.actions || []).map(action => action.binding_id).filter(Boolean))
   for (const startStepId of starts) {
     for (const field of buildTestInputFields(rule, schema, { startStepId })) {
       if (!fields.has(field.key)) fields.set(field.key, field)

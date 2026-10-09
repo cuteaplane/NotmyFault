@@ -9,6 +9,12 @@ from notmyfault.core.predicates import values_equal
 
 
 def get_rule_condition(rule: Dict[str, Any]) -> Dict[str, Any] | None:
+    graph = rule.get("workflow")
+    if isinstance(graph, dict):
+        from notmyfault.core.workflow_graph import entry_event_group
+        entry = entry_event_group(graph)
+        if entry is not None:
+            return entry["activation"]
     condition = rule.get("condition")
     return condition if isinstance(condition, dict) else None
 
@@ -18,6 +24,7 @@ def _is_event_leaf(node: Any) -> bool:
 
 def _condition_children(node: Dict[str, Any]) -> List[Dict[str, Any]]:
     children = node.get("children", [])
+    children = children if isinstance(children, list) else []
     return [child for child in children if isinstance(child, dict)]
 
 def iter_condition_events(node: Dict[str, Any] | None) -> Iterable[Dict[str, Any]]:

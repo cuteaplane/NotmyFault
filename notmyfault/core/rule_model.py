@@ -111,6 +111,25 @@ def ensure_rule_binding_ids(rule: Dict[str, Any]) -> Dict[str, Any]:
 
     if "actions" in copied:
         copied["actions"] = normalize_items(copied["actions"], "a", include_failures=True)
+    if isinstance(copied.get("workflow"), dict):
+        def graph_ids(graph):
+            graph = dict(graph)
+            nodes = []
+            for original in graph.get("nodes", []):
+                node = dict(original)
+                identity = node.get("binding_id")
+                if not isinstance(identity, str) or not _BINDING_ID_RE.fullmatch(identity) or not identity.startswith("a_") or identity in seen:
+                    identity = _new_binding_id("a")
+                node["binding_id"] = identity
+                seen.add(identity)
+                if node.get("type") == "action_group" and isinstance(node.get("workflow"), dict):
+                    node["workflow"] = graph_ids(node["workflow"])
+                if "failure_actions" in node:
+                    node["failure_actions"] = normalize_items(node["failure_actions"], "a", include_failures=False)
+                nodes.append(node)
+            graph["nodes"] = nodes
+            return graph
+        copied["workflow"] = graph_ids(copied["workflow"])
     return copied
 
 def _normalize_condition(condition: Any) -> Any:

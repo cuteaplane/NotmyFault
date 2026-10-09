@@ -4,7 +4,7 @@ import { store } from '../lib/store'
 import { PREDICATE_LABELS, RUN_STATUS_OPTIONS, workflowEventChoices } from '../lib/workflowConditions'
 import ConditionValueInput from './ConditionValueInput.vue'
 defineOptions({ name: 'PredicateEditor' })
-const props = defineProps({ node: Object, sources: { type: Array, default: () => [] }, rule: Object, shallow: Boolean })
+const props = defineProps({ node: Object, sources: { type: Array, default: () => [] }, rule: Object, shallow: Boolean, leafOnly: Boolean })
 const group = computed(() => ['all', 'any', 'not'].includes(props.node.op))
 const statusComparison = computed({ get: () => props.node.comparison === undefined ? 'eq' : props.node.comparison, set: value => { props.node.comparison = value } })
 const triggers = computed(() => workflowEventChoices(props.rule, store.schema))
@@ -49,7 +49,7 @@ const rules = computed(() => [...store.configData.rules.filter(rule => rule.rule
     <label class="field"><span class="field-label">判断方式</span>
       <select :value="node.op" class="select" @change="changeOperator($event.target.value)">
         <option v-for="(name, op) in PREDICATE_LABELS" :key="op" :value="op">{{ name }}</option>
-        <option value="event_occurred">事件是否发生</option><option value="run_status">自动化状态</option><option value="all">全部满足（AND）</option><option value="any">任一满足（OR）</option><option value="not">取反（NOT）</option>
+        <option value="event_occurred">事件是否发生</option><option value="run_status">自动化状态</option><template v-if="!leafOnly"><option value="all">全部满足（AND）</option><option value="any">任一满足（OR）</option><option value="not">取反（NOT）</option></template>
       </select>
     </label>
     <template v-if="group">
