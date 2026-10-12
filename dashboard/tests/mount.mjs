@@ -722,7 +722,7 @@ await new Promise(r => setTimeout(r, 30))
 ;[...document.querySelectorAll('.quick-create-foot button')].find(button => button.textContent.includes('在编辑器中继续'))?.click()
 await new Promise(r => setTimeout(r, 80))
 const quickCreateDraftOk = document.querySelector('.rule-title-capsule')?.textContent.includes('定时后显示通知')
-  && document.querySelector('.graph-node-event_group .graph-node-head-title')?.textContent === '事件组'
+  && document.querySelector('.graph-node-trigger .graph-node-head-title')?.textContent === '触发器'
   && document.querySelector('.graph-node-action')?.textContent.includes('显示通知')
 console.log((quickCreateSecondStepOk && quickCreateDraftOk?'PASS':'FAIL')+' - automation page opens a real prefilled rule draft')
 if (!quickCreateSecondStepOk || !quickCreateDraftOk) process.exitCode = 1
@@ -1589,6 +1589,7 @@ await pause(30)
 document.querySelector('.graph-node-failure-action')?.click()
 await pause(30)
 const recoveryInspector = await waitFor(() => document.querySelector('.node-inspector-head small')?.textContent.includes('补救') && document.querySelector('.node-inspector .plugin-type-button'))
+await waitFor(() => [...document.querySelectorAll('.node-link-label')].find(label => label.textContent === '失败时'))
 const controlLabels = [...document.querySelectorAll('.node-link-label')].map(label => label.textContent)
 const failureBranchOk = failurePickerOk
   && document.querySelectorAll('.graph-node-failure-action').length === 1
@@ -1727,6 +1728,11 @@ const inlineGroupOk = !!document.querySelector('.graph-node-event_group.graph-gr
   && !!document.querySelector('.node-inspector .predicate-editor') && !document.querySelector('[data-node-id^="dispatch-"]') && !document.querySelector('.subflow-navigation')
 console.log((branchSettingsOk && triggerDirectChoice && inlineGroupOk && emptyBranchBlocksSave && newBranchIsEvent?'PASS':'FAIL')+' - inline event groups require real event sources and edit stable IF, ELIF and ELSE outlets')
 if (!branchSettingsOk || !triggerDirectChoice || !inlineGroupOk || !emptyBranchBlocksSave || !newBranchIsEvent) process.exitCode = 1
+const concurrencySelect = document.querySelector('.rule-concurrency-field select')
+const concurrencyDefaultOk = concurrencySelect?.value === 'single'
+concurrencySelect.value = 'parallel'
+concurrencySelect.dispatchEvent(new window.Event('change', { bubbles:true }))
+await pause(30)
 ;[...document.querySelectorAll('.rule-editor-actions button')].find(button => button.textContent.includes('保存规则'))?.click()
 await pause(80)
 const savedGraph = savedRulesPayload?.find(rule => rule.rule_id === 'r_mount001')?.workflow
@@ -1738,6 +1744,31 @@ const ifSavedOk = savedEventGroup?.branches.length === 3 && savedEventGroup.bran
   && !Object.hasOwn(savedRulesPayload.find(rule => rule.rule_id === 'r_mount001'), 'actions')
 console.log((ifSavedOk?'PASS':'FAIL')+' - saving keeps condition graphs and control outlet connections as the execution model')
 if (!ifSavedOk) process.exitCode = 1
+const concurrencySavedOk = concurrencyDefaultOk
+  && savedRulesPayload.find(rule => rule.rule_id === 'r_mount001')?.concurrency?.mode === 'parallel'
+console.log((concurrencySavedOk?'PASS':'FAIL')+' - repeated triggers default to single and explicitly save parallel execution')
+if (!concurrencySavedOk) process.exitCode = 1
+
+;[...document.querySelectorAll('.editor-mode-switch button')].find(button => button.textContent.includes('节点编辑'))?.click()
+await pause(350)
+const connectedLine = document.querySelector('.node-link-hit[aria-label="控制连线操作"]')
+const controlLineCount = document.querySelectorAll('.node-link-hit[aria-label="控制连线操作"]').length
+connectedLine?.dispatchEvent(new window.MouseEvent('click', { bubbles:true, clientX:200, clientY:200 }))
+await pause(30)
+const disconnectButton = [...document.querySelectorAll('.canvas-context-menu button')].find(button => button.textContent.includes('断开连线'))
+const disconnectMenu = document.querySelector('.canvas-context-menu')?.textContent
+disconnectButton?.click()
+await pause(350)
+const disconnectedLineCount = document.querySelectorAll('.node-link-hit[aria-label="控制连线操作"]').length
+const disconnectOk = !!disconnectButton && disconnectedLineCount === controlLineCount - 1
+document.querySelector('button[title="撤销（Ctrl+Z）"]')?.click()
+await pause(350)
+const restoredConnection = document.querySelectorAll('.node-link-hit[aria-label="控制连线操作"]').length === controlLineCount
+console.log((disconnectOk && restoredConnection?'PASS':'FAIL')+' - control connections can be disconnected from their menu and restored with undo')
+if (!disconnectOk || !restoredConnection) process.exitCode = 1
+if (!disconnectOk || !restoredConnection) console.error({ disconnectMenu, controlLineCount, disconnectedLineCount, restoredLineCount: document.querySelectorAll('.node-link-hit[aria-label="控制连线操作"]').length })
+;[...document.querySelectorAll('.editor-mode-switch button')].find(button => button.textContent.includes('普通模式'))?.click()
+await pause(30)
 
 const definitionsPanel = document.querySelector('.variables-editor')
 definitionsPanel.open = true

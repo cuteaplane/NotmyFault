@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { normalizeWorkflow, createGraphAction, insertGraphNode, connectGraph, copyGraphNode, predicateToGraph, graphPredicate, getGraphTriggers, buildWorkflowGraph, removeGraphNode, graphExecutionActions, connectTriggerCondition } from '../src/lib/workflowGraph.js'
+import { normalizeWorkflow, createGraphAction, createTriggerStep, insertGraphNode, connectGraph, copyGraphNode, predicateToGraph, graphPredicate, getGraphTriggers, buildWorkflowGraph, removeGraphNode, graphExecutionActions, connectTriggerCondition } from '../src/lib/workflowGraph.js'
 import { collectTriggerLeaves, buildTestInputFields, graphBindingSources, actionOutputDefs } from '../src/lib/bindings.js'
 const schema = { triggers: { process: { name: '进程事件', outputs: [{ name: 'state', value_type: 'text', required: true }] } }, actions: { measure: { outputs: [{ name: 'latency', value_type: 'number', required: true }] }, log: { params: [{ name: 'text', value_type: 'text', type: 'string' }] } }, data_types: { custom: {} } }
 const predicate = { op: 'all', children: [{ op: 'event_occurred', trigger_id: 't_process01', expected: true }, { op: 'not', children: [{ op: 'lte', left: { $ref: { scope: 'step', node: 'a_measure01', path: ['latency'] } }, right: 80000 }] }] }
@@ -53,7 +53,22 @@ assert.equal(outputs.find(output => output.name === 'token').sensitive, true)
 assert.equal(outputs.find(output => output.name === 'token').required, false)
 assert.deepEqual(graphExecutionActions(exportRule, { startStepId: 'a_selected' }).map(node => node.binding_id), ['a_selected'])
 assert(!drawn.nodes.some(node => node.id.startsWith('dispatch-')), '事件组不显示内部调度卡片')
-assert(drawn.edges.some(edge => edge.from === 'trigger-t_process01' && edge.kind === 'activation'))
+assert(drawn.nodes.some(node => node.id === `action-${entry.binding_id}` && node.kind === 'trigger' && node.source.binding_id === 't_process01'))
+assert(drawn.edges.some(edge => edge.from === `action-${entry.binding_id}` && edge.to === 'action-a_measure01'))
+
+const triggerStep = createTriggerStep({ binding_id: 't_wait001', type: 'process', params: {} })
+const triggerWorkflow = { entry: null, nodes: [], edges: [] }
+insertGraphNode(triggerWorkflow, triggerStep)
+insertGraphNode(triggerWorkflow, createGraphAction('log'), triggerStep.binding_id, triggerStep.branches[0].id)
+const triggerDrawing = buildWorkflowGraph({ workflow: triggerWorkflow }, new Set([triggerStep.binding_id]), schema, present)
+const triggerCard = triggerDrawing.nodes.find(node => node.id === `action-${triggerStep.binding_id}`)
+assert.equal(triggerCard.kind, 'trigger')
+assert.equal(triggerCard.kicker, '等待触发器')
+assert.equal(triggerCard.source.binding_id, 't_wait001')
+assert(!triggerDrawing.nodes.some(node => node.kind === 'event_group' || node.frame))
+assert.equal(triggerCard.outputs[0].id, triggerWorkflow.edges[0].port)
+assert.equal(triggerStep.mode, 'wait')
+assert.equal(getGraphTriggers({ workflow: triggerWorkflow })[0].binding_id, 't_wait001')
 
 const { branchRemovalImpact, hasExternalRemovalReferences, removeWorkflowBranch } = await import('../src/lib/workflowInspectorOps.js')
 function removalFixture() { return { entry: 'a_gate001', nodes: [{ binding_id: 'a_gate001', type: 'event_group', branches: [{ id: 'b_if001', condition_graph: predicateToGraph({ op: 'is_true', left: true }) }, { id: 'b_else1', else: true }] }, { binding_id: 'a_left001', type: 'log' }, { binding_id: 'a_right01', type: 'log' }, { binding_id: 'a_shared1', type: 'log' }], edges: [{ source: 'a_gate001', port: 'b_if001', target: 'a_left001' }, { source: 'a_gate001', port: 'b_else1', target: 'a_right01' }, { source: 'a_left001', port: 'next', target: 'a_shared1' }, { source: 'a_right01', port: 'next', target: 'a_shared1' }, { source: 'a_shared1', port: 'next', target: null }] } }

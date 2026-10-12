@@ -40,6 +40,7 @@
 
 .page-subtitle{margin-top:8px;color:var(--md-on-surface-variant);font:var(--ts-body-m);line-height:1.7}
 .flow-rule-editor{max-width:1240px;padding-bottom:52px}
+.flow-rule-editor.canvas-layout{max-width:none}
 .flow-editor-head{
   position:sticky;top:0;z-index:20;
   padding:14px 0 16px;margin-bottom:16px;
@@ -326,6 +327,7 @@ body.ai-panel-resizing{cursor:col-resize;user-select:none}
 .graph-node-head .group-toggle{width:28px;height:28px;color:inherit}
 .graph-node-head-actions{position:absolute;right:8px;top:-36px;display:flex;gap:2px;padding:2px;border:1px solid var(--md-outline-variant);border-radius:var(--r-sm);background:var(--md-surface-c-high);box-shadow:var(--md-elev2);opacity:0;transform:translateY(4px);pointer-events:none;transition:opacity .14s ease,transform .14s ease}
 .graph-node-head-actions .icon-btn{width:28px;height:28px}
+.graph-node-head-actions::after{content:"";position:absolute;inset:100% 0 auto;height:8px}
 .graph-node:hover .graph-node-head-actions,.graph-node:focus-within .graph-node-head-actions{opacity:1;transform:none;pointer-events:auto}
 .node-context-button{opacity:0;color:inherit;transition:opacity .14s ease}
 .graph-node:hover .node-context-button,.graph-node:focus-within .node-context-button{opacity:1}
@@ -359,7 +361,9 @@ body.ai-panel-resizing{cursor:col-resize;user-select:none}
 .run-step.waiting .run-step-state,.run-step.running .run-step-state{color:var(--md-primary)}
 .node-links{z-index:1}
 .graph-node{z-index:2}
-.graph-group-frame{z-index:0}
+.node-canvas .graph-group-frame{z-index:auto;opacity:1;pointer-events:none}
+.graph-group-frame>.graph-node-head,.graph-group-frame>.node-port,.graph-group-frame>.graph-node-data-summary,.graph-group-frame>.graph-node-data{pointer-events:auto}
+.graph-group-frame .graph-node-head{position:relative;z-index:2}
 .graph-group-frame .graph-node-data-summary{position:absolute;right:0;top:48px;width:228px}
 .graph-group-frame .graph-node-data{position:absolute;right:0;bottom:16px;width:228px}
 

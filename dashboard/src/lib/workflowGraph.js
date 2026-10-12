@@ -107,6 +107,12 @@ export function createGraphAction(type, params = {}) {
   if (type === 'set_variable') return { ...base, variable: '', value: '' }
   return { ...base, params }
 }
+export function createTriggerStep(trigger, mode = 'wait') {
+  return { binding_id: graphId(), type: 'event_group', mode, activation: trigger, triggers: [], branches: [{ id: graphId('b'), else: true, label: '执行' }] }
+}
+export function standaloneTrigger(node, startup = false) {
+  return node.type === 'event_group' && (startup || node.mode === 'wait') && !node.name && node.activation?.type && !node.triggers?.length && node.branches?.length === 1 && node.branches[0].else && !node.branches[0].condition_graph && !node.branches[0].condition ? node.activation : null
+}
 export function insertGraphNode(workflow, node, source = null, port = 'next') {
   workflow.nodes.push(node)
   const edge = workflow.edges.find(edge => edge.source === source && edge.port === port)
@@ -295,7 +301,8 @@ export function buildWorkflowGraph(rule, expanded, schema, presentation, layoutC
       outletY = y + 48
       return { id: branch.id, label: branchLabel(source, branch), y }
     })
-    const w = Math.max(360, ...innerNodes.map(node => node.x + width + 104))
+    const eventOutlet = source.branches.some(branch => branch.condition_graph?.nodes.find(node => node.id === branch.condition_graph.root)?.predicate?.op === 'event_occurred')
+    const w = Math.max(360, ...innerNodes.map(node => node.x + width + (eventOutlet ? 160 : 104)))
     const h = Math.max(144, outletY - 20, ...innerNodes.map(node => node.y + (node.fixedHeight || 116))) + 28
     for (const branch of source.branches) {
       const from = branchRoots.get(branch.id)
@@ -309,6 +316,7 @@ export function buildWorkflowGraph(rule, expanded, schema, presentation, layoutC
     return content
   }
   function graphLayout(workflow, x, y, ancestry = []) {
+    const triggerFor = node => standaloneTrigger(node, workflow.entry === node.binding_id && ancestry.every(parent => parent.workflow.entry === parent.source.binding_id))
     const byId = new Map(workflow.nodes.map(node => [node.binding_id, node]))
     const ranks = new Map(), lanes = new Map(); let lane = 0
     function rank(id, depth, branchLane) {
@@ -323,8 +331,8 @@ export function buildWorkflowGraph(rule, expanded, schema, presentation, layoutC
     for (const node of workflow.nodes) if (!ranks.has(node.binding_id)) { ranks.set(node.binding_id, 0); lanes.set(node.binding_id, ++lane) }
     const columnWidths = new Map(), sizes = new Map()
     for (const source of workflow.nodes) {
-      const open = expanded.has(source.binding_id)
-      let w = width, h = cardHeight({ id: `action-${source.binding_id}`, source, kind: source.type, outputs: source.type === 'event_group' ? source.branches.map((branch, i) => ({ y: 103 + i * 28 })) : [] })
+      const trigger = triggerFor(source), open = !trigger && expanded.has(source.binding_id)
+      let w = width, h = cardHeight({ id: `action-${source.binding_id}`, source: trigger || source, kind: trigger ? 'trigger' : source.type, outputs: trigger ? [{ y: 58 }] : source.type === 'event_group' ? source.branches.map((branch, i) => ({ y: 103 + i * 28 })) : [] })
       if (open && source.type === 'action_group') {
         const preview = layoutCache.get(source.workflow) || buildWorkflowGraph({ workflow: source.workflow }, expanded, schema, presentation, layoutCache)
         layoutCache.set(source.workflow, preview)
@@ -342,7 +350,7 @@ export function buildWorkflowGraph(rule, expanded, schema, presentation, layoutC
         w = content.w; h = content.h
         sizes.set(source.binding_id, { content, inputY: content.inputY })
       }
-      sizes.set(source.binding_id, { ...sizes.get(source.binding_id), w, h, alignmentY: source.type === 'event_group' ? sizes.get(source.binding_id)?.content?.outputs[0]?.y ?? 103 : sizes.get(source.binding_id)?.inputY ?? 58 }); columnWidths.set(ranks.get(source.binding_id), Math.max(columnWidths.get(ranks.get(source.binding_id)) || 0, w))
+      sizes.set(source.binding_id, { ...sizes.get(source.binding_id), w, h, alignmentY: source.type === 'event_group' && !trigger ? sizes.get(source.binding_id)?.content?.outputs[0]?.y ?? 103 : sizes.get(source.binding_id)?.inputY ?? 58 }); columnWidths.set(ranks.get(source.binding_id), Math.max(columnWidths.get(ranks.get(source.binding_id)) || 0, w))
     }
     const columnX = depth => x + [...columnWidths].filter(([rank]) => rank < depth).sort(([a], [b]) => a - b).reduce((sum, [, w]) => sum + w + gap, 0)
     const laneHeights = new Map(), laneAnchors = new Map(), laneBelow = new Map()
@@ -354,11 +362,13 @@ export function buildWorkflowGraph(rule, expanded, schema, presentation, layoutC
     for (const [lane, anchor] of laneAnchors) laneHeights.set(lane, Math.max(row, anchor + laneBelow.get(lane) + 48))
     const laneY = lane => y + [...laneHeights].filter(([value]) => value < lane).reduce((sum, [, h]) => sum + h, 0) + laneAnchors.get(lane)
     for (const [index, source] of workflow.nodes.entries()) {
-      const { w, h } = sizes.get(source.binding_id), open = expanded.has(source.binding_id)
+      const trigger = triggerFor(source)
+      const { w, h } = sizes.get(source.binding_id), open = !trigger && expanded.has(source.binding_id)
       const group = ['event_group', 'action_group'].includes(source.type)
       const node = { id: `action-${source.binding_id}`, source, workflow, ancestry, index, kind: group ? source.type : 'action', width: w, fixedHeight: h, x: columnX(ranks.get(source.binding_id)), y: laneY(lanes.get(source.binding_id)) - sizes.get(source.binding_id).alignmentY, inputY: sizes.get(source.binding_id).inputY ?? 58, label: source.name || (source.type === 'event_group' ? '事件组' : source.type === 'action_group' ? '动作组' : actionName(source)), kicker: workflow.entry === source.binding_id && !ancestry.length ? '流程入口' : group ? '流程组' : `动作 ${index + 1}`, meta: group ? source.type === 'event_group' ? '按 IF、ELIF 顺序选择一个出口' : `${source.workflow.nodes.length} 个内部节点` : describeItem(source, 'action'), icon: source.type === 'event_group' ? 'call_split' : source.type === 'action_group' ? 'account_tree' : source.type === 'set_variable' ? 'edit_note' : source.type === 'wait' ? 'hourglass_empty' : 'play_arrow', hasInput: !(workflow.entry === source.binding_id && !ancestry.length), hasOutput: true, open, frame: group && open, availableStepIds: [...ancestry.flatMap(parent => graphPredecessors(parent.workflow, parent.source.binding_id)), ...graphPredecessors(workflow, source.binding_id)], outputs: source.type === 'event_group' ? source.branches.map((branch, i) => ({ id: branch.id, label: branch.label || (branch.else ? 'ELSE' : i ? `ELIF ${i}` : 'IF'), y: 103 + i * 28 })) : [{ id: 'next', label: '完成', y: sizes.get(source.binding_id).inputY ?? 58 }] }
       if (sizes.get(source.binding_id).content) node.outputs = sizes.get(source.binding_id).content.outputs
       if (sizes.get(source.binding_id).outputY !== undefined) node.outputs[0].y = sizes.get(source.binding_id).outputY
+      if (trigger) Object.assign(node, { source: trigger, groupOwner: source, standaloneTrigger: true, kind: 'trigger', label: eventName(trigger), kicker: source.mode === 'wait' ? '等待触发器' : '触发器', meta: describeItem(trigger, 'trigger'), icon: 'bolt', outputs: [{ id: source.branches[0].id, label: '执行', y: 58 }], open: false, frame: false })
       nodes.push(node)
       if (open && source.type === 'action_group') {
         graphLayout(source.workflow, node.x + 28, node.y + 80, [...ancestry, node])
@@ -380,7 +390,7 @@ export function buildWorkflowGraph(rule, expanded, schema, presentation, layoutC
     }
     let failureY = y + [...laneHeights.values()].reduce((sum, height) => sum + height, 0)
     for (const owner of workflow.nodes) {
-      const sourceNode = nodes.find(node => node.source === owner)
+      const sourceNode = nodes.find(node => node.source === owner || node.standaloneTrigger && node.groupOwner === owner)
       let previous = sourceNode?.id
       for (const [index, failure] of (owner.failure_actions || []).entries()) {
         const id = `failure-action-${failure.binding_id}`
@@ -390,7 +400,7 @@ export function buildWorkflowGraph(rule, expanded, schema, presentation, layoutC
       if (owner.failure_actions?.length) failureY += row
     }
     for (const edge of workflow.edges) if (edge.target) edges.push({ id: `control:${edge.source}:${edge.port}`, from: `action-${edge.source}`, to: `action-${edge.target}`, kind: 'pipeline', channel: 'control', sourcePort: edge.port, rawEdge: edge, workflow, label: '' })
-    if (!workflow.entry) nodes.push({ id: `empty-${ancestry.at(-1)?.source.binding_id || 'root'}`, workflow, kind: 'empty', ancestry, x, y, width, fixedHeight: 120, icon: 'start', kicker: '空流程', label: '选择起始操作', meta: '点击选择动作或事件组', hasInput: false, hasOutput: true })
+    if (!workflow.entry) nodes.push({ id: `empty-${ancestry.at(-1)?.source.binding_id || 'root'}`, workflow, kind: 'empty', ancestry, x, y, width, fixedHeight: 120, icon: 'start', kicker: '空流程', label: '选择起始操作', meta: '点击选择触发器、动作或事件组', hasInput: false, hasOutput: true })
   }
   graphLayout(rule.workflow, 52, 118)
   return { nodes, edges, inspectionNodes }

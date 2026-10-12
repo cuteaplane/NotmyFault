@@ -9,7 +9,7 @@ import { FLOW_DATA_PORT_STEP, FLOW_DATA_PORT_Y, FLOW_DATA_SUMMARY_HEIGHT, FLOW_N
   FLOW_NODE_BASE_HEIGHT, FLOW_NODE_WIDTH, buildFlowGraph, conditionNodeId, routeFlowEdge } from '../lib/flowGraph'
 import { buildNodeDataPorts, deriveDataEdges, typesCompatible } from '../lib/bindings'
 import { buildWorkflowGraph, connectGraph, connectConditionGraph, connectTriggerCondition, graphId } from '../lib/workflowGraph'
-import { predicateSummary, precedingSources, workflowEventChoices } from '../lib/workflowConditions'
+import { predicateSummary, predicateSummaryParts, precedingSources, workflowEventChoices } from '../lib/workflowConditions'
 import { typeLabel } from '../lib/valueTypes'
 import { isAdmin, eventName, actionName, describeItem } from '../lib/rulePresentation'
 
@@ -33,7 +33,7 @@ function openContext(event, context) {
   const clientY = keyboard && anchor ? anchor.top + anchor.height / 2 : event?.clientY ?? rect?.top ?? 0
   contextMenu.value = { ...context, x: Math.max(8, Math.min(clientX - (rect?.left || 0), (rect?.width || 800) - 250)), y: Math.max(8, Math.min(clientY - (rect?.top || 0), (rect?.height || 700) - 310)) }
 }
-function menuOperation(operation) { const context = contextMenu.value; contextMenu.value = null; if (operation === 'edit-condition') { selectNode(context.edge.inspectionId); return } emit('operation', { ...context, operation }) }
+function menuOperation(operation) { const context = contextMenu.value; if (!context) return; contextMenu.value = null; if (operation === 'edit-condition') { selectNode(context.edge.inspectionId); return } emit('operation', { ...context, operation }) }
 function edgeContext(edge) {
   return edge.activationOwner ? { kind: 'activation', group: edge.activationOwner, target: edge.activationTarget, edge } : { kind: edge.channel === 'data' ? 'data-edge' : edge.kind === 'condition' ? 'condition' : 'control', edge }
 }
@@ -51,11 +51,11 @@ function deleteNode(node) {
   contextMenu.value = null
   emit('delete-node', node)
 }
-function toggleGroup(id) {
+function toggleGroup(id, open) {
   stopCameraAnimation()
   const node = layoutNodes.value.find(node => node.source?.binding_id === id)
   const anchor = node ? { x: node.x, y: node.y } : null
-  const next = new Set(expandedGroups.value); next.has(id) ? next.delete(id) : next.add(id); expandedGroups.value = next
+  const next = new Set(expandedGroups.value); (open ?? !next.has(id)) ? next.add(id) : next.delete(id); expandedGroups.value = next
   if (anchor) nextTick(() => { const now = targetLayoutNodes.value.find(node => node.source?.binding_id === id); if (now) pan.value = { x: pan.value.x + (anchor.x - now.x) * zoom.value, y: pan.value.y + (anchor.y - now.y) * zoom.value } })
 }
 
@@ -130,7 +130,11 @@ const graph = computed(() => {
   function decorateGraph(controlGraph) {
     const fullNodes = controlGraph.nodes.map(node => {
       const built = buildNodeDataPorts(node, store.schema, props.rule)
-      return { ...built, dataInputs: node.dataInputs ?? built.dataInputs, dataOutputs: node.dataOutputs ?? built.dataOutputs }
+      const predicateParts = node.kind === 'predicate' && !['all', 'any', 'not', 'event_occurred', 'run_status'].includes(node.source.op)
+        ? predicateSummaryParts(node.source, sources.get(node.groupOwner) || precedingSources(props.rule, node.groupOwner || node.source, store.schema)) : null
+      const metaTitle = ['trigger', 'action', 'failure-action'].includes(node.kind)
+        ? describeItem(node.source, node.kind === 'trigger' ? 'trigger' : 'action', false) : node.meta
+      return { ...built, predicateParts, metaTitle, dataInputs: node.dataInputs ?? built.dataInputs, dataOutputs: node.dataOutputs ?? built.dataOutputs }
     })
     const suppliedDataEdges = controlGraph.edges.filter(edge => edge.channel === 'data')
     const suppliedIds = new Set(suppliedDataEdges.map(edge => edge.id))
@@ -806,7 +810,7 @@ function endControlDrag(event) {
     const error = target?.conditionGraph === drag.node.conditionGraph ? connectConditionGraph(target.conditionGraph, drag.node.graphCondition.id, target.graphCondition.id) : target ? '条件只能连接到同一分支的条件组' : ''
     if (error) emit('operation', { operation: 'connection-error', error })
   } else if (drag.moved && target) {
-    const valid = target.workflow === drag.node.workflow && !target.groupOwner && !target.conditionGraph && connectGraph(drag.node.workflow, drag.node.source.binding_id, drag.port.id, target.source.binding_id)
+    const valid = target.workflow === drag.node.workflow && (!target.groupOwner || target.standaloneTrigger) && !target.conditionGraph && connectGraph(drag.node.workflow, (drag.node.standaloneTrigger ? drag.node.groupOwner : drag.node.source).binding_id, drag.port.id, (target.standaloneTrigger ? target.groupOwner : target.source).binding_id)
     if (!valid) emit('operation', { operation: 'connection-error', error: '控制连接不能跨越组边界或形成循环' })
   }
   controlDrag.value = null; connectionPositions.value = null; finishGesture()
@@ -951,8 +955,8 @@ defineExpose({ nodes: layoutNodes, inspectionNodes, toggleGroup, openContext })
                 <button v-if="['event_group', 'action_group'].includes(node.kind)" class="icon-btn group-toggle" :title="node.open ? '收起组' : '展开组'" @pointerdown.stop @click.stop="toggleGroup(node.source.binding_id)" @contextmenu.prevent.stop="toggleGroup(node.source.binding_id)"><span class="material-symbols-outlined">{{ node.open ? 'unfold_less' : 'unfold_more' }}</span></button><div class="graph-node-head-actions"><button class="icon-btn node-context-button" title="节点操作" @pointerdown.stop @click.stop="openContext($event, { kind: node.conditionGraph ? 'condition' : 'control', node })" @contextmenu.prevent.stop="openContext($event, { kind: node.conditionGraph ? 'condition' : 'control', node })"><span class="material-symbols-outlined">more_horiz</span></button><button v-if="canDeleteNode(node)" class="icon-btn node-context-button icon-btn-danger" title="删除节点（Delete）" aria-label="删除节点" @pointerdown.stop @click.stop="deleteNode(node)"><span class="material-symbols-outlined">delete</span></button></div><span v-if="canvasLayout" class="material-symbols-outlined node-drag-handle">drag_indicator</span>
               </header>
               <div v-if="!node.frame" class="graph-node-body" :class="{ 'has-admin': node.admin, 'has-outlets': node.kind === 'event_group' || node.outputAnchors?.some(port => port.label) }">
-                <b>{{ node.label }}</b>
-                <small :title="node.meta">{{ node.meta }}</small>
+                <b :title="node.metaTitle">{{ node.predicateParts?.comparison || node.label }}</b>
+                <small :title="node.metaTitle">{{ node.predicateParts?.source || node.meta }}</small>
                 <span v-if="node.admin" class="node-admin">管理员权限</span>
               </div>
               <div v-if="!node.frame && (node.kind === 'event_group' || node.outputAnchors?.some(port => port.label))" class="graph-node-outlets">
@@ -979,7 +983,7 @@ defineExpose({ nodes: layoutNodes, inspectionNodes, toggleGroup, openContext })
                  <div class="data-port-column data-port-column-output">
                    <span v-for="port in node.visibleDataOutputs" :key="port.id" class="data-port-row" :class="{ optional: !port.required }" :title="`${port.label} · ${typeLabel(port.type)} · ${JSON.stringify(port.type)}`">
                       <small>{{ port.label }}</small><code class="data-type-chip">{{ typeLabel(port.type) }}</code><i class="data-port-dot draggable" role="button" tabindex="0" :aria-label="`${port.label}输出操作`"
-                       @pointerdown="startDataDrag($event, node, port)" @contextmenu.prevent.stop="openContext($event, { kind: 'data', node, port })" @keydown.enter.prevent.stop="openContext($event, { kind: 'data', node, port })" @keydown.space.prevent.stop="openContext($event, { kind: 'data', node, port })"></i>
+                       @pointerdown="startDataDrag($event, node, port)" @click.stop @contextmenu.prevent.stop="openContext($event, { kind: 'data', node, port })" @keydown.enter.prevent.stop="openContext($event, { kind: 'data', node, port })" @keydown.space.prevent.stop="openContext($event, { kind: 'data', node, port })"></i>
                    </span>
                 </div>
               </div>
@@ -1014,10 +1018,12 @@ defineExpose({ nodes: layoutNodes, inspectionNodes, toggleGroup, openContext })
             </svg>
           </div>
           <Transition name="canvas-menu"><div v-if="contextMenu" class="canvas-context-menu" role="menu" :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }" @pointerdown.stop @keydown.esc.stop="contextMenu = null">
+            <button v-if="!['data', 'data-edge'].includes(contextMenu.kind) && contextMenu.node?.kind !== 'failure-action'" role="menuitem" @click="menuOperation('trigger')"><span class="material-symbols-outlined">bolt</span>添加触发器</button>
             <template v-if="contextMenu.kind === 'activation'"><button role="menuitem" @click="menuOperation('edit-activation')"><span class="material-symbols-outlined">account_tree</span>编辑触发组合</button></template>
             <template v-else-if="['data', 'data-edge'].includes(contextMenu.kind)"><button role="menuitem" @click="menuOperation('create-variable')"><span class="material-symbols-outlined">add_box</span>创建变量并赋值</button><button role="menuitem" @click="menuOperation('assign-variable')"><span class="material-symbols-outlined">edit_note</span>给变量赋值</button><button role="menuitem" @click="menuOperation('compare')"><span class="material-symbols-outlined">rule</span>添加比较条件</button></template>
             <template v-else-if="contextMenu.kind === 'condition'"><button v-if="contextMenu.edge?.inspectionId" role="menuitem" @click="menuOperation('edit-condition')"><span class="material-symbols-outlined">bolt</span>编辑事件判断</button><button role="menuitem" @click="menuOperation('condition')"><span class="material-symbols-outlined">rule</span>添加比较条件</button><button v-for="op in ['all', 'any', 'not']" :key="op" role="menuitem" @click="menuOperation(op)"><span class="material-symbols-outlined">account_tree</span>{{ op === 'all' ? '组合 AND' : op === 'any' ? '组合 OR' : '取反 NOT' }}</button></template>
             <template v-else-if="contextMenu.node?.kind !== 'failure-action'"><button role="menuitem" @click="menuOperation('action')"><span class="material-symbols-outlined">play_arrow</span>添加动作</button><button role="menuitem" @click="menuOperation('event_group')"><span class="material-symbols-outlined">call_split</span>创建事件组</button><button role="menuitem" @click="menuOperation('action_group')"><span class="material-symbols-outlined">account_tree</span>创建动作组</button><button role="menuitem" @click="menuOperation('wait')"><span class="material-symbols-outlined">hourglass_empty</span>等待</button><button role="menuitem" @click="menuOperation('set_variable')"><span class="material-symbols-outlined">edit_note</span>变量赋值</button></template>
+            <button v-if="contextMenu.kind === 'control' && contextMenu.edge?.rawEdge?.target && contextMenu.edge?.workflow" role="menuitem" @click="menuOperation('disconnect')"><span class="material-symbols-outlined">link_off</span>断开连线</button>
             <button v-if="canDeleteNode(contextMenu.node || {})" role="menuitem" class="danger-text" @click="deleteNode(contextMenu.node)"><span class="material-symbols-outlined">delete</span>删除节点</button>
             <button v-if="contextMenu.node" role="menuitem" @click="selectNode(contextMenu.node.id); contextMenu = null"><span class="material-symbols-outlined">edit</span>编辑节点</button>
           </div></Transition>

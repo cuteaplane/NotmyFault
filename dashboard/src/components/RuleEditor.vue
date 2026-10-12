@@ -3,7 +3,7 @@ import { connectActivationNode } from '../lib/workflowInspectorOps'
 import { computed, nextTick, ref, toRef, watch, onMounted, onUnmounted } from 'vue'
 import RuleCanvas from './RuleCanvas.vue'
 import WorkflowNodeInspector from './WorkflowNodeInspector.vue'
-import { normalizeWorkflow, createGraphAction, insertGraphNode, findGraphNode, graphId, predicateToGraph } from '../lib/workflowGraph'
+import { normalizeWorkflow, createGraphAction, createTriggerStep, insertGraphNode, findGraphNode, graphId, predicateToGraph, connectTriggerCondition } from '../lib/workflowGraph'
 import { buildDefaultParams } from '../lib/utils'
 import { defaultTypedValue } from '../lib/valueTypes'
 import IfSubflowEditor from './IfSubflowEditor.vue'
@@ -152,10 +152,9 @@ function chooseFolder(folder) {
   props.rule.folder = String(folder || '').trim()
   folderPickerOpen.value = false
 }
-const concurrencyMode = computed(() => props.rule.concurrency?.mode || 'parallel')
+const concurrencyMode = computed(() => props.rule.concurrency?.mode || 'single')
 function setConcurrencyMode(mode) {
-  if (mode === 'parallel') delete props.rule.concurrency
-  else props.rule.concurrency = { ...(props.rule.concurrency || {}), mode }
+  props.rule.concurrency = { ...(props.rule.concurrency || {}), mode }
 }
 // 平台不匹配、缺能力或被用户禁用都算不可选，原因展示给已引用它的规则
 function pluginUnavailableReason(kind, type) {
@@ -218,10 +217,24 @@ function chooseEditorPlugin(type) {
   graphPickerContext.value = null; closePluginPicker()
   if (context.kind === 'trigger') {
     const trigger = { binding_id: graphId('t'), type, params: buildDefaultParams(store.schema.triggers[type]) }
+    if (context.mode === 'graph-trigger-step') {
+      const location = controlLocation(context)
+      const step = createTriggerStep(trigger, location.source === null && location.workflow === props.rule.workflow ? 'immediate' : 'wait')
+      insertOperation(context, step); return
+    }
     if (context.mode === 'graph-activation') context.owner.activation = trigger
     else if (context.mode === 'graph-observer') (context.owner.triggers ||= []).push(trigger)
     else if (context.target?.op) context.target.children.push(trigger)
     else if (context.target) { context.target.type = type; context.target.params = trigger.params }
+    if (context.conditionGraph) {
+      const condition = context.conditionGraph.nodes.find(node => node.id === context.conditionId)
+      if (condition?.predicate?.op === 'event_occurred' && !condition.predicate.trigger_id) condition.predicate.trigger_id = trigger.binding_id
+      else if (condition?.op) { const error = connectTriggerCondition(context.conditionGraph, trigger.binding_id, condition.id); if (error) alertDialog('无法连接', error) }
+    }
+    if (context.mode === 'graph-observer' || context.mode === 'graph-activation') {
+      canvasRef.value?.toggleGroup(context.owner.binding_id, true)
+      nextTick(() => selectNode(canvasRef.value?.nodes.find(node => node.source === trigger)?.id || `trigger-${trigger.binding_id}`))
+    }
     return
   }
   if (context.mode === 'graph-replace') { context.action.type = type; context.action.params = buildDefaultParams(store.schema.actions[type]) }
@@ -230,8 +243,8 @@ function chooseEditorPlugin(type) {
 }
 function controlLocation(context) {
   const original = context.node || layoutNodes.value.find(node => node.id === context.edge?.from)
-  const node = original?.kind === 'trigger' || original?.activationNode ? layoutNodes.value.find(node => node.source === original.groupOwner) : original
-  return { workflow: context.edge?.workflow || node?.workflow || props.rule.workflow, source: context.edge?.rawEdge?.source || (node?.kind === 'empty' ? null : node?.source?.binding_id), port: context.edge?.rawEdge?.port || context.outlet || node?.outputs?.[0]?.id || 'next', node }
+  const node = !original?.standaloneTrigger && (original?.kind === 'trigger' || original?.activationNode) ? layoutNodes.value.find(node => node.source === original.groupOwner) : original
+  return { workflow: context.edge?.workflow || node?.workflow || props.rule.workflow, source: context.edge?.rawEdge?.source || (node?.kind === 'empty' ? null : (node?.standaloneTrigger ? node.groupOwner : node?.source)?.binding_id), port: context.edge?.rawEdge?.port || context.outlet || node?.outputs?.[0]?.id || 'next', node }
 }
 function insertOperation(context, action) {
   const location = controlLocation(context)
@@ -243,9 +256,24 @@ function insertOperation(context, action) {
 function chooseInsertBranch(branch) { const pending = branchOperation.value; branchOperation.value = null; insertOperation({ ...pending.context, outlet: branch.id }, pending.action) }
 function activationConnect({ group, source, target }) { const error = connectActivationNode(group, source, target); if (error) alertDialog('无法修改触发连接', error) }
 function operate(context) {
+  if (context.operation === 'disconnect') {
+    const edge = context.edge?.rawEdge
+    if (context.kind === 'control' && context.edge?.workflow?.edges.includes(edge)) edge.target = null
+    return
+  }
   if (context.operation === 'connection-error') { alertDialog('无法连接', context.error); return }
   if (context.operation === 'activation-connect') { activationConnect(context); return }
   if (context.operation === 'edit-activation') { selectNode(`action-${context.group.binding_id}`); return }
+  if (context.operation === 'trigger') {
+    const node = context.node || layoutNodes.value.find(node => node.id === context.edge?.to)
+    const owner = context.group || node?.groupOwner || (node?.kind === 'event_group' ? node.source : null)
+    if (owner && !node?.standaloneTrigger && !context.edge?.rawEdge?.port) {
+      const location = findGraphNode(props.rule, owner.binding_id)
+      const entry = location?.workflow.entry === owner.binding_id && location.trail.every(parent => findGraphNode(props.rule, parent.action.binding_id)?.workflow.entry === parent.action.binding_id)
+      graphPicker({ kind: 'trigger', mode: !owner.activation && (entry || owner.mode === 'wait') ? 'graph-activation' : 'graph-observer', owner, conditionGraph: node?.conditionGraph || context.edge?.conditionGraph, conditionId: node?.graphCondition?.id || context.edge?.rawEdge?.source })
+    } else graphPicker({ ...context, kind: 'trigger', mode: 'graph-trigger-step' })
+    return
+  }
   if (context.action) { insertOperation(context, context.action); return }
   if (context.kind === 'branch-condition') {
     const owner = context.node.source
@@ -273,7 +301,7 @@ function operate(context) {
     const port = context.port || node?.dataOutputs.find(port => port.name === context.edge?.sourcePortName)
     if (!node || !port) return
     const value = { $ref: { scope: node.kind === 'trigger' ? 'trigger' : 'step', node: node.source.binding_id, path: [port.name], ...(!port.required ? { on_missing: 'error' } : {}) } }
-    const owner = node.kind === 'trigger' ? layoutNodes.value.find(item => item.source === node.groupOwner) : node
+    const owner = node.kind === 'trigger' && !node.standaloneTrigger ? layoutNodes.value.find(item => item.source === node.groupOwner) : node
     if (context.operation === 'compare') { const group = createGraphAction('event_group'); group.branches[0].condition_graph = predicateToGraph({ op: 'eq', left: value, right: '' }); insertOperation({ node: owner }, group); return }
     const assignment = createGraphAction('set_variable'); assignment.value = value
     let pendingVariable
@@ -390,7 +418,7 @@ function onEditorKeydown(event) {
 </script>
 
 <template>
-  <section class="rule-editor-page flow-rule-editor" :class="{ 'with-side-panels': hasSidePanels }">
+  <section class="rule-editor-page flow-rule-editor" :class="{ 'with-side-panels': hasSidePanels, 'canvas-layout': editorLayout === 'canvas' }">
     <header class="rule-editor-head flow-editor-head">
       <div class="rule-editor-identity">
         <button class="btn btn-text rule-back-btn" @click="emit('back')"><span class="material-symbols-outlined">arrow_back</span>全部规则</button>
@@ -459,8 +487,8 @@ function onEditorKeydown(event) {
     <VariablesEditor :rule="rule" />
     <label class="field rule-concurrency-field"><span class="field-label">重复触发</span>
       <select class="select" :value="concurrencyMode" @change="setConcurrencyMode($event.target.value)">
-        <option value="parallel">同时运行（默认）</option>
-        <option value="single">运行中忽略新触发</option>
+        <option value="parallel">同时运行</option>
+        <option value="single">运行中忽略新触发（默认）</option>
         <option value="queue">排队依次执行</option>
         <option value="replace">取消旧的执行最新的</option>
       </select>

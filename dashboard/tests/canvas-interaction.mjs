@@ -36,9 +36,9 @@ const source = { id: 'trigger-t_canvas01', kind: 'trigger', source: rule.conditi
 const target = { id: 'predicate-a_canvas01-then-root', kind: 'predicate', source: predicate, x: 1600, y: 900, label: '判断状态', dataInputs: [{ id: 'input:left', name: 'left', index: 0, type: 'any', label: '判断数据' }], dataOutputs: [] }
 const nested = { type: 'if', binding_id: 'a_nested01', condition: { op: 'eq', left: 1, right: 1 }, then: [], else: [] }
 const override = { nodes: [source, target, { id: 'action-a_nested01', kind: 'action', readOnly: true, source: nested, index: 0, x: 2000, y: 900, dataInputs: [], dataOutputs: [], label: '只读来源' }], edges: [] }
-const selected = ref(null), view = ref('main'), visible = ref(true), opened = []
+const selected = ref(null), view = ref('main'), visible = ref(true), opened = [], operations = []
 const app = createApp({ setup: () => () => visible.value ? h(RuleCanvas, { rule, graphOverride: override, selectedNodeId: selected.value, viewKey: view.value,
-  'onUpdate:selectedNodeId': id => { selected.value = id }, 'onSelect-node': id => { selected.value = id }, 'onOpen-if': action => opened.push(action),
+  'onUpdate:selectedNodeId': id => { selected.value = id }, 'onSelect-node': id => { selected.value = id }, 'onOpen-if': action => opened.push(action), onOperation: context => operations.push(context),
 }) : null })
 const flush = async () => { await nextTick(); await nextTick() }
 function pointer(element, type, x, y) {
@@ -59,6 +59,15 @@ try {
   sourceElement.dispatchEvent(new dom.window.FocusEvent('focus')); await flush(); assert.equal(camera(), initial, '鼠标焦点不触发居中')
   sourceElement.querySelector('.graph-node-data-summary button:last-child').click(); await flush()
   const port = sourceElement.querySelector('.data-port-dot.draggable'), beforeDrag = camera()
+  pointer(port, 'pointerdown', 300, 695); pointer(port, 'pointerup', 300, 695); await flush()
+  port.click(); await flush()
+  assert(document.querySelector('.canvas-context-menu'), '数据端口单击后保留操作菜单')
+  ;[...document.querySelectorAll('.canvas-context-menu button')].find(button => button.textContent.includes('创建变量并赋值')).click()
+  await flush()
+  assert.equal(operations[0].kind, 'data', '变量操作保留数据端口来源')
+  assert.equal(operations[0].operation, 'create-variable')
+  assert.equal(operations[0].node.id, source.id)
+  assert.equal(operations[0].port.name, 'state')
   const positions = [...document.querySelectorAll('.graph-node')].map(node => node.style.top)
   assert(pointer(port, 'pointerdown', 300, 695).defaultPrevented, '连接起点阻止默认焦点切换'); await flush()
   assert.equal(camera(), beforeDrag, '连接开始时不居中')

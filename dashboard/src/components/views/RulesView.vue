@@ -354,7 +354,7 @@ function triggerCount(rule) {
   return rule.workflow ? getGraphTriggers(rule).length : count(rule.condition)
 }
 function triggerSummary(rule) {
-  if (rule.workflow) { const entry = rule.workflow.nodes.find(node => node.binding_id === rule.workflow.entry); return entry?.activation ? entry.name || '事件组 · ' + triggerCount(rule) + ' 个事件来源' : '未配置启动事件' }
+  if (rule.workflow) { const entry = rule.workflow.nodes.find(node => node.binding_id === rule.workflow.entry); return entry?.activation ? entry.name || triggerSummary({ condition: entry.activation }) : '未配置启动事件' }
   if (!rule.condition) return '未配置触发条件'
   if (rule.condition.type && !rule.condition.children) return store.schema.triggers[rule.condition.type]?.name || rule.condition.type
   const op = rule.condition.op || (rule.condition.type === 'and' ? 'all' : 'any')

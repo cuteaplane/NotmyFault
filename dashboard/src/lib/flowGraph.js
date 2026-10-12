@@ -283,7 +283,7 @@ export function routeFlowEdge(edge, nodesById) {
     return {
       ...edge,
       d: `M ${x1} ${y1} C ${middle} ${y1}, ${middle} ${y2}, ${x2} ${y2}`,
-      labelX: middle,
+      labelX: edge.inspectionId && edge.targetPort ? x1 + Math.min(52, (x2 - x1) / 2) : middle,
       labelY: (y1 + y2) / 2 - 9,
     }
   }

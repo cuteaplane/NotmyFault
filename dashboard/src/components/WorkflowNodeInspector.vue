@@ -14,6 +14,7 @@ import BaseDialog from './BaseDialog.vue'
 const props = defineProps({ rule: Object, node: Object, mutations: Object })
 const emit = defineEmits(['select-node', 'toggle-group', 'pick', 'operation'])
 const action = computed(() => props.node?.source)
+const removalAction = computed(() => props.node?.standaloneTrigger ? props.node.groupOwner : action.value)
 const sources = computed(() => props.node?.groupOwner ? precedingSources(props.rule, props.node.groupOwner, store.schema) : action.value?.binding_id ? precedingSources(props.rule, action.value, store.schema) : [])
 const exportSources = computed(() => action.value?.workflow ? appendActionSources(sources.value, action.value.workflow.nodes, props.rule, store.schema) : sources.value)
 function addExport() { const exports = action.value.exports ||= {}; let name = 'result'; for (let index = 2; Object.hasOwn(exports, name); index++) name = `result${index}`; const source = exportSources.value.find(source => source.value?.$ref?.scope === 'step' && action.value.workflow.nodes.some(node => node.binding_id === source.value.$ref.node)); exports[name] = source ? { $ref: { ...source.value.$ref, on_missing: 'error' } } : '' }
@@ -21,7 +22,7 @@ function renameExport(old, name) { name = name.trim(); if (!name || name === old
 function removeCondition() { removeConditionNode(props.node.conditionGraph, props.node.graphCondition.id); emit('select-node', null) }
 function reorderCondition(edge, offset) { const incoming = props.node.conditionGraph.edges.filter(item => item.target === edge.target).sort((a, b) => a.order - b.order), index = incoming.indexOf(edge), target = index + offset; if (!incoming[target]) return; [incoming[index], incoming[target]] = [incoming[target], incoming[index]]; incoming.forEach((item, order) => item.order = order) }
 const constants = computed(() => expandBindingSources(variableBindingSources(props.rule, { constantsOnly: true }), store.schema.data_types?.custom))
-const entry = computed(() => props.node?.workflow?.entry === action.value?.binding_id && (props.node?.ancestry || []).every(parent => parent.workflow.entry === parent.source.binding_id))
+const entry = computed(() => props.node?.workflow?.entry === removalAction.value?.binding_id && (props.node?.ancestry || []).every(parent => parent.workflow.entry === parent.source.binding_id))
 function addBranch() {
   const branch = { id: graphId('b'), condition_graph: predicateToGraph() }
   const branches = action.value.branches
@@ -32,9 +33,9 @@ const pendingRemoval = ref(null)
 const pendingNodeRemoval = ref(null)
 watch([() => props.node?.id, () => props.node?.source], () => { pendingRemoval.value = null; pendingNodeRemoval.value = null })
 const migrationBlock = computed(() => pendingRemoval.value?.method === 'move' ? branchMigrationBlock(props.node.workflow, action.value, pendingRemoval.value.branch, pendingRemoval.value.destination) : '')
-const removalImpact = computed(() => pendingNodeRemoval.value && !pendingNodeRemoval.value.failure ? nodeRemovalImpact(props.node.workflow, action.value, pendingNodeRemoval.value.port) : null)
+const removalImpact = computed(() => pendingNodeRemoval.value && !pendingNodeRemoval.value.failure ? nodeRemovalImpact(props.node.workflow, removalAction.value, pendingNodeRemoval.value.port) : null)
 const nodeBlock = computed(() => pendingNodeRemoval.value && !pendingNodeRemoval.value.failure ? nodeRemovalBlock(props.rule, props.node.workflow, removalImpact.value) : '')
-const nodeReferences = computed(() => removalImpact.value ? removalReferences(props.rule, [action.value, ...removalImpact.value.detached]) : [])
+const nodeReferences = computed(() => removalImpact.value ? removalReferences(props.rule, [removalAction.value, ...removalImpact.value.detached]) : [])
 const branchReferences = computed(() => pendingRemoval.value ? removalReferences(props.rule, pendingRemoval.value.nodes, pendingRemoval.value.branch) : [])
 function referenceLabel(reference) { const owner = findGraphNode(props.rule, reference.owner)?.action; return `${owner?.name || store.schema.actions?.[owner?.type]?.name || owner?.type || '规则'} · ${reference.path.join('.')} → ${reference.node}` }
 function removeBranch(branch) {
@@ -51,15 +52,15 @@ function changeMode() { if (action.value.mode === 'immediate') delete action.val
 
 function remove() {
   if (props.node.conditionGraph) { removeCondition(); return }
-  if (props.node.kind === 'trigger') { removeSource(props.node); return }
+  if (props.node.kind === 'trigger' && !props.node.standaloneTrigger) { removeSource(props.node); return }
   if (props.node.kind === 'failure-action') {
     const references = removalReferences(props.rule, [action.value])
     if (references.length) { pendingNodeRemoval.value = { failure: true, references }; return }
     props.node.owner.failure_actions.splice(props.node.index, 1); emit('select-node', null); return
   }
-  const outgoing = props.node.workflow.edges.filter(edge => edge.source === action.value.binding_id)
-  const impact = nodeRemovalImpact(props.node.workflow, action.value)
-  if (impact && !impact.detached.length && !nodeRemovalBlock(props.rule, props.node.workflow, impact) && !['event_group', 'action_group'].includes(action.value.type)) { removeWorkflowNode(props.rule, props.node.workflow, action.value); emit('select-node', null); return }
+  const outgoing = props.node.workflow.edges.filter(edge => edge.source === removalAction.value.binding_id)
+  const impact = nodeRemovalImpact(props.node.workflow, removalAction.value)
+  if (impact && !impact.detached.length && !nodeRemovalBlock(props.rule, props.node.workflow, impact) && (props.node.standaloneTrigger || !['event_group', 'action_group'].includes(action.value.type))) { removeWorkflowNode(props.rule, props.node.workflow, removalAction.value); emit('select-node', null); return }
   pendingNodeRemoval.value = { port: impact ? outgoing[0]?.port ?? null : '', outgoing }
 }
 function removeSource(node) {
@@ -68,13 +69,13 @@ function removeSource(node) {
   else emit('select-node', null)
 }
 function requestDelete(node = props.node) {
-  if (node.activationValue || node.kind === 'trigger') removeSource(node)
+  if (!node.standaloneTrigger && (node.activationValue || node.kind === 'trigger')) removeSource(node)
   else remove()
 }
 defineExpose({ requestDelete })
 function confirmNodeRemoval() {
   if (pendingNodeRemoval.value?.failure || nodeBlock.value) return
-  if (removeWorkflowNode(props.rule, props.node.workflow, action.value, { port: pendingNodeRemoval.value.port })) { pendingNodeRemoval.value = null; emit('select-node', null) }
+  if (removeWorkflowNode(props.rule, props.node.workflow, removalAction.value, { port: pendingNodeRemoval.value.port })) { pendingNodeRemoval.value = null; emit('select-node', null) }
 }
 
 function duplicate() { const copy = copyGraphNode(action.value); if (props.node.kind === 'failure-action') { props.node.owner.failure_actions.splice(props.node.index + 1, 0, copy); emit('select-node', `failure-action-${copy.binding_id}`); return }; emit('operation', { kind: 'control', node: props.node, action: copy }) }
@@ -119,13 +120,20 @@ function moveBranch(index, offset) { const branches = action.value.branches, tar
         <div v-for="edge in node.conditionGraph.edges.filter(edge => edge.target === node.graphCondition.id).sort((a, b) => a.order - b.order)" :key="edge.source" class="inspector-action-row"><span>子条件 {{ edge.order + 1 }}</span><button class="icon-btn" title="提前判断" @click="reorderCondition(edge, -1)"><span class="material-symbols-outlined">arrow_upward</span></button><button class="icon-btn" title="稍后判断" @click="reorderCondition(edge, 1)"><span class="material-symbols-outlined">arrow_downward</span></button></div>
         <button v-if="action.op !== 'not'" class="btn btn-tonal" @click="emit('operation', { kind: 'condition-child', node })">添加子条件</button>
       </template>
-      <TriggerForm v-else-if="node.kind === 'trigger'" :node="action" :rule="rule" :sources="constants" @replace="emit('pick', { kind: 'trigger', mode: 'graph-trigger', owner: node.groupOwner, target: action })" />
+      <template v-else-if="node.kind === 'trigger'">
+        <TriggerForm :node="action" :rule="rule" :sources="constants" @replace="emit('pick', { kind: 'trigger', mode: 'graph-trigger', owner: node.groupOwner, target: action })" />
+        <template v-if="node.standaloneTrigger">
+          <p class="inspector-lead">{{ entry ? '收到此触发器的事件后启动流程。' : '执行到这里后等待此触发器的事件，收到后继续后续动作。' }}</p>
+          <button class="btn btn-text btn-sm" @click="node.groupOwner.activation = { op: 'any', children: [action], pick: 'latest' }">改为事件组合</button>
+          <label v-if="!entry" class="field"><span class="field-label">等待超时（秒，可选）</span><input v-model.number="node.groupOwner.timeout_seconds" type="number" min="0.001" step="any" class="text-field"></label>
+        </template>
+      </template>
       <template v-else-if="['action', 'failure-action'].includes(node.kind)">
         <ActionForm :action="action" :rule="rule" :index="node.index" :binding-sources="sources" :allow-failure-actions="node.kind !== 'failure-action'" @replace="replaceAction" @add-failure-action="emit('pick', { kind: 'action', mode: 'graph-failure', owner: action })" @remove-failure-action="index => action.failure_actions.splice(index, 1)" @replace-failure-action="index => emit('pick', { kind: 'action', mode: 'graph-replace', action: action.failure_actions[index] })" />
       </template>
       <button v-else class="btn btn-tonal" @click="emit('operation', { kind: 'control', node })">选择起始操作</button>
       <button v-if="node.conditionGraph" class="btn btn-text danger-text" @click="removeCondition">删除此条件</button>
-      <button v-if="node.kind === 'trigger'" class="btn btn-text danger-text" @click="remove"><span class="material-symbols-outlined">delete</span>删除事件来源</button>
+      <button v-if="node.kind === 'trigger'" class="btn btn-text danger-text" @click="remove"><span class="material-symbols-outlined">delete</span>{{ node.standaloneTrigger ? '删除触发器' : '删除事件来源' }}</button>
       <div v-if="['action', 'failure-action', 'event_group', 'action_group'].includes(node.kind)" class="inspector-action-row"><button class="btn btn-text" @click="duplicate"><span class="material-symbols-outlined">content_copy</span>复制</button><button class="btn btn-text danger-text" @click="remove"><span class="material-symbols-outlined">delete</span>删除</button></div>
       <BaseDialog :open="!!pendingRemoval" @close="pendingRemoval = null"><section v-if="pendingRemoval" class="workflow-branch-settings branch-removal-dialog" role="dialog" aria-label="移除出口"><h3>移除出口后处理动作</h3><p>这个出口独占 {{ pendingRemoval.nodes.length }} 个节点：{{ pendingRemoval.nodes.map(node => node.name || node.type).join('、') }}。</p><label class="field"><span class="field-label">处理方式</span><select v-model="pendingRemoval.method" class="select"><option value="move">保留动作，接入另一个出口</option><option value="delete" :disabled="branchReferences.length">同时删除这些动作</option></select></label><template v-if="pendingRemoval.method === 'move'"><p>选定出口将先执行这些动作，再执行它原有的动作。共享的后续节点继续保留。</p><select v-model="pendingRemoval.destination" class="select" aria-label="接入出口"><option value="" disabled>选择出口</option><option v-for="branch in action.branches.filter(branch => branch.id !== pendingRemoval.branch.id)" :key="branch.id" :value="branch.id">{{ branch.label || (branch.else ? 'ELSE' : `分支 ${action.branches.indexOf(branch) + 1}`) }}</option></select></template><p v-if="migrationBlock" class="inspector-lead">{{ migrationBlock }}</p><p v-else-if="pendingRemoval.method === 'delete'">这些动作及其组内流程将一并删除，此操作可通过撤销恢复。</p><p v-if="branchReferences.length" class="inspector-lead">其他条件或动作仍引用这些节点，必须保留动作或先移除相关引用。</p><ul v-if="branchReferences.length"><li v-for="(reference, index) in branchReferences" :key="index">{{ referenceLabel(reference) }}</li></ul><div class="inspector-action-row"><button class="btn btn-text" @click="pendingRemoval = null">取消</button><button class="btn btn-tonal" :disabled="!!migrationBlock || pendingRemoval.method === 'move' && !pendingRemoval.destination" @click="confirmBranchRemoval">确认移除出口</button></div></section></BaseDialog>
       <BaseDialog :open="!!pendingNodeRemoval" @close="pendingNodeRemoval = null"><section v-if="pendingNodeRemoval" class="workflow-branch-settings branch-removal-dialog" role="dialog" aria-label="删除节点"><h3>删除 {{ node.label }}</h3><template v-if="!pendingNodeRemoval.failure"><p>节点{{ action.type === 'action_group' ? '及其内部流程' : '' }}将被移除。入线将接到选定出口，其他独占路径也会删除，共享后续节点保留。</p><label class="field"><span class="field-label">删除后续接</span><select v-model="pendingNodeRemoval.port" class="select" aria-label="保留出口"><option value="" disabled>选择保留的出口</option><option v-for="(edge, index) in pendingNodeRemoval.outgoing" :key="edge.port" :value="edge.port">{{ action.branches?.find(branch => branch.id === edge.port)?.label || (action.branches?.find(branch => branch.id === edge.port)?.else ? 'ELSE' : action.type === 'event_group' ? `分支 ${index + 1}` : '完成') }} · {{ edge.target ? props.node.workflow.nodes.find(node => node.binding_id === edge.target)?.name || props.node.workflow.nodes.find(node => node.binding_id === edge.target)?.type : '结束' }}</option><option :value="null">结束当前路径</option></select></label><p v-if="removalImpact?.detached.length">同时删除的独占节点：{{ removalImpact.detached.map(node => node.name || node.type).join('、') }}。</p><p v-if="nodeBlock" class="inspector-lead">{{ nodeBlock }}</p></template><p v-else>其他节点仍引用此节点的数据或事件，请先调整引用。</p><ul v-if="nodeReferences.length || pendingNodeRemoval.references?.length"><li v-for="(reference, index) in nodeReferences.length ? nodeReferences : pendingNodeRemoval.references" :key="index">{{ referenceLabel(reference) }}</li></ul><div class="inspector-action-row"><button class="btn btn-text" @click="pendingNodeRemoval = null">取消</button><button v-if="!pendingNodeRemoval.failure" class="btn btn-tonal" :disabled="!!nodeBlock" @click="confirmNodeRemoval">确认删除节点及列出的路径</button></div></section></BaseDialog>

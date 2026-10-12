@@ -31,17 +31,22 @@ function formatRuleFinishedValue(value, def) {
   return formatParamValue(value, def)
 }
 
-export function describeItem(item, kind) {
+export function describeItem(item, kind, compact = true) {
   if (!item) return '需要配置'
   const meta = kind === 'trigger' ? store.schema.triggers[item.type] : store.schema.actions[item.type]
   const params = item.params || {}
   const formatter = item.type === 'rule_finished' ? formatRuleFinishedValue : formatParamValue
   const details = getVisibleParamDefs(meta, params)
     .filter(def => !(item.type === 'rule_finished' && def.name === 'owner_rule_id'))
-    .map(def => [def.label || def.name, formatter(params[def.name], def)])
+    .map(def => {
+      let value = formatter(params[def.name], def)
+      const path = def.type === 'path' || def.value_type === 'path' || def.value_type?.type === 'path'
+      if (compact && path && !isReference(params[def.name]) && value.length > 24) value = `…${value.slice(-23)}`
+      return [def.label || def.name, value]
+    })
     .filter(([, value]) => value !== '')
     .slice(0, 2)
     .map(([label, value]) => `${label}: ${value}`)
   const text = details.join(' · ') || '无额外参数'
-  return text.length > 54 ? `${text.slice(0, 52)}…` : text
+  return compact && text.length > 54 ? `${text.slice(0, 52)}…` : text
 }

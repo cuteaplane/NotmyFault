@@ -63,6 +63,10 @@ export function appendActionSources(base, actions, rule, schema) {
   })
   return [...new Map([...base, ...expandBindingSources(result, schema.data_types?.custom)].map(source => [JSON.stringify(source.value.$ref), source])).values()]
 }
+export function predicateSummaryParts(node, sources = []) {
+  const value = expression => expression?.$ref ? (sources.length ? referenceLabel(expression, sources) : expression.$ref.path?.join('.') || '数据') : typeof expression === 'string' ? `“${expression}”` : JSON.stringify(expression)
+  return { source: value(node.left) || '选择数据', comparison: `${PREDICATE_LABELS[node.op] || node.op}${['is_true', 'is_false', 'exists', 'not_exists'].includes(node.op) ? '' : ` ${value(node.right)}`}` }
+}
 export function predicateSummary(node, sources = [], rules = [], triggers = []) {
   if (!node) return '未设置条件'
   if (['all', 'any', 'not'].includes(node.op)) {
@@ -71,6 +75,6 @@ export function predicateSummary(node, sources = [], rules = [], triggers = []) 
   }
   if (node.op === 'event_occurred') return `${triggers.find(trigger => trigger.id === node.trigger_id)?.label || node.trigger_id || '选择事件来源'} · 事件${node.expected === false ? '未发生' : '已发生'}`
   if (node.op === 'run_status') return `${rules.find(rule => rule.rule_id === node.rule_id)?.name || node.rule_id || '选择自动化'} ${node.comparison === 'ne' ? '不是' : '是'} ${RUN_STATUS_OPTIONS.find(([value]) => value === node.status)?.[1] || node.status || '选择状态'}`
-  const value = expression => expression?.$ref ? (sources.length ? referenceLabel(expression, sources) : expression.$ref.path?.join('.') || '数据') : typeof expression === 'string' ? `“${expression}”` : JSON.stringify(expression)
-  return `${value(node.left) || '选择数据'} ${PREDICATE_LABELS[node.op] || node.op}${['is_true', 'is_false', 'exists', 'not_exists'].includes(node.op) ? '' : ` ${value(node.right)}`}`
+  const parts = predicateSummaryParts(node, sources)
+  return `${parts.source} ${parts.comparison}`
 }
