@@ -129,6 +129,33 @@ def test_zip_single_file_and_default_destination(tmp_path):
     assert source.read_text(encoding="utf-8") == alias.read_text(encoding="utf-8") == "单独"
 
 
+@pytest.mark.parametrize("overwrite", [False, True])
+@pytest.mark.parametrize("existing_zip", [False, True])
+def test_zip_preserves_existing_destination_unless_overwrite_is_enabled(tmp_path, overwrite, existing_zip):
+    module = load_module()
+    source = tmp_path / "source.txt"
+    source.write_bytes(b"replacement")
+    archive = tmp_path / "output.zip"
+    if existing_zip:
+        with zipfile.ZipFile(archive, "w") as output:
+            output.writestr("old.txt", b"original")
+    else:
+        archive.write_bytes(b"original destination")
+    original = archive.read_bytes()
+    result = module.run({}, {
+        "mode": "zip", "source": str(source),
+        "destination": str(archive), "overwrite": overwrite,
+    })
+    assert result["ok"] is overwrite
+    if overwrite:
+        with zipfile.ZipFile(archive) as output:
+            assert output.namelist() == ["source.txt"]
+            assert output.read("source.txt") == b"replacement"
+    else:
+        assert result["error"]
+        assert archive.read_bytes() == original
+
+
 @pytest.mark.parametrize("mode", ["zip", "unzip"])
 @pytest.mark.parametrize("reason", ["cancelled", "timeout"])
 def test_archive_stops_during_single_file(tmp_path, monkeypatch, mode, reason):

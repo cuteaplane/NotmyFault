@@ -71,7 +71,7 @@ def _copy_stream(source, output, cancellation=None) -> None:
         output.write(chunk)
 
 
-def _zip_sources(sources: list[Path], archive: Path, cancellation=None) -> int:
+def _zip_sources(sources: list[Path], archive: Path, cancellation=None, overwrite: bool = False) -> int:
     entries = []
 
     def raise_walk_error(error):
@@ -105,7 +105,7 @@ def _zip_sources(sources: list[Path], archive: Path, cancellation=None) -> int:
             raise ValueError(f"压缩包与源文件指向同一文件: {path}")
     count = 0
     archive.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(archive, "w" if overwrite else "x", compression=zipfile.ZIP_DEFLATED) as zf:
         for path, arcname in entries:
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
@@ -200,7 +200,7 @@ def run_with_context(action_info, params, context):
             return _soft(f"无法解析路径: {error}", mode=mode, archive=str(archive))
 
         try:
-            file_count = _zip_sources([source], archive, cancellation)
+            file_count = _zip_sources([source], archive, cancellation, overwrite)
         except (OSError, FileNotFoundError, ValueError) as error:
             return _soft(str(error), mode=mode, archive=str(archive))
 
