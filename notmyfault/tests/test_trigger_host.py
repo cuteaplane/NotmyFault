@@ -6,6 +6,7 @@ import pytest
 from notmyfault.core.clock import FakeClock
 from notmyfault.core.rules import config_fingerprint
 from notmyfault.tests.api_support import create_test_engine
+from notmyfault.tests.canvas_fixtures import trigger_rule, set_rule_steps
 
 
 def wait_for(predicate, timeout=3):
@@ -18,7 +19,7 @@ def wait_for(predicate, timeout=3):
 
 
 def rule(identity="r_host0001", trigger="demo", config=None):
-    return {"rule_id": identity, "name": identity, "condition": {"type": trigger, "params": config or {}}, "actions": []}
+    return trigger_rule(identity, identity, trigger, config)
 
 
 @pytest.fixture
@@ -217,7 +218,7 @@ def test_state_baseline_and_debounce_are_persisted(engine):
 def test_running_generation_retains_removed_instance_until_work_finishes(engine):
     entered, release = threading.Event(), threading.Event()
     source = rule()
-    source["actions"] = [{"type": "wait", "params": {}}]
+    set_rule_steps(source, [{"type": "wait", "params": {}}])
     engine.actions_meta["wait"] = {}
 
     def action(*args):

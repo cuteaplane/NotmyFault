@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import math
 from typing import Any
 
 from notmyfault.core.bindings import BindingResolutionError, is_reference, reference_exists, references_available, resolve_value
@@ -42,6 +43,10 @@ def validate_predicate(node: Any, path: str = "condition") -> list[str]:
             errors.append(f"{path}.trigger_id 必须是本流程触发器的节点 ID")
         if not isinstance(node.get("expected", True), bool):
             errors.append(f"{path}.expected 必须是布尔值")
+        if 'within_seconds' in node:
+            value = node['within_seconds']
+            if node.get('expected', True) or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                errors.append(f'{path}.within_seconds 只用于事件未发生，必须是大于零的有限秒数')
         return errors
     if op == "run_status":
         errors = []
@@ -103,6 +108,11 @@ def _evaluate_predicate(node: dict, context: dict, path: str, *, status_lookup, 
     if _event_occurrences is None:
         _event_occurrences = event_occurrences(context)
     if op == "event_occurred":
+        if 'within_seconds' in node:
+            observation = context.get('_event_observation')
+            if observation is None:
+                raise ValueError('连续未发生的判断需要当前运行的事件观察')
+            return observation.absent_for(node['trigger_id'], node['within_seconds'])
         return (node["trigger_id"] in _event_occurrences) == node.get("expected", True)
     if op == "run_status":
         if status_lookup is None:

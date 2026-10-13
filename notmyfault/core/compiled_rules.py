@@ -93,7 +93,6 @@ class CompiledRule:
     matcher_spec: MatcherSpec
     plan: tuple[Step, ...]
     step_index: Mapping[str, int]
-    top_level_index: Mapping[str, int]
     concurrency: FrozenDict
     references: Mapping[int, ReferenceAccessor]
 
@@ -136,5 +135,4 @@ def compile_rule(rule, template, triggers_meta, actions_meta, event_types, regis
     concurrency = {"mode": "single", **source.get("concurrency", {})}
     return CompiledRule(source["rule_id"], digest({"rule": semantic_rule, "plugins": plugins}), source, tuple(subscriptions), matcher,
                         plan, MappingProxyType({step.id: step.index for step in plan}),
-                        MappingProxyType({action["binding_id"]: index for index, action in enumerate(source.get("actions", []))}),
                         freeze(concurrency), MappingProxyType(references))

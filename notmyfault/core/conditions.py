@@ -15,8 +15,7 @@ def get_rule_condition(rule: Dict[str, Any]) -> Dict[str, Any] | None:
         entry = entry_event_group(graph)
         if entry is not None:
             return entry["activation"]
-    condition = rule.get("condition")
-    return condition if isinstance(condition, dict) else None
+    return rule.get("_matcher")
 
 def _is_event_leaf(node: Any) -> bool:
     return isinstance(node, dict) and isinstance(node.get("type"), str) and \
@@ -58,7 +57,7 @@ def validate_condition_tree(node: Dict[str, Any] | None) -> List[str]:
         op = _condition_op(current)
         if op not in ("any", "all", "not"):
             errors.append(f"{path} 的 op 必须为 any、all 或 not")
-        children = current.get("children", current.get("events", []))
+        children = current.get("children", [])
         if not isinstance(children, list):
             errors.append(f"{path}.children 必须是数组")
             children = []
@@ -132,9 +131,7 @@ def config_fingerprint(params: Any) -> str:
     )
 
 def _condition_op(node: Dict[str, Any]) -> str:
-    """读取条件运算符，兼容 ``type: and/or`` 的早期格式"""
-    op = node.get("op", node.get("type", "any"))
-    return {"or": "any", "and": "all"}.get(str(op).lower(), str(op).lower())
+    return node.get("op", "")
 
 def _event_key(event_def: Dict[str, Any]) -> str:
     """生成事件叶子的稳定键，优先使用 binding_id"""

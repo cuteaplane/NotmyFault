@@ -10,6 +10,8 @@ from decimal import Decimal
 import pytest
 
 from notmyfault.tests.api_support import create_test_engine, event_fields
+from notmyfault.tests.canvas_fixtures import runtime_sequence, execute_runtime
+from notmyfault.tests.canvas_fixtures import runtime_sequence, execute_runtime, execute_sequence, selected_branch, native_rule
 from notmyfault.core import workflow_executor as workflow_executor_module
 from notmyfault.core.workflow import ActionCancellation, build_context
 from notmyfault.core.clock import FakeClock
@@ -20,6 +22,8 @@ from notmyfault.security.errors import AdminExecutionBlocked
 def make_engine(rules=None, on_event=None):
     engine = create_test_engine({"rules": rules or []}, on_event=on_event)
     engine._alert_user = lambda *a, **k: None
+    engine.triggers_meta["manual_signal"] = {"outputs": []}
+    engine.triggers_funcs["manual_signal"] = lambda *args: None
     return engine
 
 
@@ -62,12 +66,12 @@ def test_if_trigger_automation_and_previous_output_group(steam, downloading, lat
     context["triggers"] = {"t_steam01": {"payload": {"state": steam}}}
     actions = [
         {"type": "speed", "binding_id": "a_speed01", "params": {}},
-        {"type": "if", "binding_id": "a_branch01", "condition": condition,
-         "then": [{"type": "record", "params": {"label": "pause"}}], "else": []},
+        {"type": '__decision_fixture__', "binding_id": "a_branch01", 'predicate': condition,
+         'then_steps': [{"type": "record", "params": {"label": "pause"}}], 'else_steps': []},
         {"type": "record", "params": {"label": "after"}},
     ]
     try:
-        assert engine.execute_actions(actions, "规则", context)
+        assert execute_sequence(engine, actions, "规则", context)
         assert called == expected
     finally:
         engine.shutdown(2)
@@ -79,23 +83,23 @@ def test_elif_selects_first_match_and_history_keeps_branch(first, second, expect
     engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
     register_action(engine, "record", lambda meta, params: called.append(params["label"]))
     action = lambda label: {"type": "record", "params": {"label": label}}
-    branch = {"type": "if", "binding_id": "a_branch01", "condition": {"op": "is_true", "left": first},
-              "then": [action("then")], "else": [action("else")],
-              "elif": [{"condition": {"op": "is_true", "left": second}, "then": [action("elif[0]")]},
-                       {"condition": {"op": "is_true", "left": False}, "then": [action("elif[1]")]}]}
+    branch = {"type": '__decision_fixture__', "binding_id": "a_branch01", 'predicate': {"op": "is_true", "left": first},
+              'then_steps': [action("then")], 'else_steps': [action("else")],
+              'alternatives': [{'predicate': {"op": "is_true", "left": second}, 'then_steps': [action("elif[0]")]},
+                       {'predicate': {"op": "is_true", "left": False}, 'then_steps': [action("elif[1]")]}]}
     if first or second:
-        branch["elif"][1]["condition"] = {"op": "is_true", "left": {"$ref": {"scope": "event", "path": ["missing"]}}}
+        branch["alternatives"][1]["predicate"] = {"op": "is_true", "left": {"$ref": {"scope": "event", "path": ["missing"]}}}
     context = build_context("规则", "hotkey", {}, [], run_id="run_elif")
     try:
-        assert engine.execute_actions([branch, action("after")], "规则", context)
+        assert execute_sequence(engine, [branch, action("after")], "规则", context)
         assert called == [expected, "after"]
-        assert context["steps"]["a_branch01"]["result"]["branch"] == expected
+        assert context["steps"]["a_branch01"]["result"]["branch"] == selected_branch(expected)
         assert engine.events.flush()
         history = RunHistory(str(tmp_path / "runs.jsonl"))
         for timestamp, (name, data) in enumerate(events):
             history.record({"type": name, "data": data, "ts": timestamp})
         saved = next(step for step in history.get_run("run_elif")["steps"] if step["step_id"] == "a_branch01")
-        assert saved["branch"] == expected
+        assert saved["branch"] == selected_branch(expected)
         assert saved["status"] == "succeeded"
     finally:
         engine.shutdown(2)
@@ -106,17 +110,17 @@ def test_if_missing_trigger_needs_exists_and_does_not_take_elif_on_error():
     called = []
     register_action(engine, "record", lambda meta, params: called.append(params["label"]))
     source = {"$ref": {"scope": "trigger", "node": "t_steam01", "path": ["state"]}}
-    branch = {"type": "if", "binding_id": "a_branch01", "condition": {"op": "not", "children": [{"op": "eq", "left": source, "right": "running"}]},
-              "then": [{"type": "record", "params": {"label": "pause"}}], "else": [],
-              "elif": [{"condition": {"op": "is_true", "left": True}, "then": [{"type": "record", "params": {"label": "elif"}}]}]}
+    branch = {"type": '__decision_fixture__', "binding_id": "a_branch01", 'predicate': {"op": "not", "children": [{"op": "eq", "left": source, "right": "running"}]},
+              'then_steps': [{"type": "record", "params": {"label": "pause"}}], 'else_steps': [],
+              'alternatives': [{'predicate': {"op": "is_true", "left": True}, 'then_steps': [{"type": "record", "params": {"label": "elif"}}]}]}
     try:
         context = _context()
-        assert not engine.execute_actions([branch], "规则", context)
+        assert not execute_sequence(engine, [branch], "规则", context)
         assert called == []
         assert context["steps"]["a_branch01"]["status"] == "failed"
-        branch["condition"] = {"op": "all", "children": [{"op": "exists", "left": source}, branch["condition"]]}
-        branch["elif"] = []
-        assert engine.execute_actions([branch], "规则", _context())
+        branch["predicate"] = {"op": "all", "children": [{"op": "exists", "left": source}, branch["predicate"]]}
+        branch["alternatives"] = []
+        assert execute_sequence(engine, [branch], "规则", _context())
         assert called == []
     finally:
         engine.shutdown(2)
@@ -132,10 +136,10 @@ def test_automation_state_is_sampled_once_per_if_and_again_at_next_if():
     register_action(engine, "record", lambda meta, params: called.append(params["label"]))
     predicate = {"op": "run_status", "rule_id": "r_gamedown", "status": "running"}
     def branch(identity):
-        return {"type": "if", "binding_id": identity, "condition": {"op": "all", "children": [predicate, predicate]},
-                "then": [{"type": "record", "params": {"label": "then"}}], "else": [{"type": "record", "params": {"label": "else"}}]}
+        return {"type": '__decision_fixture__', "binding_id": identity, 'predicate': {"op": "all", "children": [predicate, predicate]},
+                'then_steps': [{"type": "record", "params": {"label": "then"}}], 'else_steps': [{"type": "record", "params": {"label": "else"}}]}
     try:
-        assert engine.execute_actions([branch("a_first01"), branch("a_second01")], "规则", _context())
+        assert execute_sequence(engine, [branch("a_first01"), branch("a_second01")], "规则", _context())
         assert called == ["then", "else"]
         assert lookups == ["r_gamedown", "r_gamedown"]
     finally:
@@ -152,17 +156,18 @@ def test_selected_elif_propagates_failure_or_cancellation_without_else(failure):
         raise ActionCancelled("cancelled") if failure == "cancelled" else RuntimeError("动作失败")
     register_action(engine, "stop", stop)
     register_action(engine, "record", lambda meta, params: called.append(params["label"]))
-    branch = {"type": "if", "binding_id": "a_branch01", "condition": {"op": "is_true", "left": False}, "then": [],
-              "elif": [{"condition": {"op": "is_true", "left": True}, "then": [{"type": "stop", "params": {}}]}],
-              "else": [{"type": "record", "params": {"label": "else"}}]}
+    branch = {"type": '__decision_fixture__', "binding_id": "a_branch01", 'predicate': {"op": "is_true", "left": False}, 'then_steps': [],
+              'alternatives': [{'predicate': {"op": "is_true", "left": True}, 'then_steps': [{"type": "stop", "binding_id": "a_stop0001", "params": {}}]}],
+              'else_steps': [{"type": "record", "params": {"label": "else"}}]}
     context = _context()
     try:
-        assert not engine.execute_actions([branch, {"type": "record", "params": {"label": "after"}}], "规则", context)
+        assert not execute_sequence(engine, [branch, {"type": "record", "params": {"label": "after"}}], "规则", context)
         assert called == []
-        assert context["steps"]["a_branch01"]["status"] == failure
+        assert context["steps"]["a_branch01"]["status"] == "ok"
+        assert context["steps"]["a_stop0001"]["status"] == failure
         assert engine.events.flush()
-        result = next(data for name, data in events if name == f"run.step.{failure}" and data.get("step_id") == "a_branch01")
-        assert result["branch"] == "elif[0]"
+        result = next(data for name, data in events if name == f"run.step.{failure}" and data.get("step_id") == "a_stop0001")
+        assert context["steps"]["a_branch01"]["result"]["branch"] == selected_branch("elif[0]")
     finally:
         engine.shutdown(2)
 
@@ -181,9 +186,9 @@ def test_engine_action_timeout_uses_injected_clock():
                     {"execution_api": "context-v1", "cancellation_api": "runtime-v1"},
                     types.SimpleNamespace(run_with_context=advance))
     try:
-        outcome = engine.execute_workflow("r_clock001", {"actions": [{
+        outcome = execute_runtime(engine, "r_clock001", runtime_sequence([{
             "type": "advance", "binding_id": "a_clock001", "params": {}, "timeout_seconds": 1,
-        }]}, "规则", _context())
+        }]), "规则", _context())
         assert outcome.status == "timed_out"
     finally:
         engine.shutdown(2)
@@ -206,9 +211,9 @@ def test_engine_retry_wait_uses_injected_clock():
 
     register_action(engine, "retry", retry)
     try:
-        outcome = engine.execute_workflow("r_clock002", {"actions": [{
+        outcome = execute_runtime(engine, "r_clock002", runtime_sequence([{
             "type": "retry", "binding_id": "a_clock002", "params": {}, "retry": 1, "retry_delay_seconds": 2,
-        }]}, "规则", _context())
+        }]), "规则", _context())
         assert outcome.status == "succeeded"
         assert attempts[0] == 0 and attempts[1] >= 2
     finally:
@@ -233,24 +238,20 @@ def test_run_variables_follow_executed_branches_and_survive_failed_assignment(tm
         "params": [{"name": "rows", "type": "textarea", "value_type": {"type": "array", "items": "int"}}],
         "outputs": [{"name": "count", "type": "number", "value_type": "int"}],
     }, module=types.SimpleNamespace(run_with_context=consume))
-    rule = {
-        "constants": [{"id": "c_rows0001", "name": "起始值", "value_type": {"type": "array", "items": "int"}, "value": [1]}],
-        "variables": [
-            {"id": "v_rows0001", "name": "记录", "value_type": {"type": "array", "items": "int"}, "initial": {"$ref": {"scope": "constant", "node": "c_rows0001", "path": []}}},
-            {"id": "v_count001", "name": "数量", "value_type": "int"},
-        ],
-        "actions": [
+    rule = runtime_sequence([
             {"type": "set_variable", "binding_id": "a_invalid1", "variable": "v_rows0001", "value": [False], "on_error": "continue"},
             {"type": "consume", "binding_id": "a_before01", "params": {"rows": {"$ref": {"scope": "variable", "node": "v_rows0001", "path": []}}}},
-            {"type": "if", "binding_id": "a_branch01", "condition": {"op": "is_true", "left": True},
-             "then": [{"type": "set_variable", "binding_id": "a_assign01", "variable": "v_rows0001", "value": [1, 2]}],
-             "else": [{"type": "set_variable", "binding_id": "a_assign02", "variable": "v_rows0001", "value": [9]}]},
+            {"type": '__decision_fixture__', "binding_id": "a_branch01", 'predicate': {"op": "is_true", "left": True},
+             'then_steps': [{"type": "set_variable", "binding_id": "a_assign01", "variable": "v_rows0001", "value": [1, 2]}],
+             'else_steps': [{"type": "set_variable", "binding_id": "a_assign02", "variable": "v_rows0001", "value": [9]}]},
             {"type": "consume", "binding_id": "a_consume1", "params": {"rows": {"$ref": {"scope": "variable", "node": "v_rows0001", "path": []}}}},
             {"type": "set_variable", "binding_id": "a_count001", "variable": "v_count001", "value": {"$ref": {"scope": "step", "node": "a_consume1", "path": ["count"]}}},
-        ],
-    }
+        ], constants=[{"id": "c_rows0001", "name": "起始值", "value_type": {"type": "array", "items": "int"}, "value": [1]}], variables=[
+            {"id": "v_rows0001", "name": "记录", "value_type": {"type": "array", "items": "int"}, "initial": {"$ref": {"scope": "constant", "node": "c_rows0001", "path": []}}},
+            {"id": "v_count001", "name": "数量", "value_type": "int"},
+        ])
     context = build_context("规则", "hotkey", {}, [], run_id="run_variables")
-    engine.execute_workflow("rule", rule, "规则", context)
+    execute_runtime(engine, "rule", rule, "规则", context)
     assert received == [[1], [1, 2]]
     assert context["constants"]["c_rows0001"] == [1]
     assert context["variables"] == {"v_rows0001": [1, 2], "v_count001": 2}
@@ -276,19 +277,15 @@ def test_sensitive_variable_values_and_derived_action_outputs_stay_hidden():
         "params": [{"name": "value", "type": "string"}],
         "outputs": [{"name": "derived", "type": "string"}],
     })
-    rule = {
-        "constants": [
-            {"id": "c_value001", "name": "密钥", "value_type": "text", "value": "secret-input", "sensitive": True},
-            {"id": "c_secret01", "name": "密钥引用", "value_type": "text", "value": {"$ref": {"scope": "constant", "node": "c_value001", "path": []}}},
-        ],
-        "variables": [{"id": "v_secret01", "name": "运行密钥", "value_type": "text"}],
-        "actions": [
+    rule = runtime_sequence([
             {"type": "set_variable", "binding_id": "a_secret01", "variable": "v_secret01", "value": {"$ref": {"scope": "constant", "node": "c_secret01", "path": []}}},
             {"type": "derive", "binding_id": "a_derive01", "params": {"value": {"$ref": {"scope": "variable", "node": "v_secret01", "path": []}}}},
-        ],
-    }
+        ], constants=[
+            {"id": "c_value001", "name": "密钥", "value_type": "text", "value": "secret-input", "sensitive": True},
+            {"id": "c_secret01", "name": "密钥引用", "value_type": "text", "value": {"$ref": {"scope": "constant", "node": "c_value001", "path": []}}},
+        ], variables=[{"id": "v_secret01", "name": "运行密钥", "value_type": "text"}])
     context = _context()
-    engine.execute_workflow("rule", rule, "规则", context)
+    execute_runtime(engine, "rule", rule, "规则", context)
     assert context["steps"]["a_derive01"]["result"] == {"derived": "secret-input!"}
     assert engine.events.flush()
     assert "secret-input" not in repr(events)
@@ -352,17 +349,15 @@ class TestExecuteAction:
             "规则A", "manual", {}, [], "r_rule001", "run_test001"
         )
 
-        engine.execute_workflow(
+        execute_runtime(engine,
             "r_rule001",
-            {
-                "actions": [
+            runtime_sequence([
                     {
                         "type": "noop",
                         "binding_id": "a_step001",
                         "params": {},
                     }
-                ]
-            },
+                ]),
             "规则A",
             context,
         )
@@ -385,18 +380,14 @@ class TestExecuteAction:
         register_action(engine, "noop", lambda meta, params: "done")
 
         ok, message, run_id = engine.run_manual_rule_snapshot(
-            {
-                "rule_id": "r_rule001",
-                "name": "规则A",
-                "actions": [
+            native_rule({"type": "manual_signal", "binding_id": "t_manualsignal", "params": {}}, [
                     {
                         "type": "noop",
                         "binding_id": "a_step001",
                         "params": {},
                     }
-                ],
-            },
-            0,
+                ], rule_id="r_rule001", name="规则A"),
+            0, trigger_payloads={"t_manualsignal": {}},
         )
         assert engine._run_manager.wait_for_idle(timeout=5)
 
@@ -420,10 +411,7 @@ class TestExecuteAction:
             "second",
             lambda meta, params: received.append(params) or {"count": count},
         )
-        rule = {
-            "rule_id": "r_partial001",
-            "name": "局部运行",
-            "actions": [
+        rule = native_rule({"type": "manual_signal", "binding_id": "t_manualsignal", "params": {}}, [
                 {"type": "first", "binding_id": "a_first001", "params": {}},
                 {
                     "type": "second",
@@ -438,8 +426,7 @@ class TestExecuteAction:
                         }
                     },
                 },
-            ],
-        }
+            ], rule_id="r_partial001", name="局部运行")
 
         ok, _message, run_id = engine.run_manual_rule_snapshot(
             rule,
@@ -478,18 +465,13 @@ class TestExecuteAction:
             release.wait(timeout=5)
 
         register_action(engine, "blocking", blocking_action)
-        rule = {
-            "rule_id": "r_manual_single",
-            "name": "单运行规则",
-            "concurrency": {"mode": "single"},
-            "actions": [
+        rule = native_rule({"type": "manual_signal", "binding_id": "t_manualsignal", "params": {}}, [
                 {"type": "blocking", "binding_id": "a_block001", "params": {}}
-            ],
-        }
+            ], rule_id="r_manual_single", name="单运行规则", concurrency={"mode": "single"})
 
-        first = engine.run_manual_rule_snapshot(rule, 0)
+        first = engine.run_manual_rule_snapshot(rule, 0, trigger_payloads={"t_manualsignal": {}})
         assert started.wait(timeout=2)
-        second = engine.run_manual_rule_snapshot(rule, 0)
+        second = engine.run_manual_rule_snapshot(rule, 0, trigger_payloads={"t_manualsignal": {}})
 
         assert first[0] is True
         assert second[0] is False
@@ -532,9 +514,9 @@ class TestExecuteAction:
             }],
         }
 
-        engine.execute_workflow(
+        execute_runtime(engine,
             "r_assert001",
-            {"actions": [{"type": "result", "binding_id": "a_result001", "params": {}}]},
+            runtime_sequence([{"type": "result", "binding_id": "a_result001", "params": {}}]),
             "结果检查测试",
             context,
         )
@@ -663,8 +645,7 @@ class TestExecuteAction:
             "consumer",
             lambda meta, params: received.update(params),
         )
-        rule = {
-            "actions": [
+        rule = runtime_sequence([
                 {"type": "producer", "binding_id": "a_pro001", "params": {}},
                 {
                     "type": "consumer",
@@ -673,10 +654,9 @@ class TestExecuteAction:
                         "url": {"$ref": {"scope": "step", "node": "a_pro001", "path": ["url"]}}
                     },
                 },
-            ]
-        }
+            ])
         context = _context()
-        engine.execute_workflow("wf", rule, "规则", context)
+        execute_runtime(engine, "wf", rule, "规则", context)
         assert received == {"url": "http://x"}
         assert context["steps"]["a_pro001"]["status"] == "ok"
 
@@ -686,8 +666,7 @@ class TestExecuteAction:
         register_action(
             engine, "consumer", lambda meta, params: received.update(params)
         )
-        rule = {
-            "actions": [
+        rule = runtime_sequence([
                 {
                     "type": "consumer",
                     "binding_id": "a_con001",
@@ -695,15 +674,14 @@ class TestExecuteAction:
                         "drive": {"$ref": {"scope": "trigger", "node": "t_usb001", "path": ["drive"]}}
                     },
                 }
-            ]
-        }
+            ])
         context = _context()
         context["triggers"]["t_usb001"] = {
             "type": "usb_insert",
             "payload": {"drive": "E:"},
             "config": {},
         }
-        engine.execute_workflow("wf", rule, "规则", context)
+        execute_runtime(engine, "wf", rule, "规则", context)
         assert received == {"drive": "E:"}
 
     def test_pipeline_retries_and_stops_after_failure(self):
@@ -717,13 +695,11 @@ class TestExecuteAction:
         after = []
         register_action(engine, "flaky", flaky)
         register_action(engine, "after", lambda meta, params: after.append(1))
-        rule = {
-            "actions": [
+        rule = runtime_sequence([
                 {"type": "flaky", "binding_id": "a_fla001", "params": {}, "retry": 2},
                 {"type": "after", "binding_id": "a_aft001", "params": {}},
-            ]
-        }
-        engine.execute_workflow("wf", rule, "规则", _context())
+            ])
+        execute_runtime(engine, "wf", rule, "规则", _context())
         assert len(attempts) == 3
         # 默认 on_error=stop，后续动作不再执行
         assert after == []
@@ -734,12 +710,12 @@ class TestExecuteAction:
         register_action(engine, "broken", lambda meta, params: 1 / 0)
         register_action(engine, "after", lambda meta, params: after.append(1))
 
-        engine.execute_workflow(
+        execute_runtime(engine,
             "wf",
-            {"actions": [
+            runtime_sequence([
                 {"type": "broken", "binding_id": "a_bad001", "params": {}, "on_error": "continue"},
                 {"type": "after", "binding_id": "a_after001", "params": {}},
-            ]},
+            ]),
             "规则",
             _context(),
         )
@@ -754,9 +730,9 @@ class TestExecuteAction:
         register_action(engine, "after", lambda meta, params: calls.append("after"))
         context = _context()
 
-        engine.execute_workflow(
+        execute_runtime(engine,
             "wf",
-            {"actions": [
+            runtime_sequence([
                 {
                     "type": "broken",
                     "binding_id": "a_bad001",
@@ -769,7 +745,7 @@ class TestExecuteAction:
                     }],
                 },
                 {"type": "after", "binding_id": "a_after001", "params": {}},
-            ]},
+            ]),
             "规则",
             context,
         )
@@ -807,10 +783,10 @@ class TestExecuteAction:
             "规则", "manual", {}, [], run_id="run_cancel001"
         )
         thread = threading.Thread(
-            target=engine.execute_workflow,
+            target=lambda *args: execute_runtime(engine, *args),
             args=(
                 "wf",
-                {"actions": [{
+                runtime_sequence([{
                     "type": "waitable",
                     "binding_id": "a_wait001",
                     "params": {},
@@ -819,7 +795,7 @@ class TestExecuteAction:
                         "binding_id": "a_recover001",
                         "params": {},
                     }],
-                }]},
+                }]),
                 "规则",
                 context,
             ),
@@ -874,15 +850,15 @@ class TestExecuteAction:
         )
         context = _context()
 
-        engine.execute_workflow(
+        execute_runtime(engine,
             "wf",
-            {"actions": [{
+            runtime_sequence([{
                 "type": "waitable",
                 "binding_id": "a_wait001",
                 "params": {},
                 "timeout_seconds": 1,
                 "retry": 3,
-            }]},
+            }]),
             "规则",
             context,
         )
@@ -908,16 +884,16 @@ class TestExecuteAction:
             "规则", "manual", {}, [], run_id="run_retry001"
         )
         thread = threading.Thread(
-            target=engine.execute_workflow,
+            target=lambda *args: execute_runtime(engine, *args),
             args=(
                 "wf",
-                {"actions": [{
+                runtime_sequence([{
                     "type": "broken",
                     "binding_id": "a_broken001",
                     "params": {},
                     "retry": 1,
                     "retry_delay_seconds": 30,
-                }]},
+                }]),
                 "规则",
                 context,
             ),
@@ -959,14 +935,14 @@ class TestExecuteAction:
             module=types.SimpleNamespace(run_with_context=run_with_context),
         )
         thread = threading.Thread(
-            target=engine.execute_workflow,
+            target=lambda *args: execute_runtime(engine, *args),
             args=(
                 "wf",
-                {"actions": [{
+                runtime_sequence([{
                     "type": "waitable",
                     "binding_id": "a_wait001",
                     "params": {},
-                }]},
+                }]),
                 "规则",
                 build_context(
                     "规则", "manual", {}, [], run_id="run_shutdown001"
@@ -1024,16 +1000,16 @@ class TestExecuteAction:
         def action(label):
             return {"type": "record", "binding_id": f"a_{label}001", "params": {"label": label}}
         branch = {
-            "type": "if", "binding_id": "a_branch01",
-            "condition": {"op": "not", "children": [{
+            "type": '__decision_fixture__', "binding_id": "a_branch01",
+            'predicate': {"op": "not", "children": [{
                 "op": boolean_op, "left": {"$ref": reference},
             }]},
-            "then": [action("then")], "else": [action("else")],
+            'then_steps': [action("then")], 'else_steps': [action("else")],
         }
         if boolean_op == "is_false":
             expected = [{"then": "else", "else": "then"}.get(label, label) for label in expected]
         succeeded = isinstance(value, bool)
-        result = engine.execute_actions([branch, action("after")], "规则", context)
+        result = execute_sequence(engine, [branch, action("after")], "规则", context)
         assert result is succeeded
         assert called == expected
         assert context["steps"]["a_branch01"]["status"] == ("ok" if succeeded else "failed")
@@ -1084,18 +1060,22 @@ class TestExecuteAction:
             condition = {"op": wrapper, "children": [{"op": "is_true", "left": wrapper == "all"}, condition]}
         actions = [
             {"type": "query", "binding_id": "a_query01", "params": {}},
-            {"type": "if", "binding_id": "a_outer01", "condition": {"op": "gt", "left": source, "right": threshold}, "then": [
-                {"type": "if", "binding_id": "a_inner01", "condition": condition, "then": [
+            {"type": '__decision_fixture__', "binding_id": "a_outer01", 'predicate': {"op": "gt", "left": source, "right": threshold}, 'then_steps': [
+                {"type": '__decision_fixture__', "binding_id": "a_inner01", 'predicate': condition, 'then_steps': [
                     {"type": "record", "binding_id": "a_record01", "params": {"count": source}},
                     {"type": "fail", "binding_id": "a_failed01", "params": {}},
-                ], "else": []},
-            ], "else": []},
+                ], 'else_steps': []},
+            ], 'else_steps': []},
             {"type": "record", "params": {"count": 99}},
         ]
         context = _context()
-        assert engine.execute_actions(actions, "规则", context) is (not matched)
+        assert execute_sequence(engine, actions, "规则", context) is (not matched)
         assert called == ([count] if matched else [99])
-        assert context["steps"]["a_inner01"]["status"] == ("failed" if matched else "ok")
+        assert context["steps"]["a_inner01"]["status"] == "ok"
+        assert context["steps"]["a_inner01"]["result"]["branch"] == ("b_then0001" if matched else "b_else0001")
+        assert ("a_failed01" in context["steps"]) is matched
+        if matched:
+            assert context["steps"]["a_failed01"]["status"] == "failed"
 
     @pytest.mark.parametrize("validation", [[], ["参数无效"], RuntimeError("校验异常")])
     def test_validate_params_called(self, validation):
@@ -1213,10 +1193,7 @@ class TestErrorIsolation:
         engine.triggers_funcs["hotkey"] = stubborn
         engine.triggers_meta["hotkey"] = {"trigger_api": "event-v2"}
         register_action(engine, "noop", lambda meta, params: None)
-        snapshot = engine._prepare_rules([{
-            "name": "等待停止", "rule_id": "r_stop0001", "condition": {"type": "hotkey", "params": {}},
-            "actions": [{"type": "noop", "params": {}}],
-        }])
+        snapshot = engine._prepare_rules([native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "params": {}}], name="等待停止", rule_id="r_stop0001")])
         engine._start_trigger_threads(snapshot)
         assert entered.wait(1)
         assert engine._stop_trigger_threads(timeout=0.1) is False
@@ -1272,11 +1249,7 @@ class TestErrorIsolation:
         monkeypatch.setattr(platform_support, "show_notification", lambda *a, **k: None)
         started = threading.Event()
         stopped = threading.Event()
-        rule = {
-            "name": "启动失败清理",
-            "event": {"type": "hotkey", "params": {}},
-            "actions": [{"type": "noop", "params": {}}],
-        }
+        rule = native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "params": {}}], name="启动失败清理")
         engine = make_engine([rule])
         engine._security_mode = type(engine._security_mode).PERMISSIVE
         register_action(engine, "noop", lambda meta, params: None)
@@ -1424,8 +1397,7 @@ def test_excel_append_rows_consumes_pipeline_output():
         "excel_append_rows",
         lambda meta, params: appended.update(params),
     )
-    rule = {
-        "actions": [
+    rule = runtime_sequence([
             {"type": "collect_rows", "binding_id": "a_col001", "params": {}},
             {
                 "type": "excel_append_rows",
@@ -1434,9 +1406,8 @@ def test_excel_append_rows_consumes_pipeline_output():
                     "rows": {"$ref": {"scope": "step", "node": "a_col001", "path": ["rows"]}}
                 },
             },
-        ]
-    }
-    engine.execute_workflow("wf", rule, "规则", _context())
+        ])
+    execute_runtime(engine, "wf", rule, "规则", _context())
     assert appended["rows"] == [["a", 1], ["b", 2]]
 
 
@@ -1453,8 +1424,7 @@ def test_tianyi_upload_emits_only_new_files():
         "tianyi_upload",
         lambda meta, params: uploaded.update(params),
     )
-    rule = {
-        "actions": [
+    rule = runtime_sequence([
             {"type": "folder_diff", "binding_id": "a_dif001", "params": {}},
             {
                 "type": "tianyi_upload",
@@ -1465,9 +1435,8 @@ def test_tianyi_upload_emits_only_new_files():
                     }
                 },
             },
-        ]
-    }
-    engine.execute_workflow("wf", rule, "规则", _context())
+        ])
+    execute_runtime(engine, "wf", rule, "规则", _context())
     # 上传动作只拿到增量文件列表
     assert uploaded["files"] == ["doc1.txt"]
 
@@ -1482,22 +1451,20 @@ def test_manual_rule_with_trigger_constants_runs_selected_actions(partial):
         "execution_api": "context-v1", "params": [{"name": "value", "type": "text"}],
     }, module=types.SimpleNamespace(run_with_context=lambda meta, params, context: received.append(
         (params["value"], context["triggers"]["t_manual01"]["config"]["path"]))))
-    rule = {"rule_id": "r_manual01", "name": "手动运行", "constants": [
-        {"id": "c_folder01", "name": "目录", "value_type": "text", "value": "folder"}],
-        "condition": {"type": "demo", "binding_id": "t_manual01", "params": {"path": {
-            "$ref": {"scope": "constant", "node": "c_folder01", "path": []}}}},
-        "actions": [
+    rule = native_rule({"type": "demo", "binding_id": "t_manual01", "params": {"path": {
+            "$ref": {"scope": "constant", "node": "c_folder01", "path": []}}}}, [
             {"type": "record", "binding_id": "a_first001", "params": {"value": "first"}},
             {"type": "record", "binding_id": "a_last0001", "params": {"value": {
                 "$ref": {"scope": "trigger_config", "node": "t_manual01", "path": ["path"]}}}},
-        ]}
+        ], rule_id="r_manual01", name="手动运行", constants=[
+        {"id": "c_folder01", "name": "目录", "value_type": "text", "value": "folder"}])
     try:
-        ok, _, run_id = engine.run_manual_rule_snapshot(rule, start_step_id="a_last0001" if partial else "")
+        ok, _, run_id = engine.run_manual_rule_snapshot(rule, start_step_id="a_last0001" if partial else "", trigger_payloads={"t_manual01": {}})
         assert ok
         assert engine._run_manager.wait_for_idle(2)
         assert engine._run_manager.state(run_id) == "succeeded"
         assert received == ([("folder", "folder")] if partial else [("first", "folder"), ("folder", "folder")])
-        assert "$ref" in rule["condition"]["params"]["path"]
+        assert "$ref" in rule["workflow"]["nodes"][0]["trigger"]["params"]["path"]
     finally:
         engine.shutdown(2)
 
@@ -1508,10 +1475,9 @@ def test_saved_manual_queue_obeys_rule_generation_changes(change):
 
     entered, release = threading.Event(), threading.Event()
     received = []
-    source = {"rule_id": "r_manual02", "name": "排队运行", "condition": {
-        "type": "demo", "binding_id": "t_manual02", "params": {}},
-        "concurrency": {"mode": "queue"}, "actions": [{
-            "type": "record", "binding_id": "a_record01", "params": {"value": "old"}}]}
+    source = native_rule({
+        "type": "demo", "binding_id": "t_manual02", "params": {}}, [{
+            "type": "record", "binding_id": "a_record01", "params": {"value": "old"}}], rule_id="r_manual02", name="排队运行", concurrency={"mode": "queue"})
     engine = make_engine([source])
     engine.triggers_meta["demo"] = {}
     engine.triggers_funcs["demo"] = lambda *args: None
@@ -1525,14 +1491,14 @@ def test_saved_manual_queue_obeys_rule_generation_changes(change):
     register_action(engine, "record", record, meta={"params": [{"name": "value", "type": "text"}]})
     generation = engine._get_runtime_snapshot().generation
     try:
-        assert engine.run_manual_rule(0)[0]
+        assert engine.run_manual_rule_snapshot(source, 0, trigger_payloads={"t_manual02": {}}, _generation=generation)[0]
         assert entered.wait(2)
-        ok, _, queued_id = engine.run_manual_rule(0)
+        ok, _, queued_id = engine.run_manual_rule_snapshot(source, 0, trigger_payloads={"t_manual02": {}}, _generation=generation)
         assert ok and engine._run_manager.state(queued_id) == "queued"
         changed = copy.deepcopy(source)
         changed["name"] = "新名称"
         if change == "modify":
-            changed["actions"][0]["params"]["value"] = "new"
+            next(node for node in changed["workflow"]["nodes"] if node["type"] == "record")["params"]["value"] = "new"
         engine._generations.apply([] if change == "delete" else [changed], "test", activate=False, validate=False)
         assert engine._run_manager.state(queued_id) == ("queued" if change == "rename" else "dropped")
         release.set()
@@ -1545,8 +1511,7 @@ def test_saved_manual_queue_obeys_rule_generation_changes(change):
 
 
 def test_manual_admission_drops_rule_deleted_during_preparation(monkeypatch):
-    source = {"rule_id": "r_manual03", "name": "手动运行", "condition": {"type": "demo", "params": {}},
-              "actions": [{"type": "record", "params": {}}]}
+    source = native_rule({"type": "demo", "params": {}}, [{"type": "record", "params": {}}], rule_id="r_manual03", name="手动运行")
     engine = make_engine([source])
     engine.triggers_meta["demo"] = {}
     engine.triggers_funcs["demo"] = lambda *args: None
@@ -1579,11 +1544,11 @@ def test_if_event_occurrence_selects_branch_from_starting_events(fired):
     register_action(engine, "record", lambda meta, params: calls.append(params["label"]))
     records = [{"binding_id": "t_hot001", "event": {"type": "hotkey"}, "payload": {}}] if fired else []
     context = build_context("规则", "hotkey", {"hotkey": "Shift+Q"}, records)
-    item = {"type": "if", "binding_id": "a_branch01", "condition": {"op": "event_occurred", "trigger_id": "t_hot001"},
-            "then": [{"type": "record", "params": {"label": "then"}}],
-            "else": [{"type": "record", "params": {"label": "else"}}]}
+    item = {"type": '__decision_fixture__', "binding_id": "a_branch01", 'predicate': {"op": "event_occurred", "trigger_id": "t_hot001"},
+            'then_steps': [{"type": "record", "params": {"label": "then"}}],
+            'else_steps': [{"type": "record", "params": {"label": "else"}}]}
     try:
-        assert engine.execute_actions([item], "规则", context)
+        assert execute_sequence(engine, [item], "规则", context)
         assert calls == ["then" if fired else "else"]
     finally:
         engine.shutdown(2)
@@ -1596,12 +1561,11 @@ def test_manual_if_event_occurrence_starts_with_supplied_events(fired):
     engine.triggers_funcs["hotkey"] = lambda *args: None
     calls = []
     register_action(engine, "record", lambda meta, params: calls.append(params["label"]))
-    rule = {"rule_id": "r_rule001", "name": "规则", "condition": {"type": "hotkey", "binding_id": "t_hot001", "params": {}},
-            "actions": [{"type": "if", "binding_id": "a_branch01", "condition": {"op": "event_occurred", "trigger_id": "t_hot001"},
-                         "then": [{"type": "record", "params": {"label": "then"}}],
-                         "else": [{"type": "record", "params": {"label": "else"}}]}]}
+    rule = native_rule({"op": "any", "children": [{"type": "manual_signal", "binding_id": "t_manualsignal", "params": {}}, {"type": "hotkey", "binding_id": "t_hot001", "params": {}}]}, [{"type": '__decision_fixture__', "binding_id": "a_branch01", 'predicate': {"op": "event_occurred", "trigger_id": "t_hot001"},
+                         'then_steps': [{"type": "record", "params": {"label": "then"}}],
+                         'else_steps': [{"type": "record", "params": {"label": "else"}}]}], rule_id="r_rule001", name="规则")
     try:
-        ok, message, _ = engine.run_manual_rule_snapshot(rule, trigger_payloads={"t_hot001": {}} if fired else {})
+        ok, message, _ = engine.run_manual_rule_snapshot(rule, trigger_payloads={"t_manualsignal": {}, **({"t_hot001": {}} if fired else {})})
         assert ok, message
         assert engine._run_manager.wait_for_idle(timeout=5)
         assert calls == ["then" if fired else "else"]
@@ -1623,13 +1587,13 @@ def test_if_receives_events_during_wait_and_stops_observing_after_finish(receive
 
     register_action(engine, "barrier", barrier)
     register_action(engine, "record", lambda meta, params: calls.append(params["label"]))
-    rule = {"rule_id": "r_wait001", "name": "等待事件", "condition": {"op": "any", "children": [
+    rule = native_rule({"op": "any", "children": [
         {"type": "hotkey", "binding_id": "t_hot001", "params": {}},
         {"type": "process_state", "binding_id": "t_steam01", "params": {"process_name": "steam", "state": "running"}},
-    ]}, "actions": [{"type": "barrier", "binding_id": "a_wait001", "params": {}},
-        {"type": "if", "binding_id": "a_branch01", "condition": {"op": "event_occurred", "trigger_id": "t_steam01"},
-         "then": [{"type": "record", "params": {"label": "occurred"}}],
-         "else": [{"type": "record", "params": {"label": "absent"}}]}]}
+    ]}, [{"type": "barrier", "binding_id": "a_wait001", "params": {}},
+        {"type": '__decision_fixture__', "binding_id": "a_branch01", 'predicate': {"op": "event_occurred", "trigger_id": "t_steam01"},
+         'then_steps': [{"type": "record", "params": {"label": "occurred"}}],
+         'else_steps': [{"type": "record", "params": {"label": "absent"}}]}], rule_id="r_wait001", name="等待事件")
     engine._generations.apply([rule], "test", activate=False, validate=False)
     try:
         engine.emit_event("hotkey", {}, instance={"config": {}})
@@ -1668,13 +1632,11 @@ def test_queued_runs_receive_events_before_reaching_if():
 
     register_action(engine, "barrier", barrier)
     register_action(engine, "record", lambda meta, params: calls.append(params["label"]))
-    rule = {"rule_id": "r_queue01", "name": "排队事件", "concurrency": {"mode": "queue"},
-            "condition": {"op": "any", "children": [{"type": "hotkey", "binding_id": "t_hot001", "params": {}},
-                                                       {"type": "steam", "binding_id": "t_steam01", "params": {}}]},
-            "actions": [{"type": "barrier", "binding_id": "a_wait001", "params": {}},
-                        {"type": "if", "binding_id": "a_branch01", "condition": {"op": "event_occurred", "trigger_id": "t_steam01"},
-                         "then": [{"type": "record", "params": {"label": "occurred"}}],
-                         "else": [{"type": "record", "params": {"label": "absent"}}]}]}
+    rule = native_rule({"op": "any", "children": [{"type": "hotkey", "binding_id": "t_hot001", "params": {}},
+                                                       {"type": "steam", "binding_id": "t_steam01", "params": {}}]}, [{"type": "barrier", "binding_id": "a_wait001", "params": {}},
+                        {"type": '__decision_fixture__', "binding_id": "a_branch01", 'predicate': {"op": "event_occurred", "trigger_id": "t_steam01"},
+                         'then_steps': [{"type": "record", "params": {"label": "occurred"}}],
+                         'else_steps': [{"type": "record", "params": {"label": "absent"}}]}], rule_id="r_queue01", name="排队事件", concurrency={"mode": "queue"})
     engine._generations.apply([rule], "test", activate=False, validate=False)
     try:
         engine.emit_event("hotkey", {})
@@ -1713,28 +1675,32 @@ def test_event_group_uses_one_snapshot_and_later_if_reads_new_events():
 
 
 def test_if_and_elif_share_event_records_and_next_if_refreshes_them():
-    class Observation:
-        def __init__(self):
-            self.reads = 0
-
-        def snapshot(self):
-            self.reads += 1
-            return frozenset() if self.reads == 1 else frozenset({"t_steam01"})
-
+    from types import SimpleNamespace
+    from notmyfault.core.event_observation import RunEventObservation
     engine = make_engine()
     calls = []
-    register_action(engine, "record", lambda meta, params: calls.append(params["label"]))
+    compiled = SimpleNamespace(source={"workflow": {"nodes": [{"type": "trigger", "binding_id": "a_steam001", "trigger": {
+        "binding_id": "t_steam01", "type": "steam", "params": {},
+    }}], "edges": []}})
+    observation = RunEventObservation(compiled)
+    def record(meta, params):
+        calls.append(params["label"])
+        if params["label"] == "absent":
+            observation.record("steam", {})
+    register_action(engine, "record", record)
     event = {"op": "event_occurred", "trigger_id": "t_steam01"}
     action = lambda label: {"type": "record", "params": {"label": label}}
-    branch = {"type": "if", "binding_id": "a_branch01", "condition": event, "then": [action("early")],
-              "elif": [{"condition": {**event, "expected": False}, "then": [action("absent")]}], "else": [action("inconsistent")]}
-    next_branch = {"type": "if", "binding_id": "a_branch02", "condition": event, "then": [action("new_event")], "else": [action("stale")]}
+    branch = {"type": '__decision_fixture__', "binding_id": "a_branch01", 'predicate': event, 'then_steps': [action("early")],
+              'alternatives': [{'predicate': {**event, "expected": False}, 'then_steps': [action("absent")]}], 'else_steps': [action("inconsistent")]}
+    next_branch = {"type": '__decision_fixture__', "binding_id": "a_branch02", 'predicate': event, 'then_steps': [action("new_event")], 'else_steps': [action("stale")]}
     context = _context()
-    context["_event_observation"] = observation = Observation()
+    context["_event_observation"] = observation
     try:
-        assert engine.execute_actions([branch, next_branch], "规则", context)
+        assert execute_sequence(engine, [branch, next_branch], "规则", context)
         assert calls == ["absent", "new_event"]
-        assert observation.reads == 2
+        assert observation.snapshot() == {"t_steam01"}
+        assert context["steps"]["a_branch01"]["result"]["branch"] == "b_elif000000"
+        assert context["steps"]["a_branch02"]["result"]["branch"] == "b_then0001"
     finally:
         engine.shutdown(2)
 
@@ -1742,23 +1708,29 @@ def test_if_and_elif_share_event_records_and_next_if_refreshes_them():
 
 def test_absence_flow_records_event_arriving_before_its_if():
     calls = []
+    entered, release = threading.Event(), threading.Event()
     engine = make_engine()
     engine.triggers_meta["hotkey"] = {"params": [], "outputs": []}
     engine.triggers_funcs["hotkey"] = lambda *args: None
     register_action(engine, "record", lambda meta, params: calls.append(params["label"]))
-    rule = {"rule_id": "r_timer01", "name": "未发生事件", "condition": {"op": "not", "within_seconds": 10, "children": [
+    register_action(engine, "barrier", lambda *args: (entered.set(), release.wait(3)) and None)
+    rule = native_rule({"op": "not", "within_seconds": 10, "children": [
         {"type": "hotkey", "binding_id": "t_hot001", "params": {}},
-    ]}, "actions": [{"type": "if", "binding_id": "a_branch01", "condition": {"op": "event_occurred", "trigger_id": "t_hot001"},
-                    "then": [{"type": "record", "params": {"label": "occurred"}}],
-                    "else": [{"type": "record", "params": {"label": "absent"}}]}]}
+    ]}, [{"type": "barrier", "binding_id": "a_barrier001", "params": {}}, {"type": '__decision_fixture__', "binding_id": "a_branch01", 'predicate': {"op": "event_occurred", "trigger_id": "t_hot001"},
+                    'then_steps': [{"type": "record", "params": {"label": "occurred"}}],
+                    'else_steps': [{"type": "record", "params": {"label": "absent"}}]}], rule_id="r_timer01", name="未发生事件")
     engine._generations.apply([rule], "test", activate=False, validate=False)
     clock = FakeClock()
     engine._condition_runtime._clock = clock
     try:
         engine._event_bus.process_timers()
         clock.advance(10)
+        engine._event_bus.process_timers()
+        assert entered.wait(2)
         engine.emit_event("hotkey", {})
+        release.set()
         assert engine._run_manager.wait_for_idle(timeout=3)
         assert calls == ["occurred"]
     finally:
+        release.set()
         engine.shutdown(2)

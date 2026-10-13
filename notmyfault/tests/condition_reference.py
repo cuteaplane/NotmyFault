@@ -8,7 +8,7 @@ from notmyfault.core.conditions import (
 
 class ReferenceConditionRuntime:
     def __init__(self, rule):
-        self.node = rule["condition"]
+        self.node = rule["_matcher"]
         self.records = {}
         self.absences = {}
         self.sequence = 0
@@ -59,7 +59,7 @@ class ReferenceConditionRuntime:
             if emitted or now < deadline:
                 continue
             seconds = float(node["within_seconds"])
-            self._record(key, {"event": {"type": "absence", "params": {}},
+            self._record(key, {"binding_id": node["children"][0].get("binding_id"), "absence": True, "event": {"type": "absence", "params": {}},
                                "payload": {"wait_seconds": seconds}, "timestamp": now})
             if node.get("repeat", "once_until_seen") == "every_window":
                 self.schedule_order += 1

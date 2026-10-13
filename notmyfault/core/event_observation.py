@@ -22,7 +22,7 @@ class EventWait:
     def __init__(self, observation, identity, activation, timeout):
         self.observation = observation
         self.identity = identity
-        self.rule = {'condition': activation}
+        self.rule = {'_matcher': activation}
         self.runtime = ConditionRuntime(clock=observation.clock)
         now = observation.clock.monotonic()
         self.runtime.register_rule(identity, self.rule, now)
@@ -74,6 +74,8 @@ class RunEventObservation:
             self._fingerprints[leaf['binding_id']] = config_fingerprint(leaf.get('params', {}))
         identities = set(self._fingerprints)
         self._occurred = set(occurred) & identities
+        self._started_at = self.clock.monotonic()
+        self._absence_completed = {}
         self._latest = {}
         self._waits = {}
         self._lock = threading.RLock()
@@ -84,6 +86,9 @@ class RunEventObservation:
             for entry in events:
                 identity = entry.get('binding_id')
                 if identity in self._fingerprints:
+                    if entry.get('absence'):
+                        self._absence_completed[identity] = float(entry['payload']['wait_seconds'])
+                        continue
                     self._occurred.add(identity)
                     self._latest[identity] = hold_value(entry)
 
@@ -98,6 +103,7 @@ class RunEventObservation:
                 matches = self._fingerprints[leaf['binding_id']] == fingerprint if instance is not None else check_event_params(leaf, payload)
                 if matches:
                     identity = leaf['binding_id']
+                    self._absence_completed.pop(identity, None)
                     self._occurred.add(identity)
                     self._latest[identity] = hold_value({'binding_id': identity, 'event': {'type': event_type, 'params': leaf.get('params', {})}, 'payload': payload, 'timestamp': now})
             for waiter in self._waits.values():
@@ -161,6 +167,16 @@ class RunEventObservation:
     def snapshot(self):
         with self._lock:
             return frozenset(self._occurred)
+
+    def absent_for(self, identity, seconds):
+        with self._lock:
+            if identity not in self._fingerprints:
+                raise ValueError('事件未发生判断引用了未知触发器')
+            latest = self._latest.get(identity)
+            if latest is None and self._absence_completed.get(identity, 0) >= seconds:
+                return True
+            since = latest['timestamp'] if latest is not None else self._started_at
+            return self.clock.monotonic() - since >= seconds
 
     def data_snapshot(self):
         with self._lock:

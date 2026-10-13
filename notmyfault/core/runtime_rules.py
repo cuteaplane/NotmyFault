@@ -41,6 +41,7 @@ class PreparedRules:
     input_digests: dict[str, str] = field(default_factory=dict)
     rule_warnings: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
     validated: bool = False
+    input_rules: tuple[dict, ...] = ()
 
     def __len__(self):
         return len(self.rules)
@@ -129,7 +130,8 @@ def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_
                 continue
         try:
             protected_configs = {}
-            resolved = resolve_trigger_constants(rule, registry, protected_configs=protected_configs)
+            from notmyfault.core.canvas_workflow import lower_canvas_rule
+            resolved = resolve_trigger_constants(lower_canvas_rule(rule), registry, protected_configs=protected_configs)
             for leaf in iter_rule_event_nodes(resolved):
                 meta = triggers_meta.get(leaf.get("type"), {})
                 leaf["params"] = normalize_fields(
@@ -173,6 +175,7 @@ def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_
         input_digests=input_digests,
         rule_warnings=cached_warnings,
         validated=validate,
+        input_rules=tuple(freeze(rule) for rule in normalized),
     )
     compiled = {rule_key(rule): reused[rule_key(rule)] if rule_key(rule) in reused else
                 compile_rule(rule, contexts[rule_key(rule)], triggers_meta, actions_meta, result.event_types, registry, plugin_digests)

@@ -7,14 +7,17 @@ import pytest
 from notmyfault.core.clock import FakeClock
 from notmyfault.core.diagnostics import Diagnostics
 from notmyfault.core.event_observation import RunEventObservation
-from notmyfault.core.rules import normalize_rule_input, validate_rule_structure, validate_rule_bindings
+from notmyfault.core.rules import normalize_rule_input
+from notmyfault.core.binding_schema import check_rule_bindings, prepare_binding_context, output_type
+from notmyfault.core.compiled_rules import compile_rule
+from notmyfault.core.type_registry import TypeRegistry
 from notmyfault.core.runtime_rules import prepare_rules
 from notmyfault.core.run_manager import RunManager, RunSuspension
 from notmyfault.core.workflow import build_context
 from notmyfault.core.workflow_executor import WorkflowExecutor
 from notmyfault.core.workflow_graph import (
     condition_graph_predicate, predicate_condition_graph, normalize_workflow_rule,
-    get_all_rule_events, graph_index,
+    get_all_rule_events, graph_index, validate_workflow_graph,
 )
 
 
@@ -47,19 +50,30 @@ def group(identity, predicates, **fields):
 
 
 def rule(nodes, edges, entry=None):
-    return {'rule_id': 'r_graph001', 'name': '图执行', 'condition': leaf(),
+    return {'rule_id': 'r_graph001', 'name': '图执行', '_matcher': leaf(),
             'workflow': {'entry': entry or nodes[0]['binding_id'], 'nodes': nodes, 'edges': edges}}
+
+
+def validate_runtime_structure(source):
+    return validate_workflow_graph(source['workflow'])
+
+
+def validate_runtime_bindings(source, triggers, actions):
+    return check_rule_bindings(source, triggers, actions)
 
 
 def setup(rule, clock=None, record=None):
     records, events = [], []
-    prepared = prepare_rules([rule], TRIGGERS, ACTIONS, clock=clock)
-    assert not prepared.issues, prepared.issues
-    source = prepared.rules[0]
-    compiled = prepared.compiled[source['rule_id']]
-    observer = RunEventObservation(compiled, clock=clock)
+    source = copy.deepcopy(rule)
+    registry = TypeRegistry.from_plugins(TRIGGERS, ACTIONS)
     context = build_context(source['name'], 'start', {}, [], source['rule_id'], 'run_graph')
-    prepared.prepare_context(source, context)
+    prepare_binding_context(source, context, TRIGGERS, ACTIONS, registry=registry)
+    compiled = compile_rule(source, context, TRIGGERS, ACTIONS,
+                            {name: output_type(meta) for name, meta in TRIGGERS.items()}, registry)
+    source = compiled.source
+    observer = RunEventObservation(compiled, clock=clock)
+    context['_compiled_rule'] = compiled
+    context['_compiled_refs'] = compiled.references
     context['_event_observation'] = observer
     functions = {'record': record or (lambda meta, params: records.append(params['label'])),
                  'speed': lambda meta, params: {'latency': 180000, 'connected': True}}
@@ -68,6 +82,77 @@ def setup(rule, clock=None, record=None):
         shutdown_event=lambda: None, on_event=lambda kind, data: events.append((kind, data)), clock=clock)
     return source, context, observer, executor, records, events
 
+
+
+def canvas_fixture(runtime, *, internal_start=False):
+    from notmyfault.core.conditions import iter_condition_events
+    from notmyfault.core.workflow_graph import branch_predicate
+    native = {key: copy.deepcopy(value) for key, value in runtime.items() if key not in ('workflow', '_matcher')}
+    graph = {'entry': None, 'nodes': [], 'edges': []}
+    native['workflow'] = graph
+    triggers, count = {}, 0
+    def source(leaf, parent=None):
+        identity = leaf['binding_id']
+        if identity not in triggers:
+            wrapper = {'type': 'trigger', 'binding_id': 'a_watch_' + identity[2:], 'trigger': copy.deepcopy(leaf)}
+            if parent:
+                wrapper['parent'] = parent
+            graph['nodes'].append(wrapper)
+            triggers[identity] = wrapper
+        return triggers[identity]['binding_id'], 'event'
+    def predicate(value, parent):
+        nonlocal count
+        if value['op'] == 'event_occurred':
+            wrapper, port = source(leaf_specs[value['trigger_id']], parent)
+            if value.get('expected', True):
+                return wrapper, port
+            value = {'op': 'not', 'children': [{**value, 'expected': True}]}
+        count += 1
+        identity = f'a_predicate_{count:06d}'
+        logical = value['op'] in ('all', 'any', 'not')
+        node = {'binding_id': identity, 'type': 'logic' if logical else 'condition', 'parent': parent}
+        node.update({'op': value['op']} if logical else {'predicate': copy.deepcopy(value)})
+        graph['nodes'].append(node)
+        if logical:
+            for child in value['children']:
+                child_id, port = predicate(child, parent)
+                graph['edges'].append({'source': child_id, 'port': port, 'target': identity, 'channel': 'condition'})
+        return identity, 'result'
+    leaf_specs = {item['binding_id']: item for item in get_all_rule_events(runtime)}
+    if runtime.get('_matcher'):
+        leaf_specs.update({item['binding_id']: item for item in iter_condition_events(runtime['_matcher'])})
+    def flatten(current, parent=None):
+        for item in current['nodes']:
+            node = {key: copy.deepcopy(value) for key, value in item.items() if key not in ('workflow', 'activation', 'triggers', 'branches')}
+            if parent:
+                node['parent'] = parent
+            graph['nodes'].append(node)
+            if item['type'] == 'action_group':
+                entry = item['workflow']['entry']
+                flatten(item['workflow'], item['binding_id'])
+                if entry:
+                    graph['edges'].append({'source': item['binding_id'], 'port': 'entry', 'target': entry, 'channel': 'control'})
+            elif item['type'] == 'event_group':
+                node.update(group_type='if', branches=[])
+                for branch in item['branches']:
+                    node['branches'].append({'id': branch['id'], **({'else': True} if branch.get('else') else {})})
+                    if not branch.get('else'):
+                        condition_id, port = predicate(branch_predicate(branch), item['binding_id'])
+                        graph['edges'].append({'source': condition_id, 'port': port, 'target': item['binding_id'], 'target_port': branch['id'], 'channel': 'condition'})
+                if item.get('mode') == 'wait' and not any(not branch.get('else') for branch in item['branches']):
+                    event_id, port = source(item['activation'], item['binding_id'])
+                    branch_id = 'b_wait_' + item['binding_id'][2:]
+                    node['branches'].insert(0, {'id': branch_id})
+                    graph['edges'].append({'source': event_id, 'port': port, 'target': item['binding_id'], 'target_port': branch_id, 'channel': 'condition'})
+                    exits = [edge for edge in current['edges'] if edge['source'] == item['binding_id']]
+                    if exits and exits[0]['target']:
+                        graph['edges'].append({'source': item['binding_id'], 'port': branch_id, 'target': exits[0]['target'], 'channel': 'control'})
+        graph['edges'].extend({**edge, 'channel': 'control'} for edge in current['edges'] if edge['target'] is not None)
+    flatten(runtime['workflow'])
+    if not internal_start:
+        trigger_id, port = source(runtime.get('_matcher') or leaf())
+        graph['edges'].append({'source': trigger_id, 'port': port, 'target': runtime['workflow']['entry'], 'channel': 'control'})
+    return native
 
 def eventually(test, timeout=3):
     deadline = time.monotonic() + timeout
@@ -106,18 +191,16 @@ def test_control_connections_override_node_array_order_and_merge_once():
     assert [event[0] for event in events].count('run.group.selected') == 1
 
 
-def test_old_rule_conversion_keeps_branch_continuation_and_binding_ids():
+def test_old_rule_conversion_is_rejected_without_changing_binding_ids():
     old = {'rule_id': 'r_graph001', 'name': '转换', 'condition': leaf(), 'actions': [
         {'type': 'if', 'binding_id': 'a_decide01', 'condition': {'op': 'is_true', 'left': False},
          'then': [action('a_first01', 'first')], 'elif': [{'condition': {'op': 'is_true', 'left': True}, 'then': [action('a_second1', 'second')]}], 'else': []},
         action('a_after01', 'after'),
     ]}
-    converted = normalize_workflow_rule(old)
-    assert 'actions' not in converted and 'condition' not in converted
-    assert {node['binding_id'] for node in converted['workflow']['nodes']} >= {'a_decide01', 'a_first01', 'a_second1', 'a_after01'}
-    source, context, observer, executor, records, events = setup(converted)
-    assert executor.execute_workflow('key', source, source['name'], context).status == 'succeeded'
-    assert records == ['second', 'after']
+    original = copy.deepcopy(old)
+    with pytest.raises(ValueError, match='旧条件模型已移除'):
+        normalize_workflow_rule(old)
+    assert old == original
 
 
 def test_nested_groups_export_output_and_reject_direct_inner_reference():
@@ -134,7 +217,7 @@ def test_nested_groups_export_output_and_reject_direct_inner_reference():
     assert executor.execute_workflow('key', source, source['name'], context).status == 'succeeded'
     assert records == ['pause'] and context['steps']['a_outer01']['result']['latency'] == 180000
     decision['branches'][0]['condition_graph'] = predicate_condition_graph({**predicate, 'left': {'$ref': {'scope': 'step', 'node': 'a_speed01', 'path': ['latency']}}})
-    assert any(issue['code'] == 'forward_reference' for issue in validate_rule_bindings(graph, TRIGGERS, ACTIONS))
+    assert any(issue['code'] == 'forward_reference' for issue in validate_runtime_bindings(graph, TRIGGERS, ACTIONS))
 
 
 def waiting_rule(timeout=None, activation=None):
@@ -247,7 +330,7 @@ def test_wait_window_expires_old_event_and_timed_absence_is_distinct_from_boolea
 def test_graph_validation_rejects_cycle_fanout_cross_scope_and_unreachable(mutate, message):
     graph = rule([action('a_first01', 'first'), action('a_second1', 'second')], [edge('a_first01', 'a_second1'), edge('a_second1', None)])
     mutate(graph['workflow'])
-    assert any(message in error for error in validate_rule_structure(graph))
+    assert any(message in error for error in validate_runtime_structure(graph))
 
 
 def test_two_waiting_runs_keep_independent_observation_and_single_mode_admission():
@@ -301,15 +384,15 @@ def test_optional_branch_output_requires_missing_policy_and_type_is_checked():
     graph = rule([decision, producer, assignment], [edge('a_decide01', 'a_speed01', decision['branches'][0]['id']),
         edge('a_decide01', 'a_assign1', decision['branches'][1]['id']), edge('a_speed01', 'a_assign1'), edge('a_assign1', None)])
     graph['variables'] = [{'id': 'v_result1', 'name': '延迟', 'value_type': 'number', 'initial': 0}]
-    assert any(issue['code'] == 'conditional_source' for issue in validate_rule_bindings(graph, TRIGGERS, ACTIONS))
+    assert any(issue['code'] == 'conditional_source' for issue in validate_runtime_bindings(graph, TRIGGERS, ACTIONS))
     ref['$ref'].update(on_missing='default', default=80000)
-    assert validate_rule_bindings(graph, TRIGGERS, ACTIONS) == []
+    assert validate_runtime_bindings(graph, TRIGGERS, ACTIONS) == []
     source, context, observer, executor, records, events = setup(graph)
     assert executor.execute_workflow('one', source, source['name'], context).status == 'succeeded'
     assert context['variables']['v_result1'] == 80000
     graph['variables'][0]['value_type'] = 'bool'
     graph['variables'][0]['initial'] = False
-    assert any(issue['code'] == 'binding_type_mismatch' for issue in validate_rule_bindings(graph, TRIGGERS, ACTIONS))
+    assert any(issue['code'] == 'binding_type_mismatch' for issue in validate_runtime_bindings(graph, TRIGGERS, ACTIONS))
 
 
 def test_entry_group_matches_start_only_and_middle_trigger_is_subscribed():
@@ -320,7 +403,7 @@ def test_entry_group_matches_start_only_and_middle_trigger_is_subscribed():
         edge('a_entry01', 'a_decide01', decision['branches'][0]['id']), edge('a_entry01', 'a_else001', decision['branches'][1]['id']),
         edge('a_decide01', 'a_first01', middle['branches'][0]['id']), edge('a_decide01', 'a_else001', middle['branches'][1]['id']),
         edge('a_first01', None), edge('a_else001', None)], 'a_entry01')
-    source.pop('condition')
+    source = canvas_fixture(source)
     calls = []
     engine = create_test_engine({'rules': [source]})
     engine.triggers_meta.update(TRIGGERS)
@@ -349,7 +432,12 @@ def test_entry_route_is_fixed_before_queue_and_late_event_counts_only_middle_gro
         edge('a_entry01', 'a_wrong01', decision['branches'][0]['id']), edge('a_entry01', 'a_decide01', decision['branches'][1]['id']),
         edge('a_decide01', 'a_else001', middle['branches'][0]['id']), edge('a_decide01', 'a_first01', middle['branches'][1]['id']),
         edge('a_else001', None), edge('a_first01', None), edge('a_wrong01', None)], 'a_entry01')
-    source.pop('condition')
+    source = canvas_fixture(source)
+    native_entry = next(node for node in source['workflow']['nodes'] if node['binding_id'] == 'a_entry01')
+    native_entry['branches'].insert(1, {'id': 'b_start_elif01'})
+    source['workflow']['edges'] = [edge for edge in source['workflow']['edges'] if not (edge['source'] == 'a_watch_start01' and edge['channel'] == 'control')]
+    source['workflow']['edges'].append({'source': 'a_watch_start01', 'port': 'event', 'target': 'a_entry01', 'target_port': 'b_start_elif01', 'channel': 'condition'})
+    next(edge for edge in source['workflow']['edges'] if edge['source'] == 'a_entry01' and edge['target'] == 'a_decide01')['port'] = 'b_start_elif01'
     calls, packets = [], []
     engine = create_test_engine({'rules': [source]}, on_event=lambda event: packets.append(event.to_dict()))
     engine.triggers_meta.update(TRIGGERS)
@@ -380,10 +468,12 @@ def test_entry_route_is_fixed_before_queue_and_late_event_counts_only_middle_gro
         engine.shutdown(3)
 
 
-def test_old_conversion_is_repeatable_for_compile_digest():
+def test_old_conversion_remains_rejected_on_repeated_calls():
     old = {'rule_id': 'r_graph001', 'name': '转换', 'condition': leaf(), 'actions': [
         {'type': 'if', 'binding_id': 'a_decide01', 'condition': {'op': 'is_true', 'left': True}, 'then': [action('a_first01', 'first')], 'else': []}]}
-    assert normalize_workflow_rule(old) == normalize_workflow_rule(old)
+    for _ in range(2):
+        with pytest.raises(ValueError, match='旧条件模型已移除'):
+            normalize_workflow_rule(old)
 
 
 def test_nested_entry_event_group_can_start_outer_action_groups():
@@ -395,8 +485,10 @@ def test_nested_entry_event_group_can_start_outer_action_groups():
     inner = {'type': 'action_group', 'binding_id': 'a_inner01', 'workflow': inside}
     outer = {'type': 'action_group', 'binding_id': 'a_outer01', 'workflow': {'entry': 'a_inner01', 'nodes': [inner], 'edges': [edge('a_inner01', None)]}}
     source = rule([outer, action('a_after01', 'after')], [edge('a_outer01', 'a_after01'), edge('a_after01', None)])
-    source.pop('condition')
-    assert get_rule_condition(source) == leaf()
+    source.pop('_matcher')
+    source = canvas_fixture(source, internal_start=True)
+    from notmyfault.core.canvas_workflow import lower_canvas_rule
+    assert get_rule_condition(lower_canvas_rule(source)) == leaf()
     calls = []
     engine = create_test_engine({'rules': [source]})
     engine.triggers_meta.update(TRIGGERS)
@@ -508,7 +600,7 @@ def test_malformed_control_identifiers_return_validation_errors(field, value):
         source['workflow'][field] = value
     else:
         source['workflow']['edges'][0][field] = value
-    assert validate_rule_structure(source)
+    assert validate_runtime_structure(source)
     with pytest.raises(ValueError):
         normalize_rule_input([source])
 
@@ -550,6 +642,7 @@ def test_late_sensitive_event_remains_masked_through_assignment_and_group_export
     output = {'type': 'record', 'binding_id': 'a_record1', 'params': {'label': {'$ref': {'scope': 'step', 'node': 'a_outer01', 'path': ['token']}}}}
     source = rule([outer, output], [edge('a_outer01', 'a_record1'), edge('a_record1', None)])
     source['variables'] = [{'id': 'v_secret1', 'name': '令牌', 'value_type': 'text'}]
+    source = canvas_fixture(source)
     packets, calls, contexts = [], [], []
     engine = create_test_engine({'rules': [source]}, on_event=lambda event: packets.append(event.to_dict()))
     engine.triggers_meta.update(TRIGGERS)
@@ -587,7 +680,7 @@ def test_group_export_type_uses_dependencies_instead_of_node_array_order():
     schemas = rule_binding_types(source, TRIGGERS, ACTIONS)['step']
     assert schemas['a_second1']['properties']['value']['type'] == schemas['a_first01']['properties']['value']['type']
     assert schemas['a_second1']['properties']['value']['type'] in ('int', 'number')
-    assert validate_rule_bindings(source, TRIGGERS, ACTIONS) == []
+    assert validate_runtime_bindings(source, TRIGGERS, ACTIONS) == []
 
 
 def test_group_export_failure_records_failed_step_and_closed_generator():
@@ -660,7 +753,8 @@ def test_partial_nested_run_accepts_conditional_native_output_with_type_and_secr
     scope = find_graph_scope(source['workflow'], 'a_target1')
     assert scope['available'] == {'a_choice1'}
     assert scope['possible'] == {'a_choice1', 'a_source1'}
-    assert validate_rule_bindings(source, TRIGGERS, ACTIONS) == []
+    assert validate_runtime_bindings(source, TRIGGERS, ACTIONS) == []
+    source = canvas_fixture(source)
     calls, packets, contexts = [], [], []
     engine = create_test_engine({'rules': []}, on_event=lambda event: packets.append(event.to_dict()))
     engine.triggers_meta.update(TRIGGERS)
@@ -709,7 +803,7 @@ def test_group_export_checks_every_terminal_branch_and_handles_missing_policy(te
             edge('a_choice1', else_target, choose['branches'][1]['id']), edge('a_speed01', None)]},
         'exports': {'latency': {'$ref': reference}}}
     source = rule([outer, action('a_after01', 'after')], [edge('a_outer01', 'a_after01'), edge('a_after01', None)])
-    errors = validate_rule_bindings(source, TRIGGERS, ACTIONS)
+    errors = validate_runtime_bindings(source, TRIGGERS, ACTIONS)
     if policy is None:
         assert errors and any(error['code'] == 'conditional_source' for error in errors)
         return
@@ -733,16 +827,16 @@ def test_native_groups_reject_ignored_action_settings(kind, field):
         'type': kind, 'binding_id': 'a_group01', 'workflow': {'entry': None, 'nodes': [], 'edges': []}}
     node[field] = {'params': {}, 'retry': 1, 'retry_delay_seconds': 1, 'retry_backoff': 2, 'failure_actions': [], 'timeout_seconds': 1}[field]
     source = rule([node], [edge('a_group01', None, node['branches'][0]['id'] if kind == 'event_group' else 'next')])
-    assert any(field in error for error in validate_rule_structure(source))
+    assert any(field in error for error in validate_runtime_structure(source))
 
 
 def test_event_group_rejects_error_continuation_and_timeout_stays_failed():
     source = waiting_rule(timeout=1)
     waited = next(node for node in source['workflow']['nodes'] if node['type'] == 'event_group')
     waited['on_error'] = 'continue'
-    assert any('on_error:continue' in error for error in validate_rule_structure(source))
+    assert any('on_error:continue' in error for error in validate_runtime_structure(source))
     waited['on_error'] = 'stop'
-    assert validate_rule_structure(source) == []
+    assert validate_runtime_structure(source) == []
     clock = FakeClock()
     source, context, observer, executor, records, events = setup(source, clock)
     suspension = executor.execute_workflow('one', source, source['name'], context)
@@ -758,7 +852,7 @@ def test_event_group_rejects_error_continuation_and_timeout_stays_failed():
 def test_reload_finishes_waiting_run_without_more_events_and_releases_old_generation(change):
     from notmyfault.tests.api_support import create_test_engine
     packets, calls, contexts = [], [], []
-    source = waiting_rule()
+    source = canvas_fixture(waiting_rule())
     engine = create_test_engine({'rules': []}, on_event=lambda event: packets.append(event.to_dict()))
     engine.triggers_meta.update(TRIGGERS)
     engine.actions_meta.update(ACTIONS)

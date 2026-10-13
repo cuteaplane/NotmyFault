@@ -202,7 +202,7 @@ def check_rule_bindings(rule, triggers_meta, actions_meta):
     except (DataTypeError, BindingResolutionError) as error:
         add(error.code, error.location, str(error))
         return issues
-    leaves = get_all_rule_events(rule) if "workflow" in rule else list(_positive_events(get_rule_condition(rule)))
+    leaves = get_all_rule_events(rule)
     leaves_by_id = {leaf.get("binding_id"): leaf for leaf in leaves}
     all_actions = {action.get("binding_id") for action, _path in iter_rule_actions(rule)}
 
@@ -379,14 +379,7 @@ def check_rule_bindings(rule, triggers_meta, actions_meta):
             if not isinstance(action, dict):
                 continue
             path = f"{location}[{index}]"
-            if action.get("type") == "if":
-                predicate(action.get("condition"), f"{path}.condition", available)
-                for branch in ("then", "else"):
-                    sequence(action.get(branch, []), f"{path}.{branch}", available)
-                for branch_index, alternative in enumerate(action.get("elif", [])):
-                    predicate(alternative.get("condition"), f"{path}.elif[{branch_index}].condition", available)
-                    sequence(alternative.get("then", []), f"{path}.elif[{branch_index}].then", available)
-            elif action.get("type") == "set_variable":
+            if action.get("type") == "set_variable":
                 identity = action.get("variable")
                 if identity not in sources["variable"]:
                     add("readonly_constant" if identity in sources["constant"] else "unknown_source", path, "赋值目标必须是已声明的运行变量")
@@ -447,8 +440,5 @@ def check_rule_bindings(rule, triggers_meta, actions_meta):
             elif kind not in ("merge", "end"):
                 params(action, actions_meta.get(kind, {}), path, available)
                 sequence(action.get("failure_actions", []), f"{path}.failure_actions", available)
-    if "workflow" in rule:
-        graph_bindings(rule["workflow"], "workflow", set())
-    else:
-        sequence(rule.get("actions", []), "actions", set())
+    graph_bindings(rule["workflow"], "workflow", set())
     return issues

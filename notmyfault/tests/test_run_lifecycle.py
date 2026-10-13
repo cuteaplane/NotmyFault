@@ -5,6 +5,8 @@ import threading
 import uuid
 
 from notmyfault.tests.api_support import create_test_engine, event_fields
+from notmyfault.tests.canvas_fixtures import native_rule
+from notmyfault.core.canvas_workflow import lower_canvas_rule
 from notmyfault.core.run_manager import RunManager
 from notmyfault.core.run_history import RunHistory, build_runs
 from notmyfault.core.run_lifecycle import (
@@ -143,16 +145,11 @@ class TestExecutorSingleTerminal:
             release.wait(5)
         engine.actions_funcs["compensate"] = compensate
         engine.actions_meta["compensate"] = {}
-        rule = {
-            "name": "绑定失败规则",
-            "concurrency": {"mode": "single"},
-            "event": {"type": "hotkey", "params": {}},
-            "actions": [{
+        rule = native_rule({"type": "hotkey", "params": {}}, [{
                 "type": "noop",
                 "params": {"x": {"$ref": {"scope": "event", "path": ["missing"]}}},
                 "failure_actions": [{"type": "compensate", "params": {}}],
-            }],
-        }
+            }], name="绑定失败规则", concurrency={"mode": "single"})
         engine.rules = [rule]
         engine.triggers_meta.setdefault("hotkey", {"semantic": "oneshot"})
         engine.emit_event("hotkey", {})
@@ -176,11 +173,7 @@ class TestExecutorSingleTerminal:
         engine = self._make_engine(events)
         engine.actions_funcs["noop"] = lambda meta, params: {"ok": True}
         engine.actions_meta["noop"] = {}
-        rule = {
-            "name": "正常规则",
-            "event": {"type": "hotkey", "params": {}},
-            "actions": [{"type": "noop", "params": {}}],
-        }
+        rule = native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "params": {}}], name="正常规则")
         engine.rules = [rule]
         engine.triggers_meta.setdefault("hotkey", {"semantic": "oneshot"})
         engine.emit_event("hotkey", {})
@@ -219,13 +212,7 @@ class TestStopPathDropsQueue:
             release.wait(timeout=10)
             return {"ok": True}
 
-        rule = {
-            "rule_id": "rule-stop-1",
-            "name": "停止路径规则",
-            "event": {"type": "hotkey", "params": {"key": "f3"}},
-            "concurrency": {"mode": "queue"},
-            "actions": [{"type": "noop", "params": {}}],
-        }
+        rule = native_rule({"type": "hotkey", "params": {"key": "f3"}}, [{"type": "noop", "params": {}}], rule_id="r_stop0001", name="停止路径规则", concurrency={"mode": "queue"})
         engine = create_test_engine(
             {"rules": [rule]}, on_event=lambda event: events.append((event.type, event_fields(event)))
         )
@@ -239,28 +226,32 @@ class TestStopPathDropsQueue:
 
         scheduler = engine._run_manager
         context1 = build_context(
-            "停止路径规则", "hotkey", {"key": "f3"}, [], "rule-stop-1", "run_stop_a"
+            "停止路径规则", "hotkey", {"key": "f3"}, [], "r_stop0001", "run_stop_a"
         )
         context2 = build_context(
-            "停止路径规则", "hotkey", {"key": "f3"}, [], "rule-stop-1", "run_stop_b"
+            "停止路径规则", "hotkey", {"key": "f3"}, [], "r_stop0001", "run_stop_b"
         )
+        runtime_rule = lower_canvas_rule(rule)
+        supplied = {node["trigger"]["binding_id"] for node in rule["workflow"]["nodes"] if node["type"] == "trigger"}
+        context1["_event_occurrences"] = supplied
+        context2["_event_occurrences"] = supplied
         holder = {}
         thread = threading.Thread(
             target=lambda: holder.__setitem__(
-                0, scheduler.submit("rule-stop-1", rule, "停止路径规则", context1)
+                0, scheduler.submit("r_stop0001", runtime_rule, "停止路径规则", context1)
             ),
             daemon=True,
         )
         thread.start()
         deadline = time_mod.time() + 5
-        while scheduler.stats().get("rule-stop-1", {}).get("running", 0) < 1 \
+        while scheduler.stats().get("r_stop0001", {}).get("running", 0) < 1 \
                 and time_mod.time() < deadline:
             time_mod.sleep(0.01)
-        assert scheduler.submit("rule-stop-1", rule, "停止路径规则", context2) == "queued"
+        assert scheduler.submit("r_stop0001", runtime_rule, "停止路径规则", context2) == "queued"
 
         # 模拟 _run 循环退出后的清理序列
         engine._run_manager.shutdown()
-        assert scheduler.stats()["rule-stop-1"]["queued"] == 0
+        assert scheduler.stats()["r_stop0001"]["queued"] == 0
         assert engine.events.flush()
         dropped = [e for e in events if e[0] == "run.dropped"]
         assert len(dropped) == 1

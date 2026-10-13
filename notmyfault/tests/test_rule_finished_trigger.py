@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from notmyfault.tests.canvas_fixtures import trigger_rule, set_rule_steps
 from notmyfault.core import engine_events
 from notmyfault.security.plugin_schema import check_payload_contract, validate_plugin_meta
 
@@ -267,15 +268,15 @@ def test_prepared_rule_suppresses_its_own_finish(monkeypatch, include_self, bind
     params = {"rule_id": "r_self0001"}
     if include_self != "default":
         params["include_self"] = include_self
-    rule = {
-        "name": "监视自己",
-        "rule_id": "r_self0001",
-        "event": {"type": "rule_finished", "params": params},
-        "actions": [{"type": "noop", "params": {}}],
-    }
+    constants = []
     if binding_mode == "constant" and include_self != "default":
-        rule["constants"] = [{"id": "c_switch01", "name": "自身监视开关", "value_type": "any", "value": include_self}]
+        constants = [{"id": "c_switch01", "name": "自身监视开关", "value_type": "any", "value": include_self}]
         params["include_self"] = {"$ref": {"scope": "constant", "node": "c_switch01", "path": []}}
+    rule = set_rule_steps(trigger_rule("r_self0001", "监视自己", "rule_finished", params), [
+        {"type": "noop", "params": {}},
+    ])
+    if constants:
+        rule["constants"] = constants
     prepared = prepare_rules(
         [rule],
         {"rule_finished": meta},

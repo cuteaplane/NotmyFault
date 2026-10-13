@@ -7,6 +7,7 @@ import pytest
 
 from notmyfault.core.rules import validate_rule_bindings
 from notmyfault.core.workflow import build_context, invoke_action
+from notmyfault.tests.canvas_fixtures import native_rule
 from notmyfault.tests.api_support import create_test_engine, event_fields
 from notmyfault.values import plain_value
 
@@ -242,20 +243,22 @@ def test_data_actions_bind_structured_values_and_keep_content_out_of_summaries()
         {"type": "csv_data", "binding_id": "a_csv00001", "params": {"operation": "stringify", "value": {"$ref": {"scope": "step", "node": "a_extract1", "path": ["value"]}}}},
         {"type": "text_transform", "binding_id": "a_text0001", "params": {"operation": "trim", "text": {"$ref": {"scope": "step", "node": "a_csv00001", "path": ["text"]}}}},
     ]
-    rule = {"name": "数据转换", "condition": {"type": "manual", "binding_id": "t_manual01", "params": {}}, "actions": actions}
+    rule = native_rule({"type": "manual", "binding_id": "t_manual01", "params": {}}, actions, name="数据转换")
     events = []
     engine = create_test_engine({"rules": []}, on_event=lambda event: events.append((event.type, event_fields(event))))
+    engine.triggers_meta["manual"] = {"params": [], "outputs": []}
+    engine.triggers_funcs["manual"] = lambda *args: None
     for plugin_id in {action["type"] for action in actions}:
         meta, module = load_action(plugin_id)
         engine.actions_meta[plugin_id] = meta
         engine.actions_funcs[plugin_id] = module.run
         engine._plugin_modules[plugin_id] = module
     assert validate_rule_bindings(rule, {"manual": {"params": [], "outputs": []}}, engine.actions_meta) == []
-    context = build_context(rule["name"], "manual", {}, [])
+    context = build_context(rule["name"], "manual", {}, [{"binding_id": "t_manual01", "event": {"type": "manual", "params": {}}, "payload": {}}])
     engine.execute_workflow("data_actions", rule, rule["name"], context)
     assert plain_value(context["steps"]["a_text0001"]["result"])["text"] == "name,count\r\n甲,2"
     assert engine.events.flush()
-    executed = [data for name, data in events if name == "run.step.succeeded"]
+    executed = [data for name, data in events if name == "run.step.succeeded" and data.get("step_id") in {action["binding_id"] for action in actions}]
     assert len(executed) == 4
     assert all(data["status"] == "ok" for data in executed)
     assert engine.events.flush()

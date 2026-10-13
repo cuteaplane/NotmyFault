@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from notmyfault.tests.canvas_fixtures import native_rule
 from notmyfault.security.plugin_schema import validate_plugin_meta
 
 
@@ -47,17 +48,12 @@ def test_manifest_requires_admin_approval_for_setting_variables():
 
     from notmyfault.security import rule_approval
 
-    rule = {
-        "rule_id": "r_env0001",
-        "name": "改 PATH",
-        "event": {"type": "plain_trigger", "params": {}},
-        "actions": [
+    rule = native_rule({"type": "plain_trigger", "params": {}}, [
             {
                 "type": "environment_variable",
                 "params": {"mode": "set", "name": "PATH", "value": "/tmp"},
             }
-        ],
-    }
+        ], rule_id="r_env0001", name="改 PATH")
     schema = {
         "triggers": {"plain_trigger": {"permissions": []}},
         "actions": {"environment_variable": meta},

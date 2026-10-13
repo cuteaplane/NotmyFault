@@ -11,6 +11,7 @@ import pytest
 
 from notmyfault.core.bindings import BindingResolutionError, resolve_reference
 from notmyfault.tests.api_support import create_test_engine
+from notmyfault.tests.canvas_fixtures import native_rule
 from notmyfault.core.rules import ConditionRuntime, config_fingerprint
 from notmyfault.core.workflow import build_context
 from notmyfault.security.plugin_schema import check_payload_contract, validate_plugin_meta
@@ -61,15 +62,11 @@ class TriggerV2Tests:
                 assert isinstance(meta["outputs"], list), f"{name} outputs 必须是列表"
 
     def test_engine_binds_v2_payload_to_plugin_trigger_id(self):
-        rule = {
-            "name": "v2 绑定规则",
-            "condition": {
+        rule = native_rule({
                 "type": "demo_trigger",
                 "binding_id": "t_demo001",
                 "params": {"watch": "folder_a"},
-            },
-            "actions": [{"type": "capture", "params": {}}],
-        }
+            }, [{"type": "capture", "params": {}}], name="v2 绑定规则")
         engine = make_engine(rule)
         engine.triggers_meta["demo_trigger"] = {
             "trigger_api": "event-v2",
@@ -147,11 +144,7 @@ class V2ConfigValidationTests:
         params = {"resource": resource}
         if disk_path != "omitted":
             params["disk_path"] = disk_path
-        rule = {
-            "name": "资源监控", "rule_id": "r_resource1",
-            "event": {"type": "system_resource", "params": params},
-            "actions": [{"type": "noop", "params": {}}],
-        }
+        rule = native_rule({"type": "system_resource", "params": params}, [{"type": "noop", "params": {}}], name="资源监控", rule_id="r_resource1")
         prepared = prepare_rules([rule], {"system_resource": meta}, {"noop": {"params": []}})
         valid = isinstance(disk_path, str) and "\x00" not in disk_path
         assert len(prepared) == int(valid), prepared.issues
@@ -255,7 +248,7 @@ class V2MatchingTests:
     def _v2_rule(self):
         return {
             "name": "v2 匹配",
-            "condition": {
+            "_matcher": {
                 "op": "any",
                 "children": [
                     {"type": "folder_monitor", "binding_id": "t_alpha01",
@@ -271,7 +264,7 @@ class V2MatchingTests:
     def test_v2_config_matching_hits_own_leaf(self, extra):
         runtime = ConditionRuntime()
         rule = self._v2_rule()
-        for leaf in rule["condition"]["children"]:
+        for leaf in rule["_matcher"]["children"]:
             leaf["params"].update(extra)
         matched = runtime.match(
             "rule:1", rule, "folder_monitor", {"event": "created"},
@@ -300,7 +293,7 @@ class V2MatchingTests:
     def test_v1_payload_filtering_still_works(self, expected, actual, matched):
         rule = {
             "name": "v1 过滤",
-            "condition": {
+            "_matcher": {
                 "type": "process_state",
                 "binding_id": "t_proc001",
                 "params": {"process_name": "WeChat.exe", "state": expected},
@@ -319,7 +312,7 @@ class V2MatchingTests:
             {"process_name": "Other.exe", "state": actual},
         ) is False
 
-        engine = make_engine(rule)
+        engine = make_engine(native_rule(rule["_matcher"], [], name=rule["name"]))
         engine.triggers_meta["process_state"] = {
             "trigger_api": "event-v1",
             "outputs": [
@@ -339,7 +332,7 @@ class V2MatchingTests:
     def test_v2_and_v1_semantics_coexist_in_one_rule(self):
         rule = {
             "name": "混合语义",
-            "condition": {
+            "_matcher": {
                 "op": "all",
                 "children": [
                     {"type": "folder_monitor", "binding_id": "t_fold001",

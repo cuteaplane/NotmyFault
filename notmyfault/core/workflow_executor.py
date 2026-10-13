@@ -213,16 +213,7 @@ class WorkflowExecutor:
                 prepare_binding_context(rule, context, self._trigger_metadata(context), self._action_metadata(context))
             except (DataTypeError, BindingResolutionError) as error:
                 return RunOutcome("failed", {"failure_kind": "binding"}, error.as_dict())
-        actions = rule.get("actions", [])
-        actions = actions if isinstance(actions, list) else []
         manual_test = context.get("manual_test")
-        if isinstance(manual_test, dict):
-            start_index = int(manual_test.get("start_index", 0) or 0)
-            end_index = int(manual_test.get("end_index", len(actions) - 1))
-            selected_actions = actions[start_index:end_index + 1]
-            manual_test["active_offset"] = start_index
-        else:
-            selected_actions = actions
         if isinstance(rule.get("workflow"), dict):
             execution = context.get("_graph_execution")
             if execution is None:
@@ -248,7 +239,7 @@ class WorkflowExecutor:
                 context.pop("_graph_execution", None)
                 return RunOutcome("failed", error={"code": getattr(error, "code", "workflow_failed"), "message": str(error)})
         else:
-            succeeded = self.execute_actions(selected_actions, rule_name, context)
+            return RunOutcome("failed", error={"code": "unsupported_rule", "message": "规则必须提供 workflow 图"})
         if run_cancel_event.is_set():
             return RunOutcome("cancelled", {"failure_kind": "cancelled"})
         assertions = self.evaluate_test_assertions(context, rule_name)
@@ -436,17 +427,10 @@ class WorkflowExecutor:
         context: Dict[str, Any],
     ) -> bool:
         """按顺序执行动作并把每步结果写入 context"""
-        manual_test = context.get("manual_test")
-        offset = (
-            int(manual_test.get("active_offset", 0) or 0)
-            if isinstance(manual_test, dict)
-            else 0
-        )
         return self._execute_action_sequence(
             actions,
             rule_name,
             context,
-            legacy_offset=offset,
             run_failure_actions=True,
         )
 
@@ -456,8 +440,6 @@ class WorkflowExecutor:
         rule_name: str,
         context: Dict[str, Any],
         *,
-        legacy_offset: int = 0,
-        legacy_prefix: str = "",
         run_failure_actions: bool,
     ) -> bool:
         all_ok = True
@@ -466,19 +448,9 @@ class WorkflowExecutor:
             if run_cancel_event.is_set():
                 all_ok = False
                 break
-            legacy_step_id = (
-                f"{legacy_prefix}{action.get('type', 'action')}_"
-                f"{legacy_offset + index + 1}"
-            )
-            step_id = action.get("binding_id") or legacy_step_id
+            step_id = action["binding_id"]
             if action.get("type") == "set_variable":
                 ok = self._execute_assignment(action, step_id, rule_name, context)
-                all_ok = all_ok and ok
-                if not ok and action.get("on_error", "stop") != "continue":
-                    break
-                continue
-            if action.get("type") == "if":
-                ok = self._execute_if(action, step_id, rule_name, context, run_failure_actions)
                 all_ok = all_ok and ok
                 if not ok and action.get("on_error", "stop") != "continue":
                     break
@@ -548,7 +520,6 @@ class WorkflowExecutor:
                         failure_actions,
                         rule_name,
                         context,
-                        legacy_prefix=f"failure_{step_id}_",
                         run_failure_actions=False,
                     )
             if not ok and action.get("on_error", "stop") != "continue":
@@ -579,62 +550,6 @@ class WorkflowExecutor:
             self._on_event("run.step.failed", {**event, "error": {
                 "code": error.code, "location": error.location, "message": message,
             }, "status": "failed"})
-            return False
-
-    def _execute_if(self, action, step_id, rule_name, context, run_failure_actions):
-        started = time.perf_counter()
-        event = {
-            "action_type": "if", "step_id": step_id, "rule_name": rule_name,
-            "rule_id": context.get("rule", {}).get("id", ""), "run_id": _run_id(context), "group_path": list(context.get("_group_path", [])),
-        }
-        self._on_event("run.step.started", event)
-        try:
-            statuses = {}
-            def status_lookup(rule_id):
-                if self._status_lookup is None:
-                    raise ValueError("当前执行环境不提供自动化运行状态")
-                if rule_id not in statuses:
-                    statuses[rule_id] = self._status_lookup(rule_id)
-                return statuses[rule_id]
-
-            occurred = event_occurrences(context)
-            matched = evaluate_predicate(action.get("condition"), context, status_lookup=status_lookup, _event_occurrences=occurred)
-            branch = "then" if matched else "else"
-            actions = action.get(branch, [])
-            if not matched:
-                for index, alternative in enumerate(action.get("elif", [])):
-                    if evaluate_predicate(alternative.get("condition"), context, f"elif[{index}].condition", status_lookup=status_lookup, _event_occurrences=occurred):
-                        matched = True
-                        branch = f"elif[{index}]"
-                        actions = alternative.get("then", [])
-                        break
-            succeeded = self._execute_action_sequence(
-                actions, rule_name, context,
-                legacy_prefix=f"{step_id}_{branch}_", run_failure_actions=run_failure_actions,
-            )
-            result = {"matched": matched, "branch": branch}
-            cancelled = self._ensure_run_cancel_event(context).is_set()
-            status = "ok" if succeeded else "cancelled" if cancelled else "failed"
-            error = None if succeeded else "运行已取消" if cancelled else "分支动作执行失败"
-            context["steps"][step_id] = {
-                "type": "if", "status": status,
-                "result": result if succeeded else None,
-                "error": error,
-            }
-            self._on_event("run.step.succeeded" if succeeded else "run.step.cancelled" if cancelled else "run.step.failed", {
-                **event, "status": status, "result": result, "branch": branch,
-                "error": None if succeeded else {"code": "action_cancelled" if cancelled else "action_execution_failed", "message": error},
-                "duration_ms": round((time.perf_counter() - started) * 1000),
-            })
-            return succeeded
-        except (BindingResolutionError, ValueError, TypeError) as error:
-            message = str(error)
-            context["steps"][step_id] = {
-                "type": "if", "status": "failed", "result": None, "error": message,
-            }
-            self._on_event("run.step.failed", {**event, "error": {
-                "code": getattr(error, "code", "condition_evaluation_failed"), "message": message,
-            }, "status": "failed", "duration_ms": round((time.perf_counter() - started) * 1000)})
             return False
 
     def execute_action(

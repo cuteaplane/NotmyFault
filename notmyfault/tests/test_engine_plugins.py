@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from notmyfault.tests.api_support import create_test_engine
+from notmyfault.tests.canvas_fixtures import native_rule
 from notmyfault.security.plugin_loader import PluginLoader, PluginRegistry
 from notmyfault.security.security import SecurityMode
 
@@ -130,7 +131,7 @@ class TestEngineStart:
 
 
     def test_get_diagnostics_initial(self):
-        engine = make_engine(rules=[{"name": "a"}])
+        engine = make_engine(rules=[{"name": "a", "workflow": {"entry": None, "nodes": [], "edges": []}}])
         diag = engine.get_diagnostics()
         assert diag["uptime_seconds"] == 0
         assert diag["plugins"]["actions_loaded"] == 0
@@ -146,11 +147,7 @@ class TestEngineStart:
             monkeypatch.setattr(AUMID_Register, "register_toaster", lambda: None)
 
         alerts = []
-        engine = make_engine(rules=[{
-            "name": "r",
-            "event": {"type": "ghost_trigger", "params": {}},
-            "actions": [{"type": "noop", "params": {}}],
-        }])
+        engine = make_engine(rules=[native_rule({"type": "ghost_trigger", "params": {}}, [{"type": "noop", "params": {}}], name="r")])
         engine._alert_user = (
             lambda title, message, open_dashboard=False: alerts.append((title, open_dashboard))
         )

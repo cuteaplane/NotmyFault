@@ -20,7 +20,7 @@ from notmyfault.security.plugin_loader import (
 )
 from notmyfault.core.plugin_runtime import PluginRuntime
 from notmyfault.core.generation_manager import GenerationManager
-from notmyfault.core.run_manager import RunManager
+from notmyfault.core.run_manager import RunManager, RunOutcome
 from notmyfault.core.event_stream import Event, EventStream
 from notmyfault.core.engine_events import use_stream
 from notmyfault.core.rules import (
@@ -28,7 +28,8 @@ from notmyfault.core.rules import (
 )
 from notmyfault.core.rule_model import normalize_rules
 from notmyfault.core.runtime_rules import PreparedRules, rule_key
-from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions, find_graph_node, find_graph_scope, NATIVE_NODES
+from notmyfault.core.compiled_rules import thaw
+from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions, find_graph_node, find_graph_scope, execution_nodes, NATIVE_NODES
 from notmyfault.security.plugin_schema import check_payload_contract
 from notmyfault.security.security import (
     SecurityMode,
@@ -464,16 +465,16 @@ class AutomationEngine:
     def call_notmyfault(self, event_data: Dict[str, Any]) -> None:
         self._event_bus.call_notmyfault(event_data)
 
-    def run_manual_rule(self, rule_index: int) -> tuple[bool, str] | tuple[bool, str, str]:
+    def run_manual_rule(self, rule_index: int, *, trigger_payloads=None, event_payload=None) -> tuple[bool, str] | tuple[bool, str, str]:
         """从 Dashboard 立即执行指定规则"""
         with self._rules_lock:
-            if rule_index < 0 or rule_index >= len(self.rules):
-                return False, "规则不存在或已被重新加载"
-            rule = copy.deepcopy(self.rules[rule_index])
             generation = self._get_runtime_snapshot().generation
+            if rule_index < 0 or rule_index >= len(generation.snapshot.input_rules):
+                return False, "规则不存在或已被重新加载"
+            rule = thaw(generation.snapshot.input_rules[rule_index])
             generation.retain()
         try:
-            return self.run_manual_rule_snapshot(rule, rule_index, _generation=generation)
+            return self.run_manual_rule_snapshot(rule, rule_index, trigger_payloads=trigger_payloads, event_payload=event_payload, _generation=generation)
         finally:
             generation.release()
 
@@ -518,9 +519,6 @@ class AutomationEngine:
                 rule_id,
                 run_id,
             )
-            actions = rule.get("actions", [])
-            if not isinstance(actions, list):
-                actions = []
             try:
                 prepared = self._generations.prepare([rule], validate=False)
             except (DataTypeError, BindingResolutionError, ValueError) as error:
@@ -528,20 +526,18 @@ class AutomationEngine:
             plugins = prepared.plugins
             compiled = prepared.compiled[rule_id]
             rule = compiled.source
-            start_index = compiled.top_level_index.get(start_step_id, 0)
-            end_index = compiled.top_level_index.get(end_step_id, len(actions) - 1)
+            actions = [node for node, _path in iter_rule_actions(rule)]
+            start_index = compiled.step_index.get(start_step_id, 0)
+            end_index = compiled.step_index.get(end_step_id, len(actions) - 1)
             context["_plugins"] = plugins
             context["_compiled_rule"] = compiled
             context["_compiled_refs"] = compiled.references
             context["_trigger_configs"] = prepared.contexts[rule_id]["_trigger_configs"]
-            selected_count = max(0, end_index - start_index + 1) if actions else 0
-            if "workflow" in rule:
-                actions = [node for node, _path in iter_rule_actions(rule)]
-                selected_count = sum(node["type"] not in NATIVE_NODES - {"set_variable"} for node in actions)
-                if start_step_id and find_graph_node(rule["workflow"], start_step_id) is None:
-                    return False, "测试入口节点不存在", run_id
-                if end_step_id and find_graph_node(rule["workflow"], end_step_id) is None:
-                    return False, "测试结束节点不存在", run_id
+            selected_count = sum(node["type"] not in NATIVE_NODES - {"set_variable"} for node, _path in execution_nodes(rule['workflow'], start_step_id, end_step_id))
+            if start_step_id and find_graph_node(rule["workflow"], start_step_id) is None:
+                return False, "测试入口节点不存在", run_id
+            if end_step_id and find_graph_node(rule["workflow"], end_step_id) is None:
+                return False, "测试结束节点不存在", run_id
             context["manual_test"] = {
                 "start_step_id": start_step_id,
                 "end_step_id": end_step_id,
@@ -553,7 +549,7 @@ class AutomationEngine:
             if isinstance(step_outputs, dict):
                 provided_actions = actions[:start_index]
                 native_fields = rule_step_output_fields(rule, plugins.triggers_meta, plugins.actions_meta)
-                if "workflow" in rule and start_step_id:
+                if start_step_id:
                     found = find_graph_scope(rule["workflow"], start_step_id)
                     available = found["possible"]
                     provided_actions = [action for action in actions if action["binding_id"] in available]
@@ -636,7 +632,16 @@ class AutomationEngine:
         rule_name: str,
         context: Dict[str, Any],
     ) -> None:
-        context["_plugins"] = self._plugins.snapshot(normalize_rules([rule]))
+        prepared = self._generations.prepare([rule])
+        if not prepared.compiled:
+            return RunOutcome('failed', error={'code': 'invalid_rule', 'message': '；'.join(message for _name, message in prepared.issues) or '规则无法编译'})
+        identity = next(iter(prepared.compiled))
+        compiled = prepared.compiled[identity]
+        rule = compiled.source
+        context.update(prepared.contexts[identity])
+        context['_compiled_rule'] = compiled
+        context['_compiled_refs'] = compiled.references
+        context['_plugins'] = prepared.plugins
         return self._run_manager.execute_sync(
             workflow_key, rule, rule_name, context
         )

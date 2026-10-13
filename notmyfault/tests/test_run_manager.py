@@ -6,6 +6,7 @@ import pytest
 
 from notmyfault.core.run_manager import RunManager
 from notmyfault.tests.api_support import event_fields
+from notmyfault.tests.canvas_fixtures import native_rule
 
 
 def make_run_id():
@@ -449,13 +450,7 @@ class TestEngineWiring:
             release.wait(timeout=10)
             return {"ok": True}
 
-        rule = {
-            "rule_id": "r_single01",
-            "name": "单实例规则",
-            "event": {"type": "hotkey", "params": {"key": "f1"}},
-            "concurrency": {"mode": "single"},
-            "actions": [{"type": "noop", "params": {}}],
-        }
+        rule = native_rule({"type": "hotkey", "params": {"key": "f1"}}, [{"type": "noop", "params": {}}], rule_id="r_single01", name="单实例规则", concurrency={"mode": "single"})
         engine = self._make_engine(rule, lambda event: events.append((event.type, event_fields(event))))
         engine.actions_funcs["noop"] = slow_action
         engine.actions_meta["noop"] = {}
@@ -491,16 +486,10 @@ class TestEngineWiring:
     def test_hot_reload_drops_queue_of_removed_rule(self, monkeypatch):
         import threading
 
-        rule = {
-            "rule_id": "r_queue001",
-            "name": "排队规则",
-            "condition": {"op": "all", "children": [
+        rule = native_rule({"op": "all", "children": [
                 {"type": "hotkey", "params": {"key": "f2"}},
                 {"type": "ready", "params": {}},
-            ]},
-            "concurrency": {"mode": "queue"},
-            "actions": [{"type": "noop", "params": {}}],
-        }
+            ]}, [{"type": "noop", "params": {}}], rule_id="r_queue001", name="排队规则", concurrency={"mode": "queue"})
         events = []
         release = threading.Event()
 
@@ -537,7 +526,7 @@ class TestEngineWiring:
 
         snapshot = engine._get_runtime_snapshot()
         with pytest.raises(ValueError):
-            engine.apply_rules([{"rule_id": "r_invalid1", "name": "无效规则", "condition": {"op": "invalid", "children": [{"type": "hotkey"}]}, "actions": [{"type": "noop", "params": {}}]}])
+            engine.apply_rules([native_rule({"op": "invalid", "children": [{"type": "hotkey"}]}, [{"type": "noop", "params": {}}], rule_id="r_invalid1", name="无效规则")])
         assert engine._get_runtime_snapshot() is snapshot
         assert queued_count() == 3
 
@@ -620,7 +609,7 @@ def test_terminal_runs_stop_accepting_events(terminal):
     from notmyfault.core.run_manager import RunOutcome
 
     condition = {"type": "hotkey", "binding_id": "t_hot001", "params": {}}
-    compiled = SimpleNamespace(source={"condition": condition}, matcher_spec=build_matcher(condition))
+    compiled = SimpleNamespace(source=native_rule(condition, []), matcher_spec=build_matcher(condition))
     observation = RunEventObservation(compiled)
     context = make_context()
     context["_event_observation"] = observation

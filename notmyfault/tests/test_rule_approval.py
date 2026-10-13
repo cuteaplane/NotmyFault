@@ -4,6 +4,7 @@ import pytest
 
 from notmyfault.security import rule_approval
 from notmyfault.security.security import SecurityMode
+from notmyfault.tests.canvas_fixtures import native_rule
 
 
 SCHEMA = {
@@ -24,30 +25,15 @@ SCHEMA = {
 
 
 def admin_rule():
-    return {
-        "rule_id": "r_admin001",
-        "name": "管理员规则",
-        "event": {"type": "plain_trigger", "params": {}},
-        "actions": [{"type": "admin_action", "params": {"state": "on"}}],
-    }
+    return native_rule({"type": "plain_trigger", "params": {}}, [{"type": "admin_action", "params": {"state": "on"}}], rule_id="r_admin001", name="管理员规则")
 
 
 def plain_rule():
-    return {
-        "rule_id": "r_plain001",
-        "name": "普通规则",
-        "event": {"type": "plain_trigger", "params": {}},
-        "actions": [{"type": "plain_action", "params": {}}],
-    }
+    return native_rule({"type": "plain_trigger", "params": {}}, [{"type": "plain_action", "params": {}}], rule_id="r_plain001", name="普通规则")
 
 
 def high_risk_rule():
-    return {
-        "rule_id": "r_risk001",
-        "name": "高危规则",
-        "event": {"type": "plain_trigger", "params": {}},
-        "actions": [{"type": "run_powershell", "params": {"command": "Get-Service"}}],
-    }
+    return native_rule({"type": "plain_trigger", "params": {}}, [{"type": "run_powershell", "params": {"command": "Get-Service"}}], rule_id="r_risk001", name="高危规则")
 
 
 def test_changed_admin_plugins_ignores_unrelated_rule_edits():
@@ -58,7 +44,7 @@ def test_changed_admin_plugins_ignores_unrelated_rule_edits():
     assert rule_approval.changed_admin_plugins(previous, changed_plain, SCHEMA) == []
 
     changed_admin = deepcopy(previous)
-    changed_admin[0]["actions"][0]["params"]["state"] = "off"
+    changed_admin[0]["workflow"]["nodes"][1]["params"]["state"] = "off"
     assert rule_approval.changed_admin_plugins(
         previous, changed_admin, SCHEMA,
     ) == ["admin_action"]
@@ -66,7 +52,7 @@ def test_changed_admin_plugins_ignores_unrelated_rule_edits():
 
 def test_changed_admin_plugins_finds_failure_action():
     rule = plain_rule()
-    rule["actions"][0]["failure_actions"] = [
+    rule["workflow"]["nodes"][1]["failure_actions"] = [
         {"type": "admin_action", "params": {}},
     ]
 
@@ -75,13 +61,22 @@ def test_changed_admin_plugins_finds_failure_action():
 
 def test_admin_approval_includes_nested_elif_actions():
     rule = plain_rule()
-    rule["actions"] = [{"type": "if", "condition": {"op": "is_true", "left": False}, "then": [], "else": [],
-                        "elif": [{"condition": {"op": "is_true", "left": True}, "then": [
-                            {"type": "if", "condition": {"op": "is_true", "left": False}, "then": [], "else": [],
-                             "elif": [{"condition": {"op": "is_true", "left": True}, "then": [
-                                 {"type": "admin_action", "params": {}}, {"type": "kill_process", "params": {}}
-                             ]}]}
-                        ]}]}]
+    graph = rule["workflow"]
+    outer = {"binding_id": "a_outer001", "type": "event_group", "group_type": "if", "branches": [
+        {"id": "b_first001"}, {"id": "b_elif001"}, {"id": "b_else001", "else": True},
+    ]}
+    inner = {"binding_id": "a_inner001", "type": "event_group", "group_type": "if", "parent": outer["binding_id"], "branches": [
+        {"id": "b_first002"}, {"id": "b_elif002"}, {"id": "b_else002", "else": True},
+    ]}
+    graph["nodes"] += [outer, inner,
+        {"type": "admin_action", "binding_id": "a_restricted001", "parent": inner["binding_id"], "params": {}},
+        {"type": "kill_process", "binding_id": "a_restricted002", "parent": inner["binding_id"], "params": {}},
+    ]
+    graph["edges"] += [
+        {"source": outer["binding_id"], "port": "b_elif001", "target": inner["binding_id"], "channel": "control"},
+        {"source": inner["binding_id"], "port": "b_elif002", "target": "a_restricted001", "channel": "control"},
+        {"source": "a_restricted001", "port": "next", "target": "a_restricted002", "channel": "control"},
+    ]
     assert rule_approval.changed_admin_plugins([], [rule], SCHEMA) == ["admin_action", "kill_process"]
 
 
@@ -93,7 +88,7 @@ def test_changed_admin_plugins_finds_manifest_restricted_action():
 
 def test_changed_admin_plugins_finds_restricted_failure_action():
     rule = plain_rule()
-    rule["actions"][0]["failure_actions"] = [
+    rule["workflow"]["nodes"][1]["failure_actions"] = [
         {"type": "kill_process", "params": {}},
     ]
     assert rule_approval.changed_admin_plugins([], [rule], SCHEMA) == ["kill_process"]

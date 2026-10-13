@@ -3,6 +3,7 @@ import time
 from types import SimpleNamespace
 
 from notmyfault.tests.api_support import create_test_engine
+from notmyfault.tests.canvas_fixtures import trigger_rule
 from notmyfault.core.workflow import build_context
 
 
@@ -22,7 +23,7 @@ def shorten_timeouts(engine, seconds=0.5):
 def start_trigger(engine, trigger_id, runner):
     engine.triggers_funcs[trigger_id] = lambda meta, config, emit, stop: runner(stop)
     engine.triggers_meta[trigger_id] = {"trigger_api": "event-v2"}
-    engine._generations.apply([{"rule_id": "r_fuzz0001", "name": "停止测试", "condition": {"type": trigger_id, "params": {}}, "actions": []}], "test", validate=False)
+    engine._generations.apply([trigger_rule("r_fuzz0001", "停止测试", trigger_id)], "test", validate=False)
 
 
 class TestShutdownFuzz:

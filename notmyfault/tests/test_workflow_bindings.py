@@ -17,6 +17,7 @@ from notmyfault.core.data_types import DataTypeError
 from notmyfault.core.variables import assign_variable, initialize_variables, resolve_trigger_constants
 from notmyfault.core.rules import guaranteed_trigger_ids, validate_rule_bindings
 from notmyfault.core.workflow import build_context
+from notmyfault.tests.canvas_fixtures import native_rule, branch_rule
 
 
 TRIGGERS_META = {
@@ -69,7 +70,7 @@ def _ref(scope, node=None, path=None):
 
 
 def _rule(condition, actions, preconditions=None):
-    rule = {"name": "测试规则", "condition": condition, "actions": actions}
+    rule = native_rule(condition, actions, name="测试规则")
     if preconditions:
         rule["preconditions"] = preconditions
     return rule
@@ -159,15 +160,17 @@ def test_static_validation_accepts_guaranteed_typed_trigger_output():
 def test_if_bindings_cannot_cross_branches_or_reference_later_actions():
     first = {"type": "open_url", "binding_id": "a_first01", "params": {"url": "https://example.com"}}
     second = {"type": "notify", "binding_id": "a_second01", "params": {"message": _ref("step", "a_first01", ["status"])}}
-    branch = {"type": "if", "binding_id": "a_branch01", "condition": {"op": "eq", "left": _ref("trigger", "t_usb001", ["drive"]), "right": "D:"}, "then": [first, second], "else": []}
-    rule = _rule(_leaf("usb_insert", "t_usb001"), [branch])
+    predicate = {"op": "eq", "left": _ref("trigger", "t_usb001", ["drive"]), "right": "D:"}
+    signal = _leaf("usb_insert", "t_usb001")
+    rule = branch_rule(signal, [{"predicate": predicate, "steps": [first, second]}, {"steps": []}])
     assert validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META) == []
-    branch["then"] = [first]
-    branch["else"] = [second]
+    rule = branch_rule(signal, [{"predicate": predicate, "steps": [first]}, {"steps": [second]}])
     assert [issue["code"] for issue in validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META)] == ["forward_reference"]
-    branch["else"] = []
-    rule["actions"].append(second)
-    assert [issue["code"] for issue in validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META)] == ["forward_reference"]
+    rule = branch_rule(signal, [{"predicate": predicate, "steps": [first]}, {"steps": []}], following=[second])
+    assert [issue["code"] for issue in validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META)] == ["conditional_source"]
+    consumer = next(node for node in rule["workflow"]["nodes"] if node["binding_id"] == "a_second01")
+    consumer["params"]["message"]["$ref"]["on_missing"] = "skip"
+    assert validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META) == []
 
 
 def test_elif_bindings_use_only_previous_path_and_keep_unique_ids():
@@ -177,45 +180,45 @@ def test_elif_bindings_use_only_previous_path_and_keep_unique_ids():
 
     source = {"type": "open_url", "binding_id": "a_source01", "params": {"url": "https://example.com"}}
     consumer = {"type": "notify", "binding_id": "a_consume1", "params": {"message": _ref("step", "a_source01", ["status"])}}
-    branch = {"type": "if", "condition": {"op": "is_true", "left": False}, "then": [], "else": [],
-              "elif": [{"condition": {"op": "is_true", "left": True}, "then": [source, consumer]}]}
-    rule = normalize_rules([_rule(_leaf("usb_insert", "t_usb001"), [branch])])[0]
+    branches = [{"predicate": {"op": "is_true", "left": False}, "steps": []},
+                {"predicate": {"op": "is_true", "left": True}, "steps": [source, consumer]}, {"steps": []}]
+    rule = normalize_rules([branch_rule(_leaf("usb_insert", "t_usb001"), branches)])[0]
     assert validate_rule_binding_ids(rule) == []
     assert validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META) == []
     prepared = prepare_rules([rule], TRIGGERS_META, ACTIONS_META)
     assert len(prepared) == 1, prepared.issues
     assert "a_consume1" in prepared.compiled[rule["rule_id"]].step_index
     assert get_rule_admin_plugins(rule, TRIGGERS_META, {"open_url": {"permissions": ["admin"]}}) == ["open_url"]
-    assert len(list(iter_action_nodes(rule["actions"]))) == 3
-    rule["actions"][0]["elif"].append({"condition": {"op": "eq", "left": _ref("step", "a_source01", ["status"]), "right": "ok"}, "then": []})
+    assert len([node for node in rule["workflow"]["nodes"] if node["type"] in ("open_url", "notify")]) == 2
+    branches.insert(-1, {"predicate": {"op": "eq", "left": _ref("step", "a_source01", ["status"]), "right": "ok"}, "steps": []})
+    rule = branch_rule(_leaf("usb_insert", "t_usb001"), branches)
     assert [issue["code"] for issue in validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META)] == ["forward_reference"]
 
 
 def test_exists_accepts_optional_field_but_checks_source_path_and_comparison_type():
     meta = {"optional": {"outputs": [{"name": "state", "type": "string", "required": False}]}}
     ref = _ref("trigger", "t_option1", ["state"])
-    branch = {"type": "if", "binding_id": "a_branch01", "condition": {"op": "exists", "left": ref},
-              "then": [{"type": "notify", "params": {"message": "present"}}], "else": []}
-    rule = _rule(_leaf("optional", "t_option1"), [branch])
-    assert validate_rule_bindings(rule, meta, ACTIONS_META) == []
+    signal = _leaf("optional", "t_option1")
+    def current(predicate):
+        return branch_rule(signal, [{"predicate": predicate, "steps": [{"type": "notify", "params": {"message": "present"}}]}, {"steps": []}])
+    assert validate_rule_bindings(current({"op": "exists", "left": ref}), meta, ACTIONS_META) == []
     ref["$ref"]["path"] = ["unknown"]
-    assert [issue["code"] for issue in validate_rule_bindings(rule, meta, ACTIONS_META)] == ["unknown_output"]
+    assert [issue["code"] for issue in validate_rule_bindings(current({"op": "exists", "left": ref}), meta, ACTIONS_META)] == ["unknown_output"]
     ref["$ref"]["path"] = ["state"]
     ref["$ref"]["on_missing"] = "error"
-    branch["condition"] = {"op": "gt", "left": ref, "right": 1}
-    assert [issue["code"] for issue in validate_rule_bindings(rule, meta, ACTIONS_META)] == ["binding_type_mismatch"]
+    assert [issue["code"] for issue in validate_rule_bindings(current({"op": "gt", "left": ref, "right": 1}), meta, ACTIONS_META)] == ["binding_type_mismatch"]
 
 
 def test_run_status_references_are_checked_across_rules_and_on_target_removal():
     from notmyfault.core.rules import normalize_rule_input, RuleStructureError, validate_rules
     from notmyfault.core.runtime_rules import prepare_rules
 
-    rule = {"rule_id": "r_observer", **_rule(_leaf("hotkey", "t_hot001"), [{
-        "type": "if", "binding_id": "a_branch01", "condition": {"op": "is_true", "left": False}, "then": [], "else": [],
-        "elif": [{"condition": {"op": "run_status", "rule_id": "r_target01", "status": "succeeded"},
-                  "then": [{"type": "notify", "params": {"message": "done"}}]}],
-    }])}
-    target = {"rule_id": "r_target01", **_rule(_leaf("hotkey", "t_target01"), [{"type": "notify", "params": {"message": "target"}}])}
+    rule = branch_rule(_leaf("hotkey", "t_hot001"), [
+        {"predicate": {"op": "is_true", "left": False}, "steps": []},
+        {"predicate": {"op": "run_status", "rule_id": "r_target01", "status": "succeeded"}, "steps": [{"type": "notify", "params": {"message": "done"}}]},
+        {"steps": []},
+    ], rule_id="r_observer")
+    target = native_rule(_leaf("hotkey", "t_target01"), [{"type": "notify", "params": {"message": "target"}}], rule_id="r_target01")
     rules = normalize_rule_input([rule, target])
     assert validate_rules(rules, TRIGGERS_META, ACTIONS_META)[0] == 2
     assert len(prepare_rules(rules, TRIGGERS_META, ACTIONS_META)) == 2
@@ -266,8 +269,8 @@ def test_file_operation_allows_dynamic_source_but_not_destination():
 
     assert validate_rule_bindings(rule, triggers_meta, actions_meta) == []
 
-    rule["actions"][0]["params"]["source"] = "C:/source"
-    rule["actions"][0]["params"]["destination"] = _ref(
+    next(node for node in rule["workflow"]["nodes"] if node["type"] not in ("trigger", "logic", "event_group"))["params"]["source"] = "C:/source"
+    next(node for node in rule["workflow"]["nodes"] if node["type"] not in ("trigger", "logic", "event_group"))["params"]["destination"] = _ref(
         "trigger", "t_usb001", ["actual_drive"]
     )
     issues = validate_rule_bindings(rule, triggers_meta, actions_meta)
@@ -444,13 +447,13 @@ def test_constants_and_run_variables_have_independent_values_and_atomic_assignme
             {"id": "v_values01", "name": "当前列表", "value_type": {"type": "array", "items": "int"}, "initial": _ref("constant", "c_values01", [])},
             {"id": "v_total001", "name": "合计", "value_type": {"type": "int", "nullable": True}},
         ],
-        "condition": {"type": "path_exists", "params": {"path": _ref("constant", "c_folder01", [])}},
+        **native_rule({"type": "path_exists", "params": {"path": _ref("constant", "c_folder01", [])}}, []),
     }
     first, second = {}, {}
     initialize_variables(rule, first)
     initialize_variables(rule, second)
-    assert resolve_trigger_constants(rule)["condition"]["params"]["path"] == "D:/results"
-    assert "$ref" in rule["condition"]["params"]["path"]
+    assert resolve_trigger_constants(rule)["workflow"]["nodes"][0]["trigger"]["params"]["path"] == "D:/results"
+    assert "$ref" in rule["workflow"]["nodes"][0]["trigger"]["params"]["path"]
     value = list(resolve_value(_ref("variable", "v_values01", []), first))
     value.append(2)
     assign_variable("v_values01", value, first)
@@ -506,13 +509,12 @@ def test_builtin_numeric_parameters_validate_resolved_constants(kind, plugin_id,
         params["disk_path"] = "."
     if kind == "actions":
         params["text"] = "播报内容"
-    rule = {
-        "name": "数字参数",
-        "rule_id": "r_numeric1",
-        "constants": [{"id": "c_value001", "name": "参数值", "value_type": "any", "value": value}],
-        "condition": {"type": plugin_id if kind == "triggers" else "signal", "params": params if kind == "triggers" else {}},
-        "actions": [{"type": plugin_id if kind == "actions" else "noop", "params": params if kind == "actions" else {}}],
-    }
+    rule = native_rule(
+        {"type": plugin_id if kind == "triggers" else "signal", "params": params if kind == "triggers" else {}},
+        [{"type": plugin_id if kind == "actions" else "noop", "params": params if kind == "actions" else {}}],
+        name="数字参数", rule_id="r_numeric1",
+        constants=[{"id": "c_value001", "name": "参数值", "value_type": "any", "value": value}],
+    )
     valid = not isinstance(value, bool) and isinstance(value, (int, float))
     prepared = prepare_rules(
         [rule], {plugin_id: meta} if kind == "triggers" else {"signal": {"params": []}},
@@ -553,8 +555,8 @@ def test_typed_nested_bindings_conversion_and_optional_policy_are_checked_on_sav
     ])
     issues = validate_rule_bindings(rule, TRIGGERS_META, actions_meta)
     assert [issue["code"] for issue in issues] == ["binding_type_mismatch"]
-    assert issues[0]["location"] == "actions[1].params.record.text"
-    rule["actions"][1]["params"]["record"]["text"] = {"$convert": {"value": reference, "to": "text"}}
+    assert issues[0]["location"] == "workflow.nodes[2].params.record.text"
+    [node for node in rule["workflow"]["nodes"] if node["type"] not in ("trigger", "logic", "event_group")][1]["params"]["record"]["text"] = {"$convert": {"value": reference, "to": "text"}}
     assert validate_rule_bindings(rule, TRIGGERS_META, actions_meta) == []
     reference["$ref"].pop("on_missing")
     assert [issue["code"] for issue in validate_rule_bindings(rule, TRIGGERS_META, actions_meta)] == ["optional_output"]
@@ -563,8 +565,9 @@ def test_typed_nested_bindings_conversion_and_optional_policy_are_checked_on_sav
 def test_event_occurred_checks_workflow_identity_without_requiring_outputs():
     from notmyfault.core.predicates import evaluate_predicate, validate_predicate
     source = {"op": "event_occurred", "trigger_id": "t_hot001"}
-    rule = _rule(_leaf("hotkey", "t_hot001"), [{"type": "if", "binding_id": "a_branch01", "condition": source,
-                 "then": [{"type": "notify", "binding_id": "a_notify01", "params": {}}], "else": []}])
+    def current():
+        return branch_rule(_leaf("hotkey", "t_hot001"), [{"predicate": source, "steps": [{"type": "notify", "binding_id": "a_notify01", "params": {}}]}, {"steps": []}])
+    rule = current()
     assert validate_rule_bindings(rule, {"hotkey": {"outputs": []}}, ACTIONS_META) == []
     matched = build_context("规则", "hotkey", {}, [{"binding_id": "t_hot001", "event": {"type": "hotkey"}, "payload": {}}])
     assert evaluate_predicate(source, matched)
@@ -574,7 +577,11 @@ def test_event_occurred_checks_workflow_identity_without_requiring_outputs():
     assert not evaluate_predicate(source, matched)
     matched["manual_test"]["provided_trigger_ids"] = ("t_hot001",)
     assert evaluate_predicate(source, matched)
-    source["trigger_id"] = "t_unknown1"
-    assert [issue["code"] for issue in validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META)] == ["unknown_source"]
+    from notmyfault.core.canvas_workflow import validate_canvas_graph
+    broken = current()
+    event_edge = next(edge for edge in broken["workflow"]["edges"] if edge["channel"] == "condition")
+    event_edge["source"] = "a_missing001"
+    assert any("引用的节点不存在" in issue for issue in validate_canvas_graph(broken["workflow"]))
+    assert validate_predicate({**source, "trigger_id": "bad"})
     assert validate_predicate({"op": "event_occurred", "trigger_id": "a_action1"})
     assert validate_predicate({"op": "event_occurred", "trigger_id": "t_hot001", "expected": "false"})

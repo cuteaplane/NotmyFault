@@ -194,7 +194,7 @@ class ConditionRuntime:
                 node = next(node for node in program.absences if "not:" + program.keys[id(_condition_children(node)[0])] == name)
                 state.absences[name].emitted = True
                 seconds = float(node["within_seconds"])
-                self._hit(key, name, {"event": {"type": "absence", "params": {}},
+                self._hit(key, name, {"binding_id": _condition_children(node)[0].get('binding_id'), "absence": True, "event": {"type": "absence", "params": {}},
                                      "payload": {"wait_seconds": seconds}, "timestamp": timestamp}, timestamp)
                 if node.get("repeat", "once_until_seen") == "every_window":
                     remaining = seconds - math.fmod(timestamp - deadline, seconds)

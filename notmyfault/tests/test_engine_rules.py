@@ -8,6 +8,7 @@ from notmyfault.core.clock import FakeClock
 from notmyfault.core.workflow import ActionCancellation, ActionCancelled
 
 from notmyfault.tests.api_support import create_test_engine, event_fields
+from notmyfault.tests.canvas_fixtures import event_rule, trigger_rule, set_rule_steps, native_rule
 from notmyfault.core.event_bus import _MAX_RUN_CHAIN
 from notmyfault.core.runtime_rules import prepare_rules
 from notmyfault.core.rules import (
@@ -41,11 +42,7 @@ class TestCallNotmyfault:
     def test_missing_trigger_id(self):
         ran = []
         engine = make_engine(
-            rules=[{
-                "name": "r",
-                "event": {"type": "hotkey", "params": {}},
-                "actions": [{"type": "noop", "params": {}}],
-            }]
+            rules=[native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "params": {}}], name="r")]
         )
         register_action(engine, "noop", lambda meta, params: ran.append(1))
         engine.call_notmyfault({"triggered_params": {}})
@@ -55,11 +52,7 @@ class TestCallNotmyfault:
     def test_valid_event_forwarding(self):
         ran = []
         engine = make_engine(
-            rules=[{
-                "name": "r",
-                "event": {"type": "hotkey", "params": {}},
-                "actions": [{"type": "noop", "params": {}}],
-            }]
+            rules=[native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "params": {}}], name="r")]
         )
         register_action(engine, "noop", lambda meta, params: ran.append(1))
         engine.call_notmyfault({"trigger_id": "hotkey", "triggered_params": {}})
@@ -77,7 +70,7 @@ class TestConditionRuntime:
         clock = FakeClock(wall_time=100)
         runtime = ConditionRuntime(clock=clock)
         cancellation = ActionCancellation(timeout_seconds=10, clock=clock)
-        rule = {"condition": {"op": "not", "within_seconds": 10, "children": [
+        rule = {"_matcher": {"op": "not", "within_seconds": 10, "children": [
             {"type": "signal", "binding_id": "t_signal01", "params": {}},
         ]}}
         assert poll_runtime_timers(runtime, "r", rule) is None
@@ -102,7 +95,7 @@ class TestConditionRuntime:
         absence = {"op": "not", "within_seconds": 10, "children": [{
             "type": "signal", "binding_id": "t_signal01", "params": {"channel": channel},
         }]}
-        rule = {"condition": {"op": "all", "children": [
+        rule = {"_matcher": {"op": "all", "children": [
             {"type": "start", "binding_id": "t_start01", "params": {}}, absence,
         ]} if combined else absence}
         assert poll_runtime_timers(runtime, "r", rule, now=0) is None
@@ -121,13 +114,15 @@ class TestConditionRuntime:
         assert poll_runtime_timers(runtime, "r", rule, now=200) is None
 
     def test_absence_event_is_dispatched_through_run_manager(self, monkeypatch):
-        rule = {"name": "无事件", "condition": {"op": "not", "within_seconds": 10, "children": [
+        fixture = {"name": "无事件", "signal": {"op": "not", "within_seconds": 10, "children": [
             {"type": "signal", "params": {"channel": {"$ref": {"scope": "constant", "node": "c_channel01", "path": []}}}},
-        ]}, "actions": [], "constants": [{
+        ]}, "steps": [], "constants": [{
             "id": "c_channel01", "name": "通道", "value_type": "text", "value": "a",
         }], "variables": [{
             "id": "v_values01", "name": "值", "value_type": {"type": "array", "items": "int"}, "initial": [1],
         }]}
+        rule = event_rule("r_absence001", fixture["name"], fixture["signal"], fixture["steps"])
+        rule.update(constants=fixture["constants"], variables=fixture["variables"])
         engine = make_engine([rule])
         engine.triggers_meta["signal"] = {"params": [{"name": "channel", "value_type": "text"}]}
         dispatched = []
@@ -152,7 +147,7 @@ class TestConditionRuntime:
     @pytest.mark.parametrize("window", [10, 7200, None])
     def test_all_condition_respects_time_window(self, window):
         runtime = ConditionRuntime()
-        rule = {"condition": {
+        rule = {"_matcher": {
             "op": "all",
             "children": [
                 {"type": "evt_a", "params": {}},
@@ -160,7 +155,7 @@ class TestConditionRuntime:
             ],
         }}
         if window is not None:
-            rule["condition"]["within_seconds"] = window
+            rule["_matcher"]["within_seconds"] = window
         assert runtime.match("r", rule, "evt_a", {}, now=0.0) is False
         if window is not None:
             assert runtime.match("r", rule, "evt_b", {}, now=window + 1) is False
@@ -171,7 +166,7 @@ class TestConditionRuntime:
         assert runtime.match("r", rule, "evt_a", {}, now=window + 2 if window else 3) is True
 
     def test_nested_events_are_aggregated(self):
-        rule = {"condition": {
+        rule = {"_matcher": {
             "op": "all",
             "children": [
                 {"type": "evt_a", "params": {}},
@@ -186,7 +181,7 @@ class TestConditionRuntime:
 
     def test_consumed_all_condition_does_not_reuse_old_event(self):
         runtime = ConditionRuntime()
-        rule = {"condition": {
+        rule = {"_matcher": {
             "op": "all",
             "children": [
                 {"type": "evt_a", "params": {}},
@@ -200,7 +195,7 @@ class TestConditionRuntime:
 
     def test_nested_any_does_not_reuse_old_branch(self):
         runtime = ConditionRuntime()
-        rule = {"condition": {
+        rule = {"_matcher": {
             "op": "all",
             "consume": "all",
             "children": [
@@ -221,7 +216,7 @@ class TestConditionRuntime:
 
     def test_concurrent_match_returns_each_events_payload(self):
         runtime = ConditionRuntime()
-        rule = {"condition": {"type": "evt", "params": {}}}
+        rule = {"_matcher": {"type": "evt", "params": {}}}
         gate = threading.Barrier(3)
         results = {}
 
@@ -245,11 +240,7 @@ class TestEventDispatching:
     def test_matching_event_dispatches_action(self):
         ran = []
         engine = make_engine(
-            rules=[{
-                "name": "r",
-                "event": {"type": "hotkey", "params": {"key": "f1"}},
-                "actions": [{"type": "noop", "params": {}}],
-            }]
+            rules=[native_rule({"type": "hotkey", "params": {"key": "f1"}}, [{"type": "noop", "params": {}}], name="r")]
         )
         register_action(engine, "noop", lambda meta, params: ran.append(1))
         emit_and_wait(engine, "hotkey", {"key": "f1"})
@@ -257,17 +248,13 @@ class TestEventDispatching:
 
     def test_nested_all_condition_requires_both_events(self):
         ran = []
-        engine = make_engine(rules=[{
-            "name": "r",
-            "condition": {
+        engine = make_engine(rules=[native_rule({
                 "op": "all",
                 "children": [
                     {"type": "evt_a", "params": {}},
                     {"type": "evt_b", "params": {}},
                 ],
-            },
-            "actions": [{"type": "noop", "params": {}}],
-        }])
+            }, [{"type": "noop", "params": {}}], name="r")])
         register_action(engine, "noop", lambda meta, params: ran.append(1))
         emit_and_wait(engine, "evt_a", {})
         assert ran == []
@@ -323,9 +310,9 @@ class TestRuleStructureValidation:
             ],
         ],
     )
-    def test_invalid_rule(self, rule, expected):
+    def test_obsolete_rule_is_rejected(self, rule, expected):
         errors = validate_rule_structure(rule)
-        assert any(expected in error for error in errors)
+        assert any("旧条件模型已移除" in error for error in errors)
 
     @pytest.mark.parametrize(
         ("field", "value", "expected"),
@@ -346,40 +333,34 @@ class TestRuleStructureValidation:
     )
     @pytest.mark.parametrize("placement", ["ordinary", "then", "else", "failure_actions"])
     def test_invalid_action_failure_settings(self, field, value, expected, placement):
-        rule = {
-            "name": "r",
-            "event": {"type": "hotkey", "params": {}},
-            "actions": [{"type": "noop", "params": {}, field: value}],
-        }
+        rule = native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "params": {}, field: value}], name="r")
+        action = rule["workflow"]["nodes"][1]
         if placement in ("then", "else"):
-            rule["actions"] = [{
-                "type": "if", "condition": {"op": "is_true", "left": True},
-                placement: rule["actions"],
-            }]
+            group = {"binding_id": "a_choices001", "type": "event_group", "group_type": "if", "branches": [
+                {"id": "b_initial001"}, {"id": "b_fallback001", "else": True},
+            ]}
+            action["parent"] = group["binding_id"]
+            rule["workflow"]["nodes"].append(group)
+            rule["workflow"]["edges"] = [{"source": group["binding_id"],
+                "port": "b_initial001" if placement == "then" else "b_fallback001",
+                "target": action["binding_id"], "channel": "control"}]
         elif placement == "failure_actions":
-            rule["actions"] = [{"type": "noop", "failure_actions": rule["actions"]}]
+            set_rule_steps(rule, [{"type": "noop", "params": {}, "failure_actions": [action]}])
 
         assert any(expected in error for error in validate_rule_structure(rule))
 
     @pytest.mark.parametrize("failure_actions", [[], {}, "notify"])
     def test_failure_actions_must_be_a_non_empty_list(self, failure_actions):
-        rule = {
-            "name": "r",
-            "event": {"type": "hotkey", "params": {}},
-            "actions": [{
+        rule = native_rule({"type": "hotkey", "params": {}}, [{
                 "type": "noop",
                 "params": {},
                 "failure_actions": failure_actions,
-            }],
-        }
+            }], name="r")
 
         assert any("failure_actions 至少需要一个动作" in error for error in validate_rule_structure(rule))
 
     def test_failure_actions_cannot_nest(self):
-        rule = {
-            "name": "r",
-            "event": {"type": "hotkey", "params": {}},
-            "actions": [{
+        rule = native_rule({"type": "hotkey", "params": {}}, [{
                 "type": "noop",
                 "params": {},
                 "failure_actions": [{
@@ -387,8 +368,7 @@ class TestRuleStructureValidation:
                     "params": {},
                     "failure_actions": [{"type": "notify", "params": {}}],
                 }],
-            }],
-        }
+            }], name="r")
 
         assert any("不允许继续嵌套" in error for error in validate_rule_structure(rule))
 
@@ -403,32 +383,28 @@ class TestValidateAllRules:
         return engine, alerts
 
     def _rule(self, params=None, action_type="noop"):
-        return {
-            "name": "r",
-            "event": {"type": "hotkey", "params": {}},
-            "actions": [{"type": action_type, "params": params or {}}],
-        }
+        return native_rule({"type": "hotkey", "params": {}}, [{"type": action_type, "params": params or {}}], name="r")
 
     @pytest.mark.parametrize("failure", ["reference", "trigger"])
     def test_prepared_rules_isolate_errors_with_duplicate_names(self, failure):
         good = self._rule(params={"mode": "fast"})
         broken = self._rule(params={"mode": "fast"})
         if failure == "reference":
-            broken["actions"][0]["params"]["mode"] = {
+            broken["workflow"]["nodes"][1]["params"]["mode"] = {
                 "$ref": {"scope": "step", "node": "a_absent01", "path": ["value"]}
             }
         else:
-            broken["event"]["type"] = "unavailable"
+            broken["workflow"]["nodes"][0]["trigger"]["type"] = "unavailable"
         engine, _ = self._engine_with_meta([broken, good], {"params": [{
             "name": "mode", "type": "select", "options": ["fast", "slow"],
         }]})
         engine.triggers_funcs["hotkey"] = lambda *args: None
         engine.triggers_meta["unavailable"] = {}
         try:
-            prepared = engine._prepare_rules(engine.rules)
+            prepared = engine._prepare_rules([broken, good])
             assert prepared.total == 2
             assert len(prepared) == 1
-            assert prepared.rules[0]["actions"][0]["params"] == {"mode": "fast"}
+            assert next(node["params"] for node in prepared.rules[0]["workflow"]["nodes"] if node["type"] == "noop") == {"mode": "fast"}
             assert set(prepared.trigger_params) == {"hotkey"}
             assert len(prepared.contexts) == 1
             assert prepared.issues and all(name == "r" for name, _ in prepared.issues)
@@ -450,7 +426,7 @@ class TestValidateAllRules:
 
     def test_timeout_requires_action_cancellation_contract(self):
         rule = self._rule()
-        rule["actions"][0]["timeout_seconds"] = 60
+        rule["workflow"]["nodes"][1]["timeout_seconds"] = 60
         engine, alerts = self._engine_with_meta([rule])
 
         valid, total = engine._validate_all_rules()
@@ -464,7 +440,7 @@ class TestValidateAllRules:
 
     def test_timeout_accepts_action_cancellation_contract(self):
         rule = self._rule()
-        rule["actions"][0]["timeout_seconds"] = 60
+        rule["workflow"]["nodes"][1]["timeout_seconds"] = 60
         engine, alerts = self._engine_with_meta(
             [rule],
             {
@@ -582,9 +558,7 @@ def test_trigger_plugin_data_uses_the_trigger_owner():
             "parameter_editors": [],
         },
     }
-    rule = {
-        "name": "插件触发规则",
-        "event": {
+    rule = native_rule({
             "type": "plugin_trigger",
             "params": {
                 "query": {
@@ -593,11 +567,9 @@ def test_trigger_plugin_data_uses_the_trigger_owner():
                     "data": {"text": "x"},
                 }
             },
-        },
-        "actions": [],
-    }
+        }, [], name="插件触发规则")
     assert validate_rules([rule], {"plugin_trigger": trigger_meta}, {})[:2] == (1, 1)
-    rule["event"]["params"]["query"]["$type"] = "com.example.other/query@1"
+    rule["workflow"]["nodes"][0]["trigger"]["params"]["query"]["$type"] = "com.example.other/query@1"
     valid, total, issues, warnings = validate_rules(
         [rule], {"plugin_trigger": trigger_meta}, {}
     )
@@ -610,11 +582,7 @@ def test_required_trigger_param_rejects_blank_value():
     trigger_meta = {
         "params": [{"name": "rule_id", "type": "string", "required": True}],
     }
-    rule = {
-        "name": "监视规则", "rule_id": "r_watched1",
-        "event": {"type": "rule_finished", "params": {"rule_id": ""}},
-        "actions": [{"type": "noop", "params": {}}],
-    }
+    rule = native_rule({"type": "rule_finished", "params": {"rule_id": ""}}, [{"type": "noop", "params": {}}], name="监视规则", rule_id="r_watched1")
     valid, total, issues, _warnings = validate_rules(
         [rule], {"rule_finished": trigger_meta}, {"noop": {"params": []}}
     )
@@ -633,11 +601,7 @@ def _prepare_self_watching(params):
         }
     }
     prepared = prepare_rules(
-        [{
-            "name": "监视规则", "rule_id": "r_watched1",
-            "event": {"type": "rule_finished", "params": params},
-            "actions": [{"type": "noop", "params": {}}],
-        }],
+        [native_rule({"type": "rule_finished", "params": params}, [{"type": "noop", "params": {}}], name="监视规则", rule_id="r_watched1")],
         triggers,
         {"noop": {"params": []}},
     )
@@ -660,11 +624,7 @@ def test_prepare_rules_keeps_explicit_owner_rule_id():
 
 def test_prepare_rules_leaves_other_triggers_alone():
     prepared = prepare_rules(
-        [{
-            "name": "热键", "rule_id": "r_hotkey01",
-            "event": {"type": "hotkey", "params": {}},
-            "actions": [{"type": "noop", "params": {}}],
-        }],
+        [native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "params": {}}], name="热键", rule_id="r_hotkey01")],
         {"hotkey": {"params": [{"name": "hotkey", "type": "string"}]}},
         {"noop": {"params": []}},
     )
@@ -675,11 +635,7 @@ def test_prepare_rules_leaves_other_triggers_alone():
 def test_run_chain_limit_drops_runs_beyond_limit():
     events = []
     engine = make_engine(
-        rules=[{
-            "name": "链式规则",
-            "event": {"type": "chain", "params": {}},
-            "actions": [{"type": "noop", "params": {}}],
-        }],
+        rules=[native_rule({"type": "chain", "params": {}}, [{"type": "noop", "params": {}}], name="链式规则")],
         on_event=lambda event: events.append((event.type, event_fields(event))),
     )
     register_action(engine, "noop", lambda meta, params: None)
@@ -707,114 +663,71 @@ def test_run_chain_limit_drops_runs_beyond_limit():
     assert limits[0]["rule_name"] == "链式规则"
 
 
-def test_validate_rules_ignores_legacy_step_ids():
-    # 无 binding_id 的旧格式规则不做节点身份校验
-    rules = [{
-        "name": "r",
-        "event": {"type": "hotkey", "params": {}},
-        "actions": [{"type": "noop", "params": {}}],
-    }]
-    assert validate_rules_structure(rules) == []
+def test_validate_rules_rejects_legacy_step_ids():
+    rules = [{"name": "r", "event": {"type": "hotkey", "params": {}}, "actions": [{"type": "noop", "params": {}}]}]
+    assert any("旧条件模型已移除" in error for error in validate_rules_structure(rules))
 
 
 def test_validate_rules_rejects_duplicate_or_invalid_step_ids():
-    duplicated = {
-        "name": "r",
-        "event": {"type": "hotkey", "params": {}, "binding_id": "t_hot001"},
-        "actions": [
-            {"type": "noop", "binding_id": "a_dup001", "params": {}},
-            {"type": "noop", "binding_id": "a_dup001", "params": {}},
-        ],
-    }
-    errors = validate_rule_binding_ids(duplicated)
-    assert any("重复" in error for error in errors)
-
-    invalid = {
-        "name": "r",
-        "event": {"type": "hotkey", "params": {}, "binding_id": "t_hot001"},
-        "actions": [{"type": "noop", "binding_id": "BAD ID", "params": {}}],
-    }
-    errors = validate_rule_binding_ids(invalid)
-    assert any("binding_id 无效" in error for error in errors)
+    duplicated = native_rule({"type": "hotkey", "binding_id": "t_hot001", "params": {}}, [
+        {"type": "noop", "binding_id": "a_dup001", "params": {}},
+        {"type": "noop", "binding_id": "a_dup001", "params": {}},
+    ])
+    assert any("重复" in error for error in validate_rule_binding_ids(duplicated))
+    invalid = native_rule({"type": "hotkey", "binding_id": "t_hot001", "params": {}}, [
+        {"type": "noop", "binding_id": "BAD ID", "params": {}},
+    ])
+    assert any("binding_id 无效" in error for error in validate_rule_binding_ids(invalid))
     assert validate_rules_structure([invalid])
-
-    nested = {
-        "name": "分支",
-        "event": {"type": "hotkey", "params": {}},
-        "actions": [{
-            "type": "if",
-            "condition": {"op": "is_true", "left": True},
-            "then": [{"type": "noop", "binding_id": "a_existing01", "params": {}}],
-            "else": [],
-        }],
-    }
+    nested = native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "binding_id": "a_existing01", "params": {}}])
+    nested["workflow"]["nodes"].append({"binding_id": "a_choices001", "type": "event_group", "group_type": "if", "branches": [
+        {"id": "b_initial001"}, {"id": "b_fallback001", "else": True},
+    ]})
+    nested["workflow"]["nodes"][1]["parent"] = "a_choices001"
+    nested["workflow"]["edges"] = []
     normalized = normalize_rule_input([nested])[0]
-    assert normalized["actions"][0]["then"][0]["binding_id"] == "a_existing01"
+    assert normalized["workflow"]["nodes"][1]["binding_id"] == "a_existing01"
     assert validate_rule_binding_ids(normalized) == []
     for invalid_id in ("BAD ID", None):
-        nested["actions"][0]["then"][0]["binding_id"] = invalid_id
+        nested["workflow"]["nodes"][1]["binding_id"] = invalid_id
         with pytest.raises(ValueError, match="binding_id 无效"):
             normalize_rule_input([nested])
 
 
 def test_validate_rules_rejects_failure_action_id_reused_by_main_flow():
-    rule = {
-        "name": "r",
-        "event": {"type": "hotkey", "params": {}, "binding_id": "t_hot001"},
-        "actions": [{
-            "type": "noop",
-            "binding_id": "a_dup001",
-            "params": {},
-            "failure_actions": [{
-                "type": "notify",
-                "binding_id": "a_dup001",
-                "params": {},
-            }],
-        }],
-    }
-
+    rule = native_rule({"type": "hotkey", "params": {}, "binding_id": "t_hot001"}, [{
+        "type": "noop", "binding_id": "a_dup001", "params": {},
+        "failure_actions": [{"type": "notify", "binding_id": "a_dup001", "params": {}}],
+    }])
     assert any("重复" in error for error in validate_rule_binding_ids(rule))
 
 
 def test_validate_rules_rejects_invalid_or_duplicate_rule_ids():
-    invalid = {
-        "rule_id": "BAD ID",
-        "name": "无效",
-        "event": {"type": "hotkey", "params": {}},
-        "actions": [{"type": "noop", "params": {}}],
-    }
-    duplicate = {
-        "rule_id": "r_repeat01",
-        "name": "重复",
-        "event": {"type": "hotkey", "params": {}},
-        "actions": [{"type": "noop", "params": {}}],
-    }
-
+    invalid = native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "params": {}}])
+    invalid["rule_id"] = "BAD ID"
+    duplicate = native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "params": {}}], rule_id="r_repeat01")
     assert any("rule_id 无效" in error for error in validate_rules_structure([invalid]))
-    errors = validate_rules_structure([duplicate, dict(duplicate)])
-    assert any("rule_id 与其他规则重复" in error for error in errors)
+    assert any("rule_id 与其他规则重复" in error for error in validate_rules_structure([duplicate, dict(duplicate)]))
 
 
 def test_control_flow_structure_and_normalization():
     from notmyfault.config import normalize_rules
     from notmyfault.core.rules import get_rule_admin_plugins
-    rule = {"name": "分支", "condition": {"op": "not", "within_seconds": 10, "children": [{"type": "signal", "params": {}}]}, "actions": [
-        {"type": "if", "condition": {"op": "eq", "left": 1, "right": 1}, "then": [{"type": "admin_action", "params": {}}], "else": []},
-    ]}
+    rule = native_rule({"op": "not", "within_seconds": 10, "children": [{"type": "signal", "params": {}}]}, [
+        {"type": "admin_action", "params": {}},
+    ], name="分支")
     normalized = normalize_rules([rule])[0]
-    assert normalized["condition"]["op"] == "not"
+    assert normalized["workflow"]["nodes"][0]["occurrence"] == "absent"
     assert validate_rule_structure(normalized) == []
     assert validate_rule_binding_ids(normalized) == []
     assert get_rule_admin_plugins(normalized, {"signal": {}}, {"admin_action": {"permissions": ["admin"]}}) == ["admin_action"]
     normalized["preconditions"] = [{"type": "check"}]
-    assert any("运行前检查已移除" in error for error in validate_rule_structure(normalized))
+    assert any("旧条件模型已移除" in error for error in validate_rule_structure(normalized))
     del normalized["preconditions"]
-    normalized["condition"]["within_seconds"] = 0
+    normalized["workflow"]["nodes"][0]["duration_seconds"] = 0
     assert validate_rule_structure(normalized)
-    for changes in (
-        {"name": 42},
-        {"condition": {"op": "all", "children": [{"type": "signal"}, 42]}},
-        {"condition": {"op": "invalid", "children": [{"type": "signal"}]}},
-        {"condition": {"op": "all", "within_seconds": float("nan"), "children": [{"type": "signal"}]}},
-    ):
-        assert validate_rule_structure(normalize_rules([{**rule, **changes}])[0])
+    for field, value in (("duration_seconds", 10**1000), ("duration_seconds", float("inf")), ("duration_seconds", True), ("occurrence", "invalid")):
+        modified = native_rule({"type": "signal", "params": {}}, [{"type": "noop", "params": {}}])
+        modified["workflow"]["nodes"][0][field] = value
+        assert validate_rule_structure(modified)
+    assert validate_rule_structure({**rule, "name": 42})

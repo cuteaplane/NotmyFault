@@ -9,6 +9,7 @@ from notmyfault.core.runtime_rules import prepare_rules
 from notmyfault.core.workflow import build_context
 from notmyfault.plugin_api import Blob, RunContext, Secret
 from notmyfault.tests.api_support import create_test_engine
+from notmyfault.tests.canvas_fixtures import trigger_rule, set_rule_steps
 from notmyfault.values import BLOB_THRESHOLD, allow_secrets
 from notmyfault.values import hold_value
 from notmyfault.core.type_registry import TypeRegistry
@@ -52,6 +53,8 @@ def test_readonly_container_reference_rejects_nested_private_data():
 
 def test_plugin_cannot_change_prior_steps_or_executor_state():
     engine = create_test_engine({"rules": []})
+    engine.triggers_meta["signal"] = {}
+    engine.triggers_funcs["signal"] = lambda *args: None
     observed = []
 
     def produce(meta, params):
@@ -73,11 +76,12 @@ def test_plugin_cannot_change_prior_steps_or_executor_state():
     engine.actions_funcs.update({"produce": produce, "consume": lambda *args: None})
     engine._plugin_modules["consume"] = types.SimpleNamespace(run_with_context=consume)
     state = build_context("规则", "signal", {}, [])
+    state["_event_occurrences"] = {"t_entry_readonly1"}
     try:
-        engine.execute_workflow("rule", {"actions": [
+        engine.execute_workflow("rule", set_rule_steps(trigger_rule("r_readonly1", "规则", "signal"), [
             {"type": "produce", "binding_id": "a_produce1", "params": {}},
             {"type": "consume", "binding_id": "a_consume1", "params": {}},
-        ]}, "规则", state)
+        ]), "规则", state)
         assert observed == [(1, 2)]
     finally:
         engine.shutdown(2)
@@ -86,9 +90,12 @@ def test_plugin_cannot_change_prior_steps_or_executor_state():
 @pytest.mark.parametrize("size", [1, 5, 10])
 def test_large_step_result_and_references_share_a_blob(size):
     engine = create_test_engine({"rules": []})
+    engine.triggers_meta["signal"] = {}
+    engine.triggers_funcs["signal"] = lambda *args: None
     observed = []
     result = {"body": b"x" * (size * 1024 * 1024)}
-    engine.actions_meta.update({"produce": {}, "consume": {"execution_api": "context-v1"}})
+    engine.actions_meta.update({"produce": {"outputs": [{"name": "body", "value_type": "any"}]},
+                                "consume": {"execution_api": "context-v1", "params": [{"name": "body", "value_type": "any"}]}})
     engine.actions_funcs.update({"produce": lambda *args: result, "consume": lambda *args: None})
 
     def consume(meta, params, context):
@@ -101,12 +108,13 @@ def test_large_step_result_and_references_share_a_blob(size):
 
     engine._plugin_modules["consume"] = types.SimpleNamespace(run_with_context=consume)
     state = build_context("规则", "signal", {}, [])
+    state["_event_occurrences"] = {"t_entry_readonly1"}
     ref = {"$ref": {"scope": "step", "node": "a_produce1", "path": ["body"]}}
     try:
-        engine.execute_workflow("rule", {"actions": [
+        engine.execute_workflow("rule", set_rule_steps(trigger_rule("r_readonly1", "规则", "signal"), [
             {"type": "produce", "binding_id": "a_produce1", "params": {}},
-            *[{"type": "consume", "binding_id": f"a_consume{i}", "params": {"body": ref}} for i in range(10)],
-        ]}, "规则", state)
+            *[{"type": "consume", "binding_id": f"a_consume{i:06d}", "params": {"body": ref}} for i in range(10)],
+        ]), "规则", state)
         assert len(observed) == 10
         assert all(blob is observed[0] for blob in observed)
         assert resolve_value(ref, state) is observed[0]
@@ -127,20 +135,20 @@ def test_isolated_snapshot_contains_only_referenced_sources():
 
 
 def test_compiler_records_snapshot_sources_for_each_step(monkeypatch):
-    rule = {"rule_id": "r_sources01", "name": "规则", "condition": {"type": "signal", "params": {}}, "actions": [
+    rule = set_rule_steps(trigger_rule("r_sources01", "规则", "signal"), [
         {"type": "consume", "binding_id": "a_consume1", "params": {
             "value": {"$ref": {"scope": "step", "node": "a_used0001", "path": ["value"]}},
             "legacy": "{{ triggers.t_used0001.payload.value }}",
             "literal": {"$literal": "{{ steps.a_unused01.result }}"},
         }},
-    ]}
+    ])
     compiled = prepare_rules([rule], {"signal": {}}, {"consume": {}}, validate=False).compiled["r_sources01"]
-    assert compiled.plan[0].context_sources == (("steps", "a_used0001"), ("triggers", "t_used0001"))
+    assert next(step for step in compiled.plan if step.id == "a_consume1").context_sources == (("steps", "a_used0001"), ("triggers", "t_used0001"))
     state = build_context("规则", "signal", {}, [])
     state["steps"]["a_used0001"] = {"result": {"value": 7}}
     state["triggers"]["t_used0001"] = {"payload": {"value": 9}}
     monkeypatch.setattr("notmyfault.core.run_context.context_sources", lambda value: pytest.fail("运行时重复扫描引用"))
-    snapshot = referenced_context(state, {}, sources=compiled.plan[0].context_sources)
+    snapshot = referenced_context(state, {}, sources=next(step for step in compiled.plan if step.id == "a_consume1").context_sources)
     assert snapshot["steps"]["a_used0001"]["result"]["value"] == 7
     assert snapshot["triggers"]["t_used0001"]["payload"]["value"] == 9
 

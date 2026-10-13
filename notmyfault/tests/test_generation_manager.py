@@ -6,10 +6,11 @@ import pytest
 from notmyfault.core.clock import FakeClock
 from notmyfault.core.rule_watcher import RuleWatcher
 from notmyfault.tests.api_support import create_test_engine
+from notmyfault.tests.canvas_fixtures import trigger_rule, set_rule_steps
 
 
 def rule(identity="r_compile1", trigger="demo"):
-    return {"rule_id": identity, "name": identity, "condition": {"type": trigger, "params": {}}, "actions": []}
+    return trigger_rule(identity, identity, trigger)
 
 
 def test_compiler_requires_existing_unique_ids_and_freezes_sources():
@@ -20,7 +21,7 @@ def test_compiler_requires_existing_unique_ids_and_freezes_sources():
         source["name"] = "外部修改"
         assert snapshot.rules[0]["name"] == "r_compile1"
         with pytest.raises(TypeError):
-            snapshot.rules[0]["condition"]["params"]["x"] = 1
+            snapshot.compiled[source["rule_id"]].matcher_spec.node["params"]["x"] = 1
         with pytest.raises(ValueError, match="rule_id"):
             engine._generations.prepare([{**source, "rule_id": None}], validate=False)
         with pytest.raises(ValueError, match="重复"):
@@ -64,8 +65,8 @@ def test_reload_reuses_unchanged_programs_and_rebuilds_changed_rules(monkeypatch
     engine.actions_meta["noop"] = {}
     engine.actions_funcs["noop"] = lambda *args: None
     for source in document:
-        source["condition"]["binding_id"] = "t_" + source["rule_id"][2:]
-        source["actions"] = [{"type": "noop", "params": {}, "binding_id": "a_" + source["rule_id"][2:]}]
+        source["workflow"]["nodes"][0]["trigger"]["binding_id"] = "t_" + source["rule_id"][2:]
+        set_rule_steps(source, [{"type": "noop", "params": {}, "binding_id": "a_" + source["rule_id"][2:]}])
     try:
         old = engine._generations.apply(document, "test", activate=False)
         document[0]["concurrency"] = {"mode": "queue", "queue_limit": 2}
@@ -89,8 +90,8 @@ def test_validated_reload_does_not_reuse_unvalidated_rules():
     engine = create_test_engine({"rules": []})
     engine.triggers_meta["demo"] = {"trigger_api": "event-v2", "outputs": []}
     engine.triggers_funcs["demo"] = lambda *args: None
-    source["condition"]["binding_id"] = "t_compile1"
-    source["actions"] = [{"type": "noop", "params": {}, "binding_id": "a_compile1"}]
+    source["workflow"]["nodes"][0]["trigger"]["binding_id"] = "t_compile1"
+    set_rule_steps(source, [{"type": "noop", "params": {}, "binding_id": "a_compile1"}])
     engine.actions_meta["noop"] = {}
     engine.actions_funcs["noop"] = lambda *args: None
     try:
@@ -106,7 +107,7 @@ def test_running_workflow_uses_old_plugin_snapshot_after_swap():
     entered, release = threading.Event(), threading.Event()
     values = []
     source = rule()
-    source["actions"] = [{"type": "wait", "params": {}}, {"type": "version", "params": {}}]
+    set_rule_steps(source, [{"type": "wait", "params": {}}, {"type": "version", "params": {}}])
     engine = create_test_engine({"rules": [source]})
     engine.actions_meta.update(wait={}, version={"version": "1"})
     engine.actions_funcs["wait"] = lambda *_: (entered.set(), release.wait(3)) and None
@@ -117,7 +118,7 @@ def test_running_workflow_uses_old_plugin_snapshot_after_swap():
         old = engine._generations.current
         engine.actions_meta["version"] = {"version": "2"}
         engine.actions_funcs["version"] = lambda *_: values.append("new")
-        candidate = engine._generations.apply(source and engine.rules, "test", activate=False, validate=False)
+        candidate = engine._generations.apply([source], "test", activate=False, validate=False)
         assert candidate.snapshot.compiled[source["rule_id"]].digest != old.snapshot.compiled[source["rule_id"]].digest
         release.set()
         assert engine._run_manager.wait_for_idle(2)

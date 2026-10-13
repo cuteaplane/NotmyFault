@@ -81,6 +81,8 @@ def build_context(
         rule_context["id"] = rule_id
     triggers: Dict[str, Dict[str, Any]] = {}
     for item in condition_events:
+        if item.get('absence'):
+            continue
         binding_id = item.get("binding_id")
         event = item.get("event", {})
         if not isinstance(binding_id, str) or not binding_id:

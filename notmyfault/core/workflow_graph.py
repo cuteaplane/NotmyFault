@@ -10,7 +10,7 @@ from collections import defaultdict
 
 _BRANCH_ID = re.compile(r'^b_[a-z0-9_]{1,64}$')
 
-NATIVE_NODES = frozenset({'if', 'set_variable', 'event_group', 'action_group', 'merge', 'end'})
+NATIVE_NODES = frozenset({'trigger', 'condition', 'logic', 'set_variable', 'event_group', 'action_group', 'merge', 'end'})
 
 
 def _identity(prefix, seed=None):
@@ -29,7 +29,7 @@ def iter_graph_nodes(graph, path='workflow'):
             continue
         location = f'{path}.nodes[{index}]'
         yield node, location
-        if node.get('type') == 'action_group':
+        if node.get('type') == 'action_group' and 'workflow' in node:
             yield from iter_graph_nodes(node.get('workflow'), f'{location}.workflow')
         from notmyfault.core.rules import iter_action_nodes
         yield from iter_action_nodes(node.get('failure_actions'), f'{location}.failure_actions')
@@ -38,15 +38,33 @@ def iter_graph_nodes(graph, path='workflow'):
 def iter_rule_actions(rule, *, include_invalid=False):
     if isinstance(rule.get('workflow'), dict):
         yield from iter_graph_nodes(rule['workflow'])
-    else:
-        from notmyfault.core.rules import iter_action_nodes
-        yield from iter_action_nodes(rule.get('actions'), include_invalid=include_invalid)
+
+
+def execution_nodes(graph, start_id=None, end_id=None):
+    scope = find_graph_scope(graph, start_id) if start_id else None
+    current = scope['graph'] if scope else graph
+    entry = start_id or current.get('entry')
+    adjacent = defaultdict(list)
+    for edge in current.get('edges', []):
+        if edge.get('target') is not None:
+            adjacent[edge['source']].append(edge['target'])
+    selected, pending = set(), [entry] if entry else []
+    while pending:
+        identity = pending.pop()
+        if identity in selected:
+            continue
+        selected.add(identity)
+        if identity != end_id:
+            pending.extend(adjacent[identity])
+    nodes = [node for node in current.get('nodes', []) if node['binding_id'] in selected]
+    yield from iter_graph_nodes({'nodes': nodes})
 
 
 def iter_rule_event_nodes(rule):
     from notmyfault.core.conditions import get_rule_events, iter_condition_events
-    yield from get_rule_events(rule)
     for node, _path in iter_rule_actions(rule):
+        if node.get('type') == 'trigger':
+            yield node['trigger']
         if node.get('type') == 'event_group':
             yield from iter_condition_events(node.get('activation'))
             triggers = node.get('triggers', [])
@@ -143,7 +161,7 @@ def predicate_condition_graph(predicate, *, seed=None):
 
 
 def branch_predicate(branch):
-    return condition_graph_predicate(branch['condition_graph']) if 'condition_graph' in branch else branch.get('condition')
+    return None if branch.get('else') else condition_graph_predicate(branch['condition_graph'])
 
 
 def evaluate_group_branches(node, context, evaluated, *, status_lookup, occurred):
@@ -152,7 +170,7 @@ def evaluate_group_branches(node, context, evaluated, *, status_lookup, occurred
         if branch.get('else'):
             return branch['id']
         identities, predicates = {}, []
-        predicate = condition_graph_predicate(branch['condition_graph'], node_ids=identities) if 'condition_graph' in branch else branch.get('condition')
+        predicate = condition_graph_predicate(branch['condition_graph'], node_ids=identities)
         record = {'branch_id': branch['id'], 'predicates': predicates}
         evaluated.append(record)
         def on_result(current, path, result, error):
@@ -184,7 +202,7 @@ def find_graph_node(graph, identity):
     for node in graph.get('nodes', []):
         if node.get('binding_id') == identity:
             return graph, node
-        if node.get('type') == 'action_group':
+        if node.get('type') == 'action_group' and 'workflow' in node:
             found = find_graph_node(node['workflow'], identity)
             if found:
                 return found
@@ -199,7 +217,7 @@ def find_graph_scope(graph, identity, inherited=(), group_path=(), inherited_pos
         if node_id == identity:
             return {'graph': graph, 'node': node, 'available': frozenset(available[node_id]),
                     'possible': frozenset(possible[node_id]), 'group_path': tuple(group_path)}
-        if node.get('type') == 'action_group':
+        if node.get('type') == 'action_group' and 'workflow' in node:
             found = find_graph_scope(node['workflow'], identity, available[node_id], (*group_path, node_id), possible[node_id])
             if found is not None:
                 return found
@@ -224,54 +242,8 @@ def entry_event_group(graph):
 
 
 def normalize_workflow_rule(rule):
-    result = copy.deepcopy(rule)
-    if isinstance(result.get('workflow'), dict):
-        for node, _path in iter_rule_actions(result):
-            if node.get('type') == 'event_group':
-                for branch in node.get('branches', []):
-                    if 'condition' in branch and 'condition_graph' not in branch:
-                        branch['condition_graph'] = predicate_condition_graph(branch.pop('condition'), seed=node['binding_id'] + ':' + branch['id'])
-        return result
-    from notmyfault.core.rule_model import ensure_rule_binding_ids
-    result = ensure_rule_binding_ids(result)
-    graph = {'entry': None, 'nodes': [], 'edges': []}
-
-    def sequence(items, continuation):
-        target = continuation
-        for original in reversed(items):
-            node = copy.deepcopy(original)
-            identity = node['binding_id']
-            if node.get('type') == 'if':
-                branches = []
-                alternatives = [('IF', node['condition'], node.get('then', []))]
-                alternatives.extend(('ELIF', branch['condition'], branch.get('then', [])) for branch in node.get('elif', []))
-                alternatives.append(('ELSE', None, node.get('else', [])))
-                for branch_index, (label, predicate, actions) in enumerate(alternatives):
-                    branch = {'id': _identity('b', identity + ':' + str(branch_index)), 'label': label}
-                    if predicate is None:
-                        branch['else'] = True
-                    else:
-                        branch['condition_graph'] = predicate_condition_graph(predicate, seed=identity + ':' + branch['id'])
-                    branches.append(branch)
-                    graph['edges'].append({'source': identity, 'port': branch['id'], 'target': sequence(actions, target)})
-                node = {key: value for key, value in node.items() if key not in ('condition', 'then', 'elif', 'else')}
-                node.update(type='event_group', mode='immediate', branches=branches)
-            else:
-                graph['edges'].append({'source': identity, 'port': 'next', 'target': target})
-            graph['nodes'].append(node)
-            target = identity
-        return target
-
-    target = sequence(result.pop('actions', []), None)
-    if 'condition' in result:
-        branch_id, identity = _identity('b', result['rule_id'] + ':entry'), _identity('a', result['rule_id'] + ':entry')
-        graph['nodes'].append({'type': 'event_group', 'binding_id': identity, 'activation': result.pop('condition'),
-                               'mode': 'immediate', 'branches': [{'id': branch_id, 'else': True, 'label': '执行'}]})
-        graph['edges'].append({'source': identity, 'port': branch_id, 'target': target})
-        target = identity
-    graph['entry'] = target
-    result['workflow'] = graph
-    return result
+    from notmyfault.core.rule_model import normalize_rule_shape
+    return normalize_rule_shape(rule)
 
 
 def validate_workflow_graph(graph, path='workflow', seen=None):

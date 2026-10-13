@@ -16,10 +16,22 @@ def leaf(name):
     return {"type": name, "binding_id": f"t_{name}000000", "params": {}}
 
 
+def absence_rule(identity, name, seconds):
+    return {"rule_id": identity, "name": name, "workflow": {
+        "entry": None,
+        "nodes": [
+            {"binding_id": "a_absence000001", "type": "trigger", "trigger": leaf("a"),
+             "occurrence": "absent", "duration_seconds": seconds},
+            {"binding_id": "a_finish000001", "type": "end"},
+        ],
+        "edges": [{"source": "a_absence000001", "port": "event", "target": "a_finish000001", "channel": "control"}],
+    }}
+
+
 def runtime_for(node):
     clock = FakeClock()
     runtime = ConditionRuntime(clock=clock)
-    rule = {"condition": node}
+    rule = {"_matcher": node}
     runtime.register_rule("r", rule)
     return runtime, clock, rule
 
@@ -120,7 +132,7 @@ def test_late_timer_coalesces_missed_absence_windows():
 def test_tiny_absence_window_advances_beyond_clock_precision():
     clock = FakeClock(monotonic=1_000_000)
     runtime = ConditionRuntime(clock=clock)
-    rule = {"condition": {"op": "not", "within_seconds": 1e-300, "repeat": "every_window", "children": [leaf("a")]}}
+    rule = {"_matcher": {"op": "not", "within_seconds": 1e-300, "repeat": "every_window", "children": [leaf("a")]}}
     runtime.register_rule("r", rule)
     assert runtime.next_deadline() > clock.monotonic()
     clock.advance(1)
@@ -145,7 +157,7 @@ def test_migration_keeps_deadlines_and_event_sequence(consumed):
     if consumed:
         send(runtime, clock, rule, "b")
     candidate = ConditionRuntime(clock=clock)
-    candidate.configure({"r": SimpleNamespace(matcher_spec=build_matcher(copy.deepcopy(rule["condition"])))})
+    candidate.configure({"r": SimpleNamespace(matcher_spec=build_matcher(copy.deepcopy(rule["_matcher"])))})
     candidate.migrate_from(runtime, {"r"})
     candidate.activate()
     state = candidate.snapshot()["r"]
@@ -163,7 +175,7 @@ def test_migration_preserves_tie_order_of_rearmed_absences():
     ]})
     send(runtime, clock, rule, "b", 1)
     candidate = ConditionRuntime(clock=clock)
-    candidate.configure({"r": SimpleNamespace(matcher_spec=build_matcher(copy.deepcopy(rule["condition"])))})
+    candidate.configure({"r": SimpleNamespace(matcher_spec=build_matcher(copy.deepcopy(rule["_matcher"])))})
     candidate.migrate_from(runtime, {"r"})
     candidate.activate()
     clock.advance(1)
@@ -195,9 +207,7 @@ def test_timer_thread_waits_and_reload_wakes_it_for_an_earlier_deadline():
             self.waits.put(timeout)
             return super().wait(event, timeout)
 
-    rule = {"rule_id": "r_timertrial", "name": "缺席计时", "condition": {
-        "op": "not", "within_seconds": 10, "children": [leaf("a")],
-    }, "actions": []}
+    rule = absence_rule("r_timertrial", "缺席计时", 10)
     finished = threading.Event()
     clock = ObservedClock()
     engine = create_test_engine({"rules": [rule]}, clock=clock, on_event=lambda event: finished.set() if event.type == "run.succeeded" else None)
@@ -207,7 +217,7 @@ def test_timer_thread_waits_and_reload_wakes_it_for_an_earlier_deadline():
     try:
         assert clock.waits.get(timeout=2) == 10
         changed = copy.deepcopy(rule)
-        changed["condition"]["within_seconds"] = 3
+        changed["workflow"]["nodes"][0]["duration_seconds"] = 3
         engine._generations.apply([changed], "test", activate=False, validate=False)
         assert clock.waits.get(timeout=2) == 3
         assert not finished.is_set()
@@ -238,9 +248,7 @@ def test_event_ingress_delivers_due_absence_before_rearming(timer_first, repeat,
 def test_engine_event_ingress_executes_absence_when_timer_thread_is_late(timer_first):
     from notmyfault.tests.api_support import create_test_engine
 
-    rule = {"rule_id": "r_latenot1", "name": "缺席等待", "condition": {
-        "op": "not", "within_seconds": 2, "children": [leaf("a")],
-    }, "actions": []}
+    rule = absence_rule("r_latenot1", "缺席等待", 2)
     events = []
     engine = create_test_engine({"rules": [rule]}, on_event=events.append)
     engine.triggers_meta["a"] = {}

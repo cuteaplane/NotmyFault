@@ -1,5 +1,6 @@
 """配置、引擎、日志与首次构建的跨模块集成路径"""
 
+from notmyfault.tests.canvas_fixtures import native_rule
 from notmyfault.tests.api_support import event_fields
 
 import json
@@ -21,6 +22,7 @@ from notmyfault.tests.api_support import (
 )
 from notmyfault.host import app as host_app
 from notmyfault.security.security import SecurityMode
+from notmyfault.config import ConfigValidationError
 
 
 def test_simulator_stubs_rule_actions_without_replacing_global_modules(monkeypatch):
@@ -36,14 +38,14 @@ def test_simulator_stubs_rule_actions_without_replacing_global_modules(monkeypat
         raise AssertionError("模拟器加载了真实插件")
     monkeypatch.setattr(PluginRegistry, "resolve_action", resolve)
     actions = ["file_operation", "http_request", "set_volume", "open_url"]
-    config = {"rules": [{"name": "模拟", "event": {"type": "manual", "params": {}}, "actions": [
+    config = {"rules": [native_rule({"type": "manual", "params": {}}, [
         {"type": action, "params": {}} for action in actions
-    ]}]}
+    ], name="模拟")]}
     with SimulatedRunner(SimulatedEnvironment()) as runner:
         runner.start(config)
         directory = Path(runner._store.rules_path).parent
         runner.emit("manual")
-        assert [item["data"]["action_type"] for item in runner.events if item["type"] == "run.step.succeeded"] == actions
+        assert [item["data"]["action_type"] for item in runner.events if item["type"] == "run.step.succeeded" and item["data"]["action_type"] in actions] == actions
         assert sys.modules["datetime"] is datetime
         assert sys.modules["psutil"] is psutil
     assert not directory.exists()
@@ -66,11 +68,7 @@ class TestAPIConfigRoundtrip:
         store = isolated_config.store
         assert store.load_rules() == []
 
-        assert store.save_rules([{
-            "name": "集成规则",
-            "event": {"type": "hotkey", "params": {"key": "f9"}},
-            "actions": [{"type": "noop", "params": {}}],
-        }]) is True
+        assert store.save_rules([native_rule({"type": "hotkey", "params": {"key": "f9"}}, [{"type": "noop", "params": {}}], name="集成规则")]) is True
 
         names = [rule["name"] for rule in store.load_verified_rules()]
         assert "集成规则" in names
@@ -80,11 +78,7 @@ class TestConfigEnginePipeline:
     def test_config_written_engine_reads_rules(self, isolated_config):
         store = isolated_config.store
         store.save_config({})
-        store.save_rules([{
-            "name": "r1",
-            "event": {"type": "hotkey", "params": {}},
-            "actions": [{"type": "noop", "params": {}}],
-        }])
+        store.save_rules([native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "params": {}}], name="r1")])
         config = store.load_verified_config()
         config["rules"] = store.load_verified_rules()
         engine = create_test_engine(config, rules_store=store)
@@ -94,58 +88,29 @@ class TestConfigEnginePipeline:
     def test_config_modification_picked_up(self, isolated_config):
         store = isolated_config.store
         store.save_config({})
-        store.save_rules([{
-            "name": "旧规则",
-            "event": {"type": "hotkey", "params": {}},
-            "actions": [{"type": "noop", "params": {}}],
-        }])
+        store.save_rules([native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "params": {}}], name="旧规则")])
         rules = store.load_verified_rules()
         rules[0]["name"] = "新规则"
         store.save_rules(rules)
         assert store.load_verified_rules()[0]["name"] == "新规则"
 
-    def test_legacy_config_to_engine(self, isolated_config):
-        # 旧格式 config.json 直接落盘，模拟升级前的真实文件
-        legacy = {"processes": [{
-            "process_name": "WeChat.exe",
-            "software_name": "微信",
-            "volume_action": "max",
-            "notification": {"title": "微信运行", "message": "音量最大"},
-        }]}
-        paths = isolated_config.paths
-        store = isolated_config.store
+    def test_legacy_config_is_rejected_without_creating_rule_file(self, isolated_config):
+        legacy = {"processes": [{"process_name": "WeChat.exe", "volume_action": "max"}]}
+        paths, store = isolated_config.paths, isolated_config.store
         secret = paths.config_secret_file.read_bytes()
         content = json.dumps(legacy, sort_keys=True, ensure_ascii=False, default=str)
-        legacy["_signature"] = hmac.new(
-            secret,
-            content.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        paths.config_file.write_text(
-            json.dumps(legacy, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        legacy["_signature"] = hmac.new(secret, content.encode("utf-8"), hashlib.sha256).hexdigest()
+        paths.config_file.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
         paths.rules_file.unlink()
-        # 加载设置时自动把旧进程列表拆分到 rules.json
-        config = store.load_config()
-        config["rules"] = store.load_rules()
-        engine = create_test_engine(config, rules_store=store)
-        rule = engine.rules[0]
-        assert rule["condition"]["type"] == "process_state"
-        assert rule["condition"]["params"]["process_name"] == "WeChat.exe"
-        assert rule["actions"][0]["type"] == "set_volume"
+        with pytest.raises(ConfigValidationError, match="旧配置中的规则模型已移除"):
+            store.load_config()
+        assert not paths.rules_file.exists()
 
-    def test_legacy_trigger_config_normalized(self, isolated_config):
+    def test_legacy_trigger_config_is_rejected_without_overwriting_rules(self, isolated_config):
         store = isolated_config.store
-        store.save_config({})
-        store.save_rules([{
-            "name": "r1",
-            "trigger": {"type": "hotkey", "params": {}},
-            "actions": [{"type": "noop", "params": {}}],
-        }])
-        rule = store.load_verified_rules()[0]
-        assert "trigger" not in rule
-        assert rule["condition"]["type"] == "hotkey"
+        original = isolated_config.paths.rules_file.read_bytes()
+        assert not store.save_rules([{"name": "r1", "trigger": {"type": "hotkey", "params": {}}, "actions": [{"type": "noop", "params": {}}]}])
+        assert isolated_config.paths.rules_file.read_bytes() == original
 
 
 class TestEngineEventPipeline:
@@ -153,17 +118,13 @@ class TestEngineEventPipeline:
         events = []
         received = {}
         engine = make_engine(
-            rules=[{
-                "name": "USB 规则",
-                "event": {"type": "usb_insert", "params": {}},
-                "actions": [{
+            rules=[native_rule({"type": "usb_insert", "params": {}}, [{
                     "type": "consume",
                     "binding_id": "a_con001",
                     "params": {
                         "drive": {"$ref": {"scope": "event", "path": ["drive"]}}
                     },
-                }],
-            }],
+                }], name="USB 规则")],
             on_event=lambda event: events.append((event.type, event_fields(event))),
         )
         engine.triggers_meta["usb_insert"] = {"outputs": [{"name": "drive", "type": "string"}]}
@@ -179,11 +140,7 @@ class TestEngineEventPipeline:
         assert "run.step.succeeded" in types
 
     def test_shutdown_during_action(self):
-        engine = make_engine(rules=[{
-            "name": "r",
-            "event": {"type": "hotkey", "params": {}},
-            "actions": [{"type": "noop", "params": {}}],
-        }])
+        engine = make_engine(rules=[native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "params": {}}], name="r")])
         ran = []
         engine.actions_funcs["noop"] = lambda meta, params: ran.append(1)
         engine.actions_meta["noop"] = {}
@@ -204,14 +161,10 @@ class TestHotReloadIntegration:
         monkeypatch.setattr(platform_support, "show_notification", lambda *a, **k: None)
 
         def rule(name):
-            return {
-                "name": name,
-                "event": {"type": "hotkey", "params": {}},
-                "actions": [{"type": "noop", "params": {"name": name}}],
-            }
+            return native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "params": {"name": name}}], name=name)
 
         broken = rule("不可用规则")
-        broken["actions"][0]["type"] = "missing_action"
+        broken["workflow"]["nodes"][1]["type"] = "missing_action"
         store = isolated_config.store
         store.save_config({})
         store.save_rules([*([rule("r1")] if initial_valid else []), broken])
@@ -271,7 +224,7 @@ class TestHotReloadIntegration:
                 assert engine._run_manager.wait_for_idle(timeout=5)
                 assert executed == expected
             assert engine.get_diagnostics()["rules"]["issues"] == []
-            assert any(r["actions"][0]["type"] == "noop" for r in store.load_verified_rules())
+            assert any(node["type"] == "noop" for r in store.load_verified_rules() for node in r["workflow"]["nodes"])
         finally:
             shutdown.set()
             thread.join(timeout=10)
@@ -279,11 +232,7 @@ class TestHotReloadIntegration:
 
     def test_hot_reload_keeps_unchanged_trigger_threads(self, isolated_config):
         def rule(name):
-            return {
-                "name": name,
-                "event": {"type": "hotkey", "params": {}},
-                "actions": [{"type": "noop", "params": {"name": name}}],
-            }
+            return native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "params": {"name": name}}], name=name)
 
         starts = []
 

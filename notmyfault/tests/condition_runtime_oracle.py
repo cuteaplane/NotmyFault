@@ -67,7 +67,7 @@ class PreviousConditionRuntime:
                 if not emitted and timestamp >= deadline:
                     deadlines[key] = (deadline, True)
                     seen[key] = {
-                        "event": {"type": "absence", "params": {}},
+                        "binding_id": children[0].get("binding_id"), "absence": True, "event": {"type": "absence", "params": {}},
                         "payload": {"wait_seconds": seconds}, "timestamp": timestamp,
                     }
                     changed = True

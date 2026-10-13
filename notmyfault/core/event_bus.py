@@ -57,10 +57,6 @@ class EventBus:
         self._status_lookup = lambda identity: {"running": 0, "queued": 0, "last_status": None}
 
     def observe_events(self, compiled, occurred=()):
-        if "workflow" not in compiled.source and not any(has_event_predicate(step.action.get("condition")) or
-                   any(has_event_predicate(branch.get("condition")) for branch in (step.action.get("elif") or ()) if isinstance(branch, dict))
-                   for step in compiled.plan if step.action.get("type") == "if"):
-            return None
         snapshot = self._snapshot_fn()
         observation = RunEventObservation(compiled, occurred, clock=snapshot.runtime.clock, wake=snapshot.runtime._wake)
         with self._rules_lock:
@@ -104,7 +100,7 @@ class EventBus:
             for key, events in matches:
                 dispatches.append((snapshot.compiled[key].source, key, events, event_type, event_payload, masked_payload, depth))
             dispatches = [(item, self.observe_events(snapshot.compiled[item[1]],
-                          (event.get("binding_id") for event in item[2]))) for item in dispatches]
+                          (event.get("binding_id") for event in item[2] if not event.get('absence')))) for item in dispatches]
             for _item, observation in dispatches:
                 if observation is not None:
                     observation.seed(_item[2])
@@ -178,7 +174,7 @@ class EventBus:
             for observation in tuple(self._observations):
                 observation.process_timers(now)
             for key, matched in snapshot.runtime.take_due(now):
-                observation = self.observe_events(snapshot.compiled[key], (event.get("binding_id") for event in matched))
+                observation = self.observe_events(snapshot.compiled[key], (event.get("binding_id") for event in matched if not event.get('absence')))
                 if observation is not None:
                     observation.seed(matched)
                 dispatches.append((snapshot.compiled[key].source, key, matched, observation))

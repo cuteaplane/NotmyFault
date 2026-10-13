@@ -16,6 +16,7 @@ from notmyfault.actions.read_text.action import run_with_context as read_text
 from notmyfault.actions.write_text.action import run_with_context as write_text
 from notmyfault.core.workflow import ActionCancellation, ActionCancelled, build_context
 from notmyfault.core.rules import validate_rule_bindings
+from notmyfault.tests.canvas_fixtures import native_rule
 from notmyfault.tests.api_support import create_test_engine
 from notmyfault.values import plain_value
 
@@ -266,14 +267,16 @@ def test_file_actions_use_paths_and_content_from_trigger_data(tmp_path, monkeypa
         {"type": "read_text", "binding_id": "a_readtext", "params": {"file_path": {"$ref": {"scope": "step", "node": "a_writetext", "path": ["file"]}}}},
     ]
     trigger = {"outputs": [{"name": name, "type": "string", "value_type": "text" if name == "text" else "path"} for name in payload]}
-    rule = {"name": "按事件内容保存文件", "condition": {"type": "manual", "binding_id": "t_manual01", "params": {}}, "actions": actions}
+    rule = native_rule({"type": "manual", "binding_id": "t_manual01", "params": {}}, actions, name="按事件内容保存文件")
     assert validate_rule_bindings(rule, {"manual": trigger}, metas) == []
     engine = create_test_engine({"rules": []})
+    engine.triggers_meta["manual"] = trigger
+    engine.triggers_funcs["manual"] = lambda *args: None
     for name, module in modules.items():
         engine.actions_funcs[name] = module.run
         engine.actions_meta[name] = metas[name]
         engine._plugin_modules[name] = module
-    context = build_context(rule["name"], "manual", payload, [])
+    context = build_context(rule["name"], "manual", payload, [{"binding_id": "t_manual01", "event": {"type": "manual", "params": {}}, "payload": payload}])
     engine.execute_workflow("file_actions", rule, rule["name"], context)
     assert [context["steps"][action["binding_id"]]["status"] for action in actions] == ["ok"] * 3
 

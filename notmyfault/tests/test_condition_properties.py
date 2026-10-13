@@ -43,14 +43,14 @@ def identify(node):
 @settings(max_examples=350, deadline=None, database=None)
 @given(trees, operations)
 def test_heap_matcher_agrees_with_scanning_reference(node, actions):
-    rule = {"condition": identify(node)}
+    rule = {"_matcher": identify(node)}
     clock = FakeClock()
     runtime = ConditionRuntime(clock=clock)
     runtime.register_rule("r", rule)
     reference = ReferenceConditionRuntime(rule)
     def migrate():
         candidate = ConditionRuntime(clock=clock)
-        candidate.configure({"r": SimpleNamespace(matcher_spec=build_matcher(copy.deepcopy(rule["condition"])))})
+        candidate.configure({"r": SimpleNamespace(matcher_spec=build_matcher(copy.deepcopy(rule["_matcher"])))})
         candidate.migrate_from(runtime, {"r"})
         candidate.activate()
         return candidate
@@ -85,7 +85,7 @@ old_trees = st.recursive(
 @settings(max_examples=250, deadline=None, database=None)
 @given(old_trees, operations)
 def test_existing_all_and_absence_semantics_agree_with_previous_runtime(node, actions):
-    rule = {"condition": identify(node)}
+    rule = {"_matcher": identify(node)}
     clock = FakeClock()
     runtime = ConditionRuntime(clock=clock)
     previous = PreviousConditionRuntime(clock=clock)
@@ -106,7 +106,7 @@ def test_existing_any_and_window_semantics_agree_with_previous_runtime(op, windo
     node = {"op": op, "children": [{"type": kind, "params": {"channel": 0}} for kind in ("a", "b", "c")]}
     if op == "all":
         node["within_seconds"] = window
-    rule = {"condition": identify(node)}
+    rule = {"_matcher": identify(node)}
     clock = FakeClock()
     runtime = ConditionRuntime(clock=clock)
     previous = PreviousConditionRuntime(clock=clock)
