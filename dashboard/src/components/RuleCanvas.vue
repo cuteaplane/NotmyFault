@@ -6,9 +6,9 @@ const canvasViews = new WeakMap()
 import { computed, nextTick, ref, watch, onMounted, onUnmounted } from 'vue'
 import { store } from '../lib/store'
 import { FLOW_DATA_PORT_STEP, FLOW_DATA_PORT_Y, FLOW_DATA_SUMMARY_HEIGHT, FLOW_NODE_ADMIN_EXTRA_HEIGHT,
-  FLOW_NODE_BASE_HEIGHT, FLOW_NODE_WIDTH, buildFlowGraph, conditionNodeId, routeFlowEdge } from '../lib/flowGraph'
+  FLOW_NODE_BASE_HEIGHT, FLOW_NODE_WIDTH, routeFlowEdge } from '../lib/flowGraph'
 import { buildNodeDataPorts, deriveDataEdges, typesCompatible } from '../lib/bindings'
-import { buildWorkflowGraph, connectGraph, connectConditionGraph, connectTriggerCondition, graphId } from '../lib/workflowGraph'
+import { buildWorkflowGraph, connectGraph, arrangeWorkflow, makeGroupRoom, groupTypeLabel } from '../lib/workflowGraph'
 import { predicateSummary, predicateSummaryParts, precedingSources, workflowEventChoices } from '../lib/workflowConditions'
 import { typeLabel } from '../lib/valueTypes'
 import { isAdmin, eventName, actionName, describeItem } from '../lib/rulePresentation'
@@ -17,12 +17,25 @@ const props = defineProps({ rule: Object, layout: { type: String, default: 'canv
 const emit = defineEmits(['update:selectedNodeId', 'select-node', 'delete-node', 'add-if', 'add-assignment', 'add-wait', 'open-picker', 'move-action', 'remove-action', 'move-failure-action', 'remove-failure-action', 'add-condition-child', 'open-if', 'predicate-select', 'branch-add', 'branch-remove', 'operation'])
 const canvasLayout = computed(() => props.layout === 'canvas')
 const selectedNodeId = computed({ get: () => props.selectedNodeId, set: id => emit('update:selectedNodeId', id) })
-const conditionNode = computed(() => props.rule.condition || null)
 const typeCatalog = computed(() => Object.entries(store.schema.data_types?.custom || {}).map(([id, definition]) => ({ id, ...definition })))
 
 const nodePositions = ref({})
 const expandedGroups = ref(new Set())
 const contextMenu = ref(null)
+const selection = ref(new Set())
+const contextMenuRef = ref(null)
+watch(contextMenu, async menu => {
+  if (!menu) return
+  await nextTick()
+  if (contextMenu.value !== menu || !contextMenuRef.value) return
+  const rect = viewportRef.value?.getBoundingClientRect()
+  if (!rect) return
+  menu.x = Math.max(8, -rect.left + 8, Math.min(menu.x, Math.min(rect.width, window.innerWidth - rect.left) - contextMenuRef.value.offsetWidth - 8))
+  menu.y = Math.max(8, -rect.top + 8, Math.min(menu.y, Math.min(rect.height, window.innerHeight - rect.top) - contextMenuRef.value.offsetHeight - 8))
+})
+const selectionBox = ref(null)
+const dropGroup = ref(null)
+const dragFrames = ref(null)
 const controlDrag = ref(null)
 function openContext(event, context) {
   event?.stopPropagation?.()
@@ -31,32 +44,61 @@ function openContext(event, context) {
   const keyboard = event?.key || event?.type === 'click' && event?.detail === 0
   const clientX = keyboard && anchor ? anchor.left + anchor.width / 2 : event?.clientX ?? rect?.left ?? 0
   const clientY = keyboard && anchor ? anchor.top + anchor.height / 2 : event?.clientY ?? rect?.top ?? 0
-  contextMenu.value = { ...context, x: Math.max(8, Math.min(clientX - (rect?.left || 0), (rect?.width || 800) - 250)), y: Math.max(8, Math.min(clientY - (rect?.top || 0), (rect?.height || 700) - 310)) }
+  const position = { x: (clientX - (rect?.left || 0) - pan.value.x) / zoom.value, y: (clientY - (rect?.top || 0) - pan.value.y) / zoom.value }
+  const maxHeight = Math.max(120, Math.min(rect?.bottom || window.innerHeight, window.innerHeight) - Math.max(0, rect?.top || 0) - 16)
+  contextMenu.value = { ids: [...selection.value], position, ...context, maxHeight, x: Math.max(8, Math.min(clientX - (rect?.left || 0), (rect?.width || 800) - 250)), y: Math.max(8, Math.min(clientY - (rect?.top || 0), (rect?.height || 700) - 310)) }
 }
-function menuOperation(operation) { const context = contextMenu.value; if (!context) return; contextMenu.value = null; if (operation === 'edit-condition') { selectNode(context.edge.inspectionId); return } emit('operation', { ...context, operation }) }
+function menuOperation(operation, value) {
+  const context = contextMenu.value
+  if (!context) return
+  if (['create-variable', 'assign-variable'].includes(operation) && !context.outlet) {
+    const node = context.node || layoutNodes.value.find(node => node.id === context.edge?.from)
+    if (node?.outputs?.length > 1) { contextMenu.value = { ...context, node, kind: 'data-outlet', dataOperation: operation }; return }
+  }
+  contextMenu.value = null
+  if (operation === 'edit-condition') { selectNode(context.edge.inspectionId); return }
+  if (operation === 'edit-branch') { selectBranch(context.node, context.node.outputs.find(port => port.id === context.outlet)); return }
+  emit('operation', { ...context, operation, value })
+  if (operation === 'group-selection') selection.value = new Set()
+}
+function chooseDataOutlet(outlet) { const context = contextMenu.value; contextMenu.value = { ...context, kind: 'data', outlet }; menuOperation(context.dataOperation) }
+function selectBranch(node, port) { const id = `branch-${node.raw.binding_id}-${port.id}`; pointerSelectionId = id; selectNode(id) }
 function edgeContext(edge) {
   return edge.activationOwner ? { kind: 'activation', group: edge.activationOwner, target: edge.activationTarget, edge } : { kind: edge.channel === 'data' ? 'data-edge' : edge.kind === 'condition' ? 'condition' : 'control', edge }
 }
 function activateNode(event, node) {
   contextMenu.value = null
+  if (node.frame && event.target === event.currentTarget) { if (event.type === 'contextmenu') backgroundMenu(event); return }
+  if (event.type === 'contextmenu' && selection.value.size > 1 && selection.value.has(node.raw?.binding_id)) { openContext(event, { kind: 'control', node }); return }
+  if (event.ctrlKey && !node.gate) { const next = new Set(selection.value); next.has(node.raw.binding_id) ? next.delete(node.raw.binding_id) : next.add(node.raw.binding_id); selection.value = next; return }
+  selection.value = new Set()
   if (event.type === 'contextmenu') event.currentTarget?.focus?.({ preventScroll: true })
   if (node.kind === 'empty') openContext(event, { kind: 'control', node })
   else selectNode(node.id)
 }
-function canDeleteNode(node) {
-  return props.rule.workflow && !node.readOnly && !node.exiting && (node.conditionGraph || node.activationValue || ['action', 'failure-action', 'event_group', 'action_group', 'trigger'].includes(node.kind))
-}
+function canDeleteNode(node) { return !!node?.raw && !node.gate && !node.exiting }
+
 function deleteNode(node) {
   if (!node || !canDeleteNode(node)) return
   contextMenu.value = null
   emit('delete-node', node)
 }
+function moveFailureNode(node, offset) {
+  const actions = node.owner.failure_actions, target = node.index + offset
+  if (target >= 0 && target < actions.length) actions.splice(target, 0, actions.splice(node.index, 1)[0])
+}
 function toggleGroup(id, open) {
   stopCameraAnimation()
+  const before = targetLayoutNodes.value.map(node => ({ ...node }))
   const node = layoutNodes.value.find(node => node.source?.binding_id === id)
   const anchor = node ? { x: node.x, y: node.y } : null
   const next = new Set(expandedGroups.value); (open ?? !next.has(id)) ? next.add(id) : next.delete(id); expandedGroups.value = next
-  if (anchor) nextTick(() => { const now = targetLayoutNodes.value.find(node => node.source?.binding_id === id); if (now) pan.value = { x: pan.value.x + (anchor.x - now.x) * zoom.value, y: pan.value.y + (anchor.y - now.y) * zoom.value } })
+  nextTick(() => {
+    if (expandedGroups.value.has(id)) makeGroupRoom(props.rule.workflow, before, targetLayoutNodes.value, id)
+    const now = targetLayoutNodes.value.find(node => node.raw?.binding_id === id && !node.gate)
+    if (anchor && now) pan.value = { x: pan.value.x + (anchor.x - now.x) * zoom.value, y: pan.value.y + (anchor.y - now.y) * zoom.value }
+    if (selectedNodeId.value && ![...graph.value.nodes, ...(graph.value.inspectionNodes || [])].some(node => node.id === selectedNodeId.value)) { pointerSelectionId = `action-${id}`; selectNode(pointerSelectionId) }
+  })
 }
 
 
@@ -114,24 +156,12 @@ const graph = computed(() => {
     if (!sources.has(owner)) sources.set(owner, precedingSources(props.rule, owner, store.schema))
     return predicateSummary(predicate, sources.get(owner), store.configData.rules, events)
   }
-  const controlGraph = props.graphOverride || (props.rule.workflow ? buildWorkflowGraph(props.rule, expandedGroups.value, store.schema, { eventName, actionName, describeItem, predicateSummary: describePredicate }) : buildFlowGraph({
-    expandBranches: canvasLayout.value,
-    rule: props.rule,
-    schema: store.schema,
-    rules: store.configData.rules,
-    condition: conditionNode.value,
-    eventName,
-    actionName,
-    describeItem,
-    isAdmin: (item, kind) => isAdmin(
-      kind === 'trigger' ? store.schema.triggers[item?.type] : store.schema.actions[item?.type],
-    ),
-  }))
+  const controlGraph = props.graphOverride || buildWorkflowGraph(props.rule, expandedGroups.value, store.schema, { eventName, actionName, describeItem, predicateSummary: describePredicate, frozenGroups: dragFrames.value })
   function decorateGraph(controlGraph) {
     const fullNodes = controlGraph.nodes.map(node => {
       const built = buildNodeDataPorts(node, store.schema, props.rule)
       const predicateParts = node.kind === 'predicate' && !['all', 'any', 'not', 'event_occurred', 'run_status'].includes(node.source.op)
-        ? predicateSummaryParts(node.source, sources.get(node.groupOwner) || precedingSources(props.rule, node.groupOwner || node.source, store.schema)) : null
+        ? predicateSummaryParts(node.source, sources.get(node.groupOwner) || precedingSources(props.rule, node.raw || node.source, store.schema)) : null
       const metaTitle = ['trigger', 'action', 'failure-action'].includes(node.kind)
         ? describeItem(node.source, node.kind === 'trigger' ? 'trigger' : 'action', false) : node.meta
       return { ...built, predicateParts, metaTitle, dataInputs: node.dataInputs ?? built.dataInputs, dataOutputs: node.dataOutputs ?? built.dataOutputs }
@@ -167,7 +197,7 @@ const graph = computed(() => {
       const dataPortRows = Math.max(visibleDataInputs.length, visibleDataOutputs.length)
       const contentExtraHeight = node.admin ? FLOW_NODE_ADMIN_EXTRA_HEIGHT : 0
       const outletRows = !node.frame && (node.kind === 'event_group' ? node.outputs : node.outputAnchors?.filter(port => port.label))
-      const bodyHeight = outletRows?.length ? 90 + outletRows.length * 28 : FLOW_NODE_BASE_HEIGHT
+      const bodyHeight = node.gate ? 104 : outletRows?.length ? 90 + outletRows.length * 28 : FLOW_NODE_BASE_HEIGHT
       const dataStartY = node.frame ? node.fixedHeight - 16 - dataPortRows * FLOW_DATA_PORT_STEP : bodyHeight + contentExtraHeight
         + (hasDataPorts ? FLOW_DATA_SUMMARY_HEIGHT : 0)
       const footerHeight = !node.readOnly && ((node.kind === 'action' && !props.rule.workflow) || node.kind === 'failure-action') ? 34 : node.kind === 'condition' && !props.rule.workflow ? 40 : 0
@@ -198,23 +228,11 @@ const graph = computed(() => {
   const heights = new Map(decorated.nodes.filter(node => !node.frame).map(node => [node.id, node.height]))
   return decorateGraph(buildWorkflowGraph(props.rule, expandedGroups.value, store.schema, {
     eventName, actionName, describeItem, predicateSummary: describePredicate,
-    nodeHeight: node => heights.get(node.id),
+    nodeHeight: node => heights.get(node.id), frozenGroups: dragFrames.value,
   }))
 })
 
-const targetLayoutNodes = computed(() => {
-  const byId = new Map(graph.value.nodes.map(node => [node.id, node]))
-  const displacement = id => {
-    const saved = nodePositions.value[id], original = byId.get(id)
-    return { x: saved?.dx ?? (saved?.x !== undefined && original ? saved.x - original.x : 0), y: saved?.dy ?? (saved?.y !== undefined && original ? saved.y - original.y : 0) }
-  }
-  const nodes = graph.value.nodes.map(node => {
-    const owners = [...(node.ancestry || []).map(parent => parent.id), ...(node.groupOwner ? [`action-${node.groupOwner.binding_id}`] : [])]
-    const offset = [...new Set([...owners, node.id])].reduce((total, id) => { const delta = displacement(id); return { x: total.x + delta.x, y: total.y + delta.y } }, { x: 0, y: 0 })
-    return { ...node, x: node.x + offset.x, y: node.y + offset.y, ...(connectionPositions.value?.[node.id] || {}), manuallyPlaced: !!(connectionPositions.value?.[node.id] || nodePositions.value[node.id]) }
-  })
-  return props.rule.workflow ? nodes : resolveNodeCollisions(nodes)
-})
+const targetLayoutNodes = computed(() => graph.value.nodes.map(node => ({ ...node, ...(connectionPositions.value?.[node.id] || {}) })))
 
 const layoutNodes = ref([])
 let layoutFrame = null
@@ -258,16 +276,11 @@ watch(inspectionNodes, nodes => {
   ) selectedNodeId.value = null
 })
 function selectNode(id, reveal = false) {
-  if (suppressNodeClickId === id) { suppressNodeClickId = null; return }
+  if (suppressNodeClickId === id) return
   pointerSelectionId = reveal ? null : id
-  const node = inspectionNodes.value.find(item => item.id === id)
-  if (node?.activationNode) { emit('select-node', `action-${node.groupOwner.binding_id}`); return }
-  if (node?.readOnly) return
-  if (canvasLayout.value && node?.kind === 'action' && node.source?.type === 'if') emit('open-if', node.source)
-  else if (node?.kind === 'predicate') { emit('select-node', id); emit('predicate-select', node) }
-  else if (node?.kind === 'if-branch' && node.addBranch) emit('branch-add', node)
-  else emit('select-node', id)
+  emit('select-node', id)
 }
+
 function focusNode(node) {
   if (keyboardNavigation && canvasLayout.value && !dataDrag.value && !dragState) centerOnNode(node)
 }
@@ -336,27 +349,50 @@ function resetZoom() {
 }
 
 // 只有在空白处拖拽才会平移画布。
+function logicalPoint(event) {
+  const rect = viewportRef.value.getBoundingClientRect()
+  return { x: (event.clientX - rect.left - pan.value.x) / zoom.value, y: (event.clientY - rect.top - pan.value.y) / zoom.value }
+}
+function groupAt(point, exclude = new Set()) {
+  return layoutNodes.value.filter(node => node.frame && !exclude.has(node.raw.binding_id) && point.x > node.x && point.x < node.x + node.width && point.y > node.y + 44 && point.y < node.y + node.height).sort((a, b) => a.width * a.height - b.width * b.height)[0]?.raw.binding_id || null
+}
+function backgroundMenu(event) {
+  if (!blankCanvasTarget(event.target)) return
+  const position = logicalPoint(event)
+  openContext(event, { kind: 'background', parent: groupAt(position), position })
+}
 function startPan(event) {
-  if (!canvasLayout.value) return
-  if (event.button !== 0) return
-  if (event.target.closest('.graph-node') || event.target.closest('button')) return
-  selectedNodeId.value = null
+  if (!canvasLayout.value || event.button !== 0 || !blankCanvasTarget(event.target)) return
   stopCameraAnimation()
-  panState = { startX: event.clientX, startY: event.clientY, x: pan.value.x, y: pan.value.y, target: event.currentTarget, pointerId: event.pointerId }
-  isPanning.value = true
+  if (event.ctrlKey) {
+    const point = logicalPoint(event)
+    selectionBox.value = { start: point, x: point.x, y: point.y, width: 0, height: 0, previous: new Set(selection.value) }
+  } else { selection.value = new Set(); selectedNodeId.value = null; panState = { startX: event.clientX, startY: event.clientY, x: pan.value.x, y: pan.value.y, target: event.currentTarget, pointerId: event.pointerId }; isPanning.value = true }
   event.currentTarget.setPointerCapture?.(event.pointerId)
 }
+function blankCanvasTarget(target) {
+  if (target.closest('button, .node-link-hit')) return false
+  const card = target.closest('.graph-node')
+  return !card || card.classList.contains('graph-group-frame') && target === card
+}
 function movePan(event) {
-  if (!panState) return
-  pan.value = {
-    x: panState.x + event.clientX - panState.startX,
-    y: panState.y + event.clientY - panState.startY,
+  if (selectionBox.value) {
+    const point = logicalPoint(event), box = selectionBox.value
+    Object.assign(box, { x: Math.min(box.start.x, point.x), y: Math.min(box.start.y, point.y), width: Math.abs(point.x - box.start.x), height: Math.abs(point.y - box.start.y) })
+    const next = new Set(box.previous)
+    for (const node of layoutNodes.value) {
+      if (!node.raw || node.gate) continue
+      const contains = box.x <= node.x && box.y <= node.y && box.x + box.width >= node.x + node.width && box.y + box.height >= node.y + node.height
+      const intersects = node.x < box.x + box.width && node.x + node.width > box.x && node.y < box.y + box.height && node.y + node.height > box.y
+      if (node.frame ? contains : intersects) next.add(node.raw.binding_id)
+    }
+    selection.value = next; return
   }
+  if (panState) pan.value = { x: panState.x + event.clientX - panState.startX, y: panState.y + event.clientY - panState.startY }
 }
 function endPan() {
   if (panState?.target.hasPointerCapture?.(panState.pointerId)) panState.target.releasePointerCapture(panState.pointerId)
-  panState = null
-  isPanning.value = false
+  panState = null; selectionBox.value = null; isPanning.value = false
 }
 
 function dataReference(node, port) {
@@ -642,82 +678,58 @@ const highlightedIds = computed(() => {
 function nodeDimmed(id) { return canvasLayout.value && highlightedIds.value ? !highlightedIds.value.has(id) : false }
 function edgeDimmed(edge) { return highlightedIds.value ? !highlightedIds.value.has(edge.from) || !highlightedIds.value.has(edge.to) : false }
 
-function conditionStructureKey(node) {
-  if (!node || typeof node !== 'object') return ''
-  if (node.type && !node.children && !node.events) return `leaf:${node.binding_id || node.type}`
-  const children = node.children || node.events || []
-  return `group:${node.op || node.type || 'any'}(${children.map(conditionStructureKey).join(',')})`
-}
-
 watch(canvasLayout, async active => {
   if (!active) { resizeObserver?.disconnect(); return }
   await nextTick()
   observeViewport()
 })
-watch(() => conditionStructureKey(conditionNode.value), () => {
-  nodePositions.value = Object.fromEntries(Object.entries(nodePositions.value)
-    .filter(([id]) => !id.startsWith('condition-')))
-})
 
 function resetLayout() {
-  nodePositions.value = {}
-  fitView({ readable: true })
+  arrangeWorkflow(props.rule.workflow, expandedGroups.value, new Map(layoutNodes.value.filter(node => !node.frame && !node.gate).map(node => [node.raw.binding_id, node.height])))
+  nextTick(() => fitView({ readable: true }))
 }
 
 function startNodeDrag(event, node) {
-  if (!canvasLayout.value || dataDrag.value || controlDrag.value || dragState) return
-  if (event.button !== 0) return
-  event.preventDefault()
-  stopCameraAnimation()
-  contextMenu.value = null
+  if (!canvasLayout.value || node.gate || dataDrag.value || controlDrag.value || dragState || event.button !== 0) return
+  event.preventDefault(); stopCameraAnimation(); contextMenu.value = null
   if (layoutFrame !== null) { cancelAnimationFrame(layoutFrame); layoutFrame = null }
-  const current = { x: node.x, y: node.y }
-  dragState = {
-    id: node.id,
-    startX: event.clientX,
-    startY: event.clientY,
-    x: current.x,
-    y: current.y,
-    dx: nodePositions.value[node.id]?.dx || 0,
-    dy: nodePositions.value[node.id]?.dy || 0,
-    moved: false,
-    panX: pan.value.x, panY: pan.value.y,
-  }
+  const selected = selection.value.has(node.raw.binding_id) ? new Set(selection.value) : new Set([node.raw.binding_id])
+  const moving = new Set(selected)
+  let changed
+  do { changed = false; for (const raw of props.rule.workflow.nodes) if (moving.has(raw.parent) && !moving.has(raw.binding_id)) { moving.add(raw.binding_id); changed = true } } while (changed)
+  const positions = new Map(props.rule.workflow.nodes.filter(raw => moving.has(raw.binding_id)).map(raw => { const shown = layoutNodes.value.find(node => node.raw === raw && !node.gate); return [raw.binding_id, { ...raw.position || { x: shown?.x || 64, y: shown?.y || 118 } }] }))
+  dragFrames.value = new Map(layoutNodes.value.filter(frame => frame.frame && !moving.has(frame.raw.binding_id)).map(frame => [frame.raw.binding_id, { x: frame.x, y: frame.y, width: frame.width, height: frame.height }]))
+  const originalPositions = new Map(props.rule.workflow.nodes.filter(raw => moving.has(raw.binding_id)).map(raw => [raw.binding_id, raw.position ? { ...raw.position } : null]))
+  dragState = { id: node.id, node, selected, moving, positions, originalPositions, startX: event.clientX, startY: event.clientY, panX: pan.value.x, panY: pan.value.y, moved: false }
   captureGesture(event)
 }
 function dragNode(event) {
   if (!dragState || !matchesGesture(event)) return
-  const deltaX = event.clientX - dragState.startX
-  const deltaY = event.clientY - dragState.startY
-  if (!dragState.moved) {
-    if (Math.hypot(deltaX, deltaY) < 5) return
-    dragState.moved = true
-    // 开始拖动节点时关闭设置抽屉，并清除当前选中节点。
-    selectedNodeId.value = null
-  }
-  gesturePointer = { clientX: event.clientX, clientY: event.clientY }
-  scheduleEdgePan()
-  nodePositions.value = {
-    ...nodePositions.value,
-    [dragState.id]: {
-      dx: dragState.dx + Math.max(24, dragState.x + (deltaX + dragState.panX - pan.value.x) / zoom.value) - dragState.x,
-      dy: dragState.dy + Math.max(24, dragState.y + (deltaY + dragState.panY - pan.value.y) / zoom.value) - dragState.y,
-    },
-  }
+  const dx = (event.clientX - dragState.startX + dragState.panX - pan.value.x) / zoom.value
+  const dy = (event.clientY - dragState.startY + dragState.panY - pan.value.y) / zoom.value
+  if (!dragState.moved && Math.hypot(dx, dy) < 5) return
+  dragState.moved = true; selectedNodeId.value = null
+  for (const raw of props.rule.workflow.nodes) { const old = dragState.positions.get(raw.binding_id); if (old) raw.position = { x: old.x + dx, y: old.y + dy } }
+  const point = logicalPoint(event)
+  dropGroup.value = groupAt(point, dragState.moving)
+  gesturePointer = { clientX: event.clientX, clientY: event.clientY }; scheduleEdgePan()
 }
 function endNodeDrag(event) {
   if (event && !matchesGesture(event)) return
+  if (dragState?.moved && event?.type === 'pointercancel') {
+    for (const raw of props.rule.workflow.nodes) if (dragState.originalPositions.has(raw.binding_id)) {
+      const position = dragState.originalPositions.get(raw.binding_id)
+      if (position) raw.position = position
+      else delete raw.position
+    }
+  }
   if (dragState?.moved && event?.type !== 'pointercancel') {
-    // pointerup 后浏览器会补发 click，这里只屏蔽当前节点的一次点击。
+    emit('operation', { operation: 'move-group', ids: [...dragState.selected], parent: dropGroup.value })
     suppressNodeClickId = dragState.id
     if (suppressNodeClickTimer) clearTimeout(suppressNodeClickTimer)
-    suppressNodeClickTimer = setTimeout(() => {
-      suppressNodeClickId = null
-      suppressNodeClickTimer = null
-    }, 0)
+    suppressNodeClickTimer = setTimeout(() => { suppressNodeClickId = null; suppressNodeClickTimer = null }, 0)
   }
-  dragState = null
-  finishGesture()
+  dragState = null; dragFrames.value = null; dropGroup.value = null; finishGesture()
 }
 
 function observeViewport() {
@@ -726,16 +738,11 @@ function observeViewport() {
     resizeObserver = new ResizeObserver(entries => {
       const rect = entries[0].contentRect
       viewportSize.value = { w: rect.width, h: rect.height }
-      // 首次打开按可读文字的比例适配，长流程保留横向平移，工具栏可再次适配全图。
-      if (!fittedOnce && rect.width) {
-        fittedOnce = true
-        fitView({ readable: true })
-      }
+      if (!fittedOnce && rect.width) { fittedOnce = true; fitView({ readable: true }) }
     })
     resizeObserver.observe(viewportRef.value)
   }
 }
-
 
 onMounted(() => {
   restoreView()
@@ -800,21 +807,13 @@ function endControlDrag(event) {
   const drag = controlDrag.value; if (!drag) return
   const el = document.elementFromPoint?.(event.clientX, event.clientY)?.closest?.('[data-control-input]') || event.target?.closest?.('[data-control-input]')
   const target = layoutNodes.value.find(node => node.id === el?.dataset.controlInput)
-  if (drag.moved && drag.node.kind === 'trigger' && target?.conditionGraph) {
-    const error = target.groupOwner === drag.node.groupOwner ? connectTriggerCondition(target.conditionGraph, drag.node.source.binding_id, target.graphCondition.id) : '事件只能连接到同一事件组的条件组'
+  if (drag.moved && target) {
+    const targetPort = el?.dataset.controlPort || target.targetPort || 'input'
+    const error = connectGraph(props.rule.workflow, drag.node.raw.binding_id, drag.port.id, target.raw.binding_id, targetPort, target.gate || target.kind === 'condition-expression' || target.raw.type === 'event_group' && target.raw.group_type !== 'if' && ['trigger', 'predicate', 'condition-expression'].includes(drag.node.kind) ? 'condition' : null)
     if (error) emit('operation', { operation: 'connection-error', error })
-  } else if (drag.moved && drag.node.activationValue) {
-    if (target?.activationOwner === drag.node.activationOwner && target.activationValue?.op) emit('operation', { operation: 'activation-connect', group: drag.node.activationOwner, source: drag.node.activationValue, target: target.activationValue })
-    else if (target) emit('operation', { operation: 'connection-error', error: '事件只能连接到同一事件组的触发组合' })
-  } else if (drag.moved && drag.node.conditionGraph) {
-    const error = target?.conditionGraph === drag.node.conditionGraph ? connectConditionGraph(target.conditionGraph, drag.node.graphCondition.id, target.graphCondition.id) : target ? '条件只能连接到同一分支的条件组' : ''
-    if (error) emit('operation', { operation: 'connection-error', error })
-  } else if (drag.moved && target) {
-    const valid = target.workflow === drag.node.workflow && (!target.groupOwner || target.standaloneTrigger) && !target.conditionGraph && connectGraph(drag.node.workflow, (drag.node.standaloneTrigger ? drag.node.groupOwner : drag.node.source).binding_id, drag.port.id, (target.standaloneTrigger ? target.groupOwner : target.source).binding_id)
-    if (!valid) emit('operation', { operation: 'connection-error', error: '控制连接不能跨越组边界或形成循环' })
   }
   controlDrag.value = null; connectionPositions.value = null; finishGesture()
-  if (!drag.moved) openContext(event, drag.node.activationValue ? { kind: 'activation', group: drag.node.activationOwner, target: drag.node.activationValue, node: drag.node } : { kind: drag.node.conditionGraph ? 'condition' : 'control', node: drag.node, outlet: drag.port.id })
+  if (!drag.moved) openContext(event, { kind: 'control', node: drag.node, outlet: drag.port.id })
 }
 const pendingControlEdge = computed(() => {
   const drag = controlDrag.value, rect = viewportRef.value?.getBoundingClientRect(); if (!drag || !rect) return null
@@ -885,6 +884,7 @@ function restoreView() {
   stopCameraAnimation()
 }
 watch(() => [props.rule, props.viewKey], async () => {
+  if (activeRule?.rule_id && activeRule.rule_id === props.rule.rule_id && activeView === props.viewKey) { activeRule = props.rule; return }
   saveView()
   cancelGesture()
   activeRule = props.rule
@@ -916,8 +916,9 @@ defineExpose({ nodes: layoutNodes, inspectionNodes, toggleGroup, openContext })
         <div ref="viewportRef" class="node-canvas-viewport" :class="{ panning: isPanning }" :style="canvasLayout ? gridStyle : null"
           @pointerdown="contextMenu = null; startPan($event)" @pointermove="dataDrag ? updateDataDropTarget($event) : movePan($event)"
           @pointerup="dataDrag ? endDataDrag($event) : endPan()" @pointercancel="cancelGesture" @lostpointercapture="dataDrag || controlDrag || dragState ? cancelGesture() : null"
-          @wheel="onCanvasWheel" tabindex="0" aria-label="规则画布，可用方向键平移，加减号缩放" @keydown.self="handleCanvasKey">
+          @contextmenu.prevent="backgroundMenu" @wheel="onCanvasWheel" tabindex="0" aria-label="规则画布，可用方向键平移，加减号缩放" @keydown.self="handleCanvasKey">
           <div class="node-canvas" :class="{ 'cam-anim': camAnim }" :style="canvasLayout ? cameraStyle : null">
+            <div v-if="selectionBox" class="canvas-selection-box" :style="{ left: `${selectionBox.x}px`, top: `${selectionBox.y}px`, width: `${selectionBox.width}px`, height: `${selectionBox.height}px` }"></div>
             <!-- 画布和 SVG 共用逻辑像素坐标，overflow:visible 让连线绘制到容器外，设置 viewBox 会让端口错位。 -->
             <svg v-if="canvasLayout" class="node-links" role="group" aria-label="流程连线">
               <defs>
@@ -933,7 +934,7 @@ defineExpose({ nodes: layoutNodes, inspectionNodes, toggleGroup, openContext })
                 <path class="node-link" :class="[`node-link-${edge.kind}`, { reversed: edge.reversed }]" :d="edge.d" />
                 <text v-if="edge.label" class="node-link-label" :x="edge.labelX" :y="edge.labelY" text-anchor="middle">{{ edge.label }}</text>
                </g>
-               <g v-for="node in layoutNodes.filter(node => node.frame && node.kind === 'event_group')" :key="`outlets-${node.id}`">
+               <g v-for="node in layoutNodes.filter(node => node.frame && node.kind === 'event_group' && node.raw.group_type !== 'if')" :key="`outlets-${node.id}`">
                  <text v-for="port in node.outputs" :key="port.id" class="node-link-label" :x="node.x + node.width - 14" :y="node.y + port.y - 10" text-anchor="end">{{ port.label }}</text>
                </g>
                <path v-if="pendingControlEdge" class="node-link node-link-pending" :d="pendingControlEdge" />
@@ -942,16 +943,18 @@ defineExpose({ nodes: layoutNodes, inspectionNodes, toggleGroup, openContext })
 
             <template v-for="node in layoutNodes" :key="node.id">
             <article
-              class="graph-node" :class="[`graph-node-${node.kind}`, { selected: selectedNodeId === node.id, dimmed: nodeDimmed(node.id), 'data-incompatible': nodeDataIncompatible(node), 'graph-group-frame': node.frame, 'layout-entering': node.entering, 'layout-exiting': node.exiting }]"
+              class="graph-node" :class="[`graph-node-${node.kind}`, { selected: selectedNodeId === node.id, dimmed: nodeDimmed(node.id), 'data-incompatible': nodeDataIncompatible(node), 'graph-group-frame': node.frame, 'multi-selected': node.raw && !node.gate && selection.has(node.raw.binding_id), 'group-drop-target': node.frame && dropGroup === node.raw?.binding_id, 'layout-entering': node.entering, 'layout-exiting': node.exiting }]"
               :data-node-id="node.id"
               :style="canvasLayout ? { left: `${node.x}px`, top: `${node.y}px`, height: `${node.height}px`, width: `${node.width || FLOW_NODE_WIDTH}px` } : null"
               role="button" tabindex="0" @click.stop="activateNode($event, node)" @contextmenu.prevent.stop="activateNode($event, node)" @keydown.enter.self.prevent="selectNode(node.id)" @keydown.space.self.prevent="selectNode(node.id)" @focus="focusNode(node)"
               @pointerenter="hoverNodeId = node.id" @pointerleave="hoverNodeId = null">
-              <span v-if="canvasLayout && node.hasInput" class="node-port node-port-in" :style="{ top: `${(node.inputY ?? 58) - 7}px` }" :data-control-input="node.id"></span>
+<button v-for="port in node.inputs || []" :key="port.id" class="node-port node-port-in control-input" :style="{ top: `${port.y - 7}px`, left: `${(port.x || 0) - 7}px` }" :data-control-input="node.id" :data-control-port="port.id" :aria-label="port.label" @pointerdown.stop @click.stop="selectBranch(node, port)" @contextmenu.prevent.stop="selectBranch(node, port)"></button>
+              <template v-if="node.frame && node.raw.group_type === 'if'"><button v-for="port in node.outputs" :key="`label-${port.id}`" class="graph-branch-label" :style="{ top: `${port.y - 18}px` }" :aria-label="`设置 ${port.label} 分支`" @pointerdown.stop @click.stop="selectBranch(node, port)" @contextmenu.prevent.stop="selectBranch(node, port)">{{ port.label }}{{ port.branch.negated ? ' · NOT' : '' }}</button></template>
+              <span v-if="canvasLayout && node.hasInput" class="node-port node-port-in" :style="{ top: `${(node.inputY ?? 58) - 7}px` }" :data-control-input="node.id" :data-control-port="node.targetPort || 'input'"></span>
               <header class="graph-node-head" @pointerdown.stop="startNodeDrag($event, node)"
                 @pointermove.stop="dragNode" @pointerup.stop="endNodeDrag" @pointercancel.stop="endNodeDrag">
                 <span class="material-symbols-outlined">{{ node.icon }}</span>
-                <span class="graph-node-head-title" :title="node.frame ? node.label : node.kind === 'action_group' ? '动作组' : node.kind === 'event_group' ? '事件组' : node.kicker">{{ node.frame ? node.label : node.kind === 'action_group' ? '动作组' : node.kind === 'event_group' ? '事件组' : node.kicker }}</span>
+                <button v-if="node.raw?.type === 'event_group' && !node.gate" class="graph-node-head-title group-type-control" aria-label="切换事件组类型" @pointerdown.stop @click.stop="openContext($event, { kind: 'group-type', node })">{{ node.frame ? node.label === groupTypeLabel(node.raw.group_type) ? node.label : `${node.label} · ${groupTypeLabel(node.raw.group_type)}` : `事件组 · ${groupTypeLabel(node.raw.group_type)}` }}</button><span v-else class="graph-node-head-title">{{ node.frame ? node.label : node.kicker }}</span>
                 <button v-if="['event_group', 'action_group'].includes(node.kind)" class="icon-btn group-toggle" :title="node.open ? '收起组' : '展开组'" @pointerdown.stop @click.stop="toggleGroup(node.source.binding_id)" @contextmenu.prevent.stop="toggleGroup(node.source.binding_id)"><span class="material-symbols-outlined">{{ node.open ? 'unfold_less' : 'unfold_more' }}</span></button><div class="graph-node-head-actions"><button class="icon-btn node-context-button" title="节点操作" @pointerdown.stop @click.stop="openContext($event, { kind: node.conditionGraph ? 'condition' : 'control', node })" @contextmenu.prevent.stop="openContext($event, { kind: node.conditionGraph ? 'condition' : 'control', node })"><span class="material-symbols-outlined">more_horiz</span></button><button v-if="canDeleteNode(node)" class="icon-btn node-context-button icon-btn-danger" title="删除节点（Delete）" aria-label="删除节点" @pointerdown.stop @click.stop="deleteNode(node)"><span class="material-symbols-outlined">delete</span></button></div><span v-if="canvasLayout" class="material-symbols-outlined node-drag-handle">drag_indicator</span>
               </header>
               <div v-if="!node.frame" class="graph-node-body" :class="{ 'has-admin': node.admin, 'has-outlets': node.kind === 'event_group' || node.outputAnchors?.some(port => port.label) }">
@@ -993,9 +996,9 @@ defineExpose({ nodes: layoutNodes, inspectionNodes, toggleGroup, openContext })
                 <button class="icon-btn icon-btn-danger" title="删除动作" @click.stop="emit('remove-action', node.index, node)"><span class="material-symbols-outlined">delete</span></button>
               </footer>
               <footer v-else-if="node.kind === 'failure-action' && !node.readOnly && !node.exiting" class="graph-node-actions">
-                <button class="icon-btn" :disabled="node.index === 0" title="上移" @click.stop="emit('move-failure-action', node.parentIndex, node.index, -1, node)"><span class="material-symbols-outlined">arrow_back</span></button>
-                <button class="icon-btn" :disabled="node.index === (node.owner || rule.actions[node.parentIndex]).failure_actions.length - 1" title="下移" @click.stop="emit('move-failure-action', node.parentIndex, node.index, 1, node)"><span class="material-symbols-outlined">arrow_forward</span></button>
-                <button class="icon-btn icon-btn-danger" title="删除补救动作" @click.stop="emit('remove-failure-action', node.parentIndex, node.index, node)"><span class="material-symbols-outlined">delete</span></button>
+                <button class="icon-btn" :disabled="node.index === 0" title="上移" @click.stop="moveFailureNode(node, -1)"><span class="material-symbols-outlined">arrow_back</span></button>
+                <button class="icon-btn" :disabled="node.index === node.owner.failure_actions.length - 1" title="下移" @click.stop="moveFailureNode(node, 1)"><span class="material-symbols-outlined">arrow_forward</span></button>
+                <button class="icon-btn icon-btn-danger" title="删除补救动作" @click.stop="deleteNode(node)"><span class="material-symbols-outlined">delete</span></button>
               </footer>
               <footer v-else-if="node.kind === 'condition' && !rule.workflow" class="graph-node-logic-actions">
                 <button @click.stop="emit('add-condition-child', node, false)"><span class="material-symbols-outlined">add</span>条件</button>
@@ -1017,15 +1020,25 @@ defineExpose({ nodes: layoutNodes, inspectionNodes, toggleGroup, openContext })
                 :width="minimapViewport.w" :height="minimapViewport.h" rx="60" />
             </svg>
           </div>
-          <Transition name="canvas-menu"><div v-if="contextMenu" class="canvas-context-menu" role="menu" :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }" @pointerdown.stop @keydown.esc.stop="contextMenu = null">
-            <button v-if="!['data', 'data-edge'].includes(contextMenu.kind) && contextMenu.node?.kind !== 'failure-action'" role="menuitem" @click="menuOperation('trigger')"><span class="material-symbols-outlined">bolt</span>添加触发器</button>
-            <template v-if="contextMenu.kind === 'activation'"><button role="menuitem" @click="menuOperation('edit-activation')"><span class="material-symbols-outlined">account_tree</span>编辑触发组合</button></template>
-            <template v-else-if="['data', 'data-edge'].includes(contextMenu.kind)"><button role="menuitem" @click="menuOperation('create-variable')"><span class="material-symbols-outlined">add_box</span>创建变量并赋值</button><button role="menuitem" @click="menuOperation('assign-variable')"><span class="material-symbols-outlined">edit_note</span>给变量赋值</button><button role="menuitem" @click="menuOperation('compare')"><span class="material-symbols-outlined">rule</span>添加比较条件</button></template>
-            <template v-else-if="contextMenu.kind === 'condition'"><button v-if="contextMenu.edge?.inspectionId" role="menuitem" @click="menuOperation('edit-condition')"><span class="material-symbols-outlined">bolt</span>编辑事件判断</button><button role="menuitem" @click="menuOperation('condition')"><span class="material-symbols-outlined">rule</span>添加比较条件</button><button v-for="op in ['all', 'any', 'not']" :key="op" role="menuitem" @click="menuOperation(op)"><span class="material-symbols-outlined">account_tree</span>{{ op === 'all' ? '组合 AND' : op === 'any' ? '组合 OR' : '取反 NOT' }}</button></template>
-            <template v-else-if="contextMenu.node?.kind !== 'failure-action'"><button role="menuitem" @click="menuOperation('action')"><span class="material-symbols-outlined">play_arrow</span>添加动作</button><button role="menuitem" @click="menuOperation('event_group')"><span class="material-symbols-outlined">call_split</span>创建事件组</button><button role="menuitem" @click="menuOperation('action_group')"><span class="material-symbols-outlined">account_tree</span>创建动作组</button><button role="menuitem" @click="menuOperation('wait')"><span class="material-symbols-outlined">hourglass_empty</span>等待</button><button role="menuitem" @click="menuOperation('set_variable')"><span class="material-symbols-outlined">edit_note</span>变量赋值</button></template>
-            <button v-if="contextMenu.kind === 'control' && contextMenu.edge?.rawEdge?.target && contextMenu.edge?.workflow" role="menuitem" @click="menuOperation('disconnect')"><span class="material-symbols-outlined">link_off</span>断开连线</button>
-            <button v-if="canDeleteNode(contextMenu.node || {})" role="menuitem" class="danger-text" @click="deleteNode(contextMenu.node)"><span class="material-symbols-outlined">delete</span>删除节点</button>
-            <button v-if="contextMenu.node" role="menuitem" @click="selectNode(contextMenu.node.id); contextMenu = null"><span class="material-symbols-outlined">edit</span>编辑节点</button>
+          <Transition name="canvas-menu"><div v-if="contextMenu" ref="contextMenuRef" class="canvas-context-menu" role="menu" :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px`, maxHeight: `${contextMenu.maxHeight}px`, maxWidth: `${Math.max(240, viewportSize.w - 16)}px` }" @pointerdown.stop @keydown.esc.stop="contextMenu = null">
+            <template v-if="contextMenu.kind === 'group-type'"><button v-for="type in ['if', 'all', 'any', 'not']" :key="type" role="menuitem" @click="menuOperation('group-type', type)">{{ type === 'if' ? 'IF／ELIF／ELSE' : type === 'all' ? 'AND' : type === 'any' ? 'OR' : 'NOT' }}</button></template>
+            <template v-else-if="contextMenu.kind === 'data-outlet'"><p class="inspector-lead">选择执行赋值的分支</p><button v-for="port in contextMenu.node.outputs" :key="port.id" role="menuitem" @click="chooseDataOutlet(port.id)"><span class="material-symbols-outlined">call_split</span>{{ port.label || '完成出口' }}</button></template>
+            <template v-else-if="['data', 'data-edge'].includes(contextMenu.kind)"><button role="menuitem" @click="menuOperation('create-variable')"><span class="material-symbols-outlined">add_box</span>创建变量并赋值</button><button role="menuitem" @click="menuOperation('assign-variable')"><span class="material-symbols-outlined">edit_note</span>给变量赋值</button><button role="menuitem" @click="menuOperation('compare')"><span class="material-symbols-outlined">rule</span>创建比较条件</button></template>
+            <template v-else>
+              <template v-if="contextMenu.ids.length > 1"><button v-for="type in ['if', 'all', 'any', 'not']" :key="type" role="menuitem" @click="menuOperation('group-selection', type)"><span class="material-symbols-outlined">account_tree</span>组合 {{ type === 'if' ? 'IF／ELIF／ELSE' : type === 'all' ? 'AND' : type === 'any' ? 'OR' : 'NOT' }}</button></template>
+              <button role="menuitem" @click="menuOperation('trigger')"><span class="material-symbols-outlined">bolt</span>创建触发器</button>
+              <button role="menuitem" @click="menuOperation('action')"><span class="material-symbols-outlined">play_arrow</span>创建动作</button>
+              <button role="menuitem" @click="menuOperation('event_group')"><span class="material-symbols-outlined">call_split</span>创建 IF 事件组</button>
+              <button v-for="type in ['all', 'any', 'not']" :key="type" role="menuitem" @click="menuOperation(type)"><span class="material-symbols-outlined">account_tree</span>创建 {{ type === 'all' ? 'AND' : type === 'any' ? 'OR' : 'NOT' }} 事件组</button>
+              <button role="menuitem" @click="menuOperation('condition')"><span class="material-symbols-outlined">rule</span>创建比较条件</button>
+              <button role="menuitem" @click="menuOperation('action_group')"><span class="material-symbols-outlined">account_tree</span>创建动作组</button>
+              <button role="menuitem" @click="menuOperation('wait')"><span class="material-symbols-outlined">hourglass_empty</span>创建等待动作</button>
+              <button role="menuitem" @click="menuOperation('set_variable')"><span class="material-symbols-outlined">edit_note</span>变量赋值</button>
+              <button v-if="contextMenu.node?.raw?.group_type === 'if' && contextMenu.outlet" role="menuitem" @click="menuOperation('edit-branch')"><span class="material-symbols-outlined">edit</span>设置此分支</button>
+              <button v-if="contextMenu.node?.raw && contextMenu.node?.branch?.else !== true && ['trigger', 'logic', 'event_group'].includes(contextMenu.node.raw.type)" role="menuitem" @click="menuOperation('negate')"><span class="material-symbols-outlined">flip</span>条件取反</button>
+              <button v-if="contextMenu.edge?.rawEdge" role="menuitem" @click="menuOperation('disconnect')"><span class="material-symbols-outlined">link_off</span>断开连线</button>
+              <button v-if="canDeleteNode(contextMenu.node)" role="menuitem" class="danger-text" @click="deleteNode(contextMenu.node)"><span class="material-symbols-outlined">delete</span>删除节点</button>
+            </template>
           </div></Transition>
         </div>
         <div v-if="canvasLayout" class="canvas-help"><span class="material-symbols-outlined">pan_tool</span>拖空白处平移 · 从输出端口拖至输入端口绑定数据 · 实线为控制流，虚线为数据流</div>

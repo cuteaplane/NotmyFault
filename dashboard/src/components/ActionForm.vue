@@ -4,7 +4,6 @@ import { store } from '../lib/store'
 import { ensureParams, getVisibleParamDefs } from '../lib/utils'
 import { buildBindingSources, buildFailureBindingSources, outputDefs, parameterAllowsBinding } from '../lib/bindings'
 import ParamInput from './ParamInput.vue'
-import IfActionEditor from './IfActionEditor.vue'
 import VariableAssignmentEditor from './VariableAssignmentEditor.vue'
 import WaitActionEditor from './WaitActionEditor.vue'
 import ActionFailureSettings from './ActionFailureSettings.vue'
@@ -13,7 +12,7 @@ const props = defineProps({ action: { type: Object, required: true }, rule: { ty
 const emit = defineEmits(['replace', 'add-failure-action', 'replace-failure-action', 'remove-failure-action', 'move-failure-action'])
 const meta = computed(() => store.schema.actions[props.action.type])
 watch(() => props.action, action => {
-  if (!['if', 'set_variable', 'wait'].includes(action.type)) ensureParams(action)
+  if (!['set_variable', 'wait'].includes(action.type)) ensureParams(action)
 }, { immediate: true })
 const params = computed(() => getVisibleParamDefs(meta.value, props.action.params))
 const sources = computed(() => props.bindingSources || buildBindingSources(props.rule, props.index, store.schema))
@@ -22,8 +21,7 @@ const failureSources = index => props.failureBindingSources ? props.failureBindi
 </script>
 
 <template>
-  <IfActionEditor v-if="action.type === 'if'" :action="action" :rule="rule" :sources="sources" />
-  <VariableAssignmentEditor v-else-if="action.type === 'set_variable'" :action="action" :sources="sources" />
+  <VariableAssignmentEditor v-if="action.type === 'set_variable'" :action="action" :sources="sources" />
   <WaitActionEditor v-else-if="action.type === 'wait'" :action="action" :sources="sources" />
   <template v-else>
     <div class="field field-wide"><span class="field-label">动作类型</span>

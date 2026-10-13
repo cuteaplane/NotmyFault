@@ -59,7 +59,7 @@ const ruleQuery = ref('')
 const matchingRules = computed(() => {
   const query = ruleQuery.value.trim().toLowerCase()
   return store.configData.rules.map((rule, index) => ({ rule, index })).filter(({ rule }) =>
-    !query || [rule.name, rule.folder, triggerSummary(rule), ...(rule.actions || []).map(action => store.schema.actions[action.type]?.name || action.type)]
+    !query || [rule.name, rule.folder, triggerSummary(rule), ...(rule.workflow.nodes || []).map(action => store.schema.actions[action.type]?.name || action.name || action.type)]
       .some(value => String(value || '').toLowerCase().includes(query)),
   )
 })
@@ -80,23 +80,10 @@ const availableFolders = computed(() => [...new Set(
 
 function clone(value) { return JSON.parse(JSON.stringify(value)) }
 function visitRuleNodes(rule, visitor) {
-  const visitAction = node => {
-    if (!node || typeof node !== 'object') return
-    visitor(node, 'action')
-    ;(node.then || []).forEach(visitAction)
-    ;(node.else || []).forEach(visitAction)
-    ;(node.elif || []).forEach(branch => (branch.then || []).forEach(visitAction))
-    ;(node.failure_actions || []).forEach(visitAction)
-  }
-  const visitCondition = node => {
-    if (!node || typeof node !== 'object') return
-    if (node.type) visitor(node, 'trigger')
-    ;(node.children || []).forEach(visitCondition)
-  }
-  visitCondition(rule?.condition)
-  ;(rule?.actions || []).forEach(visitAction)
-  if (rule?.workflow) { walkGraphActions(rule.workflow, node => visitor(node, 'action')); getGraphTriggers(rule).forEach(node => visitor(node, 'trigger')) }
+  walkGraphActions(rule.workflow, node => { if (node.type !== 'trigger') visitor(node, 'action') })
+  getGraphTriggers(rule).forEach(node => visitor(node, 'trigger'))
 }
+
 function sensitiveParamNames(node, kind) {
   const catalog = kind === 'trigger' ? store.schema.triggers : store.schema.actions
   return (catalog?.[node?.type]?.params || [])
@@ -105,7 +92,6 @@ function sensitiveParamNames(node, kind) {
 }
 function sanitizedRuleForRecovery(rule) {
   const sanitized = clone(rule)
-  if (sanitized.preconditions?.length) sanitized.preconditions = [{}]
   const sensitiveVariables = new Set((sanitized.variables || []).filter(item => item.sensitive).map(item => item.id))
   for (const field of ['constants', 'variables']) {
     for (const item of sanitized[field] || []) {
@@ -120,7 +106,6 @@ function sanitizedRuleForRecovery(rule) {
   return sanitized
 }
 function restoreSensitiveParams(targetRule, currentRule) {
-  if (targetRule.preconditions?.length && currentRule.preconditions) targetRule.preconditions = clone(currentRule.preconditions)
   for (const field of ['constants', 'variables']) {
     const current = new Map((currentRule[field] || []).map(item => [item.id, item]))
     for (const item of targetRule[field] || []) {
@@ -309,7 +294,7 @@ async function openRule(index) {
 async function addRule(seed = null) {
   let next
   try {
-    next = seed ? ensureRuleBindingIds(normalizeRuleDraft(clone(seed))) : ensureRuleBindingIds({ name: '新规则', folder: '未分类', actions: [] })
+    next = seed ? ensureRuleBindingIds(normalizeRuleDraft(clone(seed))) : ensureRuleBindingIds({ name: '新规则', folder: '未分类', workflow: { entry: null, nodes: [], edges: [] } })
   } catch (error) { await alertDialog('草稿无法打开', error.message); return }
   normalizeWorkflow(next)
   editorAdminKeyPassword = ''
@@ -345,21 +330,12 @@ function openConfigSecurity() {
   window.__nmf?.switchPage?.('settings')
 }
 
-function triggerCount(rule) {
-  function count(node) {
-    if (!node) return 0
-    if (node.type && !node.children && !node.events) return 1
-    return (node.children || node.events || []).reduce((sum, child) => sum + count(child), 0)
-  }
-  return rule.workflow ? getGraphTriggers(rule).length : count(rule.condition)
-}
+function triggerCount(rule) { return getGraphTriggers(rule).length }
 function triggerSummary(rule) {
-  if (rule.workflow) { const entry = rule.workflow.nodes.find(node => node.binding_id === rule.workflow.entry); return entry?.activation ? entry.name || triggerSummary({ condition: entry.activation }) : '未配置启动事件' }
-  if (!rule.condition) return '未配置触发条件'
-  if (rule.condition.type && !rule.condition.children) return store.schema.triggers[rule.condition.type]?.name || rule.condition.type
-  const op = rule.condition.op || (rule.condition.type === 'and' ? 'all' : 'any')
-  if (op === 'not') return `未发生 · 等待 ${rule.condition.within_seconds} 秒`
-  return `${op === 'all' ? '全部满足' : '满足任一'} · ${triggerCount(rule)} 个条件`
+  const triggers = getGraphTriggers(rule)
+  if (!triggers.length) return '待创建触发器'
+  if (!rule.workflow.edges.some(edge => edge.channel === 'control')) return '触发器待连接执行路径'
+  return triggers.map(trigger => store.schema.triggers[trigger.type]?.name || trigger.type).join('、')
 }
 
 async function persistRules(nextRules, successMessage, password = '') {
@@ -367,7 +343,7 @@ async function persistRules(nextRules, successMessage, password = '') {
   const result = await saveRulesWithApproval(nextRules, password, store.configData.revision)
   if (result?.cancelled) return null
   if (!result?.ok) {
-    const details = Array.isArray(result?.details) ? result.details.join(' · ') : ''
+    const details = Array.isArray(result?.details) ? result.details.map(detail => typeof detail === 'string' ? detail : detail.message || detail.code || '').filter(Boolean).join(' · ') : ''
     throw new Error([result?.error || '未知错误', details].filter(Boolean).join('：'))
   }
   const savedRules = Array.isArray(result.rules) ? result.rules : nextRules
@@ -477,7 +453,7 @@ async function executeManualRule(index, snapshot, testContext) {
       startTestWatch(
         snapshot,
         index,
-        Number.isInteger(result.action_count) ? result.action_count : (snapshot?.actions || []).length,
+        Number.isInteger(result.action_count) ? result.action_count : (snapshot?.workflow?.nodes || []).length,
         watchFromSeq,
         result.run_id || '',
       )
@@ -840,7 +816,7 @@ onMounted(() => {
       <section v-for="([folder, entries]) in ruleFolders" :key="folder" class="rules-folder">
         <header><span class="material-symbols-outlined">folder_open</span><b>{{ folder }}</b><small>{{ entries.length }} 条规则</small></header>
         <article v-for="({ rule, index }) in entries" :key="rule.rule_id || rule" class="rule-library-row" @click="openRule(index)">
-          <button class="rule-library-row-main" :aria-label="`编辑${rule.name || '未命名规则'}`" @click.stop="openRule(index)"><h3>{{ rule.name || '未命名规则' }}</h3><div class="rule-library-meta"><span><span class="material-symbols-outlined">bolt</span>当：{{ triggerSummary(rule) }}</span><span><span class="material-symbols-outlined">play_circle</span>然后：{{ rule.workflow?.nodes?.length ?? rule.actions?.length ?? 0 }} 个动作</span></div></button>
+          <button class="rule-library-row-main" :aria-label="`编辑${rule.name || '未命名规则'}`" @click.stop="openRule(index)"><h3>{{ rule.name || '未命名规则' }}</h3><div class="rule-library-meta"><span><span class="material-symbols-outlined">bolt</span>当：{{ triggerSummary(rule) }}</span><span><span class="material-symbols-outlined">play_circle</span>然后：{{ rule.workflow.nodes.length }} 个图块</span></div></button>
           <div class="rule-library-actions">
             <button class="btn btn-text btn-sm rule-run-btn" :disabled="runningRuleIndex !== null"
               title="真实执行一次这条规则中的动作" @click.stop="runManualRule(index, rule)">

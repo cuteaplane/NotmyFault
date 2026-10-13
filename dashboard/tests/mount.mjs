@@ -10,12 +10,14 @@ import { templateAvailability } from '../src/lib/automationTemplates.js'
 import { streamRuleDraftWithAI } from '../src/lib/api.js'
 import { computeChangeSet, summarizeRuleChanges } from '../src/lib/ruleDiff.js'
 import { ensureParams } from '../src/lib/utils.js'
-import { actionOutputDefs, bindingSourceFor, buildNodeDataPorts, collectReferences, parameterAllowsBinding, regenerateBindingIds } from '../src/lib/bindings.js'
-import { getGraphTriggers, walkGraphActions, graphPredicate } from '../src/lib/workflowGraph.js'
+import { actionOutputDefs, bindingSourceFor, buildNodeDataPorts, collectReferences, parameterAllowsBinding } from '../src/lib/bindings.js'
+import { getGraphTriggers, walkGraphActions, copyGraphNode } from '../src/lib/workflowGraph.js'
 import { compatibleTypes, formatTypedInput, isOpaqueValue, parseTypedInput, typeAtPath } from '../src/lib/valueTypes.js'
 
+import { sequentialRule, ruleWith, wire, eventGroup, trigger } from './canvas-fixtures.mjs'
+
 function ruleActions(rule) {
-  if (!rule?.workflow) return rule?.actions || []
+  if (!rule?.workflow) return []
   const actions = []; walkGraphActions(rule.workflow, action => actions.push(action)); return actions
 }
 async function canvasOperation(node, label) {
@@ -43,17 +45,13 @@ const bindingPolicyOk = parameterAllowsBinding(bindingPolicyMeta, 'source')
 console.log((bindingPolicyOk?'PASS':'FAIL')+' - literal-only parameters stay out of graph binding ports')
 if (!bindingPolicyOk) process.exitCode = 1
 
-const copiedBranch = {
-  type:'if', binding_id:'a_branch01', condition:{ op:'is_true', left:true },
-  then:[
-    { type:'query', binding_id:'a_query001', params:{} },
-    { type:'notify', binding_id:'a_notify01', params:{ message:{ $ref:{ scope:'step', node:'a_query001', path:['text'] } } } },
-  ], else:[],
-}
-regenerateBindingIds(copiedBranch, 'action')
-const copiedBranchOk = copiedBranch.then[0].binding_id !== 'a_query001'
-  && copiedBranch.then[1].params.message.$ref.node === copiedBranch.then[0].binding_id
-console.log((copiedBranchOk?'PASS':'FAIL')+' - copying an IF branch keeps its internal data references')
+const copiedGroup = { type:'action_group', binding_id:'a_branch01', exports:{} }
+const copiedQuery = { type:'query', binding_id:'a_query001', parent:copiedGroup.binding_id, params:{} }
+const copiedNotify = { type:'notify', binding_id:'a_notify01', parent:copiedGroup.binding_id, params:{ message:{ $ref:{ scope:'step', node:'a_query001', path:['text'] } } } }
+const copiedBranch = copyGraphNode(copiedGroup, { nodes:[copiedGroup, copiedQuery, copiedNotify], edges:[wire(copiedQuery, copiedNotify)] })
+const copiedBranchOk = copiedBranch._copyNodes[0].binding_id !== copiedQuery.binding_id
+  && copiedBranch._copyNodes[1].params.message.$ref.node === copiedBranch._copyNodes[0].binding_id
+console.log((copiedBranchOk?'PASS':'FAIL')+' - copying a group keeps its internal data references')
 if (!copiedBranchOk) process.exitCode = 1
 
 const distDir = process.env.DASHBOARD_DIST_DIR || 'dist'
@@ -148,7 +146,7 @@ function mockAiDraftResult() {
   }
   return {
     ok:true, source:'ai', result_type:'rule_draft',
-    draft:{ name:'AI 候选草稿', folder:'未分类', event:{ type:'time_schedule', params:{ time:'09:00' } }, actions:[{ type:'notify', params:{ title:'NotmyFault', message:'AI 生成的提醒', secret:'ai-preview-secret' } }] },
+    draft:sequentialRule([{ type:'notify', params:{ title:'NotmyFault', message:'AI 生成的提醒', secret:'ai-preview-secret' } }], { name:'AI 候选草稿', folder:'未分类' }),
     validation:{ valid:true, issues:[] },
   }
 }
@@ -200,26 +198,11 @@ window.pywebview = { api: {
   get_config: async () => {
     configReads++
     if (configReads === 1) throw new Error('bridge not ready')
-    return { rules: [{
-    rule_id: 'r_mount001',
-    name: '挂载测试规则',
-    folder: '测试',
-    condition: {
-      op: 'all',
-      children: [
-        { type: 'window_title', params: { title: 'NotmyFault' } },
-        {
-          op: 'all',
-          within_seconds: 30,
-          children: [
-            { type: 'window_title', params: {} },
-            { type: 'window_title', params: {} },
-          ],
-        },
-      ],
-    },
-    actions: [{ binding_id: 'a_mount001', type: 'notify', params: { message:'公开内容', secret:'draft-recovery-secret' } }],
-    }] }
+    const group = eventGroup('mountgrp', 'all'), nested = eventGroup('mountinner', 'all', group.binding_id)
+    const events = ['mounttrigger1', 'mounttrigger2', 'mounttrigger3'].map((id, index) => ({ ...trigger(id, index ? {} : { title:'NotmyFault' }, index ? nested.binding_id : group.binding_id), trigger:{ type:'window_title', binding_id:`t_${id}`, params:index ? {} : { title:'NotmyFault' } } }))
+    const notify = { binding_id:'a_mount001', type:'notify', params:{ message:'公开内容', secret:'draft-recovery-secret' } }
+    const rule = ruleWith([group, ...events, nested, notify], [wire(events[0], group, 'condition', 'event'), wire(events[1], nested, 'condition', 'event'), wire(events[2], nested, 'condition', 'event'), wire(nested, group, 'condition', 'result'), wire(group, notify, 'control', 'result')], { rule_id:'r_mount001', name:'挂载测试规则', folder:'测试' })
+    return { rules:[rule] }
   },
   save_config: async (rules, adminKeyPassword = '') => {
     saveConfigCalls.push({ password: adminKeyPassword, rules: JSON.parse(JSON.stringify(rules)) })
@@ -565,46 +548,20 @@ if (!safeRunExportOk) process.exitCode = 1
 const missingParamsNode = { type:'notify' }
 const ensuredParamsOk = ensureParams(missingParamsNode) === missingParamsNode.params
   && Object.keys(missingParamsNode.params).length === 0
-const beforeRecovery = {
-  actions: [{
-    binding_id: 'a_main001',
-    type: 'notify',
-    params: {},
-    failure_actions: [{
-      binding_id: 'a_recover1',
-      type: 'notify',
-      params: { message:'旧值' },
-    }],
-  }],
-}
-const afterRecovery = {
-  actions: [{
-    binding_id: 'a_main001',
-    type: 'notify',
-    params: {},
-    failure_actions: [{
-      binding_id: 'a_recover1',
-      type: 'notify',
-      params: { message:'新值' },
-    }],
-  }],
-}
+const beforeRecovery = sequentialRule([{ binding_id:'a_main001', type:'notify', params:{}, failure_actions:[{ binding_id:'a_recover1', type:'notify', params:{ message:'旧值' } }] }])
+const afterRecovery = sequentialRule([{ binding_id:'a_main001', type:'notify', params:{}, failure_actions:[{ binding_id:'a_recover1', type:'notify', params:{ message:'新值' } }] }])
 const recoveryDiff = computeChangeSet(beforeRecovery, afterRecovery, { actions:{ notify:{ params:[{ name:'message', label:'消息' }] } } })
 const orderedActions = [
   { binding_id:'a_order001', type:'notify', params:{ first:1, second:2 } },
   { binding_id:'a_order002', type:'notify', params:{} },
 ]
-const orderChanges = computeChangeSet({ actions:orderedActions }, { actions:[...orderedActions].reverse() }, {})
-const sameParamsChanges = computeChangeSet({ actions:orderedActions }, {
-  actions:[{ ...orderedActions[0], params:{ second:2, first:1 } }, orderedActions[1]],
-}, {})
-const recoveryDiffOk = recoveryDiff.length === 1
-  && recoveryDiff[0].target === 'failure-action'
-  && recoveryDiff[0].detail.includes('旧值 → 新值')
+const orderChanges = computeChangeSet(sequentialRule(orderedActions), sequentialRule([...orderedActions].reverse()), {})
+const sameParamsChanges = computeChangeSet(sequentialRule(orderedActions), sequentialRule([{ ...orderedActions[0], params:{ second:2, first:1 } }, orderedActions[1]]), {})
+const recoveryDiffOk = recoveryDiff.some(change => change.target === 'failure-action' && change.detail.includes('旧值 → 新值'))
   && summarizeRuleChanges(beforeRecovery, afterRecovery).some(item => item.includes('补救动作'))
-  && orderChanges.some(item => item.target === 'action' && item.label.includes('顺序'))
+  && orderChanges.some(item => item.target === 'rule' && item.label.includes('连接'))
   && sameParamsChanges.length === 0
-console.log((ensuredParamsOk && recoveryDiffOk?'PASS':'FAIL')+' - missing params and recovery changes stay editable and visible')
+console.log((ensuredParamsOk && recoveryDiffOk?'PASS':'FAIL')+' - native graph recovery edits and execution connections remain visible')
 if (!ensuredParamsOk || !recoveryDiffOk) process.exitCode = 1
 
 const builtHtml = fs.readFileSync(path.join(distDir, 'index.html'), 'utf8')
@@ -666,6 +623,11 @@ const disabledAiCreateOk = document.querySelector('.rule-title-capsule')?.textCo
   && !document.querySelector('.automation-create-panel')
   && !document.querySelector('#natural-draft-description')
   && !document.querySelector('.automation-template')
+document.querySelector('.rule-title-edit')?.click()
+await pause(20)
+const invalidName = document.querySelector('.rule-title-capsule input')
+invalidName.value = ''; invalidName.dispatchEvent(new window.Event('input', { bubbles:true }))
+await pause(30)
 const compactValidation = document.querySelector('.flow-validation')
 const compactValidationOk = compactValidation
   && !compactValidation.classList.contains('expanded')
@@ -677,6 +639,8 @@ const validationExpandsOnDemand = document.querySelector('.flow-validation.expan
 console.log((automationPageOk && disabledAiCreateOk?'PASS':'FAIL')+' - AI-off creation opens a blank editor without draft surfaces')
 console.log((compactValidationOk && validationExpandsOnDemand?'PASS':'FAIL')+' - rule validation stays compact until expanded')
 if (!automationPageOk || !disabledAiCreateOk || !compactValidationOk || !validationExpandsOnDemand) process.exitCode = 1
+invalidName.value = '新规则'; invalidName.dispatchEvent(new window.Event('input', { bubbles:true }))
+await pause(30)
 document.querySelector('.rule-back-btn')?.click()
 await new Promise(r => setTimeout(r, 50))
 const earlySettingsNav = [...document.querySelectorAll('.nav-item')].find(
@@ -740,7 +704,7 @@ const draftRecovery = JSON.parse(window.localStorage.getItem('notmyfault.ruleDra
 const draftRecoveryStored = /^r_[a-z0-9_]{6,64}$/.test(draftRecovery?.ruleId || '')
   && !Object.prototype.hasOwnProperty.call(draftRecovery || {}, 'ruleIndex')
   && !JSON.stringify(draftRecovery).includes('draft-recovery-secret')
-  && !Object.prototype.hasOwnProperty.call(draftRecovery?.draft?.actions?.[0]?.params || {}, 'secret')
+  && !Object.prototype.hasOwnProperty.call(ruleActions(draftRecovery?.draft).find(action => action.binding_id === 'a_mount001')?.params || {}, 'secret')
 const undoDraftButton = document.querySelector('.rule-history-actions button:first-child')
 undoDraftButton?.click()
 await new Promise(r => setTimeout(r, 80))
@@ -780,7 +744,7 @@ for (const mode of ['节点编辑', '普通模式']) {
   const checksAfter = bridgeCalls.filter(call => call.path === '/api/rules/validate')
   const checked = checksAfter.at(-1)?.data.rule
   graphModesOk &&= checksAfter.length === checksBefore + 1
-    && checked?.workflow?.entry && !Object.hasOwn(checked, 'actions')
+    && checked?.workflow?.entry === null && !Object.hasOwn(checked, 'actions')
     && getGraphTriggers(checked)[0]?.binding_id === firstTrigger.binding_id
     && ruleActions(checked).find(action => action.binding_id === 'a_mount001')?.params?.message?.$ref?.node === firstTrigger.binding_id
     && document.querySelectorAll('.rule-editor-page main').length === 1
@@ -789,6 +753,16 @@ for (const mode of ['节点编辑', '普通模式']) {
 console.log((graphModesOk?'PASS':'FAIL')+' - both editor modes preserve graph trigger identities and references, and manual checks validate immediately')
 if (!graphModesOk) process.exitCode = 1
 ;[...document.querySelectorAll('.editor-mode-switch button')].find(button => button.textContent.includes('节点编辑'))?.click()
+await pause(30)
+
+const protectedTrigger = document.querySelector('[data-node-id="action-a_mounttrigger1"]')
+protectedTrigger?.querySelector('button[aria-label="删除节点"]')?.click()
+await pause(30)
+const referenceProtected = document.querySelector('.app-dialog')?.textContent.includes('节点仍被引用')
+  && !!document.querySelector('[data-node-id="action-a_mounttrigger1"]')
+console.log((referenceProtected?'PASS':'FAIL')+' - deleting a referenced trigger requires changing its data consumers first')
+if (!referenceProtected) process.exitCode = 1
+document.querySelector('.app-dialog .btn-filled')?.click()
 await pause(30)
 
 const saveRun = [...document.querySelectorAll('button')].find(
@@ -927,13 +901,12 @@ const ctxSchema = {
   triggers: { window_title: { name:'窗口标题检测', outputs:[{ name:'matched_title', label:'匹配标题', type:'string' }] } },
   actions: {},
 }
-const ctxRule = {
-  condition: { op:'all', children:[{ binding_id:'t_full01', type:'window_title', params:{} }] },
-  actions: [
-    { binding_id:'a_1', type:'notify', params:{ message:{ $ref:{ scope:'trigger', node:'t_full01', path:[] } } } },
-    { binding_id:'a_2', type:'notify', params:{ message:{ $ref:{ scope:'event', path:[] } } } },
-  ],
-}
+const ctxTrigger = { type:'trigger', binding_id:'a_full01', trigger:{ binding_id:'t_full01', type:'window_title', params:{} }, occurrence:'occurred' }
+const ctxActions = [
+  { binding_id:'a_1', type:'notify', params:{ message:{ $ref:{ scope:'trigger', node:'t_full01', path:[] } } } },
+  { binding_id:'a_2', type:'notify', params:{ message:{ $ref:{ scope:'event', path:[] } } } },
+]
+const ctxRule = ruleWith([ctxTrigger, ...ctxActions], [wire(ctxTrigger, ctxActions[0], 'control', 'event'), wire(ctxActions[0], ctxActions[1])])
 const promptInputs = ['{"matched_title":"记事本 - 无标题","count":9007199254740993}', '{"type":"window_title","payload":{}}']
 const testCtx = requestTestContext(ctxRule, ctxSchema, () => promptInputs.shift())
 const fullPayloadOk = testCtx?.trigger_payloads?.t_full01?.matched_title === '记事本 - 无标题'
@@ -1067,22 +1040,12 @@ const partialSchema = {
     consume: { name:'打开链接', outputs:[{ name:'opened', label:'打开数量', type:'number' }] },
   },
 }
-const partialRule = {
-  variables: [
-    { id:'v_secret01', name:'凭据', value_type:'text', sensitive:true },
-    { id:'v_count001', name:'计数', value_type:'int' },
-  ],
-  actions: [
-    { binding_id:'a_source001', type:'produce', params:{} },
-    { binding_id:'a_secret001', type:'set_variable', variable:'v_secret01', value:'测试凭据' },
-    { binding_id:'a_count001', type:'set_variable', variable:'v_count001', value:42 },
-    { binding_id:'a_target001', type:'consume', params:{
-      url:{ $ref:{ scope:'step', node:'a_source001', path:['url'] } },
-      secret:{ $ref:{ scope:'step', node:'a_secret001', path:['value'] } },
-      count:{ $ref:{ scope:'step', node:'a_count001', path:['value'] } },
-    } },
-  ],
-}
+const partialRule = sequentialRule([
+  { binding_id:'a_source001', type:'produce', params:{} },
+  { binding_id:'a_secret001', type:'set_variable', variable:'v_secret01', value:'测试凭据' },
+  { binding_id:'a_count001', type:'set_variable', variable:'v_count001', value:42 },
+  { binding_id:'a_target001', type:'consume', params:{ url:{ $ref:{ scope:'step', node:'a_source001', path:['url'] } }, secret:{ $ref:{ scope:'step', node:'a_secret001', path:['value'] } }, count:{ $ref:{ scope:'step', node:'a_count001', path:['value'] } } } },
+], { variables:[{ id:'v_secret01', name:'凭据', value_type:'text', sensitive:true }, { id:'v_count001', name:'计数', value_type:'int' }] })
 const partialFields = buildTestInputFields(partialRule, partialSchema, { startStepId:'a_target001' })
 const secretOutputField = partialFields.find(field => field.node === 'a_secret001')
 const countOutputField = partialFields.find(field => field.node === 'a_count001')
@@ -1099,7 +1062,7 @@ const partialInputsOk = partialFields.filter(field => field.scope === 'step').le
   && partialContext.step_outputs.a_count001.value === 42
   && secretOutputField?.sensitive === true && secretOutputField?.type === 'text'
   && allPartialFields.find(field => field.node === 'a_secret001')?.sensitive === true
-  && actionOutputDefs(partialRule.actions[1], partialSchema, partialRule)[0].sensitive === true
+  && actionOutputDefs(ruleActions(partialRule).find(node => node.binding_id === 'a_secret001'), partialSchema, partialRule)[0].sensitive === true
   && allPartialFields.some(field => field.scope === 'step')
 console.log((partialInputsOk?'PASS':'FAIL')+' - partial test run collects skipped upstream action outputs')
 if (!partialInputsOk) process.exitCode = 1
@@ -1589,11 +1552,11 @@ await pause(30)
 document.querySelector('.graph-node-failure-action')?.click()
 await pause(30)
 const recoveryInspector = await waitFor(() => document.querySelector('.node-inspector-head small')?.textContent.includes('补救') && document.querySelector('.node-inspector .plugin-type-button'))
-await waitFor(() => [...document.querySelectorAll('.node-link-label')].find(label => label.textContent === '失败时'))
+await waitFor(() => [...document.querySelectorAll('.node-link-label')].find(label => label.textContent === '失败后'))
 const controlLabels = [...document.querySelectorAll('.node-link-label')].map(label => label.textContent)
 const failureBranchOk = failurePickerOk
   && document.querySelectorAll('.graph-node-failure-action').length === 1
-  && controlLabels.includes('失败时')
+  && controlLabels.includes('失败后')
   && !!recoveryInspector
   && !document.querySelector('.node-inspector .failure-action-add')
 console.log((failureBranchOk?'PASS':'FAIL')+' - failed actions can run an editable recovery branch')
@@ -1602,15 +1565,19 @@ if (!failureBranchOk) { console.error({ failurePickerOk, controlLabels, failureC
 await pause(350)
 document.querySelector('.graph-node-failure-action button[title="删除补救动作"]')?.click()
 await pause(350)
+const deletePhases = []
+deletePhases.push([...document.querySelectorAll('.graph-node')].map(node => node.dataset.nodeId))
 let canvasDeleteOk = document.querySelectorAll('.graph-node-failure-action').length === 0
   && document.querySelectorAll('.graph-node-action').length === 1
 document.querySelector('.rule-history-actions button:first-child')?.click()
 await pause(350)
+deletePhases.push([...document.querySelectorAll('.graph-node')].map(node => node.dataset.nodeId))
 canvasDeleteOk &&= document.querySelectorAll('.graph-node-failure-action').length === 1
 document.querySelector('.graph-node-action')?.dispatchEvent(new window.MouseEvent('contextmenu', { bubbles:true, cancelable:true, button:2 }))
 await pause(30)
 ;[...document.querySelectorAll('.node-inspector-body > .inspector-action-row button')].find(button => button.textContent.includes('复制'))?.click()
 await pause(350)
+deletePhases.push([...document.querySelectorAll('.graph-node')].map(node => node.dataset.nodeId))
 canvasDeleteOk &&= document.querySelectorAll('.graph-node-action').length === 2
 const copiedActionNode = [...document.querySelectorAll('.graph-node-action')].at(-1)
 copiedActionNode?.focus()
@@ -1619,35 +1586,35 @@ await pause(350)
 canvasDeleteOk &&= document.querySelectorAll('.graph-node-action').length === 1
   && document.querySelectorAll('.graph-node-failure-action').length === 1
 console.log((canvasDeleteOk?'PASS':'FAIL')+' - canvas delete buttons remove the selected action or recovery action')
-if (!canvasDeleteOk) { console.error({ actions:document.querySelectorAll('.graph-node-action').length, recovery:document.querySelectorAll('.graph-node-failure-action').length }); process.exitCode = 1 }
+if (!canvasDeleteOk) { console.error({ deletePhases, actions:document.querySelectorAll('.graph-node-action').length, recovery:document.querySelectorAll('.graph-node-failure-action').length }); process.exitCode = 1 }
 
-document.querySelector('.graph-node-event_group')?.click()
+if (!document.querySelector('.graph-node-trigger')) document.querySelector('.graph-node-event_group .group-toggle')?.click()
+await pause(350)
+document.querySelector('.graph-node-trigger')?.click()
 await pause(30)
-const activationEditor = document.querySelector('.node-inspector .event-activation-editor')
-const activationOp = activationEditor?.querySelector('select')
-if (activationOp) {
-  activationOp.value = 'not'; activationOp.dispatchEvent(new window.Event('change', { bubbles:true }))
-}
+const occurrenceSelect = document.querySelector('select[aria-label="事件发生条件"]')
+occurrenceSelect.value = 'absent'; occurrenceSelect.dispatchEvent(new window.Event('change', { bubbles:true }))
 await pause(30)
-const absenceEditorOk = document.querySelector('.event-activation-editor')?.textContent.includes('持续没有事件时')
-  && !document.querySelector('.stage-check')
-console.log((absenceEditorOk?'PASS':'FAIL')+' - event activation supports timed absence separately from branch conditions')
+const absenceEditorOk = document.querySelector('.node-inspector')?.textContent.includes('连续未发生时长')
+  && document.querySelector('.node-inspector')?.textContent.includes('连续时长不足时判为不成立')
+  && !document.querySelector('.event-activation-editor')
+console.log((absenceEditorOk?'PASS':'FAIL')+' - trigger settings expose absence duration and immediate false for incomplete windows')
 if (!absenceEditorOk) process.exitCode = 1
-activationOp.value = 'all'; activationOp.dispatchEvent(new window.Event('change', { bubbles:true }))
+const repeatSelect = [...document.querySelectorAll('.node-inspector select')].find(select => [...select.options].some(option => option.value === 'every_window'))
+repeatSelect.value = 'every_window'; repeatSelect.dispatchEvent(new window.Event('change', { bubbles:true }))
 await pause(30)
-const consumeSelect = [...document.querySelectorAll('.event-activation-editor select')].find(select => [...select.options].some(option => option.value === 'matched'))
-consumeSelect.value = 'none'; consumeSelect.dispatchEvent(new window.Event('change', { bubbles:true }))
-await pause(30)
-const conditionPoliciesOk = consumeSelect.value === 'none'
-console.log((conditionPoliciesOk?'PASS':'FAIL')+' - event activation retains event consumption settings')
+const conditionPoliciesOk = repeatSelect.value === 'every_window'
+console.log((conditionPoliciesOk?'PASS':'FAIL')+' - absence trigger retains repeated window settings')
 if (!conditionPoliciesOk) process.exitCode = 1
+occurrenceSelect.value = 'occurred'; occurrenceSelect.dispatchEvent(new window.Event('change', { bubbles:true }))
+await pause(30)
 
 // 私有数据参数只显示插件编辑入口。
 ;[...document.querySelectorAll('button')].find(
   button => button.textContent.includes('普通模式'),
 )?.click()
 await new Promise(r => setTimeout(r, 30))
-await canvasOperation([...document.querySelectorAll('.graph-node-action')].at(-1), '添加动作')
+await canvasOperation([...document.querySelectorAll('.graph-node-action')].at(-1), '创建动作')
 await new Promise(r => setTimeout(r, 30))
 ;[...document.querySelectorAll('.plugin-picker-item')].find(
   button => button.textContent.includes('宏录制动作'),
@@ -1696,38 +1663,30 @@ const macroPageOk = macroPageSource.includes('操作宏插件页面')
 console.log((macroCaptured && macroPageOk && macroFullPageOpen?'PASS':'FAIL')+' - private macro data is edited through the full-page plugin extension view')
 if (!macroCaptured || !macroPageOk || !macroFullPageOpen) process.exitCode = 1
 
-await canvasOperation([...document.querySelectorAll('.graph-node-action')].at(-1), '创建事件组')
+;[...document.querySelectorAll('.editor-mode-switch button')].find(button => button.textContent.includes('节点编辑'))?.click()
+await pause(350)
+const viewport = document.querySelector('.node-canvas-viewport')
+viewport.dispatchEvent(new window.MouseEvent('contextmenu', { bubbles:true, cancelable:true, button:2, clientX:500, clientY:400 }))
+await pause(30)
+;[...document.querySelectorAll('.canvas-context-menu button')].find(button => button.textContent.includes('创建 IF 事件组'))?.click()
+await pause(350)
 const eventCard = [...document.querySelectorAll('.graph-node-event_group')].at(-1)
-eventCard?.click()
-await pause(30)
-;[...document.querySelectorAll('.node-inspector button')].find(button => button.textContent.includes('添加 ELIF'))?.click()
-await pause(30)
-const branchSettingsOk = document.querySelectorAll('.workflow-branch-settings').length === 3
-const emptyBranchBlocksSave = [...document.querySelectorAll('.rule-editor-actions button')].find(button => button.textContent.includes('保存规则'))?.disabled
-;[...document.querySelectorAll('.node-inspector button')].filter(button => button.textContent.includes('编辑条件图'))[1]?.click()
+eventCard?.querySelector('.group-toggle')?.click()
 await pause(350)
-const newBranchEditor = document.querySelector('.predicate-editor')
-const newBranchIsEvent = newBranchEditor?.querySelector('select')?.value === 'event_occurred'
-const newBranchEvent = newBranchEditor?.querySelectorAll('select')[1]
-newBranchEvent.value = [...newBranchEvent.options].find(option => option.value)?.value || ''
-newBranchEvent.dispatchEvent(new window.Event('change', { bubbles:true }))
-eventCard?.click()
-await pause(30)
-;[...document.querySelectorAll('.node-inspector button')].find(button => button.textContent.includes('编辑条件图'))?.click()
-await pause(350)
-const predicateInspector = document.querySelector('.node-inspector .predicate-editor')
-const predicateOperator = predicateInspector?.querySelector('select')
-predicateOperator.value = 'event_occurred'; predicateOperator.dispatchEvent(new window.Event('change', { bubbles:true }))
-await pause(350)
-const firedChoice = predicateInspector.querySelectorAll('select')[2]
-firedChoice.value = 'false'; firedChoice.dispatchEvent(new window.Event('change', { bubbles:true }))
-await pause(350)
-const triggerDirectChoice = [...predicateInspector.querySelectorAll('select')[1].options].some(option => /^t_/.test(option.value))
-  && firedChoice.options[firedChoice.selectedIndex].textContent === '未发生'
+const branchLabels = [...eventCard.querySelectorAll('.graph-branch-label')]
+const branchSettingsOk = branchLabels.map(label => label.textContent.trim()).join('|') === 'IF|ELIF 1|ELSE'
+  && !document.querySelector(`[data-node-id^="gate-${eventCard.dataset.nodeId.slice('action-'.length)}-"]`)
+const triggerDirectChoice = eventCard.querySelectorAll('.control-input[data-control-port]').length === 2
+  && !eventCard.querySelector('[aria-label="ELSE 条件"]')
+branchLabels[1]?.click(); await pause(30)
+const branchSettingsOpen = document.querySelector('.node-inspector')?.textContent.includes('出口名称')
+  && document.querySelector('.node-inspector input[aria-label="分支条件取反"]')
+document.querySelector('.node-inspector-close')?.click(); await pause(350)
 const inlineGroupOk = !!document.querySelector('.graph-node-event_group.graph-group-frame')
-  && !!document.querySelector('.node-inspector .predicate-editor') && !document.querySelector('[data-node-id^="dispatch-"]') && !document.querySelector('.subflow-navigation')
-console.log((branchSettingsOk && triggerDirectChoice && inlineGroupOk && emptyBranchBlocksSave && newBranchIsEvent?'PASS':'FAIL')+' - inline event groups require real event sources and edit stable IF, ELIF and ELSE outlets')
-if (!branchSettingsOk || !triggerDirectChoice || !inlineGroupOk || !emptyBranchBlocksSave || !newBranchIsEvent) process.exitCode = 1
+  && !document.querySelector('[data-node-id^="dispatch-"]') && !document.querySelector('.subflow-navigation')
+console.log((branchSettingsOk && triggerDirectChoice && inlineGroupOk && branchSettingsOpen?'PASS':'FAIL')+' - IF groups connect conditions directly to ports and open branch settings without extra cards')
+if (!branchSettingsOk || !triggerDirectChoice || !inlineGroupOk || !branchSettingsOpen) { console.error({branchSettingsOk,triggerDirectChoice,inlineGroupOk,branchSettingsOpen});process.exitCode=1 }
+
 const concurrencySelect = document.querySelector('.rule-concurrency-field select')
 const concurrencyDefaultOk = concurrencySelect?.value === 'single'
 concurrencySelect.value = 'parallel'
@@ -1737,12 +1696,11 @@ await pause(30)
 await pause(80)
 const savedGraph = savedRulesPayload?.find(rule => rule.rule_id === 'r_mount001')?.workflow
 const savedEventGroup = savedGraph?.nodes.filter(action => action.type === 'event_group').at(-1)
-const savedPredicate = graphPredicate(savedEventGroup?.branches?.[0]?.condition_graph)
-const ifSavedOk = savedEventGroup?.branches.length === 3 && savedEventGroup.branches.at(-1).else
-  && savedEventGroup.branches.every(branch => savedGraph.edges.some(edge => edge.source === savedEventGroup.binding_id && edge.port === branch.id))
-  && savedPredicate.op === 'event_occurred' && savedPredicate.expected === false && /^t_/.test(savedPredicate.trigger_id)
+const ifSavedOk = savedEventGroup?.group_type === 'if' && savedEventGroup.branches.length === 3 && savedEventGroup.branches.at(-1).else
+  && !Object.hasOwn(savedEventGroup, 'condition_graph') && !Object.hasOwn(savedEventGroup, 'activation')
+  && !savedGraph.edges.some(edge => edge.source === savedEventGroup.binding_id || edge.target === savedEventGroup.binding_id)
   && !Object.hasOwn(savedRulesPayload.find(rule => rule.rule_id === 'r_mount001'), 'actions')
-console.log((ifSavedOk?'PASS':'FAIL')+' - saving keeps condition graphs and control outlet connections as the execution model')
+console.log((ifSavedOk?'PASS':'FAIL')+' - saving permits unused free blocks and keeps explicit flat graph connections')
 if (!ifSavedOk) process.exitCode = 1
 const concurrencySavedOk = concurrencyDefaultOk
   && savedRulesPayload.find(rule => rule.rule_id === 'r_mount001')?.concurrency?.mode === 'parallel'
@@ -1856,7 +1814,7 @@ fieldValue.value = '{}'
 fieldValue.dispatchEvent(new window.Event('input', { bubbles:true }))
 await canvasOperation([...document.querySelectorAll('.graph-node-action')].at(-1), '变量赋值')
 await pause(30)
-const assignmentEditor = [...document.querySelectorAll('.variable-assignment-editor')].at(-1)
+const assignmentEditor = document.querySelector('.node-inspector-body')
 const assignmentTarget = assignmentEditor.querySelector('select[aria-label="赋值目标变量"]')
 assignmentTarget.value = [...assignmentTarget.options].find(option => option.value).value
 assignmentTarget.dispatchEvent(new window.Event('change', { bubbles:true }))

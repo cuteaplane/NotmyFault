@@ -16,44 +16,8 @@ export function workflowEventChoices(rule, schema) {
   }))
 }
 
-export function ifBranches(action) {
-  return [
-    { key: 'then', label: 'IF 成立', condition: action.condition, actions: action.then || [] },
-    ...(action.elif || []).map((branch, index) => ({ key: `elif[${index}]`, label: `ELIF ${index + 1} 成立`, condition: branch.condition, actions: branch.then || [], branch, index })),
-    { key: 'else', label: 'ELSE', actions: action.else || [] },
-  ]
-}
-export function walkWorkflowActions(actions, visit, trail = []) {
-  ;(actions || []).forEach((action, index) => {
-    visit(action, index, trail)
-    if (action.type === 'if') for (const branch of ifBranches(action)) {
-      walkWorkflowActions(branch.actions, visit, [...trail, { action, field: branch.key, index }])
-    }
-    walkWorkflowActions(action.failure_actions, visit, [...trail, { action, field: 'failure_actions', index }])
-  })
-}
-export function findWorkflowAction(rule, bindingId) {
-  if (rule.workflow) return findGraphNode(rule, bindingId)
-  let found = null
-  walkWorkflowActions(rule.actions, (action, index, trail) => {
-    if (action.binding_id === bindingId) found = { action, index, trail }
-  })
-  return found
-}
-export function precedingSources(rule, action, schema) {
-  if (rule.workflow) return graphBindingSources(rule, action, schema)
-  const hit = findWorkflowAction(rule, action.binding_id)
-  if (!hit) return []
-  const rootIndex = hit.trail[0]?.index ?? hit.index
-  let sources = buildBindingSources(rule, rootIndex, schema)
-  for (let depth = 0; depth < hit.trail.length; depth++) {
-    const parent = hit.trail[depth]
-    const siblings = parent.field === 'failure_actions' ? parent.action.failure_actions : ifBranches(parent.action).find(branch => branch.key === parent.field)?.actions
-    const end = hit.trail[depth + 1]?.index ?? hit.index
-    sources = appendActionSources(sources, (siblings || []).slice(0, end), rule, schema)
-  }
-  return sources
-}
+export function findWorkflowAction(rule, bindingId) { return findGraphNode(rule, bindingId) }
+export function precedingSources(rule, action, schema) { return graphBindingSources(rule, action, schema) }
 export function appendActionSources(base, actions, rule, schema) {
   const result = []
   for (const action of actions) for (const output of actionOutputDefs(action, schema, rule)) result.push({

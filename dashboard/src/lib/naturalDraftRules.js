@@ -1,34 +1,14 @@
 import { walkGraphActions, getGraphTriggers, findGraphNode } from './workflowGraph.js'
-import { getParamDefs, isConditionLeaf, normalizeRuleDraft } from './utils.js'
+import { getParamDefs, normalizeRuleDraft } from './utils.js'
 
 export function normalizeDraftResult(result) {
   if (result?.result_type !== 'rule_draft' || !result.draft) return result
   return { ...result, draft: normalizeRuleDraft(JSON.parse(JSON.stringify(result.draft))) }
 }
 
-function conditionNodes(node) {
-  if (!node || typeof node !== 'object') return []
-  return [node, ...(node.children || []).flatMap(conditionNodes)]
-}
-
-function draftActions(draft) { if (!draft?.workflow) return actionNodes(draft?.actions); const result = []; walkGraphActions(draft.workflow, node => result.push(node)); return result }
-function draftTriggers(draft) { return draft?.workflow ? getGraphTriggers(draft) : conditionNodes(draft?.condition).filter(isConditionLeaf) }
-function actionNodes(actions) {
-  return (actions || []).flatMap(node => [
-    node,
-    ...['then', 'else', 'failure_actions'].flatMap(field => actionNodes(node[field])),
-    ...(node.elif || []).flatMap(branch => actionNodes(branch.then)),
-  ])
-}
-
-export function conditionLabel(node, schema) {
-  if (!node) return '还没听清什么时候开始'
-  if (isConditionLeaf(node)) return schema.triggers?.[node.type]?.name || node.type
-  const children = (node.children || []).map(child => conditionLabel(child, schema))
-  if (node.op === 'not') return `${children.join('、')} 未发生`
-  const label = children.join(node.op === 'all' ? ' 且 ' : ' 或 ')
-  return label || '待补充触发条件'
-}
+function draftActions(draft) { const result = []; walkGraphActions(draft?.workflow, node => { if (!['trigger', 'logic', 'condition', 'event_group'].includes(node.type)) result.push(node) }); return result }
+function draftTriggers(draft) { return getGraphTriggers(draft || {}) }
+export function conditionLabel(node, schema) { return node ? schema.triggers?.[node.type]?.name || node.type : '待连接触发器' }
 
 export function actionNames(draft, schema) {
   return draftActions(draft).map(node => schema.actions?.[node.type]?.name || node.type).filter(Boolean)
@@ -36,7 +16,7 @@ export function actionNames(draft, schema) {
 
 export function ruleNodeCount(draft) {
   if (!draft) return ''
-  return `${draftTriggers(draft).length + draftActions(draft).length} 个节点`
+  return `${draft.workflow?.nodes?.length || 0} 个节点`
 }
 
 export function ruleParamRows(draft, schema) {
@@ -65,7 +45,7 @@ export function ruleSummary(result, schema) {
   if (result?.result_type !== 'rule_draft' || !draft) {
     return String(result?.message || result?.content || result?.error || '我还需要一点信息，才能继续起草。').trim().slice(0, 4000)
   }
-  return `已生成规则草稿：当 ${conditionLabel(draft.condition || (() => { let entry = findGraphNode(draft, draft.workflow?.entry)?.action; while (entry?.workflow) entry = entry.workflow.nodes.find(node => node.binding_id === entry.workflow.entry); return entry?.activation })(), schema)}，然后 ${actionNames(draft, schema).join('、') || '待补充动作'}。`.slice(0, 4000)
+  return `已生成规则草稿：${draftTriggers(draft).map(trigger => conditionLabel(trigger, schema)).join('、') || '待连接触发器'}；动作包括 ${actionNames(draft, schema).join('、') || '待添加动作'}。`.slice(0, 4000)
 }
 
 export function draftEditsCurrentRule(draft, rule) {
@@ -87,19 +67,18 @@ export function nodeIdForChange(item, rule) {
   if (!rule || item.op === 'add') return null
   if (item.node_id) return `action-${item.node_id}`
   if (item.target === 'action') {
-    const node = rule.actions?.[item.index]
+    const node = rule.workflow?.nodes?.[item.index]
     return node?.binding_id ? `action-${node.binding_id}` : null
   }
   if (item.target === 'failure-action') {
-    const parent = rule.actions?.[item.parentIndex]
+    const parent = rule.workflow?.nodes?.[item.parentIndex]
     const node = parent?.failure_actions?.[item.index]
     return node?.binding_id ? `failure-action-${node.binding_id}`
       : parent?.binding_id ? `action-${parent.binding_id}` : null
   }
   if (item.target === 'trigger') {
-    return isConditionLeaf(rule.condition)
-      ? rule.condition.binding_id ? `trigger-${rule.condition.binding_id}` : null
-      : 'condition-root'
+    const node = rule.workflow.nodes.find(node => node.type === 'trigger')
+    return node ? `action-${node.binding_id}` : null
   }
   return null
 }

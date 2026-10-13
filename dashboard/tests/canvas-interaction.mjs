@@ -11,13 +11,18 @@ const temp = path.join(root, 'agent_files/temp/canvas-interaction')
 await mkdir(temp, { recursive: true })
 const vuePath = fileURLToPath(new URL('../node_modules/vue/index.mjs', import.meta.url))
 const bundled = path.join(temp, 'canvas.mjs')
-await build({ entryPoints: [path.join(root, 'dashboard/src/components/RuleCanvas.vue')], outfile: bundled, bundle: true, format: 'esm', platform: 'node', plugins: [{ name: 'canvas-sfc', setup(builder) {
+async function bundleComponent(component, outfile) { await build({ entryPoints: [path.join(root, `dashboard/src/components/${component}.vue`)], outfile, bundle: true, format: 'esm', platform: 'node', plugins: [{ name: 'canvas-sfc', setup(builder) {
   builder.onResolve({ filter: /^vue$/ }, () => ({ path: vuePath, external: true }))
   builder.onLoad({ filter: /\.vue$/ }, async ({ path: filename }) => {
     const { descriptor } = parse(await readFile(filename, 'utf8'), { filename })
     return { contents: compileScript(descriptor, { id: 'canvas-test', inlineTemplate: true }).content, loader: 'js', resolveDir: path.dirname(filename) }
   })
-} }] })
+} }] }) }
+await bundleComponent('RuleCanvas', bundled)
+const dialogBundle = path.join(temp, 'test-dialog.mjs')
+await bundleComponent('TestRunDialog', dialogBundle)
+const predicateBundle = path.join(temp, 'predicate.mjs')
+await bundleComponent('PredicateEditor', predicateBundle)
 const dom = new JSDOM('<!doctype html><div id="app"></div>', { pretendToBeVisual: true })
 for (const key of ['window', 'document', 'Element', 'HTMLElement', 'SVGElement', 'Node', 'Event', 'MouseEvent']) globalThis[key] = dom.window[key]
 const rectangle = { left: 0, top: 0, right: 1200, bottom: 700, width: 1200, height: 700 }
@@ -30,19 +35,24 @@ globalThis.cancelAnimationFrame = id => frames.delete(id)
 dom.window.HTMLElement.prototype.getBoundingClientRect = () => rectangle
 const { createApp, h, ref, reactive, nextTick } = await import(pathToFileURL(vuePath).href)
 const { default: RuleCanvas } = await import(pathToFileURL(bundled).href)
-const rule = reactive({ rule_id: 'r_canvas01', condition: { type: 'missing', binding_id: 't_canvas01' }, actions: [] })
+const { default: TestRunDialog } = await import(pathToFileURL(dialogBundle).href)
+const { default: PredicateEditor } = await import(pathToFileURL(predicateBundle).href)
+const triggerNode = { type: 'trigger', binding_id: 'a_trigger01', trigger: { type: 'missing', binding_id: 't_canvas01' }, position: { x: 40, y: 900 } }
+const conditionNode = { type: 'condition', binding_id: 'a_compare01', position: { x: 1600, y: 900 } }
+const rule = reactive({ rule_id: 'r_canvas01', workflow: { entry: null, nodes: [triggerNode, conditionNode], edges: [] } })
 const predicate = reactive({ op: 'eq', left: '', right: '' })
-const source = { id: 'trigger-t_canvas01', kind: 'trigger', source: rule.condition, x: 40, y: 900, label: '触发数据', dataInputs: [], dataOutputs: [{ id: 'output:state', name: 'state', index: 0, type: 'text', required: true }] }
-const target = { id: 'predicate-a_canvas01-then-root', kind: 'predicate', source: predicate, x: 1600, y: 900, label: '判断状态', dataInputs: [{ id: 'input:left', name: 'left', index: 0, type: 'any', label: '判断数据' }], dataOutputs: [] }
-const nested = { type: 'if', binding_id: 'a_nested01', condition: { op: 'eq', left: 1, right: 1 }, then: [], else: [] }
-const override = { nodes: [source, target, { id: 'action-a_nested01', kind: 'action', readOnly: true, source: nested, index: 0, x: 2000, y: 900, dataInputs: [], dataOutputs: [], label: '只读来源' }], edges: [] }
+conditionNode.predicate = predicate
+const source = { id: 'action-a_trigger01', raw: rule.workflow.nodes[0], kind: 'trigger', source: rule.workflow.nodes[0].trigger, get x() { return this.raw.position.x }, get y() { return this.raw.position.y }, label: '触发数据', dataInputs: [], dataOutputs: [{ id: 'output:state', name: 'state', index: 0, type: 'text', required: true }] }
+const target = { id: 'action-a_compare01', raw: rule.workflow.nodes[1], kind: 'predicate', source: predicate, x: 1600, y: 900, label: '判断状态', dataInputs: [{ id: 'input:left', name: 'left', index: 0, type: 'any', label: '判断数据' }], dataOutputs: [] }
+const nested = { type: 'log', binding_id: 'a_nested01', params: {} }
+const override = { nodes: [source, target, { id: 'action-a_nested01', kind: 'action', raw: nested, readOnly: true, source: nested, index: 0, x: 2000, y: 900, dataInputs: [], dataOutputs: [], label: '只读来源' }], edges: [] }
 const selected = ref(null), view = ref('main'), visible = ref(true), opened = [], operations = []
 const app = createApp({ setup: () => () => visible.value ? h(RuleCanvas, { rule, graphOverride: override, selectedNodeId: selected.value, viewKey: view.value,
   'onUpdate:selectedNodeId': id => { selected.value = id }, 'onSelect-node': id => { selected.value = id }, 'onOpen-if': action => opened.push(action), onOperation: context => operations.push(context),
 }) : null })
 const flush = async () => { await nextTick(); await nextTick() }
-function pointer(element, type, x, y) {
-  const event = new dom.window.MouseEvent(type, { bubbles: true, cancelable: true, button: 0, clientX: x, clientY: y })
+function pointer(element, type, x, y, modifiers = {}) {
+  const event = new dom.window.MouseEvent(type, { bubbles: true, cancelable: true, button: 0, clientX: x, clientY: y, ...modifiers })
   Object.defineProperty(event, 'pointerId', { value: 1 }); element.dispatchEvent(event); return event
 }
 const camera = () => document.querySelector('.node-canvas').style.transform
@@ -79,7 +89,7 @@ try {
   const [px, py, z] = panZoom(), endpoint = document.querySelector('.node-link-pending').getAttribute('d').match(/, ([\d.e-]+) ([\d.e-]+)$/).slice(1).map(Number)
   assert(Math.abs(endpoint[0] * z + px - 1195) < 1e-6, '缩放平移后的连线终点横坐标跟随指针')
   assert(Math.abs(endpoint[1] * z + py - 695) < 1e-6, '缩放平移后的连线终点纵坐标跟随指针')
-  document.elementFromPoint = () => document.querySelector('[data-input-node="predicate-a_canvas01-then-root"]')
+  document.elementFromPoint = () => document.querySelector('[data-input-node="action-a_compare01"]')
   pointer(window, 'pointerup', 1195, 695); await flush()
   assert.deepEqual(JSON.parse(JSON.stringify(predicate.left)), { $ref: { scope: 'trigger', node: 't_canvas01', path: ['state'] } }, '连线写入真实条件对象')
   const afterDrop = camera(); await advance(3); assert.equal(camera(), afterDrop, '松开指针后停止平移')
@@ -91,13 +101,104 @@ try {
   const header = sourceElement.querySelector('header'), beforeNodeDrag = camera()
   pointer(header, 'pointerdown', 250, 620); await flush(); assert.equal(camera(), beforeNodeDrag, '开始拖节点时不居中')
   pointer(header, 'pointermove', 300, 620); await flush(); pointer(header, 'pointerup', 300, 620); await flush()
-  const movedLeft = sourceElement.style.left; assert.notEqual(movedLeft, '40px')
+  assert.notEqual(sourceElement.style.left, '40px')
+  const movedPosition = { ...rule.workflow.nodes[0].position }
+  pointer(header, 'pointerdown', 300, 620); pointer(header, 'pointermove', 390, 650); await flush()
+  window.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key:'Escape', bubbles:true })); await flush()
+  assert.deepEqual(rule.workflow.nodes[0].position,movedPosition,'取消节点拖拽恢复位置')
+  await advance(30)
+  assert.equal(parseFloat(sourceElement.style.left), movedPosition.x, '取消拖拽后卡片显示位置回到已保存坐标')
+  const movedLeft = sourceElement.style.left
+
   const savedCamera = camera(); view.value = 'child'; await flush(); view.value = 'main'; await flush()
   assert.equal(camera(), savedCamera, '返回主图恢复相机')
   assert.equal(document.querySelector('.graph-node-trigger').style.left, movedLeft, '返回主图恢复手动位置')
   assert(document.querySelector('.graph-node-trigger .data-port-dot.draggable'), '返回主图恢复端口展开状态')
   visible.value = false; await flush(); visible.value = true; await flush(); assert.equal(camera(), savedCamera, '卸载子图组件后恢复视图')
   const readonly = document.querySelector('.graph-node-action'); assert.equal(readonly.querySelector('footer'), null, '只读前序动作无修改按钮')
-  readonly.click(); await flush(); assert.equal(opened.length, 0, '只读IF来源不进入子图')
+  readonly.click(); await flush(); assert.equal(opened.length, 0, '只读来源不触发编辑操作')
+  const currentViewport = document.querySelector('.node-canvas-viewport')
+  const editableCards = [document.querySelector('[data-node-id="action-a_trigger01"]'), document.querySelector('[data-node-id="action-a_compare01"]')]
+  editableCards.forEach(card => card.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, ctrlKey: true })))
+  await flush()
+  assert.equal(document.querySelectorAll('.multi-selected').length, 2, 'Ctrl 点击选择两个图块')
+  currentViewport.dispatchEvent(new dom.window.MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2, clientX: 500, clientY: 300 }))
+  await flush()
+  const groupButtons = [...document.querySelectorAll('.canvas-context-menu button')].filter(button => button.textContent.includes('组合'))
+  assert.equal(groupButtons.length, 4, '多选菜单可组合 IF、AND、OR、NOT')
+  groupButtons.find(button => button.textContent.includes('IF')).click()
+  await flush()
+  const grouping = operations.at(-1)
+  assert.equal(grouping.operation, 'group-selection')
+  assert.deepEqual(grouping.ids.sort(), ['a_compare01', 'a_trigger01'])
+  assert.equal(grouping.value, 'if')
+  assert.equal(document.querySelectorAll('.multi-selected').length, 0)
+  const [bx, by, bz] = panZoom()
+  pointer(currentViewport, 'pointerdown', bx + Math.min(source.x, target.x) * bz - 2, by + 898 * bz, { ctrlKey: true })
+  pointer(currentViewport, 'pointermove', bx + (target.x + 228) * bz + 2, by + 1150 * bz, { ctrlKey: true })
+  await flush()
+  assert.equal(document.querySelectorAll('.multi-selected').length, 2, 'Ctrl 拖空白处框选两个图块')
+  pointer(currentViewport, 'pointerup', bx + (target.x + 228) * bz + 2, by + 1150 * bz, { ctrlKey: true })
+  await flush()
+  assert.equal(document.querySelector('.canvas-selection-box'), null)
+  currentViewport.dispatchEvent(new dom.window.MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2, clientX: 800, clientY: 400 }))
+  await flush()
+  ;[...document.querySelectorAll('.canvas-context-menu button')].find(button => button.textContent.includes('创建触发器')).click()
+  await flush()
+  const creation = operations.at(-1)
+  assert.equal(creation.operation, 'trigger')
+  assert.equal(creation.kind, 'background')
+  assert(Math.abs(creation.position.x - (800 - bx) / bz) < 1e-6)
+  assert(Math.abs(creation.position.y - (400 - by) / bz) < 1e-6)
+  app.unmount()
+  const dialogHost = document.createElement('div'); document.body.append(dialogHost)
+  const dialogRule = { rule_id:'r_range001', workflow:{ entry:null, nodes:[
+    { type:'trigger', binding_id:'a_start001', trigger:{ type:'missing', binding_id:'t_start001', params:{} }, occurrence:'occurred' },
+    { type:'action_group', binding_id:'a_group001', exports:{} },
+    { type:'log', binding_id:'a_internal1', parent:'a_group001', params:{} },
+    { type:'log', binding_id:'a_external1', params:{} },
+  ], edges:[
+    { source:'a_start001', port:'event', target:'a_group001', channel:'control' },
+    { source:'a_group001', port:'entry', target:'a_internal1', channel:'control' },
+    { source:'a_group001', port:'next', target:'a_external1', channel:'control' },
+  ] } }
+  const dialogOpen = ref(false), runPayloads = []
+  const dialogApp = createApp({ setup: () => () => h(TestRunDialog, { open:dialogOpen.value, rule:dialogRule, schema:{ triggers:{ missing:{ outputs:[] } }, actions:{ log:{ outputs:[] } } }, onRun:payload => runPayloads.push(payload) }) })
+  try {
+    dialogApp.mount(dialogHost); dialogOpen.value = true; await flush()
+    const range = document.querySelector('.test-range-controls select')
+    range.value = 'until'; range.dispatchEvent(new dom.window.Event('change', { bubbles:true })); await flush()
+    let destination = document.querySelectorAll('.test-range-controls select')[1]
+    assert(destination.querySelector('option[value="a_internal1"]').disabled, '动作组内部节点不能作为主流程结束位置')
+    assert(!destination.querySelector('option[value="a_external1"]').disabled, '主流程后续动作可作为结束位置')
+    destination.value = 'a_internal1'; destination.dispatchEvent(new dom.window.Event('change', { bubbles:true })); await flush()
+    document.querySelector('.test-prep-dialog .btn-filled').click(); await flush()
+    assert.equal(runPayloads.length, 0)
+    assert(document.querySelector('.test-prep-dialog').textContent.includes('结束节点必须在主流程中'))
+    range.value = 'from'; range.dispatchEvent(new dom.window.Event('change', { bubbles:true })); await flush()
+    destination = document.querySelectorAll('.test-range-controls select')[1]
+    assert(!destination.querySelector('option[value="a_internal1"]').disabled, '内部节点允许从此处继续')
+    destination.value = 'a_internal1'; destination.dispatchEvent(new dom.window.Event('change', { bubbles:true })); await flush()
+    document.querySelector('.test-prep-dialog .btn-filled').click(); await flush()
+    assert.equal(runPayloads[0]?.context.start_step_id, 'a_internal1')
+    assert.equal(runPayloads[0]?.context.end_step_id, '')
+  } finally { dialogApp.unmount(); dialogHost.remove() }
+  const predicateHost = document.createElement('div'); document.body.append(predicateHost)
+  const preboundReference = { $ref:{ scope:'step', node:'a_readtext001', path:['characters'] } }
+  const preboundPredicate = reactive({ op:'eq', left:structuredClone(preboundReference), right:3 })
+  const availableSources = ref([])
+  const predicateApp = createApp({ setup: () => () => h(PredicateEditor, { node:preboundPredicate, rule:{ rule_id:'r_prebound', workflow:{ entry:null, nodes:[], edges:[] } }, sources:availableSources.value, shallow:true, leafOnly:true }) })
+  try {
+    predicateApp.mount(predicateHost); await flush()
+    const operator = predicateHost.querySelector('.predicate-editor select')
+    for (const value of ['gte', 'exists', 'lte']) {
+      operator.value = value; operator.dispatchEvent(new dom.window.Event('change', { bubbles:true })); await flush()
+      assert.deepEqual(JSON.parse(JSON.stringify(preboundPredicate.left)), preboundReference, '未接条件出口时切换判断方式保留预绑定动作输出')
+    }
+    availableSources.value = [{ label:'其他结果', type:'number', value:{ $ref:{ scope:'step', node:'a_other001', path:['value'] } } }]
+    await flush()
+    operator.value = 'gt'; operator.dispatchEvent(new dom.window.Event('change', { bubbles:true })); await flush()
+    assert.deepEqual(JSON.parse(JSON.stringify(preboundPredicate.left)), preboundReference, '来源暂不可选时保留预绑定引用')
+  } finally { predicateApp.unmount(); predicateHost.remove() }
   console.log('Canvas pointer focus, stable endpoints, edge pan, predicate binding, cancellation and view restoration: PASS')
-} finally { app.unmount(); dom.window.close(); await rm(temp, { recursive: true, force: true }) }
+} finally { if (app._instance) app.unmount(); dom.window.close(); await rm(temp, { recursive: true, force: true }) }

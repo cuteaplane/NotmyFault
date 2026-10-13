@@ -3,8 +3,7 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { actionOutputDefs, buildAllTestInputFields, buildPreparedTestContext, buildTestInputFields } from '../lib/bindings'
 import { fieldType, typeLabel, typeAtPath, typeSpec, parseExactJson } from '../lib/valueTypes'
 import BaseDialog from './BaseDialog.vue'
-import { walkGraphActions, findGraphNode, graphExecutionActions } from '../lib/workflowGraph'
-import { walkWorkflowActions } from '../lib/workflowConditions'
+import { walkGraphActions, findGraphNode, graphExecutionActions, actionGroupScope } from '../lib/workflowGraph'
 
 const props = defineProps({
   open: Boolean,
@@ -34,7 +33,7 @@ const rangeMode = ref('all')
 const selectedStepId = ref('')
 const assertions = ref([])
 
-const actions = computed(() => { if (!props.rule?.workflow) return props.rule?.actions || []; const result = []; walkGraphActions(props.rule.workflow, action => result.push(action)); return result })
+const actions = computed(() => props.rule ? graphExecutionActions(props.rule) : [])
 const selectedIndex = computed(() => Math.max(0, actions.value.findIndex(action => action.binding_id === selectedStepId.value)))
 const startStepId = computed(() => rangeMode.value === 'from' ? selectedStepId.value : '')
 const endStepId = computed(() => rangeMode.value === 'until' ? selectedStepId.value : '')
@@ -44,9 +43,9 @@ const fields = computed(() => props.rule ? buildTestInputFields(props.rule, prop
   startStepId: startStepId.value,
   endStepId: endStepId.value,
 }).filter(field => field.scope !== 'trigger' || values.value[`event_occurrence:${field.node}:[]`] !== false) : [])
-const selectedActions = computed(() => props.rule?.workflow ? graphExecutionActions(props.rule, { startStepId: startStepId.value, endStepId: endStepId.value }) : actions.value.slice(startIndex.value, endIndex.value + 1))
+const selectedActions = computed(() => props.rule ? graphExecutionActions(props.rule, { startStepId: startStepId.value, endStepId: endStepId.value }) : [])
 const selectedIds = computed(() => new Set(selectedActions.value.map(action => action.binding_id)))
-function unavailableEnd(action) { return rangeMode.value === 'until' && props.rule?.workflow && findGraphNode(props.rule, action.binding_id)?.workflow !== props.rule.workflow }
+function unavailableEnd(action) { return rangeMode.value === 'until' && action && actionGroupScope(props.rule.workflow, action.binding_id) !== null }
 function actionLabel(action) { return action.name || props.schema.actions?.[action.type]?.name || ({ event_group: '事件组', action_group: '动作组', set_variable: '变量赋值' })[action.type] || action.type }
 
 const groups = computed(() => {
@@ -74,7 +73,7 @@ const assertionSources = computed(() => {
     })))
   }
   if (props.rule?.workflow) selectedActions.value.forEach(action => { const found = findGraphNode(props.rule, action.binding_id); visit(action, found?.index || 0, found?.trail || []) })
-  else walkWorkflowActions(selectedActions.value, visit)
+  else selectedActions.value.forEach(visit)
   return result
 })
 
@@ -154,6 +153,7 @@ function submit() {
   errors.value = {}
   submitError.value = ''
   try {
+    if (rangeMode.value !== 'all' && !actions.value.some(action => action.binding_id === selectedStepId.value)) throw new Error('请选择本次测试的起始或结束节点')
     if (rangeMode.value === 'until' && unavailableEnd(actions.value.find(action => action.binding_id === selectedStepId.value))) throw new Error('结束节点必须在主流程中；测试内部节点请使用从指定动作继续')
     const included = fields.value.filter(field => field.required || enabledFields.value[field.key])
     const context = buildPreparedTestContext(included.map(field => ({ ...field, required: true })), values.value)
@@ -180,7 +180,7 @@ watch(() => props.open, async open => {
   submitError.value = ''
   assertions.value = []
   rangeMode.value = 'all'
-  selectedStepId.value = props.rule?.workflow?.entry || props.rule?.actions?.[0]?.binding_id || ''
+  selectedStepId.value = actions.value[0]?.binding_id || ''
   remember.value = true
   await nextTick()
   dialogRef.value?.querySelector('input:not([type="checkbox"]), textarea, input[type="checkbox"]')?.focus()

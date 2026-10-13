@@ -42,7 +42,7 @@ function setType(type) { emit('update:modelValue', type === 'number' ? 0 : type 
           <option value="" disabled>{{ modelValue?.$ref?.node && !selected ? `${referenceLabel(modelValue, sources)} · 数据不可用或类型不匹配` : `选择${label}` }}</option><option v-for="source in matching" :key="referenceKey(source)" :value="referenceKey(source)">{{ source.label }} · {{ typeLabel(source.type) }}</option>
         </select>
       </label>
-      <p v-if="!matching.length" class="inspector-lead">{{ targetType === 'bool' ? '此来源没有可用于布尔判断的数据。判断事件是否发生，请选择“事件是否发生”。' : '没有符合当前判断类型的数据。请添加对应的输出、常量或变量。' }}</p>
+      <p v-if="!matching.length" class="inspector-lead">{{ targetType === 'bool' ? '此来源没有可用于布尔判断的数据。判断事件是否发生，请直接连接触发器图块。' : '没有符合当前判断类型的数据。请添加对应的输出、常量或变量。' }}</p>
       <p v-if="category === 'trigger'" class="inspector-lead">读取本次运行收到的触发器数据；未命中的触发器可能没有数据。</p>
     </template>
     <template v-else-if="category === 'literal'">
@@ -51,7 +51,7 @@ function setType(type) { emit('update:modelValue', type === 'number' ? 0 : type 
       <label v-if="literalType === 'bool'" class="field"><span class="field-label">{{ label }} · 布尔值</span><select class="select" :value="isLiteralValue(modelValue) ? modelValue.$literal : modelValue" @change="emit('update:modelValue', $event.target.value === 'true')"><option :value="true">真（true）</option><option :value="false">假（false）</option></select></label>
       <ParamInput v-else :def="{ name: label, label, type: literalType, value_type: literalType }" :model-value="modelValue" @update:model-value="emit('update:modelValue', $event)" />
     </template>
-    <p v-else class="inspector-lead">选择变量或输出数据进行判断；判断触发事件，请选择“事件是否发生”。</p>
+    <p v-else class="inspector-lead">选择变量或输出数据进行判断；判断触发事件，请直接连接触发器图块。</p>
   </div>
 </template>
 <style scoped>

@@ -1,407 +1,402 @@
 const clone = value => JSON.parse(JSON.stringify(value))
 export const graphId = (prefix = 'a') => `${prefix}_${globalThis.crypto?.randomUUID?.().replaceAll('-', '').slice(0, 12) || Math.random().toString(16).slice(2).padEnd(12, '0')}`
-export function predicateToGraph(predicate = { op: 'event_occurred', trigger_id: '', expected: true }) {
-  const graph = { root: null, nodes: [], edges: [] }
-  function visit(value) {
-    const id = graphId('p')
-    if (['all', 'any', 'not'].includes(value.op)) {
-      graph.nodes.push({ id, op: value.op })
-      ;(value.children || []).forEach((child, order) => graph.edges.push({ source: visit(child), target: id, order }))
-    } else graph.nodes.push({ id, predicate: clone(value) })
-    return id
+export const isGroup = node => ['event_group', 'action_group'].includes(node?.type)
+export const isCondition = node => ['trigger', 'condition', 'logic', 'event_group'].includes(node?.type)
+export const groupTypeLabel = type => ({ if: 'IF', all: 'AND', any: 'OR', not: 'NOT' })[type] || type
+export function outputPort(node) { return node.group_type === 'if' ? node.branches[0].id : node.type === 'trigger' ? 'event' : ['logic', 'condition', 'event_group'].includes(node.type) ? 'result' : 'next' }
+export function insertionParent(workflow, context) {
+  if (context.parent !== undefined) return context.parent
+  const edge = context.edge?.rawEdge
+  if (edge) {
+    const source = workflow.nodes.find(node => node.binding_id === edge.source)
+    const target = workflow.nodes.find(node => node.binding_id === edge.target)
+    return edge.channel === 'condition' ? target?.type === 'event_group' ? target.binding_id : target?.parent || null : edge.port === 'entry' ? source.binding_id : source?.parent || null
   }
-  graph.root = visit(predicate)
-  return graph
+  return context.node?.entryGate ? context.node.raw.binding_id : context.kind === 'background' ? null : context.node?.raw?.parent || null
 }
-export function graphPredicate(graph, id = graph?.root, seen = new Set()) {
-  if (!graph || seen.has(id)) return { op: 'is_true', left: false }
-  const node = graph.nodes.find(node => node.id === id)
-  if (!node) return { op: 'is_true', left: false }
-  if (node.predicate) return node.predicate
-  return { op: node.op, children: graph.edges.filter(edge => edge.target === id).sort((a, b) => a.order - b.order).map(edge => graphPredicate(graph, edge.source, new Set([...seen, id]))) }
+
+export function normalizeWorkflow(rule) {
+  if (['condition', 'event', 'trigger', 'actions', 'preconditions', '_matcher'].some(key => Object.hasOwn(rule, key))) throw new Error('旧条件模型已移除，请使用流程图规则')
+  if (!rule.workflow || !Array.isArray(rule.workflow.nodes) || !Array.isArray(rule.workflow.edges)) throw new Error('规则必须提供 workflow 图')
+  if (rule.workflow.nodes.some(node => node.type === 'if' || ['activation', 'condition_graph', 'workflow', 'then', 'elif', 'else', 'triggers'].some(key => Object.hasOwn(node, key)))) throw new Error('旧条件模型已移除，请重新设计事件组')
+  return rule.workflow
 }
-export function walkGraphActions(workflow, visit, trail = []) {
-  for (const [index, action] of (workflow?.nodes || []).entries()) {
-    visit(action, index, trail, workflow)
-    if (action.workflow) walkGraphActions(action.workflow, visit, [...trail, { action, index, field: 'workflow' }])
-    for (const [failureIndex, failure] of (action.failure_actions || []).entries()) visit(failure, failureIndex, [...trail, { action, index, field: 'failure_actions' }], null)
-  }
+export function walkGraphActions(workflow, visit) {
+  ;(workflow?.nodes || []).forEach((node, index) => {
+    visit(node, index, [], workflow)
+    ;(node.failure_actions || []).forEach((failure, failureIndex) => visit(failure, failureIndex, [{ action: node, index, field: 'failure_actions' }], null))
+  })
 }
-export function findGraphNode(rule, bindingId) {
+export function findGraphNode(rule, identity) {
   let result
-  walkGraphActions(rule.workflow, (action, index, trail, workflow) => { if (action.binding_id === bindingId) result = { action, index, trail, workflow } })
+  walkGraphActions(rule.workflow, (action, index, trail, workflow) => { if (action.binding_id === identity) result = { action, index, trail, workflow } })
   return result
+}
+export function getGraphTriggers(rule) { return (rule.workflow?.nodes || []).filter(node => node.type === 'trigger').map(node => node.trigger) }
+export function graphPredecessors(workflow, identity) {
+  const found = new Set()
+  function visit(target) { for (const edge of workflow?.edges || []) if (edge.target === target && !found.has(edge.source)) { found.add(edge.source); visit(edge.source) } }
+  visit(identity)
+  return [...found]
+}
+export function conditionPredecessors(workflow, identity) {
+  const found = new Set(graphPredecessors(workflow, identity)), visited = new Set([identity]), pending = [identity]
+  while (pending.length) {
+    const current = pending.pop()
+    for (const edge of workflow.edges) if (edge.channel === 'condition' && edge.source === current && !visited.has(edge.target)) {
+      visited.add(edge.target); pending.push(edge.target)
+      graphPredecessors(workflow, edge.target).forEach(source => found.add(source))
+    }
+  }
+  found.delete(identity)
+  return [...found]
+}
+export function actionGroupScope(workflow, identity) {
+  const byId = new Map(workflow.nodes.map(node => [node.binding_id, node]))
+  let parent = byId.get(identity)?.parent
+  const seen = new Set()
+  while (parent && !seen.has(parent)) {
+    seen.add(parent)
+    const group = byId.get(parent)
+    if (group?.type === 'action_group') return parent
+    parent = group?.parent
+  }
+  return null
 }
 export function graphExecutionActions(rule, { startStepId = '', endStepId = '' } = {}) {
-  const hit = startStepId ? findGraphNode(rule, startStepId) : { action: { binding_id: rule.workflow?.entry }, workflow: rule.workflow }
-  if (!hit?.workflow) return []
-  const result = [], seen = new Set()
-  function visit(workflow, id) {
-    if (!id || seen.has(id)) return
-    const action = workflow.nodes.find(node => node.binding_id === id)
-    if (!action) return
-    seen.add(id); result.push(action)
-    if (action.workflow) visit(action.workflow, action.workflow.entry)
-    for (const failure of action.failure_actions || []) { if (!seen.has(failure.binding_id)) { seen.add(failure.binding_id); result.push(failure) } }
-    if (id !== endStepId) workflow.edges.filter(edge => edge.source === id).forEach(edge => visit(workflow, edge.target))
+  const nodes = rule.workflow?.nodes || [], found = new Set(), result = []
+  function visit(identity) {
+    if (!identity || found.has(identity)) return
+    const node = nodes.find(node => node.binding_id === identity)
+    if (!node) return
+    found.add(identity); result.push(node)
+    if (identity !== endStepId) rule.workflow.edges.filter(edge => edge.source === identity && edge.channel === 'control').forEach(edge => visit(edge.target))
   }
-  visit(hit.workflow, hit.action.binding_id)
+  if (startStepId) visit(startStepId)
+  else {
+    function hasTrigger(identity, visited = new Set()) {
+      if (visited.has(identity)) return false
+      visited.add(identity)
+      const node = nodes.find(node => node.binding_id === identity)
+      if (node?.type === 'trigger') return true
+      const inputs = rule.workflow.edges.filter(edge => node?.type === 'action_group' ? edge.source === identity && edge.port === 'entry' : edge.target === identity && edge.channel === 'condition')
+      return inputs.some(edge => hasTrigger(node?.type === 'action_group' ? edge.target : edge.source, visited))
+    }
+    nodes.filter(node => ['trigger', 'logic', 'event_group', 'action_group'].includes(node.type) && !actionGroupScope(rule.workflow, node.binding_id) && rule.workflow.edges.some(edge => edge.source === node.binding_id && edge.channel === 'control') && !rule.workflow.edges.some(edge => edge.target === node.binding_id && edge.channel === 'control') && hasTrigger(node.binding_id)).forEach(node => visit(node.binding_id))
+  }
   return result
 }
-export function getGraphTriggers(rule) {
-  const leaves = new Map()
-  function condition(node) {
-    if (!node) return
-    if (node.type) leaves.set(node.binding_id, node)
-    else (node.children || []).forEach(condition)
-  }
-  condition(rule.condition)
-  walkGraphActions(rule.workflow, action => { condition(action.activation); (action.triggers || []).forEach(condition) })
-  return [...leaves.values()]
-}
-export function normalizeWorkflow(rule) {
-  if (rule.workflow) return rule.workflow
-  function sequence(actions) {
-    const workflow = { entry: null, nodes: [], edges: [] }
-    function add(items, next) {
-      let target = next
-      for (const item of [...items].reverse()) {
-        if (item.type === 'if') {
-          const branches = [{ condition: item.condition, items: item.then || [] }, ...(item.elif || []).map(branch => ({ condition: branch.condition, items: branch.then || [] })), { else: true, items: item.else || [] }]
-          const group = { binding_id: item.binding_id, type: 'event_group', mode: 'immediate', triggers: [], branches: [] }
-          for (const branch of branches) {
-            const id = graphId('b')
-            group.branches.push(branch.else ? { id, else: true } : { id, condition_graph: predicateToGraph(branch.condition) })
-            workflow.edges.push({ source: group.binding_id, port: id, target: add(branch.items, target) })
-          }
-          workflow.nodes.push(group)
-        } else {
-          workflow.nodes.push(item)
-          workflow.edges.push({ source: item.binding_id, port: 'next', target })
-        }
-        target = item.binding_id
-      }
-      return target
+
+export function makeGroupRoom(workflow, before, after, identity) {
+  const boxes = new Map(after.filter(node => !node.gate).map(node => [node.raw.binding_id, { ...node }]))
+  const previous = new Map(before.filter(node => !node.gate).map(node => [node.raw.binding_id, node]))
+  const byId = new Map(workflow.nodes.map(node => [node.binding_id, node]))
+  function shift(id, dx, dy) {
+    const ids = new Set([id])
+    for (const node of workflow.nodes) if (ids.has(node.parent)) ids.add(node.binding_id)
+    let changed
+    do { changed = false; for (const node of workflow.nodes) if (ids.has(node.parent) && !ids.has(node.binding_id)) { ids.add(node.binding_id); changed = true } } while (changed)
+    for (const node of workflow.nodes) if (ids.has(node.binding_id)) {
+      const box = boxes.get(node.binding_id), origin = node.position || box
+      if (origin) node.position = { x: origin.x + dx, y: origin.y + dy }
+      if (box) { box.x += dx; box.y += dy }
     }
-    workflow.entry = add(actions, null)
-    workflow.nodes.reverse()
-    return workflow
   }
-  const workflow = sequence(rule.actions || [])
-  if (rule.condition) {
-    const branch = { id: graphId('b'), else: true, label: '执行' }
-    const group = { binding_id: graphId(), type: 'event_group', mode: 'immediate', activation: rule.condition, triggers: [], branches: [branch] }
-    workflow.nodes.unshift(group)
-    workflow.edges.push({ source: group.binding_id, port: branch.id, target: workflow.entry })
-    workflow.entry = group.binding_id
-    delete rule.condition
+  let current = identity
+  while (current) {
+    const expanded = boxes.get(current), old = previous.get(current), owner = byId.get(current)
+    if (expanded && old && (expanded.width > old.width || expanded.height > old.height)) {
+      const placed = [expanded]
+      for (const node of workflow.nodes.filter(node => node.binding_id !== current && (node.parent || null) === (owner.parent || null)).sort((a, b) => (boxes.get(a.binding_id)?.x || 0) - (boxes.get(b.binding_id)?.x || 0))) {
+        const box = boxes.get(node.binding_id)
+        if (!box) continue
+        for (const obstacle of placed) {
+          if (box.x >= obstacle.x + obstacle.width + 32 || box.x + box.width + 32 <= obstacle.x || box.y >= obstacle.y + obstacle.height + 32 || box.y + box.height + 32 <= obstacle.y) continue
+          if (box.x >= old.x + old.width - 1 || box.x > obstacle.x + obstacle.width / 2) shift(node.binding_id, obstacle.x + obstacle.width + 44 - box.x, 0)
+          else shift(node.binding_id, 0, obstacle.y + obstacle.height + 44 - box.y)
+        }
+        placed.push(box)
+      }
+    }
+    current = owner?.parent
   }
-  rule.workflow = workflow
-  delete rule.actions
-  return workflow
+}
+
+export function arrangeWorkflow(workflow, expanded = new Set(), heights = new Map()) {
+  const byId = new Map(workflow.nodes.map(node => [node.binding_id, node])), memo = new Map()
+  function contents(parent) {
+    const siblings = workflow.nodes.filter(node => (node.parent || null) === parent)
+    const identities = new Set(siblings.map(node => node.binding_id)), levels = new Map(), visiting = new Set()
+    function level(id) {
+      if (levels.has(id)) return levels.get(id)
+      if (visiting.has(id)) return 0
+      visiting.add(id)
+      const inputs = workflow.edges.filter(edge => edge.target === id && identities.has(edge.source))
+      const value = inputs.length ? 1 + Math.max(...inputs.map(edge => level(edge.source))) : 0
+      visiting.delete(id); levels.set(id, value); return value
+    }
+    siblings.forEach(node => level(node.binding_id))
+    const columns = new Map()
+    siblings.forEach(node => { const column = levels.get(node.binding_id); if (!columns.has(column)) columns.set(column, []); columns.get(column).push(node) })
+    const placements = [], columnSizes = []
+    for (const [column, members] of [...columns].sort(([a], [b]) => a - b)) {
+      const branchOrder = node => {
+        const incoming = workflow.edges.filter(edge => edge.target === node.binding_id && edge.channel === 'control')
+        const orders = incoming.flatMap(edge => { const source = byId.get(edge.source); return source?.group_type === 'if' ? [source.branches.findIndex(branch => branch.id === edge.port)] : [] })
+        return orders.length ? Math.min(...orders) : Number.MAX_SAFE_INTEGER
+      }
+      members.sort((a, b) => branchOrder(a) - branchOrder(b))
+      const sizes = members.map(size)
+      columnSizes.push({ members, sizes, width: Math.max(...sizes.map(item => item.width)), height: sizes.reduce((sum, item) => sum + item.height, 0) + (members.length - 1) * 44 })
+    }
+    const height = Math.max(0, ...columnSizes.map(item => item.height))
+    let x = parent && byId.get(parent).type === 'action_group' ? 284 : 0
+    for (const column of columnSizes) {
+      let y = (height - column.height) / 2
+      column.members.forEach((node, index) => { const dimensions = column.sizes[index]; placements.push({ node, x, y }); y += dimensions.height + 44 })
+      x += column.width + 88
+    }
+    return { placements, width: Math.max(0, x - 88), height }
+  }
+  function size(node) {
+    if (memo.has(node.binding_id)) return memo.get(node.binding_id)
+    let result = { width: 228, height: heights.get(node.binding_id) || 146 }
+    result.height += (node.failure_actions || []).reduce((sum, failure) => sum + 44 + (heights.get(failure.binding_id) || 146), 0)
+    if (isGroup(node)) {
+      const inner = contents(node.binding_id)
+      if (expanded.has(node.binding_id)) result = { width: Math.max(284, inner.width + 56 + (node.type === 'event_group' ? node.group_type === 'if' ? 96 : 218 : 0)), height: Math.max(inner.height + 106, node.type === 'event_group' ? node.group_type === 'if' ? 158 + (visibleBranches(workflow, node, true).length - 1) * 52 : 210 : 210) }
+      result.inner = inner
+    }
+    memo.set(node.binding_id, result); return result
+  }
+  function place(part, origin) {
+    part.placements.forEach(({ node, x, y }) => {
+      node.position = { x: origin.x + x, y: origin.y + y }
+      if (isGroup(node)) place(size(node).inner, { x: node.position.x + 28, y: node.position.y + 78 })
+    })
+  }
+  place(contents(null), { x: 64, y: 118 })
 }
 export function createGraphAction(type, params = {}) {
-  const base = { type, binding_id: graphId() }
-  if (type === 'event_group') return { ...base, mode: 'immediate', triggers: [], branches: [{ id: graphId('b'), condition_graph: predicateToGraph() }, { id: graphId('b'), else: true }] }
-  if (type === 'action_group') return { ...base, workflow: { entry: null, nodes: [], edges: [] }, exports: {} }
-  if (type === 'set_variable') return { ...base, variable: '', value: '' }
-  return { ...base, params }
+  const node = { type, binding_id: graphId() }
+  if (type === 'event_group') return { ...node, group_type: 'if', branches: [{ id: graphId('b') }, { id: graphId('b') }, { id: graphId('b'), else: true }] }
+  if (type === 'action_group') return { ...node, exports: {} }
+  if (type === 'logic') return { ...node, op: params.op || 'all' }
+  if (type === 'condition') return { ...node, predicate: { op: 'eq', left: { $ref: { scope: 'step', node: '', path: [] } }, right: '' } }
+  if (type === 'set_variable') return { ...node, variable: '', value: '' }
+  return { ...node, params }
 }
-export function createTriggerStep(trigger, mode = 'wait') {
-  return { binding_id: graphId(), type: 'event_group', mode, activation: trigger, triggers: [], branches: [{ id: graphId('b'), else: true, label: '执行' }] }
+export function createTriggerStep(trigger) { return { type: 'trigger', binding_id: graphId(), trigger, occurrence: 'occurred', absence_scope: 'run', duration_seconds: 10 } }
+export function branchUsed(workflow, group, branch) {
+  return workflow.edges.some(edge => edge.source === group.binding_id && edge.port === branch.id || edge.target === group.binding_id && edge.target_port === branch.id)
 }
-export function standaloneTrigger(node, startup = false) {
-  return node.type === 'event_group' && (startup || node.mode === 'wait') && !node.name && node.activation?.type && !node.triggers?.length && node.branches?.length === 1 && node.branches[0].else && !node.branches[0].condition_graph && !node.branches[0].condition ? node.activation : null
+export function visibleBranches(workflow, group, open) {
+  const branches = group.branches || []
+  const firstSpare = branches.find((branch, index) => index > 0 && !branch.else && !branchUsed(workflow, group, branch))
+  return branches.filter((branch, index) => index === 0 || branchUsed(workflow, group, branch) || open && (branch.else || branch === firstSpare))
 }
-export function insertGraphNode(workflow, node, source = null, port = 'next') {
+export function ensureSpareBranch(workflow, group) {
+  if (group.group_type !== 'if') return
+  if (!group.branches.some((branch, index) => index > 0 && !branch.else && !branchUsed(workflow, group, branch))) group.branches.splice(group.branches.length - 1, 0, { id: graphId('b') })
+}
+export function switchGroupType(workflow, group, type) {
+  if (group.group_type === type) return
+  workflow.edges = workflow.edges.filter(edge => edge.source !== group.binding_id && edge.target !== group.binding_id)
+  group.group_type = type
+  group.branches = type === 'if' ? [{ id: graphId('b') }, { id: graphId('b') }, { id: graphId('b'), else: true }] : []
+}
+export function insertGraphNode(workflow, node, source = null, port = 'next', edge = null) {
   workflow.nodes.push(node)
-  const edge = workflow.edges.find(edge => edge.source === source && edge.port === port)
-  const target = edge?.target ?? (source === null ? workflow.entry : null)
-  if (edge) edge.target = node.binding_id
-  else if (source) workflow.edges.push({ source, port, target: node.binding_id })
-  else workflow.entry = node.binding_id
-  for (const outlet of node.type === 'event_group' ? node.branches.map(branch => branch.id) : ['next']) workflow.edges.push({ source: node.binding_id, port: outlet, target })
+  if (!source) return node
+  if (edge?.channel === 'condition') {
+    if (!['logic', 'event_group'].includes(node.type)) return node
+    const first = node.group_type === 'if' ? node.branches[0].id : 'input'
+    const input = { ...edge, target: node.binding_id, target_port: first }
+    const output = { ...edge, source: node.binding_id, port: node.group_type === 'if' ? node.branches[0].id : 'result' }
+    workflow.edges.splice(workflow.edges.indexOf(edge), 1, input, output)
+    return node
+  }
+  const old = workflow.edges.find(edge => edge.source === source && edge.port === port && edge.channel === 'control')
+  const target = old?.target
+  if (old) old.target = node.binding_id
+  else workflow.edges.push({ source, port, target: node.binding_id, channel: 'control' })
+  if (target) workflow.edges.push({ source: node.binding_id, port: outputPort(node), target, channel: 'control' })
   return node
 }
 export function removeGraphNode(workflow, node) {
-  const outgoing = workflow.edges.filter(edge => edge.source === node.binding_id)
-  const targets = [...new Set(outgoing.map(edge => edge.target))]
-  const next = targets.length === 1 ? targets[0] : null
-  workflow.edges = workflow.edges.filter(edge => edge.source !== node.binding_id)
-  for (const edge of workflow.edges) if (edge.target === node.binding_id) edge.target = next
-  if (workflow.entry === node.binding_id) workflow.entry = next
-  workflow.nodes.splice(workflow.nodes.indexOf(node), 1)
+  if (!node?.binding_id || !workflow.nodes.some(item => item.binding_id === node.binding_id)) return false
+  const removed = new Set([node.binding_id])
+  let changed
+  do { changed = false; for (const child of workflow.nodes) if (removed.has(child.parent) && !removed.has(child.binding_id)) { removed.add(child.binding_id); changed = true } } while (changed)
+  workflow.nodes = workflow.nodes.filter(item => !removed.has(item.binding_id))
+  workflow.edges = workflow.edges.filter(edge => !removed.has(edge.source) && !removed.has(edge.target))
 }
-export function connectGraph(workflow, source, port, target) {
-  if (source === target || !workflow.nodes.some(node => node.binding_id === target)) return false
-  const reachable = new Set()
-  function visit(id) { if (!id || reachable.has(id)) return; reachable.add(id); workflow.edges.filter(edge => edge.source === id).forEach(edge => visit(edge.target)) }
-  visit(target)
-  if (reachable.has(source)) return false
-  const edge = workflow.edges.find(edge => edge.source === source && edge.port === port)
-  if (edge) edge.target = target
-  else workflow.edges.push({ source, port, target })
-  return true
-}
-export function connectConditionGraph(graph, source, target) {
-  const from = graph.nodes.find(node => node.id === source), to = graph.nodes.find(node => node.id === target)
-  if (!from || !to?.op) return '条件只能连接到同一分支的条件组'
-  if (source === target) return '条件不能连接到自身'
-  if (graph.edges.some(edge => edge.source === source && edge.target === target)) return ''
-  const reachable = new Set()
-  function visit(id) { if (reachable.has(id)) return; reachable.add(id); graph.edges.filter(edge => edge.source === id).forEach(edge => visit(edge.target)) }
-  visit(target)
-  if (reachable.has(source)) return '条件连接不能形成循环'
-  if (to.op === 'not' && graph.edges.some(edge => edge.target === target)) return 'NOT 只能包含一个条件'
-  const previous = graph.edges.filter(edge => edge.source === source)
-  if (previous.some(edge => graph.edges.filter(item => item.target === edge.target).length === 1)) return '移动后原条件组为空，请先为原组添加其他条件'
-  const edges = graph.edges.filter(edge => edge.source !== source)
-  edges.push({ source, target, order: edges.filter(edge => edge.target === target).length })
-  const roots = graph.nodes.filter(node => !edges.some(edge => edge.source === node.id))
-  if (roots.length !== 1) return '连接后必须有一个完整的条件结果'
-  for (const node of graph.nodes) edges.filter(edge => edge.target === node.id).sort((a, b) => a.order - b.order).forEach((edge, order) => { edge.order = order })
-  graph.edges = edges; graph.root = roots[0].id
+export function connectGraph(workflow, source, port, target, targetPort = 'input', channel = null) {
+  const from = workflow.nodes.find(node => node.binding_id === source), to = workflow.nodes.find(node => node.binding_id === target)
+  if (!from || !to || source === target) return '连接目标无效'
+  channel ||= isCondition(from) && (to.type === 'logic' || to.type === 'event_group' && (to.group_type !== 'if' || targetPort !== 'input')) ? 'condition' : 'control'
+  if (workflow.edges.some(edge => edge.source === source && edge.port === port && edge.target === target && (edge.target_port || 'input') === targetPort && edge.channel === channel)) return ''
+  if (channel === 'condition') {
+    if (!isCondition(from) || !['logic', 'event_group'].includes(to.type)) return '条件端口类型不匹配'
+    const input = workflow.edges.filter(edge => edge.target === target && edge.channel === 'condition' && (to.type !== 'event_group' || to.group_type !== 'if' || edge.target_port === targetPort))
+    if (to.type === 'event_group' && to.group_type === 'if') {
+      const branch = to.branches.find(branch => branch.id === targetPort)
+      if (!branch || branch.else) return 'ELSE 不接受触发器或条件'
+      if (input.length) return 'IF／ELIF 只接一个条件，请先连接 AND 或 OR'
+    } else if ((to.op || to.group_type) === 'not' && input.length) return 'NOT 只接一个条件'
+  }
+  const pending = [target], visited = new Set()
+  while (pending.length) {
+    const current = pending.pop()
+    if (current === source) return '连接不能形成循环'
+    if (visited.has(current)) continue
+    visited.add(current); workflow.edges.filter(edge => edge.source === current).forEach(edge => pending.push(edge.target))
+  }
+  if (channel === 'control') workflow.edges = workflow.edges.filter(edge => edge.source !== source || edge.port !== port || edge.channel !== 'control')
+  if (workflow.edges.some(edge => edge.source === source && edge.port === port && edge.target === target && edge.target_port === targetPort && edge.channel === channel)) return ''
+  workflow.edges.push({ source, port, target, target_port: targetPort, channel })
+  if (to.type === 'event_group') ensureSpareBranch(workflow, to)
   return ''
 }
-export function connectTriggerCondition(graph, triggerId, target) {
-  const to = graph.nodes.find(node => node.id === target)
-  if (!['all', 'any', 'not'].includes(to?.op)) return '事件只能连接到 AND、OR 或 NOT 条件组'
-  const existing = graph.nodes.find(node => node.predicate?.op === 'event_occurred' && node.predicate.trigger_id === triggerId && node.predicate.expected !== false && graph.edges.some(edge => edge.source === node.id && edge.target === target))
-  if (existing) return ''
-  const pending = graph.nodes.find(node => node.predicate?.op === 'event_occurred' && !node.predicate.trigger_id && graph.edges.some(edge => edge.source === node.id && edge.target === target) && graph.edges.filter(edge => edge.source === node.id).length === 1)
-  if (pending) { pending.predicate.trigger_id = triggerId; pending.predicate.expected = true; return '' }
-  if (to.op === 'not' && graph.edges.some(edge => edge.target === target)) return 'NOT 只能包含一个条件'
-  const id = graphId('p')
-  graph.nodes.push({ id, predicate: { op: 'event_occurred', trigger_id: triggerId, expected: true } })
-  graph.edges.push({ source: id, target, order: 1 + Math.max(-1, ...graph.edges.filter(edge => edge.target === target).map(edge => edge.order ?? 0)) })
+export function moveGraphNodes(workflow, identities, parent = null) {
+  const selected = new Set(identities), all = new Set(identities)
+  let changed
+  do { changed = false; for (const node of workflow.nodes) if (all.has(node.parent) && !all.has(node.binding_id)) { all.add(node.binding_id); changed = true } } while (changed)
+  if (parent && all.has(parent)) return '不能把组拖入自身或其内部组'
+  const target = parent && workflow.nodes.find(node => node.binding_id === parent)
+  if (parent && !isGroup(target)) return '目标不是事件组或动作组'
+  const moving = workflow.nodes.filter(node => selected.has(node.binding_id) && !selected.has(node.parent) && (node.parent || null) !== parent)
+  if (!moving.length) return ''
+  workflow.edges = workflow.edges.filter(edge => all.has(edge.source) === all.has(edge.target))
+  const movedSources = new Set(workflow.nodes.filter(node => all.has(node.binding_id)).flatMap(node => [node.binding_id, node.trigger?.binding_id]).filter(Boolean))
+  function clearBindings(value, inside) {
+    if (!value || typeof value !== 'object' || value.$literal || value.$nmf_value) return
+    for (const [key, child] of Object.entries(value)) {
+      if (child?.$ref && ['trigger', 'step'].includes(child.$ref.scope) && movedSources.has(child.$ref.node) !== inside) value[key] = ''
+      else clearBindings(child, inside)
+    }
+  }
+  workflow.nodes.forEach(node => clearBindings(node, all.has(node.binding_id)))
+  moving.forEach(node => { if (parent) node.parent = parent; else delete node.parent })
   return ''
 }
-export function graphPredecessors(workflow, id) {
-  const result = new Set()
-  function visit(target) { for (const edge of workflow?.edges || []) if (edge.target === target && !result.has(edge.source)) { result.add(edge.source); visit(edge.source) } }
-  visit(id)
-  return [...result]
+export function groupGraphNodes(workflow, identities, type = 'if') {
+  const byId = new Map(workflow.nodes.map(node => [node.binding_id, node])), ids = new Set(identities)
+  const parents = node => { const result = []; let parent = node.parent; while (parent && !result.includes(parent)) { result.push(parent); parent = byId.get(parent)?.parent } return [...result, null] }
+  const selected = workflow.nodes.filter(node => ids.has(node.binding_id) && !parents(node).some(parent => ids.has(parent)))
+  if (!selected.length) return null
+  const group = createGraphAction('event_group')
+  group.group_type = type; if (type !== 'if') group.branches = []
+  group.parent = parents(selected[0]).find(parent => selected.every(node => parents(node).includes(parent))) || undefined
+  group.position = { x: Math.min(...selected.map(node => node.position?.x ?? 80)) - 32, y: Math.min(...selected.map(node => node.position?.y ?? 120)) - 80 }
+  workflow.nodes.push(group)
+  moveGraphNodes(workflow, selected.map(node => node.binding_id), group.binding_id)
+  return group
 }
-export function copyGraphNode(node) {
-  const copy = clone(node), replacements = new Map()
-  function visit(value) {
-    if (!value || typeof value !== 'object') return
-    for (const key of ['binding_id', 'id']) if (typeof value[key] === 'string') { const old = value[key]; const id = graphId(old.split('_')[0]); replacements.set(old, id); value[key] = id }
-    Object.values(value).forEach(value => { if (Array.isArray(value)) value.forEach(visit); else visit(value) })
+export function copyGraphNode(node, workflow) {
+  const originals = [node], selected = new Set([node.binding_id]), ids = new Map()
+  if (workflow && isGroup(node)) for (let i = 0; i < originals.length; i++) for (const child of workflow.nodes) if (child.parent === originals[i].binding_id) { originals.push(child); selected.add(child.binding_id) }
+  function duplicate(original) {
+    const copy = clone(original)
+    copy.binding_id = graphId(); ids.set(original.binding_id, copy.binding_id)
+    if (copy.trigger) { copy.trigger.binding_id = graphId('t'); ids.set(original.trigger.binding_id, copy.trigger.binding_id) }
+    if (copy.branches) copy.branches = original.branches.map(branch => { const id = graphId('b'); ids.set(branch.id, id); return { ...branch, id } })
+    if (copy.failure_actions) copy.failure_actions = original.failure_actions.map(duplicate)
+    return copy
   }
-  visit(copy)
-  function rewrite(value) {
-    if (!value || typeof value !== 'object') return
-    for (const key of ['source', 'target', 'entry', 'root', 'port', 'node', 'trigger_id']) if (replacements.has(value[key])) value[key] = replacements.get(value[key])
-    Object.values(value).forEach(value => { if (Array.isArray(value)) value.forEach(rewrite); else rewrite(value) })
+  function rebind(value) {
+    if (!value || typeof value !== 'object' || value.$literal || value.$nmf_value) return
+    if (value.$ref && ids.has(value.$ref.node)) value.$ref.node = ids.get(value.$ref.node)
+    for (const child of Object.values(value)) rebind(child)
   }
-  rewrite(copy)
+  const copies = originals.map(duplicate)
+  copies.forEach(copy => { if (ids.has(copy.parent)) copy.parent = ids.get(copy.parent); rebind(copy) })
+  const copy = copies[0]
+  if (workflow && isGroup(node)) {
+    copy._copyNodes = copies.slice(1)
+    copy._copyEdges = workflow.edges.filter(edge => selected.has(edge.source) && selected.has(edge.target)).map(edge => ({ ...edge, source: ids.get(edge.source), target: ids.get(edge.target), port: ids.get(edge.port) || edge.port, target_port: ids.get(edge.target_port) || edge.target_port }))
+  }
   return copy
 }
-export function buildWorkflowGraph(rule, expanded, schema, presentation, layoutCache = new Map()) {
-  const nodes = [], edges = [], inspectionNodes = []
-  const width = 228, gap = 100, row = 164
-  const cardHeight = node => {
-    const ports = node.outputs || node.outputAnchors || []
-    const outletRows = node.source?.type === 'event_group' || node.outputAnchors?.some(port => port.label)
-    const bodyHeight = outletRows ? 90 + ports.length * 28 : 116
-    return Math.max(bodyHeight, presentation.nodeHeight?.(node) || 0, ...ports.map(port => port.y + 15))
-  }
-  const { eventName, actionName, describeItem, predicateSummary } = presentation
-  const branchLabel = (source, branch) => branch.label || (branch.else ? 'ELSE' : source.branches.indexOf(branch) ? `ELIF ${source.branches.indexOf(branch)}` : 'IF')
-  function eventContent(source) {
-    if (layoutCache.has(source)) return layoutCache.get(source)
-    const innerNodes = [], innerEdges = [], inspectors = []
-    const triggerList = getGraphTriggers({ workflow: { nodes: [source] } })
-    let entry = rule.workflow.nodes.find(node => node.binding_id === rule.workflow.entry)
-    while (entry?.type === 'action_group') entry = entry.workflow.nodes.find(node => node.binding_id === entry.workflow.entry)
-    const activationLabel = source.mode === 'wait' ? '等待事件' : entry === source ? '启动事件' : '事件来源'
-    const eventSources = new Map(triggerList.map(trigger => [trigger.binding_id, `trigger-${trigger.binding_id}`]))
-    const referenced = new Set(source.branches.flatMap(branch => (branch.condition_graph?.nodes || []).map(node => node.predicate?.trigger_id).filter(Boolean)))
-    const external = getGraphTriggers(rule).filter(trigger => referenced.has(trigger.binding_id) && !eventSources.has(trigger.binding_id))
-    for (const trigger of external) eventSources.set(trigger.binding_id, `event-source-${source.binding_id}-${trigger.binding_id}`)
-    for (const trigger of [...triggerList, ...external]) innerNodes.push({ id: eventSources.get(trigger.binding_id), source: trigger, kind: 'trigger', label: eventName(trigger), kicker: '事件来源', meta: describeItem(trigger, 'trigger'), icon: 'bolt', hasInput: false, hasOutput: true, outputs: [{ id: 'event', label: '事件', y: 58 }], readOnly: external.includes(trigger), ...(external.includes(trigger) ? { dataInputs: [], dataOutputs: [] } : {}) })
-    function activationNode(value, path = []) {
-      if (value.type) {
-        const id = `trigger-${value.binding_id}`
-        Object.assign(innerNodes.find(node => node.id === id), { activationValue: value, activationOwner: source, kicker: activationLabel, hasOutput: true, outputs: [{ id: 'activation', label: '事件', y: 58 }] })
-        return id
+
+export function buildWorkflowGraph(rule, expanded, schema, presentation) {
+  const workflow = rule.workflow, raw = workflow?.nodes || [], byId = new Map(raw.map(node => [node.binding_id, node]))
+  const nodes = [], edges = [], inspectionNodes = [], width = 228
+  const ancestors = node => { const found = []; let current = byId.get(node.parent); while (current && !found.includes(current)) { found.push(current); current = byId.get(current.parent) } return found }
+  const hiddenBy = node => ancestors(node).filter(parent => !expanded.has(parent.binding_id)).at(-1)
+  const positions = new Map(raw.map((node, index) => [node.binding_id, node.position || { x: 64 + index % 4 * 340, y: 118 + Math.floor(index / 4) * 240 }]))
+  const groupBoxes = new Map()
+  function ifPorts(group, y, open = true) {
+    let previous = 78
+    return visibleBranches(workflow, group, open).map((branch, index) => {
+      const wire = workflow.edges.find(edge => edge.target === group.binding_id && edge.target_port === branch.id && edge.channel === 'condition')
+      const source = wire && byId.get(wire.source)
+      let desired = 130 + index * 52
+      if (source?.parent === group.binding_id) {
+        const sourceBox = isGroup(source) && expanded.has(source.binding_id) ? box(source) : null
+        desired = sourceBox ? sourceBox.y + sourceBox.height / 2 - y : positions.get(source.binding_id).y + 58 - y
       }
-      const id = `activation-${source.binding_id}-${path.join('-') || 'root'}`
-      const children = (value.children || []).map((child, index) => activationNode(child, [...path, index]))
-      innerNodes.push({ id, source: value, activationNode: true, activationValue: value, activationOwner: source, kind: 'activation', label: value.op === 'all' ? '全部事件 · AND' : value.op === 'any' ? '任一事件 · OR' : '事件未发生 · NOT', kicker: '触发组合', meta: value.op === 'all' ? `时间窗口 ${value.within_seconds || 0} 秒` : value.op === 'not' ? `等待 ${value.within_seconds || 0} 秒` : value.pick === 'latest' ? '使用最新事件' : '使用首个事件', icon: 'account_tree', hasInput: true, hasOutput: true, outputs: [{ id: 'activation', label: '事件组合', y: 58 }] })
-      for (const child of children) innerEdges.push({ id: `activation:${child}:${id}`, from: child, to: id, activationOwner: source, activationTarget: value, kind: 'activation', channel: 'control', label: value.op === 'all' ? '并且' : value.op === 'any' ? '或者' : '未发生' })
-      return id
-    }
-    const activationRoot = source.activation ? activationNode(source.activation) : null
-    const branchRoots = new Map()
-    for (const branch of source.branches) {
-      if (!branch.condition_graph) continue
-      const conditionGraph = branch.condition_graph
-      const conditionId = condition => `predicate-${source.binding_id}-${condition.id}`
-      const eventSource = condition => condition?.predicate?.op === 'event_occurred' && eventSources.get(condition.predicate.trigger_id)
-      const displayId = id => { const condition = conditionGraph.nodes.find(node => node.id === id); return eventSource(condition) || (condition && conditionId(condition)) }
-      for (const condition of conditionGraph.nodes) {
-        const descriptor = { id: conditionId(condition), source: condition.predicate || condition, graphCondition: condition, conditionGraph, branch, kind: condition.predicate ? 'predicate' : 'condition-expression', label: condition.predicate ? '条件判断' : condition.op === 'all' ? '全部满足 · AND' : condition.op === 'any' ? '满足任一 · OR' : '取反 · NOT', kicker: condition.predicate ? condition.predicate.op === 'event_occurred' ? '事件判断' : condition.predicate.op === 'run_status' ? '自动化状态' : '数据判断' : '条件组', meta: condition.predicate ? predicateSummary(condition.predicate, source) : '组合子条件', icon: condition.predicate ? 'rule' : 'account_tree', hasInput: true, hasOutput: true, dataInputs: condition.predicate ? ['left', 'right'].filter(name => Object.hasOwn(condition.predicate, name)).map((name, index) => ({ id: name, index, name, label: name === 'left' ? '判断数据' : '比较目标', type: 'any' })) : [], dataOutputs: [] }
-        if (eventSource(condition)) inspectors.push(descriptor)
-        else innerNodes.push(descriptor)
-      }
-      branchRoots.set(branch.id, displayId(conditionGraph.root))
-      for (const edge of [...conditionGraph.edges].sort((a, b) => a.order - b.order)) {
-        const condition = conditionGraph.nodes.find(node => node.id === edge.source)
-        innerEdges.push({ id: `condition:${source.binding_id}:${branch.id}:${edge.source}:${edge.target}`, from: displayId(edge.source), to: displayId(edge.target), channel: 'control', kind: 'condition', conditionGraph, rawEdge: edge, inspectionId: eventSource(condition) ? conditionId(condition) : null, label: eventSource(condition) ? condition.predicate.expected === false ? '事件未发生' : '事件已发生' : '' })
-      }
-    }
-    if (activationRoot && !source.branches.some(branch => branch.condition_graph)) branchRoots.set(source.branches[0]?.id, activationRoot)
-    else if (activationRoot) {
-      const root = innerNodes.find(node => node.id === activationRoot)
-      root.meta = `${root.meta} · ${source.mode === 'wait' ? '等待条件成立后判断分支' : entry === source ? '启动后判断分支' : '进入本组时立即判断分支'}`
-    }
-    innerNodes.forEach(node => { node.fixedHeight = cardHeight(node) })
-    const byId = new Map(innerNodes.map(node => [node.id, node])), incoming = new Map()
-    for (const edge of innerEdges) if (byId.has(edge.from)) {
-      if (!incoming.has(edge.to)) incoming.set(edge.to, [])
-      incoming.get(edge.to).push(edge.from)
-    }
-    const ranks = new Map(), visiting = new Set()
-    function rank(id) {
-      if (ranks.has(id)) return ranks.get(id)
-      if (visiting.has(id)) return 0
-      visiting.add(id)
-      const children = incoming.get(id) || []
-      const value = children.length ? 1 + Math.max(...children.map(rank)) : 0
-      visiting.delete(id); ranks.set(id, value)
-      return value
-    }
-    innerNodes.forEach(node => rank(node.id))
-    let leaf = 0
-    const positions = new Map()
-    function position(id) {
-      if (positions.has(id)) return positions.get(id)
-      const children = incoming.get(id) || []
-      positions.set(id, 80)
-      const value = children.length ? children.reduce((sum, child) => sum + position(child), 0) / children.length : 80 + leaf++ * 164
-      positions.set(id, value)
-      return value
-    }
-    innerNodes.forEach(node => position(node.id))
-    for (const layer of [...new Set(ranks.values())].sort((a, b) => a - b)) {
-      let bottom = 80
-      for (const node of innerNodes.filter(node => ranks.get(node.id) === layer).sort((a, b) => positions.get(a.id) - positions.get(b.id))) {
-        const children = incoming.get(node.id) || []
-        const desired = children.length ? children.reduce((sum, child) => sum + positions.get(child), 0) / children.length : positions.get(node.id)
-        node.x = 32 + layer * (width + 100); node.y = Math.max(bottom, desired)
-        positions.set(node.id, node.y); bottom = node.y + (node.fixedHeight || 116) + 32
-      }
-    }
-    let outletY = 80
-    const outputs = source.branches.map(branch => {
-      const root = byId.get(branchRoots.get(branch.id))
-      const y = Math.max(outletY, root ? root.y + 58 : outletY)
-      outletY = y + 48
-      return { id: branch.id, label: branchLabel(source, branch), y }
+      previous = open ? Math.max(index ? previous + 52 : 100, desired) : 103 + index * 28
+      return { id: branch.id, label: branch.label || (branch.else ? 'ELSE' : group.branches.indexOf(branch) === 0 ? 'IF' : `ELIF ${group.branches.indexOf(branch)}`), y: previous, branch }
     })
-    const eventOutlet = source.branches.some(branch => branch.condition_graph?.nodes.find(node => node.id === branch.condition_graph.root)?.predicate?.op === 'event_occurred')
-    const w = Math.max(360, ...innerNodes.map(node => node.x + width + (eventOutlet ? 160 : 104)))
-    const h = Math.max(144, outletY - 20, ...innerNodes.map(node => node.y + (node.fixedHeight || 116))) + 28
-    for (const branch of source.branches) {
-      const from = branchRoots.get(branch.id)
-      if (!from) continue
-      const condition = branch.condition_graph?.nodes.find(node => node.id === branch.condition_graph.root)
-      const event = condition?.predicate?.op === 'event_occurred'
-      innerEdges.push({ id: `branch:${source.binding_id}:${branch.id}`, from, to: `action-${source.binding_id}`, targetPort: branch.id, kind: branch.condition_graph ? 'condition' : 'activation', channel: 'control', conditionGraph: branch.condition_graph, inspectionId: event ? `predicate-${source.binding_id}-${condition.id}` : null, ...(branch.condition_graph ? {} : { activationOwner: source, activationTarget: source.activation }), label: event ? condition.predicate.expected === false ? '事件未发生' : '事件已发生' : '' })
-    }
-    const content = { nodes: innerNodes, inspectionNodes: inspectors, edges: innerEdges, w, h, inputY: outputs[0]?.y ?? 80, outputs }
-    layoutCache.set(source, content)
-    return content
   }
-  function graphLayout(workflow, x, y, ancestry = []) {
-    const triggerFor = node => standaloneTrigger(node, workflow.entry === node.binding_id && ancestry.every(parent => parent.workflow.entry === parent.source.binding_id))
-    const byId = new Map(workflow.nodes.map(node => [node.binding_id, node]))
-    const ranks = new Map(), lanes = new Map(); let lane = 0
-    function rank(id, depth, branchLane) {
-      if (!id || depth > workflow.nodes.length || !byId.has(id)) return
-      const previous = ranks.get(id)
-      if (previous !== undefined && previous >= depth) return
-      ranks.set(id, depth); lanes.set(id, lanes.get(id) ?? branchLane)
-      const branches = byId.get(id).branches
-      workflow.edges.filter(edge => edge.source === id && edge.target).sort((a, b) => branches ? branches.findIndex(branch => branch.id === a.port) - branches.findIndex(branch => branch.id === b.port) : 0).forEach((edge, index) => rank(edge.target, depth + 1, index ? ++lane : branchLane))
+  function box(group) {
+    if (presentation.frozenGroups?.has(group.binding_id)) return presentation.frozenGroups.get(group.binding_id)
+    if (groupBoxes.has(group.binding_id)) return groupBoxes.get(group.binding_id)
+    const position = positions.get(group.binding_id), children = raw.filter(node => node.parent === group.binding_id)
+    let x = position.x, y = position.y, right = x + 28, bottom = y + 78
+    for (const child of children) {
+      const childHeight = (presentation.nodeHeight?.({ id: `action-${child.binding_id}` }) || 170) + (child.failure_actions || []).reduce((sum, failure) => sum + 44 + (presentation.nodeHeight?.({ id: `failure-action-${failure.binding_id}` }) || 146), 0)
+      const childBox = isGroup(child) && expanded.has(child.binding_id) ? box(child) : { ...positions.get(child.binding_id), width, height: childHeight }
+      x = Math.min(x, childBox.x - 28); y = Math.min(y, childBox.y - 78)
+      right = Math.max(right, childBox.x + childBox.width + 28); bottom = Math.max(bottom, childBox.y + childBox.height + 28)
     }
-    rank(workflow.entry, 0, 0)
-    for (const node of workflow.nodes) if (!ranks.has(node.binding_id)) { ranks.set(node.binding_id, 0); lanes.set(node.binding_id, ++lane) }
-    const columnWidths = new Map(), sizes = new Map()
-    for (const source of workflow.nodes) {
-      const trigger = triggerFor(source), open = !trigger && expanded.has(source.binding_id)
-      let w = width, h = cardHeight({ id: `action-${source.binding_id}`, source: trigger || source, kind: trigger ? 'trigger' : source.type, outputs: trigger ? [{ y: 58 }] : source.type === 'event_group' ? source.branches.map((branch, i) => ({ y: 103 + i * 28 })) : [] })
-      if (open && source.type === 'action_group') {
-        const preview = layoutCache.get(source.workflow) || buildWorkflowGraph({ workflow: source.workflow }, expanded, schema, presentation, layoutCache)
-        layoutCache.set(source.workflow, preview)
-        const byId = new Map(preview.nodes.map(node => [node.id, node]))
-        const exits = source.workflow.edges.filter(edge => edge.target === null).map(edge => ({ node: byId.get(`action-${edge.source}`), port: edge.port }))
-        for (const child of source.workflow.nodes) if (!source.workflow.edges.some(edge => edge.source === child.binding_id)) exits.push({ node: byId.get(`action-${child.binding_id}`), port: 'next' })
-        const completionX = preview.nodes.reduce((max, node) => Math.max(max, node.x + (node.width || width)), 52) - 52 + 128
-        const completionY = exits.length ? 80 + exits.reduce((sum, exit) => sum + exit.node.y - 118 + (exit.node.outputs?.find(port => port.id === exit.port)?.y ?? 58), 0) / exits.length - 58 : 80
-        w = Math.max(480, completionX + width + 28)
-        h = Math.max(172, preview.nodes.reduce((max, node) => Math.max(max, node.y - 118 + (node.fixedHeight || 116)), 0) + 108, completionY + cardHeight({ id: `completion-${source.binding_id}` }) + 28)
-        const entry = preview.nodes.find(node => node.id === `action-${source.workflow.entry}`) || preview.nodes[0]
-        sizes.set(source.binding_id, { completionX, completionY, inputY: 80 + (entry?.y || 118) - 118 + (entry?.inputY ?? 58), outputY: completionY + 58 })
-      } else if (open && source.type === 'event_group') {
-        const content = eventContent(source)
-        w = content.w; h = content.h
-        sizes.set(source.binding_id, { content, inputY: content.inputY })
-      }
-      sizes.set(source.binding_id, { ...sizes.get(source.binding_id), w, h, alignmentY: source.type === 'event_group' && !trigger ? sizes.get(source.binding_id)?.content?.outputs[0]?.y ?? 103 : sizes.get(source.binding_id)?.inputY ?? 58 }); columnWidths.set(ranks.get(source.binding_id), Math.max(columnWidths.get(ranks.get(source.binding_id)) || 0, w))
+    const value = { x, y, width: Math.max(264, right - x + (group.type === 'event_group' ? group.group_type === 'if' ? 96 : 218 : 0)), height: Math.max(bottom - y, group.type === 'event_group' ? group.group_type === 'if' ? (ifPorts(group, y).at(-1)?.y || 130) + 28 : 210 : 206) }
+    groupBoxes.set(group.binding_id, value); return value
+  }
+  const ancestry = node => ancestors(node).map(parent => ({ id: `action-${parent.binding_id}`, source: parent, workflow }))
+  const labelFor = group => group.group_type === 'if' ? 'IF / ELIF / ELSE' : groupTypeLabel(group.group_type) || '动作组'
+  for (const [index, source] of raw.entries()) {
+    if (hiddenBy(source)) continue
+    const group = isGroup(source), open = group && expanded.has(source.binding_id)
+    const geometry = open ? box(source) : { ...positions.get(source.binding_id), width, height: 146 }
+    const kind = source.type === 'trigger' ? 'trigger' : source.type === 'condition' ? 'predicate' : source.type === 'logic' ? 'condition-expression' : group ? source.type : 'action'
+    const outputs = source.type === 'event_group' && source.group_type === 'if' ? ifPorts(source, geometry.y, open) : [{ id: source.type === 'trigger' ? 'event' : ['logic', 'condition', 'event_group'].includes(source.type) ? 'result' : 'next', label: '', y: 58 }]
+    const visibleSource = source.type === 'trigger' ? source.trigger : source.type === 'condition' ? source.predicate : source
+    const node = { ...geometry, id: `action-${source.binding_id}`, raw: source, source: visibleSource, workflow, ancestry: ancestry(source), index, kind, frame: open, open, fixedHeight: open ? geometry.height : Math.max(116, 90 + outputs.length * 28), hasInput: source.type !== 'trigger', hasOutput: true, inputY: 58, outputs, label: source.name || (source.type === 'trigger' ? presentation.eventName(source.trigger) : source.type === 'condition' ? '条件判断' : source.type === 'logic' ? `${groupTypeLabel(source.op)}${source.negated ? ' · 取反' : ''}` : group ? labelFor(source) : presentation.actionName(source)), kicker: source.type === 'trigger' ? '触发器' : source.type === 'condition' ? '数据判断' : source.type === 'logic' ? '逻辑节点' : source.type === 'event_group' ? '事件组' : source.type === 'action_group' ? '动作组' : `动作 ${index + 1}`, meta: source.type === 'trigger' ? `${source.occurrence === 'absent' ? '事件未发生 · ' : ''}${presentation.describeItem(source.trigger, 'trigger')}` : source.type === 'condition' ? presentation.predicateSummary(source.predicate, source) : source.type === 'logic' ? '连接触发器、条件或事件组' : group ? `${raw.filter(node => node.parent === source.binding_id).length} 个内部图块` : presentation.describeItem(source, 'action'), icon: source.type === 'trigger' ? 'bolt' : source.type === 'condition' ? 'rule' : source.type === 'logic' ? 'account_tree' : source.type === 'event_group' ? 'call_split' : source.type === 'action_group' ? 'account_tree' : source.type === 'set_variable' ? 'edit_note' : source.type === 'wait' ? 'hourglass_empty' : 'play_arrow', availableStepIds: isCondition(source) ? conditionPredecessors(workflow, source.binding_id) : graphPredecessors(workflow, source.binding_id) }
+    if (source.type === 'event_group' && source.group_type === 'if') {
+      node.inputs = outputs.filter(port => !port.branch.else).map(port => ({ id: port.id, label: `${port.label} 条件`, y: port.y, x: open ? geometry.width - 72 : 0 }))
+      for (const port of outputs) inspectionNodes.push({ id: `branch-${source.binding_id}-${port.id}`, raw: source, source: port.branch, branch: port.branch, gate: true, groupOwner: source, open, kind: 'branch', icon: 'call_split', label: port.label, kicker: '分支设置', x: geometry.x + geometry.width - 72, y: geometry.y + port.y, width: 72, height: 28 })
     }
-    const columnX = depth => x + [...columnWidths].filter(([rank]) => rank < depth).sort(([a], [b]) => a - b).reduce((sum, [, w]) => sum + w + gap, 0)
-    const laneHeights = new Map(), laneAnchors = new Map(), laneBelow = new Map()
-    for (const source of workflow.nodes) {
-      const lane = lanes.get(source.binding_id), size = sizes.get(source.binding_id), anchor = size.alignmentY
-      laneAnchors.set(lane, Math.max(laneAnchors.get(lane) || 0, anchor))
-      laneBelow.set(lane, Math.max(laneBelow.get(lane) || 0, size.h - anchor))
+
+    if (kind === 'predicate') node.dataInputs = ['left', 'right'].filter(key => Object.hasOwn(source.predicate, key)).map((name, i) => ({ id: name, name, index: i, label: name === 'left' ? '判断数据' : '比较目标', type: 'any' }))
+    nodes.push(node)
+    if (open && source.type === 'action_group') {
+      nodes.push({ id: `entry-${source.binding_id}`, raw: source, source, workflow, kind: 'branch', gate: true, entryGate: true, x: geometry.x + 28, y: geometry.y + 78, width: 180, fixedHeight: 104, hasInput: false, hasOutput: true, outputs: [{ id: 'entry', label: '', y: 52 }], label: '动作组入口', kicker: '入口', meta: '连接组内起始动作', icon: 'play_arrow' })
     }
-    for (const [lane, anchor] of laneAnchors) laneHeights.set(lane, Math.max(row, anchor + laneBelow.get(lane) + 48))
-    const laneY = lane => y + [...laneHeights].filter(([value]) => value < lane).reduce((sum, [, h]) => sum + h, 0) + laneAnchors.get(lane)
-    for (const [index, source] of workflow.nodes.entries()) {
-      const trigger = triggerFor(source)
-      const { w, h } = sizes.get(source.binding_id), open = !trigger && expanded.has(source.binding_id)
-      const group = ['event_group', 'action_group'].includes(source.type)
-      const node = { id: `action-${source.binding_id}`, source, workflow, ancestry, index, kind: group ? source.type : 'action', width: w, fixedHeight: h, x: columnX(ranks.get(source.binding_id)), y: laneY(lanes.get(source.binding_id)) - sizes.get(source.binding_id).alignmentY, inputY: sizes.get(source.binding_id).inputY ?? 58, label: source.name || (source.type === 'event_group' ? '事件组' : source.type === 'action_group' ? '动作组' : actionName(source)), kicker: workflow.entry === source.binding_id && !ancestry.length ? '流程入口' : group ? '流程组' : `动作 ${index + 1}`, meta: group ? source.type === 'event_group' ? '按 IF、ELIF 顺序选择一个出口' : `${source.workflow.nodes.length} 个内部节点` : describeItem(source, 'action'), icon: source.type === 'event_group' ? 'call_split' : source.type === 'action_group' ? 'account_tree' : source.type === 'set_variable' ? 'edit_note' : source.type === 'wait' ? 'hourglass_empty' : 'play_arrow', hasInput: !(workflow.entry === source.binding_id && !ancestry.length), hasOutput: true, open, frame: group && open, availableStepIds: [...ancestry.flatMap(parent => graphPredecessors(parent.workflow, parent.source.binding_id)), ...graphPredecessors(workflow, source.binding_id)], outputs: source.type === 'event_group' ? source.branches.map((branch, i) => ({ id: branch.id, label: branch.label || (branch.else ? 'ELSE' : i ? `ELIF ${i}` : 'IF'), y: 103 + i * 28 })) : [{ id: 'next', label: '完成', y: sizes.get(source.binding_id).inputY ?? 58 }] }
-      if (sizes.get(source.binding_id).content) node.outputs = sizes.get(source.binding_id).content.outputs
-      if (sizes.get(source.binding_id).outputY !== undefined) node.outputs[0].y = sizes.get(source.binding_id).outputY
-      if (trigger) Object.assign(node, { source: trigger, groupOwner: source, standaloneTrigger: true, kind: 'trigger', label: eventName(trigger), kicker: source.mode === 'wait' ? '等待触发器' : '触发器', meta: describeItem(trigger, 'trigger'), icon: 'bolt', outputs: [{ id: source.branches[0].id, label: '执行', y: 58 }], open: false, frame: false })
+    if (open && source.type === 'event_group' && source.group_type !== 'if') {
+      const branches = source.group_type === 'if' ? visibleBranches(workflow, source, true) : [{ id: 'input', label: groupTypeLabel(source.group_type) }]
+      branches.forEach((branch, i) => nodes.push({ id: `gate-${source.binding_id}-${branch.id}`, raw: source, source: branch, workflow, kind: 'branch', branch, groupOwner: source, gate: true, x: geometry.x + geometry.width - 218, y: geometry.y + (source.group_type === 'if' ? 78 + i * 136 : Math.max(78, (geometry.height - 104) / 2)), width: 180, fixedHeight: 104, hasInput: !branch.else, hasOutput: true, inputY: 52, outputs: [{ id: source.group_type === 'if' ? branch.id : 'result', label: '', y: 52 }], label: branch.label || (branch.else ? 'ELSE' : source.group_type === 'if' ? source.branches.indexOf(branch) === 0 ? 'IF' : `ELIF ${source.branches.indexOf(branch)}` : groupTypeLabel(source.group_type)), kicker: source.group_type === 'if' ? '分支' : '逻辑', meta: branch.else ? '全部条件不成立时执行' : source.group_type === 'all' ? '全部条件成立' : source.group_type === 'any' ? '任一条件成立' : source.group_type === 'not' ? '对输入条件取反' : '从触发器或条件节点连接', icon: 'call_split', targetPort: branch.id }))
+      if (source.group_type !== 'if') node.outputs[0].y = Math.max(130, geometry.height / 2)
+      for (const gate of nodes.filter(candidate => candidate.gate && candidate.raw === source)) edges.push({ id: `gate-out:${gate.id}`, from: gate.id, to: node.id, channel: 'control', kind: 'pipeline', sourcePort: gate.outputs[0].id, targetPort: gate.outputs[0].id, label: '' })
+    }
+  }
+  const proxy = identity => { const source = byId.get(identity); return source ? hiddenBy(source)?.binding_id || identity : identity }
+  for (const edge of workflow.edges) {
+    const source = proxy(edge.source), target = proxy(edge.target)
+    if (source === target) continue
+    const destination = byId.get(edge.target)
+    const targetId = edge.channel === 'condition' && expanded.has(target) && destination?.type === 'event_group' && destination.group_type !== 'if' ? `gate-${target}-${edge.target_port || 'input'}` : `action-${target}`
+    edges.push({ id: `wire:${edge.source}:${edge.port}:${edge.target}:${edge.target_port || ''}`, from: edge.port === 'entry' && expanded.has(source) ? `entry-${source}` : `action-${source}`, to: targetId, channel: 'control', kind: edge.channel === 'condition' ? 'condition' : 'pipeline', sourcePort: edge.port, inputPort: targetId.startsWith('gate-') ? undefined : edge.target_port, rawEdge: edge, workflow, label: '' })
+  }
+  for (const owner of [...nodes].filter(node => !node.gate && !node.frame && node.raw.failure_actions?.length)) {
+    let previous = owner, y = owner.y + (presentation.nodeHeight?.(owner) || owner.fixedHeight) + 44
+    owner.raw.failure_actions.forEach((failure, index) => {
+      const node = { x: owner.x, y, width, fixedHeight: 146, id: `failure-action-${failure.binding_id}`, raw: failure, source: failure, owner: owner.raw, ancestry: owner.ancestry, index, parentIndex: owner.index, kind: 'failure-action', hasInput: true, hasOutput: false, inputY: 58, label: presentation.actionName(failure), kicker: `补救动作 ${index + 1}`, meta: presentation.describeItem(failure, 'action'), icon: 'play_arrow', availableStepIds: [...owner.availableStepIds, ...owner.raw.failure_actions.slice(0, index).map(item => item.binding_id)] }
       nodes.push(node)
-      if (open && source.type === 'action_group') {
-        graphLayout(source.workflow, node.x + 28, node.y + 80, [...ancestry, node])
-        const id = `completion-${source.binding_id}`, size = sizes.get(source.binding_id)
-        nodes.push({ id, source, groupOwner: source, workflow, ancestry, activationNode: true, kind: 'activation', label: '返回父流程', kicker: '动作组完成', meta: '从完成出口继续后续动作', icon: 'done_all', x: node.x + size.completionX, y: node.y + size.completionY, width, fixedHeight: cardHeight({ id }), outputAnchors: [{ id: 'next', y: 58 }], hasInput: false, hasOutput: false, dataInputs: [], dataOutputs: [] })
-        const entryId = source.workflow.entry ? `action-${source.workflow.entry}` : `empty-${source.binding_id}`
-        edges.push({ id: `group-entry:${source.binding_id}`, from: node.id, to: entryId, sourceSide: 'left', sourceInput: true, kind: 'pipeline', channel: 'control', label: '' })
-        if (!source.workflow.entry) edges.push({ id: `group-empty:${source.binding_id}`, from: entryId, to: id, kind: 'pipeline', channel: 'control', label: '' })
-        for (const edge of source.workflow.edges.filter(edge => edge.target === null)) edges.push({ id: `group-return:${source.binding_id}:${edge.source}:${edge.port}`, from: `action-${edge.source}`, to: id, sourcePort: edge.port, kind: 'pipeline', channel: 'control', label: '' })
-        for (const child of source.workflow.nodes) if (!source.workflow.edges.some(edge => edge.source === child.binding_id)) edges.push({ id: `group-return:${source.binding_id}:${child.binding_id}`, from: `action-${child.binding_id}`, to: id, kind: 'pipeline', channel: 'control', label: '' })
-        edges.push({ id: `group-completed:${source.binding_id}`, from: id, to: node.id, sourcePort: 'next', targetPort: 'next', kind: 'pipeline', channel: 'control', label: '' })
-      }
-      if (open && source.type === 'event_group') {
-        const content = sizes.get(source.binding_id).content
-        nodes.push(...content.nodes.map(inner => ({ ...inner, groupOwner: source, workflow, ancestry, width, fixedHeight: inner.fixedHeight, x: node.x + inner.x, y: node.y + inner.y, availableStepIds: node.availableStepIds })))
-        inspectionNodes.push(...content.inspectionNodes.map(inner => ({ ...inner, groupOwner: source, workflow, ancestry, availableStepIds: node.availableStepIds })))
-        edges.push(...content.edges)
-      }
-    }
-    let failureY = y + [...laneHeights.values()].reduce((sum, height) => sum + height, 0)
-    for (const owner of workflow.nodes) {
-      const sourceNode = nodes.find(node => node.source === owner || node.standaloneTrigger && node.groupOwner === owner)
-      let previous = sourceNode?.id
-      for (const [index, failure] of (owner.failure_actions || []).entries()) {
-        const id = `failure-action-${failure.binding_id}`
-        nodes.push({ id, source: failure, owner, index, workflow, ancestry, kind: 'failure-action', width, x: sourceNode.x + (index + 1) * (width + gap), y: failureY, icon: 'build', label: actionName(failure), kicker: `补救 ${index + 1}`, meta: describeItem(failure, 'action'), hasInput: true, hasOutput: true, availableStepIds: [...sourceNode.availableStepIds, ...owner.failure_actions.slice(0, index).map(node => node.binding_id)] })
-        edges.push({ id: `failure:${previous}:${id}`, from: previous, to: id, kind: 'failure', channel: 'control', label: index ? '然后' : '失败时' }); previous = id
-      }
-      if (owner.failure_actions?.length) failureY += row
-    }
-    for (const edge of workflow.edges) if (edge.target) edges.push({ id: `control:${edge.source}:${edge.port}`, from: `action-${edge.source}`, to: `action-${edge.target}`, kind: 'pipeline', channel: 'control', sourcePort: edge.port, rawEdge: edge, workflow, label: '' })
-    if (!workflow.entry) nodes.push({ id: `empty-${ancestry.at(-1)?.source.binding_id || 'root'}`, workflow, kind: 'empty', ancestry, x, y, width, fixedHeight: 120, icon: 'start', kicker: '空流程', label: '选择起始操作', meta: '点击选择触发器、动作或事件组', hasInput: false, hasOutput: true })
+      edges.push({ id: `failure:${node.id}`, from: previous.id, to: node.id, sourceSide: 'left', channel: 'control', kind: 'failure', label: index === 0 ? '失败后' : '' })
+      previous = node; y += (presentation.nodeHeight?.(node) || 146) + 44
+    })
   }
-  graphLayout(rule.workflow, 52, 118)
   return { nodes, edges, inspectionNodes }
 }

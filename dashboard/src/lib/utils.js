@@ -131,75 +131,9 @@ function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
-function valuesEqual(left, right) {
-  if (left === right) return true
-  if (Array.isArray(left) || Array.isArray(right)) {
-    return Array.isArray(left)
-      && Array.isArray(right)
-      && left.length === right.length
-      && left.every((value, index) => valuesEqual(value, right[index]))
-  }
-  if (!isObject(left) || !isObject(right)) return false
-  const leftKeys = Object.keys(left)
-  const rightKeys = Object.keys(right)
-  return leftKeys.length === rightKeys.length
-    && leftKeys.every(key => Object.prototype.hasOwnProperty.call(right, key)
-      && valuesEqual(left[key], right[key]))
-}
-
-export function isConditionLeaf(node) {
-  return isObject(node)
-    && typeof node.type === 'string'
-    && node.type.length > 0
-    && !Array.isArray(node.children)
-    && !Array.isArray(node.events)
-}
-
-export function normalizeConditionTree(node) {
-  if (!isObject(node)) return node
-  if (isConditionLeaf(node)) return node
-
-  node.children = Array.isArray(node.children)
-    ? node.children
-    : (Array.isArray(node.events) ? node.events : [])
-  const op = node.op || node.type || 'any'
-  node.op = ({ and: 'all', or: 'any' })[op] || op
-  if (node.op === 'any') delete node.within_seconds
-  if (node.op === 'any') node.pick ??= 'latest'
-  if (node.op === 'all') {
-    node.consume ??= 'matched'
-    if (!Object.hasOwn(node, 'within_seconds')) node.ttl_seconds ??= 3600
-  }
-  if (node.op === 'not') node.repeat ??= 'once_until_seen'
-  delete node.events
-  delete node.type
-  node.children.forEach(normalizeConditionTree)
-  return node
-}
-
-function unwrapSingleCondition(node) {
-  if (isConditionLeaf(node)) return node
-  if (node?.op === 'not') return null
-  if (!isObject(node) || !Array.isArray(node.children) || node.children.length !== 1) return null
-  return unwrapSingleCondition(node.children[0])
-}
-
 export function normalizeRuleDraft(rule) {
   if (!isObject(rule)) return rule
-  const aliases = ['event', 'trigger'].filter(key => Object.hasOwn(rule, key))
-  const legacy = rule[aliases[0]]
-  if (aliases.length === 2 && !valuesEqual(rule.event, rule.trigger)) {
-    throw new Error('event 与 trigger 的触发条件不一致')
-  }
-  if (Object.hasOwn(rule, 'condition') && aliases.length) {
-    const normalized = normalizeConditionTree(JSON.parse(JSON.stringify(rule.condition)))
-    if (!valuesEqual(unwrapSingleCondition(normalized), legacy)) {
-      throw new Error('event/trigger 与 condition 不能同时存在')
-    }
-  }
-  if (!Object.hasOwn(rule, 'condition') && aliases.length) rule.condition = legacy
-  if (isObject(rule.condition)) normalizeConditionTree(rule.condition)
-  delete rule.event
-  delete rule.trigger
+  if (['condition', 'event', 'trigger', 'actions', 'preconditions'].some(key => Object.hasOwn(rule, key))) throw new Error('旧条件模型已移除，请使用流程图规则')
+  if (!isObject(rule.workflow) || !Array.isArray(rule.workflow.nodes) || !Array.isArray(rule.workflow.edges)) throw new Error('规则必须提供 workflow 图')
   return rule
 }

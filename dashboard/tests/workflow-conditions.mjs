@@ -1,112 +1,56 @@
 import assert from 'node:assert/strict'
-import { buildFlowGraph, buildIfSubflowGraph } from '../src/lib/flowGraph.js'
-import { ensureRuleBindingIds, regenerateBindingIds } from '../src/lib/bindings.js'
-import { ifBranches, precedingSources, predicateSummary, findWorkflowAction } from '../src/lib/workflowConditions.js'
+import { ensureRuleBindingIds, buildTestInputFields, buildPreparedTestContext, buildNodeDataPorts, deriveDataEdges } from '../src/lib/bindings.js'
+import { precedingSources, predicateSummary, findWorkflowAction, workflowEventChoices } from '../src/lib/workflowConditions.js'
 import { hasHighImpactActions, ruleNodeCount } from '../src/lib/naturalDraftRules.js'
-
-const reference = (scope, node, path) => ({ $ref: { scope, node, path } })
-const schema = { triggers: { process_state: { name: 'Steam 进程', outputs: [{ name: 'state', type: 'string' }] } }, actions: {
-  speed: { name: '测速', outputs: [{ name: 'latency_us', type: 'number' }, { name: 'connected', type: 'bool' }] },
-  pause: { name: '暂停下载', outputs: [{ name: 'result', type: 'string' }], permissions: ['admin'] },
-} }
-const inner = { binding_id: 'a_inner01', type: 'if', condition: { op: 'exists', left: reference('step', 'a_pause01', ['result']) }, then: [], elif: [], else: [] }
-const conditional = { binding_id: 'a_outer01', type: 'if', condition: { op: 'any', children: [
-  { op: 'all', children: [
-    { op: 'eq', left: reference('trigger', 't_steam01', ['state']), right: 'running' },
-    { op: 'run_status', rule_id: 'r_game001', status: 'running', comparison: 'eq' },
-    { op: 'not', children: [{ op: 'lte', left: reference('step', 'a_speed01', ['latency_us']), right: reference('variable', 'v_limit01', []) }] },
-  ] },
-  { op: 'eq', left: reference('step', 'a_speed01', ['connected']), right: false },
-] }, then: [], elif: [{ condition: { op: 'is_true', left: true }, then: [{ binding_id: 'a_pause01', type: 'pause', params: {} }, inner] }], else: [] }
-const rule = { rule_id: 'r_sample01', name: '启动游戏', variables: [{ id: 'v_limit01', name: '可接受延迟', value_type: 'number', initial: 150 }], condition: { type: 'process_state', binding_id: 't_steam01', params: {} }, actions: [{ binding_id: 'a_speed01', type: 'speed', params: {} }, conditional, { binding_id: 'a_after01', type: 'pause', params: {} }] }
+import { buildWorkflowGraph } from '../src/lib/workflowGraph.js'
+import { trigger, action, eventGroup, wire, ruleWith, reference, schema, presentation } from './canvas-fixtures.mjs'
+const steam = trigger('steam0001'), measure = action('measure01', 'measure'), group = eventGroup('if000001'), predicate = { type: 'condition', binding_id: 'a_compare01', predicate: { op: 'lte', left: reference('step', measure.binding_id, ['latency']), right: reference('variable', 'v_limit001') } }, pause = action('pause0001', 'pause'), after = action('after0001')
+const rule = ruleWith([steam, measure, group, predicate, pause, after], [wire(steam, measure, 'control', 'event'), wire(measure, group), wire(predicate, group, 'condition', 'result', group.branches[0].id), wire(group, pause, 'control', group.branches[0].id), wire(pause, after)], { variables: [{ id: 'v_limit001', name: '可接受延迟', value_type: 'number', initial: 80000 }] })
 ensureRuleBindingIds(rule)
-assert.equal(ifBranches(conditional).map(branch => branch.key).join(','), 'then,elif[0],else')
-const innerSources = precedingSources(rule, inner, schema)
-assert(innerSources.some(source => source.value.$ref.node === 'a_pause01'))
-assert(innerSources.some(source => source.value.$ref.node === 'a_speed01'))
-assert(!innerSources.some(source => source.value.$ref.node === 'a_after01'))
-const afterSources = precedingSources(rule, rule.actions[2], schema)
-assert(!afterSources.some(source => source.value.$ref.node === 'a_pause01'))
-assert.equal(findWorkflowAction(rule, 'a_inner01').trail[0].field, 'elif[0]')
-assert(hasHighImpactActions({ actions: [conditional] }, schema).length === 1)
-assert.equal(ruleNodeCount({ condition: rule.condition, actions: [conditional] }), '4 个节点')
-const copy = regenerateBindingIds(JSON.parse(JSON.stringify(conditional)), 'action')
-assert.notEqual(copy.elif[0].then[0].binding_id, 'a_pause01')
-assert.equal(copy.elif[0].then[1].condition.left.$ref.node, copy.elif[0].then[0].binding_id)
-assert.equal(copy.condition.children[1].left.$ref.node, 'a_speed01')
-const sources = precedingSources(rule, conditional, schema)
-const graph = buildIfSubflowGraph({ rule, action: conditional, schema, sources, rules: [{ rule_id: 'r_game001', name: '游戏下载' }], actionName: action => schema.actions[action.type]?.name || action.type, describeItem: () => '' })
-assert.equal(graph.nodes.filter(node => node.kind === 'predicate').length, 8)
-assert(graph.nodes.some(node => node.source === conditional.condition && node.kind === 'predicate'))
-assert(!graph.nodes.some(node => node.source === inner))
-assert(graph.nodes.filter(node => node.kind === 'action').every(node => node.readOnly))
-assert(graph.edges.some(edge => edge.label === '取反'))
-assert(graph.edges.some(edge => edge.channel === 'data' && edge.targetPortName === 'left'))
-assert.equal(graph.nodes.filter(node => node.kind === 'if-merge').length, 0)
-assert.equal(graph.nodes.filter(node => node.addBranch).length, 0)
-assert(graph.nodes.filter(node => node.kind === 'predicate').every(node => node.availableStepIds.includes('a_speed01')))
-const nodesById = new Map(graph.nodes.map(node => [node.id, node]))
-assert.equal(nodesById.size, graph.nodes.length)
-assert(graph.edges.every(edge => nodesById.has(edge.from) && nodesById.has(edge.to)))
-const summary = predicateSummary(conditional.condition, sources, [{ rule_id: 'r_game001', name: '游戏下载' }])
-assert(summary.includes('游戏下载') && summary.includes('Steam 进程') && summary.includes('可接受延迟') && summary.includes('NOT'))
-const main = buildFlowGraph({ rule, schema, rules: [{ rule_id: 'r_game001', name: '游戏下载' }], condition: rule.condition, eventName: () => 'Steam', actionName: action => action.type, describeItem: () => '', isAdmin: () => false })
-assert(main.nodes.some(node => node.source === conditional && node.meta.includes('3 个出口')))
-assert(main.nodes.some(node => node.source === inner && node.kind === 'action'))
-assert.equal(main.nodes.filter(node => node.addBranch).length, 5)
-assert.equal(main.nodes.filter(node => node.kind === 'if-merge').length, 2)
-assert(!main.nodes.some(node => node.kind === 'predicate'))
-assert(main.edges.some(edge => edge.from === 'if-merge-a_outer01' && edge.to === 'action-a_after01'))
-assert(!main.edges.some(edge => edge.from === 'action-a_outer01' && edge.to === 'action-a_after01'))
-assert(main.edges.some(edge => edge.from === 'if-merge-a_inner01' && edge.to === 'branch-add-a_outer01-elif[0]'))
-assert.equal(main.nodes.find(node => node.source === inner && node.kind === 'action').items, conditional.elif[0].then)
-const mainNodesById = new Map(main.nodes.map(node => [node.id, node]))
-assert.equal(mainNodesById.size, main.nodes.length)
-assert(main.edges.every(edge => mainNodesById.has(edge.from) && mainNodesById.has(edge.to)))
-assert.equal(new Set(main.nodes.map(node => `${node.x},${node.y}`)).size, main.nodes.length)
-const compact = buildFlowGraph({ rule, schema, condition: rule.condition, eventName: () => '', actionName: action => action.type, describeItem: () => '', isAdmin: () => false, expandBranches: false })
-assert(!compact.nodes.some(node => node.source === inner))
-assert(!compact.nodes.some(node => node.addBranch))
-const recoveryOwner = conditional.elif[0].then[0]
-recoveryOwner.on_error = 'continue'
-recoveryOwner.failure_actions = [{ binding_id: 'a_recover01', type: 'pause', params: {} }]
-const recoveryGraph = buildFlowGraph({ rule, schema, condition: rule.condition, eventName: () => '', actionName: action => action.type, describeItem: () => '', isAdmin: () => false })
-assert.equal(recoveryGraph.nodes.find(node => node.id === 'failure-action-a_recover01').owner, recoveryOwner)
-assert(recoveryGraph.edges.some(edge => edge.from === 'failure-action-a_recover01' && edge.to === 'action-a_inner01' && edge.kind === 'failure-continue'))
-assert(recoveryGraph.edges.some(edge => edge.to === 'action-a_inner01' && edge.insertActionIndex === 1 && edge.ownerId === conditional.binding_id && edge.branchKey === 'elif[0]'))
-assert.equal(new Set(recoveryGraph.nodes.map(node => `${node.x},${node.y}`)).size, recoveryGraph.nodes.length)
-delete recoveryOwner.failure_actions
-delete recoveryOwner.on_error
-assert(main.nodes.find(node => node.source === conditional).meta.includes('游戏下载'))
-assert(main.nodes.find(node => node.source === conditional).meta.includes('可接受延迟'))
-console.log('Workflow condition groups, ELIF references, path sources, summary and subflow graph: PASS')
-
-const { workflowEventChoices } = await import('../src/lib/workflowConditions.js')
-const { buildTestInputFields, buildPreparedTestContext } = await import('../src/lib/bindings.js')
-const triggerSchema = { triggers: { hotkey: { name: '全局热键', outputs: [] } }, actions: { pause: { params: [], outputs: [] } } }
-const fired = { op: 'event_occurred', trigger_id: 't_hotkey01', expected: false }
-const firedAction = { type: 'if', binding_id: 'a_branch01', condition: fired, then: [{ type: 'pause', binding_id: 'a_pause01', params: {} }], else: [] }
-const firedRule = { condition: { type: 'hotkey', binding_id: 't_hotkey01', params: {} }, actions: [firedAction] }
-const choices = workflowEventChoices(firedRule, triggerSchema)
-assert.equal(choices[0].label, '触发 1 · 全局热键')
-assert(predicateSummary(fired, [], [], choices).includes('未发生'))
-const firedGraph = buildIfSubflowGraph({ rule: firedRule, action: firedAction, schema: triggerSchema, sources: [], rules: [], actionName: action => action.type, describeItem: () => '' })
-assert(firedGraph.nodes.some(node => node.kind === 'trigger' && node.source === firedRule.condition))
-assert.deepEqual(firedGraph.nodes.find(node => node.kind === 'predicate').dataInputs, [])
-assert(firedGraph.edges.some(edge => edge.label === '事件发生记录'))
-const firedFields = buildTestInputFields(firedRule, triggerSchema)
-assert.equal(firedFields.length, 1)
-assert.equal(firedFields[0].scope, 'event_occurrence')
-assert.deepEqual(JSON.parse(JSON.stringify(buildPreparedTestContext(firedFields, { [firedFields[0].key]: true }).trigger_payloads)), { t_hotkey01: {} })
-assert.deepEqual(JSON.parse(JSON.stringify(buildPreparedTestContext(firedFields, { [firedFields[0].key]: false }).trigger_payloads)), {})
-triggerSchema.triggers.hotkey.outputs = [{ name: 'count', type: 'number' }]
-firedAction.condition = { op: 'all', children: [
-  { op: 'eq', left: { $ref: { scope: 'trigger', node: 't_hotkey01', path: ['count'], on_missing: 'default', default: 0 } }, right: 0 }, fired,
-] }
-const suppliedFields = buildTestInputFields(firedRule, triggerSchema)
-const countField = suppliedFields.find(field => field.scope === 'trigger')
-assert.equal(countField.required, true)
-assert.equal(countField.defaultValue, 0)
-const suppliedValues = Object.fromEntries(suppliedFields.map(field => [field.key, field.defaultValue]))
-assert.equal(buildPreparedTestContext(suppliedFields, suppliedValues).trigger_payloads.t_hotkey01.count, 0)
-console.log('无输出字段的事件判断、条件图和手动测试事件记录：通过')
+const sources = precedingSources(rule, group, schema)
+assert(sources.some(source => source.value.$ref.node === measure.binding_id))
+assert(sources.some(source => source.value.$ref.node === steam.trigger.binding_id))
+assert(!sources.some(source => source.value.$ref.node === pause.binding_id))
+assert.equal(findWorkflowAction(rule, predicate.binding_id).action, predicate)
+assert.equal(hasHighImpactActions(rule, schema).length, 1)
+assert.equal(ruleNodeCount(rule), '6 个节点')
+assert(predicateSummary(predicate.predicate, sources).includes('可接受延迟'))
+assert(predicateSummary({ op: 'run_status', rule_id: 'r_download', status: 'running', comparison: 'eq' }, [], [{ rule_id: 'r_download', name: '游戏下载' }]).includes('游戏下载'))
+const choices = workflowEventChoices(rule, schema)
+assert.equal(choices[0].label, '触发 1 · 进程事件')
+assert(predicateSummary({ op: 'event_occurred', trigger_id: steam.trigger.binding_id, expected: false }, [], [], choices).includes('未发生'))
+const noOutputs = { triggers: { process: { name: '进程事件', outputs: [] } }, actions: schema.actions }
+const fields = buildTestInputFields(rule, noOutputs)
+const fired = fields.find(field => field.scope === 'event_occurrence')
+assert(fired)
+assert.deepEqual(JSON.parse(JSON.stringify(buildPreparedTestContext([fired], { [fired.key]: true }).trigger_payloads)), { [steam.trigger.binding_id]: {} })
+assert.deepEqual(JSON.parse(JSON.stringify(buildPreparedTestContext([fired], { [fired.key]: false }).trigger_payloads)), {})
+const suppliedFields = buildTestInputFields(rule, schema)
+const state = suppliedFields.find(field => field.scope === 'trigger')
+assert.equal(state.required, true)
+const values = Object.fromEntries(suppliedFields.map(field => [field.key, field.defaultValue]))
+values[state.key] = 'running'
+assert.equal(buildPreparedTestContext(suppliedFields, values).trigger_payloads[steam.trigger.binding_id].state, 'running')
+const partial = buildTestInputFields(rule, schema, { startStepId: group.binding_id })
+assert(partial.some(field => field.scope === 'step' && field.node === measure.binding_id))
+assert(!partial.some(field => field.scope === 'step' && field.node === pause.binding_id))
+const read = action('readtext001', 'read_text'), compare = { type:'condition', binding_id:'a_readcompare', predicate:{ op:'gte', left:reference('step', read.binding_id, ['characters']), right:3 } }, readIf = eventGroup('readif001'), readAnd = eventGroup('readand01', 'all'), readAfter = action('readafter')
+const readSchema = { triggers:{}, actions:{ read_text:{ name:'读取文本', outputs:[{ name:'characters', value_type:'int', required:true }] }, log:schema.actions.log } }
+const readRule = ruleWith([read, compare, readIf, readAnd, readAfter], [wire(read, readIf), wire(readIf, readAfter, 'control', readIf.branches[0].id)])
+assert(!precedingSources(readRule, compare, readSchema).some(source => source.value.$ref.node === read.binding_id))
+assert.deepEqual(compare.predicate.left, reference('step', read.binding_id, ['characters']))
+readRule.workflow.edges.push(wire(compare, readAnd, 'condition', 'result'), wire(readAnd, readIf, 'condition', 'result', readIf.branches[0].id))
+const comparisonSources = precedingSources(readRule, compare, readSchema)
+assert(comparisonSources.some(source => source.value.$ref.node === read.binding_id && source.value.$ref.path[0] === 'characters'))
+assert(!comparisonSources.some(source => source.value.$ref.node === readAfter.binding_id))
+assert.equal(new Set(comparisonSources.map(source => JSON.stringify(source.value))).size, comparisonSources.length)
+const readDrawing = buildWorkflowGraph(readRule, new Set(), readSchema, presentation)
+const drawnComparison = readDrawing.nodes.find(node => node.raw === compare)
+assert(drawnComparison.availableStepIds.includes(read.binding_id))
+assert(!drawnComparison.availableStepIds.includes(readAfter.binding_id))
+const drawnRead = buildNodeDataPorts(readDrawing.nodes.find(node => node.raw === read), readSchema, readRule)
+const resultWire = deriveDataEdges(readRule, [drawnRead, drawnComparison]).find(edge => edge.to === drawnComparison.id)
+assert.equal(resultWire?.valid, true)
+assert.equal(resultWire?.sourcePortName, 'characters')
+assert.equal(resultWire?.targetPortName, 'left')
+console.log('原生条件数据、前序结果、自动化状态、事件记录和手动测试输入：通过')

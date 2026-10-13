@@ -333,7 +333,7 @@ body.ai-panel-resizing{cursor:col-resize;user-select:none}
 .graph-node:hover .node-context-button,.graph-node:focus-within .node-context-button{opacity:1}
 .node-link-hit{fill:none;stroke:transparent;stroke-width:22px;pointer-events:stroke;cursor:pointer}
 .node-links{pointer-events:none}
-.canvas-context-menu{position:absolute;z-index:30;min-width:240px;padding:8px;border-radius:var(--r-md);background:var(--md-surface-c-high);color:var(--md-on-surface);box-shadow:var(--md-elev3);border:1px solid var(--md-outline-variant);transform-origin:top left;cursor:default}
+.canvas-context-menu{position:absolute;z-index:30;min-width:240px;overflow-y:auto;padding:8px;border-radius:var(--r-md);background:var(--md-surface-c-high);color:var(--md-on-surface);box-shadow:var(--md-elev3);border:1px solid var(--md-outline-variant);transform-origin:top left;cursor:default}
 .canvas-context-menu button{display:flex;align-items:center;gap:12px;width:100%;min-height:44px;padding:8px 12px;border:0;border-radius:var(--r-xs);background:transparent;color:inherit;font:var(--ts-label-l);text-align:left;cursor:pointer}
 .canvas-context-menu button:hover,.canvas-context-menu button:focus-visible{background:color-mix(in srgb,var(--md-on-surface) 8%,transparent)}
 .canvas-context-menu button:active{background:color-mix(in srgb,var(--md-on-surface) 12%,transparent)}
@@ -370,3 +370,17 @@ body.ai-panel-resizing{cursor:col-resize;user-select:none}
 .graph-node-body.has-outlets{min-height:50px;padding:6px 14px}
 .graph-node-outlet{display:flex;align-items:center;justify-content:space-between;height:28px;padding:0 14px;border-top:1px solid var(--md-outline-variant);font:var(--ts-label-m);color:var(--md-on-surface-variant)}
 .graph-node-outlet .material-symbols-outlined{font-size:16px}
+
+.graph-node.multi-selected{outline:3px solid var(--md-primary);outline-offset:3px}
+.canvas-selection-box{position:absolute;pointer-events:none;border:1px solid var(--md-primary);background:color-mix(in srgb,var(--md-primary) 16%,transparent);z-index:6}
+.graph-group-frame.group-drop-target{border-color:var(--md-primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--md-primary) 30%,transparent)}
+.group-type-control{cursor:pointer;border-radius:var(--r-sm);padding:2px 6px;transition:background .16s ease}
+.group-type-control:hover,.group-type-control:focus-visible{background:color-mix(in srgb,var(--md-on-primary) 14%,transparent)}
+.graph-node-branch .graph-node-head{background:var(--md-tertiary-container);color:var(--md-on-tertiary-container)}
+.graph-node-branch .graph-node-body{padding:8px 12px}
+.graph-node-branch{min-height:104px}
+.graph-node-branch .graph-node-body{min-height:0}
+.graph-node-head .group-type-control{border:0;background:transparent;color:inherit;font:inherit;text-align:left;box-shadow:none;margin:0;padding:2px 6px;min-height:0;border-radius:var(--r-sm)}
+.graph-node-head .group-type-control:hover{background:color-mix(in srgb,currentColor 14%,transparent)}
+.graph-branch-label{position:absolute;right:12px;min-width:44px;max-width:120px;height:36px;padding:0 6px;border:0;border-radius:var(--r-xs);background:var(--md-surface-c-low);color:var(--md-on-surface);font:var(--ts-label-l);cursor:pointer;pointer-events:auto}
+.graph-branch-label:hover,.graph-branch-label:focus-visible{background:var(--md-secondary-container);color:var(--md-on-secondary-container)}

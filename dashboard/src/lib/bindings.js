@@ -1,4 +1,4 @@
-import { getGraphTriggers, graphExecutionActions, walkGraphActions, findGraphNode, graphPredecessors, graphPredicate } from './workflowGraph.js'
+import { getGraphTriggers, graphExecutionActions, walkGraphActions, findGraphNode, graphPredecessors } from './workflowGraph.js'
 import { compatibleTypes, fieldType, typeSpec, typeLabel, typeAtPath, isOpaqueValue, isExpression, parseExactJson, parseTypedInput, defaultTypedValue, formatTypedInput } from './valueTypes.js'
 import { normalizeRuleDraft } from './utils.js'
 
@@ -52,67 +52,13 @@ export function outputDefs(meta) {
 }
 
 export function collectTriggerLeaves(rule, includeAbsence = true) {
-  const leaves = []
-  function visit(node) {
-    if (!node || typeof node !== 'object' || (!includeAbsence && node.op === 'not')) return
-    if (node.type && !Array.isArray(node.children) && !Array.isArray(node.events)) {
-      leaves.push(node)
-      return
-    }
-    ;(node.children || node.events || []).forEach(visit)
-  }
-  visit(rule.condition)
-  if (rule.workflow) return getGraphTriggers(rule)
-  return leaves
+  return (rule.workflow?.nodes || []).filter(node => node.type === 'trigger' && (includeAbsence || node.occurrence !== 'absent')).map(node => node.trigger)
 }
 
-export function guaranteedTriggerIds(node) {
-  if (node?.op === 'not') return new Set()
-  if (!node || typeof node !== 'object') return new Set()
-  if (node.type && !Array.isArray(node.children) && !Array.isArray(node.events)) {
-    return node.binding_id ? new Set([node.binding_id]) : new Set()
-  }
-  const children = node.children || node.events || []
-  const sets = children.map(guaranteedTriggerIds)
-  if (!sets.length) return new Set()
-  if ((node.op || node.type) === 'all' || node.type === 'and') {
-    return new Set(sets.flatMap(set => [...set]))
-  }
-  return new Set([...sets[0]].filter(id => sets.slice(1).every(set => set.has(id))))
-}
 
 export function ensureRuleBindingIds(rule) {
-  normalizeRuleDraft(rule)
-  ensureRuleId(rule)
-  const seen = new Set()
-  function ensureNode(node) {
-    if (!node || typeof node !== 'object') return
-    if (node.type && !Array.isArray(node.children) && !Array.isArray(node.events)) {
-      if (!node.binding_id || seen.has(node.binding_id)) node.binding_id = createBindingId('trigger')
-      if (!node.params || typeof node.params !== 'object') node.params = {}
-      seen.add(node.binding_id)
-      return
-    }
-    ;(node.children || node.events || []).forEach(ensureNode)
-  }
-  ensureNode(rule.condition)
-  function ensureActions(items) {
-    for (const item of items || []) {
-      if (!item.binding_id || seen.has(item.binding_id)) item.binding_id = createBindingId('action')
-      seen.add(item.binding_id)
-      if (item.type === 'if') {
-        item.then ||= []
-        item.else ||= []
-        item.elif ||= []
-        item.elif.forEach(branch => { branch.then ||= []; ensureActions(branch.then) })
-        ensureActions(item.then)
-        ensureActions(item.else)
-      } else if (!item.params || typeof item.params !== 'object') item.params = {}
-      ensureActions(item.failure_actions)
-    }
-  }
-  ensureActions(rule.actions)
-  if (rule.workflow) walkGraphActions(rule.workflow, item => { if (!item.binding_id) item.binding_id = createBindingId('action'); ensureNode(item.activation); (item.triggers || []).forEach(ensureNode) })
+  normalizeRuleDraft(rule); ensureRuleId(rule)
+  walkGraphActions(rule.workflow, node => { node.binding_id ||= createBindingId('action'); if (node.type === 'trigger') node.trigger.binding_id ||= createBindingId('trigger') })
   return rule
 }
 
@@ -120,16 +66,12 @@ export function regenerateBindingIds(node, kind = 'trigger') {
   const replacements = new Map()
   function visit(item, itemKind) {
     if (!item || typeof item !== 'object') return
-    if (itemKind === 'trigger' && (Array.isArray(item.children) || Array.isArray(item.events))) {
-      ;(item.children || item.events).forEach(child => visit(child, itemKind))
-      return
-    }
     const previous = item.binding_id
     item.binding_id = createBindingId(itemKind)
     if (previous) replacements.set(previous, item.binding_id)
     if (itemKind === 'action') {
-      for (const field of ['then', 'else', 'failure_actions']) (item[field] || []).forEach(child => visit(child, 'action'))
-      for (const branch of item.elif || []) (branch.then || []).forEach(child => visit(child, 'action'))
+      ;(item.failure_actions || []).forEach(child => visit(child, 'action'))
+      if (item.type === 'trigger') visit(item.trigger, 'trigger')
     }
   }
   visit(node, kind)
@@ -230,8 +172,19 @@ export function expandBindingSources(sources, catalog = {}) {
 
 export function graphBindingSources(rule, action, schema) {
   const hit = findGraphNode(rule, action?.binding_id)
-  const result = buildBindingSources({ ...rule, actions: [], workflow: rule.workflow }, 0, schema, { allowSteps: false })
+  const result = buildBindingSources(rule, 0, schema, { allowSteps: false })
   const scopes = hit ? [...hit.trail.filter(parent => parent.field === 'workflow').map(parent => ({ ...findGraphNode(rule, parent.action.binding_id), action: parent.action })), hit] : []
+  if (['condition', 'logic', 'trigger'].includes(action?.type) || action?.type === 'event_group') {
+    const seen = new Set([action.binding_id]), pending = [action.binding_id]
+    while (pending.length) {
+      const identity = pending.pop()
+      for (const edge of rule.workflow.edges) if (edge.channel === 'condition' && edge.source === identity && !seen.has(edge.target)) {
+        seen.add(edge.target); pending.push(edge.target)
+        const consumer = findGraphNode(rule, edge.target)
+        if (consumer) scopes.push(consumer)
+      }
+    }
+  }
   for (const scope of scopes) {
     for (const id of graphPredecessors(scope.workflow, scope.action.binding_id)) {
       const previous = scope.workflow.nodes.find(node => node.binding_id === id)
@@ -250,7 +203,7 @@ export function buildBindingSources(
 ) {
   const result = variableBindingSources(rule)
   const leaves = collectTriggerLeaves(rule, false)
-  const guaranteed = guaranteedTriggerIds(rule.condition)
+  const guaranteed = new Set()
 
   for (const leaf of leaves) {
     const conditional = !guaranteed.has(leaf.binding_id)
@@ -278,7 +231,7 @@ export function buildBindingSources(
   }
 
   if (allowSteps) {
-    ;(rule.actions || []).slice(0, Math.max(0, actionIndex)).forEach((action, index) => {
+    ;graphPredecessors(rule.workflow, rule.workflow?.nodes[actionIndex]?.binding_id).map(id => rule.workflow.nodes.find(node => node.binding_id === id)).filter(Boolean).forEach((action, index) => {
       const meta = schema.actions[action.type]
       for (const output of actionOutputDefs(action, schema, rule)) {
         result.push(sourceItem(
@@ -295,7 +248,7 @@ export function buildBindingSources(
 
 export function buildFailureBindingSources(rule, actionIndex, failureIndex, schema) {
   const result = buildBindingSources(rule, actionIndex, schema)
-  const configuredActions = rule.actions?.[actionIndex]?.failure_actions
+  const configuredActions = rule.workflow?.nodes[actionIndex]?.failure_actions
   const failureActions = Array.isArray(configuredActions) ? configuredActions : []
   failureActions.slice(0, Math.max(0, failureIndex)).forEach((action, index) => {
     const meta = schema.actions[action.type]
@@ -539,12 +492,15 @@ function addTestField(fields, field) {
 export function buildTestInputFields(rule, schema, { startStepId = '', endStepId = '' } = {}) {
   const leaves = collectTriggerLeaves(rule)
   const leavesById = new Map(leaves.map(leaf => [leaf.binding_id, leaf]))
-  const actions = rule.workflow ? (() => { const result = []; walkGraphActions(rule.workflow, action => result.push(action)); return result })() : rule.actions || []
+  const actions = []; walkGraphActions(rule.workflow, action => actions.push(action))
   const startIndex = Math.max(0, actions.findIndex(action => action.binding_id === startStepId))
   const rawEndIndex = actions.findIndex(action => action.binding_id === endStepId)
   const endIndex = rawEndIndex >= 0 ? rawEndIndex : actions.length - 1
-  const selectedActions = rule.workflow ? graphExecutionActions(rule, { startStepId, endStepId }) : actions.slice(startIndex, endIndex + 1)
-  const executionSource = { actions: selectedActions }
+  const selectedActions = graphExecutionActions(rule, { startStepId, endStepId })
+  const dependencies = new Set(selectedActions.map(action => action.binding_id))
+  const pending = [...dependencies]
+  while (pending.length) { const target = pending.pop(); for (const edge of rule.workflow.edges) if (edge.channel === 'condition' && edge.target === target && !dependencies.has(edge.source)) { dependencies.add(edge.source); pending.push(edge.source) } }
+  const executionSource = { nodes: actions.filter(action => dependencies.has(action.binding_id)) }
   const references = [...new Map(
     collectReferences(executionSource)
       .filter(reference => ['trigger', 'event', 'step'].includes(reference.scope))
@@ -650,18 +606,7 @@ export function buildTestInputFields(rule, schema, { startStepId = '', endStepId
     }
     ;(node.children || []).forEach(eventCheck)
   }
-  function actionChecks(items) {
-    for (const action of items || []) {
-      if (action.type === 'event_group') for (const branch of action.branches || []) if (branch.condition_graph) eventCheck(graphPredicate(branch.condition_graph))
-      if (action.type === 'if') {
-        eventCheck(action.condition)
-        actionChecks(action.then); actionChecks(action.else)
-        for (const branch of action.elif || []) { eventCheck(branch.condition); actionChecks(branch.then) }
-      }
-      actionChecks(action.failure_actions)
-    }
-  }
-  actionChecks(selectedActions)
+  for (const action of executionSource.nodes) if (action.type === 'trigger') eventCheck({ op: 'event_occurred', trigger_id: action.trigger.binding_id })
 
   for (const variable of rule.variables || []) {
     addTestField(fields, { scope: 'variable', node: variable.id, path: [], sourceName: '运行变量（留空使用规则初始值）', label: variable.name, type: normalizedType(variable.value_type), valueType: variable.value_type, required: false, sensitive: variable.sensitive === true, defaultValue: '' })
@@ -684,7 +629,7 @@ export function buildTestInputFields(rule, schema, { startStepId = '', endStepId
 
 export function buildAllTestInputFields(rule, schema) {
   const fields = new Map()
-  const starts = ['']; if (rule.workflow) walkGraphActions(rule.workflow, action => starts.push(action.binding_id)); else starts.push(...(rule.actions || []).map(action => action.binding_id).filter(Boolean))
+  const starts = ['']; walkGraphActions(rule.workflow, action => starts.push(action.binding_id))
   for (const startStepId of starts) {
     for (const field of buildTestInputFields(rule, schema, { startStepId })) {
       if (!fields.has(field.key)) fields.set(field.key, field)
