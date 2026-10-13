@@ -12,12 +12,15 @@ _SKILL_DESCRIPTION = (
 )
 _RULE_DRAFT_DESCRIPTION = (
     "目录中的触发器和动作能够满足需求时，把需求写成规则候选，不保存或执行。"
-    "使用 workflow 保存控制图，entry 指向入口节点，edges 按 source、port、target 决定执行顺序。"
-    "入口 event_group 的 activation 配置启动事件组合；中途组的 mode 为 immediate 或 wait。"
-    "branches 按 IF、ELIF 顺序判断，最后提供 else 出口，port 使用分支 id。"
-    "condition_graph 的边从子条件指向 all、any、not 节点，order 指定短路顺序。"
-    "action_group.workflow 保存内部图，组外通过 exports 读取内部结果。"
+    "workflow 是格式 2.1 的平面图，nodes 保存所有图块，parent 指定所属事件组或动作组。"
+    "trigger 图块包含插件配置 trigger，occurrence 指定事件发生或未发生。"
+    "edges 的 channel 为 condition 或 control，source、port、target、target_port 指定端口。"
+    "event_group 的 group_type 为 if、all、any、not，IF 各分支 id 同时用作条件入口和执行出口。"
+    "IF、多个 ELIF 按顺序判断，唯一 ELSE 不接条件；同一 IF 或 ELIF 的多个条件须先连接 AND 或 OR。"
+    "action_group 从 entry 端口连接组内起始动作，从 next 端口继续外部动作，exports 提供内部结果。"
+    "无连线的图块不参与执行，不自动生成条件、分支动作或连接。"
 )
+
 
 
 def _sorted_ids(catalog: PluginCatalog, key: str) -> list[str]:
@@ -45,18 +48,12 @@ def _rule_draft_parameters(catalog: PluginCatalog) -> JSON:
         "type": "object",
         "properties": {
             "name": {"type": "string"},
-            "condition": _node_schema(_sorted_ids(catalog, "triggers")),
-            "actions": {
-                "type": "array",
-                "items": _node_schema(_sorted_ids(catalog, "actions")),
-            },
             "workflow": workflow,
             "constants": {"type": "array", "items": {"type": "object"}},
             "variables": {"type": "array", "items": {"type": "object"}},
             "concurrency": {"type": "object"},
         },
-        "required": ["name"],
-        "anyOf": [{"required": ["condition", "actions"]}, {"required": ["workflow"]}],
+        "required": ["name", "workflow"],
         "$defs": definitions,
         "additionalProperties": False,
     }

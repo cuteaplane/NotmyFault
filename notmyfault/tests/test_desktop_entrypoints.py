@@ -12,6 +12,7 @@ import urllib.request
 
 import pytest
 
+from notmyfault.tests.canvas_fixtures import native_rule
 from notmyfault.application_paths import ApplicationPaths
 
 
@@ -47,13 +48,9 @@ def test_dashboard_get_config_does_not_rewrite_rules_file(dashboard, tmp_path):
 
     env = make_api_env(tmp_path)
     paths = env.paths
-    rule = {
-        "name": "提醒",
-        "event": {"type": "time_schedule", "params": {"time": "08:00"}},
-        "actions": [{"type": "notify", "params": {"title": "提醒"}}],
-    }
+    rule = native_rule({"type": "time_schedule", "params": {"time": "08:00"}}, [{"type": "notify", "params": {"title": "提醒"}}], name="提醒")
     payload = {
-        "schema_version": 2,
+        "schema_version": "2.1",
         "value_encoding": "typed-v1",
         "rules": encode_value([rule]),
     }
@@ -77,22 +74,19 @@ def test_dashboard_save_config_writes_signed_rules(dashboard, tmp_path):
     env = make_api_env(tmp_path)
     paths, store = env.paths, env.store
     api = dashboard_api(dashboard, env)
-    rule = {
-        "name": "提醒",
-        "event": {"type": "time_schedule", "params": {"time": "08:00"}},
-        "actions": [{"type": "notify", "params": {"title": "提醒"}}],
-    }
+    rule = native_rule({"type": "time_schedule", "params": {"time": "08:00"}}, [{"type": "notify", "params": {"title": "提醒"}}], name="提醒")
     result = api.save_config(encode_value([rule]), "", "typed-v1")
     assert result.get("ok") is True, result
     loaded = store.load_verified_rules()
     assert loaded[0]["name"] == "提醒"
     workflow = loaded[0]["workflow"]
-    entry = next(node for node in workflow["nodes"] if node["binding_id"] == workflow["entry"])
+    assert workflow["entry"] is None
+    entry = next(node for node in workflow["nodes"] if node["type"] == "trigger")
     target = next(edge["target"] for edge in workflow["edges"] if edge["source"] == entry["binding_id"])
     assert next(node for node in workflow["nodes"] if node["binding_id"] == target)["type"] == "notify"
     assert "event" not in loaded[0]
     assert "actions" not in loaded[0] and "condition" not in loaded[0]
-    assert entry["activation"]["type"] == "time_schedule"
+    assert entry["trigger"]["type"] == "time_schedule"
     saved = paths.rules_file.read_bytes()
     for invalid in (None, {}, [None], [rule, None]):
         result = api.save_config(invalid, "", "typed-v1")

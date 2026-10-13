@@ -13,6 +13,7 @@ from notmyfault.core.variables import initialize_variables
 from notmyfault.core.rules import iter_action_nodes, validate_automation_references, validate_rules_structure
 from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions, normalize_workflow_rule, find_graph_scope
 from notmyfault.core.rule_model import normalize_rule_shape
+from notmyfault.core.canvas_workflow import lower_canvas_rule
 from notmyfault.host.api.ports import EngineControlPort
 from notmyfault.security.plugin_schema import check_payload_contract
 
@@ -23,7 +24,7 @@ _TEST_ASSERTION_OPERATORS = frozenset(
 )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass
 class RuleRunServiceError(Exception):
     status_code: int
     body: Dict[str, Any]
@@ -91,27 +92,14 @@ class RuleRunService:
             raise RuleRunServiceError(400, {"ok": False, "code": "invalid_test_payload", "error": str(error)}) from error
         if not isinstance(start_step_id, str) or not isinstance(end_step_id, str):
             self._fail(400, "局部运行步骤 ID 必须是字符串")
-        if isinstance(candidate_rule.get("workflow"), dict):
+        try:
+            runtime_rule = lower_canvas_rule(candidate_rule)
+        except ValueError as error:
+            self._fail(400, str(error))
+        if isinstance(runtime_rule.get("workflow"), dict):
             actions, selected_actions, selected_ids, skipped_upstream_ids = self._select_graph_actions(
-                candidate_rule, start_step_id, end_step_id,
+                runtime_rule, start_step_id, end_step_id,
             )
-        else:
-            actions = candidate_rule.get("actions", [])
-            if not isinstance(actions, list):
-                actions = []
-            action_ids = [action.get("binding_id", "") for action in actions if isinstance(action, dict)]
-            if start_step_id and start_step_id not in action_ids:
-                self._fail(400, "局部运行的起始动作不存在")
-            if end_step_id and end_step_id not in action_ids:
-                self._fail(400, "局部运行的结束动作不存在")
-            step_index = {identity: index for index, identity in enumerate(action_ids)}
-            start_index = step_index.get(start_step_id, 0)
-            end_index = step_index.get(end_step_id, len(actions) - 1)
-            if actions and start_index > end_index:
-                self._fail(400, "局部运行的起始动作不能晚于结束动作")
-            selected_actions = actions[start_index : end_index + 1] if actions else []
-            selected_ids = {action.get("binding_id") for action, _path in iter_action_nodes(selected_actions)}
-            skipped_upstream_ids = set(action_ids[:start_index])
 
         if not isinstance(step_outputs, dict):
             self._fail(400, "上游动作结果必须是 JSON 对象")
@@ -166,7 +154,7 @@ class RuleRunService:
             skipped_upstream_ids,
             step_outputs,
             registry,
-            rule_step_output_fields(candidate_rule, engine.triggers_meta, engine.actions_meta),
+            rule_step_output_fields(runtime_rule, engine.triggers_meta, engine.actions_meta),
         )
         if upstream_issues:
             raise RuleRunServiceError(

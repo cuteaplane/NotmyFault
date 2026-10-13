@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from notmyfault.host.api.auth import ApiTokenStore
 from notmyfault.host.api.middleware import install_api_middleware
 from notmyfault.tests.api_support import API_TOKEN, make_api_env
+from notmyfault.tests.canvas_fixtures import native_rule
 
 
 EXPECTED_OPERATIONS = {
@@ -252,14 +253,11 @@ def test_rule_save_rejects_missing_binding_source(tmp_path):
         headers=env.headers,
         json={
             "rules": [
-                {
-                    "name": "无效引用",
-                    "event": {
+                native_rule({
                         "type": "hotkey",
                         "binding_id": "t_hot001",
                         "params": {"hotkey": "ctrl+k"},
-                    },
-                    "actions": [
+                    }, [
                         {
                             "type": "notify",
                             "binding_id": "a_note001",
@@ -273,8 +271,7 @@ def test_rule_save_rejects_missing_binding_source(tmp_path):
                                 }
                             },
                         }
-                    ],
-                }
+                    ], name="无效引用")
             ]
         },
     )
@@ -288,8 +285,7 @@ def test_rule_save_rejects_missing_binding_source(tmp_path):
         "triggers": {"hotkey": {"params": []}},
         "actions": {"notify": {"params": [{"name": "message", "type": "string", "required": True}]}},
     })
-    rule = {"name": "必填参数", "event": {"type": "hotkey", "params": {}},
-            "actions": [{"type": "notify", "params": {}}]}
+    rule = native_rule({"type": "hotkey", "params": {}}, [{"type": "notify", "params": {}}], name="必填参数")
     assert service.validate_draft(rule)["valid"] is False
     with pytest.raises(RuleServiceError) as caught:
         service.save([rule], None)
@@ -307,10 +303,7 @@ def test_rules_transport_preserves_typed_constants_and_literal_objects(tmp_path)
         "bytes": b"\x00\xff", "object": {"$nmf_value": {"type": "int", "data": "7"}},
         "expression": {"$ref": {"scope": "step", "node": "a_literal", "path": ["x"]}},
     }
-    rule = {"name": "保存精确数据", "event": {"type": "hotkey", "params": {"hotkey": "ctrl+k"}},
-            "constants": [{"id": "c_values01", "name": "数据", "value_type": "object", "value": {"$literal": values}}],
-            "variables": [{"id": "v_result01", "name": "结果", "value_type": "object"}],
-            "actions": [{"type": "set_variable", "variable": "v_result01", "value": {"$ref": {"scope": "constant", "node": "c_values01", "path": []}}}]}
+    rule = native_rule({"type": "hotkey", "params": {"hotkey": "ctrl+k"}}, [{"type": "set_variable", "variable": "v_result01", "value": {"$ref": {"scope": "constant", "node": "c_values01", "path": []}}}], name="保存精确数据", constants=[{"id": "c_values01", "name": "数据", "value_type": "object", "value": {"$literal": values}}], variables=[{"id": "v_result01", "name": "结果", "value_type": "object"}])
     constraint = {"type": "int", "min": values["count"], "max": values["count"], "enum": [values["count"]]}
     rule["constants"].append({"id": "c_limits01", "name": "精确约束", "value_type": constraint, "value": values["count"]})
     response = env.client.put("/api/rules", headers={**env.headers, "X-NMF-Value-Encoding": "typed-v1"}, json=encode_value({"rules": [rule]}))

@@ -23,11 +23,11 @@ def tool_schema(catalog):
 
 def test_rule_schema_tracks_catalog():
     schema = tool_schema(make_catalog())
-    assert schema["properties"]["condition"]["properties"]["type"]["enum"] == [
+    assert schema["$defs"]["workflow_node"]["anyOf"][0]["properties"]["trigger"]["properties"]["type"]["enum"] == [
         "time_schedule",
         "usb_insert",
     ]
-    assert schema["properties"]["actions"]["items"]["properties"]["type"]["enum"] == [
+    assert schema["$defs"]["action"]["properties"]["type"]["enum"] == [
         "notify",
         "open_url",
     ]
@@ -36,5 +36,5 @@ def test_rule_schema_tracks_catalog():
 def test_rule_schema_rejects_extra_fields():
     schema = tool_schema(make_catalog())
     assert schema["additionalProperties"] is False
-    assert schema["properties"]["condition"]["additionalProperties"] is False
-    assert schema["properties"]["actions"]["items"]["additionalProperties"] is False
+    assert schema["$defs"]["workflow_node"]["anyOf"][0]["additionalProperties"] is False
+    assert schema["$defs"]["action"]["additionalProperties"] is False

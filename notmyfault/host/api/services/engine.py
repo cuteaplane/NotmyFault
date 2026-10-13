@@ -114,7 +114,7 @@ class EngineService:
             action_types.update(
                 action.get("type")
                 for action, _location in iter_rule_actions(rule)
-                if isinstance(action, dict) and action.get("type")
+                if isinstance(action, dict) and action.get("type") and action["type"] not in {"trigger", "condition", "logic", "event_group", "action_group", "merge", "end"}
             )
         return {
             "running": self._engine.engine_running,

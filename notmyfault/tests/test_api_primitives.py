@@ -21,6 +21,7 @@ from notmyfault.host.api.services.rule_runs import RuleRunService, RuleRunServic
 from notmyfault.core.value_codec import encode_value
 from notmyfault.security.api_key_store import KeyStoreStatus
 from notmyfault.tests.api_support import make_api_env
+from notmyfault.tests.canvas_fixtures import native_rule, branch_rule
 
 
 def test_pending_preview_store_purges_expired_directory() -> None:
@@ -379,14 +380,11 @@ def test_rule_run_route_rejects_test_data_over_one_mib(tmp_path, method, path) -
     ({"value": ""}, "default", True),
 ])
 def test_rule_run_service_validates_and_forwards_scoped_test_context(upstream, policy, valid) -> None:
-    rule = {
-        "name": "局部运行",
-        "condition": {
+    rule = native_rule({
             "type": "hotkey",
             "binding_id": "t_hot001",
             "params": {},
-        },
-        "actions": [
+        }, [
             {
                 "type": "source",
                 "binding_id": "a_source001",
@@ -413,10 +411,9 @@ def test_rule_run_service_validates_and_forwards_scoped_test_context(upstream, p
                     "event": {"$ref": {"scope": "event", "path": ["kind"]}},
                 },
             },
-        ],
-    }
+        ], name="局部运行")
     if policy is not None:
-        reference = rule["actions"][1]["params"]["upstream"]["$ref"]
+        reference = next(node for node in rule["workflow"]["nodes"] if node["binding_id"] == "a_target001")["params"]["upstream"]["$ref"]
         reference["on_missing"] = policy
         if policy == "default":
             reference["default"] = "fallback"
@@ -480,11 +477,7 @@ def test_rule_run_service_validates_and_forwards_scoped_test_context(upstream, p
 ])
 def test_rule_run_route_rejects_invalid_assertions_before_execution(tmp_path, typed, field, value):
     env = make_api_env(tmp_path)
-    rule = {
-        "name": "测试检查项",
-        "condition": {"type": "manual", "binding_id": "t_manual01", "params": {}},
-        "actions": [{"type": "target", "binding_id": "a_target001", "params": {}}],
-    }
+    rule = native_rule({"type": "manual", "binding_id": "t_manual01", "params": {}}, [{"type": "target", "binding_id": "a_target001", "params": {}}], name="测试检查项")
     assert env.store.save_rules([rule])
     calls = []
     env.runner.current_engine = SimpleNamespace(
@@ -535,10 +528,12 @@ def test_rule_run_route_rejects_invalid_assertions_before_execution(tmp_path, ty
     assert calls[0][1]["test_assertions"] == valid_body["test_assertions"]
 
 
-def test_rule_run_service_allows_assertions_in_selected_elif_but_not_starting_inside_it():
-    rule = {"rule_id": "r_target01", "name": "ELIF检查", "condition": {"type": "signal", "binding_id": "t_signal01", "params": {}},
-            "actions": [{"type": "if", "binding_id": "a_branch01", "condition": {"op": "is_true", "left": False}, "then": [], "else": [],
-                         "elif": [{"condition": {"op": "is_true", "left": True}, "then": [{"type": "target", "binding_id": "a_target01", "params": {}}]}]}]}
+def test_rule_run_service_allows_assertions_and_partial_start_in_selected_elif():
+    rule = branch_rule({"type": "signal", "binding_id": "t_signal01", "params": {}}, [
+        {"predicate": {"op": "is_true", "left": False}, "steps": []},
+        {"predicate": {"op": "is_true", "left": True}, "steps": [{"type": "target", "binding_id": "a_target01", "params": {}}]},
+        {"steps": []},
+    ], rule_id="r_target01", name="ELIF检查")
     calls = []
     engine = SimpleNamespace(actions_meta={"target": {"outputs": []}}, triggers_meta={"signal": {"outputs": []}},
                              run_manual_rule_snapshot=lambda *args, **kwargs: (calls.append(kwargs) or (True, "已执行", "run_branch")))
@@ -546,20 +541,16 @@ def test_rule_run_service_allows_assertions_in_selected_elif_but_not_starting_in
     body = {"test_assertions": [{"step_id": "a_target01", "path": [], "operator": "exists"}]}
     assert service.run(0, body)["ok"]
     assert calls[0]["test_assertions"] == body["test_assertions"]
-    with pytest.raises(RuleRunServiceError) as invalid:
-        service.run(0, {"start_step_id": "a_target01"})
-    assert invalid.value.status_code == 400
+    assert service.run(0, {"start_step_id": "a_target01"})["ok"]
+    assert calls[1]["start_step_id"] == "a_target01"
 
 
 def test_rule_run_service_checks_missing_and_invalid_reference_payloads() -> None:
-    rule = {
-        "name": "引用检查",
-        "condition": {
+    rule = native_rule({
             "type": "hotkey",
             "binding_id": "t_hot001",
             "params": {},
-        },
-        "actions": [
+        }, [
             {
                 "type": "target",
                 "binding_id": "a_target001",
@@ -573,8 +564,7 @@ def test_rule_run_service_checks_missing_and_invalid_reference_payloads() -> Non
                     }
                 },
             }
-        ],
-    }
+        ], name="引用检查")
     active_engine = SimpleNamespace(
         actions_meta={"target": {"outputs": []}},
         triggers_meta={

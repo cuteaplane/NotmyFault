@@ -23,20 +23,17 @@ def make_catalog():
 
 
 def rule_args(**overrides):
-    args = {
-        "name": "晚间提醒",
-        "event": {"type": "time_schedule", "params": {"time": "20:00"}},
-        "actions": [{"type": "notify", "params": {"message": "检查日报"}}],
-    }
+    trigger = {'type': 'trigger', 'binding_id': 'a_schedule01', 'trigger': {'binding_id': 't_schedule01', 'type': 'time_schedule', 'params': {'time': '20:00'}}}
+    action = {'type': 'notify', 'binding_id': 'a_notice001', 'params': {'message': '检查日报'}}
+    args = {'name': '晚间提醒', 'workflow': {'entry': None, 'nodes': [trigger, action], 'edges': [{'source': 'a_schedule01', 'port': 'event', 'target': 'a_notice001', 'channel': 'control'}]}}
     args.update(overrides)
     return args
 
 
 def test_valid_rule_returns_normalized_draft():
-    expected = rule_args()
-    expected["condition"] = expected.pop("event")
-    assert parse_rule_draft(rule_args(), make_catalog()) == expected
-    assert parse_rule_draft(expected, make_catalog()) == expected
+    original = rule_args()
+    assert parse_rule_draft(original, make_catalog()) == original
+    assert parse_rule_draft(original, make_catalog()) == original
 
 
 @pytest.mark.parametrize(
@@ -58,17 +55,17 @@ def test_rejects_malformed_rule_shape(bad_args):
     assert caught.value.code == "rule_invalid"
 
 
-@pytest.mark.parametrize(
-    "args",
-    [
-        rule_args(event={"type": "ghost_trigger", "params": {}}),
-        rule_args(actions=[{"type": "ghost_action", "params": {}}]),
-        rule_args(event={"type": "usb_insert", "params": {"time": "09:00"}}),
-        rule_args(actions=[{"type": "notify", "params": {"url": "https://x"}}]),
-        rule_args(event={"type": "time_schedule", "params": {}, "code": "x"}),
-    ],
-)
-def test_rejects_unknown_plugins_params_and_fields(args):
+@pytest.mark.parametrize('target, field, value', [
+    ('trigger', 'type', 'ghost_trigger'),
+    ('action', 'type', 'ghost_action'),
+    ('trigger', 'params', {'unknown': '09:00'}),
+    ('action', 'params', {'url': 'https://x'}),
+    ('trigger', 'code', 'x'),
+])
+def test_rejects_unknown_plugins_params_and_fields(target, field, value):
+    args = rule_args()
+    node = args['workflow']['nodes'][0]['trigger'] if target == 'trigger' else args['workflow']['nodes'][1]
+    node[field] = value
     with pytest.raises(ToolCallError) as caught:
         parse_rule_draft(args, make_catalog())
-    assert caught.value.code == "rule_invalid"
+    assert caught.value.code == 'rule_invalid'

@@ -162,6 +162,13 @@ class RuleService:
 
         if isinstance(rule, dict):
             collect_nodes(rule.get("workflow"))
+            by_id = {node.get('binding_id'): node for node in rule.get('workflow', {}).get('nodes', []) if isinstance(node, dict)}
+            for index, (location, identity, _groups) in enumerate(node_locations):
+                group_path, parent = [], by_id.get(identity, {}).get('parent')
+                while parent in by_id and parent not in group_path:
+                    group_path.insert(0, parent)
+                    parent = by_id[parent].get('parent')
+                node_locations[index] = location, identity, group_path
         node_locations.sort(key=lambda item: len(item[0]), reverse=True)
         seen: set[tuple[Any, ...]] = set()
         for issue in issues:

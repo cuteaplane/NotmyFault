@@ -61,15 +61,12 @@ _RULE_DRAFT_PARAMETERS: JSON = {
     "type": "object",
     "properties": {
         "name": {"type": "string"},
-        "condition": _NODE_SCHEMA,
-        "actions": {"type": "array", "items": _NODE_SCHEMA},
         "workflow": _WORKFLOW_SCHEMA,
         "constants": {"type": "array", "items": {"type": "object"}},
         "variables": {"type": "array", "items": {"type": "object"}},
         "concurrency": {"type": "object"},
     },
-    "required": ["name"],
-    "anyOf": [{"required": ["condition", "actions"]}, {"required": ["workflow"]}],
+    "required": ["name", "workflow"],
     "$defs": _WORKFLOW_DEFINITIONS,
     "additionalProperties": False,
 }

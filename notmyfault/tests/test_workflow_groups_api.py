@@ -14,21 +14,21 @@ from notmyfault.security.rule_approval import changed_admin_plugins
 def graph_rule():
     return {
         "rule_id": "r_graph001", "name": "嵌套组测试",
-        "condition": {"binding_id": "t_start001", "type": "start", "params": {}},
         "workflow": {
-            "entry": "a_source001",
+            "entry": None,
             "nodes": [
-                {"binding_id": "a_source001", "type": "produce", "params": {}},
-                {"binding_id": "a_group001", "type": "action_group", "workflow": {
-                    "entry": "a_consume01", "nodes": [{
-                        "binding_id": "a_consume01", "type": "consume",
-                        "params": {"message": {"$ref": {"scope": "step", "node": "a_source001", "path": ["value"]}}},
-                    }], "edges": [{"source": "a_consume01", "port": "next", "target": None}],
+                {"binding_id": "a_start001", "type": "trigger", "trigger": {
+                    "binding_id": "t_start001", "type": "start", "params": {},
                 }},
+                {"binding_id": "a_source001", "type": "produce", "params": {}},
+                {"binding_id": "a_group001", "type": "action_group", "exports": {}},
+                {"binding_id": "a_consume01", "type": "consume", "parent": "a_group001",
+                 "params": {"message": {"$ref": {"scope": "step", "node": "a_source001", "path": ["value"]}}}},
             ],
             "edges": [
-                {"source": "a_source001", "port": "next", "target": "a_group001"},
-                {"source": "a_group001", "port": "next", "target": None},
+                {"source": "a_start001", "port": "event", "target": "a_source001", "channel": "control"},
+                {"source": "a_source001", "port": "next", "target": "a_group001", "channel": "control"},
+                {"source": "a_group001", "port": "entry", "target": "a_consume01", "channel": "control"},
             ],
         },
     }
@@ -68,15 +68,15 @@ def test_nested_graph_test_requires_the_skipped_parent_output():
 @pytest.mark.parametrize("value, accepted", [("已就绪", True), ({"invalid": True}, False)])
 def test_partial_run_validates_the_exported_group_output(value, accepted):
     rule = graph_rule()
-    source, group = rule["workflow"]["nodes"]
-    group["workflow"] = {"entry": source["binding_id"], "nodes": [source],
-                         "edges": [{"source": source["binding_id"], "port": "next", "target": None}]}
+    trigger, source, group, original_consumer = rule["workflow"]["nodes"]
+    source["parent"] = group["binding_id"]
     group["exports"] = {"value": {"$ref": {"scope": "step", "node": source["binding_id"], "path": ["value"]}}}
     consumer = {"binding_id": "a_after001", "type": "consume", "params": {
         "message": {"$ref": {"scope": "step", "node": group["binding_id"], "path": ["value"]}}}}
-    rule["workflow"].update(entry=group["binding_id"], nodes=[group, consumer], edges=[
-        {"source": group["binding_id"], "port": "next", "target": consumer["binding_id"]},
-        {"source": consumer["binding_id"], "port": "next", "target": None}])
+    rule["workflow"].update(nodes=[trigger, group, source, consumer], edges=[
+        {"source": trigger["binding_id"], "port": "event", "target": group["binding_id"], "channel": "control"},
+        {"source": group["binding_id"], "port": "entry", "target": source["binding_id"], "channel": "control"},
+        {"source": group["binding_id"], "port": "next", "target": consumer["binding_id"], "channel": "control"}])
     service, calls = service_for(rule)
     request = {"start_step_id": consumer["binding_id"], "step_outputs": {group["binding_id"]: {"value": value}}}
     if accepted:
@@ -106,14 +106,14 @@ def test_graph_test_rejects_an_unreachable_end():
 
 def test_admin_approval_scans_nested_graph_and_failure_actions():
     rule = graph_rule()
-    rule["workflow"]["nodes"][1]["workflow"]["nodes"][0]["failure_actions"] = [{"type": "restricted", "params": {}}]
+    rule["workflow"]["nodes"][3]["failure_actions"] = [{"type": "restricted", "params": {}}]
     schema = {"triggers": {}, "actions": {"restricted": {"security": {"rule_approval": "admin_key"}}}}
     assert changed_admin_plugins([], [rule], schema) == ["restricted"]
 
 
 def test_nested_validation_issue_identifies_the_action_and_parent_group():
     rule = graph_rule()
-    rule["workflow"]["nodes"][1]["workflow"]["nodes"][0]["params"]["message"]["$ref"]["node"] = "a_unknown01"
+    rule["workflow"]["nodes"][3]["params"]["message"]["$ref"]["node"] = "a_unknown01"
     store = SimpleNamespace(load_verified_rules=lambda **kwargs: [rule])
     service = RuleService(store, lambda: {
         "triggers": {"start": {"params": [], "outputs": []}},
@@ -138,8 +138,8 @@ def test_ai_draft_accepts_graph_and_nested_group():
     assert parse_rule_draft(draft, draft_catalog()) == draft
     schema = build_rule_drafting_skill(draft_catalog()).tools[0].parameters
     assert "workflow" in schema["properties"]
-    assert schema["$defs"]["workflow_node"]["anyOf"][0]["properties"]["type"]["enum"] == ["consume", "produce"]
-    action_schema = schema["$defs"]["workflow_node"]["anyOf"][0]["properties"]
+    assert any(item["properties"]["type"].get("enum") == ["consume", "produce"] for item in schema["$defs"]["workflow_node"]["anyOf"])
+    action_schema = next(item["properties"] for item in schema["$defs"]["workflow_node"]["anyOf"] if "enum" in item["properties"]["type"])
     assert action_schema["retry_backoff"]["enum"] == ["fixed", "exponential"]
     assert action_schema["retry"]["maximum"] == 3
 
@@ -148,13 +148,13 @@ def test_ai_draft_accepts_graph_and_nested_group():
 def test_ai_draft_rejects_invalid_graph(change):
     draft = graph_rule()
     draft.pop("rule_id")
-    source = draft["workflow"]["nodes"][0]
+    source = draft["workflow"]["nodes"][1]
     if change == "unknown_plugin":
         source["type"] = "unknown"
     elif change == "unknown_field":
         source["code"] = "unused"
     else:
-        draft["workflow"]["edges"][1]["target"] = "a_source001"
+        draft["workflow"]["edges"].append({"source": "a_group001", "port": "next", "target": "a_source001", "channel": "control"})
     with pytest.raises(ToolCallError) as caught:
         parse_rule_draft(draft, draft_catalog())
     assert caught.value.code == "rule_invalid"

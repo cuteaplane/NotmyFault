@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from fastapi.testclient import TestClient
 
+from notmyfault.tests.canvas_fixtures import trigger_rule, set_rule_steps
 from notmyfault.core.run_history import RunHistory
 from notmyfault.host.api.auth import ApiTokenStore
 from notmyfault.host.api.events import EventBroker
@@ -74,26 +75,10 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
     (tmp_path / "build.json").write_text("{}", encoding="utf-8")
     (tmp_path / "build.json.sig").write_bytes(b"test-signature")
     store = make_store(paths)
-    assert store.save_rules(
-        [
-            {
-                "name": "装配初始规则",
-                "event": {
-                    "type": "time_schedule",
-                    "params": {"time": "23:58"},
-                },
-                "actions": [
-                    {
-                        "type": "notify",
-                        "params": {
-                            "title": "NotmyFault",
-                            "message": "assembly start",
-                        },
-                    }
-                ],
-            }
-        ]
-    )
+    assert store.save_rules([set_rule_steps(
+        trigger_rule("r_initial0001", "装配初始规则", "time_schedule", {"time": "23:58"}),
+        [{"type": "notify", "params": {"title": "NotmyFault", "message": "assembly start"}}],
+    )])
     runner = namespace["EngineRunner"](paths, store, create_engine)
     history = RunHistory(str(paths.run_history_file))
     events = EventBroker(history)
@@ -146,26 +131,10 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
         response = client.put(
             "/api/rules",
             headers=headers,
-            json={
-                "rules": [
-                    {
-                        "name": "装配热重载",
-                        "event": {
-                            "type": "time_schedule",
-                            "params": {"time": "23:59"},
-                        },
-                        "actions": [
-                            {
-                                "type": "notify",
-                                "params": {
-                                    "title": "NotmyFault",
-                                    "message": "assembly smoke",
-                                },
-                            }
-                        ],
-                    }
-                ]
-            },
+            json={"rules": [set_rule_steps(
+                trigger_rule("r_reload0001", "装配热重载", "time_schedule", {"time": "23:59"}),
+                [{"type": "notify", "params": {"title": "NotmyFault", "message": "assembly smoke"}}],
+            )]},
         )
         assert response.status_code == 200, response.text
         os.utime(paths.rules_file, (previous_mtime + 2, previous_mtime + 2))
