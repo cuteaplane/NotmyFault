@@ -10,6 +10,7 @@ from notmyfault.core.value_codec import encode_value, decode_value
 from notmyfault.values import Blob, FrozenList, Secret, allow_secrets, contains_secret, hold_value, plain_value
 from notmyfault.core.workflow import build_context, invoke_action
 from notmyfault.tests.api_support import create_test_engine
+from notmyfault.tests.canvas_fixtures import trigger_rule, set_rule_steps
 from notmyfault.core.run_history import RunHistory
 from notmyfault.host.api.events import EventBroker
 
@@ -127,9 +128,9 @@ def test_action_can_reveal_only_declared_parameters_and_protects_derived_output(
 
 def test_event_boundary_uses_snapshot_registry_for_sensitive_custom_output():
     identity = "com.test.secret/record@1"
-    rule = {"rule_id": "r_custom01", "name": "规则", "condition": {"type": "record_event", "params": {}},
-            "actions": [{"type": "consume", "params": {"name": {"$ref": {
-                "scope": "event", "path": ["record", "data", "name"]}}}}]}
+    rule = set_rule_steps(trigger_rule("r_custom01", "规则", "record_event"), [
+        {"type": "consume", "params": {"name": {"$ref": {"scope": "event", "path": ["record", "data", "name"]}}}},
+    ])
     engine = create_test_engine({"rules": [rule]})
     observed, packets = [], []
     engine.triggers_meta["record_event"] = {
@@ -173,10 +174,10 @@ def test_manual_checks_read_wrapped_values_without_publishing_them(value, path, 
 
 
 def test_manual_continuation_wraps_provided_sensitive_outputs_without_requiring_other_fields():
-    rule = {"rule_id": "r_manual_secret", "name": "规则", "condition": {"type": "signal", "params": {}}, "actions": [
+    rule = set_rule_steps(trigger_rule("r_manual_secret", "规则", "signal"), [
         {"type": "source", "binding_id": "a_source01", "params": {}},
         {"type": "consume", "binding_id": "a_consume1", "params": {}},
-    ]}
+    ])
     engine = create_test_engine({"rules": []})
     observed = []
     engine.triggers_meta["signal"] = {"outputs": [{"name": "required", "type": "text"}]}
@@ -215,9 +216,10 @@ def test_sensitive_inputs_remain_hidden_in_events_and_history(tmp_path, manual, 
         reference["node"] = "t_signal01"
         config = {"token": {"$ref": {"scope": "constant", "node": "c_token001", "path": []}}}
         constants = [{"id": "c_token001", "name": "口令", "value_type": "text", "value": token, "sensitive": True}]
-    rule = {"rule_id": "r_secret01", "name": "规则", "constants": constants,
-            "condition": {"type": "signal", "binding_id": "t_signal01", "params": config},
-            "actions": [{"type": "echo", "binding_id": "a_echo0001", "params": {"value": {"$ref": reference}}}]}
+    rule = set_rule_steps(trigger_rule("r_secret01", "规则", "signal", config, trigger_id="t_signal01"), [
+        {"type": "echo", "binding_id": "a_echo0001", "params": {"value": {"$ref": reference}}},
+    ])
+    rule["constants"] = constants
     engine = create_test_engine({"rules": [rule]})
     engine.triggers_meta["signal"] = {"params": [{"name": "token", "type": "string"}],
                                        "outputs": [{"name": "token", "type": "text", "sensitive": True}]}
@@ -231,7 +233,7 @@ def test_sensitive_inputs_remain_hidden_in_events_and_history(tmp_path, manual, 
     engine.events.subscribe(lambda event: packets.append(event.to_dict()))
     try:
         if manual:
-            ok, _, run_id = engine.run_manual_rule_snapshot(rule, event_payload={"token": token})
+            ok, _, run_id = engine.run_manual_rule_snapshot(rule, event_payload={"token": token}, trigger_payloads={"t_signal01": {"token": token}})
             assert ok
         else:
             engine.emit_event("signal", {"token": token}, instance={"config": {"token": token} if config else {}})
@@ -245,9 +247,19 @@ def test_sensitive_inputs_remain_hidden_in_events_and_history(tmp_path, manual, 
 
 
 def test_manual_event_protects_sensitive_fields_from_any_candidate_trigger():
-    rule = {"rule_id": "r_manual_multi", "name": "规则", "condition": {"op": "any", "children": [
-        {"type": "public", "params": {}}, {"type": "private", "params": {}}]},
-        "actions": [{"type": "echo", "params": {"value": {"$ref": {"scope": "event", "path": ["token"]}}}}]}
+    rule = set_rule_steps(trigger_rule("r_manual_multi", "规则", "public"), [
+        {"type": "echo", "params": {"value": {"$ref": {"scope": "event", "path": ["token"]}}}},
+    ])
+    graph = rule["workflow"]
+    first, action = graph["nodes"]
+    second = {"type": "trigger", "binding_id": "a_private0001", "trigger": {"type": "private", "binding_id": "t_private0001", "params": {}}}
+    combination = {"type": "logic", "binding_id": "a_signals0001", "op": "any"}
+    graph["nodes"] += [second, combination]
+    graph["edges"] = [
+        {"source": first["binding_id"], "port": "event", "target": combination["binding_id"], "channel": "condition"},
+        {"source": second["binding_id"], "port": "event", "target": combination["binding_id"], "channel": "condition"},
+        {"source": combination["binding_id"], "port": "result", "target": action["binding_id"], "channel": "control"},
+    ]
     engine = create_test_engine({"rules": []})
     packets = []
     engine.triggers_meta.update(public={"outputs": [{"name": "token", "type": "text"}]},

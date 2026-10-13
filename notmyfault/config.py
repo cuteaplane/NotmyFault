@@ -13,7 +13,6 @@ from typing import Any, Dict, List
 from notmyfault.application_paths import ApplicationPaths
 from notmyfault.core.rule_model import (
     normalize_rules, normalize_rule_shape,
-    _extract_legacy_rules,
 )
 from notmyfault.core.data_types import DataTypeError
 from notmyfault.core.value_codec import decode_value, encode_value
@@ -162,10 +161,9 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(config, dict):
         return config
 
-    # 规则已拆到 rules.json，丢弃旧文件里残留的规则和进程字段
+    if 'rules' in config or 'processes' in config:
+        raise ConfigValidationError('旧配置中的规则模型已移除，请使用 rules.json 格式 2.1')
     result = dict(config)
-    result.pop("rules", None)
-    result.pop("processes", None)
     result["schema_version"] = 2
     settings = result.get("settings")
     if not isinstance(settings, dict):
@@ -371,75 +369,18 @@ class SignedConfigStore:
 
     def load_verified_rules(self, *, for_editing: bool = False) -> List[Dict[str, Any]]:
         raw = self._read_signed(self.rules_path, "规则")
+        if raw.get("schema_version") != "2.1":
+            raise ConfigValidationError("规则只支持格式 2.1")
         rules = raw.get("rules")
         if not isinstance(rules, list):
             raise ConfigValidationError("rules 必须是列表")
         def validate(items):
-            if for_editing:
-                items = [
-                    {key: value for key, value in rule.items() if key != "preconditions"}
-                    if isinstance(rule, dict) else rule
-                    for rule in items
-                ]
             _validate_rules_for_runtime(items)
 
         validate(rules)
         normalized = normalize_rules(rules)
         validate(normalized)
         return normalized
-
-    def _keep_premigration_backup(self) -> None:
-        backup = self.config_path + ".premigration.bak"
-        if os.path.exists(backup):
-            return
-        try:
-            with open(self.config_path, "r", encoding="utf-8") as src:
-                content = src.read()
-            with open(backup, "w", encoding="utf-8") as dst:
-                dst.write(content)
-        except OSError:
-            pass
-
-    def _merge_legacy_rules(self, legacy_rules: List[Dict[str, Any]]) -> bool:
-        existing = self.load_verified_rules()
-        existing_ids = {rule.get("rule_id") for rule in existing}
-        additions = [
-            rule for rule in legacy_rules if rule.get("rule_id") not in existing_ids
-        ]
-        return self.save_rules(existing + additions)
-
-    def _migrate_rules_file(self) -> None:
-        try:
-            with open(self.config_path, "r", encoding="utf-8") as file:
-                raw = json.load(file)
-        except (json.JSONDecodeError, OSError):
-            return
-        if not isinstance(raw, dict) or (
-            "rules" not in raw and "processes" not in raw
-        ):
-            return
-
-        self._keep_premigration_backup()
-        legacy = dict(raw)
-        legacy.pop(_SIGNATURE_KEY, None)
-        legacy_rules = _extract_legacy_rules(legacy)
-        if os.path.exists(self.rules_path):
-            if legacy_rules and not self._merge_legacy_rules(legacy_rules):
-                raise ConfigValidationError("规则文件写入失败，无法完成规则合并")
-        elif not self.save_rules(legacy_rules):
-            raise ConfigValidationError("规则文件写入失败，无法完成规则拆分")
-
-        stripped = {
-            key: value
-            for key, value in raw.items()
-            if key not in ("rules", "processes", _SIGNATURE_KEY)
-        }
-        if not self.save_config(stripped):
-            raise ConfigValidationError("配置文件写入失败，无法完成规则拆分")
-        if legacy_rules:
-            print(
-                f"[Config] 已把 {len(legacy_rules)} 条规则从 config.json 拆分到 rules.json"
-            )
 
     def _recover_config(self) -> Dict[str, Any] | None:
         backup = self.config_path + ".bak"
@@ -455,15 +396,8 @@ class SignedConfigStore:
             return None
         if not signature or not self._verify(data, signature):
             return None
-        legacy_rules = _extract_legacy_rules(data)
-        if legacy_rules:
-            merged = (
-                self._merge_legacy_rules(legacy_rules)
-                if os.path.exists(self.rules_path)
-                else self.save_rules(legacy_rules)
-            )
-            if not merged:
-                return None
+        if 'rules' in data or 'processes' in data:
+            return None
         normalized = _normalize_config(data)
         if not isinstance(normalized, dict) or not self.save_config(normalized):
             return None
@@ -482,6 +416,8 @@ class SignedConfigStore:
         if not self.paths.config_secret_file.is_file():
             return None
         if not signature or not self._verify(data, signature):
+            return None
+        if data.get("schema_version") != "2.1":
             return None
         rules = normalize_rules(self._decode_rules_data(data).get("rules", []))
         _validate_rules_for_runtime(rules)
@@ -502,12 +438,10 @@ class SignedConfigStore:
             if recovered is not None:
                 return recovered
             raise
-        self._migrate_rules_file()
         return config
 
     def load_rules(self) -> List[Dict[str, Any]]:
         self.paths.config_dir.mkdir(parents=True, exist_ok=True)
-        self._migrate_rules_file()
         if not os.path.exists(self.rules_path):
             self.save_rules([])
             return []
