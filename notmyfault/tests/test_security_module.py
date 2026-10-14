@@ -23,10 +23,10 @@ def set_signed_mode(tmp_path, monkeypatch, mode):
     ("signed_mode", "environment", "expected"),
     [
         ("strict", "alpha", SecurityMode.STRICT),
-        ("normal", "dev", SecurityMode.NORMAL),
-        ("permissive", "develop", SecurityMode.NORMAL),
+        ("permissive", "dev", SecurityMode.PERMISSIVE),
+        ("permissive", "develop", SecurityMode.PERMISSIVE),
         ("permissive", "stable", SecurityMode.STRICT),
-        ("normal", "master", SecurityMode.STRICT),
+        ("unknown", "master", SecurityMode.STRICT),
         ("permissive", "  ALPHA ", SecurityMode.PERMISSIVE),
     ],
 )
@@ -68,3 +68,20 @@ def test_plugin_risk_scan_detects_public_risk_categories(source, risk_id):
 def test_plugin_risk_scan_ignores_comments_and_strings():
     analysis = analyze_plugin_source("# subprocess.run(['tool'])\nmessage = 'eval(data)'\n")
     assert analysis.risks == []
+
+
+def test_permissive_unsigned_plugin_warns_but_forbidden_code_still_fails(tmp_path):
+    from notmyfault.security.plugin_checks import PluginInspection, PluginTree, evaluate_plugin, inspection_report
+
+    entrypoint = str(tmp_path / "action.py")
+    tree = PluginTree([], {}, {entrypoint: b""}, b"", {})
+    result = PluginInspection(tmp_path, "action", "user", tree, platform_compatible=True, entrypoint=entrypoint)
+    allowed = evaluate_plugin(result, SecurityMode.PERMISSIVE)
+    assert allowed["allowed"]
+    assert "签名无效，降级加载" in allowed["warnings"]
+    assert not evaluate_plugin(result, SecurityMode.STRICT)["allowed"]
+    assert "signature" not in inspection_report(result, SecurityMode.PERMISSIVE)
+    result.capabilities.add("dynamic_exec")
+    blocked = evaluate_plugin(result, SecurityMode.PERMISSIVE)
+    assert not blocked["allowed"]
+    assert any("dynamic_exec" in error for error in blocked["errors"])

@@ -25,12 +25,12 @@ from notmyfault.tests.plugin_support import build_nmfp, make_meta, post_archive
 
 
 @pytest.fixture(autouse=True)
-def normal_plugin_installation_mode(monkeypatch):
+def permissive_plugin_installation_mode(monkeypatch):
     from notmyfault.host.api.services import plugin_installation
     from notmyfault.security.security import SecurityMode
 
     monkeypatch.setattr(
-        plugin_installation, "detect_security_mode", lambda: SecurityMode.NORMAL
+        plugin_installation, "detect_security_mode", lambda: SecurityMode.PERMISSIVE
     )
 
 
@@ -156,7 +156,7 @@ def test_update_after_id_change_keeps_only_latest_backup(tmp_path, monkeypatch):
     assert backup_meta["version_code"] == 2
 
 
-@pytest.mark.parametrize("mode", ["strict", "normal", "permissive"])
+@pytest.mark.parametrize("mode", ["strict", "permissive"])
 @pytest.mark.parametrize("operation", ["install", "update", "change_id"])
 def test_manifest_save_failure_preserves_plugins_and_backups(
     tmp_path, monkeypatch, mode, operation,
@@ -175,12 +175,14 @@ def test_manifest_save_failure_preserves_plugins_and_backups(
     monkeypatch.setattr(
         plugin_installation, "detect_security_mode", lambda: SecurityMode(mode)
     )
+    monkeypatch.setattr(plugin_installation.PluginInstallationService, "_counter_sign_author_key",
+                        lambda self, path, password: signing.counter_sign_author_key(path, key) and None)
     env = make_api_env(tmp_path)
 
     def signed_archive(meta, tag):
         archive = build_nmfp(tmp_path, meta, "actions", tag)
         root = tmp_path / f"source-{tag}" / f"plugin-{tag}"
-        signing.sign_plugin(root, "action.json", private_key=key)
+        signing.self_sign_plugin(root, key)
         with py7zr.SevenZipFile(archive, "w") as output:
             for path in sorted(root.rglob("*")):
                 if path.is_file():
@@ -341,8 +343,8 @@ def _prepare_engine_recovery(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("mode,recovery_failure", [
-    ("strict", None), ("normal", None), ("permissive", None),
-    ("strict", "save"), ("normal", "save"), ("permissive", "save"),
+    ("strict", None), ("permissive", None),
+    ("strict", "save"), ("permissive", "save"),
     ("strict", "signature"), ("strict", "import"),
 ])
 @pytest.mark.parametrize("new_id", ["old_id", "new_id"])
@@ -377,7 +379,7 @@ def test_engine_start_restores_backup_when_updated_plugin_cannot_import(
         "old_id",
         1,
         "no_run = True\n" if recovery_failure == "import" else
-        "def run(meta, params):\n    return {'version': 1}\n",
+        "def run_with_context(meta, params, context):\n    return {'version': 1}\n",
         execution_mode=execution_mode,
     )
     _write_action(
@@ -388,7 +390,8 @@ def test_engine_start_restores_backup_when_updated_plugin_cannot_import(
         execution_mode=execution_mode,
     )
     for folder in (old_backup, new_plugin):
-        signing.sign_plugin(folder, "action.json", private_key=key)
+        signing.self_sign_plugin(folder, key)
+        signing.counter_sign_author_key(folder, key)
     old_snapshot = inspect_plugin_tree(str(old_backup)).file_snapshot
     new_snapshot = inspect_plugin_tree(str(new_plugin)).file_snapshot
     unrelated = {"action.py": "a" * 64}
@@ -438,7 +441,7 @@ def test_engine_start_restores_backup_when_updated_plugin_cannot_import(
             (restored / "action.json").read_text(encoding="utf-8")
         )
         assert restored_meta["version_code"] == 1
-        assert engine.actions_funcs["old_id"]({}, {}) == {"version": 1}
+        assert engine.actions_funcs["old_id"]({}, {}, {}) == {"version": 1}
         # 更新失败会先推一条插件加载失败，回退事件不变
         assert engine.events.flush()
         assert [name for name, _data in events if name != "plugin.load_failed"] == [
@@ -480,7 +483,7 @@ def test_engine_start_keeps_loadable_update_and_backup(
         backup,
         "demo",
         1,
-        "def run(meta, params):\n    return {'version': 1}\n",
+        "def run_with_context(meta, params, context):\n    return {'version': 1}\n",
         execution_mode=execution_mode,
     )
     _write_action(
@@ -488,7 +491,7 @@ def test_engine_start_keeps_loadable_update_and_backup(
         "demo",
         2,
         "from pathlib import Path\n"
-        "def run(meta, params):\n"
+        "def run_with_context(meta, params, context):\n"
         f"    Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n"
         "    return {'version': 2}\n",
         execution_mode=execution_mode,
@@ -503,7 +506,7 @@ def test_engine_start_keeps_loadable_update_and_backup(
         assert current.is_dir()
         assert backup.is_dir()
         assert not marker.exists()
-        assert engine.actions_funcs["demo"]({}, {}) == {"version": 2}
+        assert engine.actions_funcs["demo"]({}, {}, {}) == {"version": 2}
         assert marker.read_text(encoding="utf-8") == "ran"
         assert engine.events.flush()
         assert events == []
@@ -524,7 +527,7 @@ def test_engine_start_does_not_check_disabled_update(monkeypatch, tmp_path):
         backup,
         "demo",
         1,
-        "def run(meta, params):\n    return {'version': 1}\n",
+        "def run_with_context(meta, params, context):\n    return {'version': 1}\n",
     )
     _write_action(
         current,

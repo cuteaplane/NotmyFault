@@ -15,6 +15,7 @@ def make_meta(plugin_kind: str, **overrides):
         "version": "1.0",
         "package_name": f"com.test.demo_{plugin_kind}",
     }
+    meta["trigger_api" if plugin_kind in ("trigger", "triggers") else "execution_api"] = "event-v2" if plugin_kind in ("trigger", "triggers") else "context-v1"
     meta.update(overrides)
     return meta
 
@@ -28,7 +29,7 @@ def build_nmfp(tmp_path, meta, plugin_kind, tag="pkg", extra_files=None):
     )
     entry = "trigger.py" if plugin_kind == "triggers" else "action.py"
     (source / entry).write_text(
-        "def run(meta, params):\n    return {'ok': True}\n", encoding="utf-8"
+        ("def run(meta, config, emit_event, shutdown_event):\n    shutdown_event.wait()\n" if plugin_kind == "triggers" else "def run_with_context(meta, params, context):\n    return {'ok': True}\n"), encoding="utf-8"
     )
     for name, content in (extra_files or {}).items():
         target = source / name

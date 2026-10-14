@@ -36,6 +36,18 @@ def high_risk_rule():
     return native_rule({"type": "plain_trigger", "params": {}}, [{"type": "run_powershell", "params": {"command": "Get-Service"}}], rule_id="r_risk001", name="高危规则")
 
 
+def attach_recovery(rule, plugin_id):
+    graph = rule["workflow"]
+    graph["nodes"] += [
+        {"binding_id": "a_recovery001", "type": "action_group"},
+        {"binding_id": "a_handler001", "type": plugin_id, "parent": "a_recovery001", "params": {}},
+    ]
+    graph["edges"] += [
+        {"source": graph["nodes"][1]["binding_id"], "port": "failure", "target": "a_recovery001", "channel": "control"},
+        {"source": "a_recovery001", "port": "entry", "target": "a_handler001", "channel": "control"},
+    ]
+
+
 def test_changed_admin_plugins_ignores_unrelated_rule_edits():
     previous = [admin_rule(), plain_rule()]
     changed_plain = deepcopy(previous)
@@ -52,9 +64,7 @@ def test_changed_admin_plugins_ignores_unrelated_rule_edits():
 
 def test_changed_admin_plugins_finds_failure_action():
     rule = plain_rule()
-    rule["workflow"]["nodes"][1]["failure_actions"] = [
-        {"type": "admin_action", "params": {}},
-    ]
+    attach_recovery(rule, "admin_action")
 
     assert rule_approval.changed_admin_plugins([], [rule], SCHEMA) == ["admin_action"]
 
@@ -88,15 +98,13 @@ def test_changed_admin_plugins_finds_manifest_restricted_action():
 
 def test_changed_admin_plugins_finds_restricted_failure_action():
     rule = plain_rule()
-    rule["workflow"]["nodes"][1]["failure_actions"] = [
-        {"type": "kill_process", "params": {}},
-    ]
+    attach_recovery(rule, "kill_process")
     assert rule_approval.changed_admin_plugins([], [rule], SCHEMA) == ["kill_process"]
 
 
-def test_normal_mode_does_not_request_private_key(monkeypatch):
+def test_permissive_mode_does_not_request_private_key(monkeypatch):
     monkeypatch.setattr(
-        rule_approval, "detect_security_mode", lambda: SecurityMode.NORMAL,
+        rule_approval, "detect_security_mode", lambda: SecurityMode.PERMISSIVE,
     )
 
     assert rule_approval.require_admin_rule_approval(

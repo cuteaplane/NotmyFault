@@ -508,16 +508,10 @@ def _verify_sig_with_digest(sig: bytes, digest: bytes, pubs) -> bool:
     return False
 
 
-def plugin_signature_kind_from_payload(
-    plugin_dir: str, origin: str, payload: bytes
-) -> str:
-    return plugin_signature_kind_from_digest(plugin_dir, origin, hashlib.sha256(payload).digest())
-
-
 def plugin_signature_kind_from_digest(
     plugin_dir: str, origin: str, digest: bytes
 ) -> str:
-    """返回签名来源：official、author、official-legacy 或 none，验签失败一律算 none"""
+    """返回签名来源：official、author 或 none，验签失败一律算 none"""
     try:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     except Exception:
@@ -554,34 +548,17 @@ def plugin_signature_kind_from_digest(
             return "none"
         return "author" if _verify_sig_with_digest(sig, digest, [pub]) else "none"
 
-    if origin == "third_party":
-        return "none"
-
-    # 旧安装流程用本地密钥代签的用户插件目录里没有 public_key.pem，退回官方和用户公钥表验签。
-    try:
-        from notmyfault.security.signing_keys import get_public_keys
-        pub_keys = get_public_keys()
-        if not pub_keys:
-            return "none"
-        pubs = [Ed25519PublicKey.from_public_bytes(k) for k in pub_keys]
-    except Exception:
-        return "none"
-    return "official-legacy" if _verify_sig_with_digest(sig, digest, pubs) else "none"
+    return "none"
 
 
 def plugin_signature_kind(plugin_dir: str, origin: str = "builtin") -> str:
-    """返回签名来源：official、author、official-legacy 或 none，验签失败一律算 none"""
+    """返回签名来源：official、author 或 none，验签失败一律算 none"""
     try:
         from notmyfault.security.signing import plugin_payload
         payload = plugin_payload(plugin_dir)
     except OSError:
         return "none"
-    return plugin_signature_kind_from_payload(plugin_dir, origin, payload)
-
-
-def verify_plugin_sig(plugin_dir: str, origin: str = "builtin") -> bool:
-    """校验插件签名文件和签名覆盖的文件清单，任何异常都按验签失败处理"""
-    return plugin_signature_kind(plugin_dir, origin) != "none"
+    return plugin_signature_kind_from_digest(plugin_dir, origin, hashlib.sha256(payload).digest())
 
 
 def compute_file_hash(file_path: str) -> str | None:

@@ -23,6 +23,7 @@ def make_meta(**overrides):
         "version": "1.0",
         "package_name": "com.test.demo",
     }
+    meta["trigger_api" if "trigger_api" in overrides else "execution_api"] = "event-v2" if "trigger_api" in overrides else "context-v1"
     meta.update(overrides)
     return meta
 
@@ -157,7 +158,7 @@ class TestValidatePluginMetaPermissions:
         assert errors == []
 
         ok, errors = validate_plugin_meta(
-            make_meta(cancellation_api="runtime-v1"), "action"
+            make_meta(execution_api=None, cancellation_api="runtime-v1"), "action"
         )
         assert ok is False
         assert (
@@ -249,15 +250,15 @@ class TestValidatePluginMetaPermissions:
             assert "isolated 动作暂不支持 admin 权限" in errors
 
     def test_trigger_accepts_typed_outputs(self):
-        meta = make_meta(
-            outputs=[{"name": "path", "type": "string", "label": "文件路径"}]
+        meta = make_meta(trigger_api="event-v2",
+            outputs=[{"name": "path", "type": "text", "label": "文件路径"}]
         )
         ok, errors = validate_plugin_meta(meta, "trigger")
         assert ok is True
         assert errors == []
 
     def test_outputs_reject_invalid_type(self):
-        meta = make_meta(
+        meta = make_meta(trigger_api="event-v2",
             outputs=[{"name": "x", "type": "weird", "label": "l"}]
         )
         ok, errors = validate_plugin_meta(meta, "trigger")
@@ -265,10 +266,10 @@ class TestValidatePluginMetaPermissions:
         assert any("outputs[0].type 无效" in e for e in errors)
 
     def test_outputs_reject_duplicate_names(self):
-        meta = make_meta(
+        meta = make_meta(trigger_api="event-v2",
             outputs=[
-                {"name": "x", "type": "string", "label": "l"},
-                {"name": "x", "type": "number", "label": "l2"},
+                {"name": "x", "type": "text", "label": "l"},
+                {"name": "x", "type": "float", "label": "l2"},
             ]
         )
         ok, errors = validate_plugin_meta(meta, "trigger")
@@ -343,3 +344,39 @@ class TestMacroParams:
         ok, errors = validate_plugin_meta(meta, "action")
         assert ok is False
         assert any("capture_only 必须为布尔值" in error for error in errors)
+
+
+@pytest.mark.parametrize("kind,field,current", [("action", "execution_api", "context-v1"), ("trigger", "trigger_api", "event-v2")])
+@pytest.mark.parametrize("value", [None, "legacy", "event-v1"])
+def test_removed_entry_contracts_are_rejected(kind, field, current, value):
+    meta = make_meta(**{field: current})
+    meta.pop("execution_api" if kind == "trigger" else "trigger_api", None)
+    if value is None:
+        meta.pop(field)
+    else:
+        meta[field] = value
+    valid, errors = validate_plugin_meta(meta, kind)
+    assert not valid
+    assert any(field in error for error in errors)
+
+
+@pytest.mark.parametrize("field", ["precondition_api", "item_type"])
+def test_removed_manifest_fields_are_rejected(field):
+    meta = make_meta()
+    if field == "precondition_api":
+        meta[field] = "context-v1"
+    else:
+        meta["outputs"] = [{"name": "files", "label": "文件", "type": {"type": "array", "items": "text"}, "item_type": "text"}]
+    valid, errors = validate_plugin_meta(meta, "action")
+    assert not valid
+    assert any(field in error for error in errors)
+
+
+def test_builtin_trigger_manifests_use_event_v2():
+    manifests = sorted((Path(__file__).resolve().parents[1] / "triggers").glob("*/trigger.json"))
+    assert manifests
+    for path in manifests:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        valid, errors = validate_plugin_meta(meta, "trigger")
+        assert valid, f"{path.parent.name}: {errors}"
+        assert meta["trigger_api"] == "event-v2"

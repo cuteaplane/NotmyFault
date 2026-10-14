@@ -12,12 +12,12 @@ from notmyfault.tests.plugin_support import build_nmfp, make_meta, post_archive
 
 
 @pytest.fixture(autouse=True)
-def normal_plugin_installation_mode(monkeypatch):
+def permissive_plugin_installation_mode(monkeypatch):
     from notmyfault.host.api.services import plugin_installation
     from notmyfault.security.security import SecurityMode
 
     monkeypatch.setattr(
-        plugin_installation, "detect_security_mode", lambda: SecurityMode.NORMAL
+        plugin_installation, "detect_security_mode", lambda: SecurityMode.PERMISSIVE
     )
 
 
@@ -139,7 +139,7 @@ def test_strict_install_validates_signature_before_replacing_installed_plugin(tm
     root = tmp_path / "signed"
     root.mkdir()
     (root / "action.json").write_text(json.dumps(meta), encoding="utf-8")
-    original = b"def run(meta, params): return 1\n"
+    original = b"def run_with_context(meta, params, context): return 1\n"
     (root / "action.py").write_bytes(original)
     author = Ed25519PrivateKey.generate()
     owner = Ed25519PrivateKey.generate()
@@ -167,7 +167,7 @@ def test_strict_install_validates_signature_before_replacing_installed_plugin(tm
     installed = env.paths.user_plugins_dir / "actions" / meta["id"]
     assert signing.verify_author_key_counter_signature(installed, signing_keys.get_public_keys())
     assert (installed / "signature.sig").read_bytes() == (root / "signature.sig").read_bytes()
-    (root / "action.py").write_text("def run(meta, params): return 2\n", encoding="utf-8")
+    (root / "action.py").write_text("def run_with_context(meta, params, context): return 2\n", encoding="utf-8")
     rejected = install("changed")
     assert rejected.status_code == 400
     assert "签名无效" in rejected.json()["error"]

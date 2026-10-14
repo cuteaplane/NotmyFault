@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from notmyfault.core.data_types import (
-    BUILTIN_TYPES, TYPE_ALIASES, DataTypeError, field_type, normalize_type,
+    BUILTIN_TYPES, DataTypeError, field_type, normalize_type,
     normalize_value,
 )
 
@@ -21,7 +21,7 @@ _TRIGGER_OPTIONAL_FIELDS = {
     "sampling_api",
 }
 _ACTION_OPTIONAL_FIELDS = {
-    "params", "permissions", "origin", "execution_api", "precondition_api",
+    "params", "permissions", "origin", "execution_api",
     "outputs", "platforms", "entrypoints", "build", "idempotent",
     "cancellation_api", "contributes", "requires_capabilities",
     "execution_mode", "engines", "security", "author",
@@ -50,7 +50,6 @@ _VIEW_FIELDS = {
 _DATA_TYPE_FIELDS = {"id", "version", "binding", "schema", "label"}
 _PARAMETER_EDITOR_FIELDS = {
     "id", "parameter", "data_type", "value_type", "command", "view", "ui",
-    "accepts_legacy",
 }
 _PARAMETER_EDITOR_UI_FIELDS = {
     "control", "icon", "label", "busy_label", "empty_label", "description",
@@ -460,8 +459,6 @@ def _validate_contributes_field(
                 errors.append(
                     f"{prefix}.value_type 必须与参数 {parameter!r} 的 value_type 一致"
                 )
-            if "accepts_legacy" in editor:
-                errors.append(f"{prefix}.accepts_legacy 只能用于 plugin_data 参数")
         if editor.get("command") not in command_ids:
             errors.append(
                 f"{prefix}.command 引用了未声明命令: {editor.get('command')!r}"
@@ -470,8 +467,6 @@ def _validate_contributes_field(
             errors.append(
                 f"{prefix}.view 引用了未声明视图: {editor.get('view')!r}"
             )
-        if "accepts_legacy" in editor and not isinstance(editor["accepts_legacy"], bool):
-            errors.append(f"{prefix}.accepts_legacy 必须为布尔值")
         ui = editor.get("ui")
         if not isinstance(ui, dict):
             errors.append(f"{prefix}.ui 必须是对象")
@@ -560,8 +555,8 @@ def validate_plugin_meta(
                 f"（允许: {', '.join(sorted(_ALLOWED_SEMANTICS))}）"
             )
 
-    if "trigger_api" in meta and meta["trigger_api"] not in ("legacy", "event-v1", "event-v2"):
-        errors.append("trigger_api 必须为 legacy、event-v1 或 event-v2")
+    if plugin_type in ("trigger", "triggers") and meta.get("trigger_api") != "event-v2":
+        errors.append("trigger 插件必须声明 trigger_api=event-v2")
 
     if plugin_type in ("trigger", "triggers"):
         if "sampling_api" in meta and (meta["sampling_api"] != "poll-v1" or meta.get("trigger_api") != "event-v2"):
@@ -807,10 +802,8 @@ def validate_plugin_meta(
             if isinstance(platforms, list) and set(entrypoints) != set(platforms):
                 errors.append("platforms 与 entrypoints 的平台集合必须一致")
 
-    if "execution_api" in meta and meta["execution_api"] not in ("legacy", "context-v1"):
-        errors.append("execution_api 必须为 legacy 或 context-v1")
-    if "precondition_api" in meta and meta["precondition_api"] != "context-v1":
-        errors.append("precondition_api 目前仅支持 context-v1")
+    if plugin_type in ("action", "actions") and meta.get("execution_api") != "context-v1":
+        errors.append("action 插件必须声明 execution_api=context-v1")
     if "cancellation_api" in meta:
         if meta["cancellation_api"] != "runtime-v1":
             errors.append("cancellation_api 目前仅支持 runtime-v1")
@@ -857,8 +850,8 @@ def validate_plugin_meta(
                         errors.append(
                             f"outputs[{i}].summary 无效: {output['summary']!r}"
                         )
-                    if output_type == "array" and "item_type" in output:
-                        _validate_value_type(output["item_type"], f"outputs[{i}].item_type", errors)
+                    if "item_type" in output:
+                        errors.append(f"outputs[{i}].item_type 已移除，请使用 type.items")
                 else:
                     errors.append(f"outputs[{i}] 必须是字符串或对象")
                     continue
@@ -884,6 +877,8 @@ def validate_plugin_meta(
                 for field in sorted(_REQUIRED_PARAM_FIELDS):
                     if field not in param:
                         errors.append(f"params[{i}] 缺少必填字段: {field}")
+                if "item_type" in param:
+                    errors.append(f"params[{i}].item_type 已移除，请使用 value_type.items")
                 param_name = param.get("name")
                 if (
                     not isinstance(param_name, str)
@@ -950,7 +945,7 @@ def check_payload_contract(
     *,
     normalized=None,
 ) -> List[str]:
-    """未声明 outputs 的旧插件仍跳过输出检查。"""
+    """检查声明的输出字段及其值类型"""
     declared: Dict[str, Dict[str, Any]] = {}
     if isinstance(outputs, list):
         for output in outputs:
@@ -967,27 +962,12 @@ def check_payload_contract(
             problems.append(f"缺少必填输出字段: {name}")
         elif name in payload:
             value = payload[name]
-            output_type = spec.get("type", "any")
-            if "value_type" in spec or output_type not in ("string", "number", "bool", "array", "object", "any"):
-                try:
-                    result = normalize_value(value, field_type(spec), registry, location=f"outputs.{name}")
-                    if normalized is not None:
-                        normalized[name] = result
-                except DataTypeError as error:
-                    problems.append(str(error))
-            elif output_type == "string" and not isinstance(value, str):
-                problems.append(
-                    f"输出字段 {name} 应为 string，实际为 {type(value).__name__}"
-                )
-            elif output_type == "number":
-                if isinstance(value, bool) or not isinstance(value, (int, float)):
-                    problems.append(
-                        f"输出字段 {name} 应为 number，实际为 {type(value).__name__}"
-                    )
-            elif output_type == "bool" and not isinstance(value, bool):
-                problems.append(
-                    f"输出字段 {name} 应为 bool，实际为 {type(value).__name__}"
-                )
+            try:
+                result = normalize_value(value, field_type(spec), registry, location=f"outputs.{name}")
+                if normalized is not None:
+                    normalized[name] = result
+            except DataTypeError as error:
+                problems.append(str(error))
     for key in payload:
         if key not in declared:
             problems.append(f"未声明的输出字段: {key}")

@@ -19,11 +19,9 @@ from notmyfault.security.plugin_checks import (
     evaluate_plugin,
     inspect_plugin,
     inspect_plugin_tree,
-    inspect_signature,
     is_plugin_platform_compatible,
     plugin_directories,
     resolve_plugin_entrypoint,
-    validate_plugin_signature,
 )
 from notmyfault.security.plugins import (
     load_plugin_manifest,
@@ -285,8 +283,6 @@ class PluginLoader:
             meta_with_origin = {
                 **meta, "origin": origin,
                 "signature_kind": inspection.signature.kind,
-                "signature_source": inspection.signature.source,
-                "signature_format": inspection.signature.format,
             }
             self._registry.plugin_roots[plugin_id] = folder_path
             self._registry.plugin_kinds[plugin_id] = kind
@@ -300,7 +296,6 @@ class PluginLoader:
                 "previous_root": previous_root,
                 "file_snapshot": tree.file_snapshot,
                 "signature_kind": inspection.signature.kind,
-                "signature_format": inspection.signature.format,
                 "prev": (old_module, meta_store.get(plugin_id), old_run) if old_run is not None else None,
             }
             if old_run is not None:
@@ -422,15 +417,9 @@ class PluginLoader:
             if tree is None:
                 fail("无法读取插件文件，拒绝导入")
                 return None
-            # 物化阶段必须使用与发现阶段相同的 payload 格式
-            signature_digest = (
-                tree.legacy_digest
-                if entry.get("signature_format") == "legacy"
-                else tree.payload_digest
-            )
             if (
                 plugin_signature_kind_from_digest(
-                    folder_path, origin, signature_digest
+                    folder_path, origin, tree.payload_digest
                 )
                 != expected_signature
             ):
@@ -457,21 +446,6 @@ class PluginLoader:
                 def isolated_run(
                     _meta,
                     params,
-                    _entry=py_file,
-                    _entry_hash=entry_hash,
-                    _info=meta,
-                ):
-                    ok, result = run_isolated_action(
-                        _entry, _entry_hash, _info, params, {},
-                        plugin_root=folder_path, file_snapshot=tree.file_snapshot,
-                    )
-                    if not ok:
-                        raise RuntimeError(f"isolated worker 执行失败: {result}")
-                    return result
-
-                def isolated_run_with_context(
-                    _meta,
-                    params,
                     context,
                     _entry=py_file,
                     _entry_hash=entry_hash,
@@ -485,7 +459,6 @@ class PluginLoader:
                         raise RuntimeError(f"isolated worker 执行失败: {result}")
                     return result
 
-                setattr(isolated_run, "run_with_context", isolated_run_with_context)
                 setattr(isolated_run, "_isolated_proxy", True)
 
                 def check_isolated_load():
@@ -547,13 +520,22 @@ class PluginLoader:
                 fail(f"Python 加载异常: {traceback.format_exc()[-200:]}")
                 return None
 
-            if not hasattr(module, "run"):
+            entry_name = "run_with_context" if plugin_type == "action" else "run"
+            if not callable(getattr(module, entry_name, None)):
                 print(
-                    f"[Engine] 插件 \"{plugin_id}\" ({meta['name']}) 缺少 run() 函数，跳过",
+                    f"[Engine] 插件 \"{plugin_id}\" ({meta['name']}) 缺少 {entry_name}() 函数，跳过",
                     file=sys.stderr,
                 )
-                fail("缺少 run() 函数")
+                fail(f"缺少 {entry_name}() 函数")
                 return None
+
+            if plugin_type == "action":
+                try:
+                    inspect.signature(getattr(module, entry_name)).bind({}, {}, {})
+                except (TypeError, ValueError) as exc:
+                    message = f"动作入口参数不符: {exc}"
+                    fail(message)
+                    return None
 
             if plugin_type == "trigger" and meta.get("sampling_api") == "poll-v1":
                 try:
@@ -562,20 +544,18 @@ class PluginLoader:
                     fail("poll-v1 触发器必须提供 create_sampler(context)")
                     return None
 
-            # event-v1 接收配置列表，event-v2 为每条规则使用独立配置，启动线程前先验证入口。
-            if plugin_type == "trigger" and meta.get("trigger_api") in ("event-v1", "event-v2"):
+            if plugin_type == "trigger":
                 try:
-                    config = [] if meta.get("trigger_api") == "event-v1" else {}
                     emit = lambda *_args: None
-                    inspect.signature(module.run).bind({}, config, emit, threading.Event())
+                    inspect.signature(module.run).bind({}, {}, emit, threading.Event())
                 except (TypeError, ValueError) as exc:
-                    message = f"{meta['trigger_api']} 入口不兼容: {exc}"
+                    message = f"触发器入口参数不符: {exc}"
                     print(f'[Engine] 触发器 "{plugin_id}" {message}', file=sys.stderr)
                     fail(message)
                     return None
 
             self._registry.register(
-                plugin_type, plugin_id, meta, getattr(module, "run"), module,
+                plugin_type, plugin_id, meta, getattr(module, entry_name), module,
                 source_digest=hashlib.sha256(json.dumps(tree.file_snapshot, sort_keys=True).encode()).hexdigest(),
             )
             self._registry.pending.pop(plugin_id, None)

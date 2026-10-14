@@ -62,14 +62,12 @@ class PluginTree:
     file_snapshot: dict[str, str]
     py_sources: dict[str, bytes]
     payload_digest: bytes
-    legacy_digest: bytes
     contents: dict[str, bytes]
 
 
 def inspect_plugin_tree(folder_path: str) -> PluginTree | None:
     contents = {}
     file_snapshot = {}
-    legacy_digest = hashlib.sha256()
     digest = hashlib.sha256()
 
     def entries(files):
@@ -77,7 +75,6 @@ def inspect_plugin_tree(folder_path: str) -> PluginTree | None:
             name = path.relative_to(folder_path).as_posix()
             data = path.read_bytes()
             file_snapshot[name] = hashlib.sha256(data).hexdigest()
-            legacy_digest.update(data)
             if name.endswith(".py") or name in {"action.json", "trigger.json"}:
                 contents[name] = data
             yield name, data
@@ -93,7 +90,6 @@ def inspect_plugin_tree(folder_path: str) -> PluginTree | None:
         file_snapshot=file_snapshot,
         py_sources={str(Path(folder_path) / name): data for name, data in contents.items() if name.endswith(".py")},
         payload_digest=digest.digest(),
-        legacy_digest=legacy_digest.digest(),
         contents=contents,
     )
 
@@ -101,20 +97,10 @@ def inspect_plugin_tree(folder_path: str) -> PluginTree | None:
 @dataclass(frozen=True)
 class PluginSignature:
     kind: str
-    format: str = "v1"
-
-    @property
-    def source(self) -> str:
-        return "local" if self.kind == "official-legacy" else self.kind
 
 
-def inspect_signature(root: str | Path, origin: str, tree: PluginTree, installed_hashes=None) -> PluginSignature:
-    kind = plugin_signature_kind_from_digest(str(root), origin, tree.payload_digest)
-    if kind == "none" and origin == "user" and installed_hashes == tree.file_snapshot:
-        legacy_kind = plugin_signature_kind_from_digest(str(root), origin, tree.legacy_digest)
-        if legacy_kind != "none":
-            return PluginSignature(legacy_kind, "legacy")
-    return PluginSignature(kind)
+def inspect_signature(root: str | Path, origin: str, tree: PluginTree) -> PluginSignature:
+    return PluginSignature(plugin_signature_kind_from_digest(str(root), origin, tree.payload_digest))
 
 
 def validate_plugin_signature(root: Path, meta: dict, origin: str, mode: SecurityMode, signature_kind: str | None = None) -> str:
@@ -212,7 +198,7 @@ def inspect_plugin(root: str | Path, kind: PluginKind, origin: str = "user", *, 
     installed_hashes = (installed_manifest or {}).get(meta.get("id"))
     if installed_hashes is not None:
         result.integrity_errors = plugin_integrity_problems(tree.file_snapshot, installed_hashes)
-    result.signature = inspect_signature(root, origin, tree, installed_hashes)
+    result.signature = inspect_signature(root, origin, tree)
     return result
 
 
@@ -249,7 +235,7 @@ def evaluate_plugin(result: PluginInspection, mode: SecurityMode, *, check_signa
             validate_plugin_signature(result.root, meta, result.origin, mode, result.signature.kind)
         except ValueError as error:
             errors.append(str(error))
-        if result.signature.kind == "none" and mode == SecurityMode.NORMAL:
+        if result.signature.kind == "none" and mode == SecurityMode.PERMISSIVE:
             warnings.append("签名无效，降级加载")
     (errors if mode == SecurityMode.STRICT else warnings).extend(strict_findings)
     if result.borrowed:
@@ -263,8 +249,4 @@ def inspection_report(result: PluginInspection, mode: SecurityMode) -> dict:
     return {
         "development": evaluate_plugin(result, SecurityMode.STRICT, check_signature=False),
         "load_policy": {"mode": mode.value, **evaluate_plugin(result, mode)},
-        "signature": {
-            "source": result.signature.source,
-            "format": result.signature.format,
-        },
     }
