@@ -1,22 +1,9 @@
 # NotmyFault
 
-> [!WARNING]
-> ## 下一 Alpha 版本将包含大量破坏性更改
->
-> NotmyFault 的下一个 Alpha 大版本 `alpha-0.16.x` 将迎来一次大规模的核心架构更改。
->
-> 这次更新并不是普通的功能迭代，而是会对项目底层的运行方式进行较大调整，涉及规则执行、触发器生命周期、插件接口、事件系统以及部分内部数据结构。
->
-> 因此，下一个 Alpha 版本**不可能兼容当前版本**。现有规则、插件、配置文件以及依赖旧接口的代码，都可能需要进行不同程度的调整。
->
-> 部分旧接口、兼容层和历史遗留实现将在这一过程中被直接移除。
->
-> 由于目前仍处于 Alpha 阶段，在重构完成之前，接口和行为仍可能继续变化。建议在升级前备份现有配置和规则，并留意后续版本说明。
-
 闲着没事儿写的自动化工具......
 
 NotmyFault 顾名思义是一个自动化（废话），由各种条件出发，以各种方式执行。
-当前版本 `alpha-0.15.0`。项目站点：[https://www.marshmallowmc.cn/](https://www.marshmallowmc.cn/)
+当前版本 `alpha-0.16.0`。项目站点：[https://www.marshmallowmc.cn/](https://www.marshmallowmc.cn/)
 
 ## 亮点
 
@@ -65,7 +52,7 @@ python build.py
 ```
 
 `dashboard.pyw` 会拉起引擎进程 `NOTMYFAULT.pyw`，用来日常管理规则和安装插件。
-首次运行源码前需要执行构建。缺少 build.json 或其签名时，引擎会拒绝启动；严格模式还会检查内置插件是否缺少签名。安装文件异常时，设置里的安全页会引导重新安装 NotmyFault。
+首次运行源码前需要执行构建。缺少有效 build.json 时安全模式为 strict；启动还会检查程序完整性及内置插件签名。安装文件异常时，设置里的安全页会引导重新安装 NotmyFault。
 
 ### Linux
 
@@ -104,81 +91,42 @@ Wayland 默认禁止普通应用监听全局按键或枚举其他应用的窗口
 
 | 命令 | 作用 |
 | --- | --- |
-| `python build.py build` | strict 构建：生成密码加密的私钥，签名全部插件和 build.json。不带子命令时默认执行它 |
-| `python build.py build --security-mode=permissive` | 本地开发构建：使用不加密私钥，全程免密码 |
+| `python build.py build` | strict 构建：使用已加密私钥，签名全部插件和 build.json。不带子命令时默认执行它 |
+| `python build.py build --security-mode=permissive` | 本地开发构建：不要求私钥加密 |
 | `python build.py verify` | 校验所有插件签名，有缺失或无效时以非零退出码结束 |
 | `python build.py init-keys` | 生成 Ed25519 密钥对；`--encrypt` 加密私钥，`--force` 覆盖已有密钥 |
 | `python build.py version` | 查看密钥状态、公钥指纹和插件签名数量 |
 
 - 修改内置插件或核心源码后需要重新 build，否则旧签名失效。
-- 安全模式有 strict / normal / permissive 三档，以通过签名验证的 build.json 为准，缺少有效构建信息时默认 strict。环境变量 `NOTMYFAULT_MODE` 只能提高安全等级，不能降低。
-- normal 和 permissive 都使用不加密私钥，适合本地开发和测试。
-- normal 和 permissive 允许加载签名缺失或无效的插件；配置与规则的签名验证、插件结构检查和管理员执行确认仍然生效。
+- 安全模式有 strict 和 permissive 两种。签名验证通过的 build.json 决定模式，缺失时为 strict。环境变量 `NOTMYFAULT_MODE` 只能提高安全等级：`alpha` 对应 permissive，`stable` 和 `master` 对应 strict。
+- permissive 不要求私钥加密，适合本地开发和测试。
+- permissive 允许加载签名缺失或无效的插件；配置与规则的签名验证、插件结构检查和管理员执行确认仍然生效。
 
 Windows 安装包由 `installer/windows/build.ps1` 构建。
 
 ## 规则模型
 
-一条规则由三部分组成：
+规则格式为 v2.1 平面图，使用 `workflow.nodes` 和 `workflow.edges` 保存节点及连线。
+触发器直接连接 AND / OR / NOT 或 IF / ELIF / ELSE，可以随事件组嵌套与折叠。
+执行顺序由控制连线确定；动作失败可以连接补救动作组，完成后按停止／继续设置返回。
+补救成功后停止的运行显示“已补救”；补救成功并继续完成主流程的运行记成功。
 
-```text
-触发条件（AND / OR / NOT）→ 动作按顺序执行（支持 IF / ELSE）
-```
-
-触发条件统一使用 `condition`：单个触发器直接作为叶子，多个触发器用条件组组合。
-旧规则的 `event/trigger` 在读取或导入时转换，保存后使用 `condition`。
-触发器和动作带稳定的 `binding_id`，保存时会补齐；后续动作用 `$ref` 引用这些节点的输出：
+触发器和动作带稳定的 `binding_id`，保存时为缺少身份的新节点分配 ID。
+后续动作使用 `$ref` 引用节点输出，例如：
 
 ```json
-{
-  "name": "晚间亮度",
-  "condition": {
-    "op": "all",
-    "children": [
-      {
-        "binding_id": "t_time01",
-        "type": "time_schedule",
-        "params": {"time": "20:00"}
-      },
-      {
-        "binding_id": "t_power01",
-        "type": "power_state",
-        "params": {"state": "ac"}
-      }
-    ]
-  },
-  "actions": [
-    {
-      "binding_id": "a_bright01",
-      "type": "display_control",
-      "params": {
-        "action": "set_brightness",
-        "brightness": 70
-      }
-    },
-    {
-      "binding_id": "a_notify01",
-      "type": "notify",
-      "params": {
-        "title": "NotmyFault",
-        "message": "晚间亮度已调整"
-      }
-    }
-  ]
-}
+{"$ref": {"scope": "step", "node": "a_append01", "path": ["file"]}}
 ```
 
-NOT 用于等待指定事件未发生，必须设置等待时长；收到匹配事件后重新计时，
-超时触发一次，直到再次收到事件后重新开始。它判断事件是否发生，不查询当前系统状态。
-IF 根据本次触发数据或前序动作结果选择 THEN / ELSE 分支，执行完分支后继续后续动作。
-运行前检查已移除，含非空 `preconditions` 的旧规则需要在编辑器中移除旧检查并重新配置。
+事件判断读取收到的事件。流程内判断使用执行到该节点为止收到的记录，等待期间的新
+事件也计入；持续未发生的时间不足时条件不成立。显式等待由等待事件组设置。
 
 Dashboard 侧栏是首页、自动化、插件和设置。运行记录在自动化里，安全在设置里。
 规则在自动化页编辑和校验，也可以选用 AI 服务起草草稿。
 规则支持只读常量和单次运行内的变量，参数可传递路径、时间、精确数字、结构化数据
 及插件声明的共享类型。格式与类型协议见 [docs/data-types.md](docs/data-types.md)。
 
-条件树节点和数据引用格式见 [docs/rule-schema-v2.md](docs/rule-schema-v2.md)。
+平面图和数据引用格式见 [docs/rule-schema-v2.md](docs/rule-schema-v2.md)。
 
 ## 数据位置
 
@@ -255,7 +203,7 @@ python nmf.py plugin pack path/to/plugin --output-dir dist
 - [动作运行摘要](docs/run-summary-policy.md)
 - [API 后端结构](docs/api-backend-architecture.md)
 - [变量与数据类型](docs/data-types.md)
-- [规则格式 v2](docs/rule-schema-v2.md)
+- [规则格式 v2.1](docs/rule-schema-v2.md)
 - [Windows 原生调用安全](docs/native-safety.md)
 
 ## 已知限制
