@@ -34,16 +34,12 @@ def signed_payload(secret: bytes, value: dict) -> dict:
     return payload
 
 
-def test_removed_admin_settings_are_discarded_during_normalization():
-    config = _normalize_config({
-        "settings": {
-            "admin_authorization_mode": "engine_start",
-            "admin_rule_key_verification": False,
-            "custom": "kept",
-        },
-    })
-
-    assert config["settings"] == {"custom": "kept"}
+@pytest.mark.parametrize("field", ["admin_authorization_mode", "admin_rule_key_verification"])
+def test_removed_admin_settings_are_rejected_without_modifying_input(field):
+    config = {"settings": {field: False, "custom": "kept"}}
+    with pytest.raises(ConfigValidationError, match=field):
+        _normalize_config(config)
+    assert config == {"settings": {field: False, "custom": "kept"}}
 
 
 @pytest.mark.parametrize("obsolete", ["event", "condition", "actions", "preconditions"])
@@ -169,7 +165,7 @@ def test_signed_malformed_rule_is_rejected_before_runtime(tmp_path):
     malformed["workflow"]["nodes"][1]["params"] = ["not", "an", "object"]
     paths.rules_file.write_text(
         json.dumps(
-            signed_payload(secret, {"schema_version": "2.1", "rules": [malformed]}),
+            signed_payload(secret, {"schema_version": "2.1", "value_encoding": "typed-v1", "rules": [malformed]}),
             ensure_ascii=False,
         ),
         encoding="utf-8",
@@ -238,25 +234,30 @@ def test_security_inspection_summarizes_rules_and_detects_tamper(tmp_path):
         "failure_actions": [{"type": "notify", "params": {"message": "private-failure-message"}}],
     }])
     graph = rule["workflow"]
-    source, restricted = graph["nodes"]
+    source = next(node for node in graph['nodes'] if node['type'] == 'trigger')
+    restricted = next(node for node in graph['nodes'] if node['type'] == 'shutdown_system')
     group = {"binding_id": "a_choices001", "type": "event_group", "group_type": "if", "branches": [
         {"id": "b_initial001"}, {"id": "b_alternate001"}, {"id": "b_fallback001", "else": True},
     ]}
     condition = {"binding_id": "a_compare001", "type": "condition", "parent": group["binding_id"],
                  "predicate": {"op": "eq", "left": "private-condition", "right": "private-condition"}}
     branch = {"binding_id": "a_branch001", "type": "notify", "parent": group["binding_id"],
-              "params": {"message": "private-branch-message"},
-              "failure_actions": [{"binding_id": "a_failure001", "type": "shutdown_system", "params": {}}]}
+              "params": {"message": "private-branch-message"}}
+    handler = {'binding_id': 'a_recovery001', 'type': 'action_group', 'parent': group['binding_id']}
+    failure = {'binding_id': 'a_failure001', 'type': 'shutdown_system', 'parent': handler['binding_id'], 'params': {}}
     alternate = {"binding_id": "a_alternate001", "type": "shutdown_system", "parent": group["binding_id"],
                  "params": {"reason": "private-elif-message"}}
     fallback = {"binding_id": "a_fallback001", "type": "shutdown_system", "parent": group["binding_id"], "params": {}}
-    graph["nodes"] += [group, condition, branch, alternate, fallback]
+    graph["nodes"] += [group, condition, branch, alternate, fallback, handler, failure]
     graph["edges"] += [
         {"source": restricted["binding_id"], "port": "next", "target": group["binding_id"], "channel": "control"},
         {"source": condition["binding_id"], "port": "result", "target": group["binding_id"], "target_port": "b_initial001", "channel": "condition"},
+        {"source": condition["binding_id"], "port": "result", "target": group["binding_id"], "target_port": "b_alternate001", "channel": "condition"},
         {"source": group["binding_id"], "port": "b_initial001", "target": branch["binding_id"], "channel": "control"},
         {"source": group["binding_id"], "port": "b_alternate001", "target": alternate["binding_id"], "channel": "control"},
         {"source": group["binding_id"], "port": "b_fallback001", "target": fallback["binding_id"], "channel": "control"},
+        {'source': branch['binding_id'], 'port': 'failure', 'target': handler['binding_id'], 'channel': 'control'},
+        {'source': handler['binding_id'], 'port': 'entry', 'target': failure['binding_id'], 'channel': 'control'},
     ]
     assert store.save_rules([rule])
     status = SettingsService(store, lambda: {"actions": {
@@ -275,13 +276,16 @@ def test_security_inspection_summarizes_rules_and_detects_tamper(tmp_path):
         "token": "***"
     }
     summaries = status["summary"]["rules"][0]["actions"]
-    branch = summaries[4]
-    assert branch["params"] == {"message": "***"}
-    assert branch["high_risk"] is True
-    assert branch["failure_actions"][0]["type"] == "shutdown_system"
-    assert summaries[5]["high_risk"] is True
-    assert summaries[5]["params"] == {"reason": "***"}
-    assert summaries[6]["high_risk"] is True
+    by_id = {item['binding_id']: item for item in summaries}
+    branch = by_id['a_branch001']
+    assert branch['params'] == {'message': '***'}
+    assert branch['high_risk'] is False
+    assert by_id['a_failure001']['type'] == 'shutdown_system'
+    assert by_id['a_failure001']['high_risk'] is True
+    assert by_id['a_failure001']['parent'] == 'a_recovery001'
+    assert by_id['a_alternate001']['high_risk'] is True
+    assert by_id['a_alternate001']['params'] == {'reason': '***'}
+    assert by_id['a_fallback001']['high_risk'] is True
     raw = json.loads(paths.rules_file.read_text(encoding="utf-8"))
     raw["rules"][0]["name"] = "篡改"
     paths.rules_file.write_text(json.dumps(raw), encoding="utf-8")
@@ -324,3 +328,152 @@ def test_approve_rejects_dynamic_literal_only_parameter(tmp_path):
     }
     with pytest.raises(SettingsServiceError, match="数据绑定无效"):
         SettingsService(store, lambda: schema).approve_security()
+
+
+@pytest.mark.parametrize("encoding", [None, "json", "typed-v2", True, 1, {}, []])
+@pytest.mark.parametrize("reader", ["verified", "unsigned", "backup"])
+def test_rule_encoding_required_on_all_read_paths(tmp_path, encoding, reader):
+    paths = make_paths(tmp_path)
+    store = make_store(paths)
+    payload = {"schema_version": "2.1", "rules": [simple_rule()]}
+    if encoding is not None:
+        payload["value_encoding"] = encoding
+    target = paths.rules_file.with_suffix(".json.bak") if reader == "backup" else paths.rules_file
+    target.write_text(json.dumps(signed_payload(paths.config_secret_file.read_bytes(), payload)), encoding="utf-8")
+    if reader == "backup":
+        paths.rules_file.write_text("{broken", encoding="utf-8")
+    before = target.read_bytes()
+    with pytest.raises(ConfigValidationError):
+        {"verified": store.load_verified_rules, "unsigned": store.load_unsigned_files, "backup": store.load_rules}[reader]()
+    assert target.read_bytes() == before
+    if reader == "backup":
+        assert paths.rules_file.read_text(encoding="utf-8") == "{broken"
+
+
+@pytest.mark.parametrize("schema", [None, 2, "2", "3", "2.0"])
+@pytest.mark.parametrize("reader", ["verified", "unsigned", "backup"])
+def test_rule_format_is_not_converted_by_any_read_path(tmp_path, schema, reader):
+    paths = make_paths(tmp_path)
+    store = make_store(paths)
+    payload = {"schema_version": schema, "value_encoding": "typed-v1", "rules": [simple_rule()]}
+    target = paths.rules_file.with_suffix(".json.bak") if reader == "backup" else paths.rules_file
+    target.write_text(json.dumps(signed_payload(paths.config_secret_file.read_bytes(), payload)), encoding="utf-8")
+    if reader == "backup":
+        paths.rules_file.write_text("{broken", encoding="utf-8")
+    before = target.read_bytes()
+    with pytest.raises(ConfigValidationError):
+        {"verified": store.load_verified_rules, "unsigned": store.load_unsigned_files, "backup": store.load_rules}[reader]()
+    assert target.read_bytes() == before
+
+
+def test_config_does_not_require_or_decode_rule_value_encoding(tmp_path, monkeypatch):
+    paths = make_paths(tmp_path)
+    store = make_store(paths)
+    literal = {"$nmf_value": {"type": "int", "data": "9007199254740993"}}
+    config = {"settings": {}, "custom": literal}
+    paths.config_file.write_text(json.dumps(signed_payload(paths.config_secret_file.read_bytes(), config)), encoding="utf-8")
+    from notmyfault.core.value_codec import decode_value
+    def decode_rules_only(value):
+        assert isinstance(value, list), "配置不应执行规则值解码"
+        return decode_value(value)
+    monkeypatch.setattr("notmyfault.config.decode_value", decode_rules_only)
+    assert store.load_verified_config()["custom"] == literal
+    assert store.load_unsigned_files()[0]["custom"] == literal
+    paths.config_file.with_suffix(".json.bak").write_bytes(paths.config_file.read_bytes())
+    paths.config_file.write_text("{broken", encoding="utf-8")
+    assert store.load_config()["custom"] == literal
+
+
+@pytest.mark.parametrize("reader", ["verified", "backup"])
+def test_rule_signature_checked_before_decoding(tmp_path, monkeypatch, reader):
+    paths = make_paths(tmp_path)
+    store = make_store(paths)
+    payload = {"schema_version": "2.1", "value_encoding": "typed-v1", "rules": [], "_signature": "invalid"}
+    target = paths.rules_file.with_suffix(".json.bak") if reader == "backup" else paths.rules_file
+    target.write_text(json.dumps(payload), encoding="utf-8")
+    if reader == "backup":
+        paths.rules_file.write_text("{broken", encoding="utf-8")
+    def unexpected_decode(_value):
+        raise AssertionError("无效签名的数据不应解码")
+    monkeypatch.setattr("notmyfault.config.decode_value", unexpected_decode)
+    with pytest.raises(ConfigValidationError):
+        (store.load_verified_rules if reader == "verified" else store.load_rules)()
+
+
+def test_valid_signed_rule_decodes_exact_values_after_verification(tmp_path):
+    store = make_store(make_paths(tmp_path))
+    rule = simple_rule()
+    value = 9007199254740993123456789
+    rule["constants"] = [{"id": "c_exact0001", "name": "精确整数", "value_type": "int", "value": value}]
+    assert store.save_rules([rule])
+    disk = json.loads(store.paths.rules_file.read_text(encoding="utf-8"))
+    assert disk["rules"][0]["constants"][0]["value"] == {"$nmf_value": {"type": "int", "data": str(value)}}
+    assert store.load_verified_rules()[0]["constants"][0]["value"] == value
+
+
+@pytest.mark.parametrize("field", ["admin_authorization_mode", "admin_rule_key_verification"])
+@pytest.mark.parametrize("reader", ["verified", "unsigned", "backup"])
+def test_removed_admin_settings_rejected_for_signed_unsigned_and_backup_files(tmp_path, field, reader):
+    paths = make_paths(tmp_path)
+    store = make_store(paths)
+    config = {"settings": {field: False}}
+    target = paths.config_file.with_suffix(".json.bak") if reader == "backup" else paths.config_file
+    target.write_text(json.dumps(signed_payload(paths.config_secret_file.read_bytes(), config)), encoding="utf-8")
+    if reader == "backup":
+        paths.config_file.write_text("{broken", encoding="utf-8")
+    before = target.read_bytes()
+    with pytest.raises(ConfigValidationError):
+        {"verified": store.load_verified_config, "unsigned": store.load_unsigned_files, "backup": store.load_config}[reader]()
+    assert target.read_bytes() == before
+
+
+@pytest.mark.parametrize("reader", ["verified", "unsigned", "backup"])
+def test_missing_rules_array_rejected_in_all_read_paths(tmp_path, reader):
+    paths = make_paths(tmp_path)
+    store = make_store(paths)
+    payload = {"schema_version": "2.1", "value_encoding": "typed-v1"}
+    target = paths.rules_file.with_suffix(".json.bak") if reader == "backup" else paths.rules_file
+    target.write_text(json.dumps(signed_payload(paths.config_secret_file.read_bytes(), payload)), encoding="utf-8")
+    if reader == "backup":
+        paths.rules_file.write_text("{broken", encoding="utf-8")
+    with pytest.raises(ConfigValidationError):
+        {"verified": store.load_verified_rules, "unsigned": store.load_unsigned_files, "backup": store.load_rules}[reader]()
+
+
+def test_approval_does_not_rewrite_missing_rule_encoding(tmp_path):
+    paths = make_paths(tmp_path)
+    store = make_store(paths)
+    payload = {"schema_version": "2.1", "rules": [simple_rule()], "_signature": "invalid"}
+    paths.rules_file.write_text(json.dumps(payload), encoding="utf-8")
+    before = paths.rules_file.read_bytes()
+    with pytest.raises(SettingsServiceError, match="规则数据编码版本不受支持"):
+        SettingsService(store).approve_security()
+    assert paths.rules_file.read_bytes() == before
+    assert not paths.rules_file.with_suffix(".json.bak").exists()
+
+
+@pytest.mark.parametrize("invalid", ["condition", "actions", "failure_actions", "unknown"])
+@pytest.mark.parametrize("reader", ["verified", "unsigned", "backup"])
+def test_rejected_rule_fields_are_not_converted_on_read_or_recovery(tmp_path, invalid, reader):
+    paths = make_paths(tmp_path)
+    store = make_store(paths)
+    rule = simple_rule()
+    if invalid == "condition":
+        rule["condition"] = {"op": "any", "children": []}
+    elif invalid == "actions":
+        rule["actions"] = [{"type": "notify", "params": {}}]
+    elif invalid == "failure_actions":
+        rule["workflow"]["nodes"][1]["failure_actions"] = [{"type": "notify", "params": {}}]
+    else:
+        rule["unknown"] = "unsupported"
+    payload = {"schema_version": "2.1", "value_encoding": "typed-v1", "rules": [rule]}
+    target = paths.rules_file.with_suffix(".json.bak") if reader == "backup" else paths.rules_file
+    target.write_text(json.dumps(signed_payload(paths.config_secret_file.read_bytes(), payload)), encoding="utf-8")
+    if reader == "backup":
+        paths.rules_file.write_text("{broken", encoding="utf-8")
+    before = target.read_bytes()
+    with pytest.raises(ConfigValidationError):
+        {"verified": store.load_verified_rules, "unsigned": store.load_unsigned_files, "backup": store.load_rules}[reader]()
+    assert target.read_bytes() == before
+    if reader == "backup":
+        assert paths.rules_file.read_text(encoding="utf-8") == "{broken"

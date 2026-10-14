@@ -170,8 +170,9 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         settings = {}
     else:
         settings = dict(settings)
-    settings.pop("admin_authorization_mode", None)
-    settings.pop("admin_rule_key_verification", None)
+    removed = sorted(set(settings) & {"admin_authorization_mode", "admin_rule_key_verification"})
+    if removed:
+        raise ConfigValidationError("配置包含已移除的管理员字段: " + ", ".join(removed))
     if "ai_drafting" in settings:
         settings["ai_drafting"] = get_ai_drafting_settings(result)
     result["settings"] = settings
@@ -347,13 +348,13 @@ class SignedConfigStore:
             raise ConfigValidationError(f"{label}缺少签名")
         if not self._verify(raw, signature):
             raise ConfigValidationError(f"{label}签名校验失败")
-        return self._decode_rules_data(raw)
+        return raw
 
     @staticmethod
     def _decode_rules_data(data):
+        if data.get("schema_version") != "2.1":
+            raise ConfigValidationError("规则只支持格式 2.1")
         encoding = data.get("value_encoding")
-        if encoding is None:
-            return data
         if encoding != "typed-v1":
             raise ConfigValidationError("规则数据编码版本不受支持")
         try:
@@ -367,27 +368,29 @@ class SignedConfigStore:
             raise ConfigValidationError("规范化后的配置必须是对象")
         return normalized
 
-    def load_verified_rules(self, *, for_editing: bool = False) -> List[Dict[str, Any]]:
-        raw = self._read_signed(self.rules_path, "规则")
-        if raw.get("schema_version") != "2.1":
-            raise ConfigValidationError("规则只支持格式 2.1")
+    @classmethod
+    def _normalize_rules_data(cls, data) -> List[Dict[str, Any]]:
+        raw = cls._decode_rules_data(data)
         rules = raw.get("rules")
         if not isinstance(rules, list):
             raise ConfigValidationError("rules 必须是列表")
-        def validate(items):
-            _validate_rules_for_runtime(items)
-
-        validate(rules)
-        normalized = normalize_rules(rules)
-        validate(normalized)
+        _validate_rules_for_runtime(rules)
+        try:
+            normalized = normalize_rules(rules)
+        except ValueError as error:
+            raise ConfigValidationError(str(error)) from error
+        _validate_rules_for_runtime(normalized)
         return normalized
+
+    def load_verified_rules(self) -> List[Dict[str, Any]]:
+        return self._normalize_rules_data(self._read_signed(self.rules_path, "规则"))
 
     def _recover_config(self) -> Dict[str, Any] | None:
         backup = self.config_path + ".bak"
         try:
             with open(backup, "r", encoding="utf-8") as file:
                 data = json.load(file)
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             return None
         if not isinstance(data, dict):
             return None
@@ -398,7 +401,10 @@ class SignedConfigStore:
             return None
         if 'rules' in data or 'processes' in data:
             return None
-        normalized = _normalize_config(data)
+        try:
+            normalized = _normalize_config(data)
+        except ConfigValidationError:
+            return None
         if not isinstance(normalized, dict) or not self.save_config(normalized):
             return None
         return normalized
@@ -408,7 +414,7 @@ class SignedConfigStore:
         try:
             with open(backup, "r", encoding="utf-8") as file:
                 data = json.load(file)
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             return None
         if not isinstance(data, dict):
             return None
@@ -417,10 +423,10 @@ class SignedConfigStore:
             return None
         if not signature or not self._verify(data, signature):
             return None
-        if data.get("schema_version") != "2.1":
+        try:
+            rules = self._normalize_rules_data(data)
+        except ConfigValidationError:
             return None
-        rules = normalize_rules(self._decode_rules_data(data).get("rules", []))
-        _validate_rules_for_runtime(rules)
         return rules if self.save_rules(rules) else None
 
     def load_config(self) -> Dict[str, Any]:
@@ -468,7 +474,7 @@ class SignedConfigStore:
         try:
             with open(self.config_path, "r", encoding="utf-8") as file:
                 config = json.load(file)
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             return {"status": "unreadable", "reason": "配置文件无法读取", "summary": None}
         if not isinstance(config, dict):
             return {"status": "unreadable", "reason": "配置根节点不是对象", "summary": None}
@@ -485,7 +491,7 @@ class SignedConfigStore:
             try:
                 with open(self.rules_path, "r", encoding="utf-8") as file:
                     rules_data = json.load(file)
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
                 return {"status": "unreadable", "reason": "规则文件无法读取", "summary": None}
             if not isinstance(rules_data, dict):
                 return {"status": "unreadable", "reason": "规则文件根节点不是对象", "summary": None}
@@ -509,7 +515,7 @@ class SignedConfigStore:
         try:
             with open(self.config_path, "r", encoding="utf-8") as file:
                 config = json.load(file)
-        except (json.JSONDecodeError, OSError) as error:
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as error:
             raise ConfigValidationError(f"配置文件无法解析: {error}") from error
         if not isinstance(config, dict):
             raise ConfigValidationError("配置根节点不是对象")
@@ -523,16 +529,10 @@ class SignedConfigStore:
             try:
                 with open(self.rules_path, "r", encoding="utf-8") as file:
                     rules_data = json.load(file)
-            except (json.JSONDecodeError, OSError) as error:
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError) as error:
                 raise ConfigValidationError(f"规则文件无法解析: {error}") from error
             if not isinstance(rules_data, dict):
                 raise ConfigValidationError("规则文件根节点不是对象")
             rules_data.pop(_SIGNATURE_KEY, None)
-            rules_data = self._decode_rules_data(rules_data)
-            rules = rules_data.get("rules", [])
-            if not isinstance(rules, list):
-                raise ConfigValidationError("rules 必须是列表")
-            _validate_rules_for_runtime(rules)
-            normalized_rules = normalize_rules(rules)
-            _validate_rules_for_runtime(normalized_rules)
+            normalized_rules = self._normalize_rules_data(rules_data)
         return normalized_config, normalized_rules
