@@ -4,7 +4,7 @@
 
 import os
 
-from notmyfault.plugin_api import native_lock
+from notmyfault.plugin_api import native_lock, action_values
 
 _ERROR_ENVVAR_NOT_FOUND = 203
 
@@ -77,7 +77,8 @@ def _unset(name):
     return {"name": name, "existed": existed}
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
+    params = action_values(params)
     mode = params.get("mode", "get")
     if mode not in ("get", "set", "unset"):
         raise ValueError("未知操作")

@@ -40,8 +40,6 @@ def _sleep(total, cancellation):
     return time.monotonic() - started
 
 
-def run(action_info, params):
-    return run_with_context(action_info, params, {})
 
 
 def run_with_context(action_info, params, context):

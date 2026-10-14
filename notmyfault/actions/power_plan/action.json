@@ -9,6 +9,7 @@
         "power.profile"
     ],
     "enabled": true,
+    "execution_api": "context-v1",
     "idempotent": true,
     "platforms": [
         "windows",

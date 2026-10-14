@@ -35,7 +35,7 @@ def test_tar_rejects_special_members_before_extracting_any_file(tmp_path, member
     target = tmp_path / "out"
     target.mkdir()
     with pytest.raises(ValueError, match="拒绝解压"):
-        file_operation.run({}, {"operation": "extract", "source": str(archive), "destination": str(target)})
+        file_operation.run_with_context({}, {"operation": "extract", "source": str(archive), "destination": str(target)}, {})
     assert list(target.iterdir()) == []
 
 
@@ -73,9 +73,9 @@ def test_zip_rejects_archives_over_entry_limit(tmp_path, monkeypatch):
     target.mkdir()
 
     with pytest.raises(ValueError, match="条目过多"):
-        file_operation.run(
+        file_operation.run_with_context(
             {}, {"operation": "extract", "source": str(archive), "destination": str(target)}
-        )
+        , {})
     assert list(target.iterdir()) == []
 
 
@@ -88,9 +88,9 @@ def test_zip_rejects_archives_over_size_limit(tmp_path, monkeypatch):
     target.mkdir()
 
     with pytest.raises(ValueError, match="大小超过上限"):
-        file_operation.run(
+        file_operation.run_with_context(
             {}, {"operation": "extract", "source": str(archive), "destination": str(target)}
-        )
+        , {})
     assert list(target.iterdir()) == []
 
 
@@ -131,9 +131,9 @@ def test_zip_checks_extracted_paths_before_writing_members(tmp_path, path_kind):
             output.writestr("first.txt", "normal")
             output.writestr(member, "escaped")
         with pytest.raises(ValueError, match="非法|越界"):
-            file_operation.run({}, {
+            file_operation.run_with_context({}, {
                 "operation": "extract", "source": str(archive), "destination": str(target),
-            })
+            }, {})
         assert not (target / "first.txt").exists()
         assert list(outside.iterdir()) == []
     finally:
@@ -157,10 +157,10 @@ def test_file_operations_reject_destinations_inside_root_and_regular_sources(
     for name in ("copytree", "move", "make_archive"):
         monkeypatch.setattr(file_operation.shutil, name, forbidden_operation)
     with pytest.raises(ValueError, match="内部"):
-        file_operation.run({}, {
+        file_operation.run_with_context({}, {
             "operation": operation, "source": str(source), "destination": str(destination),
             "overwrite": True,
-        })
+        }, {})
     assert not destination.exists()
 
 
@@ -213,7 +213,7 @@ def test_http_action_rejects_localhost_before_opening_network(monkeypatch):
         lambda *args, **kwargs: opened.append((args, kwargs)),
     )
     with pytest.raises(ValueError, match="内网"):
-        http_request.run({}, {"url": "http://127.0.0.1/admin"})
+        http_request.run_with_context({}, {"url": "http://127.0.0.1/admin"}, {})
     assert opened == []
 
 
@@ -224,10 +224,10 @@ def test_http_action_rejects_transport_headers(monkeypatch):
         lambda url: (urlparse(url), ("203.0.113.10",)),
     )
     with pytest.raises(ValueError, match="Host"):
-        http_request.run(
+        http_request.run_with_context(
             {},
             {"url": "https://example.com", "headers": "Host: localhost"},
-        )
+        {})
 
 
 @pytest.mark.parametrize("scheme", ["http", "https"])
@@ -458,21 +458,21 @@ def test_pinned_socket_never_resolves_the_hostname_again(monkeypatch):
 def test_linux_shortcut_rejects_multiline_fields(monkeypatch):
     monkeypatch.setattr(create_shortcut.sys, "platform", "linux")
     with pytest.raises(ValueError, match="换行"):
-        create_shortcut.run(
+        create_shortcut.run_with_context(
             {},
             {
                 "name": "safe",
                 "target_path": "/usr/bin/tool\nX-GNOME-Autostart-enabled=true",
                 "location": "start_menu",
             },
-        )
+        {})
 
 
 @pytest.mark.parametrize("prefix,escaped_prefix", [("", ""), (" ", r"\s"), ("\t", r"\t")])
 def test_linux_shortcut_quotes_exec_tokens(tmp_path, monkeypatch, prefix, escaped_prefix):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     monkeypatch.setattr(create_shortcut.sys, "platform", "linux")
-    result = create_shortcut.run(
+    result = create_shortcut.run_with_context(
         {},
         {
             "name": "safe",
@@ -482,7 +482,7 @@ def test_linux_shortcut_quotes_exec_tokens(tmp_path, monkeypatch, prefix, escape
             "working_directory": prefix + "/tmp/work\\folder ",
             "icon_path": prefix + "/tmp/icon.png ",
         },
-    )
+    {})
     content = Path(result["shortcut_path"]).read_text(encoding="utf-8")
     assert f"Path={escaped_prefix}/tmp/work\\\\folder\\s\n" in content
     assert f"Icon={escaped_prefix}/tmp/icon.png\\s\n" in content
@@ -494,7 +494,7 @@ def test_linux_shortcut_quotes_exec_tokens(tmp_path, monkeypatch, prefix, escape
 
 def test_launch_program_rejects_unbalanced_quotes():
     with pytest.raises(ValueError, match="引号"):
-        launch_program.run({}, {"path": "tool", "args": '"unfinished'})
+        launch_program.run_with_context({}, {"path": "tool", "args": '"unfinished'}, {})
 
 
 @pytest.mark.parametrize("platform", [
@@ -514,7 +514,7 @@ def test_launch_program_preserves_paths_and_platform_arguments(monkeypatch, plat
     else:
         arguments = '--config "/tmp/a b.txt" --label "two words" --empty ""'
         expected = [path, "--config", "/tmp/a b.txt", "--label", "two words", "--empty", ""]
-    launch_program.run({}, {"path": path, "args": arguments, "working_directory": directory})
+    launch_program.run_with_context({}, {"path": path, "args": arguments, "working_directory": directory}, {})
     assert len(started) == 1
     assert started[0][0] == expected
     assert started[0][1]["cwd"] == (directory or None)
@@ -523,7 +523,7 @@ def test_launch_program_preserves_paths_and_platform_arguments(monkeypatch, plat
 def test_kill_process_rejects_critical_windows_process(monkeypatch):
     monkeypatch.setattr(kill_process.os, "name", "nt")
     with pytest.raises(ValueError, match="关键系统进程"):
-        kill_process.run({}, {"process_name": "lsass"})
+        kill_process.run_with_context({}, {"process_name": "lsass"}, {})
 
 
 def test_kill_process_handles_missing_pid_on_access_denied(monkeypatch):
@@ -540,4 +540,4 @@ def test_kill_process_handles_missing_pid_on_access_denied(monkeypatch):
         lambda fields: [DeniedProcess()],
     )
     with pytest.raises(RuntimeError, match="权限不足"):
-        kill_process.run({}, {"process_name": "demo"})
+        kill_process.run_with_context({}, {"process_name": "demo"}, {})

@@ -26,7 +26,7 @@ def load_action(plugin_id):
 
 def execute(plugin_id, params):
     meta, module = load_action(plugin_id)
-    return plain_value(invoke_action(module.run, module, meta, params, {}))
+    return plain_value(invoke_action(module.run_with_context, module, meta, params, {}))
 
 
 @pytest.mark.parametrize(
@@ -178,7 +178,7 @@ def test_datetime_empty_input_uses_current_time(monkeypatch):
             return cls(2026, 9, 5, 10, 15, tzinfo=timezone.utc)
 
     monkeypatch.setattr(module, "datetime", Clock)
-    result = plain_value(invoke_action(module.run, module, meta, {"timezone": "utc"}, {}))
+    result = plain_value(invoke_action(module.run_with_context, module, meta, {"timezone": "utc"}, {}))
     assert result["iso"] == "2026-09-05T10:15:00+00:00"
 
 
@@ -251,7 +251,7 @@ def test_data_actions_bind_structured_values_and_keep_content_out_of_summaries()
     for plugin_id in {action["type"] for action in actions}:
         meta, module = load_action(plugin_id)
         engine.actions_meta[plugin_id] = meta
-        engine.actions_funcs[plugin_id] = module.run
+        engine.actions_funcs[plugin_id] = module.run_with_context
         engine._plugin_modules[plugin_id] = module
     assert validate_rule_bindings(rule, {"manual": {"params": [], "outputs": []}}, engine.actions_meta) == []
     context = build_context(rule["name"], "manual", {}, [{"binding_id": "t_manual01", "event": {"type": "manual", "params": {}}, "payload": {}}])

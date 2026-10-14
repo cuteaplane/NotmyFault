@@ -7,6 +7,7 @@
     "package_name": "io.github.notmyfault.set_default_audio",
     "requires_capabilities": ["audio.device_query"],
     "enabled": true,
+    "execution_api": "context-v1",
     "idempotent": true,
     "platforms": ["windows", "linux"],
     "permissions": ["audio", "external_binary", "native_api"],

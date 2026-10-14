@@ -138,7 +138,3 @@ def run_with_context(action_info, params, context):
             for name, result in zip(("stdout", "stderr"), streams)
         },
     }
-
-
-def run(action_info, params):
-    return run_with_context(action_info, params, {})

@@ -4,7 +4,7 @@ import subprocess
 import sys
 import uuid
 
-from notmyfault.plugin_api import platform_backend_api
+from notmyfault.plugin_api import platform_backend_api, action_values
 
 _platform_backend = platform_backend_api()
 PowerProfileBackend = _platform_backend.PowerProfileBackend
@@ -77,7 +77,8 @@ def _run_linux(plan: str, params: dict) -> dict:
     return {"plan": plan, "profile": profile}
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
+    params = action_values(params)
     plan = params.get("plan", "balanced")
     if sys.platform == "win32":
         return _run_windows(plan, params)

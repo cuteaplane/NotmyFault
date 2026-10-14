@@ -5,7 +5,7 @@ Windows 用 SetWindowPos；Linux 用 wmctrl（仅 X11）
 import os
 import time
 
-from notmyfault.plugin_api import platform_backend_api
+from notmyfault.plugin_api import platform_backend_api, action_values
 
 _platform_backend = platform_backend_api()
 WindowBackend = _platform_backend.WindowBackend
@@ -70,7 +70,8 @@ if os.name == "nt":
         return bool(style & WS_EX_TOPMOST)
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
+    params = action_values(params)
     action = str(params.get("action", "toggle") or "toggle")
     if action not in ("toggle", "pin", "unpin"):
         raise ValueError(f"未知操作: {action!r}（可选: toggle/pin/unpin）")

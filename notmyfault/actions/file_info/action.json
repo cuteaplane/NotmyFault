@@ -61,12 +61,6 @@
       "value_type": "int"
     },
     {
-      "name": "modified_at",
-      "label": "修改时间文本（兼容旧规则）",
-      "type": "string",
-      "value_type": "text"
-    },
-    {
       "name": "modified_time",
       "type": "datetime",
       "value_type": {

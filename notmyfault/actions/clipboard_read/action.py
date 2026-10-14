@@ -46,8 +46,6 @@ def _read_windows(max_chars):
             user32.CloseClipboard()
 
 
-def run(action_info, params):
-    return run_with_context(action_info, params, {})
 
 
 def run_with_context(action_info, params, context):

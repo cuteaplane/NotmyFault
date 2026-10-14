@@ -101,7 +101,3 @@ def run_with_context(action_info, params, context):
         return {"killed": 0, "denied": denied}
     print(f"[Action:kill_process] 共终止了 {killed} 个进程")
     return {"killed": killed, "denied": denied}
-
-
-def run(action_info, params):
-    return run_with_context(action_info, params, {})

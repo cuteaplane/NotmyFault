@@ -178,8 +178,6 @@ def _execute(params, cancellation=None):
         )
 
 
-def run(action_info, params):
-    return _execute(params)
 
 
 def run_with_context(action_info, params, context):

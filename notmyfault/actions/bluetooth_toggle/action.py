@@ -234,7 +234,3 @@ def run_with_context(_action_info: dict[str, Any], params: dict[str, Any], conte
     if sys.platform.startswith("linux"):
         return _run_linux(action, cancellation)
     raise RuntimeError("蓝牙开关插件仅支持 Windows 和 Linux")
-
-
-def run(action_info, params):
-    return run_with_context(action_info, params, {})

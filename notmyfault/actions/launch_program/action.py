@@ -3,7 +3,7 @@ import shlex
 import subprocess
 import sys
 
-from notmyfault.plugin_api import native_lock
+from notmyfault.plugin_api import native_lock, action_values
 
 
 def _split_windows_args(raw: str) -> list[str]:
@@ -60,7 +60,8 @@ def _split_args(raw: str) -> list:
         raise ValueError("程序参数引号不完整") from error
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
+    params = action_values(params)
     path = params.get("path", "")
     if not path:
         raise ValueError("未指定程序路径")

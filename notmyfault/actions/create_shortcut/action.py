@@ -1,3 +1,4 @@
+from notmyfault.plugin_api import action_values
 """创建快捷方式动作
 Windows 用 PowerShell 调用 Unicode ShellLink 接口创建 .lnk；Linux 创建 .desktop 文件
 """
@@ -82,7 +83,8 @@ Write-Output $path
 """
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
+    params = action_values(params)
     if sys.platform != "win32":
         return _run_linux(action_info, params)
     return _run_windows(action_info, params)

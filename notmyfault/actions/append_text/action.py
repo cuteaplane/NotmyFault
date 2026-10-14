@@ -10,11 +10,6 @@ import re
 from pathlib import Path
 
 
-def run(action_info, params):
-    # execution_api=context-v1 入口通过 run_with_context() 执行，run() 是旧协议误调用时的占位入口
-    raise RuntimeError(
-        "append_text 需要上下文执行（execution_api=context-v1），请通过引擎规则调用"
-    )
 
 
 def run_with_context(action_info, params, context):

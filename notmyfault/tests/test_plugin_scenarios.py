@@ -58,7 +58,7 @@ def test_speech_passes_text_and_controls_to_platform_backend(monkeypatch, platfo
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(module.subprocess, "run", speak)
-    invoke_action(module.run, module, meta, {"text": text, "rate": rate, "volume": volume, "voice": voice}, {})
+    invoke_action(module.run_with_context, module, meta, {"text": text, "rate": rate, "volume": volume, "voice": voice}, {})
     assert len(calls) == 1
 
 
@@ -101,7 +101,7 @@ def test_powershell_bounds_output_and_kills_cancelled_process(monkeypatch, cance
             module.run_with_context({}, params, {"runtime": {"cancellation": ActionCancellation(event)}})
         assert process.killed
     else:
-        result = module.run({}, params)
+        result = module.run_with_context({}, params, {})
         assert result["stdout"] == output[:module._MAX_OUTPUT].decode(encoding, errors="replace") + "...（已截断）"
         assert result["stderr"] == ""
 
@@ -116,7 +116,7 @@ def test_powershell_reports_exit_code_and_stderr(monkeypatch, encoding):
     if encoding in ("not-a-codec", "base64_codec", "rot_13"):
         monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("编码无效时不应启动命令"))
         with pytest.raises(ValueError, match="编码"):
-            module.run({}, {"command": "exit 3", "encoding": encoding})
+            module.run_with_context({}, {"command": "exit 3", "encoding": encoding}, {})
         return
     error_bytes = "失败：café\n".encode(encoding, errors="replace")
 
@@ -141,7 +141,7 @@ def test_powershell_reports_exit_code_and_stderr(monkeypatch, encoding):
     if encoding != "oem":
         params["encoding"] = encoding
     with pytest.raises(RuntimeError) as caught:
-        module.run({}, params)
+        module.run_with_context({}, params, {})
     assert "code=3" in str(caught.value)
     assert error_bytes.decode(encoding, errors="replace").strip() in str(caught.value)
 
@@ -172,22 +172,22 @@ def test_append_text_appends_without_overwriting(tmp_path, monkeypatch, initial_
         target.write_bytes(original_bytes)
     params = {"file_path": target.name, "text": "新内容", "add_timestamp": False, "encoding": encoding}
     meta = json.loads((PKG_ROOT / "actions/append_text/action.json").read_text(encoding="utf-8"))
-    result = invoke_action(mod.run, mod, meta, params, {})
+    result = invoke_action(mod.run_with_context, mod, meta, params, {})
     expected_bytes = original_bytes + "新内容\n".encode(byte_encoding if original else encoding)
     assert target.read_bytes() == expected_bytes
     assert result == {"file": str(target), "lines": 1, "written": "新内容"}
     loaded = reader.run_with_context({}, {"file_path": str(target), "encoding": encoding}, {})
     assert loaded["text"] == original + "新内容\n"
-    invoke_action(mod.run, mod, meta, {**params, "text": "末尾"}, {})
+    invoke_action(mod.run_with_context, mod, meta, {**params, "text": "末尾"}, {})
     assert target.read_bytes().startswith(expected_bytes)
     assert reader.run_with_context({}, {"file_path": str(target), "encoding": encoding}, {})["text"] == original + "新内容\n末尾\n"
     if initial_state == "content" and codecs.lookup(encoding).name in ("utf-16", "utf-32"):
         unmarked = "旧内容\n".encode(byte_encoding)
         target.write_bytes(unmarked)
         with pytest.raises(ValueError, match="BOM"):
-            invoke_action(mod.run, mod, meta, params, {})
+            invoke_action(mod.run_with_context, mod, meta, params, {})
         assert target.read_bytes() == unmarked
-        invoke_action(mod.run, mod, meta, {**params, "encoding": byte_encoding}, {})
+        invoke_action(mod.run_with_context, mod, meta, {**params, "encoding": byte_encoding}, {})
         assert target.read_bytes() == unmarked + "新内容\n".encode(byte_encoding)
         assert reader.run_with_context({}, {"file_path": str(target), "encoding": byte_encoding}, {})["text"] == "旧内容\n新内容\n"
 
@@ -217,14 +217,14 @@ def test_file_operation_compresses_sources_without_overwriting_them(tmp_path, di
     archive = tmp_path / "note.zip"
     source_file.write_text("内容", encoding="utf-8")
 
-    mod.run(
+    mod.run_with_context(
         {},
         {
             "operation": "compress",
             "source": str(source),
             "destination": str(archive),
         },
-    )
+    {})
 
     with zipfile.ZipFile(archive) as zipped:
         member = "nested/note.txt" if directory else "note.txt"
@@ -232,7 +232,7 @@ def test_file_operation_compresses_sources_without_overwriting_them(tmp_path, di
     alias = tmp_path / "source-alias.zip"
     os.link(source_file, alias)
     with pytest.raises(ValueError):
-        mod.run({}, {"operation": "compress", "source": str(source), "destination": str(alias)})
+        mod.run_with_context({}, {"operation": "compress", "source": str(source), "destination": str(alias)}, {})
     assert source_file.read_text(encoding="utf-8") == alias.read_text(encoding="utf-8") == "内容"
 
 
@@ -242,7 +242,7 @@ def test_archive_unzip_skips_existing_files_and_reports_them(tmp_path, entry_nam
     source = tmp_path / "a.txt"
     source.write_text("新内容", encoding="utf-8")
     archive = tmp_path / "pack.zip"
-    assert mod.run({}, {"mode": "zip", "source": str(source), "destination": str(archive)})["ok"]
+    assert mod.run_with_context({}, {"mode": "zip", "source": str(source), "destination": str(archive)}, {})["ok"]
     if entry_name != "a.txt":
         with zipfile.ZipFile(archive, "w") as zf:
             zf.writestr(entry_name, source.read_bytes())
@@ -254,15 +254,15 @@ def test_archive_unzip_skips_existing_files_and_reports_them(tmp_path, entry_nam
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("原有内容", encoding="utf-8")
 
-    skipped = mod.run(
+    skipped = mod.run_with_context(
         {}, {"mode": "unzip", "source": str(archive), "destination": str(target)}
-    )
+    , {})
     assert skipped["ok"] is True
     assert skipped["file_count"] == 0
     assert skipped["skipped"] == 1
     assert output.read_text(encoding="utf-8") == "原有内容"
 
-    overwritten = mod.run(
+    overwritten = mod.run_with_context(
         {},
         {
             "mode": "unzip",
@@ -270,7 +270,7 @@ def test_archive_unzip_skips_existing_files_and_reports_them(tmp_path, entry_nam
             "destination": str(target),
             "overwrite": True,
         },
-    )
+    {})
     assert overwritten["file_count"] == 1
     assert overwritten["skipped"] == 0
     assert output.read_text(encoding="utf-8") == "新内容"
@@ -284,9 +284,9 @@ def test_archive_unzip_rejects_archives_over_entry_limit(tmp_path, monkeypatch):
         for index in range(3):
             zipped.writestr(f"{index}.txt", "x")
 
-    result = mod.run(
+    result = mod.run_with_context(
         {}, {"mode": "unzip", "source": str(archive), "destination": str(tmp_path / "out")}
-    )
+    , {})
     assert result["ok"] is False
     assert "条目过多" in result["error"]
     assert not (tmp_path / "out" / "0.txt").exists()
@@ -299,9 +299,9 @@ def test_archive_unzip_rejects_archives_over_size_limit(tmp_path, monkeypatch):
     with zipfile.ZipFile(archive, "w") as zipped:
         zipped.writestr("big.txt", "0123456789")
 
-    result = mod.run(
+    result = mod.run_with_context(
         {}, {"mode": "unzip", "source": str(archive), "destination": str(tmp_path / "out")}
-    )
+    , {})
     assert result["ok"] is False
     assert "大小超过上限" in result["error"]
 
@@ -342,7 +342,7 @@ def test_launch_program_association_preserves_arguments_and_directory(monkeypatc
     monkeypatch.setattr(mod.os.path, "isfile", lambda path: True)
     monkeypatch.setattr(mod.os, "startfile", startfile)
 
-    mod.run({}, {"path": path, "args": arguments, "working_directory": directory})
+    mod.run_with_context({}, {"path": path, "args": arguments, "working_directory": directory}, {})
 
     startfile.assert_called_once_with(
         os.path.abspath(os.path.join(directory, path)),
@@ -384,7 +384,7 @@ def test_display_power_allows_receiver_to_acquire_native_lock(monkeypatch, opera
     receiver = threading.Thread(target=receive, daemon=True)
     receiver.start()
     try:
-        assert mod.run({}, {"action": operation}) == {"action": operation}
+        assert mod.run_with_context({}, {"action": operation}, {}) == {"action": operation}
         assert received.wait(1)
         assert messages == [(mod.HWND_BROADCAST, mod.WM_SYSCOMMAND, mod.SC_MONITORPOWER, power)]
     finally:
@@ -407,7 +407,7 @@ def test_clipboard_clear_windows_flow(monkeypatch):
         c_int=ctypes.c_int,
     )
     monkeypatch.setattr(mod, "ctypes", fake_ctypes)
-    result = mod.run({}, {})
+    result = mod.run_with_context({}, {}, {})
     assert result == {"cleared": True}
     user32.OpenClipboard.assert_called_once_with(None)
     user32.EmptyClipboard.assert_called_once()
@@ -437,7 +437,7 @@ def test_create_shortcut_preserves_values_and_unicode_result(tmp_path, monkeypat
         return original_run([*cmd[:-1], script], **{**kwargs, "env": env})
 
     monkeypatch.setattr(mod.subprocess, "run", fake_run)
-    result = mod.run(
+    result = mod.run_with_context(
         {},
         {
             "name": "快捷",
@@ -447,7 +447,7 @@ def test_create_shortcut_preserves_values_and_unicode_result(tmp_path, monkeypat
             "icon_path": "C:\\i.ico",
             "location": "start_menu",
         },
-    )
+    {})
     expected = destination / "快捷.lnk"
     assert result == {"shortcut_path": str(expected)}
     assert expected.is_file()
@@ -486,10 +486,10 @@ def test_media_control_dispatches_appcommand(monkeypatch, accepted, targets):
     user32 = _patch_media_user32(monkeypatch, mod)
     user32.SendMessageTimeoutW.side_effect = accepted
     if any(accepted):
-        assert mod.run({}, {"command": "next"}) == {"command": "next"}
+        assert mod.run_with_context({}, {"command": "next"}, {}) == {"command": "next"}
     else:
         with pytest.raises(RuntimeError, match="没有窗口接受媒体命令"):
-            mod.run({}, {"command": "next"})
+            mod.run_with_context({}, {"command": "next"}, {})
     calls = user32.SendMessageTimeoutW.call_args_list
     assert [call.args[0] for call in calls] == targets
     assert all(call.args[1] == 0x0319 and call.args[3] == (11 << 16) for call in calls)
@@ -501,7 +501,7 @@ def test_media_control_dispatches_appcommand(monkeypatch, accepted, targets):
 def test_media_control_rejects_unknown_command():
     mod = load_plugin("actions", "media_control")
     with pytest.raises(ValueError, match="未知媒体命令"):
-        mod.run({}, {"command": "warp"})
+        mod.run_with_context({}, {"command": "warp"}, {})
 
 
 @pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 GDI 截图")
@@ -555,7 +555,7 @@ def test_screenshot_deselects_active_window_bitmap_before_reading(
 
     meta = json.loads((PKG_ROOT / "actions/screenshot/action.json").read_text(encoding="utf-8"))
     assert invoke_action(
-        mod.run, mod, meta,
+        mod.run_with_context, mod, meta,
         {"mode": mode, "output_path": target.name, "format": "bmp"},
         {},
     ) == {"file": target.name}
@@ -582,24 +582,24 @@ def test_open_url_prepends_https_and_opens_all(monkeypatch, new_window):
     params = {"urls": "example.com\nhttps://foo.bar", "new_window": new_window}
     if not isinstance(new_window, bool):
         with pytest.raises(ValueError, match="布尔"):
-            invoke_action(mod.run, mod, meta, params, {})
+            invoke_action(mod.run_with_context, mod, meta, params, {})
         assert opened == []
         return
-    result = invoke_action(mod.run, mod, meta, params, {})
+    result = invoke_action(mod.run_with_context, mod, meta, params, {})
     assert result == {"opened": 2}
     assert opened == [("https://example.com", int(new_window)), ("https://foo.bar", int(new_window))]
     opened.clear()
     with pytest.raises(ValueError, match="只支持"):
-        mod.run({}, {"urls": "https://example.com\nfile:///bad"})
+        mod.run_with_context({}, {"urls": "https://example.com\nfile:///bad"}, {})
     assert opened == []
 
 
 def test_open_url_requires_input():
     mod = load_plugin("actions", "open_url")
     with pytest.raises(ValueError, match="没有可打开的链接"):
-        mod.run({}, {"urls": "  \n"})
+        mod.run_with_context({}, {"urls": "  \n"}, {})
     with pytest.raises(ValueError, match="只支持 http/https"):
-        mod.run({}, {"urls": "file://C:/x"})
+        mod.run_with_context({}, {"urls": "file://C:/x"}, {})
 
 
 # ---------------------------------------------------------------- power_plan
@@ -615,7 +615,7 @@ def test_power_plan_runs_powercfg(monkeypatch):
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(mod.subprocess, "run", fake_run)
-    result = mod.run({}, {"plan": "high_performance"})
+    result = mod.run_with_context({}, {"plan": "high_performance"}, {})
     assert result["plan"] == "high_performance"
     assert captured["cmd"][:2] == ["powercfg", "/setactive"]
     assert captured["cmd"][2] == result["guid"]
@@ -625,7 +625,7 @@ def test_power_plan_custom_guid_required(monkeypatch):
     mod = load_plugin("actions", "power_plan")
     monkeypatch.setattr(mod.sys, "platform", "win32")
     with pytest.raises(ValueError, match="必须提供 GUID"):
-        mod.run({}, {"plan": "custom"})
+        mod.run_with_context({}, {"plan": "custom"}, {})
 
 
 def test_power_plan_failure_raises(monkeypatch):
@@ -637,7 +637,7 @@ def test_power_plan_failure_raises(monkeypatch):
         lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="boom"),
     )
     with pytest.raises(RuntimeError, match="切换电源计划失败"):
-        mod.run({}, {"plan": "balanced"})
+        mod.run_with_context({}, {"plan": "balanced"}, {})
 
 
 def test_power_plan_linux_uses_powerprofilesctl(monkeypatch):
@@ -650,7 +650,7 @@ def test_power_plan_linux_uses_powerprofilesctl(monkeypatch):
             assert plan == "power_saver"
             return "power-saver"
     monkeypatch.setattr(mod, "PowerProfileBackend", FakeBackend)
-    result = mod.run({}, {"plan": "power_saver"})
+    result = mod.run_with_context({}, {"plan": "power_saver"}, {})
     assert result == {"plan": "power_saver", "profile": "power-saver"}
 
 
@@ -658,7 +658,7 @@ def test_power_plan_linux_rejects_custom_guid(monkeypatch):
     mod = load_plugin("actions", "power_plan")
     monkeypatch.setattr(mod.sys, "platform", "linux")
     with pytest.raises(ValueError, match="不支持自定义 GUID"):
-        mod.run({}, {"plan": "custom", "custom_guid": "381b4222-f694-41f0-9685-ff5bb260df2e"})
+        mod.run_with_context({}, {"plan": "custom", "custom_guid": "381b4222-f694-41f0-9685-ff5bb260df2e"}, {})
 
 
 # ------------------------------------------------------------------- run_shell
@@ -700,7 +700,7 @@ def test_run_shell_bounds_output_and_kills_cancelled_process(monkeypatch, cancel
             )
         assert process.killed
     else:
-        result = module.run({}, {"command": command})
+        result = module.run_with_context({}, {"command": command}, {})
         assert result["stdout"] == "x" * module._MAX_OUTPUT + "...（已截断）"
         assert result["stderr"] == ""
 
@@ -747,7 +747,7 @@ def test_run_shell_reports_exit_code_and_stderr(monkeypatch):
     monkeypatch.setattr(module, "_read_available", lambda stream: stream.read1(4096))
 
     with pytest.raises(RuntimeError) as caught:
-        module.run({}, {"command": "false"})
+        module.run_with_context({}, {"command": "false"}, {})
     assert "code=3" in str(caught.value)
     assert "boom" in str(caught.value)
 
@@ -760,7 +760,7 @@ def test_send_keys_hotkey_order_and_modifiers(monkeypatch):
     mod = load_plugin("actions", "send_keys")
     sent = []
     monkeypatch.setattr(mod, "_send", sent.extend)
-    mod.run({}, {"mode": "hotkey", "keys": "ctrl+shift+a"})
+    mod.run_with_context({}, {"mode": "hotkey", "keys": "ctrl+shift+a"}, {})
     sequence = [(inp.ki.wVk, inp.ki.dwFlags) for inp in sent]
     assert sequence == [
         (0x11, 0),
@@ -791,7 +791,7 @@ def test_send_keys_partial_input_releases_pressed_keys_without_repeating(monkeyp
     ))
 
     with pytest.raises(RuntimeError, match="SendInput"):
-        mod.run({}, {"mode": "hotkey", "keys": "ctrl+a"})
+        mod.run_with_context({}, {"mode": "hotkey", "keys": "ctrl+a"}, {})
 
     assert batches[0] == [(0x11, 0), (0x41, 0), (0x41, mod.KEYEVENTF_KEYUP), (0x11, mod.KEYEVENTF_KEYUP)]
     assert batches[1:] == ([] if sent == 0 else [[(0x11, mod.KEYEVENTF_KEYUP)]])
@@ -813,12 +813,12 @@ def test_send_keys_linux_dispatches_input_tool(monkeypatch):
 
     monkeypatch.setattr(mod, "os", SimpleNamespace(name="posix"))
     monkeypatch.setattr(mod, "platform_services", FakeInputBackend)
-    assert mod.run({}, {"mode": "hotkey", "keys": "ctrl+win+enter"}) == {
+    assert mod.run_with_context({}, {"mode": "hotkey", "keys": "ctrl+win+enter"}, {}) == {
         "mode": "hotkey"
     }
     # 动作只负责拆分和校验，按键名翻译在 InputBackend 里
     assert calls[-1] == ("hotkey", ["ctrl", "win", "enter"])
-    assert mod.run({}, {"mode": "type_text", "text": "a中😀"}) == {
+    assert mod.run_with_context({}, {"mode": "type_text", "text": "a中😀"}, {}) == {
         "mode": "type_text"
     }
     assert calls[-1] == ("type", "a中😀")
@@ -843,7 +843,7 @@ def _patch_pin_user32(monkeypatch, mod, exstyle=0):
 def test_window_pin_toggle_pins_active_window(monkeypatch):
     mod = load_plugin("actions", "window_pin")
     user32 = _patch_pin_user32(monkeypatch, mod)
-    result = mod.run({}, {"action": "toggle"})
+    result = mod.run_with_context({}, {"action": "toggle"}, {})
     assert result == {"state": "pinned", "hwnd": 777}
     assert user32.SetWindowPos.call_args.args[1] == mod.HWND_TOPMOST
 
@@ -863,7 +863,7 @@ def test_window_pin_linux_dispatches_wmctrl(monkeypatch):
     monkeypatch.setattr(mod, "os", SimpleNamespace(name="posix"))
     monkeypatch.setattr(mod, "WindowBackend", FakeWindowBackend)
     meta = json.loads((PKG_ROOT / "actions/window_pin/action.json").read_text(encoding="utf-8"))
-    assert invoke_action(mod.run, mod, meta, {"action": "pin", "target": "title", "title": "记事本"}, {}) == {
+    assert invoke_action(mod.run_with_context, mod, meta, {"action": "pin", "target": "title", "title": "记事本"}, {}) == {
         "state": "pinned",
         "window_id": "0x2a",
     }
@@ -890,7 +890,7 @@ def test_window_control_linux_uses_window_backend(monkeypatch):
     monkeypatch.setattr(module, "WindowBackend", FakeLinuxBackend)
     meta = json.loads((PKG_ROOT / "actions/window_control/action.json").read_text(encoding="utf-8"))
     assert "linux" in meta["platforms"]
-    result = invoke_action(module.run, module, meta, {"action": "list_monitors"}, {})
+    result = invoke_action(module.run_with_context, module, meta, {"action": "list_monitors"}, {})
     assert result["count"] == 1
     assert result["monitors"][0]["device"] == "HDMI-1"
     assert calls == [("init", module.default_runner), "monitors"]
@@ -955,7 +955,7 @@ def window_control(monkeypatch):
 ])
 def test_window_control_selection_and_output_contract(monkeypatch, selector, expected):
     module, backend, meta = window_control(monkeypatch)
-    result = invoke_action(module.run, module, meta, {"action": "list", **selector}, {})
+    result = invoke_action(module.run_with_context, module, meta, {"action": "list", **selector}, {})
     assert [item["hwnd"] for item in result["windows"]] == expected
     assert result["count"] == len(expected)
     assert backend.changed == []
@@ -965,13 +965,13 @@ def test_window_control_requires_explicit_multiple_match_policy(monkeypatch):
     module, backend, _ = window_control(monkeypatch)
     params = {"action": "pin", "target": "title", "title": "App", "include_hidden": True}
     with pytest.raises(RuntimeError, match="匹配到 2 个窗口"):
-        module.run({}, params)
+        module.run_with_context({}, params, {})
     assert backend.changed == []
-    result = module.run({}, {**params, "match": "first"})
+    result = module.run_with_context({}, {**params, "match": "first"}, {})
     assert result["hwnd"] == 22
     assert backend.changed == [(22, "pin")]
     backend.changed.clear()
-    result = module.run({}, {**params, "match": "all"})
+    result = module.run_with_context({}, {**params, "match": "all"}, {})
     assert result["count"] == 2 and result["hwnd"] == 0
     assert backend.changed == [(22, "pin"), (11, "pin")]
 
@@ -986,7 +986,7 @@ def test_window_control_requires_explicit_multiple_match_policy(monkeypatch):
 def test_window_control_restores_and_positions_in_monitor_work_area(monkeypatch, options, expected):
     module, backend, meta = window_control(monkeypatch)
     backend.windows[22]["minimized"] = True
-    result = invoke_action(module.run, module, meta, {**options, "monitor": "next"}, {})
+    result = invoke_action(module.run_with_context, module, meta, {**options, "monitor": "next"}, {})
     window = result["windows"][0]
     assert {key: window[key] for key in expected} == expected
     assert not window["minimized"]
@@ -1001,7 +1001,7 @@ def test_window_control_wait_can_be_cancelled(monkeypatch):
         return []
     monkeypatch.setattr(backend, "handles", disappear)
     with pytest.raises(ActionCancelled):
-        invoke_action(module.run, module, meta, {"target": "all", "wait_seconds": 30},
+        invoke_action(module.run_with_context, module, meta, {"target": "all", "wait_seconds": 30},
                       {"runtime": {"cancellation": ActionCancellation(cancelled)}})
     assert backend.changed == []
 
@@ -1016,7 +1016,7 @@ def test_window_control_batch_uses_one_deadline(monkeypatch):
     monkeypatch.setattr(backend, "pin", slow_pin)
     monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     with pytest.raises(RuntimeError, match="已完成 1/2"):
-        module.run({}, {"action": "pin", "target": "all", "match": "all", "include_hidden": True, "timeout_seconds": 1})
+        module.run_with_context({}, {"action": "pin", "target": "all", "match": "all", "include_hidden": True, "timeout_seconds": 1}, {})
     assert backend.changed == [(22, "pin")]
 
 

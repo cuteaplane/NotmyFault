@@ -9,6 +9,7 @@
         "screen.capture"
     ],
     "enabled": true,
+    "execution_api": "context-v1",
     "idempotent": false,
     "platforms": [
         "windows",

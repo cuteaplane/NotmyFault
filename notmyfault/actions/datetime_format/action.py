@@ -4,8 +4,6 @@ from datetime import date, datetime, timedelta, timezone
 from notmyfault.plugin_api import data_types_api
 
 
-def run(action_info, params):
-    return run_with_context(action_info, params, {})
 
 
 def run_with_context(action_info, params, context):

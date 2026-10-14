@@ -105,8 +105,6 @@ def _open_response(url, timeout, cancellation, on_connection=None):
     raise RuntimeError("下载重定向次数过多")
 
 
-def run(action_info, params):
-    return run_with_context(action_info, params, {})
 
 
 def run_with_context(action_info, params, context):

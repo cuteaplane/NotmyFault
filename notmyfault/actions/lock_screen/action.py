@@ -5,7 +5,7 @@ import sys
 from notmyfault.plugin_api import native_lock
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
     print("[Action:lock_screen] 正在锁定屏幕...")
     if sys.platform == "win32":
         with native_lock():

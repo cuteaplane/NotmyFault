@@ -23,7 +23,6 @@
       "name": "files",
       "label": "文件路径列表",
       "type": "array",
-      "item_type": "string",
       "sensitive": true,
       "summary": "hidden",
       "value_type": {

@@ -1,7 +1,7 @@
 import ctypes
 import os
 
-from notmyfault.plugin_api import native_lock, platform_services
+from notmyfault.plugin_api import native_lock, platform_services, action_values
 
 NATIVE_LOCK = native_lock()
 
@@ -32,7 +32,8 @@ if os.name == "nt":
         user32.SetClipboardData.restype = ctypes.c_void_p
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
+    params = action_values(params)
     text = params.get("text", "")
     if not isinstance(text, str):
         raise ValueError("剪贴板内容必须是文本")

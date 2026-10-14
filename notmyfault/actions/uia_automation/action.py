@@ -172,7 +172,3 @@ def run_with_context(action_info, params, context):
     if not isinstance(text, str):
         raise ValueError("写入屏幕控件的内容必须是文本")
     return perform_selector(target, operation, cancellation, text)
-
-
-def run(action_info, params):
-    return run_with_context(action_info, params, {})

@@ -55,11 +55,11 @@ def test_file_copy_and_move_respect_overwrite(tmp_path, monkeypatch, operation, 
     }
     if existing and not overwrite:
         with pytest.raises(FileExistsError):
-            file_operation.run({}, params)
+            file_operation.run_with_context({}, params, {})
         assert source_content.read_bytes() == b"new"
         assert target_content.read_bytes() == b"old"
     else:
-        file_operation.run({}, params)
+        file_operation.run_with_context({}, params, {})
         assert target_content.read_bytes() == b"new"
         assert source.exists() is (operation == "copy")
     if directory and existing:
@@ -104,11 +104,11 @@ def test_directory_move_keeps_links_and_remaining_source_on_failure(tmp_path, mo
         }
         if fail_during_merge:
             with pytest.raises(PermissionError):
-                file_operation.run({}, params)
+                file_operation.run_with_context({}, params, {})
             assert source.is_dir()
             assert len(moved) == 1
         else:
-            file_operation.run({}, params)
+            file_operation.run_with_context({}, params, {})
             assert not source.exists()
         for name, content in (("part.txt", b"part"), ("rest.txt", b"rest"), ("linked", None)):
             source_path, target_path = source / name, target / name
@@ -218,7 +218,7 @@ def test_file_info_distinguishes_missing_files_and_directories(tmp_path, monkeyp
     path = tmp_path / name
     missing = file_info({}, {"file_path": name}, {})
     assert missing["exists"] is False
-    assert missing["modified_at"] == ""
+    assert missing["modified_time"] is None
     assert missing["modified_time"] is None
     path.write_bytes(b"example")
     existing = file_info({}, {"file_path": name}, {})
@@ -229,8 +229,8 @@ def test_file_info_distinguishes_missing_files_and_directories(tmp_path, monkeyp
     assert existing["name"] == name
     assert existing["extension"] == path.suffix
     assert existing["size_bytes"] == 7
-    assert datetime.fromisoformat(existing["modified_at"]).utcoffset().total_seconds() == 0
-    assert existing["modified_time"] == existing["modified_at"]
+    assert datetime.fromisoformat(existing["modified_time"]).utcoffset().total_seconds() == 0
+    assert "modified_at" not in existing
     directory = file_info({}, {"file_path": str(tmp_path)}, {})
     assert directory["is_directory"] is True
     assert directory["is_file"] is False
@@ -273,7 +273,7 @@ def test_file_actions_use_paths_and_content_from_trigger_data(tmp_path, monkeypa
     engine.triggers_meta["manual"] = trigger
     engine.triggers_funcs["manual"] = lambda *args: None
     for name, module in modules.items():
-        engine.actions_funcs[name] = module.run
+        engine.actions_funcs[name] = module.run_with_context
         engine.actions_meta[name] = metas[name]
         engine._plugin_modules[name] = module
     context = build_context(rule["name"], "manual", payload, [{"binding_id": "t_manual01", "event": {"type": "manual", "params": {}}, "payload": payload}])

@@ -2,8 +2,6 @@ from notmyfault.plugin_api import action_values
 import json
 
 
-def run(action_info, params):
-    return run_with_context(action_info, params, {})
 
 
 def run_with_context(action_info, params, context):

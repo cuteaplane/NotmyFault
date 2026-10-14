@@ -19,8 +19,6 @@ def _query_value(value):
     raise ValueError("查询参数仅支持文本、数字、布尔值、null 或这些值的数组")
 
 
-def run(action_info, params):
-    return run_with_context(action_info, params, {})
 
 
 def run_with_context(action_info, params, context):

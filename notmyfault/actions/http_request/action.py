@@ -243,7 +243,3 @@ def run_with_context(action_info, params, context):
         finished.set()
         watcher.join(timeout=1)
         connection.close()
-
-
-def run(action_info, params):
-    return run_with_context(action_info, params, {})

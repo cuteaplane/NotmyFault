@@ -64,8 +64,6 @@ def _extract(value, pointer):
     return value
 
 
-def run(action_info, params):
-    return run_with_context(action_info, params, {})
 
 
 def run_with_context(action_info, params, context):

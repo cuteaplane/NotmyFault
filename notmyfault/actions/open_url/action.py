@@ -1,3 +1,4 @@
+from notmyfault.plugin_api import action_values
 """打开链接动作：用 webbrowser 调用系统默认浏览器
 未写协议头的 URL 自动补上 https://
 """
@@ -8,7 +9,8 @@ import webbrowser
 _SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:(?![0-9]+(?:[/?#]|$))")
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
+    params = action_values(params)
     raw = params.get("urls", "")
     urls = [line.strip() for line in str(raw).splitlines() if line.strip()]
     if not urls:

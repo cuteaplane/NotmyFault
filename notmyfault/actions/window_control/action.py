@@ -258,7 +258,3 @@ def run_with_context(_meta, params, context):
                 "windows": result, "monitors": []}
     except BackendError as error:
         raise RuntimeError(str(error)) from error
-
-
-def run(meta, params):
-    return run_with_context(meta, params, {})

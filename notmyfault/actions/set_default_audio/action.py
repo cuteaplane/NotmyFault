@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from notmyfault.plugin_api import action_values
+
 import sys
 from typing import Any
 
@@ -249,7 +251,8 @@ def _run_linux(device_type: str, target: str) -> dict[str, Any]:
     }
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
+    params = action_values(params)
     device_type = str(params.get("device_type", "render") or "render").strip().lower()
     if device_type not in _FLOWS:
         raise ValueError(

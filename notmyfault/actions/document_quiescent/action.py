@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
-from notmyfault.plugin_api import native_lock
+from notmyfault.plugin_api import native_lock, action_values
 
 
 _MAX_FILES = 5000
@@ -205,7 +205,8 @@ def check_precondition(_meta: Dict[str, Any], params: Dict[str, Any], _context: 
     return {"ok": True}
 
 
-def run(meta: Dict[str, Any], params: Dict[str, Any]):
+def run_with_context(meta: Dict[str, Any], params: Dict[str, Any], context):
+    params = action_values(params)
     result = check_precondition(meta, params, {})
     if not result.get("ok"):
         raise RuntimeError(result.get("reason") or "目录尚未静默")

@@ -24,7 +24,7 @@ def load_wait():
 
 def execute(params, context=None):
     meta, module = load_wait()
-    return invoke_action(module.run, module, meta, params, context or {})
+    return invoke_action(module.run_with_context, module, meta, params, context or {})
 
 
 def test_wait_adds_seconds_and_milliseconds():

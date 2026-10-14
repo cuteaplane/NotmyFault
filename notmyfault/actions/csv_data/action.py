@@ -37,8 +37,6 @@ def _cell(value):
     raise ValueError("CSV 单元格只能包含文本、数字、布尔值或 null")
 
 
-def run(action_info, params):
-    return run_with_context(action_info, params, {})
 
 
 def run_with_context(action_info, params, context):
