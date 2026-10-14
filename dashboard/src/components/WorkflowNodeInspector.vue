@@ -1,7 +1,7 @@
 <script setup>
 import { computed } from 'vue'
 import { store } from '../lib/store'
-import { switchGroupType, removeGraphNode, copyGraphNode } from '../lib/workflowGraph'
+import { switchGroupType, removeGraphNode, copyGraphNode, findRecoveryGroup } from '../lib/workflowGraph'
 import { precedingSources, appendActionSources } from '../lib/workflowConditions'
 import { variableBindingSources, expandBindingSources, collectReferences } from '../lib/bindings'
 import { alertDialog } from '../lib/dialog'
@@ -12,7 +12,11 @@ import ParamInput from './ParamInput.vue'
 const props = defineProps({ rule: Object, node: Object })
 const emit = defineEmits(['select-node', 'toggle-group', 'pick', 'operation'])
 const raw = computed(() => props.node?.raw)
-const sources = computed(() => props.node.owner ? appendActionSources(precedingSources(props.rule, props.node.owner, store.schema), props.node.owner.failure_actions.slice(0, props.node.index), props.rule, store.schema) : precedingSources(props.rule, raw.value, store.schema))
+const sources = computed(() => precedingSources(props.rule, raw.value, store.schema))
+const recoveryGroup = computed(() => findRecoveryGroup(props.rule.workflow, raw.value))
+const inRecovery = computed(() => { let node = raw.value; while (node?.parent) { if (props.rule.workflow.edges.some(edge => edge.port === 'failure' && edge.target === node.parent)) return true; node = props.rule.workflow.nodes.find(item => item.binding_id === node.parent) } return false })
+function editRecovery() { emit('toggle-group', recoveryGroup.value.binding_id); emit('select-node', `action-${recoveryGroup.value.binding_id}`) }
+function disconnectRecovery() { props.rule.workflow.edges = props.rule.workflow.edges.filter(edge => !(edge.source === raw.value.binding_id && edge.port === 'failure')) }
 const constants = computed(() => expandBindingSources(variableBindingSources(props.rule, { constantsOnly: true }), store.schema.data_types?.custom))
 function descendants(node) {
   const found = new Set([node.binding_id])
@@ -20,22 +24,20 @@ function descendants(node) {
   do { changed = false; for (const child of props.rule.workflow.nodes) if (found.has(child.parent) && !found.has(child.binding_id)) { found.add(child.binding_id); changed = true } } while (changed)
   return props.rule.workflow.nodes.filter(child => found.has(child.binding_id))
 }
-async function remove(node = raw.value, owner = props.node.owner || null) {
-  const removed = owner ? [node] : descendants(node)
-  const ids = new Set(removed.flatMap(item => [item.binding_id, item.trigger?.binding_id, ...(item.failure_actions || []).map(failure => failure.binding_id)]).filter(Boolean))
+async function remove(node = raw.value) {
+  const removed = descendants(node)
+  const ids = new Set(removed.flatMap(item => [item.binding_id, item.trigger?.binding_id]).filter(Boolean))
   const referenced = props.rule.workflow.nodes.filter(item => !ids.has(item.binding_id)).some(item => collectReferences(item).some(ref => ids.has(ref.node)))
   if (referenced) { await alertDialog('节点仍被引用', '请先更改引用这个节点输出的数据绑定，再删除节点。'); return }
-  if (owner) owner.failure_actions.splice(owner.failure_actions.indexOf(node), 1)
-  else { removeGraphNode(props.rule.workflow, node); emit('select-node', null) }
+  removeGraphNode(props.rule.workflow, node); emit('select-node', null)
 }
-function requestDelete(node = props.node) { return remove(node.raw, node.owner || null) }
+function requestDelete(node = props.node) { return remove(node.raw) }
 defineExpose({ requestDelete })
-function duplicate() { const copy = copyGraphNode(raw.value, props.rule.workflow); if (props.node.owner) { props.node.owner.failure_actions.splice(props.node.index + 1, 0, copy); emit('select-node', `failure-action-${copy.binding_id}`) } else emit('operation', { operation: 'duplicate', node: props.node, action: copy }) }
+function duplicate() { const copy = copyGraphNode(raw.value, props.rule.workflow); emit('operation', { operation: 'duplicate', node: props.node, action: copy }) }
 function changeGroup(event) { switchGroupType(props.rule.workflow, raw.value, event.target.value) }
 const exportSources = computed(() => appendActionSources(sources.value, descendants(raw.value).filter(node => node !== raw.value), props.rule, store.schema))
 function addExport() { const outputs = raw.value.exports ||= {}; let name = 'result'; for (let index = 2; Object.hasOwn(outputs, name); index++) name = `result${index}`; outputs[name] = '' }
 function renameExport(old, name) { name = name.trim(); if (!name || name === old || Object.hasOwn(raw.value.exports, name)) return; raw.value.exports[name] = raw.value.exports[old]; delete raw.value.exports[old] }
-function moveFailure(index, offset) { const actions = raw.value.failure_actions; const destination = index + offset; if (destination >= 0 && destination < actions.length) actions.splice(destination, 0, actions.splice(index, 1)[0]) }
 </script>
 <template>
   <aside v-if="node && raw" class="node-inspector" role="complementary" aria-label="节点设置" @pointerdown.stop>
@@ -80,7 +82,7 @@ function moveFailure(index, offset) { const actions = raw.value.failure_actions;
           <label class="field"><span class="field-label">持续未发生时</span><select v-model="raw.repeat" class="select"><option value="once_until_seen">触发一次，收到事件后重新计时</option><option value="every_window">每个时间窗口触发一次</option></select></label>
         </template>
       </template>
-      <PredicateEditor v-else-if="raw.type === 'condition'" :node="raw.predicate" :rule="rule" :sources="sources" shallow leaf-only />
+      <PredicateEditor v-else-if="raw.type === 'condition'" :node="raw.predicate" :rule="rule" :sources="sources" />
       <template v-else-if="raw.type === 'logic'">
         <label class="field"><span class="field-label">逻辑类型</span><select v-model="raw.op" class="select"><option value="all">AND · 全部满足</option><option value="any">OR · 任一满足</option><option value="not">NOT · 取反</option></select></label>
         <label class="field"><span class="field-label">结果取反</span><input v-model="raw.negated" type="checkbox" aria-label="逻辑结果取反"></label>
@@ -91,12 +93,10 @@ function moveFailure(index, offset) { const actions = raw.value.failure_actions;
         <label class="field"><span class="field-label">赋值目标</span><select v-model="raw.variable" class="select" aria-label="赋值目标变量"><option value="" disabled>选择变量</option><option v-for="variable in rule.variables || []" :key="variable.id" :value="variable.id">{{ variable.name }}</option></select></label>
         <ParamInput :def="{ name: 'value', label: '赋值内容', type: 'string', value_type: 'any' }" v-model="raw.value" allow-binding :binding-sources="sources" />
       </template>
-      <ActionForm v-else :action="raw" :rule="rule" :index="node.index" :binding-sources="sources" :allow-failure-actions="!node.owner"
+      <ActionForm v-else :action="raw" :rule="rule" :index="node.index" :binding-sources="sources" :recovery-group="recoveryGroup" :in-recovery="inRecovery"
         @replace="emit('pick', { kind: 'action', mode: 'replace', node })"
-        @add-failure-action="emit('pick', { kind: 'action', mode: 'failure', node })"
-        @replace-failure-action="index => emit('pick', { kind: 'action', mode: 'replace', node, action: raw.failure_actions[index] })"
-        @remove-failure-action="index => remove(raw.failure_actions[index], raw)"
-        @move-failure-action="moveFailure" />
+        @create-recovery="emit('operation', { operation: 'recovery-group', node })"
+        @edit-recovery="editRecovery" @disconnect-recovery="disconnectRecovery" />
       <div v-if="!node.gate" class="inspector-action-row"><button class="btn btn-text" @click="duplicate"><span class="material-symbols-outlined">content_copy</span>复制</button><button class="btn btn-text danger-text" @click="remove"><span class="material-symbols-outlined">delete</span>删除节点</button></div>
     </div>
   </aside>

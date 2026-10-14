@@ -1,6 +1,6 @@
 import { getGraphTriggers, graphExecutionActions, walkGraphActions, findGraphNode, graphPredecessors } from './workflowGraph.js'
 import { compatibleTypes, fieldType, typeSpec, typeLabel, typeAtPath, isOpaqueValue, isExpression, parseExactJson, parseTypedInput, defaultTypedValue, formatTypedInput } from './valueTypes.js'
-import { normalizeRuleDraft } from './utils.js'
+import { validateRuleGraph } from './utils.js'
 
 function randomHex() {
   if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID().replaceAll('-', '').slice(0, 12)
@@ -57,7 +57,7 @@ export function collectTriggerLeaves(rule, includeAbsence = true) {
 
 
 export function ensureRuleBindingIds(rule) {
-  normalizeRuleDraft(rule); ensureRuleId(rule)
+  validateRuleGraph(rule); ensureRuleId(rule)
   walkGraphActions(rule.workflow, node => { node.binding_id ||= createBindingId('action'); if (node.type === 'trigger') node.trigger.binding_id ||= createBindingId('trigger') })
   return rule
 }
@@ -70,7 +70,6 @@ export function regenerateBindingIds(node, kind = 'trigger') {
     item.binding_id = createBindingId(itemKind)
     if (previous) replacements.set(previous, item.binding_id)
     if (itemKind === 'action') {
-      ;(item.failure_actions || []).forEach(child => visit(child, 'action'))
       if (item.type === 'trigger') visit(item.trigger, 'trigger')
     }
   }
@@ -246,24 +245,6 @@ export function buildBindingSources(
   return expandBindingSources(result, schema.data_types?.custom)
 }
 
-export function buildFailureBindingSources(rule, actionIndex, failureIndex, schema) {
-  const result = buildBindingSources(rule, actionIndex, schema)
-  const configuredActions = rule.workflow?.nodes[actionIndex]?.failure_actions
-  const failureActions = Array.isArray(configuredActions) ? configuredActions : []
-  failureActions.slice(0, Math.max(0, failureIndex)).forEach((action, index) => {
-    const meta = schema.actions[action.type]
-    for (const output of actionOutputDefs(action, schema, rule)) {
-      result.push(sourceItem(
-        '之前的补救动作',
-        `补救动作 ${index + 1}：${meta?.name || action.type} · ${output.label || output.name}`,
-        output,
-        { scope: 'step', node: action.binding_id, path: [output.name] },
-      ))
-    }
-  })
-  return result
-}
-
 export function parameterAllowsBinding(meta, paramName) {
   if (meta?.params?.find(item => item.name === paramName)?.type === 'plugin_data') return false
   const fixedParams = meta?.security?.literal_only_params
@@ -276,7 +257,7 @@ export function buildNodeDataPorts(node, schema, rule = {}) {
     : node.kind === 'trigger'
     ? schema.triggers[node.source?.type]
     : schema.actions[node.source?.type]
-  const dataInputs = ['action', 'failure-action'].includes(node.kind)
+  const dataInputs = ['action'].includes(node.kind)
     ? (meta?.params || [])
       .filter(param => parameterAllowsBinding(meta, param.name))
       .map((param, index) => ({
@@ -288,7 +269,7 @@ export function buildNodeDataPorts(node, schema, rule = {}) {
         format: param.format,
       }))
     : []
-  const dataOutputs = !node.negated && ['trigger', 'action', 'failure-action', 'action_group'].includes(node.kind)
+  const dataOutputs = !node.negated && ['trigger', 'action', 'action_group'].includes(node.kind)
     ? outputDefs(meta).map((output, index) => ({
         id: `output:${output.name}`,
         index,
@@ -383,21 +364,6 @@ export function collectReferences(value, result = []) {
   return result
 }
 
-export function collectLegacyEventPayloadPaths(value, result = []) {
-  if (isOpaqueValue(value)) return result
-  if (typeof value === 'string') {
-    const pattern = /{{\s*event\.payload((?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*}}/g
-    for (const match of value.matchAll(pattern)) {
-      result.push(match[1].split('.').filter(Boolean))
-    }
-  } else if (Array.isArray(value)) {
-    value.forEach(item => collectLegacyEventPayloadPaths(item, result))
-  } else if (value && typeof value === 'object') {
-    Object.values(value).forEach(item => collectLegacyEventPayloadPaths(item, result))
-  }
-  return result
-}
-
 const UNSAFE_CONTEXT_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 
 function assertSafeContextKey(key) {
@@ -471,7 +437,7 @@ function testDefaultValue(output, fullPayload = false) {
   }
   const type = normalizedType(output?.type)
   if (['number', 'int', 'float'].includes(type)) return 0
-  if (type === 'bool' || type === 'boolean') return false
+  if (type === 'bool') return false
   if (type === 'array') return '[]'
   if (type === 'object') return '{}'
   return ''
@@ -493,9 +459,6 @@ export function buildTestInputFields(rule, schema, { startStepId = '', endStepId
   const leaves = collectTriggerLeaves(rule)
   const leavesById = new Map(leaves.map(leaf => [leaf.binding_id, leaf]))
   const actions = []; walkGraphActions(rule.workflow, action => actions.push(action))
-  const startIndex = Math.max(0, actions.findIndex(action => action.binding_id === startStepId))
-  const rawEndIndex = actions.findIndex(action => action.binding_id === endStepId)
-  const endIndex = rawEndIndex >= 0 ? rawEndIndex : actions.length - 1
   const selectedActions = graphExecutionActions(rule, { startStepId, endStepId })
   const dependencies = new Set(selectedActions.map(action => action.binding_id))
   const pending = [...dependencies]
@@ -505,9 +468,6 @@ export function buildTestInputFields(rule, schema, { startStepId = '', endStepId
     collectReferences(executionSource)
       .filter(reference => ['trigger', 'event', 'step'].includes(reference.scope))
       .map(reference => [JSON.stringify(reference), reference]),
-  ).values()]
-  const legacyPaths = [...new Map(
-    collectLegacyEventPayloadPaths(executionSource).map(path => [JSON.stringify(path), path]),
   ).values()]
   const fields = new Map()
 
@@ -557,7 +517,7 @@ export function buildTestInputFields(rule, schema, { startStepId = '', endStepId
   for (const reference of references) {
     const path = Array.isArray(reference.path) ? reference.path : []
     const source = sourceFor(reference)
-    if (reference.scope === 'step' && (source.actionIndex < 0 || (rule.workflow ? selectedActions.some(action => action.binding_id === reference.node) : source.actionIndex >= startIndex))) continue
+    if (reference.scope === 'step' && (source.actionIndex < 0 || selectedActions.some(action => action.binding_id === reference.node))) continue
     const outputs = reference.scope === 'step' ? actionOutputDefs(source.action, schema, rule) : outputDefs(source.meta)
     if (reference.scope === 'trigger' && outputs.length) {
       addOutputFields(reference, source, outputs)
@@ -584,45 +544,25 @@ export function buildTestInputFields(rule, schema, { startStepId = '', endStepId
     })
   }
 
-  function eventCheck(node) {
-    if (!node || typeof node !== 'object') return
-    if (node.op === 'event_occurred') {
-      const leaf = leavesById.get(node.trigger_id)
-      if (!leaf) return
-      const meta = schema.triggers?.[leaf.type]
-      const name = `触发 ${leaves.indexOf(leaf) + 1} · ${meta?.name || leaf.type}`
-      addTestField(fields, { scope: 'event_occurrence', node: node.trigger_id, path: [], sourceName: name,
-        label: '模拟事件已发生', type: 'bool', valueType: 'bool', defaultValue: true })
-      addOutputFields({ scope: 'trigger', node: node.trigger_id }, { name }, outputDefs(meta))
-      for (const field of fields.values()) {
-        if (field.scope === 'trigger' && field.node === node.trigger_id) field.sourceName = name
-      }
-      for (const output of outputDefs(meta)) {
-        if (output.required === false) continue
-        const field = fields.get(testFieldKey('trigger', node.trigger_id, [output.name]))
-        field.required = true
-        field.defaultValue = testDefaultValue(output)
-      }
+  for (const node of executionSource.nodes) {
+    if (node.type !== 'trigger') continue
+    const leaf = leavesById.get(node.trigger.binding_id)
+    const meta = schema.triggers?.[leaf.type]
+    const name = `触发 ${leaves.indexOf(leaf) + 1} · ${meta?.name || leaf.type}`
+    addTestField(fields, { scope: 'event_occurrence', node: leaf.binding_id, path: [], sourceName: name,
+      label: '模拟事件已发生', type: 'bool', valueType: 'bool', defaultValue: node.occurrence !== 'absent' })
+    addOutputFields({ scope: 'trigger', node: leaf.binding_id }, { name }, outputDefs(meta))
+    for (const field of fields.values()) if (field.scope === 'trigger' && field.node === leaf.binding_id) field.sourceName = name
+    for (const output of outputDefs(meta)) {
+      if (output.required === false || node.occurrence === 'absent') continue
+      const field = fields.get(testFieldKey('trigger', leaf.binding_id, [output.name]))
+      field.required = true
+      field.defaultValue = testDefaultValue(output)
     }
-    ;(node.children || []).forEach(eventCheck)
   }
-  for (const action of executionSource.nodes) if (action.type === 'trigger') eventCheck({ op: 'event_occurred', trigger_id: action.trigger.binding_id })
 
   for (const variable of rule.variables || []) {
     addTestField(fields, { scope: 'variable', node: variable.id, path: [], sourceName: '运行变量（留空使用规则初始值）', label: variable.name, type: normalizedType(variable.value_type), valueType: variable.value_type, required: false, sensitive: variable.sensitive === true, defaultValue: '' })
-  }
-  for (const path of legacyPaths) {
-    addTestField(fields, {
-      scope: 'event',
-      node: '',
-      path,
-      sourceName: '本次触发',
-      label: path.join('.') || '完整事件数据',
-      type: path.length ? 'string' : 'object',
-      defaultValue: path.length ? '' : '{}',
-      fullPayload: !path.length,
-      legacy: true,
-    })
   }
   return [...fields.values()]
 }
@@ -658,7 +598,7 @@ function parsePreparedTestValue(raw, field) {
     }
     return parseTypedInput(raw, field.type)
   }
-  if (type === 'bool' || type === 'boolean') return raw === true || raw === 'true'
+  if (type === 'bool') return raw === true || raw === 'true'
   return String(raw ?? '')
 }
 
@@ -708,10 +648,7 @@ export function requestTestContext(rule, schema, promptValue = globalThis.prompt
       .filter(reference => ['trigger', 'event'].includes(reference.scope))
       .map(reference => [JSON.stringify(reference), reference]),
   ).values()]
-  const legacyEventPaths = [...new Map(
-    collectLegacyEventPayloadPaths(rule).map(path => [JSON.stringify(path), path]),
-  ).values()]
-  if (!references.length && !legacyEventPaths.length) return {}
+  if (!references.length) return {}
   const context = {
     trigger_payloads: contextRecord(),
     event_payload: contextRecord(),
@@ -772,29 +709,7 @@ export function requestTestContext(rule, schema, promptValue = globalThis.prompt
       setPath(payload, path, parsed)
     }
   }
-  for (const path of legacyEventPaths) {
-    const serializedPath = JSON.stringify(path)
-    if (promptedEventPaths.has(serializedPath)) continue
-    const label = path.length ? path.join('.') : '完整事件数据（JSON）'
-    const raw = promptValue(`本次触发 · ${label}`, path.length ? '' : '{}')
-    if (raw === null) return null
-    let parsed = raw
-    if (!path.length) {
-      try {
-        parsed = parseExactJson(raw)
-      } catch (error) {
-        throw new Error(`本次触发 · ${label}：请输入有效 JSON`)
-      }
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        throw new Error(`本次触发 · ${label}：请输入 JSON 对象`)
-      }
-      assignContextRecord(context.event_payload, parsed)
-    } else {
-      setPath(context.event_payload, path, parsed)
-    }
-    promptedEventPaths.add(serializedPath)
-  }
-  if (!references.some(reference => reference.scope === 'event') && !legacyEventPaths.length) {
+  if (!references.some(reference => reference.scope === 'event')) {
     delete context.event_payload
   }
   return context

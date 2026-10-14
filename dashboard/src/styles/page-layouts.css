@@ -265,3 +265,5 @@
   .plugin-workbench .plugin-list-stage{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;scrollbar-width:thin;padding:2px 6px 2px 2px}
   .plugin-workbench .plugin-detail-view{height:100%;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;scrollbar-width:thin}
 }
+
+.run-recovered{color:var(--md-tertiary)}

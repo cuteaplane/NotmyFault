@@ -6,7 +6,7 @@ import { cancelRun, runRule } from '../../lib/api'
 import { approveRuleBeforeEditing, saveRulesWithApproval } from '../../lib/ruleSave'
 import { snackbar } from '../../lib/notify'
 import { alertDialog, confirmDialog } from '../../lib/dialog'
-import { normalizeRuleDraft } from '../../lib/utils'
+import { validateRuleGraph } from '../../lib/utils'
 import { buildAllTestInputFields, ensureRuleBindingIds } from '../../lib/bindings'
 import { summarizeRuleChanges } from '../../lib/ruleDiff'
 import { automationTemplates, createQuickDraft, instantiateTemplate, templateAvailability } from '../../lib/automationTemplates'
@@ -227,7 +227,7 @@ async function restoreDraftRecovery(index) {
   )
   if (restore) {
     try {
-      const restored = ensureRuleBindingIds(normalizeRuleDraft(clone(recovery.draft)))
+      const restored = ensureRuleBindingIds(validateRuleGraph(clone(recovery.draft)))
       restoreSensitiveParams(restored, draftRule.value)
       draftRule.value = restored
     } catch (error) {
@@ -279,7 +279,7 @@ function redoDraft() {
 }
 async function openRule(index) {
   let next
-  try { next = ensureRuleBindingIds(normalizeRuleDraft(clone(store.configData.rules[index]))) }
+  try { next = ensureRuleBindingIds(validateRuleGraph(clone(store.configData.rules[index]))) }
   catch (error) { await alertDialog('规则无法编辑', error.message); return }
   normalizeWorkflow(next)
   originalRuleSnapshot = JSON.stringify(store.configData.rules[index])
@@ -294,7 +294,7 @@ async function openRule(index) {
 async function addRule(seed = null) {
   let next
   try {
-    next = seed ? ensureRuleBindingIds(normalizeRuleDraft(clone(seed))) : ensureRuleBindingIds({ name: '新规则', folder: '未分类', workflow: { entry: null, nodes: [], edges: [] } })
+    next = seed ? ensureRuleBindingIds(validateRuleGraph(clone(seed))) : ensureRuleBindingIds({ name: '新规则', folder: '未分类', workflow: { entry: null, nodes: [], edges: [] } })
   } catch (error) { await alertDialog('草稿无法打开', error.message); return }
   normalizeWorkflow(next)
   editorAdminKeyPassword = ''
@@ -559,10 +559,16 @@ function processTestEvents() {
       finishTestWatch()
     } else if (ev.name === 'error') {
       t.steps.push({ status: 'fail', type: ev.data.action_type || '', stepId: ev.data.step_id, detail: failText(ev.data.error) })
-      finishTestWatch()
     } else if (ev.name === 'test_assertions_completed') {
       t.assertions = ev.data
+    } else if (ev.name.startsWith('run.recovery.')) {
+      const step = t.steps.find(step => step.stepId === ev.data.step_id)
+      if (step) step.recovery = { groupId: ev.data.recovery_group_id, status: ev.name.endsWith('entered') ? 'running' : ev.name.endsWith('completed') ? 'succeeded' : 'failed' }
+    } else if (ev.name === 'run.recovered') {
+      t.outcome = 'recovered'
+      finishTestWatch()
     } else if (ev.name === 'workflow_completed') {
+      t.outcome = ev.data.status
       if (ev.data.recovered) {
         t.note = '连接中断期间这次运行已结束，可到运行记录查看结果和完整步骤。'
       } else if (ev.data.status === 'cancelled') {
@@ -644,6 +650,8 @@ const testSummary = computed(() => {
   if (!t.done) return ''
   if (t.steps.some(s => s.status === 'cancelled')) return '测试已停止。'
   if (t.steps.some(s => s.status === 'timed_out')) return '有动作超过允许的运行时间。'
+  if (t.outcome === 'recovered') return '原动作失败，补救流程完成；测试已补救。'
+  if (t.outcome === 'succeeded' && t.steps.some(s => s.status === 'fail')) return '流程已完成；失败步骤已处理或按设置忽略，请查看步骤详情。'
   if (t.steps.some(s => s.status === 'fail')) return '有步骤执行失败，请查看下方详情。'
   if (t.steps.some(s => s.status === 'deferred')) return '前置条件不满足，本次测试没有执行动作。'
   if (t.assertions?.total && t.assertions.passed < t.assertions.total) return `动作已执行，但 ${t.assertions.total - t.assertions.passed} 项检查未通过。`
@@ -705,13 +713,10 @@ async function openTestStep(step) {
 }
 
 function openPendingRule() {
-  if (!store.pendingRuleId && !store.pendingRuleName) return
-  const index = store.pendingRuleId
-    ? store.configData.rules.findIndex(r => r.rule_id === store.pendingRuleId)
-    : store.configData.rules.findIndex(r => r.name === store.pendingRuleName)
+  if (!store.pendingRuleId) return
+  const index = store.configData.rules.findIndex(r => r.rule_id === store.pendingRuleId)
   const stepId = store.pendingStepId
   store.pendingRuleId = ''
-  store.pendingRuleName = ''
   store.pendingStepId = ''
   if (index >= 0) {
     automationSection.value = 'rules'
@@ -720,7 +725,7 @@ function openPendingRule() {
   }
 }
 
-watch(() => [store.pendingRuleId, store.pendingRuleName, store.pendingStepId], openPendingRule)
+watch(() => [store.pendingRuleId, store.pendingStepId], openPendingRule)
 watch(() => store.pendingAutomationSection, section => {
   if (!['rules', 'runs'].includes(section)) return
   automationSection.value = section
@@ -854,6 +859,7 @@ onMounted(() => {
           <span class="material-symbols-outlined">{{ stepIcon(s.status) }}</span>
           <div class="test-step-body">
             <b>{{ stepTitle(s) }}</b><p v-if="s.detail">{{ s.detail }}</p>
+            <small v-if="s.recovery">{{ s.recovery.status === 'running' ? '正在执行补救' : s.recovery.status === 'succeeded' ? '补救完成' : '补救失败' }} · {{ s.recovery.groupId }}</small>
             <small v-if="s.branch">执行出口 · {{ s.branch }}</small>
             <details v-if="s.evaluatedBranches?.length" class="test-condition-results">
               <summary>条件判断 · {{ s.evaluatedBranches.length }} 个分支</summary>

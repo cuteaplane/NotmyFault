@@ -6,7 +6,6 @@ function comparable(value) {
   return Object.fromEntries(Object.entries(value).filter(([key]) => !['binding_id', 'rule_id'].includes(key)).sort(([a], [b]) => a.localeCompare(b)).map(([key, child]) => [key, comparable(child)]))
 }
 function equal(a, b) { return JSON.stringify(comparable(a)) === JSON.stringify(comparable(b)) }
-function withoutFailureActions(node) { const { failure_actions, ...rest } = node; return rest }
 function nodeLabel(node, schema = {}) { return node.name || (node.type === 'trigger' ? schema.triggers?.[node.trigger.type]?.name || node.trigger.type : schema.actions?.[node.type]?.name || node.type) }
 function listSummary(before = [], after = [], noun, transform = value => value) {
   const previous = new Map(before.map(node => [node.binding_id, node])), current = new Map(after.map(node => [node.binding_id, node]))
@@ -20,9 +19,7 @@ export function summarizeRuleChanges(before, after) {
   const changes = []
   if (before.name !== after.name) changes.push('名称已改')
   if (before.folder !== after.folder) changes.push('文件夹已改')
-  const previous = new Map((before.workflow?.nodes || []).map(node => [node.binding_id, node]))
-  changes.push(...listSummary(before.workflow?.nodes, after.workflow?.nodes, '图块', withoutFailureActions))
-  for (const node of after.workflow?.nodes || []) if (previous.has(node.binding_id)) changes.push(...listSummary(previous.get(node.binding_id).failure_actions, node.failure_actions, `${nodeLabel(node)} 的补救动作`))
+  changes.push(...listSummary(before.workflow?.nodes, after.workflow?.nodes, '图块'))
   if (!equal(before.workflow?.edges, after.workflow?.edges)) changes.push('流程连接已改')
   if (!changes.length && !equal(before, after)) changes.push('规则设置已改')
   return changes
@@ -49,7 +46,7 @@ export function computeChangeSet(before, after, schema = {}) {
       const original = old.get(node.binding_id)
       const common = { target, node_id: node.binding_id, index, ...options, label: nodeLabel(node, schema) }
       if (!original) { items.push({ ...common, op: 'add', detail: '新增节点' }); continue }
-      if (equal(withoutFailureActions(original), withoutFailureActions(node))) continue
+      if (equal(original, node)) continue
       const plugin = node.type === 'trigger' ? node.trigger : node
       const previousPlugin = original.type === 'trigger' ? original.trigger : original
       const meta = node.type === 'trigger' ? schema.triggers?.[plugin.type] : schema.actions?.[plugin.type]
@@ -58,12 +55,9 @@ export function computeChangeSet(before, after, schema = {}) {
       else items.push({ ...common, op: 'modify', detail: '节点内容已变更' })
     }
     for (const [index, node] of previous.entries()) if (!now.has(node.binding_id)) items.push({ target, node_id: node.binding_id, index, ...options, op: 'delete', label: nodeLabel(node, schema) })
-    if (target === 'failure-action' && old.size === now.size && [...old.keys()].every(id => now.has(id)) && [...old.keys()].some((id, index) => id !== [...now.keys()][index])) items.push({ target, ...options, op: 'modify', label: '调整补救动作顺序' })
   }
   const previousNodes = before?.workflow?.nodes || [], nodes = after.workflow?.nodes || []
   list(previousNodes, nodes, 'graph-node')
-  const old = new Map(previousNodes.map(node => [node.binding_id, node]))
-  nodes.forEach((node, parentIndex) => { if (old.has(node.binding_id)) list(old.get(node.binding_id).failure_actions, node.failure_actions, 'failure-action', { parentIndex }) })
   if (!equal(before?.workflow?.edges, after.workflow?.edges)) items.push({ op: 'modify', target: 'rule', label: '流程连接', detail: '条件或执行路径已变更' })
   if (!items.length && !equal(before, after)) items.push({ op: 'modify', target: 'rule', label: '规则设置', detail: '已变更' })
   return items

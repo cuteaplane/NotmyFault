@@ -62,5 +62,4 @@ export function saveConversation(messages) {
 
 export function clearSavedConversation() {
   try { sessionStorage.removeItem(STORAGE_KEY) } catch {}
-  try { localStorage.removeItem(STORAGE_KEY) } catch {}
 }

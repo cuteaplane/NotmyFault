@@ -45,6 +45,7 @@ const runStatusMeta = {
   running: { label: '运行中', icon: 'progress_activity', cls: 'running', group: 'pending' },
   deferred: { label: '等待重试', icon: 'schedule', cls: 'deferred', group: 'pending' },
   succeeded: { label: '成功', icon: 'check_circle', cls: 'succeeded', group: 'succeeded' },
+  recovered: { label: '已补救', icon: 'healing', cls: 'recovered', group: 'recovered' },
   failed: { label: '失败', icon: 'error', cls: 'failed', group: 'failed' },
   timed_out: { label: '已超时', icon: 'timer_off', cls: 'failed', group: 'failed' },
   cancelled: { label: '已停止', icon: 'stop_circle', cls: 'cancelled', group: 'cancelled' },
@@ -61,7 +62,7 @@ const levelCounts = computed(() => {
 })
 
 const runCounts = computed(() => {
-  const counts = { succeeded: 0, failed: 0, cancelled: 0, pending: 0 }
+  const counts = { succeeded: 0, recovered: 0, failed: 0, cancelled: 0, pending: 0 }
   runs.value.forEach(run => {
     const group = runMeta(run.status).group
     if (counts[group] !== undefined) counts[group]++
@@ -123,89 +124,46 @@ function triggerName(type) {
 function matchingRule(run) {
   const rules = store.configData.rules || []
   return rules.find(rule => run.rule_id && rule.rule_id === run.rule_id)
-    || rules.find(rule => rule.name === run.rule_name)
-}
-
-function walkActions(actions, visit, trail = []) {
-  ;(actions || []).forEach((action, index) => {
-    visit(action, index, trail)
-    for (const field of ['then', 'else', 'failure_actions']) {
-      walkActions(action[field], visit, [...trail, { action, field, index }])
-    }
-    ;(action.elif || []).forEach((branch, branchIndex) => walkActions(branch.then, visit, [...trail, { action, field: `elif[${branchIndex}]`, index }]))
-  })
-}
-
-function findAction(actions, bindingId) {
-  let found = null
-  walkActions(actions, (action, index, trail) => {
-    if (!found && action?.binding_id === bindingId) found = { action, index, trail }
-  })
-  return found
 }
 
 function runScope(run) {
   if (!run.start_step_id && !run.end_step_id) return ''
-  const actions = matchingRule(run)?.actions || []
-  const startHit = run.start_step_id ? findAction(actions, run.start_step_id) : { index: 0, trail: [] }
-  const endHit = run.end_step_id ? findAction(actions, run.end_step_id) : { index: actions.length - 1, trail: [] }
-  if (!startHit || !endHit) return `局部测试 · ${run.action_count} 个动作`
-  if (startHit.trail.length || endHit.trail.length) return `局部测试 · ${run.action_count} 个动作`
-  return `局部测试 · 动作 ${startHit.index + 1}–${endHit.index + 1} / 共 ${actions.length} 个`
+  const rule = matchingRule(run)
+  const label = identity => {
+    const node = findGraphNode(rule || {}, identity)?.action
+    return node?.name || (node ? actionName(node.type) : identity)
+  }
+  return `局部测试 · ${run.start_step_id ? label(run.start_step_id) : '流程入口'} → ${run.end_step_id ? label(run.end_step_id) : '流程结束'}`
 }
 
 function stepNumber(run, step, fallback) {
-  const rule = matchingRule(run)
-  const found = rule?.workflow ? findGraphNode(rule, step.step_id) : findAction(rule?.actions || [], step.step_id)
-  if (!found) return fallback
-  if (!found.trail.length) return found.index + 1
-  if (rule?.workflow) return [...found.trail.map(parent => parent.index + 1), found.index + 1].join('.')
-  const parent = found.trail[0]
-  const branch = parent.field === 'then' ? 'THEN' : parent.field === 'else' ? 'ELSE' : parent.field.startsWith('elif[') ? `ELIF ${Number(parent.field.slice(5, -1)) + 1}` : '失败处理'
-  return `${parent.index + 1}.${branch}.${found.index + 1}`
+  return fallback
 }
 
 function stepContext(run, step) {
   const rule = matchingRule(run)
-  const found = rule?.workflow ? findGraphNode(rule, step.step_id) : findAction(rule?.actions || [], step.step_id)
+  const found = rule && findGraphNode(rule, step.step_id)
   if (!found) return { kind: 'action', label: '' }
-  const failureParent = found.trail.find(item => item.field === 'failure_actions')
-  if (failureParent) {
-    return {
-      kind: 'failure',
-      label: `“${actionName(failureParent.action.type)}”的失败处理`,
-    }
+  const recovery = rule.workflow.edges.find(edge => edge.channel === 'control' && edge.port === 'failure' && found.trail.some(parent => parent.action.binding_id === edge.target))
+  if (recovery) {
+    const owner = findGraphNode(rule, recovery.source)?.action
+    return { kind: 'failure', label: `“${owner?.name || actionName(owner?.type)}”的补救流程` }
   }
-  if (found.trail.some(item => item.field === 'then' || item.field === 'else' || item.field.startsWith('elif['))) {
-    const parent = found.trail[0]
-    const branch = parent.field === 'then' ? '成立时' : parent.field.startsWith('elif[') ? `ELIF ${Number(parent.field.slice(5, -1)) + 1} 成立时` : '否则'
-    return { kind: 'action', label: `“${actionName(parent.action.type)}”${branch}` }
-  }
-  if (rule?.workflow && found.trail.length) return { kind: 'action', label: found.trail.filter(parent => parent.field === 'workflow').map(parent => parent.action.name || '动作组').join(' → ') }
-  return { kind: 'action', label: '' }
+  return { kind: 'action', label: found.trail.map(parent => parent.action.name || (parent.action.type === 'action_group' ? '动作组' : '事件组')).join(' → ') }
+}
+
+function recoveryText(recovery) {
+  return ({ running: '正在执行补救', succeeded: '补救完成', failed: '补救失败' })[recovery.status] || '补救状态未知'
 }
 
 function ifBranchLabel(branch, run, step) {
   if (run && step) { const node = findGraphNode(matchingRule(run) || {}, step.step_id)?.action; const index = node?.branches?.findIndex(item => item.id === branch); if (index >= 0) return node.branches[index].label || (node.branches[index].else ? 'ELSE' : index ? `ELIF ${index}` : 'IF') }
-  if (branch === 'then') return 'IF 成立'
-  if (branch === 'else') return 'ELSE'
-  const match = /^elif\[(\d+)\]$/.exec(branch || '')
-  return match ? `ELIF ${Number(match[1]) + 1} 成立` : ''
+  return branch || ''
 }
 
 function evaluationResult(value) {
   if (value.error) return `判断出错 · ${value.error.code || '未知错误'}`
   return value.result === true ? '成立' : value.result === false ? '不成立' : '未收到判断结果'
-}
-
-function hasPreconditions(run) {
-  return Boolean(run.precondition_count || matchingRule(run)?.preconditions?.length)
-}
-
-function preconditionText(run) {
-  if (run.deferred_reason) return run.deferred_reason
-  if (run.steps?.length || ['succeeded', 'failed', 'cancelled'].includes(run.status)) return '检查通过'
-  return '等待检查结果'
 }
 
 function formatTime(timestamp) {
@@ -242,14 +200,12 @@ function toggleRun(runId) {
 
 function jumpToRule(run) {
   store.pendingRuleId = run.rule_id || ''
-  store.pendingRuleName = run.rule_name || ''
   store.pendingStepId = ''
   window.__nmf?.switchPage?.('rules')
 }
 
 function jumpToStep(run, step) {
   store.pendingRuleId = run.rule_id || ''
-  store.pendingRuleName = run.rule_name || ''
   store.pendingStepId = step.step_id || ''
   window.__nmf?.switchPage?.('rules')
 }
@@ -439,6 +395,9 @@ onUnmounted(() => {
         <button class="run-summary-card succeeded" :class="{ active: statusFilter === 'succeeded' }" :aria-pressed="statusFilter === 'succeeded'" @click="statusFilter = 'succeeded'">
           <span>成功</span><strong>{{ runCounts.succeeded }}</strong>
         </button>
+        <button class="run-summary-card recovered" :class="{ active: statusFilter === 'recovered' }" :aria-pressed="statusFilter === 'recovered'" @click="statusFilter = 'recovered'">
+          <span>已补救</span><strong>{{ runCounts.recovered }}</strong>
+        </button>
         <button class="run-summary-card failed" :class="{ active: statusFilter === 'failed' }" :aria-pressed="statusFilter === 'failed'" @click="statusFilter = 'failed'">
           <span>失败</span><strong>{{ runCounts.failed }}</strong>
         </button>
@@ -523,18 +482,11 @@ onUnmounted(() => {
                 <span class="run-step-copy"><strong>触发</strong><small>{{ triggerName(run.event_type) }}</small></span>
                 <span class="run-step-actions"><span class="material-symbols-outlined run-step-state">check</span></span>
               </div>
-              <div v-if="hasPreconditions(run)" class="run-step run-timeline-fixed" :class="run.deferred_reason ? 'deferred' : 'succeeded'">
-                <span class="run-step-index"><span class="material-symbols-outlined">rule</span></span>
-                <span class="run-step-copy">
-                  <strong>执行前检查</strong>
-                  <small>{{ preconditionText(run) }}<template v-if="run.retry_after_seconds"> · {{ run.retry_after_seconds }} 秒后再检查</template></small>
-                </span>
-                <span class="run-step-actions"><span class="material-symbols-outlined run-step-state">{{ run.deferred_reason ? 'schedule' : 'check' }}</span></span>
-              </div>
               <div v-for="(step, index) in run.steps" :key="step.step_id" class="run-step" :class="step.status">
                 <span class="run-step-index">{{ stepNumber(run, step, index + 1) }}</span>
                 <span class="run-step-copy">
                   <strong>{{ actionName(step.action_type) }}</strong>
+                  <small v-if="step.recovery">{{ recoveryText(step.recovery) }}<span v-if="step.recovery.error"> · {{ errorText(step.recovery.error) }}</span><button class="icon-btn" title="定位补救动作组" @click="jumpToStep(run, { step_id: step.recovery.group_id })"><span class="material-symbols-outlined">open_in_new</span></button></small>
                   <small v-if="stepContext(run, step).kind === 'failure'">失败处理 · {{ stepContext(run, step).label }}</small>
                   <small v-if="step.status === 'waiting'">{{ step.reason || '等待事件组合' }}</small><small v-else-if="step.status === 'running'">正在执行</small><small v-else-if="step.status === 'skipped'">{{ step.reason || '已跳过' }}</small>
                   <small v-else-if="step.status === 'failed'">{{ errorText(step.error) || '执行失败' }}</small>

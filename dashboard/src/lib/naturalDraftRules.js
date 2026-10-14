@@ -1,12 +1,12 @@
 import { walkGraphActions, getGraphTriggers, findGraphNode } from './workflowGraph.js'
-import { getParamDefs, normalizeRuleDraft } from './utils.js'
+import { getParamDefs, validateRuleGraph } from './utils.js'
 
 export function normalizeDraftResult(result) {
   if (result?.result_type !== 'rule_draft' || !result.draft) return result
-  return { ...result, draft: normalizeRuleDraft(JSON.parse(JSON.stringify(result.draft))) }
+  return { ...result, draft: validateRuleGraph(JSON.parse(JSON.stringify(result.draft))) }
 }
 
-function draftActions(draft) { const result = []; walkGraphActions(draft?.workflow, node => { if (!['trigger', 'logic', 'condition', 'event_group'].includes(node.type)) result.push(node) }); return result }
+function draftActions(draft) { const result = []; walkGraphActions(draft?.workflow, node => { if (!['trigger', 'logic', 'condition', 'event_group', 'action_group', 'merge', 'end', 'set_variable'].includes(node.type)) result.push(node) }); return result }
 function draftTriggers(draft) { return getGraphTriggers(draft || {}) }
 export function conditionLabel(node, schema) { return node ? schema.triggers?.[node.type]?.name || node.type : '待连接触发器' }
 
@@ -69,12 +69,6 @@ export function nodeIdForChange(item, rule) {
   if (item.target === 'action') {
     const node = rule.workflow?.nodes?.[item.index]
     return node?.binding_id ? `action-${node.binding_id}` : null
-  }
-  if (item.target === 'failure-action') {
-    const parent = rule.workflow?.nodes?.[item.parentIndex]
-    const node = parent?.failure_actions?.[item.index]
-    return node?.binding_id ? `failure-action-${node.binding_id}`
-      : parent?.binding_id ? `action-${parent.binding_id}` : null
   }
   if (item.target === 'trigger') {
     const node = rule.workflow.nodes.find(node => node.type === 'trigger')

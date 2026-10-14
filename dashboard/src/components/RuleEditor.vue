@@ -3,12 +3,12 @@ import { computed, nextTick, ref, toRef, watch, onMounted, onUnmounted } from 'v
 import RuleCanvas from './RuleCanvas.vue'
 import WorkflowNodeInspector from './WorkflowNodeInspector.vue'
 import { alertDialog } from '../lib/dialog'
-import { normalizeWorkflow, createGraphAction, createTriggerStep, insertGraphNode, insertionParent, findGraphNode, graphId, switchGroupType, groupGraphNodes, moveGraphNodes } from '../lib/workflowGraph'
+import { normalizeWorkflow, createGraphAction, createTriggerStep, insertGraphNode, insertionParent, findGraphNode, graphId, switchGroupType, groupGraphNodes, moveGraphNodes, createRecoveryGroup } from '../lib/workflowGraph'
 import { buildDefaultParams } from '../lib/utils'
 import { defaultTypedValue } from '../lib/valueTypes'
 import RuleValidationSummary from './RuleValidationSummary.vue'
 import { store } from '../lib/store'
-import { groupActionKeys, groupTriggerKeys, isSpecialBlockAction, normalizeRuleDraft, pluginUnavailableReason as getPluginUnavailableReason } from '../lib/utils'
+import { groupActionKeys, groupTriggerKeys, isSpecialBlockAction, validateRuleGraph, pluginUnavailableReason as getPluginUnavailableReason } from '../lib/utils'
 
 import { ensureRuleBindingIds, variableBindingSources, expandBindingSources } from '../lib/bindings'
 
@@ -33,11 +33,6 @@ const emit = defineEmits(['back', 'delete', 'save', 'save-run', 'undo', 'redo', 
 const aiEnabled = computed(() => store.aiDrafting?.enabled)
 const aiPanelOpen = ref(false)
 const aiPanelRef = ref(null)
-function savedEditorLayout() {
-  try { return localStorage.getItem('notmyfault.ruleEditorMode') === 'form' ? 'form' : 'canvas' }
-  catch { return 'canvas' }
-}
-const editorLayout = ref(savedEditorLayout())
 const selectedNodeId = ref(null)
 
 const wideLayout = ref(false)
@@ -74,7 +69,7 @@ watch(selectedNodeId, id => {
   }
 })
 const hasSidePanels = computed(() => (
-  aiPanelOpen.value || (editorLayout.value === 'canvas' && !!selectedNodeId.value)
+  aiPanelOpen.value || !!selectedNodeId.value
 ))
 function onAiDraft(draft) {
   emit('ai-draft', draft)
@@ -164,7 +159,7 @@ const actionKeys = computed(() => Object.keys(store.schema.actions).filter(
   key => !pluginUnavailableReason('actions', key) && !isSpecialBlockAction(key)
 ))
 const actionGroups = computed(() => groupActionKeys(actionKeys.value))
-watch(() => props.rule, rule => { normalizeRuleDraft(rule); ensureRuleBindingIds(rule); normalizeWorkflow(rule) }, { immediate: true })
+watch(() => props.rule, rule => { validateRuleGraph(rule); ensureRuleBindingIds(rule); normalizeWorkflow(rule) }, { immediate: true })
 
 const constantSources = computed(() => expandBindingSources(variableBindingSources(props.rule, { constantsOnly: true }), store.schema.data_types?.custom))
 
@@ -205,10 +200,6 @@ function chooseEditorPlugin(type) {
   const context = graphPickerContext.value
   if (!context) return
   closePluginPicker(); graphPickerContext.value = null
-  if (context.mode === 'failure') {
-    ;(context.node.raw.failure_actions ||= []).push(createGraphAction(type, buildDefaultParams(store.schema.actions[type])))
-    return
-  }
   if (context.mode === 'replace') {
     const raw = context.action || context.node.raw
     if (context.kind === 'trigger') { raw.trigger.type = type; raw.trigger.params = buildDefaultParams(store.schema.triggers[type]) }
@@ -220,6 +211,7 @@ function chooseEditorPlugin(type) {
 }
 function operate(context) {
   const raw = context.node?.raw
+  if (context.operation === 'recovery-group') { const group = createRecoveryGroup(props.rule.workflow, raw); canvasRef.value?.toggleGroup(group.binding_id, true); selectedNodeId.value = `action-${group.binding_id}`; return }
   if (context.operation === 'connection-error') { alertDialog('无法连接', context.error); return }
   if (context.operation === 'disconnect') { props.rule.workflow.edges = props.rule.workflow.edges.filter(edge => edge !== context.edge?.rawEdge); return }
   if (context.operation === 'group-type') { switchGroupType(props.rule.workflow, raw, context.value); return }
@@ -273,11 +265,6 @@ function saveFromEditor(event, run = false) {
 function selectNode(id) {
 
   selectedNodeId.value = id
-  if (id && editorLayout.value === 'form') nextTick(() => {
-    const inspector = inspectorRef.value?.$el
-    const viewport = inspector?.closest('.node-canvas-viewport')
-    if (viewport) viewport.scrollTop += inspector.getBoundingClientRect().top - viewport.getBoundingClientRect().top - 12
-  })
 }
 
 function focusInitialNode(id) {
@@ -289,14 +276,9 @@ function focusInitialNode(id) {
 }
 watch([() => props.initialNodeId, canvasRef], ([id]) => focusInitialNode(id), { immediate: true })
 
-watch(editorLayout, mode => {
-  try { localStorage.setItem('notmyfault.ruleEditorMode', mode) } catch {}
-  if (mode === 'form' && !selectedNodeId.value && layoutNodes.value.length) selectedNodeId.value = layoutNodes.value[0].id
-})
 
 onMounted(() => {
   window.addEventListener('keydown', onEditorKeydown)
-  if (editorLayout.value === 'form' && !selectedNodeId.value) selectedNodeId.value = layoutNodes.value[0]?.id || null
   aiPanelOpen.value = store.pendingAiPanel === true
   store.pendingAiPanel = false
   let savedWidth = 0
@@ -340,7 +322,7 @@ function onEditorKeydown(event) {
 </script>
 
 <template>
-  <section class="rule-editor-page flow-rule-editor" :class="{ 'with-side-panels': hasSidePanels, 'canvas-layout': editorLayout === 'canvas' }">
+  <section class="rule-editor-page flow-rule-editor canvas-layout" :class="{ 'with-side-panels': hasSidePanels }">
     <header class="rule-editor-head flow-editor-head">
       <div class="rule-editor-identity">
         <button class="btn btn-text rule-back-btn" @click="emit('back')"><span class="material-symbols-outlined">arrow_back</span>全部规则</button>
@@ -360,14 +342,6 @@ function onEditorKeydown(event) {
     </header>
 
     <div class="editor-mode-bar">
-      <div class="editor-mode-switch" role="tablist" aria-label="规则编辑方式">
-        <button role="tab" :aria-selected="editorLayout === 'canvas'" :class="{ active: editorLayout === 'canvas' }" @click="editorLayout = 'canvas'">
-          <span class="material-symbols-outlined">account_tree</span>节点编辑
-        </button>
-        <button role="tab" :aria-selected="editorLayout === 'form'" :class="{ active: editorLayout === 'form' }" @click="editorLayout = 'form'">
-          <span class="material-symbols-outlined">view_agenda</span>普通模式
-        </button>
-      </div>
       <div class="rule-editor-actions">
         <button v-if="aiEnabled" class="icon-btn" :class="{ 'ai-panel-active': aiPanelOpen }"
           :title="aiPanelOpen ? '收起 AI 起草' : '打开 AI 起草'" @click="toggleAiPanel">
@@ -418,7 +392,7 @@ function onEditorKeydown(event) {
     </div>
     <div class="rule-editor-main-grid">
     <div class="editor-canvas-column">
-    <RuleCanvas ref="canvasRef" :rule="rule" :layout="editorLayout" v-model:selected-node-id="selectedNodeId" @select-node="selectNode" @delete-node="deleteCanvasNode" @operation="operate">
+    <RuleCanvas ref="canvasRef" :rule="rule" v-model:selected-node-id="selectedNodeId" @select-node="selectNode" @delete-node="deleteCanvasNode" @operation="operate">
       <template #inspector>
         <WorkflowNodeInspector v-if="selectedGraphNode" ref="inspectorRef" :rule="rule" :node="selectedGraphNode" @select-node="selectNode" @toggle-group="id => canvasRef.toggleGroup(id)" @pick="graphPicker" @operation="operate" />
       </template>

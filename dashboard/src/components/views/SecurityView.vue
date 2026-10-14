@@ -17,11 +17,9 @@ const permissionFilter = ref('all')
 const mode = computed(() => configSec.value.security_mode || store.engineStatus.security_mode || 'unknown')
 const modeMap = {
   strict: { label: '严格', description: '插件签名无效或使用未声明的危险能力时，拒绝加载。' },
-  normal: { label: '标准', description: '允许签名无效的插件降级加载，未声明能力会产生告警。' },
   permissive: { label: '宽松', description: '允许开发中的未签名插件加载，未声明能力会产生告警。' },
-  unknown: { label: '未知', description: '连接后台服务后可读取当前模式。' },
 }
-const modeInfo = computed(() => modeMap[mode.value] || modeMap.unknown)
+const modeInfo = computed(() => modeMap[mode.value] || { label: '未知', description: '连接后台服务后可读取当前模式。' })
 const installation = computed(() => configSec.value.installation)
 const installationInvalid = computed(() => installation.value?.status === 'invalid')
 const configProblem = computed(() => ['tampered', 'unreadable'].includes(configSec.value.status))
@@ -42,17 +40,6 @@ const heading = computed(() => {
   if (userProblems.value.length) return { icon: 'extension_off', title: '有用户插件需要处理', text: '查看下方问题插件，更新或重新安装对应扩展。' }
   return { icon: 'verified_user', title: '当前检查未发现异常', text: '安装签名、设置与规则的检查已完成。' }
 })
-function summaryActions(actions, prefix = '动作') {
-  return (actions || []).flatMap((action, index) => {
-    const path = `${prefix} ${index + 1}`
-    return [
-      { action, path },
-      ...summaryActions(action.then, `${path} · 成立时`),
-      ...summaryActions(action.else, `${path} · 否则`),
-      ...summaryActions(action.failure_actions, `${path} · 失败补救`),
-    ]
-  })
-}
 async function approveConfig() {
   if (!await confirmDialog('重新签名配置？', '请先打开本机 rules.json 核对规则、实际参数和失败动作，此页摘要隐藏了参数值。确认后为当前设置与规则重新签名；完成后可回到首页启动引擎。', '重新签名')) return
   approving.value = true
@@ -142,11 +129,11 @@ onMounted(refresh)
                     :class="a.high_risk ? 'chip-admin' : 'chip-clean'">{{ a.type }}</span>
             </span>
             <div class="config-security-rule-details">
-              <div v-for="entry in summaryActions(rule.actions || [])"
-                   :key="entry.path" class="config-security-rule-params">
-                <small>{{ entry.path }}</small>
-                <span class="chip" :class="entry.action.high_risk ? 'chip-admin' : 'chip-clean'">{{ entry.action.type }}</span>
-                <code>{{ JSON.stringify(entry.action.params || {}) }}</code>
+              <div v-for="(action, index) in rule.actions || []"
+                   :key="action.binding_id || index" class="config-security-rule-params">
+                <small :title="action.binding_id">节点 {{ index + 1 }}<template v-if="action.parent"> · 所属组 {{ action.parent }}</template></small>
+                <span class="chip" :class="action.high_risk ? 'chip-admin' : 'chip-clean'">{{ action.type }}</span>
+                <code>{{ JSON.stringify(action.params || {}) }}</code>
               </div>
             </div>
           </div>
@@ -186,7 +173,7 @@ onMounted(refresh)
         <div><span class="material-symbols-outlined">touch_app</span><span><b>管理员命令逐次确认</b><small>每次执行管理员命令都需要你单独确认。</small></span></div>
         <div><span class="material-symbols-outlined">key</span><span><b>高权限规则审批</b><small>{{ mode === 'strict' ? '保存需要审批的规则时，验证签名私钥密码。' : mode === 'unknown' ? '读取模式后可确认当前审批要求。' : '当前模式保存规则时不要求签名私钥密码；执行管理员命令仍需确认。' }}</small></span></div>
       </div>
-      <details class="security-details"><summary>了解三种模式</summary><div class="security-mode-list"><div v-for="(info, key) in { strict: modeMap.strict, normal: modeMap.normal, permissive: modeMap.permissive }" :key="key"><b>{{ info.label }}</b><p>{{ info.description }}</p></div></div><p class="security-muted">所有模式都会检查插件结构、平台要求和配置签名。宽松模式不会让结构错误或运行报错的插件变得可用。</p></details>
+      <details class="security-details"><summary>了解两种模式</summary><div class="security-mode-list"><div v-for="(info, key) in modeMap" :key="key"><b>{{ info.label }}</b><p>{{ info.description }}</p></div></div><p class="security-muted">所有模式都会检查插件结构、平台要求和配置签名。宽松模式不会让结构错误或运行报错的插件变得可用。</p></details>
     </article>
 
     <details class="security-block security-permissions">

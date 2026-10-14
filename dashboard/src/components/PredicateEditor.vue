@@ -5,17 +5,16 @@ import { PREDICATE_LABELS, RUN_STATUS_OPTIONS } from '../lib/workflowConditions'
 import ConditionValueInput from './ConditionValueInput.vue'
 import { typesCompatible } from '../lib/bindings'
 defineOptions({ name: 'PredicateEditor' })
-const props = defineProps({ node: Object, sources: { type: Array, default: () => [] }, rule: Object, shallow: Boolean, leafOnly: Boolean })
+const props = defineProps({ node: Object, sources: { type: Array, default: () => [] }, rule: Object })
 const statusComparison = computed({ get: () => props.node.comparison || 'eq', set: value => { props.node.comparison = value } })
 const operandType = computed(() => ['is_true', 'is_false'].includes(props.node.op) ? 'bool' : ['gt', 'gte', 'lt', 'lte'].includes(props.node.op) ? 'number' : 'any')
 const unary = computed(() => ['is_true', 'is_false', 'exists', 'not_exists'].includes(props.node.op))
 function changeOperator(op) {
-  const previous = JSON.parse(JSON.stringify(props.node))
   props.node.op = op
   if (op === 'run_status') {
     props.node.rule_id ||= props.rule?.rule_id || store.configData.rules[0]?.rule_id || ''
     props.node.status ||= 'running'; props.node.comparison ||= 'eq'
-    delete props.node.children; delete props.node.left; delete props.node.right
+    delete props.node.left; delete props.node.right
   } else {
     props.node.left ??= ''; props.node.right ??= ''
     const source = props.sources.find(source => typesCompatible(source.type, operandType.value))
@@ -23,7 +22,6 @@ function changeOperator(op) {
       props.node.left = JSON.parse(JSON.stringify(source?.value || { $ref: { scope: 'step', node: '', path: [] } }))
       if (source?.optional || source?.conditional) props.node.left.$ref.on_missing = 'error'
     }
-    delete props.node.children
     if (unary.value) delete props.node.right
     if (['exists', 'not_exists'].includes(props.node.op)) {
       if (!props.node.left?.$ref) {
@@ -59,5 +57,4 @@ const rules = computed(() => [...store.configData.rules.filter(rule => rule.rule
 </template>
 <style scoped>
 .predicate-editor { display: grid; gap: 12px; }
-.predicate-child { border-left: 2px solid var(--md-outline-variant); padding-left: 12px; }
 </style>

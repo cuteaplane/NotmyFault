@@ -459,6 +459,8 @@ window.fetch = async (url, options = {}) => {
 
 global.window = window
 global.document = window.document
+global.Event = window.Event
+global.CustomEvent = window.CustomEvent
 for (const key of Object.getOwnPropertyNames(window)) {
   if (key === 'navigator') continue
   if (!(key in global)) { try { global[key] = window[key] } catch (e) {} }
@@ -548,8 +550,12 @@ if (!safeRunExportOk) process.exitCode = 1
 const missingParamsNode = { type:'notify' }
 const ensuredParamsOk = ensureParams(missingParamsNode) === missingParamsNode.params
   && Object.keys(missingParamsNode.params).length === 0
-const beforeRecovery = sequentialRule([{ binding_id:'a_main001', type:'notify', params:{}, failure_actions:[{ binding_id:'a_recover1', type:'notify', params:{ message:'旧值' } }] }])
-const afterRecovery = sequentialRule([{ binding_id:'a_main001', type:'notify', params:{}, failure_actions:[{ binding_id:'a_recover1', type:'notify', params:{ message:'新值' } }] }])
+const recoveryMain = { binding_id:'a_main001', type:'notify', params:{} }
+const recoveryGroup = { binding_id:'a_handler1', type:'action_group', exports:{} }
+const recoveryAction = { binding_id:'a_recover1', type:'notify', parent:recoveryGroup.binding_id, params:{ message:'旧值' } }
+const beforeRecovery = ruleWith([recoveryMain, recoveryGroup, recoveryAction], [wire(recoveryMain, recoveryGroup, 'failure'), wire(recoveryGroup, recoveryAction, 'entry')])
+const afterRecovery = JSON.parse(JSON.stringify(beforeRecovery))
+afterRecovery.workflow.nodes.find(node => node.binding_id === 'a_recover1').params.message = '新值'
 const recoveryDiff = computeChangeSet(beforeRecovery, afterRecovery, { actions:{ notify:{ params:[{ name:'message', label:'消息' }] } } })
 const orderedActions = [
   { binding_id:'a_order001', type:'notify', params:{ first:1, second:2 } },
@@ -557,8 +563,8 @@ const orderedActions = [
 ]
 const orderChanges = computeChangeSet(sequentialRule(orderedActions), sequentialRule([...orderedActions].reverse()), {})
 const sameParamsChanges = computeChangeSet(sequentialRule(orderedActions), sequentialRule([{ ...orderedActions[0], params:{ second:2, first:1 } }, orderedActions[1]]), {})
-const recoveryDiffOk = recoveryDiff.some(change => change.target === 'failure-action' && change.detail.includes('旧值 → 新值'))
-  && summarizeRuleChanges(beforeRecovery, afterRecovery).some(item => item.includes('补救动作'))
+const recoveryDiffOk = recoveryDiff.some(change => change.target === 'graph-node' && change.detail.includes('旧值 → 新值'))
+  && summarizeRuleChanges(beforeRecovery, afterRecovery).some(item => item.includes('图块'))
   && orderChanges.some(item => item.target === 'rule' && item.label.includes('连接'))
   && sameParamsChanges.length === 0
 console.log((ensuredParamsOk && recoveryDiffOk?'PASS':'FAIL')+' - native graph recovery edits and execution connections remain visible')
@@ -735,8 +741,7 @@ await pause(400)
 const groupedRule = bridgeCalls.filter(call => call.path === '/api/rules/validate').at(-1)?.data.rule
 const firstTrigger = getGraphTriggers(groupedRule || {})[0]
 let graphModesOk = !!firstTrigger
-for (const mode of ['节点编辑', '普通模式']) {
-  ;[...document.querySelectorAll('.editor-mode-switch button')].find(button => button.textContent.includes(mode))?.click()
+for (const mode of ['canvas']) {
   await pause(30)
   const checksBefore = bridgeCalls.filter(call => call.path === '/api/rules/validate').length
   document.querySelector('.rule-check-btn')?.click()
@@ -748,11 +753,10 @@ for (const mode of ['节点编辑', '普通模式']) {
     && getGraphTriggers(checked)[0]?.binding_id === firstTrigger.binding_id
     && ruleActions(checked).find(action => action.binding_id === 'a_mount001')?.params?.message?.$ref?.node === firstTrigger.binding_id
     && document.querySelectorAll('.rule-editor-page main').length === 1
-    && document.querySelector('.editor-mode-switch button[aria-selected="true"]')?.textContent.includes(mode)
+    && !document.querySelector('.editor-mode-switch')
 }
-console.log((graphModesOk?'PASS':'FAIL')+' - both editor modes preserve graph trigger identities and references, and manual checks validate immediately')
+console.log((graphModesOk?'PASS':'FAIL')+' - canvas preserves graph trigger identities and references, and manual checks validate immediately')
 if (!graphModesOk) process.exitCode = 1
-;[...document.querySelectorAll('.editor-mode-switch button')].find(button => button.textContent.includes('节点编辑'))?.click()
 await pause(30)
 
 const protectedTrigger = document.querySelector('[data-node-id="action-a_mounttrigger1"]')
@@ -1074,14 +1078,13 @@ settingsNav?.click()
 await new Promise(r => setTimeout(r, 50))
 mockConfigSecurity = {
   status:'tampered', reason:'配置签名无效', summary:{ rule_count:1, rules:[{
-    name:'分支审批摘要', actions:[{
-      type:'if', high_risk:true, params:{},
-      then:[{ type:'run_powershell', high_risk:true, params:{ command:'Write-Output branch-safe', secret:'***' } }],
-      else:[{ type:'if', high_risk:true, params:{}, then:[{
-        type:'launch_program', high_risk:true, params:{ path:'nested-example.exe' },
-        failure_actions:[{ type:'notify', high_risk:false, params:{ message:'分支补救摘要' } }],
-      }], else:[] }],
-    }],
+    name:'分支审批摘要', actions:[
+      { type:'event_group', binding_id:'a_summaryif', high_risk:false, params:{} },
+      { type:'run_powershell', binding_id:'a_summaryps', high_risk:true, params:{ command:'Write-Output branch-safe', secret:'***' } },
+      { type:'launch_program', binding_id:'a_summarylaunch', high_risk:true, params:{ path:'nested-example.exe' } },
+      { type:'action_group', binding_id:'a_summaryhandler', high_risk:false, params:{} },
+      { type:'notify', binding_id:'a_summarynotify', parent:'a_summaryhandler', high_risk:false, params:{ message:'分支补救摘要' } },
+    ],
   }] },
 }
 ;[...document.querySelectorAll('.settings-root-list button')].find(
@@ -1466,39 +1469,48 @@ await new Promise(r => setTimeout(r, 30))
 ;[...document.querySelectorAll('.app-dialog button')].find(button => button.textContent.trim() === '删除')?.click()
 await new Promise(r => setTimeout(r, 80))
 
-additionalRuns = ['queued', 'timed_out', 'dropped', 'toString', 'running', 'succeeded'].map((status, index) => ({
+additionalRuns = ['queued', 'timed_out', 'dropped', 'toString', 'running', 'succeeded', 'recovered'].map((status, index) => ({
   run_id:`run_status_${index}`, rule_name:`状态测试 ${status}`, event_type:'manual', status,
-  started_at:1723000000, finished_at:['timed_out', 'dropped', 'succeeded'].includes(status) ? 1723000000.2 : null,
-  duration_ms:['timed_out', 'dropped', 'succeeded'].includes(status) ? 200 : null,
-  action_count:0, steps:status === 'succeeded' ? [{ step_id:'a_loggedgroup', action_type:'event_group', status:'succeeded', branch:'b_chosen01', evaluated_branches:[{ branch_id:'b_false001', result:false, predicates:[{ node_id:'p_checked01', path:'condition.children[0]', op:'eq', result:false }] }, { branch_id:'b_chosen01', result:true, predicates:[{ node_id:'p_checked02', path:'condition', op:'event_occurred', result:true }] }] }] : [],
+  started_at:1723000000, finished_at:['timed_out', 'dropped', 'succeeded', 'recovered'].includes(status) ? 1723000000.2 : null,
+  duration_ms:['timed_out', 'dropped', 'succeeded', 'recovered'].includes(status) ? 200 : null,
+  action_count:0, steps:status === 'recovered' ? [{ step_id:'a_failedoriginal', action_type:'notify', status:'failed', error:'动作失败', recovery:{ group_id:'a_recoverygroup', status:'succeeded' } }] : status === 'succeeded' ? [{ step_id:'a_loggedgroup', action_type:'event_group', status:'succeeded', branch:'b_chosen01', evaluated_branches:[{ branch_id:'b_false001', result:false, predicates:[{ node_id:'a_checked01', op:'eq', result:false }] }, { branch_id:'b_chosen01', result:true, predicates:[{ node_id:'a_checked02', op:'event_occurred', result:true }] }] }] : [],
 }))
 rulesNav?.click()
 await waitFor('.rules-library')
 ;[...document.querySelectorAll('.automation-section-tabs button')].find(
   button => button.textContent.includes('运行记录'),
 )?.click()
-await waitFor(() => document.querySelectorAll('.run-card').length === 7)
+await waitFor(() => document.querySelectorAll('.run-card').length === 8)
 const runLabels = [...document.querySelectorAll('.run-card .run-status-label')].map(label => label.textContent)
-const runLabelsOk = runLabels.join('|') === '失败|排队中|已超时|已丢弃|未知状态|运行中|成功'
-const runSummaryOk = [...document.querySelectorAll('.run-summary-card strong')].map(value => value.textContent).join('|') === '7|1|2|1|2'
+const runLabelsOk = runLabels.join('|') === '失败|排队中|已超时|已丢弃|未知状态|运行中|成功|已补救'
+const runSummaryOk = [...document.querySelectorAll('.run-summary-card strong')].map(value => value.textContent).join('|') === '8|1|1|2|1|2'
 let runFiltersOk = true
-for (const [filter, expected] of [['failed', 2], ['cancelled', 1], ['pending', 2]]) {
+for (const [filter, expected] of [['succeeded', 1], ['recovered', 1], ['failed', 2], ['cancelled', 1], ['pending', 2]]) {
   document.querySelector(`.run-summary-card.${filter}`)?.click()
   await pause(20)
   runFiltersOk &&= document.querySelectorAll('.run-card').length === expected
 }
 document.querySelector('.run-summary-card')?.click()
 await pause(20)
-runFiltersOk &&= document.querySelectorAll('.run-card').length === 7
+runFiltersOk &&= document.querySelectorAll('.run-card').length === 8
 console.log((runLabelsOk && runSummaryOk && runFiltersOk ? 'PASS' : 'FAIL') + ' - 运行记录按新状态显示、统计和筛选，未知状态不显示运行中')
 if (!runLabelsOk || !runSummaryOk || !runFiltersOk) process.exitCode = 1
+const recoveredRunCard = [...document.querySelectorAll('.run-card')].find(card => card.textContent.includes('状态测试 recovered'))
+recoveredRunCard?.querySelector('.run-card-main')?.click()
+await pause(20)
+const recoveryDetailsOk = recoveredRunCard?.querySelector('.run-step.failed')?.textContent.includes('补救完成')
+  && recoveredRunCard.textContent.includes('动作失败')
+console.log((recoveryDetailsOk ? 'PASS' : 'FAIL') + ' - 已补救记录保留原步骤失败并显示补救完成')
+if (!recoveryDetailsOk) process.exitCode = 1
+recoveredRunCard?.querySelector('.run-card-main')?.click()
+await pause(20)
 const evaluatedRunCard = [...document.querySelectorAll('.run-card')].find(card => card.textContent.includes('状态测试 succeeded'))
 evaluatedRunCard?.querySelector('.run-card-main')?.click()
 const evaluatedDetails = await waitFor('.run-condition-results')
 const loggedEvaluationsOk = evaluatedDetails?.textContent.includes('IF · 不成立')
   && evaluatedDetails.textContent.includes('ELIF 1 · 成立')
   && evaluatedDetails.querySelectorAll('.run-condition-predicate').length === 2
-  && evaluatedDetails.textContent.includes('p_checked01')
+  && evaluatedDetails.textContent.includes('a_checked01')
   && !evaluatedDetails.textContent.includes('ELSE')
 console.log((loggedEvaluationsOk ? 'PASS' : 'FAIL') + ' - event group history shows only branches and predicates actually evaluated')
 if (!loggedEvaluationsOk) process.exitCode = 1
@@ -1533,60 +1545,41 @@ const retryBackoffSelect = [...failureSettings.querySelectorAll('.action-retry-b
 retryBackoffSelect.value = 'exponential'
 retryBackoffSelect.dispatchEvent(new window.Event('change', { bubbles:true }))
 await new Promise(r => setTimeout(r, 30))
-const actionFailureSettingsOk = failureSettings?.textContent.includes('停止，不再执行后面的动作')
-  && failureSettings.textContent.includes('继续执行后面的动作')
+const actionFailureSettingsOk = failureSettings?.textContent.includes('停止本次运行')
+  && failureSettings.textContent.includes('继续原动作的正常后继')
   && failureSettings.textContent.includes('重试可能重复发通知、写文件或启动程序')
   && failureSettings.textContent.includes('插件没有提供安全停止能力')
   && failurePolicySelect.value === 'continue' && retrySelect.value === '2'
 console.log((actionFailureSettingsOk?'PASS':'FAIL')+' - action editor exposes stop, continue and retry settings')
 if (!actionFailureSettingsOk) process.exitCode = 1
 
-const addFailureAction = [...failureSettings.querySelectorAll('button')].find(
-  button => button.textContent.includes('添加补救动作'),
-)
-addFailureAction?.click()
-await new Promise(r => setTimeout(r, 20))
-const failurePickerOk = !!document.querySelector('.plugin-picker-dialog')
-document.querySelector('.plugin-picker-item')?.click()
-await pause(30)
-document.querySelector('.graph-node-failure-action')?.click()
-await pause(30)
-const recoveryInspector = await waitFor(() => document.querySelector('.node-inspector-head small')?.textContent.includes('补救') && document.querySelector('.node-inspector .plugin-type-button'))
-await waitFor(() => [...document.querySelectorAll('.node-link-label')].find(label => label.textContent === '失败后'))
-const controlLabels = [...document.querySelectorAll('.node-link-label')].map(label => label.textContent)
-const failureBranchOk = failurePickerOk
-  && document.querySelectorAll('.graph-node-failure-action').length === 1
-  && controlLabels.includes('失败后')
-  && !!recoveryInspector
-  && !document.querySelector('.node-inspector .failure-action-add')
-console.log((failureBranchOk?'PASS':'FAIL')+' - failed actions can run an editable recovery branch')
-if (!failureBranchOk) { console.error({ failurePickerOk, controlLabels, failureCount: document.querySelectorAll('.graph-node-failure-action').length, inspector: !!recoveryInspector }); process.exitCode = 1 }
-
+const createRecovery = [...failureSettings.querySelectorAll('button')].find(button => button.textContent.includes('创建补救动作组'))
+createRecovery?.click()
 await pause(350)
-document.querySelector('.graph-node-failure-action button[title="删除补救动作"]')?.click()
-await pause(350)
+const recoveryFrame = document.querySelector('.graph-node-action_group')
+const failureBranchOk = !!recoveryFrame && [...document.querySelectorAll('.node-link-label')].some(label => label.textContent === '失败补救')
+  && document.querySelector('.node-inspector')?.textContent.includes('失败补救')
+console.log((failureBranchOk?'PASS':'FAIL')+' - failure outlet creates an ordinary editable action group')
+if (!failureBranchOk) process.exitCode = 1
 const deletePhases = []
-deletePhases.push([...document.querySelectorAll('.graph-node')].map(node => node.dataset.nodeId))
-let canvasDeleteOk = document.querySelectorAll('.graph-node-failure-action').length === 0
-  && document.querySelectorAll('.graph-node-action').length === 1
+recoveryFrame?.querySelector('button[aria-label="删除节点"]')?.click()
+await pause(350)
+let canvasDeleteOk = !document.querySelector('.graph-node-action_group') && document.querySelectorAll('.graph-node-action').length === 1
 document.querySelector('.rule-history-actions button:first-child')?.click()
 await pause(350)
-deletePhases.push([...document.querySelectorAll('.graph-node')].map(node => node.dataset.nodeId))
-canvasDeleteOk &&= document.querySelectorAll('.graph-node-failure-action').length === 1
+canvasDeleteOk &&= !!document.querySelector('.graph-node-action_group')
 document.querySelector('.graph-node-action')?.dispatchEvent(new window.MouseEvent('contextmenu', { bubbles:true, cancelable:true, button:2 }))
 await pause(30)
 ;[...document.querySelectorAll('.node-inspector-body > .inspector-action-row button')].find(button => button.textContent.includes('复制'))?.click()
 await pause(350)
-deletePhases.push([...document.querySelectorAll('.graph-node')].map(node => node.dataset.nodeId))
 canvasDeleteOk &&= document.querySelectorAll('.graph-node-action').length === 2
 const copiedActionNode = [...document.querySelectorAll('.graph-node-action')].at(-1)
 copiedActionNode?.focus()
 copiedActionNode?.dispatchEvent(new window.KeyboardEvent('keydown', { key:'Delete', bubbles:true, cancelable:true }))
 await pause(350)
-canvasDeleteOk &&= document.querySelectorAll('.graph-node-action').length === 1
-  && document.querySelectorAll('.graph-node-failure-action').length === 1
-console.log((canvasDeleteOk?'PASS':'FAIL')+' - canvas delete buttons remove the selected action or recovery action')
-if (!canvasDeleteOk) { console.error({ deletePhases, actions:document.querySelectorAll('.graph-node-action').length, recovery:document.querySelectorAll('.graph-node-failure-action').length }); process.exitCode = 1 }
+canvasDeleteOk &&= document.querySelectorAll('.graph-node-action').length === 1 && !!document.querySelector('.graph-node-action_group')
+console.log((canvasDeleteOk?'PASS':'FAIL')+' - canvas delete, undo and copy preserve native recovery groups')
+if (!canvasDeleteOk) process.exitCode = 1
 
 if (!document.querySelector('.graph-node-trigger')) document.querySelector('.graph-node-event_group .group-toggle')?.click()
 await pause(350)
@@ -1610,9 +1603,6 @@ occurrenceSelect.value = 'occurred'; occurrenceSelect.dispatchEvent(new window.E
 await pause(30)
 
 // 私有数据参数只显示插件编辑入口。
-;[...document.querySelectorAll('button')].find(
-  button => button.textContent.includes('普通模式'),
-)?.click()
 await new Promise(r => setTimeout(r, 30))
 await canvasOperation([...document.querySelectorAll('.graph-node-action')].at(-1), '创建动作')
 await new Promise(r => setTimeout(r, 30))
@@ -1663,7 +1653,6 @@ const macroPageOk = macroPageSource.includes('操作宏插件页面')
 console.log((macroCaptured && macroPageOk && macroFullPageOpen?'PASS':'FAIL')+' - private macro data is edited through the full-page plugin extension view')
 if (!macroCaptured || !macroPageOk || !macroFullPageOpen) process.exitCode = 1
 
-;[...document.querySelectorAll('.editor-mode-switch button')].find(button => button.textContent.includes('节点编辑'))?.click()
 await pause(350)
 const viewport = document.querySelector('.node-canvas-viewport')
 viewport.dispatchEvent(new window.MouseEvent('contextmenu', { bubbles:true, cancelable:true, button:2, clientX:500, clientY:400 }))
@@ -1707,7 +1696,6 @@ const concurrencySavedOk = concurrencyDefaultOk
 console.log((concurrencySavedOk?'PASS':'FAIL')+' - repeated triggers default to single and explicitly save parallel execution')
 if (!concurrencySavedOk) process.exitCode = 1
 
-;[...document.querySelectorAll('.editor-mode-switch button')].find(button => button.textContent.includes('节点编辑'))?.click()
 await pause(350)
 const connectedLine = document.querySelector('.node-link-hit[aria-label="控制连线操作"]')
 const controlLineCount = document.querySelectorAll('.node-link-hit[aria-label="控制连线操作"]').length
@@ -1725,7 +1713,6 @@ const restoredConnection = document.querySelectorAll('.node-link-hit[aria-label=
 console.log((disconnectOk && restoredConnection?'PASS':'FAIL')+' - control connections can be disconnected from their menu and restored with undo')
 if (!disconnectOk || !restoredConnection) process.exitCode = 1
 if (!disconnectOk || !restoredConnection) console.error({ disconnectMenu, controlLineCount, disconnectedLineCount, restoredLineCount: document.querySelectorAll('.node-link-hit[aria-label="控制连线操作"]').length })
-;[...document.querySelectorAll('.editor-mode-switch button')].find(button => button.textContent.includes('普通模式'))?.click()
 await pause(30)
 
 const definitionsPanel = document.querySelector('.variables-editor')

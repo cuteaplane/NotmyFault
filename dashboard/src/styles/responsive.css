@@ -1,6 +1,5 @@
 @media(max-width:980px){
   .editor-mode-bar{flex-wrap:wrap}
-  .editor-mode-switch{flex-shrink:0;white-space:nowrap}
   .rule-editor-actions{width:100%;justify-content:flex-end;flex-wrap:wrap}
   .flow-rule-editor{padding:18px}
   .rule-title-capsule{width:min(300px,38vw)}
@@ -11,7 +10,7 @@
 @media(max-width:660px){
   .rule-editor-identity{width:100%;flex-wrap:wrap}.rule-back-btn{padding-left:4px}.rule-title-capsule{order:3;width:calc(100% - 86px);max-width:none}.rule-title-edit{order:4}.rule-folder-button{order:5}
   .editor-mode-bar{align-items:stretch}.rule-editor-actions{justify-content:flex-end;flex-wrap:wrap}.draft-state{margin-right:auto}
-  .action-retry-body,.failure-action-policy-grid{grid-template-columns:1fr}
+  .action-retry-body{grid-template-columns:1fr}
   .node-canvas-tools .btn{width:34px;padding:0;justify-content:center}
   .node-canvas-tools .btn{font-size:0}
   .node-canvas-tools .btn .material-symbols-outlined{font-size:19px}

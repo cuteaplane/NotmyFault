@@ -74,7 +74,7 @@ const appVersion = __APP_VERSION__
 const ruleCount = computed(() => store.configData?.rules?.length || 0)
 const triggerCount = computed(() => Object.keys(store.pluginsData?.triggers || {}).length)
 const actionCount = computed(() => Object.keys(store.pluginsData?.actions || {}).length)
-const modeLabel = computed(() => ({ strict: '严格', normal: '标准', permissive: '宽松' })[store.engineStatus?.security_mode] || '未知')
+const modeLabel = computed(() => ({ strict: '严格', permissive: '宽松' })[store.engineStatus?.security_mode] || '未知')
 const aiProviderLabel = computed(() => {
   const provider = aiProviderPresets.find(item => item.id === aiProviderIdFor(aiSavedSnapshot.value || store.aiDrafting))
   return provider?.label || (store.aiDrafting.endpoint_url ? '自定义' : '未设置')

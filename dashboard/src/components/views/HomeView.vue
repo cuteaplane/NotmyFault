@@ -57,6 +57,7 @@ const runStatusMeta = {
   running: { label: '运行中', icon: 'progress_activity' },
   deferred: { label: '等待重试', icon: 'schedule' },
   succeeded: { label: '成功', icon: 'check_circle' },
+  recovered: { label: '已补救', icon: 'healing' },
   failed: { label: '失败', icon: 'error' },
   timed_out: { label: '已超时', icon: 'timer_off' },
   cancelled: { label: '已停止', icon: 'stop_circle' },

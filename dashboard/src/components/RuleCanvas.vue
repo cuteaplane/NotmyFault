@@ -13,9 +13,8 @@ import { predicateSummary, predicateSummaryParts, precedingSources, workflowEven
 import { typeLabel } from '../lib/valueTypes'
 import { isAdmin, eventName, actionName, describeItem } from '../lib/rulePresentation'
 
-const props = defineProps({ rule: Object, layout: { type: String, default: 'canvas' }, selectedNodeId: String, graphOverride: Object, viewKey: { type: String, default: 'main' } })
-const emit = defineEmits(['update:selectedNodeId', 'select-node', 'delete-node', 'add-if', 'add-assignment', 'add-wait', 'open-picker', 'move-action', 'remove-action', 'move-failure-action', 'remove-failure-action', 'add-condition-child', 'open-if', 'predicate-select', 'branch-add', 'branch-remove', 'operation'])
-const canvasLayout = computed(() => props.layout === 'canvas')
+const props = defineProps({ rule: Object, selectedNodeId: String, graphOverride: Object, viewKey: { type: String, default: 'main' } })
+const emit = defineEmits(['update:selectedNodeId', 'select-node', 'delete-node', 'add-if', 'add-assignment', 'add-wait', 'open-picker', 'move-action', 'remove-action', 'add-condition-child', 'open-if', 'predicate-select', 'branch-add', 'branch-remove', 'operation'])
 const selectedNodeId = computed({ get: () => props.selectedNodeId, set: id => emit('update:selectedNodeId', id) })
 const typeCatalog = computed(() => Object.entries(store.schema.data_types?.custom || {}).map(([id, definition]) => ({ id, ...definition })))
 
@@ -53,7 +52,9 @@ function menuOperation(operation, value) {
   if (!context) return
   if (['create-variable', 'assign-variable'].includes(operation) && !context.outlet) {
     const node = context.node || layoutNodes.value.find(node => node.id === context.edge?.from)
-    if (node?.outputs?.length > 1) { contextMenu.value = { ...context, node, kind: 'data-outlet', dataOperation: operation }; return }
+    const outlets = node?.outputs?.filter(port => port.id !== 'failure') || []
+    if (outlets.length > 1) { contextMenu.value = { ...context, node, kind: 'data-outlet', dataOperation: operation, outlets }; return }
+    if (outlets.length === 1) context.outlet = outlets[0].id
   }
   contextMenu.value = null
   if (operation === 'edit-condition') { selectNode(context.edge.inspectionId); return }
@@ -82,10 +83,6 @@ function deleteNode(node) {
   if (!node || !canDeleteNode(node)) return
   contextMenu.value = null
   emit('delete-node', node)
-}
-function moveFailureNode(node, offset) {
-  const actions = node.owner.failure_actions, target = node.index + offset
-  if (target >= 0 && target < actions.length) actions.splice(target, 0, actions.splice(node.index, 1)[0])
 }
 function toggleGroup(id, open) {
   stopCameraAnimation()
@@ -162,7 +159,7 @@ const graph = computed(() => {
       const built = buildNodeDataPorts(node, store.schema, props.rule)
       const predicateParts = node.kind === 'predicate' && !['all', 'any', 'not', 'event_occurred', 'run_status'].includes(node.source.op)
         ? predicateSummaryParts(node.source, sources.get(node.groupOwner) || precedingSources(props.rule, node.raw || node.source, store.schema)) : null
-      const metaTitle = ['trigger', 'action', 'failure-action'].includes(node.kind)
+      const metaTitle = ['trigger', 'action'].includes(node.kind)
         ? describeItem(node.source, node.kind === 'trigger' ? 'trigger' : 'action', false) : node.meta
       return { ...built, predicateParts, metaTitle, dataInputs: node.dataInputs ?? built.dataInputs, dataOutputs: node.dataOutputs ?? built.dataOutputs }
     })
@@ -200,7 +197,7 @@ const graph = computed(() => {
       const bodyHeight = node.gate ? 104 : outletRows?.length ? 90 + outletRows.length * 28 : FLOW_NODE_BASE_HEIGHT
       const dataStartY = node.frame ? node.fixedHeight - 16 - dataPortRows * FLOW_DATA_PORT_STEP : bodyHeight + contentExtraHeight
         + (hasDataPorts ? FLOW_DATA_SUMMARY_HEIGHT : 0)
-      const footerHeight = !node.readOnly && ((node.kind === 'action' && !props.rule.workflow) || node.kind === 'failure-action') ? 34 : node.kind === 'condition' && !props.rule.workflow ? 40 : 0
+      const footerHeight = 0
       return {
         ...node,
         visibleDataInputs,
@@ -240,7 +237,7 @@ watch(targetLayoutNodes, target => {
   if (layoutFrame !== null) cancelAnimationFrame(layoutFrame)
   const previous = new Map(layoutNodes.value.map(node => [node.id, node]))
   const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
-  if (!previous.size || dataDrag.value || controlDrag.value || dragState || !canvasLayout.value || reduced) { layoutNodes.value = target; return }
+  if (!previous.size || dataDrag.value || controlDrag.value || dragState || reduced) { layoutNodes.value = target; return }
   let start = null
   const targetIds = new Set(target.map(node => node.id))
   const leaving = [...previous.values()].filter(node => !targetIds.has(node.id)).map(node => ({ ...node, exiting: true }))
@@ -267,8 +264,6 @@ const graphEdges = computed(() => {
 })
 const inspectionNodes = computed(() => [...layoutNodes.value, ...(graph.value.inspectionNodes || [])])
 const selectedGraphNode = computed(() => inspectionNodes.value.find(node => node.id === selectedNodeId.value) || null)
-const inlineInspectorNodeId = computed(() => layoutNodes.value.some(node => node.id === selectedNodeId.value)
-  ? selectedNodeId.value : selectedGraphNode.value?.groupOwner ? `action-${selectedGraphNode.value.groupOwner.binding_id}` : null)
 watch(inspectionNodes, nodes => {
   if (
     selectedNodeId.value
@@ -282,7 +277,7 @@ function selectNode(id, reveal = false) {
 }
 
 function focusNode(node) {
-  if (keyboardNavigation && canvasLayout.value && !dataDrag.value && !dragState) centerOnNode(node)
+  if (keyboardNavigation && !dataDrag.value && !dragState) centerOnNode(node)
 }
 
 // 画布相机只改变 0×0 容器的 translate 和 scale，节点、连线都用同一逻辑坐标。
@@ -331,7 +326,6 @@ function zoomAt(nextZoom, cx, cy) {
   zoom.value = z
 }
 function onCanvasWheel(event) {
-  if (!canvasLayout.value) return
   if (!viewportRef.value) return
   event.preventDefault()
   if (dataDrag.value || dragState) return
@@ -362,7 +356,7 @@ function backgroundMenu(event) {
   openContext(event, { kind: 'background', parent: groupAt(position), position })
 }
 function startPan(event) {
-  if (!canvasLayout.value || event.button !== 0 || !blankCanvasTarget(event.target)) return
+  if (event.button !== 0 || !blankCanvasTarget(event.target)) return
   stopCameraAnimation()
   if (event.ctrlKey) {
     const point = logicalPoint(event)
@@ -407,13 +401,13 @@ function dataReference(node, port) {
 }
 function canConnectDataPorts(sourceNode, sourcePort, targetNode, targetPort) {
   if (!typesCompatible(sourcePort.type, targetPort.type)) return false
-  if (['action', 'failure-action', 'action_group'].includes(sourceNode.kind)) {
-    return !targetNode.readOnly && ['action', 'failure-action', 'predicate'].includes(targetNode.kind)
+  if (['action', 'action_group'].includes(sourceNode.kind)) {
+    return !targetNode.readOnly && ['action', 'predicate'].includes(targetNode.kind)
       && (targetNode.availableStepIds || []).includes(sourceNode.source.binding_id)
   }
   if (sourceNode.kind !== 'trigger') return false
 
-  return !targetNode.readOnly && ['action', 'failure-action', 'predicate'].includes(targetNode.kind)
+  return !targetNode.readOnly && ['action', 'predicate'].includes(targetNode.kind)
 }
 function inputPortAt(event) {
   const target = document.elementFromPoint?.(event.clientX, event.clientY)?.closest?.('[data-input-node][data-input-port]')
@@ -437,7 +431,7 @@ function updateDataDropTarget(event) {
     : null
 }
 function startDataDrag(event, node, port) {
-  if (!canvasLayout.value || dataDrag.value || controlDrag.value || dragState) return
+  if (dataDrag.value || controlDrag.value || dragState) return
   if (event.button !== 0) return
   event.preventDefault()
   event.stopPropagation()
@@ -587,7 +581,7 @@ function centerOnNode(node) {
 }
 // 工具栏或添加节点触发选中时先把目标移到视野内，手动点击的节点直接保留原位。
 watch(selectedGraphNode, (node, previous) => {
-  if (node && Number.isFinite(node.x) && node.id !== previous?.id && canvasLayout.value && !dataDrag.value && !controlDrag.value && !dragState && pointerSelectionId !== node.id) centerOnNode(node)
+  if (node && Number.isFinite(node.x) && node.id !== previous?.id && !dataDrag.value && !controlDrag.value && !dragState && pointerSelectionId !== node.id) centerOnNode(node)
   pointerSelectionId = null
 })
 
@@ -675,14 +669,9 @@ const highlightedIds = computed(() => {
   follow(nodeId, 'downstream')
   return ids
 })
-function nodeDimmed(id) { return canvasLayout.value && highlightedIds.value ? !highlightedIds.value.has(id) : false }
+function nodeDimmed(id) { return highlightedIds.value ? !highlightedIds.value.has(id) : false }
 function edgeDimmed(edge) { return highlightedIds.value ? !highlightedIds.value.has(edge.from) || !highlightedIds.value.has(edge.to) : false }
 
-watch(canvasLayout, async active => {
-  if (!active) { resizeObserver?.disconnect(); return }
-  await nextTick()
-  observeViewport()
-})
 
 function resetLayout() {
   arrangeWorkflow(props.rule.workflow, expandedGroups.value, new Map(layoutNodes.value.filter(node => !node.frame && !node.gate).map(node => [node.raw.binding_id, node.height])))
@@ -690,7 +679,7 @@ function resetLayout() {
 }
 
 function startNodeDrag(event, node) {
-  if (!canvasLayout.value || node.gate || dataDrag.value || controlDrag.value || dragState || event.button !== 0) return
+  if (node.gate || dataDrag.value || controlDrag.value || dragState || event.button !== 0) return
   event.preventDefault(); stopCameraAnimation(); contextMenu.value = null
   if (layoutFrame !== null) { cancelAnimationFrame(layoutFrame); layoutFrame = null }
   const selected = selection.value.has(node.raw.binding_id) ? new Set(selection.value) : new Set([node.raw.binding_id])
@@ -746,7 +735,7 @@ function observeViewport() {
 
 onMounted(() => {
   restoreView()
-  if (canvasLayout.value) observeViewport()
+  observeViewport()
   window.addEventListener('pointermove', moveGesture)
   window.addEventListener('pointerup', endGesture)
   window.addEventListener('pointercancel', cancelGesture)
@@ -791,7 +780,7 @@ function scheduleEdgePan() {
   if (edgePanFrame === null) edgePanFrame = requestAnimationFrame(autoPan)
 }
 function startControlDrag(event, node, port) {
-  if (event.button !== 0 || !props.rule.workflow || (!node.activationValue && node.activationNode) || node.kind === 'failure-action') return
+  if (event.button !== 0 || !props.rule.workflow || (!node.activationValue && node.activationNode)) return
   event.preventDefault(); event.stopPropagation(); contextMenu.value = null; stopCameraAnimation()
   if (layoutFrame !== null) { cancelAnimationFrame(layoutFrame); layoutFrame = null }
   freezeConnectionPositions()
@@ -897,10 +886,10 @@ defineExpose({ nodes: layoutNodes, inspectionNodes, toggleGroup, openContext })
 </script>
 
 <template>
-    <main class="node-editor-workspace editor-mode-active" :class="{ 'form-layout': !canvasLayout, 'with-inspector': canvasLayout && selectedNodeId }">
-      <section class="node-canvas-panel" :aria-label="canvasLayout ? '规则节点画布' : '规则步骤'">
+    <main class="node-editor-workspace editor-mode-active" :class="{ 'with-inspector': selectedNodeId }">
+      <section class="node-canvas-panel" aria-label="规则节点画布">
         <div class="node-canvas-toolbar">
-          <div v-if="canvasLayout" class="node-canvas-toolbar-side">
+          <div class="node-canvas-toolbar-side">
             <div class="node-canvas-zoom">
               <button class="icon-btn" title="缩小" @click="zoomStep(1 / 1.25)"><span class="material-symbols-outlined">remove</span></button>
               <button class="zoom-label" title="重置为 100%" @click="resetZoom">{{ Math.round(zoom * 100) }}%</button>
@@ -913,14 +902,14 @@ defineExpose({ nodes: layoutNodes, inspectionNodes, toggleGroup, openContext })
             </div>
           </div>
         </div>
-        <div ref="viewportRef" class="node-canvas-viewport" :class="{ panning: isPanning }" :style="canvasLayout ? gridStyle : null"
+        <div ref="viewportRef" class="node-canvas-viewport" :class="{ panning: isPanning }" :style="gridStyle"
           @pointerdown="contextMenu = null; startPan($event)" @pointermove="dataDrag ? updateDataDropTarget($event) : movePan($event)"
           @pointerup="dataDrag ? endDataDrag($event) : endPan()" @pointercancel="cancelGesture" @lostpointercapture="dataDrag || controlDrag || dragState ? cancelGesture() : null"
           @contextmenu.prevent="backgroundMenu" @wheel="onCanvasWheel" tabindex="0" aria-label="规则画布，可用方向键平移，加减号缩放" @keydown.self="handleCanvasKey">
-          <div class="node-canvas" :class="{ 'cam-anim': camAnim }" :style="canvasLayout ? cameraStyle : null">
+          <div class="node-canvas" :class="{ 'cam-anim': camAnim }" :style="cameraStyle">
             <div v-if="selectionBox" class="canvas-selection-box" :style="{ left: `${selectionBox.x}px`, top: `${selectionBox.y}px`, width: `${selectionBox.width}px`, height: `${selectionBox.height}px` }"></div>
             <!-- 画布和 SVG 共用逻辑像素坐标，overflow:visible 让连线绘制到容器外，设置 viewBox 会让端口错位。 -->
-            <svg v-if="canvasLayout" class="node-links" role="group" aria-label="流程连线">
+            <svg class="node-links" role="group" aria-label="流程连线">
               <defs>
                 <marker id="node-link-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
                   <path d="M 0 0 L 8 4 L 0 8 z" />
@@ -945,17 +934,17 @@ defineExpose({ nodes: layoutNodes, inspectionNodes, toggleGroup, openContext })
             <article
               class="graph-node" :class="[`graph-node-${node.kind}`, { selected: selectedNodeId === node.id, dimmed: nodeDimmed(node.id), 'data-incompatible': nodeDataIncompatible(node), 'graph-group-frame': node.frame, 'multi-selected': node.raw && !node.gate && selection.has(node.raw.binding_id), 'group-drop-target': node.frame && dropGroup === node.raw?.binding_id, 'layout-entering': node.entering, 'layout-exiting': node.exiting }]"
               :data-node-id="node.id"
-              :style="canvasLayout ? { left: `${node.x}px`, top: `${node.y}px`, height: `${node.height}px`, width: `${node.width || FLOW_NODE_WIDTH}px` } : null"
+              :style="{ left: `${node.x}px`, top: `${node.y}px`, height: `${node.height}px`, width: `${node.width || FLOW_NODE_WIDTH}px` }"
               role="button" tabindex="0" @click.stop="activateNode($event, node)" @contextmenu.prevent.stop="activateNode($event, node)" @keydown.enter.self.prevent="selectNode(node.id)" @keydown.space.self.prevent="selectNode(node.id)" @focus="focusNode(node)"
               @pointerenter="hoverNodeId = node.id" @pointerleave="hoverNodeId = null">
 <button v-for="port in node.inputs || []" :key="port.id" class="node-port node-port-in control-input" :style="{ top: `${port.y - 7}px`, left: `${(port.x || 0) - 7}px` }" :data-control-input="node.id" :data-control-port="port.id" :aria-label="port.label" @pointerdown.stop @click.stop="selectBranch(node, port)" @contextmenu.prevent.stop="selectBranch(node, port)"></button>
               <template v-if="node.frame && node.raw.group_type === 'if'"><button v-for="port in node.outputs" :key="`label-${port.id}`" class="graph-branch-label" :style="{ top: `${port.y - 18}px` }" :aria-label="`设置 ${port.label} 分支`" @pointerdown.stop @click.stop="selectBranch(node, port)" @contextmenu.prevent.stop="selectBranch(node, port)">{{ port.label }}{{ port.branch.negated ? ' · NOT' : '' }}</button></template>
-              <span v-if="canvasLayout && node.hasInput" class="node-port node-port-in" :style="{ top: `${(node.inputY ?? 58) - 7}px` }" :data-control-input="node.id" :data-control-port="node.targetPort || 'input'"></span>
+              <span v-if="node.hasInput" class="node-port node-port-in" :style="{ top: `${(node.inputY ?? 58) - 7}px` }" :data-control-input="node.id" :data-control-port="node.targetPort || 'input'"></span>
               <header class="graph-node-head" @pointerdown.stop="startNodeDrag($event, node)"
                 @pointermove.stop="dragNode" @pointerup.stop="endNodeDrag" @pointercancel.stop="endNodeDrag">
                 <span class="material-symbols-outlined">{{ node.icon }}</span>
                 <button v-if="node.raw?.type === 'event_group' && !node.gate" class="graph-node-head-title group-type-control" aria-label="切换事件组类型" @pointerdown.stop @click.stop="openContext($event, { kind: 'group-type', node })">{{ node.frame ? node.label === groupTypeLabel(node.raw.group_type) ? node.label : `${node.label} · ${groupTypeLabel(node.raw.group_type)}` : `事件组 · ${groupTypeLabel(node.raw.group_type)}` }}</button><span v-else class="graph-node-head-title">{{ node.frame ? node.label : node.kicker }}</span>
-                <button v-if="['event_group', 'action_group'].includes(node.kind)" class="icon-btn group-toggle" :title="node.open ? '收起组' : '展开组'" @pointerdown.stop @click.stop="toggleGroup(node.source.binding_id)" @contextmenu.prevent.stop="toggleGroup(node.source.binding_id)"><span class="material-symbols-outlined">{{ node.open ? 'unfold_less' : 'unfold_more' }}</span></button><div class="graph-node-head-actions"><button class="icon-btn node-context-button" title="节点操作" @pointerdown.stop @click.stop="openContext($event, { kind: node.conditionGraph ? 'condition' : 'control', node })" @contextmenu.prevent.stop="openContext($event, { kind: node.conditionGraph ? 'condition' : 'control', node })"><span class="material-symbols-outlined">more_horiz</span></button><button v-if="canDeleteNode(node)" class="icon-btn node-context-button icon-btn-danger" title="删除节点（Delete）" aria-label="删除节点" @pointerdown.stop @click.stop="deleteNode(node)"><span class="material-symbols-outlined">delete</span></button></div><span v-if="canvasLayout" class="material-symbols-outlined node-drag-handle">drag_indicator</span>
+                <button v-if="['event_group', 'action_group'].includes(node.kind)" class="icon-btn group-toggle" :title="node.open ? '收起组' : '展开组'" @pointerdown.stop @click.stop="toggleGroup(node.source.binding_id)" @contextmenu.prevent.stop="toggleGroup(node.source.binding_id)"><span class="material-symbols-outlined">{{ node.open ? 'unfold_less' : 'unfold_more' }}</span></button><div class="graph-node-head-actions"><button class="icon-btn node-context-button" title="节点操作" @pointerdown.stop @click.stop="openContext($event, { kind: node.conditionGraph ? 'condition' : 'control', node })" @contextmenu.prevent.stop="openContext($event, { kind: node.conditionGraph ? 'condition' : 'control', node })"><span class="material-symbols-outlined">more_horiz</span></button><button v-if="canDeleteNode(node)" class="icon-btn node-context-button icon-btn-danger" title="删除节点（Delete）" aria-label="删除节点" @pointerdown.stop @click.stop="deleteNode(node)"><span class="material-symbols-outlined">delete</span></button></div><span class="material-symbols-outlined node-drag-handle">drag_indicator</span>
               </header>
               <div v-if="!node.frame" class="graph-node-body" :class="{ 'has-admin': node.admin, 'has-outlets': node.kind === 'event_group' || node.outputAnchors?.some(port => port.label) }">
                 <b :title="node.metaTitle">{{ node.predicateParts?.comparison || node.label }}</b>
@@ -965,7 +954,7 @@ defineExpose({ nodes: layoutNodes, inspectionNodes, toggleGroup, openContext })
               <div v-if="!node.frame && (node.kind === 'event_group' || node.outputAnchors?.some(port => port.label))" class="graph-node-outlets">
                 <div v-for="port in (node.kind === 'event_group' ? node.outputs : node.outputAnchors)" :key="port.id" class="graph-node-outlet"><span>{{ port.label }}</span><span class="material-symbols-outlined">arrow_forward</span></div>
               </div>
-              <div v-if="canvasLayout && node.hasDataPorts" class="graph-node-data-summary">
+              <div v-if="node.hasDataPorts" class="graph-node-data-summary">
                 <button :class="{ active: sideExpanded(node.id, 'inputs') }" :disabled="!node.dataInputs.length" @click.stop="togglePorts(node.id, 'inputs')" @contextmenu.prevent.stop="togglePorts(node.id, 'inputs')">
                   <span class="material-symbols-outlined">input</span>{{ dataSideLabel(node, 'inputs') }}
                   <span class="material-symbols-outlined">{{ sideExpanded(node.id, 'inputs') ? 'expand_less' : 'expand_more' }}</span>
@@ -975,7 +964,7 @@ defineExpose({ nodes: layoutNodes, inspectionNodes, toggleGroup, openContext })
                   <span class="material-symbols-outlined">{{ sideExpanded(node.id, 'outputs') ? 'expand_less' : 'expand_more' }}</span>
                 </button>
               </div>
-              <div v-if="canvasLayout && node.dataPortRows" class="graph-node-data">
+              <div v-if="node.dataPortRows" class="graph-node-data">
                  <div class="data-port-column data-port-column-input">
                    <span v-for="port in node.visibleDataInputs" :key="port.id" class="data-port-row"
                      :class="dataInputDropState(node, port)" :data-input-node="node.id" :data-input-port="port.name"
@@ -990,27 +979,12 @@ defineExpose({ nodes: layoutNodes, inspectionNodes, toggleGroup, openContext })
                    </span>
                 </div>
               </div>
-              <footer v-if="node.kind === 'action' && !node.readOnly && !rule.workflow" class="graph-node-actions">
-                <button class="icon-btn" :disabled="node.index === 0" title="提前执行" @click.stop="emit('move-action', node.index, -1, node)"><span class="material-symbols-outlined">arrow_back</span></button>
-                <button class="icon-btn" :disabled="node.index === (node.items?.length ?? rule.actions.length) - 1" title="稍后执行" @click.stop="emit('move-action', node.index, 1, node)"><span class="material-symbols-outlined">arrow_forward</span></button>
-                <button class="icon-btn icon-btn-danger" title="删除动作" @click.stop="emit('remove-action', node.index, node)"><span class="material-symbols-outlined">delete</span></button>
-              </footer>
-              <footer v-else-if="node.kind === 'failure-action' && !node.readOnly && !node.exiting" class="graph-node-actions">
-                <button class="icon-btn" :disabled="node.index === 0" title="上移" @click.stop="moveFailureNode(node, -1)"><span class="material-symbols-outlined">arrow_back</span></button>
-                <button class="icon-btn" :disabled="node.index === node.owner.failure_actions.length - 1" title="下移" @click.stop="moveFailureNode(node, 1)"><span class="material-symbols-outlined">arrow_forward</span></button>
-                <button class="icon-btn icon-btn-danger" title="删除补救动作" @click.stop="deleteNode(node)"><span class="material-symbols-outlined">delete</span></button>
-              </footer>
-              <footer v-else-if="node.kind === 'condition' && !rule.workflow" class="graph-node-logic-actions">
-                <button @click.stop="emit('add-condition-child', node, false)"><span class="material-symbols-outlined">add</span>条件</button>
-                <button @click.stop="emit('add-condition-child', node, true)"><span class="material-symbols-outlined">account_tree</span>条件组</button>
-              </footer>
-              <template v-if="canvasLayout && node.outputs"><button v-for="port in node.outputs" :key="port.id" class="node-port node-port-out control-port" :style="{ top: `${port.y - 7}px` }" :title="port.label" :aria-label="`${port.label}出口操作`" @pointerdown="startControlDrag($event, node, port)" @contextmenu.prevent.stop="openContext($event, node.activationValue ? { kind: 'activation', group: node.activationOwner, target: node.activationValue, node } : { kind: 'control', node, outlet: port.id })" @click.stop="$event.detail === 0 && openContext($event, node.activationValue ? { kind: 'activation', group: node.activationOwner, target: node.activationValue, node } : { kind: 'control', node, outlet: port.id })"></button></template><span v-else-if="canvasLayout && node.hasOutput" class="node-port node-port-out" role="button" tabindex="0" aria-label="出口操作" @pointerdown="node.conditionGraph ? startControlDrag($event, node, { id: 'condition', y: 58 }) : null" @click.stop="openContext($event, { kind: node.conditionGraph ? 'condition' : 'control', node })" @contextmenu.prevent.stop="openContext($event, { kind: node.conditionGraph ? 'condition' : 'control', node })" @keydown.enter.prevent.stop="openContext($event, { kind: node.conditionGraph ? 'condition' : 'control', node })" @keydown.space.prevent.stop="openContext($event, { kind: node.conditionGraph ? 'condition' : 'control', node })"></span>
+              <template v-if="node.outputs"><button v-for="port in node.outputs" :key="port.id" class="node-port node-port-out control-port" :style="{ top: `${port.y - 7}px` }" :title="port.label" :aria-label="`${port.label}出口操作`" @pointerdown="startControlDrag($event, node, port)" @contextmenu.prevent.stop="openContext($event, node.activationValue ? { kind: 'activation', group: node.activationOwner, target: node.activationValue, node } : { kind: 'control', node, outlet: port.id })" @click.stop="$event.detail === 0 && openContext($event, node.activationValue ? { kind: 'activation', group: node.activationOwner, target: node.activationValue, node } : { kind: 'control', node, outlet: port.id })"></button></template><span v-else-if="node.hasOutput" class="node-port node-port-out" role="button" tabindex="0" aria-label="出口操作" @pointerdown="node.conditionGraph ? startControlDrag($event, node, { id: 'condition', y: 58 }) : null" @click.stop="openContext($event, { kind: node.conditionGraph ? 'condition' : 'control', node })" @contextmenu.prevent.stop="openContext($event, { kind: node.conditionGraph ? 'condition' : 'control', node })" @keydown.enter.prevent.stop="openContext($event, { kind: node.conditionGraph ? 'condition' : 'control', node })" @keydown.space.prevent.stop="openContext($event, { kind: node.conditionGraph ? 'condition' : 'control', node })"></span>
             </article>
-            <slot v-if="!canvasLayout && inlineInspectorNodeId === node.id" name="inspector" />
             </template>
           </div>
 
-          <div v-if="canvasLayout && layoutNodes.length" class="node-minimap" tabindex="0" role="group" aria-label="小地图，可用方向键平移" title="小地图：点击或拖动跳转" @keydown.self="handleCanvasKey"
+          <div v-if="layoutNodes.length" class="node-minimap" tabindex="0" role="group" aria-label="小地图，可用方向键平移" title="小地图：点击或拖动跳转" @keydown.self="handleCanvasKey"
             @pointerdown.stop="startMinimapDrag" @pointermove="moveMinimapDrag"
             @pointerup="endMinimapDrag" @pointercancel="endMinimapDrag">
             <svg :viewBox="`${minimapFrame.x} ${minimapFrame.y} ${minimapFrame.w} ${minimapFrame.h}`" preserveAspectRatio="xMidYMid meet">
@@ -1022,7 +996,7 @@ defineExpose({ nodes: layoutNodes, inspectionNodes, toggleGroup, openContext })
           </div>
           <Transition name="canvas-menu"><div v-if="contextMenu" ref="contextMenuRef" class="canvas-context-menu" role="menu" :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px`, maxHeight: `${contextMenu.maxHeight}px`, maxWidth: `${Math.max(240, viewportSize.w - 16)}px` }" @pointerdown.stop @keydown.esc.stop="contextMenu = null">
             <template v-if="contextMenu.kind === 'group-type'"><button v-for="type in ['if', 'all', 'any', 'not']" :key="type" role="menuitem" @click="menuOperation('group-type', type)">{{ type === 'if' ? 'IF／ELIF／ELSE' : type === 'all' ? 'AND' : type === 'any' ? 'OR' : 'NOT' }}</button></template>
-            <template v-else-if="contextMenu.kind === 'data-outlet'"><p class="inspector-lead">选择执行赋值的分支</p><button v-for="port in contextMenu.node.outputs" :key="port.id" role="menuitem" @click="chooseDataOutlet(port.id)"><span class="material-symbols-outlined">call_split</span>{{ port.label || '完成出口' }}</button></template>
+            <template v-else-if="contextMenu.kind === 'data-outlet'"><p class="inspector-lead">选择执行赋值的分支</p><button v-for="port in contextMenu.outlets" :key="port.id" role="menuitem" @click="chooseDataOutlet(port.id)"><span class="material-symbols-outlined">call_split</span>{{ port.label || '完成出口' }}</button></template>
             <template v-else-if="['data', 'data-edge'].includes(contextMenu.kind)"><button role="menuitem" @click="menuOperation('create-variable')"><span class="material-symbols-outlined">add_box</span>创建变量并赋值</button><button role="menuitem" @click="menuOperation('assign-variable')"><span class="material-symbols-outlined">edit_note</span>给变量赋值</button><button role="menuitem" @click="menuOperation('compare')"><span class="material-symbols-outlined">rule</span>创建比较条件</button></template>
             <template v-else>
               <template v-if="contextMenu.ids.length > 1"><button v-for="type in ['if', 'all', 'any', 'not']" :key="type" role="menuitem" @click="menuOperation('group-selection', type)"><span class="material-symbols-outlined">account_tree</span>组合 {{ type === 'if' ? 'IF／ELIF／ELSE' : type === 'all' ? 'AND' : type === 'any' ? 'OR' : 'NOT' }}</button></template>
@@ -1041,9 +1015,9 @@ defineExpose({ nodes: layoutNodes, inspectionNodes, toggleGroup, openContext })
             </template>
           </div></Transition>
         </div>
-        <div v-if="canvasLayout" class="canvas-help"><span class="material-symbols-outlined">pan_tool</span>拖空白处平移 · 从输出端口拖至输入端口绑定数据 · 实线为控制流，虚线为数据流</div>
+        <div class="canvas-help"><span class="material-symbols-outlined">pan_tool</span>拖空白处平移 · 从输出端口拖至输入端口绑定数据 · 实线为控制流，虚线为数据流</div>
       </section>
-      <div v-if="canvasLayout" class="inspector-width" :class="{ open: selectedNodeId }"><Transition name="node-inspector-slide"><div v-if="selectedNodeId" class="inspector-surface"><slot name="inspector" /></div></Transition></div>
+      <div class="inspector-width" :class="{ open: selectedNodeId }"><Transition name="node-inspector-slide"><div v-if="selectedNodeId" class="inspector-surface"><slot name="inspector" /></div></Transition></div>
 
           </main>
 </template>

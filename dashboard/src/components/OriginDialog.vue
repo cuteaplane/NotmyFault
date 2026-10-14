@@ -43,7 +43,6 @@ async function openOriginRule(rule) {
 
 function jumpToRule(rule) {
   store.pendingRuleId = rule.rule_id || ''
-  store.pendingRuleName = rule.name || ''
   emit('close')
   if (window.__nmf?.switchPage) window.__nmf.switchPage('rules')
 }

@@ -1,3 +1,5 @@
+import { normalizeWorkflow } from './workflowGraph.js'
+
 export function getParamDefs(m) {
   if (!m) return []
   if (Array.isArray(m.params)) return m.params
@@ -52,7 +54,6 @@ const commonOptionLabels = {
   on: '开启', off: '关闭', toggle: '切换', query: '查询状态',
   created: '新建', modified: '修改', deleted: '删除', all: '全部',
   above: '高于阈值', below: '低于阈值',
-  low_brightness: '低亮度', high_brightness: '高亮度',
 }
 
 function friendlyOptionLabel(value) {
@@ -131,9 +132,9 @@ function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
-export function normalizeRuleDraft(rule) {
-  if (!isObject(rule)) return rule
-  if (['condition', 'event', 'trigger', 'actions', 'preconditions'].some(key => Object.hasOwn(rule, key))) throw new Error('旧条件模型已移除，请使用流程图规则')
-  if (!isObject(rule.workflow) || !Array.isArray(rule.workflow.nodes) || !Array.isArray(rule.workflow.edges)) throw new Error('规则必须提供 workflow 图')
+export function validateRuleGraph(rule) {
+  if (!isObject(rule)) throw new Error('规则必须是对象')
+  if (Object.keys(rule).some(key => !['rule_id', 'name', 'folder', 'workflow', 'constants', 'variables', 'concurrency'].includes(key))) throw new Error('规则包含不支持的字段')
+  normalizeWorkflow(rule)
   return rule
 }

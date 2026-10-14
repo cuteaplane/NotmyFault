@@ -137,7 +137,7 @@ function normalizeAssertions() {
 
 function inputKind(field) {
   if (['object', 'array', 'union', 'any'].includes(field.type) && field.valueType || field.fullPayload || field.type?.includes('/')) return 'json'
-  if (['bool', 'boolean'].includes(field.type)) return 'boolean'
+  if (field.type === 'bool') return 'boolean'
   if (['number', 'float'].includes(field.type)) return 'number'
   return field.sensitive ? 'password' : 'text'
 }

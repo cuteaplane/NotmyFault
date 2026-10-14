@@ -55,6 +55,7 @@ function safeStep(step) {
     step_id: text(step?.step_id, 100),
     action_type: text(step?.action_type, 100),
     status: text(step?.status, 30),
+    recovery: step?.recovery ? { group_id: text(step.recovery.group_id, 100), status: text(step.recovery.status, 30), updated_at: numberOr(step.recovery.updated_at), error: safeError(step.recovery.error) } : null,
     branch: text(step?.branch, 100),
     evaluated_branches: safeEvaluations(step?.evaluated_branches),
     group_path: Array.isArray(step?.group_path) ? step.group_path.slice(0, 32).map(id => text(id, 100)) : [],

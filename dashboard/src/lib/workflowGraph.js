@@ -18,13 +18,103 @@ export function insertionParent(workflow, context) {
 export function normalizeWorkflow(rule) {
   if (['condition', 'event', 'trigger', 'actions', 'preconditions', '_matcher'].some(key => Object.hasOwn(rule, key))) throw new Error('旧条件模型已移除，请使用流程图规则')
   if (!rule.workflow || !Array.isArray(rule.workflow.nodes) || !Array.isArray(rule.workflow.edges)) throw new Error('规则必须提供 workflow 图')
-  if (rule.workflow.nodes.some(node => node.type === 'if' || ['activation', 'condition_graph', 'workflow', 'then', 'elif', 'else', 'triggers'].some(key => Object.hasOwn(node, key)))) throw new Error('旧条件模型已移除，请重新设计事件组')
+  if (rule.workflow.nodes.some(node => node.type === 'if' || ['activation', 'condition_graph', 'workflow', 'then', 'elif', 'else', 'triggers', 'failure_actions'].some(key => Object.hasOwn(node, key)))) throw new Error('旧条件模型已移除，请重新设计事件组')
+  const graph = rule.workflow, nodes = new Map(), seenIds = new Set()
+  if (graph.entry != null) throw new Error('平面流程图的入口由连线确定，entry 必须为 null')
+  for (const node of graph.nodes) {
+    if (!node || typeof node !== 'object' || Array.isArray(node) || !node.type) throw new Error('图块必须提供类型')
+    if (node.binding_id) {
+      if (!/^a_[a-z0-9_]{6,64}$/.test(node.binding_id) || seenIds.has(node.binding_id)) throw new Error('图块身份无效或重复')
+      seenIds.add(node.binding_id); nodes.set(node.binding_id, node)
+    }
+    if (node.type === 'trigger') {
+      if (!node.trigger || typeof node.trigger !== 'object' || !node.trigger.type) throw new Error('触发器图块必须提供插件触发器')
+      const id = node.trigger.binding_id
+      if (id && (!/^t_[a-z0-9_]{6,64}$/.test(id) || seenIds.has(id))) throw new Error('触发器身份无效或重复')
+      if (id) seenIds.add(id)
+    }
+    if (node.type === 'condition' && (!node.predicate || 'children' in node.predicate || !['eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'contains', 'is_true', 'is_false', 'exists', 'not_exists', 'run_status'].includes(node.predicate.op))) throw new Error('条件图块只接受数据比较或自动化状态判断')
+    if (node.type === 'logic' && !['all', 'any', 'not'].includes(node.op) || node.type === 'event_group' && !['if', 'all', 'any', 'not'].includes(node.group_type)) throw new Error('逻辑节点或事件组的类型无效')
+    for (const key of ['within_seconds', 'duration_seconds', 'timeout_seconds']) if (Object.hasOwn(node, key) && (!Number.isFinite(node[key]) || node[key] <= 0 || node[key] > 86400)) throw new Error('时间范围必须是大于零且不超过 86400 的有限秒数')
+    if (node.position && !['x', 'y'].every(key => Number.isFinite(node.position[key]))) throw new Error('图块位置必须是有限数字坐标')
+    if (node.type === 'event_group' && node.group_type === 'if') {
+      const branches = node.branches || [], ids = new Set()
+      if (branches.length < 2 || branches.filter(branch => branch.else).length !== 1 || !branches.at(-1)?.else) throw new Error('IF 事件组必须有 IF 和末尾唯一 ELSE')
+      for (const branch of branches) {
+        if (!/^b_[a-z0-9_]+$/.test(branch.id || '') || ids.has(branch.id) || ['condition', 'condition_graph', 'then'].some(key => Object.hasOwn(branch, key))) throw new Error('事件组分支无效')
+        ids.add(branch.id)
+      }
+    }
+  }
+  for (const node of graph.nodes) {
+    let parent = node.parent
+    const visited = new Set([node.binding_id])
+    while (parent) {
+      if (visited.has(parent)) throw new Error('组不能包含自身或祖先组')
+      visited.add(parent)
+      if (!isGroup(nodes.get(parent))) throw new Error('图块所属组不存在')
+      parent = nodes.get(parent).parent
+    }
+  }
+  const handlers = new Set(graph.edges.filter(edge => edge.channel === 'control' && edge.port === 'failure').map(edge => edge.target))
+  const outlets = new Set(), pairs = new Set(), counts = new Map(), adjacency = new Map()
+  for (const edge of graph.edges) {
+    const source = nodes.get(edge.source), target = nodes.get(edge.target), input = edge.target_port || 'input'
+    if (!source || !target || !['control', 'condition'].includes(edge.channel)) throw new Error('连线引用的节点或类型无效')
+    const ports = source.group_type === 'if' ? source.branches.map(branch => branch.id) : source.type === 'trigger' ? ['event'] : ['condition', 'logic', 'event_group'].includes(source.type) ? ['result'] : source.type === 'action_group' ? ['next', 'entry'] : source.type === 'end' ? [] : source.type === 'merge' ? ['next'] : ['next', 'failure']
+    if (!ports.includes(edge.port)) throw new Error('连线来源端口不存在')
+    const pair = JSON.stringify([edge.source, edge.port, edge.target, input, edge.channel])
+    if (pairs.has(pair)) throw new Error('连线重复')
+    pairs.add(pair)
+    if (edge.channel === 'condition') {
+      if (!isCondition(source) || !['logic', 'event_group'].includes(target.type)) throw new Error('条件端口类型不匹配')
+      if (target.group_type === 'if') {
+        const branch = target.branches.find(branch => branch.id === input)
+        if (!branch || branch.else) throw new Error('ELSE 不接受触发器或条件')
+      } else if (input !== 'input') throw new Error('目标条件端口不存在')
+      const key = `${edge.target}:${input}`, count = (counts.get(key) || 0) + 1
+      counts.set(key, count)
+      if (count > 1 && (target.group_type === 'if' || (target.op || target.group_type) === 'not')) throw new Error('IF／ELIF／NOT 只接一个条件')
+    } else {
+      const key = `${edge.source}:${edge.port}`
+      if (outlets.has(key)) throw new Error('同一控制出口只能接一个目标')
+      outlets.add(key)
+      if (input !== 'input' || ['logic', 'condition'].includes(target.type)) throw new Error('控制流只能连接执行入口')
+      if (edge.port === 'entry') {
+        if (source.type !== 'action_group' || actionGroupScope(graph, edge.target) !== edge.source) throw new Error('动作组入口只能连接组内节点')
+      } else if (actionGroupScope(graph, edge.source) !== actionGroupScope(graph, edge.target)) throw new Error('控制流不能跨越动作组边界')
+      if (edge.port === 'failure' && target.type !== 'action_group') throw new Error('失败出口只能连接动作组')
+      if (handlers.has(edge.target) && edge.port !== 'failure') throw new Error('补救动作组不能连接主流程入口')
+      if (handlers.has(edge.source) && edge.port === 'next') throw new Error('补救动作组不能连接外部后继')
+    }
+    if (!adjacency.has(edge.source)) adjacency.set(edge.source, [])
+    adjacency.get(edge.source).push(edge.target)
+  }
+  for (const node of graph.nodes) if (node.group_type === 'if') for (const branch of node.branches) {
+    if (!branch.else && graph.edges.some(edge => edge.source === node.binding_id && edge.port === branch.id && edge.channel === 'control') && !counts.get(`${node.binding_id}:${branch.id}`)) throw new Error('已使用的 IF／ELIF 分支必须连接条件')
+  }
+  const complete = new Set(), visiting = new Set()
+  function checkCycle(id) {
+    if (visiting.has(id)) throw new Error('连线不能形成循环')
+    if (complete.has(id)) return
+    visiting.add(id)
+    for (const target of adjacency.get(id) || []) checkCycle(target)
+    visiting.delete(id); complete.add(id)
+  }
+  for (const id of nodes.keys()) checkCycle(id)
   return rule.workflow
 }
 export function walkGraphActions(workflow, visit) {
-  ;(workflow?.nodes || []).forEach((node, index) => {
-    visit(node, index, [], workflow)
-    ;(node.failure_actions || []).forEach((failure, failureIndex) => visit(failure, failureIndex, [{ action: node, index, field: 'failure_actions' }], null))
+  const nodes = workflow?.nodes || [], byId = new Map(nodes.map(node => [node.binding_id, node]))
+  nodes.forEach((node, index) => {
+    const trail = [], seen = new Set([node.binding_id])
+    let parent = byId.get(node.parent)
+    while (parent && !seen.has(parent.binding_id)) {
+      seen.add(parent.binding_id)
+      trail.unshift({ action: parent, index: nodes.indexOf(parent), field: 'workflow' })
+      parent = byId.get(parent.parent)
+    }
+    visit(node, index, trail, workflow)
   })
 }
 export function findGraphNode(rule, identity) {
@@ -32,11 +122,42 @@ export function findGraphNode(rule, identity) {
   walkGraphActions(rule.workflow, (action, index, trail, workflow) => { if (action.binding_id === identity) result = { action, index, trail, workflow } })
   return result
 }
+export function findRecoveryGroup(workflow, action) {
+  const identity = typeof action === 'string' ? action : action?.binding_id
+  const edge = workflow.edges.find(edge => edge.source === identity && edge.port === 'failure' && edge.channel === 'control')
+  return edge && workflow.nodes.find(node => node.binding_id === edge.target && node.type === 'action_group')
+}
+export function createRecoveryGroup(workflow, action) {
+  const existing = findRecoveryGroup(workflow, action)
+  if (existing) return existing
+  const group = createGraphAction('action_group')
+  group.name = '失败补救'
+  if (action.parent) group.parent = action.parent
+  group.position = { x: (action.position?.x || 64) + 340, y: (action.position?.y || 118) + 240 }
+  workflow.nodes.push(group)
+  const error = connectGraph(workflow, action.binding_id, 'failure', group.binding_id, 'input', 'control')
+  if (error) { workflow.nodes.pop(); throw new Error(error) }
+  return group
+}
 export function getGraphTriggers(rule) { return (rule.workflow?.nodes || []).filter(node => node.type === 'trigger').map(node => node.trigger) }
 export function graphPredecessors(workflow, identity) {
-  const found = new Set()
-  function visit(target) { for (const edge of workflow?.edges || []) if (edge.target === target && !found.has(edge.source)) { found.add(edge.source); visit(edge.source) } }
+  const found = new Set(), visited = new Set(), byId = new Map((workflow?.nodes || []).map(node => [node.binding_id, node]))
+  function visit(target) {
+    if (visited.has(target)) return
+    visited.add(target)
+    for (const edge of workflow?.edges || []) if (edge.target === target && edge.channel === 'control') {
+      visit(edge.source)
+      if (!['entry', 'failure'].includes(edge.port)) found.add(edge.source)
+      if (edge.port === 'next') {
+        const handler = findRecoveryGroup(workflow, edge.source)
+        if (handler && byId.get(edge.source)?.on_error === 'continue') found.add(handler.binding_id)
+      }
+    }
+    const parent = byId.get(target)?.parent
+    if (parent) visit(parent)
+  }
   visit(identity)
+  found.delete(identity)
   return [...found]
 }
 export function conditionPredecessors(workflow, identity) {
@@ -161,7 +282,6 @@ export function arrangeWorkflow(workflow, expanded = new Set(), heights = new Ma
   function size(node) {
     if (memo.has(node.binding_id)) return memo.get(node.binding_id)
     let result = { width: 228, height: heights.get(node.binding_id) || 146 }
-    result.height += (node.failure_actions || []).reduce((sum, failure) => sum + 44 + (heights.get(failure.binding_id) || 146), 0)
     if (isGroup(node)) {
       const inner = contents(node.binding_id)
       if (expanded.has(node.binding_id)) result = { width: Math.max(284, inner.width + 56 + (node.type === 'event_group' ? node.group_type === 'if' ? 96 : 218 : 0)), height: Math.max(inner.height + 106, node.type === 'event_group' ? node.group_type === 'if' ? 158 + (visibleBranches(workflow, node, true).length - 1) * 52 : 210 : 210) }
@@ -245,6 +365,22 @@ export function connectGraph(workflow, source, port, target, targetPort = 'input
       if (input.length) return 'IF／ELIF 只接一个条件，请先连接 AND 或 OR'
     } else if ((to.op || to.group_type) === 'not' && input.length) return 'NOT 只接一个条件'
   }
+  if (channel === 'control') {
+    if (['logic', 'condition'].includes(to.type)) return '控制流不能接入条件节点'
+    if (targetPort !== 'input') return '控制流只能连接执行入口'
+    if (port === 'entry') {
+      if (from.type !== 'action_group' || actionGroupScope(workflow, target) !== source) return '动作组入口只能连接组内节点'
+    } else if (actionGroupScope(workflow, source) !== actionGroupScope(workflow, target)) return '控制流不能跨越动作组边界'
+    const handler = workflow.edges.some(edge => edge.target === target && edge.port === 'failure' && edge.channel === 'control')
+    if (port === 'failure') {
+      if (isCondition(from) || ['action_group', 'merge', 'end'].includes(from.type) || to.type !== 'action_group') return '失败出口只能连接动作组'
+      if (actionGroupScope(workflow, source) !== actionGroupScope(workflow, target)) return '补救动作组必须与原动作处于同一执行范围'
+      if (workflow.edges.some(edge => edge.target === target && edge.channel === 'control' && edge.port !== 'failure') || workflow.edges.some(edge => edge.source === target && edge.port === 'next' && edge.channel === 'control')) return '补救动作组不能连接主流程入口或外部后继'
+    } else {
+      if (handler) return '补救动作组不能连接主流程入口'
+      if (port === 'next' && workflow.edges.some(edge => edge.target === source && edge.port === 'failure' && edge.channel === 'control')) return '补救动作组按停止／继续设置返回，不能连接外部后继'
+    }
+  }
   const pending = [target], visited = new Set()
   while (pending.length) {
     const current = pending.pop()
@@ -295,13 +431,13 @@ export function groupGraphNodes(workflow, identities, type = 'if') {
 }
 export function copyGraphNode(node, workflow) {
   const originals = [node], selected = new Set([node.binding_id]), ids = new Map()
-  if (workflow && isGroup(node)) for (let i = 0; i < originals.length; i++) for (const child of workflow.nodes) if (child.parent === originals[i].binding_id) { originals.push(child); selected.add(child.binding_id) }
+  if (workflow && !isGroup(node)) { const handler = findRecoveryGroup(workflow, node); if (handler) { originals.push(handler); selected.add(handler.binding_id) } }
+  if (workflow && originals.some(isGroup)) for (let i = 0; i < originals.length; i++) for (const child of workflow.nodes) if (child.parent === originals[i].binding_id) { originals.push(child); selected.add(child.binding_id) }
   function duplicate(original) {
     const copy = clone(original)
     copy.binding_id = graphId(); ids.set(original.binding_id, copy.binding_id)
     if (copy.trigger) { copy.trigger.binding_id = graphId('t'); ids.set(original.trigger.binding_id, copy.trigger.binding_id) }
     if (copy.branches) copy.branches = original.branches.map(branch => { const id = graphId('b'); ids.set(branch.id, id); return { ...branch, id } })
-    if (copy.failure_actions) copy.failure_actions = original.failure_actions.map(duplicate)
     return copy
   }
   function rebind(value) {
@@ -312,7 +448,7 @@ export function copyGraphNode(node, workflow) {
   const copies = originals.map(duplicate)
   copies.forEach(copy => { if (ids.has(copy.parent)) copy.parent = ids.get(copy.parent); rebind(copy) })
   const copy = copies[0]
-  if (workflow && isGroup(node)) {
+  if (workflow && originals.length > 1) {
     copy._copyNodes = copies.slice(1)
     copy._copyEdges = workflow.edges.filter(edge => selected.has(edge.source) && selected.has(edge.target)).map(edge => ({ ...edge, source: ids.get(edge.source), target: ids.get(edge.target), port: ids.get(edge.port) || edge.port, target_port: ids.get(edge.target_port) || edge.target_port }))
   }
@@ -346,7 +482,7 @@ export function buildWorkflowGraph(rule, expanded, schema, presentation) {
     const position = positions.get(group.binding_id), children = raw.filter(node => node.parent === group.binding_id)
     let x = position.x, y = position.y, right = x + 28, bottom = y + 78
     for (const child of children) {
-      const childHeight = (presentation.nodeHeight?.({ id: `action-${child.binding_id}` }) || 170) + (child.failure_actions || []).reduce((sum, failure) => sum + 44 + (presentation.nodeHeight?.({ id: `failure-action-${failure.binding_id}` }) || 146), 0)
+      const childHeight = (presentation.nodeHeight?.({ id: `action-${child.binding_id}` }) || 170)
       const childBox = isGroup(child) && expanded.has(child.binding_id) ? box(child) : { ...positions.get(child.binding_id), width, height: childHeight }
       x = Math.min(x, childBox.x - 28); y = Math.min(y, childBox.y - 78)
       right = Math.max(right, childBox.x + childBox.width + 28); bottom = Math.max(bottom, childBox.y + childBox.height + 28)
@@ -362,6 +498,8 @@ export function buildWorkflowGraph(rule, expanded, schema, presentation) {
     const geometry = open ? box(source) : { ...positions.get(source.binding_id), width, height: 146 }
     const kind = source.type === 'trigger' ? 'trigger' : source.type === 'condition' ? 'predicate' : source.type === 'logic' ? 'condition-expression' : group ? source.type : 'action'
     const outputs = source.type === 'event_group' && source.group_type === 'if' ? ifPorts(source, geometry.y, open) : [{ id: source.type === 'trigger' ? 'event' : ['logic', 'condition', 'event_group'].includes(source.type) ? 'result' : 'next', label: '', y: 58 }]
+    if (!['trigger', 'condition', 'logic', 'event_group', 'action_group', 'merge', 'end'].includes(source.type)) outputs.push({ id: 'failure', label: '失败', y: 90 })
+    if (source.type === 'end') outputs.splice(0)
     const visibleSource = source.type === 'trigger' ? source.trigger : source.type === 'condition' ? source.predicate : source
     const node = { ...geometry, id: `action-${source.binding_id}`, raw: source, source: visibleSource, workflow, ancestry: ancestry(source), index, kind, frame: open, open, fixedHeight: open ? geometry.height : Math.max(116, 90 + outputs.length * 28), hasInput: source.type !== 'trigger', hasOutput: true, inputY: 58, outputs, label: source.name || (source.type === 'trigger' ? presentation.eventName(source.trigger) : source.type === 'condition' ? '条件判断' : source.type === 'logic' ? `${groupTypeLabel(source.op)}${source.negated ? ' · 取反' : ''}` : group ? labelFor(source) : presentation.actionName(source)), kicker: source.type === 'trigger' ? '触发器' : source.type === 'condition' ? '数据判断' : source.type === 'logic' ? '逻辑节点' : source.type === 'event_group' ? '事件组' : source.type === 'action_group' ? '动作组' : `动作 ${index + 1}`, meta: source.type === 'trigger' ? `${source.occurrence === 'absent' ? '事件未发生 · ' : ''}${presentation.describeItem(source.trigger, 'trigger')}` : source.type === 'condition' ? presentation.predicateSummary(source.predicate, source) : source.type === 'logic' ? '连接触发器、条件或事件组' : group ? `${raw.filter(node => node.parent === source.binding_id).length} 个内部图块` : presentation.describeItem(source, 'action'), icon: source.type === 'trigger' ? 'bolt' : source.type === 'condition' ? 'rule' : source.type === 'logic' ? 'account_tree' : source.type === 'event_group' ? 'call_split' : source.type === 'action_group' ? 'account_tree' : source.type === 'set_variable' ? 'edit_note' : source.type === 'wait' ? 'hourglass_empty' : 'play_arrow', availableStepIds: isCondition(source) ? conditionPredecessors(workflow, source.binding_id) : graphPredecessors(workflow, source.binding_id) }
     if (source.type === 'event_group' && source.group_type === 'if') {
@@ -387,16 +525,7 @@ export function buildWorkflowGraph(rule, expanded, schema, presentation) {
     if (source === target) continue
     const destination = byId.get(edge.target)
     const targetId = edge.channel === 'condition' && expanded.has(target) && destination?.type === 'event_group' && destination.group_type !== 'if' ? `gate-${target}-${edge.target_port || 'input'}` : `action-${target}`
-    edges.push({ id: `wire:${edge.source}:${edge.port}:${edge.target}:${edge.target_port || ''}`, from: edge.port === 'entry' && expanded.has(source) ? `entry-${source}` : `action-${source}`, to: targetId, channel: 'control', kind: edge.channel === 'condition' ? 'condition' : 'pipeline', sourcePort: edge.port, inputPort: targetId.startsWith('gate-') ? undefined : edge.target_port, rawEdge: edge, workflow, label: '' })
-  }
-  for (const owner of [...nodes].filter(node => !node.gate && !node.frame && node.raw.failure_actions?.length)) {
-    let previous = owner, y = owner.y + (presentation.nodeHeight?.(owner) || owner.fixedHeight) + 44
-    owner.raw.failure_actions.forEach((failure, index) => {
-      const node = { x: owner.x, y, width, fixedHeight: 146, id: `failure-action-${failure.binding_id}`, raw: failure, source: failure, owner: owner.raw, ancestry: owner.ancestry, index, parentIndex: owner.index, kind: 'failure-action', hasInput: true, hasOutput: false, inputY: 58, label: presentation.actionName(failure), kicker: `补救动作 ${index + 1}`, meta: presentation.describeItem(failure, 'action'), icon: 'play_arrow', availableStepIds: [...owner.availableStepIds, ...owner.raw.failure_actions.slice(0, index).map(item => item.binding_id)] }
-      nodes.push(node)
-      edges.push({ id: `failure:${node.id}`, from: previous.id, to: node.id, sourceSide: 'left', channel: 'control', kind: 'failure', label: index === 0 ? '失败后' : '' })
-      previous = node; y += (presentation.nodeHeight?.(node) || 146) + 44
-    })
+    edges.push({ id: `wire:${edge.source}:${edge.port}:${edge.target}:${edge.target_port || ''}`, from: edge.port === 'entry' && expanded.has(source) ? `entry-${source}` : `action-${source}`, to: targetId, channel: 'control', kind: edge.port === 'failure' ? 'failure' : edge.channel === 'condition' ? 'condition' : 'pipeline', sourcePort: edge.port, inputPort: targetId.startsWith('gate-') ? undefined : edge.target_port, rawEdge: edge, workflow, label: edge.port === 'failure' ? '失败补救' : '' })
   }
   return { nodes, edges, inspectionNodes }
 }

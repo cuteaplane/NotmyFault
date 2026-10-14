@@ -2,14 +2,14 @@
 import { computed, watch } from 'vue'
 import { store } from '../lib/store'
 import { ensureParams, getVisibleParamDefs } from '../lib/utils'
-import { buildBindingSources, buildFailureBindingSources, outputDefs, parameterAllowsBinding } from '../lib/bindings'
+import { buildBindingSources, outputDefs, parameterAllowsBinding } from '../lib/bindings'
 import ParamInput from './ParamInput.vue'
 import VariableAssignmentEditor from './VariableAssignmentEditor.vue'
 import WaitActionEditor from './WaitActionEditor.vue'
 import ActionFailureSettings from './ActionFailureSettings.vue'
 
-const props = defineProps({ action: { type: Object, required: true }, rule: { type: Object, required: true }, index: { type: Number, required: true }, bindingSources: { type: Array, default: null }, failureBindingSources: { type: Function, default: null }, allowFailureActions: { type: Boolean, default: true } })
-const emit = defineEmits(['replace', 'add-failure-action', 'replace-failure-action', 'remove-failure-action', 'move-failure-action'])
+const props = defineProps({ action: { type: Object, required: true }, rule: { type: Object, required: true }, index: { type: Number, required: true }, bindingSources: { type: Array, default: null }, recoveryGroup: { type: Object, default: null }, inRecovery: Boolean })
+const emit = defineEmits(['replace', 'create-recovery', 'edit-recovery', 'disconnect-recovery'])
 const meta = computed(() => store.schema.actions[props.action.type])
 watch(() => props.action, action => {
   if (!['set_variable', 'wait'].includes(action.type)) ensureParams(action)
@@ -17,7 +17,6 @@ watch(() => props.action, action => {
 const params = computed(() => getVisibleParamDefs(meta.value, props.action.params))
 const sources = computed(() => props.bindingSources || buildBindingSources(props.rule, props.index, store.schema))
 const outputHint = computed(() => outputDefs(meta.value).map(output => `${props.action.binding_id} · ${output.label || output.name}`).join('　'))
-const failureSources = index => props.failureBindingSources ? props.failureBindingSources(index) : buildFailureBindingSources(props.rule, props.index, index, store.schema)
 </script>
 
 <template>
@@ -34,10 +33,7 @@ const failureSources = index => props.failureBindingSources ? props.failureBindi
     <div class="param-grid"><ParamInput v-for="param in params" :key="param.name" :def="param" :plugin-id="action.type"
       v-model="action.params[param.name]" :allow-binding="parameterAllowsBinding(meta, param.name)" :binding-sources="sources" /></div>
     <div v-if="outputHint" class="workflow-output-hint">后续步骤可引用：<code>{{ outputHint }}</code></div>
-    <ActionFailureSettings v-if="allowFailureActions" :action="action" :meta="meta" :schema="store.schema.actions" :binding-sources="failureSources"
-      @add-failure-action="emit('add-failure-action')"
-      @replace-failure-action="index => emit('replace-failure-action', index)"
-      @remove-failure-action="index => emit('remove-failure-action', index)"
-      @move-failure-action="(index, offset) => emit('move-failure-action', index, offset)" />
+    <ActionFailureSettings :action="action" :meta="meta" :recovery-group="recoveryGroup" :in-recovery="inRecovery"
+      @create-recovery="emit('create-recovery')" @edit-recovery="emit('edit-recovery')" @disconnect-recovery="emit('disconnect-recovery')" />
   </template>
 </template>

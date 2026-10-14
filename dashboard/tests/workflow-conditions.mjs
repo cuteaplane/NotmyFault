@@ -18,7 +18,6 @@ assert(predicateSummary(predicate.predicate, sources).includes('可接受延迟'
 assert(predicateSummary({ op: 'run_status', rule_id: 'r_download', status: 'running', comparison: 'eq' }, [], [{ rule_id: 'r_download', name: '游戏下载' }]).includes('游戏下载'))
 const choices = workflowEventChoices(rule, schema)
 assert.equal(choices[0].label, '触发 1 · 进程事件')
-assert(predicateSummary({ op: 'event_occurred', trigger_id: steam.trigger.binding_id, expected: false }, [], [], choices).includes('未发生'))
 const noOutputs = { triggers: { process: { name: '进程事件', outputs: [] } }, actions: schema.actions }
 const fields = buildTestInputFields(rule, noOutputs)
 const fired = fields.find(field => field.scope === 'event_occurrence')

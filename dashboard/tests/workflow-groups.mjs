@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { normalizeWorkflow, createGraphAction, insertGraphNode, connectGraph, copyGraphNode, getGraphTriggers, buildWorkflowGraph, removeGraphNode, graphExecutionActions, groupGraphNodes, moveGraphNodes, switchGroupType, visibleBranches, insertionParent } from '../src/lib/workflowGraph.js'
+import { normalizeWorkflow, createGraphAction, insertGraphNode, connectGraph, copyGraphNode, getGraphTriggers, buildWorkflowGraph, removeGraphNode, graphExecutionActions, groupGraphNodes, moveGraphNodes, switchGroupType, visibleBranches, insertionParent, createRecoveryGroup, findRecoveryGroup } from '../src/lib/workflowGraph.js'
 import { collectTriggerLeaves, buildTestInputFields, actionOutputDefs } from '../src/lib/bindings.js'
 import { trigger, action, eventGroup, wire, ruleWith, reference, schema, presentation } from './canvas-fixtures.mjs'
 
@@ -91,10 +91,20 @@ assert.deepEqual(referenceOwner.params.literal, preservedLiteral)
 assert.equal(crossingRule.workflow.edges.length, 0)
 const firstFailure = action('failurefirst', 'measure'), secondFailure = action('failuresecond', 'log', { text: reference('step', firstFailure.binding_id, ['latency']) })
 const failureOwner = action('failureowner', 'log')
-failureOwner.failure_actions = [firstFailure, secondFailure]
-const failureCopy = copyGraphNode(failureOwner, { nodes: [failureOwner], edges: [] })
-assert.notEqual(failureCopy.failure_actions[0].binding_id, firstFailure.binding_id)
-assert.equal(failureCopy.failure_actions[1].params.text.$ref.node, failureCopy.failure_actions[0].binding_id, '复制补救动作保持内部结果引用')
+const recoveryGraph = { nodes: [failureOwner, firstFailure, secondFailure], edges: [] }
+const recoveryGroup = createRecoveryGroup(recoveryGraph, failureOwner)
+firstFailure.parent = recoveryGroup.binding_id; secondFailure.parent = recoveryGroup.binding_id
+assert.equal(connectGraph(recoveryGraph, recoveryGroup.binding_id, 'entry', firstFailure.binding_id), '')
+assert.equal(connectGraph(recoveryGraph, firstFailure.binding_id, 'next', secondFailure.binding_id), '')
+assert.equal(findRecoveryGroup(recoveryGraph, failureOwner), recoveryGroup)
+assert.match(connectGraph(recoveryGraph, recoveryGroup.binding_id, 'next', failureOwner.binding_id), /外部后继/)
+const failureCopy = copyGraphNode(failureOwner, recoveryGraph)
+const copiedFirst = failureCopy._copyNodes.find(node => node.type === 'measure')
+const copiedSecond = failureCopy._copyNodes.find(node => node.type === 'log')
+assert.notEqual(copiedFirst.binding_id, firstFailure.binding_id)
+assert.equal(copiedSecond.params.text.$ref.node, copiedFirst.binding_id)
+assert(failureCopy._copyEdges.some(edge => edge.source === failureCopy.binding_id && edge.port === 'failure'))
+assert.throws(() => normalizeWorkflow(ruleWith([{ ...failureOwner, failure_actions: [] }])), /旧条件模型/)
 
 const insertionTrigger = trigger('inserttrigger'), insertionTarget = eventGroup('inserttarget')
 const conditionWire = wire(insertionTrigger, insertionTarget, 'condition', 'event', insertionTarget.branches[0].id)
