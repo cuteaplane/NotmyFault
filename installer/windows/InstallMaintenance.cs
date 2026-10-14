@@ -99,19 +99,9 @@ namespace NotmyFault.Setup
             {
                 string path = PendingUpgradeDirectory(NormalizeDirectory(directory));
                 string marker = Path.Combine(path, StateFile);
-                if (File.Exists(marker))
-                {
-                    using (StreamReader reader = new StreamReader(marker, Encoding.UTF8))
-                        return reader.ReadLine() == StateHeader && File.Exists(Path.Combine(path, FilesFile));
-                }
-                return File.Exists(Path.Combine(path, "app", "installer-build.json")) &&
-                    File.Exists(Path.Combine(path, "app", "build.json")) &&
-                    File.Exists(Path.Combine(path, "app", "build.json.sig")) &&
-                    File.Exists(Path.Combine(path, "app", "build.py")) &&
-                    File.Exists(Path.Combine(path, "app", "dashboard.pyw")) &&
-                    File.Exists(Path.Combine(path, "runtime", "python.exe")) &&
-                    File.Exists(Path.Combine(path, ".venv", "Scripts", "python.exe")) &&
-                    File.Exists(Path.Combine(path, "NotmyFault.vbs"));
+                if (!File.Exists(marker)) return false;
+                using (StreamReader reader = new StreamReader(marker, Encoding.UTF8))
+                    return reader.ReadLine() == StateHeader && File.Exists(Path.Combine(path, FilesFile));
             }
             catch (IOException) { return false; }
             catch (ArgumentException) { return false; }
@@ -122,18 +112,11 @@ namespace NotmyFault.Setup
         {
             if (!IsInstalledDirectory(directory)) return "";
             directory = PendingUpgradeDirectory(NormalizeDirectory(directory));
-            string marker = Path.Combine(directory, StateFile);
-            if (File.Exists(marker))
+            using (StreamReader reader = new StreamReader(Path.Combine(directory, StateFile), Encoding.UTF8))
             {
-                using (StreamReader reader = new StreamReader(marker, Encoding.UTF8))
-                {
-                    reader.ReadLine();
-                    return reader.ReadLine() ?? "未知版本";
-                }
+                reader.ReadLine();
+                return reader.ReadLine() ?? "未知版本";
             }
-            string metadata = File.ReadAllText(Path.Combine(directory, "app", "installer-build.json"), Encoding.UTF8);
-            var match = System.Text.RegularExpressions.Regex.Match(metadata, "\"version\"\\s*:\\s*\"([^\"]+)\"");
-            return match.Success ? match.Groups[1].Value : "早期安装版本";
         }
 
         public static string FindInstalledDirectory()
@@ -188,24 +171,9 @@ namespace NotmyFault.Setup
                 value.Equals("app/.private/signing_public.pem", StringComparison.OrdinalIgnoreCase))
                 return InstalledFileKind.SigningKey;
             if (value.Equals("app/.private", StringComparison.OrdinalIgnoreCase) ||
-                value.StartsWith("app/.private/", StringComparison.OrdinalIgnoreCase) ||
-                value.Equals("app/user_plugins", StringComparison.OrdinalIgnoreCase) ||
-                value.StartsWith("app/user_plugins/", StringComparison.OrdinalIgnoreCase) ||
-                value.Equals("user_plugins", StringComparison.OrdinalIgnoreCase) ||
-                value.StartsWith("user_plugins/", StringComparison.OrdinalIgnoreCase))
+                value.StartsWith("app/.private/", StringComparison.OrdinalIgnoreCase))
                 return InstalledFileKind.UserData;
             return installerOwned ? InstalledFileKind.Program : InstalledFileKind.UserData;
-        }
-
-        private static bool LegacyProgramFile(string relative)
-        {
-            string value = relative.Replace('\\', '/');
-            foreach (string prefix in new[] { "runtime/", ".venv/", "wheels/", ".setup-data/", "app/notmyfault/", "app/dashboard/", "app/Win_toaster/" })
-                if (value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return true;
-            foreach (string file in new[] { "NotmyFault.vbs", "install.log", "app/build.py", "app/nmf.py", "app/dashboard.pyw", "app/NOTMYFAULT.pyw",
-                "app/requirements.txt", "app/build.json", "app/build.json.sig", "app/installer-build.json", "app/LICENSE", "app/logo.ico", "app/logo.png" })
-                if (value.Equals(file, StringComparison.OrdinalIgnoreCase)) return true;
-            return false;
         }
 
         internal static IEnumerable<string> EnumerateFiles(string directory)
@@ -255,21 +223,11 @@ namespace NotmyFault.Setup
         {
             List<string> files = new List<string>(EnumerateFiles(directory));
             HashSet<string> owned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            string manifest = Path.Combine(directory, FilesFile);
-            if (File.Exists(manifest))
+            foreach (string relative in File.ReadAllLines(Path.Combine(directory, FilesFile), Encoding.UTF8))
             {
-                foreach (string relative in File.ReadAllLines(manifest, Encoding.UTF8))
-                {
-                    OwnedPath(directory, relative, false);
-                    owned.Add(relative.Replace('/', Path.DirectorySeparatorChar));
-                }
+                OwnedPath(directory, relative, false);
+                owned.Add(relative.Replace('/', Path.DirectorySeparatorChar));
             }
-            else
-                foreach (string file in files)
-                {
-                    string relative = Relative(directory, file);
-                    if (LegacyProgramFile(relative)) owned.Add(relative);
-                }
             foreach (string file in files)
             {
                 string relative = Relative(directory, file);
@@ -875,8 +833,8 @@ namespace NotmyFault.Setup
                     }
                     return "";
                 }
-                catch (IOException) { return "升级已完成，但旧程序文件未能全部清理。关闭占用文件的程序后可删除：" + BackupPath; }
-                catch (UnauthorizedAccessException) { return "升级已完成，但旧程序文件未能全部清理。请检查目录权限后删除：" + BackupPath; }
+                catch (IOException) { return "升级已完成，但替换前的程序文件未能全部清理。关闭占用文件的程序后可删除：" + BackupPath; }
+                catch (UnauthorizedAccessException) { return "升级已完成，但替换前的程序文件未能全部清理。请检查目录权限后删除：" + BackupPath; }
             }
 
             public void Dispose()

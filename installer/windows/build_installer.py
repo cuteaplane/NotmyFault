@@ -340,11 +340,6 @@ def main():
             build_python, "-m", "pip", "wheel", "--no-input",
             "-r", ROOT / "requirements.txt", "--wheel-dir", wheels,
         ])
-        (app / "installer-build.json").write_text(json.dumps({
-            "version": version, "development_build": args.development_key,
-            "security_mode": "strict", "python_version": python_info["version"],
-            "platform": "windows-x64",
-        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         version_file = work / "version.txt"
         version_file.write_text(version, encoding="utf-8")
         payload = work / "payload.zip"
