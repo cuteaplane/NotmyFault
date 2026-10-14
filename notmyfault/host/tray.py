@@ -65,7 +65,6 @@ class TrayIcon:
         self._hwnd: Optional[int] = None
         self._thread: Optional[threading.Thread] = None
         self._shutdown_event = threading.Event()
-        self._engine_running = False
         self._engine_state = "stopped"
         self._auto_start_enabled = _is_auto_start_enabled()
 
@@ -85,14 +84,10 @@ class TrayIcon:
             if self._thread is not threading.current_thread():
                 self._thread.join(timeout=3)
 
-    def set_engine_running(self, running: bool):
-        """把旧的布尔状态调用转发到 set_engine_state。"""
-        self.set_engine_state("running" if running else "stopped")
 
     def set_engine_state(self, state: str):
         """更新托盘标题和菜单中的引擎状态。"""
         self._engine_state = state
-        self._engine_running = state == "running"
         self._update_tray_tip()
 
     def show_balloon(self, title: str, message: str, icon_type: int = NIIF_INFO):

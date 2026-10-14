@@ -1,5 +1,4 @@
 import glob
-import json
 import os
 import sys
 import threading
@@ -76,60 +75,6 @@ def _get_plugin_paths(store: SignedConfigStore):
     if os.path.isdir(user_dir):
         paths.append((user_dir, "user"))
     return paths
-
-
-def migrate_user_plugin_enabled_state(
-    config: Dict[str, Any],
-    store: SignedConfigStore,
-    user_dir: Optional[str] = None,
-) -> list[str]:
-    if user_dir is None:
-        user_dir = str(store.paths.user_plugins_dir)
-    if not os.path.isdir(user_dir):
-        return []
-
-    disabled = config.get("disabled_plugins", {})
-    if not isinstance(disabled, dict):
-        disabled = {"triggers": [], "actions": []}
-        config["disabled_plugins"] = disabled
-
-    migrated: list[str] = []
-    for ptype, json_name in (("triggers", "trigger.json"), ("actions", "action.json")):
-        ptype_root = os.path.join(user_dir, ptype)
-        if not os.path.isdir(ptype_root):
-            continue
-        disabled_list = disabled.get(ptype, [])
-        if not isinstance(disabled_list, list):
-            disabled_list = []
-            disabled[ptype] = disabled_list
-        for folder_name in sorted(os.listdir(ptype_root)):
-            json_path = os.path.join(ptype_root, folder_name, json_name)
-            if not os.path.isfile(json_path):
-                continue
-            try:
-                with open(json_path, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                continue
-            if not isinstance(meta, dict) or meta.get("enabled") is not False:
-                continue
-            pid = meta.get("id") or folder_name
-            if pid not in disabled_list:
-                disabled_list.append(pid)
-                migrated.append(pid)
-
-    if not migrated:
-        return []
-
-    if not store.save_config(config):
-        print("[Plugins] 迁移开关状态后保存 config 失败", file=sys.stderr)
-        return []
-
-    print(
-        f"[Plugins] 已把 {len(migrated)} 个用户插件的开关状态迁到 config: "
-        f"{', '.join(migrated)}"
-    )
-    return migrated
 
 
 def _plugin_check_needed(
@@ -317,7 +262,6 @@ def create_engine(
 ) -> AutomationEngine:
     _ensure_first_run_build(str(store.paths.package_root))
     config = store.load_config()
-    migrate_user_plugin_enabled_state(config, store)
     config["rules"] = store.load_rules()
     load_paths = _get_plugin_paths(store)
     engine = AutomationEngine(config, on_event=on_event, rules_store=store)

@@ -5,15 +5,14 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from notmyfault.config import ConfigValidationError, SignedConfigStore
-from notmyfault.core.bindings import BindingResolutionError, validate_binding_path, iter_legacy_event_payload_paths, iter_references, resolve_reference
+from notmyfault.core.bindings import BindingResolutionError, validate_binding_path, iter_references, resolve_reference
 from notmyfault.core.binding_schema import rule_step_output_fields
 from notmyfault.core.data_types import DataTypeError, copy_value
 from notmyfault.core.type_registry import TypeRegistry
 from notmyfault.core.variables import initialize_variables
-from notmyfault.core.rules import iter_action_nodes, validate_automation_references, validate_rules_structure
+from notmyfault.core.rules import validate_automation_references, validate_rules_structure
 from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions, normalize_workflow_rule, find_graph_scope
 from notmyfault.core.rule_model import normalize_rule_shape
-from notmyfault.core.canvas_workflow import lower_canvas_rule
 from notmyfault.host.api.ports import EngineControlPort
 from notmyfault.security.plugin_schema import check_payload_contract
 
@@ -92,14 +91,9 @@ class RuleRunService:
             raise RuleRunServiceError(400, {"ok": False, "code": "invalid_test_payload", "error": str(error)}) from error
         if not isinstance(start_step_id, str) or not isinstance(end_step_id, str):
             self._fail(400, "局部运行步骤 ID 必须是字符串")
-        try:
-            runtime_rule = lower_canvas_rule(candidate_rule)
-        except ValueError as error:
-            self._fail(400, str(error))
-        if isinstance(runtime_rule.get("workflow"), dict):
-            actions, selected_actions, selected_ids, skipped_upstream_ids = self._select_graph_actions(
-                runtime_rule, start_step_id, end_step_id,
-            )
+        actions, selected_actions, selected_ids, skipped_upstream_ids = self._select_graph_actions(
+            candidate_rule, start_step_id, end_step_id,
+        )
 
         if not isinstance(step_outputs, dict):
             self._fail(400, "上游动作结果必须是 JSON 对象")
@@ -154,7 +148,7 @@ class RuleRunService:
             skipped_upstream_ids,
             step_outputs,
             registry,
-            rule_step_output_fields(runtime_rule, engine.triggers_meta, engine.actions_meta),
+            rule_step_output_fields(candidate_rule, engine.triggers_meta, engine.actions_meta),
         )
         if upstream_issues:
             raise RuleRunServiceError(
@@ -171,7 +165,6 @@ class RuleRunService:
             test_assertions,
             selected_ids,
         )
-        legacy_event_paths = list(iter_legacy_event_payload_paths(execution_source))
         required_trigger_ids = sorted(
             {
                 binding_id
@@ -191,7 +184,7 @@ class RuleRunService:
         ]
         needs_event = any(
             usage.reference.get("scope") == "event" and usage.reference.get("on_missing") not in ("default", "skip") for usage in references
-        ) or bool(legacy_event_paths)
+        )
         if missing_trigger_ids or (needs_event and event_payload is None):
             raise RuleRunServiceError(
                 400,
@@ -245,39 +238,21 @@ class RuleRunService:
         }
 
     def _select_graph_actions(self, rule, start_id, end_id):
-        def reachable(graph, identity, stop=None):
-            adjacent = {}
-            for edge in graph.get("edges", []):
-                source, target = edge.get("source"), edge.get("target")
-                if source and target:
-                    adjacent.setdefault(source, []).append(target)
-            found, pending = set(), [identity] if identity else []
-            while pending:
-                current = pending.pop()
-                if current in found:
-                    continue
-                found.add(current)
-                if current != stop:
-                    pending.extend(adjacent.get(current, []))
-            return found
-
-        root = rule["workflow"]
-        start_id = start_id or root.get("entry")
-        scope = find_graph_scope(root, start_id) if start_id else None
+        from notmyfault.core.canvas_workflow import CanvasProgram
+        program = CanvasProgram(rule)
+        scope = find_graph_scope(rule['workflow'], start_id) if start_id else None
         if start_id and scope is None:
-            self._fail(400, "局部运行的起始动作不存在")
-        graph = scope["graph"] if scope else root
-        if end_id and not any(node.get("binding_id") == end_id for node in graph.get("nodes", [])):
-            self._fail(400, "局部运行的结束动作必须与起始动作位于同一流程组")
-        selected_roots = reachable(graph, start_id, end_id or None)
-        if end_id and end_id not in selected_roots:
-            self._fail(400, "局部运行的结束动作不能从起始动作到达")
-        selected_nodes = [node for node in graph.get("nodes", []) if node.get("binding_id") in selected_roots]
-        selected = [node for node, _path in iter_rule_actions({"workflow": {"nodes": selected_nodes}})]
-        selected_ids = {node["binding_id"] for node in selected}
-        upstream = scope["possible"] if scope else frozenset()
+            self._fail(400, '局部运行的起始动作不存在')
+        if end_id and (end_id not in program.nodes or start_id and program.scopes[end_id] != program.scopes[start_id]):
+            self._fail(400, '局部运行的结束动作必须与起始动作位于同一流程组')
+        entries = (start_id,) if start_id else program.roots()
+        selected_ids = set(identity for entry in entries for identity in program.reachable(entry, end_id or None))
+        if end_id and end_id not in selected_ids:
+            self._fail(400, '局部运行的结束动作不能从起始动作到达')
         actions = [node for node, _path in iter_rule_actions(rule)]
-        skipped = {node["binding_id"] for node in actions if node.get("binding_id") in upstream} - selected_ids
+        selected = [node for node in actions if node['binding_id'] in selected_ids]
+        upstream = scope['possible'] if scope else frozenset()
+        skipped = {node['binding_id'] for node in actions if node['binding_id'] in upstream} - selected_ids
         return actions, selected, selected_ids, skipped
 
     def _select_rule(

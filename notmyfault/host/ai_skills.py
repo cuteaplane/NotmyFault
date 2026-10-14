@@ -18,6 +18,8 @@ _RULE_DRAFT_DESCRIPTION = (
     "event_group 的 group_type 为 if、all、any、not，IF 各分支 id 同时用作条件入口和执行出口。"
     "IF、多个 ELIF 按顺序判断，唯一 ELSE 不接条件；同一 IF 或 ELIF 的多个条件须先连接 AND 或 OR。"
     "action_group 从 entry 端口连接组内起始动作，从 next 端口继续外部动作，exports 提供内部结果。"
+    "插件动作或变量赋值的 failure 出口只接同一执行范围的普通 action_group；补救组不接主流程入口或外部 next。"
+    "补救成功后按原动作 on_error 停止或返回正常后继，补救失败立即停止；停止且补救成功显示已补救。"
     "无连线的图块不参与执行，不自动生成条件、分支动作或连接。"
 )
 

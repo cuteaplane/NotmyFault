@@ -23,6 +23,7 @@ from notmyfault.security.security import SecurityMode
 def extension_meta():
     return {
         "id": "sample",
+        "execution_api": "context-v1",
         "name": "示例扩展",
         "description": "测试扩展 API",
         "enabled": True,
@@ -68,6 +69,7 @@ def extension_meta():
 def native_editor_meta():
     return {
         "id": "native_sample",
+        "trigger_api": "event-v2",
         "name": "普通值编辑器",
         "description": "测试普通参数编辑器",
         "enabled": True,
@@ -78,7 +80,7 @@ def native_editor_meta():
             "name": "hotkey",
             "label": "快捷键",
             "type": "hotkey",
-            "value_type": "string",
+            "value_type": "text",
         }],
         "contributes": {
             "commands": [{
@@ -89,7 +91,7 @@ def native_editor_meta():
             "parameter_editors": [{
                 "id": "recorder",
                 "parameter": "hotkey",
-                "value_type": "string",
+                "value_type": "text",
                 "command": "capture",
                 "ui": {"control": "button", "label": "录制"},
             }],
@@ -160,9 +162,10 @@ def make_isolated_engine(tmp_path, meta, source, request):
     root = tmp_path / "plugins"
     folder = root / meta["id"]
     folder.mkdir(parents=True)
-    meta = {**meta, "execution_mode": "isolated"}
+    meta = {**meta, "execution_mode": "isolated", "execution_api": "context-v1"}
+    meta.pop("trigger_api", None)
     (folder / "action.json").write_text(json.dumps(meta), encoding="utf-8")
-    (folder / "action.py").write_text("def run(meta, params):\n    pass\n", encoding="utf-8")
+    (folder / "action.py").write_text("def run_with_context(meta, params, ctx):\n    pass\n", encoding="utf-8")
     (folder / "extension.py").write_text(source, encoding="utf-8")
     (folder / "editor.html").write_text("<h1>插件页面</h1>", encoding="utf-8")
     engine = create_test_engine({})
@@ -278,7 +281,7 @@ def test_action_extension_commands_follow_lazy_loading(tmp_path, monkeypatch, ex
         "def hidden(context, payload):\n"
         "    return context.result(payload)\n"
     )
-    run_source = "def run(meta, params):\n    return {'ok': True}\n"
+    run_source = "def run_with_context(meta, params, ctx):\n    return {'ok': True}\n"
     (plugin_root / "action.py").write_text(
         run_source + (source if command_file == "action.py" else ""), encoding="utf-8"
     )
@@ -444,7 +447,7 @@ def test_extension_rejects_wrong_native_current_value_type(tmp_path):
         },
     )
     assert response.status_code == 400
-    assert response.json()["error"] == "当前值不是 string"
+    assert response.json()["error"] == "当前值不是 text"
 
 
 def test_extension_rejects_owned_value_from_other_plugin(tmp_path):

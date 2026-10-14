@@ -81,13 +81,15 @@ def _parse_workflow_draft(args, catalog):
     common = {"binding_id", "type", "name", "parent", "position"}
     native_fields = {
         "trigger": {"trigger", "occurrence", "absence_scope", "duration_seconds", "repeat"},
-        "condition": {"predicate"},
-        "logic": {"op", "negated", "within_seconds", "duration_seconds", "consume"},
-        "event_group": {"group_type", "branches", "negated", "within_seconds", "duration_seconds", "consume", "mode", "timeout_seconds"},
+        "condition": {"predicate", "negated"},
+        "logic": {"op", "negated", "within_seconds", "duration_seconds", "consume", "pick", "ttl_seconds", "repeat"},
+        "event_group": {"group_type", "branches", "negated", "within_seconds", "duration_seconds", "consume", "pick", "ttl_seconds", "repeat", "mode", "timeout_seconds"},
         "action_group": {"exports"},
+        "merge": set(),
+        "end": set(),
         "set_variable": {"variable", "value", "on_error"},
     }
-    plugin_fields = {"binding_id", "type", "params", "retry", "retry_delay_seconds", "retry_backoff", "timeout_seconds", "on_error", "failure_actions"}
+    plugin_fields = {"binding_id", "type", "params", "retry", "retry_delay_seconds", "retry_backoff", "timeout_seconds", "on_error"}
     for action, location in iter_rule_actions(args):
         action_type = action["type"]
         _reject_extra_fields(action, frozenset(common | native_fields.get(action_type, plugin_fields)), location, "rule_invalid")

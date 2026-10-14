@@ -92,29 +92,13 @@ class SettingsService:
             action_type = item.get("type", "?")
             summary = {
                 "type": action_type,
+                "binding_id": item.get("binding_id"),
+                "parent": item.get("parent"),
                 "high_risk": requires_admin_rule_approval(
                     action_schema.get(action_type, {})
                 ),
                 "params": summarize_params(item.get("params")),
             }
-            child_fields = ("then", "else", "failure_actions") if action_type == "if" else ("failure_actions",)
-            for field in child_fields:
-                children = item.get(field, [])
-                if isinstance(children, list) and (children or field in ("then", "else")):
-                    summary[field] = [summarize_item(child) for child in children]
-                    summary["high_risk"] |= any(child["high_risk"] for child in summary[field])
-            if action_type == "if" and isinstance(item.get("elif"), list):
-                summary["elif"] = [
-                    {"then": [summarize_item(child) for child in alternative.get("then", [])]}
-                    for alternative in item["elif"]
-                    if isinstance(alternative, dict) and isinstance(alternative.get("then", []), list)
-                ]
-                summary["high_risk"] |= any(
-                    child["high_risk"] for alternative in summary["elif"] for child in alternative["then"]
-                )
-            if action_type == "action_group" and isinstance(item.get("workflow"), dict):
-                summary["actions"] = [summarize_item(child) for child in item["workflow"].get("nodes", [])]
-                summary["high_risk"] |= any(child["high_risk"] for child in summary["actions"])
             return summary
 
         status["summary"] = {
@@ -129,7 +113,7 @@ class SettingsService:
                     "actions": (
                         [summarize_item(action) for action in (
                             rule["workflow"].get("nodes", []) if isinstance(rule.get("workflow"), dict)
-                            else rule.get("actions", [])
+                            else []
                         )]
                         if isinstance(rule, dict)
                         else []

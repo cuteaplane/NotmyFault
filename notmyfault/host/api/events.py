@@ -31,7 +31,7 @@ class EventBroker:
         if isinstance(event_type, Event):
             event = event_type.to_dict()
             history_packet = event
-            terminal = {"run.succeeded", "run.failed", "run.cancelled", "run.timed_out"}
+            terminal = {"run.succeeded", "run.recovered", "run.failed", "run.cancelled", "run.timed_out"}
             names = {"engine.failed": "error", "run.triggered": "rule_triggered", "run.queued": "run_queued", "run.dropped": "run_dropped",
                      "run.step.succeeded": "action_executed", "run.step.skipped": "action_skipped",
                      "run.step.failed": "error", "run.step.cancelled": "action_cancelled", "run.step.timed_out": "action_timed_out",

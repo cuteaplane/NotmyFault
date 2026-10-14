@@ -43,7 +43,7 @@ class RuleService:
     def list_rules(self) -> Dict[str, Any]:
         try:
             with self._store.rules_lock:
-                rules = self._store.load_verified_rules(for_editing=True)
+                rules = self._store.load_verified_rules()
                 revision = self._store.rules_revision()
         except ConfigValidationError as error:
             return {"ok": False, "rules": None, "config_error": str(error)}
@@ -76,7 +76,7 @@ class RuleService:
             schema = self._plugin_schema()
             known_rule_ids = {normalized["rule_id"]}
             try:
-                known_rule_ids.update(item.get("rule_id") for item in self._store.load_verified_rules(for_editing=True))
+                known_rule_ids.update(item.get("rule_id") for item in self._store.load_verified_rules())
             except ConfigValidationError as error:
                 add("error", "rules_unverified", str(error))
             _valid, _total, plugin_errors, plugin_warnings = validate_rules(
@@ -277,7 +277,7 @@ class RuleService:
         previous_rules = []
         if os.path.exists(self._store.rules_path):
             try:
-                previous_rules = self._store.load_verified_rules(for_editing=True)
+                previous_rules = self._store.load_verified_rules()
             except ConfigValidationError as error:
                 raise RuleServiceError(
                     409,

@@ -112,7 +112,7 @@ def test_security_approval_returns_parse_reason(tmp_path):
     assert body["error"].startswith("配置文件无法解析:")
 
 
-@pytest.mark.parametrize("mode_name", ["strict", "normal", "permissive"])
+@pytest.mark.parametrize("mode_name", ["strict", "permissive"])
 def test_security_status_separates_installation_from_config_without_engine(
     tmp_path, monkeypatch, mode_name
 ):

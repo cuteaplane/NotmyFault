@@ -39,8 +39,8 @@ def service_for(rule):
     engine = SimpleNamespace(
         triggers_meta={"start": {"outputs": []}},
         actions_meta={
-            "produce": {"outputs": [{"name": "value", "type": "string", "required": True}]},
-            "consume": {"params": [{"name": "message", "type": "string"}]},
+            "produce": {"outputs": [{"name": "value", "type": "text", "required": True}]},
+            "consume": {"params": [{"name": "message", "type": "text"}]},
         },
         run_manual_rule_snapshot=lambda *args, **kwargs: (calls.append((args, kwargs)) or (True, "已提交", "run_graph001")),
     )
@@ -104,9 +104,16 @@ def test_graph_test_rejects_an_unreachable_end():
     assert calls == []
 
 
-def test_admin_approval_scans_nested_graph_and_failure_actions():
+def test_admin_approval_scans_nested_graph_and_recovery_group():
     rule = graph_rule()
-    rule["workflow"]["nodes"][3]["failure_actions"] = [{"type": "restricted", "params": {}}]
+    rule["workflow"]["nodes"].extend([
+        {"type": "action_group", "binding_id": "a_recovery01", "parent": "a_group001"},
+        {"type": "restricted", "binding_id": "a_repair001", "parent": "a_recovery01", "params": {}},
+    ])
+    rule["workflow"]["edges"].extend([
+        {"source": "a_consume01", "port": "failure", "target": "a_recovery01", "channel": "control"},
+        {"source": "a_recovery01", "port": "entry", "target": "a_repair001", "channel": "control"},
+    ])
     schema = {"triggers": {}, "actions": {"restricted": {"security": {"rule_approval": "admin_key"}}}}
     assert changed_admin_plugins([], [rule], schema) == ["restricted"]
 
@@ -118,7 +125,7 @@ def test_nested_validation_issue_identifies_the_action_and_parent_group():
     service = RuleService(store, lambda: {
         "triggers": {"start": {"params": [], "outputs": []}},
         "actions": {"produce": {"params": [], "outputs": [{"name": "value", "type": "text"}]},
-                    "consume": {"params": [{"name": "message", "type": "string"}]}},
+                    "consume": {"params": [{"name": "message", "type": "text"}]}},
     })
     result = service.validate_draft(rule)
     issue = next(item for item in result["issues"] if item["code"] == "unknown_source")

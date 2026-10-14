@@ -96,7 +96,7 @@ class EngineService:
     def status(self) -> Dict[str, Any]:
         config_error = None
         try:
-            rules = self._store.load_verified_rules(for_editing=True)
+            rules = self._store.load_verified_rules()
         except ConfigValidationError as error:
             rules = []
             config_error = str(error)

@@ -68,9 +68,9 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
     public_key = signing_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
     monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [public_key])
     signing.sign_plugin(
-        package_root / "triggers" / "time_schedule", "trigger.json", signing_key
+        package_root / "triggers" / "time_schedule", private_key=signing_key
     )
-    signing.sign_plugin(package_root / "actions" / "notify", "action.json", signing_key)
+    signing.sign_plugin(package_root / "actions" / "notify", private_key=signing_key)
     paths = make_paths(tmp_path, package_root=package_root)
     (tmp_path / "build.json").write_text("{}", encoding="utf-8")
     (tmp_path / "build.json.sig").write_bytes(b"test-signature")

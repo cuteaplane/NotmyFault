@@ -69,3 +69,26 @@ def test_rejects_unknown_plugins_params_and_fields(target, field, value):
     with pytest.raises(ToolCallError) as caught:
         parse_rule_draft(args, make_catalog())
     assert caught.value.code == 'rule_invalid'
+
+
+def test_recovery_uses_native_group_and_failure_edge():
+    args = rule_args()
+    owner = args['workflow']['nodes'][1]
+    group = {'binding_id': 'a_recovery01', 'type': 'action_group', 'exports': {}}
+    remedy = {'binding_id': 'a_remedy0001', 'type': 'notify', 'parent': group['binding_id'], 'params': {'message': '读取失败'}}
+    args['workflow']['nodes'].extend([group, remedy])
+    args['workflow']['edges'].extend([
+        {'source': owner['binding_id'], 'port': 'failure', 'target': group['binding_id'], 'channel': 'control'},
+        {'source': group['binding_id'], 'port': 'entry', 'target': remedy['binding_id'], 'channel': 'control'},
+    ])
+    assert parse_rule_draft(args, make_catalog()) == args
+    args['workflow']['edges'].append({'source': group['binding_id'], 'port': 'next', 'target': owner['binding_id'], 'channel': 'control'})
+    with pytest.raises(ToolCallError):
+        parse_rule_draft(args, make_catalog())
+
+
+def test_recovery_array_is_rejected():
+    args = rule_args()
+    args['workflow']['nodes'][1]['failure_actions'] = []
+    with pytest.raises(ToolCallError):
+        parse_rule_draft(args, make_catalog())

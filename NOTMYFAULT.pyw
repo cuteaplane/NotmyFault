@@ -42,14 +42,7 @@ except Exception:
 
 
 def setup_logging(log_dir: str) -> str:
-    """创建带时间戳的会话日志，保留最近 7 个文件并删除旧版 engine.log"""
-    old_log = os.path.join(os.path.dirname(log_dir), "engine.log")
-    if os.path.exists(old_log):
-        try:
-            os.remove(old_log)
-        except OSError:
-            pass
-
+    """创建带时间戳的会话日志，保留最近 7 个文件"""
     log_path = init_session_log(log_dir)
     log_fp = open(log_path, "a", encoding="utf-8", buffering=1)
 
