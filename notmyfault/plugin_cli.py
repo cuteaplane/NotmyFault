@@ -221,6 +221,8 @@ def _create_plugin(
         "permissions": [],
         "params": [],
     }
+    if kind == "action":
+        meta["execution_api"] = "context-v1"
     if kind == "trigger":
         meta.update({"semantic": "oneshot", "trigger_api": "event-v2"})
         source = (
@@ -234,13 +236,13 @@ def _create_plugin(
         )
     else:
         source = (
-            "def run(action_info, params):\n"
+            "def run_with_context(action_info, params, context):\n"
             "    return {\"ok\": True}\n"
         )
         test_source = (
-            "from action import run\n\n\n"
+            "from action import run_with_context\n\n\n"
             "def test_action_runs():\n"
-            "    assert run({}, {}) == {\"ok\": True}\n"
+            "    assert run_with_context({}, {}, {}) == {\"ok\": True}\n"
         )
     valid, errors = validate_plugin_meta(meta, kind)
     if not valid:

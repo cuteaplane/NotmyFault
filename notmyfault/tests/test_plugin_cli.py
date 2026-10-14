@@ -18,13 +18,14 @@ def write_action(root: Path, **overrides) -> Path:
         "version": "1.0",
         "package_name": "com.example.sample_action",
         "permissions": [],
+        "execution_api": "context-v1",
     }
     meta.update(overrides)
     (root / "action.json").write_text(
         json.dumps(meta, ensure_ascii=False), encoding="utf-8"
     )
     (root / "action.py").write_text(
-        "def run(action_info, params):\n    return {'ok': True}\n",
+        "def run_with_context(action_info, params, context):\n    return {'ok': True}\n",
         encoding="utf-8",
     )
     return root
@@ -144,6 +145,10 @@ def test_create_action_and_trigger_templates(tmp_path, capsys):
         if kind == "trigger":
             meta = json.loads((root / "trigger.json").read_text(encoding="utf-8"))
             assert meta["trigger_api"] == "event-v2"
+        else:
+            meta = json.loads((root / "action.json").read_text(encoding="utf-8"))
+            assert meta["execution_api"] == "context-v1"
+            assert "def run_with_context(action_info, params, context)" in (root / "action.py").read_text()
         assert (root / "test_plugin.py").is_file()
         assert (root / ".github" / "workflows" / "test.yml").is_file()
         test_result = plugin_cli.main(["plugin", "test", str(root), "-q"])
