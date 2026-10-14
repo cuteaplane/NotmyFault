@@ -54,6 +54,7 @@
             "options": [
                 {"value": "any", "label": "任意结束"},
                 {"value": "succeeded", "label": "仅成功"},
+                {"value": "recovered", "label": "仅已补救"},
                 {"value": "failed", "label": "仅失败"},
                 {"value": "cancelled", "label": "仅取消"},
                 {"value": "dropped", "label": "仅丢弃或被替换"}

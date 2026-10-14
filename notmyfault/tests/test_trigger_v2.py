@@ -73,7 +73,7 @@ class TriggerV2Tests:
             "semantic": "oneshot",
             "outputs": [{"name": "value", "type": "number"}],
         }
-        engine.actions_funcs["capture"] = lambda meta, params: None
+        engine.actions_funcs["capture"] = lambda meta, params, _run_context: None
         engine.actions_meta["capture"] = {}
 
         engine.emit_event(
@@ -208,7 +208,7 @@ class V2ConfigValidationTests:
 
 class V2ContractTests:
     OUTPUTS = [
-        {"name": "event", "label": "变化类型", "type": "string"},
+        {"name": "event", "label": "变化类型", "type": "text"},
         {"name": "count", "label": "数量", "type": "number"},
     ]
 
@@ -221,19 +221,19 @@ class V2ContractTests:
         assert any("缺少必填输出字段: count" in problem for problem in problems)
 
     def test_optional_missing_is_allowed(self):
-        outputs = [{"name": "note", "type": "string", "required": False}]
+        outputs = [{"name": "note", "type": "text", "required": False}]
         assert check_payload_contract(outputs, {}) == []
 
     def test_wrong_simple_type_is_rejected(self):
         problems = check_payload_contract(
             [{"name": "flag", "type": "bool"}], {"flag": "yes"}
         )
-        assert any("应为 bool" in problem for problem in problems)
+        assert problems and all("outputs.flag" in problem for problem in problems)
 
         problems = check_payload_contract(
             [{"name": "count", "type": "number"}], {"count": True}
         )
-        assert any("应为 number" in problem for problem in problems)
+        assert problems and all("outputs.count" in problem for problem in problems)
 
     def test_unknown_field_is_rejected(self):
         problems = check_payload_contract(
@@ -246,9 +246,7 @@ class V2ContractTests:
 
 class V2MatchingTests:
     def _v2_rule(self):
-        return {
-            "name": "v2 匹配",
-            "_matcher": {
+        return native_rule({
                 "op": "any",
                 "children": [
                     {"type": "folder_monitor", "binding_id": "t_alpha01",
@@ -256,16 +254,15 @@ class V2MatchingTests:
                     {"type": "folder_monitor", "binding_id": "t_beta02",
                      "params": {"folder_path": "B"}},
                 ],
-            },
-            "actions": [],
-        }
+            }, [], name="v2 匹配")
 
     @pytest.mark.parametrize("extra", [{}, {"amount": Decimal("1.20"), "data": b"\x00\xff", "day": date(2024, 2, 29)}])
     def test_v2_config_matching_hits_own_leaf(self, extra):
         runtime = ConditionRuntime()
         rule = self._v2_rule()
-        for leaf in rule["_matcher"]["children"]:
-            leaf["params"].update(extra)
+        for node in rule["workflow"]["nodes"]:
+            if node.get("type") == "trigger":
+                node["trigger"]["params"].update(extra)
         matched = runtime.match(
             "rule:1", rule, "folder_monitor", {"event": "created"},
             instance={"config": {"folder_path": "B", **extra}},
@@ -288,51 +285,47 @@ class V2MatchingTests:
         (True, 1, False), (False, 0, False),
         ([True], [1], False), ({"ready": [False]}, {"ready": [0]}, False),
         ({"ready": [False]}, {"ready": [False]}, True),
-        (1, 1.0, True), (Decimal("1.0"), 1, True), (None, None, True),
+        (1, 1.0, True), (Decimal("1.0"), 1, False), (Decimal("1.0"), Decimal("1.0"), True), (None, None, True),
     ])
-    def test_v1_payload_filtering_still_works(self, expected, actual, matched):
-        rule = {
-            "name": "v1 过滤",
-            "_matcher": {
+    def test_v2_config_fingerprint_preserves_boolean_and_numeric_semantics(self, expected, actual, matched):
+        rule = native_rule({
                 "type": "process_state",
                 "binding_id": "t_proc001",
                 "params": {"process_name": "WeChat.exe", "state": expected},
-            },
-            "actions": [],
-        }
+            }, [], name="配置匹配")
         runtime = ConditionRuntime()
         assert runtime.match(
             "rule:1", rule, "process_state",
             {"process_name": "WeChat.exe", "state": actual},
+            instance={"config": {"process_name": "WeChat.exe", "state": actual}},
         ) is matched
 
         runtime = ConditionRuntime()
         assert runtime.match(
             "rule:2", rule, "process_state",
             {"process_name": "Other.exe", "state": actual},
+            instance={"config": {"process_name": "Other.exe", "state": actual}},
         ) is False
 
-        engine = make_engine(native_rule(rule["_matcher"], [], name=rule["name"]))
+        engine = make_engine(rule)
         engine.triggers_meta["process_state"] = {
-            "trigger_api": "event-v1",
+            "trigger_api": "event-v2",
             "outputs": [
-                {"name": "process_name", "type": "string"},
+                {"name": "process_name", "type": "text"},
                 {"name": "state", "value_type": "any"},
             ],
         }
         dispatched = []
         engine._event_bus._scheduler_submit_fn = lambda *args: dispatched.append(args)
 
-        engine.emit_event("process_state", {"process_name": "Other.exe", "state": actual})
-        engine.emit_event("process_state", {"process_name": "WeChat.exe", "state": actual})
+        engine.emit_event("process_state", {"process_name": "Other.exe", "state": actual}, instance={"config": {"process_name": "Other.exe", "state": actual}})
+        engine.emit_event("process_state", {"process_name": "WeChat.exe", "state": actual}, instance={"config": {"process_name": "WeChat.exe", "state": actual}})
         assert len(dispatched) == int(matched)
         if matched:
             assert dispatched[0][3]["event"]["payload"]["state"] == actual
 
-    def test_v2_and_v1_semantics_coexist_in_one_rule(self):
-        rule = {
-            "name": "混合语义",
-            "_matcher": {
+    def test_v2_instances_combine_in_and_group(self):
+        rule = native_rule({
                 "op": "all",
                 "children": [
                     {"type": "folder_monitor", "binding_id": "t_fold001",
@@ -340,9 +333,7 @@ class V2MatchingTests:
                     {"type": "process_state", "binding_id": "t_proc002",
                      "params": {"process_name": "WeChat.exe", "state": "running"}},
                 ],
-            },
-            "actions": [],
-        }
+            }, [], name="组合配置")
         runtime = ConditionRuntime()
         assert runtime.match(
             "rule:1", rule, "folder_monitor", {"event": "created"},
@@ -351,6 +342,7 @@ class V2MatchingTests:
         assert runtime.match(
             "rule:1", rule, "process_state",
             {"process_name": "WeChat.exe", "state": "running"},
+            instance={"config": {"process_name": "WeChat.exe", "state": "running"}},
         ) is True
 
 

@@ -10,8 +10,9 @@ from threading import Lock
 from notmyfault.plugin_api import engine_events_api
 
 _OUTCOME_ALIASES = {
-    "any": frozenset({"succeeded", "failed", "cancelled", "dropped", "timed_out"}),
+    "any": frozenset({"succeeded", "recovered", "failed", "cancelled", "dropped", "timed_out"}),
     "succeeded": frozenset({"succeeded"}),
+    "recovered": frozenset({"recovered"}),
     "failed": frozenset({"failed", "timed_out"}),
     "cancelled": frozenset({"cancelled"}),
     "dropped": frozenset({"dropped"}),

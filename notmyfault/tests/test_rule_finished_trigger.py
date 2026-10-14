@@ -38,6 +38,15 @@ def test_manifest_is_valid():
     assert ok, errors
 
 
+@pytest.mark.parametrize('outcome,expected', [('any', True), ('recovered', True), ('succeeded', False), ('failed', False)])
+def test_recovered_is_a_separate_finished_outcome(outcome, expected):
+    meta, module = load_trigger()
+    trigger = module.RuleFinishedTrigger(meta, {'rule_id': 'r_target01', 'outcome': outcome}, lambda data: None, threading.Event())
+    trigger.validate()
+    assert 'run.recovered' in trigger._api.RULE_TERMINAL_EVENTS
+    assert trigger._should_emit('run.recovered', {'rule_id': 'r_target01'}) is expected
+
+
 def test_emits_when_watched_rule_finishes():
     meta, module = load_trigger()
     events = []
