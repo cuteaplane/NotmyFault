@@ -1,3 +1,3 @@
 """NotmyFault 版本"""
 
-__version__ = "alpha-0.15.2"
+__version__ = "alpha-0.16.0"
