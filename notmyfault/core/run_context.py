@@ -82,7 +82,7 @@ def run_view(context, cancellation):
 
 
 def context_sources(expressions):
-    from notmyfault.core.bindings import iter_references, is_literal, is_typed_value, _LEGACY_TEMPLATE
+    from notmyfault.core.bindings import iter_references
 
     selected = []
     for usage in iter_references(expressions):
@@ -95,24 +95,6 @@ def context_sources(expressions):
         elif scope == "event":
             selected.append(("event", None))
 
-    def legacy(value):
-        if is_literal(value) or is_typed_value(value):
-            return
-        if isinstance(value, str):
-            for match in _LEGACY_TEMPLATE.finditer(value):
-                parts = match.group(1).split(".")
-                if parts[0] == "event":
-                    selected.append(("event", None))
-                elif parts[0] in ("steps", "triggers", "constants", "variables") and len(parts) > 1:
-                    selected.append((parts[0], parts[1]))
-        elif isinstance(value, dict):
-            for item in value.values():
-                legacy(item)
-        elif isinstance(value, list):
-            for item in value:
-                legacy(item)
-
-    legacy(expressions)
     return tuple(dict.fromkeys(selected))
 
 

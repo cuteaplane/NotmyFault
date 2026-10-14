@@ -143,21 +143,17 @@ def main() -> None:
             _serve_extension(request, protocol, importer, module, entry, tree)
             return
         elif request.get("load_only") is True:
-            runner = module.run
-            arguments = (action_info, {})
-            if action_info.get("execution_api") == "context-v1":
-                runner = getattr(module, "run_with_context", None)
-                arguments = (action_info, {}, {})
+            runner = getattr(module, "run_with_context", None)
             if not callable(runner):
                 raise TypeError("隔离动作缺少可调用的执行入口")
-            inspect.signature(runner).bind(*arguments)
+            inspect.signature(runner).bind(action_info, {}, {})
             _extension_handlers(importer, module, entry, action_info)
             result = None
         else:
             context = request.get("context", {})
             if typed:
                 context["_type_registry"] = TypeRegistry(request.get("data_types"))
-            result = invoke_action(module.run, module, action_info, request["params"], context)
+            result = invoke_action(getattr(module, "run_with_context", None), module, action_info, request["params"], context)
         if typed:
             result = encode_value(result, _transport=True)
         else:

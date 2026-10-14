@@ -6,9 +6,8 @@ from hypothesis import given, settings, strategies as st
 from notmyfault.core.clock import FakeClock
 from notmyfault.core.condition_program import build_matcher
 from notmyfault.core.condition_runtime import ConditionRuntime
-from notmyfault.core.conditions import iter_condition_events
+from notmyfault.tests.canvas_fixtures import event_rule
 from notmyfault.tests.condition_reference import ReferenceConditionRuntime
-from notmyfault.tests.condition_runtime_oracle import PreviousConditionRuntime
 
 
 signals = st.sampled_from(["a", "b", "c"])
@@ -35,22 +34,29 @@ operations = st.lists(st.tuples(st.integers(0, 15), st.sampled_from(["poll", "a"
 
 def identify(node):
     result = copy.deepcopy(node)
-    for index, event in enumerate(iter_condition_events(result)):
-        event["binding_id"] = f"t_leaf{index:06d}"
+    events = []
+    def collect(current):
+        if 'op' not in current:
+            events.append(current)
+        for child in current.get('children', ()):
+            collect(child)
+    collect(result)
+    for index, event in enumerate(events):
+        event['binding_id'] = f't_leaf{index:06d}'
     return result
 
 
 @settings(max_examples=350, deadline=None, database=None)
 @given(trees, operations)
 def test_heap_matcher_agrees_with_scanning_reference(node, actions):
-    rule = {"_matcher": identify(node)}
+    rule = event_rule('r_property001', '图匹配', identify(node), [])
     clock = FakeClock()
     runtime = ConditionRuntime(clock=clock)
     runtime.register_rule("r", rule)
     reference = ReferenceConditionRuntime(rule)
     def migrate():
         candidate = ConditionRuntime(clock=clock)
-        candidate.configure({"r": SimpleNamespace(matcher_spec=build_matcher(copy.deepcopy(rule["_matcher"])))})
+        candidate.configure({"r": SimpleNamespace(matcher_spec=build_matcher(copy.deepcopy(rule)))})
         candidate.migrate_from(runtime, {"r"})
         candidate.activate()
         return candidate
@@ -84,37 +90,36 @@ old_trees = st.recursive(
 
 @settings(max_examples=250, deadline=None, database=None)
 @given(old_trees, operations)
-def test_existing_all_and_absence_semantics_agree_with_previous_runtime(node, actions):
-    rule = {"_matcher": identify(node)}
+def test_all_and_absence_graphs_agree_with_scanning_reference(node, actions):
+    rule = event_rule('r_property001', '图匹配', identify(node), [])
     clock = FakeClock()
     runtime = ConditionRuntime(clock=clock)
-    previous = PreviousConditionRuntime(clock=clock)
+    previous = ReferenceConditionRuntime(rule)
     runtime.register_rule("r", rule)
-    previous.poll_absences("r", rule)
     for index, (delta, kind, channel, by_instance, timer_first, migrate_first) in enumerate(actions):
         clock.advance(delta)
-        assert dict(runtime.take_due()).get("r") == previous.poll_absences("r", rule)
+        assert dict(runtime.take_due()).get("r") == previous.poll(clock.monotonic())
         if kind != "poll":
             payload = {"channel": channel, "value": index}
             instance = {"config": {"channel": channel}} if by_instance else None
-            assert runtime.match_and_take("r", rule, kind, payload, instance=instance) == previous.match_and_take("r", rule, kind, payload, instance=instance)
+            assert runtime.match_and_take("r", rule, kind, payload, instance=instance) == previous.match(kind, payload, clock.monotonic(), instance)
 
 
 @settings(max_examples=250, deadline=None, database=None)
 @given(st.sampled_from(["any", "all"]), st.integers(1, 10), operations)
-def test_existing_any_and_window_semantics_agree_with_previous_runtime(op, window, actions):
+def test_any_and_window_graphs_agree_with_scanning_reference(op, window, actions):
     node = {"op": op, "children": [{"type": kind, "params": {"channel": 0}} for kind in ("a", "b", "c")]}
     if op == "all":
         node["within_seconds"] = window
-    rule = {"_matcher": identify(node)}
+    rule = event_rule('r_property001', '图匹配', identify(node), [])
     clock = FakeClock()
     runtime = ConditionRuntime(clock=clock)
-    previous = PreviousConditionRuntime(clock=clock)
+    previous = ReferenceConditionRuntime(rule)
     runtime.register_rule("r", rule)
     for index, (delta, kind, channel, by_instance, timer_first, migrate_first) in enumerate(actions):
         clock.advance(delta)
-        assert dict(runtime.take_due()).get("r") == previous.poll_absences("r", rule)
+        assert dict(runtime.take_due()).get("r") == previous.poll(clock.monotonic())
         if kind != "poll":
             payload = {"channel": channel, "value": index}
             instance = {"config": {"channel": channel}} if by_instance else None
-            assert runtime.match_and_take("r", rule, kind, payload, instance=instance) == previous.match_and_take("r", rule, kind, payload, instance=instance)
+            assert runtime.match_and_take("r", rule, kind, payload, instance=instance) == previous.match(kind, payload, clock.monotonic(), instance)

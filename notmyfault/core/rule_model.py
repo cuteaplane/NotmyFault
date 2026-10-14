@@ -32,8 +32,6 @@ def ensure_rule_binding_ids(rule: Dict[str, Any]) -> Dict[str, Any]:
     copied = copy.deepcopy(rule)
     def action_identity(node):
         node.setdefault('binding_id', _new_binding_id('a'))
-        for failure in node.get('failure_actions', []):
-            action_identity(failure)
     for node in copied.get('workflow', {}).get('nodes', []):
         action_identity(node)
         if node.get('type') == 'trigger' and isinstance(node.get('trigger'), dict):

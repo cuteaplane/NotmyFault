@@ -14,7 +14,7 @@ DEFAULT_MODE = "single"
 DEFAULT_MAX_CONCURRENCY = 1
 DEFAULT_QUEUE_LIMIT = 20
 DEFAULT_WORKERS = 8
-TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled", "timed_out", "dropped"})
+TERMINAL_STATES = frozenset({"succeeded", "recovered", "failed", "cancelled", "timed_out", "dropped"})
 
 
 def _concurrency_config(rule: dict[str, Any]) -> dict[str, Any]:

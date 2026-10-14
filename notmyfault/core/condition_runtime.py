@@ -11,8 +11,7 @@ from typing import Any
 from notmyfault.core.clock import Clock, SystemClock
 from notmyfault.core.condition_program import DEFAULT_TTL_SECONDS, build_matcher
 from notmyfault.core.conditions import (
-    _condition_children, _condition_op, _is_event_leaf, check_event_params,
-    config_fingerprint, get_rule_condition,
+    check_event_params, config_fingerprint,
 )
 
 
@@ -37,6 +36,8 @@ class MatcherState:
     fired: tuple[tuple[str, int], ...] = ()
     last_match: list[dict] = field(default_factory=list)
     consume: frozenset[str] = frozenset()
+    reset_signatures: dict[str, tuple] = field(default_factory=dict)
+    last_root: str | None = None
 
 
 @dataclass(frozen=True)
@@ -74,10 +75,10 @@ class ConditionRuntime:
             self._programs = {key: rule.matcher_spec for key, rule in rules.items()}
             self._heap_limit = 64 + 2 * sum(len(program.retention) + len(program.absences) for program in self._programs.values())
 
-    def register_rule(self, rule_key, rule, now=None):
+    def register_rule(self, rule_key, rule, now=None, *, program=None):
         with self._lock:
             if rule_key not in self._programs:
-                self._programs[rule_key] = build_matcher(get_rule_condition(rule), self._default_ttl)
+                self._programs[rule_key] = program or build_matcher(rule, self._default_ttl)
                 program = self._programs[rule_key]
                 self._heap_limit += 2 * (len(program.retention) + len(program.absences))
             self._arm_absences(rule_key, self._timestamp(now))
@@ -135,9 +136,9 @@ class ConditionRuntime:
             return
         state = self._states.setdefault(rule_key, MatcherState())
         for node in program.absences:
-            name = "not:" + program.keys[id(_condition_children(node)[0])]
+            name = node.key
             if name not in state.absences:
-                self._rearm(rule_key, name, self._future(timestamp, float(node["within_seconds"])))
+                self._rearm(rule_key, name, self._future(timestamp, node.seconds))
 
     def _rearm(self, rule_key, name, deadline):
         token = next(self._sequence)
@@ -191,12 +192,12 @@ class ConditionRuntime:
                     state.seen.pop(name)
                     continue
                 program = self._programs[key]
-                node = next(node for node in program.absences if "not:" + program.keys[id(_condition_children(node)[0])] == name)
+                node = next(node for node in program.absences if node.key == name)
                 state.absences[name].emitted = True
-                seconds = float(node["within_seconds"])
-                self._hit(key, name, {"binding_id": _condition_children(node)[0].get('binding_id'), "absence": True, "event": {"type": "absence", "params": {}},
+                seconds = node.seconds
+                self._hit(key, name, {"binding_id": program.graph.nodes[node.node_id].get("trigger", {}).get("binding_id"), "absence": True, "event": {"type": "absence", "params": {}},
                                      "payload": {"wait_seconds": seconds}, "timestamp": timestamp}, timestamp)
-                if node.get("repeat", "once_until_seen") == "every_window":
+                if node.repeat == "every_window":
                     remaining = seconds - math.fmod(timestamp - deadline, seconds)
                     self._rearm(key, name, self._future(timestamp, remaining))
                 affected.add(key)
@@ -237,19 +238,6 @@ class ConditionRuntime:
 
     def match_and_take(self, rule_key, rule, event_type, event_payload, now=None, instance=None):
         with self._lock:
-            program = self._programs.get(rule_key)
-            if program is not None and _is_event_leaf(program.node) and rule_key not in self._states:
-                leaf = program.node
-                if leaf["type"] != event_type:
-                    return None
-                if instance is not None:
-                    fingerprint = instance.get("fingerprint") or config_fingerprint(instance.get("config"))
-                    if program.fingerprints[id(leaf)] != fingerprint:
-                        return None
-                elif not check_event_params(leaf, event_payload):
-                    return None
-                return [{"binding_id": leaf.get("binding_id"), "event": {"type": event_type, "params": leaf.get("params", {})},
-                         "timestamp": self._timestamp(now), "payload": event_payload}]
             if not self.match(rule_key, rule, event_type, event_payload, now=now, instance=instance):
                 return None
             return self.take_last_match(rule_key)
@@ -258,13 +246,14 @@ class ConditionRuntime:
         timestamp = self._timestamp(now)
         with self._lock:
             if rule_key not in self._programs:
-                self._programs[rule_key] = build_matcher(get_rule_condition(rule), self._default_ttl)
+                self._programs[rule_key] = build_matcher(rule, self._default_ttl)
                 program = self._programs[rule_key]
                 self._heap_limit += 2 * (len(program.retention) + len(program.absences))
             program = self._programs[rule_key]
             fingerprint = (instance.get("fingerprint") or config_fingerprint(instance.get("config"))) if instance is not None else None
-            leaves = [leaf for leaf in program.leaves.get(event_type, ()) if
-                      (program.fingerprints[id(leaf)] == fingerprint if instance is not None else check_event_params(leaf, event_payload))]
+            leaves = [identity for identity in program.leaves.get(event_type, ()) if
+                      (program.fingerprints[identity] == fingerprint if instance is not None else
+                       check_event_params(program.graph.nodes[identity]["trigger"], event_payload))]
             if not leaves:
                 return False
             self._arm_absences(rule_key, timestamp)
@@ -272,18 +261,25 @@ class ConditionRuntime:
             for name, hit in list(state.seen.items()):
                 if hit.expires_at <= timestamp:
                     state.seen.pop(name)
-            names = {program.keys[id(leaf)] for leaf in leaves}
-            for node in program.absences:
-                name = program.keys[id(_condition_children(node)[0])]
-                if name in names:
-                    self._rearm(rule_key, "not:" + name, self._future(timestamp, float(node["within_seconds"])))
-                    state.seen.pop("not:" + name, None)
-            for leaf in leaves:
-                name = program.keys[id(leaf)]
+            for identity in leaves:
+                leaf = program.graph.nodes[identity]['trigger']
+                name = program.keys[identity]
                 if name in program.positive_keys:
-                    self._hit(rule_key, name, {"binding_id": leaf.get("binding_id"),
-                                              "event": {"type": leaf["type"], "params": dict(leaf.get("params", {}))},
-                                              "timestamp": timestamp, "payload": dict(event_payload)}, timestamp)
+                    self._hit(rule_key, name, {'binding_id': leaf['binding_id'],
+                        'event': {'type': leaf['type'], 'params': dict(leaf.get('params', {}))},
+                        'timestamp': timestamp, 'payload': dict(event_payload)}, timestamp)
+            for absence in program.absences:
+                node = program.graph.nodes[absence.node_id]
+                if node['type'] == 'trigger':
+                    reset = program.keys[absence.node_id] in {program.keys[identity] for identity in leaves}
+                else:
+                    candidate = self._evaluate(absence.reset_roots[0], program, state.seen)
+                    signature = candidate.signature if candidate is not None else ()
+                    reset = bool(signature) and signature != state.reset_signatures.get(absence.key)
+                    state.reset_signatures[absence.key] = signature
+                if reset:
+                    self._rearm(rule_key, absence.key, self._future(timestamp, absence.seconds))
+                    state.seen.pop(absence.key, None)
             matched = self._record_match(rule_key)
             self._compact()
         self._wake()
@@ -291,42 +287,65 @@ class ConditionRuntime:
 
     def _record_match(self, rule_key):
         program, state = self._programs[rule_key], self._states[rule_key]
-        result = self._evaluate(program.node, program, state.seen)
-        if result is None or result.signature == state.fired:
+        matches = [(identity, result) for identity in program.roots
+                   if (result := self._evaluate(identity, program, state.seen)) is not None and result.signature]
+        if not matches:
+            return False
+        root, result = max(matches, key=lambda item: (max(item[1].marks), max(sequence for _name, sequence in item[1].signature)))
+        if result.signature == state.fired:
             return False
         state.fired = result.signature
-        state.last_match = [dict(state.seen[name].event) for name, _sequence in result.signature]
+        state.last_root = root
+        state.last_match = [{**state.seen[name].event, 'root_id': root} for name, _sequence in result.signature]
         state.consume = result.consume
         return True
 
-    def _evaluate(self, node, program, seen):
-        if node is None:
-            return None
-        if _is_event_leaf(node) or _condition_op(node) == "not":
-            name = program.keys[id(node)] if _is_event_leaf(node) else "not:" + program.keys[id(_condition_children(node)[0])]
+    def _evaluate(self, identity, program, seen, memo=None):
+        memo = {} if memo is None else memo
+        if identity in memo:
+            return memo[identity]
+        node = program.graph.nodes[identity]
+        kind, op = node['type'], node.get('op', node.get('group_type'))
+        absence = next((item for item in program.absences if item.node_id == identity), None)
+        if absence is not None:
+            name = absence.key
+        elif kind == 'trigger':
+            name = program.keys[identity]
+        else:
+            name = None
+        if name is not None:
             hit = seen.get(name)
-            return Evaluation(((name, hit.sequence),), (hit.event["timestamp"],), frozenset({name})) if hit else None
-        children = _condition_children(node)
-        results = [self._evaluate(child, program, seen) for child in children]
-        if _condition_op(node) == "any":
-            candidates = [item for item in results if item is not None]
-            if not candidates:
-                return None
-            if node.get("pick", "latest") == "first":
-                return candidates[0]
-            return max(candidates, key=lambda item: (max(item.marks), max(sequence for _name, sequence in item.signature)))
-        if not results or any(item is None for item in results):
-            return None
-        marks = tuple(mark for item in results for mark in item.marks)
-        window = node.get("within_seconds")
-        if window is not None and max(marks) - min(marks) > float(window):
-            return None
-        signature = tuple(sorted({part for item in results for part in item.signature}))
-        retain = frozenset(name for item in results for name in item.retain)
-        consume = frozenset(name for item in results for name in item.consume)
-        policy = node.get("consume", "matched")
-        if policy == "none":
-            return Evaluation(signature, marks, frozenset(), program.subtree_keys[id(node)])
-        if policy == "all":
-            consume = program.subtree_keys[id(node)] - retain
-        return Evaluation(signature, marks, consume, retain)
+            result = Evaluation(((name, hit.sequence),), (hit.event['timestamp'],), frozenset({name})) if hit else None
+        elif kind == 'condition':
+            result = None
+        elif op == 'not':
+            children = program.graph.dependencies(identity)
+            result = Evaluation(retain=program.dependency_keys[identity]) if children and self._evaluate(children[0], program, seen, memo) is None else None
+        else:
+            results = [value for child in program.graph.dependencies(identity)
+                       if (value := self._evaluate(child, program, seen, memo)) is not None]
+            relevant = [child for child in program.graph.dependencies(identity) if program.dependency_keys.get(child)]
+            if not results:
+                result = None
+            elif op == 'all' and len(results) != len(relevant):
+                result = None
+            elif op != 'all':
+                result = results[0] if node.get('pick', 'latest') == 'first' else max(results,
+                    key=lambda item: (max(item.marks, default=float('-inf')), max((sequence for _name, sequence in item.signature), default=0)))
+            else:
+                marks = tuple(mark for item in results for mark in item.marks)
+                window = node.get('within_seconds')
+                if window is not None and marks and max(marks) - min(marks) > float(window):
+                    result = None
+                else:
+                    signature = tuple(sorted({part for item in results for part in item.signature}))
+                    retain = frozenset(name for item in results for name in item.retain)
+                    consume = frozenset(name for item in results for name in item.consume)
+                    policy = node.get('consume', 'matched')
+                    if policy == 'none':
+                        consume, retain = frozenset(), program.dependency_keys[identity]
+                    elif policy == 'all':
+                        consume = program.dependency_keys[identity] - retain
+                    result = Evaluation(signature, marks, consume, retain)
+        memo[identity] = result
+        return result

@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 
-TYPE_ALIASES = {"string": "text", "integer": "int", "boolean": "bool", "list": "array"}
+TYPE_ALIASES = {"string": "text"}
 BUILTIN_TYPES = frozenset({
     "any", "null", "text", "int", "float", "number", "decimal", "bool",
     "date", "time", "datetime", "timestamp", "duration", "path", "url", "uuid",
@@ -165,16 +165,14 @@ def field_type(field: dict | None, *, parameter: bool = False) -> dict:
         kind = "string"
     elif parameter and kind == "plugin_data":
         kind = "object"
-    if not parameter and kind == "array" and "item_type" in field:
-        return normalize_type({"type": "array", "items": field["item_type"]})
     return normalize_type(kind)
 
 
 def has_type_contract(field):
-    legacy = ("string", "number", "bool", "array", "object", "any")
+    controls = ("string", "number", "bool", "array", "object", "any")
     if "value_type" in field:
         return True
-    return field.get("type", "any") not in legacy
+    return field.get("type", "any") not in controls
 
 
 def normalize_fields(values, fields, registry=None, *, parameters=False, location="$", wrap_sensitive=False, partial=False):

@@ -15,7 +15,7 @@ from notmyfault.core.bindings import (
 )
 from notmyfault.core.data_types import DataTypeError
 from notmyfault.core.variables import assign_variable, initialize_variables, resolve_trigger_constants
-from notmyfault.core.rules import guaranteed_trigger_ids, validate_rule_bindings
+from notmyfault.core.rules import validate_rule_bindings
 from notmyfault.core.workflow import build_context
 from notmyfault.tests.canvas_fixtures import native_rule, branch_rule
 
@@ -90,7 +90,6 @@ def test_build_context_indexes_condition_payloads_by_binding_id():
         {"binding_id": "", "event": {"type": "hotkey"}, "payload": {}},
     ]
     ctx = build_context("规则A", "usb_insert", {"drive": "E:"}, condition_events)
-    assert ctx["context_version"] == 2
     assert ctx["rule"] == {"name": "规则A"}
     assert set(ctx["triggers"]) == {"t_usb001"}
     entry = ctx["triggers"]["t_usb001"]
@@ -121,8 +120,22 @@ def test_guaranteed_sources_respect_nested_any_and_all():
             },
         ],
     }
-    # all 取并集，any 取交集：hotkey 分支与嵌套 all 都保证 hot001 命中
-    assert guaranteed_trigger_ids(tree) == {"t_usb001", "t_hot001"}
+    rule = _rule(tree, [{'type': 'notify', 'params': {'message': 'done'}}])
+    graph = rule['workflow']
+    duplicates = [node for node in graph['nodes'] if node.get('type') == 'trigger' and node['trigger']['binding_id'] == 't_hot001']
+    kept, removed = duplicates
+    for edge in graph['edges']:
+        if edge['source'] == removed['binding_id']:
+            edge['source'] = kept['binding_id']
+    graph['nodes'].remove(removed)
+    from notmyfault.core.condition_runtime import ConditionRuntime
+    from notmyfault.core.condition_program import build_matcher
+    matcher = build_matcher(rule)
+    assert len(matcher.leaves['hotkey']) == 1
+    runtime = ConditionRuntime()
+    assert runtime.match_and_take('rule', rule, 'usb_insert', {}, now=0) is None
+    hit = runtime.match_and_take('rule', rule, 'hotkey', {}, now=1)
+    assert {item['binding_id'] for item in hit} == {'t_usb001', 't_hot001'}
 
 
 def test_actions_allow_conditional_or_source():
@@ -175,7 +188,7 @@ def test_if_bindings_cannot_cross_branches_or_reference_later_actions():
 
 def test_elif_bindings_use_only_previous_path_and_keep_unique_ids():
     from notmyfault.core.rule_model import normalize_rules
-    from notmyfault.core.rules import iter_action_nodes, validate_rule_binding_ids, get_rule_admin_plugins
+    from notmyfault.core.rules import validate_rule_binding_ids, get_rule_admin_plugins
     from notmyfault.core.runtime_rules import prepare_rules
 
     source = {"type": "open_url", "binding_id": "a_source01", "params": {"url": "https://example.com"}}
@@ -187,7 +200,7 @@ def test_elif_bindings_use_only_previous_path_and_keep_unique_ids():
     assert validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META) == []
     prepared = prepare_rules([rule], TRIGGERS_META, ACTIONS_META)
     assert len(prepared) == 1, prepared.issues
-    assert "a_consume1" in prepared.compiled[rule["rule_id"]].step_index
+    assert "a_consume1" in prepared.compiled[rule["rule_id"]].steps
     assert get_rule_admin_plugins(rule, TRIGGERS_META, {"open_url": {"permissions": ["admin"]}}) == ["open_url"]
     assert len([node for node in rule["workflow"]["nodes"] if node["type"] in ("open_url", "notify")]) == 2
     branches.insert(-1, {"predicate": {"op": "eq", "left": _ref("step", "a_source01", ["status"]), "right": "ok"}, "steps": []})
@@ -227,7 +240,7 @@ def test_run_status_references_are_checked_across_rules_and_on_target_removal():
     assert validate_rules([rules[0]], TRIGGERS_META, ACTIONS_META, known_rule_ids={"r_target01", "r_observer"})[0] == 1
 
 
-def test_event_reference_and_legacy_template_remain_supported():
+def test_event_reference_and_template_syntax_as_literal_text():
     rule = _rule(
         _leaf("usb_insert", "t_usb001"),
         [
@@ -243,8 +256,10 @@ def test_event_reference_and_legacy_template_remain_supported():
             },
         ],
     )
-    # event scope 与旧模板都不应产生静态问题
     assert validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META) == []
+    text = '盘符 {{ event.payload.drive }}'
+    assert resolve_value(text, {'event': {'payload': {'drive': 'E:'}}}) == text
+    assert not contains_dynamic_value(text)
 
 
 def test_file_operation_allows_dynamic_source_but_not_destination():
@@ -280,7 +295,6 @@ def test_file_operation_allows_dynamic_source_but_not_destination():
 @pytest.mark.parametrize(
     "value",
     [
-        "{{ _run_cancel_event }}",
         {"$ref": {"scope": "event", "path": ["_private"]}},
     ],
 )
@@ -398,7 +412,7 @@ def test_structured_reference_preserves_original_types():
     resolved = resolve_value(_ref("trigger", "t_usb001", ["ok"]), context)
     assert resolved is True
     resolved = resolve_value("{{ triggers.t_usb001.payload.count }}", context)
-    assert resolved == 5 and isinstance(resolved, int)
+    assert resolved == "{{ triggers.t_usb001.payload.count }}"
 
 
 def test_nested_keys_templates_and_explicit_conversion_preserve_literal_data():
@@ -534,12 +548,12 @@ def test_builtin_numeric_parameters_validate_resolved_constants(kind, plugin_id,
     resolved = resolve_value(params, context)
     calls = []
     if valid:
-        invoke_action(lambda info, actual: calls.append(actual), None, meta, resolved, context)
+        invoke_action(lambda info, actual, _run_context: calls.append(actual), None, meta, resolved, context)
         assert len(calls) == 1
         assert calls[0][parameter] == value and type(calls[0][parameter]) is type(value)
     else:
         with pytest.raises(DataTypeError, match=parameter):
-            invoke_action(lambda info, actual: calls.append(actual), None, meta, resolved, context)
+            invoke_action(lambda info, actual, _run_context: calls.append(actual), None, meta, resolved, context)
         assert calls == []
 
 
@@ -563,25 +577,23 @@ def test_typed_nested_bindings_conversion_and_optional_policy_are_checked_on_sav
 
 
 def test_event_occurred_checks_workflow_identity_without_requiring_outputs():
-    from notmyfault.core.predicates import evaluate_predicate, validate_predicate
+    from notmyfault.core.canvas_workflow import CanvasProgram
     source = {"op": "event_occurred", "trigger_id": "t_hot001"}
     def current():
         return branch_rule(_leaf("hotkey", "t_hot001"), [{"predicate": source, "steps": [{"type": "notify", "binding_id": "a_notify01", "params": {}}]}, {"steps": []}])
     rule = current()
     assert validate_rule_bindings(rule, {"hotkey": {"outputs": []}}, ACTIONS_META) == []
     matched = build_context("规则", "hotkey", {}, [{"binding_id": "t_hot001", "event": {"type": "hotkey"}, "payload": {}}])
-    assert evaluate_predicate(source, matched)
-    assert not evaluate_predicate(source, build_context("规则", "other", {}, []))
-    assert evaluate_predicate({**source, "expected": False}, build_context("规则", "other", {}, []))
-    matched["manual_test"] = {"provided_trigger_ids": ()}
-    assert not evaluate_predicate(source, matched)
-    matched["manual_test"]["provided_trigger_ids"] = ("t_hot001",)
-    assert evaluate_predicate(source, matched)
+    program = CanvasProgram(rule)
+    trigger = next(node['binding_id'] for node in rule['workflow']['nodes'] if node['type'] == 'trigger')
+    assert program.evaluate(trigger, matched)
+    assert not program.evaluate(trigger, build_context('规则', 'other', {}, []))
+    matched['manual_test'] = {'provided_trigger_ids': ()}
+    assert not program.evaluate(trigger, matched)
+    matched['manual_test']['provided_trigger_ids'] = ('t_hot001',)
+    assert program.evaluate(trigger, matched)
     from notmyfault.core.canvas_workflow import validate_canvas_graph
     broken = current()
     event_edge = next(edge for edge in broken["workflow"]["edges"] if edge["channel"] == "condition")
     event_edge["source"] = "a_missing001"
     assert any("引用的节点不存在" in issue for issue in validate_canvas_graph(broken["workflow"]))
-    assert validate_predicate({**source, "trigger_id": "bad"})
-    assert validate_predicate({"op": "event_occurred", "trigger_id": "a_action1"})
-    assert validate_predicate({"op": "event_occurred", "trigger_id": "t_hot001", "expected": "false"})

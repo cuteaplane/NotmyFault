@@ -57,7 +57,7 @@ def test_plugin_cannot_change_prior_steps_or_executor_state():
     engine.triggers_funcs["signal"] = lambda *args: None
     observed = []
 
-    def produce(meta, params):
+    def produce(meta, params, _run_context):
         return {"rows": [{"value": 1}]}
 
     def consume(meta, params, context):
@@ -138,17 +138,17 @@ def test_compiler_records_snapshot_sources_for_each_step(monkeypatch):
     rule = set_rule_steps(trigger_rule("r_sources01", "规则", "signal"), [
         {"type": "consume", "binding_id": "a_consume1", "params": {
             "value": {"$ref": {"scope": "step", "node": "a_used0001", "path": ["value"]}},
-            "legacy": "{{ triggers.t_used0001.payload.value }}",
+            "trigger": {"$ref": {"scope": "trigger", "node": "t_used0001", "path": ["value"]}},
             "literal": {"$literal": "{{ steps.a_unused01.result }}"},
         }},
     ])
     compiled = prepare_rules([rule], {"signal": {}}, {"consume": {}}, validate=False).compiled["r_sources01"]
-    assert next(step for step in compiled.plan if step.id == "a_consume1").context_sources == (("steps", "a_used0001"), ("triggers", "t_used0001"))
+    assert compiled.steps["a_consume1"].context_sources == (("steps", "a_used0001"), ("triggers", "t_used0001"))
     state = build_context("规则", "signal", {}, [])
     state["steps"]["a_used0001"] = {"result": {"value": 7}}
     state["triggers"]["t_used0001"] = {"payload": {"value": 9}}
     monkeypatch.setattr("notmyfault.core.run_context.context_sources", lambda value: pytest.fail("运行时重复扫描引用"))
-    snapshot = referenced_context(state, {}, sources=next(step for step in compiled.plan if step.id == "a_consume1").context_sources)
+    snapshot = referenced_context(state, {}, sources=compiled.steps["a_consume1"].context_sources)
     assert snapshot["steps"]["a_used0001"]["result"]["value"] == 7
     assert snapshot["triggers"]["t_used0001"]["payload"]["value"] == 9
 

@@ -21,7 +21,7 @@ def test_compiler_requires_existing_unique_ids_and_freezes_sources():
         source["name"] = "外部修改"
         assert snapshot.rules[0]["name"] == "r_compile1"
         with pytest.raises(TypeError):
-            snapshot.compiled[source["rule_id"]].matcher_spec.node["params"]["x"] = 1
+            snapshot.compiled[source["rule_id"]].source["workflow"]["nodes"][0]["trigger"]["params"]["x"] = 1
         with pytest.raises(ValueError, match="rule_id"):
             engine._generations.prepare([{**source, "rule_id": None}], validate=False)
         with pytest.raises(ValueError, match="重复"):

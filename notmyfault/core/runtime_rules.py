@@ -129,10 +129,16 @@ def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_
             if not valid:
                 continue
         try:
+            from notmyfault.core.canvas_workflow import CanvasProgram
+            program = CanvasProgram(rule)
+            active = program.active_nodes()
+            active_triggers = {program.nodes[identity]["trigger"]["binding_id"] for identity in active if program.nodes[identity]["type"] == "trigger"}
             protected_configs = {}
-            from notmyfault.core.canvas_workflow import lower_canvas_rule
-            resolved = resolve_trigger_constants(lower_canvas_rule(rule), registry, protected_configs=protected_configs)
+            resolved = resolve_trigger_constants(rule, registry, protected_configs=protected_configs, active_trigger_ids=active_triggers)
             for leaf in iter_rule_event_nodes(resolved):
+                if leaf["binding_id"] not in active_triggers:
+                    protected_configs[leaf["binding_id"]] = hold_value(leaf.get("params", {}))
+                    continue
                 meta = triggers_meta.get(leaf.get("type"), {})
                 leaf["params"] = normalize_fields(
                     leaf.get("params", {}), meta.get("params"), registry, parameters=True,
@@ -147,6 +153,8 @@ def prepare_rules(rules, triggers_meta, actions_meta, *, validate=True, resolve_
             prepare_binding_context(resolved, context, triggers_meta, actions_meta, registry=registry)
             if resolve_trigger is not None:
                 for leaf in iter_rule_event_nodes(resolved):
+                    if leaf["binding_id"] not in active_triggers:
+                        continue
                     trigger_id = leaf["type"]
                     if trigger_id not in trigger_ready:
                         trigger_ready[trigger_id] = resolve_trigger(trigger_id) is not None

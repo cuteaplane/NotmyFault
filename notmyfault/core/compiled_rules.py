@@ -9,7 +9,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from notmyfault.core.bindings import iter_references, validate_binding_path, validate_reference_fields
-from notmyfault.core.conditions import get_rule_condition, config_fingerprint
+from notmyfault.core.conditions import config_fingerprint
 from notmyfault.core.data_types import DataTypeError, type_at_path
 from notmyfault.core.condition_program import MatcherSpec, build_matcher
 from notmyfault.core.workflow_graph import iter_rule_actions, get_all_rule_events, NATIVE_NODES
@@ -78,7 +78,6 @@ class ReferenceAccessor:
 @dataclass(frozen=True, slots=True)
 class Step:
     id: str
-    index: int
     location: str
     action: FrozenDict
     context_sources: tuple[tuple[str, str | None], ...]
@@ -91,8 +90,7 @@ class CompiledRule:
     source: FrozenDict
     subscriptions: tuple[SubscriptionSpec, ...]
     matcher_spec: MatcherSpec
-    plan: tuple[Step, ...]
-    step_index: Mapping[str, int]
+    steps: Mapping[str, Step]
     concurrency: FrozenDict
     references: Mapping[int, ReferenceAccessor]
 
@@ -111,8 +109,12 @@ def compile_rule(rule, template, triggers_meta, actions_meta, event_types, regis
     leaves = get_all_rule_events(source)
     by_event = defaultdict(list)
     subscriptions = []
-    matcher = build_matcher(get_rule_condition(source))
+    matcher = build_matcher(source)
+    active = matcher.graph.active_nodes()
+    active_triggers = {matcher.graph.nodes[identity]["trigger"]["binding_id"] for identity in active if matcher.graph.nodes[identity]["type"] == "trigger"}
     for leaf in leaves:
+        if leaf["binding_id"] not in active_triggers:
+            continue
         by_event[leaf["type"]].append(leaf)
         fingerprint = config_fingerprint(leaf.get("params", {}))
         subscriptions.append(SubscriptionSpec(leaf["type"], fingerprint, leaf["binding_id"]))
@@ -127,12 +129,15 @@ def compile_rule(rule, template, triggers_meta, actions_meta, event_types, regis
         static_type = _reference_type(root, path, registry)
         variants = {name: _reference_type(schema, path, registry) for name, schema in event_types.items() if name in by_event} if scope == "event" else {}
         references[id(ref)] = ReferenceAccessor(scope, node, path, freeze(static_type), MappingProxyType(variants))
-    plan = tuple(Step(action["binding_id"], index, location, action, context_sources(action.get("params", {})))
-                 for index, (action, location) in enumerate(iter_rule_actions(source)))
-    plugin_ids = {("trigger", leaf["type"]) for leaf in leaves} | {("action", step.action["type"]) for step in plan if step.action["type"] not in NATIVE_NODES}
+    steps = {action["binding_id"]: Step(action["binding_id"], location, action, context_sources(action.get("params", {})))
+             for action, location in iter_rule_actions(source)}
+    plugin_ids = {("trigger", leaf["type"]) for leaf in leaves} | {("action", step.action["type"]) for step in steps.values() if step.action["type"] not in NATIVE_NODES}
     plugins = {kind + ":" + name: ((plugin_digests or {}).get(kind + ":" + name) or digest((triggers_meta if kind == "trigger" else actions_meta).get(name, {}))) for kind, name in plugin_ids}
-    semantic_rule = {key: value for key, value in source.items() if key != "name"}
+    semantic_rule = {key: value for key, value in source.items() if key not in ("name", "folder")}
+    semantic_rule["workflow"] = {**source["workflow"], "nodes": sorted(
+        ({key: value for key, value in node.items() if key not in ("position", "name")} for node in source["workflow"]["nodes"]),
+        key=lambda node: node["binding_id"])}
     concurrency = {"mode": "single", **source.get("concurrency", {})}
     return CompiledRule(source["rule_id"], digest({"rule": semantic_rule, "plugins": plugins}), source, tuple(subscriptions), matcher,
-                        plan, MappingProxyType({step.id: step.index for step in plan}),
+                        MappingProxyType(steps),
                         freeze(concurrency), MappingProxyType(references))

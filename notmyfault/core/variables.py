@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import re
 
-from notmyfault.core.bindings import contains_legacy_template, is_expression, is_typed_value, iter_references, resolve_value
+from notmyfault.core.bindings import is_expression, is_typed_value, iter_references, resolve_value
 from notmyfault.core.data_types import DataTypeError, normalize_type, normalize_value
 from notmyfault.values import contains_secret, hold_value, plain_value, protect
 
@@ -52,8 +52,6 @@ def expression_is_sensitive(value, context):
 
 
 def _constant_dependencies(expression, location):
-    if contains_legacy_template(expression):
-        raise DataTypeError("初始化只支持结构化常量引用，原样文本请使用 $literal", location=location, code="invalid_variable")
     references = list(iter_references(expression, location=location))
     for usage in references:
         if usage.reference.get("scope") != "constant":
@@ -143,7 +141,7 @@ def assign_variable(identity, expression, context):
     return value
 
 
-def resolve_trigger_constants(rule, registry=None, *, protected_configs=None):
+def resolve_trigger_constants(rule, registry=None, *, protected_configs=None, active_trigger_ids=None):
     from notmyfault.core.workflow_graph import iter_rule_event_nodes
 
     context, _definitions = constant_context(rule, registry)
@@ -163,7 +161,7 @@ def resolve_trigger_constants(rule, registry=None, *, protected_configs=None):
 
     for index, event in enumerate(iter_rule_event_nodes(resolved)):
         params = event.get("params", {})
-        config = resolve_config(params, f"condition[{index}].params")
+        config = resolve_config(params, f"workflow.triggers[{index}].params") if active_trigger_ids is None or event["binding_id"] in active_trigger_ids else copy.deepcopy(params)
         if protected_configs is not None:
             protected_configs[event["binding_id"]] = hold_value(config)
         event["params"] = plain_value(config)

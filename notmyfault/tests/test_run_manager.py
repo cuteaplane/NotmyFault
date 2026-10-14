@@ -446,7 +446,7 @@ class TestEngineWiring:
         events = []
         release = threading.Event()
 
-        def slow_action(meta, params):
+        def slow_action(meta, params, _run_context):
             release.wait(timeout=10)
             return {"ok": True}
 
@@ -493,7 +493,7 @@ class TestEngineWiring:
         events = []
         release = threading.Event()
 
-        def slow_action(meta, params):
+        def slow_action(meta, params, _run_context):
             release.wait(timeout=10)
             return {"ok": True}
 

@@ -9,7 +9,8 @@ import pytest
 from notmyfault.core.clock import FakeClock
 from notmyfault.core.condition_program import build_matcher
 from notmyfault.core.condition_runtime import ConditionRuntime, MatcherState
-from notmyfault.core.conditions import validate_condition_tree
+from notmyfault.core.canvas_workflow import validate_canvas_graph
+from notmyfault.tests.canvas_fixtures import event_rule
 
 
 def leaf(name):
@@ -31,7 +32,7 @@ def absence_rule(identity, name, seconds):
 def runtime_for(node):
     clock = FakeClock()
     runtime = ConditionRuntime(clock=clock)
-    rule = {"_matcher": node}
+    rule = event_rule('r_runtime001', '事件匹配', node, [])
     runtime.register_rule("r", rule)
     return runtime, clock, rule
 
@@ -132,7 +133,8 @@ def test_late_timer_coalesces_missed_absence_windows():
 def test_tiny_absence_window_advances_beyond_clock_precision():
     clock = FakeClock(monotonic=1_000_000)
     runtime = ConditionRuntime(clock=clock)
-    rule = {"_matcher": {"op": "not", "within_seconds": 1e-300, "repeat": "every_window", "children": [leaf("a")]}}
+    rule = absence_rule('r_runtime001', '事件匹配', 1e-300)
+    rule['workflow']['nodes'][0]['repeat'] = 'every_window'
     runtime.register_rule("r", rule)
     assert runtime.next_deadline() > clock.monotonic()
     clock.advance(1)
@@ -157,7 +159,7 @@ def test_migration_keeps_deadlines_and_event_sequence(consumed):
     if consumed:
         send(runtime, clock, rule, "b")
     candidate = ConditionRuntime(clock=clock)
-    candidate.configure({"r": SimpleNamespace(matcher_spec=build_matcher(copy.deepcopy(rule["_matcher"])))})
+    candidate.configure({"r": SimpleNamespace(matcher_spec=build_matcher(copy.deepcopy(rule)))})
     candidate.migrate_from(runtime, {"r"})
     candidate.activate()
     state = candidate.snapshot()["r"]
@@ -175,7 +177,7 @@ def test_migration_preserves_tie_order_of_rearmed_absences():
     ]})
     send(runtime, clock, rule, "b", 1)
     candidate = ConditionRuntime(clock=clock)
-    candidate.configure({"r": SimpleNamespace(matcher_spec=build_matcher(copy.deepcopy(rule["_matcher"])))})
+    candidate.configure({"r": SimpleNamespace(matcher_spec=build_matcher(copy.deepcopy(rule)))})
     candidate.migrate_from(runtime, {"r"})
     candidate.activate()
     clock.advance(1)
@@ -189,10 +191,12 @@ def test_migration_preserves_tie_order_of_rearmed_absences():
     ("all", "ttl_seconds", float("inf")), ("all", "ttl_seconds", 10**1000),
 ])
 def test_invalid_options_are_reported(op, option, value):
-    node = {"op": op, option: value, "children": [leaf("a")]}
+    rule = event_rule('r_runtime001', '事件匹配', {'op': op, 'within_seconds': 2, 'children': [leaf('a')]}, [])
+    node = rule['workflow']['nodes'][0]
+    node[option] = value
     if op == "not":
-        node["within_seconds"] = 2
-    assert any(option in error for error in validate_condition_tree(node))
+        node['duration_seconds'] = 2
+    assert any(option in error for error in validate_canvas_graph(rule['workflow']))
 
 
 def test_timer_thread_waits_and_reload_wakes_it_for_an_earlier_deadline():

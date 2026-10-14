@@ -14,7 +14,7 @@ from notmyfault.core.workflow import build_context
 from notmyfault.core.run_context import RunState
 from notmyfault.core.runtime_rules import PreparedRules, rule_key
 from notmyfault.core.conditions import config_fingerprint
-from notmyfault.core.event_observation import RunEventObservation, has_event_predicate
+from notmyfault.core.event_observation import RunEventObservation
 from notmyfault.core.workflow_graph import iter_rule_actions, NATIVE_NODES, entry_event_group
 
 # 两条规则互相监视会形成一条不会结束的触发链，链到这么深就丢弃这次运行
@@ -223,27 +223,42 @@ class EventBus:
             except (DataTypeError, BindingResolutionError) as error:
                 state["_preparation_error"] = error.as_dict()
 
-        if "workflow" in rule:
-            graph = rule["workflow"]
-            entry = entry_event_group(graph)
-            if entry is not None and entry.get("type") == "event_group" and "activation" in entry:
-                prepare(context)
-                if not context.get("_preparation_error"):
-                    from notmyfault.core.workflow_graph import evaluate_group_branches
-                    occurred = observation.apply_snapshot(context) if observation is not None else frozenset(event.get("binding_id") for event in matched_events)
-                    statuses = {}
-                    def lookup(identity):
-                        if identity not in statuses:
-                            statuses[identity] = self._status_lookup(identity)
-                        return statuses[identity]
-                    try:
-                        evaluated = context['_entry_evaluated_branches'] = []
-                        selected = evaluate_group_branches(entry, context, evaluated, status_lookup=lookup, occurred=occurred)
-                        context["_entry_branch"] = (entry["binding_id"], selected)
-                    except (ValueError, TypeError) as error:
-                        context["_preparation_error"] = {"code": "condition_evaluation_failed", "message": str(error)}
-            else:
-                context.defer_preparation(prepare)
+        program = snapshot.compiled[key].matcher_spec.graph
+        root = next((event.get('root_id') for event in matched_events if event.get('root_id') in program.nodes), None)
+        if root is None:
+            roots = program.roots()
+            root = roots[0] if roots else None
+        context['_entry_root'] = root
+        if root is not None:
+            prepare(context)
+            if not context.get('_preparation_error'):
+                occurred = observation.apply_snapshot(context) if observation is not None else frozenset(
+                    event.get('binding_id') for event in matched_events if not event.get('absence'))
+                statuses = {}
+                def lookup(identity):
+                    if identity not in statuses:
+                        statuses[identity] = self._status_lookup(identity)
+                    return statuses[identity]
+                choices, evaluated = {}, {}
+                current = root
+                try:
+                    while current is not None:
+                        node = program.nodes[current]
+                        if node['type'] == 'action_group':
+                            current = program.successors.get((current, 'entry'))
+                            continue
+                        records = evaluated[current] = []
+                        if node['type'] == 'trigger':
+                            choices[current] = 'event'
+                        else:
+                            from notmyfault.core.workflow_graph import evaluate_group_branches
+                            choices[current] = evaluate_group_branches(node, context, records, program=program,
+                                status_lookup=lookup, occurred=occurred)
+                        break
+                    context['_entry_choices'] = choices
+                    context['_entry_evaluated_nodes'] = evaluated
+                except (ValueError, TypeError) as error:
+                    context['_preparation_error'] = {'code': 'condition_evaluation_failed', 'message': str(error)}
         else:
             context.defer_preparation(prepare)
         if self._scheduler_submit_fn is not None:

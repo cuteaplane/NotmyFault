@@ -6,7 +6,6 @@ import uuid
 
 from notmyfault.tests.api_support import create_test_engine, event_fields
 from notmyfault.tests.canvas_fixtures import native_rule
-from notmyfault.core.canvas_workflow import lower_canvas_rule
 from notmyfault.core.run_manager import RunManager
 from notmyfault.core.run_history import RunHistory, build_runs
 from notmyfault.core.run_lifecycle import (
@@ -136,11 +135,11 @@ class TestExecutorSingleTerminal:
     def test_binding_failure_emits_single_terminal(self):
         events = []
         engine = self._make_engine(events)
-        engine.actions_funcs["noop"] = lambda meta, params: {"ok": True}
+        engine.actions_funcs["noop"] = lambda meta, params, _run_context: {"ok": True}
         engine.actions_meta["noop"] = {}
         compensation_started = threading.Event()
         release = threading.Event()
-        def compensate(meta, params):
+        def compensate(meta, params, _run_context):
             compensation_started.set()
             release.wait(5)
         engine.actions_funcs["compensate"] = compensate
@@ -155,7 +154,7 @@ class TestExecutorSingleTerminal:
         engine.emit_event("hotkey", {})
         assert compensation_started.wait(5)
         assert engine.events.flush()
-        assert not [e for e in events if e[0] in ("run.failed", "run.succeeded")]
+        assert not [e for e in events if e[0] in ("run.failed", "run.succeeded", "run.recovered")]
         engine.emit_event("hotkey", {})
         assert engine.events.flush()
         assert any(e[0] == "run.dropped" for e in events)
@@ -163,15 +162,15 @@ class TestExecutorSingleTerminal:
         assert engine._run_manager.wait_for_idle(timeout=5)
 
         assert engine.events.flush()
-        terminals = [e for e in events if e[0] in ("run.failed", "run.succeeded")]
+        terminals = [e for e in events if e[0] in ("run.failed", "run.succeeded", "run.recovered")]
         assert len(terminals) == 1
-        assert terminals[0][0] == "run.failed"
-        assert terminals[0][1]["status"] == "failed"
+        assert terminals[0][0] == "run.recovered"
+        assert terminals[0][1]["status"] == "recovered"
 
     def test_cancel_run_twice_only_first_wins(self):
         events = []
         engine = self._make_engine(events)
-        engine.actions_funcs["noop"] = lambda meta, params: {"ok": True}
+        engine.actions_funcs["noop"] = lambda meta, params, _run_context: {"ok": True}
         engine.actions_meta["noop"] = {}
         rule = native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "params": {}}], name="正常规则")
         engine.rules = [rule]
@@ -208,7 +207,7 @@ class TestStopPathDropsQueue:
         release = threading.Event()
         events = []
 
-        def slow_action(meta, params):
+        def slow_action(meta, params, _run_context):
             release.wait(timeout=10)
             return {"ok": True}
 
@@ -231,7 +230,7 @@ class TestStopPathDropsQueue:
         context2 = build_context(
             "停止路径规则", "hotkey", {"key": "f3"}, [], "r_stop0001", "run_stop_b"
         )
-        runtime_rule = lower_canvas_rule(rule)
+        runtime_rule = rule
         supplied = {node["trigger"]["binding_id"] for node in rule["workflow"]["nodes"] if node["type"] == "trigger"}
         context1["_event_occurrences"] = supplied
         context2["_event_occurrences"] = supplied

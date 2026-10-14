@@ -13,31 +13,14 @@ from notmyfault.core.variables import variable_definitions
 from notmyfault.extensions.protocol import owned_value_identity
 from notmyfault.core.predicates import validate_predicate
 from notmyfault.core.workflow_graph import (
-    NATIVE_NODES, iter_rule_actions, get_all_rule_events, iter_rule_event_nodes, validate_workflow_graph, branch_predicate, entry_event_group,
+    NATIVE_NODES, iter_rule_actions, get_all_rule_events, iter_rule_event_nodes, validate_workflow_graph, entry_event_group,
 )
 from notmyfault.core.rule_model import normalize_rule_shape, normalize_rules, _BINDING_ID_RE, _RULE_ID_RE
 from notmyfault.core.condition_runtime import ConditionRuntime
-from notmyfault.core.conditions import (
-    get_rule_condition, _is_event_leaf, _condition_children, iter_condition_events,
-    get_rule_events, validate_condition_tree, check_event_params,
-    config_fingerprint, _condition_op, _absence_nodes, _positive_events,
-    _event_key, _canonical_config_value,
-)
+from notmyfault.core.conditions import check_event_params, config_fingerprint, _canonical_config_value
 
 
 
-
-def iter_action_nodes(actions: Any, path: str = "actions", *, include_invalid: bool = False):
-    if not isinstance(actions, list):
-        return
-    for index, action in enumerate(actions):
-        if not isinstance(action, dict):
-            if include_invalid:
-                yield action, f"{path}[{index}]"
-            continue
-        location = f"{path}[{index}]"
-        yield action, location
-        yield from iter_action_nodes(action.get("failure_actions"), f"{location}.failure_actions", include_invalid=include_invalid)
 
 
 def get_rule_admin_plugins(
@@ -57,6 +40,9 @@ def get_rule_admin_plugins(
         if "admin" in (actions_meta.get(plugin_id, {}).get("permissions") or []):
             required.add(plugin_id)
     return sorted(required)
+
+
+_RULE_TOP_LEVEL_FIELDS = frozenset({'rule_id', 'name', 'folder', 'workflow', 'constants', 'variables', 'concurrency'})
 
 
 def validate_rule_structure(rule: Any) -> List[str]:
@@ -81,6 +67,10 @@ def validate_rule_structure(rule: Any) -> List[str]:
 
     if not isinstance(rule.get("name"), str) or not rule["name"].strip():
         errors.append("name 必须是非空字符串")
+
+    unknown = sorted(set(rule) - _RULE_TOP_LEVEL_FIELDS)
+    if unknown:
+        errors.append('包含未知字段: ' + ', '.join(unknown))
 
     if "concurrency" in rule:
         concurrency = rule["concurrency"]
@@ -111,7 +101,7 @@ def validate_rule_structure(rule: Any) -> List[str]:
     from notmyfault.core.canvas_workflow import validate_canvas_graph
     errors.extend(validate_canvas_graph(rule.get('workflow')))
 
-    def validate_action(action: Any, path: str, *, allow_failure_actions: bool) -> None:
+    def validate_action(action: Any, path: str) -> None:
         if not isinstance(action, dict):
             errors.append(f"{path} 必须是对象")
             return
@@ -187,23 +177,8 @@ def validate_rule_structure(rule: Any) -> List[str]:
             errors.append(
                 f"{path}.retry_backoff 必须是 fixed 或 exponential"
             )
-        if "failure_actions" not in action:
-            return
-        failure_actions = action["failure_actions"]
-        if not allow_failure_actions:
-            errors.append(f"{path}.failure_actions 不允许继续嵌套")
-        elif not isinstance(failure_actions, list) or not failure_actions:
-            errors.append(f"{path}.failure_actions 至少需要一个动作")
-        else:
-            for failure_index, failure_action in enumerate(failure_actions):
-                validate_action(
-                    failure_action,
-                    f"{path}.failure_actions[{failure_index}]",
-                    allow_failure_actions=False,
-                )
-
     for node, path in iter_rule_actions(rule):
-        validate_action(node, path, allow_failure_actions=True)
+        validate_action(node, path)
 
     return errors
 
@@ -239,18 +214,6 @@ def validate_rule_binding_ids(rule: Dict[str, Any], *, allow_missing: bool = Fal
             return
         _validate_node_binding_id(node, prefix, path, seen, errors)
 
-    def visit(node: Any, path: str) -> None:
-        if not isinstance(node, dict):
-            return
-        if _is_event_leaf(node):
-            check(node, "t", path)
-            return
-        for index, child in enumerate(_condition_children(node)):
-            visit(child, f"{path}.children[{index}]")
-
-    condition = get_rule_condition(rule)
-    if condition is not None:
-        visit(condition, "condition")
     if "workflow" in rule:
         trigger_ids = {}
         for event in iter_rule_event_nodes(rule):
@@ -313,22 +276,11 @@ def validate_automation_references(rule, known_rule_ids):
             not isinstance(node.get("rule_id"), str) or node["rule_id"] not in known_rule_ids
         ):
             errors.append(f"{path}.rule_id 引用的自动化不存在")
-        children = node.get("children", [])
-        for index, child in enumerate(children if isinstance(children, list) else []):
-            condition(child, f"{path}.children[{index}]")
+
 
     for action, path in iter_rule_actions(rule):
         if action.get('type') == 'condition':
             condition(action.get('predicate'), f'{path}.predicate')
-        if action.get("type") == "event_group":
-            if 'group_type' in action:
-                continue
-            for index, branch in enumerate(action.get("branches", [])):
-                try:
-                    condition(branch_predicate(branch), f"{path}.branches[{index}]")
-                except ValueError as error:
-                    errors.append(str(error))
-            continue
     return errors
 
 
@@ -360,33 +312,17 @@ def aggregate_trigger_params(rules: List[Dict[str, Any]]) -> Dict[str, List[Dict
     """把同一 trigger 的参数聚合成列表，并复制字典隔离规则配置"""
     aggregated: Dict[str, List[Dict[str, Any]]] = {}
     for rule in rules:
+        from notmyfault.core.canvas_workflow import CanvasProgram
+        program = CanvasProgram(rule)
+        active_triggers = {program.nodes[identity]["trigger"]["binding_id"] for identity in program.active_nodes() if program.nodes[identity]["type"] == "trigger"}
         for event_def in get_all_rule_events(rule):
+            if event_def["binding_id"] not in active_triggers:
+                continue
             event_type = event_def.get("type")
             if not event_type:
                 continue
             aggregated.setdefault(event_type, []).append(copy.deepcopy(event_def.get("params", {})))
     return aggregated
-
-
-def guaranteed_trigger_ids(node: Dict[str, Any] | None) -> set[str]:
-    """返回条件树每次成立时都必然出现的触发器节点"""
-    if not isinstance(node, dict):
-        return set()
-    if _is_event_leaf(node):
-        binding_id = node.get("binding_id")
-        return {binding_id} if isinstance(binding_id, str) else set()
-    children = _condition_children(node)
-    if not children:
-        return set()
-    child_sets = [guaranteed_trigger_ids(child) for child in children]
-    if _condition_op(node) == "not":
-        return set()
-    if _condition_op(node) == "all":
-        return set().union(*child_sets)
-    result = set(child_sets[0])
-    for child_set in child_sets[1:]:
-        result.intersection_update(child_set)
-    return result
 
 
 def _valid_plugin_data(
@@ -396,21 +332,7 @@ def _valid_plugin_data(
 ) -> bool:
     identity = owned_value_identity(value)
     if identity is None:
-        if isinstance(value, dict) and "$type" in value:
-            return False
-        if not isinstance(value, dict) or not value:
-            return False
-        contributes = plugin_meta.get("contributes")
-        editors = (
-            contributes.get("parameter_editors", [])
-            if isinstance(contributes, dict) else []
-        )
-        return any(
-            isinstance(editor, dict)
-            and editor.get("parameter") == param.get("name")
-            and editor.get("accepts_legacy") is True
-            for editor in editors
-        )
+        return False
     package_name, data_type_id, version = identity
     if package_name != plugin_meta.get("package_name"):
         return False
@@ -435,17 +357,13 @@ def validate_rule_bindings(
 ) -> List[Dict[str, Any]]:
     from notmyfault.core.binding_schema import check_rule_bindings
 
-    from notmyfault.core.canvas_workflow import lower_canvas_rule
     rule = normalize_rule_shape(rule)
-    runtime = lower_canvas_rule(rule)
-    raw_locations = {node['binding_id']: path for node, path in iter_rule_actions(rule)}
-    mappings = sorted(((path, raw_locations[node['binding_id']], node['binding_id']) for node, path in iter_rule_actions(runtime) if node['binding_id'] in raw_locations), key=lambda item: len(item[0]), reverse=True)
-    issues = check_rule_bindings(runtime, triggers_meta, actions_meta)
+    issues = check_rule_bindings(rule, triggers_meta, actions_meta)
+    locations = {path: node['binding_id'] for node, path in iter_rule_actions(rule)}
     for issue in issues:
-        location = issue.get('location', '')
-        for compiled_path, raw_path, identity in mappings:
-            if location == compiled_path or location.startswith(compiled_path + '.'):
-                issue.update(location=raw_path + location[len(compiled_path):], node_id=identity)
+        for path, identity in locations.items():
+            if issue.get('location', '').startswith(path + '.') or issue.get('location') == path:
+                issue['node_id'] = identity
                 break
     return issues
 
@@ -471,21 +389,16 @@ def validate_rules(
             issues.append((rule_name, str(error)))
             continue
 
-        try:
-            from notmyfault.core.canvas_workflow import lower_canvas_rule
-            rule = lower_canvas_rule(rule)
-        except (ValueError, KeyError, TypeError) as error:
-            issues.append((rule_name, str(error)))
-            continue
-        if rule['workflow']['entry'] is None:
-            valid_count += 1
-            continue
-        condition_errors = validate_condition_tree(get_rule_condition(rule))
+        condition_errors = validate_rule_structure(rule)
         condition_errors.extend(validate_automation_references(rule, known_rule_ids))
         if condition_errors:
             issues.extend((rule_name, error) for error in condition_errors)
             continue
-        rule_events = get_all_rule_events(rule)
+        from notmyfault.core.canvas_workflow import CanvasProgram
+        program = CanvasProgram(rule)
+        active = program.active_nodes()
+        active_triggers = {program.nodes[identity]["trigger"]["binding_id"] for identity in active if program.nodes[identity]["type"] == "trigger"}
+        rule_events = [event for event in get_all_rule_events(rule) if event["binding_id"] in active_triggers]
         all_events_valid = True
         for event_def in rule_events:
             event_type = event_def.get("type", "")
@@ -543,6 +456,8 @@ def validate_rules(
 
         rule_ok = True
         for action, action_path in iter_rule_actions(rule, include_invalid=True):
+            if isinstance(action, dict) and action["binding_id"] not in active:
+                continue
             if not isinstance(action, dict):
                 issues.append((rule_name, f"{action_path} 必须是对象"))
                 rule_ok = False

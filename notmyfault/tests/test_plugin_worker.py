@@ -52,15 +52,12 @@ def extension_context(meta):
 
 
 SIMPLE_ACTION = """
-def run(action_info, params):
+def run_with_context(action_info, params, context):
     print("动作里的 print 进日志")
     return {"echo": params.get("value")}
 """
 
 CONTEXT_ACTION = """
-def run(action_info, params):
-    raise RuntimeError("context-v1 不应调用 run()")
-
 def run_with_context(action_info, params, context):
     return {
         "run_id": context.get("run", {}).get("id"),
@@ -69,14 +66,14 @@ def run_with_context(action_info, params, context):
 """
 
 RAISING_ACTION = """
-def run(action_info, params):
+def run_with_context(action_info, params, context):
     raise ValueError("动作故意失败")
 """
 
 SLEEPY_ACTION = """
 import time
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
     time.sleep(30)
     return {}
 """
@@ -84,7 +81,7 @@ def run(action_info, params):
 CRASHING_ACTION = """
 import os
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
     os._exit(3)
 """
 
@@ -93,7 +90,7 @@ raise RuntimeError("模块 import 阶段就崩")
 """
 
 NOISY_ACTION = """
-def run(action_info, params):
+def run_with_context(action_info, params, context):
     print("x" * 262144)
     return {"completed": True}
 """
@@ -101,7 +98,7 @@ def run(action_info, params):
 PLUGIN_API_ACTION = """
 from notmyfault.plugin_api import platform_services
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
     return {"platform": platform_services().platform}
 """
 
@@ -143,7 +140,7 @@ class TestRunIsolatedAction:
         }
         registry = TypeRegistry.from_plugins([meta])
         value = registry.make_value(identity, {"amount": Decimal("1.00000000000000001"), "data": b"\x00\xff", "count": 2**100 + 1, "_business_key": "kept"})
-        entry = write_action(tmp_path, "typed", "def run(meta, params):\n    return {}\ndef run_with_context(meta, params, context):\n    assert params['value'] == context['variables']['saved']\n    return {'echo': params['value']}\n")
+        entry = write_action(tmp_path, "typed", "def run_with_context(meta, params, context):\n    assert params['value'] == context['variables']['saved']\n    return {'echo': params['value']}\n")
         ok, result = run_isolated_action(entry, meta, {"value": value}, {"variables": {"saved": value}, "_type_registry": registry})
         assert ok is True
         assert result == {"echo": value}
@@ -192,7 +189,7 @@ class TestRunIsolatedAction:
             tmp_path,
             "with_helper",
             "from helper import triple\n\n"
-            "def run(action_info, params):\n"
+            "def run_with_context(action_info, params, context):\n"
             "    return {'result': triple(params['value'])}\n",
         )
         ok, result = run_isolated_action(
@@ -399,7 +396,6 @@ class TestLoaderIsolatedMode:
         self,
         tmp_path,
         execution_mode="isolated",
-        context_api=False,
         source=None,
     ):
         from types import SimpleNamespace
@@ -411,10 +407,8 @@ class TestLoaderIsolatedMode:
         plugin_dir.mkdir(parents=True)
         if source is None:
             source = (
-                CONTEXT_ACTION
-                if context_api
-                else "def run(action_info, params):\n"
-                     "    return {'doubled': params.get('n', 0) * 2}\n"
+                "def run_with_context(action_info, params, context):\n"
+                "    return {'doubled': params.get('n', 0) * 2}\n"
             )
         (plugin_dir / "action.py").write_text(source, encoding="utf-8")
         meta = {
@@ -428,8 +422,7 @@ class TestLoaderIsolatedMode:
             "permissions": [],
             "execution_mode": execution_mode,
         }
-        if context_api:
-            meta["execution_api"] = "context-v1"
+        meta["execution_api"] = "context-v1"
         (plugin_dir / "action.json").write_text(
             json.dumps(meta, ensure_ascii=False), encoding="utf-8"
         )
@@ -458,7 +451,7 @@ class TestLoaderIsolatedMode:
     def test_isolated_action_runs_in_worker(self, tmp_path, origin):
         loader = self._make_plugin(tmp_path, source=(
             "from helper import double\n"
-            "def run(meta, params): return {'doubled': double(params['n'])}\n"
+            "def run_with_context(meta, params, context): return {'doubled': double(params['n'])}\n"
         ))
         helper = tmp_path / "actions" / "iso_action" / "helper.py"
         helper.write_text("def double(value): return value * 2\n", encoding="utf-8")
@@ -471,15 +464,15 @@ class TestLoaderIsolatedMode:
         assert run is not None
         # isolated 动作不 import 进引擎进程
         assert loader._registry.get_module("iso_action") is None
-        assert func_store["iso_action"]({}, {"n": 21}) == {"doubled": 42}
+        assert func_store["iso_action"]({}, {"n": 21}, {}) == {"doubled": 42}
         helper.write_text("def double(value): return value * 3\n", encoding="utf-8")
         with pytest.raises(RuntimeError, match="完整性校验失败"):
-            func_store["iso_action"]({}, {"n": 21})
+            func_store["iso_action"]({}, {"n": 21}, {})
 
     def test_isolated_context_action_runs_through_registered_proxy(self, tmp_path):
         from notmyfault.core.workflow import invoke_action
 
-        loader = self._make_plugin(tmp_path, context_api=True)
+        loader = self._make_plugin(tmp_path, source=CONTEXT_ACTION)
         meta_store, func_store = loader._registry.stores("action")
         loaded, failed = loader.load(str(tmp_path / "actions"), "action", origin="user")
         assert (loaded, failed) == (1, 0)
@@ -509,7 +502,7 @@ class TestLoaderIsolatedMode:
         loaded, failed = loader.load(str(tmp_path / "actions"), "action", origin="user")
         assert (loaded, failed) == (1, 0)
         assert loader.materialize_pending_action("iso_action") is not None
-        result = func_store["iso_action"]({}, {})
+        result = func_store["iso_action"]({}, {}, {})
         assert result["platform"] in {"windows", "linux", "macos"}
 
 
@@ -519,9 +512,6 @@ def test_isolated_worker_keeps_wrappers_and_hides_private_context(tmp_path):
 
     entry = write_action(tmp_path, "wrapped_values", """
 from notmyfault.plugin_api import Blob, Secret
-
-def run(meta, params):
-    raise RuntimeError("需要上下文入口")
 
 def run_with_context(meta, params, context):
     assert isinstance(params['token'], Secret)
@@ -534,16 +524,12 @@ def run_with_context(meta, params, context):
         {'name': 'token', 'type': 'text', 'sensitive': True}, {'name': 'body', 'type': 'bytes'}],
         'outputs': [{'name': 'value', 'type': 'text'}, {'name': 'size', 'type': 'int'}]}
 
-    def proxy(meta, params):
-        pytest.fail("需要上下文入口")
-
-    def context_proxy(meta, params, context):
+    def proxy(meta, params, context):
         ok, result = run_isolated_action(entry, meta, params, context)
         assert ok
         return result
 
     proxy._isolated_proxy = True
-    proxy.run_with_context = context_proxy
     result = invoke_action(proxy, None, meta, {'token': Secret('token-value'), 'body': Blob(b'x' * (2 * 1024 * 1024))},
                            {'run': {'id': 'run_worker_wrapped'}, '_hidden': 'private', 'manual_test': {'assertions': []}})
     assert isinstance(result, Secret)

@@ -314,8 +314,6 @@ class TriggerHost:
         self.events.publish("trigger.started", {"trigger_id": instance.key[0], "instance_id": instance.id})
         try:
             with use_stream(self.events), use_trigger_context(context):
-                if instance.meta.get("trigger_api") != "event-v2":
-                    raise ValueError("触发器必须使用 event-v2")
                 instance.function(instance.meta, thaw(instance.config), context.emit, context.stopping)
             if not instance.stop.is_set() and instance.meta.get("lifecycle") != "one_shot":
                 raise RuntimeError("持续运行的触发器提前返回")

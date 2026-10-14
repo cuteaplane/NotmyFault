@@ -9,23 +9,18 @@ from notmyfault.core.workflow_graph import get_all_rule_events
 from notmyfault.values import hold_value
 
 
-def has_event_predicate(node):
-    if not isinstance(node, dict):
-        return False
-    children = node.get('children')
-    return node.get('op') == 'event_occurred' or (
-        isinstance(children, list) and any(has_event_predicate(child) for child in children)
-    )
-
-
 class EventWait:
-    def __init__(self, observation, identity, activation, timeout):
+    def __init__(self, observation, identity, timeout):
         self.observation = observation
         self.identity = identity
-        self.rule = {'_matcher': activation}
+        self.rule = observation.rule
         self.runtime = ConditionRuntime(clock=observation.clock)
         now = observation.clock.monotonic()
-        self.runtime.register_rule(identity, self.rule, now)
+        from notmyfault.core.condition_program import build_matcher
+        self.program = build_matcher(self.rule, roots=(identity,))
+        if not self.program.leaves:
+            raise ValueError('等待事件组必须连接触发器')
+        self.runtime.register_rule(identity, self.rule, now, program=self.program)
         self.deadline = None if timeout is None else now + float(timeout)
         self.ready = False
         self.timed_out = False
@@ -65,6 +60,7 @@ class EventWait:
 
 class RunEventObservation:
     def __init__(self, compiled, occurred=(), *, clock=None, wake=None):
+        self.rule = compiled.source
         self.clock = clock or SystemClock()
         self.wake = wake or (lambda: None)
         self._leaves = {}
@@ -121,17 +117,16 @@ class RunEventObservation:
             callback()
         self.wake()
 
-    def wait_for(self, identity, activation, timeout=None):
+    def wait_for(self, identity, timeout=None):
         with self._lock:
             existing = self._waits.get(identity)
             if existing is not None:
                 return existing
-            waiter = EventWait(self, identity, activation, timeout)
+            waiter = EventWait(self, identity, timeout)
             self._waits[identity] = waiter
-            from notmyfault.core.condition_program import build_matcher
-            program = build_matcher(activation)
+            program = waiter.program
             now = self.clock.monotonic()
-            retention_by_id = {leaf['binding_id']: program.retention.get(program.keys[id(leaf)]) for leaves in program.leaves.values() for leaf in leaves}
+            retention_by_id = {program.graph.nodes[node_id]['trigger']['binding_id']: program.retention.get(program.keys[node_id]) for leaves in program.leaves.values() for node_id in leaves}
             for entry in sorted(self._latest.values(), key=lambda event: event['timestamp']):
                 retention = retention_by_id.get(entry['binding_id'])
                 if retention is not None and (now > entry['timestamp'] + retention.seconds or now == entry['timestamp'] + retention.seconds and not retention.inclusive):

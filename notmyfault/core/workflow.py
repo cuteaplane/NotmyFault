@@ -5,7 +5,7 @@ from typing import Any, Callable, Dict
 from notmyfault.core.data_types import DataTypeError, normalize_fields
 from notmyfault.core.clock import Clock, SystemClock
 from notmyfault.core.run_context import RunState, run_view
-from notmyfault.values import action_values, allow_secrets, contains_secret, hold_value, protect
+from notmyfault.values import allow_secrets, contains_secret, hold_value, protect
 
 
 class ActionCancelled(RuntimeError):
@@ -94,7 +94,6 @@ def build_context(
             "config": hold_value(event.get("params", {})),
         }
     context = {
-        "context_version": 2,
         "rule": rule_context,
         "event": {
             "type": event_type,
@@ -117,21 +116,18 @@ def invoke_action(
     params: Dict[str, Any],
     context: Dict[str, Any],
 ) -> Any:
-    """按插件元数据调用新旧动作 API，兼容 run 和 run_with_context"""
+    """调用动作插件的 run_with_context(action_info, params, context)"""
     registry = context.get("_type_registry")
     params = normalize_fields(params, action_meta.get("params"), registry, parameters=True, location="params", wrap_sensitive=True)
     declared = {field.get("name") if isinstance(field, dict) else field for field in action_meta.get("params", [])}
     with allow_secrets({name: value for name, value in params.items() if name in declared}):
-        if action_meta.get("execution_api") == "context-v1":
-            context_runner = getattr(module, "run_with_context", None)
-            if not callable(context_runner):
-                context_runner = getattr(action_func, "run_with_context", None)
-            if not callable(context_runner):
-                raise TypeError("execution_api=context-v1 的插件必须定义 run_with_context()")
-            view = context if getattr(action_func, "_isolated_proxy", False) else run_view(context, context.get("runtime", {}).get("cancellation"))
-            result = context_runner(action_meta, params, view)
-        else:
-            result = action_func(action_meta, action_values(params))
+        runner = getattr(module, "run_with_context", None)
+        if not callable(runner):
+            runner = action_func
+        if not callable(runner):
+            raise TypeError("动作插件必须定义 run_with_context()")
+        view = context if getattr(runner, "_isolated_proxy", False) else run_view(context, context.get("runtime", {}).get("cancellation"))
+        result = runner(action_meta, params, view)
     result = normalize_fields(result, action_meta.get("outputs"), registry, location="outputs", wrap_sensitive=True)
     result = protect(result) if contains_secret(params) else hold_value(result)
     if registry is not None:

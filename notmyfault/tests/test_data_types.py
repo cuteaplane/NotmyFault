@@ -17,7 +17,7 @@ def test_legacy_field_declarations_and_numeric_contracts():
     assert types.field_type({"type": "textarea"}, parameter=True) == {"type": "text"}
     assert types.field_type({"type": "path"}, parameter=True) == {"type": "text"}
     assert types.field_type({"type": "number"}, parameter=True) == {"type": "number"}
-    assert types.field_type({"type": "textarea", "value_type": {"type": "array", "items": "integer"}}, parameter=True) == {"type": "array", "items": {"type": "int"}}
+    assert types.field_type({"type": "textarea", "value_type": {"type": "array", "items": "int"}}, parameter=True) == {"type": "array", "items": {"type": "int"}}
     for value in (1, 1.5):
         actual = types.normalize_value(value, "number")
         assert actual == value and type(actual) is type(value)
@@ -39,11 +39,11 @@ def test_legacy_field_declarations_and_numeric_contracts():
     ):
         field = {"name": "value", "type": "textarea", "value_type": kind}
         meta = {"params": [field], "outputs": [field]}
-        assert invoke_action(lambda info, params: params, None, meta, {"value": valid}, {}) == {"value": valid}
+        assert invoke_action(lambda info, params, _run_context: params, None, meta, {"value": valid}, {}) == {"value": valid}
         with pytest.raises(types.DataTypeError):
-            invoke_action(lambda info, params: params, None, meta, {"value": invalid}, {})
+            invoke_action(lambda info, params, _run_context: params, None, meta, {"value": invalid}, {})
         with pytest.raises(types.DataTypeError):
-            invoke_action(lambda info, params: {"value": invalid}, None, meta, {"value": valid}, {})
+            invoke_action(lambda info, params, _run_context: {"value": invalid}, None, meta, {"value": valid}, {})
 
 
 def test_structured_values_keep_field_types_optionality_and_independent_copies():

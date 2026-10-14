@@ -527,8 +527,6 @@ class AutomationEngine:
             compiled = prepared.compiled[rule_id]
             rule = compiled.source
             actions = [node for node, _path in iter_rule_actions(rule)]
-            start_index = compiled.step_index.get(start_step_id, 0)
-            end_index = compiled.step_index.get(end_step_id, len(actions) - 1)
             context["_plugins"] = plugins
             context["_compiled_rule"] = compiled
             context["_compiled_refs"] = compiled.references
@@ -541,13 +539,11 @@ class AutomationEngine:
             context["manual_test"] = {
                 "start_step_id": start_step_id,
                 "end_step_id": end_step_id,
-                "start_index": start_index,
-                "end_index": end_index,
                 "assertions": copy.deepcopy(test_assertions or []),
                 "provided_trigger_ids": tuple(trigger_payloads or {}),
             }
             if isinstance(step_outputs, dict):
-                provided_actions = actions[:start_index]
+                provided_actions = []
                 native_fields = rule_step_output_fields(rule, plugins.triggers_meta, plugins.actions_meta)
                 if start_step_id:
                     found = find_graph_scope(rule["workflow"], start_step_id)
@@ -648,14 +644,6 @@ class AutomationEngine:
 
     def cancel_run(self, run_id: str) -> bool:
         return self._run_manager.cancel_run(run_id)
-
-    def execute_actions(
-        self,
-        actions: List[Dict[str, Any]],
-        rule_name: str,
-        context: Dict[str, Any],
-    ) -> bool:
-        return self._workflow_executor.execute_actions(actions, rule_name, context)
 
     def execute_action(
         self,

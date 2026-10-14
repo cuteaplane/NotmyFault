@@ -19,7 +19,7 @@ def test_async_history_keeps_queries_current_and_flushes_batches(tmp_path, monke
     monkeypatch.setattr(history, "_write_batch", slow_write)
     try:
         for index in range(1100):
-            history.record_async({"type": "run.triggered", "ts": index, "data": {"run_id": f"run_{index}"}})
+            history.record_async({"v": 1, "type": "run.triggered", "ts": index, "data": {"run_id": f"run_{index}"}})
         assert writing.wait(5)
         assert len(history.list_runs(1000)) == 1000
         assert history.get_run("run_1")["run_id"] == "run_1"
@@ -32,7 +32,7 @@ def test_async_history_keeps_queries_current_and_flushes_batches(tmp_path, monke
 
 
 def packet(name, timestamp, **data):
-    return {"type": name, "ts": timestamp, "data": data}
+    return {"v": 1, "type": name, "ts": timestamp, "data": data}
 
 
 def test_waiting_group_resumes_and_keeps_the_stable_branch_and_parent(tmp_path):
@@ -67,14 +67,14 @@ def test_history_keeps_only_condition_results_and_drops_operands_and_invalid_tra
     history.record(packet('run.triggered', 1, run_id='run_trace'))
     history.record(packet('run.step.failed', 2, run_id='run_trace', step_id='a_group001', action_type='event_group', evaluated_branches=[
         {'branch_id': 'b_first01', 'result': False, 'left': '不能保存', 'predicates': [
-            {'node_id': 'p_first01', 'path': 'condition', 'op': 'eq', 'result': False, 'left': '不能保存'},
+            {'node_id': 'a_first01', 'op': 'eq', 'result': False, 'left': '不能保存'},
             {'node_id': '不能保存', 'path': 'condition', 'op': {}, 'result': True}]},
         {'branch_id': 'b_second1', 'error': {'code': 'missing_binding_value', 'message': '不能保存'}, 'predicates': []},
         {'branch_id': 'b_third01', 'result': '不能保存'}]))
     history.flush()
     restored = RunHistory(history.path).get_run('run_trace')['steps'][0]['evaluated_branches']
     assert restored == [
-        {'branch_id': 'b_first01', 'result': False, 'predicates': [{'node_id': 'p_first01', 'path': 'condition', 'op': 'eq', 'result': False}]},
+        {'branch_id': 'b_first01', 'result': False, 'predicates': [{'node_id': 'a_first01', 'op': 'eq', 'result': False}]},
         {'branch_id': 'b_second1', 'error': {'code': 'missing_binding_value'}, 'predicates': []}]
     assert '不能保存' not in (tmp_path / 'runs.jsonl').read_text()
 
@@ -153,7 +153,7 @@ def test_run_history_builds_completed_run_with_steps(tmp_path):
 
     assert run["status"] == "succeeded"
     assert run["duration_ms"] == 500
-    assert run["precondition_count"] == 1
+    assert "precondition_count" not in run
     assert [step["status"] for step in run["steps"]] == ["succeeded", "skipped"]
     assert run["steps"][0]["duration_ms"] == 180
     assert run["steps"][0]["input_summary"][0]["display"] == "文本 · 4 字符"
@@ -215,7 +215,7 @@ def test_run_history_rejects_malformed_counts_and_timestamps(tmp_path):
     run = history.get_run("run_malformed")
 
     assert run["action_count"] == 0
-    assert run["precondition_count"] == 0
+    assert "precondition_count" not in run
     assert run["assertions_passed"] == 0
     assert run["assertions_total"] == 0
     assert run["duration_ms"] is None

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import copy
 import math
 from collections import defaultdict
+from types import MappingProxyType
 
 
 CANVAS_NODES = frozenset({'trigger', 'condition', 'logic', 'event_group', 'action_group'})
@@ -50,8 +50,17 @@ def validate_canvas_graph(graph):
         kind = node.get('type')
         if not isinstance(kind, str) or not kind:
             errors.append(f'{path}.type 不能为空')
-        if kind == 'if' or any(field in node for field in ('activation', 'condition_graph', 'workflow', 'then', 'elif', 'else', 'triggers')):
-            errors.append(f'{path} 使用了已移除的条件模型')
+        obsolete = set(node) & {'activation', 'condition_graph', 'workflow', 'then', 'elif', 'else', 'triggers', 'failure_actions'}
+        if kind == 'if' or obsolete:
+            errors.append(f'{path} 使用了已移除的条件模型: {", ".join(sorted(obsolete)) or "if"}')
+        if kind in CANVAS_NODES:
+            unsupported = set(node) & {'params', 'retry', 'retry_delay_seconds', 'retry_backoff'}
+            if kind != 'action_group' and 'on_error' in node:
+                unsupported.add('on_error')
+            if kind == 'action_group' and 'timeout_seconds' in node:
+                unsupported.add('timeout_seconds')
+            if unsupported:
+                errors.append(f'{path} 不支持字段: {", ".join(sorted(unsupported))}')
         if kind == 'trigger':
             trigger = node.get('trigger')
             if not isinstance(trigger, dict) or not isinstance(trigger.get('type'), str) or not isinstance(trigger.get('params', {}), dict):
@@ -72,7 +81,7 @@ def validate_canvas_graph(graph):
             errors.append(f'{path}.op 必须是 all、any 或 not')
         if kind == 'condition':
             predicate = node.get('predicate')
-            if not isinstance(predicate, dict) or predicate.get('op') not in ('eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'contains', 'is_true', 'is_false', 'exists', 'not_exists', 'run_status'):
+            if not isinstance(predicate, dict) or 'children' in predicate or predicate.get('op') not in ('eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'contains', 'is_true', 'is_false', 'exists', 'not_exists', 'run_status'):
                 errors.append(f'{path}.predicate 必须是数据比较或自动化状态判断')
         if kind == 'event_group':
             if node.get('mode', 'immediate') not in ('immediate', 'wait'):
@@ -113,6 +122,17 @@ def validate_canvas_graph(graph):
                     errors.append(f'{path}.{field} 必须是 0 到 86400 之间的秒数')
         if 'negated' in node and not isinstance(node['negated'], bool):
             errors.append(f'{path}.negated 必须是布尔值')
+        op = node.get('op', node.get('group_type'))
+        for option, owner, allowed in (
+            ('consume', 'all', ('matched', 'all', 'none')),
+            ('pick', 'any', ('latest', 'first')),
+            ('repeat', 'not', ('once_until_seen', 'every_window')),
+        ):
+            trigger_repeat = kind == 'trigger' and option == 'repeat'
+            if option in node and not trigger_repeat and (op != owner or node[option] not in allowed):
+                errors.append(f'{path}.{option} 不是该条件组支持的选项')
+        if 'ttl_seconds' in node and (op != 'all' or not _finite_number(node['ttl_seconds']) or node['ttl_seconds'] <= 0):
+            errors.append(f'{path}.ttl_seconds 只用于 AND，必须是大于零的有限秒数')
         if node.get('parent') is not None and not isinstance(node['parent'], str):
             errors.append(f'{path}.parent 必须是所属组的节点身份')
         if 'position' in node:
@@ -157,7 +177,7 @@ def validate_canvas_graph(graph):
         pairs.add(key)
         if channel not in ('control', 'condition'):
             errors.append(f'{path}.channel 必须是 control 或 condition')
-        valid_ports = branches.get(edge['source'], {}) if source.get('group_type') == 'if' else ('event',) if source['type'] == 'trigger' else ('result',) if source['type'] in ('logic', 'condition', 'event_group') else ('next', 'entry') if source['type'] == 'action_group' else ('next',)
+        valid_ports = branches.get(edge['source'], {}) if source.get('group_type') == 'if' else ('event',) if source['type'] == 'trigger' else ('result',) if source['type'] in ('logic', 'condition', 'event_group') else ('next', 'entry') if source['type'] == 'action_group' else () if source['type'] == 'end' else ('next',) if source['type'] == 'merge' else ('next', 'failure')
         if port not in valid_ports:
             errors.append(f'{path} 的来源端口不存在')
         if channel == 'condition':
@@ -186,13 +206,29 @@ def validate_canvas_graph(graph):
                     errors.append(f'{path} 动作组入口只能连接组内节点')
             elif action_scope(edge['source']) != action_scope(edge['target']):
                 errors.append(f'{path} 控制流不能跨越动作组边界')
+            if port == 'failure' and target['type'] != 'action_group':
+                errors.append(f'{path} 失败出口只能连接动作组')
         adjacency[edge['source']].append(edge['target'])
+    handlers = {edge['target'] for edge in graph['edges'] if isinstance(edge, dict)
+                and edge.get('channel') == 'control' and edge.get('port') == 'failure'
+                and isinstance(edge.get('target'), str)}
+    for edge in graph['edges']:
+        if not isinstance(edge, dict) or edge.get('channel') != 'control':
+            continue
+        if isinstance(edge.get('target'), str) and edge['target'] in handlers and edge.get('port') != 'failure':
+            errors.append('补救动作组不能同时连接主流程入口')
+        if isinstance(edge.get('source'), str) and edge['source'] in handlers and edge.get('port') == 'next':
+            errors.append('补救动作组按停止／继续设置返回，不能连接对外 next 出口')
     for (identity, port), count in inputs.items():
         node = nodes[identity]
         if count > 1 and node.get('group_type') == 'if':
             errors.append('IF 或 ELIF 只能直接连接一个条件，请先组合 AND 或 OR')
         if count > 1 and (node.get('group_type') == 'not' or node.get('op') == 'not'):
             errors.append('NOT 只能连接一个条件')
+    for identity, values in branches.items():
+        for port, branch in values.items():
+            if not branch.get('else') and (identity, port) in outlets and not inputs[identity, port]:
+                errors.append('IF 或 ELIF 已连接动作，请先连接该分支的条件')
     visited, visiting = set(), set()
     def visit(identity):
         if identity in visiting:
@@ -207,226 +243,184 @@ def validate_canvas_graph(graph):
         visited.add(identity)
     for identity in nodes:
         visit(identity)
+    if not errors:
+        program = CanvasProgram({'workflow': graph})
+        active = program.active_nodes()
+        for identity in active:
+            if nodes[identity].get('mode') == 'wait' and not program.event_dependencies(identity):
+                errors.append('等待事件组必须连接触发器')
     return errors
 
 
 class CanvasProgram:
+    __slots__ = ('nodes', 'edges', 'inputs', 'predecessors', 'successors', 'paths', 'scopes', 'control_sources')
+
+    def __setattr__(self, name, value):
+        if hasattr(self, name):
+            raise TypeError('编译后的图索引不能修改')
+        object.__setattr__(self, name, value)
+
     def __init__(self, rule):
-        self.rule = rule
-        self.nodes = {node['binding_id']: node for node in canvas_nodes(rule)}
-        self.edges = rule['workflow']['edges']
-        self.inputs = defaultdict(list)
-        self.controls = defaultdict(list)
+        graph = rule['workflow']
+        self.nodes = MappingProxyType({node['binding_id']: node for node in graph['nodes']})
+        self.edges = tuple(graph['edges'])
+        conditions, predecessors, successors = defaultdict(list), defaultdict(list), {}
         for edge in self.edges:
-            (self.inputs if edge['channel'] == 'condition' else self.controls)[edge['target']].append(edge)
+            if edge['channel'] == 'condition':
+                conditions[edge['target'], edge.get('target_port', 'input')].append(edge)
+            else:
+                successors[edge['source'], edge['port']] = edge['target']
+                predecessors[edge['target']].append(edge)
+        self.inputs = MappingProxyType({key: tuple(value) for key, value in conditions.items()})
+        self.predecessors = MappingProxyType({key: tuple(value) for key, value in predecessors.items()})
+        self.successors = MappingProxyType(successors)
+        self.control_sources = frozenset(source for source, _port in successors)
+        self.paths = MappingProxyType({identity: self._group_path(identity) for identity in self.nodes})
+        self.scopes = MappingProxyType({identity: next((parent for parent in reversed(self.paths[identity])
+            if self.nodes[parent]['type'] == 'action_group'), None) for identity in self.nodes})
 
-    def children(self, identity, port=None):
-        return [edge['source'] for edge in self.inputs[identity] if port is None or edge.get('target_port', 'input') == port]
-
-    def operands(self, identity, port=None):
-        return [edge for edge in self.inputs[identity] if port is None or edge.get('target_port', 'input') == port]
-
-    def operand_predicate(self, edge, visiting=frozenset()):
-        source = self.nodes[edge['source']]
-        port = edge['port'] if source.get('group_type') == 'if' else None
-        return self.predicate(edge['source'], port, visiting)
-
-    def scope(self, identity):
+    def _group_path(self, identity):
+        path = []
         parent = self.nodes[identity].get('parent')
         while parent is not None:
-            node = self.nodes[parent]
-            if node['type'] == 'action_group':
-                return parent
-            parent = node.get('parent')
-        return None
+            path.append(parent)
+            parent = self.nodes[parent].get('parent')
+        return tuple(reversed(path))
 
-    def predicate(self, identity, port=None, visiting=frozenset()):
-        if identity in visiting:
-            raise ValueError('条件连线不能形成循环')
-        visiting = visiting | {identity}
-        node, kind = self.nodes[identity], self.nodes[identity]['type']
-        if kind == 'trigger':
-            result = {'op': 'event_occurred', 'trigger_id': node['trigger']['binding_id'], 'expected': node.get('occurrence', 'occurred') == 'occurred'}
-            if node.get('absence_scope') == 'window' and node.get('occurrence') == 'absent':
-                result['within_seconds'] = node.get('duration_seconds', 10)
-        elif kind == 'condition':
-            result = copy.deepcopy(node['predicate'])
-        elif kind == 'action_group':
-            entry = next((edge['target'] for edge in self.edges if edge['source'] == identity and edge['port'] == 'entry' and edge['channel'] == 'control'), None)
-            result = self.predicate(entry, visiting=visiting) if entry else {'op': 'is_true', 'left': False}
-        elif kind == 'event_group' and node['group_type'] == 'if':
-            values = []
-            result = None
-            for branch in node['branches']:
-                incoming = self.operands(identity, branch['id'])
-                if branch.get('else'):
-                    if port == branch['id']:
-                        result = {'op': 'not', 'children': [{'op': 'any', 'children': values}]} if values else {'op': 'is_true', 'left': True}
-                    continue
-                if incoming:
-                    value = self.operand_predicate(incoming[0], visiting)
-                    value = {'op': 'not', 'children': [value]} if branch.get('negated') else value
-                    if port == branch['id']:
-                        result = {'op': 'all', 'children': [{'op': 'not', 'children': [{'op': 'any', 'children': list(values)}]}, value]} if values else value
-                    values.append(value)
-            if result is None:
-                result = {'op': 'any', 'children': values} if port is None and values else {'op': 'is_true', 'left': False}
-        else:
-            op = node.get('op', node.get('group_type'))
-            values = [self.operand_predicate(edge, visiting) for edge in self.operands(identity)]
-            if not values:
-                result = {'op': 'is_true', 'left': False}
-            elif op == 'not' and len(values) != 1:
-                raise ValueError('NOT 只能连接一个条件')
+    def operands(self, identity, port='input'):
+        return self.inputs.get((identity, port), ())
+
+    def dependencies(self, identity):
+        node = self.nodes[identity]
+        if node['type'] == 'action_group':
+            entry = self.successors.get((identity, 'entry'))
+            return (entry,) if entry is not None else ()
+        if node.get('group_type') == 'if':
+            return tuple(edge['source'] for branch in node['branches'] if not branch.get('else')
+                for edge in self.operands(identity, branch['id']))
+        return tuple(edge['source'] for edge in self.operands(identity))
+
+    def event_dependencies(self, identity):
+        result, pending, seen = set(), [identity], set()
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            if self.nodes[current]['type'] == 'trigger':
+                result.add(current)
             else:
-                result = {'op': op, 'children': values}
-        if node.get('negated'):
-            result = {'op': 'not', 'children': [result]}
-        return result
-
-    def activation(self, identity, port=None, visiting=frozenset()):
-        if identity in visiting:
-            raise ValueError('启动条件连线不能形成循环')
-        visiting = visiting | {identity}
-        node, kind = self.nodes[identity], self.nodes[identity]['type']
-        if kind == 'trigger':
-            trigger = copy.deepcopy(node['trigger'])
-            if node.get('occurrence') == 'absent':
-                return {'op': 'not', 'children': [trigger], 'within_seconds': node.get('duration_seconds', 10), 'repeat': node.get('repeat', 'once_until_seen')}
-            return trigger
-        if kind == 'condition':
-            return None
-        if kind == 'action_group':
-            entry = next((edge['target'] for edge in self.edges if edge['source'] == identity and edge['port'] == 'entry' and edge['channel'] == 'control'), None)
-            return self.activation(entry, visiting=visiting) if entry else None
-        if kind == 'event_group' and node['group_type'] == 'if':
-            children = [self.activation(child, visiting=visiting) for branch in node['branches'] if not branch.get('else') for child in self.children(identity, branch['id'])]
-            op = 'any'
-        else:
-            children = [self.activation(child, visiting=visiting) for child in self.children(identity)]
-            op = node.get('op', node.get('group_type'))
-        children = [child for child in children if child is not None]
-        if not children:
-            return None
-        if op == 'not' or node.get('negated'):
-            if len(children) == 1 and 'type' in children[0]:
-                return {'op': 'not', 'children': children, 'within_seconds': node.get('duration_seconds', 10), 'repeat': node.get('repeat', 'once_until_seen')}
-            op = 'any'
-        result = children[0] if len(children) == 1 else {'op': op, 'children': children}
-        if len(children) > 1 and op == 'all':
-            result.update(within_seconds=node.get('within_seconds', 10), consume=node.get('consume', 'matched'))
-        return result
+                pending.extend(self.dependencies(current))
+        return frozenset(result)
 
     def roots(self):
-        roots = []
-        for edge in self.edges:
-            if edge['channel'] != 'control':
-                continue
-            source = self.nodes[edge['source']]
-            if self.scope(source['binding_id']) is not None:
-                continue
-            if self.controls[source['binding_id']]:
-                continue
-            if source['type'] in ('trigger', 'logic', 'event_group', 'action_group') and self.activation(source['binding_id']) is not None:
-                roots.append(source['binding_id'])
-        return list(dict.fromkeys(roots))
+        return tuple(sorted(identity for identity, node in self.nodes.items()
+            if self.scopes[identity] is None and not self.predecessors.get(identity)
+            and identity in self.control_sources
+            and self.event_dependencies(identity)))
 
-    def lower(self, roots=None, scope=None):
-        from notmyfault.core.workflow_graph import predicate_condition_graph
-        roots = self.roots() if roots is None else roots
-        result = {key: copy.deepcopy(value) for key, value in self.rule.items() if key != 'workflow'}
-        graph = {'entry': None, 'nodes': [], 'edges': []}
-        result['workflow'] = graph
-        used, pending = set(), list(roots)
+    def reachable(self, entry, stop=None):
+        result, pending = set(), [entry]
         while pending:
-            identity = pending.pop()
-            if identity in used:
+            current = pending.pop()
+            if current in result or current is None:
                 continue
-            used.add(identity)
-            pending.extend(edge['target'] for edge in self.edges if edge['channel'] == 'control' and edge['source'] == identity and edge['port'] != 'entry' and self.scope(edge['target']) == scope)
-        if not roots:
-            return result
-        for identity in self.nodes:
-            if identity not in used:
-                continue
-            raw = self.nodes[identity]
-            kind = raw['type']
-            node = {key: copy.deepcopy(value) for key, value in raw.items() if key not in ('parent', 'position', 'group_type', 'negated')}
-            if kind == 'action_group':
-                entry = [edge['target'] for edge in self.edges if edge['source'] == identity and edge['port'] == 'entry' and edge['channel'] == 'control']
-                node['workflow'] = self.lower(entry, identity)['workflow']
-            if kind in ('trigger', 'logic', 'event_group'):
-                node = {'binding_id': identity, 'type': 'event_group', 'mode': 'immediate', 'name': raw.get('name', '')}
-                if kind == 'event_group' and raw['group_type'] == 'if':
-                    branches = []
-                    for branch in raw['branches']:
-                        if branch.get('else'):
-                            branches.append(copy.deepcopy(branch))
-                            continue
-                        incoming = self.operands(identity, branch['id'])
-                        if len(incoming) > 1:
-                            raise ValueError('IF 或 ELIF 只能直接连接一个条件，请先组合 AND 或 OR')
-                        if incoming:
-                            value = self.operand_predicate(incoming[0])
-                            if branch.get('negated'):
-                                value = {'op': 'not', 'children': [value]}
-                            branches.append({**branch, 'condition_graph': predicate_condition_graph(value, seed=identity + branch['id'])})
-                        elif any(edge['source'] == identity and edge['port'] == branch['id'] and edge['channel'] == 'control' for edge in self.edges):
-                            raise ValueError('IF 或 ELIF 已连接动作，请先连接该分支的条件')
-                    node['branches'] = branches
+            result.add(current)
+            if current != stop:
+                pending.extend(target for (source, _port), target in self.successors.items() if source == current)
+        return frozenset(result)
+
+    def active_nodes(self):
+        active = set(identity for root in self.roots() for identity in self.reachable(root))
+        pending = list(active)
+        while pending:
+            for dependency in self.dependencies(pending.pop()):
+                if dependency not in active:
+                    active.add(dependency)
+                    pending.append(dependency)
+        return frozenset(active)
+
+    def evaluate(self, identity, context, *, port=None, status_lookup=None, occurred=None, records=None):
+        from notmyfault.core.predicates import evaluate_predicate, event_occurrences
+        occurred = event_occurrences(context) if occurred is None else occurred
+        memo = {}
+
+        def value(current, output=None):
+            key = current, output
+            if key in memo:
+                return memo[key]
+            node = self.nodes[current]
+            kind = node['type']
+            if kind == 'trigger':
+                trigger_id = node['trigger']['binding_id']
+                if node.get('occurrence') == 'absent':
+                    if node.get('absence_scope') == 'window':
+                        observation = context.get('_event_observation')
+                        if observation is None:
+                            raise ValueError('连续未发生判断需要当前运行的事件观察')
+                        result = observation.absent_for(trigger_id, node.get('duration_seconds', 10))
+                    else:
+                        result = trigger_id not in occurred
                 else:
-                    node['branches'] = [{'id': 'b_pass_' + identity[2:], 'condition_graph': predicate_condition_graph(self.predicate(identity), seed=identity)}, {'id': 'b_else_' + identity[2:], 'else': True}]
-                leaves = []
-                def collect(value):
-                    if value.get('op') == 'event_occurred':
-                        leaves.append(value['trigger_id'])
-                    for child in value.get('children', []):
-                        collect(child)
-                for branch in node['branches']:
-                    if not branch.get('else'):
-                        from notmyfault.core.workflow_graph import branch_predicate
-                        collect(branch_predicate(branch))
-                node['triggers'] = [copy.deepcopy(candidate['trigger']) for candidate in self.nodes.values() if candidate['type'] == 'trigger' and candidate['trigger']['binding_id'] in leaves]
-                waiting = raw.get('mode') == 'wait' or kind == 'trigger' and (scope is not None or self.controls[identity])
-                if identity in roots or waiting:
-                    node['activation'] = self.activation(identity)
-                if waiting:
-                    if node['activation'] is None:
-                        raise ValueError('等待事件组必须连接触发器')
-                    node['mode'] = 'wait'
-                    if 'timeout_seconds' in raw:
-                        node['timeout_seconds'] = raw['timeout_seconds']
-            graph['nodes'].append(node)
-            outgoing = [edge for edge in self.edges if edge['source'] == identity and edge['channel'] == 'control' and edge['port'] != 'entry' and self.scope(edge['target']) == scope]
-            for edge in outgoing:
-                port = edge['port']
-                if kind in ('trigger', 'logic') or kind == 'event_group' and raw['group_type'] != 'if':
-                    port = 'b_pass_' + identity[2:]
-                graph['edges'].append({'source': identity, 'port': port, 'target': edge['target']})
-            available = [branch['id'] for branch in node.get('branches', [])] if node['type'] == 'event_group' else ['next']
-            for port in available:
-                if not any(edge['source'] == identity and edge['port'] == port for edge in graph['edges']):
-                    graph['edges'].append({'source': identity, 'port': port, 'target': None})
-        if len(roots) == 1:
-            graph['entry'] = roots[0]
-        else:
-            virtual_id = 'a_canvas_entry'
-            if virtual_id in self.nodes:
-                raise ValueError('a_canvas_entry 是编译器保留身份')
-            virtual = {'binding_id': virtual_id, 'type': 'event_group', 'mode': 'immediate', 'triggers': trigger_leaves(self.rule), 'branches': [], 'activation': {'op': 'any', 'children': [self.activation(identity) for identity in roots]}}
-            for index, identity in enumerate(roots):
-                branch_id = f'b_entry_{index}'
-                virtual['branches'].append({'id': branch_id, 'condition_graph': predicate_condition_graph(self.predicate(identity), seed=branch_id)})
-                graph['edges'].append({'source': virtual_id, 'port': branch_id, 'target': identity})
-            virtual['branches'].append({'id': 'b_entry_else', 'else': True})
-            graph['edges'].append({'source': virtual_id, 'port': 'b_entry_else', 'target': None})
-            graph['nodes'].insert(0, virtual)
-            graph['entry'] = virtual_id
-        return result
+                    result = trigger_id in occurred
+            elif kind == 'condition':
+                try:
+                    result = evaluate_predicate(node['predicate'], context, f'{current}.predicate', status_lookup=status_lookup)
+                except (ValueError, TypeError) as error:
+                    if records is not None:
+                        records.append({'node_id': current, 'op': node['predicate']['op'],
+                                        'error': {'code': getattr(error, 'code', 'condition_evaluation_failed')}})
+                    raise
+            elif kind == 'action_group':
+                entry = self.successors.get((current, 'entry'))
+                result = value(entry) if entry is not None else False
+            elif node.get('group_type') == 'if':
+                selected = choose(current)
+                result = selected == output if output is not None else selected is not None and not next(
+                    branch for branch in node['branches'] if branch['id'] == selected).get('else')
+            else:
+                operands = self.operands(current)
+                op = node.get('op', node.get('group_type'))
+                if not operands:
+                    result = False
+                elif op == 'all':
+                    result = all(value(edge['source'], edge['port']) for edge in operands)
+                elif op == 'any':
+                    result = any(value(edge['source'], edge['port']) for edge in operands)
+                elif op == 'not':
+                    result = not value(operands[0]['source'], operands[0]['port'])
+                else:
+                    raise ValueError('条件连线引用了不可求值的图块')
+            if node.get('negated'):
+                result = not result
+            memo[key] = result
+            if records is not None:
+                records.append({'node_id': current, 'op': node['predicate']['op'] if kind == 'condition' else node.get('op', node.get('group_type', kind)), 'result': result})
+            return result
 
+        def choose(current):
+            node = self.nodes[current]
+            for branch in node['branches']:
+                if branch.get('else'):
+                    return branch['id']
+                operands = self.operands(current, branch['id'])
+                if not operands:
+                    continue
+                try:
+                    result = value(operands[0]['source'], operands[0]['port'])
+                except (ValueError, TypeError) as error:
+                    if records is not None:
+                        records.append({'branch_id': branch['id'], 'error': {'code': getattr(error, 'code', 'condition_evaluation_failed')}})
+                    raise
+                if branch.get('negated'):
+                    result = not result
+                if records is not None:
+                    records.append({'branch_id': branch['id'], 'result': result})
+                if result:
+                    return branch['id']
+            return None
 
-def lower_canvas_rule(rule):
-    errors = validate_canvas_graph(rule.get('workflow'))
-    if errors:
-        raise ValueError('；'.join(errors))
-    return CanvasProgram(rule).lower()
+        node = self.nodes[identity]
+        if node.get('group_type') == 'if' and port is None:
+            return choose(identity)
+        return value(identity, port)

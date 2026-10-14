@@ -23,6 +23,7 @@ class EventType(StrEnum):
     RUN_QUEUED = "run.queued"
     RUN_STARTED = "run.started"
     RUN_SUCCEEDED = "run.succeeded"
+    RUN_RECOVERED = "run.recovered"
     RUN_FAILED = "run.failed"
     RUN_CANCELLED = "run.cancelled"
     RUN_TIMED_OUT = "run.timed_out"
@@ -43,6 +44,9 @@ class EventType(StrEnum):
     GROUP_SELECTED = "run.group.selected"
     GROUP_COMPLETED = "run.group.completed"
     GROUP_FAILED = "run.group.failed"
+    RECOVERY_ENTERED = "run.recovery.entered"
+    RECOVERY_COMPLETED = "run.recovery.completed"
+    RECOVERY_FAILED = "run.recovery.failed"
     ASSERTIONS_COMPLETED = "run.assertions.completed"
     TRIGGER_DISPATCH_FAILED = "trigger.dispatch_failed"
     TRIGGER_STARTED = "trigger.started"
@@ -61,7 +65,7 @@ class EventType(StrEnum):
     PLUGIN_UPDATE_ROLLBACK_FAILED = "plugin.update.rollback_failed"
 
 
-RUN_TERMINAL_EVENTS = frozenset({EventType.RUN_SUCCEEDED, EventType.RUN_FAILED,
+RUN_TERMINAL_EVENTS = frozenset({EventType.RUN_SUCCEEDED, EventType.RUN_RECOVERED, EventType.RUN_FAILED,
                                EventType.RUN_CANCELLED, EventType.RUN_TIMED_OUT, EventType.RUN_DROPPED})
 
 

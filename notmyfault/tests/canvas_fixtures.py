@@ -16,22 +16,13 @@ def trigger_rule(identity, name, plugin, params=None, *, trigger_id=None):
 def set_rule_steps(rule, steps):
     graph = rule['workflow']
     source = graph['nodes'][0]
-    nodes = deepcopy(steps)
-    def assign(node, suffix):
-        node.setdefault('binding_id', 'a_step_' + rule['rule_id'][2:] + '_' + suffix)
-        failures = node.get('failure_actions', [])
-        if isinstance(failures, list):
-            for index, failure in enumerate(failures):
-                if isinstance(failure, dict):
-                    assign(failure, suffix + '_failure' + str(index))
-    for index, node in enumerate(nodes):
-        assign(node, str(index))
-    if not nodes:
-        nodes = [{'binding_id': 'a_end_' + rule['rule_id'][2:], 'type': 'end'}]
-    graph['nodes'] = [source, *nodes]
-    graph['edges'] = [{'source': source['binding_id'], 'port': 'event', 'target': nodes[0]['binding_id'], 'channel': 'control'}]
-    graph['edges'].extend({'source': left['binding_id'], 'port': 'next', 'target': right['binding_id'], 'channel': 'control'}
-                          for left, right in zip(nodes, nodes[1:]))
+    graph['nodes'] = [source]
+    graph['edges'] = []
+    target = append_canvas_steps(graph, steps)
+    if target is None:
+        target = 'a_end_' + rule['rule_id'][2:]
+        graph['nodes'].append({'binding_id': target, 'type': 'end'})
+    graph['edges'].append({'source': source['binding_id'], 'port': 'event', 'target': target, 'channel': 'control'})
     return rule
 
 
@@ -80,45 +71,19 @@ def native_rule(signal, steps, **fields):
 
 
 def runtime_sequence(steps, **fields):
-    from notmyfault.core.workflow_graph import predicate_condition_graph
-    nodes, edges = [], []
-    index = 0
-    def sequence(items, successor=None):
-        nonlocal index
-        current = successor
-        for item in reversed(deepcopy(items)):
-            index += 1
-            identity = item.get('binding_id', f'a_runtime_{index:06d}')
-            if item.get('type') == '__decision_fixture__':
-                alternatives = [{'predicate': item['predicate'], 'then_steps': item.get('then_steps', [])},
-                                *item.get('alternatives', []), {'else': True, 'then_steps': item.get('else_steps', [])}]
-                group = {'binding_id': identity, 'type': 'event_group', 'branches': []}
-                for branch_index, branch in enumerate(alternatives):
-                    label = 'b_else0001' if branch.get('else') else 'b_then0001' if branch_index == 0 else f'b_elif{branch_index - 1:06d}'
-                    record = {'id': label}
-                    if branch.get('else'):
-                        record['else'] = True
-                    else:
-                        record['condition_graph'] = predicate_condition_graph(branch['predicate'])
-                    group['branches'].append(record)
-                    target = sequence(branch['then_steps'], current)
-                    edges.append({'source': identity, 'port': label, 'target': target})
-                nodes.append(group)
-            else:
-                item['binding_id'] = identity
-                for failure_index, failure in enumerate(item.get('failure_actions', [])):
-                    failure.setdefault('binding_id', identity + f'_failure{failure_index}')
-                nodes.append(item)
-                edges.append({'source': identity, 'port': 'next', 'target': current})
-            current = identity
-        return current
-    entry = sequence(steps)
-    return {**deepcopy(fields), 'workflow': {'entry': entry, 'nodes': list(reversed(nodes)), 'edges': edges}}
+    return native_rule({'binding_id': 't_test00001', 'type': '__test_signal__', 'params': {}}, steps, **fields)
 
 
 def execute_runtime(engine, key, rule, name, context):
+    from notmyfault.core.canvas_workflow import CanvasProgram
     context['_plugins'] = engine._plugins.snapshot([])
-    return engine._run_manager.execute_sync(key, rule, name, context)
+    program = CanvasProgram(rule)
+    roots = program.roots()
+    if roots:
+        context['_entry_root'] = roots[0]
+        if program.nodes[roots[0]]['type'] == 'trigger':
+            context['_entry_choices'] = {roots[0]: 'event'}
+    return engine._run_manager.execute_sync(rule.get('rule_id', key), rule, name, context)
 
 
 def branch_rule(signal, branches, *, following=(), group_id='a_branch01', **fields):
@@ -164,24 +129,12 @@ def branch_rule(signal, branches, *, following=(), group_id='a_branch01', **fiel
             source, output = operand(predicate)
             graph['edges'].append({'source': source, 'port': output, 'target': group_id, 'target_port': port, 'channel': 'condition'})
         group['branches'].append(record)
-        nodes = runtime_sequence(branch.get('steps', []))['workflow']['nodes']
-        for step_number, node in enumerate(nodes):
-            if node['binding_id'].startswith('a_runtime_'):
-                node['binding_id'] = f'a_branchstep_{number:06d}_{step_number:06d}'
-            node['parent'] = group_id
-        graph['nodes'].extend(nodes)
-        previous, output = group_id, port
-        for node in nodes:
-            graph['edges'].append({'source': previous, 'port': output, 'target': node['binding_id'], 'channel': 'control'})
-            previous, output = node['binding_id'], 'next'
-        exits.append((previous, output))
-    following_nodes = runtime_sequence(following)['workflow']['nodes']
-    graph['nodes'].extend(following_nodes)
-    if following_nodes:
-        for source, port in exits:
-            graph['edges'].append({'source': source, 'port': port, 'target': following_nodes[0]['binding_id'], 'channel': 'control'})
-        graph['edges'].extend({'source': left['binding_id'], 'port': 'next', 'target': right['binding_id'], 'channel': 'control'}
-                              for left, right in zip(following_nodes, following_nodes[1:]))
+        exits.append((port, branch.get('steps', [])))
+    target = append_canvas_steps(graph, following)
+    for port, steps in exits:
+        first = append_canvas_steps(graph, steps, successor=target)
+        if first is not None:
+            graph['edges'].append({'source': group_id, 'port': port, 'target': first, 'channel': 'control'})
     return rule
 
 
@@ -194,15 +147,19 @@ def selected_branch(label):
     return 'b_then0001' if label == 'then' else 'b_else0001' if label == 'else' else 'b_elif' + f'{int(label[5:-1]):06d}'
 
 
-def append_canvas_steps(graph, steps):
-    index = 0
+def append_canvas_steps(graph, steps, *, successor=None):
+    index = len(graph['nodes'])
     def add_predicate(predicate, parent):
         nonlocal index
         index += 1
         identity = f'a_condition_{index:06d}'
         op = predicate.get('op')
         if op == 'event_occurred':
-            source = next(node for node in graph['nodes'] if node.get('type') == 'trigger' and node['trigger']['binding_id'] == predicate['trigger_id'])
+            source = next((node for node in graph['nodes'] if node.get('type') == 'trigger' and node['trigger']['binding_id'] == predicate['trigger_id']), None)
+            if source is None:
+                source = {'binding_id': identity + '_event', 'type': 'trigger', 'parent': parent,
+                          'trigger': {'binding_id': predicate['trigger_id'], 'type': '__test_event__', 'params': {}}}
+                graph['nodes'].append(source)
             if predicate.get('expected', True) == (source.get('occurrence', 'occurred') != 'absent'):
                 return source['binding_id'], 'event'
             node = {'binding_id': identity, 'type': 'logic', 'op': 'not', 'parent': parent}
@@ -245,14 +202,21 @@ def append_canvas_steps(graph, steps):
                 item['binding_id'] = identity
                 if parent:
                     item['parent'] = parent
-                failures = item.get('failure_actions', [])
-                if isinstance(failures, list):
-                    for order, failure in enumerate(failures):
-                        if isinstance(failure, dict):
-                            failure.setdefault('binding_id', identity + f'_failure{order}')
+                failures = item.pop('failure_actions', [])
                 graph['nodes'].append(item)
+                if failures:
+                    handler_id = 'a_recovery_' + identity[2:]
+                    handler = {'binding_id': handler_id, 'type': 'action_group'}
+                    if parent:
+                        handler['parent'] = parent
+                    graph['nodes'].append(handler)
+                    for order, failure in enumerate(failures):
+                        failure.setdefault('binding_id', identity + f'_failure{order}')
+                    first = sequence(failures, parent=handler_id)
+                    graph['edges'].append({'source': identity, 'port': 'failure', 'target': handler_id, 'channel': 'control'})
+                    graph['edges'].append({'source': handler_id, 'port': 'entry', 'target': first, 'channel': 'control'})
                 if current is not None:
                     graph['edges'].append({'source': identity, 'port': 'next', 'target': current, 'channel': 'control'})
             current = identity
         return current
-    return sequence(steps)
+    return sequence(steps, successor)

@@ -78,6 +78,10 @@ def test_event_freeze_cache_releases_source_after_public_event_is_saved():
 ])
 def test_templates_keep_derived_text_secret(expression):
     value = resolve_value(expression, {"constants": {"c_token001": Secret("token")}})
+    if isinstance(expression, str):
+        assert value == expression
+        assert not isinstance(value, Secret)
+        return
     assert isinstance(value, Secret)
     assert encode_value(value) == "***"
     with allow_secrets({"value": value}):
@@ -139,7 +143,7 @@ def test_event_boundary_uses_snapshot_registry_for_sensitive_custom_output():
         }]}, "outputs": [{"name": "record", "type": identity, "sensitive": True}],
     }
     engine.actions_meta["consume"] = {"params": [{"name": "name", "type": "string", "value_type": "text"}]}
-    engine.actions_funcs["consume"] = lambda meta, params: observed.append(params["name"])
+    engine.actions_funcs["consume"] = lambda meta, params, _run_context: observed.append(params["name"])
     engine.events.subscribe(packets.append)
     try:
         engine.emit_event("record_event", {"record": {"$type": identity, "data": {"name": "甲"}}})
@@ -226,7 +230,7 @@ def test_sensitive_inputs_remain_hidden_in_events_and_history(tmp_path, manual, 
     engine.actions_meta["echo"] = {"params": [{"name": "value", "type": "string", "summary": "value"}],
                                    "outputs": [{"name": "value", "type": "text", "summary": "value"}]}
     observed, packets = [], []
-    engine.actions_funcs["echo"] = lambda meta, params: observed.append(params["value"]) or {"value": params["value"]}
+    engine.actions_funcs["echo"] = lambda meta, params, _run_context: observed.append(params["value"]) or {"value": params["value"]}
     history = RunHistory(str(tmp_path / "runs.jsonl"))
     broker = EventBroker(history)
     engine.events.subscribe(broker.publish)
@@ -264,7 +268,7 @@ def test_manual_event_protects_sensitive_fields_from_any_candidate_trigger():
     packets = []
     engine.triggers_meta.update(public={"outputs": [{"name": "token", "type": "text"}]},
                                 private={"outputs": [{"name": "token", "type": "text", "sensitive": True}]})
-    engine.actions_funcs["echo"] = lambda meta, params: params["value"]
+    engine.actions_funcs["echo"] = lambda meta, params, _run_context: params["value"]
     engine.actions_meta["echo"] = {"params": [{"name": "value", "type": "string"}]}
     engine.events.subscribe(lambda event: packets.append(event.to_dict()))
     try:

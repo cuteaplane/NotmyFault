@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import copy
-import re
 from dataclasses import dataclass
-from collections.abc import Mapping
 from typing import Any, Dict, Iterable, Tuple
 
 from notmyfault.core.data_types import DataTypeError, infer_type, is_custom_type, normalize_type, type_at_path
@@ -13,11 +11,6 @@ from notmyfault.core.value_conversion import convert_value
 from notmyfault.values import Blob, Secret, contains_secret, hold_value, plain_value, protect, secret_value
 
 
-_LEGACY_TEMPLATE = re.compile(r"{{\s*([a-zA-Z_][\w.]*)\s*}}")
-_LEGACY_EVENT_PAYLOAD = re.compile(
-    r"{{\s*event\.payload(?P<path>(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*}}"
-)
-_SEGMENT_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _MISSING = object()
 
 
@@ -237,31 +230,12 @@ def expression_type(value, context):
     return infer_type(value)
 
 
-def _lookup_legacy(context: Dict[str, Any], dotted_path: str) -> Any:
-    current: Any = context
-    sensitive = False
-    for segment in dotted_path.split("."):
-        if isinstance(current, Secret):
-            sensitive = True
-            current = secret_value(current)
-        if (
-            not _SEGMENT_RE.fullmatch(segment)
-            or segment.startswith("_")
-            or not isinstance(current, Mapping)
-            or segment not in current
-        ):
-            return _MISSING
-        current = current[segment]
-    return protect(current) if sensitive else current
-
-
 def resolve_value(
     value: Any,
     context: Dict[str, Any],
     *,
     location: str = "$",
 ) -> Any:
-    """递归解析 v2 ``$ref`` 与旧 ``{{ dotted.path }}`` 模板"""
     if is_reference(value):
         return resolve_reference(value["$ref"], context, location=location)
     if is_literal(value):
@@ -309,39 +283,7 @@ def resolve_value(
             resolve_value(item, context, location=f"{location}[{index}]")
             for index, item in enumerate(value)
         ]
-    if not isinstance(value, str):
-        return value
-
-    full = _LEGACY_TEMPLATE.fullmatch(value)
-    if full:
-        resolved = _lookup_legacy(context, full.group(1))
-        if resolved is _MISSING:
-            raise BindingResolutionError(
-                "missing_binding_value",
-                location,
-                {"legacy": full.group(1)},
-                f"运行数据不存在: {full.group(1)}",
-            )
-        return hold_value(resolved)
-
-    sensitive = False
-
-    def replace(match: re.Match[str]) -> str:
-        nonlocal sensitive
-        resolved = _lookup_legacy(context, match.group(1))
-        if resolved is _MISSING:
-            raise BindingResolutionError(
-                "missing_binding_value",
-                location,
-                {"legacy": match.group(1)},
-                f"运行数据不存在: {match.group(1)}",
-            )
-        sensitive = sensitive or isinstance(resolved, Secret)
-        resolved = secret_value(resolved)
-        return resolved.text() if isinstance(resolved, Blob) and resolved.type == "text" else str(resolved)
-
-    text = _LEGACY_TEMPLATE.sub(replace, value)
-    return protect(text) if sensitive else text
+    return value
 
 
 def iter_references(value: Any, *, location: str = "$") -> Iterable[BindingUsage]:
@@ -360,19 +302,6 @@ def iter_references(value: Any, *, location: str = "$") -> Iterable[BindingUsage
             yield from iter_references(item, location=f"{location}[{index}]")
 
 
-def contains_legacy_template(value: Any) -> bool:
-    """递归判断字符串或嵌套结构里是否带旧 ``{{ }}`` 模板"""
-    if is_literal(value) or is_typed_value(value):
-        return False
-    if isinstance(value, str):
-        return bool(_LEGACY_TEMPLATE.search(value))
-    if isinstance(value, dict):
-        return any(contains_legacy_template(item) for item in value.values())
-    if isinstance(value, list):
-        return any(contains_legacy_template(item) for item in value)
-    return False
-
-
 def contains_dynamic_value(value):
     if is_literal(value) or is_typed_value(value):
         return False
@@ -382,7 +311,7 @@ def contains_dynamic_value(value):
         return any(contains_dynamic_value(child) for child in value.values())
     if isinstance(value, list):
         return any(contains_dynamic_value(child) for child in value)
-    return contains_legacy_template(value)
+    return False
 
 
 def unavailable_references(
@@ -428,19 +357,3 @@ def unavailable_references(
 
 def references_available(value: Any, context: Dict[str, Any]) -> bool:
     return not unavailable_references(value, context)
-
-
-def iter_legacy_event_payload_paths(value: Any) -> Iterable[Tuple[str, ...]]:
-    """遍历旧模板中需要手动测试输入的 ``event.payload`` 路径"""
-    if is_literal(value) or is_typed_value(value):
-        return
-    if isinstance(value, str):
-        for match in _LEGACY_EVENT_PAYLOAD.finditer(value):
-            suffix = match.group("path")
-            yield tuple(segment for segment in suffix.split(".") if segment)
-    elif isinstance(value, dict):
-        for item in value.values():
-            yield from iter_legacy_event_payload_paths(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from iter_legacy_event_payload_paths(item)

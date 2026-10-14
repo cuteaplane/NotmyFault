@@ -16,10 +16,10 @@ from notmyfault.core import run_lifecycle as lifecycle
 
 
 _RUN_EVENT_TYPES = frozenset({
-    "run.triggered", "run.queued", "run.started", "run.succeeded", "run.failed",
+    "run.triggered", "run.queued", "run.started", "run.succeeded", "run.recovered", "run.failed",
     "run.cancelled", "run.timed_out", "run.dropped", "run.step.started", "run.step.succeeded",
     "run.step.failed", "run.step.skipped", "run.step.cancelled", "run.step.timed_out", "run.step.waiting",
-    "run.step.resumed", "run.assertions.completed",
+    "run.step.resumed", "run.assertions.completed", "run.recovery.entered", "run.recovery.completed", "run.recovery.failed",
 })
 
 
@@ -78,24 +78,25 @@ def _safe_evaluated_branches(value):
         return {'error': {'code': code}} if isinstance(code, str) and re.fullmatch(r'[a-z_]{1,80}', code) else None
     result = []
     for branch in value[:256]:
-        if not isinstance(branch, dict) or not isinstance(branch.get('branch_id'), str) or not re.fullmatch(r'b_[a-z0-9_]{1,64}', branch['branch_id']):
+        if not isinstance(branch, dict):
+            continue
+        identity = 'branch_id' if 'branch_id' in branch else 'node_id'
+        pattern = r'b_[a-z0-9_]{1,64}' if identity == 'branch_id' else r'a_[a-z0-9_]{6,64}'
+        if not isinstance(branch.get(identity), str) or not re.fullmatch(pattern, branch[identity]):
             continue
         evaluated = outcome(branch)
         if evaluated is None:
             continue
-        record = {'branch_id': branch['branch_id'], **evaluated, 'predicates': []}
+        record = {identity: branch[identity], **evaluated, 'predicates': []}
         predicates = branch.get('predicates', [])
         for item in predicates[:1024] if isinstance(predicates, list) else []:
-            if not isinstance(item, dict) or not isinstance(item.get('op'), str) or item['op'] not in COMPARISON_OPERATORS | {'all', 'any', 'not', 'event_occurred', 'run_status'}:
+            if not isinstance(item, dict) or not isinstance(item.get('op'), str) or item['op'] not in COMPARISON_OPERATORS | {'all', 'any', 'not', 'trigger', 'run_status'}:
                 continue
-            path = item.get('path')
-            state = outcome(item)
-            if state is None or not isinstance(path, str) or len(path) > 1024 or not re.fullmatch(r'condition(?:\.children\[[0-9]+\])*', path):
-                continue
-            predicate = {'path': path, 'op': item['op'], **state}
             node_id = item.get('node_id')
-            if isinstance(node_id, str) and re.fullmatch(r'p_[a-z0-9_]{1,64}', node_id):
-                predicate['node_id'] = node_id
+            state = outcome(item)
+            if state is None or not isinstance(node_id, str) or not re.fullmatch(r'a_[a-z0-9_]{6,64}', node_id):
+                continue
+            predicate = {'node_id': node_id, 'op': item['op'], **state}
             record['predicates'].append(predicate)
         result.append(record)
     return result
@@ -107,8 +108,8 @@ def _safe_event(packet: Dict[str, Any]) -> Dict[str, Any] | None:
     if event_type not in _RUN_EVENT_TYPES or not isinstance(data, dict):
         return None
     data = {**data, **{key: packet[key] for key in ("run_id", "rule_id", "step_id", "error") if packet.get(key) is not None}}
-    schema = packet.get("v", packet.get("schema"))
-    if isinstance(schema, int) and schema > lifecycle.RUN_EVENT_SCHEMA_VERSION:
+    schema = packet.get("v")
+    if type(schema) is not int or schema != lifecycle.RUN_EVENT_SCHEMA_VERSION:
         return None
     run_id = data.get("run_id")
     if not isinstance(run_id, str) or not run_id:
@@ -122,7 +123,6 @@ def _safe_event(packet: Dict[str, Any]) -> Dict[str, Any] | None:
             "rule_name",
             "event_type",
             "action_count",
-            "precondition_count",
             "start_step_id",
             "end_step_id",
             "assertion_count",
@@ -141,11 +141,11 @@ def _safe_event(packet: Dict[str, Any]) -> Dict[str, Any] | None:
     }
     error = data.get("error")
     branch = data.get("branch")
-    if isinstance(branch, str) and (re.fullmatch(r"b_[a-z0-9_]{1,64}", branch) or branch in ("then", "else") or (
-        branch.startswith("elif[") and branch.endswith("]") and branch[5:-1].isascii()
-        and branch[5:-1].isdecimal() and len(branch) <= 16
-    )):
+    if isinstance(branch, str) and re.fullmatch(r"b_[a-z0-9_]{1,64}", branch):
         kept["branch"] = branch
+    recovery_group_id = data.get('recovery_group_id')
+    if isinstance(recovery_group_id, str) and re.fullmatch(r'a_[a-z0-9_]{6,64}', recovery_group_id):
+        kept['recovery_group_id'] = recovery_group_id
     group_path = data.get("group_path")
     if isinstance(group_path, (list, tuple)) and len(group_path) <= 64 and all(
         isinstance(identity, str) and re.fullmatch(r"a_[a-z0-9_]{6,64}", identity) for identity in group_path
@@ -182,12 +182,11 @@ def _safe_event(packet: Dict[str, Any]) -> Dict[str, Any] | None:
             if isinstance(result, dict)
         ]
     saved = {
+        "v": lifecycle.RUN_EVENT_SCHEMA_VERSION,
         "type": event_type,
         "data": kept,
         "ts": packet.get("ts"),
     }
-    if packet.get("schema") is not None:
-        saved["schema"] = packet.get("schema")
     return saved
 
 
@@ -202,7 +201,6 @@ def _new_run(data: Dict[str, Any], timestamp: Any) -> Dict[str, Any]:
         "finished_at": None,
         "duration_ms": None,
         "action_count": _safe_count(data.get("action_count")),
-        "precondition_count": _safe_count(data.get("precondition_count")),
         "start_step_id": data.get("start_step_id", ""),
         "end_step_id": data.get("end_step_id", ""),
         "assertions_passed": 0,
@@ -228,6 +226,15 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
     timestamp = packet.get("ts")
     if lifecycle.is_terminal(run["status"]):
         return
+    if event_type.startswith('run.recovery.'):
+        step = _find_step(run, data.get('step_id'))
+        if step is not None and 'recovery_group_id' in data:
+            step['recovery'] = {
+                'group_id': data['recovery_group_id'],
+                'status': 'running' if event_type == 'run.recovery.entered' else 'succeeded' if event_type == 'run.recovery.completed' else 'failed',
+                'updated_at': timestamp,
+            }
+        return
     if event_type == "run.triggered":
         run.update(
             rule_id=data.get("rule_id", run["rule_id"]),
@@ -235,9 +242,6 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
             event_type=data.get("event_type", run["event_type"]),
             action_count=_safe_count(
                 data.get("action_count"), run["action_count"]
-            ),
-            precondition_count=_safe_count(
-                data.get("precondition_count"), run["precondition_count"]
             ),
             start_step_id=data.get("start_step_id", run["start_step_id"]),
             end_step_id=data.get("end_step_id", run["end_step_id"]),

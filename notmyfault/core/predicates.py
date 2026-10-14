@@ -10,7 +10,7 @@ from notmyfault.values import plain_value
 
 
 COMPARISON_OPERATORS = {"eq", "ne", "gt", "gte", "lt", "lte", "contains", "is_true", "is_false", "exists", "not_exists"}
-RUN_STATUSES = {"running", "queued", "succeeded", "failed", "cancelled", "timed_out", "dropped", "never_run"}
+RUN_STATUSES = {"running", "queued", "succeeded", "recovered", "failed", "cancelled", "timed_out", "dropped", "never_run"}
 
 
 def values_equal(left: Any, right: Any) -> bool:
@@ -36,18 +36,6 @@ def validate_predicate(node: Any, path: str = "condition") -> list[str]:
     if not isinstance(node, dict):
         return [f"{path} 必须是对象"]
     op = node.get("op")
-    if op == "event_occurred":
-        identity = node.get("trigger_id")
-        errors = []
-        if not isinstance(identity, str) or not identity.startswith("t_") or not _BINDING_ID_RE.fullmatch(identity):
-            errors.append(f"{path}.trigger_id 必须是本流程触发器的节点 ID")
-        if not isinstance(node.get("expected", True), bool):
-            errors.append(f"{path}.expected 必须是布尔值")
-        if 'within_seconds' in node:
-            value = node['within_seconds']
-            if node.get('expected', True) or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-                errors.append(f'{path}.within_seconds 只用于事件未发生，必须是大于零的有限秒数')
-        return errors
     if op == "run_status":
         errors = []
         if not isinstance(node.get("rule_id"), str) or not _RULE_ID_RE.fullmatch(node["rule_id"]):
@@ -56,16 +44,6 @@ def validate_predicate(node: Any, path: str = "condition") -> list[str]:
             errors.append(f"{path}.status 不是支持的运行状态")
         if node.get("comparison", "eq") not in ("eq", "ne"):
             errors.append(f"{path}.comparison 必须是 eq 或 ne")
-        return errors
-    if op in ("all", "any", "not"):
-        children = node.get("children")
-        if not isinstance(children, list) or not children:
-            return [f"{path}.children 至少需要一个条件"]
-        errors = []
-        if op == "not" and len(children) != 1:
-            errors.append(f"{path} 的 NOT 必须有且仅有一个子条件")
-        for index, child in enumerate(children):
-            errors.extend(validate_predicate(child, f"{path}.children[{index}]"))
         return errors
     if not isinstance(op, str) or op not in COMPARISON_OPERATORS:
         return [f"{path}.op 不是支持的比较方式"]
@@ -87,33 +65,11 @@ def event_occurrences(context):
     )
 
 
-def evaluate_predicate(node: dict, context: dict, path: str = "condition", *, status_lookup=None, _event_occurrences=None, _on_result=None) -> bool:
-    try:
-        result = _evaluate_predicate(node, context, path, status_lookup=status_lookup,
-            _event_occurrences=_event_occurrences, _on_result=_on_result)
-    except (ValueError, TypeError) as error:
-        if _on_result is not None:
-            _on_result(node, path, None, error)
-        raise
-    if _on_result is not None:
-        _on_result(node, path, result, None)
-    return result
-
-
-def _evaluate_predicate(node: dict, context: dict, path: str, *, status_lookup, _event_occurrences, _on_result) -> bool:
+def evaluate_predicate(node: dict, context: dict, path: str = "condition", *, status_lookup=None) -> bool:
     errors = validate_predicate(node, path)
     if errors:
         raise ValueError("；".join(errors))
     op = node["op"]
-    if _event_occurrences is None:
-        _event_occurrences = event_occurrences(context)
-    if op == "event_occurred":
-        if 'within_seconds' in node:
-            observation = context.get('_event_observation')
-            if observation is None:
-                raise ValueError('连续未发生的判断需要当前运行的事件观察')
-            return observation.absent_for(node['trigger_id'], node['within_seconds'])
-        return (node["trigger_id"] in _event_occurrences) == node.get("expected", True)
     if op == "run_status":
         if status_lookup is None:
             raise ValueError("当前执行环境不提供自动化运行状态")
@@ -126,14 +82,6 @@ def _evaluate_predicate(node: dict, context: dict, path: str, *, status_lookup, 
         else:
             matched = state["last_status"] == expected
         return matched if node.get("comparison", "eq") == "eq" else not matched
-    if op == "not":
-        return not evaluate_predicate(node["children"][0], context, f"{path}.children[0]", status_lookup=status_lookup, _event_occurrences=_event_occurrences, _on_result=_on_result)
-    if op in ("all", "any"):
-        values = (
-            evaluate_predicate(child, context, f"{path}.children[{index}]", status_lookup=status_lookup, _event_occurrences=_event_occurrences, _on_result=_on_result)
-            for index, child in enumerate(node["children"])
-        )
-        return all(values) if op == "all" else any(values)
     if op in ("exists", "not_exists"):
         present = reference_exists(node["left"]["$ref"], context, location=f"{path}.left")
         return present if op == "exists" else not present
