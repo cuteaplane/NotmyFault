@@ -5,7 +5,6 @@
     "version_code": 1,
     "version": "1.0",
     "package_name": "io.github.notmyfault.send_keys",
-    "enabled": true,
     "execution_api": "context-v1",
     "idempotent": false,
     "requires_capabilities": ["input.send"],

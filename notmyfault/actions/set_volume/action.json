@@ -6,7 +6,6 @@
     "version": "1.1",
     "package_name": "io.github.notmyfault.set_volume",
     "requires_capabilities": ["audio.control"],
-    "enabled": true,
     "execution_api": "context-v1",
     "idempotent": true,
     "execution_mode": "isolated",
