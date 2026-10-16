@@ -41,13 +41,16 @@ class RuleWatcher:
         self._initialized = False
 
     def read_stamp(self) -> FileStamp | None:
+        with self._lock:
+            has_pending = self._has_pending
         path = Path(self._path())
         with self._read_lock:
             try:
                 stat = path.stat()
                 key = (str(path), stat.st_dev, stat.st_ino, stat.st_ctime_ns, stat.st_mtime_ns, stat.st_size)
                 now = self._clock.monotonic()
-                if self._read_cache is not None and self._read_cache[0] == key and now - self._verified_at < self._verify_interval:
+                # 文件时间和大小可能不变，防抖期间仍需读取内容。
+                if not has_pending and self._read_cache is not None and self._read_cache[0] == key and now - self._verified_at < self._verify_interval:
                     return self._read_cache[1]
                 data = path.read_bytes()
                 after = path.stat()

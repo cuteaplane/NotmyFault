@@ -131,7 +131,7 @@ def test_running_workflow_uses_old_plugin_snapshot_after_swap():
         engine.shutdown()
 
 
-def test_watcher_debounces_latest_write_and_skips_identical_content(tmp_path):
+def test_watcher_debounces_latest_write_and_skips_identical_content(tmp_path, monkeypatch):
     path = tmp_path / "rules.json"
     path.write_text("[]")
     clock = FakeClock()
@@ -140,14 +140,22 @@ def test_watcher_debounces_latest_write_and_skips_identical_content(tmp_path):
     watcher.acknowledge()
     path.write_text('[1]')
     assert not watcher.check_once()
+    pending_stat = path.stat()
+    stat = type(path).stat
+
+    def unchanged_stat(candidate, *args, **kwargs):
+        return pending_stat if candidate == path else stat(candidate, *args, **kwargs)
+
     clock.advance(0.2)
     path.write_text('[2]')
-    assert not watcher.check_once()
-    clock.advance(0.299)
-    assert not watcher.check_once()
-    clock.advance(0.002)
-    assert watcher.check_once()
-    assert calls == [('[2]', 'file')]
+    with monkeypatch.context() as same_metadata:
+        same_metadata.setattr(type(path), "stat", unchanged_stat)
+        assert not watcher.check_once()
+        clock.advance(0.299)
+        assert not watcher.check_once()
+        clock.advance(0.002)
+        assert watcher.check_once()
+        assert calls == [('[2]', 'file')]
     path.write_text('[2]')
     watcher.check_once()
     clock.advance(0.3)
