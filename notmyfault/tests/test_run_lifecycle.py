@@ -17,14 +17,14 @@ from notmyfault.core.workflow import build_context
 
 def packets(*events):
     return [
-        {"type": event, "data": data, "ts": index + 1}
+        {"v": RUN_EVENT_SCHEMA_VERSION, "type": event, "data": data, "ts": index + 1}
         for index, (event, data) in enumerate(events)
     ]
 
 
 class TestStatusAfter:
     def test_terminal_states_are_absorbing(self):
-        for terminal in ("succeeded", "failed", "cancelled", "dropped", "timed_out"):
+        for terminal in ("succeeded", "recovered", "failed", "cancelled", "dropped", "timed_out"):
             assert status_after("run.succeeded", {"status": "failed"}, terminal) is None
 
     def test_normal_progression(self):
@@ -76,13 +76,12 @@ class TestReplayInvariants:
         path.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
         history = RunHistory(str(path))
         assert history.get_run(run_id)["status"] == "queued"
-        history.record({"type": "run.step.succeeded", "data": {"run_id": run_id, "step_id": "s1"}, "ts": 3})
+        history.record_async({"v": RUN_EVENT_SCHEMA_VERSION, "type": "run.started", "data": {"run_id": run_id}, "ts": 3})
+        history.record_async({"v": RUN_EVENT_SCHEMA_VERSION, "type": "run.step.succeeded", "data": {"run_id": run_id, "step_id": "s1"}, "ts": 4})
         assert history.get_run(run_id)["status"] == "running"
-        history.record(events[-1])
-        history.record_async(events[-1])
-        assert history.get_run(run_id)["status"] == "running"
+        assert history.get_run(run_id)["steps"][0]["status"] == "succeeded"
         assert history.flush()
-        assert len(path.read_text(encoding="utf-8").splitlines()) == 5
+        assert len(path.read_text(encoding="utf-8").splitlines()) == 4
 
     def test_late_steps_after_dropped_do_not_appear(self):
         run_id = f"run_{uuid.uuid4().hex}"
@@ -94,26 +93,6 @@ class TestReplayInvariants:
         assert runs[0]["status"] == "dropped"
         assert runs[0]["steps"] == []
 
-
-class TestSchemaVersion:
-    def test_record_stamps_schema_version(self, tmp_path):
-        history = RunHistory(str(tmp_path / "runs.jsonl"))
-        history.record({"type": "run.triggered", "data": {"run_id": "r1"}, "ts": 1})
-        with open(tmp_path / "runs.jsonl", encoding="utf-8") as file:
-            saved = json.loads(file.readline())
-        assert saved["schema"] == RUN_EVENT_SCHEMA_VERSION
-
-    def test_explicit_schema_not_overwritten(self, tmp_path):
-        history = RunHistory(str(tmp_path / "runs.jsonl"))
-        history.record({
-            "type": "run.triggered",
-            "data": {"run_id": "r1"},
-            "ts": 1,
-            "schema": RUN_EVENT_SCHEMA_VERSION,
-        })
-        with open(tmp_path / "runs.jsonl", encoding="utf-8") as file:
-            saved = json.loads(file.readline())
-        assert saved["schema"] == RUN_EVENT_SCHEMA_VERSION
 
     def test_replayable_stays_false(self):
         run_id = f"run_{uuid.uuid4().hex}"
@@ -144,11 +123,27 @@ class TestExecutorSingleTerminal:
             release.wait(5)
         engine.actions_funcs["compensate"] = compensate
         engine.actions_meta["compensate"] = {}
-        rule = native_rule({"type": "hotkey", "params": {}}, [{
-                "type": "noop",
-                "params": {"x": {"$ref": {"scope": "event", "path": ["missing"]}}},
-                "failure_actions": [{"type": "compensate", "params": {}}],
-            }], name="绑定失败规则", concurrency={"mode": "single"})
+        rule = {
+            "rule_id": "r_recovery_fixture01",
+            "name": "绑定失败规则",
+            "workflow": {
+                "entry": None,
+                "nodes": [
+                    {"binding_id": "a_source_recovery01", "type": "trigger",
+                     "trigger": {"type": "hotkey", "params": {}, "binding_id": "t_test00001"}},
+                    {"binding_id": "a_noop_recovery01", "type": "noop",
+                     "params": {"x": {"$ref": {"scope": "event", "path": ["missing"]}}}},
+                    {"binding_id": "a_handler_recovery01", "type": "action_group", "exports": {}},
+                    {"binding_id": "a_compensate_recovery01", "type": "compensate", "parent": "a_handler_recovery01", "params": {}},
+                ],
+                "edges": [
+                    {"source": "a_source_recovery01", "port": "event", "target": "a_noop_recovery01", "channel": "control"},
+                    {"source": "a_noop_recovery01", "port": "failure", "target": "a_handler_recovery01", "channel": "control"},
+                    {"source": "a_handler_recovery01", "port": "entry", "target": "a_compensate_recovery01", "channel": "control"},
+                ],
+            },
+            "concurrency": {"mode": "single"},
+        }
         engine.rules = [rule]
         engine.triggers_meta.setdefault("hotkey", {"semantic": "oneshot"})
         engine.emit_event("hotkey", {})
@@ -188,13 +183,13 @@ class TestExecutorSingleTerminal:
 class TestSchemaVersionReadSide:
     def test_newer_schema_event_is_rejected(self, tmp_path):
         history = RunHistory(str(tmp_path / "runs.jsonl"))
-        history.record({
+        history.record_async({
             "type": "run.triggered",
             "data": {"run_id": "r1"},
             "ts": 1,
-            "schema": RUN_EVENT_SCHEMA_VERSION + 1,
+            "v": RUN_EVENT_SCHEMA_VERSION + 1,
         })
-        history.record({"type": "run.triggered", "data": {"run_id": "r2"}, "ts": 2})
+        history.record_async({"v": RUN_EVENT_SCHEMA_VERSION, "type": "run.triggered", "data": {"run_id": "r2"}, "ts": 2})
         runs = history.list_runs()
         assert [run["run_id"] for run in runs] == ["r2"]
 

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from notmyfault.core.canvas_workflow import CanvasProgram, validate_canvas_graph
+from notmyfault.core.canvas_workflow import CanvasProgram
 
 
 NATIVE_NODES = frozenset({'trigger', 'condition', 'logic', 'set_variable', 'event_group', 'action_group', 'merge', 'end'})
+NON_ACTION_NODES = NATIVE_NODES - {'set_variable'}
 
 
 def iter_graph_nodes(graph, path='workflow'):
@@ -14,7 +15,7 @@ def iter_graph_nodes(graph, path='workflow'):
             yield node, f'{path}.nodes[{index}]'
 
 
-def iter_rule_actions(rule, *, include_invalid=False):
+def iter_rule_actions(rule):
     yield from iter_graph_nodes(rule.get('workflow'))
 
 
@@ -192,10 +193,3 @@ def evaluate_group_branches(node, context, evaluated, *, program, status_lookup,
     return selected if node.get('group_type') == 'if' else 'result' if selected else None
 
 
-def normalize_workflow_rule(rule):
-    from notmyfault.core.rule_model import normalize_rule_shape
-    return normalize_rule_shape(rule)
-
-
-def validate_workflow_graph(graph, path='workflow', seen=None):
-    return validate_canvas_graph(graph)

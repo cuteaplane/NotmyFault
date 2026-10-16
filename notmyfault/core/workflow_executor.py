@@ -30,7 +30,6 @@ from notmyfault.core.run_summary import summarize_fields
 from notmyfault.core.workflow import (
     ActionCancellation,
     ActionCancelled,
-    build_context,
     invoke_action,
 )
 from notmyfault.values import allow_secrets, action_values, contains_secret, hold_value, plain_value, secret_value
@@ -490,18 +489,6 @@ class WorkflowExecutor:
             }, "status": "failed"})
             return False
 
-    def execute_action(
-        self,
-        action: Dict[str, Any],
-        rule_name: str = "",
-        context: Optional[Dict[str, Any]] = None,
-    ) -> Any:
-        """执行一个动作并返回插件结果，供旧调用方使用"""
-        if context is None:
-            context = build_context(rule_name, "", {}, [])
-        ok, result = self.run_action(action, rule_name, context)
-        return result if ok else None
-
     def _authorize_action_parameters(self, action, rule_name, context):
         action_type = action.get("type")
         dynamic_parameter_error = ""
@@ -735,7 +722,6 @@ class WorkflowExecutor:
         rule_name: str,
         context: Dict[str, Any],
     ) -> Tuple[bool, Any]:
-        """执行一个动作并兼容带上下文和旧版两参数插件"""
         started = time.perf_counter()
         shutdown_event = self._shutdown_event()
         if shutdown_event and shutdown_event.is_set():

@@ -38,27 +38,23 @@ def emit_and_wait(engine, event_type, payload):
     assert engine._run_manager.wait_for_idle(timeout=5)
 
 
-class TestCallNotmyfault:
-    def test_missing_trigger_id(self):
-        ran = []
-        engine = make_engine(
-            rules=[native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "params": {}}], name="r")]
-        )
-        register_action(engine, "noop", lambda meta, params, _run_context: ran.append(1))
-        engine.call_notmyfault({"triggered_params": {}})
-        engine.call_notmyfault({"trigger_id": 123, "triggered_params": {}})
-        assert ran == []
+def apply_rules_snapshot(engine):
+    return engine.apply_rules(engine.rules).snapshot
 
+
+
+
+
+
+class TestEventForwarding:
     def test_valid_event_forwarding(self):
         ran = []
         engine = make_engine(
             rules=[native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "params": {}}], name="r")]
         )
         register_action(engine, "noop", lambda meta, params, _run_context: ran.append(1))
-        engine.call_notmyfault({"trigger_id": "hotkey", "triggered_params": {}})
-        assert engine._run_manager.wait_for_idle(timeout=5)
+        emit_and_wait(engine, "hotkey", {})
         assert ran == [1]
-
 
 def poll_runtime_timers(runtime, key, rule, now=None):
     runtime.register_rule(key, rule, now)
@@ -357,10 +353,11 @@ class TestRuleStructureValidation:
         assert any('已移除的条件模型' in error for error in validate_rule_structure(rule))
 
 
-class TestValidateAllRules:
+class TestRulesValidation:
     def _engine_with_meta(self, rules, action_meta=None):
         engine = make_engine(rules=rules)
         engine.triggers_meta["hotkey"] = {}
+        engine.triggers_funcs["hotkey"] = lambda *args: None
         register_action(engine, "noop", lambda meta, params, _run_context: None, action_meta)
         alerts = []
         engine._alert_user = lambda title, message, *a, **k: alerts.append((title, message))
@@ -395,7 +392,7 @@ class TestValidateAllRules:
         finally:
             engine.close()
 
-    def test_select_param_invalid_value(self, capsys):
+    def test_select_param_invalid_value(self):
         meta = {"params": [{
             "name": "mode",
             "type": "select",
@@ -404,23 +401,20 @@ class TestValidateAllRules:
         engine, alerts = self._engine_with_meta(
             [self._rule(params={"mode": "ludicrous"})], meta
         )
-        valid, total = engine._validate_all_rules()
-        assert (valid, total) == (0, 1)
-        assert "数据不在允许的枚举值中" in capsys.readouterr().err
+        snapshot = apply_rules_snapshot(engine)
+        assert not snapshot.rules
+        assert any("数据不在允许的枚举值中" in message for _, message in snapshot.issues)
+        assert engine._diag_obj.snapshot()["rule_issues"]
 
     def test_timeout_requires_action_cancellation_contract(self):
         rule = self._rule()
         rule["workflow"]["nodes"][1]["timeout_seconds"] = 60
         engine, alerts = self._engine_with_meta([rule])
 
-        valid, total = engine._validate_all_rules()
-
-        assert (valid, total) == (0, 1)
+        snapshot = apply_rules_snapshot(engine)
+        assert not snapshot.rules
+        assert any("不支持安全取消" in message for _, message in snapshot.issues)
         assert alerts
-        assert any(
-            "不支持安全取消" in issue[1]
-            for issue in engine._diag_obj.snapshot()["rule_issues"]
-        )
 
     def test_timeout_accepts_action_cancellation_contract(self):
         rule = self._rule()
@@ -433,7 +427,9 @@ class TestValidateAllRules:
             },
         )
 
-        assert engine._validate_all_rules() == (1, 1)
+        snapshot = apply_rules_snapshot(engine)
+        assert len(snapshot.rules) == snapshot.total == 1
+        assert snapshot.issues == []
         assert alerts == []
 
     def test_required_action_param_must_be_present(self):
@@ -445,12 +441,10 @@ class TestValidateAllRules:
         }]}
         engine, alerts = self._engine_with_meta([self._rule()], meta)
 
-        assert engine._validate_all_rules() == (0, 1)
+        snapshot = apply_rules_snapshot(engine)
+        assert not snapshot.rules
+        assert any("缺少必填参数: target" in message for _, message in snapshot.issues)
         assert alerts
-        assert any(
-            "缺少必填参数: target" in issue[1]
-            for issue in engine._diag_obj.snapshot()["rule_issues"]
-        )
 
     def test_plugin_data_requires_declared_owner_and_version(self):
         meta = {
@@ -480,14 +474,18 @@ class TestValidateAllRules:
         engine, alerts = self._engine_with_meta(
             [self._rule(params={"document": valid_value})], meta
         )
-        assert engine._validate_all_rules() == (1, 1)
+        snapshot = apply_rules_snapshot(engine)
+        assert len(snapshot.rules) == snapshot.total == 1
+        assert snapshot.issues == []
         assert alerts == []
 
         invalid_value = {**valid_value, "$type": "com.example.other/document@2"}
         engine, alerts = self._engine_with_meta(
             [self._rule(params={"document": invalid_value})], meta
         )
-        assert engine._validate_all_rules() == (0, 1)
+        snapshot = apply_rules_snapshot(engine)
+        assert not snapshot.rules
+        assert snapshot.issues
         assert alerts
 
     def test_malformed_owned_marker_is_not_legacy_data(self):
@@ -514,18 +512,23 @@ class TestValidateAllRules:
         engine, alerts = self._engine_with_meta([
             self._rule(params={"document": {"$type": "broken", "data": {}}})
         ], meta)
-        assert engine._validate_all_rules() == (0, 1)
+        snapshot = apply_rules_snapshot(engine)
+        assert not snapshot.rules
+        assert snapshot.issues
         assert alerts
 
         engine, alerts = self._engine_with_meta(
             [self._rule(params={"document": {}})], meta
         )
-        assert engine._validate_all_rules() == (0, 1)
-
+        snapshot = apply_rules_snapshot(engine)
+        assert not snapshot.rules
+        assert snapshot.issues
         engine, alerts = self._engine_with_meta(
             [self._rule(params={"document": {"legacy": True}})], meta
         )
-        assert engine._validate_all_rules() == (0, 1)
+        snapshot = apply_rules_snapshot(engine)
+        assert not snapshot.rules
+        assert snapshot.issues
 
 
 def test_trigger_plugin_data_uses_the_trigger_owner():

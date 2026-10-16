@@ -378,24 +378,20 @@ class RunHistory:
         self._lock = threading.Lock()
         self._file_lock = threading.Lock()
         self._writer_done = threading.Condition(self._lock)
-        self._events = deque(self._read_events_unlocked()[-self.max_events:], maxlen=self.max_events)
+        self._events, self._event_count = self._read_events_unlocked()
         self._pending: deque[str] = deque(maxlen=self.max_events)
         self._writer: threading.Thread | None = None
         self._write_error: OSError | None = None
-        self._event_count = self._count_events()
 
-    def _count_events(self) -> int:
-        try:
-            with open(self.path, "r", encoding="utf-8") as file:
-                return sum(1 for line in file if line.strip())
-        except OSError:
-            return 0
-
-    def _read_events_unlocked(self) -> list[Dict[str, Any]]:
-        events = []
+    def _read_events_unlocked(self) -> tuple[deque[Dict[str, Any]], int]:
+        events: deque[Dict[str, Any]] = deque(maxlen=self.max_events)
+        line_count = 0
         try:
             with open(self.path, "r", encoding="utf-8") as file:
                 for line in file:
+                    if not line.strip():
+                        continue
+                    line_count += 1
                     try:
                         packet = json.loads(line)
                     except json.JSONDecodeError:
@@ -408,10 +404,10 @@ class RunHistory:
             from notmyfault.core.logging import engine_error
 
             engine_error("run_history_read_failed", error=str(error))
-        return events
+        return events, line_count
 
     def _compact_unlocked(self) -> None:
-        events = self._read_events_unlocked()[-self.max_events :]
+        events, _ = self._read_events_unlocked()
         temp_path = self.path + ".tmp"
         with open(temp_path, "w", encoding="utf-8", newline="\n") as file:
             for packet in events:
@@ -420,32 +416,19 @@ class RunHistory:
         os.replace(temp_path, self.path)
         self._event_count = len(events)
 
-    def _prepare_packet(self, packet: Dict[str, Any]) -> Dict[str, Any] | None:
-        if isinstance(packet, dict) and "schema" not in packet:
-            packet = {**packet, "schema": lifecycle.RUN_EVENT_SCHEMA_VERSION}
-        return _safe_event(packet)
-
-    def _write_batch(self, packets: list[Dict[str, Any] | str]) -> None:
+    def _write_batch(self, packets: list[str]) -> None:
         with self._file_lock:
             os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
             with open(self.path, "a", encoding="utf-8", newline="\n") as file:
                 for packet in packets:
-                    file.write(packet if isinstance(packet, str) else json.dumps(packet, ensure_ascii=False, separators=(",", ":")))
+                    file.write(packet)
                     file.write("\n")
             self._event_count += len(packets)
             if self._event_count > self.max_events + 500:
                 self._compact_unlocked()
 
-    def record(self, packet: Dict[str, Any]) -> None:
-        safe_packet = self._prepare_packet(packet)
-        if safe_packet is None:
-            return
-        self._write_batch([safe_packet])
-        with self._lock:
-            self._events.append(safe_packet)
-
     def record_async(self, packet: Dict[str, Any]) -> None:
-        safe_packet = self._prepare_packet(packet)
+        safe_packet = _safe_event(packet)
         if safe_packet is None:
             return
         encoded = json.dumps(safe_packet, ensure_ascii=False, separators=(",", ":"))

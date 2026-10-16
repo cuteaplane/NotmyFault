@@ -308,55 +308,60 @@ def test_bindings_cannot_read_internal_context_keys(value):
         resolve_value(value, context)
 
 
-def test_failure_actions_can_use_earlier_main_and_recovery_outputs():
-    rule = _rule(
-        _leaf("usb_insert", "t_usb001"),
-        [
-            {"type": "open_url", "binding_id": "a_early01", "params": {"url": "x"}},
-            {
-                "type": "open_url",
-                "binding_id": "a_parent1",
-                "params": {"url": "x"},
-                "failure_actions": [
-                    {
-                        "type": "open_url",
-                        "binding_id": "a_recover1",
-                        "params": {"url": _ref("step", "a_early01", ["status"])},
-                    },
-                    {
-                        "type": "notify",
-                        "binding_id": "a_recover2",
-                        "params": {"message": _ref("step", "a_recover1", ["status"])},
-                    },
-                ],
-            },
-        ],
-    )
+def test_recovery_graph_can_use_earlier_main_and_recovery_outputs():
+    rule = {
+        "rule_id": "r_recovery_fixture01",
+        "name": "测试规则",
+        "workflow": {
+            "entry": None,
+            "nodes": [
+                {"binding_id": "a_source_recovery01", "type": "trigger",
+                 "trigger": _leaf("usb_insert", "t_usb001")},
+                {"binding_id": "a_early01", "type": "open_url", "params": {"url": "x"}},
+                {"binding_id": "a_parent1", "type": "open_url", "params": {"url": "x"}},
+                {"binding_id": "a_handler_recovery01", "type": "action_group", "exports": {}},
+                {"binding_id": "a_recover1", "type": "open_url", "parent": "a_handler_recovery01",
+                 "params": {"url": _ref("step", "a_early01", ["status"])}},
+                {"binding_id": "a_recover2", "type": "notify", "parent": "a_handler_recovery01",
+                 "params": {"message": _ref("step", "a_recover1", ["status"])}},
+            ],
+            "edges": [
+                {"source": "a_source_recovery01", "port": "event", "target": "a_early01", "channel": "control"},
+                {"source": "a_early01", "port": "next", "target": "a_parent1", "channel": "control"},
+                {"source": "a_parent1", "port": "failure", "target": "a_handler_recovery01", "channel": "control"},
+                {"source": "a_handler_recovery01", "port": "entry", "target": "a_recover1", "channel": "control"},
+                {"source": "a_recover1", "port": "next", "target": "a_recover2", "channel": "control"},
+            ],
+        },
+    }
 
     assert validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META) == []
 
 
 def test_failure_branch_and_main_flow_cannot_use_conditional_recovery_outputs():
-    rule = _rule(
-        _leaf("usb_insert", "t_usb001"),
-        [
-            {
-                "type": "open_url",
-                "binding_id": "a_parent1",
-                "params": {"url": "x"},
-                "failure_actions": [{
-                    "type": "notify",
-                    "binding_id": "a_recover1",
-                    "params": {"message": _ref("step", "a_parent1", ["status"])},
-                }],
-            },
-            {
-                "type": "notify",
-                "binding_id": "a_after01",
-                "params": {"message": _ref("step", "a_recover1", ["status"])},
-            },
-        ],
-    )
+    rule = {
+        "rule_id": "r_recovery_fixture01",
+        "name": "测试规则",
+        "workflow": {
+            "entry": None,
+            "nodes": [
+                {"binding_id": "a_source_recovery01", "type": "trigger",
+                 "trigger": _leaf("usb_insert", "t_usb001")},
+                {"binding_id": "a_parent1", "type": "open_url", "params": {"url": "x"}},
+                {"binding_id": "a_after01", "type": "notify",
+                 "params": {"message": _ref("step", "a_recover1", ["status"])}},
+                {"binding_id": "a_handler_recovery01", "type": "action_group", "exports": {}},
+                {"binding_id": "a_recover1", "type": "notify", "parent": "a_handler_recovery01",
+                 "params": {"message": _ref("step", "a_parent1", ["status"])}},
+            ],
+            "edges": [
+                {"source": "a_source_recovery01", "port": "event", "target": "a_parent1", "channel": "control"},
+                {"source": "a_parent1", "port": "next", "target": "a_after01", "channel": "control"},
+                {"source": "a_parent1", "port": "failure", "target": "a_handler_recovery01", "channel": "control"},
+                {"source": "a_handler_recovery01", "port": "entry", "target": "a_recover1", "channel": "control"},
+            ],
+        },
+    }
 
     codes = [issue["code"] for issue in validate_rule_bindings(rule, TRIGGERS_META, ACTIONS_META)]
     assert codes == ["forward_reference", "forward_reference"]

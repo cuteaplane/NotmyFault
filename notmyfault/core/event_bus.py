@@ -6,7 +6,7 @@ import weakref
 from collections import deque
 from typing import Any, Callable, Dict, Optional
 
-from notmyfault.core.logging import engine_error, engine_warn
+from notmyfault.core.logging import engine_error
 from notmyfault.core.bindings import BindingResolutionError
 from notmyfault.values import hold_value
 from notmyfault.core.data_types import DataTypeError, normalize_fields
@@ -15,7 +15,7 @@ from notmyfault.core.run_context import RunState
 from notmyfault.core.runtime_rules import PreparedRules, rule_key
 from notmyfault.core.conditions import config_fingerprint
 from notmyfault.core.event_observation import RunEventObservation
-from notmyfault.core.workflow_graph import iter_rule_actions, NATIVE_NODES, entry_event_group
+from notmyfault.core.workflow_graph import iter_rule_actions, NON_ACTION_NODES, entry_event_group
 
 # 两条规则互相监视会形成一条不会结束的触发链，链到这么深就丢弃这次运行
 _MAX_RUN_CHAIN = 16
@@ -35,8 +35,9 @@ class EventBus:
         actions_meta_fn: Callable[[], Dict[str, Dict[str, Any]]],
         is_shutdown_fn: Callable[[], bool],
         safe_on_event: Callable[[str, Dict[str, Any]], None],
-        execute_workflow_cb: Callable[..., None],
-        scheduler_submit_fn: Callable[..., str] | None = None,
+        *,
+        scheduler_submit_fn: Callable[..., str],
+        status_lookup: Callable[[str], dict] | None = None,
         alert_fn: Callable[[str, str], None] | None = None,
     ) -> None:
         self._snapshot_fn = snapshot_fn
@@ -45,16 +46,14 @@ class EventBus:
         self._actions_meta_fn = actions_meta_fn
         self._is_shutdown_fn = is_shutdown_fn
         self._safe_on_event = safe_on_event
-        self._execute_workflow_cb = execute_workflow_cb
-        # 有调度器时先决定跑不跑，没有就直接执行，旧测试路径走这里
         self._scheduler_submit_fn = scheduler_submit_fn
+        self._status_lookup = status_lookup
         self._alert_fn = alert_fn
         self._run_depths: Dict[str, int] = {}
         self._run_depth_order: deque = deque()
         self._chain_alerts: set = set()
         self._depth_lock = threading.Lock()
         self._observations = weakref.WeakSet()
-        self._status_lookup = lambda identity: {"running": 0, "queued": 0, "last_status": None}
 
     def observe_events(self, compiled, occurred=()):
         snapshot = self._snapshot_fn()
@@ -208,7 +207,7 @@ class EventBus:
                 "run_id": run_id,
                 "rule_name": rule_name,
                 "event_type": event_type,
-                "action_count": sum(node["type"] not in NATIVE_NODES - {"set_variable"} for node, _path in iter_rule_actions(rule)),
+                "action_count": sum(node["type"] not in NON_ACTION_NODES for node, _path in iter_rule_actions(rule)),
                 "event_payload": masked_payload,
             },
         )
@@ -235,7 +234,12 @@ class EventBus:
                 occurred = observation.apply_snapshot(context) if observation is not None else frozenset(
                     event.get('binding_id') for event in matched_events if not event.get('absence'))
                 statuses = {}
+                missing_status_lookup = False
                 def lookup(identity):
+                    nonlocal missing_status_lookup
+                    if self._status_lookup is None:
+                        missing_status_lookup = True
+                        raise ValueError("run_status 条件需要 status_lookup")
                     if identity not in statuses:
                         statuses[identity] = self._status_lookup(identity)
                     return statuses[identity]
@@ -258,19 +262,9 @@ class EventBus:
                     context['_entry_choices'] = choices
                     context['_entry_evaluated_nodes'] = evaluated
                 except (ValueError, TypeError) as error:
+                    if missing_status_lookup:
+                        raise
                     context['_preparation_error'] = {'code': 'condition_evaluation_failed', 'message': str(error)}
         else:
             context.defer_preparation(prepare)
-        if self._scheduler_submit_fn is not None:
-            self._scheduler_submit_fn(key, rule, rule_name, context)
-        else:
-            self._execute_workflow_cb(key, rule, rule_name, context)
-
-    def call_notmyfault(self, event_data: Dict[str, Any]) -> None:
-        """接收触发器线程推送的外部事件"""
-        event_type = event_data.get("trigger_id")
-        event_payload = event_data.get("triggered_params", {})
-        if not isinstance(event_type, str) or not isinstance(event_payload, dict):
-            engine_warn("忽略格式无效的外部事件")
-            return
-        self.emit_event(event_type, event_payload)
+        self._scheduler_submit_fn(key, rule, rule_name, context)

@@ -17,9 +17,8 @@ from notmyfault.core.runtime_rules import prepare_rules
 from notmyfault.core.run_manager import RunManager, RunSuspension
 from notmyfault.core.workflow import build_context
 from notmyfault.core.workflow_executor import WorkflowExecutor
-from notmyfault.core.workflow_graph import (
-    graph_index, validate_workflow_graph,
-)
+from notmyfault.core.canvas_workflow import validate_canvas_graph
+from notmyfault.core.workflow_graph import graph_index
 
 
 TRIGGERS = {name: {'params': [], 'outputs': [{'name': 'value', 'type': 'number'}]} for name in ('start', 'steam', 'network')}
@@ -37,35 +36,49 @@ def action(identity, label):
     return {'type': 'record', 'binding_id': identity, 'params': {'label': label}}
 
 
-def edge(source, target, port='next'):
-    return {'source': source, 'target': target, 'port': port}
+def edge(source, target, port='next', *, channel='control', target_port=None):
+    result = {'source': source, 'target': target, 'port': port, 'channel': channel}
+    if target_port is not None:
+        result['target_port'] = target_port
+    return result
 
 
-def branch(identity, predicate=None):
-    return {'id': identity, 'test_predicate': copy.deepcopy(predicate)} if predicate is not None else {'id': identity, 'else': True}
+def branch(identity, *, otherwise=False):
+    return {'id': identity, **({'else': True} if otherwise else {})}
 
 
-def group(identity, predicates, **fields):
-    return {'type': 'event_group', 'binding_id': identity, 'mode': 'immediate',
-            'branches': [branch(f'b_{identity}_{i}', predicate) for i, predicate in enumerate(predicates)], **fields}
+def group(identity, branches, **fields):
+    return {'type': 'event_group', 'binding_id': identity, 'group_type': 'if',
+            'mode': 'immediate', 'branches': branches, **fields}
 
 
-def rule(nodes, edges, entry=None):
-    return {'rule_id': 'r_graph001', 'name': '图执行', 'test_start': leaf(),
-            'workflow': {'entry': entry or nodes[0]['binding_id'], 'nodes': nodes, 'edges': edges}}
+def rule(nodes, edges):
+    return {'rule_id': 'r_graph001', 'name': '图执行',
+            'workflow': {'entry': None, 'nodes': nodes, 'edges': edges}}
 
 
 def validate_runtime_structure(source):
-    return validate_workflow_graph(canvas_fixture(source)['workflow'])
+    return validate_canvas_graph(source['workflow'])
 
 
 def validate_runtime_bindings(source, triggers, actions):
-    return check_rule_bindings(canvas_fixture(source), triggers, actions)
+    return check_rule_bindings(source, triggers, actions)
+
+
+def trigger(identity, kind='start', parent=None, params=None):
+    node = {'type': 'trigger', 'binding_id': identity, 'trigger': {
+        'type': kind, 'binding_id': {'start': 't_start01', 'steam': 't_steam01',
+                                     'network': 't_net001'}[kind],
+        'params': params or {},
+    }}
+    if parent is not None:
+        node['parent'] = parent
+    return node
 
 
 def setup(rule, clock=None, record=None):
     records, events = [], []
-    source = canvas_fixture(rule)
+    source = rule
     registry = TypeRegistry.from_plugins(TRIGGERS, ACTIONS)
     context = build_context(source['name'], 'start', {}, [], source['rule_id'], 'run_graph')
     prepare_binding_context(source, context, TRIGGERS, ACTIONS, registry=registry)
@@ -87,93 +100,6 @@ def setup(rule, clock=None, record=None):
 
 
 
-def canvas_fixture(runtime, *, internal_start=False):
-    if any(node.get('type') == 'trigger' for node in runtime['workflow']['nodes']):
-        return copy.deepcopy(runtime)
-    def leaves(value):
-        if not isinstance(value, dict):
-            return
-        if 'type' in value and 'binding_id' in value:
-            yield value
-        for child in value.get('children', []):
-            yield from leaves(child)
-    def graph_events(graph):
-        for node in graph['nodes']:
-            yield from node.get('triggers', [])
-            yield from leaves(node.get('activation', {}))
-            if 'workflow' in node:
-                yield from graph_events(node['workflow'])
-    native = {key: copy.deepcopy(value) for key, value in runtime.items() if key not in ('workflow', 'test_start')}
-    graph = {'entry': None, 'nodes': [], 'edges': []}
-    native['workflow'] = graph
-    triggers, count = {}, 0
-    def source(leaf, parent=None):
-        identity = leaf['binding_id']
-        if identity not in triggers:
-            wrapper = {'type': 'trigger', 'binding_id': 'a_watch_' + identity[2:], 'trigger': copy.deepcopy(leaf)}
-            if parent:
-                wrapper['parent'] = parent
-            graph['nodes'].append(wrapper)
-            triggers[identity] = wrapper
-        return triggers[identity]['binding_id'], 'event'
-    def predicate(value, parent):
-        nonlocal count
-        if 'type' in value:
-            return source(value, parent)
-        if value['op'] == 'event_occurred':
-            wrapper, port = source(leaf_specs[value['trigger_id']], parent)
-            if value.get('expected', True):
-                return wrapper, port
-            value = {'op': 'not', 'children': [{**value, 'expected': True}]}
-        count += 1
-        identity = f'a_predicate_{count:06d}'
-        logical = value['op'] in ('all', 'any', 'not')
-        node = {'binding_id': identity, 'type': 'logic' if logical else 'condition', 'parent': parent}
-        node.update({'op': value['op']} if logical else {'predicate': copy.deepcopy(value)})
-        for field in ('within_seconds', 'duration_seconds', 'consume', 'pick', 'repeat'):
-            if field in value:
-                node[field] = value[field]
-        graph['nodes'].append(node)
-        if logical:
-            for child in value['children']:
-                child_id, port = predicate(child, parent)
-                graph['edges'].append({'source': child_id, 'port': port, 'target': identity, 'channel': 'condition'})
-        return identity, 'result'
-    leaf_specs = {item['binding_id']: item for item in graph_events(runtime['workflow'])}
-    if runtime.get('test_start'):
-        leaf_specs.update({item['binding_id']: item for item in leaves(runtime['test_start'])})
-    def flatten(current, parent=None):
-        for item in current['nodes']:
-            node = {key: copy.deepcopy(value) for key, value in item.items() if key not in ('workflow', 'activation', 'triggers', 'branches')}
-            if parent:
-                node['parent'] = parent
-            graph['nodes'].append(node)
-            if item['type'] == 'action_group':
-                entry = item['workflow']['entry']
-                flatten(item['workflow'], item['binding_id'])
-                if entry:
-                    graph['edges'].append({'source': item['binding_id'], 'port': 'entry', 'target': entry, 'channel': 'control'})
-            elif item['type'] == 'event_group':
-                node.update(group_type='if', branches=[])
-                for branch in item['branches']:
-                    node['branches'].append({'id': branch['id'], **({'else': True} if branch.get('else') else {})})
-                    if not branch.get('else'):
-                        condition_id, port = predicate(branch['test_predicate'], item['binding_id'])
-                        graph['edges'].append({'source': condition_id, 'port': port, 'target': item['binding_id'], 'target_port': branch['id'], 'channel': 'condition'})
-                if item.get('mode') == 'wait' and not any(not branch.get('else') for branch in item['branches']):
-                    event_id, port = source(item['activation'], item['binding_id'])
-                    branch_id = 'b_wait_' + item['binding_id'][2:]
-                    node['branches'].insert(0, {'id': branch_id})
-                    graph['edges'].append({'source': event_id, 'port': port, 'target': item['binding_id'], 'target_port': branch_id, 'channel': 'condition'})
-                    exits = [edge for edge in current['edges'] if edge['source'] == item['binding_id']]
-                    if exits and exits[0]['target']:
-                        graph['edges'].append({'source': item['binding_id'], 'port': branch_id, 'target': exits[0]['target'], 'channel': 'control'})
-        graph['edges'].extend({**edge, 'channel': 'control'} for edge in current['edges'] if edge['target'] is not None)
-    flatten(runtime['workflow'])
-    if not internal_start:
-        trigger_id, port = source(runtime.get('test_start') or leaf())
-        graph['edges'].append({'source': trigger_id, 'port': port, 'target': runtime['workflow']['entry'], 'channel': 'control'})
-    return native
 
 def eventually(test, timeout=3):
     deadline = time.monotonic() + timeout
@@ -197,17 +123,26 @@ def test_conditions_follow_edges_and_short_circuit_in_input_order():
     with pytest.raises(ValueError):
         CanvasProgram(source).evaluate('a_choice01', {})
     source['workflow']['edges'].append({'source': 'a_choice01', 'port': 'result', 'target': 'a_choice01', 'channel': 'condition'})
-    assert any('环' in error for error in validate_workflow_graph(source['workflow']))
+    assert any('环' in error for error in validate_canvas_graph(source['workflow']))
 
 
 def test_control_connections_override_node_array_order_and_merge_once():
-    decision = group('a_decide01', [{'op': 'is_true', 'left': True}, {'op': 'is_true', 'left': True}, None])
-    nodes = [action('a_else001', 'else'), action('a_after01', 'after'), decision,
+
+    decision = group('a_decide01', [
+        branch('b_a_decide01_0'), branch('b_a_decide01_1'), branch('b_a_decide01_2', otherwise=True)])
+    nodes = [trigger('a_watch_start01'), action('a_else001', 'else'), action('a_after01', 'after'), decision,
+             {'type': 'condition', 'binding_id': 'a_predicate_000001', 'parent': 'a_decide01',
+              'predicate': {'op': 'is_true', 'left': True}},
+             {'type': 'condition', 'binding_id': 'a_predicate_000002', 'parent': 'a_decide01',
+              'predicate': {'op': 'is_true', 'left': True}},
              action('a_elif001', 'elif'), action('a_first01', 'first')]
-    graph = rule(nodes, [edge('a_decide01', 'a_first01', decision['branches'][0]['id']),
+    graph = rule(nodes, [edge('a_watch_start01', 'a_decide01', 'event'),
+        edge('a_predicate_000001', 'a_decide01', 'result', channel='condition', target_port=decision['branches'][0]['id']),
+        edge('a_predicate_000002', 'a_decide01', 'result', channel='condition', target_port=decision['branches'][1]['id']),
+        edge('a_decide01', 'a_first01', decision['branches'][0]['id']),
         edge('a_decide01', 'a_elif001', decision['branches'][1]['id']),
         edge('a_decide01', 'a_else001', decision['branches'][2]['id']),
-        edge('a_first01', 'a_after01'), edge('a_elif001', 'a_after01'), edge('a_else001', 'a_after01'), edge('a_after01', None)], 'a_decide01')
+        edge('a_first01', 'a_after01'), edge('a_elif001', 'a_after01'), edge('a_else001', 'a_after01')])
     source, context, observer, executor, records, events = setup(graph)
     assert executor.execute_workflow('key', source, source['name'], context).status == 'succeeded'
     assert records == ['first', 'after']
@@ -228,31 +163,41 @@ def test_old_rule_conversion_is_rejected_without_changing_binding_ids():
 
 
 def test_nested_groups_export_output_and_reject_direct_inner_reference():
-    producer = {'type': 'speed', 'binding_id': 'a_speed01', 'params': {}}
-    inner = {'type': 'action_group', 'binding_id': 'a_inner01', 'workflow': {'entry': 'a_speed01', 'nodes': [producer], 'edges': [edge('a_speed01', None)]},
+
+    producer = {'type': 'speed', 'binding_id': 'a_speed01', 'parent': 'a_inner01', 'params': {}}
+    inner = {'type': 'action_group', 'binding_id': 'a_inner01', 'parent': 'a_outer01',
              'exports': {'latency': {'$ref': {'scope': 'step', 'node': 'a_speed01', 'path': ['latency']}}}}
-    outer = {'type': 'action_group', 'binding_id': 'a_outer01', 'workflow': {'entry': 'a_inner01', 'nodes': [inner], 'edges': [edge('a_inner01', None)]},
+    outer = {'type': 'action_group', 'binding_id': 'a_outer01',
              'exports': {'latency': {'$ref': {'scope': 'step', 'node': 'a_inner01', 'path': ['latency']}}}}
     predicate = {'op': 'gt', 'left': {'$ref': {'scope': 'step', 'node': 'a_outer01', 'path': ['latency']}}, 'right': 80000}
-    decision = group('a_decide01', [predicate, None])
-    graph = rule([outer, decision, action('a_first01', 'pause')], [edge('a_outer01', 'a_decide01'),
-        edge('a_decide01', 'a_first01', decision['branches'][0]['id']), edge('a_decide01', None, decision['branches'][1]['id']), edge('a_first01', None)])
+    decision = group('a_decide01', [branch('b_a_decide01_0'), branch('b_a_decide01_1', otherwise=True)])
+    condition = {'type': 'condition', 'binding_id': 'a_predicate_000001', 'parent': 'a_decide01', 'predicate': predicate}
+    graph = rule([trigger('a_watch_start01'), outer, inner, producer, decision, condition, action('a_first01', 'pause')], [
+        edge('a_watch_start01', 'a_outer01', 'event'), edge('a_outer01', 'a_inner01', 'entry'),
+        edge('a_inner01', 'a_speed01', 'entry'), edge('a_outer01', 'a_decide01'),
+        edge('a_predicate_000001', 'a_decide01', 'result', channel='condition', target_port='b_a_decide01_0'),
+        edge('a_decide01', 'a_first01', 'b_a_decide01_0')])
     source, context, observer, executor, records, events = setup(graph)
     assert executor.execute_workflow('key', source, source['name'], context).status == 'succeeded'
     assert records == ['pause'] and context['steps']['a_outer01']['result']['latency'] == 180000
-    decision['branches'][0]['test_predicate'] = {**predicate, 'left': {'$ref': {'scope': 'step', 'node': 'a_speed01', 'path': ['latency']}}}
+    condition['predicate'] = {**predicate, 'left': {'$ref': {'scope': 'step', 'node': 'a_speed01', 'path': ['latency']}}}
     assert any(issue['code'] == 'forward_reference' for issue in validate_runtime_bindings(graph, TRIGGERS, ACTIONS))
 
 
-def waiting_rule(timeout=None, activation=None):
-    wait = group('a_wait001', [{'op': 'event_occurred', 'trigger_id': 't_steam01'}, None], mode='wait',
-        activation=activation or leaf('steam', 't_steam01'), triggers=[leaf('network', 't_net001'), leaf('steam', 't_steam01')])
-    if activation is not None:
-        wait['branches'][0]['test_predicate'] = activation
-    if timeout is not None:
-        wait['timeout_seconds'] = timeout
-    return rule([action('a_before1', 'before'), wait, action('a_after01', 'after')], [edge('a_before1', 'a_wait001'),
-        edge('a_wait001', 'a_after01', wait['branches'][0]['id']), edge('a_wait001', 'a_after01', wait['branches'][1]['id']), edge('a_after01', None)])
+def waiting_rule(timeout=None):
+    wait = group('a_wait001', [branch('b_a_wait001_0'), branch('b_a_wait001_1', otherwise=True)],
+                 mode='wait', **({'timeout_seconds': timeout} if timeout is not None else {}))
+    nodes = [trigger('a_watch_start01'), action('a_before1', 'before'), wait,
+             trigger('a_watch_steam01', 'steam', parent='a_wait001'),
+             action('a_after01', 'after')]
+    return rule(nodes, [
+        edge('a_watch_start01', 'a_before1', 'event'),
+        edge('a_before1', 'a_wait001'),
+        edge('a_wait001', 'a_after01', 'b_a_wait001_0'),
+        edge('a_wait001', 'a_after01', 'b_a_wait001_1'),
+        edge('a_watch_steam01', 'a_wait001', 'event', channel='condition',
+             target_port='b_a_wait001_0'),
+    ])
 
 
 def test_wait_releases_single_worker_and_late_event_resumes_without_repeating_action():
@@ -261,7 +206,8 @@ def test_wait_releases_single_worker_and_late_event_resumes_without_repeating_ac
     try:
         assert manager.submit('one', source, source['name'], context) == 'started'
         eventually(lambda: any(kind == 'run.group.waiting' for kind, data in events))
-        other = rule([action('a_extra01', 'other')], [edge('a_extra01', None)])
+        other = rule([trigger('a_watch_start01'), action('a_extra01', 'other')],
+                     [edge('a_watch_start01', 'a_extra01', 'event')])
         other_source, other_context, _, _, _, _ = setup(other)
         other_context['run']['id'] = 'run_other'
         assert manager.submit('two', other_source, '另一条', other_context) == 'started'
@@ -297,7 +243,8 @@ def test_wait_ends_on_cancel_timeout_shutdown_or_replacement(finish):
             manager.shutdown()
             expected = 'cancelled'
         elif finish == 'replace':
-            other = rule([action('a_extra01', 'new')], [edge('a_extra01', None)])
+            other = rule([trigger('a_watch_start01'), action('a_extra01', 'new')],
+                         [edge('a_watch_start01', 'a_extra01', 'event')])
             other['concurrency'] = {'mode': 'replace'}
             other_source, other_context, _, _, _, _ = setup(other)
             other_context['run']['id'] = 'run_other'
@@ -327,8 +274,18 @@ def test_event_arriving_between_yield_and_arm_is_not_lost():
 
 def test_wait_window_expires_old_event_and_timed_absence_is_distinct_from_boolean_not():
     clock = FakeClock()
-    activation = {'op': 'all', 'within_seconds': 2, 'children': [leaf('steam', 't_steam01'), leaf('network', 't_net001')]}
-    source, context, observer, executor, records, events = setup(waiting_rule(activation=activation), clock)
+    source = waiting_rule()
+    graph = source['workflow']
+    graph['nodes'].append({'type': 'logic', 'binding_id': 'a_predicate_000001', 'parent': 'a_wait001',
+                           'op': 'all', 'within_seconds': 2})
+    graph['nodes'].append(trigger('a_watch_net001', 'network', parent='a_wait001'))
+    graph['edges'] = [connection for connection in graph['edges']
+                      if connection['source'] != 'a_watch_steam01']
+    graph['edges'].extend([
+        edge('a_watch_steam01', 'a_predicate_000001', 'event', channel='condition'),
+        edge('a_watch_net001', 'a_predicate_000001', 'event', channel='condition'),
+        edge('a_predicate_000001', 'a_wait001', 'result', channel='condition', target_port='b_a_wait001_0')])
+    source, context, observer, executor, records, events = setup(source, clock)
     observer.record('steam', {'value': 1})
     clock.advance(3)
     observer.record('network', {'value': 1})
@@ -337,7 +294,16 @@ def test_wait_window_expires_old_event_and_timed_absence_is_distinct_from_boolea
     observer.record('steam', {'value': 2})
     assert first.wait.ready
     assert executor.execute_workflow('one', source, source['name'], context).status == 'succeeded'
-    source, context, observer, executor, records, events = setup(waiting_rule(activation={'op': 'not', 'duration_seconds': 2, 'children': [leaf('steam', 't_steam01')]}), clock)
+    source = waiting_rule()
+    graph = source['workflow']
+    graph['nodes'].append({'type': 'logic', 'binding_id': 'a_predicate_000001', 'parent': 'a_wait001',
+                           'op': 'not', 'duration_seconds': 2})
+    graph['edges'] = [connection for connection in graph['edges']
+                      if connection['source'] != 'a_watch_steam01']
+    graph['edges'].extend([
+        edge('a_watch_steam01', 'a_predicate_000001', 'event', channel='condition'),
+        edge('a_predicate_000001', 'a_wait001', 'result', channel='condition', target_port='b_a_wait001_0')])
+    source, context, observer, executor, records, events = setup(source, clock)
     suspension = executor.execute_workflow('one', source, source['name'], context)
     assert isinstance(suspension, RunSuspension)
     clock.advance(2)
@@ -353,18 +319,18 @@ def test_wait_window_expires_old_event_and_timed_absence_is_distinct_from_boolea
     (lambda graph: graph['edges'].append(edge('a_second1', 'a_inner01')), '不存在'),
 ])
 def test_graph_validation_rejects_cycle_fanout_and_missing_target(mutate, message):
-    graph = rule([action('a_first01', 'first'), action('a_second1', 'second')], [edge('a_first01', 'a_second1'), edge('a_second1', None)])
+    graph = rule([trigger('a_watch_start01'), action('a_first01', 'first'), action('a_second1', 'second')],
+                 [edge('a_watch_start01', 'a_first01', 'event'), edge('a_first01', 'a_second1')])
     mutate(graph['workflow'])
     assert any(message in error for error in validate_runtime_structure(graph))
 
 
 def test_control_edge_cannot_enter_an_action_group_member_directly():
-    source = canvas_fixture(rule([
-        action('a_first01', 'first'),
-        {'type': 'action_group', 'binding_id': 'a_outer01', 'workflow': {
-            'entry': 'a_inside01', 'nodes': [action('a_inside01', 'inside')], 'edges': [],
-        }},
-    ], [edge('a_first01', 'a_outer01')]))
+    inside = action('a_inside01', 'inside') | {'parent': 'a_outer01'}
+    outer = {'type': 'action_group', 'binding_id': 'a_outer01'}
+    source = rule([trigger('a_watch_start01'), action('a_first01', 'first'), outer, inside], [
+        edge('a_watch_start01', 'a_first01', 'event'), edge('a_first01', 'a_outer01'),
+        edge('a_outer01', 'a_inside01', 'entry')])
     connection = next(item for item in source['workflow']['edges'] if item['source'] == 'a_first01')
     connection['target'] = 'a_inside01'
     assert any('跨越动作组边界' in error for error in validate_runtime_structure(source))
@@ -372,7 +338,8 @@ def test_control_edge_cannot_enter_an_action_group_member_directly():
 
 def test_unconnected_nodes_remain_editable_without_entering_execution():
     from notmyfault.core.workflow_graph import execution_nodes
-    source = canvas_fixture(rule([action('a_first01', 'first')], [edge('a_first01', None)]))
+    source = rule([trigger('a_watch_start01'), action('a_first01', 'first')],
+                  [edge('a_watch_start01', 'a_first01', 'event')])
     source['workflow']['nodes'].append(action('a_orphan1', 'unused'))
     assert validate_runtime_structure(source) == []
     assert 'a_orphan1' not in {node['binding_id'] for node, _ in execution_nodes(source['workflow'])}
@@ -402,10 +369,19 @@ def test_two_waiting_runs_keep_independent_observation_and_single_mode_admission
 
 
 def test_nested_wait_retains_group_path_and_continues_outer_edges():
-    nested = waiting_rule()['workflow']
-    outer = {'type': 'action_group', 'binding_id': 'a_outer01', 'workflow': nested}
-    graph = rule([outer, action('a_finish1', 'finish')], [edge('a_outer01', 'a_finish1'), edge('a_finish1', None)])
-    source, context, observer, executor, records, events = setup(graph)
+    source = waiting_rule()
+    graph = source['workflow']
+    outer = {'type': 'action_group', 'binding_id': 'a_outer01'}
+    for identity in ('a_before1', 'a_wait001', 'a_after01'):
+        next(node for node in graph['nodes'] if node['binding_id'] == identity)['parent'] = 'a_outer01'
+    graph['nodes'].append(outer)
+    graph['nodes'].append(action('a_finish1', 'finish'))
+    graph['edges'] = [connection for connection in graph['edges']
+                      if not (connection['source'] == 'a_watch_start01' and connection['target'] == 'a_before1')]
+    graph['edges'].extend([edge('a_watch_start01', 'a_outer01', 'event'),
+                           edge('a_outer01', 'a_before1', 'entry'),
+                           edge('a_outer01', 'a_finish1')])
+    source, context, observer, executor, records, events = setup(source)
     manager = RunManager(executor.execute_workflow, max_workers=1)
     try:
         manager.submit('one', source, source['name'], context)
@@ -422,12 +398,17 @@ def test_nested_wait_retains_group_path_and_continues_outer_edges():
 
 
 def test_optional_branch_output_requires_missing_policy_and_type_is_checked():
-    decision = group('a_decide01', [{'op': 'is_true', 'left': False}, None])
+    decision = group('a_decide01', [branch('b_a_decide01_0'), branch('b_a_decide01_1', otherwise=True)])
+    condition = {'type': 'condition', 'binding_id': 'a_predicate_000001', 'parent': 'a_decide01',
+                 'predicate': {'op': 'is_true', 'left': False}}
     producer = {'type': 'speed', 'binding_id': 'a_speed01', 'params': {}}
     ref = {'$ref': {'scope': 'step', 'node': 'a_speed01', 'path': ['latency']}}
     assignment = {'type': 'set_variable', 'binding_id': 'a_assign1', 'variable': 'v_result1', 'value': ref}
-    graph = rule([decision, producer, assignment], [edge('a_decide01', 'a_speed01', decision['branches'][0]['id']),
-        edge('a_decide01', 'a_assign1', decision['branches'][1]['id']), edge('a_speed01', 'a_assign1'), edge('a_assign1', None)])
+    graph = rule([trigger('a_watch_start01'), decision, condition, producer, assignment], [
+        edge('a_watch_start01', 'a_decide01', 'event'),
+        edge('a_predicate_000001', 'a_decide01', 'result', channel='condition', target_port='b_a_decide01_0'),
+        edge('a_decide01', 'a_speed01', 'b_a_decide01_0'),
+        edge('a_decide01', 'a_assign1', 'b_a_decide01_1'), edge('a_speed01', 'a_assign1')])
     graph['variables'] = [{'id': 'v_result1', 'name': '延迟', 'value_type': 'number', 'initial': 0}]
     assert any(issue['code'] == 'conditional_source' for issue in validate_runtime_bindings(graph, TRIGGERS, ACTIONS))
     ref['$ref'].update(on_missing='default', default=80000)
@@ -442,13 +423,16 @@ def test_optional_branch_output_requires_missing_policy_and_type_is_checked():
 
 def test_entry_group_matches_start_only_and_middle_trigger_is_subscribed():
     from notmyfault.tests.api_support import create_test_engine
-    decision = group('a_entry01', [{'op': 'event_occurred', 'trigger_id': 't_start01'}, None], activation=leaf())
-    middle = group('a_decide01', [{'op': 'event_occurred', 'trigger_id': 't_steam01'}, None], triggers=[leaf('steam', 't_steam01')])
-    source = rule([decision, middle, action('a_first01', 'first'), action('a_else001', 'else')], [
-        edge('a_entry01', 'a_decide01', decision['branches'][0]['id']), edge('a_entry01', 'a_else001', decision['branches'][1]['id']),
-        edge('a_decide01', 'a_first01', middle['branches'][0]['id']), edge('a_decide01', 'a_else001', middle['branches'][1]['id']),
-        edge('a_first01', None), edge('a_else001', None)], 'a_entry01')
-    source = canvas_fixture(source)
+    decision = group('a_entry01', [branch('b_a_entry01_0'), branch('b_a_entry01_1', otherwise=True)])
+    middle = group('a_decide01', [branch('b_a_decide01_0'), branch('b_a_decide01_1', otherwise=True)])
+    start = trigger('a_watch_start01')
+    steam = trigger('a_watch_steam01', 'steam')
+    source = rule([start, steam, decision, middle, action('a_first01', 'first'), action('a_else001', 'else')], [
+        edge('a_watch_start01', 'a_entry01', 'event'),
+        edge('a_watch_start01', 'a_entry01', 'event', channel='condition', target_port='b_a_entry01_0'),
+        edge('a_watch_steam01', 'a_decide01', 'event', channel='condition', target_port='b_a_decide01_0'),
+        edge('a_entry01', 'a_decide01', 'b_a_entry01_0'), edge('a_entry01', 'a_else001', 'b_a_entry01_1'),
+        edge('a_decide01', 'a_first01', 'b_a_decide01_0'), edge('a_decide01', 'a_else001', 'b_a_decide01_1')])
     calls = []
     engine = create_test_engine({'rules': [source]})
     engine.triggers_meta.update(TRIGGERS)
@@ -471,18 +455,17 @@ def test_entry_group_matches_start_only_and_middle_trigger_is_subscribed():
 def test_entry_route_is_fixed_before_queue_and_late_event_counts_only_middle_group():
     from notmyfault.tests.api_support import create_test_engine
     entered, release = threading.Event(), threading.Event()
-    decision = group('a_entry01', [{'op': 'event_occurred', 'trigger_id': 't_steam01'}, None], activation=leaf(), triggers=[leaf('steam', 't_steam01')])
-    middle = group('a_decide01', [{'op': 'event_occurred', 'trigger_id': 't_steam01'}, None])
-    source = rule([decision, middle, action('a_first01', 'first'), action('a_else001', 'middle'), action('a_wrong01', 'wrong')], [
-        edge('a_entry01', 'a_wrong01', decision['branches'][0]['id']), edge('a_entry01', 'a_decide01', decision['branches'][1]['id']),
-        edge('a_decide01', 'a_else001', middle['branches'][0]['id']), edge('a_decide01', 'a_first01', middle['branches'][1]['id']),
-        edge('a_else001', None), edge('a_first01', None), edge('a_wrong01', None)], 'a_entry01')
-    source = canvas_fixture(source)
-    native_entry = next(node for node in source['workflow']['nodes'] if node['binding_id'] == 'a_entry01')
-    native_entry['branches'].insert(1, {'id': 'b_start_elif01'})
-    source['workflow']['edges'] = [edge for edge in source['workflow']['edges'] if not (edge['source'] == 'a_watch_start01' and edge['channel'] == 'control')]
-    source['workflow']['edges'].append({'source': 'a_watch_start01', 'port': 'event', 'target': 'a_entry01', 'target_port': 'b_start_elif01', 'channel': 'condition'})
-    next(edge for edge in source['workflow']['edges'] if edge['source'] == 'a_entry01' and edge['target'] == 'a_decide01')['port'] = 'b_start_elif01'
+    decision = group('a_entry01', [branch('b_a_entry01_0'), branch('b_start_elif01'),
+                                   branch('b_a_entry01_1', otherwise=True)])
+    middle = group('a_decide01', [branch('b_a_decide01_0'), branch('b_a_decide01_1', otherwise=True)])
+    source = rule([trigger('a_watch_start01'), trigger('a_watch_steam01', 'steam'), decision, middle,
+        action('a_first01', 'first'), action('a_else001', 'middle'), action('a_wrong01', 'wrong')], [
+        edge('a_watch_steam01', 'a_entry01', 'event', channel='condition', target_port='b_a_entry01_0'),
+        edge('a_watch_start01', 'a_entry01', 'event', channel='condition', target_port='b_start_elif01'),
+        edge('a_watch_steam01', 'a_decide01', 'event', channel='condition', target_port='b_a_decide01_0'),
+        edge('a_entry01', 'a_wrong01', 'b_a_entry01_0'),
+        edge('a_entry01', 'a_decide01', 'b_start_elif01'),
+        edge('a_decide01', 'a_else001', 'b_a_decide01_0'), edge('a_decide01', 'a_first01', 'b_a_decide01_1')])
     calls, packets = [], []
     engine = create_test_engine({'rules': [source]}, on_event=lambda event: packets.append(event.to_dict()))
     engine.triggers_meta.update(TRIGGERS)
@@ -493,8 +476,9 @@ def test_entry_route_is_fixed_before_queue_and_late_event_counts_only_middle_gro
     engine._event_bus._status_lookup = manager.rule_status
     engine.actions_funcs['block'] = lambda meta, params, context: (entered.set(), release.wait(3))
     engine.actions_meta['block'] = {'params': [], 'outputs': []}
-    blocking = canvas_fixture(rule([{'type': 'block', 'binding_id': 'a_block01', 'params': {}}], [edge('a_block01', None)]))
-    blocking['rule_id'] = 'r_block001'
+    blocking = {'rule_id': 'r_block001', 'name': '占用', 'workflow': {'entry': None, 'nodes': [
+        trigger('a_watch_start01'), {'type': 'block', 'binding_id': 'a_block01', 'params': {}}],
+        'edges': [edge('a_watch_start01', 'a_block01', 'event')]}}
     try:
         block_context = build_context('占用', 'start', {}, [], 'r_block001', 'run_block')
         block_context['_entry_root'] = 'a_watch_start01'
@@ -526,14 +510,17 @@ def test_old_conversion_remains_rejected_on_repeated_calls():
 
 def test_nested_entry_event_group_can_start_outer_action_groups():
     from notmyfault.tests.api_support import create_test_engine
-    decision = group('a_entry01', [{'op': 'event_occurred', 'trigger_id': 't_start01'}, None], activation=leaf())
-    inside = {'entry': 'a_entry01', 'nodes': [decision, action('a_first01', 'first')], 'edges': [
-        edge('a_entry01', 'a_first01', decision['branches'][0]['id']), edge('a_entry01', None, decision['branches'][1]['id']), edge('a_first01', None)]}
-    inner = {'type': 'action_group', 'binding_id': 'a_inner01', 'workflow': inside}
-    outer = {'type': 'action_group', 'binding_id': 'a_outer01', 'workflow': {'entry': 'a_inner01', 'nodes': [inner], 'edges': [edge('a_inner01', None)]}}
-    source = rule([outer, action('a_after01', 'after')], [edge('a_outer01', 'a_after01'), edge('a_after01', None)])
-    source.pop('test_start')
-    source = canvas_fixture(source, internal_start=True)
+    decision = group('a_entry01', [branch('b_a_entry01_0'), branch('b_a_entry01_1', otherwise=True)])
+    inner = {'type': 'action_group', 'binding_id': 'a_inner01', 'parent': 'a_outer01'}
+    outer = {'type': 'action_group', 'binding_id': 'a_outer01'}
+    entry = decision | {'parent': 'a_inner01'}
+    first = action('a_first01', 'first') | {'parent': 'a_inner01'}
+    start = trigger('a_watch_start01', parent='a_entry01')
+    after = action('a_after01', 'after')
+    source = rule([outer, inner, entry, first, start, after], [
+        edge('a_outer01', 'a_inner01', 'entry'), edge('a_inner01', 'a_entry01', 'entry'),
+        edge('a_watch_start01', 'a_entry01', 'event', channel='condition', target_port='b_a_entry01_0'),
+        edge('a_entry01', 'a_first01', 'b_a_entry01_0'), edge('a_outer01', 'a_after01', 'next')])
     from notmyfault.core.condition_program import build_matcher
     assert set(build_matcher(source).leaves) == {'start'}
     calls = []
@@ -552,62 +539,150 @@ def test_nested_entry_event_group_can_start_outer_action_groups():
 def _download_graph():
     ref = lambda identity, field: {'$ref': {'scope': 'step', 'node': identity, 'path': [field]}}
     limit = {'$ref': {'scope': 'variable', 'node': 'v_limit01', 'path': []}}
-    event = lambda identity: {'op': 'event_occurred', 'trigger_id': identity}
-    state = lambda identity, value: {'type': 'set_variable', 'binding_id': identity, 'variable': 'v_status1', 'value': value}
-    speed = lambda identity, phase: {'type': 'speed', 'binding_id': identity, 'params': {'phase': phase}}
-    sequence = lambda nodes: {'entry': nodes[0]['binding_id'], 'nodes': nodes, 'edges': [edge(node['binding_id'], nodes[index + 1]['binding_id'] if index + 1 < len(nodes) else None) for index, node in enumerate(nodes)]}
+    def group_node(identity, branches, *, mode='immediate', parent=None):
+        node = {'type': 'event_group', 'binding_id': identity, 'group_type': 'if',
+                'mode': mode, 'branches': branches}
+        if parent is not None:
+            node['parent'] = parent
+        return node
+    def logic(identity, parent, op):
+        return {'type': 'logic', 'binding_id': identity, 'parent': parent, 'op': op}
+    def condition(identity, parent, predicate):
+        return {'type': 'condition', 'binding_id': identity, 'parent': parent, 'predicate': predicate}
+    def member(node, parent):
+        return {**node, 'parent': parent}
 
-    def choice(decision, flows):
-        nodes, edges = [decision], []
-        for exit_branch, flow in zip(decision['branches'], flows):
-            nodes.extend(flow)
-            edges.append(edge(decision['binding_id'], flow[0]['binding_id'] if flow else None, exit_branch['id']))
-            edges.extend(edge(node['binding_id'], flow[index + 1]['binding_id'] if index + 1 < len(flow) else None) for index, node in enumerate(flow))
-        return {'entry': decision['binding_id'], 'nodes': nodes, 'edges': edges}
-
-    def prepend(prefix, graph):
-        return {'entry': prefix[0]['binding_id'], 'nodes': prefix + graph['nodes'], 'edges':
-            [edge(node['binding_id'], prefix[index + 1]['binding_id'] if index + 1 < len(prefix) else graph['entry']) for index, node in enumerate(prefix)] + graph['edges']}
-
-    def resume(identity):
-        speed_id = f'a_{identity}speed'
-        predicate = {'op': 'all', 'children': [
-            {'op': 'is_true', 'left': ref(speed_id, 'connected')}, {'op': 'lte', 'left': ref(speed_id, 'latency'), 'right': limit}]}
-        decide = group(f'a_{identity}safe', [predicate, None])
-        graph = choice(decide, [[state(f'a_{identity}set1', 'running'), action(f'a_{identity}note1', 'resume')],
-                                [state(f'a_{identity}set0', 'paused'), action(f'a_{identity}note0', 'keep_paused')]])
-        return {'type': 'action_group', 'binding_id': f'a_{identity}group', 'workflow': prepend([speed(speed_id, 'repair')], graph)}
-
-    quality = group('a_quality1', [{'op': 'all', 'children': [
-        {'op': 'is_true', 'left': ref('a_recheck1', 'connected')},
-        {'op': 'any', 'children': [{'op': 'lte', 'left': ref('a_recheck1', 'latency'), 'right': limit},
-                                  {'op': 'lt', 'left': ref('a_recheck1', 'latency'), 'right': ref('a_measure1', 'latency')}]}]}, None])
-    repair = {'type': 'action_group', 'binding_id': 'a_repair01', 'workflow': prepend([
-        action('a_relink1', 'reconnect'), speed('a_recheck1', 'repair')], choice(quality, [[action('a_good001', 'repair_ok')], [action('a_bad0001', 'repair_failed')]]))}
-    needs_repair = group('a_needfix1', [{'op': 'is_false', 'left': ref('a_measure1', 'connected')}, None])
-    protection = {'type': 'action_group', 'binding_id': 'a_protect1', 'workflow': prepend([
-        action('a_capture1', 'capture'), state('a_pause001', 'paused')], choice(needs_repair, [[repair], [action('a_skipfix1', 'skip_repair')]]))}
-    steam_start, steam_exit, network = leaf('steam', 't_steam01'), leaf('steam', 't_exit001'), leaf('network', 't_net001')
-    steam_start['params'] = {'value': 1}
-    steam_exit['params'] = {'value': 0}
-    network['params'] = {'value': 1}
-    protection_condition = {'op': 'any', 'children': [
-        {'op': 'all', 'children': [event('t_steam01'), {'op': 'run_status', 'rule_id': 'r_graph001', 'status': 'running'},
-            {'op': 'not', 'children': [{'op': 'lte', 'left': ref('a_measure1', 'latency'), 'right': limit}]}]},
-        {'op': 'is_false', 'left': ref('a_measure1', 'connected')}]}
-    resume_condition = {'op': 'all', 'children': [{'op': 'any', 'children': [event('t_exit001'), event('t_net001')]},
-        {'op': 'is_true', 'left': ref('a_measure1', 'connected')}]}
-    dispatch = group('a_dispatch', [protection_condition, resume_condition, None], triggers=[steam_start, steam_exit, network])
-    wait = group('a_recover1', [event('t_exit001'), {'op': 'all', 'children': [event('t_net001'), {'op': 'not', 'children': [event('t_exit001')]}]}, None],
-        mode='wait', activation={'op': 'any', 'children': [steam_exit, network]})
-    recovery, direct = resume('recover'), resume('direct1')
-    graph = rule([speed('a_measure1', 'first'), dispatch, protection, wait, recovery, direct,
-        action('a_hold001', 'hold_paused'), action('a_unknown1', 'uncertain'), action('a_idle001', 'idle')], [
-        edge('a_measure1', 'a_dispatch'), edge('a_dispatch', 'a_protect1', dispatch['branches'][0]['id']),
-        edge('a_dispatch', direct['binding_id'], dispatch['branches'][1]['id']), edge('a_dispatch', 'a_idle001', dispatch['branches'][2]['id']),
-        edge('a_protect1', 'a_recover1'), edge('a_recover1', recovery['binding_id'], wait['branches'][0]['id']),
-        edge('a_recover1', 'a_hold001', wait['branches'][1]['id']), edge('a_recover1', 'a_unknown1', wait['branches'][2]['id']),
-        edge(recovery['binding_id'], None), edge(direct['binding_id'], None), edge('a_hold001', None), edge('a_unknown1', None), edge('a_idle001', None)])
+    dispatch = group_node('a_dispatch', [
+        branch('b_a_dispatch_0'), branch('b_a_dispatch_1'), branch('b_a_dispatch_2', otherwise=True)])
+    needfix = group_node('a_needfix1', [branch('b_a_needfix1_0'), branch('b_a_needfix1_1', otherwise=True)],
+                         parent='a_protect1')
+    quality = group_node('a_quality1', [branch('b_a_quality1_0'), branch('b_a_quality1_1', otherwise=True)],
+                         parent='a_repair01')
+    recovery_wait = group_node('a_recover1', [
+        branch('b_a_recover1_0'), branch('b_a_recover1_1'),
+        branch('b_a_recover1_2', otherwise=True)], mode='wait')
+    recover_safe = group_node('a_recoversafe', [
+        branch('b_a_recoversafe_0'), branch('b_a_recoversafe_1', otherwise=True)], parent='a_recovergroup')
+    direct_safe = group_node('a_direct1safe', [
+        branch('b_a_direct1safe_0'), branch('b_a_direct1safe_1', otherwise=True)], parent='a_direct1group')
+    nodes = [
+        {'type': 'trigger', 'binding_id': 'a_watch_start01', 'trigger': leaf()},
+        {'type': 'trigger', 'binding_id': 'a_watch_steam01', 'trigger': {**leaf('steam', 't_steam01'), 'params': {'value': 1}}},
+        {'type': 'trigger', 'binding_id': 'a_watch_exit001', 'trigger': {**leaf('steam', 't_exit001'), 'params': {'value': 0}}},
+        {'type': 'trigger', 'binding_id': 'a_watch_net001', 'trigger': {**leaf('network', 't_net001'), 'params': {'value': 1}}},
+        {'type': 'speed', 'binding_id': 'a_measure1', 'params': {'phase': 'first'}},
+        dispatch,
+        {'type': 'action_group', 'binding_id': 'a_protect1'},
+        member(action('a_capture1', 'capture'), 'a_protect1'),
+        member({'type': 'set_variable', 'binding_id': 'a_pause001', 'variable': 'v_status1', 'value': 'paused'}, 'a_protect1'),
+        needfix,
+        member({'type': 'action_group', 'binding_id': 'a_repair01'}, 'a_protect1'),
+        member(action('a_relink1', 'reconnect'), 'a_repair01'),
+        member({'type': 'speed', 'binding_id': 'a_recheck1', 'params': {'phase': 'repair'}}, 'a_repair01'),
+        quality,
+        member(action('a_good001', 'repair_ok'), 'a_repair01'),
+        member(action('a_bad0001', 'repair_failed'), 'a_repair01'),
+        member(action('a_skipfix1', 'skip_repair'), 'a_protect1'),
+        recovery_wait,
+        {'type': 'action_group', 'binding_id': 'a_recovergroup'},
+        {'type': 'speed', 'binding_id': 'a_recoverspeed', 'parent': 'a_recovergroup', 'params': {'phase': 'repair'}},
+        recover_safe,
+        member({'type': 'set_variable', 'binding_id': 'a_recoverset1', 'variable': 'v_status1', 'value': 'running'}, 'a_recovergroup'),
+        member(action('a_recovernote1', 'resume'), 'a_recovergroup'),
+        member({'type': 'set_variable', 'binding_id': 'a_recoverset0', 'variable': 'v_status1', 'value': 'paused'}, 'a_recovergroup'),
+        member(action('a_recovernote0', 'keep_paused'), 'a_recovergroup'),
+        {'type': 'action_group', 'binding_id': 'a_direct1group'},
+        {'type': 'speed', 'binding_id': 'a_direct1speed', 'parent': 'a_direct1group', 'params': {'phase': 'repair'}},
+        direct_safe,
+        member({'type': 'set_variable', 'binding_id': 'a_direct1set1', 'variable': 'v_status1', 'value': 'running'}, 'a_direct1group'),
+        member(action('a_direct1note1', 'resume'), 'a_direct1group'),
+        member({'type': 'set_variable', 'binding_id': 'a_direct1set0', 'variable': 'v_status1', 'value': 'paused'}, 'a_direct1group'),
+        member(action('a_direct1note0', 'keep_paused'), 'a_direct1group'),
+        action('a_hold001', 'hold_paused'), action('a_unknown1', 'uncertain'), action('a_idle001', 'idle'),
+        logic('a_predicate_000001', 'a_dispatch', 'any'),
+        logic('a_predicate_000002', 'a_dispatch', 'all'),
+        condition('a_predicate_000003', 'a_dispatch', {'op': 'run_status', 'rule_id': 'r_graph001', 'status': 'running'}),
+        logic('a_predicate_000004', 'a_dispatch', 'not'),
+        condition('a_predicate_000005', 'a_dispatch', {'op': 'lte', 'left': ref('a_measure1', 'latency'), 'right': limit}),
+        condition('a_predicate_000006', 'a_dispatch', {'op': 'is_false', 'left': ref('a_measure1', 'connected')}),
+        logic('a_predicate_000007', 'a_dispatch', 'all'),
+        logic('a_predicate_000008', 'a_dispatch', 'any'),
+        condition('a_predicate_000009', 'a_dispatch', {'op': 'is_true', 'left': ref('a_measure1', 'connected')}),
+        condition('a_predicate_000010', 'a_needfix1', {'op': 'is_false', 'left': ref('a_measure1', 'connected')}),
+        logic('a_predicate_000011', 'a_quality1', 'all'),
+        condition('a_predicate_000012', 'a_quality1', {'op': 'is_true', 'left': ref('a_recheck1', 'connected')}),
+        logic('a_predicate_000013', 'a_quality1', 'any'),
+        condition('a_predicate_000014', 'a_quality1', {'op': 'lte', 'left': ref('a_recheck1', 'latency'), 'right': limit}),
+        condition('a_predicate_000015', 'a_quality1', {'op': 'lt', 'left': ref('a_recheck1', 'latency'), 'right': ref('a_measure1', 'latency')}),
+        logic('a_predicate_000016', 'a_recover1', 'all'),
+        logic('a_predicate_000017', 'a_recover1', 'not'),
+        logic('a_predicate_000018', 'a_recoversafe', 'all'),
+        condition('a_predicate_000019', 'a_recoversafe', {'op': 'is_true', 'left': ref('a_recoverspeed', 'connected')}),
+        condition('a_predicate_000020', 'a_recoversafe', {'op': 'lte', 'left': ref('a_recoverspeed', 'latency'), 'right': limit}),
+        logic('a_predicate_000021', 'a_direct1safe', 'all'),
+        condition('a_predicate_000022', 'a_direct1safe', {'op': 'is_true', 'left': ref('a_direct1speed', 'connected')}),
+        condition('a_predicate_000023', 'a_direct1safe', {'op': 'lte', 'left': ref('a_direct1speed', 'latency'), 'right': limit}),
+    ]
+    edges = [
+        edge('a_watch_start01', 'a_measure1', 'event'), edge('a_measure1', 'a_dispatch'),
+        edge('a_watch_steam01', 'a_predicate_000002', 'event', channel='condition'),
+        edge('a_predicate_000003', 'a_predicate_000002', 'result', channel='condition'),
+        edge('a_predicate_000005', 'a_predicate_000004', 'result', channel='condition'),
+        edge('a_predicate_000004', 'a_predicate_000002', 'result', channel='condition'),
+        edge('a_predicate_000002', 'a_predicate_000001', 'result', channel='condition'),
+        edge('a_predicate_000006', 'a_predicate_000001', 'result', channel='condition'),
+        edge('a_predicate_000001', 'a_dispatch', 'result', channel='condition', target_port='b_a_dispatch_0'),
+        edge('a_watch_exit001', 'a_predicate_000008', 'event', channel='condition'),
+        edge('a_watch_net001', 'a_predicate_000008', 'event', channel='condition'),
+        edge('a_predicate_000008', 'a_predicate_000007', 'result', channel='condition'),
+        edge('a_predicate_000009', 'a_predicate_000007', 'result', channel='condition'),
+        edge('a_predicate_000007', 'a_dispatch', 'result', channel='condition', target_port='b_a_dispatch_1'),
+        edge('a_dispatch', 'a_protect1', 'b_a_dispatch_0'),
+        edge('a_dispatch', 'a_direct1group', 'b_a_dispatch_1'),
+        edge('a_dispatch', 'a_idle001', 'b_a_dispatch_2'),
+        edge('a_protect1', 'a_capture1', 'entry'), edge('a_capture1', 'a_pause001'),
+        edge('a_pause001', 'a_needfix1'),
+        edge('a_predicate_000010', 'a_needfix1', 'result', channel='condition', target_port='b_a_needfix1_0'),
+        edge('a_needfix1', 'a_repair01', 'b_a_needfix1_0'),
+        edge('a_needfix1', 'a_skipfix1', 'b_a_needfix1_1'),
+        edge('a_repair01', 'a_relink1', 'entry'), edge('a_relink1', 'a_recheck1'),
+        edge('a_recheck1', 'a_quality1'),
+        edge('a_predicate_000012', 'a_predicate_000011', 'result', channel='condition'),
+        edge('a_predicate_000014', 'a_predicate_000013', 'result', channel='condition'),
+        edge('a_predicate_000015', 'a_predicate_000013', 'result', channel='condition'),
+        edge('a_predicate_000013', 'a_predicate_000011', 'result', channel='condition'),
+        edge('a_predicate_000011', 'a_quality1', 'result', channel='condition', target_port='b_a_quality1_0'),
+        edge('a_quality1', 'a_good001', 'b_a_quality1_0'),
+        edge('a_quality1', 'a_bad0001', 'b_a_quality1_1'),
+        edge('a_protect1', 'a_recover1'),
+        edge('a_watch_exit001', 'a_recover1', 'event', channel='condition', target_port='b_a_recover1_0'),
+        edge('a_watch_net001', 'a_predicate_000016', 'event', channel='condition'),
+        edge('a_watch_exit001', 'a_predicate_000017', 'event', channel='condition'),
+        edge('a_predicate_000017', 'a_predicate_000016', 'result', channel='condition'),
+        edge('a_predicate_000016', 'a_recover1', 'result', channel='condition', target_port='b_a_recover1_1'),
+        edge('a_recover1', 'a_recovergroup', 'b_a_recover1_0'),
+        edge('a_recover1', 'a_hold001', 'b_a_recover1_1'),
+        edge('a_recover1', 'a_unknown1', 'b_a_recover1_2'),
+        edge('a_recovergroup', 'a_recoverspeed', 'entry'),
+        edge('a_recoverspeed', 'a_recoversafe'),
+        edge('a_predicate_000019', 'a_predicate_000018', 'result', channel='condition'),
+        edge('a_predicate_000020', 'a_predicate_000018', 'result', channel='condition'),
+        edge('a_predicate_000018', 'a_recoversafe', 'result', channel='condition', target_port='b_a_recoversafe_0'),
+        edge('a_recoversafe', 'a_recoverset1', 'b_a_recoversafe_0'),
+        edge('a_recoverset1', 'a_recovernote1'),
+        edge('a_recoversafe', 'a_recoverset0', 'b_a_recoversafe_1'),
+        edge('a_recoverset0', 'a_recovernote0'),
+        edge('a_direct1group', 'a_direct1speed', 'entry'),
+        edge('a_direct1speed', 'a_direct1safe'),
+        edge('a_predicate_000022', 'a_predicate_000021', 'result', channel='condition'),
+        edge('a_predicate_000023', 'a_predicate_000021', 'result', channel='condition'),
+        edge('a_predicate_000021', 'a_direct1safe', 'result', channel='condition', target_port='b_a_direct1safe_0'),
+        edge('a_direct1safe', 'a_direct1set1', 'b_a_direct1safe_0'),
+        edge('a_direct1set1', 'a_direct1note1'),
+        edge('a_direct1safe', 'a_direct1set0', 'b_a_direct1safe_1'),
+        edge('a_direct1set0', 'a_direct1note0'),
+    ]
+    graph = rule(nodes, edges)
     graph['variables'] = [{'id': 'v_limit01', 'name': '可接受延迟', 'value_type': 'number', 'initial': 80000},
                           {'id': 'v_status1', 'name': '下载状态', 'value_type': 'text', 'initial': 'running'}]
     return graph
@@ -642,11 +717,12 @@ def test_download_workflow_runs_six_scenarios_through_production_executor(scenar
 
 @pytest.mark.parametrize('field, value', [('entry', []), ('entry', {}), ('source', {}), ('target', []), ('port', {})])
 def test_malformed_control_identifiers_return_validation_errors(field, value):
-    source = canvas_fixture(rule([action('a_first01', 'first'), action('a_second1', 'second')], [edge('a_first01', 'a_second1')]))
+    source = rule([trigger('a_watch_start01'), action('a_first01', 'first'), action('a_second1', 'second')],
+                  [edge('a_watch_start01', 'a_first01', 'event'), edge('a_first01', 'a_second1')])
     if field == 'entry':
         source['workflow'][field] = value
     else:
-        source['workflow']['edges'][0][field] = value
+        next(item for item in source['workflow']['edges'] if item['source'] == 'a_first01')[field] = value
     assert validate_runtime_structure(source)
     with pytest.raises(ValueError):
         normalize_rule_input([source])
@@ -654,10 +730,12 @@ def test_malformed_control_identifiers_return_validation_errors(field, value):
 
 @pytest.mark.parametrize('field, value', [('source', {}), ('target', []), ('port', {})])
 def test_malformed_condition_identifiers_raise_structured_validation_error(field, value):
-    source = canvas_fixture(rule([group('a_choice01', [{'op': 'is_true', 'left': True}, None])], []))
-    connection = next(item for item in source['workflow']['edges'] if item['channel'] == 'condition')
-    connection[field] = value
-    assert validate_workflow_graph(source['workflow'])
+    choice = group('a_choice01', [branch('b_a_choice01_0'), branch('b_a_choice01_1', otherwise=True)])
+    source = rule([choice, {'type': 'condition', 'binding_id': 'a_predicate_000001',
+                            'parent': 'a_choice01', 'predicate': {'op': 'is_true', 'left': True}}],
+        [edge('a_predicate_000001', 'a_choice01', 'result', channel='condition', target_port='b_a_choice01_0')])
+    source['workflow']['edges'][0][field] = value
+    assert validate_canvas_graph(source['workflow'])
     with pytest.raises(ValueError):
         normalize_rule_input([source])
 
@@ -667,28 +745,30 @@ def test_export_type_inference_understands_literal_template_and_conversion():
     exports = {'literal': {'$literal': 'text'}, 'template': {'$template': ['prefix', 'suffix']},
                'converted': {'$convert': {'value': '3', 'to': 'number'}},
                'nested': {'values': [{'$literal': True}, {'$literal': False}]}}
-    outer = {'type': 'action_group', 'binding_id': 'a_outer01', 'workflow': {'entry': None, 'nodes': [], 'edges': []}, 'exports': exports}
-    source = rule([outer], [edge('a_outer01', None)])
-    schema = rule_binding_types(canvas_fixture(source), TRIGGERS, ACTIONS)['step']['a_outer01']['properties']
-    assert schema['literal']['type'] == 'text'
-    assert schema['template']['type'] == 'text'
-    assert schema['converted']['type'] == 'number'
-    assert schema['nested']['properties']['values']['items']['type'] == 'bool'
+    outer = {'type': 'action_group', 'binding_id': 'a_outer01', 'exports': exports}
+    source = rule([trigger('a_watch_start01'), outer], [edge('a_watch_start01', 'a_outer01', 'event')])
+    schema = rule_binding_types(source, TRIGGERS, ACTIONS)['step']['a_outer01']['properties']
 
 
 def test_late_sensitive_event_remains_masked_through_assignment_and_group_export():
     from notmyfault.tests.api_support import create_test_engine, event_fields
     from notmyfault.values import contains_secret
-    waited = group('a_wait001', [None], mode='wait', activation=leaf('steam', 't_steam01'))
-    assignment = {'type': 'set_variable', 'binding_id': 'a_assign1', 'variable': 'v_secret1',
+    waited = group('a_wait001', [branch('b_wait_wait001'), branch('b_a_wait001_0', otherwise=True)],
+                   mode='wait', parent='a_outer01')
+    assignment = {'type': 'set_variable', 'binding_id': 'a_assign1', 'parent': 'a_outer01',
+                  'variable': 'v_secret1',
                   'value': {'$ref': {'scope': 'trigger', 'node': 't_steam01', 'path': ['token']}}}
-    outer = {'type': 'action_group', 'binding_id': 'a_outer01', 'workflow': {'entry': 'a_enter01', 'nodes': [{'type': 'merge', 'binding_id': 'a_enter01'}, waited, assignment], 'edges': [
-        edge('a_enter01', 'a_wait001'), edge('a_wait001', 'a_assign1', waited['branches'][0]['id']), edge('a_assign1', None)]},
-        'exports': {'token': {'$ref': {'scope': 'variable', 'node': 'v_secret1', 'path': []}}}}
+    outer = {'type': 'action_group', 'binding_id': 'a_outer01',
+             'exports': {'token': {'$ref': {'scope': 'variable', 'node': 'v_secret1', 'path': []}}}}
+    enter = {'type': 'merge', 'binding_id': 'a_enter01', 'parent': 'a_outer01'}
+    steam = trigger('a_watch_steam01', 'steam', parent='a_wait001')
     output = {'type': 'record', 'binding_id': 'a_record1', 'params': {'label': {'$ref': {'scope': 'step', 'node': 'a_outer01', 'path': ['token']}}}}
-    source = rule([outer, output], [edge('a_outer01', 'a_record1'), edge('a_record1', None)])
+    source = rule([trigger('a_watch_start01'), outer, enter, waited, assignment, steam, output], [
+        edge('a_watch_start01', 'a_outer01', 'event'), edge('a_outer01', 'a_enter01', 'entry'),
+        edge('a_enter01', 'a_wait001'), edge('a_watch_steam01', 'a_wait001', 'event', channel='condition', target_port='b_wait_wait001'),
+        edge('a_wait001', 'a_assign1', 'b_wait_wait001'), edge('a_wait001', 'a_assign1', 'b_a_wait001_0'),
+        edge('a_outer01', 'a_record1')])
     source['variables'] = [{'id': 'v_secret1', 'name': '令牌', 'value_type': 'text'}]
-    source = canvas_fixture(source)
     packets, calls, contexts = [], [], []
     engine = create_test_engine({'rules': [source]}, on_event=lambda event: packets.append(event.to_dict()))
     engine.triggers_meta.update(TRIGGERS)
@@ -719,20 +799,21 @@ def test_late_sensitive_event_remains_masked_through_assignment_and_group_export
 
 def test_group_export_type_uses_dependencies_instead_of_node_array_order():
     from notmyfault.core.binding_schema import rule_binding_types
-    producer = {'type': 'action_group', 'binding_id': 'a_first01', 'workflow': {'entry': None, 'nodes': [], 'edges': []}, 'exports': {'value': {'$literal': 12}}}
-    consumer = {'type': 'action_group', 'binding_id': 'a_second1', 'workflow': {'entry': None, 'nodes': [], 'edges': []},
+    producer = {'type': 'action_group', 'binding_id': 'a_first01', 'exports': {'value': {'$literal': 12}}}
+    consumer = {'type': 'action_group', 'binding_id': 'a_second1',
                 'exports': {'value': {'$ref': {'scope': 'step', 'node': 'a_first01', 'path': ['value']}}}}
-    source = rule([consumer, producer], [edge('a_first01', 'a_second1'), edge('a_second1', None)], 'a_first01')
-    schemas = rule_binding_types(canvas_fixture(source), TRIGGERS, ACTIONS)['step']
+    source = rule([trigger('a_watch_start01'), consumer, producer], [
+        edge('a_watch_start01', 'a_first01', 'event'), edge('a_first01', 'a_second1')])
+    schemas = rule_binding_types(source, TRIGGERS, ACTIONS)['step']
     assert schemas['a_second1']['properties']['value']['type'] == schemas['a_first01']['properties']['value']['type']
     assert schemas['a_second1']['properties']['value']['type'] in ('int', 'number')
     assert validate_runtime_bindings(source, TRIGGERS, ACTIONS) == []
 
 
 def test_group_export_failure_records_failed_step_and_closed_generator():
-    outer = {'type': 'action_group', 'binding_id': 'a_outer01', 'workflow': {'entry': None, 'nodes': [], 'edges': []},
+    outer = {'type': 'action_group', 'binding_id': 'a_outer01',
              'exports': {'value': {'$ref': {'scope': 'variable', 'node': 'v_uninit1', 'path': [], 'on_missing': 'error'}}}}
-    source = rule([outer], [edge('a_outer01', None)])
+    source = rule([trigger('a_watch_start01'), outer], [edge('a_watch_start01', 'a_outer01', 'event')])
     source['variables'] = [{'id': 'v_uninit1', 'name': '未初始化', 'value_type': 'text'}]
     source, context, observer, executor, records, events = setup(source)
     assert executor.execute_workflow('one', source, source['name'], context).status == 'failed'
@@ -742,8 +823,15 @@ def test_group_export_failure_records_failed_step_and_closed_generator():
 
 
 def test_nested_cancellation_records_all_open_groups_and_clears_execution_position():
-    outer = {'type': 'action_group', 'binding_id': 'a_outer01', 'workflow': waiting_rule()['workflow']}
-    source = rule([outer], [edge('a_outer01', None)])
+    source = waiting_rule()
+    graph = source['workflow']
+    graph['nodes'].append({'type': 'action_group', 'binding_id': 'a_outer01'})
+    for identity in ('a_before1', 'a_wait001', 'a_after01'):
+        next(node for node in graph['nodes'] if node['binding_id'] == identity)['parent'] = 'a_outer01'
+    graph['edges'] = [connection for connection in graph['edges']
+                      if not (connection['source'] == 'a_watch_start01' and connection['target'] == 'a_before1')]
+    graph['edges'].extend([edge('a_watch_start01', 'a_outer01', 'event'),
+                           edge('a_outer01', 'a_before1', 'entry')])
     source, context, observer, executor, records, events = setup(source)
     manager = RunManager(executor.execute_workflow, max_workers=1)
     try:
@@ -762,11 +850,13 @@ def test_nested_cancellation_records_all_open_groups_and_clears_execution_positi
 
 def test_partial_nested_node_keeps_preceding_parent_data_and_group_path():
     from notmyfault.core.workflow_graph import find_graph_scope
-    producer = {'type': 'speed', 'binding_id': 'a_speed01', 'params': {}}
-    assignment = {'type': 'set_variable', 'binding_id': 'a_assign1', 'variable': 'v_result1',
-                  'value': {'$ref': {'scope': 'step', 'node': 'a_speed01', 'path': ['latency']}}}
-    inner = {'type': 'action_group', 'binding_id': 'a_inner01', 'workflow': {'entry': 'a_assign1', 'nodes': [assignment], 'edges': [edge('a_assign1', None)]}}
-    source = rule([producer, inner], [edge('a_speed01', 'a_inner01'), edge('a_inner01', None)])
+    producer = {'type': 'speed', 'binding_id': 'a_speed01'}
+    assignment = {'type': 'set_variable', 'binding_id': 'a_assign1', 'parent': 'a_inner01',
+                  'variable': 'v_result1', 'value': {'$ref': {'scope': 'step', 'node': 'a_speed01', 'path': ['latency']}}}
+    inner = {'type': 'action_group', 'binding_id': 'a_inner01'}
+    source = rule([trigger('a_watch_start01'), producer, inner, assignment], [
+        edge('a_watch_start01', 'a_speed01', 'event'), edge('a_speed01', 'a_inner01'),
+        edge('a_inner01', 'a_assign1', 'entry')])
     source['variables'] = [{'id': 'v_result1', 'name': '延迟', 'value_type': 'number', 'initial': 0}]
     source, context, observer, executor, records, events = setup(source)
     scope = find_graph_scope(source['workflow'], 'a_assign1')
@@ -785,22 +875,26 @@ def test_partial_nested_run_accepts_conditional_native_output_with_type_and_secr
     from notmyfault.core.workflow_graph import find_graph_scope
     from notmyfault.tests.api_support import create_test_engine
     from notmyfault.values import contains_secret
-    choose = group('a_choice1', [{'op': 'is_true', 'left': True}, None])
+    choose = group('a_choice1', [branch('b_a_choice1_0'), branch('b_a_choice1_1', otherwise=True)])
     if kind == 'action_group':
-        producer = {'type': kind, 'binding_id': 'a_source1', 'workflow': {'entry': None, 'nodes': [], 'edges': []},
+        producer = {'type': kind, 'binding_id': 'a_source1',
                     'exports': {'value': {'$ref': {'scope': 'variable', 'node': 'v_secret1', 'path': []}}}}
     else:
         producer = {'type': kind, 'binding_id': 'a_source1', 'variable': 'v_secret1', 'value': 'initial-secret'}
-    target = action('a_target1', {'$ref': {'scope': 'step', 'node': 'a_source1', 'path': ['value'], 'on_missing': 'default', 'default': 'missing'}})
-    inner = {'type': 'action_group', 'binding_id': 'a_inner01', 'workflow': {'entry': 'a_target1', 'nodes': [target], 'edges': [edge('a_target1', None)]}}
-    source = rule([choose, producer, inner], [edge('a_choice1', 'a_source1', choose['branches'][0]['id']),
-                  edge('a_choice1', 'a_inner01', choose['branches'][1]['id']), edge('a_source1', 'a_inner01'), edge('a_inner01', None)])
+    target = action('a_target1', {'$ref': {'scope': 'step', 'node': 'a_source1', 'path': ['value'], 'on_missing': 'default', 'default': 'missing'}}) | {'parent': 'a_inner01'}
+    inner = {'type': 'action_group', 'binding_id': 'a_inner01'}
+    condition = {'type': 'condition', 'binding_id': 'a_predicate_000001', 'parent': 'a_choice1',
+                 'predicate': {'op': 'is_true', 'left': True}}
+    source = rule([trigger('a_watch_start01'), choose, condition, producer, inner, target], [
+        edge('a_watch_start01', 'a_choice1', 'event'),
+        edge('a_predicate_000001', 'a_choice1', 'result', channel='condition', target_port='b_a_choice1_0'),
+        edge('a_choice1', 'a_source1', 'b_a_choice1_0'), edge('a_source1', 'a_inner01'),
+        edge('a_choice1', 'a_inner01', 'b_a_choice1_1'), edge('a_inner01', 'a_target1', 'entry')])
     source['variables'] = [{'id': 'v_secret1', 'name': '令牌', 'value_type': 'text', 'sensitive': True, 'initial': 'initial-secret'}]
-    scope = find_graph_scope(canvas_fixture(source)['workflow'], 'a_target1')
+    scope = find_graph_scope(source['workflow'], 'a_target1')
     assert scope['available'] == {'a_choice1', 'a_watch_start01'}
     assert scope['possible'] == {'a_choice1', 'a_source1', 'a_watch_start01'}
     assert validate_runtime_bindings(source, TRIGGERS, ACTIONS) == []
-    source = canvas_fixture(source)
     calls, packets, contexts = [], [], []
     engine = create_test_engine({'rules': []}, on_event=lambda event: packets.append(event.to_dict()))
     engine.triggers_meta.update(TRIGGERS)
@@ -831,24 +925,29 @@ def test_partial_nested_run_accepts_conditional_native_output_with_type_and_secr
 @pytest.mark.parametrize('termination', ['null', 'end'])
 @pytest.mark.parametrize('policy', [None, 'skip', 'default'])
 def test_group_export_checks_every_terminal_branch_and_handles_missing_policy(termination, policy):
-    choose = group('a_choice1', [{'op': 'is_true', 'left': False}, None])
-    speed = {'type': 'speed', 'binding_id': 'a_speed01', 'params': {}}
-    nodes = [choose, speed]
-    else_target = None
+    choose = group('a_choice1', [branch('b_a_choice1_0'), branch('b_a_choice1_1', otherwise=True)],
+                   parent='a_outer01')
+    speed = {'type': 'speed', 'binding_id': 'a_speed01', 'parent': 'a_outer01', 'params': {}}
+    nodes = [trigger('a_watch_start01'), {'type': 'action_group', 'binding_id': 'a_outer01'}, choose, speed,
+             {'type': 'condition', 'binding_id': 'a_predicate_000001', 'parent': 'a_choice1',
+              'predicate': {'op': 'is_true', 'left': False}}]
+    edges = [edge('a_watch_start01', 'a_outer01', 'event'),
+             edge('a_outer01', 'a_choice1', 'entry'),
+             edge('a_predicate_000001', 'a_choice1', 'result', channel='condition', target_port='b_a_choice1_0'),
+             edge('a_choice1', 'a_speed01', 'b_a_choice1_0')]
     if termination == 'end':
-        nodes.append({'type': 'end', 'binding_id': 'a_end0001'})
-        else_target = 'a_end0001'
+        nodes.append({'type': 'end', 'binding_id': 'a_end0001', 'parent': 'a_outer01'})
+        edges.append(edge('a_choice1', 'a_end0001', 'b_a_choice1_1'))
     reference = {'scope': 'step', 'node': 'a_speed01', 'path': ['latency']}
     if policy:
         reference['on_missing'] = policy
     if policy == 'default':
         reference['default'] = 123
-    outer = {'type': 'action_group', 'binding_id': 'a_outer01',
-        'workflow': {'entry': 'a_choice1', 'nodes': nodes, 'edges': [
-            edge('a_choice1', 'a_speed01', choose['branches'][0]['id']),
-            edge('a_choice1', else_target, choose['branches'][1]['id']), edge('a_speed01', None)]},
-        'exports': {'latency': {'$ref': reference}}}
-    source = rule([outer, action('a_after01', 'after')], [edge('a_outer01', 'a_after01'), edge('a_after01', None)])
+    outer = nodes[1]
+    outer['exports'] = {'latency': {'$ref': reference}}
+    nodes.append(action('a_after01', 'after'))
+    edges.append(edge('a_outer01', 'a_after01'))
+    source = rule(nodes, edges)
     errors = validate_runtime_bindings(source, TRIGGERS, ACTIONS)
     if policy is None:
         assert errors and any(error['code'] == 'conditional_source' for error in errors)
@@ -869,10 +968,20 @@ def test_group_export_checks_every_terminal_branch_and_handles_missing_policy(te
 @pytest.mark.parametrize('kind', ['event_group', 'action_group'])
 @pytest.mark.parametrize('field', ['params', 'retry', 'retry_delay_seconds', 'retry_backoff', 'failure_actions', 'timeout_seconds'])
 def test_native_groups_reject_ignored_action_settings(kind, field):
-    node = group('a_group01', [None]) if kind == 'event_group' else {
-        'type': kind, 'binding_id': 'a_group01', 'workflow': {'entry': None, 'nodes': [], 'edges': []}}
-    node[field] = {'params': {}, 'retry': 1, 'retry_delay_seconds': 1, 'retry_backoff': 2, 'failure_actions': [], 'timeout_seconds': 1}[field]
-    source = rule([node], [edge('a_group01', None, node['branches'][0]['id'] if kind == 'event_group' else 'next')])
+    if kind == 'event_group':
+        node = group('a_group01', [branch('b_a_group01_0'), branch('b_a_group01_1', otherwise=True)])
+        nodes = [trigger('a_watch_start01'), node,
+                 {'type': 'condition', 'binding_id': 'a_predicate_000001', 'parent': 'a_group01',
+                  'predicate': {'op': 'is_true', 'left': True}}]
+        edges = [edge('a_watch_start01', 'a_group01', 'event'),
+                 edge('a_predicate_000001', 'a_group01', 'result', channel='condition', target_port='b_a_group01_0')]
+    else:
+        node = {'type': kind, 'binding_id': 'a_group01'}
+        nodes = [trigger('a_watch_start01'), node]
+        edges = [edge('a_watch_start01', 'a_group01', 'event')]
+    node[field] = {'params': {}, 'retry': 1, 'retry_delay_seconds': 1, 'retry_backoff': 2,
+                   'failure_actions': [], 'timeout_seconds': 1}[field]
+    source = rule(nodes, edges)
     errors = validate_runtime_structure(source)
     assert any((field if field != 'failure_actions' else '已移除') in error for error in errors)
 
@@ -899,7 +1008,7 @@ def test_event_group_rejects_error_continuation_and_timeout_stays_failed():
 def test_reload_finishes_waiting_run_without_more_events_and_releases_old_generation(change):
     from notmyfault.tests.api_support import create_test_engine
     packets, calls, contexts = [], [], []
-    source = canvas_fixture(waiting_rule())
+    source = waiting_rule()
     engine = create_test_engine({'rules': []}, on_event=lambda event: packets.append(event.to_dict()))
     engine.triggers_meta.update(TRIGGERS)
     engine.actions_meta.update(ACTIONS)
@@ -936,10 +1045,24 @@ def test_reload_finishes_waiting_run_without_more_events_and_releases_old_genera
 @pytest.mark.parametrize('first', [True, False])
 def test_group_records_only_evaluated_branches_and_short_circuited_predicates(first, tmp_path):
     from notmyfault.core.run_history import RunHistory
-    choose = group('a_choice1', [{'op': 'all', 'children': [{'op': 'is_true', 'left': first}, {'op': 'is_true', 'left': True}]},
-                                 {'op': 'is_true', 'left': True}, None])
-    source = rule([choose, action('a_after01', 'after')], [
-        *(edge('a_choice1', 'a_after01', branch['id']) for branch in choose['branches']), edge('a_after01', None)])
+
+    choose = group('a_choice1', [branch('b_a_choice1_0'), branch('b_a_choice1_1'),
+                                 branch('b_a_choice1_2', otherwise=True)])
+    nodes = [trigger('a_watch_start01'), choose,
+        {'type': 'logic', 'binding_id': 'a_predicate_000001', 'parent': 'a_choice1', 'op': 'all'},
+        {'type': 'condition', 'binding_id': 'a_predicate_000002', 'parent': 'a_choice1',
+         'predicate': {'op': 'is_true', 'left': first}},
+        {'type': 'condition', 'binding_id': 'a_predicate_000003', 'parent': 'a_choice1',
+         'predicate': {'op': 'is_true', 'left': True}},
+        {'type': 'condition', 'binding_id': 'a_predicate_000004', 'parent': 'a_choice1',
+         'predicate': {'op': 'is_true', 'left': True}}, action('a_after01', 'after')]
+    edges = [edge('a_watch_start01', 'a_choice1', 'event'),
+        edge('a_predicate_000002', 'a_predicate_000001', 'result', channel='condition'),
+        edge('a_predicate_000003', 'a_predicate_000001', 'result', channel='condition'),
+        edge('a_predicate_000001', 'a_choice1', 'result', channel='condition', target_port=choose['branches'][0]['id']),
+        edge('a_predicate_000004', 'a_choice1', 'result', channel='condition', target_port=choose['branches'][1]['id']),
+        *(edge('a_choice1', 'a_after01', branch['id']) for branch in choose['branches'][:2])]
+    source = rule(nodes, edges)
     source, context, observer, executor, records, events = setup(source)
     assert executor.execute_workflow('one', source, source['name'], context).status == 'succeeded'
     selected = next(data for kind, data in events if kind == 'run.group.selected' and data['step_id'] == 'a_choice1')
@@ -951,10 +1074,10 @@ def test_group_records_only_evaluated_branches_and_short_circuited_predicates(fi
         ['is_true', 'is_true', 'all'] if first else ['is_true', 'all'])
     assert all(item.get('node_id') for record in evaluated for item in record['predicates'])
     history = RunHistory(str(tmp_path / 'runs.jsonl'))
-    history.record({'v': 1, 'type': 'run.triggered', 'data': {'run_id': 'run_graph'}})
+    history.record_async({'v': 1, 'type': 'run.triggered', 'data': {'run_id': 'run_graph'}})
     for kind, data in events:
-        history.record({'v': 1, 'type': kind, 'data': data})
-    history.flush()
+        history.record_async({'v': 1, 'type': kind, 'data': data})
+    assert history.flush()
     saved = next(step for step in RunHistory(history.path).get_run('run_graph')['steps'] if step['step_id'] == 'a_choice1')
     assert saved['evaluated_branches'] == evaluated
     assert saved['branch'] == choose['branches'][0 if first else 1]['id']
@@ -962,9 +1085,18 @@ def test_group_records_only_evaluated_branches_and_short_circuited_predicates(fi
 
 def test_group_condition_error_is_recorded_without_false_or_else_selection(tmp_path):
     from notmyfault.core.run_history import RunHistory
-    choose = group('a_choice1', [{'op': 'is_true', 'left': False},
-        {'op': 'eq', 'left': {'$ref': {'scope': 'trigger', 'node': 't_steam01', 'path': ['value']}}, 'right': 1}, None], triggers=[leaf('steam', 't_steam01')])
-    source = rule([choose], [edge('a_choice1', None, branch['id']) for branch in choose['branches']])
+    choose = group('a_choice1', [branch('b_a_choice1_0'), branch('b_a_choice1_1'),
+                                 branch('b_a_choice1_2', otherwise=True)])
+    nodes = [trigger('a_watch_start01'), choose,
+        {'type': 'condition', 'binding_id': 'a_predicate_000001', 'parent': 'a_choice1',
+         'predicate': {'op': 'is_true', 'left': False}},
+        {'type': 'condition', 'binding_id': 'a_predicate_000002', 'parent': 'a_choice1',
+         'predicate': {'op': 'eq', 'left': {'$ref': {'scope': 'trigger', 'node': 't_steam01', 'path': ['value']}}, 'right': 1}},
+        trigger('a_watch_steam01', 'steam')]
+    source = rule(nodes, [
+        edge('a_watch_start01', 'a_choice1', 'event'),
+        edge('a_predicate_000001', 'a_choice1', 'result', channel='condition', target_port='b_a_choice1_0'),
+        edge('a_predicate_000002', 'a_choice1', 'result', channel='condition', target_port='b_a_choice1_1')])
     source, context, observer, executor, records, events = setup(source)
     assert executor.execute_workflow('one', source, source['name'], context).status == 'failed'
     assert not any(kind == 'run.group.selected' and data['step_id'] == 'a_choice1' for kind, data in events)
@@ -974,10 +1106,10 @@ def test_group_condition_error_is_recorded_without_false_or_else_selection(tmp_p
     assert 'result' not in evaluated[1] and evaluated[1]['error']['code'] == 'missing_binding_value'
     assert 'result' not in evaluated[1]['predicates'][0]
     history = RunHistory(str(tmp_path / 'runs.jsonl'))
-    history.record({'v': 1, 'type': 'run.triggered', 'data': {'run_id': 'run_graph'}})
+    history.record_async({'v': 1, 'type': 'run.triggered', 'data': {'run_id': 'run_graph'}})
     for kind, data in events:
-        history.record({'v': 1, 'type': kind, 'data': data})
-    history.flush()
+        history.record_async({'v': 1, 'type': kind, 'data': data})
+    assert history.flush()
     restored = next(step for step in RunHistory(history.path).get_run('run_graph')['steps'] if step['step_id'] == 'a_choice1')
     assert restored['evaluated_branches'] == evaluated and 'branch' not in restored
 

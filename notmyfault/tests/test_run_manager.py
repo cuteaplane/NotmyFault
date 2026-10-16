@@ -1,3 +1,4 @@
+import json
 import copy
 import threading
 import time
@@ -320,7 +321,7 @@ class TestQueueMode:
         scheduler.shutdown()
 
 
-def test_execute_exception_emits_stable_terminal_event():
+def test_execute_exception_emits_stable_terminal_event(capsys):
     events = []
 
     def fail(*args):
@@ -332,7 +333,7 @@ def test_execute_exception_emits_stable_terminal_event():
     )
     context = make_context()
     assert scheduler.submit("key", {"rule_id": "r_rule001"}, "规则", context) == "started"
-    wait_until(lambda: scheduler.stats()["key"]["running"] == 0)
+    assert scheduler.wait_for_idle(5)
 
     failures = [data for kind, data in events if kind == "run.failed"]
     assert failures == [{
@@ -342,11 +343,29 @@ def test_execute_exception_emits_stable_terminal_event():
         "status": "failed",
         "error": {
             "code": "execution_failed",
-            "message": "工作流执行异常",
+            "message": "工作流执行异常（RuntimeError）",
         },
     }]
     assert "private detail" not in str(failures)
+    error_log = next(line for line in capsys.readouterr().out.splitlines() if '"event": "workflow_execution_failed"' in line)
+    logged = json.loads(error_log.partition("] ")[2])
+    assert logged["error_type"] == "RuntimeError"
+    assert "RuntimeError: private detail" in logged["traceback"]
     scheduler.shutdown()
+def test_event_callback_failure_does_not_leave_worker_accounted_as_running():
+    def callback(kind, _data):
+        if kind == "run.succeeded":
+            raise RuntimeError("subscriber failed")
+
+    manager = RunManager(lambda *_args: None, on_event=callback)
+    try:
+        assert manager.submit("key", {"rule_id": "r_callback"}, "规则", make_context()) == "started"
+        assert manager.wait_for_idle(5)
+        assert manager.rule_status("r_callback") == {
+            "running": 0, "queued": 0, "last_status": "succeeded",
+        }
+    finally:
+        manager.shutdown()
 
 
 def submit_from_thread_with_context(scheduler, rule, rule_key, result, index):
@@ -431,6 +450,38 @@ class TestShutdownAndReload:
         first_thread.join(timeout=5)
 
 
+def test_deleted_rule_late_completion_cannot_replace_recreated_rule_status():
+    from notmyfault.core.run_manager import RunOutcome
+
+    jobs = []
+    manager = RunManager(
+        lambda _key, _rule, _name, context: RunOutcome(
+            "failed" if context["run"]["id"] == "run_old" else "succeeded"
+        ),
+        max_workers=2,
+        spawn_thread_fn=jobs.append,
+    )
+    rule = {"rule_id": "r_recreated", "concurrency": {"mode": "parallel", "max_concurrency": 2}}
+    try:
+        assert manager.submit("r_recreated", rule, "规则", make_context(run_id="run_old")) == "started"
+        assert manager.drop_rule("r_recreated") == 0
+        assert manager.rule_status("r_recreated") == {
+            "running": 1, "queued": 0, "last_status": None,
+        }
+        assert manager.submit("r_recreated", rule, "规则", make_context(run_id="run_new")) == "started"
+        assert len(jobs) == 2
+        jobs[1]()
+        assert manager.rule_status("r_recreated") == {
+            "running": 1, "queued": 0, "last_status": "succeeded",
+        }
+        jobs[0]()
+        assert manager.wait_for_idle(5)
+        assert manager.rule_status("r_recreated") == {
+            "running": 0, "queued": 0, "last_status": "succeeded",
+        }
+        assert manager.stats()["r_recreated"] == {"running": 0, "queued": 0}
+    finally:
+        manager.shutdown()
 class TestEngineWiring:
     def _make_engine(self, rule, on_event):
         from notmyfault.tests.api_support import create_test_engine
@@ -553,6 +604,16 @@ class TestEngineWiring:
 
         release.set()
         first.join(timeout=5)
+        assert engine._run_manager.wait_for_idle(timeout=5)
+        assert engine._run_manager.rule_status("r_queue001")["last_status"] is None
+        for plugin_id in ("hotkey", "ready"):
+            engine.triggers_meta[plugin_id]["trigger_api"] = "event-v2"
+            engine.triggers_funcs[plugin_id] = lambda meta, config, emit, stop: None
+        engine.triggers_meta["hotkey"]["params"] = [{"name": "key", "type": "text"}]
+        engine.apply_rules([rule])
+        trigger_rule()
+        assert engine._run_manager.wait_for_idle(timeout=5)
+        assert engine._run_manager.rule_status("r_queue001")["last_status"] == "succeeded"
 
 
 def test_queued_cancellation_never_enters_executor_and_has_one_terminal():
@@ -601,7 +662,7 @@ def test_pending_rules_take_turns_and_callbacks_can_read_from_another_thread():
 
 
 
-@pytest.mark.parametrize("terminal", ["succeeded", "failed", "cancelled", "timed_out", "dropped"])
+@pytest.mark.parametrize("terminal", ["succeeded", "recovered", "failed", "cancelled", "timed_out", "dropped"])
 def test_terminal_runs_stop_accepting_events(terminal):
     from types import SimpleNamespace
     from notmyfault.core.condition_program import build_matcher
@@ -609,7 +670,8 @@ def test_terminal_runs_stop_accepting_events(terminal):
     from notmyfault.core.run_manager import RunOutcome
 
     condition = {"type": "hotkey", "binding_id": "t_hot001", "params": {}}
-    compiled = SimpleNamespace(source=native_rule(condition, []), matcher_spec=build_matcher(condition))
+    source = native_rule(condition, [])
+    compiled = SimpleNamespace(source=source, matcher_spec=build_matcher(source))
     observation = RunEventObservation(compiled)
     context = make_context()
     context["_event_observation"] = observation

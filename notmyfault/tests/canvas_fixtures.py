@@ -75,7 +75,12 @@ def runtime_sequence(steps, **fields):
 
 
 def execute_runtime(engine, key, rule, name, context):
+    import threading
+    from uuid import uuid4
+
     from notmyfault.core.canvas_workflow import CanvasProgram
+    from notmyfault.core.run_manager import RunOutcome
+
     context['_plugins'] = engine._plugins.snapshot([])
     program = CanvasProgram(rule)
     roots = program.roots()
@@ -83,7 +88,30 @@ def execute_runtime(engine, key, rule, name, context):
         context['_entry_root'] = roots[0]
         if program.nodes[roots[0]]['type'] == 'trigger':
             context['_entry_choices'] = {roots[0]: 'event'}
-    return engine._run_manager.execute_sync(rule.get('rule_id', key), rule, name, context)
+    run_id = context.setdefault('run', {}).setdefault('id', f'run_{uuid4().hex}')
+    terminal = threading.Event()
+    completed = {}
+    terminal_types = {
+        'run.succeeded', 'run.recovered', 'run.failed', 'run.cancelled',
+        'run.timed_out', 'run.dropped',
+    }
+
+    def on_event(event):
+        if event.run_id == run_id and event.type in terminal_types:
+            completed['event'] = event
+            terminal.set()
+
+    subscription = engine.events.subscribe(on_event)
+    try:
+        decision = engine._run_manager.submit(rule.get('rule_id', key), rule, name, context)
+        if not terminal.wait(10):
+            raise TimeoutError(f'运行 {run_id} 未在限定时间内结束（提交状态：{decision}）')
+        event = completed['event']
+        if event.type == 'run.dropped':
+            return None
+        return RunOutcome(event.type.removeprefix('run.'), event.data, event.error)
+    finally:
+        engine.events.unsubscribe(subscription)
 
 
 def branch_rule(signal, branches, *, following=(), group_id='a_branch01', **fields):

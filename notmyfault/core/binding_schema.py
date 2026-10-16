@@ -20,14 +20,16 @@ from notmyfault.core.workflow_graph import (
 
 
 def output_type(meta, *, parameters=False):
+    key = "params" if parameters else "outputs"
     properties, required = {}, []
-    for item in meta.get("params" if parameters else "outputs", []):
-        field = {"name": item, "type": "any"} if isinstance(item, str) else item
-        if not isinstance(field, dict) or not isinstance(field.get("name"), str):
+    for item in meta.get(key, []):
+        if not isinstance(item, dict):
+            raise DataTypeError(f"{key} 字段声明必须是对象", location=key, code="invalid_field")
+        if not isinstance(item.get("name"), str):
             continue
-        properties[field["name"]] = field_type(field, parameter=parameters)
-        if field.get("required") is not False:
-            required.append(field["name"])
+        properties[item["name"]] = field_type(item, parameter=parameters)
+        if item.get("required") is not False:
+            required.append(item["name"])
     return normalize_type({"type": "object", "properties": properties, "required": required, "additional_properties": False})
 
 

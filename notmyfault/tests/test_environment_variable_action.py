@@ -36,7 +36,6 @@ def test_manifest_is_cross_platform_without_capabilities():
     assert meta["permissions"] == ["native_api"]
     assert "requires_capabilities" not in meta
     assert meta["idempotent"] is False
-    assert meta["enabled"] is True
     assert meta["package_name"] == "io.github.notmyfault.environment_variable"
     assert meta["version"] == "1.0"
     assert meta["version_code"] == 1
@@ -66,7 +65,7 @@ def test_manifest_requires_admin_approval_for_setting_variables():
 def test_get_existing(monkeypatch):
     module = load_module()
     monkeypatch.setenv("NMF_EV_TEST_EXISTING", "hello")
-    result = module.run({}, {"mode": "get", "name": "NMF_EV_TEST_EXISTING"})
+    result = module.run_with_context({}, {"mode": "get", "name": "NMF_EV_TEST_EXISTING"}, {})
     assert result == {
         "name": "NMF_EV_TEST_EXISTING",
         "value": "hello",
@@ -77,9 +76,10 @@ def test_get_existing(monkeypatch):
 def test_get_missing_empty(monkeypatch):
     module = load_module()
     monkeypatch.delenv("NMF_EV_TEST_MISSING", raising=False)
-    result = module.run(
+    result = module.run_with_context(
         {},
         {"mode": "get", "name": "NMF_EV_TEST_MISSING", "missing": "empty"},
+        {},
     )
     assert result == {
         "name": "NMF_EV_TEST_MISSING",
@@ -92,49 +92,53 @@ def test_get_missing_error(monkeypatch):
     module = load_module()
     monkeypatch.delenv("NMF_EV_TEST_MISSING", raising=False)
     with pytest.raises(ValueError, match="环境变量不存在"):
-        module.run(
+        module.run_with_context(
             {},
             {"mode": "get", "name": "NMF_EV_TEST_MISSING", "missing": "error"},
+            {},
         )
 
 
 def test_set_creates_and_overwrites(monkeypatch):
     module = load_module()
     monkeypatch.delenv("NMF_EV_TEST_SET", raising=False)
-    created = module.run(
+    created = module.run_with_context(
         {},
         {"mode": "set", "name": "NMF_EV_TEST_SET", "value": "one"},
+        {},
     )
     assert created == {
         "name": "NMF_EV_TEST_SET",
         "value": "one",
         "existed": False,
     }
-    overwritten = module.run(
+    overwritten = module.run_with_context(
         {},
         {"mode": "set", "name": "NMF_EV_TEST_SET", "value": "two"},
+        {},
     )
     assert overwritten == {
         "name": "NMF_EV_TEST_SET",
         "value": "two",
         "existed": True,
     }
-    assert module.run({}, {"mode": "get", "name": "NMF_EV_TEST_SET"})["value"] == "two"
+    assert module.run_with_context({}, {"mode": "get", "name": "NMF_EV_TEST_SET"}, {})["value"] == "two"
 
 
 def test_set_allows_empty_value(monkeypatch):
     module = load_module()
     monkeypatch.delenv("NMF_EV_TEST_EMPTY", raising=False)
-    result = module.run(
+    result = module.run_with_context(
         {},
         {"mode": "set", "name": "NMF_EV_TEST_EMPTY", "value": ""},
+        {},
     )
     assert result == {
         "name": "NMF_EV_TEST_EMPTY",
         "value": "",
         "existed": False,
     }
-    assert module.run({}, {"mode": "get", "name": "NMF_EV_TEST_EMPTY"}) == {
+    assert module.run_with_context({}, {"mode": "get", "name": "NMF_EV_TEST_EMPTY"}, {}) == {
         "name": "NMF_EV_TEST_EMPTY",
         "value": "",
         "existed": True,
@@ -143,16 +147,16 @@ def test_set_allows_empty_value(monkeypatch):
     try:
         assert json.loads(subprocess.check_output([sys.executable, "-c", child], text=True)) == ""
     finally:
-        module.run({}, {"mode": "unset", "name": "NMF_EV_TEST_EMPTY"})
+        module.run_with_context({}, {"mode": "unset", "name": "NMF_EV_TEST_EMPTY"}, {})
     assert json.loads(subprocess.check_output([sys.executable, "-c", child], text=True)) is None
 
 
 def test_unset_present_and_absent(monkeypatch):
     module = load_module()
     monkeypatch.setenv("NMF_EV_TEST_UNSET", "gone")
-    present = module.run({}, {"mode": "unset", "name": "NMF_EV_TEST_UNSET"})
+    present = module.run_with_context({}, {"mode": "unset", "name": "NMF_EV_TEST_UNSET"}, {})
     assert present == {"name": "NMF_EV_TEST_UNSET", "existed": True}
-    absent = module.run({}, {"mode": "unset", "name": "NMF_EV_TEST_UNSET"})
+    absent = module.run_with_context({}, {"mode": "unset", "name": "NMF_EV_TEST_UNSET"}, {})
     assert absent == {"name": "NMF_EV_TEST_UNSET", "existed": False}
 
 
@@ -168,7 +172,7 @@ def test_read_and_unset_tolerate_concurrent_removal(monkeypatch, mode, method):
 
     def first_operation():
         try:
-            results.append(module.run({}, {"mode": mode, "name": name}))
+            results.append(module.run_with_context({}, {"mode": mode, "name": name}, {}))
         except Exception as error:
             errors.append(error)
 
@@ -210,12 +214,12 @@ def test_reject_bad_names():
     ]
     for name, match in cases:
         with pytest.raises(ValueError, match=match):
-            module.run({}, {"mode": "get", "name": name})
+            module.run_with_context({}, {"mode": "get", "name": name}, {})
 
 
 def test_reject_non_string_name_and_unknown_mode():
     module = load_module()
     with pytest.raises(ValueError, match="变量名必须是文本"):
-        module.run({}, {"mode": "get", "name": 123})
+        module.run_with_context({}, {"mode": "get", "name": 123}, {})
     with pytest.raises(ValueError, match="未知操作"):
-        module.run({}, {"mode": "append", "name": "NMF_EV_TEST"})
+        module.run_with_context({}, {"mode": "append", "name": "NMF_EV_TEST"}, {})

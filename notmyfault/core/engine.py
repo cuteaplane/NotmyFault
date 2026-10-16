@@ -20,17 +20,13 @@ from notmyfault.security.plugin_loader import (
 )
 from notmyfault.core.plugin_runtime import PluginRuntime
 from notmyfault.core.generation_manager import GenerationManager
-from notmyfault.core.run_manager import RunManager, RunOutcome
+from notmyfault.core.run_manager import RunManager
 from notmyfault.core.event_stream import Event, EventStream
 from notmyfault.core.engine_events import use_stream
-from notmyfault.core.rules import (
-    validate_rules,
-)
 from notmyfault.core.rule_model import normalize_rules
-from notmyfault.core.runtime_rules import PreparedRules, rule_key
+from notmyfault.core.runtime_rules import PreparedRules
 from notmyfault.core.compiled_rules import thaw
-from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions, find_graph_node, find_graph_scope, execution_nodes, NATIVE_NODES
-from notmyfault.security.plugin_schema import check_payload_contract
+from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions, find_graph_node, find_graph_scope, execution_nodes, NATIVE_NODES, NON_ACTION_NODES
 from notmyfault.security.security import (
     SecurityMode,
     detect_security_mode as _detect_security_mode,
@@ -160,7 +156,7 @@ class AutomationEngine:
                 self._shutdown_flag and self._shutdown_flag.is_set()
             ),
             safe_on_event=self._safe_on_event,
-            execute_workflow_cb=self.execute_workflow,
+            status_lookup=lambda rule_id: self._run_manager.rule_status(rule_id),
             scheduler_submit_fn=lambda *args: self._run_manager.submit(*args),
             alert_fn=lambda title, message: self._alert_user(title, message),
         )
@@ -181,7 +177,6 @@ class AutomationEngine:
             execute_fn=self._workflow_executor.execute_workflow,
             on_event=self._safe_on_event,
         )
-        self._event_bus._status_lookup = self._run_manager.rule_status
         self._generations = GenerationManager(self._plugins, self._run_manager, self.events, lock=self._rules_lock,
                                               reconcile=self._trigger_host.reconcile, on_change=self._trigger_host._wake.set,
                                               clock=self.clock)
@@ -189,9 +184,6 @@ class AutomationEngine:
         self._trigger_host.deadline_callback = self._condition_deadline
         # isolated 动作崩了通过这个回调推 plugin_worker_crashed 事件
         plugin_worker.set_crash_callback(self._safe_on_event)
-        # 旧扩展和测试仍直接读取这些同步对象
-        self._action_lock = self._workflow_executor.action_lock
-        self._action_done = self._workflow_executor.action_done
         self._rule_watcher = RuleWatcher(
             lambda: self._rules_store.rules_path, self._rules_store.load_verified_rules,
             self.apply_rules, on_error=self._watcher_error,
@@ -262,9 +254,6 @@ class AutomationEngine:
                 f"已跳过 {prepared.total - len(prepared)} 条规则，引擎继续运行。请在 Dashboard 查看规则错误并修正。",
             )
 
-    @property
-    def _active_actions(self) -> int:
-        return self._workflow_executor.active_actions
 
     @staticmethod
     def _alert_user(title: str, message: str, open_dashboard: bool = False) -> None:
@@ -422,36 +411,6 @@ class AutomationEngine:
             for command in contributes.get("commands", [])
         )
 
-    def _validate_all_rules(self) -> Tuple[int, int]:
-        """校验规则引用和参数并记录问题"""
-        # 复制规则列表后再校验，热重载线程可以同时准备下一份配置
-        with self._rules_lock:
-            rules = list(self.rules)
-
-        self._diag_obj.reset_rule_issues()
-        valid, total, issues, warnings = validate_rules(
-            rules, self.triggers_meta, self.actions_meta
-        )
-
-        # 引用问题写入诊断和日志，Dashboard 可以查看
-        for rule_name, msg in issues:
-            print(f"[Engine] [!!] 规则 \"{rule_name}\" {msg}", file=sys.stderr)
-            self._diag_obj.add_rule_issue(rule_name, msg)
-            engine_error("rule_issue", rule=rule_name, issue=msg)
-
-        # 参数类型不匹配只打印提醒，保持原有行为
-        for rule_name, msg in warnings:
-            print(f"[Engine] [!!] 规则 \"{rule_name}\" {msg}", file=sys.stderr)
-
-        print(f"[Engine] 规则校验完成: {valid}/{total} 条有效规则")
-
-        if valid < total:
-            self._alert_user(
-                "规则配置异常",
-                f"{total - valid} 条规则引用了未加载的插件或参数不匹配，请检查Engine日志",
-            )
-
-        return valid, total
 
     # 事件分发逻辑在 EventBus 里，保留老名字，触发器线程和测试直接调用
     def emit_event(
@@ -462,8 +421,6 @@ class AutomationEngine:
     ) -> None:
         self._event_bus.emit_event(event_type, event_payload, instance=instance)
 
-    def call_notmyfault(self, event_data: Dict[str, Any]) -> None:
-        self._event_bus.call_notmyfault(event_data)
 
     def run_manual_rule(self, rule_index: int, *, trigger_payloads=None, event_payload=None) -> tuple[bool, str] | tuple[bool, str, str]:
         """从 Dashboard 立即执行指定规则"""
@@ -531,7 +488,7 @@ class AutomationEngine:
             context["_compiled_rule"] = compiled
             context["_compiled_refs"] = compiled.references
             context["_trigger_configs"] = prepared.contexts[rule_id]["_trigger_configs"]
-            selected_count = sum(node["type"] not in NATIVE_NODES - {"set_variable"} for node, _path in execution_nodes(rule['workflow'], start_step_id, end_step_id))
+            selected_count = sum(node["type"] not in NON_ACTION_NODES for node, _path in execution_nodes(rule['workflow'], start_step_id, end_step_id))
             if start_step_id and find_graph_node(rule["workflow"], start_step_id) is None:
                 return False, "测试入口节点不存在", run_id
             if end_step_id and find_graph_node(rule["workflow"], end_step_id) is None:
@@ -621,37 +578,9 @@ class AutomationEngine:
             if generation is not None:
                 generation.release()
 
-    def execute_workflow(
-        self,
-        workflow_key: str,
-        rule: Dict[str, Any],
-        rule_name: str,
-        context: Dict[str, Any],
-    ) -> None:
-        prepared = self._generations.prepare([rule])
-        if not prepared.compiled:
-            return RunOutcome('failed', error={'code': 'invalid_rule', 'message': '；'.join(message for _name, message in prepared.issues) or '规则无法编译'})
-        identity = next(iter(prepared.compiled))
-        compiled = prepared.compiled[identity]
-        rule = compiled.source
-        context.update(prepared.contexts[identity])
-        context['_compiled_rule'] = compiled
-        context['_compiled_refs'] = compiled.references
-        context['_plugins'] = prepared.plugins
-        return self._run_manager.execute_sync(
-            workflow_key, rule, rule_name, context
-        )
 
     def cancel_run(self, run_id: str) -> bool:
         return self._run_manager.cancel_run(run_id)
-
-    def execute_action(
-        self,
-        action: Dict[str, Any],
-        rule_name: str = "",
-        context: Optional[Dict[str, Any]] = None,
-    ) -> Any:
-        return self._workflow_executor.execute_action(action, rule_name, context)
 
     def _run_action(
         self,

@@ -198,14 +198,14 @@ def test_watcher_start_keeps_stamp_captured_before_initial_rule_load(tmp_path):
     watcher = RuleWatcher(lambda: path, path.read_text, lambda doc, source: calls.append(doc), clock=clock)
     watcher.acknowledge()
     original = watcher._stamp
-    path.write_text("new")
+    path.write_text("new content")
     try:
         watcher.start()
         assert watcher._stamp == original
         watcher.check_once()
         clock.advance(0.3)
         watcher.check_once()
-        assert calls == ["new"]
+        assert calls == ["new content"]
     finally:
         assert watcher.stop(1)
 

@@ -94,9 +94,8 @@ def test_desktop_runner_forwards_event_sink_to_engine_factory(monkeypatch, tmp_p
     )
     runner._handle_engine_state("starting")
     runner._handle_engine_state("stopped")
-    assert notifications == []
     runner._handle_engine_state("running")
-    assert notifications == [("NotmyFault", "引擎已启动")]
+    assert notifications == []
     cleanup = []
     runner._runtime = SimpleNamespace(
         request_stop=lambda: cleanup.append("request_stop"),

@@ -6,6 +6,8 @@ from typing import Protocol
 
 
 class Clock(Protocol):
+    """规则时钟可以暂停，线程退出和文件刷新使用真实时间计时"""
+
     def monotonic(self) -> float: ...
 
     def time(self) -> float: ...

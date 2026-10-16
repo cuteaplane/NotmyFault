@@ -97,7 +97,7 @@ def test_elif_selects_first_match_and_history_keeps_branch(first, second, expect
         assert engine.events.flush()
         history = RunHistory(str(tmp_path / "runs.jsonl"))
         for timestamp, (name, data) in enumerate(events):
-            history.record({"v": 1, "type": name, "data": data, "ts": timestamp})
+            history.record_async({"v": 1, "type": name, "data": data, "ts": timestamp})
         saved = next(step for step in history.get_run("run_elif")["steps"] if step["step_id"] == "a_branch01")
         assert saved["branch"] == selected_branch(expected)
         assert saved["status"] == "succeeded"
@@ -263,7 +263,7 @@ def test_run_variables_follow_executed_branches_and_survive_failed_assignment(tm
     history = RunHistory(str(tmp_path / "runs.jsonl"))
     assert engine.events.flush()
     for timestamp, (name, data) in enumerate(events):
-        history.record({"v": 1, "type": name, "data": data, "ts": timestamp})
+        history.record_async({"v": 1, "type": name, "data": data, "ts": timestamp})
     failed = next(step for step in history.get_run("run_variables")["steps"] if step["step_id"] == "a_invalid1")
     assert failed["status"] == "failed"
     assert failed["error"]["code"] == "type_mismatch"
@@ -725,30 +725,38 @@ class TestExecuteAction:
 
         assert after == [1]
 
-    def test_pipeline_runs_failure_actions_before_continuing_main_flow(self):
+    def test_pipeline_runs_recovery_graph_before_continuing_main_flow(self):
         engine = make_engine()
         calls = []
         register_action(engine, "broken", lambda meta, params, _run_context: 1 / 0)
         register_action(engine, "recover", lambda meta, params, _run_context: calls.append("recover"))
         register_action(engine, "after", lambda meta, params, _run_context: calls.append("after"))
         context = _context()
+        rule = {
+            "rule_id": "r_recovery_fixture01",
+            "name": "测试规则",
+            "workflow": {
+                "entry": None,
+                "nodes": [
+                    {"binding_id": "a_source_recovery01", "type": "trigger",
+                     "trigger": {"type": "__test_signal__", "params": {}, "binding_id": "t_test00001"}},
+                    {"binding_id": "a_bad001", "type": "broken", "params": {}, "on_error": "continue"},
+                    {"binding_id": "a_after001", "type": "after", "params": {}},
+                    {"binding_id": "a_handler_recovery01", "type": "action_group", "exports": {}},
+                    {"binding_id": "a_rec001", "type": "recover", "parent": "a_handler_recovery01", "params": {}},
+                ],
+                "edges": [
+                    {"source": "a_source_recovery01", "port": "event", "target": "a_bad001", "channel": "control"},
+                    {"source": "a_bad001", "port": "next", "target": "a_after001", "channel": "control"},
+                    {"source": "a_bad001", "port": "failure", "target": "a_handler_recovery01", "channel": "control"},
+                    {"source": "a_handler_recovery01", "port": "entry", "target": "a_rec001", "channel": "control"},
+                ],
+            },
+        }
 
         execute_runtime(engine,
             "wf",
-            runtime_sequence([
-                {
-                    "type": "broken",
-                    "binding_id": "a_bad001",
-                    "params": {},
-                    "on_error": "continue",
-                    "failure_actions": [{
-                        "type": "recover",
-                        "binding_id": "a_rec001",
-                        "params": {},
-                    }],
-                },
-                {"type": "after", "binding_id": "a_after001", "params": {}},
-            ]),
+            rule,
             "规则",
             context,
         )
@@ -785,23 +793,28 @@ class TestExecuteAction:
         context = build_context(
             "规则", "manual", {}, [], run_id="run_cancel001"
         )
+        rule = {
+            "rule_id": "r_recovery_fixture01",
+            "name": "测试规则",
+            "workflow": {
+                "entry": None,
+                "nodes": [
+                    {"binding_id": "a_source_recovery01", "type": "trigger",
+                     "trigger": {"type": "__test_signal__", "params": {}, "binding_id": "t_test00001"}},
+                    {"binding_id": "a_wait001", "type": "waitable", "params": {}},
+                    {"binding_id": "a_handler_recovery01", "type": "action_group", "exports": {}},
+                    {"binding_id": "a_recover001", "type": "recover", "parent": "a_handler_recovery01", "params": {}},
+                ],
+                "edges": [
+                    {"source": "a_source_recovery01", "port": "event", "target": "a_wait001", "channel": "control"},
+                    {"source": "a_wait001", "port": "failure", "target": "a_handler_recovery01", "channel": "control"},
+                    {"source": "a_handler_recovery01", "port": "entry", "target": "a_recover001", "channel": "control"},
+                ],
+            },
+        }
         thread = threading.Thread(
             target=lambda *args: execute_runtime(engine, *args),
-            args=(
-                "wf",
-                runtime_sequence([{
-                    "type": "waitable",
-                    "binding_id": "a_wait001",
-                    "params": {},
-                    "failure_actions": [{
-                        "type": "recover",
-                        "binding_id": "a_recover001",
-                        "params": {},
-                    }],
-                }]),
-                "规则",
-                context,
-            ),
+            args=("wf", rule, "规则", context),
         )
 
         thread.start()
@@ -1019,7 +1032,7 @@ class TestExecuteAction:
         history = RunHistory(str(tmp_path / "runs.jsonl"))
         assert engine.events.flush()
         for timestamp, (name, data) in enumerate(events):
-            history.record({"v": 1, "type": name, "data": data, "ts": timestamp})
+            history.record_async({"v": 1, "type": name, "data": data, "ts": timestamp})
         saved = next(step for step in history.get_run("run_branch")["steps"] if step["step_id"] == "a_branch01")
         assert saved["status"] == ("succeeded" if succeeded else "failed")
         if not succeeded:

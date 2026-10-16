@@ -2,13 +2,14 @@ import threading
 import time
 from types import SimpleNamespace
 
+from notmyfault.core.clock import FakeClock
 from notmyfault.tests.api_support import create_test_engine
 from notmyfault.tests.canvas_fixtures import trigger_rule
 from notmyfault.core.workflow import build_context
 
 
-def make_engine():
-    engine = create_test_engine({"rules": []})
+def make_engine(**kwargs):
+    engine = create_test_engine({"rules": []}, **kwargs)
     engine._alert_user = lambda *a, **k: None
     return engine
 
@@ -45,7 +46,8 @@ class TestShutdownFuzz:
         assert engine._shutdown_clean is True
 
     def test_shutdown_with_stuck_trigger(self):
-        engine = make_engine()
+        clock = FakeClock()
+        engine = make_engine(clock=clock)
         shorten_timeouts(engine)
         stuck = threading.Event()
         entered = threading.Event()
@@ -56,9 +58,29 @@ class TestShutdownFuzz:
 
         start_trigger(engine, "fuzz_stuck", runner)
         assert entered.wait(1)
-        engine.shutdown()
-        stuck.set()
-        assert engine._shutdown_clean is False
+        finished = threading.Event()
+        errors = []
+
+        def stop():
+            try:
+                engine.shutdown()
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                finished.set()
+
+        stopper = threading.Thread(target=stop, daemon=True)
+        stopper.start()
+        try:
+            assert finished.wait(2)
+            if errors:
+                raise errors[0]
+            assert engine._shutdown_clean is False
+        finally:
+            stuck.set()
+            clock.advance(60)
+            stopper.join(timeout=5)
+            engine.shutdown()
 
     def test_shutdown_with_stuck_action(self):
         engine = make_engine()
@@ -68,7 +90,7 @@ class TestShutdownFuzz:
         teardown = []
         engine._plugin_modules["fuzz_slow"] = SimpleNamespace(teardown=lambda: teardown.append(True))
 
-        def slow_action(meta, params):
+        def slow_action(meta, params, context):
             entered.set()
             release.wait(timeout=10)
 

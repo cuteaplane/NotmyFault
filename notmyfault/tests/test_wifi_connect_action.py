@@ -55,13 +55,13 @@ def test_manifest_is_valid_cross_platform_action():
 def test_connect_requires_ssid(params):
     module = load_module()
     with pytest.raises(ValueError, match="必须填写目标 SSID"):
-        module.run({}, params)
+        module.run_with_context({}, params, {})
 
 
 def test_unknown_action_rejected():
     module = load_module()
     with pytest.raises(ValueError, match="不支持的 WiFi 操作"):
-        module.run({}, {"action": "scan"})
+        module.run_with_context({}, {"action": "scan"}, {})
 
 
 @pytest.mark.parametrize("ssid", ["HomeWiFi", '"家中:WiFi"', r"Lab\WiFi", "Cafe:WiFi", 'Home"', " Home ", " ", "\u3000Home\u3000"])
@@ -117,16 +117,16 @@ def test_windows_connect_uses_netsh_and_waits_for_ssid(monkeypatch, ssid, profil
 
     if profile_kind in ("missing", "query_failed", "adapter_missing"):
         with pytest.raises(RuntimeError):
-            module.run({}, {"action": "connect", "ssid": ssid})
+            module.run_with_context({}, {"action": "connect", "ssid": ssid}, {})
         assert not any(command[:3] == ["netsh", "wlan", "connect"] for command in calls)
         return
     if profile_kind == "wrong_adapter_after_connect":
         with pytest.raises(RuntimeError, match="回读为"):
-            module.run({}, {"action": "connect", "ssid": ssid})
+            module.run_with_context({}, {"action": "connect", "ssid": ssid}, {})
         assert any(command[:3] == ["netsh", "wlan", "connect"] for command in calls)
         return
 
-    result = module.run({}, {"action": "connect", "ssid": ssid})
+    result = module.run_with_context({}, {"action": "connect", "ssid": ssid}, {})
 
     assert result["ssid"] == ssid
     assert result["previous_ssid"] == (ssid if profile_kind == "already_selected" else "OldNet")
@@ -283,7 +283,7 @@ def test_windows_connect_skips_when_already_on_target(monkeypatch):
         "run",
         lambda *args, **kwargs: pytest.fail("不应再调用 netsh"),
     )
-    result = module.run({}, {"action": "connect", "ssid": "HomeWiFi"})
+    result = module.run_with_context({}, {"action": "connect", "ssid": "HomeWiFi"}, {})
     assert result == {
         "action": "connect",
         "ssid": "HomeWiFi",
@@ -380,7 +380,7 @@ def test_windows_disconnect(monkeypatch):
     )
     monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
 
-    result = module.run({}, {"action": "disconnect"})
+    result = module.run_with_context({}, {"action": "disconnect"}, {})
     assert result["connected"] is False
     assert result["previous_ssid"] == "HomeWiFi"
     assert result["changed"] is True
@@ -441,7 +441,7 @@ def test_linux_connect_uses_saved_connection(monkeypatch, ssid, profile_kind, lo
         sleep=lambda _seconds: clock.__setitem__(0, clock[0] + 1),
     ))
 
-    result = module.run({}, {"action": "connect", "ssid": ssid})
+    result = module.run_with_context({}, {"action": "connect", "ssid": ssid}, {})
     assert result["method"] == "nmcli"
     assert result["ssid"] == ssid
     assert result["previous_ssid"] == "Cafe"
@@ -485,11 +485,11 @@ def test_linux_connect_with_password_for_new_network(monkeypatch, query_failure)
 
     if query_failure:
         with pytest.raises(RuntimeError):
-            module.run({}, {"action": "connect", "ssid": "NewNet", "password": "secret"})
+            module.run_with_context({}, {"action": "connect", "ssid": "NewNet", "password": "secret"}, {})
         assert not any(command[1:3] == ["connection", "up"] or command[1:4] == ["device", "wifi", "connect"] for command in calls)
         return
-    result = module.run(
-        {}, {"action": "connect", "ssid": "NewNet", "password": "secret"}
+    result = module.run_with_context(
+        {}, {"action": "connect", "ssid": "NewNet", "password": "secret"}, {}
     )
     assert result["ssid"] == "NewNet"
     connect_cmd = calls[1]
@@ -514,8 +514,8 @@ def test_linux_password_warning_printed_once(monkeypatch, capsys):
     monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
 
     params = {"action": "connect", "ssid": "NewNet", "password": "secret"}
-    assert module.run({}, params)["ssid"] == "NewNet"
-    assert module.run({}, params)["ssid"] == "NewNet"
+    assert module.run_with_context({}, params, {})["ssid"] == "NewNet"
+    assert module.run_with_context({}, params, {})["ssid"] == "NewNet"
 
     captured = capsys.readouterr()
     assert captured.err.count("进程命令行") == 1
@@ -556,9 +556,9 @@ def test_linux_disconnect_uses_wifi_device(monkeypatch, other_connected, query_f
 
     if query_failure:
         with pytest.raises(RuntimeError):
-            module.run({}, {"action": "disconnect"})
+            module.run_with_context({}, {"action": "disconnect"}, {})
     else:
-        result = module.run({}, {"action": "disconnect"})
+        result = module.run_with_context({}, {"action": "disconnect"}, {})
         assert result["changed"] is True
         assert result["connected"] is False
         assert result["previous_ssid"] == "HomeWiFi"

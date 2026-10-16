@@ -132,8 +132,8 @@ def test_recovery_history_preserves_original_failure_and_handler_result(tmp_path
     outcome, context, emitted = execute(rule, [])
     history = RunHistory(str(tmp_path / 'runs.jsonl'))
     for timestamp, (kind, data) in enumerate(emitted):
-        history.record({'v': 1, 'type': kind, 'data': data, 'ts': timestamp})
-    history.record({'v': 1, 'type': 'run.' + outcome.status, 'data': {'run_id': 'run_direct', 'rule_id': rule['rule_id']}, 'ts': len(emitted)})
+        history.record_async({'v': 1, 'type': kind, 'data': data, 'ts': timestamp})
+    history.record_async({'v': 1, 'type': 'run.' + outcome.status, 'data': {'run_id': 'run_direct', 'rule_id': rule['rule_id']}, 'ts': len(emitted)})
     history.flush()
     restored = RunHistory(history.path).get_run('run_direct')
     assert restored['status'] == 'recovered'

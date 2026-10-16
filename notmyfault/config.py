@@ -333,12 +333,17 @@ class SignedConfigStore:
             data,
         )
 
-    def _read_signed(self, path: str, label: str) -> Dict[str, Any]:
+    def _read_json(self, path: str, label: str, *, recoverable: bool = False) -> Any:
         try:
             with open(path, "r", encoding="utf-8") as file:
-                raw = json.load(file)
+                return json.load(file)
         except (json.JSONDecodeError, OSError, UnicodeDecodeError) as error:
-            raise ConfigValidationError(f"{label}文件无法解析: {error}", recoverable=True) from error
+            raise ConfigValidationError(
+                f"{label}文件无法解析: {error}", recoverable=recoverable
+            ) from error
+
+    def _read_signed(self, path: str, label: str) -> Dict[str, Any]:
+        raw = self._read_json(path, label, recoverable=True)
         if not isinstance(raw, dict):
             raise ConfigValidationError(f"{label}文件根节点必须是对象", recoverable=True)
         signature = raw.pop(_SIGNATURE_KEY, "")
@@ -388,9 +393,8 @@ class SignedConfigStore:
     def _recover_config(self) -> Dict[str, Any] | None:
         backup = self.config_path + ".bak"
         try:
-            with open(backup, "r", encoding="utf-8") as file:
-                data = json.load(file)
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            data = self._read_json(backup, "配置备份")
+        except ConfigValidationError:
             return None
         if not isinstance(data, dict):
             return None
@@ -412,9 +416,8 @@ class SignedConfigStore:
     def _recover_rules(self) -> List[Dict[str, Any]] | None:
         backup = self.rules_path + ".bak"
         try:
-            with open(backup, "r", encoding="utf-8") as file:
-                data = json.load(file)
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            data = self._read_json(backup, "规则备份")
+        except ConfigValidationError:
             return None
         if not isinstance(data, dict):
             return None
@@ -472,9 +475,8 @@ class SignedConfigStore:
                 "引擎已暂停，请核对下方配置摘要后选择处理方式。"
             )
         try:
-            with open(self.config_path, "r", encoding="utf-8") as file:
-                config = json.load(file)
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            config = self._read_json(self.config_path, "配置")
+        except ConfigValidationError:
             return {"status": "unreadable", "reason": "配置文件无法读取", "summary": None}
         if not isinstance(config, dict):
             return {"status": "unreadable", "reason": "配置根节点不是对象", "summary": None}
@@ -489,9 +491,8 @@ class SignedConfigStore:
         rules: List[Any] = []
         if os.path.exists(self.rules_path):
             try:
-                with open(self.rules_path, "r", encoding="utf-8") as file:
-                    rules_data = json.load(file)
-            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                rules_data = self._read_json(self.rules_path, "规则")
+            except ConfigValidationError:
                 return {"status": "unreadable", "reason": "规则文件无法读取", "summary": None}
             if not isinstance(rules_data, dict):
                 return {"status": "unreadable", "reason": "规则文件根节点不是对象", "summary": None}
@@ -512,11 +513,7 @@ class SignedConfigStore:
         return status
 
     def load_unsigned_files(self) -> tuple[dict, list[dict] | None]:
-        try:
-            with open(self.config_path, "r", encoding="utf-8") as file:
-                config = json.load(file)
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as error:
-            raise ConfigValidationError(f"配置文件无法解析: {error}") from error
+        config = self._read_json(self.config_path, "配置")
         if not isinstance(config, dict):
             raise ConfigValidationError("配置根节点不是对象")
         config.pop(_SIGNATURE_KEY, None)
@@ -526,11 +523,7 @@ class SignedConfigStore:
 
         normalized_rules: List[Dict[str, Any]] | None = None
         if os.path.exists(self.rules_path):
-            try:
-                with open(self.rules_path, "r", encoding="utf-8") as file:
-                    rules_data = json.load(file)
-            except (json.JSONDecodeError, OSError, UnicodeDecodeError) as error:
-                raise ConfigValidationError(f"规则文件无法解析: {error}") from error
+            rules_data = self._read_json(self.rules_path, "规则")
             if not isinstance(rules_data, dict):
                 raise ConfigValidationError("规则文件根节点不是对象")
             rules_data.pop(_SIGNATURE_KEY, None)

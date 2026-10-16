@@ -13,7 +13,7 @@ from notmyfault.core.variables import variable_definitions
 from notmyfault.extensions.protocol import owned_value_identity
 from notmyfault.core.predicates import validate_predicate
 from notmyfault.core.workflow_graph import (
-    NATIVE_NODES, iter_rule_actions, get_all_rule_events, iter_rule_event_nodes, validate_workflow_graph, entry_event_group,
+    NATIVE_NODES, NON_ACTION_NODES, iter_rule_actions, get_all_rule_events, iter_rule_event_nodes, entry_event_group,
 )
 from notmyfault.core.rule_model import normalize_rule_shape, normalize_rules, _BINDING_ID_RE, _RULE_ID_RE
 from notmyfault.core.condition_runtime import ConditionRuntime
@@ -101,11 +101,8 @@ def validate_rule_structure(rule: Any) -> List[str]:
     from notmyfault.core.canvas_workflow import validate_canvas_graph
     errors.extend(validate_canvas_graph(rule.get('workflow')))
 
-    def validate_action(action: Any, path: str) -> None:
-        if not isinstance(action, dict):
-            errors.append(f"{path} 必须是对象")
-            return
-        if action.get("type") in ("trigger", "condition", "logic", "event_group", "action_group", "merge", "end"):
+    def validate_action(action: Dict[str, Any], path: str) -> None:
+        if action.get("type") in NON_ACTION_NODES:
             return
         if action.get("type") == "set_variable":
             if not isinstance(action.get("variable"), str):
@@ -455,12 +452,8 @@ def validate_rules(
             continue
 
         rule_ok = True
-        for action, action_path in iter_rule_actions(rule, include_invalid=True):
-            if isinstance(action, dict) and action["binding_id"] not in active:
-                continue
-            if not isinstance(action, dict):
-                issues.append((rule_name, f"{action_path} 必须是对象"))
-                rule_ok = False
+        for action, action_path in iter_rule_actions(rule):
+            if action["binding_id"] not in active:
                 continue
             if action.get("type") in NATIVE_NODES:
                 continue

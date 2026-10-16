@@ -6,50 +6,60 @@ from hypothesis import given, settings, strategies as st
 from notmyfault.core.clock import FakeClock
 from notmyfault.core.condition_program import build_matcher
 from notmyfault.core.condition_runtime import ConditionRuntime
-from notmyfault.tests.canvas_fixtures import event_rule
 from notmyfault.tests.condition_reference import ReferenceConditionRuntime
 
 
 signals = st.sampled_from(["a", "b", "c"])
-leaf = st.builds(lambda kind, channel: {"type": kind, "params": {"channel": channel}}, signals, st.integers(0, 1))
-absence = st.builds(lambda child, window, repeat: {"op": "not", "children": [child], "within_seconds": window, "repeat": repeat},
-                    leaf, st.integers(1, 10), st.sampled_from(["once_until_seen", "every_window"]))
-
-
-def groups(children):
-    return st.one_of(
-        st.builds(lambda items, pick: {"op": "any", "children": items, "pick": pick},
-                  st.lists(children, min_size=1, max_size=3), st.sampled_from(["latest", "first"])),
-        st.builds(lambda items, consume, ttl: {"op": "all", "children": items, "consume": consume, "ttl_seconds": ttl},
-                  st.lists(children, min_size=1, max_size=3), st.sampled_from(["matched", "all", "none"]), st.integers(1, 20)),
-        st.builds(lambda items, consume, window: {"op": "all", "children": items, "consume": consume, "within_seconds": window},
-                  st.lists(children, min_size=1, max_size=3), st.sampled_from(["matched", "all", "none"]), st.integers(1, 10)),
-    )
-
-
-trees = st.recursive(st.one_of(leaf, absence), groups, max_leaves=8)
 operations = st.lists(st.tuples(st.integers(0, 15), st.sampled_from(["poll", "a", "b", "c"]), st.integers(0, 1), st.booleans(), st.booleans(), st.booleans()),
                      min_size=1, max_size=80)
 
 
-def identify(node):
-    result = copy.deepcopy(node)
-    events = []
-    def collect(current):
-        if 'op' not in current:
-            events.append(current)
-        for child in current.get('children', ()):
-            collect(child)
-    collect(result)
-    for index, event in enumerate(events):
-        event['binding_id'] = f't_leaf{index:06d}'
-    return result
+@st.composite
+def native_rules(draw, *, allowed_ops=("all", "any"), allow_repeat=True, max_leaves=8):
+    count = draw(st.integers(1, max_leaves))
+    nodes, edges, pool = [], [], []
+    for index in range(1, count + 1):
+        node = {'binding_id': f'a_signal_{index:06d}', 'type': 'trigger',
+                'trigger': {'binding_id': f't_leaf{index:06d}', 'type': draw(signals),
+                            'params': {'channel': draw(st.integers(0, 1))}}}
+        if draw(st.booleans()):
+            repeats = ["once_until_seen", "every_window"] if allow_repeat else ["once_until_seen"]
+            node['occurrence'] = 'absent'
+            node['duration_seconds'] = draw(st.integers(1, 10))
+            node['repeat'] = draw(st.sampled_from(repeats))
+        nodes.append(node)
+        pool.append((node['binding_id'], 'event'))
+    serial = 0
+    while len(pool) > 1:
+        size = draw(st.integers(2, min(3, len(pool))))
+        start = draw(st.integers(0, len(pool) - size))
+        segment = pool[start:start + size]
+        serial += 1
+        identity = f'a_logic_{serial:06d}'
+        op = draw(st.sampled_from(allowed_ops))
+        node = {'binding_id': identity, 'type': 'logic', 'op': op}
+        if op == 'any':
+            node['pick'] = draw(st.sampled_from(['latest', 'first']))
+        else:
+            node['consume'] = draw(st.sampled_from(['matched', 'all', 'none']))
+            if draw(st.booleans()):
+                node['within_seconds'] = draw(st.integers(1, 10))
+            else:
+                node['ttl_seconds'] = draw(st.integers(1, 20))
+        nodes.append(node)
+        for source, port in segment:
+            edges.append({'source': source, 'port': port, 'target': identity, 'channel': 'condition'})
+        pool[start:start + size] = [(identity, 'result')]
+    root, root_port = pool[0]
+    nodes.append({'binding_id': 'a_end_property01', 'type': 'end'})
+    edges.append({'source': root, 'port': root_port, 'target': 'a_end_property01', 'channel': 'control'})
+    return {'rule_id': 'r_property001', 'name': '图匹配',
+            'workflow': {'entry': None, 'nodes': nodes, 'edges': edges}}
 
 
 @settings(max_examples=350, deadline=None, database=None)
-@given(trees, operations)
-def test_heap_matcher_agrees_with_scanning_reference(node, actions):
-    rule = event_rule('r_property001', '图匹配', identify(node), [])
+@given(native_rules(), operations)
+def test_heap_matcher_agrees_with_scanning_reference(rule, actions):
     clock = FakeClock()
     runtime = ConditionRuntime(clock=clock)
     runtime.register_rule("r", rule)
@@ -81,17 +91,9 @@ def test_heap_matcher_agrees_with_scanning_reference(node, actions):
             runtime = migrate()
 
 
-old_trees = st.recursive(
-    st.one_of(leaf, st.builds(lambda child, window: {"op": "not", "children": [child], "within_seconds": window}, leaf, st.integers(1, 5))),
-    lambda children: st.builds(lambda items: {"op": "all", "children": items}, st.lists(children, min_size=1, max_size=3)),
-    max_leaves=8,
-)
-
-
 @settings(max_examples=250, deadline=None, database=None)
-@given(old_trees, operations)
-def test_all_and_absence_graphs_agree_with_scanning_reference(node, actions):
-    rule = event_rule('r_property001', '图匹配', identify(node), [])
+@given(native_rules(allowed_ops=('all',), allow_repeat=False), operations)
+def test_all_and_absence_graphs_agree_with_scanning_reference(rule, actions):
     clock = FakeClock()
     runtime = ConditionRuntime(clock=clock)
     previous = ReferenceConditionRuntime(rule)
@@ -108,10 +110,17 @@ def test_all_and_absence_graphs_agree_with_scanning_reference(node, actions):
 @settings(max_examples=250, deadline=None, database=None)
 @given(st.sampled_from(["any", "all"]), st.integers(1, 10), operations)
 def test_any_and_window_graphs_agree_with_scanning_reference(op, window, actions):
-    node = {"op": op, "children": [{"type": kind, "params": {"channel": 0}} for kind in ("a", "b", "c")]}
+    nodes = [{'binding_id': f'a_signal_{index:06d}', 'type': 'trigger',
+              'trigger': {'binding_id': f't_leaf{index:06d}', 'type': kind, 'params': {'channel': 0}}}
+             for index, kind in enumerate(("a", "b", "c"), 1)]
+    root = {'binding_id': 'a_logic_000001', 'type': 'logic', 'op': op}
     if op == "all":
-        node["within_seconds"] = window
-    rule = event_rule('r_property001', '图匹配', identify(node), [])
+        root["within_seconds"] = window
+    nodes.append(root)
+    edges = [{'source': node['binding_id'], 'port': 'event', 'target': root['binding_id'], 'channel': 'condition'} for node in nodes[:3]]
+    nodes.append({'binding_id': 'a_end_property01', 'type': 'end'})
+    edges.append({'source': root['binding_id'], 'port': 'result', 'target': 'a_end_property01', 'channel': 'control'})
+    rule = {'rule_id': 'r_property001', 'name': '图匹配', 'workflow': {'entry': None, 'nodes': nodes, 'edges': edges}}
     clock = FakeClock()
     runtime = ConditionRuntime(clock=clock)
     previous = ReferenceConditionRuntime(rule)

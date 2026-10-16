@@ -9,7 +9,7 @@ from notmyfault.core.runtime_rules import prepare_rules
 from notmyfault.core.workflow import build_context
 from notmyfault.plugin_api import Blob, RunContext, Secret
 from notmyfault.tests.api_support import create_test_engine
-from notmyfault.tests.canvas_fixtures import trigger_rule, set_rule_steps
+from notmyfault.tests.canvas_fixtures import execute_runtime, trigger_rule, set_rule_steps
 from notmyfault.values import BLOB_THRESHOLD, allow_secrets
 from notmyfault.values import hold_value
 from notmyfault.core.type_registry import TypeRegistry
@@ -78,10 +78,11 @@ def test_plugin_cannot_change_prior_steps_or_executor_state():
     state = build_context("规则", "signal", {}, [])
     state["_event_occurrences"] = {"t_entry_readonly1"}
     try:
-        engine.execute_workflow("rule", set_rule_steps(trigger_rule("r_readonly1", "规则", "signal"), [
+        rule = set_rule_steps(trigger_rule("r_readonly1", "规则", "signal"), [
             {"type": "produce", "binding_id": "a_produce1", "params": {}},
             {"type": "consume", "binding_id": "a_consume1", "params": {}},
-        ]), "规则", state)
+        ])
+        assert execute_runtime(engine, "rule", rule, "规则", state).status == "succeeded"
         assert observed == [(1, 2)]
     finally:
         engine.shutdown(2)
@@ -111,10 +112,11 @@ def test_large_step_result_and_references_share_a_blob(size):
     state["_event_occurrences"] = {"t_entry_readonly1"}
     ref = {"$ref": {"scope": "step", "node": "a_produce1", "path": ["body"]}}
     try:
-        engine.execute_workflow("rule", set_rule_steps(trigger_rule("r_readonly1", "规则", "signal"), [
+        rule = set_rule_steps(trigger_rule("r_readonly1", "规则", "signal"), [
             {"type": "produce", "binding_id": "a_produce1", "params": {}},
             *[{"type": "consume", "binding_id": f"a_consume{i:06d}", "params": {"body": ref}} for i in range(10)],
-        ]), "规则", state)
+        ])
+        assert execute_runtime(engine, "rule", rule, "规则", state).status == "succeeded"
         assert len(observed) == 10
         assert all(blob is observed[0] for blob in observed)
         assert resolve_value(ref, state) is observed[0]

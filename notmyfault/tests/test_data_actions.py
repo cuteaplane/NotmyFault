@@ -7,7 +7,7 @@ import pytest
 
 from notmyfault.core.rules import validate_rule_bindings
 from notmyfault.core.workflow import build_context, invoke_action
-from notmyfault.tests.canvas_fixtures import native_rule
+from notmyfault.tests.canvas_fixtures import execute_runtime, native_rule
 from notmyfault.tests.api_support import create_test_engine, event_fields
 from notmyfault.values import plain_value
 
@@ -255,7 +255,8 @@ def test_data_actions_bind_structured_values_and_keep_content_out_of_summaries()
         engine._plugin_modules[plugin_id] = module
     assert validate_rule_bindings(rule, {"manual": {"params": [], "outputs": []}}, engine.actions_meta) == []
     context = build_context(rule["name"], "manual", {}, [{"binding_id": "t_manual01", "event": {"type": "manual", "params": {}}, "payload": {}}])
-    engine.execute_workflow("data_actions", rule, rule["name"], context)
+    outcome = execute_runtime(engine, "data_actions", rule, rule["name"], context)
+    assert outcome.status == "succeeded"
     assert plain_value(context["steps"]["a_text0001"]["result"])["text"] == "name,count\r\n甲,2"
     assert engine.events.flush()
     executed = [data for name, data in events if name == "run.step.succeeded" and data.get("step_id") in {action["binding_id"] for action in actions}]

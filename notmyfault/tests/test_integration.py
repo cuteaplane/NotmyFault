@@ -128,7 +128,7 @@ class TestEngineEventPipeline:
             on_event=lambda event: events.append((event.type, event_fields(event))),
         )
         engine.triggers_meta["usb_insert"] = {"outputs": [{"name": "drive", "type": "string"}]}
-        engine.actions_funcs["consume"] = lambda meta, params: received.update(params)
+        engine.actions_funcs["consume"] = lambda meta, params, context: received.update(params)
         engine.actions_meta["consume"] = {}
 
         engine.emit_event("usb_insert", {"drive": "E:"})
@@ -142,7 +142,7 @@ class TestEngineEventPipeline:
     def test_shutdown_during_action(self):
         engine = make_engine(rules=[native_rule({"type": "hotkey", "params": {}}, [{"type": "noop", "params": {}}], name="r")])
         ran = []
-        engine.actions_funcs["noop"] = lambda meta, params: ran.append(1)
+        engine.actions_funcs["noop"] = lambda meta, params, context: ran.append(1)
         engine.actions_meta["noop"] = {}
         engine._shutdown_flag = threading.Event()
         engine._shutdown_flag.set()
@@ -176,7 +176,7 @@ class TestHotReloadIntegration:
         engine.triggers_funcs["hotkey"] = lambda meta, config, emit, stop: stop.wait(30)
         engine.triggers_meta["hotkey"] = {"trigger_api": "event-v2"}
         executed = []
-        engine.actions_funcs["noop"] = lambda meta, params: executed.append(params["name"])
+        engine.actions_funcs["noop"] = lambda meta, params, context: executed.append(params["name"])
         engine.actions_meta["noop"] = {"params": [{"name": "name", "type": "string"}]}
 
         shutdown = threading.Event()
@@ -251,7 +251,7 @@ class TestHotReloadIntegration:
         engine.triggers_funcs["hotkey"] = hotkey_trigger
         engine.triggers_meta["hotkey"] = {"trigger_api": "event-v2"}
         engine.actions_meta["noop"] = {"params": [{"name": "name", "type": "string"}]}
-        engine.actions_funcs["noop"] = lambda meta, params: None
+        engine.actions_funcs["noop"] = lambda meta, params, context: None
 
         shutdown = threading.Event()
         thread = threading.Thread(target=engine.start, kwargs={"shutdown_event": shutdown})
