@@ -214,7 +214,6 @@ def _create_plugin(
         "id": plugin_id,
         "name": plugin_id.replace("_", " ").title(),
         "description": "请填写插件说明",
-        "enabled": True,
         "version_code": 1,
         "version": "0.1.0",
         "package_name": package_name,

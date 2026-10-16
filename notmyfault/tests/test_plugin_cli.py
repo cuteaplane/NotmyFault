@@ -13,7 +13,6 @@ def write_action(root: Path, **overrides) -> Path:
         "id": "sample_action",
         "name": "示例动作",
         "description": "命令行测试插件",
-        "enabled": True,
         "version_code": 1,
         "version": "1.0",
         "package_name": "com.example.sample_action",
