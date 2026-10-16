@@ -97,7 +97,7 @@ Wayland 默认禁止普通应用监听全局按键或枚举其他应用的窗口
 | `python build.py init-keys` | 生成 Ed25519 密钥对；`--encrypt` 加密私钥，`--force` 覆盖已有密钥 |
 | `python build.py version` | 查看密钥状态、公钥指纹和插件签名数量 |
 
-- 修改内置插件或核心源码后需要重新 build，否则旧签名失效。
+- 修改内置插件或核心源码后需要重新 build，签名和完整性清单必须匹配当前文件。
 - 安全模式有 strict 和 permissive 两种。签名验证通过的 build.json 决定模式，缺失时为 strict。环境变量 `NOTMYFAULT_MODE` 只能提高安全等级：`alpha` 对应 permissive，`stable` 和 `master` 对应 strict。
 - permissive 不要求私钥加密，适合本地开发和测试。
 - permissive 允许加载签名缺失或无效的插件；配置与规则的签名验证、插件结构检查和管理员执行确认仍然生效。
@@ -168,7 +168,7 @@ cd dashboard
 npm test
 ```
 
-等于 `vite build && node tests/mount.mjs && node tests/macro-page.mjs`。
+包含 Vite 构建、组件挂载、操作宏页面、条件、分组、布局和画布指针交互检查。
 
 验证插件签名：
 

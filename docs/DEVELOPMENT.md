@@ -1,4 +1,4 @@
-# NotmyFault 开发文档（Alpha）
+# NotMyFault 开发文档（Alpha）
 
 这里写当前可以使用和验证的开发接口。尚未实现的规划不放在这里。
 
@@ -77,7 +77,7 @@ npm exec vite build -- --emptyOutDir
 
 | 位置 | 用途 |
 | --- | --- |
-| `notmyfault/core/` | 引擎核心：engine / rules / workflow / workflow_executor / bindings / trigger_supervisor / runtime_controller / diagnostics / logging |
+| `notmyfault/core/` | 引擎核心：engine / rules / workflow / workflow_executor / bindings / trigger_host / runtime_controller / diagnostics / logging |
 | `notmyfault/security/` | 安全：security / sudo / signing / signing_keys / plugins / plugin_loader / plugin_schema |
 | `notmyfault/host/` | 桌面端、托盘、HTTP 装配和 API 路由 |
 | `notmyfault/host/api/` | 六组 HTTP 路由、认证、事件和对应业务对象 |
@@ -90,108 +90,98 @@ npm exec vite build -- --emptyOutDir
 
 用户/第三方插件不存放在仓库内，部署位置是平台配置目录下的 `plugins/`（Windows：`%APPDATA%\NotmyFault\plugins\`）。
 
-## 3. 规则现在怎么工作
+## 3. 规则结构
 
-一条规则由触发条件和动作列表组成：
+规则顶层字段见 `rule-schema-v2.md`，工作流为平面图：`workflow.nodes` 放全部节点，`workflow.edges` 放全部连线，`workflow.entry` 为 `null`。编译器从无入边的节点推导根节点，执行不依赖顶层动作数组。
 
-```text
-触发条件  →  动作列表
-```
+### 身份
 
-### 触发条件
+图节点 `binding_id` 以 `a_` 开头，触发器叶子 `trigger.binding_id` 以 `t_` 开头，符合 `^[ta]_[a-z0-9_]{6,64}$`。分支身份以 `b_` 开头，例如 `b_then0001`、`b_elif000001`、`b_else0001`。规则文件中身份必填且唯一，API 为缺失的新身份补值，保持已有身份和连线不变。
 
-单个触发器直接放入 `condition`：
+### 边
 
 ```json
 {
-  "condition": {
-    "binding_id": "t_schedule01",
-    "type": "time_schedule",
-    "params": {"time": "17:00"}
-  }
+  "source": "a_condition_000001",
+  "port": "result",
+  "target": "a_logic_000002",
+  "target_port": "input",
+  "channel": "condition"
 }
 ```
 
-旧规则的 `event/trigger` 在读取或导入时转换，保存时只写 `condition`。
-多个条件也使用 `condition`。`any` 是“满足任一项”，`all` 是“全部满足”；两者可以嵌套。
+`channel` 为 `condition` 或 `control`。`target_port` 省略时默认 `input`，连入 `event_group` 且 `group_type` 为 `if` 时必须指向分支 ID。
+
+### 节点与端口
+
+| 类型 | 字段 | 输出端口 |
+| --- | --- | --- |
+| `trigger` | `trigger.binding_id`/`type`/`params`、`occurrence` (`occurred`/`absent`)、`absence_scope` (`run`/`window`)、`duration_seconds`、`repeat` | `event` |
+| `condition` | `predicate` 单一比较，`op` 如 `eq`/`ne`/`gt`/`lt`/`contains`/`run_status` | `result` |
+| `logic` | `op: all/any/not`，输入全部来自条件边，`not` 只接受一条 | `result` |
+| `event_group` | `group_type: if/all/any/not`、`branches: [{id, else?}]`、`mode: immediate/wait`、`timeout_seconds` 仅在 `wait` 时有效 | `if` 时输出分支 ID，其余输出 `result` |
+| 插件动作 | `type` 为插件 ID，`params` 放参数，`retry`/`retry_delay_seconds`/`on_error` (`stop`/`continue`) 等 | `next` / `failure` |
+| `action_group` | `exports: {name: $ref}`，用 `entry` 进入内部图 | `entry` 进组，`next` 返回，`failure` 不在该组类型上 |
+| `end` / `merge` | 终止或汇合 | `end` 无出口，`merge` 输出 `next` |
+
+组归属通过节点的 `parent` 指向 `action_group` 的 `binding_id` 保存，支持多层嵌套和折叠。`action_group` 的 `entry` 边指向组内首节点，组内图执行完后通过 `next` 边返回父图。`exports` 在组成功且非补救停止时计算，映射导出名到 `$ref` 表达式，供外部通过 `{"$ref": {"scope": "step", "node": "<group_id>", "path": [name]}}` 读取。
+
+### 条件连接
+
+多触发条件通过 AND/OR/NOT 图块和条件边组合，条件边来源是触发器的 `event` 端口或 `logic`/`condition`/`event_group` 的 `result` 端口，目标是 `logic` 或 `event_group` 的 IF/ELIF 端口。规则示例不保存 `op`/`children` 条件树，画布支持事件组嵌套和折叠。
 
 ```json
 {
-  "condition": {
-    "op": "any",
-    "children": [
-      {
-        "binding_id": "t_schedule01",
-        "type": "time_schedule",
-        "params": {"time": "17:00"}
-      },
-      {
-        "binding_id": "t_usb01",
-        "type": "usb_insert",
-        "params": {"drive_letter": "ANY"}
-      }
+  "workflow": {
+    "entry": null,
+    "nodes": [
+      {"binding_id": "a_trigger01", "type": "trigger", "trigger": {"binding_id": "t_trigger01", "type": "time_schedule", "params": {"time": "17:00"}}},
+      {"binding_id": "a_append01", "type": "append_text", "params": {"file_path": "D:\\NotmyFault\\events.txt", "text": "记录一次事件", "add_timestamp": true, "encoding": "utf-8"}},
+      {"binding_id": "a_notify01", "type": "notify", "params": {"title": "NotmyFault", "message": {"$ref": {"scope": "step", "node": "a_append01", "path": ["file"]}}}},
+      {"binding_id": "a_end01", "type": "end"}
+    ],
+    "edges": [
+      {"source": "a_trigger01", "port": "event", "target": "a_append01", "channel": "control"},
+      {"source": "a_append01", "port": "next", "target": "a_notify01", "channel": "control"},
+      {"source": "a_notify01", "port": "next", "target": "a_end01", "channel": "control"}
     ]
   }
 }
 ```
 
-`all` 可以设置 `within_seconds`，表示这些事件必须在这段时间内都出现。
-
-### 旧规则的运行前检查
-
-运行前检查已移除。非空 `preconditions` 会被规则校验拒绝，宿主不再调用
-`check_precondition()`，也不再因检查未通过而自动延后工作流。
-
-已签名的旧规则可以读取供编辑，保存和运行前必须移除旧检查。需要判断本次运行
-数据时，使用 IF / ELSE 动作分支；需要监视一段时间内没有发生某事件时，使用
-NOT 触发条件。NOT 不查询进程、窗口或文件的当前状态，旧检查也不会自动转换。
-结构与示例见 [规则格式](rule-schema-v2.md)。
-
-### 动作执行顺序和上一步结果
-
-动作按顺序执行。每个动作使用稳定的 `binding_id`，后续动作通过结构化 `$ref`
-引用前面的结果：
+上例中 `a_append01` 是真实动作 `append_text`，参数名以 `action.json` 为准，输出 `file` 为字符串。完整 `$ref` 保留原本的数据类型，结果写入 `context.steps.<binding_id>.result`，跨组可通过组导出引用：
 
 ```json
-{
-  "actions": [
-    {
-      "binding_id": "a_append01",
-      "type": "append_text",
-      "params": {
-        "file_path": "D:\\NotmyFault\\events.txt",
-        "text": "记录一次事件",
-        "add_timestamp": true,
-        "encoding": "utf-8"
-      }
-    },
-    {
-      "binding_id": "a_notify01",
-      "type": "notify",
-      "params": {
-        "title": "NotmyFault",
-        "message": {
-          "$ref": {
-            "scope": "step",
-            "node": "a_append01",
-            "path": ["file"]
-          }
-        }
-      }
-    }
-  ]
-}
+{"$ref": {"scope": "step", "node": "a_append01", "path": ["file"]}}
 ```
 
-上例中，`append_text` 返回的 `file` 是字符串。完整 `$ref` 会保留原本的数据类型。
-动作返回结果会写入：
+示例节点 ID 与本文一致。
 
-```text
-context.steps.<binding_id>.result
-```
+### IF/ELIF/ELSE 与逻辑块
 
-旧规则的 `{{ event.payload.x }}` 和 `{{ steps.action_1.result.value }}` 仍会解析，
-但 Dashboard 不再生成新的字符串引用。完整格式见 `docs/rule-schema-v2.md`。
+`event_group` 的 `group_type` 为 `if` 时，`branches` 保存稳定有序的分支身份 `b_`，第一个成立的分支胜出，`ELSE` 唯一且无输入。分支连线使用条件边：`source` 为逻辑/条件/触发器节点，`port` 为其输出端口，`target` 为事件组，`target_port` 为分支 ID。控制边使用 `port` 为分支 ID、`target` 为该分支首节点的图后继。
+
+`logic` 的 `op` 为 `all`/`any`/`not`，通过条件边组合条件输入，`not` 只能连一条输入。`condition` 的 `predicate` 只包含一次比较。
+
+### 入口持续未发生、流程内未发生和显式等待
+
+区分三种未发生语义：
+
+- 入口持续未发生：在规则入口路径上，`trigger` 设 `occurrence: absent`，配合 `duration_seconds` 和 `repeat: once_until_seen/every_window`。条件运行时在入队前通过定时器固定入口选择，持续未发生定时到达才触发。
+- 流程内截至判定点未发生：`trigger` 在非入口位置或跟随控制前序，`occurrence: absent`。`absence_scope: run` 表示截至当前判定点未发生过该 `trigger.binding_id`，`absence_scope: window` 表示通过 `EventObservation.absent_for(binding_id, duration_seconds)` 判断窗口内持续未发生。
+- 显式等待：`event_group` 的 `mode: wait`，`timeout_seconds` 仅在此模式下合法。执行到该组时返回 `RunSuspension`，并设置等待回调，收到通知时恢复执行。事件未发生不查询进程、窗口或文件的当前状态。
+
+### 补救与运行结束状态
+
+插件动作的 `failure` 控制出口连接同一执行范围中的普通 `action_group`，该组内可放动作、IF 和嵌套组。作为补救入口的动作组不同时接受主流程控制入口或对外 `next` 连线，由连线校验拒绝冲突。
+
+- `on_error: stop`：补救动作组成功后结束运行，状态为 `recovered`，界面显示已补救，原动作步骤保留失败记录。
+- `on_error: continue`：补救成功后返回原动作的正常 `next` 后继，流程随后完成则运行为 `succeeded`。
+- 无补救路线且 `continue`：明确忽略本次错误，流程完成则记成功。
+- 补救本身失败：停止并记失败，不自动返回主流程。
+- 取消和执行超时直接结束，不进入补救图。插件执行超时表现为步骤 `timed_out`，触发器等待超时表现为 `event_wait_timeout`，均绕过补救。
+
+结构与示例见 [规则格式](rule-schema-v2.md)。
 
 ## 4. 写动作插件
 
@@ -206,14 +196,9 @@ my_action/
   action.py
 ```
 
-旧动作 API：
+### 动作入口
 
-```python
-def run(meta, params):
-    return {"ok": True}
-```
-
-需要读取事件、条件命中信息或前序步骤结果时，使用新 API：
+插件清单声明 `execution_api: "context-v1"`。
 
 ```json
 {
@@ -223,7 +208,7 @@ def run(meta, params):
 ```
 
 ```python
-def run_with_context(meta, params, context):
+def run_with_context(action_info, params, context):
     event = context["event"]
     previous = context["steps"]
     return {"result_name": "value"}
@@ -243,7 +228,7 @@ python nmf.py plugin pack <插件目录路径>
 
 ## 5. 写触发器
 
-内置触发器使用 `event-v2`。每条规则配置独立运行，入口固定为：
+触发器清单声明 trigger_api 为 event-v2，每个配置实例独立运行，入口固定为：
 
 ```python
 def run(meta, config, emit_event, shutdown_event):
@@ -259,8 +244,7 @@ def run(meta, config, emit_event, shutdown_event):
 {"trigger_api": "event-v2"}
 ```
 
-加载时会检查这四个参数是否齐全；不合格的触发器不会启动后台线程。已有
-`event-v1` 和未声明 `trigger_api` 的用户触发器仍按旧方式兼容。
+加载时检查上述四个参数；不合格的触发器不会启动后台线程。
 
 ### 轮询型触发器用基类
 
@@ -271,8 +255,8 @@ def run(meta, config, emit_event, shutdown_event):
 
 ### event-v2 怎么启动
 
-- **每配置一个实例**：同一条触发器被 N 条规则使用时启动 N 个隔离线程，
-  实例 ID 为 `trigger_id:序号`（只有一个配置时就是 `trigger_id`）。
+- **每个不同配置一个实例**：同一触发器有 N 个不同配置时启动 N 个实例，
+  实例 ID 为 `<触发器 id>:<配置指纹的 SHA-256 哈希>`。
 - **相同配置去重**：多条规则使用完全相同的配置（如同一热键、同一监控目录）
   时只启动一个实例；事件仍按配置指纹匹配所有规则。
 - **配置指纹**：JSON 规范化后比较（整数值 90 与 90.0 视为相同）。事件命中
@@ -303,11 +287,9 @@ Linux 使用 pkexec。源码与运行进程属于当前用户，导入检查和�
 
 ## 6. 改代码时的检查项
 
-- 旧格式 `event` / `trigger` 规则不能被新条件树改坏。
-- 旧两参数动作 `run(meta, params)` 必须继续可用。
 - 热加载和关闭时要取消已延后的工作流。
 - 测试中模拟触发器崩溃时必须 mock 通知，不能真的向 Windows 通知中心刷错误消息。
-- 改动插件元数据、规则格式或 Dashboard 表单时，同时补测试和兼容迁移。
+- 改动插件元数据、规则格式或 Dashboard 表单时，同时补测试。
 - 原生调用必须声明 `ctypes argtypes/restype`；跨线程的原生段必须包
   `notmyfault.native.NATIVE_LOCK`；不可信的 COM/音频等原生代码放
   子进程隔离。详见 `docs/native-safety.md`。
@@ -341,7 +323,7 @@ API 测试使用 `notmyfault/tests/api_support.py` 创建临时
 类型快照，`value_codec.py` 统一保存和跨进程编码，`value_conversion.py` 处理
 显式转换。`bindings.py` 解析表达式，`binding_schema.py` 检查来源类型和可用性，
 `variables.py` 初始化常量与变量并执行赋值。
-Dashboard 的 `valueTypes.js` 保留编码值并提供端口标签、编辑和兼容提示。
+Dashboard 的 `valueTypes.js` 保留编码值并提供端口标签、编辑和类型提示。
 类型与规则格式见 [data-types.md](data-types.md)。
 
 ## 8. Windows 安装升级恢复

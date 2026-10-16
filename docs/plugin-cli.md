@@ -18,8 +18,7 @@ python nmf.py plugin create trigger my_trigger --output-dir plugins
 但 strict 模式的加载检查会拒绝签名无效或缺少本地副签的插件。
 
 JSON 中 `ok` 对应 `checks.development.allowed`；`checks.load_policy` 给出当前模式、
-是否满足加载策略、错误和警告。`checks.signature` 分别给出签名来源 `source` 与格式
-`format`。安装预览和插件列表也提供同名检查结果。加载器仍会在实际导入前复查文件，
+是否满足加载策略、错误和警告。安装预览和插件列表也提供同名检查结果。加载器仍会在实际导入前复查文件，
 加载检查结果不代表已经执行过插件。
 
 `plugin test` 用当前 Python 运行插件目录里的 pytest，300 秒没有结束时返回 2。
@@ -28,5 +27,5 @@ JSON 中 `ok` 对应 `checks.development.allowed`；`checks.load_policy` 给出�
 `public_key.pem` 和 `public_key.sig`，排除 `__pycache__` 缓存目录。
 
 `plugin create` 不覆盖已有目录。action 和 trigger 模板都带最小清单、Python
-入口、`test_plugin.py` 和 `.github/workflows/test.yml`。工作流在 Windows 与
+入口、`test_plugin.py` 和 `.github/workflows/test.yml`。action 模板声明 execution_api 为 context-v1，入口为 run_with_context；trigger 模板声明 trigger_api 为 event-v2。工作流在 Windows 与
 Ubuntu 上运行 pytest。

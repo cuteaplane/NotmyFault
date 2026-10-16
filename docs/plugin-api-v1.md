@@ -31,13 +31,27 @@ action 专属：
 
 | 字段 | 说明 |
 | --- | --- |
-| execution_api | 不写走 run()；写 "context-v1" 走 run_with_context() |
-| precondition_api | 旧清单字段，运行前检查已移除，宿主不再调用 check_precondition() |
+| execution_api | 必填，值为 "context-v1" |
 | cancellation_api | 写 "runtime-v1" 才允许规则配 timeout_seconds |
 | idempotent | true 表示可安全重试，false 表示重复执行可能产生额外结果 |
 | execution_mode | "isolated" 是实验字段，动作在子进程里跑（见下文） |
 
-trigger 专属：trigger_api（event-v1 / event-v2）、semantic（state / oneshot）。
+trigger 专属：trigger_api（必填，值为 "event-v2"）、semantic（state / oneshot）。
+
+触发器还可声明以下字段：
+
+| 字段 | 取值与限制 |
+| --- | --- |
+| sampling_api | 可选 `"poll-v1"`；必须同时提供 `create_sampler(context)`，加载时仍检查四参数 `run` 入口 |
+| lifecycle | `"continuous"` 或 `"one_shot"`，默认 `"continuous"` |
+| event_queue_size | 1–10000 的整数，默认 200 |
+| overflow | `"drop_oldest"` 或 `"coalesce"`，默认 `"drop_oldest"`；后者须声明 `coalesce_key` 并引用已声明的输出字段 |
+| debounce_seconds | 0–3600 秒，默认 0 |
+| state_key | `semantic: "state"` 时必填，引用已声明的输出字段 |
+| state_mode | `"edge"` 或 `"level"`，默认 `"edge"` |
+
+`state_filter`、`state_initial_value`、`state_partition_key`、`state_untracked`、
+`state_hysteresis` 和 `previous_state_output` 的约束见 `notmyfault/security/plugin_schema.py`。
 
 结构校验都在 `notmyfault/security/plugin_schema.py`，校验失败的原因会进诊断页。
 
@@ -46,42 +60,23 @@ trigger 专属：trigger_api（event-v1 / event-v2）、semantic（state / onesh
 
 ## 动作
 
-### action legacy（稳定）
-
-```python
-def run(action_info, params):
-    return {"ok": True}
-```
-
-返回值会进规则上下文，供后续步骤 $ref 引用。抛异常表示失败。
-仓库例子：`notmyfault/actions/set_volume/action.py`。
-
-引擎在调用动作前解析常量、变量与其他步骤引用。两种动作入口都接收解析后的
-`params`，不需要在插件内再次解析表达式。参数和输出的 `value_type`、显式转换与
-自定义类型使用方法见 `data-types.md`；插件通过 `notmyfault.plugin_api.data_types_api()`
-访问类型校验和转换。
-
-### execution_api=context-v1（稳定）
+### 动作入口
 
 ```python
 def run_with_context(action_info, params, context):
     return {"ok": True}
 ```
 
-context 是这次 run 独享的上下文，能读到 event payload、前面步骤的结果和
-规则信息。结构见 `notmyfault/core/workflow.py` 的 build_context。
-声明了 execution_api=context-v1 却没定义 run_with_context 会在执行时报
-TypeError，加载期不拦。仓库例子：`notmyfault/actions/append_text/action.py`。
+返回值会进规则上下文，供后续步骤 $ref 引用。抛异常表示失败。
+仓库例子：`notmyfault/actions/set_volume/action.py`。
 
-### 旧版 precondition_api（已移除）
+引擎在调用动作前解析常量、变量与其他步骤引用。动作入口接收解析后的
+`params`，不需要在插件内再次解析表达式。参数和输出的 `value_type`、显式转换与
+自定义类型使用方法见 `data-types.md`；插件通过 `notmyfault.plugin_api.data_types_api()`
+访问类型校验和转换。
 
-清单校验仍接受 `precondition_api: "context-v1"`，宿主不再调用
-`check_precondition()`，也不再根据 `retry_after_seconds` 延后工作流。
-新插件无需声明此字段或实现此入口。
-
-非空 `preconditions` 会被规则校验拒绝。旧规则必须移除该字段中的检查；
-需要判断运行数据时使用 IF，需要监视事件未发生时使用 NOT 触发条件。
-两者的结构和适用条件见 [规则格式](rule-schema-v2.md)。
+工作流传给动作的上下文包括当前事件、前面步骤的结果和规则信息。结构见
+`notmyfault/core/workflow.py` 的 build_context。动作模块缺少 run_with_context 时，加载器拒绝加载该插件。
 
 ### cancellation_api=runtime-v1（稳定）
 
@@ -99,7 +94,7 @@ if cancel is not None:
 
 ## 触发器
 
-### trigger event-v2（稳定）
+### 触发器入口
 
 ```python
 from notmyfault.triggers.base import PollingTrigger
@@ -120,10 +115,9 @@ def run(meta, config, emit_event, shutdown_event):
 `notmyfault/triggers/base.py` 的模块 docstring。仓库例子：
 `notmyfault/triggers/window_title/trigger.py`。
 
-### trigger event-v1（稳定，不推荐新插件用）
-
-入口签名 run(meta, configs, emit_event, shutdown_event)，configs 是配置列表，
-轮询循环要自己写。老触发器都长这样，新插件请用 event-v2。
+引擎逐项比较配置中的键值与事件 payload，区分布尔值与数字，嵌套数组和对象
+也适用。数值相同的整数、浮点数和精确小数仍可匹配；不匹配的事件不重置 NOT
+等待计时。
 
 ## 贡献（contributes，稳定）
 
@@ -136,8 +130,7 @@ def run(meta, config, emit_event, shutdown_event):
 
 普通参数编辑器声明 `value_type`，命令用 `context.commit_value()` 提交新值。自有数据
 编辑器声明 `data_type`，命令用 `context.commit()` 提交带归属信息的值。完整协议见
-`plugin-extension-api.md`。数据类型的版本属于值的 `$type` 标识；当前没有自动迁移钩子。
-更改类型 id 或版本前，插件必须自行处理已经保存的值。
+`plugin-extension-api.md`。数据类型的版本属于值的 $type 标识。宿主不转换已保存的值；更改类型 id 或版本时，插件自行处理已保存的值。
 
 ## 平台服务（稳定）
 
@@ -148,7 +141,7 @@ def run(meta, config, emit_event, shutdown_event):
 from notmyfault.plugin_api import platform_services
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
     services = platform_services()
     services.write_clipboard(str(params.get("text", "")))
     return {"backend": services.capability("clipboard.write").backend}
@@ -186,9 +179,9 @@ from notmyfault.plugin_api import engine_events_api
 def run(meta, config, emit_event, shutdown_event):
     api = engine_events_api()
 
-    def on_event(event_type, data):
-        if event_type == "workflow_completed":
-            emit_event({"status": data.get("status", "")})
+    def on_event(event):
+        if event.type == "run.succeeded":
+            emit_event({"status": "succeeded"})
 
     token = api.subscribe(on_event)
     try:
@@ -198,27 +191,27 @@ def run(meta, config, emit_event, shutdown_event):
 ```
 
 `engine_events_api()` 提供 `subscribe(callback)`、`unsubscribe(token)` 和
-`RULE_TERMINAL_EVENTS`。回调签名是 `(event_type, data)`，在引擎发布线程里同步执行；
-回调异常只记日志，不会打断其他订阅者。引擎停止时会清空全部订阅。
+`RULE_TERMINAL_EVENTS`。回调接收单个 `Event` 对象，可读取 `type`、`data`、`run_id`、
+`rule_id` 和 `step_id`。每个回调订阅由独立的 `EventSubscriber` 线程按队列顺序处理；
+回调异常会记日志，处理线程随后继续消费事件。插件退出时在 `finally` 中取消订阅。
 
-规则运行终态可依赖的事件名见 `RULE_TERMINAL_EVENTS`：
+规则运行结束时可订阅的事件名见 `RULE_TERMINAL_EVENTS`：
 
 | 事件 | 含义 |
 | --- | --- |
-| `workflow_completed` | 动作序列走完，`status` 为 succeeded / failed / cancelled |
-| `workflow_failed` | 引擎未能把 run 走下去，例如绑定解析失败 |
-| `run_dropped` | 本次触发被丢弃，未进入执行 |
-| `run_replaced` | 本次 run 被后来的触发替换 |
+| `run.succeeded` | 流程成功完成 |
+| `run.recovered` | 原动作失败后补救成功，并按停止设置结束 |
+| `run.failed` | 发生未处理失败或补救失败 |
+| `run.cancelled` | 运行被取消 |
+| `run.timed_out` | 运行超时 |
+| `run.dropped` | 运行被丢弃；替换原因记录在事件数据中 |
 
 实现位于 `notmyfault/core/engine_events.py`。仓库例子：
 `notmyfault/triggers/rule_finished/trigger.py`。
 
 ## 插件私有数据（plugin_data，稳定）
 
-参数 `type` 可以写 `plugin_data`。值由 `parameter_editor` 的命令提交。规则校验默认只接受
-`package_name`、数据类型 id 和版本都匹配的自有数据信封；编辑器声明 `accepts_legacy: true`
-时，也可以读取旧的非空对象。插件升级没有迁移钩子；`version_code` 变化不会使旧值失效，
-但编辑器应能处理或重新生成旧值。
+参数 `type` 可以写 `plugin_data`。值由 `parameter_editor` 的命令提交。规则校验只接受 package_name、数据类型 id 和版本都匹配的自有数据信封。
 
 `plugin_data` 参数允许声明 `sensitive: true`。运行记录会显示“敏感值已隐藏”；
 规则编辑器也不会展示摘要。未标记敏感时，编辑器会显示信封中的 `summary`。用户打开
@@ -228,18 +221,31 @@ def run(meta, config, emit_event, shutdown_event):
 ## 隔离执行（execution_mode: isolated，experimental）
 
 manifest 写 `"execution_mode": "isolated"` 的动作不会在引擎进程中导入。每次执行会启动
-子进程调用 `run()` 或 `run_with_context()`；父子进程之间使用 JSON 标准输入和输出，
+子进程调用 `run_with_context()`；父子进程之间使用 JSON 标准输入和输出，
 新宿主使用 `typed-v1` 编解码保留大整数、Decimal 和二进制等值。
 子进程先发 `{"type":"ready","protocol":1}`，父进程再发送 entry、action_info、
 params、最小 context 和整棵插件目录的文件快照。worker 每次运行前复核文件快照，
 入口、兄弟模块和扩展命令使用校验时读取的源码；目录内容变化时拒绝执行。
 执行结果的 `type` 是 `result`，无法通过数据编解码的返回值按动作失败处理。
 这只隔离崩溃，不是安全沙箱，也不限制文件、网络、进程或系统调用权限。worker 异常退出时，引擎发布
-`plugin_worker_crashed` 事件，规则中的该步骤失败。默认启动等待为 10 秒，动作执行等待为
+`plugin.worker.crashed` 事件，规则中的该步骤失败。默认启动等待为 10 秒，动作执行等待为
 120 秒，进程退出等待为 5 秒。
 实现位于 `notmyfault/core/plugin_worker.py`。内置和用户动作均可声明 `isolated`；
 隔离模式不能声明 `cancellation_api` 或 `admin` 权限。调用原生库或 `ctypes` 的第三方动作优先使用此模式，
 原生代码仍拥有当前用户的文件、网络和系统调用权限。
+
+隔离动作的扩展命令也在子进程中运行。每个扩展会话使用独立的子进程，同一会话
+中的命令共享模块和 `context.session.data`，与规则执行动作的子进程分开。
+每次调用命令前复核文件快照；普通值和自有数据信封使用 `typed-v1` 编码，状态文字
+传回宿主。
+关闭会话或停止引擎时，子进程运行 `context.register_cleanup()` 注册的函数后退出；
+未在 5 秒内退出时终止进程。命令执行等待为 120 秒。
+
+引擎启动时，存在保留备份的更新版隔离动作会在 worker 子进程中检查导入、执行入口
+参数和全部扩展命令入口。
+检查会复核文件快照，但不调用 `run_with_context()` 或参数校验函数。
+导入失败、缺少可调用入口或入口参数不兼容时，启动流程尝试恢复旧版；正常动作执行
+仍在每次运行时单独启动子进程。
 
 内置 `set_volume` 使用 `isolated`，Windows 的 pycaw COM 调用在子进程中执行。
 该动作不声明 `cancellation_api`，规则不能为它配置协作取消超时。
@@ -256,7 +262,7 @@ params、最小 context 和整棵插件目录的文件快照。worker 每次运�
 - notmyfault.platform.platform_support（show_notification 等 NotmyFault 服务）
 
 除此之外的 notmyfault.* 都是引擎内部实现，不属于稳定插件 API；其中
-notmyfault.core.engine、notmyfault.core.trigger_supervisor、
+notmyfault.core.engine、notmyfault.core.trigger_host、
 notmyfault.core.workflow_executor、notmyfault.host.*、notmyfault.platform.linux_support
 和 notmyfault.platform.backends 明确不要引用。
 安全扫描目前只拦危险调用和动态导入，不检查 import 了哪些内部模块，
@@ -290,9 +296,7 @@ Python 的 `__pycache__` 缓存与签名材料本身。修改依赖内容也需�
 安装预览返回 `installation.required_risk_ids`；安装的 `confirmed_risk_ids` 必须包含
 这些 ID，遗漏时返回 HTTP 400 和 `risk_confirmation_required`。构建命令遗漏确认时
 继续使用 `build_hook_confirmation_required`。
-签名来源与摘要格式分开记录，旧本地密钥签名可以使用当前摘要格式。用户插件继续
-核对已安装文件清单，旧摘要格式只在文件与已安装记录一致时接受。安装构建后的检查
-和延迟导入前的复查分别执行。
+签名结果为 official、author 或 none，插件元数据中的 signature_kind 保存该结果。用户插件的已安装文件清单与文件内容逐项核对。安装构建后的检查和延迟导入前的复查分别执行。
 
 ## 安全扫描的边界
 
@@ -307,6 +311,9 @@ Python 的 `__pycache__` 缓存与签名材料本身。修改依赖内容也需�
 
 - setup：trigger 加载后、启动前调一次，返回 False 拒绝启用（action 没有 setup）
 - 执行：动作按规则触发；isolated 动作在子进程
+- 重复加载：同一个 `PluginLoader` 接受已物化的同 ID 动作新版后，后续调用使用
+  新版入口、元数据和资源目录，支持在 `in-process` 与 `isolated` 之间切换。
+  新版导入或导入前复查失败时恢复旧入口、元数据和资源目录。
 - 参数校验：插件定义 `validate_params(action_info, params)` 时，返回错误列表或抛出异常都会拒绝执行本步
 - teardown：引擎停止时调用，插件在这里注销热键、关连接
 - 引擎停止：扩展会话一并关闭
@@ -316,8 +323,8 @@ Python 的 `__pycache__` 缓存与签名材料本身。修改依赖内容也需�
 
 `data_types_api()` 提供类型声明、校验、转换、共享类型注册和传输编解码。
 参数通过 `value_type` 声明数据类型；输出也可使用此字段精化原有 `type`。
-`run(meta, params)`、`run_with_context(meta, params, context)` 和原触发协议继续可用。
+动作入口为 run_with_context(action_info, params, context)，触发器入口为 run(meta, config, emit_event, shutdown_event)。
 共享自定义类型由清单声明，宿主在执行前检查类型和依赖。运行上下文中的
 `constants` 与 `variables` 是传给插件的值副本，修改它们不会给规则变量赋值。
 隔离动作协议通过 `value_encoding: typed-v1` 保留大整数、精确小数和二进制等值。
-类型、转换和旧清单兼容规则见 [data-types.md](data-types.md)。
+类型、转换和值编码见 [data-types.md](data-types.md)。

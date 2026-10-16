@@ -39,14 +39,13 @@ NOTMYFAULT.pyw
 
 `ApplicationPaths` 从平台配置目录计算 `config.json`、`rules.json`、
 `.config_secret`、`.api_token`、`.ai_api_key`、`run-events.jsonl`、日志和用户
-插件目录。插件私钥仍在项目根目录的 `.private/signing_private_key.pem`。
-这些位置没有迁移。
+插件目录。插件私钥在项目根目录的 `.private/signing_private_key.pem`。
 
-`SignedConfigStore` 负责读取、验签、备份和写回配置与规则。规则身份、旧条件字段和
-模板迁移由 `core/rule_model.py` 处理；脱敏安全摘要由 `SettingsService` 生成。
+`SignedConfigStore` 负责读取、验签、备份和写回配置与规则。规则身份由
+`core/rule_model.py` 处理；脱敏安全摘要由 `SettingsService` 生成。
 `NOTMYFAULT.pyw` 只创建一个实例。`EngineRunner` 把它交给 `create_engine()`；
 `AutomationEngine` 和 `RulesHotReloader` 保留这个实例；API 服务也使用它。
-配置和规则文件仍使用 `_signature` 字段和 `.config_secret` 中的
+配置和规则文件使用 `_signature` 字段和 `.config_secret` 中的
 HMAC-SHA256 密钥。
 
 桌面后台启动顺序是：
@@ -67,8 +66,8 @@ Dashboard 的普通 JSON 请求通过 `window.pywebview.api.request_api()` 发�
 下载和 SSE 直接访问 HTTP，在请求前通过 `window.pywebview.api.get_api_token()` 读取
 令牌。直接请求收到 403 时会重新读取令牌并重试一次。
 
-规则读取和保存也通过上述代理进入 `RuleService`。保存先检查输入并转换旧条件字段，
-校验已有身份后补齐缺失身份，完成插件参数、引用及管理员批准检查后写入。读取失败返回
+规则读取和保存也通过上述代理进入 `RuleService`。保存先检查输入，校验已有身份后补齐缺失身份，
+完成插件参数、引用及管理员批准检查后写入。读取失败返回
 `ok: false`、`rules: null` 和 `config_error`，安全页继续提供脱敏摘要供核对。
 
 `GET /api/engine/logs` 返回原始行和总数；`GET /api/engine/logs/files` 列出日志文件；
@@ -85,7 +84,7 @@ PATCH 请求上限为 1 MiB，插件预览和安装 multipart 请求上限为 65
 
 `GET /api/rules` 返回 `rules` 和 `revision`。`PUT /api/rules` 可携带 `expected_revision`，
 版本不匹配时返回 HTTP 409 和 `code: "rules_conflict"`，原规则保持不变。保存成功返回
-实际写入的规则和新版本号；旧调用方未传版本时仍直接保存。读取规则或配置失败且没有
+实际写入的规则和新版本号。请求未带 `expected_revision` 时直接保存。读取规则或配置失败且没有
 可用签名备份时，保留原文件和备份，不写入空规则。
 
 插件切换和卸载失败返回 HTTP 400、404、409 或 500，包含 `ok: false` 和 `error`。
