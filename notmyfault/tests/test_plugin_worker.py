@@ -415,7 +415,6 @@ class TestLoaderIsolatedMode:
             "id": "iso_action",
             "name": "隔离动作",
             "description": "测试 isolated 执行",
-            "enabled": True,
             "version_code": 1,
             "version": "1.0",
             "package_name": "io.github.notmyfault.iso",
@@ -460,7 +459,7 @@ class TestLoaderIsolatedMode:
         assert (loaded, failed) == (1, 0)
         assert "iso_action" not in func_store
 
-        run = loader.materialize_pending_action("iso_action")
+        run = loader.materialize_pending("iso_action")
         assert run is not None
         # isolated 动作不 import 进引擎进程
         assert loader._registry.get_module("iso_action") is None
@@ -477,7 +476,7 @@ class TestLoaderIsolatedMode:
         loaded, failed = loader.load(str(tmp_path / "actions"), "action", origin="user")
         assert (loaded, failed) == (1, 0)
 
-        assert loader.materialize_pending_action("iso_action") is not None
+        assert loader.materialize_pending("iso_action") is not None
         run = func_store["iso_action"]
         module = loader._registry.get_module("iso_action")
         result = invoke_action(
@@ -501,7 +500,7 @@ class TestLoaderIsolatedMode:
         meta_store, func_store = loader._registry.stores("action")
         loaded, failed = loader.load(str(tmp_path / "actions"), "action", origin="user")
         assert (loaded, failed) == (1, 0)
-        assert loader.materialize_pending_action("iso_action") is not None
+        assert loader.materialize_pending("iso_action") is not None
         result = func_store["iso_action"]({}, {}, {})
         assert result["platform"] in {"windows", "linux", "macos"}
 

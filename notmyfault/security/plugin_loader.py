@@ -64,21 +64,17 @@ class PluginRegistry:
         self.plugin_kinds: Dict[str, PluginKind] = {}
         self.extensions = ExtensionRegistry()
         self.importers: Dict[str, PluginImports] = {}
-        self._action_materializer: Optional[Callable[[str], Any]] = None
-        self._trigger_materializer: Optional[Callable[[str], Any]] = None
+        self._materializer: Optional[Callable[[str], Any]] = None
 
-    def set_action_materializer(self, callback: Callable[[str], Any]) -> None:
-        self._action_materializer = callback
-
-    def set_trigger_materializer(self, callback: Callable[[str], Any]) -> None:
-        self._trigger_materializer = callback
+    def set_materializer(self, callback: Callable[[str], Any]) -> None:
+        self._materializer = callback
 
     def resolve_action(self, plugin_id: str) -> Optional[Callable[..., Any]]:
         """返回动作入口函数，还没导入的插件在这里触发首次导入。"""
         run = self.actions_funcs.get(plugin_id)
         if run is not None:
             return run
-        materializer = self._action_materializer
+        materializer = self._materializer
         if materializer is None:
             return None
         materializer(plugin_id)
@@ -89,7 +85,7 @@ class PluginRegistry:
         run = self.triggers_funcs.get(plugin_id)
         if run is not None:
             return run
-        materializer = self._trigger_materializer
+        materializer = self._materializer
         if materializer is None:
             return None
         materializer(plugin_id)
@@ -188,8 +184,7 @@ class PluginLoader:
         self._plugin_manifest_path = plugin_manifest_path
         # 多个工作流线程可能同时首次执行同一个懒加载动作。
         self._materialize_lock = threading.RLock()
-        registry.set_action_materializer(self.materialize_pending_action)
-        registry.set_trigger_materializer(self.materialize_pending_trigger)
+        registry.set_materializer(self.materialize_pending)
 
     def _restore_override(
         self,
@@ -237,9 +232,6 @@ class PluginLoader:
                 decision = evaluate_plugin(inspection, self._security_mode)
                 failed_count += 1
                 reject(plugin_id, "; ".join(decision["errors"]))
-                continue
-            if origin == "builtin" and not meta["enabled"]:
-                print(f'[Engine] 插件 "{plugin_id}" 已禁用，跳过')
                 continue
             disabled = self._config.get("disabled_plugins", {})
             if isinstance(disabled, dict) and plugin_id in disabled.get(kind + "s", []):
@@ -311,15 +303,8 @@ class PluginLoader:
             print(f"[Engine] 装载{store_name} {loaded_count} 个: " + ", ".join(loaded_summaries))
         return loaded_count, failed_count
 
-    def materialize_pending_action(self, plugin_id: str) -> Optional[Any]:
-        """导入还没加载的动作插件，找不到对应条目时返回 None"""
-        entry = self._registry.pending.get(plugin_id)
-        if entry is None:
-            return None
-        return self.materialize_entry(entry)
-
-    def materialize_pending_trigger(self, plugin_id: str) -> Optional[Any]:
-        """导入还没加载的触发器插件，找不到对应条目时返回 None"""
+    def materialize_pending(self, plugin_id: str) -> Optional[Any]:
+        """导入还没加载的插件，找不到对应条目时返回 None"""
         entry = self._registry.pending.get(plugin_id)
         if entry is None:
             return None

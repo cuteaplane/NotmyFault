@@ -10,7 +10,7 @@ from notmyfault.core.data_types import (
     normalize_value,
 )
 
-_REQUIRED_META_FIELDS = {"id", "name", "description", "enabled", "version_code", "version", "package_name"}
+_REQUIRED_META_FIELDS = {"id", "name", "description", "version_code", "version", "package_name"}
 _TRIGGER_OPTIONAL_FIELDS = {
     "semantic", "params", "permissions", "origin", "trigger_api", "platforms",
     "entrypoints", "outputs", "build", "contributes",
@@ -530,8 +530,6 @@ def validate_plugin_meta(
         errors.append(f"字段 'description' 必须是字符串")
     if "author" in meta and not isinstance(meta["author"], str):
         errors.append("字段 'author' 必须是字符串")
-    if "enabled" in meta and not isinstance(meta["enabled"], bool):
-        errors.append(f"字段 'enabled' 必须为布尔值 (true/false)，实际: {type(meta['enabled']).__name__}")
     if "version_code" in meta:
         if not isinstance(meta["version_code"], int) or isinstance(meta["version_code"], bool):
             errors.append(f"字段 'version_code' 必须为整数，实际: {type(meta['version_code']).__name__}")
@@ -824,37 +822,30 @@ def validate_plugin_meta(
         else:
             output_names: set[str] = set()
             for i, output in enumerate(outputs):
-                # 旧 action 插件可把输出写成字符串列表。
-                if isinstance(output, str):
-                    if not output:
-                        errors.append(f"outputs[{i}] 不能为空")
-                        continue
-                    output_name = output
-                elif isinstance(output, dict):
-                    for field in sorted(_REQUIRED_OUTPUT_FIELDS):
-                        if field not in output:
-                            errors.append(f"outputs[{i}] 缺少必填字段: {field}")
-                    output_name = output.get("name")
-                    output_type = output.get("type")
-                    if "type" in output:
-                        _validate_value_type(output_type, f"outputs[{i}].type", errors)
-                    if "value_type" in output:
-                        _validate_value_type(output["value_type"], f"outputs[{i}].value_type", errors)
-                    for flag in ("required", "sensitive"):
-                        if flag in output and not isinstance(output[flag], bool):
-                            errors.append(f"outputs[{i}].{flag} 必须为布尔值")
-                    if (
-                        "summary" in output
-                        and output["summary"] not in _ALLOWED_SUMMARY_POLICIES
-                    ):
-                        errors.append(
-                            f"outputs[{i}].summary 无效: {output['summary']!r}"
-                        )
-                    if "item_type" in output:
-                        errors.append(f"outputs[{i}].item_type 已移除，请使用 type.items")
-                else:
-                    errors.append(f"outputs[{i}] 必须是字符串或对象")
+                if not isinstance(output, dict):
+                    errors.append(f"outputs[{i}] 必须是对象")
                     continue
+                for field in sorted(_REQUIRED_OUTPUT_FIELDS):
+                    if field not in output:
+                        errors.append(f"outputs[{i}] 缺少必填字段: {field}")
+                output_name = output.get("name")
+                output_type = output.get("type")
+                if "type" in output:
+                    _validate_value_type(output_type, f"outputs[{i}].type", errors)
+                if "value_type" in output:
+                    _validate_value_type(output["value_type"], f"outputs[{i}].value_type", errors)
+                for flag in ("required", "sensitive"):
+                    if flag in output and not isinstance(output[flag], bool):
+                        errors.append(f"outputs[{i}].{flag} 必须为布尔值")
+                if (
+                    "summary" in output
+                    and output["summary"] not in _ALLOWED_SUMMARY_POLICIES
+                ):
+                    errors.append(
+                        f"outputs[{i}].summary 无效: {output['summary']!r}"
+                    )
+                if "item_type" in output:
+                    errors.append(f"outputs[{i}].item_type 已移除，请使用 type.items")
 
                 if not isinstance(output_name, str) or not output_name:
                     errors.append(f"outputs[{i}].name 必须是非空字符串")
@@ -946,13 +937,15 @@ def check_payload_contract(
     normalized=None,
 ) -> List[str]:
     """检查声明的输出字段及其值类型"""
+    if outputs is None:
+        return []
+    if not isinstance(outputs, list):
+        return ["输出声明必须是对象数组"]
     declared: Dict[str, Dict[str, Any]] = {}
-    if isinstance(outputs, list):
-        for output in outputs:
-            if isinstance(output, str):
-                declared[output] = {"type": "any", "required": True}
-            elif isinstance(output, dict) and isinstance(output.get("name"), str):
-                declared[output["name"]] = {"required": True, **output}
+    for output in outputs:
+        if not isinstance(output, dict) or not isinstance(output.get("name"), str):
+            return ["输出声明必须是带 name 的对象"]
+        declared[output["name"]] = {"required": True, **output}
     if not declared:
         return []
 
@@ -978,8 +971,6 @@ def scan_plugins(
     base_dir: str,
     plugins_dir: str,
     json_filename: str,
-    *,
-    include_disabled: bool = False,
 ) -> Dict[str, Dict]:
     from notmyfault.security.plugin_checks import (
         inspect_plugin_metadata, is_plugin_platform_compatible, plugin_directories,
@@ -989,7 +980,7 @@ def scan_plugins(
     kind = "trigger" if json_filename == "trigger.json" else "action"
     for folder in plugin_directories(Path(base_dir) / plugins_dir):
         meta, errors, schema_errors = inspect_plugin_metadata(folder, kind)
-        if errors or schema_errors or (meta.get("enabled") is False and not include_disabled):
+        if errors or schema_errors:
             continue
         result[meta["id"]] = {
             **meta,

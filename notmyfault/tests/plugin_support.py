@@ -10,7 +10,6 @@ def make_meta(plugin_kind: str, **overrides):
         "id": f"demo_{plugin_kind}",
         "name": "演示插件",
         "description": "演示用插件",
-        "enabled": True,
         "version_code": 1,
         "version": "1.0",
         "package_name": f"com.test.demo_{plugin_kind}",

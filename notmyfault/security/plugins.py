@@ -47,16 +47,6 @@ def check_sudo_import_from_source(source: str) -> bool:
     return _check_sudo_from_tree(parse_plugin_source(source))
 
 
-def check_sudo_import(py_file_path: str) -> bool:
-    """用 AST 检查源码是否导入 notmyfault.security.sudo。"""
-    try:
-        with open(py_file_path, "r", encoding="utf-8") as f:
-            source = f.read()
-    except Exception:
-        return False
-    return check_sudo_import_from_source(source)
-
-
 _NATIVE_MODULES = {"ctypes", "win32api", "win32con", "pywintypes", "_winapi"}
 _EXTERNAL_MODULES = {"subprocess"}
 _OS_DANGEROUS = {
@@ -329,16 +319,6 @@ def scan_plugin_capabilities_from_source(source: str) -> Set[str]:
     return _scan_source_from_tree(parse_plugin_source(source), "plugin.py")[0]
 
 
-def scan_plugin_capabilities(py_file_path: str) -> Set[str]:
-    """用 AST 记录插件使用的 native_api、external_binary、self_elevation 和 dynamic_exec"""
-    try:
-        with open(py_file_path, "r", encoding="utf-8") as f:
-            source = f.read()
-    except Exception:
-        return set()
-    return scan_plugin_capabilities_from_source(source)
-
-
 _PLUGIN_MODULE_PREFIXES = (
     "notmyfault.action_", "notmyfault.trigger_",
     "notmyfault.actions.", "notmyfault.triggers.",
@@ -472,16 +452,6 @@ def scan_borrowed_privilege_from_source(source: str) -> list[str]:
     return _scan_borrowed_from_tree(parse_plugin_source(source))
 
 
-def scan_borrowed_privilege(py_file_path: str) -> list[str]:
-    """检查插件是否调用已加载的插件模块或动态执行函数"""
-    try:
-        with open(py_file_path, "r", encoding="utf-8") as f:
-            source = f.read()
-    except Exception:
-        return []
-    return scan_borrowed_privilege_from_source(source)
-
-
 @dataclass
 class PluginSourceAnalysis:
     capabilities: Set[str]
@@ -559,15 +529,6 @@ def plugin_signature_kind(plugin_dir: str, origin: str = "builtin") -> str:
     except OSError:
         return "none"
     return plugin_signature_kind_from_digest(plugin_dir, origin, hashlib.sha256(payload).digest())
-
-
-def compute_file_hash(file_path: str) -> str | None:
-    """计算文件 SHA-256，读取失败时返回 None"""
-    try:
-        with open(file_path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
-    except OSError:
-        return None
 
 
 def load_plugin_manifest(
@@ -666,17 +627,3 @@ def verify_plugin_integrity_from_hashes(
         if not save_plugin_manifest(manifest, manifest_path):
             return False, "无法保存完整性清单"
     return True, "完整性校验通过"
-
-
-def verify_plugin_integrity(
-    plugin_id: str,
-    files: List[Tuple[str, str]],
-    manifest_path: str | os.PathLike[str] | None = None,
-) -> Tuple[bool, str]:
-    """校验插件文件与清单的一致性并记录首次哈希"""
-    current: dict[str, str] = {}
-    for file_type, file_path in files:
-        current[file_type] = compute_file_hash(file_path) or ""
-    return verify_plugin_integrity_from_hashes(
-        plugin_id, current, manifest_path
-    )

@@ -4,14 +4,13 @@ import json
 from pathlib import Path
 
 from notmyfault.security import plugins as security_plugins
+from notmyfault.security.plugin_checks import inspect_plugin_tree
 
 
-def _files(plugin_dir: Path) -> list[tuple[str, str]]:
-    return [
-        (path.name, str(path))
-        for path in sorted(plugin_dir.iterdir())
-        if path.is_file()
-    ]
+def _hashes(plugin_dir: Path) -> dict[str, str]:
+    tree = inspect_plugin_tree(str(plugin_dir))
+    assert tree is not None
+    return tree.file_snapshot
 
 
 def _manifest_path(tmp_path) -> Path:
@@ -25,8 +24,8 @@ def test_first_check_records_all_files(tmp_path):
     (plugin_dir / "action.json").write_text("{}", encoding="utf-8")
     (plugin_dir / "action.py").write_text("def run(): pass\n", encoding="utf-8")
 
-    ok, message = security_plugins.verify_plugin_integrity(
-        "demo", _files(plugin_dir), manifest_path
+    ok, message = security_plugins.verify_plugin_integrity_from_hashes(
+        "demo", _hashes(plugin_dir), manifest_path
     )
 
     assert ok is True
@@ -41,14 +40,14 @@ def test_changed_file_keeps_original_manifest(tmp_path):
     plugin_dir.mkdir()
     action_path = plugin_dir / "action.py"
     action_path.write_text("old\n", encoding="utf-8")
-    security_plugins.verify_plugin_integrity(
-        "demo", _files(plugin_dir), manifest_path
+    security_plugins.verify_plugin_integrity_from_hashes(
+        "demo", _hashes(plugin_dir), manifest_path
     )
     original = manifest_path.read_bytes()
 
     action_path.write_text("new\n", encoding="utf-8")
-    ok, message = security_plugins.verify_plugin_integrity(
-        "demo", _files(plugin_dir), manifest_path
+    ok, message = security_plugins.verify_plugin_integrity_from_hashes(
+        "demo", _hashes(plugin_dir), manifest_path
     )
 
     assert ok is False
@@ -61,14 +60,14 @@ def test_added_file_is_reported_and_not_recorded(tmp_path):
     plugin_dir = tmp_path / "plugin"
     plugin_dir.mkdir()
     (plugin_dir / "action.py").write_text("old\n", encoding="utf-8")
-    security_plugins.verify_plugin_integrity(
-        "demo", _files(plugin_dir), manifest_path
+    security_plugins.verify_plugin_integrity_from_hashes(
+        "demo", _hashes(plugin_dir), manifest_path
     )
     original = manifest_path.read_bytes()
 
     (plugin_dir / "helper.py").write_text("value = 1\n", encoding="utf-8")
-    ok, message = security_plugins.verify_plugin_integrity(
-        "demo", _files(plugin_dir), manifest_path
+    ok, message = security_plugins.verify_plugin_integrity_from_hashes(
+        "demo", _hashes(plugin_dir), manifest_path
     )
 
     assert ok is False
@@ -84,14 +83,14 @@ def test_deleted_file_is_reported_and_manifest_is_kept(tmp_path):
     helper_path = plugin_dir / "helper.py"
     action_path.write_text("old\n", encoding="utf-8")
     helper_path.write_text("value = 1\n", encoding="utf-8")
-    security_plugins.verify_plugin_integrity(
-        "demo", _files(plugin_dir), manifest_path
+    security_plugins.verify_plugin_integrity_from_hashes(
+        "demo", _hashes(plugin_dir), manifest_path
     )
     original = manifest_path.read_bytes()
 
     helper_path.unlink()
-    ok, message = security_plugins.verify_plugin_integrity(
-        "demo", _files(plugin_dir), manifest_path
+    ok, message = security_plugins.verify_plugin_integrity_from_hashes(
+        "demo", _hashes(plugin_dir), manifest_path
     )
 
     assert ok is False
@@ -127,8 +126,8 @@ def test_first_check_reports_manifest_write_failure(tmp_path, monkeypatch):
         lambda manifest, path=None: False,
     )
 
-    ok, message = security_plugins.verify_plugin_integrity(
-        "demo", _files(plugin_dir), manifest_path
+    ok, message = security_plugins.verify_plugin_integrity_from_hashes(
+        "demo", _hashes(plugin_dir), manifest_path
     )
 
     assert ok is False

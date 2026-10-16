@@ -15,7 +15,6 @@ def make_meta(plugin_id="plug_a", **overrides):
         "id": plugin_id,
         "name": "测试插件",
         "description": "测试用插件",
-        "enabled": True,
         "version_code": 1,
         "version": "1.0",
         "package_name": "com.test.plug",
@@ -62,10 +61,26 @@ def make_loader(tmp_path, mode=SecurityMode.PERMISSIVE):
 
 
 @pytest.mark.parametrize(
-    ("kind", "plugins_dir", "json_name", "py_name", "resolver_name"),
+    ("kind", "plugins_dir", "json_name", "py_name", "resolver_name", "api", "entry"),
     [
-        ("action", "actions", "action.json", "action.py", "resolve_action"),
-        ("trigger", "triggers", "trigger.json", "trigger.py", "resolve_trigger"),
+        (
+            "action",
+            "actions",
+            "action.json",
+            "action.py",
+            "resolve_action",
+            {"execution_api": "context-v1"},
+            "def run_with_context(action_info, params, context)",
+        ),
+        (
+            "trigger",
+            "triggers",
+            "trigger.json",
+            "trigger.py",
+            "resolve_trigger",
+            {"trigger_api": "event-v2"},
+            "def run(meta, config, emit_event, shutdown_event)",
+        ),
     ],
 )
 def test_materialize_rejects_plugin_changed_after_discovery(
@@ -75,14 +90,16 @@ def test_materialize_rejects_plugin_changed_after_discovery(
     json_name,
     py_name,
     resolver_name,
+    api,
+    entry,
 ):
     loader, registry, errors = make_loader(tmp_path)
     plugin_id = f"toctou_{kind}"
     folder = write_plugin(
         tmp_path / plugins_dir,
         plugin_id,
-        make_meta(plugin_id),
-        "def run(meta, params):\n    return 'ok'\n",
+        make_meta(plugin_id, **api),
+        f"{entry}:\n    return 'ok'\n",
         json_name=json_name,
         py_name=py_name,
     )
@@ -90,7 +107,7 @@ def test_materialize_rejects_plugin_changed_after_discovery(
     assert (loaded, failed) == (1, 0)
 
     (folder / py_name).write_text(
-        "def run(meta, params):\n    return 'changed'\n",
+        f"{entry}:\n    return 'changed'\n",
         encoding="utf-8",
     )
     assert getattr(registry, resolver_name)(plugin_id) is None

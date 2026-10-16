@@ -22,7 +22,6 @@ def make_meta(plugin_id="plug_a", **overrides):
         "id": plugin_id,
         "name": "测试插件",
         "description": "测试用插件",
-        "enabled": True,
         "version_code": 1,
         "version": "1.0",
         "package_name": "com.test.plug",
@@ -307,15 +306,36 @@ class TestLoadPlugins:
         assert registry.resolve_action("plug_a") is None
         assert any("Python 加载异常" in msg for _, _, msg in errors)
 
-    def test_plugin_disabled(self, tmp_path, capsys):
-        loader, registry, errors, _ = make_loader(tmp_path)
-        write_plugin(
-            tmp_path / "actions", "off", make_meta(enabled=False), CLEAN_RUN
+    def test_builtin_plugin_disabled_by_config(self, tmp_path):
+        loader, registry, errors, _ = make_loader(
+            tmp_path, config={"disabled_plugins": {"actions": ["plug_a"]}}
         )
-        loaded, failed, meta_store, func_store = load_actions(loader, tmp_path)
+        write_plugin(tmp_path / "actions", "off", make_meta(), CLEAN_RUN)
+        loaded, failed, meta_store, _ = load_actions(loader, tmp_path)
         assert (loaded, failed) == (0, 0)
         assert meta_store == {}
-        assert "已禁用" in capsys.readouterr().out
+        assert registry.resolve_action("plug_a") is None
+
+    def test_user_plugin_disabled_by_config(self, tmp_path):
+        loader, registry, errors, _ = make_loader(
+            tmp_path, config={"disabled_plugins": {"actions": ["plug_a"]}}
+        )
+        write_plugin(tmp_path / "actions", "off", make_meta(), CLEAN_RUN)
+        loaded, failed, meta_store, _ = load_actions(loader, tmp_path, origin="user")
+        assert (loaded, failed) == (0, 0)
+        assert meta_store == {}
+        assert registry.resolve_action("plug_a") is None
+
+    def test_disabled_plugin_loads_again_after_config_cleared(self, tmp_path):
+        write_plugin(tmp_path / "actions", "off", make_meta(), CLEAN_RUN)
+        disabled_loader, _, _, _ = make_loader(
+            tmp_path, config={"disabled_plugins": {"actions": ["plug_a"]}}
+        )
+        assert load_actions(disabled_loader, tmp_path)[:2] == (0, 0)
+        loader, registry, errors, _ = make_loader(tmp_path)
+        loaded, failed, meta_store, _ = load_actions(loader, tmp_path)
+        assert (loaded, failed) == (1, 0)
+        assert meta_store["plug_a"]["id"] == "plug_a"
 
     def test_successful_plugin_load(self, tmp_path):
         loader, registry, errors, _ = make_loader(tmp_path)
@@ -711,8 +731,8 @@ def test_plugins_keep_separate_verified_sibling_modules(tmp_path, monkeypatch, r
 
     monkeypatch.setattr(plugin_loader, "inspect_plugin_tree", inspect_then_change)
     try:
-        loader.materialize_pending_action("first")
-        loader.materialize_pending_action("second")
+        loader.materialize_pending("first")
+        loader.materialize_pending("second")
         assert errors == []
         assert funcs["first"]({}, {}, {}) == (1, 10)
         assert funcs["second"]({}, {}, {}) == (2, 20)
