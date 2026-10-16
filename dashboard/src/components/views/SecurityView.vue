@@ -141,7 +141,7 @@ onMounted(refresh)
         </div>
         <p class="config-security-risk">
           <span class="material-symbols-outlined">warning</span>
-          <span>红色标记为需要签名私钥审批的动作。此处参数值已隐藏；请打开本机 rules.json 核对实际参数、前置检查和失败动作，再重新签名。</span>
+          <span>红色标记为需要签名私钥审批的动作。此处参数值已隐藏；请打开本机 rules.json 核对实际参数和补救路线，再重新签名。</span>
         </p>
       </div>
       <footer class="config-security-actions">

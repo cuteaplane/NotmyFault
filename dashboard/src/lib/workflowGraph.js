@@ -226,14 +226,14 @@ export function makeGroupRoom(workflow, before, after, identity) {
   let current = identity
   while (current) {
     const expanded = boxes.get(current), old = previous.get(current), owner = byId.get(current)
-    if (expanded && old && (expanded.width > old.width || expanded.height > old.height)) {
+    if (expanded && (!old || expanded.width > old.width || expanded.height > old.height)) {
       const placed = [expanded]
       for (const node of workflow.nodes.filter(node => node.binding_id !== current && (node.parent || null) === (owner.parent || null)).sort((a, b) => (boxes.get(a.binding_id)?.x || 0) - (boxes.get(b.binding_id)?.x || 0))) {
         const box = boxes.get(node.binding_id)
         if (!box) continue
         for (const obstacle of placed) {
           if (box.x >= obstacle.x + obstacle.width + 32 || box.x + box.width + 32 <= obstacle.x || box.y >= obstacle.y + obstacle.height + 32 || box.y + box.height + 32 <= obstacle.y) continue
-          if (box.x >= old.x + old.width - 1 || box.x > obstacle.x + obstacle.width / 2) shift(node.binding_id, obstacle.x + obstacle.width + 44 - box.x, 0)
+          if (box.x >= (old ? old.x + old.width : expanded.x) - 1 || box.x > obstacle.x + obstacle.width / 2) shift(node.binding_id, obstacle.x + obstacle.width + 44 - box.x, 0)
           else shift(node.binding_id, 0, obstacle.y + obstacle.height + 44 - box.y)
         }
         placed.push(box)

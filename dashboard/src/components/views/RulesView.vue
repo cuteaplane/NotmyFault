@@ -514,6 +514,25 @@ function failText(err) {
   return String(err || '').slice(-300)
 }
 
+// 动作失败、事件组失败和补救失败都记到同一个 step_id 的失败记录里。
+function recordFailedStep(t, ev) {
+  const pending = t.steps.find(step => step.stepId === ev.data.step_id && ['waiting', 'running'].includes(step.status))
+  if (pending) t.steps = t.steps.filter(step => step !== pending)
+  const existing = t.steps.find(step => step.stepId === ev.data.step_id && step.status === 'fail')
+  const record = {
+    status: 'fail',
+    type: ev.data.action_type || pending?.type || existing?.type || '',
+    stepId: ev.data.step_id,
+    detail: failText(ev.data.error),
+    branch: ev.data.branch || pending?.branch || existing?.branch,
+    evaluatedBranches: ev.data.evaluated_branches || pending?.evaluatedBranches || existing?.evaluatedBranches || [],
+    inputSummary: ev.data.input_summary || existing?.inputSummary || [],
+    outputSummary: [],
+  }
+  if (existing) Object.assign(existing, record)
+  else t.steps.push(record)
+}
+
 function processTestEvents() {
   const t = testResult.value
   if (!t || t.done) return
@@ -526,12 +545,6 @@ function processTestEvents() {
       if (!step) { step = { status: 'running', type: 'event_group', stepId: ev.data.step_id, detail: '' }; t.steps.push(step) }
       step.branch = ev.data.branch
       step.evaluatedBranches = ev.data.evaluated_branches || []
-    } else if (['run.step.succeeded', 'run.step.failed'].includes(ev.name) && ev.data.action_type === 'event_group') {
-      let step = t.steps.find(step => step.stepId === ev.data.step_id)
-      if (!step) { step = { type: 'event_group', stepId: ev.data.step_id }; t.steps.push(step) }
-      step.status = ev.name === 'run.step.failed' ? 'fail' : 'ok'
-      step.detail = ev.name === 'run.step.failed' ? failText(ev.data.error) : ''
-      step.evaluatedBranches = ev.data.evaluated_branches || step.evaluatedBranches || []
     } else if (ev.name === 'run.step.waiting' || ev.name === 'run.step.resumed') {
       const step = t.steps.find(step => step.stepId === ev.data.step_id && step.status === 'waiting')
       if (step) { step.status = ev.name === 'run.step.resumed' ? 'running' : 'waiting'; step.detail = ev.data.reason || '' }
@@ -548,43 +561,40 @@ function processTestEvents() {
       })
     } else if (ev.name === 'action_skipped') {
       t.steps.push({ status: 'skipped', type: ev.data.action_type, stepId: ev.data.step_id, detail: '引用的运行数据不可用，已跳过' })
-    } else if (ev.name === 'action_cancelled') {
-      t.steps.push({ status: 'cancelled', type: ev.data.action_type, stepId: ev.data.step_id, detail: failText(ev.data.error) })
-    } else if (ev.name === 'action_timed_out') {
-      t.steps.push({ status: 'timed_out', type: ev.data.action_type, stepId: ev.data.step_id, detail: failText(ev.data.error) })
+    } else if (ev.name === 'action_cancelled' || ev.name === 'action_timed_out') {
+      t.steps = t.steps.filter(step => !(step.stepId === ev.data.step_id && ['waiting', 'running'].includes(step.status)))
+      t.steps.push({ status: ev.name === 'action_cancelled' ? 'cancelled' : 'timed_out', type: ev.data.action_type, stepId: ev.data.step_id, detail: failText(ev.data.error) })
     } else if (ev.name === 'workflow_failed') {
-      const groupStep = ev.data.action_type === 'event_group' ? t.steps.find(step => step.stepId === ev.data.step_id) : null
-      if (groupStep) t.steps = t.steps.filter(step => step !== groupStep)
-      t.steps.push({ status: 'fail', type: ev.data.action_type || '', stepId: ev.data.step_id, detail: failText(ev.data.error), branch: ev.data.branch || groupStep?.branch, evaluatedBranches: ev.data.evaluated_branches || groupStep?.evaluatedBranches || [], inputSummary: ev.data.input_summary || [], outputSummary: [] })
+      recordFailedStep(t, ev)
       finishTestWatch()
     } else if (ev.name === 'error') {
-      t.steps.push({ status: 'fail', type: ev.data.action_type || '', stepId: ev.data.step_id, detail: failText(ev.data.error) })
+      recordFailedStep(t, ev)
     } else if (ev.name === 'test_assertions_completed') {
       t.assertions = ev.data
     } else if (ev.name.startsWith('run.recovery.')) {
       const step = t.steps.find(step => step.stepId === ev.data.step_id)
       if (step) step.recovery = { groupId: ev.data.recovery_group_id, status: ev.name.endsWith('entered') ? 'running' : ev.name.endsWith('completed') ? 'succeeded' : 'failed' }
-    } else if (ev.name === 'run.recovered') {
-      t.outcome = 'recovered'
-      finishTestWatch()
     } else if (ev.name === 'workflow_completed') {
       t.outcome = ev.data.status
+      let note = ''
       if (ev.data.recovered) {
-        t.note = '连接中断期间这次运行已结束，可到运行记录查看结果和完整步骤。'
+        note = '连接中断期间这次运行已结束，可到运行记录查看结果和完整步骤。'
       } else if (ev.data.status === 'cancelled') {
-        t.note = '测试已停止。'
+        note = '测试已停止。'
       } else if (!t.expected && ev.data.status === 'succeeded') {
-        t.note = '这条规则没有动作，测试已验证触发条件。'
+        note = '这条规则没有动作，测试已验证触发条件。'
       }
-      finishTestWatch()
+      finishTestWatch(note)
     }
   }
 }
 
-function finishTestWatch() {
+function finishTestWatch(note = '') {
   const t = testResult.value
   if (!t) return
+  t.note = note
   t.done = true
+  t.cancelling = false
   if (t.timer) { clearTimeout(t.timer); t.timer = null }
 }
 
@@ -599,6 +609,7 @@ async function stopTestRun() {
   t.cancelling = true
   try {
     const result = await cancelRun(t.runId)
+    if (t.done || testResult.value !== t) return
     if (!result?.ok) {
       t.cancelling = false
       await alertDialog('无法停止测试', result?.error || '这次运行已经结束或不存在')
@@ -606,6 +617,7 @@ async function stopTestRun() {
     }
     t.note = '正在停止；已经开始的动作会在安全位置结束。'
   } catch (error) {
+    if (t.done || testResult.value !== t) return
     t.cancelling = false
     await alertDialog('无法停止测试', error.message)
   }
@@ -632,7 +644,7 @@ onUnmounted(() => {
 })
 
 function stepIcon(status) {
-  return ({ ok: 'check_circle', fail: 'error', skipped: 'skip_next', deferred: 'hourglass_empty', cancelled: 'stop_circle', timed_out: 'timer_off' })[status] || 'help'
+  return ({ ok: 'check_circle', fail: 'error', skipped: 'skip_next', waiting: 'hourglass_empty', running: 'play_arrow', cancelled: 'stop_circle', timed_out: 'timer_off' })[status] || 'help'
 }
 function stepTitle(step) {
   const name = step.type ? (store.schema.actions[step.type]?.name || step.type) : ''
@@ -641,7 +653,9 @@ function stepTitle(step) {
   if (step.status === 'cancelled') return name ? `${name} 已停止` : '运行已停止'
   if (step.status === 'timed_out') return name ? `${name} 已超时` : '动作已超时'
   if (step.status === 'skipped') return `${name} 被跳过`
-  return '前置条件未满足，已推迟'
+  if (step.status === 'waiting') return '等待事件组合'
+  if (step.status === 'running') return name ? `${name} 执行中` : '执行中'
+  return name ? `${name} 状态未知` : '状态未知'
 }
 const testSummary = computed(() => {
   const t = testResult.value
@@ -653,7 +667,6 @@ const testSummary = computed(() => {
   if (t.outcome === 'recovered') return '原动作失败，补救流程完成；测试已补救。'
   if (t.outcome === 'succeeded' && t.steps.some(s => s.status === 'fail')) return '流程已完成；失败步骤已处理或按设置忽略，请查看步骤详情。'
   if (t.steps.some(s => s.status === 'fail')) return '有步骤执行失败，请查看下方详情。'
-  if (t.steps.some(s => s.status === 'deferred')) return '前置条件不满足，本次测试没有执行动作。'
   if (t.assertions?.total && t.assertions.passed < t.assertions.total) return `动作已执行，但 ${t.assertions.total - t.assertions.passed} 项检查未通过。`
   if (t.assertions?.total) return `全部 ${t.steps.length} 个动作执行成功，${t.assertions.total} 项检查均通过。`
   return `全部 ${t.steps.length} 个动作执行成功。`

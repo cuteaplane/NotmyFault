@@ -40,15 +40,12 @@ export function isReference(value) {
     && typeof value.$ref === 'object'
 }
 
+// 插件清单的 outputs 由服务器保证是对象数组，非法条目在这里跳过。
 export function outputDefs(meta) {
-  const outputs = Array.isArray(meta?.outputs)
-    ? meta.outputs
-    : (meta?.outputs && typeof meta.outputs === 'object' ? [meta.outputs] : [])
-  return outputs.map(output => (
-    typeof output === 'string'
-      ? { name: output, label: output, type: 'any', required: true }
-      : { required: true, sensitive: false, ...output }
-  ))
+  if (!Array.isArray(meta?.outputs)) return []
+  return meta.outputs
+    .filter(output => output && typeof output === 'object' && !Array.isArray(output))
+    .map(output => ({ required: true, sensitive: false, ...output }))
 }
 
 export function collectTriggerLeaves(rule, includeAbsence = true) {

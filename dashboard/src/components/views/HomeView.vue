@@ -129,26 +129,37 @@ function statsForStatus(status) {
     ? { rules: status.rules_count ?? '-', triggers: status.triggers_count ?? '-', actions: status.actions_count ?? '-' }
     : { rules: '-', triggers: '-', actions: '-' }
 }
-async function loadStats() {
+async function loadStats(status = null) {
   if (statsLoading || disposed) return
   statsLoading = true
   try {
-    const status = await getEngineStatus()
+    const current = status ?? await getEngineStatus()
     statusError.value = ''
     if (disposed) return
-    await syncStatus(status)
-    const scheduler = status.scheduler || {}
+    await syncStatus(current)
+    if (disposed) return
+    const scheduler = current.scheduler || {}
     schedulerText.value = `${scheduler.running ?? 0} / ${scheduler.queued ?? 0}`
-    stats.value = statsForStatus(status)
-    if (status.api_alive === true) {
-      try {
-        recentRuns.value = await listRuns(5)
+    stats.value = statsForStatus(current)
+    if (!isRunning.value) diag.value = null
+    const runsRead = current.api_alive === true
+      ? listRuns(5).then(runs => {
+        if (disposed) return
+        recentRuns.value = runs
         runsError.value = ''
-      } catch (error) {
+      }).catch(error => {
+        if (disposed) return
         runsError.value = error.message
-      }
-    }
-    diag.value = isRunning.value ? await readDiagnostics() : null
+      })
+      : Promise.resolve()
+    const diagnosticsRead = isRunning.value
+      ? readDiagnostics().then(data => {
+        if (disposed || !isRunning.value) return
+        diag.value = data
+      })
+      : Promise.resolve()
+    await Promise.all([runsRead, diagnosticsRead])
+    if (disposed) return
     if (isRunning.value && !diag.value) statusError.value = '无法读取诊断数据，请刷新重试'
   } catch (error) {
     statusError.value = error.message || '无法读取引擎状态，请刷新重试'
@@ -166,18 +177,18 @@ function refreshHome() {
 watch(() => store.engineStatus, status => {
   stats.value = statsForStatus(status)
 }, { immediate: true })
-watch(() => store.refreshSignal, loadStats)
+watch(() => store.refreshSignal, () => loadStats())
 watch(isControllerOnline, online => {
-  if (online) loadStats()
+  if (online) loadStats(store.engineStatus)
 })
 watch(isRunning, running => {
   if (!running) diag.value = null
-  else loadStats()
+  else loadStats(store.engineStatus)
 })
 
 onMounted(() => {
-  if (isControllerOnline.value) loadStats()
-  if (hasBridge()) diagTimer = setInterval(loadStats, 30000)
+  if (isControllerOnline.value) loadStats(store.engineStatus)
+  if (hasBridge()) diagTimer = setInterval(() => loadStats(), 30000)
 })
 onUnmounted(() => { disposed = true; if (diagTimer) clearInterval(diagTimer) })
 </script>

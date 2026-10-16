@@ -13,10 +13,8 @@ function start() {
   createApp(App).mount('#app')
 }
 
-// 桌面 WebView 等桥接就绪，普通浏览器直接挂载供预览和开发调试使用。
-if (window.pywebview && window.pywebview.api) {
-  start()
-} else if (!window.pywebview) {
+// pywebview 在页面加载后注入 API。
+if (window.pywebview?.api || import.meta.env.DEV) {
   start()
 } else {
   window.addEventListener('pywebviewready', start, { once: true })

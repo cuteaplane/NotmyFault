@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { readFile, mkdir, rm } from 'node:fs/promises'
+import { readFile, mkdir, rm, writeFile } from 'node:fs/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import path from 'node:path'
 import { build } from 'esbuild'
@@ -11,18 +11,26 @@ const temp = path.join(root, 'agent_files/temp/canvas-interaction')
 await mkdir(temp, { recursive: true })
 const vuePath = fileURLToPath(new URL('../node_modules/vue/index.mjs', import.meta.url))
 const bundled = path.join(temp, 'canvas.mjs')
-async function bundleComponent(component, outfile) { await build({ entryPoints: [path.join(root, `dashboard/src/components/${component}.vue`)], outfile, bundle: true, format: 'esm', platform: 'node', plugins: [{ name: 'canvas-sfc', setup(builder) {
-  builder.onResolve({ filter: /^vue$/ }, () => ({ path: vuePath, external: true }))
+const canvasEntry = path.join(temp, 'canvas-entry.mjs')
+const posix = value => value.replace(/\\/g, '/')
+const relative = target => posix(path.relative(temp, target))
+// 画布和共享状态从同一个入口打包，测试才能给画布准备插件清单。
+await writeFile(canvasEntry, [
+  `export { default as RuleCanvas } from ${JSON.stringify(relative(path.join(root, 'dashboard/src/components/RuleCanvas.vue')))}`,
+  `export { store } from ${JSON.stringify(relative(path.join(root, 'dashboard/src/lib/store.js')))}`,
+].join('\n'))
+async function bundleEntry(entry, outfile) { await build({ entryPoints: [entry], outfile, bundle: true, format: 'esm', platform: 'node', plugins: [{ name: 'canvas-sfc', setup(builder) {
+  builder.onResolve({ filter: /^vue$/ }, () => ({ path: pathToFileURL(vuePath).href, external: true }))
   builder.onLoad({ filter: /\.vue$/ }, async ({ path: filename }) => {
     const { descriptor } = parse(await readFile(filename, 'utf8'), { filename })
     return { contents: compileScript(descriptor, { id: 'canvas-test', inlineTemplate: true }).content, loader: 'js', resolveDir: path.dirname(filename) }
   })
 } }] }) }
-await bundleComponent('RuleCanvas', bundled)
+await bundleEntry(canvasEntry, bundled)
 const dialogBundle = path.join(temp, 'test-dialog.mjs')
-await bundleComponent('TestRunDialog', dialogBundle)
+await bundleEntry(path.join(root, 'dashboard/src/components/TestRunDialog.vue'), dialogBundle)
 const predicateBundle = path.join(temp, 'predicate.mjs')
-await bundleComponent('PredicateEditor', predicateBundle)
+await bundleEntry(path.join(root, 'dashboard/src/components/PredicateEditor.vue'), predicateBundle)
 const dom = new JSDOM('<!doctype html><div id="app"></div>', { pretendToBeVisual: true })
 for (const key of ['window', 'document', 'Element', 'HTMLElement', 'SVGElement', 'Node', 'Event', 'MouseEvent']) globalThis[key] = dom.window[key]
 const rectangle = { left: 0, top: 0, right: 1200, bottom: 700, width: 1200, height: 700 }
@@ -34,21 +42,21 @@ globalThis.requestAnimationFrame = callback => { const id = ++nextFrame; frames.
 globalThis.cancelAnimationFrame = id => frames.delete(id)
 dom.window.HTMLElement.prototype.getBoundingClientRect = () => rectangle
 const { createApp, h, ref, reactive, nextTick } = await import(pathToFileURL(vuePath).href)
-const { default: RuleCanvas } = await import(pathToFileURL(bundled).href)
+const { RuleCanvas, store } = await import(pathToFileURL(bundled).href)
 const { default: TestRunDialog } = await import(pathToFileURL(dialogBundle).href)
 const { default: PredicateEditor } = await import(pathToFileURL(predicateBundle).href)
-const triggerNode = { type: 'trigger', binding_id: 'a_trigger01', trigger: { type: 'missing', binding_id: 't_canvas01' }, position: { x: 40, y: 900 } }
+const triggerNode = { type: 'trigger', binding_id: 'a_trigger01', trigger: { type: 'missing', binding_id: 't_canvas01' }, occurrence: 'occurred', position: { x: 40, y: 900 } }
 const conditionNode = { type: 'condition', binding_id: 'a_compare01', position: { x: 1600, y: 900 } }
 const rule = reactive({ rule_id: 'r_canvas01', workflow: { entry: null, nodes: [triggerNode, conditionNode], edges: [] } })
 const predicate = reactive({ op: 'eq', left: '', right: '' })
 conditionNode.predicate = predicate
-const source = { id: 'action-a_trigger01', raw: rule.workflow.nodes[0], kind: 'trigger', source: rule.workflow.nodes[0].trigger, get x() { return this.raw.position.x }, get y() { return this.raw.position.y }, label: '触发数据', dataInputs: [], dataOutputs: [{ id: 'output:state', name: 'state', index: 0, type: 'text', required: true }] }
-const target = { id: 'action-a_compare01', raw: rule.workflow.nodes[1], kind: 'predicate', source: predicate, x: 1600, y: 900, label: '判断状态', dataInputs: [{ id: 'input:left', name: 'left', index: 0, type: 'any', label: '判断数据' }], dataOutputs: [] }
-const nested = { type: 'log', binding_id: 'a_nested01', params: {} }
-const override = { nodes: [source, target, { id: 'action-a_nested01', kind: 'action', raw: nested, readOnly: true, source: nested, index: 0, x: 2000, y: 900, dataInputs: [], dataOutputs: [], label: '只读来源' }], edges: [] }
-const selected = ref(null), view = ref('main'), visible = ref(true), opened = [], operations = []
-const app = createApp({ setup: () => () => visible.value ? h(RuleCanvas, { rule, graphOverride: override, selectedNodeId: selected.value, viewKey: view.value,
-  'onUpdate:selectedNodeId': id => { selected.value = id }, 'onSelect-node': id => { selected.value = id }, 'onOpen-if': action => opened.push(action), onOperation: context => operations.push(context),
+Object.assign(store.schema, {
+  triggers: { missing: { name: '缺失事件', params: [], outputs: [{ name: 'state', label: '状态', type: 'text' }] } },
+  actions: { log: { name: '日志', params: [{ name: 'message', label: '消息', type: 'string' }], outputs: [{ name: 'result', label: '结果', type: 'text' }] } },
+})
+const selected = ref(null), visible = ref(true), operations = []
+const app = createApp({ setup: () => () => visible.value ? h(RuleCanvas, { rule, selectedNodeId: selected.value,
+  'onUpdate:selectedNodeId': id => { selected.value = id }, 'onSelect-node': id => { selected.value = id }, onOperation: context => operations.push(context),
 }) : null })
 const flush = async () => { await nextTick(); await nextTick() }
 function pointer(element, type, x, y, modifiers = {}) {
@@ -76,7 +84,7 @@ try {
   await flush()
   assert.equal(operations[0].kind, 'data', '变量操作保留数据端口来源')
   assert.equal(operations[0].operation, 'create-variable')
-  assert.equal(operations[0].node.id, source.id)
+  assert.equal(operations[0].node.id, 'action-a_trigger01')
   assert.equal(operations[0].port.name, 'state')
   const positions = [...document.querySelectorAll('.graph-node')].map(node => node.style.top)
   assert(pointer(port, 'pointerdown', 300, 695).defaultPrevented, '连接起点阻止默认焦点切换'); await flush()
@@ -110,13 +118,11 @@ try {
   assert.equal(parseFloat(sourceElement.style.left), movedPosition.x, '取消拖拽后卡片显示位置回到已保存坐标')
   const movedLeft = sourceElement.style.left
 
-  const savedCamera = camera(); view.value = 'child'; await flush(); view.value = 'main'; await flush()
-  assert.equal(camera(), savedCamera, '返回主图恢复相机')
-  assert.equal(document.querySelector('.graph-node-trigger').style.left, movedLeft, '返回主图恢复手动位置')
-  assert(document.querySelector('.graph-node-trigger .data-port-dot.draggable'), '返回主图恢复端口展开状态')
-  visible.value = false; await flush(); visible.value = true; await flush(); assert.equal(camera(), savedCamera, '卸载子图组件后恢复视图')
-  const readonly = document.querySelector('.graph-node-action'); assert.equal(readonly.querySelector('footer'), null, '只读前序动作无修改按钮')
-  readonly.click(); await flush(); assert.equal(opened.length, 0, '只读来源不触发编辑操作')
+  const savedCamera = camera()
+  visible.value = false; await flush(); visible.value = true; await flush()
+  assert.equal(camera(), savedCamera, '卸载后重新挂载恢复视图')
+  assert.equal(document.querySelector('.graph-node-trigger').style.left, movedLeft, '重新挂载恢复手动位置')
+  assert(document.querySelector('.graph-node-trigger .data-port-dot.draggable'), '重新挂载恢复端口展开状态')
   const currentViewport = document.querySelector('.node-canvas-viewport')
   const editableCards = [document.querySelector('[data-node-id="action-a_trigger01"]'), document.querySelector('[data-node-id="action-a_compare01"]')]
   editableCards.forEach(card => card.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, ctrlKey: true })))
@@ -134,11 +140,11 @@ try {
   assert.equal(grouping.value, 'if')
   assert.equal(document.querySelectorAll('.multi-selected').length, 0)
   const [bx, by, bz] = panZoom()
-  pointer(currentViewport, 'pointerdown', bx + Math.min(source.x, target.x) * bz - 2, by + 898 * bz, { ctrlKey: true })
-  pointer(currentViewport, 'pointermove', bx + (target.x + 228) * bz + 2, by + 1150 * bz, { ctrlKey: true })
+  pointer(currentViewport, 'pointerdown', bx + Math.min(triggerNode.position.x, conditionNode.position.x) * bz - 2, by + 898 * bz, { ctrlKey: true })
+  pointer(currentViewport, 'pointermove', bx + (conditionNode.position.x + 228) * bz + 2, by + 1150 * bz, { ctrlKey: true })
   await flush()
   assert.equal(document.querySelectorAll('.multi-selected').length, 2, 'Ctrl 拖空白处框选两个图块')
-  pointer(currentViewport, 'pointerup', bx + (target.x + 228) * bz + 2, by + 1150 * bz, { ctrlKey: true })
+  pointer(currentViewport, 'pointerup', bx + (conditionNode.position.x + 228) * bz + 2, by + 1150 * bz, { ctrlKey: true })
   await flush()
   assert.equal(document.querySelector('.canvas-selection-box'), null)
   currentViewport.dispatchEvent(new dom.window.MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2, clientX: 800, clientY: 400 }))

@@ -1,4 +1,5 @@
 <script>
+// 画布按规则对象保存平移、缩放和展开状态。
 const canvasViews = new WeakMap()
 </script>
 
@@ -13,12 +14,11 @@ import { predicateSummary, predicateSummaryParts, precedingSources, workflowEven
 import { typeLabel } from '../lib/valueTypes'
 import { isAdmin, eventName, actionName, describeItem } from '../lib/rulePresentation'
 
-const props = defineProps({ rule: Object, selectedNodeId: String, graphOverride: Object, viewKey: { type: String, default: 'main' } })
-const emit = defineEmits(['update:selectedNodeId', 'select-node', 'delete-node', 'add-if', 'add-assignment', 'add-wait', 'open-picker', 'move-action', 'remove-action', 'add-condition-child', 'open-if', 'predicate-select', 'branch-add', 'branch-remove', 'operation'])
+const props = defineProps({ rule: Object, selectedNodeId: String })
+const emit = defineEmits(['update:selectedNodeId', 'select-node', 'delete-node', 'operation'])
 const selectedNodeId = computed({ get: () => props.selectedNodeId, set: id => emit('update:selectedNodeId', id) })
 const typeCatalog = computed(() => Object.entries(store.schema.data_types?.custom || {}).map(([id, definition]) => ({ id, ...definition })))
 
-const nodePositions = ref({})
 const expandedGroups = ref(new Set())
 const contextMenu = ref(null)
 const selection = ref(new Set())
@@ -153,7 +153,7 @@ const graph = computed(() => {
     if (!sources.has(owner)) sources.set(owner, precedingSources(props.rule, owner, store.schema))
     return predicateSummary(predicate, sources.get(owner), store.configData.rules, events)
   }
-  const controlGraph = props.graphOverride || buildWorkflowGraph(props.rule, expandedGroups.value, store.schema, { eventName, actionName, describeItem, predicateSummary: describePredicate, frozenGroups: dragFrames.value })
+  const controlGraph = buildWorkflowGraph(props.rule, expandedGroups.value, store.schema, { eventName, actionName, describeItem, predicateSummary: describePredicate, frozenGroups: dragFrames.value })
   function decorateGraph(controlGraph) {
     const fullNodes = controlGraph.nodes.map(node => {
       const built = buildNodeDataPorts(node, store.schema, props.rule)
@@ -220,7 +220,7 @@ const graph = computed(() => {
     }
   }
   const decorated = decorateGraph(controlGraph)
-  if (!props.rule.workflow || props.graphOverride) return decorated
+  if (!props.rule.workflow) return decorated
   // 连线决定显示的数据行，组边界使用同一份卡片高度。
   const heights = new Map(decorated.nodes.filter(node => !node.frame).map(node => [node.id, node.height]))
   return decorateGraph(buildWorkflowGraph(props.rule, expandedGroups.value, store.schema, {
@@ -305,7 +305,6 @@ let edgePanTime = null
 let gesturePointer = null
 let captureTarget = null
 let capturePointerId = null
-let activeView = props.viewKey
 let activeRule = props.rule
 
 function clampZoom(value) { return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, value)) }
@@ -857,32 +856,28 @@ function trackKeyboard(event) {
 function trackPointer() { keyboardNavigation = false }
 function saveView() {
   if (!activeRule) return
-  let views = canvasViews.get(activeRule)
-  if (!views) { views = new Map(); canvasViews.set(activeRule, views) }
-  views.set(activeView, { pan: { ...pan.value }, zoom: zoom.value,
-    positions: { ...nodePositions.value }, ports: { ...portExpansion.value }, expanded: [...expandedGroups.value], fitted: fittedOnce })
+  canvasViews.set(activeRule, { pan: { ...pan.value }, zoom: zoom.value,
+    ports: { ...portExpansion.value }, expanded: [...expandedGroups.value], fitted: fittedOnce })
 }
 function restoreView() {
-  const saved = canvasViews.get(activeRule)?.get(activeView)
+  const saved = canvasViews.get(activeRule)
   pan.value = saved?.pan || { x: 0, y: 0 }
   zoom.value = saved?.zoom || 1
-  nodePositions.value = saved?.positions || {}
   portExpansion.value = saved?.ports || {}
   expandedGroups.value = new Set(saved?.expanded || [])
   fittedOnce = saved?.fitted || false
   stopCameraAnimation()
 }
-watch(() => [props.rule, props.viewKey], async () => {
-  if (activeRule?.rule_id && activeRule.rule_id === props.rule.rule_id && activeView === props.viewKey) { activeRule = props.rule; return }
+watch(() => props.rule, async () => {
+  if (activeRule?.rule_id && activeRule.rule_id === props.rule.rule_id) { activeRule = props.rule; return }
   saveView()
   cancelGesture()
   activeRule = props.rule
-  activeView = props.viewKey
   restoreView()
   await nextTick()
   if (!fittedOnce && viewportSize.value.w) { fittedOnce = true; fitView({ readable: true }) }
 }, { flush: 'sync' })
-defineExpose({ nodes: layoutNodes, inspectionNodes, toggleGroup, openContext })
+defineExpose({ nodes: layoutNodes, targetNodes: targetLayoutNodes, inspectionNodes, toggleGroup, openContext })
 </script>
 
 <template>

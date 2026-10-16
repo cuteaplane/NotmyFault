@@ -5,6 +5,7 @@ import {
   API,
   deleteAIApiKey,
   getAIDraftingSetting,
+  hasBridge,
   readPlatformCapabilities,
   saveAIApiKey,
   updateAIDraftingSetting,
@@ -23,6 +24,11 @@ const currentPage = ref(validPages.has(store.pendingSettingsSection) ? store.pen
 store.pendingSettingsSection = ''
 const q = ref('')
 const platformReport = ref(null)
+const residentOnClose = ref(true)
+const desktopSettingsLoading = ref(false)
+const savingDesktopSettings = ref(false)
+const desktopSettingsError = ref('')
+let desktopSettingsDisposed = false
 const savingAIFeature = ref(false)
 const savingAIService = ref(false)
 const savingAIKey = ref(false)
@@ -90,7 +96,7 @@ const capabilityRows = computed(() => Object.entries(platformReport.value?.capab
 const availableCapabilityCount = computed(() => capabilityRows.value.filter(row => row.available).length)
 
 const settingsItems = computed(() => [
-  { page: 'general', icon: 'tune', title: '常规', value: isDark.value ? '深色模式' : '浅色模式', tone: 'blue', terms: '主题 外观 运行' },
+  { page: 'general', icon: 'tune', title: '常规', value: isDark.value ? '深色模式' : '浅色模式', tone: 'blue', terms: '主题 外观 运行 驻留 后台 窗口 关闭' },
   { page: 'ai', icon: 'auto_awesome', title: 'AI 功能', value: store.aiDrafting.enabled ? '已开启' : '已关闭', tone: 'violet', terms: '规则 草稿 服务商 api 密钥 模型' },
   { page: 'security', icon: 'shield_lock', title: '安全与权限', value: modeLabel.value, tone: 'cyan', terms: '管理员 授权 签名 验证 插件 权限' },
   { page: 'diagnostics', icon: 'monitor_heart', title: '系统与诊断', value: store.engineStatus.engine_running ? '引擎运行中' : '查看日志', tone: 'amber', terms: '日志 错误 崩溃 启动 引擎 诊断' },
@@ -127,6 +133,45 @@ async function load() {
     applyAISavedSettings(aiDrafting)
     store.aiApiKeyStatus = aiApiKeyStatus || 'none'
   } catch { snackbar('无法读取设置') }
+}
+
+async function loadDesktopSettings() {
+  if (!hasBridge()) return
+  desktopSettingsLoading.value = true
+  try {
+    const result = await window.pywebview.api.get_dashboard_settings()
+    if (desktopSettingsDisposed) return
+    if (typeof result?.resident_on_close === 'boolean') residentOnClose.value = result.resident_on_close
+    desktopSettingsError.value = result?.ok === false ? (result.error || '无法读取桌面设置') : ''
+  } catch (error) {
+    if (!desktopSettingsDisposed) desktopSettingsError.value = error.message || '无法读取桌面设置'
+  } finally {
+    if (!desktopSettingsDisposed) desktopSettingsLoading.value = false
+  }
+}
+
+async function toggleResidentOnClose(event) {
+  if (savingDesktopSettings.value) return
+  const input = event.target
+  savingDesktopSettings.value = true
+  try {
+    const result = await window.pywebview.api.set_dashboard_settings(input.checked)
+    if (desktopSettingsDisposed) return
+    if (result?.ok !== true) {
+      input.checked = residentOnClose.value
+      desktopSettingsError.value = result?.error || '无法保存桌面设置'
+      return
+    }
+    residentOnClose.value = result.resident_on_close === true
+    input.checked = residentOnClose.value
+    desktopSettingsError.value = ''
+  } catch (error) {
+    if (desktopSettingsDisposed) return
+    input.checked = residentOnClose.value
+    desktopSettingsError.value = error.message || '无法保存桌面设置'
+  } finally {
+    if (!desktopSettingsDisposed) savingDesktopSettings.value = false
+  }
 }
 
 async function toggleAIDrafting() {
@@ -229,10 +274,12 @@ function onKonamiKey(event) {
 
 onMounted(async () => {
   load()
+  loadDesktopSettings()
   platformReport.value = await readPlatformCapabilities()
   window.addEventListener('keydown', onKonamiKey)
 })
 onUnmounted(() => {
+  desktopSettingsDisposed = true
   aiApiKeyDraft.value = ''
   window.removeEventListener('keydown', onKonamiKey)
 })
@@ -276,10 +323,16 @@ onUnmounted(() => {
             </button>
             <div class="a16-row">
               <span class="material-symbols-outlined a16-row-ico">memory</span>
+              <span class="a16-row-body"><span class="a16-row-title">关闭后驻留后台</span><span class="a16-row-sub">{{ hasBridge() ? '关闭窗口后保留 Dashboard，再次打开更快；退出托盘时一并关闭。' : '桌面桥接尚未就绪，暂时无法修改' }}</span></span>
+              <label class="switch"><input type="checkbox" aria-label="关闭后驻留后台" :checked="residentOnClose" :disabled="desktopSettingsLoading || savingDesktopSettings || !hasBridge()" @change="toggleResidentOnClose"><span class="switch-track"><span class="switch-thumb"></span></span></label>
+            </div>
+            <div class="a16-row">
+              <span class="material-symbols-outlined a16-row-ico">memory</span>
               <span class="a16-row-body"><span class="a16-row-title">引擎</span><span class="a16-row-sub">自动化运行状态</span></span>
               <span class="a16-row-val">{{ store.engineStatus.engine_running ? '运行中' : store.engineStatus.api_alive ? '已暂停' : '离线' }}</span>
             </div>
           </div>
+          <p v-if="desktopSettingsError" class="settings-inline-note danger-text" role="alert">{{ desktopSettingsError }}</p>
         </section>
 
         <section v-else-if="currentPage === 'ai'" class="settings-subpage ai-drafting-settings">

@@ -66,7 +66,7 @@ let sseReconnectTimer = null
 let sseEventSeq = 0
 let refreshSignalTimer = null
 // 规则测试回显只关心这几类执行事件。
-const RULE_EVENTS = ['run.group.selected', 'run.group.entered', 'run.group.completed', 'run.group.failed', 'run.group.waiting', 'run.group.awakened', 'run.recovered', 'run.recovery.entered', 'run.recovery.completed', 'run.recovery.failed', 'run.step.waiting', 'run.step.resumed', 'action_executed', 'action_skipped', 'action_cancelled', 'action_timed_out', 'workflow_failed', 'workflow_completed', 'test_assertions_completed', 'error', 'run_dropped', 'run_replaced']
+const RULE_EVENTS = ['run.group.selected', 'run.group.entered', 'run.group.completed', 'run.group.failed', 'run.group.waiting', 'run.group.awakened', 'run.recovery.entered', 'run.recovery.completed', 'run.recovery.failed', 'run.step.waiting', 'run.step.resumed', 'action_executed', 'action_skipped', 'action_cancelled', 'action_timed_out', 'workflow_failed', 'workflow_completed', 'test_assertions_completed', 'error', 'run_dropped']
 const timers = []
 function setTracked(fn, ms) { const id = setInterval(fn, ms); timers.push(id); return id }
 
@@ -241,7 +241,7 @@ function dispatchSSEEvent(eventName, dataText) {
     store.engineEvents.push({ name: eventName, data: d, seq: ++sseEventSeq })
     if (store.engineEvents.length > 40) store.engineEvents.splice(0, store.engineEvents.length - 40)
     if (
-      ['workflow_failed', 'workflow_completed', 'run_dropped', 'run_replaced'].includes(eventName)
+      ['workflow_failed', 'workflow_completed', 'run_dropped'].includes(eventName)
       && store.activeManualRun?.runId === d.run_id
     ) store.activeManualRun = null
   }

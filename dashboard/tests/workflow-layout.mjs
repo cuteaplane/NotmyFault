@@ -59,3 +59,25 @@ const orderedChoice = eventGroup('orderedchoice'), orderedElif = action('ordered
 const orderedGraph = ruleWith([orderedChoice,orderedElif,orderedIf],[wire(orderedChoice,orderedIf,'control',orderedChoice.branches[0].id),wire(orderedChoice,orderedElif,'control',orderedChoice.branches[1].id)]).workflow
 arrangeWorkflow(orderedGraph,new Set([orderedChoice.binding_id]))
 assert(orderedIf.position.y < orderedElif.position.y,'后续动作按 IF／ELIF 出口顺序排列，不按图块创建顺序排列')
+
+const insertSource = action('insertsource'), insertTarget = action('inserttarget')
+const insertGroup = { type: 'action_group', binding_id: 'a_insertgroup', exports: {}, position: { x: 340, y: 240 } }
+const insertChild = action('insertchild', 'log', {}, insertGroup.binding_id)
+insertSource.position = { x: 0, y: 0 }
+insertTarget.position = { x: 208, y: 0 }
+insertChild.position = { x: 624, y: 318 }
+const insertRule = ruleWith([insertSource, insertTarget, insertGroup, insertChild], [wire(insertSource, insertTarget), wire(insertGroup, insertChild, 'control', 'entry')])
+const insertExpanded = new Set([insertGroup.binding_id])
+const beforeInsert = buildWorkflowGraph(insertRule, insertExpanded, {}, presentation).nodes
+const inserted = action('insertnew')
+inserted.position = { x: 308, y: 0 }
+insertRule.workflow.nodes.push(inserted)
+const childOffset = { x: insertChild.position.x - insertGroup.position.x, y: insertChild.position.y - insertGroup.position.y }
+makeGroupRoom(insertRule.workflow, beforeInsert, buildWorkflowGraph(insertRule, insertExpanded, {}, presentation).nodes, inserted.binding_id)
+const insertedLayout = buildWorkflowGraph(insertRule, insertExpanded, {}, presentation).nodes.filter(node => !node.gate && !node.raw.parent)
+for (let i = 0; i < insertedLayout.length; i++) for (let j = i + 1; j < insertedLayout.length; j++) {
+  const one = insertedLayout[i], two = insertedLayout[j]
+  assert(one.x + one.width <= two.x || two.x + two.width <= one.x || one.y + one.height <= two.y || two.y + two.height <= one.y, `插入后卡片不能重叠 ${one.id}, ${two.id}`)
+}
+assert.deepEqual(insertSource.position, { x: 0, y: 0 }, '插入后继保留来源图块的位置')
+assert.deepEqual({ x: insertChild.position.x - insertGroup.position.x, y: insertChild.position.y - insertGroup.position.y }, childOffset, '避让动作组时保持组内相对位置')

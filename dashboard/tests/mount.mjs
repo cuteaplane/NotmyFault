@@ -91,6 +91,8 @@ let mockAiDrafting = { enabled: false, endpoint_url: '', model: '', api_format: 
 let mockConfigSecurity = { status:'ok', reason:'', summary:null }
 let mockAiApiKeyStatus = 'none'
 let mockBluetoothInstalled = false
+let mockResidentOnClose = true
+let mockDashboardSettingsSaveFail = false
 let exportedRunBlob = null
 let exportedRunFileName = ''
 const exportedFileNames = []
@@ -259,6 +261,17 @@ window.pywebview = { api: {
   set_window_state: async (action) => {
     windowStateCalls.push(action)
     return { ok:true, action }
+  },
+  get_dashboard_settings: async () => ({ ok:true, resident_on_close:mockResidentOnClose }),
+  set_dashboard_settings: async residentOnClose => {
+    if (typeof residentOnClose !== 'boolean') {
+      return { ok:false, resident_on_close:mockResidentOnClose, error:'驻留设置必须是布尔值' }
+    }
+    if (mockDashboardSettingsSaveFail) {
+      return { ok:false, resident_on_close:mockResidentOnClose, error:'设置文件写入失败' }
+    }
+    mockResidentOnClose = residentOnClose
+    return { ok:true, resident_on_close:mockResidentOnClose }
   },
   request_api: async (path, method, data) => {
     bridgeCalls.push({ path, method, data })
@@ -573,7 +586,30 @@ if (!ensuredParamsOk || !recoveryDiffOk) process.exitCode = 1
 const builtHtml = fs.readFileSync(path.join(distDir, 'index.html'), 'utf8')
 const entryPath = builtHtml.match(/<script[^>]*type="module"[^>]*src="([^"]+)"/)?.[1]
 if (!entryPath) throw new Error('Dashboard 构建结果缺少入口脚本')
+const desktopBridge = window.pywebview
+const startupFetch = window.fetch
+let prematureApiReads = 0
+window.fetch = (...args) => {
+  if (String(args[0]).includes('/api/')) prematureApiReads++
+  return startupFetch(...args)
+}
+global.fetch = window.fetch
+delete window.pywebview
 await import(new URL(entryPath, pathToFileURL(path.resolve(distDir, 'index.html'))).href)
+await new Promise(r => setTimeout(r, 100))
+
+const bridgeAbsentHtml = document.getElementById('app').innerHTML
+const bridgeAbsentOk = bridgeAbsentHtml === ''
+  && prematureApiReads === 0
+  && engineStatusReads === 0
+  && configReads === 0
+console.log((bridgeAbsentOk?'PASS':'FAIL')+' - production entry stays empty and reads no engine or config data before the desktop bridge exists')
+if (!bridgeAbsentOk) process.exitCode = 1
+window.fetch = startupFetch
+global.fetch = startupFetch
+
+window.pywebview = desktopBridge
+window.dispatchEvent(new window.Event('pywebviewready'))
 await new Promise(r => setTimeout(r, 100))
 
 const offlineHtml = document.getElementById('app').innerHTML
@@ -589,8 +625,7 @@ const html = document.getElementById('app').innerHTML
 const checks = [
   ['engine running', html.includes('运行中')],
 ]
-const startupRetryOk = engineStatusReads >= 2 && configReads >= 2
-  && document.querySelector('.home-engine-metrics')?.textContent.includes('1')
+const startupRetryOk = document.querySelector('.home-engine-metrics')?.textContent.includes('1')
   && !document.querySelector('.dashboard-first-run')
 const homeKeepsCapabilitiesOutOfDiagnostics = !document.querySelector('.dashboard-capability-report')
 checks.push(['bridge readiness restores engine state without waiting for polling', startupRetryOk])
@@ -899,6 +934,171 @@ const snapshotOk = snapshotCall?.data?.rule?.name === '挂载测试规则'
 console.log((snapshotOk?'PASS':'FAIL')+' - test-rule sends exact saved rule snapshot')
 if (!snapshotOk) process.exitCode = 1
 
+const emitTestEvent = (name, data) => engineEventController.enqueue(
+  textEncoder.encode(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`),
+)
+// 20 秒提示由 setTimeout 触发，测试先接住它再手动调用。
+async function startObservedTest() {
+  recoveredRun = null
+  saveRun.click()
+  await waitFor(() => document.querySelector('.test-prep-dialog'), 2000)
+  const originalSetTimeout = globalThis.setTimeout
+  let showLongRunningHint
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    if (delay === 20000) showLongRunningHint = () => callback(...args)
+    return originalSetTimeout(callback, delay, ...args)
+  }
+  try {
+    ;[...document.querySelectorAll('.test-prep-dialog button')].find(
+      button => button.textContent.includes('用这些数据运行'),
+    ).click()
+    await waitFor(() => showLongRunningHint, 2000)
+  } finally {
+    globalThis.setTimeout = originalSetTimeout
+  }
+  return showLongRunningHint
+}
+async function closeTestDialog() {
+  ;[...document.querySelectorAll('.test-result-dialog button')].find(button => button.textContent.includes('关闭')).click()
+  await pause(30)
+}
+const observedEventData = { run_id:'run_test001', step_id:'a_mount001', action_type:'notify' }
+
+for (const [eventName, runStatus, stepStatus] of [
+  ['action_executed', 'succeeded', 'ok'],
+  ['action_cancelled', 'cancelled', 'cancelled'],
+  ['action_timed_out', 'timed_out', 'timed_out'],
+]) {
+  const showLongRunningHint = await startObservedTest()
+  const eventData = { ...observedEventData }
+  emitTestEvent('run.step.waiting', eventData)
+  await waitFor(() => document.querySelector('.test-step-waiting'), 2000)
+  showLongRunningHint()
+  await pause(20)
+  const runningHint = document.querySelector('.test-summary')?.textContent
+  emitTestEvent(eventName, { ...eventData, error:{ message:'运行已结束' } })
+  emitTestEvent('workflow_completed', { run_id:'run_test001', status:runStatus })
+  await waitFor(() => document.querySelector(`.test-step-${stepStatus}`), 2000)
+  await pause(20)
+  const terminalDialog = document.querySelector('.test-result-dialog')
+  const terminalReplacesWaiting = terminalDialog.querySelectorAll('.test-step').length === 1
+    && !terminalDialog.querySelector('.test-step-waiting, .test-step-running')
+    && runningHint && terminalDialog.querySelector('.test-summary')?.textContent !== runningHint
+    && ![...terminalDialog.querySelectorAll('button')].some(button => button.textContent.includes('停止测试'))
+  console.log((terminalReplacesWaiting?'PASS':'FAIL') + ` - ${runStatus} replaces the pending step and long-running hint`)
+  if (!terminalReplacesWaiting) process.exitCode = 1
+  await closeTestDialog()
+}
+
+for (const replyFails of [false, true]) {
+  await startObservedTest()
+  emitTestEvent('run.step.waiting', { ...observedEventData })
+  await waitFor(() => document.querySelector('.test-step-waiting'), 2000)
+  const requestApi = window.pywebview.api.request_api
+  let finishCancel
+  window.pywebview.api.request_api = (...args) => {
+    if (args[0] !== '/api/runs/run_test001/cancel') return requestApi(...args)
+    return new Promise((resolve, reject) => {
+      finishCancel = () => replyFails ? reject(new Error('连接已关闭')) : resolve({ ok:true })
+    })
+  }
+  try {
+    ;[...document.querySelectorAll('.test-result-dialog button')].find(button => button.textContent.includes('停止测试')).click()
+    await waitFor(() => finishCancel, 2000)
+    emitTestEvent('action_cancelled', { ...observedEventData, error:{ message:'运行已取消' } })
+    emitTestEvent('workflow_completed', { run_id:'run_test001', status:'cancelled' })
+    await waitFor(() => document.querySelector('.test-step-cancelled')
+      && ![...document.querySelectorAll('.test-result-dialog button')].some(button => button.textContent.includes('正在停止')), 2000)
+    const completedSummary = document.querySelector('.test-result-dialog .test-summary').textContent
+    finishCancel()
+    await pause(30)
+    const completedDialog = document.querySelector('.test-result-dialog')
+    const replyCannotChangeCompletion = completedDialog.querySelector('.test-summary').textContent === completedSummary
+      && !completedDialog.querySelector('.test-step-waiting, .test-step-running')
+      && document.querySelectorAll('.nmf-dialog-backdrop').length === 1
+    console.log((replyCannotChangeCompletion?'PASS':'FAIL') + ` - late cancellation ${replyFails?'failure':'reply'} preserves completed UI`)
+    if (!replyCannotChangeCompletion) process.exitCode = 1
+  } finally {
+    window.pywebview.api.request_api = requestApi
+    await closeTestDialog()
+  }
+}
+
+// 同一个步骤先等待再失败时只留一条失败记录，测试等流程结束后才收尾。
+{
+  const showLongRunningHint = await startObservedTest()
+  emitTestEvent('run.step.waiting', { ...observedEventData })
+  await waitFor(() => document.querySelector('.test-step-waiting'), 2000)
+  showLongRunningHint()
+  await pause(20)
+  emitTestEvent('error', { ...observedEventData, error:{ code:'action_execution_failed', message:'写文件失败' },
+    input_summary:[{ name:'message', label:'消息', display:'公开内容' }] })
+  await waitFor(() => document.querySelector('.test-step-fail'), 2000)
+  await pause(20)
+  const failedDialog = document.querySelector('.test-result-dialog')
+  const failureKeepsObservation = failedDialog.querySelectorAll('.test-step').length === 1
+    && failedDialog.querySelectorAll('.test-step-fail').length === 1
+    && !failedDialog.querySelector('.test-step-waiting, .test-step-running')
+    && failedDialog.textContent.includes('写文件失败')
+    && failedDialog.textContent.includes('公开内容')
+    && [...failedDialog.querySelectorAll('button')].some(button => button.textContent.includes('停止测试'))
+  console.log((failureKeepsObservation?'PASS':'FAIL') + ' - step failure replaces the waiting step and keeps the test observable')
+  if (!failureKeepsObservation) process.exitCode = 1
+  emitTestEvent('workflow_completed', { run_id:'run_test001', status:'succeeded' })
+  await waitFor(() => document.querySelector('.test-result-dialog .test-summary')?.textContent.includes('流程已完成'), 2000)
+  const continuedAfterFailure = document.querySelectorAll('.test-result-dialog .test-step-fail').length === 1
+    && ![...document.querySelectorAll('.test-result-dialog button')].some(button => button.textContent.includes('停止测试'))
+  console.log((continuedAfterFailure?'PASS':'FAIL') + ' - handled failure lets the run finish without a duplicate step card')
+  if (!continuedAfterFailure) process.exitCode = 1
+  await closeTestDialog()
+}
+
+// 补救完成并继续执行时，步骤保留失败原因和补救结果。
+{
+  const showLongRunningHint = await startObservedTest()
+  showLongRunningHint()
+  emitTestEvent('error', { ...observedEventData, error:{ code:'action_execution_failed', message:'通知失败' } })
+  await waitFor(() => document.querySelector('.test-step-fail'), 2000)
+  emitTestEvent('run.recovery.entered', { ...observedEventData, recovery_group_id:'a_recoverygroup' })
+  emitTestEvent('run.recovery.completed', { ...observedEventData, recovery_group_id:'a_recoverygroup' })
+  await pause(20)
+  const recoveryDialog = document.querySelector('.test-result-dialog')
+  const recoveryKeepsObservation = recoveryDialog.querySelector('.test-step-fail')?.textContent.includes('补救完成')
+    && recoveryDialog.querySelector('.test-step-fail')?.textContent.includes('a_recoverygroup')
+    && [...recoveryDialog.querySelectorAll('button')].some(button => button.textContent.includes('停止测试'))
+  console.log((recoveryKeepsObservation?'PASS':'FAIL') + ' - recovery keeps the failed step and the test observable')
+  if (!recoveryKeepsObservation) process.exitCode = 1
+  emitTestEvent('workflow_completed', { run_id:'run_test001', status:'recovered' })
+  await waitFor(() => document.querySelector('.test-result-dialog .test-summary')?.textContent.includes('测试已补救'), 2000)
+  const recoveredOutcome = document.querySelector('.test-result-dialog .test-summary')?.textContent.includes('测试已补救')
+    && document.querySelector('.test-result-dialog .test-step-fail')?.textContent.includes('补救完成')
+  console.log((recoveredOutcome?'PASS':'FAIL') + ' - recovered run reports the outcome after recovery')
+  if (!recoveredOutcome) process.exitCode = 1
+  await closeTestDialog()
+}
+
+// 事件组先失败、补救路径又缺绑定值时，失败记录只更新一条并结束测试观察。
+{
+  const showLongRunningHint = await startObservedTest()
+  showLongRunningHint()
+  emitTestEvent('error', { ...observedEventData, action_type:'event_group',
+    error:{ code:'condition_evaluation_failed', message:'条件判断失败' },
+    evaluated_branches:[{ branch_id:'b_first001', result:false, predicates:[{ node_id:'a_compare01', op:'eq', result:false }] }] })
+  await waitFor(() => document.querySelector('.test-step-fail'), 2000)
+  emitTestEvent('workflow_failed', { ...observedEventData, action_type:'event_group', branch:'b_first001',
+    error:{ code:'missing_binding_value', message:'缺少绑定值' } })
+  await waitFor(() => document.querySelector('.test-result-dialog .test-summary')?.textContent.includes('有步骤执行失败'), 2000)
+  const failedStep = document.querySelector('.test-result-dialog .test-step-fail')
+  const bindingFailureEndsWatch = document.querySelectorAll('.test-result-dialog .test-step-fail').length === 1
+    && ![...document.querySelectorAll('.test-result-dialog button')].some(button => button.textContent.includes('停止测试'))
+    && failedStep?.textContent.includes('缺少绑定值')
+    && failedStep?.textContent.includes('b_first001')
+    && !!failedStep?.querySelector('.test-condition-results')
+  console.log((bindingFailureEndsWatch?'PASS':'FAIL') + ' - binding failure updates the failed step and ends the test watch')
+  if (!bindingFailureEndsWatch) process.exitCode = 1
+  await closeTestDialog()
+}
+
 // D. requestTestContext：空 path（完整 payload）必须写入 trigger_payloads / event_payload
 const { buildAllTestInputFields, buildPreparedTestContext, buildTestInputFields, requestTestContext } = await import('../src/lib/bindings.js')
 const ctxSchema = {
@@ -1076,6 +1276,48 @@ const settingsNav = [...document.querySelectorAll('.nav-item')].find(
 )
 settingsNav?.click()
 await new Promise(r => setTimeout(r, 50))
+;[...document.querySelectorAll('.settings-root-list button')].find(
+  button => button.textContent.includes('常规'),
+)?.click()
+await waitFor('input[aria-label="关闭后驻留后台"]')
+const residentSwitch = () => document.querySelector('input[aria-label="关闭后驻留后台"]')
+const residentDefaultOk = residentSwitch()?.checked === true
+  && residentSwitch()?.disabled === false
+  && mockResidentOnClose === true
+console.log((residentDefaultOk?'PASS':'FAIL')+' - general settings keeps closing to the background on by default')
+if (!residentDefaultOk) process.exitCode = 1
+
+residentSwitch()?.click()
+await new Promise(r => setTimeout(r, 30))
+;[...document.querySelectorAll('.settings-root-list button')].find(
+  button => button.textContent.includes('关于 NotmyFault'),
+)?.click()
+await new Promise(r => setTimeout(r, 30))
+;[...document.querySelectorAll('.settings-root-list button')].find(
+  button => button.textContent.includes('常规'),
+)?.click()
+await waitFor('input[aria-label="关闭后驻留后台"]')
+const residentOffKept = residentSwitch()?.checked === false && mockResidentOnClose === false
+console.log((residentOffKept?'PASS':'FAIL')+' - turning background residency off survives leaving the general page')
+if (!residentOffKept) process.exitCode = 1
+
+mockDashboardSettingsSaveFail = true
+residentSwitch()?.click()
+await new Promise(r => setTimeout(r, 30))
+const residentFailureKeepsOldValue = residentSwitch()?.checked === false
+  && mockResidentOnClose === false
+  && document.querySelector('[role="alert"]')?.textContent.includes('设置文件写入失败')
+console.log((residentFailureKeepsOldValue?'PASS':'FAIL')+' - a failed background save restores the switch and shows the error')
+if (!residentFailureKeepsOldValue) process.exitCode = 1
+mockDashboardSettingsSaveFail = false
+residentSwitch()?.click()
+await new Promise(r => setTimeout(r, 30))
+const residentSwitchRestored = residentSwitch()?.checked === true
+  && mockResidentOnClose === true
+  && !document.querySelector('[role="alert"]')
+console.log((residentSwitchRestored?'PASS':'FAIL')+' - the background switch saves again once saving works')
+if (!residentSwitchRestored) process.exitCode = 1
+
 mockConfigSecurity = {
   status:'tampered', reason:'配置签名无效', summary:{ rule_count:1, rules:[{
     name:'分支审批摘要', actions:[
@@ -1092,15 +1334,14 @@ mockConfigSecurity = {
 )?.click()
 await new Promise(r => setTimeout(r, 50))
 const securitySummaryDetails = document.querySelector('.config-security-rule-details')
-const securitySummaryOk = securitySummaryDetails?.textContent.includes('动作 1 · 成立时 1')
+const securitySummaryOk = securitySummaryDetails?.textContent.includes('节点 1')
+  && securitySummaryDetails?.textContent.includes('节点 5 · 所属组 a_summaryhandler')
   && securitySummaryDetails?.textContent.includes('Write-Output branch-safe')
-  && securitySummaryDetails?.textContent.includes('动作 1 · 否则 1 · 成立时 1')
   && securitySummaryDetails?.textContent.includes('nested-example.exe')
-  && securitySummaryDetails?.textContent.includes('失败补救 1')
   && securitySummaryDetails?.textContent.includes('分支补救摘要')
   && securitySummaryDetails?.textContent.includes('"secret":"***"')
-  && securitySummaryDetails?.querySelectorAll('.chip-admin').length === 4
-console.log((securitySummaryOk?'PASS':'FAIL')+' - security approval shows nested branches, fallback actions and masked parameters')
+  && securitySummaryDetails?.querySelectorAll('.chip-admin').length === 2
+console.log((securitySummaryOk?'PASS':'FAIL')+' - security approval lists graph nodes with their groups and masked parameters')
 if (!securitySummaryOk) process.exitCode = 1
 mockConfigSecurity = { status:'ok', reason:'', summary:null }
 ;[...document.querySelectorAll('.settings-root-list button')].find(

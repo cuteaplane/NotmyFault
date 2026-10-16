@@ -3,9 +3,10 @@ import { computed, nextTick, ref, toRef, watch, onMounted, onUnmounted } from 'v
 import RuleCanvas from './RuleCanvas.vue'
 import WorkflowNodeInspector from './WorkflowNodeInspector.vue'
 import { alertDialog } from '../lib/dialog'
-import { normalizeWorkflow, createGraphAction, createTriggerStep, insertGraphNode, insertionParent, findGraphNode, graphId, switchGroupType, groupGraphNodes, moveGraphNodes, createRecoveryGroup } from '../lib/workflowGraph'
+import { normalizeWorkflow, createGraphAction, createTriggerStep, insertGraphNode, insertionParent, findGraphNode, graphId, switchGroupType, groupGraphNodes, moveGraphNodes, createRecoveryGroup, makeGroupRoom } from '../lib/workflowGraph'
 import { buildDefaultParams } from '../lib/utils'
 import { defaultTypedValue } from '../lib/valueTypes'
+import { FLOW_NODE_WIDTH } from '../lib/flowGraph'
 import RuleValidationSummary from './RuleValidationSummary.vue'
 import { store } from '../lib/store'
 import { groupActionKeys, groupTriggerKeys, isSpecialBlockAction, validateRuleGraph, pluginUnavailableReason as getPluginUnavailableReason } from '../lib/utils'
@@ -182,8 +183,13 @@ function graphPicker(context) {
   picker.value = { open: true, kind: context.kind || 'action', title: context.kind === 'trigger' ? '选择触发器' : '选择动作' }
 }
 function placeNode(context, action) {
+  const before = (canvasRef.value?.targetNodes || layoutNodes.value).map(node => ({ ...node }))
   const raw = context.node?.raw
-  action.position = context.position ? context.node ? { x: context.position.x + 80, y: context.position.y - 58 } : context.position : { x: (raw?.position?.x || 64) + 340, y: raw?.position?.y || 118 }
+  const source = context.kind === 'background' || context.kind === 'data' ? null
+    : before.find(node => node.id === context.node?.id || context.edge?.rawEdge && node.raw?.binding_id === context.edge.rawEdge.source) || context.node
+  action.position = source
+    ? { x: source.x + (source.width || FLOW_NODE_WIDTH) + 80, y: source.y }
+    : context.position || { x: (raw?.position?.x ?? 64) + 340, y: raw?.position?.y ?? 118 }
   const parent = insertionParent(props.rule.workflow, context)
   if (parent) action.parent = parent
   if (context.operation === 'duplicate') {
@@ -195,6 +201,7 @@ function placeNode(context, action) {
   }
   else insertGraphNode(props.rule.workflow, action, context.edge?.rawEdge?.source || (context.kind === 'background' || context.kind === 'data' ? null : raw?.binding_id), context.edge?.rawEdge?.port || context.outlet || context.node?.outputs?.[0]?.id || 'next', context.edge?.rawEdge)
   selectedNodeId.value = `action-${action.binding_id}`
+  if (source) nextTick(() => makeGroupRoom(props.rule.workflow, before, canvasRef.value?.targetNodes || layoutNodes.value, action.binding_id))
 }
 function chooseEditorPlugin(type) {
   const context = graphPickerContext.value
