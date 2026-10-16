@@ -313,7 +313,7 @@ internal static class Scenarios
             Check(Directory.Exists(retry), "retry directory does not exist");
             Check(File.Exists(Path.Combine(retry, ".notmyfault-uninstall")), "uninstall lost its cleanup list");
             Check(File.ReadAllText(Path.Combine(retry, "keep-me.txt")) == "user data", "interrupted uninstall changed user data");
-            Check(File.ReadAllText(Path.Combine(retry, UnownedResource)) == UnownedResource, "interrupted uninstall changed a user plugin");
+            Check(File.ReadAllText(Path.Combine(retry, UnownedResource)) == "personal resource", "interrupted uninstall changed an unowned resource");
             Check(File.ReadAllText(Path.Combine(retry, PrivateNote)) == PrivateNote, "uninstaller removed another private file");
             if (failure == "move")
             {
