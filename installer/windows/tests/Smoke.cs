@@ -22,6 +22,7 @@ public static class Smoke
     [STAThread]
     public static int Main(string[] args)
     {
+        Console.OutputEncoding = System.Text.Encoding.UTF8;
         string probeAssembly = Environment.GetEnvironmentVariable("NOTMYFAULT_SMOKE_INSTALLER");
         if (!String.IsNullOrEmpty(probeAssembly))
             AppDomain.CurrentDomain.AssemblyResolve += delegate(object sender, ResolveEventArgs request)
@@ -488,7 +489,6 @@ internal static class Scenarios
     {
         workspace = root;
         RunMaintenance(Path.Combine(root, "maintenance"));
-        Console.OutputEncoding = System.Text.Encoding.UTF8;
         string unrelated = Path.Combine(workspace, "unrelated");
         Directory.CreateDirectory(unrelated);
         File.WriteAllText(Path.Combine(unrelated, "keep.txt"), "keep");

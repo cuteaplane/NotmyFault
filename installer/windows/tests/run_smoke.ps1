@@ -32,6 +32,8 @@ $startInfo.UseShellExecute = $false
 $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
+$startInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+$startInfo.StandardErrorEncoding = [System.Text.Encoding]::UTF8
 $process = New-Object System.Diagnostics.Process
 $process.StartInfo = $startInfo
 try {
@@ -46,4 +48,9 @@ try {
 } finally {
     $process.Dispose()
 }
-if ($code -ne 0) { throw "安装器测试失败，退出码 $code。" }
+if ($code -ne 0) {
+    Get-ChildItem -LiteralPath $testDirectory -Filter 'install-*.log' -Recurse -File | ForEach-Object {
+        Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 | Write-Output
+    }
+    throw "安装器测试失败，退出码 $code。"
+}
