@@ -6,6 +6,7 @@ import copy
 import json
 import math
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -14,22 +15,12 @@ from typing import Any, Dict, Iterable
 from notmyfault.core import run_lifecycle as lifecycle
 
 
-_RUN_EVENT_TYPES = frozenset(
-    {
-        "rule_triggered",
-        "workflow_failed",
-        "workflow_completed",
-        "action_executed",
-        "action_skipped",
-        "action_cancelled",
-        "action_timed_out",
-        "test_assertions_completed",
-        "error",
-        "run_queued",
-        "run_dropped",
-        "run_replaced",
-    }
-)
+_RUN_EVENT_TYPES = frozenset({
+    "run.triggered", "run.queued", "run.started", "run.succeeded", "run.recovered", "run.failed",
+    "run.cancelled", "run.timed_out", "run.dropped", "run.step.started", "run.step.succeeded",
+    "run.step.failed", "run.step.skipped", "run.step.cancelled", "run.step.timed_out", "run.step.waiting",
+    "run.step.resumed", "run.assertions.completed", "run.recovery.entered", "run.recovery.completed", "run.recovery.failed",
+})
 
 
 def _duration_ms(started_at: Any, finished_at: Any) -> int | None:
@@ -75,14 +66,50 @@ def _safe_summary(value: Any) -> list[Dict[str, Any]]:
     return result
 
 
+def _safe_evaluated_branches(value):
+    from notmyfault.core.predicates import COMPARISON_OPERATORS
+    if not isinstance(value, list):
+        return []
+    def outcome(item):
+        if isinstance(item.get('result'), bool):
+            return {'result': item['result']}
+        error = item.get('error')
+        code = error.get('code') if isinstance(error, dict) else None
+        return {'error': {'code': code}} if isinstance(code, str) and re.fullmatch(r'[a-z_]{1,80}', code) else None
+    result = []
+    for branch in value[:256]:
+        if not isinstance(branch, dict):
+            continue
+        identity = 'branch_id' if 'branch_id' in branch else 'node_id'
+        pattern = r'b_[a-z0-9_]{1,64}' if identity == 'branch_id' else r'a_[a-z0-9_]{6,64}'
+        if not isinstance(branch.get(identity), str) or not re.fullmatch(pattern, branch[identity]):
+            continue
+        evaluated = outcome(branch)
+        if evaluated is None:
+            continue
+        record = {identity: branch[identity], **evaluated, 'predicates': []}
+        predicates = branch.get('predicates', [])
+        for item in predicates[:1024] if isinstance(predicates, list) else []:
+            if not isinstance(item, dict) or not isinstance(item.get('op'), str) or item['op'] not in COMPARISON_OPERATORS | {'all', 'any', 'not', 'trigger', 'run_status'}:
+                continue
+            node_id = item.get('node_id')
+            state = outcome(item)
+            if state is None or not isinstance(node_id, str) or not re.fullmatch(r'a_[a-z0-9_]{6,64}', node_id):
+                continue
+            predicate = {'node_id': node_id, 'op': item['op'], **state}
+            record['predicates'].append(predicate)
+        result.append(record)
+    return result
+
+
 def _safe_event(packet: Dict[str, Any]) -> Dict[str, Any] | None:
     event_type = packet.get("type")
     data = packet.get("data")
     if event_type not in _RUN_EVENT_TYPES or not isinstance(data, dict):
         return None
-    # 比当前版本新的事件格式读不懂，整条丢弃，等引擎升级后再解释
-    schema = packet.get("schema")
-    if isinstance(schema, int) and schema > lifecycle.RUN_EVENT_SCHEMA_VERSION:
+    data = {**data, **{key: packet[key] for key in ("run_id", "rule_id", "step_id", "error") if packet.get(key) is not None}}
+    schema = packet.get("v")
+    if type(schema) is not int or schema != lifecycle.RUN_EVENT_SCHEMA_VERSION:
         return None
     run_id = data.get("run_id")
     if not isinstance(run_id, str) or not run_id:
@@ -96,7 +123,6 @@ def _safe_event(packet: Dict[str, Any]) -> Dict[str, Any] | None:
             "rule_name",
             "event_type",
             "action_count",
-            "precondition_count",
             "start_step_id",
             "end_step_id",
             "assertion_count",
@@ -114,6 +140,19 @@ def _safe_event(packet: Dict[str, Any]) -> Dict[str, Any] | None:
         if key in data
     }
     error = data.get("error")
+    branch = data.get("branch")
+    if isinstance(branch, str) and re.fullmatch(r"b_[a-z0-9_]{1,64}", branch):
+        kept["branch"] = branch
+    recovery_group_id = data.get('recovery_group_id')
+    if isinstance(recovery_group_id, str) and re.fullmatch(r'a_[a-z0-9_]{6,64}', recovery_group_id):
+        kept['recovery_group_id'] = recovery_group_id
+    group_path = data.get("group_path")
+    if isinstance(group_path, (list, tuple)) and len(group_path) <= 64 and all(
+        isinstance(identity, str) and re.fullmatch(r"a_[a-z0-9_]{6,64}", identity) for identity in group_path
+    ):
+        kept["group_path"] = list(group_path)
+    if 'evaluated_branches' in data:
+        kept['evaluated_branches'] = _safe_evaluated_branches(data['evaluated_branches'])
     if isinstance(error, dict):
         kept["error"] = {
             key: str(error[key])[:240]
@@ -121,16 +160,13 @@ def _safe_event(packet: Dict[str, Any]) -> Dict[str, Any] | None:
             if key in error
         }
     elif error is not None:
-        kept["error"] = {
-            "code": "run_error",
-            "message": "运行失败",
-        }
+        return None
     if event_type in {
-        "action_executed", "action_cancelled", "action_timed_out", "error"
+        "run.step.succeeded", "run.step.cancelled", "run.step.timed_out", "run.step.failed"
     }:
         kept["input_summary"] = _safe_summary(data.get("input_summary"))
         kept["output_summary"] = _safe_summary(data.get("output_summary"))
-    if event_type == "test_assertions_completed":
+    if event_type == "run.assertions.completed":
         kept["passed"] = _safe_count(data.get("passed"))
         kept["total"] = _safe_count(data.get("total"))
         raw_results = data.get("results", [])
@@ -146,12 +182,11 @@ def _safe_event(packet: Dict[str, Any]) -> Dict[str, Any] | None:
             if isinstance(result, dict)
         ]
     saved = {
+        "v": lifecycle.RUN_EVENT_SCHEMA_VERSION,
         "type": event_type,
         "data": kept,
         "ts": packet.get("ts"),
     }
-    if packet.get("schema") is not None:
-        saved["schema"] = packet.get("schema")
     return saved
 
 
@@ -161,12 +196,11 @@ def _new_run(data: Dict[str, Any], timestamp: Any) -> Dict[str, Any]:
         "rule_id": data.get("rule_id", ""),
         "rule_name": data.get("rule_name", "未命名规则"),
         "event_type": data.get("event_type", ""),
-        "status": "running",
+        "status": "queued",
         "started_at": timestamp,
         "finished_at": None,
         "duration_ms": None,
         "action_count": _safe_count(data.get("action_count")),
-        "precondition_count": _safe_count(data.get("precondition_count")),
         "start_step_id": data.get("start_step_id", ""),
         "end_step_id": data.get("end_step_id", ""),
         "assertions_passed": 0,
@@ -175,8 +209,6 @@ def _new_run(data: Dict[str, Any], timestamp: Any) -> Dict[str, Any]:
         "failure_kind": "",
         "steps": [],
         "error": None,
-        "deferred_reason": None,
-        "retry_after_seconds": None,
         "replayable": False,
     }
 
@@ -192,20 +224,24 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
     event_type = packet["type"]
     data = packet["data"]
     timestamp = packet.get("ts")
-    # 到终点的 run 不再吃任何事件。重复 complete / cancel / resume 在写入侧
-    # 被 _finish_run 挡掉，迟到的在这里跳过
     if lifecycle.is_terminal(run["status"]):
         return
-    if event_type == "rule_triggered":
+    if event_type.startswith('run.recovery.'):
+        step = _find_step(run, data.get('step_id'))
+        if step is not None and 'recovery_group_id' in data:
+            step['recovery'] = {
+                'group_id': data['recovery_group_id'],
+                'status': 'running' if event_type == 'run.recovery.entered' else 'succeeded' if event_type == 'run.recovery.completed' else 'failed',
+                'updated_at': timestamp,
+            }
+        return
+    if event_type == "run.triggered":
         run.update(
             rule_id=data.get("rule_id", run["rule_id"]),
             rule_name=data.get("rule_name", run["rule_name"]),
             event_type=data.get("event_type", run["event_type"]),
             action_count=_safe_count(
                 data.get("action_count"), run["action_count"]
-            ),
-            precondition_count=_safe_count(
-                data.get("precondition_count"), run["precondition_count"]
             ),
             start_step_id=data.get("start_step_id", run["start_step_id"]),
             end_step_id=data.get("end_step_id", run["end_step_id"]),
@@ -215,19 +251,21 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
         )
         return
 
-    if event_type == "test_assertions_completed":
+    if event_type == "run.assertions.completed":
         run["assertions_passed"] = _safe_count(data.get("passed"))
         run["assertions_total"] = _safe_count(data.get("total"))
         run["assertion_results"] = data.get("results", [])
         return
 
     if event_type in {
-        "action_executed",
-        "action_skipped",
-        "action_cancelled",
-        "action_timed_out",
-        "error",
-        "workflow_failed",
+        "run.step.succeeded",
+        "run.step.skipped",
+        "run.step.cancelled",
+        "run.step.timed_out",
+        "run.step.failed",
+        "run.step.started",
+        "run.step.waiting",
+        "run.step.resumed",
     }:
         step_id = str(data.get("step_id") or "")
         if step_id:
@@ -237,56 +275,66 @@ def _apply_event(run: Dict[str, Any], packet: Dict[str, Any]) -> None:
                     "step_id": step_id,
                     "action_type": data.get("action_type", ""),
                     "status": "running",
-                    "finished_at": timestamp,
+                    "finished_at": None,
                     "duration_ms": data.get("duration_ms"),
                     "attempt": data.get("attempt"),
                     "reason": None,
                     "error": None,
                 }
                 run["steps"].append(step)
-            if event_type == "action_executed":
+            if event_type == "run.step.started":
+                step["status"] = "running"
+                step["started_at"] = timestamp
+            elif event_type == "run.step.waiting":
+                step["status"] = "waiting"
+                step["reason"] = data.get("reason")
+            elif event_type == "run.step.resumed":
+                step["status"] = "running"
+                step["reason"] = None
+            elif event_type == "run.step.succeeded":
                 step["status"] = "succeeded"
-            elif event_type == "action_skipped":
+            elif event_type == "run.step.skipped":
                 step["status"] = "skipped"
                 step["reason"] = data.get("reason")
-            elif event_type == "action_cancelled":
+            elif event_type == "run.step.cancelled":
                 step["status"] = "cancelled"
                 step["reason"] = data.get("error") or "动作已取消"
-            elif event_type == "action_timed_out":
+            elif event_type == "run.step.timed_out":
                 step["status"] = "timed_out"
                 step["error"] = data.get("error")
             else:
                 step["status"] = "failed"
                 step["error"] = data.get("error")
-            step["finished_at"] = timestamp
+            if event_type in {"run.step.started", "run.step.waiting", "run.step.resumed"}:
+                step["finished_at"] = None
+            else:
+                step["finished_at"] = timestamp
             step["duration_ms"] = data.get("duration_ms", step.get("duration_ms"))
             step["attempt"] = data.get("attempt", step.get("attempt"))
+            if "branch" in data:
+                step["branch"] = data["branch"]
+            if "group_path" in data:
+                step["group_path"] = data["group_path"]
+            if 'evaluated_branches' in data:
+                step['evaluated_branches'] = data['evaluated_branches']
             if "input_summary" in data:
                 step["input_summary"] = data["input_summary"]
             if "output_summary" in data:
                 step["output_summary"] = data["output_summary"]
 
-    current = "queued" if run["status"] == "deferred" else run["status"]
+    current = run["status"]
     new_status = lifecycle.status_after(event_type, data, current)
-    if event_type == "workflow_deferred":
-        run["status"] = "deferred"
-        run["deferred_reason"] = data.get("reason")
-        run["retry_after_seconds"] = data.get("retry_after_seconds")
-    elif event_type == "run_queued":
+    if event_type == "run.queued":
         run["status"] = new_status or run["status"]
         run["queued_reason"] = data.get("reason")
-    elif event_type in ("run_dropped", "run_replaced"):
+    elif event_type == "run.dropped":
         run["status"] = new_status or run["status"]
         run["drop_reason"] = data.get("reason")
         run["finished_at"] = timestamp
         run["duration_ms"] = _duration_ms(run["started_at"], timestamp)
-    elif event_type == "workflow_failed":
+    elif event_type in {f"run.{status}" for status in lifecycle.TERMINAL_STATUSES}:
         run["status"] = new_status or run["status"]
         run["error"] = data.get("error")
-        run["finished_at"] = timestamp
-        run["duration_ms"] = _duration_ms(run["started_at"], timestamp)
-    elif event_type == "workflow_completed":
-        run["status"] = new_status or run["status"]
         run["assertions_passed"] = _safe_count(
             data.get("assertions_passed"), run["assertions_passed"]
         )
@@ -330,24 +378,20 @@ class RunHistory:
         self._lock = threading.Lock()
         self._file_lock = threading.Lock()
         self._writer_done = threading.Condition(self._lock)
-        self._events = deque(self._read_events_unlocked()[-self.max_events:], maxlen=self.max_events)
+        self._events, self._event_count = self._read_events_unlocked()
         self._pending: deque[str] = deque(maxlen=self.max_events)
         self._writer: threading.Thread | None = None
         self._write_error: OSError | None = None
-        self._event_count = self._count_events()
 
-    def _count_events(self) -> int:
-        try:
-            with open(self.path, "r", encoding="utf-8") as file:
-                return sum(1 for line in file if line.strip())
-        except OSError:
-            return 0
-
-    def _read_events_unlocked(self) -> list[Dict[str, Any]]:
-        events = []
+    def _read_events_unlocked(self) -> tuple[deque[Dict[str, Any]], int]:
+        events: deque[Dict[str, Any]] = deque(maxlen=self.max_events)
+        line_count = 0
         try:
             with open(self.path, "r", encoding="utf-8") as file:
                 for line in file:
+                    if not line.strip():
+                        continue
+                    line_count += 1
                     try:
                         packet = json.loads(line)
                     except json.JSONDecodeError:
@@ -360,10 +404,10 @@ class RunHistory:
             from notmyfault.core.logging import engine_error
 
             engine_error("run_history_read_failed", error=str(error))
-        return events
+        return events, line_count
 
     def _compact_unlocked(self) -> None:
-        events = self._read_events_unlocked()[-self.max_events :]
+        events, _ = self._read_events_unlocked()
         temp_path = self.path + ".tmp"
         with open(temp_path, "w", encoding="utf-8", newline="\n") as file:
             for packet in events:
@@ -372,32 +416,19 @@ class RunHistory:
         os.replace(temp_path, self.path)
         self._event_count = len(events)
 
-    def _prepare_packet(self, packet: Dict[str, Any]) -> Dict[str, Any] | None:
-        if isinstance(packet, dict) and "schema" not in packet:
-            packet = {**packet, "schema": lifecycle.RUN_EVENT_SCHEMA_VERSION}
-        return _safe_event(packet)
-
-    def _write_batch(self, packets: list[Dict[str, Any] | str]) -> None:
+    def _write_batch(self, packets: list[str]) -> None:
         with self._file_lock:
             os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
             with open(self.path, "a", encoding="utf-8", newline="\n") as file:
                 for packet in packets:
-                    file.write(packet if isinstance(packet, str) else json.dumps(packet, ensure_ascii=False, separators=(",", ":")))
+                    file.write(packet)
                     file.write("\n")
             self._event_count += len(packets)
             if self._event_count > self.max_events + 500:
                 self._compact_unlocked()
 
-    def record(self, packet: Dict[str, Any]) -> None:
-        safe_packet = self._prepare_packet(packet)
-        if safe_packet is None:
-            return
-        self._write_batch([safe_packet])
-        with self._lock:
-            self._events.append(safe_packet)
-
     def record_async(self, packet: Dict[str, Any]) -> None:
-        safe_packet = self._prepare_packet(packet)
+        safe_packet = _safe_event(packet)
         if safe_packet is None:
             return
         encoded = json.dumps(safe_packet, ensure_ascii=False, separators=(",", ":"))

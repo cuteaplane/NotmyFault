@@ -1,4 +1,4 @@
-const aliases = { string: 'text', integer: 'int', boolean: 'bool', list: 'array' }
+const aliases = { string: 'text' }
 const customTypePattern = /^[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+\/[a-zA-Z][a-zA-Z0-9_-]*@[1-9][0-9]*$/
 export const typeLabels = { any: '任意数据', null: '空值', text: '文本', int: '整数', float: '浮点数', number: '数字', decimal: '精确小数', bool: '布尔值', date: '日期', time: '时间', datetime: '日期时间', timestamp: '时间戳', duration: '时长', path: '路径', url: '网址', uuid: 'UUID', bytes: '二进制', array: '数组', object: '对象', union: '多种类型' }
 
@@ -14,7 +14,7 @@ export function fieldType(field = {}, parameter = false) {
   const kind = field.type || 'any'
   if (parameter && ['textarea', 'select', 'path', 'time', 'hotkey', 'string'].includes(kind)) return { type: 'text' }
   if (parameter && kind === 'plugin_data') return { type: 'object' }
-  return typeSpec(kind === 'array' ? { type: 'array', items: field.item_type || 'any' } : kind)
+  return typeSpec(kind === 'array' ? { type: 'array', items: 'any' } : kind)
 }
 
 export function typeLabel(value) {

@@ -1,5 +1,6 @@
+import { getGraphTriggers, graphExecutionActions, walkGraphActions, findGraphNode, graphPredecessors } from './workflowGraph.js'
 import { compatibleTypes, fieldType, typeSpec, typeLabel, typeAtPath, isOpaqueValue, isExpression, parseExactJson, parseTypedInput, defaultTypedValue, formatTypedInput } from './valueTypes.js'
-import { normalizeRuleDraft } from './utils.js'
+import { validateRuleGraph } from './utils.js'
 
 function randomHex() {
   if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID().replaceAll('-', '').slice(0, 12)
@@ -39,75 +40,22 @@ export function isReference(value) {
     && typeof value.$ref === 'object'
 }
 
+// 插件清单的 outputs 由服务器保证是对象数组，非法条目在这里跳过。
 export function outputDefs(meta) {
-  const outputs = Array.isArray(meta?.outputs)
-    ? meta.outputs
-    : (meta?.outputs && typeof meta.outputs === 'object' ? [meta.outputs] : [])
-  return outputs.map(output => (
-    typeof output === 'string'
-      ? { name: output, label: output, type: 'any', required: true }
-      : { required: true, sensitive: false, ...output }
-  ))
+  if (!Array.isArray(meta?.outputs)) return []
+  return meta.outputs
+    .filter(output => output && typeof output === 'object' && !Array.isArray(output))
+    .map(output => ({ required: true, sensitive: false, ...output }))
 }
 
 export function collectTriggerLeaves(rule, includeAbsence = true) {
-  const leaves = []
-  function visit(node) {
-    if (!node || typeof node !== 'object' || (!includeAbsence && node.op === 'not')) return
-    if (node.type && !Array.isArray(node.children) && !Array.isArray(node.events)) {
-      leaves.push(node)
-      return
-    }
-    ;(node.children || node.events || []).forEach(visit)
-  }
-  visit(rule.condition)
-  return leaves
+  return (rule.workflow?.nodes || []).filter(node => node.type === 'trigger' && (includeAbsence || node.occurrence !== 'absent')).map(node => node.trigger)
 }
 
-export function guaranteedTriggerIds(node) {
-  if (node?.op === 'not') return new Set()
-  if (!node || typeof node !== 'object') return new Set()
-  if (node.type && !Array.isArray(node.children) && !Array.isArray(node.events)) {
-    return node.binding_id ? new Set([node.binding_id]) : new Set()
-  }
-  const children = node.children || node.events || []
-  const sets = children.map(guaranteedTriggerIds)
-  if (!sets.length) return new Set()
-  if ((node.op || node.type) === 'all' || node.type === 'and') {
-    return new Set(sets.flatMap(set => [...set]))
-  }
-  return new Set([...sets[0]].filter(id => sets.slice(1).every(set => set.has(id))))
-}
 
 export function ensureRuleBindingIds(rule) {
-  normalizeRuleDraft(rule)
-  ensureRuleId(rule)
-  const seen = new Set()
-  function ensureNode(node) {
-    if (!node || typeof node !== 'object') return
-    if (node.type && !Array.isArray(node.children) && !Array.isArray(node.events)) {
-      if (!node.binding_id || seen.has(node.binding_id)) node.binding_id = createBindingId('trigger')
-      if (!node.params || typeof node.params !== 'object') node.params = {}
-      seen.add(node.binding_id)
-      return
-    }
-    ;(node.children || node.events || []).forEach(ensureNode)
-  }
-  ensureNode(rule.condition)
-  function ensureActions(items) {
-    for (const item of items || []) {
-      if (!item.binding_id || seen.has(item.binding_id)) item.binding_id = createBindingId('action')
-      seen.add(item.binding_id)
-      if (item.type === 'if') {
-        item.then ||= []
-        item.else ||= []
-        ensureActions(item.then)
-        ensureActions(item.else)
-      } else if (!item.params || typeof item.params !== 'object') item.params = {}
-      ensureActions(item.failure_actions)
-    }
-  }
-  ensureActions(rule.actions)
+  validateRuleGraph(rule); ensureRuleId(rule)
+  walkGraphActions(rule.workflow, node => { node.binding_id ||= createBindingId('action'); if (node.type === 'trigger') node.trigger.binding_id ||= createBindingId('trigger') })
   return rule
 }
 
@@ -115,15 +63,11 @@ export function regenerateBindingIds(node, kind = 'trigger') {
   const replacements = new Map()
   function visit(item, itemKind) {
     if (!item || typeof item !== 'object') return
-    if (itemKind === 'trigger' && (Array.isArray(item.children) || Array.isArray(item.events))) {
-      ;(item.children || item.events).forEach(child => visit(child, itemKind))
-      return
-    }
     const previous = item.binding_id
     item.binding_id = createBindingId(itemKind)
     if (previous) replacements.set(previous, item.binding_id)
     if (itemKind === 'action') {
-      for (const field of ['then', 'else', 'failure_actions']) (item[field] || []).forEach(child => visit(child, 'action'))
+      if (item.type === 'trigger') visit(item.trigger, 'trigger')
     }
   }
   visit(node, kind)
@@ -165,7 +109,37 @@ export function variableBindingSources(rule, { constantsOnly = false } = {}) {
   ))
 }
 
-export function actionOutputDefs(action, schema, rule = {}) {
+export function actionOutputDefs(action, schema, rule = {}, seen = new Set()) {
+  if (action?.type === 'action_group') {
+    if (seen.has(action.binding_id)) return []
+    const nextSeen = new Set([...seen, action.binding_id])
+    const catalog = Object.entries(schema.data_types?.custom || {}).map(([id, definition]) => ({ id, ...definition }))
+    function info(value) {
+      if (isReference(value)) {
+        const ref = value.$ref, path = ref.path || []
+        let output, root
+        if (['constant', 'variable'].includes(ref.scope)) {
+          const definition = rule[ref.scope === 'constant' ? 'constants' : 'variables']?.find(item => item.id === ref.node)
+          output = definition; root = definition?.value_type || 'any'
+        } else {
+          const source = ref.scope === 'step' ? findGraphNode(rule, ref.node)?.action : collectTriggerLeaves(rule).find(item => item.binding_id === ref.node)
+          const definitions = ref.scope === 'step' ? actionOutputDefs(source, schema, rule, nextSeen) : ref.scope === 'trigger_config' ? schema.triggers?.[source?.type]?.params || [] : outputDefs(schema.triggers?.[source?.type])
+          output = definitions.find(item => item.name === path[0])
+          if (path.length) root = fieldType(output, ref.scope === 'trigger_config')
+          else { root = { type: 'object', properties: Object.fromEntries(definitions.map(output => [output.name, fieldType(output)])), required: definitions.filter(output => output.required !== false).map(output => output.name) }; output = { sensitive: definitions.some(output => output.sensitive === true) } }
+        }
+        let selected = root
+        try { selected = typeAtPath(root, ['constant', 'variable'].includes(ref.scope) ? path : path.slice(1), catalog).type } catch { selected = 'any' }
+        return { type: selected || 'any', sensitive: output?.sensitive === true, required: ref.on_missing !== 'skip' }
+      }
+      if (value?.$convert) return { ...info(value.$convert.value), type: typeSpec(value.$convert.to) }
+      if (value?.$template) return { type: 'text', sensitive: collectReferences(value).some(reference => info({ $ref: reference }).sensitive), required: true }
+      if (value?.$nmf_value) return { type: value.$nmf_value.type, sensitive: false, required: true }
+      if (value && Object.hasOwn(value, '$literal')) return info(value.$literal)
+      return { type: value === null ? 'null' : Array.isArray(value) ? { type: 'array', items: 'any' } : typeof value === 'boolean' ? 'bool' : typeof value === 'number' ? 'number' : typeof value === 'string' ? 'text' : 'object', sensitive: false, required: true }
+    }
+    return Object.entries(action.exports || {}).map(([name, expression]) => { const output = info(expression); return { name, label: name, value_type: output.type, required: output.required, sensitive: output.sensitive } })
+  }
   if (action?.type === 'set_variable') {
     const variable = rule.variables?.find(item => item.id === action.variable)
     return [{ name: 'value', label: '赋值结果', value_type: variable?.value_type || 'any', required: true, sensitive: variable?.sensitive === true }]
@@ -192,6 +166,31 @@ export function expandBindingSources(sources, catalog = {}) {
   return result
 }
 
+export function graphBindingSources(rule, action, schema) {
+  const hit = findGraphNode(rule, action?.binding_id)
+  const result = buildBindingSources(rule, 0, schema, { allowSteps: false })
+  const scopes = hit ? [...hit.trail.filter(parent => parent.field === 'workflow').map(parent => ({ ...findGraphNode(rule, parent.action.binding_id), action: parent.action })), hit] : []
+  if (['condition', 'logic', 'trigger'].includes(action?.type) || action?.type === 'event_group') {
+    const seen = new Set([action.binding_id]), pending = [action.binding_id]
+    while (pending.length) {
+      const identity = pending.pop()
+      for (const edge of rule.workflow.edges) if (edge.channel === 'condition' && edge.source === identity && !seen.has(edge.target)) {
+        seen.add(edge.target); pending.push(edge.target)
+        const consumer = findGraphNode(rule, edge.target)
+        if (consumer) scopes.push(consumer)
+      }
+    }
+  }
+  for (const scope of scopes) {
+    for (const id of graphPredecessors(scope.workflow, scope.action.binding_id)) {
+      const previous = scope.workflow.nodes.find(node => node.binding_id === id)
+      if (!previous) continue
+      for (const output of actionOutputDefs(previous, schema, rule)) result.push(sourceItem('前序动作输出', `${schema.actions[previous.type]?.name || previous.name || previous.type} · ${output.label || output.name}`, output, { scope: 'step', node: id, path: [output.name] }, true))
+    }
+  }
+  return expandBindingSources([...new Map(result.map(source => [JSON.stringify(source.value.$ref), source])).values()], schema.data_types?.custom)
+}
+
 export function buildBindingSources(
   rule,
   actionIndex,
@@ -200,7 +199,7 @@ export function buildBindingSources(
 ) {
   const result = variableBindingSources(rule)
   const leaves = collectTriggerLeaves(rule, false)
-  const guaranteed = guaranteedTriggerIds(rule.condition)
+  const guaranteed = new Set()
 
   for (const leaf of leaves) {
     const conditional = !guaranteed.has(leaf.binding_id)
@@ -228,7 +227,7 @@ export function buildBindingSources(
   }
 
   if (allowSteps) {
-    ;(rule.actions || []).slice(0, Math.max(0, actionIndex)).forEach((action, index) => {
+    ;graphPredecessors(rule.workflow, rule.workflow?.nodes[actionIndex]?.binding_id).map(id => rule.workflow.nodes.find(node => node.binding_id === id)).filter(Boolean).forEach((action, index) => {
       const meta = schema.actions[action.type]
       for (const output of actionOutputDefs(action, schema, rule)) {
         result.push(sourceItem(
@@ -243,24 +242,6 @@ export function buildBindingSources(
   return expandBindingSources(result, schema.data_types?.custom)
 }
 
-export function buildFailureBindingSources(rule, actionIndex, failureIndex, schema) {
-  const result = buildBindingSources(rule, actionIndex, schema)
-  const configuredActions = rule.actions?.[actionIndex]?.failure_actions
-  const failureActions = Array.isArray(configuredActions) ? configuredActions : []
-  failureActions.slice(0, Math.max(0, failureIndex)).forEach((action, index) => {
-    const meta = schema.actions[action.type]
-    for (const output of actionOutputDefs(action, schema, rule)) {
-      result.push(sourceItem(
-        '之前的补救动作',
-        `补救动作 ${index + 1}：${meta?.name || action.type} · ${output.label || output.name}`,
-        output,
-        { scope: 'step', node: action.binding_id, path: [output.name] },
-      ))
-    }
-  })
-  return result
-}
-
 export function parameterAllowsBinding(meta, paramName) {
   if (meta?.params?.find(item => item.name === paramName)?.type === 'plugin_data') return false
   const fixedParams = meta?.security?.literal_only_params
@@ -268,12 +249,12 @@ export function parameterAllowsBinding(meta, paramName) {
 }
 
 export function buildNodeDataPorts(node, schema, rule = {}) {
-  const meta = node.source?.type === 'set_variable'
+  const meta = node.source?.type === 'action_group' ? { outputs: actionOutputDefs(node.source, schema, rule) } : node.source?.type === 'set_variable'
     ? { params: [{ name: 'value', label: '赋值内容', type: 'string', value_type: rule.variables?.find(item => item.id === node.source.variable)?.value_type || 'any' }], outputs: actionOutputDefs(node.source, schema, rule) }
     : node.kind === 'trigger'
     ? schema.triggers[node.source?.type]
     : schema.actions[node.source?.type]
-  const dataInputs = ['action', 'failure-action'].includes(node.kind)
+  const dataInputs = ['action'].includes(node.kind)
     ? (meta?.params || [])
       .filter(param => parameterAllowsBinding(meta, param.name))
       .map((param, index) => ({
@@ -285,7 +266,7 @@ export function buildNodeDataPorts(node, schema, rule = {}) {
         format: param.format,
       }))
     : []
-  const dataOutputs = !node.negated && ['trigger', 'action', 'failure-action'].includes(node.kind)
+  const dataOutputs = !node.negated && ['trigger', 'action', 'action_group'].includes(node.kind)
     ? outputDefs(meta).map((output, index) => ({
         id: `output:${output.name}`,
         index,
@@ -308,12 +289,12 @@ export function buildNodeDataPorts(node, schema, rule = {}) {
 export function deriveDataEdges(rule, nodes, catalog = []) {
   const nodesByBindingId = new Map(
     nodes
-      .filter(node => node.source?.binding_id)
+      .filter(node => node.source?.binding_id && node.dataOutputs?.length)
       .map(node => [node.source.binding_id, node]),
   )
   const edges = []
-  for (const target of nodes.filter(node => ['action', 'failure-action'].includes(node.kind))) {
-    const params = target.source?.type === 'set_variable' ? { value: target.source.value } : target.source?.params || {}
+  for (const target of nodes.filter(node => ['action', 'failure-action', 'predicate'].includes(node.kind))) {
+    const params = target.kind === 'predicate' ? Object.fromEntries(['left', 'right'].filter(key => Object.hasOwn(target.source, key)).map(key => [key, target.source[key]])) : target.source?.type === 'set_variable' ? { value: target.source.value } : target.source?.params || {}
     for (const [paramName, value] of Object.entries(params)) {
       const targetPort = target.dataInputs.find(port => port.name === paramName)
       for (const [referenceIndex, reference] of collectReferences(value).entries()) {
@@ -322,7 +303,7 @@ export function deriveDataEdges(rule, nodes, catalog = []) {
         const outputName = Array.isArray(reference.path) ? reference.path[0] : null
         const sourcePort = source?.dataOutputs.find(port => port.name === outputName)
         if (!source || !sourcePort || !targetPort) continue
-        const sourceIsAction = ['action', 'failure-action'].includes(source.kind)
+        const sourceIsAction = ['action', 'failure-action', 'action_group'].includes(source.kind)
         const validOrder = !sourceIsAction
           || (target.availableStepIds || []).includes(source.source.binding_id)
         let selectedType = sourcePort.type
@@ -376,21 +357,6 @@ export function collectReferences(value, result = []) {
   if (Array.isArray(value)) value.forEach(item => collectReferences(item, result))
   else if (value && typeof value === 'object') {
     Object.values(value).forEach(item => collectReferences(item, result))
-  }
-  return result
-}
-
-export function collectLegacyEventPayloadPaths(value, result = []) {
-  if (isOpaqueValue(value)) return result
-  if (typeof value === 'string') {
-    const pattern = /{{\s*event\.payload((?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*}}/g
-    for (const match of value.matchAll(pattern)) {
-      result.push(match[1].split('.').filter(Boolean))
-    }
-  } else if (Array.isArray(value)) {
-    value.forEach(item => collectLegacyEventPayloadPaths(item, result))
-  } else if (value && typeof value === 'object') {
-    Object.values(value).forEach(item => collectLegacyEventPayloadPaths(item, result))
   }
   return result
 }
@@ -468,7 +434,7 @@ function testDefaultValue(output, fullPayload = false) {
   }
   const type = normalizedType(output?.type)
   if (['number', 'int', 'float'].includes(type)) return 0
-  if (type === 'bool' || type === 'boolean') return false
+  if (type === 'bool') return false
   if (type === 'array') return '[]'
   if (type === 'object') return '{}'
   return ''
@@ -489,19 +455,16 @@ function addTestField(fields, field) {
 export function buildTestInputFields(rule, schema, { startStepId = '', endStepId = '' } = {}) {
   const leaves = collectTriggerLeaves(rule)
   const leavesById = new Map(leaves.map(leaf => [leaf.binding_id, leaf]))
-  const actions = rule.actions || []
-  const startIndex = Math.max(0, actions.findIndex(action => action.binding_id === startStepId))
-  const rawEndIndex = actions.findIndex(action => action.binding_id === endStepId)
-  const endIndex = rawEndIndex >= 0 ? rawEndIndex : actions.length - 1
-  const selectedActions = actions.slice(startIndex, endIndex + 1)
-  const executionSource = { actions: selectedActions }
+  const actions = []; walkGraphActions(rule.workflow, action => actions.push(action))
+  const selectedActions = graphExecutionActions(rule, { startStepId, endStepId })
+  const dependencies = new Set(selectedActions.map(action => action.binding_id))
+  const pending = [...dependencies]
+  while (pending.length) { const target = pending.pop(); for (const edge of rule.workflow.edges) if (edge.channel === 'condition' && edge.target === target && !dependencies.has(edge.source)) { dependencies.add(edge.source); pending.push(edge.source) } }
+  const executionSource = { nodes: actions.filter(action => dependencies.has(action.binding_id)) }
   const references = [...new Map(
     collectReferences(executionSource)
       .filter(reference => ['trigger', 'event', 'step'].includes(reference.scope))
       .map(reference => [JSON.stringify(reference), reference]),
-  ).values()]
-  const legacyPaths = [...new Map(
-    collectLegacyEventPayloadPaths(executionSource).map(path => [JSON.stringify(path), path]),
   ).values()]
   const fields = new Map()
 
@@ -551,7 +514,7 @@ export function buildTestInputFields(rule, schema, { startStepId = '', endStepId
   for (const reference of references) {
     const path = Array.isArray(reference.path) ? reference.path : []
     const source = sourceFor(reference)
-    if (reference.scope === 'step' && (source.actionIndex < 0 || source.actionIndex >= startIndex)) continue
+    if (reference.scope === 'step' && (source.actionIndex < 0 || selectedActions.some(action => action.binding_id === reference.node))) continue
     const outputs = reference.scope === 'step' ? actionOutputDefs(source.action, schema, rule) : outputDefs(source.meta)
     if (reference.scope === 'trigger' && outputs.length) {
       addOutputFields(reference, source, outputs)
@@ -578,28 +541,32 @@ export function buildTestInputFields(rule, schema, { startStepId = '', endStepId
     })
   }
 
+  for (const node of executionSource.nodes) {
+    if (node.type !== 'trigger') continue
+    const leaf = leavesById.get(node.trigger.binding_id)
+    const meta = schema.triggers?.[leaf.type]
+    const name = `触发 ${leaves.indexOf(leaf) + 1} · ${meta?.name || leaf.type}`
+    addTestField(fields, { scope: 'event_occurrence', node: leaf.binding_id, path: [], sourceName: name,
+      label: '模拟事件已发生', type: 'bool', valueType: 'bool', defaultValue: node.occurrence !== 'absent' })
+    addOutputFields({ scope: 'trigger', node: leaf.binding_id }, { name }, outputDefs(meta))
+    for (const field of fields.values()) if (field.scope === 'trigger' && field.node === leaf.binding_id) field.sourceName = name
+    for (const output of outputDefs(meta)) {
+      if (output.required === false || node.occurrence === 'absent') continue
+      const field = fields.get(testFieldKey('trigger', leaf.binding_id, [output.name]))
+      field.required = true
+      field.defaultValue = testDefaultValue(output)
+    }
+  }
+
   for (const variable of rule.variables || []) {
     addTestField(fields, { scope: 'variable', node: variable.id, path: [], sourceName: '运行变量（留空使用规则初始值）', label: variable.name, type: normalizedType(variable.value_type), valueType: variable.value_type, required: false, sensitive: variable.sensitive === true, defaultValue: '' })
-  }
-  for (const path of legacyPaths) {
-    addTestField(fields, {
-      scope: 'event',
-      node: '',
-      path,
-      sourceName: '本次触发',
-      label: path.join('.') || '完整事件数据',
-      type: path.length ? 'string' : 'object',
-      defaultValue: path.length ? '' : '{}',
-      fullPayload: !path.length,
-      legacy: true,
-    })
   }
   return [...fields.values()]
 }
 
 export function buildAllTestInputFields(rule, schema) {
   const fields = new Map()
-  const starts = ['', ...(rule.actions || []).map(action => action.binding_id).filter(Boolean)]
+  const starts = ['']; walkGraphActions(rule.workflow, action => starts.push(action.binding_id))
   for (const startStepId of starts) {
     for (const field of buildTestInputFields(rule, schema, { startStepId })) {
       if (!fields.has(field.key)) fields.set(field.key, field)
@@ -628,7 +595,7 @@ function parsePreparedTestValue(raw, field) {
     }
     return parseTypedInput(raw, field.type)
   }
-  if (type === 'bool' || type === 'boolean') return raw === true || raw === 'true'
+  if (type === 'bool') return raw === true || raw === 'true'
   return String(raw ?? '')
 }
 
@@ -640,6 +607,7 @@ export function buildPreparedTestContext(fields, values) {
     variable_values: contextRecord(),
   }
   let hasEvent = false
+  const absentTriggers = new Set()
   for (const field of fields) {
     let value
     try { value = parsePreparedTestValue(values[field.key], field) }
@@ -648,6 +616,11 @@ export function buildPreparedTestContext(fields, values) {
       throw error
     }
     if (value === undefined) continue
+    if (field.scope === 'event_occurrence') {
+      if (value === true) contextBucket(context.trigger_payloads, field.node)
+      else absentTriggers.add(field.node)
+      continue
+    }
     if (field.scope === 'variable') { context.variable_values[field.node] = safeContextValue(value); continue }
     const target = field.scope === 'event'
       ? context.event_payload
@@ -658,6 +631,7 @@ export function buildPreparedTestContext(fields, values) {
     else setPath(target, field.path, value)
     if (field.scope === 'event') hasEvent = true
   }
+  for (const node of absentTriggers) delete context.trigger_payloads[node]
   if (!hasEvent) delete context.event_payload
   if (!Object.keys(context.step_outputs).length) delete context.step_outputs
   if (!Object.keys(context.variable_values).length) delete context.variable_values
@@ -671,10 +645,7 @@ export function requestTestContext(rule, schema, promptValue = globalThis.prompt
       .filter(reference => ['trigger', 'event'].includes(reference.scope))
       .map(reference => [JSON.stringify(reference), reference]),
   ).values()]
-  const legacyEventPaths = [...new Map(
-    collectLegacyEventPayloadPaths(rule).map(path => [JSON.stringify(path), path]),
-  ).values()]
-  if (!references.length && !legacyEventPaths.length) return {}
+  if (!references.length) return {}
   const context = {
     trigger_payloads: contextRecord(),
     event_payload: contextRecord(),
@@ -735,29 +706,7 @@ export function requestTestContext(rule, schema, promptValue = globalThis.prompt
       setPath(payload, path, parsed)
     }
   }
-  for (const path of legacyEventPaths) {
-    const serializedPath = JSON.stringify(path)
-    if (promptedEventPaths.has(serializedPath)) continue
-    const label = path.length ? path.join('.') : '完整事件数据（JSON）'
-    const raw = promptValue(`本次触发 · ${label}`, path.length ? '' : '{}')
-    if (raw === null) return null
-    let parsed = raw
-    if (!path.length) {
-      try {
-        parsed = parseExactJson(raw)
-      } catch (error) {
-        throw new Error(`本次触发 · ${label}：请输入有效 JSON`)
-      }
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        throw new Error(`本次触发 · ${label}：请输入 JSON 对象`)
-      }
-      assignContextRecord(context.event_payload, parsed)
-    } else {
-      setPath(context.event_payload, path, parsed)
-    }
-    promptedEventPaths.add(serializedPath)
-  }
-  if (!references.some(reference => reference.scope === 'event') && !legacyEventPaths.length) {
+  if (!references.some(reference => reference.scope === 'event')) {
     delete context.event_payload
   }
   return context

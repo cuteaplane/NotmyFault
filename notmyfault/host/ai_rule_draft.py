@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Mapping, TypeAlias
 from notmyfault.core.rule_model import normalize_rule_shape
+from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions
 
 from notmyfault.host.ai_tools import (
     JSON,
@@ -53,42 +54,51 @@ def _catalog_map(catalog: PluginCatalog, key: str) -> dict[str, JSON]:
     return value
 
 
-_RULE_FIELDS = frozenset({"name", "condition", "actions"})
 _NODE_FIELDS = frozenset({"type", "params"})
 
 
-def parse_rule_draft(
-    args: Mapping[str, JSON], catalog: PluginCatalog
-) -> Mapping[str, JSON]:
+def parse_rule_draft(args: Mapping[str, JSON], catalog: PluginCatalog) -> Mapping[str, JSON]:
     try:
         args = normalize_rule_shape(dict(args))
     except ValueError as error:
         raise ToolCallError("rule_invalid", str(error)) from error
-    _reject_extra_fields(args, _RULE_FIELDS, "rule", "rule_invalid")
-    name = _require_str(args.get("name"), "rule.name", "rule_invalid")
-    condition = _require_object(args.get("condition"), "rule.condition", "rule_invalid")
-    actions = _require_list(
-        args.get("actions"), "rule.actions", "rule_invalid", nonempty=True
-    )
-    triggers = _catalog_map(catalog, "triggers")
-    actions_meta = _catalog_map(catalog, "actions")
-    normalized: list[JSON] = []
-    for index, action in enumerate(actions):
-        location = f"actions[{index}]"
-        normalized.append(
-            _parse_node(
-                _require_object(action, location, "rule_invalid"),
-                actions_meta,
-                location,
-                "动作",
-            )
-        )
-    draft: dict[str, JSON] = {
-        "name": name,
-        "condition": _parse_node(condition, triggers, "condition", "触发器"),
-        "actions": normalized,
+    return _parse_workflow_draft(args, catalog)
+
+
+def _parse_workflow_draft(args, catalog):
+    from notmyfault.core.rules import validate_rule_structure
+
+    _reject_extra_fields(args, frozenset({"name", "workflow", "constants", "variables", "concurrency"}), "rule", "rule_invalid")
+    _require_str(args.get("name"), "rule.name", "rule_invalid")
+    _require_object(args.get("workflow"), "rule.workflow", "rule_invalid")
+    errors = validate_rule_structure(args)
+    if errors:
+        raise ToolCallError("rule_invalid", "；".join(errors[:10]))
+    triggers, actions = _catalog_map(catalog, "triggers"), _catalog_map(catalog, "actions")
+    for index, trigger in enumerate(get_all_rule_events(args)):
+        _reject_extra_fields(trigger, frozenset({"type", "params", "binding_id"}), f"triggers[{index}]", "rule_invalid")
+        _parse_node({key: trigger[key] for key in ("type", "params") if key in trigger}, triggers, f"triggers[{index}]", "触发器")
+    common = {"binding_id", "type", "name", "parent", "position"}
+    native_fields = {
+        "trigger": {"trigger", "occurrence", "absence_scope", "duration_seconds", "repeat"},
+        "condition": {"predicate", "negated"},
+        "logic": {"op", "negated", "within_seconds", "duration_seconds", "consume", "pick", "ttl_seconds", "repeat"},
+        "event_group": {"group_type", "branches", "negated", "within_seconds", "duration_seconds", "consume", "pick", "ttl_seconds", "repeat", "mode", "timeout_seconds"},
+        "action_group": {"exports"},
+        "merge": set(),
+        "end": set(),
+        "set_variable": {"variable", "value", "on_error"},
     }
-    return draft
+    plugin_fields = {"binding_id", "type", "params", "retry", "retry_delay_seconds", "retry_backoff", "timeout_seconds", "on_error"}
+    for action, location in iter_rule_actions(args):
+        action_type = action["type"]
+        _reject_extra_fields(action, frozenset(common | native_fields.get(action_type, plugin_fields)), location, "rule_invalid")
+        if action_type == "event_group":
+            for index, branch in enumerate(action.get("branches", [])):
+                _reject_extra_fields(branch, frozenset({"id", "label", "negated", "else"}), f"{location}.branches[{index}]", "rule_invalid")
+        elif action_type not in native_fields:
+            _parse_node({key: action[key] for key in ("type", "params") if key in action}, actions, location, "动作")
+    return dict(args)
 
 
 def _parse_node(

@@ -27,7 +27,7 @@
 .log-empty{color:var(--md-on-surface-variant);text-align:center;padding:40px 16px}
 .log-hint{margin-top:10px;color:var(--md-warn);font:var(--ts-body-s)}
 .run-center-tabs{margin-bottom:20px}
-.run-summary-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:14px;margin-bottom:22px}
+.run-summary-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:14px;margin-bottom:22px}
 .run-summary-card{display:flex;flex-direction:column;gap:8px;min-width:0;padding:18px 20px;border:1px solid var(--md-outline-variant);border-radius:var(--r-md);background:var(--md-surface-c-low);color:var(--md-on-surface-variant);text-align:left;cursor:pointer;transition:background .15s,border-color .15s,box-shadow .15s}
 .run-summary-card:hover{background:var(--md-surface-c)}
 .run-summary-card.active{border-color:var(--md-primary);box-shadow:inset 0 0 0 1px var(--md-primary)}
@@ -128,3 +128,7 @@
   .step-summary-strip{align-items:flex-start;flex-direction:column}
   .step-summary-arrow{transform:rotate(90deg)}
 }
+
+.run-summary-card.recovered strong,.run-card.recovered .run-status-icon{color:var(--md-tertiary)}
+.run-card.recovered{border-left:4px solid var(--md-tertiary)}
+.run-card.recovered .run-status-label,.run-message.recovered{background:var(--md-tertiary-container);color:var(--md-on-tertiary-container)}

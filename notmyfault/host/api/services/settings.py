@@ -92,17 +92,13 @@ class SettingsService:
             action_type = item.get("type", "?")
             summary = {
                 "type": action_type,
+                "binding_id": item.get("binding_id"),
+                "parent": item.get("parent"),
                 "high_risk": requires_admin_rule_approval(
                     action_schema.get(action_type, {})
                 ),
                 "params": summarize_params(item.get("params")),
             }
-            child_fields = ("then", "else", "failure_actions") if action_type == "if" else ("failure_actions",)
-            for field in child_fields:
-                children = item.get(field, [])
-                if isinstance(children, list) and (children or field in ("then", "else")):
-                    summary[field] = [summarize_item(child) for child in children]
-                    summary["high_risk"] |= any(child["high_risk"] for child in summary[field])
             return summary
 
         status["summary"] = {
@@ -115,9 +111,11 @@ class SettingsService:
                         else f"规则 #{index + 1}"
                     ),
                     "actions": (
-                        [summarize_item(action) for action in rule.get("actions", [])]
+                        [summarize_item(action) for action in (
+                            rule["workflow"].get("nodes", []) if isinstance(rule.get("workflow"), dict)
+                            else []
+                        )]
                         if isinstance(rule, dict)
-                        and isinstance(rule.get("actions", []), list)
                         else []
                     ),
                 }
@@ -133,9 +131,13 @@ class SettingsService:
             from notmyfault.core.rules import (
                 validate_rule_bindings,
                 validate_rules_structure,
+                validate_automation_references,
             )
 
             structure_errors = validate_rules_structure(normalized_rules)
+            known_rule_ids = {rule.get("rule_id") for rule in normalized_rules if isinstance(rule, dict)}
+            structure_errors.extend(error for rule in normalized_rules if isinstance(rule, dict)
+                                    for error in validate_automation_references(rule, known_rule_ids))
             if structure_errors:
                 raise ConfigValidationError(
                     "规则包含结构无效的规则，拒绝重新签名: "

@@ -1,6 +1,7 @@
 """通过系统蓝牙无线电接口查询或切换蓝牙状态。"""
 
 from __future__ import annotations
+from notmyfault.plugin_api import action_values
 
 import json
 import os
@@ -218,6 +219,7 @@ def _run_linux(action: str, cancellation=None) -> dict[str, Any]:
 
 
 def run_with_context(_action_info: dict[str, Any], params: dict[str, Any], context) -> dict[str, Any]:
+    params = action_values(params)
     action = str(params.get("action", "toggle")).strip().lower()
     if action not in _ACTIONS:
         raise ValueError(f"不支持的蓝牙操作: {action}")
@@ -232,7 +234,3 @@ def run_with_context(_action_info: dict[str, Any], params: dict[str, Any], conte
     if sys.platform.startswith("linux"):
         return _run_linux(action, cancellation)
     raise RuntimeError("蓝牙开关插件仅支持 Windows 和 Linux")
-
-
-def run(action_info, params):
-    return run_with_context(action_info, params, {})

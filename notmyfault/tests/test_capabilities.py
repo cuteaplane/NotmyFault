@@ -261,10 +261,10 @@ class SchemaValidationTests(unittest.TestCase):
             "id": "cap_plugin",
             "name": "能力插件",
             "description": "测试",
-            "enabled": True,
             "version_code": 1,
             "version": "1.0",
             "package_name": "io.github.notmyfault.cap",
+            "execution_api": "context-v1",
             "requires_capabilities": ["display.brightness"],
         }
         is_valid, errors = validate_plugin_meta(meta, "action")
@@ -275,10 +275,10 @@ class SchemaValidationTests(unittest.TestCase):
             "id": "cap_plugin",
             "name": "能力插件",
             "description": "测试",
-            "enabled": True,
             "version_code": 1,
             "version": "1.0",
             "package_name": "io.github.notmyfault.cap",
+            "execution_api": "context-v1",
             "requires_capabilities": ["teleport.wormhole"],
         }
         is_valid, errors = validate_plugin_meta(meta, "action")
@@ -290,10 +290,10 @@ class SchemaValidationTests(unittest.TestCase):
             "id": "cap_plugin",
             "name": "能力插件",
             "description": "测试",
-            "enabled": True,
             "version_code": 1,
             "version": "1.0",
             "package_name": "io.github.notmyfault.cap",
+            "execution_api": "context-v1",
             "requires_capabilities": "display.brightness",
         }
         is_valid, errors = validate_plugin_meta(meta, "action")

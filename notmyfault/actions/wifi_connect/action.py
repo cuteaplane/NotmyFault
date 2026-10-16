@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from notmyfault.plugin_api import action_values
+
 import sys
 import os
 import re
@@ -460,7 +462,8 @@ def _run_linux(action: str, ssid: str, password: str) -> dict[str, Any]:
     }
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
+    params = action_values(params)
     action = str(params.get("action", "connect") or "connect").strip().lower()
     if action not in _ACTIONS:
         raise ValueError(f"不支持的 WiFi 操作: {action}")

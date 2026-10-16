@@ -65,7 +65,8 @@ jobs:
         with:
           name: NotmyFault-windows-x64-logs
           path: |
-            installer/windows/build/**/build.log
+            installer/windows/dist/work-*.log
             installer/windows/build/**/smoke.log
+            installer/windows/build/**/install-*.log
           if-no-files-found: ignore
           retention-days: 7

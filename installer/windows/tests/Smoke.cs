@@ -22,6 +22,7 @@ public static class Smoke
     [STAThread]
     public static int Main(string[] args)
     {
+        Console.OutputEncoding = System.Text.Encoding.UTF8;
         string probeAssembly = Environment.GetEnvironmentVariable("NOTMYFAULT_SMOKE_INSTALLER");
         if (!String.IsNullOrEmpty(probeAssembly))
             AppDomain.CurrentDomain.AssemblyResolve += delegate(object sender, ResolveEventArgs request)
@@ -98,7 +99,7 @@ internal static class Scenarios
     private const string PrivateKey = "app/.private/signing_private_key.pem";
     private const string PublicKey = "app/.private/signing_public.pem";
     private const string PrivateNote = "app/.private/notes.txt";
-    private const string UserPluginResource = "app/user_plugins/sample/resource.txt";
+    private const string UnownedResource = "personal/sample/resource.txt";
     private static string workspace;
 
     private sealed class Progress : IProgress<InstallProgress>
@@ -266,6 +267,20 @@ internal static class Scenarios
     {
         Directory.CreateDirectory(root);
         CheckWindows();
+        string identification = Path.Combine(root, "installation-identification");
+        Directory.CreateDirectory(identification);
+        File.WriteAllText(Path.Combine(identification, ".notmyfault-install"), "NotmyFault Windows installer 1\ntest\n");
+        Check(!InstallMaintenance.IsInstalledDirectory(identification), "installation without file manifest was accepted");
+        File.WriteAllText(Path.Combine(identification, ".notmyfault-files"), "");
+        Check(InstallMaintenance.IsInstalledDirectory(identification), "marked installation was rejected");
+        Check(InstallMaintenance.GetInstalledVersion(identification) == "test", "marked version could not be read");
+        File.Delete(Path.Combine(identification, ".notmyfault-install"));
+        Check(!InstallMaintenance.IsInstalledDirectory(identification), "installation without marker was accepted");
+        bool missingMarkerRejected = false;
+        try { InstallEngine.ValidateDirectory(identification); }
+        catch (IOException) { missingMarkerRejected = true; }
+        Check(missingMarkerRejected, "nonempty target without marker was accepted");
+        Check(File.Exists(Path.Combine(identification, ".notmyfault-files")), "directory validation modified target files");
         CheckShortcuts(root);
         CheckLaunch(root);
         CheckUninstallHandoff(root);
@@ -274,9 +289,10 @@ internal static class Scenarios
         {
             string original = Path.Combine(root, failure);
             Directory.CreateDirectory(Path.Combine(original, "app", ".private"));
-            Directory.CreateDirectory(Path.Combine(original, "app", "user_plugins", "sample"));
+            Directory.CreateDirectory(Path.Combine(original, "personal", "sample"));
             File.WriteAllText(Path.Combine(original, ".notmyfault-install"), "NotmyFault Windows installer 1\ntest\n");
-            string[] owned = { RemovedProgram, InterruptedProgram, PrivateKey, PublicKey, PrivateNote, UserPluginResource };
+            string[] owned = { RemovedProgram, InterruptedProgram, PrivateKey, PublicKey, PrivateNote };
+            File.WriteAllText(Path.Combine(original, UnownedResource), "personal resource");
             File.WriteAllLines(Path.Combine(original, ".notmyfault-files"), owned);
             foreach (string relative in owned) File.WriteAllText(Path.Combine(original, relative), relative);
             File.WriteAllText(Path.Combine(original, "keep-me.txt"), "user data");
@@ -298,7 +314,7 @@ internal static class Scenarios
             Check(Directory.Exists(retry), "retry directory does not exist");
             Check(File.Exists(Path.Combine(retry, ".notmyfault-uninstall")), "uninstall lost its cleanup list");
             Check(File.ReadAllText(Path.Combine(retry, "keep-me.txt")) == "user data", "interrupted uninstall changed user data");
-            Check(File.ReadAllText(Path.Combine(retry, UserPluginResource)) == UserPluginResource, "interrupted uninstall changed a user plugin");
+            Check(File.ReadAllText(Path.Combine(retry, UnownedResource)) == "personal resource", "interrupted uninstall changed an unowned resource");
             Check(File.ReadAllText(Path.Combine(retry, PrivateNote)) == PrivateNote, "uninstaller removed another private file");
             if (failure == "move")
             {
@@ -320,7 +336,7 @@ internal static class Scenarios
                 new InterruptedUninstall()).GetAwaiter().GetResult();
             Check(Directory.Exists(retained) && !Directory.Exists(original), "retry did not retain user data separately");
             Check(File.ReadAllText(Path.Combine(retained, "keep-me.txt")) == "user data", "retry changed user data");
-            Check(File.Exists(Path.Combine(retained, "app", "user_plugins", "sample", "resource.txt")), "retry removed a user plugin");
+            Check(File.Exists(Path.Combine(retained, "personal", "sample", "resource.txt")), "retry removed an unowned resource");
             Check(File.Exists(Path.Combine(retained, "app", ".private", "notes.txt")), "retry removed another private file");
             foreach (string relative in new[] { RemovedProgram, InterruptedProgram, PrivateKey, PublicKey,
                 ".notmyfault-install", ".notmyfault-files", ".notmyfault-uninstall" })
@@ -463,8 +479,9 @@ internal static class Scenarios
 
     private static void UserDataSurvives(string directory)
     {
-        Check(File.ReadAllText(Path.Combine(directory, "app", "user_plugins", "sample", "resource.txt")) == "user plugin", "user plugin changed");
+        Check(File.ReadAllText(Path.Combine(directory, "personal", "sample", "resource.txt")) == "personal resource", "unowned resource changed");
         Check(File.ReadAllText(Path.Combine(directory, "keep-me.txt")) == "unrelated file", "unknown file changed");
+        Check(File.ReadAllText(Path.Combine(workspace, "profile", "NotmyFault", "plugins", "actions", "sample", "resource.txt")) == "profile plugin", "profile plugin changed");
         Check(File.ReadAllText(Path.Combine(workspace, "profile", "NotmyFault", "config.json")) == "{\"smoke\":true}", "user configuration changed");
     }
 
@@ -472,7 +489,6 @@ internal static class Scenarios
     {
         workspace = root;
         RunMaintenance(Path.Combine(root, "maintenance"));
-        Console.OutputEncoding = System.Text.Encoding.UTF8;
         string unrelated = Path.Combine(workspace, "unrelated");
         Directory.CreateDirectory(unrelated);
         File.WriteAllText(Path.Combine(unrelated, "keep.txt"), "keep");
@@ -544,10 +560,11 @@ internal static class Scenarios
         Console.WriteLine("PASS: upgrade and uninstall reject a running installation");
 
         byte[] signingKey = File.ReadAllBytes(Path.Combine(directory, "app", ".private", "signing_private_key.pem"));
-        Directory.CreateDirectory(Path.Combine(directory, "app", "user_plugins", "sample"));
-        File.WriteAllText(Path.Combine(directory, "app", "user_plugins", "sample", "resource.txt"), "user plugin");
+        Directory.CreateDirectory(Path.Combine(directory, "personal", "sample"));
+        File.WriteAllText(Path.Combine(directory, "personal", "sample", "resource.txt"), "personal resource");
         File.WriteAllText(Path.Combine(directory, "keep-me.txt"), "unrelated file");
-        Directory.CreateDirectory(Path.Combine(workspace, "profile", "NotmyFault"));
+        Directory.CreateDirectory(Path.Combine(workspace, "profile", "NotmyFault", "plugins", "actions", "sample"));
+        File.WriteAllText(Path.Combine(workspace, "profile", "NotmyFault", "plugins", "actions", "sample", "resource.txt"), "profile plugin");
         File.WriteAllText(Path.Combine(workspace, "profile", "NotmyFault", "config.json"), "{\"smoke\":true}");
         bool wrongPasswordRejected = false;
         try { Install(directory, true, "wrong password", CancellationToken.None, new Progress()); }
@@ -585,16 +602,6 @@ internal static class Scenarios
         RunPython(directory, "build.py verify");
         RunPython(directory, "-c \"import sys,pathlib; assert pathlib.Path(sys.base_prefix).resolve() == pathlib.Path('..','runtime').resolve(); print('upgraded venv points to the installed runtime')\"");
         Console.WriteLine("PASS: upgrade preserves the signing key and data and replaces the runtime");
-
-        File.Delete(Path.Combine(directory, ".notmyfault-install"));
-        File.Delete(Path.Combine(directory, ".notmyfault-files"));
-        File.Delete(Path.Combine(directory, "NotmyFault-Uninstall.exe"));
-        Check(InstallEngine.IsInstalledDirectory(directory), "previous installer format is not recognized");
-        Install(directory, true, Password, CancellationToken.None, new Progress());
-        DataSurvives(directory, signingKey);
-        RegistrationMatches(directory);
-        RunPython(directory, "build.py verify");
-        Console.WriteLine("PASS: installations from the previous installer can upgrade");
 
         string retained = InstallMaintenance.UninstallAsync(directory, new Progress(), CancellationToken.None).GetAwaiter().GetResult();
         Check(Directory.Exists(retained), "uninstaller did not report retained user data");

@@ -1,4 +1,5 @@
 """执行 UIA 控件操作或录制的桌面操作宏。"""
+from notmyfault.plugin_api import action_values
 
 import time
 import sys
@@ -139,11 +140,12 @@ def execute_macro(steps, cancellation=None):
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     mode = str(params.get("mode", "control") or "control")
     if mode not in _TARGET_MODES | {"macro"}:
         raise ValueError(f"不支持的 UIA 自动化模式: {mode}")
     runtime = context.get("runtime", {})
-    cancellation = runtime.get("cancellation") if isinstance(runtime, dict) else None
+    cancellation = runtime.get("cancellation")
 
     if mode == "macro":
         macro = _unpack_plugin_data(params.get("macro"), "mouse_macro")
@@ -170,7 +172,3 @@ def run_with_context(action_info, params, context):
     if not isinstance(text, str):
         raise ValueError("写入屏幕控件的内容必须是文本")
     return perform_selector(target, operation, cancellation, text)
-
-
-def run(action_info, params):
-    return run_with_context(action_info, params, {})

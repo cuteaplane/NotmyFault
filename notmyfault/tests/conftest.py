@@ -43,3 +43,13 @@ def stub_desktop_alerts(monkeypatch):
         "show_notification",
         lambda title, message: True,
     )
+
+
+@pytest.fixture(autouse=True)
+def close_hosted_samplers(close_static_rules_stores):
+    from notmyfault.tests.plugin_support import _hosted_samplers
+
+    yield
+    for engine in _hosted_samplers:
+        engine.shutdown(timeout=3)
+    _hosted_samplers.clear()

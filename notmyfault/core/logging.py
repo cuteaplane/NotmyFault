@@ -18,6 +18,7 @@
 import glob
 import json
 import os
+import re
 import sys
 import threading
 from collections import deque
@@ -131,45 +132,23 @@ def engine_error(event: str, **data: Any) -> None:
 
 
 def parse_log_line(line: str) -> Dict[str, Any] | None:
-    """解析带时间戳的日志行，并兼容没有级别标记的旧格式"""
-    line = line.strip()
-    if not line:
+    """解析宿主写入的时间戳、级别和正文。"""
+    match = re.fullmatch(
+        r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] \[(INFO|WARN|ERROR)\] (.*)",
+        line.rstrip("\r\n"),
+    )
+    if match is None:
         return None
-
-    if not line.startswith("["):
-        return None
-
-    ts_end = line.find("] ")
-    if ts_end < 0:
-        return None
-    ts = line[1:ts_end]
-
-    rest = line[ts_end + 2:]
-
-    level = "INFO"
-    payload = rest
-    if rest.startswith("[") and "] " in rest:
-        bracket_end = rest.find("] ")
-        candidate_level = rest[1:bracket_end]
-        if candidate_level in ("INFO", "WARN", "ERROR"):
-            # 旧格式正文可能以 [LEVEL] 开头，遇到嵌套级别时保留 INFO
-            after_level = rest[bracket_end + 2:]
-            if after_level.startswith("[") and "] " in after_level:
-                nested_candidate = after_level[1:after_level.find("] ")]
-                if nested_candidate in ("INFO", "WARN", "ERROR"):
-                    pass  # 嵌套 [LEVEL] → 保持旧格式
-                else:
-                    level = candidate_level
-                    payload = after_level
-            else:
-                level = candidate_level
-                payload = after_level
-
+    ts, level, payload = match.groups()
     data = None
     text = payload
     if level == "ERROR":
         try:
-            data = json.loads(payload)
+            decoded = json.loads(payload)
+        except json.JSONDecodeError:
+            decoded = None
+        if isinstance(decoded, dict):
+            data = decoded
             event = data.get("event", "?")
             plugin = data.get("plugin", data.get("rule", ""))
             reason = data.get("reason", "")
@@ -177,9 +156,6 @@ def parse_log_line(line: str) -> Dict[str, Any] | None:
                 text = f"[{event}] {plugin}: {reason}"
             elif reason:
                 text = f"[{event}] {reason}"
-        except json.JSONDecodeError:
-            pass
-
     return {"ts": ts, "level": level, "text": text, "data": data}
 
 

@@ -1,3 +1,4 @@
+from notmyfault.plugin_api import action_values
 import json
 import math
 import re
@@ -18,11 +19,10 @@ def _query_value(value):
     raise ValueError("查询参数仅支持文本、数字、布尔值、null 或这些值的数组")
 
 
-def run(action_info, params):
-    return run_with_context(action_info, params, {})
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     operation = params.get("operation", "encode")
     value = params.get("value", "")
     result = {"text": "", "scheme": "", "hostname": "", "port": None, "path": "", "query": {}, "fragment": ""}

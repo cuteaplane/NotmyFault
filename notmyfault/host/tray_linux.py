@@ -75,8 +75,6 @@ class TrayIcon:
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=3)
 
-    def set_engine_running(self, running: bool) -> None:
-        self.set_engine_state("running" if running else "stopped")
 
     def set_engine_state(self, state: str) -> None:
         self._engine_state = state

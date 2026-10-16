@@ -2,6 +2,7 @@
 
 import os as _os
 import sys as _sys
+from typing import TYPE_CHECKING as _TYPE_CHECKING
 
 __all__ = ["run", "__version__"]
 
@@ -86,5 +87,20 @@ def _guard_package_import() -> None:
 
 _guard_package_import()
 
-from .host.app import run
 from .version import __version__
+
+if _TYPE_CHECKING:
+    from .host.app import run
+
+
+def __getattr__(name: str):
+    if name == "run":
+        from .host.app import run
+
+        globals()["run"] = run
+        return run
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

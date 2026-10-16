@@ -38,9 +38,9 @@ def test_manifest_requires_audio_device_query():
 def test_rejects_empty_device_and_bad_type():
     module = load_module()
     with pytest.raises(ValueError, match="必须填写目标设备"):
-        module.run({}, {"device_type": "render", "device": " "})
+        module.run_with_context({}, {"device_type": "render", "device": " "}, {})
     with pytest.raises(ValueError, match="无效的设备类型"):
-        module.run({}, {"device_type": "output", "device": "42"})
+        module.run_with_context({}, {"device_type": "output", "device": "42"}, {})
 
 
 def test_linux_sets_default_via_platform_services(monkeypatch):
@@ -65,7 +65,7 @@ def test_linux_sets_default_via_platform_services(monkeypatch):
         lambda: FakeServices(),
     )
 
-    result = module.run({}, {"device_type": "render", "device": "41"})
+    result = module.run_with_context({}, {"device_type": "render", "device": "41"}, {})
     assert calls == [("render", "41")]
     assert result["device_id"] == "41"
     assert result["previous_device_id"] == "12"
@@ -91,7 +91,7 @@ def test_linux_skips_when_already_default(monkeypatch):
         "notmyfault.plugin_api.platform_services",
         lambda: FakeServices(),
     )
-    result = module.run({}, {"device_type": "render", "device": "41"})
+    result = module.run_with_context({}, {"device_type": "render", "device": "41"}, {})
     assert result["changed"] is False
     assert result["device_id"] == "41"
 
@@ -114,7 +114,7 @@ def test_linux_surfaces_platform_service_error(monkeypatch):
         lambda: FakeServices(),
     )
     with pytest.raises(RuntimeError, match="未安装 wpctl 或 pactl"):
-        module.run({}, {"device_type": "render", "device": "41"})
+        module.run_with_context({}, {"device_type": "render", "device": "41"}, {})
 
 
 def test_linux_rejects_when_readback_mismatches(monkeypatch):
@@ -136,7 +136,7 @@ def test_linux_rejects_when_readback_mismatches(monkeypatch):
         lambda: FakeServices(),
     )
     with pytest.raises(RuntimeError, match="回读为"):
-        module.run({}, {"device_type": "render", "device": "41"})
+        module.run_with_context({}, {"device_type": "render", "device": "41"}, {})
 
 
 @pytest.mark.parametrize("device_type", ["render", "capture"])
@@ -170,9 +170,9 @@ def test_windows_sets_and_verifies_every_default_device_role(monkeypatch, device
     monkeypatch.setattr(module, "_set_windows_default", set_default)
     if failed_role is not None:
         with pytest.raises(RuntimeError, match="回读为"):
-            module.run({}, {"device_type": device_type, "device": "target"})
+            module.run_with_context({}, {"device_type": device_type, "device": "target"}, {})
     else:
-        result = module.run({}, {"device_type": device_type, "device": "target"})
+        result = module.run_with_context({}, {"device_type": device_type, "device": "target"}, {})
         assert result["changed"] is (initial_mask != 7)
         assert result["device_id"] == "target"
         assert result["previous_device_id"] == previous

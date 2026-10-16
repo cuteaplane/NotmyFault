@@ -1,7 +1,8 @@
 """NotmyFault 的独立 Dashboard 进程，通过 HTTP API 与引擎通信"""
-import json
 import os
 import sys
+import threading
+import json
 import time
 import urllib.request
 import urllib.error
@@ -10,7 +11,6 @@ import functools
 import http.server
 import socketserver
 import socket
-import threading
 import secrets
 import re
 import shutil
@@ -36,6 +36,7 @@ def _preload_webview() -> None:
         from webview.platforms import winforms  # noqa: F401
     except Exception:
         pass
+
 
 
 def _patch_qt_permission_policy():
@@ -186,7 +187,98 @@ class DashboardAPI:
         self._paths = paths or ApplicationPaths.default()
 
         self._logs = LogFiles(str(self._paths.logs_dir))
+        self._http_opener = urllib.request.OpenerDirector()
+        for handler in (
+            urllib.request.HTTPHandler(),
+            urllib.request.HTTPDefaultErrorHandler(),
+            urllib.request.HTTPRedirectHandler(),
+            urllib.request.HTTPErrorProcessor(),
+        ):
+            self._http_opener.add_handler(handler)
+        self._dashboard_settings_lock = threading.Lock()
+
+        self._dashboard_settings = {"resident_on_close": True}
+        self._dashboard_settings_error = ""
+        self._load_dashboard_settings()
         self._window = None
+
+    def _load_dashboard_settings(self) -> None:
+        try:
+            settings = json.loads(
+                self._paths.dashboard_settings_file.read_text(encoding="utf-8")
+            )
+            if not isinstance(settings, dict):
+                raise ValueError("设置文件根值必须是对象")
+            if (
+                "resident_on_close" in settings
+                and type(settings["resident_on_close"]) is not bool
+            ):
+                raise ValueError("resident_on_close 必须是布尔值")
+            with self._dashboard_settings_lock:
+                self._dashboard_settings = settings
+                self._dashboard_settings.setdefault("resident_on_close", True)
+        except FileNotFoundError:
+            return
+        except (OSError, UnicodeError, ValueError, TypeError) as error:
+            message = str(error)
+            with self._dashboard_settings_lock:
+                self._dashboard_settings_error = message
+            print(f"[Dashboard] 无法读取桌面设置: {message}", file=sys.stderr)
+
+    def get_dashboard_settings(self) -> dict:
+        with self._dashboard_settings_lock:
+            return {
+                "ok": not self._dashboard_settings_error,
+                "resident_on_close": self._dashboard_settings["resident_on_close"],
+                **(
+                    {"error": self._dashboard_settings_error}
+                    if self._dashboard_settings_error else {}
+                ),
+            }
+
+    def set_dashboard_settings(self, resident_on_close: bool) -> dict:
+        if type(resident_on_close) is not bool:
+            return {
+                "ok": False,
+                "resident_on_close": self.get_dashboard_settings()["resident_on_close"],
+                "error": "resident_on_close 必须是布尔值",
+            }
+        with self._dashboard_settings_lock:
+            settings = dict(self._dashboard_settings)
+            settings["resident_on_close"] = resident_on_close
+            temp_path = None
+            try:
+                import tempfile
+
+                target = self._paths.dashboard_settings_file
+                target.parent.mkdir(parents=True, exist_ok=True)
+                descriptor, temp_path = tempfile.mkstemp(
+                    prefix=f".{target.name}.",
+                    suffix=".tmp",
+                    dir=str(target.parent),
+                )
+                with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                    json.dump(settings, output, ensure_ascii=False)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temp_path, target)
+            except Exception as error:
+                if temp_path is not None:
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
+                message = str(error)
+                self._dashboard_settings_error = message
+                print(f"[Dashboard] 无法保存桌面设置: {message}", file=sys.stderr)
+                return {
+                    "ok": False,
+                    "resident_on_close": self._dashboard_settings["resident_on_close"],
+                    "error": message,
+                }
+            self._dashboard_settings = settings
+            self._dashboard_settings_error = ""
+            return {"ok": True, "resident_on_close": resident_on_close}
 
     def set_window_state(self, action: str) -> dict:
         if action not in ("minimize", "restore"):
@@ -310,7 +402,8 @@ class DashboardAPI:
                     req.add_header("Content-Type", "application/json")
                 if value_encoding:
                     req.add_header("X-NMF-Value-Encoding", value_encoding)
-                return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+                with self._http_opener.open(req, timeout=timeout) as response:
+                    return json.loads(response.read())
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", errors="replace")
                 try:
@@ -602,7 +695,23 @@ def main():
 
     def on_closing():
         print("[Dashboard] 窗口正在关闭...")
+        if quit_requested.is_set():
+            return
+        if os.name == "nt":
+            try:
+                import ctypes
 
+                if ctypes.windll.user32.GetSystemMetrics(0x2000):
+                    return
+            except Exception as error:
+                print(f"[Dashboard] 无法检查 Windows 关机状态: {error}", file=sys.stderr)
+                return
+        with api._dashboard_settings_lock:
+            if not api._dashboard_settings["resident_on_close"]:
+                return
+        window.hide()
+        print("[Dashboard] 窗口已隐藏")
+        return False
     window.events.closing += on_closing
     window.events.closed += lambda: print("[Dashboard] 窗口已关闭")
 

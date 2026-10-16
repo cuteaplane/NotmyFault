@@ -1,14 +1,13 @@
 """轮询型触发器基类
-每轮调用子类的 poll()，native=True 时持有 NATIVE_LOCK，异常记录后继续轮询，退出时调用 teardown()
+每轮调用子类的 poll()，native=True 时持有 NATIVE_LOCK，退出时调用 teardown()
 子类实现 validate()、setup()、poll()、teardown()，文件末尾的 run() 包装函数转发到基类
 """
-import sys
 import threading
-import traceback
-import time
 from typing import Any, Dict
 
-from notmyfault.native import NATIVE_LOCK
+from notmyfault.plugin_api import native_lock, system_clock, trigger_context
+
+NATIVE_LOCK = native_lock()
 
 
 class PollingTrigger:
@@ -19,13 +18,17 @@ class PollingTrigger:
 
     def __init__(self, meta: Dict[str, Any], config: Any,
                  emit_event: Any, shutdown_event: threading.Event) -> None:
+        self.ctx = trigger_context()
+        self.clock = self.ctx.clock if self.ctx is not None else system_clock()
+        self.state = self.ctx.state if self.ctx is not None else None
+        self.boot_id = self.ctx.boot_id if self.ctx is not None else ""
+        self.engine_started_at = self.ctx.engine_started_at if self.ctx is not None else self.clock.time()
+        self.stopping = shutdown_event
         self.meta = meta
         self.config = config
         self._emit_event = emit_event
         self._stop_event = shutdown_event
         self.trigger_id = str(meta.get("id", type(self).__name__))
-        self._last_poll_error = None
-        self._last_error_at = 0.0
 
     def emit(self, payload: Dict[str, Any]) -> None:
         """向引擎发送带 trigger_id 校验的 event-v2 事件"""
@@ -41,31 +44,30 @@ class PollingTrigger:
         """启动前执行一次性初始化，子类可注册热键或创建隐藏窗口"""
 
     def poll(self) -> None:
-        """执行一次采样，run() 捕获异常并继续下一轮"""
+        """执行一次采样"""
 
     def teardown(self) -> None:
         """退出时释放资源，子类可注销热键或销毁窗口"""
 
+    @classmethod
+    def from_context(cls, context):
+        return cls(context.meta, dict(context.config), context.emit, context.stopping)
+
+    def sample(self):
+        if self.native:
+            with NATIVE_LOCK:
+                self.poll()
+        else:
+            self.poll()
+
     def run(self) -> None:
+        self.completed = False
         self.validate()
         try:
             self.setup()
-            while not self._stop_event.is_set():
-                try:
-                    if self.native:
-                        with NATIVE_LOCK:
-                            self.poll()
-                    else:
-                        self.poll()
-                except Exception as error:
-                    key = (type(error), str(error))
-                    now = time.monotonic()
-                    if key != self._last_poll_error or now - self._last_error_at >= 60:
-                        print(f"[Trigger:{self.trigger_id}] 轮询出错:", file=sys.stderr)
-                        traceback.print_exc(limit=3)
-                        self._last_poll_error, self._last_error_at = key, now
-                else:
-                    self._last_poll_error = None
-                self._stop_event.wait(self.interval)
+            while not self._stop_event.is_set() and not self.completed:
+                self.sample()
+                if not self.completed:
+                    self.clock.wait(self._stop_event, self.interval)
         finally:
             self.teardown()

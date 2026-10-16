@@ -53,15 +53,20 @@ const engineDescription = computed(() => {
 })
 
 const runStatusMeta = {
+  queued: { label: '排队中', icon: 'schedule' },
   running: { label: '运行中', icon: 'progress_activity' },
   deferred: { label: '等待重试', icon: 'schedule' },
   succeeded: { label: '成功', icon: 'check_circle' },
+  recovered: { label: '已补救', icon: 'healing' },
   failed: { label: '失败', icon: 'error' },
+  timed_out: { label: '已超时', icon: 'timer_off' },
   cancelled: { label: '已停止', icon: 'stop_circle' },
+  dropped: { label: '已丢弃', icon: 'block' },
 }
+const unknownRunMeta = { label: '未知状态', icon: 'help' }
 
 function runMeta(status) {
-  return runStatusMeta[status] || runStatusMeta.running
+  return Object.hasOwn(runStatusMeta, status) ? runStatusMeta[status] : unknownRunMeta
 }
 
 function formatRunTime(timestamp) {
@@ -124,26 +129,37 @@ function statsForStatus(status) {
     ? { rules: status.rules_count ?? '-', triggers: status.triggers_count ?? '-', actions: status.actions_count ?? '-' }
     : { rules: '-', triggers: '-', actions: '-' }
 }
-async function loadStats() {
+async function loadStats(status = null) {
   if (statsLoading || disposed) return
   statsLoading = true
   try {
-    const status = await getEngineStatus()
+    const current = status ?? await getEngineStatus()
     statusError.value = ''
     if (disposed) return
-    await syncStatus(status)
-    const scheduler = status.scheduler || {}
+    await syncStatus(current)
+    if (disposed) return
+    const scheduler = current.scheduler || {}
     schedulerText.value = `${scheduler.running ?? 0} / ${scheduler.queued ?? 0}`
-    stats.value = statsForStatus(status)
-    if (status.api_alive === true) {
-      try {
-        recentRuns.value = await listRuns(5)
+    stats.value = statsForStatus(current)
+    if (!isRunning.value) diag.value = null
+    const runsRead = current.api_alive === true
+      ? listRuns(5).then(runs => {
+        if (disposed) return
+        recentRuns.value = runs
         runsError.value = ''
-      } catch (error) {
+      }).catch(error => {
+        if (disposed) return
         runsError.value = error.message
-      }
-    }
-    diag.value = isRunning.value ? await readDiagnostics() : null
+      })
+      : Promise.resolve()
+    const diagnosticsRead = isRunning.value
+      ? readDiagnostics().then(data => {
+        if (disposed || !isRunning.value) return
+        diag.value = data
+      })
+      : Promise.resolve()
+    await Promise.all([runsRead, diagnosticsRead])
+    if (disposed) return
     if (isRunning.value && !diag.value) statusError.value = '无法读取诊断数据，请刷新重试'
   } catch (error) {
     statusError.value = error.message || '无法读取引擎状态，请刷新重试'
@@ -161,18 +177,18 @@ function refreshHome() {
 watch(() => store.engineStatus, status => {
   stats.value = statsForStatus(status)
 }, { immediate: true })
-watch(() => store.refreshSignal, loadStats)
+watch(() => store.refreshSignal, () => loadStats())
 watch(isControllerOnline, online => {
-  if (online) loadStats()
+  if (online) loadStats(store.engineStatus)
 })
 watch(isRunning, running => {
   if (!running) diag.value = null
-  else loadStats()
+  else loadStats(store.engineStatus)
 })
 
 onMounted(() => {
-  if (isControllerOnline.value) loadStats()
-  if (hasBridge()) diagTimer = setInterval(loadStats, 30000)
+  if (isControllerOnline.value) loadStats(store.engineStatus)
+  if (hasBridge()) diagTimer = setInterval(() => loadStats(), 30000)
 })
 onUnmounted(() => { disposed = true; if (diagTimer) clearInterval(diagTimer) })
 </script>

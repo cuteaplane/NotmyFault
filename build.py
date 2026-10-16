@@ -139,7 +139,7 @@ def cmd_sign(args):
     plugins = _collect_plugins()
     signed = 0
     for plugin_dir, json_name in plugins:
-        sign_plugin(plugin_dir, json_name, private_key)
+        sign_plugin(plugin_dir, private_key=private_key)
         plugin_id = json.loads((plugin_dir / json_name).read_text(encoding="utf-8")).get("id", plugin_dir.name)
         print(f"  + {plugin_id:20s} signed ({len(plugin_files(plugin_dir))} files)")
         signed += 1
@@ -203,45 +203,26 @@ def _key_is_encrypted() -> bool:
     return b"ENCRYPTED" in PRIVATE_KEY_FILE.read_bytes()[:40]
 
 
-def _ensure_strict_encrypted_key() -> None:
-    """为 strict 模式准备密码加密的私钥，缺少时生成。"""
-    if PRIVATE_KEY_FILE.exists() and _key_is_encrypted():
-        return
-    if not PRIVATE_KEY_FILE.exists():
-        print("[strict] 未找到私钥；strict 模式需要密码加密的私钥，现在生成。")
-        cmd_init_keys({"force": False, "builtin": True, "encrypt": True})
-    else:
-        print("[strict] 当前私钥未加密；strict 模式要求加密，现在为它设置密码。")
-        key = load_private_key(PRIVATE_KEY_FILE)  # 未加密，无需密码即可加载
-        _save_private_key(key, PRIVATE_KEY_FILE, encrypt=True)
-
-
 def _ensure_key_for_build(security_mode: str, force: bool = False) -> None:
-    """按安全模式准备签署 build.json 所需的私钥，strict 模式还要求私钥加密"""
-    if security_mode == "strict":
-        if force:
-            print("[strict] --force：重新生成加密私钥（会要求设置密码）。")
-            cmd_init_keys({"force": True, "builtin": True, "encrypt": True})
-            return
-        _ensure_strict_encrypted_key()
-        return
-    # normal 和 permissive 模式接受未加密私钥
-    if force or not PRIVATE_KEY_FILE.exists():
-        if force and PRIVATE_KEY_FILE.exists():
-            print(f"[{security_mode}] --force：重新生成不加密私钥（覆盖现有私钥）。")
-        else:
-            print(f"[{security_mode}] 未找到私钥，生成一个（不加密）用于签名 build.json。")
-        cmd_init_keys({"force": bool(force), "builtin": True, "encrypt": False})
+    """构建使用现有私钥，strict 还要求该私钥已加密。"""
+    if force:
+        print("! build 不更换密钥；请单独使用 init-keys --force。")
+        raise SystemExit(1)
+    if not PRIVATE_KEY_FILE.exists():
+        print("! 未找到签名私钥；请先使用 init-keys 创建密钥。")
+        raise SystemExit(1)
+    if security_mode == "strict" and not _key_is_encrypted():
+        print("! strict 构建需要已加密的签名私钥；构建不会修改现有密钥。")
+        raise SystemExit(1)
 
 
 def cmd_build(args):
     """签名插件并写入带签名的 build.json，默认使用 strict 模式"""
     security_mode = args.get("security_mode") or "strict"
-    if security_mode not in ("strict", "normal", "permissive"):
-        print(f"! 未知 security_mode: {security_mode}（应为 strict / normal / permissive）")
+    if security_mode not in ("strict", "permissive"):
+        print(f"! 未知 security_mode: {security_mode}（应为 strict / permissive）")
         raise SystemExit(1)
 
-    # build.json 需要私钥签名，strict 模式还会强制加密
     _ensure_key_for_build(security_mode, force=args.get("force"))
 
     # cmd_sign 返回的私钥同时用于插件和 build.json，减少一次解锁
@@ -311,14 +292,14 @@ def cmd_version(args):
 def _print_usage(cmds):
     print("用法: python build.py <command> [options]")
     print(f"命令: {', '.join(sorted(cmds))}")
-    print("选项: --force                  强制覆盖已有密钥（build 里：按当前模式重新生成私钥）")
+    print("选项: --force                  强制覆盖已有密钥（仅 init-keys）")
     print("      --builtin                同时写入内置公钥到 signing_keys.py")
     print("      --encrypt                用密码加密私钥（init-keys 用）")
-    print("      --security-mode=MODE     指定安全模式: strict / normal / permissive")
+    print("      --security-mode=MODE     指定安全模式: strict / permissive")
     print("                               （仅 build 命令；默认 strict）")
     print("说明: 直接 `python build.py`（不带子命令）= build。")
-    print("      permissive/normal 用不加密私钥免密码；若现有私钥是加密的，加 --force 重新生成不加密私钥（覆盖现有）。")
-    print("      fresh clone 必须先跑一次以生成插件签名与 build.json。")
+    print("      strict 需要已加密私钥；permissive 接受加密或未加密私钥；build 不生成或更换密钥。")
+    print("      首次构建前先用 init-keys 配置签名密钥。")
 
 
 def main():
@@ -346,7 +327,7 @@ def main():
     if not cmds_list:
         # 未指定子命令时按安全模式执行默认 build
         mode = security_mode or "strict"
-        extra = "，会要求设置签名密码" if mode == "strict" else "（permissive/normal 用不加密私钥，免密码；加 --force 可重新生成不加密私钥）"
+        extra = "，使用现有加密签名私钥" if mode == "strict" else "，使用现有签名私钥"
         print(f"[build] 未指定子命令，默认执行 build（{mode}{extra}）。")
         print("[build] 查看完整用法: python build.py help")
         cmds_list = ["build"]

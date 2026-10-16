@@ -94,9 +94,8 @@ def test_desktop_runner_forwards_event_sink_to_engine_factory(monkeypatch, tmp_p
     )
     runner._handle_engine_state("starting")
     runner._handle_engine_state("stopped")
-    assert notifications == []
     runner._handle_engine_state("running")
-    assert notifications == [("NotmyFault", "引擎已启动")]
+    assert notifications == []
     cleanup = []
     runner._runtime = SimpleNamespace(
         request_stop=lambda: cleanup.append("request_stop"),
@@ -113,6 +112,7 @@ def test_runtime_controller_rejects_restart_while_old_thread_is_stopping():
         _shutdown_clean = False
         hold = threading.Event()
         stops = []
+        allow_cleanup = False
 
         def start(self, shutdown_event):
             self.shutdown_event = shutdown_event
@@ -121,7 +121,7 @@ def test_runtime_controller_rejects_restart_while_old_thread_is_stopping():
 
         def shutdown(self, timeout):
             self.stops.append(timeout)
-            self._shutdown_clean = not self.hold.is_set()
+            self._shutdown_clean = self.allow_cleanup
 
     engine = DirtyEngine()
     controller = RuntimeController(lambda on_event=None: engine)
@@ -140,8 +140,11 @@ def test_runtime_controller_rejects_restart_while_old_thread_is_stopping():
     assert _wait(lambda: controller.state == "stopped")
     assert controller.current_engine is engine
     assert controller.status().last_error == "引擎仍有未退出的触发器或动作"
-    assert controller.start() is True
+    assert controller.start() is False
+    assert controller.current_engine is engine
     assert engine.stops[-1] == _STALE_CLEANUP_TIMEOUT
+    engine.allow_cleanup = True
+    assert controller.start() is True
     controller.stop()
 
 
@@ -154,7 +157,7 @@ def test_runtime_controller_reports_factory_failure():
 
     controller = RuntimeController(
         factory,
-        event_sink=lambda t, d: events.append((t, d)),
+        event_sink=lambda event: events.append((event.type, event.to_dict()["error"])),
         failure_listener=failures.append,
     )
     assert controller.start() is True
@@ -162,7 +165,7 @@ def test_runtime_controller_reports_factory_failure():
     assert len(failures) == 1
     assert str(failures[0]) == "factory exploded"
     assert controller.status().last_error == "factory exploded"
-    assert ("error", {"error": "factory exploded"}) in events
+    assert ("engine.failed", {"code": "engine_start_failed", "message": "factory exploded"}) in events
 
 
 def test_runtime_controller_reports_integrity_start_failure(monkeypatch):
@@ -184,14 +187,14 @@ def test_runtime_controller_reports_integrity_start_failure(monkeypatch):
     )
     controller = RuntimeController(
         factory,
-        event_sink=lambda event_type, data: events.append((event_type, data)),
+        event_sink=lambda event: events.append((event.type, event.to_dict()["error"])),
     )
 
     assert controller.start() is True
     assert _wait(lambda: controller.state == "stopped")
     assert controller.current_engine is None
     assert controller.status().last_error == "核心文件完整性校验失败"
-    assert ("error", {"error": "核心文件完整性校验失败"}) in events
+    assert ("engine.failed", {"code": "engine_start_failed", "message": "核心文件完整性校验失败"}) in events
     assert alerts[0][0][0] == "NotmyFault 完整性校验失败"
 
 
@@ -227,3 +230,49 @@ def test_runtime_controller_serializes_concurrent_start_requests():
     assert results.count(True) == 1
     assert len(created) == 1
     controller.stop()
+
+
+def test_state_notifications_allow_status_queries_and_keep_transition_order():
+    controller = RuntimeController(lambda **kwargs: FakeEngine())
+    seen, lock_owned, completed = [], [], []
+    workers = []
+
+    def listener(state):
+        seen.append(state)
+        lock_owned.append(controller._lifecycle_lock._is_owned())
+        queried = threading.Event()
+        worker = threading.Thread(target=lambda: (controller.status(), queried.set()))
+        workers.append(worker)
+        worker.start()
+        completed.append(queried.wait(1))
+
+    controller.add_state_listener(listener)
+    try:
+        assert controller.start()
+        assert _wait(lambda: "running" in seen)
+        assert controller.stop(2)
+        assert _wait(lambda: "stopped" in seen)
+        assert seen == ["starting", "running", "stopping", "stopped"]
+        assert not any(lock_owned)
+        assert all(completed)
+    finally:
+        controller.stop(2)
+        for worker in workers:
+            worker.join(2)
+
+
+
+def test_listener_can_request_stop_and_receive_all_transitions():
+    controller = RuntimeController(lambda **kwargs: FakeEngine())
+    seen = []
+
+    def listener(state):
+        seen.append(state)
+        if state == "running":
+            controller.request_stop()
+
+    controller.add_state_listener(listener)
+    assert controller.start()
+    assert _wait(lambda: controller.state == "stopped")
+    controller._engine_thread.join(2)
+    assert seen == ["starting", "running", "stopping", "stopped"]

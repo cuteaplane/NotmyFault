@@ -1,11 +1,11 @@
+from notmyfault.plugin_api import action_values
 from pathlib import Path
 
 
-def run(action_info, params):
-    return run_with_context(action_info, params, {})
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     file_path = str(params.get("file_path", "") or "")
     if not file_path:
         raise ValueError("未指定文件路径")

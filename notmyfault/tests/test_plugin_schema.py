@@ -8,6 +8,7 @@ import pytest
 from notmyfault.security.plugin_checks import inspect_plugin
 from notmyfault.security.plugin_schema import validate_plugin_meta
 from notmyfault.security.plugin_schema import check_payload_contract
+from notmyfault.security.plugin_schema import scan_plugins
 
 # 这两个能力在载入阶段就被否掉，不需要在 permissions 里声明
 FORBIDDEN_CAPABILITIES = frozenset({"self_elevation", "dynamic_exec"})
@@ -18,11 +19,11 @@ def make_meta(**overrides):
         "id": "demo",
         "name": "演示插件",
         "description": "演示用插件",
-        "enabled": True,
         "version_code": 1,
         "version": "1.0",
         "package_name": "com.test.demo",
     }
+    meta["trigger_api" if "trigger_api" in overrides else "execution_api"] = "event-v2" if "trigger_api" in overrides else "context-v1"
     meta.update(overrides)
     return meta
 
@@ -43,7 +44,7 @@ BAD_FIELD_VALUES = (None, 5, True, "x", [], {})
 def test_validate_plugin_meta_reports_instead_of_raising():
     """元数据是插件作者写的，字段类型不对只能报错，不能让校验器自己抛异常。"""
     fields = (
-        "id", "name", "description", "enabled", "version_code", "version",
+        "id", "name", "description", "version_code", "version",
         "package_name", "platforms", "permissions", "params", "outputs",
         "security", "contributes", "requires_capabilities", "engines",
     )
@@ -97,6 +98,17 @@ def test_shared_types_and_structured_ports_validate_through_plugin_metadata():
     assert validate_plugin_meta(meta, "action")[0] is False
 
 
+@pytest.mark.parametrize("sampling_api,trigger_api,valid", [
+    ("poll-v1", "event-v2", True),
+    ("poll-v1", "event-v1", False),
+    ("poll-v2", "event-v2", False),
+])
+def test_sampling_api_requires_supported_event_contract(sampling_api, trigger_api, valid):
+    result, errors = validate_plugin_meta(make_meta(sampling_api=sampling_api, trigger_api=trigger_api), "trigger")
+    assert result is valid
+    assert bool(errors) is not valid
+
+
 class TestValidatePluginMetaPermissions:
     @pytest.mark.parametrize("editor_type", ["unknown_editor", "uia_selector"])
     def test_param_rejects_invalid_editor_type(self, editor_type):
@@ -146,7 +158,7 @@ class TestValidatePluginMetaPermissions:
         assert errors == []
 
         ok, errors = validate_plugin_meta(
-            make_meta(cancellation_api="runtime-v1"), "action"
+            make_meta(execution_api=None, cancellation_api="runtime-v1"), "action"
         )
         assert ok is False
         assert (
@@ -238,15 +250,15 @@ class TestValidatePluginMetaPermissions:
             assert "isolated 动作暂不支持 admin 权限" in errors
 
     def test_trigger_accepts_typed_outputs(self):
-        meta = make_meta(
-            outputs=[{"name": "path", "type": "string", "label": "文件路径"}]
+        meta = make_meta(trigger_api="event-v2",
+            outputs=[{"name": "path", "type": "text", "label": "文件路径"}]
         )
         ok, errors = validate_plugin_meta(meta, "trigger")
         assert ok is True
         assert errors == []
 
     def test_outputs_reject_invalid_type(self):
-        meta = make_meta(
+        meta = make_meta(trigger_api="event-v2",
             outputs=[{"name": "x", "type": "weird", "label": "l"}]
         )
         ok, errors = validate_plugin_meta(meta, "trigger")
@@ -254,15 +266,31 @@ class TestValidatePluginMetaPermissions:
         assert any("outputs[0].type 无效" in e for e in errors)
 
     def test_outputs_reject_duplicate_names(self):
-        meta = make_meta(
+        meta = make_meta(trigger_api="event-v2",
             outputs=[
-                {"name": "x", "type": "string", "label": "l"},
-                {"name": "x", "type": "number", "label": "l2"},
+                {"name": "x", "type": "text", "label": "l"},
+                {"name": "x", "type": "float", "label": "l2"},
             ]
         )
         ok, errors = validate_plugin_meta(meta, "trigger")
         assert ok is False
         assert any("重复名称: x" in e for e in errors)
+
+    @pytest.mark.parametrize("outputs", [["count"], [5], [{"name": "count", "type": "number", "label": "数量"}, "count"]])
+    def test_outputs_must_be_object_array(self, outputs):
+        ok, errors = validate_plugin_meta(
+            make_meta(trigger_api="event-v2", outputs=outputs), "trigger"
+        )
+        assert ok is False
+        assert errors
+
+    def test_outputs_single_object_wrapper_is_rejected(self):
+        ok, errors = validate_plugin_meta(
+            make_meta(trigger_api="event-v2", outputs={"name": "count", "type": "number", "label": "数量"}),
+            "trigger",
+        )
+        assert ok is False
+        assert errors
 
     def test_summary_policy_is_validated_for_params_and_outputs(self):
         meta = make_meta(
@@ -332,3 +360,91 @@ class TestMacroParams:
         ok, errors = validate_plugin_meta(meta, "action")
         assert ok is False
         assert any("capture_only 必须为布尔值" in error for error in errors)
+
+
+@pytest.mark.parametrize("kind,field,current", [("action", "execution_api", "context-v1"), ("trigger", "trigger_api", "event-v2")])
+@pytest.mark.parametrize("value", [None, "legacy", "event-v1"])
+def test_removed_entry_contracts_are_rejected(kind, field, current, value):
+    meta = make_meta(**{field: current})
+    meta.pop("execution_api" if kind == "trigger" else "trigger_api", None)
+    if value is None:
+        meta.pop(field)
+    else:
+        meta[field] = value
+    valid, errors = validate_plugin_meta(meta, kind)
+    assert not valid
+    assert any(field in error for error in errors)
+
+
+@pytest.mark.parametrize("field", ["precondition_api", "item_type"])
+def test_removed_manifest_fields_are_rejected(field):
+    meta = make_meta()
+    if field == "precondition_api":
+        meta[field] = "context-v1"
+    else:
+        meta["outputs"] = [{"name": "files", "label": "文件", "type": {"type": "array", "items": "text"}, "item_type": "text"}]
+    valid, errors = validate_plugin_meta(meta, "action")
+    assert not valid
+    assert any(field in error for error in errors)
+
+
+@pytest.mark.parametrize("kind", ["action", "trigger"])
+@pytest.mark.parametrize("value", [True, False])
+def test_manifest_enabled_field_is_rejected(kind, value):
+    meta = make_meta(trigger_api="event-v2") if kind == "trigger" else make_meta()
+    assert validate_plugin_meta(meta, kind)[0] is True
+    meta["enabled"] = value
+    valid, errors = validate_plugin_meta(meta, kind)
+    assert valid is False
+    assert any("enabled" in error for error in errors)
+
+
+def test_payload_contract_rejects_non_object_declarations():
+    assert check_payload_contract(["count"], {"count": 1})
+    assert check_payload_contract(
+        [{"name": "count", "type": "number"}, "count"], {"count": 1}
+    )
+    assert check_payload_contract("count", {"count": 1})
+    assert check_payload_contract({"name": "count", "type": "number"}, {"count": 1})
+    assert check_payload_contract([], {"count": 1}) == []
+    assert check_payload_contract(None, {"count": 1}) == []
+
+
+def test_binding_layer_rejects_non_object_field_declarations():
+    from notmyfault.core.binding_schema import output_type
+    from notmyfault.core.data_types import DataTypeError
+
+    schema = output_type({"outputs": [{"name": "count", "type": "number"}]})
+    assert schema["properties"]["count"]["type"] == "number"
+    with pytest.raises(DataTypeError):
+        output_type({"outputs": ["count"]})
+    with pytest.raises(DataTypeError):
+        output_type({"params": [5]}, parameters=True)
+
+
+def test_scan_plugins_returns_valid_manifests_without_enabled(tmp_path):
+    root = tmp_path / "actions"
+    plain = root / "plain"
+    plain.mkdir(parents=True)
+    (plain / "action.json").write_text(
+        json.dumps(make_meta(id="plain")), encoding="utf-8"
+    )
+    flagged = root / "flagged"
+    flagged.mkdir(parents=True)
+    (flagged / "action.json").write_text(
+        json.dumps(make_meta(id="flagged", enabled=True)), encoding="utf-8"
+    )
+
+    scanned = scan_plugins(str(tmp_path), "actions", "action.json")
+
+    assert list(scanned) == ["plain"]
+
+
+def test_builtin_trigger_manifests_use_event_v2():
+    manifests = sorted((Path(__file__).resolve().parents[1] / "triggers").glob("*/trigger.json"))
+    assert manifests
+    for path in manifests:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        valid, errors = validate_plugin_meta(meta, "trigger")
+        assert valid, f"{path.parent.name}: {errors}"
+        assert meta["trigger_api"] == "event-v2"

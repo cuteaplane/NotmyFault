@@ -162,6 +162,8 @@ namespace NotmyFault.Setup
                     Run(python, PythonArguments + Quote(Path.Combine(app, "build.py")) + " verify",
                         app, directory, log, 2, "正在检查随包插件签名", progress, token, false);
                     transaction.RestoreUserFiles();
+                    const string signingInput = "import os,runpy,sys; " +
+                        "os.environ['NOTMYFAULT_SIGNING_PASSPHRASE']=sys.stdin.buffer.read().decode('utf-8'); ";
                     if (options.Upgrade)
                     {
                         RequireFile(Path.Combine(app, ".private", "signing_private_key.pem"));
@@ -180,12 +182,19 @@ namespace NotmyFault.Setup
                             throw new InvalidOperationException("无法解锁原安装的签名密钥，请检查原签名密码。", ex);
                         }
                     }
-                    string build = "import os,runpy,sys; " +
-                        "os.environ['NOTMYFAULT_SIGNING_PASSPHRASE']=sys.stdin.buffer.read().decode('utf-8'); " +
+                    else
+                    {
+                        string initialize = signingInput +
+                            "sys.argv=['build.py','init-keys','--encrypt']; " +
+                            "runpy.run_path('build.py',run_name='__main__')";
+                        Run(python, PythonArguments + "-c " + Quote(initialize), app, directory, log, 2,
+                            "正在创建加密签名密钥", progress, token, false, options.SigningPassword);
+                    }
+                    string build = signingInput +
                         "sys.argv=['build.py','build','--security-mode=strict']; " +
                         "runpy.run_path('build.py',run_name='__main__')";
                     Run(python, PythonArguments + "-c " + Quote(build),
-                        app, directory, log, 2, options.Upgrade ? "正在使用原签名密钥完成本地构建" : "正在创建签名密钥并完成本地构建",
+                        app, directory, log, 2, options.Upgrade ? "正在使用原签名密钥完成本地构建" : "正在完成本地签名构建",
                         progress, token, false, options.SigningPassword);
                     Run(python, PythonArguments + Quote(Path.Combine(app, "build.py")) + " verify",
                         app, directory, log, 2, "正在验证本地构建签名", progress, token, false);

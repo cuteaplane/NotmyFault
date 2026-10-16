@@ -3,7 +3,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from notmyfault.plugin_api import native_lock
+from notmyfault.plugin_api import native_lock, action_values
 
 SPI_SETDESKWALLPAPER = 0x0014
 SPIF_UPDATEINIFILE = 0x01
@@ -18,7 +18,8 @@ _WALLPAPER_STYLES = {
 }
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
+    params = action_values(params)
     image_path = params.get("image_path", "")
     style = params.get("style", "fill")
     if style not in _WALLPAPER_STYLES:

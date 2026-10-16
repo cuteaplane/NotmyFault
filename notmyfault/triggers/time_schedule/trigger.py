@@ -29,11 +29,11 @@ class TimeScheduleTrigger(PollingTrigger):
 
     def setup(self):
         self._fired_on_date = None
-        self._previous_poll = datetime.now()
+        self._previous_poll = datetime.fromtimestamp(self.clock.time())
         self.log(f"已设定触发时间: {self.target_time}")
 
     def poll(self):
-        now = datetime.now()
+        now = datetime.fromtimestamp(self.clock.time())
         current_time = now.strftime("%H:%M")
         today = now.strftime("%Y-%m-%d")
         hour, minute = map(int, self.target_time.split(":"))
@@ -44,6 +44,9 @@ class TimeScheduleTrigger(PollingTrigger):
             self.emit({"triggered_time": self.target_time})
             self._fired_on_date = today
         self._previous_poll = now
+
+
+create_sampler = TimeScheduleTrigger.from_context
 
 
 def run(meta, config, emit_event, shutdown_event):

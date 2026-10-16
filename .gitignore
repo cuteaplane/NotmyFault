@@ -19,7 +19,6 @@ env/
 .agents/
 .claude/
 .opencode/
-.qoder/
 .cursor/
 agent_docs/
 agent_files/

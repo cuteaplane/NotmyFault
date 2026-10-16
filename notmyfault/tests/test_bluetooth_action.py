@@ -44,7 +44,7 @@ def test_unknown_action_is_rejected_before_platform_dispatch(monkeypatch):
     monkeypatch.setattr(module, "_run_windows", lambda action: pytest.fail(action))
 
     with pytest.raises(ValueError, match="不支持的蓝牙操作"):
-        module.run({}, {"action": "reset-adapter"})
+        module.run_with_context({}, {"action": "reset-adapter"}, {})
 
 
 def test_windows_query_uses_packaged_helper_and_returns_payload(monkeypatch):
@@ -63,7 +63,7 @@ def test_windows_query_uses_packaged_helper_and_returns_payload(monkeypatch):
     monkeypatch.setattr(module.sys, "platform", "win32")
     monkeypatch.setattr(module.subprocess, "run", fake_run)
 
-    result = module.run({}, {"action": "query"})
+    result = module.run_with_context({}, {"action": "query"}, {})
 
     assert result == {
         "action": "query",
@@ -118,7 +118,7 @@ def test_linux_query_reads_powered_state(monkeypatch):
         lambda command, **kwargs: completed(stdout="Controller AA:BB\n\tPowered: yes\n"),
     )
 
-    assert module.run({}, {"action": "query"}) == {
+    assert module.run_with_context({}, {"action": "query"}, {}) == {
         "action": "query",
         "state": "on",
         "changed": False,
@@ -142,7 +142,7 @@ def test_linux_toggle_changes_and_confirms_state(monkeypatch):
     monkeypatch.setattr(module.subprocess, "run", fake_run)
     monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
 
-    assert module.run({}, {"action": "toggle"}) == {
+    assert module.run_with_context({}, {"action": "toggle"}, {}) == {
         "action": "toggle",
         "state": "off",
         "changed": True,

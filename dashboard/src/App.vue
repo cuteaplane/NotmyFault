@@ -7,7 +7,7 @@ import { store, syncEngineStatus as updateStatus } from './lib/store'
 import { snack } from './lib/notify'
 import { fetchAuthenticated, hasBridge, loadConfig, loadPlugins, getSchema, getEngineStatus, getPluginExtensions, getAIDraftingSetting, getRun } from './lib/api'
 import { ensureRuleIds } from './lib/bindings'
-import { normalizeRuleDraft } from './lib/utils'
+import { validateRuleGraph } from './lib/utils'
 import { useTheme } from './composables/useTheme'
 
 const { init: initTheme } = useTheme()
@@ -66,7 +66,7 @@ let sseReconnectTimer = null
 let sseEventSeq = 0
 let refreshSignalTimer = null
 // 规则测试回显只关心这几类执行事件。
-const RULE_EVENTS = ['action_executed', 'action_skipped', 'action_cancelled', 'action_timed_out', 'workflow_failed', 'workflow_completed', 'test_assertions_completed', 'error', 'run_dropped', 'run_replaced']
+const RULE_EVENTS = ['run.group.selected', 'run.group.entered', 'run.group.completed', 'run.group.failed', 'run.group.waiting', 'run.group.awakened', 'run.recovery.entered', 'run.recovery.completed', 'run.recovery.failed', 'run.step.waiting', 'run.step.resumed', 'action_executed', 'action_skipped', 'action_cancelled', 'action_timed_out', 'workflow_failed', 'workflow_completed', 'test_assertions_completed', 'error', 'run_dropped']
 const timers = []
 function setTracked(fn, ms) { const id = setInterval(fn, ms); timers.push(id); return id }
 
@@ -88,7 +88,7 @@ function applyConfig(cfg) {
   }
   if (!cfg || !Array.isArray(cfg.rules)) return false
   try {
-    const rules = ensureRuleIds(cfg.rules.map(rule => normalizeRuleDraft(rule)))
+    const rules = ensureRuleIds(cfg.rules.map(rule => validateRuleGraph(rule)))
     store.configError = ''
     store.configData = { ...cfg, rules }
   } catch (error) {
@@ -190,7 +190,7 @@ async function connectSSE() {
     if (activeRun) {
       getRun(activeRun.runId).then(run => {
         if (disposed || store.activeManualRun !== activeRun) return
-        if (run && ['succeeded', 'failed', 'cancelled'].includes(run.status)) {
+        if (run && ['succeeded', 'recovered', 'failed', 'cancelled', 'timed_out', 'dropped'].includes(run.status)) {
           dispatchSSEEvent('workflow_completed', JSON.stringify({
             run_id: activeRun.runId, status: run.status, recovered: true,
           }))
@@ -241,7 +241,7 @@ function dispatchSSEEvent(eventName, dataText) {
     store.engineEvents.push({ name: eventName, data: d, seq: ++sseEventSeq })
     if (store.engineEvents.length > 40) store.engineEvents.splice(0, store.engineEvents.length - 40)
     if (
-      ['workflow_failed', 'workflow_completed', 'run_dropped', 'run_replaced'].includes(eventName)
+      ['workflow_failed', 'workflow_completed', 'run_dropped'].includes(eventName)
       && store.activeManualRun?.runId === d.run_id
     ) store.activeManualRun = null
   }

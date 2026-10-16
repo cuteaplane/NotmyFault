@@ -6,18 +6,22 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from notmyfault.core.data_types import (
-    BUILTIN_TYPES, TYPE_ALIASES, DataTypeError, field_type, normalize_type,
+    BUILTIN_TYPES, DataTypeError, field_type, normalize_type,
     normalize_value,
 )
 
-_REQUIRED_META_FIELDS = {"id", "name", "description", "enabled", "version_code", "version", "package_name"}
+_REQUIRED_META_FIELDS = {"id", "name", "description", "version_code", "version", "package_name"}
 _TRIGGER_OPTIONAL_FIELDS = {
     "semantic", "params", "permissions", "origin", "trigger_api", "platforms",
     "entrypoints", "outputs", "build", "contributes",
     "requires_capabilities", "engines", "security", "author",
+    "lifecycle", "state_key", "state_filter", "previous_state_output",
+    "debounce_seconds", "event_queue_size", "overflow", "coalesce_key",
+    "state_mode", "state_initial_value", "state_partition_key", "state_untracked", "state_hysteresis",
+    "sampling_api",
 }
 _ACTION_OPTIONAL_FIELDS = {
-    "params", "permissions", "origin", "execution_api", "precondition_api",
+    "params", "permissions", "origin", "execution_api",
     "outputs", "platforms", "entrypoints", "build", "idempotent",
     "cancellation_api", "contributes", "requires_capabilities",
     "execution_mode", "engines", "security", "author",
@@ -46,7 +50,6 @@ _VIEW_FIELDS = {
 _DATA_TYPE_FIELDS = {"id", "version", "binding", "schema", "label"}
 _PARAMETER_EDITOR_FIELDS = {
     "id", "parameter", "data_type", "value_type", "command", "view", "ui",
-    "accepts_legacy",
 }
 _PARAMETER_EDITOR_UI_FIELDS = {
     "control", "icon", "label", "busy_label", "empty_label", "description",
@@ -456,8 +459,6 @@ def _validate_contributes_field(
                 errors.append(
                     f"{prefix}.value_type 必须与参数 {parameter!r} 的 value_type 一致"
                 )
-            if "accepts_legacy" in editor:
-                errors.append(f"{prefix}.accepts_legacy 只能用于 plugin_data 参数")
         if editor.get("command") not in command_ids:
             errors.append(
                 f"{prefix}.command 引用了未声明命令: {editor.get('command')!r}"
@@ -466,8 +467,6 @@ def _validate_contributes_field(
             errors.append(
                 f"{prefix}.view 引用了未声明视图: {editor.get('view')!r}"
             )
-        if "accepts_legacy" in editor and not isinstance(editor["accepts_legacy"], bool):
-            errors.append(f"{prefix}.accepts_legacy 必须为布尔值")
         ui = editor.get("ui")
         if not isinstance(ui, dict):
             errors.append(f"{prefix}.ui 必须是对象")
@@ -531,8 +530,6 @@ def validate_plugin_meta(
         errors.append(f"字段 'description' 必须是字符串")
     if "author" in meta and not isinstance(meta["author"], str):
         errors.append("字段 'author' 必须是字符串")
-    if "enabled" in meta and not isinstance(meta["enabled"], bool):
-        errors.append(f"字段 'enabled' 必须为布尔值 (true/false)，实际: {type(meta['enabled']).__name__}")
     if "version_code" in meta:
         if not isinstance(meta["version_code"], int) or isinstance(meta["version_code"], bool):
             errors.append(f"字段 'version_code' 必须为整数，实际: {type(meta['version_code']).__name__}")
@@ -556,8 +553,76 @@ def validate_plugin_meta(
                 f"（允许: {', '.join(sorted(_ALLOWED_SEMANTICS))}）"
             )
 
-    if "trigger_api" in meta and meta["trigger_api"] not in ("legacy", "event-v1", "event-v2"):
-        errors.append("trigger_api 必须为 legacy、event-v1 或 event-v2")
+    if plugin_type in ("trigger", "triggers") and meta.get("trigger_api") != "event-v2":
+        errors.append("trigger 插件必须声明 trigger_api=event-v2")
+
+    if plugin_type in ("trigger", "triggers"):
+        if "sampling_api" in meta and (meta["sampling_api"] != "poll-v1" or meta.get("trigger_api") != "event-v2"):
+            errors.append("sampling_api 必须为 poll-v1，且 trigger_api 必须为 event-v2")
+        if meta.get("lifecycle", "continuous") not in ("continuous", "one_shot"):
+            errors.append("lifecycle 必须为 continuous 或 one_shot")
+        if meta.get("overflow", "drop_oldest") not in ("drop_oldest", "coalesce"):
+            errors.append("overflow 必须为 drop_oldest 或 coalesce")
+        if meta.get("overflow") == "coalesce" and not meta.get("coalesce_key"):
+            errors.append("coalesce 必须声明 coalesce_key")
+        capacity = meta.get("event_queue_size", 200)
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or not 1 <= capacity <= 10000:
+            errors.append("event_queue_size 必须为 1 到 10000 之间的整数")
+        delay = meta.get("debounce_seconds", 0)
+        if isinstance(delay, bool) or not isinstance(delay, (float, int)) or not 0 <= delay <= 3600:
+            errors.append("debounce_seconds 必须为 0 到 3600 之间的秒数")
+        names = {item.get("name") for item in meta.get("outputs", []) if isinstance(item, dict) and isinstance(item.get("name"), str)}
+        for key in ("state_key", "state_partition_key", "previous_state_output", "coalesce_key"):
+            if key in meta and (not isinstance(meta[key], str) or meta[key] not in names):
+                errors.append(f"{key} 必须引用已声明的输出字段")
+        if meta.get("state_mode", "edge") not in ("edge", "level"):
+            errors.append("state_mode 必须为 edge 或 level")
+        if meta.get("semantic") == "state" and not meta.get("state_key"):
+            errors.append("state 触发器必须声明 state_key")
+        if "state_untracked" in meta and not isinstance(meta["state_untracked"], list):
+            errors.append("state_untracked 必须为数组")
+        hysteresis = meta.get("state_hysteresis")
+        if hysteresis is not None:
+            parameters = {item.get("name") for item in meta.get("params", []) if isinstance(item, dict)}
+            allowed = {"value", "threshold_param", "direction_param", "margin", "threshold", "direction", "active_value", "when", "guard"}
+            if not isinstance(hysteresis, dict) or set(hysteresis) - allowed or not {"value", "margin"}.issubset(hysteresis):
+                errors.append("state_hysteresis 必须声明 value 和 margin")
+            else:
+                if not isinstance(hysteresis["value"], str) or hysteresis["value"] not in names:
+                    errors.append("state_hysteresis.value 必须引用已声明的输出字段")
+                for key in ("threshold", "direction"):
+                    if (key in hysteresis) == (key + "_param" in hysteresis):
+                        errors.append(f"state_hysteresis 必须声明 {key} 或 {key}_param 中的一项")
+                    if key + "_param" in hysteresis and (not isinstance(hysteresis[key + "_param"], str) or hysteresis[key + "_param"] not in parameters):
+                        errors.append(f"state_hysteresis.{key}_param 必须引用已声明的参数")
+                margin = hysteresis["margin"]
+                if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not 0 <= margin <= 100:
+                    errors.append("state_hysteresis.margin 必须为 0 到 100 之间的数字")
+                if "threshold" in hysteresis and (isinstance(hysteresis["threshold"], bool) or not isinstance(hysteresis["threshold"], (float, int))):
+                    errors.append("state_hysteresis.threshold 必须为数字")
+                if "direction" in hysteresis and hysteresis["direction"] not in ("above", "below"):
+                    errors.append("state_hysteresis.direction 必须为 above 或 below")
+                for key, available in (("when", parameters), ("guard", names)):
+                    if key in hysteresis and (not isinstance(hysteresis[key], dict) or any(name not in available for name in hysteresis[key])):
+                        errors.append(f"state_hysteresis.{key} 必须引用已声明的字段")
+        state_filter = meta.get("state_filter", {})
+        if not isinstance(state_filter, dict) or set(state_filter) - {"param", "cases", "default"}:
+            errors.append("state_filter 必须是包含 param、cases、default 的对象")
+        else:
+            cases = state_filter.get("cases", {})
+            if not isinstance(cases, dict):
+                errors.append("state_filter.cases 必须为对象")
+            else:
+                parameters = {item.get("name") for item in meta.get("params", []) if isinstance(item, dict)}
+                if "param" in state_filter and (not isinstance(state_filter["param"], str) or state_filter["param"] not in parameters):
+                    errors.append("state_filter.param 必须引用已声明的参数")
+                for conditions in [*cases.values(), state_filter.get("default", {})]:
+                    if not isinstance(conditions, dict) or any(key not in names for key in conditions):
+                        errors.append("state_filter 条件必须引用已声明的输出字段")
+                        continue
+                    for expected in conditions.values():
+                        if isinstance(expected, dict) and (set(expected) != {"config"} or not isinstance(expected["config"], str) or expected["config"] not in parameters):
+                            errors.append("state_filter.config 必须引用已声明的参数")
 
     if "permissions" in meta:
         perms = meta["permissions"]
@@ -735,10 +800,8 @@ def validate_plugin_meta(
             if isinstance(platforms, list) and set(entrypoints) != set(platforms):
                 errors.append("platforms 与 entrypoints 的平台集合必须一致")
 
-    if "execution_api" in meta and meta["execution_api"] not in ("legacy", "context-v1"):
-        errors.append("execution_api 必须为 legacy 或 context-v1")
-    if "precondition_api" in meta and meta["precondition_api"] != "context-v1":
-        errors.append("precondition_api 目前仅支持 context-v1")
+    if plugin_type in ("action", "actions") and meta.get("execution_api") != "context-v1":
+        errors.append("action 插件必须声明 execution_api=context-v1")
     if "cancellation_api" in meta:
         if meta["cancellation_api"] != "runtime-v1":
             errors.append("cancellation_api 目前仅支持 runtime-v1")
@@ -759,37 +822,30 @@ def validate_plugin_meta(
         else:
             output_names: set[str] = set()
             for i, output in enumerate(outputs):
-                # 旧 action 插件可把输出写成字符串列表。
-                if isinstance(output, str):
-                    if not output:
-                        errors.append(f"outputs[{i}] 不能为空")
-                        continue
-                    output_name = output
-                elif isinstance(output, dict):
-                    for field in sorted(_REQUIRED_OUTPUT_FIELDS):
-                        if field not in output:
-                            errors.append(f"outputs[{i}] 缺少必填字段: {field}")
-                    output_name = output.get("name")
-                    output_type = output.get("type")
-                    if "type" in output:
-                        _validate_value_type(output_type, f"outputs[{i}].type", errors)
-                    if "value_type" in output:
-                        _validate_value_type(output["value_type"], f"outputs[{i}].value_type", errors)
-                    for flag in ("required", "sensitive"):
-                        if flag in output and not isinstance(output[flag], bool):
-                            errors.append(f"outputs[{i}].{flag} 必须为布尔值")
-                    if (
-                        "summary" in output
-                        and output["summary"] not in _ALLOWED_SUMMARY_POLICIES
-                    ):
-                        errors.append(
-                            f"outputs[{i}].summary 无效: {output['summary']!r}"
-                        )
-                    if output_type == "array" and "item_type" in output:
-                        _validate_value_type(output["item_type"], f"outputs[{i}].item_type", errors)
-                else:
-                    errors.append(f"outputs[{i}] 必须是字符串或对象")
+                if not isinstance(output, dict):
+                    errors.append(f"outputs[{i}] 必须是对象")
                     continue
+                for field in sorted(_REQUIRED_OUTPUT_FIELDS):
+                    if field not in output:
+                        errors.append(f"outputs[{i}] 缺少必填字段: {field}")
+                output_name = output.get("name")
+                output_type = output.get("type")
+                if "type" in output:
+                    _validate_value_type(output_type, f"outputs[{i}].type", errors)
+                if "value_type" in output:
+                    _validate_value_type(output["value_type"], f"outputs[{i}].value_type", errors)
+                for flag in ("required", "sensitive"):
+                    if flag in output and not isinstance(output[flag], bool):
+                        errors.append(f"outputs[{i}].{flag} 必须为布尔值")
+                if (
+                    "summary" in output
+                    and output["summary"] not in _ALLOWED_SUMMARY_POLICIES
+                ):
+                    errors.append(
+                        f"outputs[{i}].summary 无效: {output['summary']!r}"
+                    )
+                if "item_type" in output:
+                    errors.append(f"outputs[{i}].item_type 已移除，请使用 type.items")
 
                 if not isinstance(output_name, str) or not output_name:
                     errors.append(f"outputs[{i}].name 必须是非空字符串")
@@ -812,6 +868,8 @@ def validate_plugin_meta(
                 for field in sorted(_REQUIRED_PARAM_FIELDS):
                     if field not in param:
                         errors.append(f"params[{i}] 缺少必填字段: {field}")
+                if "item_type" in param:
+                    errors.append(f"params[{i}].item_type 已移除，请使用 value_type.items")
                 param_name = param.get("name")
                 if (
                     not isinstance(param_name, str)
@@ -875,15 +933,19 @@ def check_payload_contract(
     outputs: Any,
     payload: Dict[str, Any],
     registry=None,
+    *,
+    normalized=None,
 ) -> List[str]:
-    """未声明 outputs 的旧插件仍跳过输出检查。"""
+    """检查声明的输出字段及其值类型"""
+    if outputs is None:
+        return []
+    if not isinstance(outputs, list):
+        return ["输出声明必须是对象数组"]
     declared: Dict[str, Dict[str, Any]] = {}
-    if isinstance(outputs, list):
-        for output in outputs:
-            if isinstance(output, str):
-                declared[output] = {"type": "any", "required": True}
-            elif isinstance(output, dict) and isinstance(output.get("name"), str):
-                declared[output["name"]] = {"required": True, **output}
+    for output in outputs:
+        if not isinstance(output, dict) or not isinstance(output.get("name"), str):
+            return ["输出声明必须是带 name 的对象"]
+        declared[output["name"]] = {"required": True, **output}
     if not declared:
         return []
 
@@ -893,25 +955,12 @@ def check_payload_contract(
             problems.append(f"缺少必填输出字段: {name}")
         elif name in payload:
             value = payload[name]
-            output_type = spec.get("type", "any")
-            if "value_type" in spec or output_type not in ("string", "number", "bool", "array", "object", "any"):
-                try:
-                    normalize_value(value, field_type(spec), registry, location=f"outputs.{name}")
-                except DataTypeError as error:
-                    problems.append(str(error))
-            elif output_type == "string" and not isinstance(value, str):
-                problems.append(
-                    f"输出字段 {name} 应为 string，实际为 {type(value).__name__}"
-                )
-            elif output_type == "number":
-                if isinstance(value, bool) or not isinstance(value, (int, float)):
-                    problems.append(
-                        f"输出字段 {name} 应为 number，实际为 {type(value).__name__}"
-                    )
-            elif output_type == "bool" and not isinstance(value, bool):
-                problems.append(
-                    f"输出字段 {name} 应为 bool，实际为 {type(value).__name__}"
-                )
+            try:
+                result = normalize_value(value, field_type(spec), registry, location=f"outputs.{name}")
+                if normalized is not None:
+                    normalized[name] = result
+            except DataTypeError as error:
+                problems.append(str(error))
     for key in payload:
         if key not in declared:
             problems.append(f"未声明的输出字段: {key}")
@@ -922,8 +971,6 @@ def scan_plugins(
     base_dir: str,
     plugins_dir: str,
     json_filename: str,
-    *,
-    include_disabled: bool = False,
 ) -> Dict[str, Dict]:
     from notmyfault.security.plugin_checks import (
         inspect_plugin_metadata, is_plugin_platform_compatible, plugin_directories,
@@ -933,7 +980,7 @@ def scan_plugins(
     kind = "trigger" if json_filename == "trigger.json" else "action"
     for folder in plugin_directories(Path(base_dir) / plugins_dir):
         meta, errors, schema_errors = inspect_plugin_metadata(folder, kind)
-        if errors or schema_errors or (meta.get("enabled") is False and not include_disabled):
+        if errors or schema_errors:
             continue
         result[meta["id"]] = {
             **meta,

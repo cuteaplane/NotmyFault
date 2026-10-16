@@ -9,7 +9,6 @@
     "package_name": "io.github.notmyfault.clipboard",
     "requires_capabilities": ["clipboard.read"],
     "platforms": ["windows", "linux"],
-    "enabled": true,
     "permissions": ["clipboard", "native_api", "external_binary"],
     "outputs": [
         {"name": "text", "label": "剪贴板内容", "type": "string", "sensitive": true},

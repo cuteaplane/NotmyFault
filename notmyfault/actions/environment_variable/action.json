@@ -5,7 +5,7 @@
     "version_code": 1,
     "version": "1.0",
     "package_name": "io.github.notmyfault.environment_variable",
-    "enabled": true,
+    "execution_api": "context-v1",
     "idempotent": false,
     "platforms": ["windows", "linux"],
     "permissions": ["native_api"],

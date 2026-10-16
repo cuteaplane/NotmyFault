@@ -50,7 +50,6 @@ def is_admin_process() -> bool:
 
 class SecurityMode(Enum):
     STRICT = "strict"
-    NORMAL = "normal"
     PERMISSIVE = "permissive"
 
 
@@ -75,9 +74,6 @@ def detect_security_mode() -> SecurityMode:
             if _m == "permissive":
                 signed_mode = SecurityMode.PERMISSIVE
                 break
-            if _m == "normal":
-                signed_mode = SecurityMode.NORMAL
-                break
             if _m == "strict":
                 signed_mode = SecurityMode.STRICT
                 break
@@ -87,16 +83,13 @@ def detect_security_mode() -> SecurityMode:
     env_name = os.environ.get("NOTMYFAULT_MODE", "").lower().strip()
     env_modes = {
         "alpha": SecurityMode.PERMISSIVE,
-        "develop": SecurityMode.NORMAL,
-        "dev": SecurityMode.NORMAL,
         "stable": SecurityMode.STRICT,
         "master": SecurityMode.STRICT,
     }
     requested = env_modes.get(env_name, signed_mode)
     rank = {
         SecurityMode.PERMISSIVE: 0,
-        SecurityMode.NORMAL: 1,
-        SecurityMode.STRICT: 2,
+        SecurityMode.STRICT: 1,
     }
     return requested if rank[requested] > rank[signed_mode] else signed_mode
 

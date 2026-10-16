@@ -47,7 +47,7 @@
 }
 ```
 
-`notmyfault/actions/uia_automation/action.json` 是自有数据编辑器的实例。
+`notmyfault/actions/uia_automation/action.json` 是自有数据编辑器的实例，以下为操作宏相关字段的节选。
 
 ```json
 {
@@ -124,19 +124,26 @@
 
 每个命令包含 `id`、`title` 和 `handler`。`handler` 使用 `相对.py路径:函数名` 格式。处理函数接收 `context` 和 `payload` 两个参数。
 
+宿主最多同时执行 8 个扩展命令；超过时返回 HTTP 429，`code` 为 `extension_busy`。
+
+动作声明 `execution_mode: "isolated"` 时，扩展命令在子进程中运行，主入口和命令
+模块均不在引擎进程中导入。每个编辑会话使用独立的子进程，同一会话中的命令
+共享模块和 `context.session.data`；规则执行动作使用另外的子进程。
+命令每次执行前复核插件目录的文件快照，文件变化时拒绝执行。会话关闭和引擎
+停止时，子进程执行注册的清理函数后退出；未在 5 秒内退出时终止进程。
+单次命令执行等待为 120 秒。隔离执行的限制见 [plugin-api-v1.md](plugin-api-v1.md)。
+
 命令不会因为出现在清单中就得到全局入口。`parameter_editors.command` 是参数编辑入口；`views.commands` 是页面在同一会话中可以调用的命令。
 
 ### parameter_editors
 
-参数编辑器绑定本插件的一个参数和一个命令。当前 UI 控件只支持 `button`。一个参数不能声明多个编辑器。
-
-普通参数必须同时在参数和编辑器中声明相同的 `value_type`。类型可使用基本类型、结构化声明和已安装的共享类型，见 [data-types.md](data-types.md)。普通参数编辑器不能声明 `data_type` 或 `accepts_legacy`。
+普通参数必须同时在参数和编辑器中声明相同的 `value_type`。类型可使用基本类型、结构化声明和已安装的共享类型，见 [data-types.md](data-types.md)。普通参数编辑器不能声明 data_type。
 
 普通参数的原有输入控件仍然可用。按钮文案来自 `ui.label`，命令执行中的文案来自 `ui.busy_label`。`ui.icon` 和 `ui.description` 分别控制图标和提示文字。
 
 `plugin_data` 参数必须在参数和编辑器中声明相同的 `data_type`。编辑器不能再声明 `value_type`。未保存数据时的按钮文案来自 `ui.empty_label`。
 
-`accepts_legacy: true` 允许编辑器读取升级前保存的非信封对象。重新保存后会写成新的自有数据格式。空对象和带有错误 `$type` 的对象不会通过规则校验。
+自有数据的值必须是带有效 $type 的信封。空对象和 $type 不匹配的对象不会通过规则校验。
 
 ### views
 
@@ -168,11 +175,7 @@
   }
 }
 ```
-
-`$type` 由插件的 `package_name`、数据类型 id 和版本组成。`summary` 是 Dashboard 可以显示的短文本。私有类型由专用编辑器处理 `data`；共享类型可以使用标准结构化输入和字段引用。
-
-实例里的数据类型 id 仍是 `mouse_macro`，用于读取已经保存的值。它是存储标识，不是显示名称；界面统一称为“操作宏”。需要改数据类型 id 时，应先提供明确的数据迁移机制。
-
+实例里的数据类型 id 仍是 `mouse_macro`，用于读取已经保存的值。数据类型 id mouse_macro 是存储标识，界面称为“操作宏”。需要改数据类型 id 时，应先提供明确的数据迁移机制。
 信封和摘要由 `notmyfault/extensions/protocol.py` 检查。信封经过通用值编码后总大小不能超过 1 MiB，摘要不能超过 160 个字符。
 
 动作执行时仍应使用 `unpack_owned_value()` 检查归属。`notmyfault/actions/uia_automation/action.py` 演示了自有数据的读取方式；`mouse_macro` 和 `uia_selector` 的内部结构均由插件维护，宿主只校验通用信封。
@@ -207,7 +210,7 @@ def save(context, payload):
     return context.commit(data, "已经保存")
 ```
 
-普通参数的 `context.current_value` 是规则中保存的原值。自有数据参数会先检查信封归属，再把拆出的 `data` 交给命令。允许读取旧数据时，旧对象会按原值传入。
+普通参数的 `context.current_value` 是规则中保存的原值。自有数据参数会先检查信封归属，再把拆出的 `data` 交给命令。
 
 `context.open_view(view_id, state)` 打开清单声明的页面。`state` 通过初始化消息发给页面。
 

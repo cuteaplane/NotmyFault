@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import json
 import os
 from pathlib import Path
 import runpy
@@ -12,6 +13,7 @@ import urllib.request
 
 import pytest
 
+from notmyfault.tests.canvas_fixtures import native_rule
 from notmyfault.application_paths import ApplicationPaths
 
 
@@ -47,13 +49,9 @@ def test_dashboard_get_config_does_not_rewrite_rules_file(dashboard, tmp_path):
 
     env = make_api_env(tmp_path)
     paths = env.paths
-    rule = {
-        "name": "提醒",
-        "event": {"type": "time_schedule", "params": {"time": "08:00"}},
-        "actions": [{"type": "notify", "params": {"title": "提醒"}}],
-    }
+    rule = native_rule({"type": "time_schedule", "params": {"time": "08:00"}}, [{"type": "notify", "params": {"title": "提醒"}}], name="提醒")
     payload = {
-        "schema_version": 2,
+        "schema_version": "2.1",
         "value_encoding": "typed-v1",
         "rules": encode_value([rule]),
     }
@@ -77,18 +75,19 @@ def test_dashboard_save_config_writes_signed_rules(dashboard, tmp_path):
     env = make_api_env(tmp_path)
     paths, store = env.paths, env.store
     api = dashboard_api(dashboard, env)
-    rule = {
-        "name": "提醒",
-        "event": {"type": "time_schedule", "params": {"time": "08:00"}},
-        "actions": [{"type": "notify", "params": {"title": "提醒"}}],
-    }
+    rule = native_rule({"type": "time_schedule", "params": {"time": "08:00"}}, [{"type": "notify", "params": {"title": "提醒"}}], name="提醒")
     result = api.save_config(encode_value([rule]), "", "typed-v1")
     assert result.get("ok") is True, result
     loaded = store.load_verified_rules()
     assert loaded[0]["name"] == "提醒"
-    assert loaded[0]["actions"][0]["type"] == "notify"
+    workflow = loaded[0]["workflow"]
+    assert workflow["entry"] is None
+    entry = next(node for node in workflow["nodes"] if node["type"] == "trigger")
+    target = next(edge["target"] for edge in workflow["edges"] if edge["source"] == entry["binding_id"])
+    assert next(node for node in workflow["nodes"] if node["binding_id"] == target)["type"] == "notify"
     assert "event" not in loaded[0]
-    assert loaded[0]["condition"]["type"] == "time_schedule"
+    assert "actions" not in loaded[0] and "condition" not in loaded[0]
+    assert entry["trigger"]["type"] == "time_schedule"
     saved = paths.rules_file.read_bytes()
     for invalid in (None, {}, [None], [rule, None]):
         result = api.save_config(invalid, "", "typed-v1")
@@ -110,6 +109,78 @@ def test_dashboard_reads_history_from_application_paths(dashboard, tmp_path):
     api = dashboard.DashboardAPI(paths=paths)
     assert api.list_log_files()[0]["name"] == "engine-20260906.log"
     assert api.read_log_file_entries("engine-20260906.log")[0]["text"] == "桌面日志"
+
+def test_dashboard_settings_persist_without_engine(dashboard, tmp_path):
+    paths = ApplicationPaths(tmp_path / "config", tmp_path / "package", tmp_path)
+    api = dashboard.DashboardAPI(paths=paths)
+
+    assert api.get_dashboard_settings() == {"ok": True, "resident_on_close": True}
+    assert api.set_dashboard_settings(False) == {
+        "ok": True,
+        "resident_on_close": False,
+    }
+    assert dashboard.DashboardAPI(paths=paths).get_dashboard_settings() == {
+        "ok": True,
+        "resident_on_close": False,
+    }
+    assert api.set_dashboard_settings(True) == {
+        "ok": True,
+        "resident_on_close": True,
+    }
+    assert json.loads(paths.dashboard_settings_file.read_text(encoding="utf-8"))[
+        "resident_on_close"
+    ] is True
+
+
+def test_dashboard_settings_reject_invalid_values_without_changes(dashboard, tmp_path):
+    paths = ApplicationPaths(tmp_path / "config", tmp_path / "package", tmp_path)
+    api = dashboard.DashboardAPI(paths=paths)
+    assert api.set_dashboard_settings(False)["ok"] is True
+    before = paths.dashboard_settings_file.read_bytes()
+
+    for invalid in (0, 1, "false", None):
+        result = api.set_dashboard_settings(invalid)
+        assert result["ok"] is False
+        assert result["resident_on_close"] is False
+        assert paths.dashboard_settings_file.read_bytes() == before
+
+    assert api.get_dashboard_settings()["resident_on_close"] is False
+
+
+def test_dashboard_settings_replace_failure_preserves_file_and_state(
+    dashboard, tmp_path, monkeypatch
+):
+    paths = ApplicationPaths(tmp_path / "config", tmp_path / "package", tmp_path)
+    api = dashboard.DashboardAPI(paths=paths)
+    assert api.set_dashboard_settings(False)["ok"] is True
+    before = paths.dashboard_settings_file.read_bytes()
+
+    def fail_replace(source, destination):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(dashboard.os, "replace", fail_replace)
+    result = api.set_dashboard_settings(True)
+
+    assert result["ok"] is False
+    assert result["resident_on_close"] is False
+    assert result["error"] == "replace failed"
+    assert api.get_dashboard_settings()["resident_on_close"] is False
+    assert paths.dashboard_settings_file.read_bytes() == before
+    assert list(paths.config_dir.glob(".dashboard-settings.json.*.tmp")) == []
+
+
+def test_dashboard_settings_bad_json_is_reported_without_rewrite(dashboard, tmp_path):
+    paths = ApplicationPaths(tmp_path / "config", tmp_path / "package", tmp_path)
+    paths.config_dir.mkdir(parents=True)
+    paths.dashboard_settings_file.write_bytes(b"{ invalid")
+    before = paths.dashboard_settings_file.read_bytes()
+
+    result = dashboard.DashboardAPI(paths=paths).get_dashboard_settings()
+
+    assert result["ok"] is False
+    assert result["resident_on_close"] is True
+    assert result["error"]
+    assert paths.dashboard_settings_file.read_bytes() == before
 
 
 def test_dashboard_rebuilds_changed_sources_and_rejects_failed_build(dashboard, tmp_path, monkeypatch):

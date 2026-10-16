@@ -9,293 +9,81 @@ export const FLOW_DATA_PORT_STEP = 24
 export const FLOW_COLUMN_STEP = 360
 export const FLOW_ROW_STEP = 220
 
-const LEFT = 52
-const TOP = 118
-
-
-function describeWait(item) {
-  const seconds = Number(item?.params?.seconds ?? 0) || 0
-  const milliseconds = Number(item?.params?.milliseconds ?? 0) || 0
-  if (seconds > 0 && milliseconds > 0) return `${seconds} 秒 + ${milliseconds} 毫秒`
-  if (milliseconds > 0) return `${milliseconds} 毫秒`
-  if (seconds > 0) return `${seconds} 秒`
-  return '时长未设置'
-}
-
-function isLeaf(node) {
-  return !!node
-    && typeof node === 'object'
-    && typeof node.type === 'string'
-    && !Array.isArray(node.children)
-    && !Array.isArray(node.events)
-}
-
-function conditionDepth(node) {
-  if (isLeaf(node)) return 0
-  const children = Array.isArray(node?.children) ? node.children : []
-  return 1 + Math.max(0, ...children.map(conditionDepth))
-}
-
-export function conditionNodeId(node, path = []) {
-  if (isLeaf(node) && node.binding_id) return `trigger-${node.binding_id}`
-  return path.length ? `condition-${path.join('-')}` : 'condition-root'
-}
-
-export function buildFlowGraph({
-  rule,
-  condition,
-  eventName,
-  actionName,
-  describeItem,
-  isAdmin,
-}) {
-  const nodes = []
-  const edges = []
-  let conditionExit
-  let leafIndex = 0
-
-  if (condition) {
-    const maxDepth = conditionDepth(condition)
-
-    function visit(node, path, depth, negated = false) {
-      const id = conditionNodeId(node, path)
-      if (!node || typeof node !== 'object' || Array.isArray(node)) {
-        const y = TOP + leafIndex * FLOW_ROW_STEP
-        leafIndex += 1
-        nodes.push({
-          id,
-          kind: 'invalid',
-          path,
-          source: node,
-          x: LEFT + (maxDepth - depth) * FLOW_COLUMN_STEP,
-          y,
-          icon: 'error',
-          kicker: '无效条件',
-          label: '无法读取此节点',
-          meta: '删除后重新添加',
-          hasInput: false,
-          hasOutput: true,
-        })
-        return { id, y }
-      }
-      if (isLeaf(node)) {
-        const y = TOP + leafIndex * FLOW_ROW_STEP
-        leafIndex += 1
-        nodes.push({
-          id,
-          kind: 'trigger',
-          negated,
-          path,
-          source: node,
-          x: LEFT + (maxDepth - depth) * FLOW_COLUMN_STEP,
-          y,
-          icon: 'bolt',
-          kicker: `触发 ${leafIndex}`,
-          label: eventName(node),
-          meta: describeItem(node, 'trigger'),
-          admin: isAdmin(node, 'trigger'),
-          hasInput: false,
-          hasOutput: true,
-        })
-        return { id, y }
-      }
-
-      const children = Array.isArray(node?.children) ? node.children : []
-      const childLayouts = children.map((child, index) => visit(child, [...path, index], depth + 1, node.op === 'not'))
-      const y = childLayouts.length
-        ? childLayouts.reduce((total, child) => total + child.y, 0) / childLayouts.length
-        : TOP
-      const op = node?.op || 'any'
-      nodes.push({
-        id,
-        kind: 'condition',
-        path,
-        source: node,
-        x: LEFT + (maxDepth - depth) * FLOW_COLUMN_STEP,
-        y,
-        icon: op === 'not' ? 'timer' : op === 'all' ? 'done_all' : 'alt_route',
-        kicker: '逻辑汇合',
-        label: op === 'not' ? '未发生 · NOT' : op === 'all' ? '全部满足 · AND' : '满足任一 · OR',
-        meta: op === 'not' ? `等待 ${node.within_seconds || 0} 秒未发生` : `${children.length} 条分支${op === 'all' && node?.within_seconds ? ` · ${node.within_seconds} 秒内` : ''}`,
-        hasInput: childLayouts.length > 0,
-        hasOutput: true,
-      })
-      childLayouts.forEach((child, index) => edges.push({
-        id: `${child.id}-${id}`,
-        from: child.id,
-        to: id,
-        kind: 'condition',
-        channel: 'control',
-        label: children.length > 1 ? (op === 'all' ? '并且' : '或者') : '',
-        branch: index + 1,
-      }))
-      return { id, y }
-    }
-
-    conditionExit = visit(condition, [], 0)
-  } else {
-    nodes.push({
-      id: 'condition-root',
-      kind: 'trigger',
-      source: null,
-      path: [],
-      x: LEFT,
-      y: TOP,
-      icon: 'bolt',
-      kicker: '当',
-      label: eventName(null),
-      meta: '需要配置',
-      admin: false,
-      hasInput: false,
-      hasOutput: true,
-    })
-    conditionExit = { id: 'condition-root', y: TOP }
-  }
-
-  const conditionExitNode = nodes.find(node => node.id === conditionExit.id)
-  let previousId = conditionExit.id
-  let x = conditionExitNode.x + FLOW_COLUMN_STEP
-  const pipelineY = conditionExit.y
-
-  const actions = Array.isArray(rule.actions) ? rule.actions : []
-  const actionNodes = []
-  actions.forEach((item, index) => {
-    const id = `action-${item.binding_id || index}`
-    const actionNode = {
-      id,
-      kind: 'action',
-      index,
-      source: item,
-      x,
-      y: pipelineY,
-      icon: item.type === 'if' ? 'call_split' : item.type === 'wait' ? 'hourglass_empty' : item.type === 'set_variable' ? 'edit_note' : 'play_arrow',
-      kicker: `动作 ${index + 1}`,
-      label: actionName(item),
-      meta: item.type === 'if' ? `成立 ${item.then?.length || 0} 步 · 否则 ${item.else?.length || 0} 步` : item.type === 'wait' ? describeWait(item) : describeItem(item, 'action'),
-      admin: isAdmin(item, 'action'),
-      hasInput: true,
-      hasOutput: true,
-      availableStepIds: actions.slice(0, index).map(action => action.binding_id).filter(Boolean),
-    }
-    nodes.push(actionNode)
-    actionNodes.push(actionNode)
-    const previousAction = actions[index - 1]
-    edges.push({
-      id: `${previousId}-${id}`,
-      from: previousId,
-      to: id,
-      kind: 'pipeline',
-      channel: 'control',
-      label: previousAction?.failure_actions?.length
-        ? '成功后'
-        : (index ? '然后' : '执行'),
-      insertActionIndex: index,
-    })
-    previousId = id
-    x += FLOW_COLUMN_STEP
-  })
-
-  nodes.push({
-    id: 'add-action',
-    kind: 'add',
-    x,
-    y: pipelineY,
-    icon: 'add',
-    kicker: '下一步',
-    label: '添加动作',
-    meta: '继续这条规则',
-    hasInput: true,
-    hasOutput: false,
-  })
-  edges.push({
-    id: `${previousId}-add-action`,
-    from: previousId,
-    to: 'add-action',
-    kind: 'add',
-    channel: 'control',
-    label: actions.at(-1)?.failure_actions?.length ? '成功后' : '',
-    insertActionIndex: actions.length,
-  })
-
-  actions.forEach((action, actionIndex) => {
-    const failureActions = Array.isArray(action.failure_actions) ? action.failure_actions : []
-    if (!failureActions.length) return
-    const parentNode = actionNodes[actionIndex]
-    const availableStepIds = actions.slice(0, actionIndex).map(item => item.binding_id).filter(Boolean)
-    let branchPreviousId = parentNode.id
-    failureActions.forEach((failureAction, failureIndex) => {
-      const id = `failure-action-${failureAction.binding_id || `${actionIndex}-${failureIndex}`}`
-      const node = {
-        id,
-        kind: 'failure-action',
-        index: failureIndex,
-        parentIndex: actionIndex,
-        source: failureAction,
-        x: parentNode.x + (failureIndex + 1) * FLOW_COLUMN_STEP,
-        y: pipelineY + FLOW_ROW_STEP,
-        icon: 'build',
-        kicker: `补救 ${failureIndex + 1}`,
-        label: actionName(failureAction),
-        meta: describeItem(failureAction, 'action'),
-        admin: isAdmin(failureAction, 'action'),
-        hasInput: true,
-        hasOutput: true,
-        availableStepIds: [...availableStepIds],
-      }
-      nodes.push(node)
-      edges.push({
-        id: `${branchPreviousId}-${id}`,
-        from: branchPreviousId,
-        to: id,
-        kind: 'failure',
-        channel: 'control',
-        label: failureIndex ? '然后' : '失败时',
-      })
-      if (failureAction.binding_id) availableStepIds.push(failureAction.binding_id)
-      branchPreviousId = id
-    })
-    if (action.on_error === 'continue') {
-      const nextId = actionNodes[actionIndex + 1]?.id || 'add-action'
-      edges.push({
-        id: `${branchPreviousId}-${nextId}-recover`,
-        from: branchPreviousId,
-        to: nextId,
-        kind: 'failure-continue',
-        channel: 'control',
-        label: '处理后继续',
-      })
-    }
-  })
-
-  return { nodes, edges }
-}
-
 export function routeFlowEdge(edge, nodesById) {
   const source = nodesById.get(edge.from)
   const target = nodesById.get(edge.to)
   if (!source || !target) return null
 
-  const x1 = source.x + FLOW_NODE_WIDTH
+  const x1 = source.x + (edge.sourceSide === 'left' ? 0 : source.width || FLOW_NODE_WIDTH)
   const sourceDataY = source.dataOutputY?.[edge.sourcePortName]
     ?? FLOW_DATA_PORT_Y + edge.sourcePortIndex * FLOW_DATA_PORT_STEP
   const targetDataY = target.dataInputY?.[edge.targetPortName]
     ?? FLOW_DATA_PORT_Y + edge.targetPortIndex * FLOW_DATA_PORT_STEP
-  const y1 = source.y + (edge.channel === 'data' ? sourceDataY : FLOW_NODE_PORT_Y)
-  const x2 = target.x
-  const y2 = target.y + (edge.channel === 'data' ? targetDataY : FLOW_NODE_PORT_Y)
+  const y1 = source.y + (edge.channel === 'data' ? sourceDataY : edge.sourceInput ? source.inputY ?? FLOW_NODE_PORT_Y : (source.outputs || source.outputAnchors)?.find(port => port.id === edge.sourcePort)?.y ?? FLOW_NODE_PORT_Y)
+  const x2 = target.x + (edge.targetPort ? target.width || FLOW_NODE_WIDTH : target.inputs?.find(port => port.id === edge.inputPort)?.x || 0)
+  const y2 = target.y + (edge.channel === 'data' ? targetDataY : edge.targetPort ? target.outputs?.find(port => port.id === edge.targetPort)?.y ?? FLOW_NODE_PORT_Y : target.inputs?.find(port => port.id === edge.inputPort)?.y ?? target.inputY ?? FLOW_NODE_PORT_Y)
 
-  if (x2 - x1 >= 24) {
+  if (x2 >= x1) {
+    const obstacles = [...nodesById.values()].filter(node => node !== source && node !== target && !node.frame)
+      .map(node => ({ left: node.x - 10, right: node.x + (node.width || FLOW_NODE_WIDTH) + 10, top: node.y - 10, bottom: node.y + (node.height || node.fixedHeight || FLOW_NODE_BASE_HEIGHT) + 10 }))
     const middle = (x1 + x2) / 2
+    const caption = [0.5, 0.35, 0.65, 0.2, 0.8].map(t => {
+      const u = 1 - t
+      return { x: u ** 3 * x1 + 3 * u * t * middle + t ** 3 * x2, y: (u ** 3 + 3 * u * u * t) * y1 + (3 * u * t * t + t ** 3) * y2 - 9 }
+    }).find(point => !obstacles.some(box => point.x + Math.max(24, (edge.label || '').length * 4) > box.left && point.x - Math.max(24, (edge.label || '').length * 4) < box.right && point.y + 6 > box.top && point.y - 14 < box.bottom))
+    const blockedCurve = obstacles.some(box => {
+      for (let index = 1; index < 40; index++) {
+        const t = index / 40, u = 1 - t
+        const x = u ** 3 * x1 + 3 * u * t * middle + t ** 3 * x2
+        const y = (u ** 3 + 3 * u * u * t) * y1 + (3 * u * t * t + t ** 3) * y2
+        if (x > box.left && x < box.right && y > box.top && y < box.bottom) return true
+      }
+      return false
+    })
+    if (blockedCurve && !edge.targetPort && x2 - x1 > 48) {
+      const clear = (a, b) => !obstacles.some(box => a.x === b.x ? a.x > box.left && a.x < box.right && Math.max(a.y, b.y) > box.top && Math.min(a.y, b.y) < box.bottom : a.y > box.top && a.y < box.bottom && Math.max(a.x, b.x) > box.left && Math.min(a.x, b.x) < box.right)
+      const rows = [...new Set([y1, y2, ...obstacles.filter(box => box.right > x1 && box.left < x2).flatMap(box => [box.top - 14, box.bottom + 14])])]
+      const routes = rows.map(y => [{ x: x1, y: y1 }, { x: x1 + 24, y: y1 }, { x: x1 + 24, y }, { x: x2 - 24, y }, { x: x2 - 24, y: y2 }, { x: x2, y: y2 }])
+        .filter(points => points.slice(1).every((point, index) => clear(points[index], point)))
+        .sort((a, b) => a.slice(1).reduce((sum, point, index) => sum + Math.abs(point.x - a[index].x) + Math.abs(point.y - a[index].y), 0) - b.slice(1).reduce((sum, point, index) => sum + Math.abs(point.x - b[index].x) + Math.abs(point.y - b[index].y), 0))
+      if (routes.length) {
+        const points = routes[0].filter((point, index, all) => !index || point.x !== all[index - 1].x || point.y !== all[index - 1].y)
+        let d = `M ${points[0].x} ${points[0].y}`
+        for (let index = 1; index < points.length; index++) {
+          const point = points[index], before = points[index - 1], after = points[index + 1]
+          if (!after) { d += ` L ${point.x} ${point.y}`; continue }
+          const radius = Math.min(8, Math.hypot(point.x - before.x, point.y - before.y) / 2, Math.hypot(after.x - point.x, after.y - point.y) / 2)
+          d += ` L ${point.x - Math.sign(point.x - before.x) * radius} ${point.y - Math.sign(point.y - before.y) * radius} Q ${point.x} ${point.y}, ${point.x + Math.sign(after.x - point.x) * radius} ${point.y + Math.sign(after.y - point.y) * radius}`
+        }
+        return { ...edge, d, labelX: (x1 + x2) / 2, labelY: routes[0][2].y - 9 }
+      }
+    }
+    if (edge.targetPort && target.frame && source.groupOwner === target.source) {
+      const obstacles = [...nodesById.values()].filter(node => node !== source && !node.frame && node.groupOwner === target.source && node.x >= x1 && node.x < x2)
+      if (obstacles.some(node => node.y < Math.max(y1, y2) + 10 && node.y + (node.height || node.fixedHeight || FLOW_NODE_BASE_HEIGHT) > Math.min(y1, y2) - 10)) {
+        const outlet = target.outputs.findIndex(port => port.id === edge.targetPort)
+        const bottom = target.y + (target.height || target.fixedHeight) - 6 - 16 * (outlet + 1) / (target.outputs.length + 1)
+        const left = x1 + 28, right = x2 - 24
+        return { ...edge, d: `M ${x1} ${y1} H ${left - 8} Q ${left} ${y1}, ${left} ${y1 + 8} V ${bottom - 8} Q ${left} ${bottom}, ${left + 8} ${bottom} H ${right - 8} Q ${right} ${bottom}, ${right} ${bottom - 8} V ${y2 + 8} Q ${right} ${y2}, ${right + 8} ${y2} H ${x2}`, labelX: x1 + 50, labelY: y1 + 30 }
+      }
+    }
+    const outlet = source.outputs?.findIndex(port => port.id === edge.sourcePort) ?? -1
+    if (source.kind === 'event_group' && edge.channel !== 'data' && !edge.targetPort && outlet >= 0 && y2 - y1 > 64 && x2 - x1 > 48) {
+      const rail = x1 + (x2 - x1) * (source.outputs.length - outlet) / (source.outputs.length + 1)
+      const radius = Math.min(12, (rail - x1) / 2, (x2 - rail) / 2)
+      return { ...edge, d: `M ${x1} ${y1} H ${rail - radius} Q ${rail} ${y1}, ${rail} ${y1 + radius} V ${y2 - radius} Q ${rail} ${y2}, ${rail + radius} ${y2} H ${x2}`, labelX: rail, labelY: (y1 + y2) / 2 - 9 }
+    }
     return {
       ...edge,
       d: `M ${x1} ${y1} C ${middle} ${y1}, ${middle} ${y2}, ${x2} ${y2}`,
-      labelX: middle,
-      labelY: (y1 + y2) / 2 - 9,
+      label: caption ? edge.label : '',
+      labelX: caption?.x ?? middle,
+      labelY: caption?.y ?? (y1 + y2) / 2 - 9,
     }
   }
 
   // 目标节点在来源左侧时，连线从两节点右侧绕行。
-  const routeX = Math.max(x1, target.x + FLOW_NODE_WIDTH) + 58
+  const routeX = Math.max(x1, target.x + (target.width || FLOW_NODE_WIDTH)) + 58
   return {
     ...edge,
     d: `M ${x1} ${y1} L ${routeX} ${y1} L ${routeX} ${y2} L ${x2} ${y2}`,

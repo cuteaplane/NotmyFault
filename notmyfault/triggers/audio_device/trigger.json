@@ -7,7 +7,6 @@
     "version_code": 1,
     "version": "1.0",
     "package_name": "io.github.notmyfault.audio_device",
-    "enabled": true,
     "requires_capabilities": ["audio.device_query"],
     "platforms": ["windows", "linux"],
     "permissions": ["external_binary"],
@@ -29,5 +28,8 @@
                 {"value": "any", "label": "任意变化"}
             ]
         }
-    ]
+    ],
+    "state_key": "device_id",
+    "state_partition_key": "device_type",
+    "previous_state_output": "previous_device_id"
 }

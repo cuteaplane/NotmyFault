@@ -25,7 +25,7 @@ _SIGNATURE_ARTIFACT_NAMES = frozenset({"signature.sig", "public_key.pem", "publi
 
 
 def plugin_files(plugin_dir) -> list[Path]:
-    """返回插件目录内全部常规文件，sign_plugin 与 verify_plugin_sig 必须使用同一清单。"""
+    """返回插件目录内全部常规文件，sign_plugin 与 plugin_payload 必须使用同一清单。"""
     files = []
     plugin_root = Path(plugin_dir)
     for f in sorted(
@@ -41,11 +41,6 @@ def plugin_files(plugin_dir) -> list[Path]:
             continue
         files.append(f)
     return files
-
-
-def _plugin_files(plugin_dir: Path, json_name: str) -> list[Path]:
-    # 保留旧的 json_name 参数，实际清单统一由 plugin_files 生成。
-    return plugin_files(plugin_dir)
 
 
 def plugin_payload_chunks(entries):
@@ -96,7 +91,7 @@ def load_private_key(path: Path, password: Optional[str] = None):
     return Ed25519PrivateKey.from_private_bytes(data)
 
 
-def sign_plugin(plugin_dir: Path, json_name: str, private_key=None) -> bool:
+def sign_plugin(plugin_dir: Path, private_key=None) -> bool:
     if private_key is None:
         private_key = load_private_key(PRIVATE_KEY_FILE)
     payload = plugin_payload(plugin_dir)
@@ -121,7 +116,7 @@ def export_public_key(private_key, out_path: Path) -> Path:
 
 def self_sign_plugin(plugin_dir: Path, private_key) -> bool:
     """作者用自己的私钥签名插件，并把配套公钥写进插件目录。"""
-    sign_plugin(Path(plugin_dir), "", private_key=private_key)
+    sign_plugin(Path(plugin_dir), private_key=private_key)
     export_public_key(private_key, Path(plugin_dir) / "public_key.pem")
     return True
 

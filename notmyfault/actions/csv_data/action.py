@@ -1,3 +1,4 @@
+from notmyfault.plugin_api import action_values
 import csv
 import io
 import json
@@ -36,11 +37,10 @@ def _cell(value):
     raise ValueError("CSV 单元格只能包含文本、数字、布尔值或 null")
 
 
-def run(action_info, params):
-    return run_with_context(action_info, params, {})
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     operation = params.get("operation", "parse")
     delimiter = params.get("delimiter", ",")
     if not isinstance(delimiter, str) or len(delimiter) != 1 or delimiter in '\r\n"\x00':

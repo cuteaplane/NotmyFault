@@ -1,3 +1,4 @@
+from notmyfault.plugin_api import action_values
 """文件操作：复制、移动、删除、压缩和解压
 失败时抛异常，由引擎记录为失败
 """
@@ -122,7 +123,8 @@ def _move_to_target(source: str, dest: str, overwrite: bool) -> None:
         shutil.move(source, dest)
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
+    params = action_values(params)
     operation = params.get("operation", "copy")
     source = params.get("source", "")
     dest = params.get("destination", "")

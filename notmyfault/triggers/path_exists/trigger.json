@@ -5,9 +5,9 @@
   "version_code": 1,
   "version": "1.0",
   "package_name": "io.github.notmyfault.path_exists",
-  "enabled": true,
   "semantic": "state",
   "trigger_api": "event-v2",
+  "sampling_api": "poll-v1",
   "permissions": [
     "filesystem"
   ],
@@ -97,5 +97,18 @@
         "unit": "seconds"
       }
     }
-  ]
+  ],
+  "state_key": "state",
+  "state_filter": {
+    "default": {
+      "state": {
+        "config": "state"
+      }
+    },
+    "param": "state",
+    "cases": {
+      "changed": {},
+      "any": {}
+    }
+  }
 }

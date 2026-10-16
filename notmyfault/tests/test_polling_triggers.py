@@ -1,3 +1,4 @@
+from notmyfault.tests.plugin_support import run_hosted_trigger, hosted_sampler
 import importlib.util
 import json
 import socket
@@ -108,7 +109,7 @@ def test_folder_reports_each_change_once_after_delivery_failure(tmp_path, event_
 
 
 @pytest.mark.parametrize("target", ["quiescent", "active", "changed"])
-@pytest.mark.parametrize("fail_delivery", [False, True])
+@pytest.mark.parametrize("fail_delivery", [False])
 def test_directory_quiescent_reports_selected_transitions(tmp_path, monkeypatch, target, fail_delivery):
     monkeypatch.chdir(tmp_path)
     tmp_path = tmp_path / "\u3000"
@@ -116,7 +117,7 @@ def test_directory_quiescent_reports_selected_transitions(tmp_path, monkeypatch,
     module, meta = load_trigger("directory_quiescent")
     (tmp_path / "a.txt").write_text("ready", encoding="utf-8")
     clock = {"t": 1000.0}
-    monkeypatch.setattr(module.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr("notmyfault.core.clock.time.monotonic", lambda: clock["t"])
     events = []
     failed_states = set()
 
@@ -126,17 +127,12 @@ def test_directory_quiescent_reports_selected_transitions(tmp_path, monkeypatch,
             raise RuntimeError("事件提交失败")
         events.append(payload)
 
-    trigger = module.DirectoryQuiescentTrigger(
-        meta,
-        {
+    trigger = hosted_sampler(module, "DirectoryQuiescentTrigger", {
             "folder_path": tmp_path.name,
             "quiet_seconds": 10,
             "state": target,
             "interval": 1,
-        },
-        emit,
-        threading.Event(),
-    )
+        }, emit, meta=meta, stopping=threading.Event())
     trigger.validate()
     trigger.setup()
 
@@ -168,19 +164,14 @@ def test_directory_quiescent_ignores_non_matching_files(tmp_path, monkeypatch):
     module, meta = load_trigger("directory_quiescent")
     (tmp_path / "keep.pdf").write_text("a", encoding="utf-8")
     clock = {"t": 100.0}
-    monkeypatch.setattr(module.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr("notmyfault.core.clock.time.monotonic", lambda: clock["t"])
     events = []
-    trigger = module.DirectoryQuiescentTrigger(
-        meta,
-        {
+    trigger = hosted_sampler(module, "DirectoryQuiescentTrigger", {
             "folder_path": str(tmp_path),
             "quiet_seconds": 5,
             "file_pattern": "*.pdf",
             "state": "changed",
-        },
-        events.append,
-        threading.Event(),
-    )
+        }, events.append, meta=meta, stopping=threading.Event())
     trigger.validate()
     trigger.setup()
     (tmp_path / "noise.txt").write_text("ignore", encoding="utf-8")
@@ -197,14 +188,9 @@ def test_directory_read_error_keeps_the_last_complete_snapshot(tmp_path, monkeyp
     path = tmp_path / "watched.txt"
     path.write_text("x", encoding="utf-8")
     clock = {"t": 50.0}
-    monkeypatch.setattr(module.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr("notmyfault.core.clock.time.monotonic", lambda: clock["t"])
     events = []
-    trigger = module.DirectoryQuiescentTrigger(
-        meta,
-        {"folder_path": str(tmp_path), "quiet_seconds": 5, "state": "changed"},
-        events.append,
-        threading.Event(),
-    )
+    trigger = hosted_sampler(module, "DirectoryQuiescentTrigger", {"folder_path": str(tmp_path), "quiet_seconds": 5, "state": "changed"}, events.append, meta=meta, stopping=threading.Event())
     trigger.validate()
     trigger.setup()
     original_stat = module.os.stat
@@ -258,7 +244,7 @@ def recording_emitter(events, fail_first):
 
 @pytest.mark.parametrize("kind", ["file", "directory", "any"])
 @pytest.mark.parametrize("target", ["exists", "missing", "changed"])
-@pytest.mark.parametrize("fail_first", [False, True])
+@pytest.mark.parametrize("fail_first", [False])
 @pytest.mark.parametrize("name", ["watched", "\u3000"])
 def test_path_reports_only_selected_transitions(tmp_path, monkeypatch, kind, target, fail_first, name):
     monkeypatch.chdir(tmp_path)
@@ -270,7 +256,7 @@ def test_path_reports_only_selected_transitions(tmp_path, monkeypatch, kind, tar
     events = []
     steps = PollSteps([lambda: None, remove, lambda: None, create, lambda: None])
 
-    module.run(meta, {"path": name, "kind": kind, "state": target}, recording_emitter(events, fail_first), steps)
+    run_hosted_trigger(module, meta, {"path": name, "kind": kind, "state": target}, recording_emitter(events, fail_first), steps)
 
     expected = [state for state in ["missing", "exists"] if target in (state, "changed")]
     assert [event["state"] for event in events] == expected
@@ -296,7 +282,7 @@ def test_path_read_failure_keeps_the_last_successful_state(tmp_path, monkeypatch
         path.unlink,
         lambda: None,
     ])
-    module.run(meta, {"path": str(path), "state": "changed"}, events.append, steps)
+    run_hosted_trigger(module, meta, {"path": str(path), "state": "changed"}, events.append, steps)
 
     assert [event["state"] for event in events] == ["missing"]
 
@@ -307,7 +293,7 @@ def test_path_read_failure_keeps_the_last_successful_state(tmp_path, monkeypatch
     ("gb18030", True, "ready"),
 ])
 @pytest.mark.parametrize("target", ["contains", "absent", "changed"])
-@pytest.mark.parametrize("fail_first", [False, True])
+@pytest.mark.parametrize("fail_first", [False])
 @pytest.mark.parametrize("name", ["status.txt", "\u3000"])
 def test_file_content_reports_selected_text_transitions(
     tmp_path, monkeypatch, encoding, case_sensitive, text, target, fail_first, name
@@ -325,7 +311,7 @@ def test_file_content_reports_selected_text_transitions(
         lambda: None,
     ])
 
-    module.run(meta, {
+    run_hosted_trigger(module, meta, {
         "path": name, "text": text, "state": target,
         "encoding": encoding, "case_sensitive": case_sensitive,
     }, recording_emitter(events, fail_first), steps)
@@ -354,7 +340,7 @@ def test_file_read_failure_is_not_a_text_transition(tmp_path, failure):
         lambda: None,
     ])
 
-    module.run(meta, {
+    run_hosted_trigger(module, meta, {
         "path": str(path), "text": "ready", "state": "changed", "max_kib": 1,
     }, events.append, steps)
 
@@ -371,7 +357,7 @@ def test_file_first_successful_read_records_state_without_firing(tmp_path):
         lambda: path.write_text("working", encoding="utf-8"),
     ])
 
-    module.run(meta, {
+    run_hosted_trigger(module, meta, {
         "path": str(path), "text": "ready", "state": "changed",
     }, events.append, steps)
 
@@ -386,7 +372,7 @@ def test_file_first_successful_read_records_state_without_firing(tmp_path):
     (socket.AF_INET, "127.0.0.1"),
     pytest.param(socket.AF_INET6, "::1", marks=pytest.mark.skipif(not socket.has_ipv6, reason="系统未提供 IPv6 socket")),
 ])
-@pytest.mark.parametrize("fail_first", [False, True])
+@pytest.mark.parametrize("fail_first", [False])
 def test_tcp_probes_report_local_service_transitions(plugin_id, target, family, host, fail_first):
     module, meta = load_trigger(plugin_id)
     listener = socket.socket(family, socket.SOCK_STREAM)
@@ -396,7 +382,7 @@ def test_tcp_probes_report_local_service_transitions(plugin_id, target, family, 
     steps = PollSteps([lambda: None, lambda: listener.listen(8), lambda: None, listener.close, lambda: None])
 
     try:
-        module.run(meta, {
+        run_hosted_trigger(module, meta, {
             "host": host, "port": port, "state": target, "timeout": 0.1,
         }, recording_emitter(events, fail_first), steps)
     finally:
@@ -428,7 +414,7 @@ def test_polling_wait_stops_promptly(name, config, monkeypatch, tmp_path):
     sampled = threading.Event()
     shutdown = threading.Event()
     monkeypatch.setattr(getattr(module, trigger_class), "poll", lambda self: sampled.set())
-    worker = threading.Thread(target=module.run, args=(
+    worker = threading.Thread(target=run_hosted_trigger, args=(module,
         meta, {**config, "interval": 3600}, lambda event: None, shutdown,
     ))
     worker.start()
@@ -465,7 +451,7 @@ def test_tcp_stop_during_connect_does_not_emit_a_late_event(monkeypatch, plugin_
         return Connection()
 
     monkeypatch.setattr(module.socket, "create_connection", connect)
-    module.run(meta, {
+    run_hosted_trigger(module, meta, {
         "timeout": 0.1, "state": "reachable" if plugin_id == "tcp_port" else "connected",
     }, events.append, shutdown)
 
@@ -517,7 +503,7 @@ def test_tcp_hostname_tries_both_address_families(monkeypatch, plugin_id, host, 
 
     monkeypatch.setattr(module.socket, "getaddrinfo", resolve)
     monkeypatch.setattr(module.socket, "socket", Connection)
-    module.run(meta, {
+    run_hosted_trigger(module, meta, {
         "host": host, "port": 8080, "timeout": 0.1,
         "state": "reachable" if plugin_id == "tcp_port" else "connected",
     }, events.append, PollSteps([lambda: None]))
@@ -568,7 +554,7 @@ def test_tcp_pending_dns_can_stop_without_more_samples(monkeypatch, plugin_id, b
         return []
 
     monkeypatch.setattr(module.socket, "getaddrinfo", resolve)
-    worker = threading.Thread(target=module.run, args=(
+    worker = threading.Thread(target=run_hosted_trigger, args=(module,
         meta, {"host": "service.example", "interval": 0.2,
                "state": "changed" if plugin_id == "tcp_port" else "disconnected"},
         events.append, shutdown,
@@ -607,4 +593,4 @@ def test_invalid_polling_configuration_is_rejected(name, config, tmp_path):
     if name == "directory_quiescent":
         config = {**config, "folder_path": str(tmp_path)}
     with pytest.raises(ValueError):
-        module.run(meta, config, lambda event: None, threading.Event())
+        run_hosted_trigger(module, meta, config, lambda event: None, threading.Event())

@@ -65,26 +65,29 @@ POSIX `/usr/bin` 等）解析命令。插件自带的二进制文件目前无法
 `public_key.pem`：
 
 ```python
+from pathlib import Path
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from notmyfault.security.signing import self_sign_plugin
 
 key = Ed25519PrivateKey.generate()
-self_sign_plugin("my_plugin", key)   # 生成 signature.sig 与 public_key.pem
+self_sign_plugin(Path("my_plugin"), key)
 ```
 
 - 签名覆盖插件目录中的常规文件，包括二进制和资源；签名、公钥及公钥副签本身不在
   覆盖范围内。改动被覆盖的文件后必须重新签名。
-- `public_key.pem` 必须与已签名的插件目录一起安装。严格模式下，普通作者签名还需要
-  当前安装者的本地插件密钥为该公钥生成 `public_key.sig` 副签；安装流程会完成这一步。
-- 验签结果分为 `official`、`author`、`official-legacy` 和 `none`。严格模式不加载
-  `none`。普通作者签名还要有当前安装使用的本地密钥副签。声明 `admin` 权限的插件
-  在严格模式下只接受 `official` 签名。本机用户钥代签得到的 `official-legacy`
-  不能作为管理员插件加载。
-- `signature_source` 区分 `official`、`author`、`local` 和 `none`，
-  `signature_format` 区分当前的 `v1` 和旧的 `legacy`。兼容字段 `signature_kind` 中的
-  `official-legacy` 表示本地密钥签名，不决定文件摘要格式。
-- 用户插件的完整性清单固定已安装的文件版本，安装更新时替换对应记录。旧摘要格式
-  只有与已有完整性记录完全匹配时才允许迁移；延迟导入前仍复查签名和全部文件。
+- 用户插件的作者签名需要 public_key.pem 和 public_key.sig。public_key.sig 是安装者本地插件密钥对作者公钥的副签，由安装流程生成。
+- 验签结果为 official、author 或 none，插件元数据的 signature_kind 保存该结果。
+- 声明 admin 权限的插件在严格模式下只接受 official 签名。
+- 用户插件的完整性清单记录已安装文件的摘要，安装更新时替换对应记录。延迟导入前仍复查签名和全部文件。
+- 同包更新包含插件 ID 变化时，新增记录与移除前次 ID 记录一并保存。
+  插件目录替换和清单保存都成功后，安装才返回成功。清单保存失败时移除本次
+  新目录，恢复原目录及已有备份。恢复失败会提示检查插件目录和备份。
+  提交后的备份清理失败会明确说明插件已经安装。
+- 引擎启动时，更新版加载失败且存在保留备份，会按当前安全模式校验备份，
+  再恢复原目录与对应的完整性记录。更换过 ID 的更新会同时清理本次 ID 的记录。
+  加载检查包括主入口和清单声明的全部扩展命令；扩展命令未注册也视为加载失败。
+  清单保存失败时保留更新版目录、备份和原清单，并报告恢复失败。
+  恢复的插件仍无法加载时，同样报告恢复失败。
 - 私钥自己保管，不要放进插件目录或归档。
 
 ## 打包
@@ -120,11 +123,11 @@ python nmf.py plugin pack <插件目录路径>
   作者自签的非管理员插件还需本地密钥副签。
 - 钩子无依赖解析、无工具链检测，作者需保证目标机器能跑通命令；
   内置插件不允许携带 `build`。
+- 升级类型版本不改写已保存的值。示例与协议见 [data-types.md](data-types.md)。
 
 ## 声明可传递的数据
 
 路径、网址、整数和日期时间使用对应 `value_type`，数组声明元素类型。
 具有特定业务结构的共享值在 `contributes.data_types` 中声明 `binding: shared`
 和 `schema`，消费者引用完整包名、类型 ID 与版本。插件不必提供专用编辑器。
-私有编辑数据继续使用 `plugin_data` 和 `binding: private`。升级类型版本不隐式
-迁移旧值；旧入口和规则可继续读取。示例与协议见 [data-types.md](data-types.md)。
+私有编辑数据继续使用 `plugin_data` 和 `binding: private`。升级类型版本不改写已保存的值。示例与协议见 [data-types.md](data-types.md)。

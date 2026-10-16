@@ -14,7 +14,6 @@ export const store = reactive({
   refreshSignal: 0,   // SSE 事件到达时自增，视图监听它后刷新统计。
   engineEvents: [],   // SSE 推来的规则执行事件，规则测试回显用。
   pendingRuleId: '',
-  pendingRuleName: '', // 旧调用仍可按名称跳转，规则页优先使用 rule_id。
   pendingStepId: '',
   pendingRunId: '',
   activeManualRun: null,

@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from types import SimpleNamespace
+from threading import Event
+from typing import Any, Callable, Mapping, Protocol
+
+from notmyfault.core.run_context import RunContext
+from notmyfault.values import Blob, Secret, action_values
 
 
 HOST_API_VERSION = 1
@@ -118,8 +125,57 @@ def engines_compatibility(meta: dict) -> tuple[bool, str]:
 def engine_events_api():
     from notmyfault.core import engine_events
 
+    stream = engine_events.current_stream()
     return SimpleNamespace(
-        subscribe=engine_events.subscribe,
-        unsubscribe=engine_events.unsubscribe,
+        subscribe=stream.subscribe,
+        unsubscribe=stream.unsubscribe,
         RULE_TERMINAL_EVENTS=engine_events.RULE_TERMINAL_EVENTS,
     )
+
+
+class TriggerState(Protocol):
+    def get(self, key: str, default: Any = None) -> Any: ...
+
+    def set(self, key: str, value: Any, *, durable: bool = False) -> None: ...
+
+
+class TriggerClock(Protocol):
+    def monotonic(self) -> float: ...
+
+    def time(self) -> float: ...
+
+    def wait(self, event: Event, timeout: float | None) -> bool: ...
+
+
+def system_clock() -> TriggerClock:
+    from notmyfault.core.clock import SystemClock
+
+    return SystemClock()
+
+
+@dataclass(frozen=True, slots=True)
+class TriggerContext:
+    meta: Mapping[str, Any]
+    config: Mapping[str, Any]
+    emit: Callable[[dict[str, Any]], bool]
+    stopping: Event
+    state: TriggerState
+    boot_id: str
+    engine_started_at: float
+    clock: TriggerClock
+
+
+_trigger_context = ContextVar("trigger_context", default=None)
+
+
+def trigger_context():
+    return _trigger_context.get()
+
+
+@contextmanager
+def use_trigger_context(context):
+    token = _trigger_context.set(context)
+    try:
+        yield context
+    finally:
+        _trigger_context.reset(token)

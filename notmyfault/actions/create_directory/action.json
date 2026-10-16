@@ -5,7 +5,6 @@
   "version_code": 1,
   "version": "1.0",
   "package_name": "io.github.notmyfault.create_directory",
-  "enabled": true,
   "idempotent": true,
   "permissions": [
     "filesystem"

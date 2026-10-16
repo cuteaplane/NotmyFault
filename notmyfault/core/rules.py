@@ -12,30 +12,15 @@ from notmyfault.core.data_types import DataTypeError
 from notmyfault.core.variables import variable_definitions
 from notmyfault.extensions.protocol import owned_value_identity
 from notmyfault.core.predicates import validate_predicate
+from notmyfault.core.workflow_graph import (
+    NATIVE_NODES, NON_ACTION_NODES, iter_rule_actions, get_all_rule_events, iter_rule_event_nodes, entry_event_group,
+)
 from notmyfault.core.rule_model import normalize_rule_shape, normalize_rules, _BINDING_ID_RE, _RULE_ID_RE
 from notmyfault.core.condition_runtime import ConditionRuntime
-from notmyfault.core.conditions import (
-    get_rule_condition, _is_event_leaf, _condition_children, iter_condition_events,
-    get_rule_events, validate_condition_tree, check_event_params,
-    config_fingerprint, _condition_op, _absence_nodes, _positive_events,
-    _event_key, _canonical_config_value,
-)
+from notmyfault.core.conditions import check_event_params, config_fingerprint, _canonical_config_value
 
 
 
-
-def iter_action_nodes(actions: Any, path: str = "actions", *, include_invalid: bool = False):
-    if not isinstance(actions, list):
-        return
-    for index, action in enumerate(actions):
-        if not isinstance(action, dict):
-            if include_invalid:
-                yield action, f"{path}[{index}]"
-            continue
-        location = f"{path}[{index}]"
-        yield action, location
-        for field in ("then", "else", "failure_actions"):
-            yield from iter_action_nodes(action.get(field), f"{location}.{field}", include_invalid=include_invalid)
 
 
 def get_rule_admin_plugins(
@@ -45,16 +30,19 @@ def get_rule_admin_plugins(
 ) -> List[str]:
     """返回规则引用的管理员插件，包含失败后动作。"""
     required = set()
-    for event in get_rule_events(rule):
+    for event in get_all_rule_events(rule):
         plugin_id = event.get("type")
         if "admin" in (triggers_meta.get(plugin_id, {}).get("permissions") or []):
             required.add(plugin_id)
 
-    for item, _location in iter_action_nodes(rule.get("actions"), "actions"):
+    for item, _location in iter_rule_actions(rule):
         plugin_id = item.get("type")
         if "admin" in (actions_meta.get(plugin_id, {}).get("permissions") or []):
             required.add(plugin_id)
     return sorted(required)
+
+
+_RULE_TOP_LEVEL_FIELDS = frozenset({'rule_id', 'name', 'folder', 'workflow', 'constants', 'variables', 'concurrency'})
 
 
 def validate_rule_structure(rule: Any) -> List[str]:
@@ -80,12 +68,16 @@ def validate_rule_structure(rule: Any) -> List[str]:
     if not isinstance(rule.get("name"), str) or not rule["name"].strip():
         errors.append("name 必须是非空字符串")
 
+    unknown = sorted(set(rule) - _RULE_TOP_LEVEL_FIELDS)
+    if unknown:
+        errors.append('包含未知字段: ' + ', '.join(unknown))
+
     if "concurrency" in rule:
         concurrency = rule["concurrency"]
         if not isinstance(concurrency, dict):
             errors.append("concurrency 必须是对象")
         else:
-            mode = concurrency.get("mode", "parallel")
+            mode = concurrency.get("mode", "single")
             if mode not in ("single", "queue", "replace", "parallel"):
                 errors.append(
                     "concurrency.mode 必须是 single / queue / replace / parallel"
@@ -106,14 +98,11 @@ def validate_rule_structure(rule: Any) -> List[str]:
                         f"concurrency.{field} 必须是 1 到 {ceiling} 的整数"
                     )
 
-    if "condition" not in rule:
-        errors.append("必须配置 condition")
-    else:
-        errors.extend(validate_condition_tree(get_rule_condition(rule)))
+    from notmyfault.core.canvas_workflow import validate_canvas_graph
+    errors.extend(validate_canvas_graph(rule.get('workflow')))
 
-    def validate_action(action: Any, path: str, *, allow_failure_actions: bool) -> None:
-        if not isinstance(action, dict):
-            errors.append(f"{path} 必须是对象")
+    def validate_action(action: Dict[str, Any], path: str) -> None:
+        if action.get("type") in NON_ACTION_NODES:
             return
         if action.get("type") == "set_variable":
             if not isinstance(action.get("variable"), str):
@@ -125,23 +114,6 @@ def validate_rule_structure(rule: Any) -> List[str]:
             for field in ("params", "retry", "retry_delay_seconds", "retry_backoff", "timeout_seconds", "failure_actions"):
                 if field in action:
                     errors.append(f"{path} 的赋值动作不支持 {field}")
-            return
-        if action.get("type") == "if":
-            if action.get("on_error", "stop") not in ("stop", "continue"):
-                errors.append(f"{path}.on_error 必须是 stop 或 continue")
-            errors.extend(validate_predicate(action.get("condition"), f"{path}.condition"))
-            for branch in ("then", "else"):
-                items = action.get(branch, [])
-                if not isinstance(items, list):
-                    errors.append(f"{path}.{branch} 必须是动作列表")
-                    continue
-                for index, item in enumerate(items):
-                    validate_action(item, f"{path}.{branch}[{index}]", allow_failure_actions=allow_failure_actions)
-            if not action.get("then") and not action.get("else"):
-                errors.append(f"{path} 至少需要一个分支动作")
-            for field in ("params", "retry", "retry_delay_seconds", "retry_backoff", "timeout_seconds", "failure_actions"):
-                if field in action:
-                    errors.append(f"{path} 的 if 不支持 {field}")
             return
         if not str(action.get("type", "")).strip():
             errors.append(f"{path}.type 不能为空")
@@ -202,30 +174,8 @@ def validate_rule_structure(rule: Any) -> List[str]:
             errors.append(
                 f"{path}.retry_backoff 必须是 fixed 或 exponential"
             )
-        if "failure_actions" not in action:
-            return
-        failure_actions = action["failure_actions"]
-        if not allow_failure_actions:
-            errors.append(f"{path}.failure_actions 不允许继续嵌套")
-        elif not isinstance(failure_actions, list) or not failure_actions:
-            errors.append(f"{path}.failure_actions 至少需要一个动作")
-        else:
-            for failure_index, failure_action in enumerate(failure_actions):
-                validate_action(
-                    failure_action,
-                    f"{path}.failure_actions[{failure_index}]",
-                    allow_failure_actions=False,
-                )
-
-    actions = rule.get("actions")
-    if not isinstance(actions, list) or not actions:
-        errors.append("actions 至少需要一个动作")
-    else:
-        for index, action in enumerate(actions):
-            validate_action(action, f"actions[{index}]", allow_failure_actions=True)
-
-    if rule.get("preconditions"):
-        errors.append("运行前检查已移除，请改用 NOT 触发条件或 if 分支")
+    for node, path in iter_rule_actions(rule):
+        validate_action(node, path)
 
     return errors
 
@@ -249,7 +199,6 @@ def _validate_node_binding_id(
 
 
 def validate_rule_binding_ids(rule: Dict[str, Any], *, allow_missing: bool = False) -> List[str]:
-    """校验 v2 节点身份，v1 规则的补齐由配置迁移器完成"""
     errors: List[str] = []
     try:
         rule = normalize_rule_shape(rule)
@@ -262,20 +211,21 @@ def validate_rule_binding_ids(rule: Dict[str, Any], *, allow_missing: bool = Fal
             return
         _validate_node_binding_id(node, prefix, path, seen, errors)
 
-    def visit(node: Any, path: str) -> None:
-        if not isinstance(node, dict):
-            return
-        if _is_event_leaf(node):
-            check(node, "t", path)
-            return
-        for index, child in enumerate(_condition_children(node)):
-            visit(child, f"{path}.children[{index}]")
-
-    condition = get_rule_condition(rule)
-    if condition is not None:
-        visit(condition, "condition")
-    for item, location in iter_action_nodes(rule.get("actions"), "actions"):
-        check(item, "a", location)
+    if "workflow" in rule:
+        trigger_ids = {}
+        for event in iter_rule_event_nodes(rule):
+            identity = event.get("binding_id")
+            if not isinstance(identity, str):
+                check(event, "t", "workflow.triggers")
+                continue
+            if identity not in trigger_ids:
+                if identity not in seen:
+                    check(event, "t", "workflow.triggers")
+                trigger_ids[identity] = event
+            elif event != trigger_ids[identity]:
+                errors.append("同一触发器 binding_id 的配置不一致")
+        for item, location in iter_rule_actions(rule):
+            check(item, "a", location)
     return errors
 
 
@@ -313,6 +263,24 @@ class RuleStructureError(ValueError):
         super().__init__("；".join(errors))
 
 
+def validate_automation_references(rule, known_rule_ids):
+    errors = []
+
+    def condition(node, path):
+        if not isinstance(node, dict):
+            return
+        if node.get("op") == "run_status" and (
+            not isinstance(node.get("rule_id"), str) or node["rule_id"] not in known_rule_ids
+        ):
+            errors.append(f"{path}.rule_id 引用的自动化不存在")
+
+
+    for action, path in iter_rule_actions(rule):
+        if action.get('type') == 'condition':
+            condition(action.get('predicate'), f'{path}.predicate')
+    return errors
+
+
 def normalize_rule_input(rules: Any) -> List[Dict[str, Any]]:
     try:
         shaped = [normalize_rule_shape(rule) if isinstance(rule, dict) else rule for rule in rules] if isinstance(rules, list) else rules
@@ -323,6 +291,13 @@ def normalize_rule_input(rules: Any) -> List[Dict[str, Any]]:
         errors = validate_rules_structure(normalized)
         if errors:
             raise RuleStructureError(errors)
+        known_rule_ids = {rule["rule_id"] for rule in normalized}
+        reference_errors = [
+            f"规则 {rule['name']}: {error}" for rule in normalized
+            for error in validate_automation_references(rule, known_rule_ids)
+        ]
+        if reference_errors:
+            raise RuleStructureError(reference_errors)
         return normalized
     except RuleStructureError:
         raise
@@ -334,33 +309,17 @@ def aggregate_trigger_params(rules: List[Dict[str, Any]]) -> Dict[str, List[Dict
     """把同一 trigger 的参数聚合成列表，并复制字典隔离规则配置"""
     aggregated: Dict[str, List[Dict[str, Any]]] = {}
     for rule in rules:
-        for event_def in get_rule_events(rule):
+        from notmyfault.core.canvas_workflow import CanvasProgram
+        program = CanvasProgram(rule)
+        active_triggers = {program.nodes[identity]["trigger"]["binding_id"] for identity in program.active_nodes() if program.nodes[identity]["type"] == "trigger"}
+        for event_def in get_all_rule_events(rule):
+            if event_def["binding_id"] not in active_triggers:
+                continue
             event_type = event_def.get("type")
             if not event_type:
                 continue
             aggregated.setdefault(event_type, []).append(copy.deepcopy(event_def.get("params", {})))
     return aggregated
-
-
-def guaranteed_trigger_ids(node: Dict[str, Any] | None) -> set[str]:
-    """返回条件树每次成立时都必然出现的触发器节点"""
-    if not isinstance(node, dict):
-        return set()
-    if _is_event_leaf(node):
-        binding_id = node.get("binding_id")
-        return {binding_id} if isinstance(binding_id, str) else set()
-    children = _condition_children(node)
-    if not children:
-        return set()
-    child_sets = [guaranteed_trigger_ids(child) for child in children]
-    if _condition_op(node) == "not":
-        return set()
-    if _condition_op(node) == "all":
-        return set().union(*child_sets)
-    result = set(child_sets[0])
-    for child_set in child_sets[1:]:
-        result.intersection_update(child_set)
-    return result
 
 
 def _valid_plugin_data(
@@ -370,21 +329,7 @@ def _valid_plugin_data(
 ) -> bool:
     identity = owned_value_identity(value)
     if identity is None:
-        if isinstance(value, dict) and "$type" in value:
-            return False
-        if not isinstance(value, dict) or not value:
-            return False
-        contributes = plugin_meta.get("contributes")
-        editors = (
-            contributes.get("parameter_editors", [])
-            if isinstance(contributes, dict) else []
-        )
-        return any(
-            isinstance(editor, dict)
-            and editor.get("parameter") == param.get("name")
-            and editor.get("accepts_legacy") is True
-            for editor in editors
-        )
+        return False
     package_name, data_type_id, version = identity
     if package_name != plugin_meta.get("package_name"):
         return False
@@ -409,18 +354,29 @@ def validate_rule_bindings(
 ) -> List[Dict[str, Any]]:
     from notmyfault.core.binding_schema import check_rule_bindings
 
-    return check_rule_bindings(normalize_rule_shape(rule), triggers_meta, actions_meta)
+    rule = normalize_rule_shape(rule)
+    issues = check_rule_bindings(rule, triggers_meta, actions_meta)
+    locations = {path: node['binding_id'] for node, path in iter_rule_actions(rule)}
+    for issue in issues:
+        for path, identity in locations.items():
+            if issue.get('location', '').startswith(path + '.') or issue.get('location') == path:
+                issue['node_id'] = identity
+                break
+    return issues
 
 
 def validate_rules(
     rules: List[Dict[str, Any]],
     triggers_meta: Dict[str, Dict[str, Any]],
     actions_meta: Dict[str, Dict[str, Any]],
+    *, known_rule_ids=None,
 ) -> Tuple[int, int, List[Tuple[str, str]], List[Tuple[str, str]]]:
     """校验所有规则的插件引用和参数并返回统计结果"""
     issues: List[Tuple[str, str]] = []
     warnings: List[Tuple[str, str]] = []
     valid_count = 0
+    if known_rule_ids is None:
+        known_rule_ids = {rule.get("rule_id") for rule in rules if isinstance(rule, dict)}
 
     for i, rule in enumerate(rules):
         rule_name = rule.get("name", f"规则 #{i+1}")
@@ -430,11 +386,16 @@ def validate_rules(
             issues.append((rule_name, str(error)))
             continue
 
-        condition_errors = validate_condition_tree(get_rule_condition(rule))
+        condition_errors = validate_rule_structure(rule)
+        condition_errors.extend(validate_automation_references(rule, known_rule_ids))
         if condition_errors:
             issues.extend((rule_name, error) for error in condition_errors)
             continue
-        rule_events = get_rule_events(rule)
+        from notmyfault.core.canvas_workflow import CanvasProgram
+        program = CanvasProgram(rule)
+        active = program.active_nodes()
+        active_triggers = {program.nodes[identity]["trigger"]["binding_id"] for identity in active if program.nodes[identity]["type"] == "trigger"}
+        rule_events = [event for event in get_all_rule_events(rule) if event["binding_id"] in active_triggers]
         all_events_valid = True
         for event_def in rule_events:
             event_type = event_def.get("type", "")
@@ -491,12 +452,10 @@ def validate_rules(
             continue
 
         rule_ok = True
-        for action, action_path in iter_action_nodes(rule.get("actions", []), include_invalid=True):
-            if not isinstance(action, dict):
-                issues.append((rule_name, f"{action_path} 必须是对象"))
-                rule_ok = False
+        for action, action_path in iter_rule_actions(rule):
+            if action["binding_id"] not in active:
                 continue
-            if action.get("type") in ("if", "set_variable"):
+            if action.get("type") in NATIVE_NODES:
                 continue
             action_type = action.get("type", "")
             if not action_type:
@@ -561,11 +520,8 @@ def validate_rules(
                     ))
                     rule_ok = False
 
-        binding_issues = validate_rule_bindings(
-            rule,
-            triggers_meta,
-            actions_meta,
-        )
+        from notmyfault.core.binding_schema import check_rule_bindings
+        binding_issues = check_rule_bindings(rule, triggers_meta, actions_meta)
         if binding_issues:
             issues.extend(
                 (rule_name, issue.get("message", "规则数据绑定无效"))

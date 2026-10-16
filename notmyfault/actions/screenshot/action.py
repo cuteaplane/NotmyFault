@@ -4,7 +4,7 @@ import struct
 import io
 from datetime import datetime
 
-from notmyfault.plugin_api import native_lock, platform_backend_api
+from notmyfault.plugin_api import native_lock, platform_backend_api, action_values
 
 NATIVE_LOCK = native_lock()
 _platform_backend = platform_backend_api()
@@ -63,7 +63,8 @@ if os.name == "nt":
         gdi32.GetDIBits.restype = ctypes.c_int
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
+    params = action_values(params)
     mode = params.get("mode", "fullscreen")
     output_path = params.get("output_path", "")
     fmt = str(params.get("format", "png")).lower()

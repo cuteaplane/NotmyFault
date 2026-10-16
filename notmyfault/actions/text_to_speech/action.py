@@ -1,3 +1,4 @@
+from notmyfault.plugin_api import action_values
 import json
 import os
 import re
@@ -66,7 +67,8 @@ def _speak_windows(text: str, rate, volume, voice_name: str) -> None:
         raise RuntimeError(f"语音播报失败: {stderr[:200] or 'SAPI 错误'}")
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
+    params = action_values(params)
     text = str(params.get("text", "")).strip()
     rate = params.get("rate", 0)
     volume = params.get("volume", 100)

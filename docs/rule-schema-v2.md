@@ -1,301 +1,194 @@
-# 规则格式 v2
+# 规则格式 v2.1
 
-规则格式 v2 为触发条件和动作分配稳定的 `binding_id`，并使用
-结构化 `$ref` 在一次规则运行中传递数据。规则对象中嵌套的对象和数组最多 64 层，
-超过上限时规则校验返回结构错误。
+规则以 `workflow.nodes` 和 `workflow.edges` 保存平面图。节点、组、分支和端口具有稳定身份。
+编辑器、API、文件读取、编译、事件匹配和执行使用同一张图。
+对象和数组嵌套最多 64 层；超出上限时返回结构错误。
 
-## 条件字段与旧格式读取
+## 文件与规则字段
 
-新保存的规则只写 `condition`。单个触发器是含 `type/params` 的叶子，组合条件
-使用 `op/children`。文件的 `schema_version` 仍为 2，该版本原本就接受条件叶子。
+`rules.json` 包含 `schema_version: "2.1"`、`value_encoding: "typed-v1"` 和 `rules`。
+读取时先验签，再检查格式和编码标记，随后解码并校验图。
+规则备份恢复执行相同检查。普通 `config.json` 保存程序配置，其校验不要求规则编码标记。
 
-读取和导入时，旧的 `event/trigger` 转为 `condition`，条件组的 `events` 转为
-`children`，`and/or` 转为 `all/any`。重复的等价条件合为一份，互不等价的条件
-返回结构错误。编辑器、AI 草稿、规则保存响应和运行时均使用转换后的结构。
+规则顶层允许 `rule_id`、`name`、`folder`、`workflow`、`constants`、`variables`、`concurrency`。
+其他字段返回“包含未知字段”错误。`workflow.entry` 可以省略或为 `null`；入口由连线确定。
+执行顺序由边决定，与节点数组中的排列无关。
 
-已有合法的 `rule_id/binding_id` 保持不变。纯模板转换为 `$ref`；混合模板保留
-原字符串和字符串化语义，并更新已知的旧步骤名。仅打开规则不会重写规则文件。
+## 身份与所属组
 
-## 编辑布局与旧记录
+- `rule_id` 标识规则。
+- 图块的 `binding_id` 使用 `a_` 前缀，包括触发器图块。
+- 触发器事件身份是图块内的 `trigger.binding_id`，使用 `t_` 前缀。
+- IF／ELIF／ELSE 的端口身份保存在事件组 `branches` 中，使用 `b_` 前缀。
+- `parent` 引用所属事件组或动作组的图块身份。组内节点仍保存在同一个 `nodes` 数组中。
 
-节点编辑与普通模式共用节点和参数表单。普通模式按纵向列表显示步骤，选中步骤后
-在下方展开全宽表单。切换布局保留规则内容和选中节点；校验定位保留当前布局。
-两种布局都可设置重复触发策略。
+API 校验已有身份后为缺少身份的新节点分配值。非法或重复身份不能用自动分配掩盖。
+规则文件中的身份必须有效且唯一。移动节点保持身份；复制节点生成新身份，并更新内部引用与连线。
+所属组不能形成循环。
 
-旧 `preconditions` 只保留供读取和移除，不再分配节点身份、升级引用或列入设置页
-的动作摘要。包含旧检查的规则仍须移除该字段后才能保存和执行。草稿恢复不保存
-旧检查内容，恢复时从当前规则文件取回。
+## 节点与端口
 
-`workflow_deferred` 仅用于读取旧运行记录。新事件写入和实时状态转换不接收它。
+| 节点 | 主要字段 | 来源端口 |
+| --- | --- | --- |
+| `trigger` | `trigger.type`、`trigger.params`、`trigger.binding_id` | `event` |
+| `condition` | `predicate` 保存单个比较或自动化状态判断 | `result` |
+| `logic` | `op: all / any / not` | `result` |
+| `event_group` | `group_type`、`mode`、`branches` | IF 组使用分支 ID；其他组使用 `result` |
+| `action_group` | `exports` | `entry` 进入组内，`next` 接组外后继 |
+| `set_variable` | `variable`、`value` | `next`、`failure` |
+| 插件动作 | `type`、`params` | `next`、`failure` |
+| `merge` | 接收汇合后的控制流 | `next` |
+| `end` | 显式结束当前路径 | 无 |
 
-## 节点身份
+连线保存 `source`、`port`、`target`、`channel`，条件输入可以用 `target_port` 指定端口。
+`channel` 为 `condition` 或 `control`。条件线传递判定结果，控制线决定执行路线。
+数据线由结构化引用和组导出生成，不单独保存数据绑定。
+无效端口、循环、重复连线、同一执行出口连接多个目标和跨动作组边界的控制线会被拒绝。
 
-- 触发条件：`t_...`
-- 动作：`a_...`
+## IF／ELIF／ELSE
 
-节点移动时 ID 不变，复制节点时必须生成新 ID。
+事件组使用 `type: "event_group"`、`group_type: "if"`。
+`branches` 的第一项是 IF，中间项是 ELIF，最后一项是唯一的 `else: true` 分支。
+IF 和 ELIF 的 `target_port` 使用对应分支 ID，各接一个条件结果。
+多个条件先用 AND／OR／NOT 图块组合，再接入分支。ELSE 没有条件输入。
 
-## 数据引用
+分支按数组顺序判断，选择首个成立出口。有条件而未连接动作的分支也可以被选中并结束路径。
+未接条件的备用 ELIF 不参与判断；IF／ELIF 已连接执行目标但没有条件时，结构校验失败。
 
-读取指定触发条件的输出：
+入口收到相关事件后立即选择路线。ELIF 先发生且 IF 未成立时，可以直接选择 ELIF。
+入队前固定选中分支和入口事件快照；随后收到的事件不会改写该次运行的入口路线。
+
+以下完整图来自 `notmyfault/tests/test_canvas_workflow.py` 的 `example()`；
+`event_aaaaaa`、`event_bbbbbb` 和 `record` 是测试插件，分别验证两个入口与分支输出：
 
 ```json
 {
-  "$ref": {
-    "scope": "trigger",
-    "node": "t_folder01",
-    "path": ["path"]
+  "rule_id": "r_canvas_000001",
+  "name": "双事件分支",
+  "workflow": {
+    "entry": null,
+    "nodes": [
+      {"binding_id": "a_source_aaaaaa", "type": "trigger", "trigger": {"binding_id": "t_source_aaaaaa", "type": "event_aaaaaa", "params": {}}},
+      {"binding_id": "a_source_bbbbbb", "type": "trigger", "trigger": {"binding_id": "t_source_bbbbbb", "type": "event_bbbbbb", "params": {}}},
+      {"binding_id": "a_choice_000001", "type": "event_group", "group_type": "if", "branches": [{"id": "b_first001"}, {"id": "b_second01"}, {"id": "b_spare001"}, {"id": "b_other001", "else": true}]},
+      {"binding_id": "a_action_aaaaaa", "type": "record", "params": {"message": "aaaaaa"}},
+      {"binding_id": "a_action_bbbbbb", "type": "record", "params": {"message": "bbbbbb"}}
+    ],
+    "edges": [
+      {"source": "a_source_aaaaaa", "port": "event", "target": "a_choice_000001", "target_port": "b_first001", "channel": "condition"},
+      {"source": "a_source_bbbbbb", "port": "event", "target": "a_choice_000001", "target_port": "b_second01", "channel": "condition"},
+      {"source": "a_choice_000001", "port": "b_first001", "target": "a_action_aaaaaa", "channel": "control"},
+      {"source": "a_choice_000001", "port": "b_second01", "target": "a_action_bbbbbb", "channel": "control"}
+    ]
   }
 }
 ```
 
-读取指定触发器的配置值。v2 规则中，事件节点的 `params` 就是该实例的配置，
-例如热键字符串或监控路径：
+## 条件、未发生与等待
+
+AND 使用 `op: "all"`，OR 使用 `op: "any"`，NOT 使用 `op: "not"`。
+依赖由条件线连接，共享上游节点保持同一身份。AND 支持 `within_seconds` 时间窗口、
+`ttl_seconds` 保留期限和 `consume: matched / all / none`；OR 支持 `pick: latest / first`。
+
+触发器节点的 `occurrence: "absent"` 表示未发生。
+入口持续未发生使用 `duration_seconds` 计时；匹配事件到达后重新计时。
+`repeat: "once_until_seen"` 每轮只触发一次，`every_window` 按窗口重复。
+流程内 `absence_scope: "run"` 判断本次运行至今未发生；`window` 判断连续指定秒数未发生。
+窗口尚未达到时立即返回 false，不自动等待。未发生不查询进程、窗口或文件的当前状态，
+也不生成被监视事件的输出数据。
+
+需要等待后续事件时，使用 `mode: "wait"` 的事件组，按需设置 `timeout_seconds`。
+执行到该组时挂起运行，事件或期限通知后恢复；等待不占用动作工作线程，也不重做等待前的动作。
+每次运行独立记录收到的事件、匹配消费和等待状态。
+取消、规则删除、替换和关闭能够结束等待。
+
+比较图块的 `predicate` 保存 `op`、`left` 和按需使用的 `right`。
+支持相等、不等、大小比较、包含、布尔、存在性与自动化运行状态判断。
+布尔值与数字区分；数组和对象中的嵌套值也按此规则比较。
+大小比较接受整数、浮点数或精确小数，不把布尔值当作数字。
+逻辑组合通过图块和条件线表达。
+
+## 动作组、补救与运行结束状态
+
+动作组通过 `entry` 控制线进入内部图。内部节点的 `parent` 指向组身份。
+组内执行完成后，由运行栈返回组的 `next` 后继；组不创建另一条规则运行。
+组可以嵌套，向组外提供的数据由 `exports` 声明。
+
+插件动作的 `failure` 控制出口只能连接同一执行范围内的普通动作组。
+该补救组不能同时接受主流程入口，也不能对外连接 `next`；返回位置属于运行状态。
+补救组内可以放插件动作、事件组和嵌套动作组。
+
+动作重试耗尽后才进入补救。取消和运行整体超时直接结束运行。
+`on_error` 决定原动作失败后的停止或继续行为：
+
+| 设置与执行结果 | 后续路线与运行结束状态 |
+| --- | --- |
+| `stop`，补救成功 | 结束运行，状态为 `recovered`，界面显示“已补救” |
+| `continue`，补救成功 | 返回原动作正常后继；后续完成时为 `succeeded` |
+| `continue`，未连接补救 | 明确忽略本次错误，后续完成时为 `succeeded` |
+| 未处理失败或补救失败 | 结束运行，状态为 `failed` |
+| 取消或运行整体超时 | 分别为 `cancelled` 或 `timed_out` |
+
+原动作的失败步骤一直保留。补救后又发生未处理失败、超时或取消时，按实际结果记录失败、超时或取消。
+`run.recovered` 单独通知运行因补救完成而结束。规则结束触发器的“任意”包含该状态，
+“仅成功”和“仅失败”不包含它；可以单独筛选“已补救”。
+
+普通动作 `retry` 范围为 0 到 3，`retry_delay_seconds` 为 0 到 3600 秒，
+`timeout_seconds` 为 1 到 86400 秒。重试与超时还需满足动作的协议声明和权限要求。
+
+## 数据引用与类型
+
+`$ref` 保留来源值的类型。`scope: "trigger"` 按事件身份读取触发器输出，
+`trigger_config` 读取实例配置；`event` 读取入口匹配事件；`step` 按图块身份读取动作输出。
+例如 `append_text` 的文件路径输出：
 
 ```json
-{
-  "$ref": {
-    "scope": "trigger_config",
-    "node": "t_hotkey01",
-    "path": ["hotkey"]
-  }
-}
+{"$ref": {"scope": "step", "node": "a_append01", "path": ["file"]}}
 ```
 
-读取本次促成规则成立的事件：
+`a_append01` 必须是本图中可达的 `append_text` 动作身份。
+引用检查覆盖参数、变量初值、比较操作数、组导出和补救图块。
+失败动作没有成功输出，不能把失败步骤当作已经产生结果。
+组外只能读取声明的导出；不同分支上可能未执行的结果按缺失值策略处理。
+未发生条件不提供匹配事件输出。入口条件不能读取尚未执行的动作输出。
 
-```json
-{
-  "$ref": {
-    "scope": "event",
-    "path": ["path"]
-  }
-}
-```
+触发器最新输出和入口匹配快照分别保存：前者按判定点已收到的最后一次事件读取，
+后者固定本次运行的入口匹配集合。二者不会相互覆盖。
+错误字段与成功输出分开处理，是否可引用以对应节点的类型和可达性检查为准。
 
-读取前序动作结果：
+参数控件使用 `type`，数据合同使用 `value_type`。输出可以声明类型、`required` 和 `sensitive`。
+数组元素类型在 `value_type.items` 或输出类型声明的 `items` 中给出。
+自有插件数据必须是带有效 `$type` 且归属匹配的信封，空对象不能通过该校验。
 
-```json
-{
-  "$ref": {
-    "scope": "step",
-    "node": "a_upload01",
-    "path": ["uploaded_files"]
-  }
-}
-```
+`constants` 为只读常量，`variables` 每次运行独立初始化，`set_variable` 执行赋值。
+`$convert` 显式转换，`$template` 拼接文本，`$literal` 保留原始数据。
+普通字符串按字面值传递。完整类型、缺失值策略与编码见 [data-types.md](data-types.md)。
 
-完整引用保留数字、布尔、数组和对象等原始类型。旧的
-`{{ event.payload.path }}` 与 `{{ steps.action_1.result.value }}` 继续解析，
-但 Dashboard 不再生成新的字符串引用。
+动作清单声明 `execution_api: "context-v1"`，入口为
+`run_with_context(action_info, params, context)`。触发器清单声明 `trigger_api: "event-v2"`，
+入口为 `run(meta, config, emit_event, shutdown_event)`。
+相同实例配置按 `config_fingerprint()` 去重并匹配；`payload` 提供输出数据。
+输出缺少必填字段、包含未声明字段或类型不符时，引擎拦截事件并告警。
 
-## 输出字段
+## 节点画布与运行记录
 
-触发器和动作通过插件清单的 `outputs` 描述可供后续节点使用的数据：
+编辑器提供节点画布、节点设置侧栏、分组折叠、排列、相机缩放和撤销／重做。
+补救图使用同一套节点创建、复制、删除、拖动和引用操作。
+拖入或拖出组时保存实际断线，编译器不推测补线。
+局部测试以原图节点与可达路径选择范围，并收集必需的前序数据；敏感数据不保存为测试草稿。
+运行记录使用原图节点身份，显示选中分支、条件结果、等待与恢复、组进入与退出、补救和最终状态。
+未连入执行路线的图块可以保存，但不计入实际执行动作数。
+插件与管理员权限检查覆盖整个有效图，包括补救路线、嵌套组和未连入主流程的图块。
 
-```json
-{
-  "name": "path",
-  "label": "变化文件",
-  "type": "string",
-  "value_type": "path",
-  "required": true,
-  "sensitive": false
-}
-```
+## 并发与热重载
 
-支持基本标量、时间、路径、网址、结构化集合和插件共享类型，完整声明见
-[data-types.md](data-types.md)。旧动作插件的
-字符串简写 `["files", "count"]` 等价于类型为 `any` 的必需输出。
+`concurrency.mode` 支持 `single`、`queue`、`replace` 和 `parallel`。
+`single` 在同规则已有运行或排队时丢弃新触发；`replace` 请求取消前次运行并替换待执行记录。
+`queue` 和 `parallel` 可用 `max_concurrency`、`queue_limit` 限制每条规则的并发和等待数。
+动作实际退出前仍占用工作线程；协作取消决定其何时能退出。
 
-动作通过 `params` 声明输入端口。`type` 继续描述 Dashboard 使用的表单控件；
-当运行数据类型与控件类型不同时，使用 `value_type` 单独声明：
-
-```json
-{
-  "name": "records",
-  "label": "记录",
-  "type": "textarea",
-  "value_type": "array"
-}
-```
-
-## 条件可用性
-
-对于普通事件条件，`all` 组合中的所有事件都已发生；`any` 组合只保证实际命中的分支已发生。
-`all.within_seconds` 限制各事件命中时间的最大间隔，接受大于 0 的有限数字。
-没有设置时，未被消费的事件不会按固定时长过期。
-动作可以引用 `any` 中的单个分支。该分支未命中时，引用它的动作状态为
-`skipped`。引用被跳过步骤输出的后续动作也会跳过。
-NOT 的被监视事件不提供本次运行的数据，IF 引用缺失数据时失败，不进入任一分支。
-
-若所有可能触发事件都声明了同名同类型输出，也可以使用 `scope: "event"`。
-
-## NOT 事件条件
-
-普通事件条件在事件发生时命中。`op: "not"` 在指定事件持续未发生时命中，
-只接受一个事件叶子，`within_seconds` 必须是大于 0 的有限数字。
-
-```json
-{
-  "op": "not",
-  "within_seconds": 60,
-  "children": [{
-    "binding_id": "t_folder01",
-    "type": "folder_monitor",
-    "params": {"folder_path": "D:\\watch", "event_type": "all"}
-  }]
-}
-```
-
-引擎开始监视规则时启动计时。收到匹配事件后重新计时；其他类型或其他实例的
-事件不会重置等待。超时产生一次 `absence` 事件，之后保持安静，直到再次收到
-匹配事件。引擎每秒检查到期时间，因此触发可能比等待时长略晚。规则重载时重新计时。
-
-NOT 判断事件是否发生，不查询进程、窗口或文件的当前状态。NOT 可作为 AND / OR
-的子条件；AND 仍需等其他分支命中。超时事件没有被监视事件的 payload，因此
-含 NOT 的规则不接受 `scope: "event"` 数据引用；应指定实际发生的触发节点。
-
-## IF / ELSE 动作分支
-
-动作列表可放入 `type: "if"` 节点。`condition` 判断本次运行数据，成立执行 `then`，
-否则执行 `else`。`else` 可省略或留空，两个分支至少有一个动作。
-分支可继续嵌套 IF，执行完后继续外层动作。
-
-```json
-{
-  "binding_id": "a_branch01",
-  "type": "if",
-  "condition": {
-    "op": "eq",
-    "left": {"$ref": {"scope": "step", "node": "a_append01", "path": ["file"]}},
-    "right": "D:\\NotmyFault\\events.txt"
-  },
-  "then": [{
-    "binding_id": "a_notify01",
-    "type": "notify",
-    "params": {"title": "NotmyFault", "message": "文件已写入"}
-  }],
-  "else": []
-}
-```
-
-此例应放在 `binding_id: "a_append01"` 的 `append_text` 动作之后。
-比较支持 `eq`、`ne`、`gt`、`gte`、`lt`、`lte`、`contains`、`is_true`、`is_false`。
-比较节点使用 `left` 和 `right`，布尔判断只使用 `left`。`all`、`any`、`not` 使用
-`children` 组合判断，判断中的 NOT 是逻辑取反，必须只有一个子条件，不计时。
-
-大小比较要求两侧为整数、浮点数或精确小数，布尔值不当作数字。`is_true` / `is_false` 要求布尔值。
-引用缺失、未执行或失败步骤的数据会使 IF 失败，不能通过 NOT 将缺失数据变为真。
-IF 默认失败后停止；`on_error: "continue"` 可继续外层动作。重试、超时和失败后动作
-配置放在分支内的普通动作上，IF 本身不接受这些配置。
-
-分支可以引用外层前序动作和当前分支内的前序动作。不能引用另一个分支、后续动作
-或从分支外引用分支内部的结果。复制 IF 时生成新节点 ID，并同步修改分支内部引用。
-保存时两个分支的插件、参数引用和管理员权限均会检查。
-重新签名前的安全摘要也展开两个分支及失败后动作，外层节点汇总内部高风险标记。
-
-## 旧的运行前检查
-
-规则不再执行 `preconditions`，也不再因为检查未通过而自动延后工作流。
-非空 `preconditions` 会被规则校验拒绝。编辑器可移除旧检查，随后使用 NOT 监视
-事件未发生，或使用 IF 判断运行数据。旧检查不会自动转换成 NOT。
-已签名的旧规则仍可读取供编辑；运行入口继续拒绝非空运行前检查，保存前必须移除。
-
-## 运行上下文
-
-引擎为每次规则运行创建独立快照：
-
-```json
-{
-  "context_version": 2,
-  "constants": {},
-  "variables": {},
-  "event": {"type": "folder_monitor", "payload": {}},
-  "triggers": {
-    "t_folder01": {
-      "type": "folder_monitor",
-      "payload": {},
-      "config": {"folder_path": "D:\\watch"}
-    }
-  },
-  "steps": {
-    "a_upload01": {
-      "type": "upload",
-      "status": "ok",
-      "result": {},
-      "error": null
-    }
-  }
-}
-```
-
-步骤状态包括 `ok`、`failed`、`skipped`、`timed_out` 和 `cancelled`。
-`config` 是该触发器实例的配置快照，供 `scope: "trigger_config"` 引用。
-
-## 事件匹配（event-v2）
-
-- `event-v2` 触发器为每种配置创建一个实例。引擎用 `config_fingerprint()`
-  将实例配置和规则事件节点的 `params` 通过 `typed-v1` 编码转成统一格式的 JSON 字符串，
-  字符串相同即匹配。`payload` 只提供输出数据，不参与匹配。
-- v1/legacy 触发器继续逐项比较事件节点 `params` 与 `payload` 中的键值。
-- 引擎按插件的 `outputs` 声明检查 `emit_event(payload)`。缺少 `required`
-  输出、包含未声明字段或基本类型不符时，引擎拦截事件并告警，不再分发。
-- 旧规则中的纯模板字符串（`{{ event.payload.x }}`、
-  `{{ steps.action_1.result.value }}`）在配置加载时自动升级为结构化 `$ref`；
-  带前后缀的混合模板保留，在运行时解析。
-- 转成 JSON 字符串前，整数值的浮点数会先转成整数。例如 `90.0` 转成 `90`，
-  两种写法视为同一配置，实例去重和规则重载后的匹配结果保持一致。
-  布尔值仍与 `0` / `1` 区分。
-- 枚举型参数（state / resource / direction / event_type 等）取值非法时
-  触发器直接抛异常并告警，不会静默空转。
-
-普通动作插件仍只接收解析后的 `params`，不需要声明 `context-v1`。
-
-## 常量、变量与显式转换
-
-规则的 `constants` 声明只读常量，`variables` 声明每次运行独立初始化的变量。
-`set_variable` 动作完成赋值，值通过 `constant` 和 `variable` 引用范围读取。
-`$convert` 负责显式转换，`$template` 拼接文本，`$literal` 保留原始数据。
-可选字段可以使用 `on_missing` 指定报错、跳过或默认值。
-完整格式、单位、精度和传输协议见 [data-types.md](data-types.md)。
-
-## 运行并发与结束
-
-规则的 `concurrency.mode` 支持 `single`、`queue`、`replace` 和 `parallel`，默认 `parallel`。
-所有模式共用 8 个工作线程和默认 32 条等待记录的总上限。
-线程已满时，新运行进入有界队列；队列已满时产生 `run_dropped`。
-
-`single` 在同一规则已有运行或排队记录时丢弃新触发。
-`replace` 请求取消旧运行并替换该规则尚未执行的排队记录。
-旧动作实际退出前仍占用工作线程，状态接口的 `running` 也继续计入该运行。
-取消是否立即生效取决于动作的协作取消支持。
-`queue` 默认每条规则运行一个实例，`parallel` 默认可使用全部空闲线程。
-这两种模式可以通过 `max_concurrency` 和 `queue_limit` 限制单条规则的并发与等待数量。
-
-动作绑定失败和参数校验失败先产生动作错误，按配置执行 `failure_actions`。
-工作流在失败后动作结束时发送一次终态，失败动作按 `on_error` 决定是否继续。
-停止超时且仍有触发器或动作运行时，引擎保持 `stopping`，保留插件资源并拒绝启动新实例。
-剩余线程退出后再次停止，才能完成插件清理。
-
-
-## 规则准备与热重载
-
-保存、引擎启动和热重载共用 `normalize_rule_input()` 转换旧输入、校验已有身份并补齐缺失身份。
-IF 和失败后动作中的节点也检查身份。随后检查插件引用与数据绑定。
-检查通过后展开常量并规范化触发器参数。触发器装配、事件匹配和 NOT 等待使用
-同一份准备好的规则。每次运行分别复制常量、变量初始值和绑定上下文，运行间
-不共享可修改的变量值。
-
-插件缺失、参数或数据引用无效、触发器无法加载时，启动和热重载都会跳过对应规则，
-将规则名和原因写入日志与诊断信息，其余有效规则继续运行。全部规则都不可用时，
-引擎保持运行并等待规则更新。跳过不会删除或改写保存的规则，修正后重新加载。
-
-规则文件的格式、签名或结构校验失败时，热重载保留旧触发器、已有条件命中和排队动作。
-候选规则准备完成后停止旧触发器、切换有效规则并启动新触发器。新触发器启动失败时
-恢复旧规则及其条件命中状态；新触发器尚未停止时，在下一轮继续恢复。
-新配置被接受后，才丢弃已经删除的规则对应的排队动作。
-
-调度器不再产生等待前置条件的 deferred 运行，历史读取继续支持已经保存的
-`workflow_deferred` 事件。替换运行会立即记录 `run_replaced`，而 `running`
-统计在旧运行实际退出后才扣除它。
+每次运行有独立的常量、变量、取消信号和事件观察记录。
+文件加载严格检查身份，API 保存允许补齐新身份，随后检查插件引用、参数与数据绑定。
+插件缺失、参数或引用无效时，启动和热重载跳过对应规则并记录原因，其余有效规则继续运行。
+全部规则不可用时，引擎仍可等待规则更新。文件签名或结构校验失败时，热重载保留现行运行规则。
+停止超时且仍有线程运行时，引擎保持 `stopping` 并保留资源；线程退出后才能完成清理。

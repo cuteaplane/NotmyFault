@@ -1,3 +1,5 @@
+import { normalizeWorkflow } from './workflowGraph.js'
+
 export function getParamDefs(m) {
   if (!m) return []
   if (Array.isArray(m.params)) return m.params
@@ -52,7 +54,6 @@ const commonOptionLabels = {
   on: '开启', off: '关闭', toggle: '切换', query: '查询状态',
   created: '新建', modified: '修改', deleted: '删除', all: '全部',
   above: '高于阈值', below: '低于阈值',
-  low_brightness: '低亮度', high_brightness: '高亮度',
 }
 
 function friendlyOptionLabel(value) {
@@ -131,69 +132,9 @@ function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
-function valuesEqual(left, right) {
-  if (left === right) return true
-  if (Array.isArray(left) || Array.isArray(right)) {
-    return Array.isArray(left)
-      && Array.isArray(right)
-      && left.length === right.length
-      && left.every((value, index) => valuesEqual(value, right[index]))
-  }
-  if (!isObject(left) || !isObject(right)) return false
-  const leftKeys = Object.keys(left)
-  const rightKeys = Object.keys(right)
-  return leftKeys.length === rightKeys.length
-    && leftKeys.every(key => Object.prototype.hasOwnProperty.call(right, key)
-      && valuesEqual(left[key], right[key]))
-}
-
-export function isConditionLeaf(node) {
-  return isObject(node)
-    && typeof node.type === 'string'
-    && node.type.length > 0
-    && !Array.isArray(node.children)
-    && !Array.isArray(node.events)
-}
-
-export function normalizeConditionTree(node) {
-  if (!isObject(node)) return node
-  if (isConditionLeaf(node)) return node
-
-  node.children = Array.isArray(node.children)
-    ? node.children
-    : (Array.isArray(node.events) ? node.events : [])
-  const op = node.op || node.type || 'any'
-  node.op = ({ and: 'all', or: 'any' })[op] || op
-  if (node.op === 'any') delete node.within_seconds
-  delete node.events
-  delete node.type
-  node.children.forEach(normalizeConditionTree)
-  return node
-}
-
-function unwrapSingleCondition(node) {
-  if (isConditionLeaf(node)) return node
-  if (node?.op === 'not') return null
-  if (!isObject(node) || !Array.isArray(node.children) || node.children.length !== 1) return null
-  return unwrapSingleCondition(node.children[0])
-}
-
-export function normalizeRuleDraft(rule) {
-  if (!isObject(rule)) return rule
-  const aliases = ['event', 'trigger'].filter(key => Object.hasOwn(rule, key))
-  const legacy = rule[aliases[0]]
-  if (aliases.length === 2 && !valuesEqual(rule.event, rule.trigger)) {
-    throw new Error('event 与 trigger 的触发条件不一致')
-  }
-  if (Object.hasOwn(rule, 'condition') && aliases.length) {
-    const normalized = normalizeConditionTree(JSON.parse(JSON.stringify(rule.condition)))
-    if (!valuesEqual(unwrapSingleCondition(normalized), legacy)) {
-      throw new Error('event/trigger 与 condition 不能同时存在')
-    }
-  }
-  if (!Object.hasOwn(rule, 'condition') && aliases.length) rule.condition = legacy
-  if (isObject(rule.condition)) normalizeConditionTree(rule.condition)
-  delete rule.event
-  delete rule.trigger
+export function validateRuleGraph(rule) {
+  if (!isObject(rule)) throw new Error('规则必须是对象')
+  if (Object.keys(rule).some(key => !['rule_id', 'name', 'folder', 'workflow', 'constants', 'variables', 'concurrency'].includes(key))) throw new Error('规则包含不支持的字段')
+  normalizeWorkflow(rule)
   return rule
 }

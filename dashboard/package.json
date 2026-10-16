@@ -6,7 +6,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "vite build && node tests/mount.mjs && node tests/macro-page.mjs"
+    "test": "vite build && node tests/mount.mjs && node tests/macro-page.mjs && node tests/workflow-conditions.mjs && node tests/workflow-groups.mjs && node tests/workflow-layout.mjs && node tests/canvas-interaction.mjs"
   },
   "dependencies": {
     "markdown-it": "^15.0.0",

@@ -1,4 +1,8 @@
-def run(action_info, params):
+from notmyfault.plugin_api import action_values
+
+
+def run_with_context(action_info, params, context):
+    params = action_values(params)
     from notmyfault.platform.platform_support import show_notification
 
     title = params.get("title", "NotmyFault")

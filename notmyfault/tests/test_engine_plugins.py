@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from notmyfault.tests.api_support import create_test_engine
+from notmyfault.tests.canvas_fixtures import native_rule
 from notmyfault.security.plugin_loader import PluginLoader, PluginRegistry
 from notmyfault.security.security import SecurityMode
 
@@ -21,11 +22,11 @@ def make_meta(plugin_id="plug_a", **overrides):
         "id": plugin_id,
         "name": "测试插件",
         "description": "测试用插件",
-        "enabled": True,
         "version_code": 1,
         "version": "1.0",
         "package_name": "com.test.plug",
     }
+    meta["trigger_api" if "trigger_api" in overrides or "semantic" in overrides else "execution_api"] = "event-v2" if "trigger_api" in overrides or "semantic" in overrides else "context-v1"
     meta.update(overrides)
     if "admin" in meta.get("permissions", []) and "security" not in meta:
         meta["security"] = {"admin_executables": ["cmd.exe"]}
@@ -33,6 +34,9 @@ def make_meta(plugin_id="plug_a", **overrides):
 
 
 def write_plugin(root, folder, meta, py_code, json_name="action.json", py_name="action.py"):
+    meta = dict(meta)
+    meta.pop("execution_api" if json_name == "trigger.json" else "trigger_api", None)
+    meta.setdefault("execution_api" if json_name == "action.json" else "trigger_api", "context-v1" if json_name == "action.json" else "event-v2")
     folder_path = Path(root) / folder
     folder_path.mkdir(parents=True, exist_ok=True)
     (folder_path / json_name).write_text(
@@ -100,26 +104,11 @@ def sign_with_test_key(plugin_dir, monkeypatch):
     key = ed25519.Ed25519PrivateKey.generate()
     public_bytes = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
     monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [public_bytes])
-    signing.sign_plugin(Path(plugin_dir), "action.json", private_key=key)
+    signing.self_sign_plugin(Path(plugin_dir), key)
+    signing.counter_sign_author_key(Path(plugin_dir), key)
 
 
-def sign_with_old_payload(plugin_dir, monkeypatch):
-    from cryptography.hazmat.primitives.asymmetric import ed25519
-    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-    from notmyfault.security import signing, signing_keys
-
-    key = ed25519.Ed25519PrivateKey.generate()
-    public_bytes = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [public_bytes])
-    old_payload = b"".join(
-        path.read_bytes() for path in signing.plugin_files(plugin_dir)
-    )
-    import hashlib
-
-    (Path(plugin_dir) / "signature.sig").write_bytes(key.sign(hashlib.sha256(old_payload).digest()))
-
-
-CLEAN_RUN = "def run(meta, params):\n    return None\n"
+CLEAN_RUN = "def run_with_context(meta, params, context):\n    return None\n"
 
 
 class TestEngineStart:
@@ -130,7 +119,7 @@ class TestEngineStart:
 
 
     def test_get_diagnostics_initial(self):
-        engine = make_engine(rules=[{"name": "a"}])
+        engine = make_engine(rules=[{"name": "a", "workflow": {"entry": None, "nodes": [], "edges": []}}])
         diag = engine.get_diagnostics()
         assert diag["uptime_seconds"] == 0
         assert diag["plugins"]["actions_loaded"] == 0
@@ -146,23 +135,37 @@ class TestEngineStart:
             monkeypatch.setattr(AUMID_Register, "register_toaster", lambda: None)
 
         alerts = []
-        engine = make_engine(rules=[{
-            "name": "r",
-            "event": {"type": "ghost_trigger", "params": {}},
-            "actions": [{"type": "noop", "params": {}}],
-        }])
+        engine = make_engine(rules=[native_rule({"type": "ghost_trigger", "params": {}}, [{"type": "noop", "params": {}}], name="r")])
         engine._alert_user = (
             lambda title, message, open_dashboard=False: alerts.append((title, open_dashboard))
         )
         engine._security_mode = SecurityMode.PERMISSIVE
         stopped = threading.Event()
-        monkeypatch.setattr(engine._hot_reloader, "begin", stopped.set)
+        monkeypatch.setattr(engine._rule_watcher, "start", stopped.set)
         engine.start(shutdown_event=stopped)
         assert engine.get_diagnostics()["rules"]["issue_count"] == 1
         assert alerts
 
 
 class TestLoadPlugins:
+    @pytest.mark.parametrize("factory,valid", [
+        ("", False),
+        ("def create_sampler(context, required):\n    pass\n", False),
+        ("def create_sampler(context):\n    return object()\n", True),
+    ])
+    def test_sampled_trigger_requires_context_factory(self, tmp_path, factory, valid):
+        loader, registry, errors, _ = make_loader(tmp_path)
+        meta = make_meta(trigger_api="event-v2", sampling_api="poll-v1")
+        write_plugin(tmp_path / "triggers", "plug_a", meta,
+                     "def run(meta, config, emit, stop):\n    pass\n" + factory,
+                     json_name="trigger.json", py_name="trigger.py")
+        loaded, failed, _, _ = load_triggers(loader, tmp_path)
+        assert (loaded, failed) == (1, 0)
+        assert (registry.resolve_trigger("plug_a") is not None) is valid
+        assert ("plug_a" in registry.triggers_funcs) is valid
+        if not valid:
+            assert any("create_sampler(context)" in message for _, _, message in errors)
+
     def test_json_parse_error(self, tmp_path):
         loader, registry, errors, _ = make_loader(tmp_path)
         folder = tmp_path / "actions" / "bad"
@@ -290,7 +293,7 @@ class TestLoadPlugins:
         loaded, failed, _, _ = load_actions(loader, tmp_path)
         assert (loaded, failed) == (1, 0)
         assert registry.resolve_action("plug_a") is None
-        assert any("缺少 run() 函数" in msg for _, _, msg in errors)
+        assert any("缺少 run_with_context() 函数" in msg for _, _, msg in errors)
 
     def test_python_import_error(self, tmp_path):
         loader, registry, errors, _ = make_loader(tmp_path)
@@ -303,15 +306,36 @@ class TestLoadPlugins:
         assert registry.resolve_action("plug_a") is None
         assert any("Python 加载异常" in msg for _, _, msg in errors)
 
-    def test_plugin_disabled(self, tmp_path, capsys):
-        loader, registry, errors, _ = make_loader(tmp_path)
-        write_plugin(
-            tmp_path / "actions", "off", make_meta(enabled=False), CLEAN_RUN
+    def test_builtin_plugin_disabled_by_config(self, tmp_path):
+        loader, registry, errors, _ = make_loader(
+            tmp_path, config={"disabled_plugins": {"actions": ["plug_a"]}}
         )
-        loaded, failed, meta_store, func_store = load_actions(loader, tmp_path)
+        write_plugin(tmp_path / "actions", "off", make_meta(), CLEAN_RUN)
+        loaded, failed, meta_store, _ = load_actions(loader, tmp_path)
         assert (loaded, failed) == (0, 0)
         assert meta_store == {}
-        assert "已禁用" in capsys.readouterr().out
+        assert registry.resolve_action("plug_a") is None
+
+    def test_user_plugin_disabled_by_config(self, tmp_path):
+        loader, registry, errors, _ = make_loader(
+            tmp_path, config={"disabled_plugins": {"actions": ["plug_a"]}}
+        )
+        write_plugin(tmp_path / "actions", "off", make_meta(), CLEAN_RUN)
+        loaded, failed, meta_store, _ = load_actions(loader, tmp_path, origin="user")
+        assert (loaded, failed) == (0, 0)
+        assert meta_store == {}
+        assert registry.resolve_action("plug_a") is None
+
+    def test_disabled_plugin_loads_again_after_config_cleared(self, tmp_path):
+        write_plugin(tmp_path / "actions", "off", make_meta(), CLEAN_RUN)
+        disabled_loader, _, _, _ = make_loader(
+            tmp_path, config={"disabled_plugins": {"actions": ["plug_a"]}}
+        )
+        assert load_actions(disabled_loader, tmp_path)[:2] == (0, 0)
+        loader, registry, errors, _ = make_loader(tmp_path)
+        loaded, failed, meta_store, _ = load_actions(loader, tmp_path)
+        assert (loaded, failed) == (1, 0)
+        assert meta_store["plug_a"]["id"] == "plug_a"
 
     def test_successful_plugin_load(self, tmp_path):
         loader, registry, errors, _ = make_loader(tmp_path)
@@ -348,25 +372,25 @@ class TestLoadPlugins:
         assert any("setup() 执行异常" in msg for _, _, msg in errors)
 
     def test_sudo_import_warning_no_admin_permission(self, tmp_path, capsys):
-        loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.NORMAL)
+        loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.PERMISSIVE)
         code = (
             "import notmyfault.security.sudo\n"
-            "def run(meta, params):\n"
+            "def run_with_context(meta, params, context):\n"
             "    return None\n"
         )
         write_plugin(tmp_path / "actions", "warned", make_meta("warned"), code)
         loaded, failed, _, _ = load_actions(loader, tmp_path)
-        # normal 模式只警告，不拒载
+        # 宽松模式只警告，不拒载
         assert (loaded, failed) == (1, 0)
         assert "未在元数据中声明" in capsys.readouterr().err
 
     def test_override_plugin_does_not_inherit_admin(self, tmp_path):
-        loader, registry, errors, sudo = make_loader(tmp_path, mode=SecurityMode.NORMAL)
+        loader, registry, errors, sudo = make_loader(tmp_path, mode=SecurityMode.PERMISSIVE)
         meta_store, func_store = {}, {}
 
         admin_code = (
             "from notmyfault.security import sudo\n"
-            "def run(meta, params):\n"
+            "def run_with_context(meta, params, context):\n"
             "    return None\n"
         )
         write_plugin(
@@ -414,7 +438,7 @@ class TestLoadPlugins:
         public_bytes = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [public_bytes])
         loader, registry, errors, _sudo = make_loader(tmp_path, mode=mode)
-        source = "from helper import value\ndef run(meta, params): return value\n"
+        source = "from helper import value\ndef run_with_context(meta, params, context): return value\n"
         contributes = {"commands": [{"id": "value", "title": "读取", "handler": "command.py:read_value"}]}
         command_source = "from helper import value\ndef read_value(context, payload): return context.result(value)\n"
         old_folder = write_plugin(
@@ -424,12 +448,12 @@ class TestLoadPlugins:
         (old_folder / "command.py").write_text(command_source, encoding="utf-8")
         (old_folder / "helper.py").write_text("value = 1\n", encoding="utf-8")
         (old_folder / "version.txt").write_text("1", encoding="utf-8")
-        signing.sign_plugin(old_folder, "action.json", private_key=key)
+        signing.sign_plugin(old_folder, private_key=key)
 
         try:
             assert load_actions(loader, tmp_path / "builtin")[:2] == (1, 0)
             old_run = registry.resolve_action("plug_a")
-            assert old_run(registry.actions_meta["plug_a"], {}) == 1
+            assert old_run(registry.actions_meta["plug_a"], {}, {}) == 1
             old_meta = registry.actions_meta["plug_a"]
 
             new_folder = write_plugin(
@@ -440,7 +464,8 @@ class TestLoadPlugins:
             (new_folder / "helper.py").write_text("value = 2\n", encoding="utf-8")
             (new_folder / "command.py").write_text(command_source, encoding="utf-8")
             (new_folder / "version.txt").write_text("2", encoding="utf-8")
-            signing.sign_plugin(new_folder, "action.json", private_key=key)
+            signing.self_sign_plugin(new_folder, key)
+            signing.counter_sign_author_key(new_folder, key)
 
             loaded, failed, meta_store, _func_store = load_actions(
                 loader, tmp_path / "user", origin="user"
@@ -449,7 +474,7 @@ class TestLoadPlugins:
             if valid:
                 assert (loaded, failed) == (1, 0)
                 assert run is not old_run
-                assert run(meta_store["plug_a"], {}) == 2
+                assert run(meta_store["plug_a"], {}, {}) == 2
                 assert meta_store["plug_a"]["version_code"] == 2
                 assert meta_store["plug_a"]["origin"] == "user"
                 assert Path(registry.resource("plug_a", "version.txt")).read_text() == "2"
@@ -458,9 +483,9 @@ class TestLoadPlugins:
                 assert (loaded, failed) == (0, 1)
                 assert run is old_run
                 assert meta_store["plug_a"] is old_meta
-                assert run(meta_store["plug_a"], {}) == 1
+                assert run(meta_store["plug_a"], {}, {}) == 1
                 assert Path(registry.resource("plug_a", "version.txt")).read_text() == "1"
-                assert any("缺少 run() 函数" in msg for _, _, msg in errors)
+                assert any("缺少 run_with_context() 函数" in msg for _, _, msg in errors)
             session = ExtensionSession(
                 plugin_id="plug_a", command_id="value", plugin_meta=meta_store["plug_a"],
                 source_kind="parameter_editors", source_id="editor",
@@ -482,19 +507,19 @@ class TestLoadPlugins:
 class TestSecurityScanIntegration:
     def test_builtin_plugin_does_not_use_user_hash_cache(self, tmp_path):
         manifest_path = tmp_path / "manifest.json"
-        loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.NORMAL)
+        loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.PERMISSIVE)
         write_plugin(tmp_path / "actions", "good", make_meta(), CLEAN_RUN)
         loaded, failed, _, _ = load_actions(loader, tmp_path)
         # builtin 插件依赖构建签名，不写入用户哈希清单
         assert (loaded, failed) == (1, 0)
         assert not manifest_path.exists()
 
-    def test_event_v1_trigger_with_wrong_signature_is_rejected(self, tmp_path):
+    def test_trigger_with_wrong_entry_signature_is_rejected(self, tmp_path):
         loader, registry, errors, _ = make_loader(tmp_path)
         code = "def run(meta, config):\n    pass\n"
         write_plugin(
             tmp_path / "triggers", "badapi",
-            make_meta("badapi", trigger_api="event-v1"),
+            make_meta("badapi", trigger_api="event-v2"),
             code, json_name="trigger.json", py_name="trigger.py",
         )
         loaded, failed, meta_store, func_store = load_triggers(loader, tmp_path)
@@ -502,11 +527,11 @@ class TestSecurityScanIntegration:
         assert registry.resolve_trigger("badapi") is None
         assert "badapi" not in func_store
         assert "badapi" not in meta_store
-        assert any("event-v1 入口不兼容" in msg for _, _, msg in errors)
+        assert any("触发器入口参数不符" in msg for _, _, msg in errors)
 
     def test_permissive_warns_but_loads(self, tmp_path, capsys):
         loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.PERMISSIVE)
-        code = "import subprocess\ndef run(meta, params):\n    return None\n"
+        code = "import subprocess\ndef run_with_context(meta, params, context):\n    return None\n"
         write_plugin(tmp_path / "actions", "wild", make_meta("wild"), code)
         loaded, failed, _, _ = load_actions(loader, tmp_path)
         assert (loaded, failed) == (1, 0)
@@ -514,7 +539,7 @@ class TestSecurityScanIntegration:
 
     def test_strict_allows_declared_subprocess(self, tmp_path, monkeypatch):
         loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
-        code = "import subprocess\ndef run(meta, params):\n    return None\n"
+        code = "import subprocess\ndef run_with_context(meta, params, context):\n    return None\n"
         folder = write_plugin(
             tmp_path / "actions", "declared",
             make_meta("declared", permissions=["external_binary"]), code,
@@ -528,7 +553,7 @@ class TestSecurityScanIntegration:
 
     def test_strict_rejects_undeclared_subprocess(self, tmp_path, monkeypatch):
         loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
-        code = "import subprocess\ndef run(meta, params):\n    return None\n"
+        code = "import subprocess\ndef run_with_context(meta, params, context):\n    return None\n"
         folder = write_plugin(tmp_path / "actions", "sneaky", make_meta("sneaky"), code)
         sign_with_test_key(folder, monkeypatch)
         loaded, failed, _, func_store = load_actions(loader, tmp_path)
@@ -552,7 +577,7 @@ class TestSecurityScanIntegration:
         code = (
             f"from pathlib import Path\n"
             f"Path(r'{marker}').write_text('x', encoding='utf-8')\n"
-            "def run(meta, params):\n"
+            "def run_with_context(meta, params, context):\n"
             "    return None\n"
         )
         folder = write_plugin(tmp_path / "actions", "tampered", make_meta("tampered"), code)
@@ -563,82 +588,6 @@ class TestSecurityScanIntegration:
         assert not marker.exists()
         assert any("签名无效" in msg for _, _, msg in errors)
 
-    def test_strict_loads_user_plugin_signed_by_legacy_local_key(
-        self, tmp_path, monkeypatch
-    ):
-        loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
-        folder = write_plugin(tmp_path / "actions", "legacy", make_meta("legacy"), CLEAN_RUN)
-        sign_with_test_key(folder, monkeypatch)
-        # 旧格式签名只有 signature.sig，目录里没有 public_key.pem
-        assert not (folder / "public_key.pem").exists()
-        loaded, failed, meta_store, _ = load_actions(loader, tmp_path, origin="user")
-        assert (loaded, failed) == (1, 0)
-        assert meta_store["legacy"]["signature_kind"] == "official-legacy"
-        run = registry.resolve_action("legacy")
-        assert run is not None
-        assert run(meta_store["legacy"], {}) is None
-
-    def test_strict_migrates_old_payload_with_existing_integrity_record(
-        self, tmp_path, monkeypatch
-    ):
-        from notmyfault.security.plugin_loader import inspect_plugin_tree
-
-        loader, _registry, errors, _sudo = make_loader(
-            tmp_path,
-            mode=SecurityMode.STRICT,
-        )
-        folder = write_plugin(
-            tmp_path / "actions",
-            "oldpayload",
-            make_meta("oldpayload"),
-            "def run(meta, params):\n    return {'value': params['value']}\n",
-        )
-        sign_with_old_payload(folder, monkeypatch)
-        tree = inspect_plugin_tree(str(folder))
-        assert tree is not None
-        (tmp_path / "manifest.json").write_text(
-            json.dumps({"oldpayload": tree.file_snapshot}),
-            encoding="utf-8",
-        )
-
-        loaded, failed, meta_store, func_store = load_actions(
-            loader,
-            tmp_path,
-            origin="user",
-        )
-
-        assert (loaded, failed) == (1, 0)
-        assert meta_store["oldpayload"]["signature_kind"] == "official-legacy"
-        assert errors == []
-        assert loader.materialize_pending_action("oldpayload") is not None
-        assert func_store["oldpayload"](meta_store["oldpayload"], {"value": 7}) == {
-            "value": 7
-        }
-
-    def test_strict_rejects_old_payload_without_existing_integrity_record(
-        self, tmp_path, monkeypatch
-    ):
-        loader, _registry, errors, _sudo = make_loader(
-            tmp_path,
-            mode=SecurityMode.STRICT,
-        )
-        folder = write_plugin(
-            tmp_path / "actions",
-            "oldpayload",
-            make_meta("oldpayload"),
-            CLEAN_RUN,
-        )
-        sign_with_old_payload(folder, monkeypatch)
-
-        loaded, failed, _, _ = load_actions(
-            loader,
-            tmp_path,
-            origin="user",
-        )
-
-        assert (loaded, failed) == (0, 1)
-        assert any("签名无效" in message for _, _, message in errors)
-
     def test_strict_rejects_self_signed_admin_plugin(self, tmp_path):
         from cryptography.hazmat.primitives.asymmetric import ed25519
         from notmyfault.security import signing
@@ -646,7 +595,7 @@ class TestSecurityScanIntegration:
         loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
         admin_code = (
             "from notmyfault.security.sudo import run_as_admin\n"
-            "def run(meta, params):\n"
+            "def run_with_context(meta, params, context):\n"
             "    return None\n"
         )
         folder = write_plugin(
@@ -659,11 +608,11 @@ class TestSecurityScanIntegration:
         assert (loaded, failed) == (0, 1)
         assert any("未使用官方签名" in msg for _, _, msg in errors)
 
-    def test_strict_rejects_legacy_signed_user_admin_plugin(self, tmp_path, monkeypatch):
+    def test_strict_rejects_user_admin_plugin_without_official_signature(self, tmp_path, monkeypatch):
         loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
         admin_code = (
             "from notmyfault.security.sudo import run_as_admin\n"
-            "def run(meta, params):\n"
+            "def run_with_context(meta, params, context):\n"
             "    return None\n"
         )
         folder = write_plugin(
@@ -679,7 +628,7 @@ class TestSecurityScanIntegration:
         loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.STRICT)
         admin_code = (
             "from notmyfault.security.sudo import run_as_admin\n"
-            "def run(meta, params):\n"
+            "def run_with_context(meta, params, context):\n"
             "    return None\n"
         )
         folder = write_plugin(
@@ -702,7 +651,7 @@ class TestSecurityScanIntegration:
         loaded, failed, _, _ = load_actions(loader, tmp_path, origin="user")
         assert (loaded, failed) == (1, 0)
         (folder / "action.py").write_text(
-            "def run(meta, params):\n    return {'value': 2}\n",
+            "def run_with_context(meta, params, context):\n    return {'value': 2}\n",
             encoding="utf-8",
         )
         sign_with_test_key(folder, monkeypatch)
@@ -765,7 +714,7 @@ def test_plugins_keep_separate_verified_sibling_modules(tmp_path, monkeypatch, r
     prefix = "." if relative else ""
     for plugin_id, value in (("first", 1), ("second", 2)):
         folder = write_plugin(tmp_path / "actions", plugin_id, make_meta(plugin_id),
-                              f"def run(meta, params):\n    from {prefix}helper import VALUE\n    from {prefix}lib import nested\n    return VALUE, nested.VALUE\n")
+                              f"def run_with_context(meta, params, context):\n    from {prefix}helper import VALUE\n    from {prefix}lib import nested\n    return VALUE, nested.VALUE\n")
         (folder / "helper.py").write_text(f"VALUE = {value}\n", encoding="utf-8")
         (folder / "lib").mkdir()
         (folder / "lib" / "__init__.py").write_text("from . import nested\n", encoding="utf-8")
@@ -782,15 +731,23 @@ def test_plugins_keep_separate_verified_sibling_modules(tmp_path, monkeypatch, r
 
     monkeypatch.setattr(plugin_loader, "inspect_plugin_tree", inspect_then_change)
     try:
-        loader.materialize_pending_action("first")
-        loader.materialize_pending_action("second")
+        loader.materialize_pending("first")
+        loader.materialize_pending("second")
         assert errors == []
-        assert funcs["first"]({}, {}) == (1, 10)
-        assert funcs["second"]({}, {}) == (2, 20)
+        assert funcs["first"]({}, {}, {}) == (1, 10)
+        assert funcs["second"]({}, {}, {}) == (2, 20)
         assert registry.plugin_roots["first"] not in sys.path
         first_names = set(registry.importers["first"].modules)
         registry.unregister("action", "first")
         assert first_names.isdisjoint(sys.modules)
-        assert funcs["second"]({}, {}) == (2, 20)
+        assert funcs["second"]({}, {}, {}) == (2, 20)
     finally:
         registry.clear()
+
+
+def test_action_with_two_argument_context_entry_is_rejected(tmp_path):
+    loader, registry, errors, _ = make_loader(tmp_path, mode=SecurityMode.PERMISSIVE)
+    write_plugin(tmp_path / "actions", "plug_a", make_meta(), "def run_with_context(meta, params):\n    return None\n")
+    assert load_actions(loader, tmp_path)[:2] == (1, 0)
+    assert registry.resolve_action("plug_a") is None
+    assert any("动作入口参数不符" in message for _, _, message in errors)

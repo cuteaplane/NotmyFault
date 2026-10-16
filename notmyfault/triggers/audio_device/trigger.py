@@ -56,7 +56,6 @@ class AudioDeviceTrigger(PollingTrigger):
                 f"无效的设备类型: {device_type!r}（可选: render/capture/any）"
             )
         self.device_type = device_type
-        self._last_ids: dict[str, str] = {}
 
     def poll(self) -> None:
         devices = _query_default_devices()
@@ -66,20 +65,7 @@ class AudioDeviceTrigger(PollingTrigger):
             if self.device_type != "any" and self.device_type != flow:
                 continue
             current = devices.get(flow, "")
-            previous = self._last_ids.get(flow)
-            if previous is None:
-                # 第一轮只记录当前状态，不触发
-                self._last_ids[flow] = current
-                continue
-            if current != previous:
-                self.log(f"默认{flow}设备变化: {previous!r} -> {current!r}")
-                self.emit({
-                    "device_type": flow,
-                    "device_id": current,
-                    "previous_device_id": previous,
-                    "changed": True,
-                })
-                self._last_ids[flow] = current
+            self.emit({"device_type": flow, "device_id": current, "previous_device_id": current, "changed": True})
 
 
 def run(meta, config, emit_event, shutdown_event):

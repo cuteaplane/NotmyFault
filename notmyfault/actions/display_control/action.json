@@ -5,7 +5,7 @@
     "version_code": 3,
     "version": "1.2",
     "package_name": "io.github.notmyfault.display_control",
-    "enabled": true,
+    "execution_api": "context-v1",
     "idempotent": true,
     "platforms": ["windows", "linux"],
     "permissions": ["native_api", "external_binary"],

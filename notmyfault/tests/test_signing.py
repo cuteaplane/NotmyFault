@@ -129,7 +129,7 @@ class TestSignPlugin:
     def test_signs_and_writes_sig(self, tmp_path):
         (tmp_path / "action.json").write_text('{"id": "demo"}', encoding="utf-8")
         (tmp_path / "action.py").write_text("def run(params):\n    return True\n")
-        assert signing.sign_plugin(tmp_path, "action.json", private_key=make_key())
+        assert signing.sign_plugin(tmp_path, private_key=make_key())
         sig_file = tmp_path / "signature.sig"
         assert sig_file.exists()
         assert len(sig_file.read_bytes()) == 64
@@ -138,7 +138,7 @@ class TestSignPlugin:
         (tmp_path / "action.json").write_text('{"id": "demo"}', encoding="utf-8")
         (tmp_path / "action.py").write_text("VALUE = 1\n")
         key = make_key()
-        signing.sign_plugin(tmp_path, "action.json", private_key=key)
+        signing.sign_plugin(tmp_path, private_key=key)
 
         payload = signing.plugin_payload(tmp_path)
         digest = hashlib.sha256(payload).digest()
@@ -210,3 +210,78 @@ class TestKeyStatus:
         path.write_bytes(key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption()))
         monkeypatch.setattr(signing, "PRIVATE_KEY_FILE", path)
         assert signing.key_status() == {"exists": True, "encrypted": False}
+
+
+@pytest.mark.parametrize("mode,encrypted,allowed", [
+    ("strict", True, True), ("strict", False, False),
+    ("permissive", True, True), ("permissive", False, True),
+])
+def test_build_checks_existing_key_without_replacing_it(tmp_path, monkeypatch, mode, encrypted, allowed):
+    import build
+
+    key_path = tmp_path / "key.pem"
+    encryption = BestAvailableEncryption(b"test-password") if encrypted else NoEncryption()
+    original = make_key().private_bytes(Encoding.PEM, PrivateFormat.PKCS8, encryption)
+    key_path.write_bytes(original)
+    monkeypatch.setattr(build, "PRIVATE_KEY_FILE", key_path)
+    if allowed:
+        build._ensure_key_for_build(mode)
+    else:
+        with pytest.raises(SystemExit) as failure:
+            build._ensure_key_for_build(mode)
+        assert failure.value.code == 1
+    assert key_path.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [key_path]
+
+
+@pytest.mark.parametrize("mode", ["strict", "permissive"])
+def test_build_missing_key_does_not_generate_one(tmp_path, monkeypatch, mode):
+    import build
+
+    key_path = tmp_path / "key.pem"
+    monkeypatch.setattr(build, "PRIVATE_KEY_FILE", key_path)
+    with pytest.raises(SystemExit) as failure:
+        build._ensure_key_for_build(mode)
+    assert failure.value.code == 1
+    assert not key_path.exists()
+
+
+def test_build_rejects_normal_before_signing(monkeypatch):
+    import build
+
+    monkeypatch.setattr(build, "cmd_sign", lambda args: pytest.fail("unexpected signing"))
+    with pytest.raises(SystemExit) as failure:
+        build.cmd_build({"security_mode": "normal"})
+    assert failure.value.code == 1
+
+
+def test_plugin_signature_rejects_removed_local_signature_fallback(tmp_path, monkeypatch):
+    from notmyfault.security import plugins, signing_keys
+
+    (tmp_path / "action.json").write_text('{"id":"demo"}', encoding="utf-8")
+    (tmp_path / "action.py").write_text('VALUE = 1\n', encoding="utf-8")
+    key = make_key()
+    monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [
+        key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    ])
+    signing.sign_plugin(tmp_path, private_key=key)
+    assert plugins.plugin_signature_kind(str(tmp_path), "builtin") == "official"
+    assert plugins.plugin_signature_kind(str(tmp_path), "user") == "none"
+    signing.self_sign_plugin(tmp_path, key)
+    assert plugins.plugin_signature_kind(str(tmp_path), "user") == "author"
+    old_payload = b"".join(path.read_bytes() for path in signing.plugin_files(tmp_path))
+    (tmp_path / "signature.sig").write_bytes(key.sign(hashlib.sha256(old_payload).digest()))
+    assert plugins.plugin_signature_kind(str(tmp_path), "user") == "none"
+
+
+def test_build_force_does_not_replace_existing_key(tmp_path, monkeypatch):
+    import build
+
+    key_path = tmp_path / "key.pem"
+    original = make_key().private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+    key_path.write_bytes(original)
+    monkeypatch.setattr(build, "PRIVATE_KEY_FILE", key_path)
+    with pytest.raises(SystemExit) as failure:
+        build._ensure_key_for_build("permissive", force=True)
+    assert failure.value.code == 1
+    assert key_path.read_bytes() == original

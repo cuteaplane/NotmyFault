@@ -5,7 +5,7 @@ Windows 用 SendInput；Linux 走 InputBackend（xdotool 或 ydotool）
 import os
 import subprocess
 
-from notmyfault.plugin_api import native_lock, platform_services
+from notmyfault.plugin_api import native_lock, platform_services, action_values
 
 NATIVE_LOCK = native_lock()
 
@@ -177,7 +177,8 @@ if os.name == "nt":
         _send(inputs)
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
+    params = action_values(params)
     mode = params.get("mode", "type_text")
     if os.name == "nt":
         with NATIVE_LOCK:

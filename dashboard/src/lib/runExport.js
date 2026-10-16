@@ -33,11 +33,32 @@ function safeSummary(summary) {
   })
 }
 
+function safeEvaluations(values) {
+  if (!Array.isArray(values)) return []
+  const resultFields = value => typeof value?.result === 'boolean'
+    ? { result: value.result }
+    : value?.error?.code ? { error: { code: text(value.error.code, 100) } } : {}
+  return values.slice(0, 100).filter(value => value && typeof value === 'object').map(value => ({
+    branch_id: text(value.branch_id, 100),
+    ...resultFields(value),
+    predicates: Array.isArray(value.predicates) ? value.predicates.slice(0, 500).filter(item => item && typeof item === 'object').map(item => ({
+      ...(item.node_id ? { node_id: text(item.node_id, 100) } : {}),
+      path: text(item.path, 300),
+      op: text(item.op, 40),
+      ...resultFields(item),
+    })) : [],
+  }))
+}
+
 function safeStep(step) {
   return {
     step_id: text(step?.step_id, 100),
     action_type: text(step?.action_type, 100),
     status: text(step?.status, 30),
+    recovery: step?.recovery ? { group_id: text(step.recovery.group_id, 100), status: text(step.recovery.status, 30), updated_at: numberOr(step.recovery.updated_at), error: safeError(step.recovery.error) } : null,
+    branch: text(step?.branch, 100),
+    evaluated_branches: safeEvaluations(step?.evaluated_branches),
+    group_path: Array.isArray(step?.group_path) ? step.group_path.slice(0, 32).map(id => text(id, 100)) : [],
     finished_at: numberOr(step?.finished_at),
     duration_ms: numberOr(step?.duration_ms),
     attempt: numberOr(step?.attempt),

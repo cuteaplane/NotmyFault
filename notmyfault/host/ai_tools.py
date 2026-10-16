@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Mapping, Sequence, TypeAlias
+from notmyfault.host.ai_graph_schema import workflow_draft_schema
 
 JSON: TypeAlias = Mapping[str, "JSON"] | Sequence["JSON"] | str | int | float | bool | None
 
@@ -55,14 +56,18 @@ _NODE_SCHEMA: JSON = {
     "additionalProperties": False,
 }
 
+_WORKFLOW_SCHEMA, _WORKFLOW_DEFINITIONS = workflow_draft_schema()
 _RULE_DRAFT_PARAMETERS: JSON = {
     "type": "object",
     "properties": {
         "name": {"type": "string"},
-        "condition": _NODE_SCHEMA,
-        "actions": {"type": "array", "items": _NODE_SCHEMA},
+        "workflow": _WORKFLOW_SCHEMA,
+        "constants": {"type": "array", "items": {"type": "object"}},
+        "variables": {"type": "array", "items": {"type": "object"}},
+        "concurrency": {"type": "object"},
     },
-    "required": ["name", "condition", "actions"],
+    "required": ["name", "workflow"],
+    "$defs": _WORKFLOW_DEFINITIONS,
     "additionalProperties": False,
 }
 

@@ -117,7 +117,7 @@ class PluginInteractionService:
                         )
                     elif isinstance(current_value, dict) and "$type" in current_value:
                         raise OwnedValueError("插件数据的归属信息无效")
-                    elif source.get("accepts_legacy") is not True:
+                    else:
                         raise OwnedValueError("当前值不是该插件声明的数据")
                 except OwnedValueError as error:
                     self._fail(400, str(error))

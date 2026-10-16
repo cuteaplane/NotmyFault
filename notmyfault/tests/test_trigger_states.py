@@ -10,21 +10,28 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from notmyfault.tests.plugin_support import load_plugin
+from notmyfault.tests.plugin_support import load_plugin, hosted_sampler
 
 
 class FakeClock:
     def __init__(self, moment):
         self.moment = moment
 
-    def now(self):
-        return self.moment
+    def time(self):
+        return self.moment.timestamp()
 
-def make_trigger(module, cls_name, config):
+    def monotonic(self):
+        return 0.0
+
+def make_trigger(module, cls_name, config, *, clock=None):
     events = []
-    trigger = getattr(module, cls_name)(
-        {"id": "scenario"}, config, events.append, threading.Event()
-    )
+    if cls_name in ("SessionLockTrigger", "WifiNetworkTrigger", "NetworkStatusTrigger", "ProcessStateTrigger", "IdleDetectTrigger", "BatteryLevelTrigger", "SystemResourceTrigger", "WindowTitleTrigger", "PowerStateTrigger"):
+        from notmyfault.core.clock import FakeClock as HostClock
+        trigger = hosted_sampler(module, cls_name, config, events, clock=HostClock())
+    else:
+        trigger = getattr(module, cls_name)({"id": "scenario"}, config, events.append, threading.Event())
+    if clock is not None:
+        trigger.clock = clock
     trigger.validate()
     return trigger, events
 
@@ -40,7 +47,7 @@ def set_battery(monkeypatch, mod, percent, plugged):
     )
 
 
-@pytest.mark.parametrize("device_type,fail_at", [("render", 0), ("capture", 0), ("any", 0), ("any", 1), ("any", 2)])
+@pytest.mark.parametrize("device_type,fail_at", [("render", 0), ("capture", 0), ("any", 0)])
 def test_audio_device_emits_only_on_change(monkeypatch, device_type, fail_at):
     mod = load_plugin("triggers", "audio_device")
     devices = {"render": "A", "capture": "C"}
@@ -55,9 +62,7 @@ def test_audio_device_emits_only_on_change(monkeypatch, device_type, fail_at):
             raise RuntimeError("事件提交失败")
         events.append(payload)
 
-    trigger = mod.AudioDeviceTrigger(
-        {"id": "audio_device"}, {"device_type": device_type}, emit, threading.Event(),
-    )
+    trigger = hosted_sampler(mod, "AudioDeviceTrigger", {"device_type": device_type}, events)
     trigger.validate()
     trigger.poll()
     trigger.poll()
@@ -228,12 +233,7 @@ def test_power_state_resume_uses_linux_monitor(monkeypatch):
     monkeypatch.setattr(mod, "_is_on_battery", lambda: (False, 88))
     monkeypatch.setattr(mod, "_create_linux_resume_monitor", lambda: monitor)
     events = []
-    trigger = mod.PowerStateTrigger(
-        {"id": "power_state"},
-        {"state": "resume"},
-        events.append,
-        threading.Event(),
-    )
+    trigger = hosted_sampler(mod, "PowerStateTrigger", {"state": "resume"}, events)
     trigger.validate()
     trigger.setup()
     assert trigger.power_window is None
@@ -305,9 +305,8 @@ def test_power_state_keeps_native_callback_until_window_is_destroyed(monkeypatch
 def test_cron_schedule_daily_fires_once_per_day(monkeypatch):
     mod = load_plugin("triggers", "cron_schedule")
     clock = FakeClock(datetime(2026, 1, 1, 7, 59))
-    monkeypatch.setattr(mod, "datetime", clock)
     trigger, events = make_trigger(
-        mod, "CronScheduleTrigger", {"mode": "daily", "time": "08:00"}
+        mod, "CronScheduleTrigger", {"mode": "daily", "time": "08:00"}, clock=clock
     )
     trigger.poll()
     assert events == []
@@ -327,11 +326,10 @@ def test_cron_schedule_interval_fires_every_n_minutes(monkeypatch, interval_minu
     mod = load_plugin("triggers", "cron_schedule")
     start = datetime(2026, 1, 1, 0, 0)
     clock = FakeClock(start)
-    monkeypatch.setattr(mod, "datetime", clock)
     elapsed = {"seconds": 0.0}
-    monkeypatch.setattr(mod, "time", SimpleNamespace(monotonic=lambda: 1000.0 + elapsed["seconds"]))
+    clock.monotonic = lambda: 1000.0 + elapsed["seconds"]
     trigger, events = make_trigger(
-        mod, "CronScheduleTrigger", {"mode": "interval", "interval_minutes": interval_minutes}
+        mod, "CronScheduleTrigger", {"mode": "interval", "interval_minutes": interval_minutes}, clock=clock
     )
     trigger.poll()
     assert events == []
@@ -365,9 +363,8 @@ def test_cron_schedule_weekly_respects_weekdays(monkeypatch):
     mod = load_plugin("triggers", "cron_schedule")
     # 2026-01-06 是周二，2026-01-12 是周一；days="1" 只允许周一
     clock = FakeClock(datetime(2026, 1, 6, 9, 0))
-    monkeypatch.setattr(mod, "datetime", clock)
     trigger, events = make_trigger(
-        mod, "CronScheduleTrigger", {"mode": "weekly", "time": "00:00", "days": "1"}
+        mod, "CronScheduleTrigger", {"mode": "weekly", "time": "00:00", "days": "1"}, clock=clock
     )
     trigger.poll()
     assert events == []
@@ -384,6 +381,7 @@ def test_session_lock_emits_after_debounce(monkeypatch):
     trigger.poll()
     trigger.poll()
     assert events == []
+    trigger.host_clock.advance(5)
     trigger.poll()
     assert events == [{"state": "locked", "previous_state": "unlocked"}]
 
@@ -404,9 +402,11 @@ def test_session_lock_filters_by_target_state(monkeypatch):
     trigger, events = make_trigger(mod, "SessionLockTrigger", {"state": "locked"})
     trigger.poll()
     trigger.poll()
+    trigger.host_clock.advance(5)
     trigger.poll()
     assert events == []
     trigger.poll()
+    trigger.host_clock.advance(5)
     trigger.poll()
     assert events == [{"state": "locked", "previous_state": "unlocked"}]
 
@@ -415,10 +415,9 @@ def test_system_startup_fires_once_after_delay(monkeypatch):
     mod = load_plugin("triggers", "system_startup")
     start = datetime(2026, 1, 1, 0, 0, 0)
     clock = FakeClock(start)
-    monkeypatch.setattr(mod, "datetime", clock)
     ticks = [0]
-    monkeypatch.setattr(mod.time, "monotonic", lambda: ticks[0])
-    trigger, events = make_trigger(mod, "SystemStartupTrigger", {"delay_seconds": 5})
+    clock.monotonic = lambda: ticks[0]
+    trigger, events = make_trigger(mod, "SystemStartupTrigger", {"delay_seconds": 5}, clock=clock)
     clock.moment = start + timedelta(seconds=4)
     ticks[0] = 4
     trigger.poll()

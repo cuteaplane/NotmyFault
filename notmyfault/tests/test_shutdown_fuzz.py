@@ -2,33 +2,29 @@ import threading
 import time
 from types import SimpleNamespace
 
+from notmyfault.core.clock import FakeClock
 from notmyfault.tests.api_support import create_test_engine
+from notmyfault.tests.canvas_fixtures import trigger_rule
 from notmyfault.core.workflow import build_context
 
 
-def make_engine():
-    engine = create_test_engine({"rules": []})
+def make_engine(**kwargs):
+    engine = create_test_engine({"rules": []}, **kwargs)
     engine._alert_user = lambda *a, **k: None
     return engine
 
 
 def shorten_timeouts(engine, seconds=0.5):
-    supervisor_stop = engine._trigger_supervisor.stop
+    supervisor_stop = engine._trigger_host.stop
     engine._stop_trigger_threads = lambda timeout=30: supervisor_stop(seconds)
     wait_actions = engine._workflow_executor.wait_active_actions
     engine._wait_active_actions = lambda timeout=60: wait_actions(seconds)
 
 
 def start_trigger(engine, trigger_id, runner):
-    def run_trigger_cb(instance_id, event_type, func, meta, config, stop_event):
-        runner(stop_event)
-
-    engine._trigger_supervisor.start(
-        {trigger_id: [{}]},
-        {trigger_id: lambda meta, config, emit, stop: None},
-        {trigger_id: {}},
-        run_trigger_cb,
-    )
+    engine.triggers_funcs[trigger_id] = lambda meta, config, emit, stop: runner(stop)
+    engine.triggers_meta[trigger_id] = {"trigger_api": "event-v2"}
+    engine._generations.apply([trigger_rule("r_fuzz0001", "停止测试", trigger_id)], "test", validate=False)
 
 
 class TestShutdownFuzz:
@@ -50,17 +46,41 @@ class TestShutdownFuzz:
         assert engine._shutdown_clean is True
 
     def test_shutdown_with_stuck_trigger(self):
-        engine = make_engine()
+        clock = FakeClock()
+        engine = make_engine(clock=clock)
         shorten_timeouts(engine)
         stuck = threading.Event()
+        entered = threading.Event()
 
         def runner(stop_event):
+            entered.set()
             stuck.wait(timeout=10)
 
         start_trigger(engine, "fuzz_stuck", runner)
-        engine.shutdown()
-        stuck.set()
-        assert engine._shutdown_clean is False
+        assert entered.wait(1)
+        finished = threading.Event()
+        errors = []
+
+        def stop():
+            try:
+                engine.shutdown()
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                finished.set()
+
+        stopper = threading.Thread(target=stop, daemon=True)
+        stopper.start()
+        try:
+            assert finished.wait(2)
+            if errors:
+                raise errors[0]
+            assert engine._shutdown_clean is False
+        finally:
+            stuck.set()
+            clock.advance(60)
+            stopper.join(timeout=5)
+            engine.shutdown()
 
     def test_shutdown_with_stuck_action(self):
         engine = make_engine()
@@ -70,7 +90,7 @@ class TestShutdownFuzz:
         teardown = []
         engine._plugin_modules["fuzz_slow"] = SimpleNamespace(teardown=lambda: teardown.append(True))
 
-        def slow_action(meta, params):
+        def slow_action(meta, params, context):
             entered.set()
             release.wait(timeout=10)
 

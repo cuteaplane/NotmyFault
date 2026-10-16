@@ -1,6 +1,43 @@
 # NotmyFault 更新日志
 
-## alpha-0.15.0（待发布）
+## alpha-0.16.0
+
+本版本按现行结构、编码、协议和签名校验数据。规则使用 v2.1 平面图，不提供旧结构转换。
+
+### 删除
+
+- 安全模式 `normal`，以及 `NOTMYFAULT_MODE` 的 `dev`、`develop` 取值。
+- 规则编辑器的普通模式。
+- 规则顶层 condition／event／trigger／actions／preconditions，以及 then／elif／else 和 failure_actions 动作数组。
+- 内部条件树和顺序动作数组执行入口；匹配、执行和补救使用原生平面图。
+- 条件组的 events 与 type: "and"／type: "or"；动作 id 与 `steps.<id>` 引用。
+- `{{ path }}` 文本模板。
+- `config.json` 中的 `rules`、`processes`；没有 `value_encoding` 的 `rules.json`。
+- 显示器控制的 `low_brightness`、`high_brightness` 操作。
+- 动作两参数入口 `run(action_info, params)`、`execution_api: "legacy"`、`precondition_api`。
+- 触发器 `event-v1` 与 `trigger_api: "legacy"`。
+- 类型别名 `integer`、`boolean`、`list`；数组输出的 `item_type`；参数编辑器的 `accepts_legacy`。
+- 签名结果 `official-legacy` 与旧摘要格式；插件元数据的 `signature_source`、`signature_format`；`inspection_report` 的 `signature` 键；`sign_plugin` 的 `json_name` 参数。
+- 用户插件清单 `enabled: false` 到 `disabled_plugins` 的转换；配置目录根部 `engine.log` 的清理。
+- 安装器对无安装标记目录和 `installer-build.json` 的识别。
+- file_info.modified_at 输出；数据文档使用 modified_time。
+
+### 变更
+
+- 动作清单必须声明 `execution_api: "context-v1"`，触发器清单必须声明 `trigger_api: "event-v2"`。
+- 规则顶层出现未列出的字段时校验不通过。
+- 补救动作通过失败连线进入图，完成后按停止／继续设置返回；被处理的失败保留步骤错误，流程完成时运行可以成功。
+- 运行结束状态增加 recovered（已补救），对应 `run.recovered` 通知；原动作选择“停止”时补救成功即以 recovered 结束。
+- 规则结束触发器的状态筛选增加“已补救”，any 包含该状态；默认不归入“仅成功”或“仅失败”。Dashboard 单独显示和计数已补救运行，自动化状态选择器可判断最近一次已补救。
+- 版本更新为 alpha-0.16.0。
+
+### 修复
+
+- 从已有流程节点新增卡片时，按节点布局计算位置并移动后方节点及其组内节点，修正卡片重叠。
+- 规则测试显示事件组的等待状态；运行结束后清除长时间等待和停止中的提示。
+- 规则测试取消或超时后，用已停止或已超时的卡片替换同一步骤的等待卡片。
+
+## alpha-0.15.0
 
 ### chore(deps): 固定运行与测试依赖版本
 

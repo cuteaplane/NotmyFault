@@ -5,14 +5,16 @@ from __future__ import annotations
 import threading
 import time
 import traceback
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from notmyfault.core.logging import engine_error, engine_info
+from notmyfault.core.event_stream import Event, EventStream
 
 
 EngineFactory = Callable[..., Any]
-EventSink = Callable[[str, dict[str, Any]], None]
+EventSink = Callable[[Event], None]
 StateListener = Callable[[str], None]
 FailureListener = Callable[[Exception], None]
 
@@ -46,6 +48,10 @@ class RuntimeController:
         self._failure_listener = failure_listener
         self._state_listeners: list[StateListener] = []
         self._lifecycle_lock = threading.RLock()
+        self._state_notifications = deque()
+        self._notifying = False
+        self._starting = False
+        self._startup_cancelled = False
 
         self._state = "stopped"
         self._shutdown_event = threading.Event()
@@ -98,73 +104,85 @@ class RuntimeController:
             if listener not in self._state_listeners:
                 self._state_listeners.append(listener)
 
-    def _set_state(self, state: str) -> None:
-        with self._lifecycle_lock:
-            if self._state == state:
-                return
+    def _set_state_locked(self, state: str) -> None:
+        if self._state != state:
             self._state = state
-            listeners = tuple(self._state_listeners)
-        engine_info(f"引擎状态：{state}")
-        for listener in listeners:
-            try:
-                listener(state)
-            except Exception:
-                traceback.print_exc()
+            self._state_notifications.append((state, tuple(self._state_listeners)))
 
-    def _emit_event(self, event_type: str, data: dict[str, Any]) -> None:
+    def _notify_states(self) -> None:
+        with self._lifecycle_lock:
+            if self._notifying:
+                return
+            self._notifying = True
+        while True:
+            with self._lifecycle_lock:
+                if not self._state_notifications:
+                    self._notifying = False
+                    return
+                state, listeners = self._state_notifications.popleft()
+            engine_info(f"引擎状态：{state}")
+            for listener in listeners:
+                try:
+                    listener(state)
+                except Exception:
+                    traceback.print_exc()
+
+    def _emit_event(self, event: Event) -> None:
         with self._lifecycle_lock:
             sink = self._event_sink
         if sink is not None:
-            sink(event_type, data)
+            sink(event)
 
     def start(self) -> bool:
         """创建并启动新一代引擎，已有线程运行时返回 False"""
         with self._lifecycle_lock:
             thread = self._engine_thread
-            if self._state in ("running", "starting"):
+            if self._starting or self._state in ("running", "starting"):
                 print("[Engine] 引擎已在运行或正在启动")
                 return False
             if thread is not None and thread.is_alive():
                 print(f"[Engine] 引擎当前处于 {self._state}，拒绝重复启动")
                 return False
-            if self._current_engine is not None:
-                # 上一代线程退出时没收干净，先让它再收一次尾：卡住的动作可能已经结束，
-                # 插件 teardown 跑完才不会和这一代共用热键、事件订阅这些全局资源
+            self._starting = True
+            self._startup_cancelled = False
+            previous = self._current_engine
+        try:
+            if previous is not None:
                 print("[Engine] 上一代引擎仍有未退出的触发器或动作，先尝试收尾")
                 try:
-                    self._current_engine.shutdown(timeout=_STALE_CLEANUP_TIMEOUT)
+                    previous.shutdown(timeout=_STALE_CLEANUP_TIMEOUT)
                 except Exception as exc:
-                    engine_error(
-                        "engine_stale_cleanup_failed",
-                        reason=str(exc),
-                        error_type=type(exc).__name__,
-                    )
+                    engine_error("engine_stale_cleanup_failed", reason=str(exc), error_type=type(exc).__name__)
+                if not getattr(previous, "_shutdown_clean", True):
+                    return False
+            with self._lifecycle_lock:
                 self._current_engine = None
-
-            self._shutdown_event = threading.Event()
-            self._generation += 1
-            generation = self._generation
-            self._last_error = None
-            thread = threading.Thread(
-                target=self._run_generation,
-                args=(generation, self._shutdown_event),
-                name=f"Engine-Core-{generation}",
-                daemon=False,
-            )
-            self._engine_thread = thread
-            self._set_state("starting")
-            try:
-                thread.start()
-            except Exception as exc:
-                self._engine_thread = None
-                self._set_state("stopped")
-                engine_error(
-                    "engine_start_failed",
-                    reason=str(exc),
-                    error_type=type(exc).__name__,
+                self._shutdown_event = threading.Event()
+                if self._startup_cancelled:
+                    self._shutdown_event.set()
+                self._generation += 1
+                generation = self._generation
+                self._last_error = None
+                thread = threading.Thread(
+                    target=self._run_generation,
+                    args=(generation, self._shutdown_event),
+                    name=f"Engine-Core-{generation}",
+                    daemon=False,
                 )
-                raise
+                self._engine_thread = thread
+                self._set_state_locked("stopping" if self._startup_cancelled else "starting")
+                try:
+                    thread.start()
+                except Exception as exc:
+                    self._engine_thread = None
+                    self._set_state_locked("stopped")
+                    engine_error("engine_start_failed", reason=str(exc), error_type=type(exc).__name__)
+                    raise
             return True
+        finally:
+            with self._lifecycle_lock:
+                self._starting = False
+            self._notify_states()
 
     def _run_generation(
         self,
@@ -177,7 +195,8 @@ class RuntimeController:
                 if generation != self._generation:
                     return
                 self._current_engine = engine
-                self._set_state("stopping" if shutdown_event.is_set() else "running")
+                self._set_state_locked("stopping" if shutdown_event.is_set() else "running")
+            self._notify_states()
             engine.start(shutdown_event=shutdown_event)
         except KeyboardInterrupt:
             pass
@@ -191,7 +210,11 @@ class RuntimeController:
             )
             print(f"[Engine] 引擎错误: {exc}")
             traceback.print_exc()
-            self._emit_event("error", {"error": str(exc)})
+            stream = EventStream()
+            stream.subscribe(self._emit_event)
+            stream.publish("engine.failed", {"error": {"code": "engine_start_failed", "message": str(exc)}})
+            stream.flush()
+            stream.close()
             if self._failure_listener is not None:
                 try:
                     self._failure_listener(exc)
@@ -207,18 +230,21 @@ class RuntimeController:
                     else:
                         # 线程已经结束，收不干净的原因记在 last_error 里给界面看，状态回到 stopped
                         self._last_error = "引擎仍有未退出的触发器或动作"
-            if is_current_generation:
-                self._set_state("stopped")
+                    self._set_state_locked("stopped")
+            self._notify_states()
 
     def request_stop(self) -> bool:
         """发出停止信号并返回当前是否存在运行线程"""
         with self._lifecycle_lock:
+            if self._starting:
+                self._startup_cancelled = True
             thread = self._engine_thread
             alive = bool(thread and thread.is_alive())
             if alive:
-                self._set_state("stopping")
+                self._set_state_locked("stopping")
             shutdown_event = self._shutdown_event
             shutdown_event.set()
+        self._notify_states()
         return alive
 
     def stop(self, timeout: float = 5.0) -> bool:
@@ -229,6 +255,8 @@ class RuntimeController:
         with self._lifecycle_lock:
             thread = self._engine_thread
             generation = self._generation
+            if self._starting and (thread is None or not thread.is_alive()):
+                return False
         if thread is not None and thread.is_alive():
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
             if thread.is_alive():
@@ -245,5 +273,6 @@ class RuntimeController:
                 return False
             if self._current_engine is engine:
                 self._current_engine = None
-            self._set_state("stopped")
+            self._set_state_locked("stopped")
+        self._notify_states()
         return True

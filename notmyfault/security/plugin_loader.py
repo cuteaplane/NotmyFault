@@ -1,6 +1,8 @@
 """插件校验后再导入，使用调用方传入的注册表、诊断对象和提权模块。"""
 
 import inspect
+import hashlib
+import json
 import os
 import sys
 import threading
@@ -17,11 +19,9 @@ from notmyfault.security.plugin_checks import (
     evaluate_plugin,
     inspect_plugin,
     inspect_plugin_tree,
-    inspect_signature,
     is_plugin_platform_compatible,
     plugin_directories,
     resolve_plugin_entrypoint,
-    validate_plugin_signature,
 )
 from notmyfault.security.plugins import (
     load_plugin_manifest,
@@ -56,6 +56,7 @@ class PluginRegistry:
         self.actions_funcs: Dict[str, Callable[..., Any]] = {}
         # 模块表按 plugin id 存储模块，trigger 和 action 不能使用同一个 id。
         self.modules: Dict[str, Any] = {}
+        self.source_digests: Dict[str, str] = {}
         # 已发现但还没导入的动作插件，第一次执行时才导入。
         self.pending: Dict[str, Dict[str, Any]] = {}
         # 插件根目录，plugin_resource 靠它定位插件自带的二进制和资源。
@@ -63,21 +64,17 @@ class PluginRegistry:
         self.plugin_kinds: Dict[str, PluginKind] = {}
         self.extensions = ExtensionRegistry()
         self.importers: Dict[str, PluginImports] = {}
-        self._action_materializer: Optional[Callable[[str], Any]] = None
-        self._trigger_materializer: Optional[Callable[[str], Any]] = None
+        self._materializer: Optional[Callable[[str], Any]] = None
 
-    def set_action_materializer(self, callback: Callable[[str], Any]) -> None:
-        self._action_materializer = callback
-
-    def set_trigger_materializer(self, callback: Callable[[str], Any]) -> None:
-        self._trigger_materializer = callback
+    def set_materializer(self, callback: Callable[[str], Any]) -> None:
+        self._materializer = callback
 
     def resolve_action(self, plugin_id: str) -> Optional[Callable[..., Any]]:
         """返回动作入口函数，还没导入的插件在这里触发首次导入。"""
         run = self.actions_funcs.get(plugin_id)
         if run is not None:
             return run
-        materializer = self._action_materializer
+        materializer = self._materializer
         if materializer is None:
             return None
         materializer(plugin_id)
@@ -88,7 +85,7 @@ class PluginRegistry:
         run = self.triggers_funcs.get(plugin_id)
         if run is not None:
             return run
-        materializer = self._trigger_materializer
+        materializer = self._materializer
         if materializer is None:
             return None
         materializer(plugin_id)
@@ -114,12 +111,14 @@ class PluginRegistry:
         meta: Dict[str, Any],
         run: Callable[..., Any],
         module: Any,
+        *, source_digest: str = "",
     ) -> None:
         # 注册项必须同时保存元数据、入口函数和模块对象。
         meta_store, func_store = self.stores(kind)
         func_store[plugin_id] = run
         meta_store[plugin_id] = meta
         self.modules[plugin_id] = module
+        self.source_digests[plugin_id] = source_digest
         self.plugin_kinds[plugin_id] = kind
 
     def unregister(self, kind: PluginKind, plugin_id: str) -> None:
@@ -128,6 +127,7 @@ class PluginRegistry:
         func_store.pop(plugin_id, None)
         meta_store.pop(plugin_id, None)
         module = self.modules.pop(plugin_id, None)
+        self.source_digests.pop(plugin_id, None)
         if module is not None:
             sys.modules.pop(getattr(module, "__name__", ""), None)
         self.pending.pop(plugin_id, None)
@@ -147,6 +147,7 @@ class PluginRegistry:
         self.actions_meta.clear()
         self.actions_funcs.clear()
         self.modules.clear()
+        self.source_digests.clear()
         self.pending.clear()
         self.plugin_roots.clear()
         self.plugin_kinds.clear()
@@ -183,14 +184,14 @@ class PluginLoader:
         self._plugin_manifest_path = plugin_manifest_path
         # 多个工作流线程可能同时首次执行同一个懒加载动作。
         self._materialize_lock = threading.RLock()
-        registry.set_action_materializer(self.materialize_pending_action)
-        registry.set_trigger_materializer(self.materialize_pending_trigger)
+        registry.set_materializer(self.materialize_pending)
 
     def _restore_override(
         self,
         plugin_type: PluginKind,
         plugin_id: str,
         prev: Optional[Tuple[Any, Any, Any]],
+        source_digest: str = "",
     ) -> None:
         """覆盖加载失败时恢复旧插件。"""
         if not prev:
@@ -198,7 +199,7 @@ class PluginLoader:
         old_module, old_meta, old_run = prev
         if old_meta is None or old_run is None:
             return
-        self._registry.register(plugin_type, plugin_id, old_meta, old_run, old_module)
+        self._registry.register(plugin_type, plugin_id, old_meta, old_run, old_module, source_digest=source_digest)
 
     def load(
         self, base_dir: str, kind: PluginKind, origin: str = "builtin"
@@ -231,9 +232,6 @@ class PluginLoader:
                 decision = evaluate_plugin(inspection, self._security_mode)
                 failed_count += 1
                 reject(plugin_id, "; ".join(decision["errors"]))
-                continue
-            if origin == "builtin" and not meta["enabled"]:
-                print(f'[Engine] 插件 "{plugin_id}" 已禁用，跳过')
                 continue
             disabled = self._config.get("disabled_plugins", {})
             if isinstance(disabled, dict) and plugin_id in disabled.get(kind + "s", []):
@@ -277,8 +275,6 @@ class PluginLoader:
             meta_with_origin = {
                 **meta, "origin": origin,
                 "signature_kind": inspection.signature.kind,
-                "signature_source": inspection.signature.source,
-                "signature_format": inspection.signature.format,
             }
             self._registry.plugin_roots[plugin_id] = folder_path
             self._registry.plugin_kinds[plugin_id] = kind
@@ -292,7 +288,6 @@ class PluginLoader:
                 "previous_root": previous_root,
                 "file_snapshot": tree.file_snapshot,
                 "signature_kind": inspection.signature.kind,
-                "signature_format": inspection.signature.format,
                 "prev": (old_module, meta_store.get(plugin_id), old_run) if old_run is not None else None,
             }
             if old_run is not None:
@@ -308,15 +303,8 @@ class PluginLoader:
             print(f"[Engine] 装载{store_name} {loaded_count} 个: " + ", ".join(loaded_summaries))
         return loaded_count, failed_count
 
-    def materialize_pending_action(self, plugin_id: str) -> Optional[Any]:
-        """导入还没加载的动作插件，找不到对应条目时返回 None"""
-        entry = self._registry.pending.get(plugin_id)
-        if entry is None:
-            return None
-        return self.materialize_entry(entry)
-
-    def materialize_pending_trigger(self, plugin_id: str) -> Optional[Any]:
-        """导入还没加载的触发器插件，找不到对应条目时返回 None"""
+    def materialize_pending(self, plugin_id: str) -> Optional[Any]:
+        """导入还没加载的插件，找不到对应条目时返回 None"""
         entry = self._registry.pending.get(plugin_id)
         if entry is None:
             return None
@@ -339,6 +327,7 @@ class PluginLoader:
         previous_root = entry.get("previous_root")
 
         with self._materialize_lock:
+            previous_digest = self._registry.source_digests.get(plugin_id, "")
             if prev is None and plugin_id in func_store:
                 return func_store[plugin_id]
 
@@ -371,7 +360,7 @@ class PluginLoader:
                 self._registry.plugin_kinds.pop(plugin_id, None)
                 if prev is not None:
                     self._restore_override(
-                        plugin_type, plugin_id, prev
+                        plugin_type, plugin_id, prev, previous_digest
                     )
                     if previous_importer is not None:
                         self._registry.importers[plugin_id] = previous_importer
@@ -413,15 +402,9 @@ class PluginLoader:
             if tree is None:
                 fail("无法读取插件文件，拒绝导入")
                 return None
-            # 物化阶段必须使用与发现阶段相同的 payload 格式
-            signature_digest = (
-                tree.legacy_digest
-                if entry.get("signature_format") == "legacy"
-                else tree.payload_digest
-            )
             if (
                 plugin_signature_kind_from_digest(
-                    folder_path, origin, signature_digest
+                    folder_path, origin, tree.payload_digest
                 )
                 != expected_signature
             ):
@@ -448,21 +431,6 @@ class PluginLoader:
                 def isolated_run(
                     _meta,
                     params,
-                    _entry=py_file,
-                    _entry_hash=entry_hash,
-                    _info=meta,
-                ):
-                    ok, result = run_isolated_action(
-                        _entry, _entry_hash, _info, params, {},
-                        plugin_root=folder_path, file_snapshot=tree.file_snapshot,
-                    )
-                    if not ok:
-                        raise RuntimeError(f"isolated worker 执行失败: {result}")
-                    return result
-
-                def isolated_run_with_context(
-                    _meta,
-                    params,
                     context,
                     _entry=py_file,
                     _entry_hash=entry_hash,
@@ -476,7 +444,7 @@ class PluginLoader:
                         raise RuntimeError(f"isolated worker 执行失败: {result}")
                     return result
 
-                setattr(isolated_run, "run_with_context", isolated_run_with_context)
+                setattr(isolated_run, "_isolated_proxy", True)
 
                 def check_isolated_load():
                     ok, result = run_isolated_action(
@@ -520,7 +488,7 @@ class PluginLoader:
                     self._sudo.deauthorize_plugin(plugin_id, self._engine_token)
                 if previous_importer is not None:
                     previous_importer.close()
-                self._registry.register(plugin_type, plugin_id, meta, isolated_run, None)
+                self._registry.register(plugin_type, plugin_id, meta, isolated_run, None, source_digest=hashlib.sha256(json.dumps(tree.file_snapshot, sort_keys=True).encode()).hexdigest())
                 self._registry.pending.pop(plugin_id, None)
                 return meta
 
@@ -537,28 +505,43 @@ class PluginLoader:
                 fail(f"Python 加载异常: {traceback.format_exc()[-200:]}")
                 return None
 
-            if not hasattr(module, "run"):
+            entry_name = "run_with_context" if plugin_type == "action" else "run"
+            if not callable(getattr(module, entry_name, None)):
                 print(
-                    f"[Engine] 插件 \"{plugin_id}\" ({meta['name']}) 缺少 run() 函数，跳过",
+                    f"[Engine] 插件 \"{plugin_id}\" ({meta['name']}) 缺少 {entry_name}() 函数，跳过",
                     file=sys.stderr,
                 )
-                fail("缺少 run() 函数")
+                fail(f"缺少 {entry_name}() 函数")
                 return None
 
-            # event-v1 接收配置列表，event-v2 为每条规则使用独立配置，启动线程前先验证入口。
-            if plugin_type == "trigger" and meta.get("trigger_api") in ("event-v1", "event-v2"):
+            if plugin_type == "action":
                 try:
-                    config = [] if meta.get("trigger_api") == "event-v1" else {}
-                    emit = lambda *_args: None
-                    inspect.signature(module.run).bind({}, config, emit, threading.Event())
+                    inspect.signature(getattr(module, entry_name)).bind({}, {}, {})
                 except (TypeError, ValueError) as exc:
-                    message = f"{meta['trigger_api']} 入口不兼容: {exc}"
+                    message = f"动作入口参数不符: {exc}"
+                    fail(message)
+                    return None
+
+            if plugin_type == "trigger" and meta.get("sampling_api") == "poll-v1":
+                try:
+                    inspect.signature(module.create_sampler).bind(None)
+                except (AttributeError, TypeError, ValueError):
+                    fail("poll-v1 触发器必须提供 create_sampler(context)")
+                    return None
+
+            if plugin_type == "trigger":
+                try:
+                    emit = lambda *_args: None
+                    inspect.signature(module.run).bind({}, {}, emit, threading.Event())
+                except (TypeError, ValueError) as exc:
+                    message = f"触发器入口参数不符: {exc}"
                     print(f'[Engine] 触发器 "{plugin_id}" {message}', file=sys.stderr)
                     fail(message)
                     return None
 
             self._registry.register(
-                plugin_type, plugin_id, meta, getattr(module, "run"), module
+                plugin_type, plugin_id, meta, getattr(module, entry_name), module,
+                source_digest=hashlib.sha256(json.dumps(tree.file_snapshot, sort_keys=True).encode()).hexdigest(),
             )
             self._registry.pending.pop(plugin_id, None)
 

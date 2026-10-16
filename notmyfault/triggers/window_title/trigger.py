@@ -65,7 +65,6 @@ class WindowTitleTrigger(PollingTrigger):
     def setup(self):
         self.pattern = str(self.config.get("title_pattern", "")).strip()
         self.target_state = self.config.get("state", "opened")
-        self._was_matched = False
         self.log(f"开始监视窗口标题: {self.pattern}")
 
     def poll(self):
@@ -73,25 +72,7 @@ class WindowTitleTrigger(PollingTrigger):
         matched_titles = [t for t in titles.values() if self.pattern.lower() in t.lower()]
         matched = bool(matched_titles)
 
-        if matched and not self._was_matched:
-            if self.target_state == "opened":
-                actual_title = max(matched_titles, key=len)
-                self.log(f"窗口出现: '{self.pattern}'")
-                self.emit({
-                    "title_pattern": self.pattern,
-                    "state": "opened",
-                    "matched_title": actual_title,
-                })
-            self._was_matched = True
-        elif not matched and self._was_matched:
-            if self.target_state == "closed":
-                self.log(f"窗口关闭: '{self.pattern}'")
-                self.emit({
-                    "title_pattern": self.pattern,
-                    "state": "closed",
-                    "matched_title": "",
-                })
-            self._was_matched = False
+        self.emit({"title_pattern": self.pattern, "state": "opened" if matched else "closed", "matched_title": max(matched_titles, key=len) if matched else ""})
 
 
 def run(meta, config, emit_event, shutdown_event):

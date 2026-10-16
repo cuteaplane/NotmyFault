@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from fastapi.testclient import TestClient
 
+from notmyfault.tests.canvas_fixtures import trigger_rule, set_rule_steps
 from notmyfault.core.run_history import RunHistory
 from notmyfault.host.api.auth import ApiTokenStore
 from notmyfault.host.api.events import EventBroker
@@ -67,33 +68,17 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
     public_key = signing_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
     monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [public_key])
     signing.sign_plugin(
-        package_root / "triggers" / "time_schedule", "trigger.json", signing_key
+        package_root / "triggers" / "time_schedule", private_key=signing_key
     )
-    signing.sign_plugin(package_root / "actions" / "notify", "action.json", signing_key)
+    signing.sign_plugin(package_root / "actions" / "notify", private_key=signing_key)
     paths = make_paths(tmp_path, package_root=package_root)
     (tmp_path / "build.json").write_text("{}", encoding="utf-8")
     (tmp_path / "build.json.sig").write_bytes(b"test-signature")
     store = make_store(paths)
-    assert store.save_rules(
-        [
-            {
-                "name": "装配初始规则",
-                "event": {
-                    "type": "time_schedule",
-                    "params": {"time": "23:58"},
-                },
-                "actions": [
-                    {
-                        "type": "notify",
-                        "params": {
-                            "title": "NotmyFault",
-                            "message": "assembly start",
-                        },
-                    }
-                ],
-            }
-        ]
-    )
+    assert store.save_rules([set_rule_steps(
+        trigger_rule("r_initial0001", "装配初始规则", "time_schedule", {"time": "23:58"}),
+        [{"type": "notify", "params": {"title": "NotmyFault", "message": "assembly start"}}],
+    )])
     runner = namespace["EngineRunner"](paths, store, create_engine)
     history = RunHistory(str(paths.run_history_file))
     events = EventBroker(history)
@@ -140,32 +125,16 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
         assert client.get("/api/engine/status", headers=headers).json()[
             "engine_state"
         ] == "running"
-        assert wait_for(lambda: runner.current_engine._hot_reloader._rules_mtime > 0)
-        previous_mtime = runner.current_engine._hot_reloader._rules_mtime
+        assert wait_for(lambda: runner.current_engine._rule_watcher._thread is not None)
+        previous_mtime = runner.current_engine._rule_watcher._stamp.mtime_ns / 1e9
 
         response = client.put(
             "/api/rules",
             headers=headers,
-            json={
-                "rules": [
-                    {
-                        "name": "装配热重载",
-                        "event": {
-                            "type": "time_schedule",
-                            "params": {"time": "23:59"},
-                        },
-                        "actions": [
-                            {
-                                "type": "notify",
-                                "params": {
-                                    "title": "NotmyFault",
-                                    "message": "assembly smoke",
-                                },
-                            }
-                        ],
-                    }
-                ]
-            },
+            json={"rules": [set_rule_steps(
+                trigger_rule("r_reload0001", "装配热重载", "time_schedule", {"time": "23:59"}),
+                [{"type": "notify", "params": {"title": "NotmyFault", "message": "assembly smoke"}}],
+            )]},
         )
         assert response.status_code == 200, response.text
         os.utime(paths.rules_file, (previous_mtime + 2, previous_mtime + 2))
@@ -181,3 +150,31 @@ def test_real_api_engine_store_event_and_hot_reload_assembly(monkeypatch, tmp_pa
         assert wait_for(lambda: runner.engine_state == "stopped", timeout=15)
     finally:
         runner.stop_engine()
+
+
+def test_http_maps_binding_failure_without_changing_history_envelope():
+    from notmyfault.core.event_stream import EventStream
+
+    class History:
+        def __init__(self):
+            self.events = []
+
+        def record_async(self, event):
+            self.events.append(event)
+
+    async def receive():
+        history = History()
+        broker = EventBroker(history)
+        subscription = broker.subscribe()
+        stream = EventStream()
+        event = stream.publish("run.failed", {"run_id": "run_binding", "failure_kind": "binding", "error": {"code": "missing_binding_value", "message": "缺少运行数据"}})
+        broker.publish(event)
+        packet = await asyncio.wait_for(subscription.queue.get(), 1)
+        assert packet["type"] == "workflow_failed"
+        assert packet["data"]["error"]["code"] == "missing_binding_value"
+        assert history.events[0]["type"] == "run.failed"
+        assert history.events[0]["v"] == 1
+        broker.close()
+        stream.close()
+
+    asyncio.run(receive())

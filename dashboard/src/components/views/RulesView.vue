@@ -1,11 +1,12 @@
 <script setup>
+import { normalizeWorkflow, walkGraphActions, getGraphTriggers } from '../../lib/workflowGraph'
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { store } from '../../lib/store'
 import { cancelRun, runRule } from '../../lib/api'
 import { approveRuleBeforeEditing, saveRulesWithApproval } from '../../lib/ruleSave'
 import { snackbar } from '../../lib/notify'
 import { alertDialog, confirmDialog } from '../../lib/dialog'
-import { normalizeRuleDraft } from '../../lib/utils'
+import { validateRuleGraph } from '../../lib/utils'
 import { buildAllTestInputFields, ensureRuleBindingIds } from '../../lib/bindings'
 import { summarizeRuleChanges } from '../../lib/ruleDiff'
 import { automationTemplates, createQuickDraft, instantiateTemplate, templateAvailability } from '../../lib/automationTemplates'
@@ -58,7 +59,7 @@ const ruleQuery = ref('')
 const matchingRules = computed(() => {
   const query = ruleQuery.value.trim().toLowerCase()
   return store.configData.rules.map((rule, index) => ({ rule, index })).filter(({ rule }) =>
-    !query || [rule.name, rule.folder, triggerSummary(rule), ...(rule.actions || []).map(action => store.schema.actions[action.type]?.name || action.type)]
+    !query || [rule.name, rule.folder, triggerSummary(rule), ...(rule.workflow.nodes || []).map(action => store.schema.actions[action.type]?.name || action.name || action.type)]
       .some(value => String(value || '').toLowerCase().includes(query)),
   )
 })
@@ -79,21 +80,10 @@ const availableFolders = computed(() => [...new Set(
 
 function clone(value) { return JSON.parse(JSON.stringify(value)) }
 function visitRuleNodes(rule, visitor) {
-  const visitAction = node => {
-    if (!node || typeof node !== 'object') return
-    visitor(node, 'action')
-    ;(node.then || []).forEach(visitAction)
-    ;(node.else || []).forEach(visitAction)
-    ;(node.failure_actions || []).forEach(visitAction)
-  }
-  const visitCondition = node => {
-    if (!node || typeof node !== 'object') return
-    if (node.type) visitor(node, 'trigger')
-    ;(node.children || []).forEach(visitCondition)
-  }
-  visitCondition(rule?.condition)
-  ;(rule?.actions || []).forEach(visitAction)
+  walkGraphActions(rule.workflow, node => { if (node.type !== 'trigger') visitor(node, 'action') })
+  getGraphTriggers(rule).forEach(node => visitor(node, 'trigger'))
 }
+
 function sensitiveParamNames(node, kind) {
   const catalog = kind === 'trigger' ? store.schema.triggers : store.schema.actions
   return (catalog?.[node?.type]?.params || [])
@@ -102,7 +92,6 @@ function sensitiveParamNames(node, kind) {
 }
 function sanitizedRuleForRecovery(rule) {
   const sanitized = clone(rule)
-  if (sanitized.preconditions?.length) sanitized.preconditions = [{}]
   const sensitiveVariables = new Set((sanitized.variables || []).filter(item => item.sensitive).map(item => item.id))
   for (const field of ['constants', 'variables']) {
     for (const item of sanitized[field] || []) {
@@ -117,7 +106,6 @@ function sanitizedRuleForRecovery(rule) {
   return sanitized
 }
 function restoreSensitiveParams(targetRule, currentRule) {
-  if (targetRule.preconditions?.length && currentRule.preconditions) targetRule.preconditions = clone(currentRule.preconditions)
   for (const field of ['constants', 'variables']) {
     const current = new Map((currentRule[field] || []).map(item => [item.id, item]))
     for (const item of targetRule[field] || []) {
@@ -239,7 +227,7 @@ async function restoreDraftRecovery(index) {
   )
   if (restore) {
     try {
-      const restored = ensureRuleBindingIds(normalizeRuleDraft(clone(recovery.draft)))
+      const restored = ensureRuleBindingIds(validateRuleGraph(clone(recovery.draft)))
       restoreSensitiveParams(restored, draftRule.value)
       draftRule.value = restored
     } catch (error) {
@@ -291,8 +279,9 @@ function redoDraft() {
 }
 async function openRule(index) {
   let next
-  try { next = ensureRuleBindingIds(normalizeRuleDraft(clone(store.configData.rules[index]))) }
+  try { next = ensureRuleBindingIds(validateRuleGraph(clone(store.configData.rules[index]))) }
   catch (error) { await alertDialog('规则无法编辑', error.message); return }
+  normalizeWorkflow(next)
   originalRuleSnapshot = JSON.stringify(store.configData.rules[index])
   editorAdminKeyPassword = ''
   showCreatePanel.value = false
@@ -305,8 +294,9 @@ async function openRule(index) {
 async function addRule(seed = null) {
   let next
   try {
-    next = seed ? ensureRuleBindingIds(normalizeRuleDraft(clone(seed))) : ensureRuleBindingIds({ name: '新规则', folder: '未分类', actions: [] })
+    next = seed ? ensureRuleBindingIds(validateRuleGraph(clone(seed))) : ensureRuleBindingIds({ name: '新规则', folder: '未分类', workflow: { entry: null, nodes: [], edges: [] } })
   } catch (error) { await alertDialog('草稿无法打开', error.message); return }
+  normalizeWorkflow(next)
   editorAdminKeyPassword = ''
   showCreatePanel.value = false
   activeRuleIndex.value = -1
@@ -340,20 +330,12 @@ function openConfigSecurity() {
   window.__nmf?.switchPage?.('settings')
 }
 
-function triggerCount(rule) {
-  function count(node) {
-    if (!node) return 0
-    if (node.type && !node.children && !node.events) return 1
-    return (node.children || node.events || []).reduce((sum, child) => sum + count(child), 0)
-  }
-  return count(rule.condition)
-}
+function triggerCount(rule) { return getGraphTriggers(rule).length }
 function triggerSummary(rule) {
-  if (!rule.condition) return '未配置触发条件'
-  if (rule.condition.type && !rule.condition.children) return store.schema.triggers[rule.condition.type]?.name || rule.condition.type
-  const op = rule.condition.op || (rule.condition.type === 'and' ? 'all' : 'any')
-  if (op === 'not') return `未发生 · 等待 ${rule.condition.within_seconds} 秒`
-  return `${op === 'all' ? '全部满足' : '满足任一'} · ${triggerCount(rule)} 个条件`
+  const triggers = getGraphTriggers(rule)
+  if (!triggers.length) return '待创建触发器'
+  if (!rule.workflow.edges.some(edge => edge.channel === 'control')) return '触发器待连接执行路径'
+  return triggers.map(trigger => store.schema.triggers[trigger.type]?.name || trigger.type).join('、')
 }
 
 async function persistRules(nextRules, successMessage, password = '') {
@@ -361,7 +343,7 @@ async function persistRules(nextRules, successMessage, password = '') {
   const result = await saveRulesWithApproval(nextRules, password, store.configData.revision)
   if (result?.cancelled) return null
   if (!result?.ok) {
-    const details = Array.isArray(result?.details) ? result.details.join(' · ') : ''
+    const details = Array.isArray(result?.details) ? result.details.map(detail => typeof detail === 'string' ? detail : detail.message || detail.code || '').filter(Boolean).join(' · ') : ''
     throw new Error([result?.error || '未知错误', details].filter(Boolean).join('：'))
   }
   const savedRules = Array.isArray(result.rules) ? result.rules : nextRules
@@ -471,7 +453,7 @@ async function executeManualRule(index, snapshot, testContext) {
       startTestWatch(
         snapshot,
         index,
-        Number.isInteger(result.action_count) ? result.action_count : (snapshot?.actions || []).length,
+        Number.isInteger(result.action_count) ? result.action_count : (snapshot?.workflow?.nodes || []).length,
         watchFromSeq,
         result.run_id || '',
       )
@@ -532,6 +514,25 @@ function failText(err) {
   return String(err || '').slice(-300)
 }
 
+// 动作失败、事件组失败和补救失败都记到同一个 step_id 的失败记录里。
+function recordFailedStep(t, ev) {
+  const pending = t.steps.find(step => step.stepId === ev.data.step_id && ['waiting', 'running'].includes(step.status))
+  if (pending) t.steps = t.steps.filter(step => step !== pending)
+  const existing = t.steps.find(step => step.stepId === ev.data.step_id && step.status === 'fail')
+  const record = {
+    status: 'fail',
+    type: ev.data.action_type || pending?.type || existing?.type || '',
+    stepId: ev.data.step_id,
+    detail: failText(ev.data.error),
+    branch: ev.data.branch || pending?.branch || existing?.branch,
+    evaluatedBranches: ev.data.evaluated_branches || pending?.evaluatedBranches || existing?.evaluatedBranches || [],
+    inputSummary: ev.data.input_summary || existing?.inputSummary || [],
+    outputSummary: [],
+  }
+  if (existing) Object.assign(existing, record)
+  else t.steps.push(record)
+}
+
 function processTestEvents() {
   const t = testResult.value
   if (!t || t.done) return
@@ -539,43 +540,61 @@ function processTestEvents() {
     if (ev.seq <= t.lastSeq) continue
     t.lastSeq = ev.seq
     if (t.runId ? ev.data?.run_id !== t.runId : ev.data?.rule_name !== t.ruleName) continue
-    if (ev.name === 'action_executed') {
+    if (ev.name === 'run.group.selected') {
+      let step = t.steps.find(step => step.stepId === ev.data.step_id)
+      if (!step) { step = { status: 'running', type: 'event_group', stepId: ev.data.step_id, detail: '' }; t.steps.push(step) }
+      step.branch = ev.data.branch
+      step.evaluatedBranches = ev.data.evaluated_branches || []
+    } else if (ev.name === 'run.step.waiting' || ev.name === 'run.step.resumed') {
+      const step = t.steps.find(step => step.stepId === ev.data.step_id && step.status === 'waiting')
+      if (step) { step.status = ev.name === 'run.step.resumed' ? 'running' : 'waiting'; step.detail = ev.data.reason || '' }
+      else if (ev.name === 'run.step.waiting') t.steps.push({ status: 'waiting', type: ev.data.action_type || 'event_group', stepId: ev.data.step_id, detail: ev.data.reason || '等待事件组合' })
+    } else if (ev.name === 'action_executed') {
+      const groupStep = ev.data.action_type === 'event_group' ? t.steps.find(step => step.stepId === ev.data.step_id) : null
+      if (groupStep) t.steps = t.steps.filter(step => step !== groupStep)
+      t.steps = t.steps.filter(step => !(step.stepId === ev.data.step_id && ['waiting', 'running'].includes(step.status)))
       t.steps.push({
         status: 'ok', type: ev.data.action_type, stepId: ev.data.step_id, detail: '',
+        branch: ev.data.branch || groupStep?.branch, evaluatedBranches: ev.data.evaluated_branches || groupStep?.evaluatedBranches || [],
         inputSummary: ev.data.input_summary || [],
         outputSummary: ev.data.output_summary || [],
       })
     } else if (ev.name === 'action_skipped') {
       t.steps.push({ status: 'skipped', type: ev.data.action_type, stepId: ev.data.step_id, detail: '引用的运行数据不可用，已跳过' })
-    } else if (ev.name === 'action_cancelled') {
-      t.steps.push({ status: 'cancelled', type: ev.data.action_type, stepId: ev.data.step_id, detail: failText(ev.data.error) })
-    } else if (ev.name === 'action_timed_out') {
-      t.steps.push({ status: 'timed_out', type: ev.data.action_type, stepId: ev.data.step_id, detail: failText(ev.data.error) })
+    } else if (ev.name === 'action_cancelled' || ev.name === 'action_timed_out') {
+      t.steps = t.steps.filter(step => !(step.stepId === ev.data.step_id && ['waiting', 'running'].includes(step.status)))
+      t.steps.push({ status: ev.name === 'action_cancelled' ? 'cancelled' : 'timed_out', type: ev.data.action_type, stepId: ev.data.step_id, detail: failText(ev.data.error) })
     } else if (ev.name === 'workflow_failed') {
-      t.steps.push({ status: 'fail', type: ev.data.action_type || '', stepId: ev.data.step_id, detail: failText(ev.data.error), inputSummary: ev.data.input_summary || [], outputSummary: [] })
+      recordFailedStep(t, ev)
       finishTestWatch()
     } else if (ev.name === 'error') {
-      t.steps.push({ status: 'fail', type: ev.data.action_type || '', stepId: ev.data.step_id, detail: failText(ev.data.error) })
-      finishTestWatch()
+      recordFailedStep(t, ev)
     } else if (ev.name === 'test_assertions_completed') {
       t.assertions = ev.data
+    } else if (ev.name.startsWith('run.recovery.')) {
+      const step = t.steps.find(step => step.stepId === ev.data.step_id)
+      if (step) step.recovery = { groupId: ev.data.recovery_group_id, status: ev.name.endsWith('entered') ? 'running' : ev.name.endsWith('completed') ? 'succeeded' : 'failed' }
     } else if (ev.name === 'workflow_completed') {
+      t.outcome = ev.data.status
+      let note = ''
       if (ev.data.recovered) {
-        t.note = '连接中断期间这次运行已结束，可到运行记录查看结果和完整步骤。'
+        note = '连接中断期间这次运行已结束，可到运行记录查看结果和完整步骤。'
       } else if (ev.data.status === 'cancelled') {
-        t.note = '测试已停止。'
+        note = '测试已停止。'
       } else if (!t.expected && ev.data.status === 'succeeded') {
-        t.note = '这条规则没有动作，测试已验证触发条件。'
+        note = '这条规则没有动作，测试已验证触发条件。'
       }
-      finishTestWatch()
+      finishTestWatch(note)
     }
   }
 }
 
-function finishTestWatch() {
+function finishTestWatch(note = '') {
   const t = testResult.value
   if (!t) return
+  t.note = note
   t.done = true
+  t.cancelling = false
   if (t.timer) { clearTimeout(t.timer); t.timer = null }
 }
 
@@ -590,6 +609,7 @@ async function stopTestRun() {
   t.cancelling = true
   try {
     const result = await cancelRun(t.runId)
+    if (t.done || testResult.value !== t) return
     if (!result?.ok) {
       t.cancelling = false
       await alertDialog('无法停止测试', result?.error || '这次运行已经结束或不存在')
@@ -597,6 +617,7 @@ async function stopTestRun() {
     }
     t.note = '正在停止；已经开始的动作会在安全位置结束。'
   } catch (error) {
+    if (t.done || testResult.value !== t) return
     t.cancelling = false
     await alertDialog('无法停止测试', error.message)
   }
@@ -623,7 +644,7 @@ onUnmounted(() => {
 })
 
 function stepIcon(status) {
-  return ({ ok: 'check_circle', fail: 'error', skipped: 'skip_next', deferred: 'hourglass_empty', cancelled: 'stop_circle', timed_out: 'timer_off' })[status] || 'help'
+  return ({ ok: 'check_circle', fail: 'error', skipped: 'skip_next', waiting: 'hourglass_empty', running: 'play_arrow', cancelled: 'stop_circle', timed_out: 'timer_off' })[status] || 'help'
 }
 function stepTitle(step) {
   const name = step.type ? (store.schema.actions[step.type]?.name || step.type) : ''
@@ -632,7 +653,9 @@ function stepTitle(step) {
   if (step.status === 'cancelled') return name ? `${name} 已停止` : '运行已停止'
   if (step.status === 'timed_out') return name ? `${name} 已超时` : '动作已超时'
   if (step.status === 'skipped') return `${name} 被跳过`
-  return '前置条件未满足，已推迟'
+  if (step.status === 'waiting') return '等待事件组合'
+  if (step.status === 'running') return name ? `${name} 执行中` : '执行中'
+  return name ? `${name} 状态未知` : '状态未知'
 }
 const testSummary = computed(() => {
   const t = testResult.value
@@ -641,8 +664,9 @@ const testSummary = computed(() => {
   if (!t.done) return ''
   if (t.steps.some(s => s.status === 'cancelled')) return '测试已停止。'
   if (t.steps.some(s => s.status === 'timed_out')) return '有动作超过允许的运行时间。'
+  if (t.outcome === 'recovered') return '原动作失败，补救流程完成；测试已补救。'
+  if (t.outcome === 'succeeded' && t.steps.some(s => s.status === 'fail')) return '流程已完成；失败步骤已处理或按设置忽略，请查看步骤详情。'
   if (t.steps.some(s => s.status === 'fail')) return '有步骤执行失败，请查看下方详情。'
-  if (t.steps.some(s => s.status === 'deferred')) return '前置条件不满足，本次测试没有执行动作。'
   if (t.assertions?.total && t.assertions.passed < t.assertions.total) return `动作已执行，但 ${t.assertions.total - t.assertions.passed} 项检查未通过。`
   if (t.assertions?.total) return `全部 ${t.steps.length} 个动作执行成功，${t.assertions.total} 项检查均通过。`
   return `全部 ${t.steps.length} 个动作执行成功。`
@@ -702,13 +726,10 @@ async function openTestStep(step) {
 }
 
 function openPendingRule() {
-  if (!store.pendingRuleId && !store.pendingRuleName) return
-  const index = store.pendingRuleId
-    ? store.configData.rules.findIndex(r => r.rule_id === store.pendingRuleId)
-    : store.configData.rules.findIndex(r => r.name === store.pendingRuleName)
+  if (!store.pendingRuleId) return
+  const index = store.configData.rules.findIndex(r => r.rule_id === store.pendingRuleId)
   const stepId = store.pendingStepId
   store.pendingRuleId = ''
-  store.pendingRuleName = ''
   store.pendingStepId = ''
   if (index >= 0) {
     automationSection.value = 'rules'
@@ -717,7 +738,7 @@ function openPendingRule() {
   }
 }
 
-watch(() => [store.pendingRuleId, store.pendingRuleName, store.pendingStepId], openPendingRule)
+watch(() => [store.pendingRuleId, store.pendingStepId], openPendingRule)
 watch(() => store.pendingAutomationSection, section => {
   if (!['rules', 'runs'].includes(section)) return
   automationSection.value = section
@@ -813,7 +834,7 @@ onMounted(() => {
       <section v-for="([folder, entries]) in ruleFolders" :key="folder" class="rules-folder">
         <header><span class="material-symbols-outlined">folder_open</span><b>{{ folder }}</b><small>{{ entries.length }} 条规则</small></header>
         <article v-for="({ rule, index }) in entries" :key="rule.rule_id || rule" class="rule-library-row" @click="openRule(index)">
-          <button class="rule-library-row-main" :aria-label="`编辑${rule.name || '未命名规则'}`" @click.stop="openRule(index)"><h3>{{ rule.name || '未命名规则' }}</h3><div class="rule-library-meta"><span><span class="material-symbols-outlined">bolt</span>当：{{ triggerSummary(rule) }}</span><span><span class="material-symbols-outlined">play_circle</span>然后：{{ rule.actions?.length || 0 }} 个动作</span></div></button>
+          <button class="rule-library-row-main" :aria-label="`编辑${rule.name || '未命名规则'}`" @click.stop="openRule(index)"><h3>{{ rule.name || '未命名规则' }}</h3><div class="rule-library-meta"><span><span class="material-symbols-outlined">bolt</span>当：{{ triggerSummary(rule) }}</span><span><span class="material-symbols-outlined">play_circle</span>然后：{{ rule.workflow.nodes.length }} 个图块</span></div></button>
           <div class="rule-library-actions">
             <button class="btn btn-text btn-sm rule-run-btn" :disabled="runningRuleIndex !== null"
               title="真实执行一次这条规则中的动作" @click.stop="runManualRule(index, rule)">
@@ -851,6 +872,15 @@ onMounted(() => {
           <span class="material-symbols-outlined">{{ stepIcon(s.status) }}</span>
           <div class="test-step-body">
             <b>{{ stepTitle(s) }}</b><p v-if="s.detail">{{ s.detail }}</p>
+            <small v-if="s.recovery">{{ s.recovery.status === 'running' ? '正在执行补救' : s.recovery.status === 'succeeded' ? '补救完成' : '补救失败' }} · {{ s.recovery.groupId }}</small>
+            <small v-if="s.branch">执行出口 · {{ s.branch }}</small>
+            <details v-if="s.evaluatedBranches?.length" class="test-condition-results">
+              <summary>条件判断 · {{ s.evaluatedBranches.length }} 个分支</summary>
+              <div v-for="(evaluation, evaluationIndex) in s.evaluatedBranches" :key="evaluation.branch_id">
+                <p>{{ evaluationIndex ? `ELIF ${evaluationIndex}` : 'IF' }} · {{ evaluation.error ? `判断出错 · ${evaluation.error.code}` : evaluation.result === true ? '成立' : evaluation.result === false ? '不成立' : '未收到判断结果' }} · {{ evaluation.branch_id }}</p>
+                <small v-for="(predicate, predicateIndex) in evaluation.predicates" :key="predicateIndex">{{ predicate.op }} · {{ predicate.error ? `判断出错 · ${predicate.error.code}` : predicate.result === true ? '成立' : predicate.result === false ? '不成立' : '未收到判断结果' }} · {{ predicate.node_id || predicate.path }}</small>
+              </div>
+            </details>
             <div v-if="s.inputSummary?.length || s.outputSummary?.length" class="step-summary-strip test-step-summary">
               <div v-if="s.inputSummary?.length" class="step-summary-side">
                 <span class="step-summary-kind"><span class="material-symbols-outlined">login</span>输入</span>
@@ -885,3 +915,9 @@ onMounted(() => {
   </BaseDialog>
   </div>
 </template>
+
+<style scoped>
+.test-condition-results { margin-block: 8px; padding: 10px 12px; border: 1px solid var(--md-outline-variant); border-radius: var(--r-sm); background: var(--md-surface-c); }
+.test-condition-results summary { cursor: pointer; color: var(--md-on-surface-variant); }
+.test-condition-results small { display: block; margin-block: 4px; }
+</style>

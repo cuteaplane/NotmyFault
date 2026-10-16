@@ -2,10 +2,6 @@ import threading
 import math
 from concurrent.futures import Future
 
-from windows_toasts import InteractableWindowsToaster, Toast
-from winrt.runtime import ApartmentType, init_apartment, uninit_apartment
-
-
 # 多个通知线程同时进 WinRT 会互相踩，创建和发送这一段串行执行
 _winrt_lock = threading.Lock()
 
@@ -15,6 +11,9 @@ def _show_toast_in_thread(toast, display_seconds, dismiss_event, shown):
     initialized = False
     try:
         with _winrt_lock:
+            from windows_toasts import InteractableWindowsToaster
+            from winrt.runtime import ApartmentType, init_apartment, uninit_apartment
+
             init_apartment(ApartmentType.MULTI_THREADED)
             initialized = True
             # 通知对象在创建它的 WinRT 线程中释放。
@@ -64,6 +63,8 @@ def show_toast(toast, display_seconds=10, dismiss_event=None):
 def show_notification(title, message, display_seconds=10):
     if not isinstance(title, str) or not isinstance(message, str):
         raise ValueError("通知标题和内容必须是文本")
+    from windows_toasts import Toast
+
     toast = Toast()
     toast.text_fields = [title, message]
     show_toast(toast, display_seconds)

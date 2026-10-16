@@ -5,8 +5,9 @@ from __future__ import annotations
 import copy
 import re
 
-from notmyfault.core.bindings import contains_legacy_template, is_expression, is_typed_value, iter_references, resolve_value
+from notmyfault.core.bindings import is_expression, is_typed_value, iter_references, resolve_value
 from notmyfault.core.data_types import DataTypeError, normalize_type, normalize_value
+from notmyfault.values import contains_secret, hold_value, plain_value, protect
 
 
 _IDENTITY = re.compile(r"^[cv]_[a-z0-9_]{6,64}$")
@@ -44,21 +45,13 @@ def variable_definitions(rule):
 
 
 def expression_is_sensitive(value, context):
-    sources = context.get("_sensitive_sources", {})
-    for usage in iter_references(value):
-        reference = usage.reference
-        paths = sources.get(reference.get("scope"), {}).get(reference.get("node", ""), [])
-        selected = reference.get("path", [])
-        for marked in paths:
-            overlap = min(len(selected), len(marked))
-            if selected[:overlap] == marked[:overlap]:
-                return True
-    return False
+    try:
+        return contains_secret(resolve_value(value, context))
+    except ValueError:
+        return False
 
 
 def _constant_dependencies(expression, location):
-    if contains_legacy_template(expression):
-        raise DataTypeError("初始化只支持结构化常量引用，原样文本请使用 $literal", location=location, code="invalid_variable")
     references = list(iter_references(expression, location=location))
     for usage in references:
         if usage.reference.get("scope") != "constant":
@@ -75,7 +68,6 @@ def constant_context(rule, registry=None):
     context = {
         "constants": {}, "_type_registry": registry,
         "_binding_types": {scope: {key: item["value_type"] for key, item in entries.items()} for scope, entries in definitions.items()},
-        "_sensitive_sources": {"constant": {}, "variable": {}},
     }
     pending = set()
 
@@ -96,7 +88,7 @@ def constant_context(rule, registry=None):
         if registry is not None:
             context["constants"][identity] = registry.binding_value(context["constants"][identity])
         if definition.get("sensitive") or expression_is_sensitive(definition["value"], context):
-            context["_sensitive_sources"]["constant"][identity] = [[]]
+            context["constants"][identity] = protect(context["constants"][identity])
         pending.remove(identity)
 
     for identity in definitions["constant"]:
@@ -122,11 +114,11 @@ def initialize_variables(rule, context, registry=None, *, overrides=None):
         if registry is not None and identity in values:
             values[identity] = registry.binding_value(values[identity])
         if definition.get("sensitive") or expression_is_sensitive(definition.get("initial"), prepared):
-            prepared["_sensitive_sources"]["variable"][identity] = [[]]
-    context["constants"] = prepared["constants"]
-    context["variables"] = values
+            if identity in values:
+                values[identity] = protect(values[identity])
+    context["constants"] = hold_value(prepared["constants"])
+    context["variables"] = {identity: hold_value(value) for identity, value in values.items()}
     context.setdefault("_binding_types", {}).update(prepared["_binding_types"])
-    context.setdefault("_sensitive_sources", {}).update(prepared["_sensitive_sources"])
     context["_variable_definitions"] = definitions["variable"]
     context["_type_registry"] = registry
     context["_variables_initialized"] = True
@@ -144,17 +136,13 @@ def assign_variable(identity, expression, context):
     if context.get("_type_registry") is not None:
         value = context["_type_registry"].binding_value(value)
     sensitive = definition.get("sensitive") or expression_is_sensitive(expression, context)
+    value = protect(value) if sensitive else hold_value(value)
     context["variables"][identity] = value
-    marked = context.setdefault("_sensitive_sources", {}).setdefault("variable", {})
-    if sensitive:
-        marked[identity] = [[]]
-    else:
-        marked.pop(identity, None)
-    return copy.deepcopy(value)
+    return value
 
 
-def resolve_trigger_constants(rule, registry=None):
-    from notmyfault.core.rules import get_rule_events
+def resolve_trigger_constants(rule, registry=None, *, protected_configs=None, active_trigger_ids=None):
+    from notmyfault.core.workflow_graph import iter_rule_event_nodes
 
     context, _definitions = constant_context(rule, registry)
     resolved = copy.deepcopy(rule)
@@ -171,7 +159,10 @@ def resolve_trigger_constants(rule, registry=None):
             return [resolve_config(child, f"{location}[{index}]") for index, child in enumerate(value)]
         return copy.deepcopy(value)
 
-    for index, event in enumerate(get_rule_events(resolved)):
+    for index, event in enumerate(iter_rule_event_nodes(resolved)):
         params = event.get("params", {})
-        event["params"] = resolve_config(params, f"condition[{index}].params")
+        config = resolve_config(params, f"workflow.triggers[{index}].params") if active_trigger_ids is None or event["binding_id"] in active_trigger_ids else copy.deepcopy(params)
+        if protected_configs is not None:
+            protected_configs[event["binding_id"]] = hold_value(config)
+        event["params"] = plain_value(config)
     return resolved

@@ -7,7 +7,6 @@
     "version_code": 1,
     "version": "1.0",
     "package_name": "io.github.notmyfault.session_lock",
-    "enabled": true,
     "platforms": ["windows", "linux"],
     "requires_capabilities": ["session.lock"],
     "permissions": ["external_binary"],
@@ -27,5 +26,20 @@
                 {"value": "any", "label": "任意变化"}
             ]
         }
-    ]
+    ],
+    "state_key": "state",
+    "state_filter": {
+        "default": {
+            "state": {
+                "config": "state"
+            }
+        },
+        "param": "state",
+        "cases": {
+            "changed": {},
+            "any": {}
+        }
+    },
+    "debounce_seconds": 5,
+    "previous_state_output": "previous_state"
 }

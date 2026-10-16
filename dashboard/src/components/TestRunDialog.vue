@@ -3,6 +3,7 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { actionOutputDefs, buildAllTestInputFields, buildPreparedTestContext, buildTestInputFields } from '../lib/bindings'
 import { fieldType, typeLabel, typeAtPath, typeSpec, parseExactJson } from '../lib/valueTypes'
 import BaseDialog from './BaseDialog.vue'
+import { walkGraphActions, findGraphNode, graphExecutionActions, actionGroupScope } from '../lib/workflowGraph'
 
 const props = defineProps({
   open: Boolean,
@@ -32,7 +33,7 @@ const rangeMode = ref('all')
 const selectedStepId = ref('')
 const assertions = ref([])
 
-const actions = computed(() => props.rule?.actions || [])
+const actions = computed(() => props.rule ? graphExecutionActions(props.rule) : [])
 const selectedIndex = computed(() => Math.max(0, actions.value.findIndex(action => action.binding_id === selectedStepId.value)))
 const startStepId = computed(() => rangeMode.value === 'from' ? selectedStepId.value : '')
 const endStepId = computed(() => rangeMode.value === 'until' ? selectedStepId.value : '')
@@ -41,8 +42,11 @@ const endIndex = computed(() => rangeMode.value === 'until' ? selectedIndex.valu
 const fields = computed(() => props.rule ? buildTestInputFields(props.rule, props.schema, {
   startStepId: startStepId.value,
   endStepId: endStepId.value,
-}) : [])
-const selectedActionCount = computed(() => Math.max(0, endIndex.value - startIndex.value + 1))
+}).filter(field => field.scope !== 'trigger' || values.value[`event_occurrence:${field.node}:[]`] !== false) : [])
+const selectedActions = computed(() => props.rule ? graphExecutionActions(props.rule, { startStepId: startStepId.value, endStepId: endStepId.value }) : [])
+const selectedIds = computed(() => new Set(selectedActions.value.map(action => action.binding_id)))
+function unavailableEnd(action) { return rangeMode.value === 'until' && action && actionGroupScope(props.rule.workflow, action.binding_id) !== null }
+function actionLabel(action) { return action.name || props.schema.actions?.[action.type]?.name || ({ event_group: '事件组', action_group: '动作组', set_variable: '变量赋值' })[action.type] || action.type }
 
 const groups = computed(() => {
   const result = []
@@ -58,22 +62,20 @@ const groups = computed(() => {
   return result
 })
 const sensitiveCount = computed(() => fields.value.filter(field => field.sensitive).length)
-const assertionSources = computed(() => actions.value
-  .slice(startIndex.value, endIndex.value + 1)
-  .flatMap((action, localIndex) => {
-    const actionIndex = startIndex.value + localIndex
+const assertionSources = computed(() => {
+  const result = []
+  const visit = (action, index, trail = []) => {
     const meta = props.schema.actions?.[action.type]
-    return actionOutputDefs(action, props.schema, props.rule)
-      .filter(output => output.sensitive !== true)
-      .map(output => ({
-        key: `${action.binding_id}:${output.name}`,
-        stepId: action.binding_id,
-        path: [output.name],
-        type: fieldType(output).type,
-        valueType: fieldType(output),
-        label: `动作 ${actionIndex + 1}：${meta?.name || action.type} · ${output.label || output.name}`,
-      }))
-  }))
+    const location = trail.map(parent => parent.field === 'then' ? 'IF' : parent.field === 'else' ? 'ELSE' : parent.field.startsWith('elif[') ? `ELIF ${Number(parent.field.slice(5, -1)) + 1}` : parent.field === 'workflow' ? parent.action.name || '动作组' : '失败处理').join(' → ')
+    result.push(...actionOutputDefs(action, props.schema, props.rule).filter(output => output.sensitive !== true).map(output => ({
+      key: `${action.binding_id}:${output.name}`, stepId: action.binding_id, path: [output.name], type: fieldType(output).type, valueType: fieldType(output),
+      label: `${location ? `${location} · ` : ''}动作 ${index + 1}：${actionLabel(action)} · ${output.label || output.name}`,
+    })))
+  }
+  if (props.rule?.workflow) selectedActions.value.forEach(action => { const found = findGraphNode(props.rule, action.binding_id); visit(action, found?.index || 0, found?.trail || []) })
+  else selectedActions.value.forEach(visit)
+  return result
+})
 
 function sourceForAssertion(assertion) {
   return assertionSources.value.find(source => source.key === assertion.sourceKey)
@@ -135,7 +137,7 @@ function normalizeAssertions() {
 
 function inputKind(field) {
   if (['object', 'array', 'union', 'any'].includes(field.type) && field.valueType || field.fullPayload || field.type?.includes('/')) return 'json'
-  if (['bool', 'boolean'].includes(field.type)) return 'boolean'
+  if (field.type === 'bool') return 'boolean'
   if (['number', 'float'].includes(field.type)) return 'number'
   return field.sensitive ? 'password' : 'text'
 }
@@ -151,6 +153,8 @@ function submit() {
   errors.value = {}
   submitError.value = ''
   try {
+    if (rangeMode.value !== 'all' && !actions.value.some(action => action.binding_id === selectedStepId.value)) throw new Error('请选择本次测试的起始或结束节点')
+    if (rangeMode.value === 'until' && unavailableEnd(actions.value.find(action => action.binding_id === selectedStepId.value))) throw new Error('结束节点必须在主流程中；测试内部节点请使用从指定动作继续')
     const included = fields.value.filter(field => field.required || enabledFields.value[field.key])
     const context = buildPreparedTestContext(included.map(field => ({ ...field, required: true })), values.value)
     context.start_step_id = startStepId.value
@@ -176,7 +180,7 @@ watch(() => props.open, async open => {
   submitError.value = ''
   assertions.value = []
   rangeMode.value = 'all'
-  selectedStepId.value = props.rule?.actions?.[0]?.binding_id || ''
+  selectedStepId.value = actions.value[0]?.binding_id || ''
   remember.value = true
   await nextTick()
   dialogRef.value?.querySelector('input:not([type="checkbox"]), textarea, input[type="checkbox"]')?.focus()
@@ -210,15 +214,16 @@ watch(() => props.open, async open => {
 
       <div class="test-prep-scroll">
         <section class="test-source-group test-range-group">
-          <header><span class="material-symbols-outlined">conversion_path</span><div><b>选择执行范围</b><small>只运行需要验证的连续动作；前置条件仍会检查</small></div></header>
+          <header><span class="material-symbols-outlined">conversion_path</span><div><b>选择执行范围</b><small>按实际连线执行；分支条件决定本次经过哪些节点</small></div></header>
           <div class="test-range-controls">
             <label><span>方式</span><select v-model="rangeMode" class="text-field"><option value="all">运行全部动作</option><option value="until" :disabled="!actions.length">运行到指定动作</option><option value="from" :disabled="!actions.length">从指定动作继续</option></select></label>
-            <label v-if="rangeMode !== 'all'"><span>{{ rangeMode === 'until' ? '结束于' : '开始于' }}</span><select v-model="selectedStepId" class="text-field"><option v-for="(action, index) in actions" :key="action.binding_id" :value="action.binding_id">动作 {{ index + 1 }}：{{ schema.actions?.[action.type]?.name || action.type }}</option></select></label>
+            <label v-if="rangeMode !== 'all'"><span>{{ rangeMode === 'until' ? '结束于' : '开始于' }}</span><select v-model="selectedStepId" class="text-field"><option v-for="(action, index) in actions" :key="action.binding_id" :value="action.binding_id" :disabled="unavailableEnd(action)">节点 {{ index + 1 }}：{{ actionLabel(action) }}</option></select></label>
           </div>
-          <div v-if="actions.length" class="test-range-track" :aria-label="`本次会执行 ${selectedActionCount} 个动作`">
-            <span v-for="(action, index) in actions" :key="action.binding_id" :class="{ active: index >= startIndex && index <= endIndex, skipped: index < startIndex || index > endIndex }"><i>{{ index + 1 }}</i><small>{{ schema.actions?.[action.type]?.name || action.type }}</small></span>
+          <div v-if="actions.length" class="test-range-track" aria-label="本次可执行的节点范围">
+            <span v-for="(action, index) in actions" :key="action.binding_id" :class="{ active: selectedIds.has(action.binding_id), skipped: !selectedIds.has(action.binding_id) }"><i>{{ index + 1 }}</i><small>{{ actionLabel(action) }}</small></span>
           </div>
-          <p v-else class="test-empty-copy">这条规则没有动作，本次只验证触发与前置条件链路。</p>
+          <p v-if="rule?.workflow && actions.length" class="test-empty-copy">高亮节点在本次可达范围内；未选中的分支不会执行。结束节点需在主流程中，内部节点可选择“从指定动作继续”。</p>
+          <p v-if="!actions.length" class="test-empty-copy">这条规则没有动作，本次只验证触发与前置条件链路。</p>
         </section>
 
         <section v-for="group in groups" :key="group.name" class="test-source-group">

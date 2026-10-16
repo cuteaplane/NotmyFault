@@ -1,0 +1,36 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 18 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  benchmarks:
+    name: Benchmarks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: python -m pip install --no-input -r requirements-dev.txt
+      - name: Run benchmarks
+        run: python -m bench.run --output agent_files/benchmarks.json
+      - uses: actions/upload-artifact@v6
+        with:
+          name: benchmarks-${{ matrix.os }}
+          path: agent_files/benchmarks.json

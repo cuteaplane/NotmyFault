@@ -5,11 +5,13 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from notmyfault.config import ConfigValidationError, SignedConfigStore
-from notmyfault.core.bindings import BindingResolutionError, validate_binding_path, iter_legacy_event_payload_paths, iter_references, resolve_reference
+from notmyfault.core.bindings import BindingResolutionError, validate_binding_path, iter_references, resolve_reference
+from notmyfault.core.binding_schema import rule_step_output_fields
 from notmyfault.core.data_types import DataTypeError, copy_value
 from notmyfault.core.type_registry import TypeRegistry
 from notmyfault.core.variables import initialize_variables
-from notmyfault.core.rules import get_rule_events, validate_rules_structure
+from notmyfault.core.rules import validate_automation_references, validate_rules_structure
+from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions, find_graph_scope
 from notmyfault.core.rule_model import normalize_rule_shape
 from notmyfault.host.api.ports import EngineControlPort
 from notmyfault.security.plugin_schema import check_payload_contract
@@ -21,7 +23,7 @@ _TEST_ASSERTION_OPERATORS = frozenset(
 )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass
 class RuleRunServiceError(Exception):
     status_code: int
     body: Dict[str, Any]
@@ -77,33 +79,21 @@ class RuleRunService:
             has_snapshot,
             rule_snapshot,
         )
+        reference_errors = validate_automation_references(
+            candidate_rule, {rule.get("rule_id") for rule in verified_rules} | {candidate_rule.get("rule_id")}
+        )
+        if reference_errors:
+            self._fail(400, "；".join(reference_errors))
         try:
             registry = TypeRegistry.from_plugins(engine.triggers_meta, engine.actions_meta)
             initialize_variables(candidate_rule, {}, registry, overrides=variable_values)
         except (DataTypeError, BindingResolutionError) as error:
             raise RuleRunServiceError(400, {"ok": False, "code": "invalid_test_payload", "error": str(error)}) from error
-        actions = candidate_rule.get("actions", [])
-        if not isinstance(actions, list):
-            actions = []
-        action_ids = [
-            action.get("binding_id", "") if isinstance(action, dict) else ""
-            for action in actions
-        ]
         if not isinstance(start_step_id, str) or not isinstance(end_step_id, str):
             self._fail(400, "局部运行步骤 ID 必须是字符串")
-        if start_step_id and start_step_id not in action_ids:
-            self._fail(400, "局部运行的起始动作不存在")
-        if end_step_id and end_step_id not in action_ids:
-            self._fail(400, "局部运行的结束动作不存在")
-        start_index = action_ids.index(start_step_id) if start_step_id else 0
-        end_index = (
-            action_ids.index(end_step_id) if end_step_id else len(actions) - 1
+        actions, selected_actions, selected_ids, skipped_upstream_ids = self._select_graph_actions(
+            candidate_rule, start_step_id, end_step_id,
         )
-        if actions and start_index > end_index:
-            self._fail(400, "局部运行的起始动作不能晚于结束动作")
-        selected_actions = actions[start_index : end_index + 1] if actions else []
-        selected_ids = set(action_ids[start_index : end_index + 1])
-        skipped_upstream_ids = set(action_ids[:start_index])
 
         if not isinstance(step_outputs, dict):
             self._fail(400, "上游动作结果必须是 JSON 对象")
@@ -158,6 +148,7 @@ class RuleRunService:
             skipped_upstream_ids,
             step_outputs,
             registry,
+            rule_step_output_fields(candidate_rule, engine.triggers_meta, engine.actions_meta),
         )
         if upstream_issues:
             raise RuleRunServiceError(
@@ -174,7 +165,6 @@ class RuleRunService:
             test_assertions,
             selected_ids,
         )
-        legacy_event_paths = list(iter_legacy_event_payload_paths(execution_source))
         required_trigger_ids = sorted(
             {
                 binding_id
@@ -194,7 +184,7 @@ class RuleRunService:
         ]
         needs_event = any(
             usage.reference.get("scope") == "event" and usage.reference.get("on_missing") not in ("default", "skip") for usage in references
-        ) or bool(legacy_event_paths)
+        )
         if missing_trigger_ids or (needs_event and event_payload is None):
             raise RuleRunServiceError(
                 400,
@@ -247,6 +237,24 @@ class RuleRunService:
             "action_count": len(selected_actions),
         }
 
+    def _select_graph_actions(self, rule, start_id, end_id):
+        from notmyfault.core.canvas_workflow import CanvasProgram
+        program = CanvasProgram(rule)
+        scope = find_graph_scope(rule['workflow'], start_id) if start_id else None
+        if start_id and scope is None:
+            self._fail(400, '局部运行的起始动作不存在')
+        if end_id and (end_id not in program.nodes or start_id and program.scopes[end_id] != program.scopes[start_id]):
+            self._fail(400, '局部运行的结束动作必须与起始动作位于同一流程组')
+        entries = (start_id,) if start_id else program.roots()
+        selected_ids = set(identity for entry in entries for identity in program.reachable(entry, end_id or None))
+        if end_id and end_id not in selected_ids:
+            self._fail(400, '局部运行的结束动作不能从起始动作到达')
+        actions = [node for node, _path in iter_rule_actions(rule)]
+        selected = [node for node in actions if node['binding_id'] in selected_ids]
+        upstream = scope['possible'] if scope else frozenset()
+        skipped = {node['binding_id'] for node in actions if node['binding_id'] in upstream} - selected_ids
+        return actions, selected, selected_ids, skipped
+
     def _select_rule(
         self,
         rules: list[Dict[str, Any]],
@@ -272,7 +280,7 @@ class RuleRunService:
             if (
                 rule_index < 0
                 or rule_index >= len(rules)
-                or rules[rule_index] != snapshot
+                or normalize_rule_shape(rules[rule_index]) != normalize_rule_shape(snapshot)
             ):
                 self._fail(409, "规则保存版本已变化，请刷新后重试")
             return snapshot
@@ -330,6 +338,7 @@ class RuleRunService:
         skipped_ids: set[str],
         step_outputs: Dict[str, Any],
         registry=None,
+        step_fields=None,
     ) -> List[str]:
         issues: List[str] = []
         actions_by_id = {
@@ -355,6 +364,8 @@ class RuleRunService:
             source_action = actions_by_id.get(step_id, {})
             source_meta = actions_meta.get(source_action.get("type", ""), {})
             outputs = source_meta.get("outputs", [])
+            if source_action.get("type") in {"action_group", "set_variable", "event_group"}:
+                outputs = (step_fields or {}).get(step_id, [])
             output = (
                 next(
                     (
@@ -392,7 +403,7 @@ class RuleRunService:
     ) -> List[str]:
         leaves_by_id = {
             leaf.get("binding_id"): leaf
-            for leaf in get_rule_events(rule)
+            for leaf in get_all_rule_events(rule)
             if isinstance(leaf.get("binding_id"), str)
         }
         unknown_ids = sorted(set(trigger_payloads) - set(leaves_by_id))

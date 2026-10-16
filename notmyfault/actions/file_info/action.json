@@ -5,7 +5,6 @@
   "version_code": 1,
   "version": "1.0",
   "package_name": "io.github.notmyfault.file_info",
-  "enabled": true,
   "idempotent": true,
   "permissions": [
     "filesystem"
@@ -59,12 +58,6 @@
       "label": "文件字节数，目录或不存在时为 0",
       "type": "number",
       "value_type": "int"
-    },
-    {
-      "name": "modified_at",
-      "label": "修改时间文本（兼容旧规则）",
-      "type": "string",
-      "value_type": "text"
     },
     {
       "name": "modified_time",

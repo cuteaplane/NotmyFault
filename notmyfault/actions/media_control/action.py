@@ -1,3 +1,4 @@
+from notmyfault.plugin_api import action_values
 """媒体控制动作
 Windows 用 WM_APPCOMMAND；Linux 用 playerctl
 """
@@ -77,7 +78,8 @@ if os.name == "nt":
         raise RuntimeError("没有窗口接受媒体命令")
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
+    params = action_values(params)
     command = str(params.get("command", "play_pause") or "play_pause")
     print(f"[Action:media_control] 发送媒体命令: {command}")
     if os.name == "nt":

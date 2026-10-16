@@ -38,7 +38,6 @@ class FileContentTrigger(PollingTrigger):
         self.max_bytes = int(max_kib * 1024)
 
     def setup(self):
-        self._previous = None
         self._read_error = False
 
     def poll(self):
@@ -64,16 +63,12 @@ class FileContentTrigger(PollingTrigger):
             if self.case_sensitive
             else self.text.casefold() in content.casefold()
         )
-        previous = self._previous
         state = "contains" if contains else "absent"
-        if (
-            previous is not None
-            and contains != previous
-            and self.target_state in (state, "changed")
-            and not self._stop_event.is_set()
-        ):
+        if not self._stop_event.is_set():
             self.emit({"path": str(self.path), "state": state, "contains": contains})
-        self._previous = contains
+
+
+create_sampler = FileContentTrigger.from_context
 
 
 def run(meta, config, emit_event, shutdown_event):

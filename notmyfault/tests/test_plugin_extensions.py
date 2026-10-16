@@ -18,10 +18,10 @@ def make_meta(plugin_id="plug_a", **overrides):
         "id": plugin_id,
         "name": "测试插件",
         "description": "测试用插件",
-        "enabled": True,
         "version_code": 1,
         "version": "1.0",
         "package_name": "com.test.plug",
+        "execution_api": "context-v1",
     }
     meta.update(overrides)
     return meta
@@ -34,7 +34,7 @@ def write_plugin(root, folder, meta):
         json.dumps(meta, ensure_ascii=False), encoding="utf-8"
     )
     (folder_path / "action.py").write_text(
-        "def run(meta, params):\n    return None\n", encoding="utf-8"
+        "def run_with_context(action_info, params, context):\n    return None\n", encoding="utf-8"
     )
     return folder_path
 
@@ -83,7 +83,7 @@ def test_plugin_resource_resolves_inside_registered_plugin(tmp_path, import_code
         (folder / "bin").mkdir()
         (folder / "bin" / "tool.exe").write_bytes(b"\x00")
         (folder / "action.py").write_text(
-            f"{import_code}\ndef run(meta, params):\n    return {resource}('res_a', 'bin', 'tool.exe')\n",
+            f"{import_code}\ndef run_with_context(action_info, params, context):\n    return {resource}('res_a', 'bin', 'tool.exe')\n",
             encoding="utf-8",
         )
         assert load_actions(loader, base) == (1, 0)
@@ -93,7 +93,7 @@ def test_plugin_resource_resolves_inside_registered_plugin(tmp_path, import_code
     try:
         for loader, run, folder in loaded:
             expected = os.path.realpath(str(folder / "bin" / "tool.exe"))
-            assert run({}, {}) == expected
+            assert run({}, {}, {}) == expected
             assert loader._registry.resource("res_a", "bin", "tool.exe") == expected
     finally:
         for loader, _, _ in loaded:

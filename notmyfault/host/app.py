@@ -1,5 +1,4 @@
 import glob
-import json
 import os
 import sys
 import threading
@@ -7,6 +6,7 @@ from typing import Any, Callable, Dict, Optional
 
 from notmyfault.config import SignedConfigStore
 from notmyfault.core.engine import AutomationEngine
+from notmyfault.core.event_stream import Event
 from notmyfault.security.security import SecurityMode, detect_security_mode
 from notmyfault.host.api.plugin_installation import (
     PluginBackupStore,
@@ -77,60 +77,6 @@ def _get_plugin_paths(store: SignedConfigStore):
     return paths
 
 
-def migrate_user_plugin_enabled_state(
-    config: Dict[str, Any],
-    store: SignedConfigStore,
-    user_dir: Optional[str] = None,
-) -> list[str]:
-    if user_dir is None:
-        user_dir = str(store.paths.user_plugins_dir)
-    if not os.path.isdir(user_dir):
-        return []
-
-    disabled = config.get("disabled_plugins", {})
-    if not isinstance(disabled, dict):
-        disabled = {"triggers": [], "actions": []}
-        config["disabled_plugins"] = disabled
-
-    migrated: list[str] = []
-    for ptype, json_name in (("triggers", "trigger.json"), ("actions", "action.json")):
-        ptype_root = os.path.join(user_dir, ptype)
-        if not os.path.isdir(ptype_root):
-            continue
-        disabled_list = disabled.get(ptype, [])
-        if not isinstance(disabled_list, list):
-            disabled_list = []
-            disabled[ptype] = disabled_list
-        for folder_name in sorted(os.listdir(ptype_root)):
-            json_path = os.path.join(ptype_root, folder_name, json_name)
-            if not os.path.isfile(json_path):
-                continue
-            try:
-                with open(json_path, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                continue
-            if not isinstance(meta, dict) or meta.get("enabled") is not False:
-                continue
-            pid = meta.get("id") or folder_name
-            if pid not in disabled_list:
-                disabled_list.append(pid)
-                migrated.append(pid)
-
-    if not migrated:
-        return []
-
-    if not store.save_config(config):
-        print("[Plugins] 迁移开关状态后保存 config 失败", file=sys.stderr)
-        return []
-
-    print(
-        f"[Plugins] 已把 {len(migrated)} 个用户插件的开关状态迁到 config: "
-        f"{', '.join(migrated)}"
-    )
-    return migrated
-
-
 def _plugin_check_needed(
     backup: RetainedPluginBackup,
     config: Dict[str, Any],
@@ -160,13 +106,13 @@ def _plugin_check_needed(
 def _notify_plugin_recovery(
     restored: list[dict[str, Any]],
     failed: list[dict[str, Any]],
-    on_event: Optional[Callable[[str, Dict[str, Any]], None]],
+    on_event: Optional[Callable[[Event], None]],
 ) -> None:
     if restored:
         payload = {"plugins": restored}
         if on_event is not None:
             try:
-                on_event("plugin_update_rolled_back", payload)
+                on_event("plugin.update.rolled_back", payload)
             except Exception:
                 pass
         names = ", ".join(
@@ -185,7 +131,7 @@ def _notify_plugin_recovery(
             print("[Plugins] 无法发送插件恢复提示", file=sys.stderr)
     if failed and on_event is not None:
         try:
-            on_event("plugin_update_rollback_failed", {"plugins": failed})
+            on_event("plugin.update.rollback_failed", {"plugins": failed})
         except Exception:
             pass
 
@@ -195,7 +141,7 @@ def _recover_failed_plugin_updates(
     config: Dict[str, Any],
     store: SignedConfigStore,
     load_paths: list[tuple[str, str]],
-    on_event: Optional[Callable[[str, Dict[str, Any]], None]],
+    on_event: Optional[Callable[[Event], None]],
     file_system: PluginFileSystem,
 ) -> AutomationEngine:
     backups = PluginBackupStore(
@@ -228,7 +174,7 @@ def _recover_failed_plugin_updates(
         ):
             broken.append(backup)
     if not broken:
-        _notify_plugin_recovery([], unresolved, on_event)
+        _notify_plugin_recovery([], unresolved, engine._safe_on_event)
         return engine
 
     engine.shutdown()
@@ -305,18 +251,17 @@ def _recover_failed_plugin_updates(
                 }
             )
             restored = [item for item in restored if item.get("id") != plugin_id]
-    _notify_plugin_recovery(restored, unresolved, on_event)
+    _notify_plugin_recovery(restored, unresolved, replacement._safe_on_event)
     return replacement
 
 
 def create_engine(
     store: SignedConfigStore,
-    on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    on_event: Optional[Callable[[Event], None]] = None,
     plugin_file_system: PluginFileSystem | None = None,
 ) -> AutomationEngine:
     _ensure_first_run_build(str(store.paths.package_root))
     config = store.load_config()
-    migrate_user_plugin_enabled_state(config, store)
     config["rules"] = store.load_rules()
     load_paths = _get_plugin_paths(store)
     engine = AutomationEngine(config, on_event=on_event, rules_store=store)
@@ -334,7 +279,7 @@ def create_engine(
 def run(
     store: SignedConfigStore,
     shutdown_event: "threading.Event | None" = None,
-    on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    on_event: Optional[Callable[[Event], None]] = None,
 ) -> None:
     # 引擎以普通权限启动，插件提权通过 notmyfault.security.sudo 请求 UAC 授权。
     from notmyfault.security.security import is_admin_process

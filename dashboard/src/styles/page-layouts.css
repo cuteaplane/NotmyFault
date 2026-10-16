@@ -29,7 +29,7 @@
 .home-run-row:last-child,.home-issue-row:last-child{border-bottom:0}.home-run-row:hover,.home-issue-row:hover{background:color-mix(in srgb,var(--md-primary) 6%,transparent)}
 .home-run-row>.material-symbols-outlined,.home-issue-row>.material-symbols-outlined{font-size:20px}.home-run-row>.material-symbols-outlined:last-child,.home-issue-row>.material-symbols-outlined:last-child{color:var(--md-outline)}
 .home-run-copy{display:flex;min-width:0;flex-direction:column}.home-run-copy b{overflow:hidden;font:var(--ts-label-l);text-overflow:ellipsis;white-space:nowrap}.home-run-copy small{margin-top:2px;color:var(--md-on-surface-variant);font:var(--ts-label-s)}
-.home-run-status{font:var(--ts-label-m)}.run-succeeded{color:var(--md-success)}.run-failed{color:var(--md-error)}.run-deferred{color:var(--md-warn)}.run-running{color:var(--md-primary)}.run-cancelled{color:var(--md-on-surface-variant)}
+.home-run-status{font:var(--ts-label-m)}.run-succeeded{color:var(--md-success)}.run-failed,.run-timed_out{color:var(--md-error)}.run-deferred,.run-queued{color:var(--md-warn)}.run-running{color:var(--md-primary)}.run-cancelled,.run-dropped{color:var(--md-on-surface-variant)}
 .home-issue-row>span:nth-child(2){min-width:0;overflow:hidden;font:var(--ts-body-s);text-overflow:ellipsis;white-space:nowrap}.home-issue-row .error{color:var(--md-error)}.home-issue-row .warning{color:var(--md-warn)}
 .home-empty-state{display:flex;min-height:150px;align-items:center;justify-content:center;gap:8px;color:var(--md-on-surface-variant);font:var(--ts-body-m)}.home-empty-state .material-symbols-outlined{font-size:22px}.home-empty-state.ok .material-symbols-outlined{color:var(--md-success)}
 
@@ -265,3 +265,5 @@
   .plugin-workbench .plugin-list-stage{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;scrollbar-width:thin;padding:2px 6px 2px 2px}
   .plugin-workbench .plugin-detail-view{height:100%;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;scrollbar-width:thin}
 }
+
+.run-recovered{color:var(--md-tertiary)}

@@ -62,20 +62,6 @@ NotmyFault 宿主只提供通用插件加载、权限声明、自有数据信封
 坐标回放校验当前虚拟桌面的坐标范围，不比较完整的显示器布局。更换显示器布局
 后，即使原坐标仍在桌面内，也需要重新检查坐标步骤的目标。
 
-## Alpha 升级
-
-以下内置动作已经移除，不会自动迁移：
-
-| 旧动作 | 新动作设置 |
-| --- | --- |
-| `uia_control` | `uia_automation`，方式设为 `control` |
-| `uia_focus_window` | `uia_automation`，方式设为 `focus_window` |
-| `uia_read_text` | `uia_automation`，方式设为 `read_text` |
-| `uia_wait` | `uia_automation`，方式设为 `wait` |
-| `uia_macro` | `uia_automation`，方式设为 `macro` |
-
-升级后，应在规则编辑器中删除旧动作步骤并添加新的 `uia_automation` 步骤，然后重新选择屏幕控件或重新录制操作宏。旧规则继续引用已移除动作时，规则校验会报告插件未加载。
-
 ## 检查
 
 插件目录可执行以下检查：

@@ -1,4 +1,5 @@
 <script setup>
+import { findGraphNode } from '../../lib/workflowGraph'
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { listRuns, readLogEntries, readLogFileEntries, listLogFiles } from '../../lib/api'
 import { store } from '../../lib/store'
@@ -40,12 +41,17 @@ const levelMeta = {
   INFO: { label: '信息', cls: 'log-info' },
 }
 const runStatusMeta = {
-  running: { label: '运行中', icon: 'progress_activity', cls: 'running' },
-  deferred: { label: '等待重试', icon: 'schedule', cls: 'deferred' },
-  succeeded: { label: '成功', icon: 'check_circle', cls: 'succeeded' },
-  failed: { label: '失败', icon: 'error', cls: 'failed' },
-  cancelled: { label: '已停止', icon: 'stop_circle', cls: 'cancelled' },
+  queued: { label: '排队中', icon: 'schedule', cls: 'deferred', group: 'pending' },
+  running: { label: '运行中', icon: 'progress_activity', cls: 'running', group: 'pending' },
+  deferred: { label: '等待重试', icon: 'schedule', cls: 'deferred', group: 'pending' },
+  succeeded: { label: '成功', icon: 'check_circle', cls: 'succeeded', group: 'succeeded' },
+  recovered: { label: '已补救', icon: 'healing', cls: 'recovered', group: 'recovered' },
+  failed: { label: '失败', icon: 'error', cls: 'failed', group: 'failed' },
+  timed_out: { label: '已超时', icon: 'timer_off', cls: 'failed', group: 'failed' },
+  cancelled: { label: '已停止', icon: 'stop_circle', cls: 'cancelled', group: 'cancelled' },
+  dropped: { label: '已丢弃', icon: 'block', cls: 'cancelled', group: 'cancelled' },
 }
+const unknownRunMeta = { label: '未知状态', icon: 'help', cls: 'unknown', group: null }
 
 const levelCounts = computed(() => {
   const counts = { ERROR: 0, WARN: 0, INFO: 0 }
@@ -56,9 +62,10 @@ const levelCounts = computed(() => {
 })
 
 const runCounts = computed(() => {
-  const counts = { succeeded: 0, failed: 0, cancelled: 0, running: 0, deferred: 0 }
+  const counts = { succeeded: 0, recovered: 0, failed: 0, cancelled: 0, pending: 0 }
   runs.value.forEach(run => {
-    if (counts[run.status] !== undefined) counts[run.status]++
+    const group = runMeta(run.status).group
+    if (counts[group] !== undefined) counts[group]++
   })
   return counts
 })
@@ -77,8 +84,7 @@ const filteredRuns = computed(() => {
   const rangeSeconds = { '24h': 86400, '7d': 604800, '30d': 2592000 }[timeFilter.value] || 0
   const cutoff = rangeSeconds ? Date.now() / 1000 - rangeSeconds : 0
   return runs.value.filter(run => {
-    if (statusFilter.value === 'pending' && !['running', 'deferred'].includes(run.status)) return false
-    if (!['all', 'pending'].includes(statusFilter.value) && run.status !== statusFilter.value) return false
+    if (statusFilter.value !== 'all' && runMeta(run.status).group !== statusFilter.value) return false
     if (cutoff && Number(run.started_at || 0) < cutoff) return false
     if (actionFilter.value !== 'all'
       && !(run.steps || []).some(step => step.action_type === actionFilter.value)) return false
@@ -103,7 +109,7 @@ const filteredEntries = computed(() => {
 })
 
 function runMeta(status) {
-  return runStatusMeta[status] || runStatusMeta.running
+  return Object.hasOwn(runStatusMeta, status) ? runStatusMeta[status] : unknownRunMeta
 }
 
 function actionName(type) {
@@ -118,73 +124,46 @@ function triggerName(type) {
 function matchingRule(run) {
   const rules = store.configData.rules || []
   return rules.find(rule => run.rule_id && rule.rule_id === run.rule_id)
-    || rules.find(rule => rule.name === run.rule_name)
-}
-
-function walkActions(actions, visit, trail = []) {
-  ;(actions || []).forEach((action, index) => {
-    visit(action, index, trail)
-    for (const field of ['then', 'else', 'failure_actions']) {
-      if (Array.isArray(action?.[field]) && action[field].length) {
-        walkActions(action[field], visit, [...trail, { action, field, index }])
-      }
-    }
-  })
-}
-
-function findAction(actions, bindingId) {
-  let found = null
-  walkActions(actions, (action, index, trail) => {
-    if (!found && action?.binding_id === bindingId) found = { action, index, trail }
-  })
-  return found
 }
 
 function runScope(run) {
   if (!run.start_step_id && !run.end_step_id) return ''
-  const actions = matchingRule(run)?.actions || []
-  const startHit = run.start_step_id ? findAction(actions, run.start_step_id) : { index: 0, trail: [] }
-  const endHit = run.end_step_id ? findAction(actions, run.end_step_id) : { index: actions.length - 1, trail: [] }
-  if (!startHit || !endHit) return `局部测试 · ${run.action_count} 个动作`
-  if (startHit.trail.length || endHit.trail.length) return `局部测试 · ${run.action_count} 个动作`
-  return `局部测试 · 动作 ${startHit.index + 1}–${endHit.index + 1} / 共 ${actions.length} 个`
+  const rule = matchingRule(run)
+  const label = identity => {
+    const node = findGraphNode(rule || {}, identity)?.action
+    return node?.name || (node ? actionName(node.type) : identity)
+  }
+  return `局部测试 · ${run.start_step_id ? label(run.start_step_id) : '流程入口'} → ${run.end_step_id ? label(run.end_step_id) : '流程结束'}`
 }
 
 function stepNumber(run, step, fallback) {
-  const found = findAction(matchingRule(run)?.actions || [], step.step_id)
-  if (!found) return fallback
-  if (!found.trail.length) return found.index + 1
-  const parent = found.trail[0]
-  const branch = parent.field === 'then' ? 'THEN' : parent.field === 'else' ? 'ELSE' : '失败处理'
-  return `${parent.index + 1}.${branch}.${found.index + 1}`
+  return fallback
 }
 
 function stepContext(run, step) {
-  const found = findAction(matchingRule(run)?.actions || [], step.step_id)
+  const rule = matchingRule(run)
+  const found = rule && findGraphNode(rule, step.step_id)
   if (!found) return { kind: 'action', label: '' }
-  const failureParent = found.trail.find(item => item.field === 'failure_actions')
-  if (failureParent) {
-    return {
-      kind: 'failure',
-      label: `“${actionName(failureParent.action.type)}”的失败处理`,
-    }
+  const recovery = rule.workflow.edges.find(edge => edge.channel === 'control' && edge.port === 'failure' && found.trail.some(parent => parent.action.binding_id === edge.target))
+  if (recovery) {
+    const owner = findGraphNode(rule, recovery.source)?.action
+    return { kind: 'failure', label: `“${owner?.name || actionName(owner?.type)}”的补救流程` }
   }
-  if (found.trail.some(item => item.field === 'then' || item.field === 'else')) {
-    const parent = found.trail[0]
-    const branch = parent.field === 'then' ? '成立时' : '否则'
-    return { kind: 'action', label: `“${actionName(parent.action.type)}”${branch}` }
-  }
-  return { kind: 'action', label: '' }
+  return { kind: 'action', label: found.trail.map(parent => parent.action.name || (parent.action.type === 'action_group' ? '动作组' : '事件组')).join(' → ') }
 }
 
-function hasPreconditions(run) {
-  return Boolean(run.precondition_count || matchingRule(run)?.preconditions?.length)
+function recoveryText(recovery) {
+  return ({ running: '正在执行补救', succeeded: '补救完成', failed: '补救失败' })[recovery.status] || '补救状态未知'
 }
 
-function preconditionText(run) {
-  if (run.deferred_reason) return run.deferred_reason
-  if (run.steps?.length || ['succeeded', 'failed', 'cancelled'].includes(run.status)) return '检查通过'
-  return '等待检查结果'
+function ifBranchLabel(branch, run, step) {
+  if (run && step) { const node = findGraphNode(matchingRule(run) || {}, step.step_id)?.action; const index = node?.branches?.findIndex(item => item.id === branch); if (index >= 0) return node.branches[index].label || (node.branches[index].else ? 'ELSE' : index ? `ELIF ${index}` : 'IF') }
+  return branch || ''
+}
+
+function evaluationResult(value) {
+  if (value.error) return `判断出错 · ${value.error.code || '未知错误'}`
+  return value.result === true ? '成立' : value.result === false ? '不成立' : '未收到判断结果'
 }
 
 function formatTime(timestamp) {
@@ -221,14 +200,12 @@ function toggleRun(runId) {
 
 function jumpToRule(run) {
   store.pendingRuleId = run.rule_id || ''
-  store.pendingRuleName = run.rule_name || ''
   store.pendingStepId = ''
   window.__nmf?.switchPage?.('rules')
 }
 
 function jumpToStep(run, step) {
   store.pendingRuleId = run.rule_id || ''
-  store.pendingRuleName = run.rule_name || ''
   store.pendingStepId = step.step_id || ''
   window.__nmf?.switchPage?.('rules')
 }
@@ -418,6 +395,9 @@ onUnmounted(() => {
         <button class="run-summary-card succeeded" :class="{ active: statusFilter === 'succeeded' }" :aria-pressed="statusFilter === 'succeeded'" @click="statusFilter = 'succeeded'">
           <span>成功</span><strong>{{ runCounts.succeeded }}</strong>
         </button>
+        <button class="run-summary-card recovered" :class="{ active: statusFilter === 'recovered' }" :aria-pressed="statusFilter === 'recovered'" @click="statusFilter = 'recovered'">
+          <span>已补救</span><strong>{{ runCounts.recovered }}</strong>
+        </button>
         <button class="run-summary-card failed" :class="{ active: statusFilter === 'failed' }" :aria-pressed="statusFilter === 'failed'" @click="statusFilter = 'failed'">
           <span>失败</span><strong>{{ runCounts.failed }}</strong>
         </button>
@@ -425,7 +405,7 @@ onUnmounted(() => {
           <span>已停止</span><strong>{{ runCounts.cancelled }}</strong>
         </button>
         <button class="run-summary-card pending" :class="{ active: statusFilter === 'pending' }" :aria-pressed="statusFilter === 'pending'" @click="statusFilter = 'pending'">
-          <span>进行中</span><strong>{{ runCounts.running + runCounts.deferred }}</strong>
+          <span>进行中</span><strong>{{ runCounts.pending }}</strong>
         </button>
       </div>
 
@@ -502,24 +482,30 @@ onUnmounted(() => {
                 <span class="run-step-copy"><strong>触发</strong><small>{{ triggerName(run.event_type) }}</small></span>
                 <span class="run-step-actions"><span class="material-symbols-outlined run-step-state">check</span></span>
               </div>
-              <div v-if="hasPreconditions(run)" class="run-step run-timeline-fixed" :class="run.deferred_reason ? 'deferred' : 'succeeded'">
-                <span class="run-step-index"><span class="material-symbols-outlined">rule</span></span>
-                <span class="run-step-copy">
-                  <strong>执行前检查</strong>
-                  <small>{{ preconditionText(run) }}<template v-if="run.retry_after_seconds"> · {{ run.retry_after_seconds }} 秒后再检查</template></small>
-                </span>
-                <span class="run-step-actions"><span class="material-symbols-outlined run-step-state">{{ run.deferred_reason ? 'schedule' : 'check' }}</span></span>
-              </div>
               <div v-for="(step, index) in run.steps" :key="step.step_id" class="run-step" :class="step.status">
                 <span class="run-step-index">{{ stepNumber(run, step, index + 1) }}</span>
                 <span class="run-step-copy">
                   <strong>{{ actionName(step.action_type) }}</strong>
+                  <small v-if="step.recovery">{{ recoveryText(step.recovery) }}<span v-if="step.recovery.error"> · {{ errorText(step.recovery.error) }}</span><button class="icon-btn" title="定位补救动作组" @click="jumpToStep(run, { step_id: step.recovery.group_id })"><span class="material-symbols-outlined">open_in_new</span></button></small>
                   <small v-if="stepContext(run, step).kind === 'failure'">失败处理 · {{ stepContext(run, step).label }}</small>
-                  <small v-if="step.status === 'skipped'">{{ step.reason || '已跳过' }}</small>
+                  <small v-if="step.status === 'waiting'">{{ step.reason || '等待事件组合' }}</small><small v-else-if="step.status === 'running'">正在执行</small><small v-else-if="step.status === 'skipped'">{{ step.reason || '已跳过' }}</small>
                   <small v-else-if="step.status === 'failed'">{{ errorText(step.error) || '执行失败' }}</small>
                   <small v-else-if="step.status === 'cancelled'">已安全停止</small>
                   <small v-else-if="step.status === 'timed_out'">超过允许的运行时间</small>
                   <small v-else>{{ formatDuration(step.duration_ms) }}<template v-if="step.attempt > 1"> · 共尝试 {{ step.attempt }} 次</template></small>
+                  <small v-if="stepContext(run, step).label && stepContext(run, step).kind !== 'failure'">{{ stepContext(run, step).label }}</small>
+                  <small v-if="ifBranchLabel(step.branch, run, step)">执行分支 · {{ ifBranchLabel(step.branch, run, step) }}</small>
+                  <details v-if="step.evaluated_branches?.length" class="run-condition-results">
+                    <summary>条件判断 · {{ step.evaluated_branches.length }} 个分支</summary>
+                    <div v-for="(evaluation, evaluationIndex) in step.evaluated_branches" :key="evaluation.branch_id" class="run-condition-branch">
+                      <small><b>{{ evaluationIndex ? `ELIF ${evaluationIndex}` : 'IF' }}</b> · {{ evaluationResult(evaluation) }}</small>
+                      <code class="run-step-binding">{{ evaluation.branch_id }}</code>
+                      <small v-for="(predicate, predicateIndex) in evaluation.predicates" :key="predicateIndex" class="run-condition-predicate">
+                        {{ predicate.op }} · {{ evaluationResult(predicate) }}
+                        <code class="run-step-binding">{{ predicate.node_id || predicate.path }}</code>
+                      </small>
+                    </div>
+                  </details>
                   <code class="run-step-binding">{{ step.step_id }}</code>
                   <div v-if="step.input_summary?.length || step.output_summary?.length" class="step-summary-strip run-step-summary">
                     <div v-if="step.input_summary?.length" class="step-summary-side">
@@ -534,7 +520,7 @@ onUnmounted(() => {
                   </div>
                 </span>
                 <span class="run-step-actions">
-                  <span class="material-symbols-outlined run-step-state">{{ step.status === 'succeeded' ? 'check' : step.status === 'skipped' ? 'skip_next' : step.status === 'cancelled' ? 'stop' : step.status === 'timed_out' ? 'timer_off' : 'close' }}</span>
+                  <span class="material-symbols-outlined run-step-state">{{ step.status === 'waiting' ? 'hourglass_empty' : step.status === 'running' ? 'pending' : step.status === 'succeeded' ? 'check' : step.status === 'skipped' ? 'skip_next' : step.status === 'cancelled' ? 'stop' : step.status === 'timed_out' ? 'timer_off' : 'close' }}</span>
                   <button v-if="step.status === 'failed'" class="btn btn-text btn-sm run-step-open" @click="jumpToStep(run, step)">编辑这一步</button>
                 </span>
               </div>
@@ -599,3 +585,13 @@ onUnmounted(() => {
     </template>
   </section>
 </template>
+
+<style scoped>
+.run-condition-results { margin-block: 8px; padding: 10px 12px; border: 1px solid var(--md-outline-variant); border-radius: 12px; background: var(--md-surface-c); }
+.run-condition-results summary { cursor: pointer; color: var(--md-on-surface-variant); font-size: 12px; }
+.run-condition-results summary:focus-visible { outline: 2px solid var(--md-primary); outline-offset: 4px; }
+.run-condition-branch { padding-block: 8px; }
+.run-condition-branch + .run-condition-branch { border-top: 1px solid var(--md-outline-variant); }
+.run-condition-predicate { display: block; margin: 6px 0 0 12px; }
+.run-condition-predicate code { display: block; }
+</style>

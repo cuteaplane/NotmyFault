@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from typing import Any, Dict, Iterable, List
+from notmyfault.values import Blob, Secret
 
 
 _MAX_FIELDS = 8
@@ -19,6 +20,10 @@ def _text(value: Any, limit: int) -> str:
 
 
 def _shape(value: Any, field_type: str) -> str:
+    if isinstance(value, Secret):
+        return "敏感值已隐藏"
+    if isinstance(value, Blob):
+        return f"{value.type} · {value.size} 字节"
     if value is None:
         return "空值"
     if isinstance(value, bool):
@@ -42,6 +47,8 @@ def _shape(value: Any, field_type: str) -> str:
 
 
 def _visible_value(value: Any, field_type: str) -> str:
+    if isinstance(value, (Secret, Blob)):
+        return _shape(value, field_type)
     if value is None:
         return "空值"
     if isinstance(value, bool):
@@ -83,7 +90,7 @@ def summarize_fields(value: Any, definitions: Any) -> List[Dict[str, Any]]:
         policy = spec.get("summary", "shape")
         if policy == "hidden":
             continue
-        sensitive = spec.get("sensitive") is True
+        sensitive = spec.get("sensitive") is True or isinstance(value[name], Secret)
         field_type = spec.get("value_type") or spec.get("type") or "any"
         if isinstance(field_type, dict):
             field_type = field_type.get("type", "any")

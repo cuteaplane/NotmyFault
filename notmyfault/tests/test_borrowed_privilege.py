@@ -1,63 +1,57 @@
 """借壳提权扫描：跨插件模块导入、sys.modules 与内置动态执行绕过"""
 
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from notmyfault.security.plugins import (
-    scan_borrowed_privilege,
-    scan_plugin_capabilities,
-)
+from notmyfault.security.plugins import analyze_plugin_source
 from notmyfault.security.plugin_loader import PluginLoader, PluginRegistry
 from notmyfault.security.security import SecurityMode
 
 
-def scan(tmp_path, source):
-    py_file = Path(tmp_path) / "action.py"
-    py_file.write_text(source, encoding="utf-8")
-    return scan_borrowed_privilege(str(py_file))
+def scan(source):
+    return analyze_plugin_source(source, "action.py").borrowed
 
 
-def test_plain_plugin_no_findings(tmp_path):
-    assert scan(tmp_path, "def run(params):\n    return True\n") == []
+def test_plain_plugin_no_findings():
+    assert scan("def run_with_context(action_info, params, context):\n    return True\n") == []
 
 
-def test_import_notmyfault_public_api_no_findings(tmp_path):
+def test_import_notmyfault_public_api_no_findings():
     source = (
         "import notmyfault\n"
         "import notmyfault.config\n"
         "from notmyfault.core.logging import engine_info\n"
         "from notmyfault.triggers.base import PollingTrigger\n"
     )
-    assert scan(tmp_path, source) == []
+    assert scan(source) == []
 
 
-def test_import_sudo_via_public_api_no_findings(tmp_path):
+def test_import_sudo_via_public_api_no_findings():
     source = "from notmyfault.security.sudo import run_as_admin\n"
-    assert scan(tmp_path, source) == []
+    assert scan(source) == []
 
 
 @pytest.mark.parametrize("module", ["notmyfault.action_other", "notmyfault.actions.other", "notmyfault.triggers.other"])
-def test_direct_import_of_engine_plugin_module(tmp_path, module):
-    findings = scan(tmp_path, f"import {module}\n")
+def test_direct_import_of_engine_plugin_module(module):
+    findings = scan(f"import {module}\n")
     assert any(
         f"直接导入引擎插件模块 {module}" in f for f in findings
     )
 
 
-def test_from_import_of_engine_plugin_module(tmp_path):
-    findings = scan(tmp_path, "from notmyfault.trigger_hotkey import helper\n")
+def test_from_import_of_engine_plugin_module():
+    findings = scan("from notmyfault.trigger_hotkey import helper\n")
     assert any(
         "from-import 引擎插件模块 notmyfault.trigger_hotkey 的 helper" in f
         for f in findings
     )
 
 
-def test_sys_modules_access(tmp_path):
+def test_sys_modules_access():
     findings = scan(
-        tmp_path, "import sys\nvictim = sys.modules['notmyfault.action_victim']\n"
+        "import sys\nvictim = sys.modules['notmyfault.action_victim']\n"
     )
     assert any(
         "通过 sys.modules 获取引擎插件模块 notmyfault.action_victim" in f
@@ -65,26 +59,26 @@ def test_sys_modules_access(tmp_path):
     )
 
 
-def test_sys_modules_non_plugin_key_no_findings(tmp_path):
-    assert scan(tmp_path, "import sys\nm = sys.modules['os']\n") == []
+def test_sys_modules_non_plugin_key_no_findings():
+    assert scan("import sys\nm = sys.modules['os']\n") == []
 
 
-def test_sys_modules_getattr_bypass_detected(tmp_path):
+def test_sys_modules_getattr_bypass_detected():
     source = (
         "import sys\n"
         "run = getattr(sys.modules['notmyfault.action_victim'], 'run')\n"
     )
-    findings = scan(tmp_path, source)
+    findings = scan(source)
     assert any("sys.modules" in f for f in findings)
 
 
-def test_sys_modules_subprocess_popen_bypass_detected(tmp_path):
+def test_sys_modules_subprocess_popen_bypass_detected():
     source = (
         "import sys\n"
         "m = sys.modules['notmyfault.trigger_x']\n"
         "m.Popen('cmd')\n"
     )
-    findings = scan(tmp_path, source)
+    findings = scan(source)
     assert any("sys.modules" in f for f in findings)
     assert any(
         "调用引擎插件模块内部函数 notmyfault.trigger_x.Popen()" in f
@@ -92,38 +86,36 @@ def test_sys_modules_subprocess_popen_bypass_detected(tmp_path):
     )
 
 
-def test_alias_call_of_plugin_module_internal(tmp_path):
+def test_alias_call_of_plugin_module_internal():
     source = (
         "import notmyfault.action_other as other\n"
         "other.helper()\n"
     )
-    findings = scan(tmp_path, source)
+    findings = scan(source)
     assert any(
         "调用引擎插件模块内部函数 notmyfault.action_other.helper()" in f
         for f in findings
     )
 
 
-def test_getattr_builtins_exec_bypass(tmp_path):
-    findings = scan(tmp_path, 'f = getattr(__builtins__, "exec")\n')
+def test_getattr_builtins_exec_bypass():
+    findings = scan('f = getattr(__builtins__, "exec")\n')
     assert any("getattr 获取内置动态执行函数 exec" in f for f in findings)
 
 
-def test_getattr_unrelated_no_findings(tmp_path):
-    assert scan(tmp_path, 'name = getattr(obj, "name")\n') == []
+def test_getattr_unrelated_no_findings():
+    assert scan('name = getattr(obj, "name")\n') == []
 
 
-def test_builtins_subscript_exec_bypass_detected(tmp_path):
-    py_file = Path(tmp_path) / "action.py"
-    py_file.write_text('f = __builtins__["exec"]\nf("print(1)")\n', encoding="utf-8")
-    assert "dynamic_exec" in scan_plugin_capabilities(str(py_file))
+def test_builtins_subscript_exec_bypass_detected():
+    analysis = analyze_plugin_source('f = __builtins__["exec"]\nf("print(1)")\n', "action.py")
+    assert "dynamic_exec" in analysis.capabilities
 
 
-def test_builtins_subscript_benign_key_no_false_positive(tmp_path):
-    py_file = Path(tmp_path) / "action.py"
-    py_file.write_text('f = __builtins__["len"]\nf([1])\n', encoding="utf-8")
-    assert "dynamic_exec" not in scan_plugin_capabilities(str(py_file))
-    assert scan_borrowed_privilege(str(py_file)) == []
+def test_builtins_subscript_benign_key_no_false_positive():
+    source = 'f = __builtins__["len"]\nf([1])\n'
+    assert "dynamic_exec" not in analyze_plugin_source(source, "action.py").capabilities
+    assert scan(source) == []
 
 
 class SudoStub:
@@ -146,7 +138,7 @@ def test_loader_warns_on_borrowed_privilege_for_every_origin(
                 "id": "borrow",
                 "name": "借壳插件",
                 "description": "测试借壳扫描",
-                "enabled": True,
+                "execution_api": "context-v1",
                 "version_code": 1,
                 "version": "1.0",
                 "package_name": "com.test.borrow",
@@ -162,7 +154,7 @@ def test_loader_warns_on_borrowed_privilege_for_every_origin(
         "except KeyError:\n"
         "    victim = None\n"
         "\n"
-        "def run(params):\n"
+        "def run_with_context(action_info, params, context):\n"
         "    return True\n",
         encoding="utf-8",
     )

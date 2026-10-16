@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from notmyfault.values import Blob, FrozenDict, FrozenList, Secret, protect, secret_value
+
 import copy
 import math
 import re
@@ -13,7 +15,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 
-TYPE_ALIASES = {"string": "text", "integer": "int", "boolean": "bool", "list": "array"}
+TYPE_ALIASES = {"string": "text"}
 BUILTIN_TYPES = frozenset({
     "any", "null", "text", "int", "float", "number", "decimal", "bool",
     "date", "time", "datetime", "timestamp", "duration", "path", "url", "uuid",
@@ -163,28 +165,33 @@ def field_type(field: dict | None, *, parameter: bool = False) -> dict:
         kind = "string"
     elif parameter and kind == "plugin_data":
         kind = "object"
-    if not parameter and kind == "array" and "item_type" in field:
-        return normalize_type({"type": "array", "items": field["item_type"]})
     return normalize_type(kind)
 
 
 def has_type_contract(field):
-    legacy = ("string", "number", "bool", "array", "object", "any")
+    controls = ("string", "number", "bool", "array", "object", "any")
     if "value_type" in field:
         return True
-    return field.get("type", "any") not in legacy
+    return field.get("type", "any") not in controls
 
 
-def normalize_fields(values, fields, registry=None, *, parameters=False, location="$"):
+def normalize_fields(values, fields, registry=None, *, parameters=False, location="$", wrap_sensitive=False, partial=False):
+    if isinstance(values, Secret):
+        return protect(normalize_fields(
+            secret_value(values), fields, registry, parameters=parameters, location=location,
+            wrap_sensitive=wrap_sensitive, partial=partial,
+        ))
     contracted = [field for field in fields or [] if isinstance(field, dict) and has_type_contract(field) and (not parameters or "value_type" in field)]
-    if not contracted:
+    if not contracted and not isinstance(values, dict):
         return copy.deepcopy(values)
     if not isinstance(values, dict):
         raise DataTypeError("输入或输出必须是对象", location=location)
-    result = copy.deepcopy(values)
+    result = dict(values)
     for field in contracted:
         name = field["name"]
         if name not in result:
+            if partial:
+                continue
             if parameters and "default" in field:
                 result[name] = copy.deepcopy(field["default"])
             elif field.get("required", not parameters):
@@ -192,10 +199,16 @@ def normalize_fields(values, fields, registry=None, *, parameters=False, locatio
             else:
                 continue
         result[name] = normalize_value(result[name], field_type(field, parameter=parameters), registry, location=f"{location}.{name}")
+    for field in fields or []:
+        if wrap_sensitive and isinstance(field, dict) and field.get("sensitive") and field.get("name") in result:
+            result[field["name"]] = protect(result[field["name"]])
     return result
 
 
 def infer_type(value: Any) -> dict:
+    value = secret_value(value)
+    if isinstance(value, Blob):
+        return normalize_type(value.type)
     if value is None:
         kind = "null"
     elif isinstance(value, bool):
@@ -235,6 +248,8 @@ def copy_value(value: Any, *, location: str = "$") -> Any:
     def visit(item, path, depth):
         if depth > 64:
             raise DataTypeError("数据嵌套超过 64 层", location=path)
+        if isinstance(item, (Secret, Blob, FrozenDict, FrozenList)):
+            return item
         if item is None or isinstance(item, (str, bool, int)):
             return item
         if isinstance(item, (float, Decimal)):
@@ -271,6 +286,13 @@ def normalize_value(value: Any, declaration: Any, registry=None, *, location: st
 
     def visit(item, spec, path, depth=0):
         kind = spec["type"]
+
+        if isinstance(item, Secret):
+            normalized = visit(secret_value(item), spec, path, depth)
+            return item if normalized is secret_value(item) else protect(normalized)
+        if isinstance(item, Blob):
+            visit(item._value, spec, path, depth)
+            return item
 
         def invalid(message=None, code="type_mismatch"):
             raise DataTypeError(message or f"数据应为 {TYPE_LABELS.get(kind, kind)}", location=path, code=code)

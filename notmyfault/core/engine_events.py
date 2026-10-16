@@ -1,68 +1,45 @@
-"""引擎运行事件的进程内订阅
+from contextlib import contextmanager
+from contextvars import ContextVar
 
-插件通过 plugin_api.engine_events_api() 订阅。引擎在 _safe_on_event 里 publish。
-回调在发布线程同步执行，异常只记日志，不打断其他订阅者。
-"""
+from notmyfault.core.event_stream import EventStream, RUN_TERMINAL_EVENTS
 
-from __future__ import annotations
-
-import itertools
-import sys
-import threading
-import traceback
-from typing import Any, Callable, Dict
-
-EventCallback = Callable[[str, Dict[str, Any]], None]
-
-# 规则跑完相关的稳定事件，第三方插件可以依赖这些名字
-RULE_TERMINAL_EVENTS = frozenset(
-    {
-        "workflow_completed",
-        "workflow_failed",
-        "run_dropped",
-        "run_replaced",
-    }
-)
-
-_lock = threading.RLock()
-_next_token = itertools.count(1)
-_subscribers: Dict[int, EventCallback] = {}
+RULE_TERMINAL_EVENTS = RUN_TERMINAL_EVENTS
+_default_stream = EventStream()
+_current_stream = ContextVar("engine_event_stream", default=None)
 
 
-def subscribe(callback: EventCallback) -> int:
-    if not callable(callback):
-        raise TypeError("callback 必须可调用")
-    with _lock:
-        token = next(_next_token)
-        _subscribers[token] = callback
-        return token
+def current_stream():
+    return _current_stream.get() or _default_stream
 
 
-def unsubscribe(token: int) -> None:
-    with _lock:
-        _subscribers.pop(token, None)
+@contextmanager
+def use_stream(stream):
+    token = _current_stream.set(stream)
+    try:
+        yield
+    finally:
+        _current_stream.reset(token)
 
 
-def publish(event_type: str, data: Dict[str, Any] | None = None) -> None:
-    payload = dict(data or {})
-    with _lock:
-        callbacks = list(_subscribers.values())
-    for callback in callbacks:
-        try:
-            callback(event_type, payload)
-        except Exception:
-            print(
-                f"[EngineEvents] 订阅回调异常 ({event_type}):",
-                file=sys.stderr,
-            )
-            traceback.print_exc(limit=3, file=sys.stderr)
+def subscribe(callback, **options):
+    return current_stream().subscribe(callback, **options)
 
 
-def clear() -> None:
-    with _lock:
-        _subscribers.clear()
+def unsubscribe(subscription):
+    current_stream().unsubscribe(subscription)
 
 
-def subscriber_count() -> int:
-    with _lock:
-        return len(_subscribers)
+def publish(event_type, data=None):
+    return current_stream().publish(event_type, data)
+
+
+def clear():
+    current_stream().clear()
+
+
+def flush(timeout=5):
+    return current_stream().flush(timeout)
+
+
+def subscriber_count():
+    return current_stream().subscriber_count()

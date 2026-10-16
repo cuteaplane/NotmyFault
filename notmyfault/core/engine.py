@@ -8,36 +8,41 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 from notmyfault.core.diagnostics import Diagnostics
+from notmyfault.core.clock import Clock, SystemClock
 from notmyfault.config import ConfigValidationError
 from notmyfault.core.event_bus import EventBus
-from notmyfault.core.hot_reloader import RulesHotReloader
+from notmyfault.core.rule_watcher import RuleWatcher
 from notmyfault.core.logging import engine_error, engine_info, engine_warn
 from notmyfault.core import plugin_worker
 from notmyfault.security.plugin_loader import (
     PluginLoader,
     PluginRegistry,
 )
-from notmyfault.core.rule_scheduler import RuleScheduler
-from notmyfault.core.rules import (
-    get_rule_events,
-    validate_rules,
-)
+from notmyfault.core.plugin_runtime import PluginRuntime
+from notmyfault.core.generation_manager import GenerationManager
+from notmyfault.core.run_manager import RunManager
+from notmyfault.core.event_stream import Event, EventStream
+from notmyfault.core.engine_events import use_stream
 from notmyfault.core.rule_model import normalize_rules
-from notmyfault.core.runtime_rules import PreparedRules, prepare_rules, rule_key
-from notmyfault.security.plugin_schema import check_payload_contract
+from notmyfault.core.runtime_rules import PreparedRules
+from notmyfault.core.compiled_rules import thaw
+from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions, find_graph_node, find_graph_scope, execution_nodes, NATIVE_NODES, NON_ACTION_NODES
 from notmyfault.security.security import (
     SecurityMode,
     detect_security_mode as _detect_security_mode,
     verify_core_integrity,
 )
-from notmyfault.core.trigger_supervisor import TriggerSupervisor
+from notmyfault.core.trigger_host import TriggerHost
+from notmyfault.core.state_store import StateStore
+from pathlib import Path
+from notmyfault.platform.boot_identity import boot_id
 from notmyfault.core.workflow import build_context
-from notmyfault.core.binding_schema import prepare_binding_context
+from notmyfault.core.binding_schema import prepare_binding_context, rule_step_output_fields
 from notmyfault.core.bindings import BindingResolutionError
 from notmyfault.core.data_types import DataTypeError, normalize_fields
 from notmyfault.core.type_registry import TypeRegistry
-from notmyfault.core.variables import resolve_trigger_constants
 from notmyfault.core.workflow_executor import WorkflowExecutor
+from notmyfault.values import hold_value
 
 
 class RulesStorePort(Protocol):
@@ -60,8 +65,8 @@ class _PluginErrorReporter:
     def record_plugin_error(self, store: str, plugin_id: str, reason: str) -> None:
         self._diagnostics.record_plugin_error(store, plugin_id, reason)
         self._emit(
-            "plugin_load_failed",
-            {"store": store, "plugin_id": plugin_id, "reason": reason},
+            "plugin.load_failed",
+            {"store": store, "plugin_id": plugin_id, "reason": reason, "error": {"code": "plugin_load_failed", "message": reason, "location": plugin_id}},
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -74,16 +79,23 @@ class AutomationEngine:
     def __init__(
         self,
         config: Dict[str, Any],
-        on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        on_event: Optional[Callable[[Event], None]] = None,
         *,
         rules_store: RulesStorePort,
+        clock: Clock | None = None,
     ) -> None:
         # 热重载只替换 rules，构造函数传入的 config 保持原对象
         self.config = config
+        self.clock = clock or SystemClock()
         self._rules_store = rules_store
         self._rules_lock = threading.RLock()
         self.rules: List[Dict[str, Any]] = config.get("rules", [])
-        self.on_event = on_event
+        self.events = EventStream(clock=self.clock)
+        self._event_subscription = None
+        if on_event is not None:
+            self._event_subscription = self.events.subscribe(
+                on_event, overflow="drop_oldest", on_overflow=self._report_event_overflow,
+            )
 
         self._plugin_registry = PluginRegistry()
         # 旧插件、Dashboard 和测试仍直接读取这些注册表对象
@@ -111,9 +123,14 @@ class AutomationEngine:
 
         self._shutdown_flag: "threading.Event | None" = None
 
-        self._trigger_supervisor = TriggerSupervisor(
-            # 运行时查找 _alert_user，构造后替换的告警回调仍然生效
-            alert_cb=lambda title, message: self._alert_user(title, message),
+        self._state_store = None
+        self._state_store_lock = threading.Lock()
+        self._trigger_host = TriggerHost(
+            self.emit_event, self.events, self._get_state_store,
+            clock=self.clock,
+            alert=lambda title, message: self._alert_user(title, message),
+            boot_id=boot_id(), engine_started_at=self.clock.time(),
+            on_failure=self._diag_obj.record_trigger_crash,
         )
 
         self._start_time: float = 0.0
@@ -128,6 +145,7 @@ class AutomationEngine:
             integrity_errors=self._plugin_integrity_errors,
             plugin_manifest_path=rules_store.plugin_manifest_path,
         )
+        self._plugins = PluginRuntime(self._plugin_registry, self._plugin_loader)
         # rules 和 meta 走 lambda 运行时取值，锁和条件运行时传同一个对象
         self._event_bus = EventBus(
             snapshot_fn=self._get_runtime_snapshot,
@@ -138,8 +156,8 @@ class AutomationEngine:
                 self._shutdown_flag and self._shutdown_flag.is_set()
             ),
             safe_on_event=self._safe_on_event,
-            execute_workflow_cb=self.execute_workflow,
-            scheduler_submit_fn=lambda *args: self._rule_scheduler.submit(*args),
+            status_lookup=lambda rule_id: self._run_manager.rule_status(rule_id),
+            scheduler_submit_fn=lambda *args: self._run_manager.submit(*args),
             alert_fn=lambda title, message: self._alert_user(title, message),
         )
         self._workflow_executor = WorkflowExecutor(
@@ -151,64 +169,76 @@ class AutomationEngine:
             shutdown_event=lambda: self._shutdown_flag,
             on_event=self._safe_on_event,
             action_resolver=self._plugin_registry.resolve_action,
-            sensitive_values=self._collect_sensitive_values,
+            clock=self.clock,
+            status_lookup=lambda rule_id: self._run_manager.rule_status(rule_id),
         )
         # 同一规则反复触发时先到这里决定丢弃、排队还是直接跑
-        self._rule_scheduler = RuleScheduler(
-            execute_fn=self.execute_workflow,
-            cancel_run_fn=self._workflow_executor.cancel_run,
-            on_history_event=self._safe_on_event,
-            prepare_run_fn=self._workflow_executor.prepare_run,
+        self._run_manager = RunManager(
+            execute_fn=self._workflow_executor.execute_workflow,
+            on_event=self._safe_on_event,
         )
+        self._generations = GenerationManager(self._plugins, self._run_manager, self.events, lock=self._rules_lock,
+                                              reconcile=self._trigger_host.reconcile, on_change=self._trigger_host._wake.set,
+                                              clock=self.clock)
+        self._trigger_host.timer_callback = self._event_bus.process_timers
+        self._trigger_host.deadline_callback = self._condition_deadline
         # isolated 动作崩了通过这个回调推 plugin_worker_crashed 事件
         plugin_worker.set_crash_callback(self._safe_on_event)
-        # 旧扩展和测试仍直接读取这些同步对象
-        self._action_lock = self._workflow_executor.action_lock
-        self._action_done = self._workflow_executor.action_done
-        self._hot_reloader = RulesHotReloader(
-            rules_path_fn=lambda: self._rules_store.rules_path,
-            load_rules_fn=self._rules_store.load_verified_rules,
-            stop_triggers_fn=self._stop_trigger_threads,
-            prepare_rules_fn=self._prepare_rules,
-            apply_rules_fn=self._apply_hot_reload_rules,
-            accept_rules_fn=self._accept_hot_reload_rules,
-            start_triggers_fn=self._start_trigger_threads,
-            diagnostics=self._diag_obj,
-            alert_cb=lambda title, message: self._alert_user(title, message),
-            current_rules_fn=lambda: self._get_runtime_snapshot(),
+        self._rule_watcher = RuleWatcher(
+            lambda: self._rules_store.rules_path, self._rules_store.load_verified_rules,
+            self.apply_rules, on_error=self._watcher_error,
+            clock=self.clock,
         )
+
+    def _get_state_store(self):
+        with self._state_store_lock:
+            if self._state_store is None:
+                self._state_store = StateStore(Path(self._rules_store.rules_path).parent / "runtime.sqlite3")
+            return self._state_store
+
+    def _watcher_error(self, error, stage):
+        self._diag_obj.add_rule_issue("", str(error))
+        if stage == "read":
+            self.events.publish("rules.rejected", {"source": "file", "error": {"code": "rules_read_failed", "message": str(error)}})
+        self._alert_user("规则更新失败", str(error))
 
     @property
     def rules(self):
-        return self._rules
+        manager = getattr(self, "_generations", None)
+        generation = manager.current if manager is not None else None
+        return generation.snapshot.rules if generation is not None else self._rules
 
     @rules.setter
     def rules(self, rules):
-        with self._rules_lock:
-            self._rules = rules
-            self._prepared_rules = None
+        normalized = normalize_rules(rules)
+        manager = getattr(self, "_generations", None)
+        if manager is not None and manager.current is not None:
+            manager.apply(normalized, "assignment", activate=False, validate=False)
+        else:
+            self._rules = normalized
 
     @property
     def _condition_runtime(self):
         return self._get_runtime_snapshot().runtime
 
     def _get_runtime_snapshot(self):
-        with self._rules_lock:
-            if self._prepared_rules is None:
-                self._prepared_rules = prepare_rules(
-                    self.rules, self.triggers_meta, self.actions_meta, validate=False,
-                )
-                self._rules = self._prepared_rules.rules
-            return self._prepared_rules
+        generation = self._generations.current
+        if generation is None:
+            generation = self._generations.ensure_initial(self._rules)
+        return generation.snapshot
 
     def _prepare_rules(self, rules):
         try:
-            return prepare_rules(
-                rules, self.triggers_meta, self.actions_meta,
-                resolve_trigger=self._plugin_registry.resolve_trigger,
-            )
+            return self._generations.prepare(rules)
         except (ValueError, DataTypeError, BindingResolutionError) as error:
             raise ConfigValidationError(str(error)) from error
+
+    def apply_rules(self, document, source="api"):
+        generation = self._generations.apply(document, source)
+        self._report_rule_issues(generation.snapshot)
+        if source == "api":
+            self._rule_watcher.acknowledge()
+        return generation
 
     def _report_rule_issues(self, prepared: PreparedRules) -> None:
         self._diag_obj.reset_rule_issues()
@@ -224,9 +254,6 @@ class AutomationEngine:
                 f"已跳过 {prepared.total - len(prepared)} 条规则，引擎继续运行。请在 Dashboard 查看规则错误并修正。",
             )
 
-    @property
-    def _active_actions(self) -> int:
-        return self._workflow_executor.active_actions
 
     @staticmethod
     def _alert_user(title: str, message: str, open_dashboard: bool = False) -> None:
@@ -238,143 +265,20 @@ class AutomationEngine:
             engine_warn(f"alert_user 调用失败 ({title}): {e}")
 
     def _safe_on_event(self, event_type: str, payload: Dict[str, Any]) -> None:
-        """调用外部事件回调并记录回调异常"""
-        if event_type in ("workflow_completed", "workflow_failed"):
-            scheduler = getattr(self, "_rule_scheduler", None)
-            if scheduler is not None:
-                scheduler.on_run_event(event_type, payload.get("run_id"))
-        # 插件订阅与 Dashboard/SSE 并行，互不影响
-        try:
-            from notmyfault.core.engine_events import publish as publish_engine_event
-            publish_engine_event(event_type, payload)
-        except Exception:
-            err = traceback.format_exc()
-            print(f"[Engine] [!!] 引擎事件订阅分发异常 ({event_type}):", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-            engine_error("engine_events_error", event_type=event_type, error=err[-500:])
-            self._diag_obj.record_error("engine_events", f"{event_type}: {err[-300:]}")
-        if not self.on_event:
-            return
-        # UI 或 SSE 推送失败时记录错误并继续分发
-        try:
-            self.on_event(event_type, copy.deepcopy(payload))
-        except Exception:
-            err = traceback.format_exc()
-            print(f"[Engine] [!!] on_event 回调异常 ({event_type}):", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-            engine_error("event_callback_error", event_type=event_type, error=err[-500:])
-            self._diag_obj.record_error("event_callback", f"{event_type}: {err[-300:]}")
+        self.events.publish(event_type, payload)
 
-    def _run_trigger(
-        self,
-        instance_id: str,
-        trigger_id: str,
-        trigger_func: Callable[..., Any],
-        trigger_meta: Dict[str, Any],
-        config: Any,
-        stop_event: threading.Event,
-    ) -> None:
-        """触发器线程入口，隔离插件异常并上报崩溃"""
-        # 触发器代码来自插件，异常由这里捕获并上报
-        try:
-            registry = self._get_runtime_snapshot().registry
-            def emit_checked(event_name: str, payload: Dict[str, Any]) -> None:
-                if stop_event.is_set():
-                    return
-                if not isinstance(payload, dict):
-                    raise TypeError("emit_event 的 payload 必须是对象")
-                problems = check_payload_contract(
-                    trigger_meta.get("outputs"), payload,
-                    registry,
-                )
-                if problems:
-                    print(
-                        f"[Engine] [!!] 触发器 {instance_id} 事件 payload "
-                        "违反输出契约，已拦截:",
-                        file=sys.stderr,
-                    )
-                    for problem in problems:
-                        print(f"         - {problem}", file=sys.stderr)
-                    engine_error(
-                        "trigger_payload_invalid",
-                        trigger=instance_id,
-                        error="; ".join(problems),
-                    )
-                    self._safe_on_event(
-                        "trigger_payload_invalid",
-                        {
-                            "trigger_id": trigger_id,
-                            "instance_id": instance_id,
-                            "problems": problems,
-                        },
-                    )
-                    return
-                self.emit_event(
-                    event_name,
-                    normalize_fields(payload, trigger_meta.get("outputs"), registry),
-                    instance=(
-                        {"config": config}
-                        if trigger_meta.get("trigger_api") == "event-v2"
-                        else None
-                    ),
-                )
-
-            if trigger_meta.get("trigger_api") == "event-v2":
-
-                def emit_event(payload: Dict[str, Any]) -> None:
-                    emit_checked(trigger_id, payload)
-
-                trigger_func(trigger_meta, config, emit_event, stop_event)
-            else:
-                def emit_legacy(event_name: str, payload: Dict[str, Any]) -> None:
-                    emit_checked(event_name, payload)
-
-                trigger_func(trigger_meta, config, emit_legacy, stop_event)
-            if not stop_event.is_set():
-                self._safe_on_event("trigger_stopped", {"trigger_id": trigger_id, "instance_id": instance_id})
-                self._alert_user(f"触发器 {instance_id} 已停止", "触发器已返回，相关规则将不再接收该实例的事件", open_dashboard=False)
-        except Exception as error:
-            error_type = type(error).__name__
-            print(
-                f"[Engine] [!!] 触发器线程 {instance_id} 崩溃 "
-                f"({error_type})",
-                file=sys.stderr,
-            )
-            engine_error(
-                "trigger_crashed",
-                plugin=instance_id,
-                trigger=instance_id,
-                error_type=error_type,
-                reason=error_type,
-            )
-            self._diag_obj.record_trigger_crash(instance_id, error_type)
-            attempts = self._trigger_supervisor.mark_crashed(instance_id, error_type)
-            self._safe_on_event(
-                "trigger_crashed",
-                {
-                    "trigger_id": trigger_id,
-                    "instance_id": instance_id,
-                    "error": {
-                        "code": "trigger_crashed",
-                        "message": "触发器异常退出",
-                    },
-                },
-            )
-            if attempts <= 1:
-                # 连续失败会按退避自动重启，只在第一次故障时打扰用户
-                self._alert_user(
-                    f"触发器 {instance_id} 崩溃",
-                    "触发器异常退出，引擎会按退避自动重启；连续失败会停止重试，请检查诊断状态",
-                    open_dashboard=False,
-                )
+    def _report_event_overflow(self, count: int) -> None:
+        message = f"宿主事件队列已满，丢弃 {count} 个旧事件，订阅继续接收后续事件"
+        self._diag_obj.record_error("event_queue_full", message)
+        engine_warn(message)
 
     def scheduler_stats(self) -> Dict[str, Dict[str, int]]:
         """每个规则当前的运行数和排队数，状态接口展示用"""
-        return self._rule_scheduler.stats()
+        return self._run_manager.stats()
 
     def get_diagnostics(self) -> Dict[str, Any]:
         """返回当前诊断数据供 Dashboard 展示"""
-        uptime = time.time() - self._start_time if self._start_time > 0 else 0
+        uptime = self.clock.time() - self._start_time if self._start_time > 0 else 0
         snap = self._diag_obj.snapshot()
         total_actions = snap["action_ok"] + snap["action_fail"]
         return {
@@ -388,7 +292,7 @@ class AutomationEngine:
                 "integrity_errors": self._plugin_integrity_errors[-10:],
             },
             "rules": {
-                "total": self._prepared_rules.total if self._prepared_rules is not None else len(self.rules),
+                "total": self._get_runtime_snapshot().total,
                 "issues": snap["rule_issues"],
                 "issue_count": len(snap["rule_issues"]),
             },
@@ -401,9 +305,10 @@ class AutomationEngine:
             "trigger_crashes": snap["trigger_crashes"],
             "trigger_crash_details": snap["trigger_crash_details"],
             "triggers": {
-                "health": self._trigger_supervisor.health(),
+                "health": self._trigger_host.health(),
             },
             "errors": snap["errors"][-20:],
+            "event_delivery": self._event_subscription.stats() if self._event_subscription is not None else None,
         }
 
     def auto_load(self, load_paths) -> None:
@@ -506,36 +411,6 @@ class AutomationEngine:
             for command in contributes.get("commands", [])
         )
 
-    def _validate_all_rules(self) -> Tuple[int, int]:
-        """校验规则引用和参数并记录问题"""
-        # 复制规则列表后再校验，热重载线程可以同时准备下一份配置
-        with self._rules_lock:
-            rules = list(self.rules)
-
-        self._diag_obj.reset_rule_issues()
-        valid, total, issues, warnings = validate_rules(
-            rules, self.triggers_meta, self.actions_meta
-        )
-
-        # 引用问题写入诊断和日志，Dashboard 可以查看
-        for rule_name, msg in issues:
-            print(f"[Engine] [!!] 规则 \"{rule_name}\" {msg}", file=sys.stderr)
-            self._diag_obj.add_rule_issue(rule_name, msg)
-            engine_error("rule_issue", rule=rule_name, issue=msg)
-
-        # 参数类型不匹配只打印提醒，保持原有行为
-        for rule_name, msg in warnings:
-            print(f"[Engine] [!!] 规则 \"{rule_name}\" {msg}", file=sys.stderr)
-
-        print(f"[Engine] 规则校验完成: {valid}/{total} 条有效规则")
-
-        if valid < total:
-            self._alert_user(
-                "规则配置异常",
-                f"{total - valid} 条规则引用了未加载的插件或参数不匹配，请检查Engine日志",
-            )
-
-        return valid, total
 
     # 事件分发逻辑在 EventBus 里，保留老名字，触发器线程和测试直接调用
     def emit_event(
@@ -546,25 +421,19 @@ class AutomationEngine:
     ) -> None:
         self._event_bus.emit_event(event_type, event_payload, instance=instance)
 
-    def call_notmyfault(self, event_data: Dict[str, Any]) -> None:
-        self._event_bus.call_notmyfault(event_data)
 
-    def _mask_event_payload(
-        self, event_type: str, payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        return self._event_bus._mask_event_payload(event_type, payload)
-
-    def _collect_sensitive_values(self, context: Dict[str, Any]) -> set:
-        return self._event_bus._collect_sensitive_values(context)
-
-    def run_manual_rule(self, rule_index: int) -> tuple[bool, str] | tuple[bool, str, str]:
+    def run_manual_rule(self, rule_index: int, *, trigger_payloads=None, event_payload=None) -> tuple[bool, str] | tuple[bool, str, str]:
         """从 Dashboard 立即执行指定规则"""
         with self._rules_lock:
-            if rule_index < 0 or rule_index >= len(self.rules):
+            generation = self._get_runtime_snapshot().generation
+            if rule_index < 0 or rule_index >= len(generation.snapshot.input_rules):
                 return False, "规则不存在或已被重新加载"
-            rule = copy.deepcopy(self.rules[rule_index])
-
-        return self.run_manual_rule_snapshot(rule, rule_index)
+            rule = thaw(generation.snapshot.input_rules[rule_index])
+            generation.retain()
+        try:
+            return self.run_manual_rule_snapshot(rule, rule_index, trigger_payloads=trigger_payloads, event_payload=event_payload, _generation=generation)
+        finally:
+            generation.release()
 
     def run_manual_rule_snapshot(
         self,
@@ -577,135 +446,141 @@ class AutomationEngine:
         end_step_id: str = "",
         test_assertions: Optional[List[Dict[str, Any]]] = None,
         variable_values: Optional[Dict[str, Any]] = None,
+        _generation=None,
     ) -> tuple[bool, str, str]:
         """执行调用方传入的规则快照"""
         rule = normalize_rules([rule])[0]
 
         rule_name = rule.get("name", f"规则 #{rule_index + 1}")
         rule_id = rule.get("rule_id", "")
-        run_id = f"run_{uuid.uuid4().hex}"
-        manual_payload = (
-            dict(event_payload)
-            if isinstance(event_payload, dict)
-            else {"source": "dashboard", "rule_index": rule_index}
-        )
-        context = build_context(
-            rule_name,
-            "manual",
-            manual_payload,
-            [],
-            rule_id,
-            run_id,
-        )
-        actions = rule.get("actions", [])
-        if not isinstance(actions, list):
-            actions = []
-        action_ids = [
-            action.get("binding_id", "") if isinstance(action, dict) else ""
-            for action in actions
-        ]
-        start_index = action_ids.index(start_step_id) if start_step_id in action_ids else 0
-        end_index = (
-            action_ids.index(end_step_id)
-            if end_step_id in action_ids
-            else len(actions) - 1
-        )
-        selected_count = max(0, end_index - start_index + 1) if actions else 0
-        context["manual_test"] = {
-            "start_step_id": start_step_id,
-            "end_step_id": end_step_id,
-            "start_index": start_index,
-            "end_index": end_index,
-            "assertions": copy.deepcopy(test_assertions or []),
-        }
-        if isinstance(step_outputs, dict):
-            for action_index, action in enumerate(actions[:start_index]):
-                if not isinstance(action, dict):
-                    continue
-                step_id = action.get("binding_id")
-                if not isinstance(step_id, str) or step_id not in step_outputs:
-                    continue
-                record = {
-                    "type": action.get("type", "action"),
-                    "status": "ok",
-                    "result": copy.deepcopy(step_outputs[step_id]),
-                    "error": None,
-                    "provided": True,
-                }
-                context["steps"][step_id] = record
-        supplied_trigger_payloads = trigger_payloads if isinstance(trigger_payloads, dict) else {}
-        context["triggers"] = {
-            event.get("binding_id"): {
-                "type": event.get("type", ""),
-                "payload": copy.deepcopy(
-                    supplied_trigger_payloads.get(event.get("binding_id"), {})
-                ),
-                "config": copy.deepcopy(event.get("params", {})),
-            }
-            for event in get_rule_events(rule)
-            if isinstance(event.get("binding_id"), str)
-        }
-        context["manual_test"]["variable_values"] = variable_values
+        with self._rules_lock:
+            generation = _generation or self._generations.current
+            if generation is not None and rule_id in generation.snapshot.compiled:
+                generation.retain()
+            else:
+                if generation is not None and rule_index >= 0:
+                    return False, "规则不存在或已被重新加载", f"run_{uuid.uuid4().hex}"
+                generation = None
         try:
-            prepared_rule = resolve_trigger_constants(rule, TypeRegistry.from_plugins(self.triggers_meta, self.actions_meta))
-            configs = {event.get("binding_id"): event.get("params", {}) for event in get_rule_events(prepared_rule)}
-            for identity, trigger in context["triggers"].items():
-                trigger["config"] = configs.get(identity, trigger["config"])
-            prepare_binding_context(rule, context, self.triggers_meta, self.actions_meta)
-        except (DataTypeError, BindingResolutionError) as error:
-            return False, str(error), run_id
-        self._safe_on_event("rule_triggered", {
-            "rule_id": rule_id,
-            "run_id": run_id,
-            "rule_name": rule_name,
-            "event_type": "manual",
-            "action_count": selected_count,
-            "start_step_id": start_step_id,
-            "end_step_id": end_step_id,
-            "assertion_count": len(test_assertions or []),
-            "event_payload": manual_payload,
-        })
-        decision = self._rule_scheduler.submit(
-            rule_id or rule_name,
-            rule,
-            rule_name,
-            context,
-        )
-        if decision == "queued":
-            return True, "已加入队列", run_id
-        if decision == "dropped":
-            return False, "当前规则不允许新的运行", run_id
-        return True, "已开始执行", run_id
+            run_id = f"run_{uuid.uuid4().hex}"
+            manual_payload = (
+                dict(event_payload)
+                if isinstance(event_payload, dict)
+                else {"source": "dashboard", "rule_index": rule_index}
+            )
+            context = build_context(
+                rule_name,
+                "manual",
+                manual_payload,
+                [],
+                rule_id,
+                run_id,
+            )
+            try:
+                prepared = self._generations.prepare([rule], validate=False)
+            except (DataTypeError, BindingResolutionError, ValueError) as error:
+                return False, str(error), run_id
+            plugins = prepared.plugins
+            compiled = prepared.compiled[rule_id]
+            rule = compiled.source
+            actions = [node for node, _path in iter_rule_actions(rule)]
+            context["_plugins"] = plugins
+            context["_compiled_rule"] = compiled
+            context["_compiled_refs"] = compiled.references
+            context["_trigger_configs"] = prepared.contexts[rule_id]["_trigger_configs"]
+            selected_count = sum(node["type"] not in NON_ACTION_NODES for node, _path in execution_nodes(rule['workflow'], start_step_id, end_step_id))
+            if start_step_id and find_graph_node(rule["workflow"], start_step_id) is None:
+                return False, "测试入口节点不存在", run_id
+            if end_step_id and find_graph_node(rule["workflow"], end_step_id) is None:
+                return False, "测试结束节点不存在", run_id
+            context["manual_test"] = {
+                "start_step_id": start_step_id,
+                "end_step_id": end_step_id,
+                "assertions": copy.deepcopy(test_assertions or []),
+                "provided_trigger_ids": tuple(trigger_payloads or {}),
+            }
+            if isinstance(step_outputs, dict):
+                provided_actions = []
+                native_fields = rule_step_output_fields(rule, plugins.triggers_meta, plugins.actions_meta)
+                if start_step_id:
+                    found = find_graph_scope(rule["workflow"], start_step_id)
+                    available = found["possible"]
+                    provided_actions = [action for action in actions if action["binding_id"] in available]
+                for action_index, action in enumerate(provided_actions):
+                    if not isinstance(action, dict):
+                        continue
+                    step_id = action.get("binding_id")
+                    if not isinstance(step_id, str) or step_id not in step_outputs:
+                        continue
+                    try:
+                        provided = normalize_fields(
+                            step_outputs[step_id], native_fields.get(step_id) if action.get('type') in NATIVE_NODES else plugins.actions_meta.get(action.get("type"), {}).get("outputs"),
+                            prepared.registry, wrap_sensitive=True, partial=True,
+                        )
+                    except DataTypeError as error:
+                        return False, str(error), run_id
+                    record = {
+                        "type": action.get("type", "action"),
+                        "status": "ok",
+                        "result": provided,
+                        "error": None,
+                        "provided": True,
+                    }
+                    context["steps"][step_id] = hold_value(record)
+            supplied_trigger_payloads = trigger_payloads if isinstance(trigger_payloads, dict) else {}
+            context["triggers"] = {
+                event.get("binding_id"): {
+                    "type": event.get("type", ""),
+                    "payload": copy.deepcopy(
+                        supplied_trigger_payloads.get(event.get("binding_id"), {})
+                    ),
+                    "config": copy.deepcopy(event.get("params", {})),
+                }
+                for event in get_all_rule_events(rule)
+                if isinstance(event.get("binding_id"), str)
+            }
+            context["manual_test"]["variable_values"] = variable_values
+            try:
+                prepare_binding_context(rule, context, plugins.triggers_meta, plugins.actions_meta)
+            except (DataTypeError, BindingResolutionError) as error:
+                return False, str(error), run_id
+            if generation is not None:
+                if generation.snapshot.compiled[rule_id].digest != compiled.digest:
+                    return False, "规则运行版本已变化，请刷新后重试", run_id
+                context["_generation"] = generation
+            else:
+                context["_standalone_snapshot"] = True
+            context["_event_observation"] = self._event_bus.observe_events(compiled, trigger_payloads or {})
+            if context["_event_observation"] is not None:
+                timestamp = context["_event_observation"].clock.monotonic()
+                context["_event_observation"].seed([
+                    {"binding_id": identity, "event": {"type": trigger["type"], "params": trigger.get("config", {})}, "payload": trigger["payload"], "timestamp": timestamp}
+                    for identity, trigger in context["triggers"].items() if identity in supplied_trigger_payloads
+                ])
+            self._safe_on_event("run.triggered", {
+                "rule_id": rule_id,
+                "run_id": run_id,
+                "rule_name": rule_name,
+                "event_type": "manual",
+                "action_count": selected_count,
+                "start_step_id": start_step_id,
+                "end_step_id": end_step_id,
+                "assertion_count": len(test_assertions or []),
+                "event_payload": context["event"]["payload"],
+            })
+            decision = self._run_manager.submit(rule_id, rule, rule_name, context)
+            if decision == "queued":
+                return True, "已加入队列", run_id
+            if decision == "dropped":
+                return False, "当前规则不允许新的运行", run_id
+            return True, "已开始执行", run_id
+        finally:
+            if generation is not None:
+                generation.release()
 
-    def execute_workflow(
-        self,
-        workflow_key: str,
-        rule: Dict[str, Any],
-        rule_name: str,
-        context: Dict[str, Any],
-    ) -> None:
-        return self._workflow_executor.execute_workflow(
-            workflow_key, rule, rule_name, context
-        )
 
     def cancel_run(self, run_id: str) -> bool:
-        return self._workflow_executor.cancel_run(run_id)
-
-    def execute_actions(
-        self,
-        actions: List[Dict[str, Any]],
-        rule_name: str,
-        context: Dict[str, Any],
-    ) -> bool:
-        return self._workflow_executor.execute_actions(actions, rule_name, context)
-
-    def execute_action(
-        self,
-        action: Dict[str, Any],
-        rule_name: str = "",
-        context: Optional[Dict[str, Any]] = None,
-    ) -> Any:
-        return self._workflow_executor.execute_action(action, rule_name, context)
+        return self._run_manager.cancel_run(run_id)
 
     def _run_action(
         self,
@@ -717,19 +592,11 @@ class AutomationEngine:
 
     def _start_trigger_threads(self, rules: PreparedRules | None = None) -> int:
         snapshot = rules if rules is not None else self._get_runtime_snapshot()
-        for trigger_id in snapshot.trigger_params:
-            self._plugin_registry.resolve_trigger(trigger_id)
-
-        return self._trigger_supervisor.start(
-            aggregated=snapshot.trigger_params,
-            triggers_funcs=self.triggers_funcs,
-            triggers_meta=self.triggers_meta,
-            run_trigger_cb=self._run_trigger,
-        )
+        generation = self._generations.apply_prepared(snapshot, "initial")
+        return len(generation.snapshot.subscription_counts)
 
     def _stop_trigger_threads(self, timeout: float = 30.0) -> bool:
-        """请求停止所有触发器并返回是否全部退出"""
-        return self._trigger_supervisor.stop(timeout)
+        return self._trigger_host.stop(timeout)
 
     def start(
         self, shutdown_event: "threading.Event | None" = None
@@ -751,34 +618,10 @@ class AutomationEngine:
             self._sudo.end_engine_session(self._engine_token)
             self._privilege_session_closed = True
 
-    def _apply_hot_reload_rules(
-        self, new_rules: PreparedRules
-    ) -> PreparedRules:
-        with self._rules_lock:
-            previous = self._get_runtime_snapshot()
-            self._prepared_rules = new_rules
-            self._rules = new_rules.rules
-        try:
-            self._report_rule_issues(new_rules)
-        except Exception:
-            # 上报问题失败不能把已经换好的快照退回半截状态，热重载要能继续走下去
-            err = traceback.format_exc()
-            print("[Engine] [!!] 热重载后上报规则问题失败:", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-            engine_error("hot_reload_report_failed", error=err[-500:])
-        return previous
-
-    def _accept_hot_reload_rules(self, previous: PreparedRules) -> None:
-        new_keys = {rule_key(rule) for rule in self.rules}
-        for rule in previous.rules:
-            key = rule_key(rule)
-            if key not in new_keys:
-                self._rule_scheduler.drop_rule(key)
-
     def _run(
         self, shutdown_event: "threading.Event | None" = None
     ) -> None:
-        self._start_time = time.time()
+        self._start_time = self.clock.time()
         self._shutdown_flag = shutdown_event or threading.Event()
         try:
             if self._security_mode == SecurityMode.STRICT and not getattr(sys, "frozen", False):
@@ -795,15 +638,13 @@ class AutomationEngine:
                     raise RuntimeError("核心文件完整性校验失败")
 
             try:
-                snapshot = self._prepare_rules(self.rules)
+                self._rule_watcher.acknowledge()
+                snapshot = self._prepare_rules(self._rules_store.load_verified_rules())
             except ConfigValidationError as error:
                 self._diag_obj.add_rule_issue("", str(error))
                 engine_error("rule_issue", issue=str(error))
                 self._alert_user("NotmyFault 启动失败", str(error), open_dashboard=True)
                 raise
-            with self._rules_lock:
-                self._prepared_rules = snapshot
-                self._rules = snapshot.rules
             self._report_rule_issues(snapshot)
 
             from notmyfault.platform.platform_support import show_notification
@@ -817,25 +658,24 @@ class AutomationEngine:
 
             show_notification("NotmyFault 已加载", "")
 
-            thread_count = self._start_trigger_threads()
+            thread_count = self._start_trigger_threads(snapshot)
 
             if thread_count == 0:
                 print("[Engine] 当前没有可用触发器，保持运行并等待规则更新")
 
             se = self._shutdown_flag
-            self._hot_reloader.begin()
-            self._event_bus.poll_absences()
-
+            self._rule_watcher.start()
             try:
-                while not se.is_set():
-                    se.wait(1)
-                    self._hot_reloader.check_once()
-                    self._event_bus.poll_absences()
-                    self._trigger_supervisor.revive_crashed()
+                se.wait()
             except KeyboardInterrupt:
                 print("[Engine] 主程序收到中断，退出中...")
         finally:
             self._cleanup_runtime()
+
+    def _condition_deadline(self):
+        with self._rules_lock:
+            values = [value for value in (self._get_runtime_snapshot().runtime.next_deadline(), self._event_bus.next_observation_deadline()) if value is not None]
+            return min(values) if values else None
 
     def _cleanup_runtime(self, timeout: float = 90.0) -> None:
         with self._runtime_cleanup_lock:
@@ -844,8 +684,9 @@ class AutomationEngine:
             from notmyfault.security.admin_prompt import cancel_pending_admin_requests
 
             cancel_pending_admin_requests()
-            self._rule_scheduler.shutdown()
-            self._trigger_supervisor.request_stop_all()
+            self._rule_watcher.stop()
+            self._run_manager.shutdown()
+            self._trigger_host.request_stop_all()
             deadline = time.monotonic() + max(0.0, timeout)
             stopped = self._stop_trigger_threads(timeout=min(30.0, max(0.0, timeout)))
             scheduled_stopped, drained = self._wait_runtime_work(
@@ -857,6 +698,9 @@ class AutomationEngine:
             if not self._shutdown_clean:
                 return
             self._shutdown_plugins()
+            if self._state_store is not None and not self._state_store.close():
+                self._shutdown_clean = False
+                return
             self._runtime_cleaned = True
 
     def _shutdown_plugins(self) -> None:
@@ -884,8 +728,8 @@ class AutomationEngine:
                     engine_error(
                         "teardown_failed", plugin=plugin_id, error=traceback.format_exc()[-500:]
                     )
-        from notmyfault.core.engine_events import clear as clear_engine_events
-        clear_engine_events()
+        self.events.flush()
+        self.events.close()
         self._plugin_registry.clear()
 
     def _wait_active_actions(self, timeout: float = 60.0) -> bool:
@@ -893,7 +737,7 @@ class AutomationEngine:
 
     def _wait_runtime_work(self, timeout: float = 60.0) -> tuple[bool, bool]:
         deadline = time.monotonic() + timeout
-        scheduled_stopped = self._rule_scheduler.wait_for_idle(timeout=timeout)
+        scheduled_stopped = self._run_manager.wait_for_idle(timeout=timeout)
         remaining = max(deadline - time.monotonic(), 0.0)
         drained = self._wait_active_actions(timeout=remaining)
         return scheduled_stopped, drained

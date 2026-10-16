@@ -50,8 +50,8 @@ def test_extract_accepts_normal_plugin(tmp_path):
     archive_path = make_archive(
         tmp_path,
         [
-            ("demo_plugin/action.json", '{"id": "demo_plugin"}'),
-            ("demo_plugin/action.py", "def run(params):\n    return True\n"),
+            ("demo_plugin/action.json", '{"id": "demo_plugin", "execution_api": "context-v1"}'),
+            ("demo_plugin/action.py", "def run_with_context(action_info, params, context):\n    return True\n"),
         ],
     )
     extract_dir = tmp_path / "out"
@@ -145,14 +145,14 @@ def test_pack_all_prefix_preserves_plugin_subdirectories(tmp_path):
             "id": "demo",
             "name": "测试插件",
             "description": "测试",
-            "enabled": true,
+            "execution_api": "context-v1",
             "version_code": 1,
             "version": "1.0",
             "package_name": "com.test.demo"
         }""",
         encoding="utf-8",
     )
-    (plugin_dir / "action.py").write_text("def run(meta, params): pass\n", encoding="utf-8")
+    (plugin_dir / "action.py").write_text("def run_with_context(action_info, params, context): pass\n", encoding="utf-8")
     (nested_dir / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
 
     archive_path = pack_plugin.pack_plugin(

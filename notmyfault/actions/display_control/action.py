@@ -4,7 +4,7 @@ import os
 import subprocess
 import time
 
-from notmyfault.plugin_api import native_lock, platform_backend_api
+from notmyfault.plugin_api import native_lock, platform_backend_api, action_values
 
 _platform_backend = platform_backend_api()
 DisplayBackend = _platform_backend.DisplayBackend
@@ -18,12 +18,8 @@ MONITOR_OFF = 2
 
 
 def _brightness_level(params) -> int:
-    """返回经过校验的整数亮度，也处理旧动作别名"""
+    """返回经过校验的整数亮度"""
     action = params.get("action", "off")
-    if action == "low_brightness":
-        return 10
-    if action == "high_brightness":
-        return 90
     if action != "set_brightness":
         raise ValueError(f"不支持的亮度操作: {action}")
 
@@ -45,7 +41,7 @@ def _brightness_level(params) -> int:
 
 def validate_params(_action_info, params):
     action = params.get("action", "off")
-    if action in ("set_brightness", "low_brightness", "high_brightness"):
+    if action == "set_brightness":
         try:
             _brightness_level(params)
         except ValueError as exc:
@@ -231,7 +227,8 @@ def _set_brightness(level: int):
     return {"brightness": level, "methods": methods, "warnings": errors}
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
+    params = action_values(params)
     action = params.get("action", "off")
 
     print(f"[Action:display_control] 执行: {action}")
@@ -240,7 +237,7 @@ def run(action_info, params):
         if os.name != "nt":
             backend = DisplayBackend(default_runner)
             result = {"action": action}
-            if action in ("set_brightness", "low_brightness", "high_brightness"):
+            if action == "set_brightness":
                 brightness = _brightness_level(params)
                 backend.set_brightness(brightness)
                 result["brightness"] = brightness
@@ -269,7 +266,7 @@ def run(action_info, params):
                     raise RuntimeError("发送显示器电源命令失败")
             print("[Action:display_control] 已发送关闭显示器命令" if action == "off" else "[Action:display_control] 已发送开启显示器命令")
 
-        elif action in ("set_brightness", "low_brightness", "high_brightness"):
+        elif action == "set_brightness":
             brightness = _brightness_level(params)
             result = _set_brightness(brightness)
             result["action"] = action

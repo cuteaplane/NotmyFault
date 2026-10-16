@@ -1,3 +1,4 @@
+from notmyfault.plugin_api import action_values
 import os
 import time
 import psutil
@@ -25,6 +26,7 @@ def _target_name(process_name: str) -> str:
 
 
 def run_with_context(action_info, params, context):
+    params = action_values(params)
     process_name = params.get("process_name", "").strip()
     if not process_name:
         raise ValueError("未指定进程名")
@@ -99,7 +101,3 @@ def run_with_context(action_info, params, context):
         return {"killed": 0, "denied": denied}
     print(f"[Action:kill_process] 共终止了 {killed} 个进程")
     return {"killed": killed, "denied": denied}
-
-
-def run(action_info, params):
-    return run_with_context(action_info, params, {})

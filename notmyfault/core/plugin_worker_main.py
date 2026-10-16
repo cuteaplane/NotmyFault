@@ -17,7 +17,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 from notmyfault.core.type_registry import TypeRegistry
 from notmyfault.core.value_codec import decode_value, encode_value
 from notmyfault.core.workflow import invoke_action
-from notmyfault.core.plugin_worker import MAX_EXTENSION_PROTOCOL_LINE
+from notmyfault.core.plugin_worker import MAX_EXTENSION_PROTOCOL_LINE, MAX_PROTOCOL_LINE
 from notmyfault.security.plugin_imports import PluginImports
 from notmyfault.security.plugin_loader import inspect_plugin_tree
 from notmyfault.extensions.registry import ExtensionRegistry
@@ -107,7 +107,10 @@ def main() -> None:
     protocol.write(json.dumps({"type": "ready", "protocol": 1}) + "\n")
     protocol.flush()
     try:
-        request = json.loads(sys.stdin.readline())
+        line = sys.stdin.readline(MAX_PROTOCOL_LINE + 1)
+        if len(line) > MAX_PROTOCOL_LINE:
+            sys.exit(2)
+        request = json.loads(line)
     except (json.JSONDecodeError, OSError):
         sys.exit(2)
 
@@ -115,7 +118,7 @@ def main() -> None:
     try:
         typed = request.get("value_encoding") == "typed-v1"
         if typed:
-            request = decode_value(request)
+            request = decode_value(request, _transport=True)
         entry = Path(request["entry"])
         plugin_root = Path(request["plugin_root"]).resolve()
         tree = inspect_plugin_tree(str(plugin_root))
@@ -140,23 +143,19 @@ def main() -> None:
             _serve_extension(request, protocol, importer, module, entry, tree)
             return
         elif request.get("load_only") is True:
-            runner = module.run
-            arguments = (action_info, {})
-            if action_info.get("execution_api") == "context-v1":
-                runner = getattr(module, "run_with_context", None)
-                arguments = (action_info, {}, {})
+            runner = getattr(module, "run_with_context", None)
             if not callable(runner):
                 raise TypeError("隔离动作缺少可调用的执行入口")
-            inspect.signature(runner).bind(*arguments)
+            inspect.signature(runner).bind(action_info, {}, {})
             _extension_handlers(importer, module, entry, action_info)
             result = None
         else:
             context = request.get("context", {})
             if typed:
                 context["_type_registry"] = TypeRegistry(request.get("data_types"))
-            result = invoke_action(module.run, module, action_info, request["params"], context)
+            result = invoke_action(getattr(module, "run_with_context", None), module, action_info, request["params"], context)
         if typed:
-            result = encode_value(result)
+            result = encode_value(result, _transport=True)
         else:
             json.dumps(result, allow_nan=False)
         payload = {"type": "result", "ok": True, "result": result}

@@ -10,19 +10,24 @@ from pathlib import PurePath, PurePosixPath, PureWindowsPath
 from uuid import UUID
 
 from notmyfault.core.data_types import DataTypeError, copy_value
+from notmyfault.values import Blob, Secret
 
 
 WIRE_KEY = "$nmf_value"
 MAX_SAFE_INTEGER = 2**53 - 1
 
 
-def encode_value(value):
+def encode_value(value, *, _transport=False):
     value = copy_value(value)
 
     def tagged(kind, data):
         return {WIRE_KEY: {"type": kind, "data": data}}
 
     def encode(item):
+        if isinstance(item, Secret):
+            return tagged("secret", encode(item._value)) if _transport else "***"
+        if isinstance(item, Blob):
+            return tagged("blob", encode(item._value)) if _transport else item.descriptor()
         if isinstance(item, bool) or item is None or isinstance(item, (str, float)):
             return item
         if isinstance(item, int):
@@ -52,7 +57,7 @@ def encode_value(value):
     return encode(value)
 
 
-def decode_value(value):
+def decode_value(value, *, _transport=False):
     value = copy_value(value)
 
     def decode(item, location):
@@ -67,6 +72,9 @@ def decode_value(value):
             raise DataTypeError("类型编码缺少 type 或 data", location=location, code="invalid_encoding")
         kind, data = record["type"], record["data"]
         try:
+            if _transport and kind in ("secret", "blob"):
+                decoded = decode(data, location)
+                return Secret(decoded) if kind == "secret" else Blob(decoded)
             if kind == "object":
                 if not isinstance(data, list):
                     raise ValueError()

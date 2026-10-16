@@ -12,12 +12,12 @@ from notmyfault.tests.plugin_support import build_nmfp, make_meta, post_archive
 
 
 @pytest.fixture(autouse=True)
-def normal_plugin_installation_mode(monkeypatch):
+def permissive_plugin_installation_mode(monkeypatch):
     from notmyfault.host.api.services import plugin_installation
     from notmyfault.security.security import SecurityMode
 
     monkeypatch.setattr(
-        plugin_installation, "detect_security_mode", lambda: SecurityMode.NORMAL
+        plugin_installation, "detect_security_mode", lambda: SecurityMode.PERMISSIVE
     )
 
 
@@ -139,7 +139,7 @@ def test_strict_install_validates_signature_before_replacing_installed_plugin(tm
     root = tmp_path / "signed"
     root.mkdir()
     (root / "action.json").write_text(json.dumps(meta), encoding="utf-8")
-    original = b"def run(meta, params): return 1\n"
+    original = b"def run_with_context(meta, params, context): return 1\n"
     (root / "action.py").write_bytes(original)
     author = Ed25519PrivateKey.generate()
     owner = Ed25519PrivateKey.generate()
@@ -167,7 +167,7 @@ def test_strict_install_validates_signature_before_replacing_installed_plugin(tm
     installed = env.paths.user_plugins_dir / "actions" / meta["id"]
     assert signing.verify_author_key_counter_signature(installed, signing_keys.get_public_keys())
     assert (installed / "signature.sig").read_bytes() == (root / "signature.sig").read_bytes()
-    (root / "action.py").write_text("def run(meta, params): return 2\n", encoding="utf-8")
+    (root / "action.py").write_text("def run_with_context(meta, params, context): return 2\n", encoding="utf-8")
     rejected = install("changed")
     assert rejected.status_code == 400
     assert "签名无效" in rejected.json()["error"]
@@ -364,6 +364,57 @@ def test_toggle_and_uninstall_use_signed_config_store(tmp_path):
     assert removed.json() == {"ok": True, "restart_required": True}
 
 
+def test_plugin_list_enabled_follows_disabled_plugins_config(tmp_path):
+    env = make_api_env(tmp_path)
+    listed = env.client.get("/api/plugins/list", headers=env.headers).json()
+    assert listed["actions"]["notify"]["enabled"] is True
+    assert listed["triggers"]["time_schedule"]["enabled"] is True
+
+    config = env.store.load_verified_config()
+    config["disabled_plugins"] = {"triggers": ["time_schedule"], "actions": ["notify"]}
+    assert env.store.save_config(config)
+
+    listed = env.client.get("/api/plugins/list", headers=env.headers).json()
+    assert listed["actions"]["notify"]["enabled"] is False
+    assert listed["triggers"]["time_schedule"]["enabled"] is False
+
+    config = env.store.load_verified_config()
+    config["disabled_plugins"] = {"triggers": [], "actions": []}
+    assert env.store.save_config(config)
+
+    listed = env.client.get("/api/plugins/list", headers=env.headers).json()
+    assert listed["actions"]["notify"]["enabled"] is True
+    assert listed["triggers"]["time_schedule"]["enabled"] is True
+
+
+def test_plugin_list_enabled_follows_config_for_user_plugin(tmp_path):
+    env = make_api_env(tmp_path)
+    archive = build_nmfp(tmp_path, make_meta("actions"), "actions")
+    assert post_archive(env, "/api/plugins/install", archive).status_code == 200
+    listed = env.client.get("/api/plugins/list", headers=env.headers).json()
+    assert listed["actions"]["demo_actions"]["enabled"] is True
+
+    config = env.store.load_verified_config()
+    config["disabled_plugins"] = {"triggers": [], "actions": ["demo_actions"]}
+    assert env.store.save_config(config)
+
+    listed = env.client.get("/api/plugins/list", headers=env.headers).json()
+    assert listed["actions"]["demo_actions"]["enabled"] is False
+
+
+def test_plugin_list_locks_switches_when_config_cannot_be_verified(tmp_path):
+    env = make_api_env(tmp_path)
+    raw = json.loads(env.paths.config_file.read_text(encoding="utf-8"))
+    raw["disabled_plugins"] = {"triggers": [], "actions": []}
+    env.paths.config_file.write_text(json.dumps(raw), encoding="utf-8")
+
+    payload = env.client.get("/api/plugins/list", headers=env.headers).json()
+
+    assert payload["config_error"]
+    assert payload["actions"]["notify"]["enabled"] is False
+    assert payload["actions"]["notify"]["_error"] == payload["config_error"]
+
+
 def test_uninstall_reports_strict_delete_failure(tmp_path):
     class FailingRemovalFileSystem(PluginFileSystem):
         def remove_tree(self, path):
@@ -461,7 +512,7 @@ def test_plugin_list_does_not_claim_errors_for_shadowed_ids(tmp_path):
     shadow.mkdir(parents=True)
     (shadow / "action.json").write_text(
         json.dumps({
-            "id": "notify", "name": "用户版通知", "enabled": True,
+            "id": "notify", "name": "用户版通知",
             "platforms": ["windows", "linux"], "permissions": [],
             "params": [], "outputs": [],
         }),

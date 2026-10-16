@@ -10,7 +10,7 @@ from notmyfault.plugin_api import native_lock, platform_services
 NATIVE_LOCK = native_lock()
 
 
-def run(action_info, params):
+def run_with_context(action_info, params, context):
     if os.name != "nt":
         platform_services().write_clipboard("")
         print("[Action:clipboard_clear] 剪贴板已清空")
