@@ -13,44 +13,71 @@ import tempfile
 import threading
 import time
 import tracemalloc
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import psutil
 
+from notmyfault.core.compiled_rules import thaw
 from notmyfault.core.engine import AutomationEngine
 from notmyfault.core.event_bus import EventBus
 from notmyfault.core.plugin_worker import run_isolated_action
 from notmyfault.core.runtime_rules import prepare_rules
 from notmyfault.core.workflow import build_context
+from notmyfault.core.workflow_graph import NON_ACTION_NODES, iter_rule_actions
 from notmyfault.security.security import SecurityMode
 from notmyfault.plugin_api import Blob, RunContext
 
 
 ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS = ROOT / "agent_files"
+FIRST_STEP = "a_bench000000"
+RUN_FINISHED = frozenset({
+    "run.succeeded", "run.recovered", "run.failed",
+    "run.cancelled", "run.timed_out", "run.dropped",
+})
 
 
 def metadata(identity, kind):
     meta = {
         "id": identity, "name": identity, "description": "性能测量插件",
-        "enabled": True, "version_code": 1, "version": "1.0",
+        "version_code": 1, "version": "1.0",
         "package_name": f"io.notmyfault.bench.{identity}", "params": [],
     }
     if kind == "trigger":
         meta.update(trigger_api="event-v2", outputs=[])
+    else:
+        meta.update(execution_api="context-v1")
     return meta
 
 
 def rules(count, trigger_count, steps=10):
-    return [{
-        "name": f"bench_{index}", "rule_id": f"r_bench{index:06}",
-        "condition": {"type": f"signal_{index % trigger_count}", "params": {},
-                      "binding_id": f"t_bench{index:06}"},
-        "actions": [{"type": "noop", "params": {}, "binding_id": f"a_bench{step:06}"}
-                    for step in range(steps)],
-    } for index in range(count)]
+    document = []
+    for index in range(count):
+        nodes = [{
+            "binding_id": f"a_entry_{index:06d}", "type": "trigger",
+            "trigger": {"binding_id": f"t_bench{index:06d}",
+                        "type": f"signal_{index % trigger_count}", "params": {}},
+        }]
+        nodes.extend({"binding_id": f"a_bench{step:06d}", "type": "noop", "params": {}}
+                     for step in range(steps))
+        if not steps:
+            nodes.append({"binding_id": f"a_end_{index:06d}", "type": "end"})
+        chain = [node["binding_id"] for node in nodes]
+        edges = [{"source": source, "port": "event" if position == 0 else "next",
+                  "target": target, "channel": "control"}
+                 for position, (source, target) in enumerate(zip(chain, chain[1:]))]
+        document.append({
+            "name": f"bench_{index}", "rule_id": f"r_bench{index:06d}",
+            "workflow": {"entry": None, "nodes": nodes, "edges": edges},
+        })
+    return document
+
+
+def action_nodes(rule):
+    return [node for node, _path in iter_rule_actions(rule) if node["type"] not in NON_ACTION_NODES]
 
 
 def summary(samples):
@@ -80,11 +107,14 @@ def make_engine(document, directory):
     engine = AutomationEngine({"rules": document}, rules_store=store)
     engine._alert_user = lambda *args, **kwargs: None
     engine.actions_meta["noop"] = metadata("noop", "action")
-    engine.actions_funcs["noop"] = lambda meta, params: None
+    engine.actions_funcs["noop"] = lambda meta, params, context: None
     for rule in document:
-        identity = rule["condition"]["type"]
-        engine.triggers_meta[identity] = metadata(identity, "trigger")
-        engine.triggers_funcs[identity] = lambda meta, config, emit, stop: stop.wait()
+        for node in rule["workflow"]["nodes"]:
+            if node["type"] != "trigger":
+                continue
+            identity = node["trigger"]["type"]
+            engine.triggers_meta[identity] = metadata(identity, "trigger")
+            engine.triggers_funcs[identity] = lambda meta, config, emit, stop: stop.wait()
     return engine
 
 
@@ -102,7 +132,7 @@ def dispatch(count):
         snapshot_fn=lambda: snapshot, rules_lock=threading.RLock(),
         triggers_meta_fn=lambda: triggers, actions_meta_fn=lambda: {},
         is_shutdown_fn=lambda: False, safe_on_event=lambda *args: None,
-        execute_workflow_cb=submit, scheduler_submit_fn=submit,
+        scheduler_submit_fn=submit,
     )
     bus.emit_event("signal_0", {}, instance={"config": {}})
     result = measure(lambda: bus.emit_event("signal_0", {}, instance={"config": {}}), count)
@@ -119,7 +149,7 @@ def workflow(directory, count, *, payload_mb=0, blob_kind=None):
     engine = make_engine(document, directory)
     if payload_mb:
         engine.actions_meta["noop"]["outputs"] = [{
-            "name": "data", "type": blob_kind or "array", "label": "数据",
+            "name": "data", "label": "数据", "type": blob_kind or "array",
             "value_type": blob_kind or {"type": "array", "items": "text"},
         }]
         payload = [f"{index:05}" + "x" * 1019 for index in range(payload_mb * 1024)]
@@ -127,32 +157,54 @@ def workflow(directory, count, *, payload_mb=0, blob_kind=None):
             payload = "x" * (payload_mb * 1024 * 1024)
             if blob_kind == "bytes":
                 payload = payload.encode("utf-8")
-        engine.actions_funcs["noop"] = lambda meta, params: {"data": payload}
-        document[0]["actions"] = document[0]["actions"][:1] + [
-            {"type": "sink", "params": {}, "binding_id": f"a_sink{index:06}"}
-            for index in range(10)
+        engine.actions_funcs["noop"] = lambda meta, params, context: {"data": payload}
+        reference = {"$ref": {"scope": "step", "node": FIRST_STEP, "path": ["data"]}}
+        graph = document[0]["workflow"]
+        graph["nodes"] = [
+            graph["nodes"][0], graph["nodes"][1],
+            *({"binding_id": f"a_sink{index:06d}", "type": "sink", "params": {"data": reference}}
+              for index in range(10)),
         ]
+        chain = [node["binding_id"] for node in graph["nodes"]]
+        graph["edges"] = [{"source": source, "port": "event" if position == 0 else "next",
+                           "target": target, "channel": "control"}
+                          for position, (source, target) in enumerate(zip(chain, chain[1:]))]
         engine.actions_meta["sink"] = metadata("sink", "action")
-        engine.actions_funcs["sink"] = lambda meta, params: None
-        if payload_mb:
-            reference = {"$ref": {"scope": "step", "node": "a_bench000000", "path": ["data"]}}
-            for action in document[0]["actions"][1:]:
-                action["params"] = {"data": reference}
-            engine.actions_meta["sink"].update(
-                execution_api="context-v1", params=[{"name": "data", "type": "any", "value_type": "any"}],
-            )
+        engine.actions_funcs["sink"] = lambda meta, params, context: None
+        engine.actions_meta["sink"].update(
+            params=[{"name": "data", "label": "数据", "type": "textarea", "value_type": "any"}],
+        )
 
-            def consume(meta, params, context):
-                value = params["data"]
-                if (not isinstance(context, RunContext)
-                        or value is not context["steps"]["a_bench000000"]["result"]["data"]
-                        or blob_kind and (not isinstance(value, Blob) or value.size != payload_mb * 1024 * 1024)
-                        or not blob_kind and (not isinstance(value, list) or len(value) != payload_mb * 1024)):
-                    raise RuntimeError("步骤引用没有共用已保存的结果")
+        def consume(meta, params, context):
+            value = params["data"]
+            if (not isinstance(context, RunContext)
+                    or value is not context["steps"][FIRST_STEP]["result"]["data"]
+                    or blob_kind and (not isinstance(value, Blob) or value.size != payload_mb * 1024 * 1024)
+                    or not blob_kind and (not isinstance(value, list) or len(value) != payload_mb * 1024)):
+                raise RuntimeError("步骤引用没有共用已保存的结果")
 
-            engine._plugin_modules["sink"] = SimpleNamespace(run_with_context=consume)
+        engine._plugin_modules["sink"] = SimpleNamespace(run_with_context=consume)
     engine.rules = document
-    rule = engine._get_runtime_snapshot().rules[0]
+    snapshot = engine._get_runtime_snapshot()
+    rule = thaw(snapshot.rules[0])
+    step_ids = [node["binding_id"] for node in action_nodes(rule)]
+    entry_root = next(node["binding_id"] for node, _path in iter_rule_actions(rule)
+                      if node["type"] == "trigger")
+    finished = {}
+    signals = {}
+    lock = threading.Lock()
+
+    def on_event(event):
+        if event.type not in RUN_FINISHED:
+            return
+        with lock:
+            signal = signals.get(event.run_id)
+            if signal is None:
+                return
+            finished[event.run_id] = event
+        signal.set()
+
+    subscription = engine.events.subscribe(on_event, capacity=4096, overflow="drop_oldest")
     downstream = []
     run_action = engine._workflow_executor.run_action
 
@@ -166,13 +218,30 @@ def workflow(directory, count, *, payload_mb=0, blob_kind=None):
     engine._workflow_executor.run_action = timed_action
 
     def execute():
-        context = build_context(rule["name"], "signal_0", {}, [], rule["rule_id"], "run_bench")
-        engine._get_runtime_snapshot().prepare_context(rule, context)
-        outcome = engine._workflow_executor.execute_workflow(rule["rule_id"], rule, rule["name"], context)
-        if outcome.status != "succeeded" or len(context["steps"]) != len(rule["actions"]):
-            raise RuntimeError("性能测量中的步骤数量不符")
-        if any(step["status"] != "ok" for step in context["steps"].values()):
-            raise RuntimeError("性能测量中的步骤未成功")
+        run_id = f"run_{uuid.uuid4().hex}"
+        signal = threading.Event()
+        with lock:
+            signals[run_id] = signal
+        try:
+            context = build_context(rule["name"], "signal_0", {}, [], rule["rule_id"], run_id)
+            snapshot.prepare_context(rule, context)
+            context["_plugins"] = snapshot.plugins
+            context["_entry_root"] = entry_root
+            context["_entry_choices"] = {entry_root: "event"}
+            decision = engine._run_manager.submit(rule["rule_id"], rule, rule["name"], context)
+            if not signal.wait(60):
+                raise TimeoutError(f"性能测量中的运行 {run_id} 未结束（提交状态：{decision}）")
+            event = finished.pop(run_id)
+            if event.type != "run.succeeded":
+                raise RuntimeError(f"性能测量中的运行未成功: {event.type}")
+            records = [context["steps"][identity] for identity in step_ids
+                       if identity in context["steps"]]
+            if len(records) != len(step_ids) or any(record["status"] != "ok" for record in records):
+                raise RuntimeError("性能测量中的步骤数量不符")
+        finally:
+            with lock:
+                signals.pop(run_id, None)
+                finished.pop(run_id, None)
 
     try:
         execute()
@@ -191,9 +260,10 @@ def workflow(directory, count, *, payload_mb=0, blob_kind=None):
             result["peak_bytes"] = peak
         else:
             result["budget_per_step_ms"] = 1
-        result.update(steps=len(rule["actions"]), per_step_ms=result["median_ms"] / len(rule["actions"]))
+        result.update(steps=len(step_ids), per_step_ms=result["median_ms"] / len(step_ids))
         return result
     finally:
+        engine.events.unsubscribe(subscription)
         engine.shutdown(timeout=5)
 
 
@@ -202,7 +272,10 @@ def idle(directory, seconds):
 
     document = rules(100, 30, steps=1)
     for rule in document:
-        rule["condition"]["params"] = {"path": str(directory / rule["condition"]["type"]), "interval": 1}
+        for node in rule["workflow"]["nodes"]:
+            if node["type"] == "trigger":
+                node["trigger"]["params"] = {"path": str(directory / node["trigger"]["type"]),
+                                             "interval": 1}
     engine = make_engine(document, directory)
     ready = threading.Event()
     shutdown = threading.Event()
@@ -274,14 +347,17 @@ def startup(directory, count):
             path = plugin_dir / f"{kind}s" / identity
             path.mkdir(parents=True)
             (path / f"{kind}.json").write_text(json.dumps(metadata(identity, kind)), encoding="utf-8")
-            source = "def run(meta, params):\n    return None\n" if kind == "action" else (
-                "def run(meta, config, emit, stop):\n    stop.wait()\n"
-            )
+            source = ("def run_with_context(meta, params, context):\n    return None\n"
+                      if kind == "action" else
+                      "def run(meta, config, emit, stop):\n    stop.wait()\n")
             (path / f"{kind}.py").write_text(source, encoding="utf-8")
     document = rules(100, 20, steps=1)
     for index, rule in enumerate(document):
-        rule["condition"]["type"] = f"trigger_{index % 20}"
-        rule["actions"][0]["type"] = f"action_{index % 20}"
+        for node in rule["workflow"]["nodes"]:
+            if node["type"] == "trigger":
+                node["trigger"]["type"] = f"trigger_{index % 20}"
+            elif node["type"] not in NON_ACTION_NODES:
+                node["type"] = f"action_{index % 20}"
 
     samples = []
 
@@ -335,7 +411,7 @@ def reload_rules(directory, count):
 def isolated(directory, count):
     path = directory / "worker" / "action.py"
     path.parent.mkdir()
-    source = b"def run(meta, params):\n    return {'value': params['value']}\n"
+    source = b"def run_with_context(meta, params, context):\n    return {'value': params['value']}\n"
     path.write_bytes(source)
     digest = hashlib.sha256(source).hexdigest()
 
