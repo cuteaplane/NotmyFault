@@ -162,7 +162,7 @@ namespace NotmyFault.Setup
                     Run(python, PythonArguments + Quote(Path.Combine(app, "build.py")) + " verify",
                         app, directory, log, 2, "正在检查随包插件签名", progress, token, false);
                     transaction.RestoreUserFiles();
-c                    const string signingInput = "import os,runpy,sys; " +
+                    const string signingInput = "import os,runpy,sys; " +
                         "os.environ['NOTMYFAULT_SIGNING_PASSPHRASE']=sys.stdin.buffer.read().decode('utf-8'); ";
                     if (options.Upgrade)
                     {
