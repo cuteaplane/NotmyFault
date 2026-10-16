@@ -11,7 +11,7 @@ from notmyfault.core.data_types import DataTypeError, copy_value
 from notmyfault.core.type_registry import TypeRegistry
 from notmyfault.core.variables import initialize_variables
 from notmyfault.core.rules import validate_automation_references, validate_rules_structure
-from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions, normalize_workflow_rule, find_graph_scope
+from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions, find_graph_scope
 from notmyfault.core.rule_model import normalize_rule_shape
 from notmyfault.host.api.ports import EngineControlPort
 from notmyfault.security.plugin_schema import check_payload_contract
@@ -280,7 +280,7 @@ class RuleRunService:
             if (
                 rule_index < 0
                 or rule_index >= len(rules)
-                or normalize_workflow_rule(rules[rule_index]) != normalize_workflow_rule(snapshot)
+                or normalize_rule_shape(rules[rule_index]) != normalize_rule_shape(snapshot)
             ):
                 self._fail(409, "规则保存版本已变化，请刷新后重试")
             return snapshot

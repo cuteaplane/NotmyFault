@@ -16,7 +16,7 @@ from notmyfault.core.rules import (
     validate_rules,
     validate_rules_structure,
 )
-from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions, normalize_workflow_rule, NATIVE_NODES
+from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions, NATIVE_NODES
 from notmyfault.security.rule_approval import (
     AdminRuleApprovalError,
     require_admin_rule_approval,
@@ -47,7 +47,7 @@ class RuleService:
                 revision = self._store.rules_revision()
         except ConfigValidationError as error:
             return {"ok": False, "rules": None, "config_error": str(error)}
-        return {"rules": [normalize_workflow_rule(rule) for rule in rules], "revision": revision}
+        return {"rules": [normalize_rule_shape(rule) for rule in rules], "revision": revision}
 
     def validate_draft(self, rule: Any) -> Dict[str, Any]:
         issues: List[Dict[str, Any]] = []
@@ -308,7 +308,7 @@ class RuleService:
     @staticmethod
     def _normalize_input(rules: Any) -> List[Dict[str, Any]]:
         try:
-            return [normalize_workflow_rule(rule) for rule in normalize_rule_input(rules)]
+            return [normalize_rule_shape(rule) for rule in normalize_rule_input(rules)]
         except RuleStructureError as error:
             errors = error.errors
         raise RuleServiceError(400, {

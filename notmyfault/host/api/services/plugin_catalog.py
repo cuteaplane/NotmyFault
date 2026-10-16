@@ -88,7 +88,6 @@ class PluginCatalogService:
                     user_dir,
                     plugin_kind,
                     json_name,
-                    include_disabled=True,
                 ).items():
                     meta["origin"] = "user"
                     if plugin_id not in result[plugin_kind]:
@@ -104,12 +103,8 @@ class PluginCatalogService:
                         capability_report,
                         origins,
                     )
-            for plugin_id in disabled_set:
-                if plugin_id in result[plugin_kind]:
-                    result[plugin_kind][plugin_id]["enabled"] = False
             for plugin_id, meta in result[plugin_kind].items():
-                if meta.get("origin") == "user":
-                    meta["enabled"] = plugin_id not in disabled_set
+                meta["enabled"] = plugin_id not in disabled_set
 
         for plugin_kind in ("triggers", "actions"):
             for meta in result[plugin_kind].values():
@@ -232,7 +227,6 @@ class PluginCatalogService:
                 user_dir,
                 plugin_kind,
                 json_name,
-                include_disabled=True,
             ).items():
                 if predicate(plugin_id, meta):
                     return plugin_kind, plugin_id, meta

@@ -13,7 +13,17 @@ pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="仅 Windows 通
 @pytest.fixture
 def notifications(monkeypatch):
     module = importlib.import_module("Win_toaster.show_notification")
-    state = SimpleNamespace(events=[], on_show=None, released=threading.Event())
+    windows_toasts = importlib.import_module("windows_toasts")
+    winrt_runtime = importlib.import_module("winrt.runtime")
+    fake_windows_toasts = SimpleNamespace(**vars(windows_toasts))
+    fake_runtime = SimpleNamespace(**vars(winrt_runtime))
+    state = SimpleNamespace(
+        events=[],
+        on_show=None,
+        released=threading.Event(),
+        runtime=fake_runtime,
+        Toast=windows_toasts.Toast,
+    )
 
     def record(operation, toast=None, owner=None):
         state.events.append((operation, toast, owner, threading.current_thread()))
@@ -37,15 +47,17 @@ def notifications(monkeypatch):
         def remove_toast(self, toast):
             record("remove", toast, self.owner)
 
-    monkeypatch.setattr(module, "init_apartment", initialize)
-    monkeypatch.setattr(module, "uninit_apartment", uninitialize)
-    monkeypatch.setattr(module, "InteractableWindowsToaster", Toaster)
+    fake_windows_toasts.InteractableWindowsToaster = Toaster
+    fake_runtime.init_apartment = initialize
+    fake_runtime.uninit_apartment = uninitialize
+    monkeypatch.setitem(sys.modules, "windows_toasts", fake_windows_toasts)
+    monkeypatch.setitem(sys.modules, "winrt.runtime", fake_runtime)
     return module, state
 
 
 def test_parallel_notifications_send_and_remove_on_their_own_threads(notifications):
     module, state = notifications
-    toasts = [module.Toast([title, ""]) for title in ("提醒", "第二条", "第三条")]
+    toasts = [state.Toast([title, ""]) for title in ("提醒", "第二条", "第三条")]
     dismiss = threading.Event()
     workers = []
     try:
@@ -78,7 +90,7 @@ def test_notification_send_failure_reaches_the_caller(notifications, monkeypatch
         raise OSError("notification unavailable")
 
     if stage == "initialize":
-        monkeypatch.setattr(module, "init_apartment", fail)
+        monkeypatch.setattr(state.runtime, "init_apartment", fail)
     else:
         state.on_show = fail
 
@@ -87,6 +99,27 @@ def test_notification_send_failure_reaches_the_caller(notifications, monkeypatch
     if stage != "initialize":
         assert state.released.wait(timeout=5)
     assert not any(event[0] == "remove" for event in state.events)
+
+
+def test_missing_notification_sdk_import_reaches_the_caller(notifications, monkeypatch):
+    module, state = notifications
+    toast = state.Toast()
+    monkeypatch.setitem(sys.modules, "windows_toasts", None)
+    errors = []
+    finished = threading.Event()
+
+    def send():
+        try:
+            module.show_toast(toast, 0)
+        except Exception as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    threading.Thread(target=send, daemon=True).start()
+    assert finished.wait(timeout=5)
+    assert len(errors) == 1 and isinstance(errors[0], ImportError)
+
 
 
 @pytest.mark.parametrize("decision", ["approve", "deny", "cancel"])

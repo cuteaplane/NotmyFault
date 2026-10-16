@@ -8,6 +8,58 @@ from notmyfault.platform.platform_support import launch_python_entry
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
+
+_DASHBOARD_CONTROL_PORT = 19197
+_DASHBOARD_SHOW = b"NMF_DASHBOARD_SHOW_V2"
+_DASHBOARD_QUIT = b"NMF_DASHBOARD_QUIT_V2"
+_DASHBOARD_OK = b"NMF_DASHBOARD_OK_V1"
+
+
+def _send_dashboard_command(command: bytes) -> bool:
+    from notmyfault.application_paths import ApplicationPaths
+
+    try:
+        token = (
+            ApplicationPaths.default()
+            .dashboard_control_token_file.read_text(encoding="utf-8")
+            .strip()
+        )
+        if len(token) != 64:
+            return False
+        int(token, 16)
+        with socket.create_connection(
+            ("127.0.0.1", _DASHBOARD_CONTROL_PORT), timeout=1
+        ) as client:
+            client.settimeout(1)
+            client.sendall(token.encode("ascii") + b" " + command + b"\n")
+            return client.makefile("rb").readline(64).rstrip(b"\r\n") == _DASHBOARD_OK
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+
+def _open_dashboard():
+    if _send_dashboard_command(_DASHBOARD_SHOW):
+        return
+    dashboard_pyw = os.path.join(PROJECT_ROOT, "dashboard.pyw")
+    if os.path.exists(dashboard_pyw):
+        try:
+            launch_python_entry(dashboard_pyw)
+            return
+        except Exception:
+            pass
+    print("[Dashboard] 找不到可启动的 Dashboard 入口", file=sys.stderr)
+
+
+if (
+    __name__ == "__main__"
+    and "--dashboard" in sys.argv
+    and "--enable-autostart" not in sys.argv
+    and "--disable-autostart" not in sys.argv
+):
+    _open_dashboard()
+    raise SystemExit(0)
+
+
 from notmyfault.host.app import create_engine
 from notmyfault.application_paths import ApplicationPaths
 from notmyfault.config import SignedConfigStore
@@ -25,9 +77,6 @@ from notmyfault.security.api_key_store import AIKeyStore
 from notmyfault.core.logging import init_session_log
 from notmyfault.core.runtime_controller import RuntimeController
 
-# Dashboard 控制端口和退出协议与 dashboard.pyw 共用，直接导入会拉起 webview 依赖
-_DASHBOARD_CONTROL_PORT = 19197
-_DASHBOARD_QUIT = b"NMF_DASHBOARD_QUIT_V2"
 
 # 托盘模块导入失败时仍可运行引擎
 try:
@@ -102,36 +151,8 @@ def setup_logging(log_dir: str) -> str:
     return log_path
 
 
-def _notify_dashboard_quit():
-    """通知 Dashboard 控制端口关闭自身，让 UI 与引擎一起退出"""
-    try:
-        token = (
-            ApplicationPaths.default()
-            .dashboard_control_token_file.read_text(encoding="utf-8")
-            .strip()
-        )
-        if len(token) != 64:
-            return
-        int(token, 16)
-        with socket.create_connection(
-            ("127.0.0.1", _DASHBOARD_CONTROL_PORT), timeout=1
-        ) as client:
-            client.settimeout(1)
-            client.sendall(token.encode("ascii") + b" " + _DASHBOARD_QUIT + b"\n")
-            client.makefile("rb").readline(32)
-    except (OSError, UnicodeError, ValueError):
-        pass
 
 
-def _open_dashboard():
-    dashboard_pyw = os.path.join(PROJECT_ROOT, "dashboard.pyw")
-    if os.path.exists(dashboard_pyw):
-        try:
-            launch_python_entry(dashboard_pyw)
-            return
-        except Exception:
-            pass
-    print("[Dashboard] 找不到可启动的 Dashboard 入口", file=sys.stderr)
 
 
 class EngineRunner:
@@ -189,8 +210,6 @@ class EngineRunner:
     def _handle_engine_state(self, state: str) -> None:
         if self._tray:
             self._tray.set_engine_state(state)
-            if state == "running":
-                self._tray.show_balloon("NotmyFault", "引擎已启动")
         if self._api:
             self._api.publish_event("engine_state_changed", {"state": state})
 
@@ -221,7 +240,7 @@ class EngineRunner:
     def _tray_exit(self):
         """退出时依次关闭引擎、HTTP 服务、Dashboard 和进程"""
         print("[Tray] 用户请求退出")
-        _notify_dashboard_quit()
+        _send_dashboard_command(_DASHBOARD_QUIT)
         self.stop_engine()
         self.request_process_shutdown(force_after=5)
 
@@ -417,7 +436,5 @@ if __name__ == "__main__":
         enabled = "--enable-autostart" in sys.argv
         set_linux_autostart(enabled, PROJECT_ROOT)
         print("已启用开机自启" if enabled else "已关闭开机自启")
-    elif "--dashboard" in sys.argv:
-        _open_dashboard()
     else:
         main()

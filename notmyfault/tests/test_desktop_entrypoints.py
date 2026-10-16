@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import json
 import os
 from pathlib import Path
 import runpy
@@ -108,6 +109,78 @@ def test_dashboard_reads_history_from_application_paths(dashboard, tmp_path):
     api = dashboard.DashboardAPI(paths=paths)
     assert api.list_log_files()[0]["name"] == "engine-20260906.log"
     assert api.read_log_file_entries("engine-20260906.log")[0]["text"] == "桌面日志"
+
+def test_dashboard_settings_persist_without_engine(dashboard, tmp_path):
+    paths = ApplicationPaths(tmp_path / "config", tmp_path / "package", tmp_path)
+    api = dashboard.DashboardAPI(paths=paths)
+
+    assert api.get_dashboard_settings() == {"ok": True, "resident_on_close": True}
+    assert api.set_dashboard_settings(False) == {
+        "ok": True,
+        "resident_on_close": False,
+    }
+    assert dashboard.DashboardAPI(paths=paths).get_dashboard_settings() == {
+        "ok": True,
+        "resident_on_close": False,
+    }
+    assert api.set_dashboard_settings(True) == {
+        "ok": True,
+        "resident_on_close": True,
+    }
+    assert json.loads(paths.dashboard_settings_file.read_text(encoding="utf-8"))[
+        "resident_on_close"
+    ] is True
+
+
+def test_dashboard_settings_reject_invalid_values_without_changes(dashboard, tmp_path):
+    paths = ApplicationPaths(tmp_path / "config", tmp_path / "package", tmp_path)
+    api = dashboard.DashboardAPI(paths=paths)
+    assert api.set_dashboard_settings(False)["ok"] is True
+    before = paths.dashboard_settings_file.read_bytes()
+
+    for invalid in (0, 1, "false", None):
+        result = api.set_dashboard_settings(invalid)
+        assert result["ok"] is False
+        assert result["resident_on_close"] is False
+        assert paths.dashboard_settings_file.read_bytes() == before
+
+    assert api.get_dashboard_settings()["resident_on_close"] is False
+
+
+def test_dashboard_settings_replace_failure_preserves_file_and_state(
+    dashboard, tmp_path, monkeypatch
+):
+    paths = ApplicationPaths(tmp_path / "config", tmp_path / "package", tmp_path)
+    api = dashboard.DashboardAPI(paths=paths)
+    assert api.set_dashboard_settings(False)["ok"] is True
+    before = paths.dashboard_settings_file.read_bytes()
+
+    def fail_replace(source, destination):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(dashboard.os, "replace", fail_replace)
+    result = api.set_dashboard_settings(True)
+
+    assert result["ok"] is False
+    assert result["resident_on_close"] is False
+    assert result["error"] == "replace failed"
+    assert api.get_dashboard_settings()["resident_on_close"] is False
+    assert paths.dashboard_settings_file.read_bytes() == before
+    assert list(paths.config_dir.glob(".dashboard-settings.json.*.tmp")) == []
+
+
+def test_dashboard_settings_bad_json_is_reported_without_rewrite(dashboard, tmp_path):
+    paths = ApplicationPaths(tmp_path / "config", tmp_path / "package", tmp_path)
+    paths.config_dir.mkdir(parents=True)
+    paths.dashboard_settings_file.write_bytes(b"{ invalid")
+    before = paths.dashboard_settings_file.read_bytes()
+
+    result = dashboard.DashboardAPI(paths=paths).get_dashboard_settings()
+
+    assert result["ok"] is False
+    assert result["resident_on_close"] is True
+    assert result["error"]
+    assert paths.dashboard_settings_file.read_bytes() == before
 
 
 def test_dashboard_rebuilds_changed_sources_and_rejects_failed_build(dashboard, tmp_path, monkeypatch):

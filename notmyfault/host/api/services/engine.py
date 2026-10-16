@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, Protocol
 from notmyfault.application_paths import ApplicationPaths
 from notmyfault.config import ConfigValidationError, SignedConfigStore
 from notmyfault.host.log_files import LogFiles
-from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions
+from notmyfault.core.workflow_graph import get_all_rule_events, iter_rule_actions, NON_ACTION_NODES
 from notmyfault.core.run_history import RunHistory
 from notmyfault.host.api.ports import EngineControlPort
 from notmyfault.security.security import detect_security_mode
@@ -114,7 +114,7 @@ class EngineService:
             action_types.update(
                 action.get("type")
                 for action, _location in iter_rule_actions(rule)
-                if isinstance(action, dict) and action.get("type") and action["type"] not in {"trigger", "condition", "logic", "event_group", "action_group", "merge", "end"}
+                if action.get("type") and action["type"] not in NON_ACTION_NODES
             )
         return {
             "running": self._engine.engine_running,
