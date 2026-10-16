@@ -10,7 +10,7 @@
 - 规则编辑器的普通模式。
 - 规则顶层 condition／event／trigger／actions／preconditions，以及 then／elif／else 和 failure_actions 动作数组。
 - 内部条件树和顺序动作数组执行入口；匹配、执行和补救使用原生平面图。
-- 条件组的 events 与 type: "and"／type: "or"；动作 id 与 steps.<id> 引用。
+- 条件组的 events 与 type: "and"／type: "or"；动作 id 与 `steps.<id>` 引用。
 - `{{ path }}` 文本模板。
 - `config.json` 中的 `rules`、`processes`；没有 `value_encoding` 的 `rules.json`。
 - 显示器控制的 `low_brightness`、`high_brightness` 操作。
