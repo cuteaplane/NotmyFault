@@ -72,16 +72,6 @@ export async function apiWrite(path, method, body, isForm) {
   return res
 }
 
-export async function apiDownload(path, body) {
-  const res = await fetchAuthenticated(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body || {}),
-  })
-  if (res.status === 403) throw new Error('Dashboard 与后台服务认证不同步')
-  return res
-}
-
 export async function loadConfig() {
   return await (await apiRead('/api/rules')).json()
 }

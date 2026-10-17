@@ -2342,10 +2342,9 @@ const pluginsNav = [...document.querySelectorAll('.nav-item')].find(
 )
 pluginsNav?.click()
 await waitFor('.plugin-management-page')
-const registryButton = [...document.querySelectorAll('.page-head button')].find(button => button.textContent.trim() === '插件索引')
-registryButton?.click()
-if (!await waitFor('.plugin-registry-panel')) throw new Error('插件索引入口没有打开面板')
-registryButton.click()
+if ([...document.querySelectorAll('.page-head button')].some(button => button.textContent.trim() === '插件索引')) {
+  throw new Error('插件索引入口仍然存在')
+}
 ;[...document.querySelectorAll('.page-head button')].find(
   button => button.textContent.includes('安装插件'),
 )?.click()

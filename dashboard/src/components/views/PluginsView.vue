@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { store } from '../../lib/store'
-import { apiDownload, apiRead, apiWrite, loadPlugins, getSchema } from '../../lib/api'
+import { apiRead, apiWrite, loadPlugins, getSchema } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
 import { alertDialog, confirmDialog } from '../../lib/dialog'
 import { useEngineControl } from '../../composables/useEngineControl'
@@ -85,77 +85,6 @@ const previewLoading = ref(false)
 const previewError = ref('')
 const fileForUpload = ref(null)
 const installError = ref('')
-const showRegistry = ref(false)
-let savedRegistryUrl = ''
-try { savedRegistryUrl = localStorage.getItem('nmf-plugin-registry-url') || '' } catch {}
-const registryUrl = ref(savedRegistryUrl)
-const registryPlugins = ref([])
-const registryLoading = ref(false)
-const registryError = ref('')
-const registryDownloading = ref('')
-const installedPackages = computed(() => new Set(
-  Object.values(store.pluginsData.triggers || {}).concat(Object.values(store.pluginsData.actions || {}))
-    .map(meta => meta?.package_name)
-    .filter(Boolean),
-))
-
-async function loadRegistry() {
-  const url = registryUrl.value.trim()
-  if (!url) {
-    registryError.value = '请输入插件索引地址'
-    return
-  }
-  try { if (new URL(url).protocol !== 'https:') throw new Error() }
-  catch { registryError.value = '请输入有效的 HTTPS 插件索引地址'; return }
-  registryLoading.value = true
-  registryError.value = ''
-  try {
-    const response = await apiWrite('/api/plugins/registry', 'POST', { url })
-    const data = await response.json()
-    if (!data.ok) {
-      registryError.value = data.error || '读取插件索引失败'
-      return
-    }
-    try { localStorage.setItem('nmf-plugin-registry-url', url) } catch {}
-    registryPlugins.value = data.plugins || []
-  } catch (error) {
-    registryError.value = error.message || '读取插件索引失败'
-  } finally {
-    registryLoading.value = false
-  }
-}
-
-async function previewRegistryPlugin(entry) {
-  const identity = `${entry.package_name}@${entry.version}`
-  registryDownloading.value = identity
-  registryError.value = ''
-  try {
-    const response = await apiDownload('/api/plugins/registry/download', {
-      url: registryUrl.value.trim(),
-      package_name: entry.package_name,
-      version: entry.version,
-    })
-    if (!response.ok) {
-      const data = await response.json().catch(() => ({}))
-      registryError.value = data.error || '下载插件包失败'
-      return
-    }
-    const archive = await response.blob()
-    const file = new File(
-      [archive],
-      `${entry.package_name}-${entry.version}.nmfp`,
-      { type: 'application/octet-stream' },
-    )
-    openInstall()
-    fileForUpload.value = file
-    await uploadPreview(file)
-  } catch (error) {
-    registryError.value = error.message || '下载插件包失败'
-  } finally {
-    registryDownloading.value = ''
-  }
-}
-
 async function refresh() {
   try {
     const [plugins, sch] = await Promise.all([
@@ -495,45 +424,10 @@ onUnmounted(() => clearTimeout(refreshTimer))
 <template>
   <section class="page active plugin-management-page">
     <div class="page-head"><div><h2>插件管理</h2><p class="page-subtitle">异常插件优先显示；选择插件查看状态、权限和来源。</p></div><div class="actions">
-      <button class="btn btn-outlined" :aria-expanded="showRegistry" @click="showRegistry = !showRegistry">插件索引</button>
       <button class="btn btn-filled" @click="openInstall"><span class="material-symbols-outlined">install_desktop</span>安装插件</button>
     </div></div>
     <div class="plugin-workbench" :class="{ 'has-selection': selectedPlugin }">
       <div class="plugin-list-view">
-        <section v-if="showRegistry" class="plugin-registry-panel">
-          <div class="plugin-registry-head">
-            <div>
-              <h3>只读插件索引</h3>
-              <p>填写 registry.json 的 HTTPS 地址。下载后仍会进入本地安全预览，不会直接安装。</p>
-            </div>
-            <div class="plugin-registry-load">
-              <input v-model="registryUrl" class="text-field" type="url" spellcheck="false" placeholder="https://raw.githubusercontent.com/.../registry.json" @keyup.enter="loadRegistry">
-              <button class="btn btn-filled" :disabled="registryLoading" @click="loadRegistry">{{ registryLoading ? '读取中…' : '读取索引' }}</button>
-            </div>
-          </div>
-          <p v-if="registryError" class="plugin-registry-error"><span class="material-symbols-outlined">warning</span>{{ registryError }}</p>
-          <div v-if="registryPlugins.length" class="plugin-registry-grid">
-            <article v-for="entry in registryPlugins" :key="entry.package_name + '@' + entry.version" class="plugin-registry-card">
-              <div>
-                <h4>{{ entry.name }}</h4>
-                <p>{{ entry.package_name }}</p>
-              </div>
-              <div class="preview-meta">
-                <span class="chip">v{{ entry.version }}</span>
-                <span v-for="platform in entry.supported_platforms" :key="platform" class="chip">{{ platform }}</span>
-                <span class="chip" :class="installedPackages.has(entry.package_name) ? 'chip-clean' : ''">{{ installedPackages.has(entry.package_name) ? '已安装' : '未安装' }}</span>
-              </div>
-              <div class="plugin-registry-actions">
-                <a class="btn btn-text" :href="entry.homepage" target="_blank" rel="noreferrer">主页</a>
-                <button class="btn btn-filled btn-sm" :disabled="registryDownloading === entry.package_name + '@' + entry.version" @click="previewRegistryPlugin(entry)">
-                  {{ registryDownloading === entry.package_name + '@' + entry.version ? '下载中…' : installedPackages.has(entry.package_name) ? '检查更新' : '下载并检查' }}
-                </button>
-              </div>
-            </article>
-          </div>
-          <p v-else-if="!registryLoading && !registryError" class="plugin-registry-empty">索引尚未读取。</p>
-        </section>
-
         <div class="plugin-origin-switch" :class="{ 'user-active': originTab === 'user' }" role="tablist" aria-label="插件来源">
           <button type="button" role="tab" :aria-selected="originTab === 'builtin'"
             :class="{ active: originTab === 'builtin' }" @click="originTab = 'builtin'">
