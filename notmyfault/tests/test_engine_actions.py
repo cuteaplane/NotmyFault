@@ -1485,6 +1485,48 @@ def test_manual_rule_with_trigger_constants_runs_selected_actions(partial):
         engine.shutdown(2)
 
 
+def _two_root_manual_rule():
+    def chain(suffix, value):
+        trigger_node = {
+            "binding_id": f"a_signal_{suffix}",
+            "type": "trigger",
+            "trigger": {"binding_id": f"t_manual_{suffix}", "type": "manual_signal", "params": {}},
+        }
+        action = {"binding_id": f"a_record_{suffix}", "type": "record", "params": {"value": value}}
+        end = {"binding_id": f"a_end_{suffix}", "type": "end"}
+        edges = [
+            {"source": trigger_node["binding_id"], "port": "event", "target": action["binding_id"], "channel": "control"},
+            {"source": action["binding_id"], "port": "next", "target": end["binding_id"], "channel": "control"},
+        ]
+        return [trigger_node, action, end], edges
+
+    a_nodes, a_edges = chain("aaaaaa", "a")
+    b_nodes, b_edges = chain("bbbbbb", "b")
+    return {
+        "rule_id": "r_manual_two",
+        "name": "双入口手动运行",
+        "workflow": {"entry": None, "nodes": a_nodes + b_nodes, "edges": a_edges + b_edges},
+    }
+
+
+@pytest.mark.parametrize(("payloads", "expected"), [
+    ({"t_manual_bbbbbb": {}}, ["b"]),
+    ({"t_manual_aaaaaa": {}, "t_manual_bbbbbb": {}}, ["a", "b"]),
+])
+def test_manual_rule_runs_every_supplied_trigger_root(payloads, expected):
+    received = []
+    engine = make_engine()
+    register_action(engine, "record", lambda meta, params, _context: received.append(params["value"]))
+    try:
+        ok, _, run_id = engine.run_manual_rule_snapshot(_two_root_manual_rule(), 0, trigger_payloads=payloads)
+        assert ok
+        assert engine._run_manager.wait_for_idle(2)
+        assert engine._run_manager.state(run_id) == "succeeded"
+        assert received == expected
+    finally:
+        engine.shutdown(2)
+
+
 @pytest.mark.parametrize("change", ["rename", "modify", "delete"])
 def test_saved_manual_queue_obeys_rule_generation_changes(change):
     import copy

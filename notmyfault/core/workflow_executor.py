@@ -304,7 +304,19 @@ class WorkflowExecutor:
         compiled = context.get('_compiled_rule')
         program = compiled.matcher_spec.graph if compiled is not None else CanvasProgram({'workflow': graph})
         roots = program.roots()
-        current = start_id or context.get('_entry_root') or (roots[0] if roots else None)
+        current = start_id or context.get('_entry_root')
+        if current is None and isinstance(context.get('manual_test'), dict):
+            # 手动测试未指定起点时，按测试对话框展示的范围执行所有独立触发入口
+            recovered = bool(context.pop('_recovered_stop', False))
+            for root in roots:
+                context.pop('_recovered_stop', None)
+                if not (yield from self._execute_graph(graph, rule_name, context, start_id=root, end_id=end_id)):
+                    return False
+                recovered = recovered or bool(context.pop('_recovered_stop', False))
+            if recovered:
+                context['_recovered_stop'] = True
+            return True
+        current = current or (roots[0] if roots else None)
         cancel = self._ensure_run_cancel_event(context)
         while current is not None:
             if cancel.is_set():
