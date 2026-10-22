@@ -52,6 +52,7 @@ def validate_params(_action_info, params):
 def _set_wmi_brightness(level: int) -> int:
     """设置并回读 root/WMI 提供的显示器亮度"""
     script = (
+        "[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false);"
         "$ErrorActionPreference='Stop';"
         "$methods=@(Get-CimInstance -Namespace root/WMI "
         "-ClassName WmiMonitorBrightnessMethods -ErrorAction Stop);"
@@ -73,6 +74,7 @@ def _set_wmi_brightness(level: int) -> int:
          "-NoProfile", "-NonInteractive", "-Command", script],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         errors="replace",
         timeout=8,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
