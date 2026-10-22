@@ -53,6 +53,25 @@ def test_folder_read_error_keeps_the_last_complete_snapshot(tmp_path, monkeypatc
     assert [event["event"] for event in events] == ["deleted"]
 
 
+def test_folder_file_deleted_during_scan_counts_as_deleted(tmp_path, monkeypatch):
+    module, meta = load_trigger("folder_monitor")
+    path = tmp_path / "gone.txt"
+    path.touch()
+    events = []
+    trigger = module.FolderMonitorTrigger(meta, {"folder_path": str(tmp_path), "event_type": "all"}, events.append, threading.Event())
+    trigger.validate()
+    trigger.setup()
+    original_stat = module.os.stat
+    def vanishing_stat(target, *args, **kwargs):
+        if str(target) == str(path):
+            raise FileNotFoundError("deleted after listing")
+        return original_stat(target, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(module.os, "stat", vanishing_stat)
+        trigger.poll()
+    assert [(event["event"], event["path"]) for event in events] == [("deleted", str(path))]
+
+
 def load_trigger(name):
     folder = TRIGGERS / name
     spec = importlib.util.spec_from_file_location(f"polling_{name}", folder / "trigger.py")

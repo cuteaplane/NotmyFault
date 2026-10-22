@@ -24,7 +24,11 @@ def _dir_snapshot(folder: str):
     for root, dirs, files in os.walk(folder, onerror=raise_walk_error):
         for f in files:
             fpath = os.path.join(root, f)
-            stat = os.stat(fpath)
+            try:
+                stat = os.stat(fpath)
+            except FileNotFoundError:
+                # os.walk 列出文件后到 stat 之前文件可能已被删掉，按已删除处理
+                continue
             snap[fpath] = (stat.st_size, stat.st_mtime_ns)
     return snap
 

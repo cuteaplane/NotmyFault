@@ -302,22 +302,51 @@ def test_power_state_keeps_native_callback_until_window_is_destroyed(monkeypatch
     assert window["wnd_proc"] not in mod._WND_PROC_HOLD
 
 
-def test_cron_schedule_daily_fires_once_per_day(monkeypatch):
+@pytest.mark.parametrize("mode,next_date", [("daily", 2), ("weekly", 8)])
+def test_cron_schedule_fires_once_per_scheduled_date(tmp_path, mode, next_date):
+    from notmyfault.core.state_store import StateStore, TriggerState
+    from notmyfault.plugin_api import TriggerContext, use_trigger_context
+
     mod = load_plugin("triggers", "cron_schedule")
     clock = FakeClock(datetime(2026, 1, 1, 7, 59))
-    trigger, events = make_trigger(
-        mod, "CronScheduleTrigger", {"mode": "daily", "time": "08:00"}, clock=clock
-    )
-    trigger.poll()
-    assert events == []
-    clock.moment = datetime(2026, 1, 1, 9, 0)
-    trigger.poll()
-    trigger.poll()
-    assert len(events) == 1
-    clock.moment = datetime(2026, 1, 2, 8, 0)
-    trigger.poll()
-    assert len(events) == 2
-    assert all(e["mode"] == "daily" for e in events)
+    config = {"mode": mode, "time": "08:00", "days": "4"}
+    events = []
+    path = tmp_path / "runtime.sqlite3"
+    store = StateStore(path)
+
+    def create_trigger():
+        context = TriggerContext(
+            {"id": "cron_schedule"}, config, events.append, threading.Event(),
+            TriggerState(lambda: store, "cron_schedule"), "boot", clock.time(), clock,
+        )
+        with use_trigger_context(context):
+            trigger = mod.CronScheduleTrigger.from_context(context)
+        trigger.validate()
+        return trigger
+
+    try:
+        trigger = create_trigger()
+        trigger.poll()
+        assert events == []
+        clock.moment = datetime(2026, 1, 1, 8, 0, 5)
+        trigger.poll()
+        trigger.poll()
+        assert len(events) == 1
+
+        assert store.close()
+        store = StateStore(path)
+        clock.moment = datetime(2026, 1, 1, 8, 0, 30)
+        restarted = create_trigger()
+        restarted.poll()
+        assert len(events) == 1
+
+        clock.moment = datetime(2026, 1, next_date, 9, 0)
+        restarted.poll()
+        restarted.poll()
+        assert len(events) == 2
+        assert all(event["mode"] == mode for event in events)
+    finally:
+        assert store.close()
 
 
 @pytest.mark.parametrize("interval_minutes", [1, 30, 1440])

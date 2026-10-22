@@ -156,14 +156,14 @@ else:
             keycode = self._disp.keysym_to_keycode(keysym)
             if keycode == 0:
                 raise RuntimeError(f"当前键盘没有映射 {main_key_name} 的按键")
-            root.grab_key(keycode, modifiers, False, X.GrabModeAsync, X.GrabModeAsync)
             # XGrabKey 不吃 NumLock/CapsLock，注册带锁的变体
-            for extra in (0, X.LockMask, X.Mod2Mask, X.LockMask | X.Mod2Mask):
-                if extra and (modifiers & extra) == 0:
-                    root.grab_key(keycode, modifiers | extra, False,
-                                  X.GrabModeAsync, X.GrabModeAsync)
-            self._disp.sync()
+            masks = sorted({modifiers | extra for extra in (0, X.LockMask, X.Mod2Mask, X.LockMask | X.Mod2Mask)})
             self._keycode = keycode
+            self._grabbed_masks = []
+            for mask in masks:
+                root.grab_key(keycode, mask, False, X.GrabModeAsync, X.GrabModeAsync)
+                self._grabbed_masks.append(mask)
+            self._disp.sync()
             self._triggered = False
             self.log(f"已注册热键: {self._raw}")
 
@@ -185,7 +185,8 @@ else:
             if hasattr(self, '_disp') and hasattr(self, '_keycode'):
                 try:
                     root = self._disp.screen().root
-                    root.ungrab_key(self._keycode, 0, False)
+                    for mask in getattr(self, '_grabbed_masks', ()):
+                        root.ungrab_key(self._keycode, mask)
                     self._disp.sync()
                 except Exception:
                     pass
