@@ -78,7 +78,11 @@ def check_plugin(plugin_dir: str | Path) -> dict[str, Any]:
         "declared": meta.get("entrypoints") or {},
         "selected": selected,
         "exists": inspection.entrypoint_exists,
+        "checked": inspection.entrypoint_checked,
     }
+    unchecked_reason = "schema 未通过" if inspection.schema_errors else "检查未执行"
+    if not inspection.entrypoint_checked:
+        entrypoint["reason"] = unchecked_reason
     contributes = meta.get("contributes") or {}
     if not isinstance(contributes, dict):
         contributes = {}
@@ -95,7 +99,12 @@ def check_plugin(plugin_dir: str | Path) -> dict[str, Any]:
         "id": meta.get("id", ""),
         "package_name": meta.get("package_name", ""),
         "schema": {"ok": schema_ok, "errors": schema_errors},
-        "platform": {"name": platform, "compatible": platform_ok},
+        "platform": {
+            "name": platform,
+            "compatible": platform_ok,
+            "checked": inspection.platform_checked,
+            **({} if inspection.platform_checked else {"reason": unchecked_reason}),
+        },
         "capabilities": capabilities,
         "permissions": {
             "ok": permission_ok,
@@ -128,10 +137,16 @@ def _print_report(report: dict[str, Any]) -> None:
     print(f"schema: {'ok' if report['schema']['ok'] else 'failed'}")
     for error in report["schema"]["errors"]:
         print(f"  - {error}")
-    print(
-        f"platform: {report['platform']['name']} "
-        f"{'ok' if report['platform']['compatible'] else 'unavailable'}"
-    )
+    for error in report.get("checks", {}).get("development", {}).get("errors", []):
+        print(f"开发检查错误: {error}")
+    platform = report["platform"]
+    if platform.get("checked", True):
+        print(
+            f"platform: {platform['name']} "
+            f"{'ok' if platform['compatible'] else 'unavailable'}"
+        )
+    else:
+        print(f"platform: 未检查（{platform.get('reason', '检查未执行')}）")
     for item in report["capabilities"]:
         state = "ok" if item["available"] else item.get("reason") or "unavailable"
         print(f"capability: {item['id']} {state}")
@@ -142,8 +157,12 @@ def _print_report(report: dict[str, Any]) -> None:
     print(f"load policy ({policy['mode']}): {'allowed' if policy['allowed'] else 'rejected'}")
     for error in policy["errors"]:
         print(f"  - {error}")
-    selected = report["entrypoints"].get("selected") or "none"
-    print(f"entrypoint: {selected} {'ok' if report['entrypoints']['exists'] else 'missing'}")
+    entrypoints = report["entrypoints"]
+    if entrypoints.get("checked", True):
+        selected = entrypoints.get("selected") or "none"
+        print(f"entrypoint: {selected} {'ok' if entrypoints['exists'] else 'missing'}")
+    else:
+        print(f"entrypoint: 未检查（{entrypoints.get('reason', '检查未执行')}）")
     for kind, identifiers in report["contributions"].items():
         print(f"contributions.{kind}: {', '.join(identifiers) or 'none'}")
     for risk in report["risks"]:
