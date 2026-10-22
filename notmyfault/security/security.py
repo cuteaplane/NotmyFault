@@ -94,6 +94,38 @@ def detect_security_mode() -> SecurityMode:
     return requested if rank[requested] > rank[signed_mode] else signed_mode
 
 
+def core_source_files(package_root: Path) -> dict[str, Path]:
+    def reject_link(path):
+        if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+            raise ValueError(f"核心源码不能包含文件或目录链接: {path}")
+
+    reject_link(package_root)
+    files = {}
+    for path in package_root.rglob("*"):
+        relative = path.relative_to(package_root).as_posix()
+        parts = relative.split("/")
+        if parts[0] in ("tests", "simulator", "actions", "__pycache__") or "__pycache__" in parts:
+            continue
+        if parts[0] == "triggers" and relative not in ("triggers", "triggers/__init__.py", "triggers/base.py"):
+            continue
+        reject_link(path)
+        if path.is_file() and path.suffix == ".py":
+            files[relative] = path
+    root = package_root.parent
+    for name in ("NOTMYFAULT.pyw", "dashboard.pyw", "build.py"):
+        path = root / name
+        reject_link(path)
+        if path.is_file():
+            files["../" + name] = path
+    reject_link(root / "Win_toaster")
+    for path in (root / "Win_toaster").rglob("*"):
+        if "__pycache__" not in path.relative_to(root).parts:
+            reject_link(path)
+            if path.is_file() and path.suffix == ".py":
+                files["../" + path.relative_to(root).as_posix()] = path
+    return files
+
+
 def verify_core_integrity() -> Tuple[bool, List[str]]:
     """校验核心源码是否匹配签名的 integrity.json 清单，清单缺失、签名无效、哈希不匹配或 security.py 被修改都会失败。"""
     import hashlib
@@ -120,25 +152,9 @@ def verify_core_integrity() -> Tuple[bool, List[str]]:
             continue
         if actual != expected:
             bad.append(name)
-    current: set[str] = set()
-    for path in _PKG_ROOT.rglob("*.py"):
-        relative = path.relative_to(_PKG_ROOT).as_posix()
-        parts = relative.split("/")
-        if (
-            parts[0] in (
-                "tests",
-                "simulator",
-                "actions",
-                "__pycache__",
-            )
-            or "__pycache__" in parts
-        ):
-            continue
-        if parts[0] == "triggers" and relative not in (
-            "triggers/__init__.py",
-            "triggers/base.py",
-        ):
-            continue
-        current.add(relative)
+    try:
+        current = set(core_source_files(_PKG_ROOT))
+    except (OSError, ValueError) as error:
+        return False, [*bad, str(error)]
     bad.extend(f"{name} (unlisted)" for name in sorted(current - set(listed)))
     return (len(bad) == 0), bad

@@ -392,6 +392,24 @@ def test_display_power_allows_receiver_to_acquire_native_lock(monkeypatch, opera
         receiver.join(timeout=1)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 WMI 亮度脚本")
+def test_display_wmi_preserves_chinese_error(monkeypatch):
+    mod = load_plugin("actions", "display_control")
+    run = mod.subprocess.run
+    monkeypatch.setattr("locale.getencoding", lambda: "utf-8")
+
+    def without_monitors(command, **kwargs):
+        command = list(command)
+        command[-1] = "function Get-CimInstance { @() };" + command[-1]
+        return run(command, **kwargs)
+
+    monkeypatch.setattr(mod.subprocess, "run", without_monitors)
+    with pytest.raises(RuntimeError) as caught:
+        mod._set_wmi_brightness(50)
+    assert "未发现支持 WMI 亮度控制的显示器" in str(caught.value)
+    assert "\ufffd" not in str(caught.value)
+
+
 # ------------------------------------------------------------- clipboard_clear
 
 

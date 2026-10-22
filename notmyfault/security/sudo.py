@@ -2,6 +2,7 @@
 
 import inspect
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ _engine_token: str | None = None
 _admin_plugins: set[str] = set()
 _admin_executables: dict[str, set[str]] = {}
 _admin_by_module: dict[int, tuple[weakref.ReferenceType, str]] = {}
+_plugin_code_owners: dict[int, tuple[weakref.ReferenceType, str]] = {}
 _session_lock = threading.RLock()
 
 
@@ -173,7 +175,17 @@ def _find_plugin_callers() -> list[tuple[str, Any]]:
     seen_globals: set[int] = set()
     try:
         for frame_info in inspect.stack():
-            module_name = frame_info.frame.f_globals.get("__name__", "")
+            frame = frame_info.frame
+            with _session_lock:
+                owner = _plugin_code_owners.get(id(frame.f_code))
+                plugin_id = owner[1] if owner is not None and owner[0]() is frame.f_code else None
+            module_name = frame.f_globals.get("__name__", "")
+            if plugin_id is not None:
+                globals_id = id(frame.f_globals)
+                if globals_id not in seen_globals:
+                    callers.append((plugin_id, frame.f_globals))
+                    seen_globals.add(globals_id)
+                continue
             for prefix in ("notmyfault.action_", "notmyfault.trigger_"):
                 if module_name.startswith(prefix):
                     globals_id = id(frame_info.frame.f_globals)
@@ -184,6 +196,24 @@ def _find_plugin_callers() -> list[tuple[str, Any]]:
         return callers
     except Exception:
         return []
+
+
+def register_plugin_code(code, plugin_id: str) -> None:
+    from types import CodeType
+
+    identity = id(code)
+
+    def discard(reference):
+        with _session_lock:
+            previous = _plugin_code_owners.get(identity)
+            if previous is not None and previous[0] is reference:
+                _plugin_code_owners.pop(identity, None)
+
+    with _session_lock:
+        _plugin_code_owners[identity] = weakref.ref(code, discard), plugin_id
+    for child in code.co_consts:
+        if isinstance(child, CodeType):
+            register_plugin_code(child, plugin_id)
 
 
 def _get_caller_plugin_id() -> str | None:
@@ -222,16 +252,15 @@ def _run_with_uac(
 ) -> subprocess.CompletedProcess | subprocess.Popen:
     command = _resolve_admin_command(command, allowed_executables)
     if os.name == "nt":
-        # PowerShell 单引号使用两个单引号转义。
         def _ps_quote(value: str) -> str:
-            return "'" + value.replace("'", "''") + "'"
+            return "'" + re.sub("['\u2018-\u201b]", lambda match: match[0] * 2, value) + "'"
 
         executable = _ps_quote(command[0])
         arguments = _ps_quote(subprocess.list2cmdline(command[1:])) if command[1:] else ""
         start_process = (
             f"Start-Process -FilePath {executable}"
             + (f" -ArgumentList {arguments}" if arguments else "")
-            + " -Verb RunAs"
+            + " -Verb RunAs -ErrorAction Stop"
         )
         if wait:
             ps_script = (
@@ -311,7 +340,7 @@ def run_as_admin(
             (
                 plugin_id
                 for plugin_id, authorized_id in authorized_callers
-                if authorized_id is None or authorized_id not in _admin_plugins
+                if authorized_id != plugin_id or authorized_id not in _admin_plugins
             ),
             None,
         )

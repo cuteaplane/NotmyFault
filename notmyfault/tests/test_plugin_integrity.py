@@ -3,8 +3,55 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from notmyfault.security import plugins as security_plugins
 from notmyfault.security.plugin_checks import inspect_plugin_tree
+
+
+@pytest.mark.parametrize("namespace", ["isolated_action", "notmyfault.action_snapshot_test"])
+def test_plugin_sibling_imports_use_verified_sources(tmp_path, namespace):
+    from notmyfault.security.plugin_imports import PluginImports
+
+    entry = tmp_path / "action.py"
+    entry.write_text(
+        f"import {namespace}.sibling\nfrom {namespace} import sibling\n"
+        "from .sibling import VALUE\n"
+        f"RESULT = ({namespace}.sibling.VALUE, sibling.VALUE, VALUE)\n",
+        encoding="utf-8",
+    )
+    sibling = tmp_path / "sibling.py"
+    sibling.write_text("VALUE = 'verified'\n", encoding="utf-8")
+    tree = inspect_plugin_tree(str(tmp_path))
+    assert tree is not None
+    sibling.write_text("raise RuntimeError('changed on disk')\n", encoding="utf-8")
+    importer = PluginImports(str(tmp_path), namespace, tree.py_sources)
+    try:
+        assert importer.load_entry(str(entry)).RESULT == ("verified",) * 3
+    finally:
+        importer.close()
+
+
+@pytest.mark.parametrize("import_expression", ["__import__('isolated_action.__pycache__.payload')", "importlib.import_module('isolated_action.__pycache__.payload')"])
+def test_plugin_imports_reject_unsigned_disk_modules(tmp_path, import_expression):
+    from notmyfault.security.plugin_imports import PluginImports
+
+    source = f"import importlib\ndef execute():\n    return {import_expression}\n".encode()
+    entry = tmp_path / "action.py"
+    entry.write_bytes(source)
+    cache = tmp_path / "__pycache__"
+    cache.mkdir()
+    (cache / "payload.py").write_text("VALUE = 'unsigned'\n", encoding="utf-8")
+    tree = inspect_plugin_tree(str(tmp_path))
+    assert tree is not None
+    assert "__pycache__/payload.py" not in tree.file_snapshot
+    importer = PluginImports(str(tmp_path), "isolated_action", tree.py_sources)
+    try:
+        module = importer.load_entry(str(entry))
+        with pytest.raises(ModuleNotFoundError):
+            module.execute()
+    finally:
+        importer.close()
 
 
 def _hashes(plugin_dir: Path) -> dict[str, str]:

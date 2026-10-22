@@ -133,7 +133,9 @@ class PluginInspection:
     errors: list[str] = field(default_factory=list)
     schema_errors: list[str] = field(default_factory=list)
     platform_compatible: bool = False
+    platform_checked: bool = False
     entrypoint: str | None = None
+    entrypoint_checked: bool = False
     capability_problems: list[dict] = field(default_factory=list)
     capabilities: set[str] = field(default_factory=set)
     uses_sudo: bool = False
@@ -177,10 +179,12 @@ def inspect_plugin(root: str | Path, kind: PluginKind, origin: str = "user", *, 
     if result.errors or result.schema_errors:
         return result
     result.platform_compatible = is_plugin_platform_compatible(meta)
+    result.platform_checked = True
     try:
         result.entrypoint = resolve_plugin_entrypoint(str(root), meta, f"{kind}.py")
     except ValueError as error:
         result.errors.append(str(error))
+    result.entrypoint_checked = True
     from notmyfault.platform.capabilities import is_capability_compatible
     from notmyfault.plugin_api import engines_compatibility
 

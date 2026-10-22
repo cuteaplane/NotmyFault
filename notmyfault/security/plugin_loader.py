@@ -439,6 +439,7 @@ class PluginLoader:
                     ok, result = run_isolated_action(
                         _entry, _entry_hash, _info, params, context,
                         plugin_root=folder_path, file_snapshot=tree.file_snapshot,
+                        cancellation=context.get("runtime", {}).get("cancellation"),
                     )
                     if not ok:
                         raise RuntimeError(f"isolated worker 执行失败: {result}")

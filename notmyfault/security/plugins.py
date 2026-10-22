@@ -96,24 +96,34 @@ def _resolved_name(
         owner = _resolved_name(node.value, names)
         if owner:
             return owner + "." + node.attr
+    if isinstance(node, ast.Subscript):
+        owner = _resolved_name(node.value, names)
+        attribute = _constant_string(node.slice)
+        if owner in {"builtins", "__builtins__", "builtins.__dict__", "__builtins__.__dict__"} and attribute:
+            return owner.removesuffix(".__dict__") + "." + attribute
     return None
 
 
 def _risk_ids_for_name(name: str, is_call: bool) -> List[str]:
     risk_ids: List[str] = []
-    if is_call and name in {
+    if name in {
         "eval", "exec", "compile", "__import__",
         "builtins.eval", "builtins.exec", "builtins.compile", "builtins.__import__",
+        "__builtins__.eval", "__builtins__.exec", "__builtins__.compile", "__builtins__.__import__",
     }:
         risk_ids.append("code_injection")
     if name in {"__import__", "builtins.__import__"}:
         if "code_injection" not in risk_ids:
             risk_ids.append("code_injection")
         risk_ids.append("dynamic_import")
-    if name.startswith("subprocess.") or name in {"os.system", "os.popen"}:
+    if name.startswith("subprocess.") or name.startswith("os.") and name.split(".", 1)[1] in _OS_DANGEROUS:
         risk_ids.append("subprocess")
     if name.startswith("importlib."):
         risk_ids.append("dynamic_import")
+    if name == "runpy" or name.startswith("runpy."):
+        risk_ids.append("dynamic_import")
+    if name in {"runpy.run_path", "runpy.run_module"}:
+        risk_ids.append("code_injection")
     if is_call and (
         name in {"open", "builtins.open"}
         or name.startswith("shutil.copy")
@@ -124,7 +134,7 @@ def _risk_ids_for_name(name: str, is_call: bool) -> List[str]:
         risk_ids.append("network_request")
     if name.startswith(("winreg.", "_winreg.")):
         risk_ids.append("registry_access")
-    if name.startswith("ctypes."):
+    if name == "_winapi" or name.startswith(("ctypes.", "_winapi.")) or name.rsplit(".", 1)[-1].lower() in _ELEVATION_FUNCS:
         risk_ids.append("native_call")
     return risk_ids
 
@@ -152,11 +162,15 @@ def _scan_source_from_tree(tree: ast.Module, filename: str) -> tuple[Set[str], l
 
     for node in ast.walk(tree):
         risk_node = node.func if isinstance(node, ast.Call) else node
-        if isinstance(node, (ast.Call, ast.Attribute)) or isinstance(node, ast.Name) and node.id == "__import__":
+        if isinstance(node, (ast.Call, ast.Attribute, ast.Subscript)) or isinstance(node, ast.Name) and node.id == "__import__":
             name = _resolved_name(risk_node, names)
             if name:
                 for risk_id in _risk_ids_for_name(name, isinstance(node, ast.Call)):
                     findings.setdefault(risk_id, name)
+                if name.startswith(("builtins.", "__builtins__.")) and name.rsplit(".", 1)[-1] in _DYNAMIC_EXEC_BYPASS:
+                    caps.add("dynamic_exec")
+                if name in {"runpy.run_path", "runpy.run_module"}:
+                    caps.add("dynamic_exec")
         if isinstance(node, ast.Import):
             for alias in node.names:
                 top = alias.name.split(".")[0]
@@ -164,6 +178,8 @@ def _scan_source_from_tree(tree: ast.Module, filename: str) -> tuple[Set[str], l
                     caps.add("native_api")
                 if top in _EXTERNAL_MODULES:
                     caps.add("external_binary")
+                for risk_id in _risk_ids_for_name(alias.name, False):
+                    findings.setdefault(risk_id, alias.name)
         elif isinstance(node, ast.ImportFrom):
             mod = node.module or ""
             top = mod.split(".")[0] if mod else ""
@@ -171,6 +187,11 @@ def _scan_source_from_tree(tree: ast.Module, filename: str) -> tuple[Set[str], l
                 caps.add("native_api")
             if top in _EXTERNAL_MODULES:
                 caps.add("external_binary")
+            if top == "runpy":
+                findings.setdefault("dynamic_import", "runpy")
+                if any(alias.name in {"run_path", "run_module", "*"} for alias in node.names):
+                    caps.add("dynamic_exec")
+                    findings.setdefault("code_injection", "runpy")
             if top == "os":
                 for alias in node.names:
                     if alias.name in _OS_DANGEROUS:
@@ -339,6 +360,13 @@ def _scan_borrowed_from_tree(tree: ast.Module) -> list[str]:
     # 记录别名指向的完整模块名。
     module_aliases: dict[str, str] = {}
 
+    def module_lookup(node):
+        if isinstance(node, ast.Subscript) and _resolved_name(node.value, module_aliases) == "sys.modules":
+            return _constant_string(node.slice)
+        if isinstance(node, ast.Call) and _resolved_name(node.func, module_aliases) == "sys.modules.get" and node.args:
+            return _constant_string(node.args[0])
+        return None
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -358,6 +386,9 @@ def _scan_borrowed_from_tree(tree: ast.Module) -> list[str]:
         elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             # 记录从 sys.modules 取出的插件模块别名。
             val = node.value
+            module_name = module_lookup(val)
+            if module_name is not None and _is_plugin_module(module_name):
+                module_aliases[node.targets[0].id] = module_name
             if (
                 isinstance(val, ast.Subscript)
                 and isinstance(val.value, ast.Attribute)
@@ -371,6 +402,9 @@ def _scan_borrowed_from_tree(tree: ast.Module) -> list[str]:
                 module_aliases[node.targets[0].id] = val.slice.value
 
     for node in ast.walk(tree):
+        module_name = module_lookup(node)
+        if module_name is not None and _is_plugin_module(module_name):
+            findings.append(f"通过 sys.modules 获取引擎插件模块 {module_name}")
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if _is_plugin_module(alias.name):

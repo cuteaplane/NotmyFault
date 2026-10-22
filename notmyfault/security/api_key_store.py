@@ -364,6 +364,11 @@ def _validate_key(key: str) -> str:
         raise KeyStoreInvalidKeyError("API key 不能为空")
     if len(normalized_key) > _MAX_KEY_LENGTH:
         raise KeyStoreInvalidKeyError(f"API key 超过 {_MAX_KEY_LENGTH} 字符上限")
+    if not normalized_key.isascii() or any(
+        ord(character) < 0x20 or ord(character) == 0x7F
+        for character in normalized_key
+    ):
+        raise KeyStoreInvalidKeyError("API key 含无效字符")
     return normalized_key
 
 
