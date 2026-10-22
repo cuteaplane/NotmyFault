@@ -539,6 +539,7 @@ global.window = window
 global.document = window.document
 global.Event = window.Event
 global.CustomEvent = window.CustomEvent
+global.FormData = window.FormData
 for (const key of Object.getOwnPropertyNames(window)) {
   if (key === 'navigator') continue
   if (!(key in global)) { try { global[key] = window[key] } catch (e) {} }
@@ -2565,6 +2566,13 @@ if (!signingPasswordUsesDedicatedField) process.exitCode = 1
 const retryForceCheckbox = document.querySelector('.preview-foot input[type="checkbox"]')
 retryForceCheckbox?.click()
 document.querySelector('.preview-foot-actions .btn-filled')?.click()
+const retrySigningPasswordInput = await waitFor(() => document.querySelector('.install-dialog input[type="password"]'))
+if (!retrySigningPasswordInput || retrySigningPasswordInput.value !== '') throw new Error('安装重试未重新请求私钥密码')
+retrySigningPasswordInput.value = 'local-signing-password'
+retrySigningPasswordInput.dispatchEvent(new window.Event('input', { bubbles:true }))
+;[...document.querySelectorAll('.install-dialog button')].find(
+  button => button.textContent.trim() === '确认',
+)?.click()
 await waitFor(() => document.querySelector('.app-dialog')?.textContent.includes('重启引擎使更改生效？'), 2000)
 const pluginInstallRetryReuploadsFile = pluginInstallForms.length === 2
   && pluginInstallForms.every(form => form.file?.name === 'author-signed.nmfp')

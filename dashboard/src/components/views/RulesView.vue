@@ -601,6 +601,7 @@ function processTestEvents() {
 function finishTestWatch(note = '') {
   const t = testResult.value
   if (!t) return
+  if (t.runId && activeManualRun.value?.runId === t.runId) activeManualRun.value = null
   if (t.runId && store.activeManualRun?.runId === t.runId) store.activeManualRun = null
   t.note = note
   t.done = true
