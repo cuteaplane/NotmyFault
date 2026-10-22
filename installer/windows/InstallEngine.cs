@@ -171,7 +171,8 @@ namespace NotmyFault.Setup
                             "from cryptography.hazmat.primitives.serialization import load_pem_private_key,Encoding,PublicFormat; " +
                             "key=load_pem_private_key(pathlib.Path('.private/signing_private_key.pem').read_bytes()," +
                             "password=sys.stdin.buffer.read()); " +
-                            "pathlib.Path('.private/signing_public.pem').write_bytes(key.public_key().public_bytes(Encoding.Raw,PublicFormat.Raw))";
+                            "pathlib.Path('.private/signing_public.pem').write_bytes(key.public_key().public_bytes(Encoding.Raw,PublicFormat.Raw)); " +
+                            "import build; build.pin_user_public_key(key.public_key().public_bytes(Encoding.Raw,PublicFormat.Raw))";
                         try
                         {
                             Run(python, PythonArguments + "-c " + Quote(unlock), app, directory, log, 2,

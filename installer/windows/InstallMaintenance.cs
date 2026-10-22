@@ -804,11 +804,36 @@ namespace NotmyFault.Setup
                 if (BackupPath == null) return;
                 foreach (string relative in Preserved)
                 {
+                    if (IsUnlistedCoreCode(relative))
+                        throw new IOException("升级发现未列入新版程序清单的源码或可执行文件：" + relative + "。请先将其移出安装目录，然后重试。");
+                }
+                foreach (string relative in Preserved)
+                {
                     string source = OwnedPath(BackupPath, relative);
                     string destination = OwnedPath(DirectoryPath, relative);
                     if (File.Exists(destination)) throw new IOException("新版程序与保留文件重名，请先移动这个文件：" + relative);
                     Directory.CreateDirectory(Path.GetDirectoryName(destination));
                     File.Copy(source, destination);
+                }
+            }
+
+            private static bool IsUnlistedCoreCode(string relative)
+            {
+                string normalized = relative.Replace('\\', '/');
+                bool corePath = normalized.StartsWith("app/notmyfault/", StringComparison.OrdinalIgnoreCase)
+                    || normalized.StartsWith("app/Win_toaster/", StringComparison.OrdinalIgnoreCase)
+                    || (normalized.StartsWith("app/", StringComparison.OrdinalIgnoreCase)
+                        && normalized.IndexOf('/', 4) < 0);
+                if (!corePath) return false;
+
+                string extension = Path.GetExtension(normalized);
+                switch (extension.ToLowerInvariant())
+                {
+                    case ".py": case ".pyw": case ".pyc": case ".pyo": case ".pyd":
+                    case ".exe": case ".dll": case ".com": case ".bat": case ".cmd": case ".ps1":
+                        return true;
+                    default:
+                        return false;
                 }
             }
 
