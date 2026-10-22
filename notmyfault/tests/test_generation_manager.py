@@ -180,6 +180,42 @@ def test_watcher_debounces_deleted_file_and_deduplicates_read_error(tmp_path):
     assert errors == ["read"]
 
 
+def test_watcher_retries_load_failure_before_committing_stamp(tmp_path):
+    path = tmp_path / "rules.json"
+    path.write_text("[]")
+    clock = FakeClock()
+    errors = []
+    calls = []
+    attempts = 0
+
+    def load():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("临时读取失败")
+        return path.read_text()
+
+    watcher = RuleWatcher(
+        lambda: path,
+        load,
+        lambda document, source: calls.append((document, source)),
+        clock=clock,
+        on_error=lambda error, stage: errors.append(stage),
+    )
+    watcher.acknowledge()
+    previous = watcher._stamp
+    path.write_text("[1]")
+    assert not watcher.check_once()
+    clock.advance(0.3)
+
+    assert not watcher.check_once()
+    assert watcher._stamp == previous
+    assert watcher.check_once()
+    assert attempts == 2
+    assert errors == ["read"]
+    assert calls == [("[1]", "file")]
+
+
 def test_file_watcher_detects_backwards_timestamp(tmp_path):
     import os
 

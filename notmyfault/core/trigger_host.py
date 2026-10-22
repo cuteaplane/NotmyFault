@@ -198,7 +198,7 @@ class TriggerHost:
                 if existing is not None and existing.version == version:
                     if existing.status == "zombie" and self._busy(existing):
                         raise RuntimeError(f"触发器 {existing.id} 尚未退出")
-                    if existing.status != "zombie" and (existing.status != "stopped" or existing.meta.get("lifecycle") == "one_shot"):
+                    if not existing.stop.is_set() and existing.status != "zombie" and (existing.status != "stopped" or existing.meta.get("lifecycle") == "one_shot"):
                         desired[key] = existing
                         continue
                 if existing is not None and (self._busy(existing) or existing.sampler_open):

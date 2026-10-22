@@ -75,13 +75,13 @@ class ConditionRuntime:
             self._programs = {key: rule.matcher_spec for key, rule in rules.items()}
             self._heap_limit = 64 + 2 * sum(len(program.retention) + len(program.absences) for program in self._programs.values())
 
-    def register_rule(self, rule_key, rule, now=None, *, program=None):
+    def register_rule(self, rule_key, rule, now=None, *, program=None, absence_since=None):
         with self._lock:
             if rule_key not in self._programs:
                 self._programs[rule_key] = program or build_matcher(rule, self._default_ttl)
                 program = self._programs[rule_key]
                 self._heap_limit += 2 * (len(program.retention) + len(program.absences))
-            self._arm_absences(rule_key, self._timestamp(now))
+            self._arm_absences(rule_key, self._timestamp(now), absence_since=absence_since)
         self._wake()
 
     def activate(self, now=None):
@@ -130,7 +130,7 @@ class ConditionRuntime:
     def _future(timestamp, seconds):
         return max(timestamp + seconds, math.nextafter(timestamp, math.inf))
 
-    def _arm_absences(self, rule_key, timestamp):
+    def _arm_absences(self, rule_key, timestamp, *, absence_since=None):
         program = self._programs[rule_key]
         if not program.absences:
             return
@@ -138,7 +138,9 @@ class ConditionRuntime:
         for node in program.absences:
             name = node.key
             if name not in state.absences:
-                self._rearm(rule_key, name, self._future(timestamp, node.seconds))
+                since = absence_since.get(name) if absence_since is not None else None
+                deadline = self._future(timestamp, node.seconds) if since is None else since + node.seconds
+                self._rearm(rule_key, name, deadline)
 
     def _rearm(self, rule_key, name, deadline):
         token = next(self._sequence)
@@ -177,7 +179,7 @@ class ConditionRuntime:
         self._states.setdefault(rule_key, MatcherState()).seen[name] = hit
         self._push(deadline, rule_key, "expiry", name, hit.sequence)
 
-    def take_due(self, now=None):
+    def take_due(self, now=None, *, consume=True):
         timestamp = self._timestamp(now)
         with self._lock:
             self.activate(timestamp)
@@ -195,7 +197,9 @@ class ConditionRuntime:
                 node = next(node for node in program.absences if node.key == name)
                 state.absences[name].emitted = True
                 seconds = node.seconds
-                self._hit(key, name, {"binding_id": program.graph.nodes[node.node_id].get("trigger", {}).get("binding_id"), "absence": True, "event": {"type": "absence", "params": {}},
+                self._hit(key, name, {"binding_id": program.graph.nodes[node.node_id].get("trigger", {}).get("binding_id"),
+                                     "absence_node_id": node.node_id, "absence": True,
+                                     "event": {"type": "absence", "params": {}},
                                      "payload": {"wait_seconds": seconds}, "timestamp": timestamp}, timestamp)
                 if node.repeat == "every_window":
                     remaining = seconds - math.fmod(timestamp - deadline, seconds)
@@ -204,7 +208,14 @@ class ConditionRuntime:
             result = []
             for key in sorted(affected):
                 if self._record_match(key):
-                    result.append((key, self.take_last_match(key)))
+                    if consume:
+                        events = self.take_last_match(key)
+                    else:
+                        state = self._states[key]
+                        events = self.last_match(key)
+                        state.last_match = []
+                        state.consume = frozenset()
+                    result.append((key, events))
             self._compact()
             return result
 
@@ -224,6 +235,49 @@ class ConditionRuntime:
             state = self._states.get(rule_key)
             return [{**entry, "event": dict(entry["event"]), "payload": dict(entry["payload"])}
                     for entry in state.last_match] if state is not None else []
+
+    def current_match(self, rule_key, now=None, *, consume=False):
+        timestamp = self._timestamp(now)
+        with self._lock:
+            program = self._programs.get(rule_key)
+            state = self._states.get(rule_key)
+            if program is None or state is None:
+                return []
+            for name, hit in list(state.seen.items()):
+                if hit.expires_at <= timestamp:
+                    state.seen.pop(name)
+            matches = [(identity, result) for identity in program.roots
+                if (result := self._evaluate(identity, program, state.seen)) is not None and result.signature]
+            if not matches:
+                return []
+            root, result = max(matches, key=lambda item: (max(item[1].marks, default=float('-inf')),
+                max((sequence for _name, sequence in item[1].signature), default=0)))
+            events = [{**state.seen[name].event, 'root_id': root} for name, _sequence in result.signature
+                if name in state.seen]
+            if consume:
+                for name in result.consume:
+                    state.seen.pop(name, None)
+                state.last_match = []
+                state.consume = frozenset()
+            return events
+
+    def current_node_match(self, rule_key, node_id, now=None):
+        timestamp = self._timestamp(now)
+        with self._lock:
+            program = self._programs.get(rule_key)
+            state = self._states.get(rule_key)
+            if program is None or state is None or node_id not in program.graph.nodes:
+                return False
+            for name, hit in list(state.seen.items()):
+                if hit.expires_at <= timestamp:
+                    state.seen.pop(name)
+            return self._evaluate(node_id, program, state.seen) is not None
+
+    def absence_token(self, rule_key, absence_key):
+        with self._lock:
+            state = self._states.get(rule_key)
+            absence = state.absences.get(absence_key) if state is not None else None
+            return absence.token if absence is not None else None
 
     def take_last_match(self, rule_key):
         with self._lock:
@@ -300,10 +354,11 @@ class ConditionRuntime:
         state.consume = result.consume
         return True
 
-    def _evaluate(self, identity, program, seen, memo=None):
+    def _evaluate(self, identity, program, seen, memo=None, port=None):
         memo = {} if memo is None else memo
-        if identity in memo:
-            return memo[identity]
+        memo_key = identity, port
+        if memo_key in memo:
+            return memo[memo_key]
         node = program.graph.nodes[identity]
         kind, op = node['type'], node.get('op', node.get('group_type'))
         absence = next((item for item in program.absences if item.node_id == identity), None)
@@ -318,12 +373,42 @@ class ConditionRuntime:
             result = Evaluation(((name, hit.sequence),), (hit.event['timestamp'],), frozenset({name})) if hit else None
         elif kind == 'condition':
             result = None
+        elif kind == 'action_group':
+            entry = program.graph.successors.get((identity, 'entry'))
+            result = self._evaluate(entry, program, seen, memo) if entry is not None else None
         elif op == 'not':
             children = program.graph.dependencies(identity)
-            result = Evaluation(retain=program.dependency_keys[identity]) if children and self._evaluate(children[0], program, seen, memo) is None else None
+            matched = children and self._evaluate(children[0], program, seen, memo) is not None
+            if 'duration_seconds' in node:
+                result = None
+            else:
+                result = Evaluation(retain=program.dependency_keys[identity]) if not matched else None
+        elif op == 'if':
+            selected = None
+            selected_result = None
+            for branch in node.get('branches', ()):
+                if branch.get('else'):
+                    selected = branch['id']
+                    selected_result = Evaluation(retain=program.dependency_keys[identity])
+                    break
+                operands = program.graph.operands(identity, branch['id'])
+                if not operands:
+                    continue
+                edge = operands[0]
+                candidate = self._evaluate(edge['source'], program, seen, memo, edge['port'])
+                matched = candidate is not None
+                if branch.get('negated'):
+                    candidate = Evaluation(retain=program.dependency_keys.get(edge['source'], frozenset())) if not matched else None
+                    matched = not matched
+                if matched:
+                    selected, selected_result = branch['id'], candidate
+                    break
+            result = selected_result if port is None or selected == port else None
         else:
-            results = [value for child in program.graph.dependencies(identity)
-                       if (value := self._evaluate(child, program, seen, memo)) is not None]
+            operands = program.graph.operands(identity)
+            edges = operands or tuple({'source': child, 'port': 'input'} for child in program.graph.dependencies(identity))
+            results = [value for edge in edges
+                       if (value := self._evaluate(edge['source'], program, seen, memo, edge['port'])) is not None]
             relevant = [child for child in program.graph.dependencies(identity) if program.dependency_keys.get(child)]
             if not results:
                 result = None
@@ -347,5 +432,7 @@ class ConditionRuntime:
                     elif policy == 'all':
                         consume = program.dependency_keys[identity] - retain
                     result = Evaluation(signature, marks, consume, retain)
-        memo[identity] = result
+        if node.get('negated'):
+            result = Evaluation(retain=program.dependency_keys.get(identity, frozenset())) if result is None else None
+        memo[memo_key] = result
         return result

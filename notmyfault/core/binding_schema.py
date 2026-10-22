@@ -174,6 +174,9 @@ def protect_context_inputs(context, triggers_meta, registry=None):
         names = {field["name"] for trigger in context.get("triggers", {}).values()
                  for field in triggers_meta.get(trigger.get("type"), {}).get("outputs", [])
                  if isinstance(field, dict) and field.get("sensitive") and "name" in field}
+        names.update(field["name"] for trigger_type in manual.get("candidate_trigger_types", ())
+                     for field in triggers_meta.get(trigger_type, {}).get("outputs", [])
+                     if isinstance(field, dict) and field.get("sensitive") and "name" in field)
         fields = [{"name": name, "type": "any", "sensitive": True} for name in names]
     event["payload"] = hold_value(normalize_fields(event.get("payload", {}), fields, registry, wrap_sensitive=True, partial=manual is not None))
     for identity, trigger in context.get("triggers", {}).items():

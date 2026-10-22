@@ -388,7 +388,18 @@ class CanvasProgram:
                 elif op == 'any':
                     result = any(value(edge['source'], edge['port']) for edge in operands)
                 elif op == 'not':
-                    result = not value(operands[0]['source'], operands[0]['port'])
+                    if 'duration_seconds' in node:
+                        source = self.nodes[operands[0]['source']]
+                        observation = context.get('_event_observation')
+                        if observation is None:
+                            raise ValueError('定时 NOT 需要当前运行的事件观察')
+                        if source['type'] == 'trigger':
+                            result = observation.absent_for(
+                                source['trigger']['binding_id'], node['duration_seconds'])
+                        else:
+                            result = observation.absence_matched(current)
+                    else:
+                        result = not value(operands[0]['source'], operands[0]['port'])
                 else:
                     raise ValueError('条件连线引用了不可求值的图块')
             if node.get('negated'):

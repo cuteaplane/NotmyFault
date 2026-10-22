@@ -378,7 +378,13 @@ class RunManager:
     def _return_worker(self, run: _Run, outcome: RunOutcome) -> None:
         with self._idle:
             self._worker_count -= 1
-            if isinstance(outcome, RunSuspension) and not run.cancel.is_set() and not self._closed:
+            if isinstance(outcome, RunSuspension):
+                reason = self._generation_drop_reason(run, self._generation)
+                if reason or run.key in self._removed or run.cancel.is_set() or self._closed:
+                    run.cancel.set()
+                    outcome.wait.close()
+                    outcome = RunOutcome("cancelled", {"failure_kind": "cancelled"})
+            if isinstance(outcome, RunSuspension):
                 run.suspension = outcome
                 self._effects.append(lambda: outcome.wait.arm(lambda: self._resume(run.id)))
                 self._dispatch_locked()

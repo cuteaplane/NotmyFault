@@ -76,13 +76,14 @@ def trigger(identity, kind='start', parent=None, params=None):
     return node
 
 
-def setup(rule, clock=None, record=None):
+def setup(rule, clock=None, record=None, *, actions=None, extra_functions=None):
     records, events = [], []
     source = rule
+    action_metadata = ACTIONS if actions is None else actions
     registry = TypeRegistry.from_plugins(TRIGGERS, ACTIONS)
     context = build_context(source['name'], 'start', {}, [], source['rule_id'], 'run_graph')
-    prepare_binding_context(source, context, TRIGGERS, ACTIONS, registry=registry)
-    compiled = compile_rule(source, context, TRIGGERS, ACTIONS,
+    prepare_binding_context(source, context, TRIGGERS, action_metadata, registry=registry)
+    compiled = compile_rule(source, context, TRIGGERS, action_metadata,
                             {name: output_type(meta) for name, meta in TRIGGERS.items()}, registry)
     source = compiled.source
     observer = RunEventObservation(compiled, clock=clock)
@@ -92,8 +93,9 @@ def setup(rule, clock=None, record=None):
     context['_event_observation'] = observer
     functions = {'record': lambda meta, params, context: (record(meta, params) if record else records.append(params['label'])),
                  'speed': lambda meta, params, context: {'latency': 180000, 'connected': True}}
+    functions.update(extra_functions or {})
     modules = {name: SimpleNamespace(run_with_context=lambda meta, params, context, name=name: functions[name](meta, params, context)) for name in functions}
-    executor = WorkflowExecutor(actions_meta=lambda: ACTIONS, triggers_meta=lambda: TRIGGERS,
+    executor = WorkflowExecutor(actions_meta=lambda: action_metadata, triggers_meta=lambda: TRIGGERS,
         actions_funcs=lambda: functions, plugin_modules=lambda: modules, diagnostics=Diagnostics(),
         shutdown_event=lambda: None, on_event=lambda kind, data: events.append((kind, data)), clock=clock)
     return source, context, observer, executor, records, events
@@ -311,6 +313,95 @@ def test_wait_window_expires_old_event_and_timed_absence_is_distinct_from_boolea
     assert suspension.wait.ready
     assert executor.execute_workflow('one', source, source['name'], context).status == 'succeeded'
     assert 't_steam01' not in observer.snapshot()
+
+
+def test_wait_replay_uses_final_and_not_state_after_later_event():
+    source = waiting_rule()
+    graph = source['workflow']
+    graph['nodes'].append({'type': 'logic', 'binding_id': 'a_not00001', 'parent': 'a_wait001', 'op': 'not'})
+    graph['nodes'].append({'type': 'logic', 'binding_id': 'a_and00001', 'parent': 'a_wait001', 'op': 'all'})
+    graph['nodes'].append(trigger('a_watch_net001', 'network', parent='a_wait001'))
+    graph['edges'] = [connection for connection in graph['edges']
+        if connection['source'] not in ('a_watch_steam01', 'a_wait001')]
+    graph['edges'].extend([
+        edge('a_watch_steam01', 'a_not00001', 'event', channel='condition'),
+        edge('a_watch_net001', 'a_and00001', 'event', channel='condition'),
+        edge('a_not00001', 'a_and00001', 'result', channel='condition'),
+        edge('a_and00001', 'a_wait001', 'result', channel='condition', target_port='b_a_wait001_0'),
+        edge('a_wait001', 'a_after01', 'b_a_wait001_0'),
+    ])
+    source, _context, observer, _executor, _records, _events = setup(source)
+    observer.record('network', {'value': 1})
+    observer.record('steam', {'value': 2})
+
+    waiter = observer.wait_for('a_wait001')
+
+    assert not waiter.ready
+    assert waiter.matches == []
+
+
+def test_replayed_timed_not_after_quiet_period_selects_its_wait_branch():
+    clock = FakeClock()
+    source = waiting_rule()
+    graph = source['workflow']
+    graph['nodes'].append({'type': 'logic', 'binding_id': 'a_not00001', 'parent': 'a_wait001',
+                           'op': 'not', 'duration_seconds': 2})
+    graph['edges'] = [connection for connection in graph['edges']
+        if connection['source'] != 'a_watch_steam01']
+    graph['edges'].extend([
+        edge('a_watch_steam01', 'a_not00001', 'event', channel='condition'),
+        edge('a_not00001', 'a_wait001', 'result', channel='condition', target_port='b_a_wait001_0'),
+    ])
+    source, context, observer, executor, records, events = setup(source, clock)
+    observer.record('steam', {'value': 1})
+    clock.advance(3)
+
+    outcome = executor.execute_workflow('one', source, source['name'], context)
+
+    assert outcome.status == 'succeeded'
+    assert records == ['before', 'after']
+    assert any(kind == 'run.group.selected' and data['step_id'] == 'a_wait001'
+               and data['branch'] == 'b_a_wait001_0' for kind, data in events)
+
+
+def test_composite_timed_not_wait_branch_resets_after_new_positive_match():
+    clock = FakeClock()
+    source = waiting_rule()
+    graph = source['workflow']
+    graph['nodes'].extend([
+        {'type': 'logic', 'binding_id': 'a_pair00001', 'parent': 'a_wait001', 'op': 'all'},
+        {'type': 'logic', 'binding_id': 'a_not00001', 'parent': 'a_wait001',
+         'op': 'not', 'duration_seconds': 2},
+        trigger('a_watch_net001', 'network', parent='a_wait001'),
+    ])
+    graph['edges'] = [connection for connection in graph['edges']
+        if connection['source'] != 'a_watch_steam01']
+    graph['edges'].extend([
+        edge('a_watch_steam01', 'a_pair00001', 'event', channel='condition'),
+        edge('a_watch_net001', 'a_pair00001', 'event', channel='condition'),
+        edge('a_pair00001', 'a_not00001', 'result', channel='condition'),
+        edge('a_not00001', 'a_wait001', 'result', channel='condition', target_port='b_a_wait001_0'),
+    ])
+    source, context, observer, executor, records, _events = setup(source, clock)
+    observer.record('steam', {'value': 1})
+    observer.record('network', {'value': 1})
+    clock.advance(3)
+
+    outcome = executor.execute_workflow('one', source, source['name'], context)
+
+    assert outcome.status == 'succeeded'
+    assert records == ['before', 'after']
+    assert observer.absence_matched('a_not00001')
+
+    observer.record('steam', {'value': 2})
+
+    assert not observer.absence_matched('a_not00001')
+
+    observer.seed([{'binding_id': None, 'absence_node_id': 'a_not00001', 'absence': True,
+                    'event': {'type': 'absence', 'params': {}}, 'payload': {'wait_seconds': 2},
+                    'timestamp': clock.monotonic()}])
+
+    assert observer.absence_matched('a_not00001')
 
 
 @pytest.mark.parametrize('mutate, message', [
@@ -963,6 +1054,81 @@ def test_group_export_checks_every_terminal_branch_and_handles_missing_policy(te
         assert not context['_open_groups']
     else:
         assert result['status'] == 'ok' and result['result']['latency'] == 123
+
+
+def test_group_export_skip_is_published_by_engine_event_stream():
+    from notmyfault.tests.api_support import create_test_engine
+
+    packets = []
+    engine = create_test_engine({'rules': []}, on_event=lambda event: packets.append(event.to_dict()))
+    engine.triggers_meta.update(TRIGGERS)
+    engine.actions_meta.update(ACTIONS)
+    engine.actions_funcs['speed'] = lambda *_args: {'latency': 180000, 'connected': True}
+    engine.actions_funcs['record'] = lambda *_args: None
+    choose = group('a_choice1', [branch('b_a_choice1_0'), branch('b_a_choice1_1', otherwise=True)],
+                   parent='a_outer01')
+    source = rule([
+        trigger('a_watch_start01'),
+        {'type': 'action_group', 'binding_id': 'a_outer01', 'exports': {
+            'latency': {'$ref': {'scope': 'step', 'node': 'a_speed01', 'path': ['latency'], 'on_missing': 'skip'}}}},
+        choose,
+        {'type': 'speed', 'binding_id': 'a_speed01', 'parent': 'a_outer01', 'params': {}},
+        {'type': 'condition', 'binding_id': 'a_predicate_000001', 'parent': 'a_choice1',
+         'predicate': {'op': 'is_true', 'left': False}},
+        action('a_after01', 'after'),
+    ], [
+        edge('a_watch_start01', 'a_outer01', 'event'),
+        edge('a_outer01', 'a_choice1', 'entry'),
+        edge('a_predicate_000001', 'a_choice1', 'result', channel='condition', target_port='b_a_choice1_0'),
+        edge('a_choice1', 'a_speed01', 'b_a_choice1_0'),
+        edge('a_outer01', 'a_after01'),
+    ])
+    try:
+        engine._generations.apply([source], 'test', activate=False, validate=False)
+        engine.emit_event('start', {})
+        assert engine._run_manager.wait_for_idle(3)
+        assert engine.events.flush()
+        assert any(packet['type'] == 'run.group.skipped' and packet['step_id'] == 'a_outer01'
+                   for packet in packets)
+        assert any(packet['type'] == 'run.succeeded' for packet in packets)
+    finally:
+        engine.shutdown(3)
+
+
+def test_action_group_timeout_stays_timed_out_when_group_continues():
+    from notmyfault.core.workflow import ActionCancelled
+
+    actions = {**ACTIONS, 'slow': {
+        'params': [], 'outputs': [], 'cancellation_api': 'runtime-v1',
+    }}
+    source = rule([
+        trigger('a_watch_start01'),
+        {'type': 'action_group', 'binding_id': 'a_outer01', 'on_error': 'continue'},
+        {'type': 'slow', 'binding_id': 'a_slow0001', 'parent': 'a_outer01',
+         'params': {}, 'timeout_seconds': 1},
+        {'type': 'end', 'binding_id': 'a_end000001', 'parent': 'a_outer01'},
+        action('a_after01', 'after'),
+    ], [
+        edge('a_watch_start01', 'a_outer01', 'event'),
+        edge('a_outer01', 'a_slow0001', 'entry'),
+        edge('a_slow0001', 'a_end000001'),
+        edge('a_outer01', 'a_after01'),
+    ])
+
+    def timeout(*_args):
+        raise ActionCancelled('timeout')
+
+    source, context, _observer, executor, records, events = setup(
+        source, actions=actions, extra_functions={'slow': timeout},
+    )
+
+    outcome = executor.execute_workflow('one', source, source['name'], context)
+
+    assert outcome.status == 'timed_out'
+    assert context['steps']['a_outer01']['status'] == 'timed_out'
+    assert context['steps']['a_slow0001']['status'] == 'timed_out'
+    assert records == ['after']
+    assert any(kind == 'run.step.timed_out' and data['step_id'] == 'a_outer01' for kind, data in events)
 
 
 @pytest.mark.parametrize('kind', ['event_group', 'action_group'])

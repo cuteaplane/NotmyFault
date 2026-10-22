@@ -37,9 +37,11 @@ class PluginWorkerStartupTimeout(PluginWorkerTimeout):
 _lock = threading.Lock()
 _live_processes: set[subprocess.Popen] = set()
 _live_extension_workers: set = set()
+_intentional_stops: set[subprocess.Popen] = set()
 _on_crash = None
 _PROTOCOL_EOF = object()
 _PROTOCOL_OVERSIZE = object()
+_PROTOCOL_QUEUE_FULL = object()
 
 
 def set_crash_callback(callback) -> None:
@@ -66,7 +68,10 @@ def _sanitize_context(context):
     return clean({key: value for key, value in context.items() if not str(key).startswith("_") and key not in {"manual_test", "runtime"}})
 
 
-def _stop_process(process: subprocess.Popen) -> None:
+def _stop_process(process: subprocess.Popen, *, intentional=False) -> None:
+    if intentional:
+        with _lock:
+            _intentional_stops.add(process)
     if process.poll() is not None:
         return
     process.terminate()
@@ -114,12 +119,39 @@ def _read_protocol(stream, messages: queue.Queue, max_line: int = MAX_PROTOCOL_L
             if not line:
                 break
             if len(line) > max_line:
-                messages.put(_PROTOCOL_OVERSIZE)
+                try:
+                    messages.put_nowait(_PROTOCOL_OVERSIZE)
+                except queue.Full:
+                    while True:
+                        try:
+                            messages.get_nowait()
+                        except queue.Empty:
+                            break
+                    messages.put_nowait(_PROTOCOL_OVERSIZE)
                 return
-            messages.put(line)
+            try:
+                messages.put_nowait(line)
+            except queue.Full:
+                while True:
+                    try:
+                        messages.get_nowait()
+                    except queue.Empty:
+                        break
+                messages.put_nowait(_PROTOCOL_QUEUE_FULL)
+                return
     finally:
         stream.close()
-        messages.put(_PROTOCOL_EOF)
+        try:
+            messages.put_nowait(_PROTOCOL_EOF)
+        except queue.Full:
+            try:
+                messages.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                messages.put_nowait(_PROTOCOL_EOF)
+            except queue.Full:
+                pass
 
 
 def run_isolated_action(
@@ -134,6 +166,7 @@ def run_isolated_action(
     plugin_root: str | None = None,
     file_snapshot: dict[str, str] | None = None,
     load_only: bool = False,
+    cancellation=None,
 ):
     from notmyfault.security.plugin_checks import inspect_plugin_tree
 
@@ -185,9 +218,9 @@ def run_isolated_action(
     started = time.monotonic()
     try:
         startup_budget = min(max(float(startup_timeout), 0.0), execute_timeout)
-        _wait_until_ready(process, messages, startup_budget)
+        _wait_until_ready(process, messages, startup_budget, cancellation=cancellation)
         remaining = max(float(execute_timeout) - (time.monotonic() - started), 0.0)
-        result = _drive(process, messages, request, remaining)
+        result = _drive(process, messages, request, remaining, cancellation=cancellation)
         completed = True
         return result
     finally:
@@ -196,12 +229,14 @@ def run_isolated_action(
         if completed:
             _wait_for_exit(process)
         else:
-            _stop_process(process)
+            _stop_process(process, intentional=cancellation is not None and cancellation.is_cancelled())
+        with _lock:
+            _intentional_stops.discard(process)
         stdout_thread.join(timeout=EXIT_TIMEOUT)
         stderr_thread.join(timeout=EXIT_TIMEOUT)
 
 
-def _wait_until_ready(process, messages, startup_timeout):
+def _wait_until_ready(process, messages, startup_timeout, *, cancellation=None):
     payload = _receive_payload(
         process,
         messages,
@@ -210,6 +245,7 @@ def _wait_until_ready(process, messages, startup_timeout):
             f"worker 启动超过 {startup_timeout}s，已终止"
         ),
         "worker 没有发回启动结果就退出了",
+        cancellation=cancellation,
     )
     if (
         payload.get("type") != "ready"
@@ -336,7 +372,7 @@ class ExtensionWorker:
             self._stderr_thread.join(timeout=EXIT_TIMEOUT)
 
 
-def _drive(process, messages, request, execute_timeout):
+def _drive(process, messages, request, execute_timeout, *, cancellation=None):
     try:
         if process.stdin is None:
             raise OSError("stdin unavailable")
@@ -356,6 +392,7 @@ def _drive(process, messages, request, execute_timeout):
         execute_timeout,
         PluginWorkerTimeout(f"worker 执行超过 {execute_timeout}s，已终止"),
         "worker 没有返回结果就退出了",
+        cancellation=cancellation,
     )
     if payload.get("type") != "result":
         _fail_protocol(process, "worker 执行结果不符合协议")
@@ -370,13 +407,29 @@ def _drive(process, messages, request, execute_timeout):
     return False, payload.get("error") or "worker 执行失败"
 
 
-def _receive_payload(process, messages, timeout, timeout_error, eof_reason):
-    try:
-        line = messages.get(timeout=max(0.0, timeout))
-    except queue.Empty:
-        _stop_process(process)
-        _report_crash(process, str(timeout_error))
-        raise timeout_error
+def _receive_payload(process, messages, timeout, timeout_error, eof_reason, *, cancellation=None):
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        if cancellation is not None and cancellation.is_cancelled():
+            _stop_process(process, intentional=True)
+            from notmyfault.core.workflow import ActionCancelled
+
+            raise ActionCancelled(cancellation.reason)
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining <= 0:
+            _stop_process(process)
+            _report_crash(process, str(timeout_error))
+            raise timeout_error
+        try:
+            line = messages.get(timeout=min(remaining, 0.1) if cancellation is not None else remaining)
+            break
+        except queue.Empty:
+            continue
+    if cancellation is not None and cancellation.is_cancelled():
+        _stop_process(process, intentional=True)
+        from notmyfault.core.workflow import ActionCancelled
+
+        raise ActionCancelled(cancellation.reason)
     if line is _PROTOCOL_EOF:
         _report_crash(process, eof_reason)
         raise PluginWorkerCrashed(
@@ -384,6 +437,8 @@ def _receive_payload(process, messages, timeout, timeout_error, eof_reason):
         )
     if line is _PROTOCOL_OVERSIZE:
         _fail_protocol(process, "worker 协议消息超过大小限制")
+    if line is _PROTOCOL_QUEUE_FULL:
+        _fail_protocol(process, "worker 协议消息过多")
     try:
         payload = json.loads(line)
     except (json.JSONDecodeError, TypeError):
@@ -400,6 +455,9 @@ def _fail_protocol(process, reason):
 
 
 def _report_crash(process, reason: str) -> None:
+    with _lock:
+        if process in _intentional_stops:
+            return
     callback = _on_crash
     if callback is None:
         return
@@ -425,4 +483,4 @@ def shutdown_all() -> None:
     for worker in extension_workers:
         worker.close()
     for process in processes:
-        _stop_process(process)
+        _stop_process(process, intentional=True)

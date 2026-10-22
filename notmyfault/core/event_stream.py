@@ -44,6 +44,7 @@ class EventType(StrEnum):
     GROUP_SELECTED = "run.group.selected"
     GROUP_COMPLETED = "run.group.completed"
     GROUP_FAILED = "run.group.failed"
+    GROUP_SKIPPED = "run.group.skipped"
     RECOVERY_ENTERED = "run.recovery.entered"
     RECOVERY_COMPLETED = "run.recovery.completed"
     RECOVERY_FAILED = "run.recovery.failed"

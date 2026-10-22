@@ -101,10 +101,11 @@ class RuleWatcher:
             if now < self._deadline:
                 return False
             previous = self._stamp
-            self._stamp = stamp
-            self._pending = None
-            self._has_pending = False
         if stamp is not None and previous is not None and stamp.sha256 == previous.sha256:
+            with self._lock:
+                self._stamp = stamp
+                self._pending = None
+                self._has_pending = False
             return False
         try:
             document = self._load()
@@ -117,6 +118,9 @@ class RuleWatcher:
             self._report(error, "apply")
             return False
         with self._lock:
+            self._stamp = stamp
+            self._pending = None
+            self._has_pending = False
             self._last_error = None
         return True
 

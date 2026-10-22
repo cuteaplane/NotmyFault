@@ -2,6 +2,7 @@ import hashlib
 import json
 import io
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -19,6 +20,7 @@ from notmyfault.core.plugin_worker import (
     PluginWorkerStartupTimeout,
     PluginWorkerTimeout,
 )
+from notmyfault.core.workflow import ActionCancelled, ActionCancellation
 
 
 def write_action(tmp_path, name, source):
@@ -208,6 +210,47 @@ class TestRunIsolatedAction:
         assert ok is True
         assert result == {"completed": True}
         assert len(logs.getvalue()) >= 262144
+
+    def test_protocol_reader_reports_queue_overflow_without_blocking(self):
+        messages = queue.Queue(maxsize=4)
+        reader = threading.Thread(
+            target=plugin_worker._read_protocol,
+            args=(io.StringIO("line\n" * 8), messages),
+            daemon=True,
+        )
+
+        reader.start()
+        reader.join(timeout=1)
+
+        assert not reader.is_alive()
+        assert messages.get_nowait() is plugin_worker._PROTOCOL_QUEUE_FULL
+
+    def test_cancelled_isolated_action_stops_worker_without_crash_event(self, tmp_path, monkeypatch):
+        entry = write_action(tmp_path, "sleepy_cancel", SLEEPY_ACTION)
+        cancelled = threading.Event()
+        cancellation = ActionCancellation(run_event=cancelled)
+        crashes = []
+        outcome = {}
+        monkeypatch.setattr(plugin_worker, "_on_crash", lambda *args: crashes.append(args))
+
+        def run():
+            try:
+                run_isolated_action(entry, {}, {}, {}, execute_timeout=30, cancellation=cancellation)
+            except BaseException as error:
+                outcome["error"] = error
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        deadline = time.time() + 5
+        while not plugin_worker._live_processes and time.time() < deadline:
+            time.sleep(0.02)
+        assert plugin_worker._live_processes
+        cancelled.set()
+        worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert isinstance(outcome.get("error"), ActionCancelled)
+        assert not crashes
 
     @pytest.mark.parametrize("load_only", [False, True])
     def test_raising_action_reports_error(self, tmp_path, load_only):

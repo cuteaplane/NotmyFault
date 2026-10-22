@@ -248,7 +248,27 @@ def copy_value(value: Any, *, location: str = "$") -> Any:
     def visit(item, path, depth):
         if depth > 64:
             raise DataTypeError("数据嵌套超过 64 层", location=path)
-        if isinstance(item, (Secret, Blob, FrozenDict, FrozenList)):
+        if isinstance(item, Secret):
+            visit(secret_value(item), path, depth + 1)
+            return item
+        if isinstance(item, Blob):
+            return item
+        if isinstance(item, (FrozenDict, FrozenList)):
+            identity = id(item)
+            if identity in ancestors:
+                raise DataTypeError("数据不能循环引用", location=path)
+            ancestors.add(identity)
+            try:
+                if isinstance(item, FrozenList):
+                    for index, child in enumerate(item):
+                        visit(child, f"{path}[{index}]", depth + 1)
+                else:
+                    for key, child in item.items():
+                        if not isinstance(key, str):
+                            raise DataTypeError("对象键必须是字符串", location=path)
+                        visit(child, f"{path}.{key}", depth + 1)
+            finally:
+                ancestors.remove(identity)
             return item
         if item is None or isinstance(item, (str, bool, int)):
             return item
@@ -354,8 +374,16 @@ def normalize_value(value: Any, declaration: Any, registry=None, *, location: st
                     invalid("转为浮点数会丢失整数精度")
                 item = converted
             for bound, comparison in (("min", lambda a, b: a < b), ("max", lambda a, b: a > b)):
-                if bound in spec and comparison(Decimal(str(item)), Decimal(str(spec[bound]))):
-                    invalid(f"数据超出 {bound} 限制")
+                if bound in spec:
+                    value_decimal, bound_decimal = Decimal(str(item)), Decimal(str(spec[bound]))
+                    if not value_decimal.is_finite() or not bound_decimal.is_finite():
+                        invalid("数字必须是有限值")
+                    try:
+                        outside = comparison(value_decimal, bound_decimal)
+                    except InvalidOperation:
+                        invalid("数字必须是有限值")
+                    if outside:
+                        invalid(f"数据超出 {bound} 限制")
             return item
         if kind == "bytes":
             if not isinstance(item, bytes):

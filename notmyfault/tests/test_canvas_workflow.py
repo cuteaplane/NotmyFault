@@ -121,6 +121,27 @@ def test_timed_absence_is_false_before_duration_and_resets_on_event():
     assert observation._waits == {}
 
 
+def test_timed_not_logic_uses_latest_trigger_observation_window():
+    class Clock:
+        time = 0
+        def monotonic(self):
+            return self.time
+    clock = Clock()
+    source = example()
+    logic = {'binding_id': 'a_timednot01', 'type': 'logic', 'op': 'not', 'duration_seconds': 5}
+    source['workflow']['nodes'].append(logic)
+    source['workflow']['edges'].append({'source': 'a_source_aaaaaa', 'port': 'event',
+        'target': logic['binding_id'], 'channel': 'condition'})
+    observation = RunEventObservation(SimpleNamespace(source=source), clock=clock)
+    program = CanvasProgram(source)
+    context = {'_event_observation': observation}
+
+    assert program.evaluate(logic['binding_id'], context) is False
+    observation.record('event_aaaaaa', {})
+    clock.time = 6
+    assert program.evaluate(logic['binding_id'], context) is True
+
+
 def test_and_and_nested_not_are_derived_from_explicit_connections():
     source = example()
     logic = {'binding_id': 'a_logic_000001', 'type': 'logic', 'op': 'all'}

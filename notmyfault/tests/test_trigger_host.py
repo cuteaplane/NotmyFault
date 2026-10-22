@@ -54,6 +54,20 @@ def test_identity_shared_references_and_rename_keep_thread(engine):
     assert next(iter(engine._trigger_host.health().values()))["references"] == 1
 
 
+def test_reconcile_replaces_stopped_instance_even_if_status_is_stale(engine, monkeypatch):
+    apply(engine, [rule()])
+    previous = instance(engine)
+    wait_for(lambda: previous.status == "running")
+    previous.stop.set()
+    monkeypatch.setattr(engine._trigger_host, "_busy", lambda _item: False)
+
+    apply(engine, [rule()])
+
+    current = instance(engine)
+    assert current is not previous
+    assert not current.stop.is_set()
+
+
 def test_partial_start_failure_rolls_back_only_added_threads(engine, monkeypatch):
     original_generation = apply(engine, [rule()])
     original = instance(engine)
