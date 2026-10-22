@@ -315,19 +315,28 @@ class AudioBackend:
         if result.returncode != 0:
             return {}
         devices: dict[str, str] = {}
-        # 按标题行切 Sinks / Sources 段，带星号的行是该段的默认设备
+        # 按标题行切 Sinks / Sources 段，带星号的行是该段的默认设备。
+        # wpctl 1.x 用树形前缀（" ├─ Sinks:"），只看 Audio 段，避免 Video 段同名的 Sinks/Sources 混进来。
         section = None
+        in_audio = False
         for line in result.stdout.splitlines():
             stripped = line.strip()
-            if stripped.startswith("Sinks"):
+            if not stripped:
+                continue
+            label = stripped.lstrip("│├└─┬ ").strip()
+            if label.startswith("Sinks:"):
                 section = "render"
                 continue
-            if stripped.startswith("Sources"):
+            if label.startswith("Sources:"):
                 section = "capture"
                 continue
-            if section is None or ("*+" not in stripped and "* " not in stripped):
+            if not line[:1].isspace():
+                in_audio = stripped == "Audio"
+                section = None
                 continue
-            match = re.search(r"(\d+)\.\s", stripped)
+            if not in_audio or section is None or not label.startswith("*"):
+                continue
+            match = re.search(r"(\d+)\.\s", label)
             if match:
                 devices.setdefault(section, match.group(1))
         return devices

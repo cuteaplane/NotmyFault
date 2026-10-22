@@ -106,7 +106,8 @@ class CommandRunnerTests(unittest.TestCase):
 class InputBackendTests(LinuxPathTest):
     def test_type_text_uses_xdotool_with_clearmodifiers(self):
         runner = FakeRunner(paths={"xdotool": "/usr/bin/xdotool"})
-        InputBackend(runner).type_text("a中😀")
+        with patch("notmyfault.platform.linux_support.session_type", return_value="x11"):
+            InputBackend(runner).type_text("a中😀")
         self.assertEqual(
             runner.calls[0]["args"],
             ["/usr/bin/xdotool", "type", "--clearmodifiers", "--", "a中😀"],
@@ -152,7 +153,8 @@ class InputBackendTests(LinuxPathTest):
 
     def test_hotkey_maps_keys_for_xdotool(self):
         runner = FakeRunner(paths={"xdotool": "/usr/bin/xdotool"})
-        InputBackend(runner).send_hotkey(["ctrl", "win", "enter"])
+        with patch("notmyfault.platform.linux_support.session_type", return_value="x11"):
+            InputBackend(runner).send_hotkey(["ctrl", "win", "enter"])
         self.assertEqual(
             runner.calls[0]["args"],
             ["/usr/bin/xdotool", "key", "--clearmodifiers", "ctrl+super+Return"],
@@ -174,8 +176,9 @@ class InputBackendTests(LinuxPathTest):
             paths={"xdotool": "/usr/bin/xdotool"},
             results=[ok(stderr="boom", returncode=1)],
         )
-        with self.assertRaises(BackendFailedError) as ctx:
-            InputBackend(runner).type_text("hi")
+        with patch("notmyfault.platform.linux_support.session_type", return_value="x11"):
+            with self.assertRaises(BackendFailedError) as ctx:
+                InputBackend(runner).type_text("hi")
         self.assertIn("boom", str(ctx.exception))
 
     def test_windows_raises_unsupported(self):
@@ -240,6 +243,35 @@ class AudioBackendTests(LinuxPathTest):
         self.assertEqual(
             AudioBackend(runner).default_devices(),
             {"render": "41", "capture": "55"},
+        )
+
+    def test_default_devices_parses_wpctl_tree_layout_audio_section_only(self):
+        status = (
+            "Audio\n"
+            " ├─ Devices:\n"
+            " │      53. Arrow Lake cAVS                     [alsa]\n"
+            " │  \n"
+            " ├─ Sinks:\n"
+            " │      59. HDMI / DisplayPort 3 Output [vol: 1.00]\n"
+            " │  *   62. Speaker             [vol: 0.40]\n"
+            " │  \n"
+            " ├─ Sources:\n"
+            " │  *   64. Digital Microphone  [vol: 1.00]\n"
+            " │  \n"
+            " └─ Streams:\n"
+            "\n"
+            "Video\n"
+            " ├─ Sinks:\n"
+            " ├─ Sources:\n"
+            " │  *   80. Integrated RGB Camera (V4L2)\n"
+        )
+        runner = FakeRunner(
+            paths={"wpctl": "/usr/bin/wpctl"},
+            results=[ok(stdout=status)],
+        )
+        self.assertEqual(
+            AudioBackend(runner).default_devices(),
+            {"render": "62", "capture": "64"},
         )
 
     def test_default_devices_from_pactl(self):
