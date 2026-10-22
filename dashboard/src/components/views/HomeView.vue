@@ -12,6 +12,7 @@ const diag = ref(null)
 const recentRuns = ref([])
 const runsError = ref('')
 let statsLoading = false
+let statsRefreshPending = false
 let disposed = false
 let diagTimer = null
 
@@ -130,8 +131,13 @@ function statsForStatus(status) {
     : { rules: '-', triggers: '-', actions: '-' }
 }
 async function loadStats(status = null) {
-  if (statsLoading || disposed) return
+  if (disposed) return
+  if (statsLoading) {
+    statsRefreshPending = true
+    return
+  }
   statsLoading = true
+  let diagnosticsRequested = false
   try {
     const current = status ?? await getEngineStatus()
     statusError.value = ''
@@ -152,7 +158,8 @@ async function loadStats(status = null) {
         runsError.value = error.message
       })
       : Promise.resolve()
-    const diagnosticsRead = isRunning.value
+    diagnosticsRequested = isRunning.value
+    const diagnosticsRead = diagnosticsRequested
       ? readDiagnostics().then(data => {
         if (disposed || !isRunning.value) return
         diag.value = data
@@ -160,12 +167,16 @@ async function loadStats(status = null) {
       : Promise.resolve()
     await Promise.all([runsRead, diagnosticsRead])
     if (disposed) return
-    if (isRunning.value && !diag.value) statusError.value = '无法读取诊断数据，请刷新重试'
+    if (diagnosticsRequested && isRunning.value && !diag.value) statusError.value = '无法读取诊断数据，请刷新重试'
   } catch (error) {
     statusError.value = error.message || '无法读取引擎状态，请刷新重试'
     stats.value = { rules: '-', triggers: '-', actions: '-' }
   } finally {
     statsLoading = false
+    if (statsRefreshPending && !disposed) {
+      statsRefreshPending = false
+      void loadStats()
+    }
   }
 }
 

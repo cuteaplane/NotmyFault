@@ -30,7 +30,7 @@ const expandedRunId = ref('')
 let timer = null
 let runsLoading = false
 let logsGeneration = 0
-const loadingLogFiles = new Set()
+const loadingLogFiles = new Map()
 let disposed = false
 const runsError = ref('')
 
@@ -245,14 +245,21 @@ async function refreshRuns() {
 
 async function refreshLogs() {
   const file = currentFile.value
-  if (disposed || loadingLogFiles.has(file)) return
-  loadingLogFiles.add(file)
+  if (disposed) return
   const generation = ++logsGeneration
+  let request = loadingLogFiles.get(file)
+  if (!request) {
+    request = Promise.resolve().then(() => file === ''
+      ? readLogEntries(600)
+      : readLogFileEntries(file, 600))
+    loadingLogFiles.set(file, request)
+    request.finally(() => {
+      if (loadingLogFiles.get(file) === request) loadingLogFiles.delete(file)
+    }).catch(() => {})
+  }
   try {
     const nearBottom = isNearBottom()
-    const list = file === ''
-      ? await readLogEntries(600)
-      : await readLogFileEntries(file, 600)
+    const list = await request
     if (disposed || generation !== logsGeneration || file !== currentFile.value) return
     entries.value = Array.isArray(list) ? list : []
     logsError.value = ''
@@ -260,8 +267,6 @@ async function refreshLogs() {
     if (nearBottom) scrollToEnd()
   } catch (error) {
     if (!disposed && generation === logsGeneration) logsError.value = error.message
-  } finally {
-    loadingLogFiles.delete(file)
   }
 }
 

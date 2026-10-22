@@ -1,6 +1,7 @@
 <script setup>
 import { nextTick, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import { closeExtensionSession, getExtensionViewPage, invokeExtensionCommand } from '../lib/api'
+import { snackbar } from '../lib/notify'
 
 const props = defineProps({
   open: Boolean,
@@ -119,12 +120,12 @@ async function requestClose() {
   const session = activeSession.value
   try {
     await closeSession(session)
-    activeSession.value = null
-    emit('close')
   } catch (reason) {
-    error.value = reason.message || '关闭插件会话失败，请重试。'
+    snackbar(`插件视图已关闭，但会话清理失败：${reason.message || '请稍后重试。'}`)
   } finally {
+    activeSession.value = null
     closing.value = false
+    emit('close')
   }
 }
 
@@ -206,8 +207,8 @@ onBeforeUnmount(() => {
     <main v-if="open" ref="pageRef" class="extension-page-layer" tabindex="-1"
       :aria-label="title" @keydown="handlePageKey">
       <header class="extension-page-head">
-        <button class="icon-btn" title="返回（Esc）" :disabled="closing" @click="requestClose">
-          <span class="material-symbols-outlined">arrow_back</span>
+        <button class="icon-btn" aria-label="返回" title="返回（Esc）" :disabled="closing" @click="requestClose">
+          <span class="material-symbols-outlined" aria-hidden="true">arrow_back</span>
         </button>
         <h1>{{ title }}</h1>
       </header>

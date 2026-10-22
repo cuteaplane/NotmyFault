@@ -339,8 +339,8 @@ function onEditorKeydown(event) {
             @blur="finishRuleNameEdit" @keydown.enter.prevent="finishRuleNameEdit">
           <span v-else :title="rule.name">{{ rule.name || '未命名规则' }}</span>
         </div>
-        <button class="icon-btn rule-title-edit" title="修改规则名称" @click="startRuleNameEdit">
-          <span class="material-symbols-outlined">edit</span>
+        <button class="icon-btn rule-title-edit" aria-label="修改规则名称" title="修改规则名称" @click="startRuleNameEdit">
+          <span class="material-symbols-outlined" aria-hidden="true">edit</span>
         </button>
         <button class="rule-folder-button" :class="{ empty: !currentFolderName }" title="管理文件夹" @click="folderPickerOpen = true">
           <span class="material-symbols-outlined">folder</span><span v-if="currentFolderName">{{ currentFolderName }}</span>
@@ -350,13 +350,13 @@ function onEditorKeydown(event) {
 
     <div class="editor-mode-bar">
       <div class="rule-editor-actions">
-        <button v-if="aiEnabled" class="icon-btn" :class="{ 'ai-panel-active': aiPanelOpen }"
+        <button v-if="aiEnabled" class="icon-btn" :aria-label="aiPanelOpen ? '收起 AI 起草' : '打开 AI 起草'" :class="{ 'ai-panel-active': aiPanelOpen }"
           :title="aiPanelOpen ? '收起 AI 起草' : '打开 AI 起草'" @click="toggleAiPanel">
-          <span class="material-symbols-outlined">auto_awesome</span>
+          <span class="material-symbols-outlined" aria-hidden="true">auto_awesome</span>
         </button>
         <div class="rule-history-actions" aria-label="草稿历史">
-          <button class="icon-btn" :disabled="!canUndo" title="撤销（Ctrl+Z）" @click="emit('undo')"><span class="material-symbols-outlined">undo</span></button>
-          <button class="icon-btn" :disabled="!canRedo" title="重做（Ctrl+Y）" @click="emit('redo')"><span class="material-symbols-outlined">redo</span></button>
+          <button class="icon-btn" :disabled="!canUndo" aria-label="撤销" title="撤销（Ctrl+Z）" @click="emit('undo')"><span class="material-symbols-outlined" aria-hidden="true">undo</span></button>
+          <button class="icon-btn" :disabled="!canRedo" aria-label="重做" title="重做（Ctrl+Y）" @click="emit('redo')"><span class="material-symbols-outlined" aria-hidden="true">redo</span></button>
         </div>
         <button class="btn btn-text rule-check-btn" :disabled="checkingRule" title="立即检查当前草稿" @click="runRuleCheck">
           <span v-if="checkingRule" class="spinner"></span>
@@ -418,9 +418,9 @@ function onEditorKeydown(event) {
           <span class="material-symbols-outlined ai-panel-head-icon">auto_awesome</span>
           <b>AI 助手</b>
           <div class="flex-1"></div>
-          <button class="icon-btn ai-panel-head-btn" title="新对话" @click="newAiConversation"><span class="material-symbols-outlined">refresh</span></button>
-          <button class="icon-btn ai-panel-head-btn" title="更多" @click="aiMenuOpen = !aiMenuOpen"><span class="material-symbols-outlined">more_vert</span></button>
-          <button class="icon-btn ai-panel-head-btn" title="关闭" @click="toggleAiPanel"><span class="material-symbols-outlined">close</span></button>
+          <button class="icon-btn ai-panel-head-btn" aria-label="新对话" title="新对话" @click="newAiConversation"><span class="material-symbols-outlined" aria-hidden="true">refresh</span></button>
+          <button class="icon-btn ai-panel-head-btn" aria-label="更多" title="更多" @click="aiMenuOpen = !aiMenuOpen"><span class="material-symbols-outlined" aria-hidden="true">more_vert</span></button>
+          <button class="icon-btn ai-panel-head-btn" aria-label="关闭 AI 助手" title="关闭" @click="toggleAiPanel"><span class="material-symbols-outlined" aria-hidden="true">close</span></button>
         </header>
         <Transition name="ai-msg">
           <div v-if="aiMenuOpen" class="ai-panel-menu-backdrop" @click="aiMenuOpen = false"></div>

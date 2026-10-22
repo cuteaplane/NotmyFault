@@ -301,7 +301,7 @@ async function addRule(seed = null) {
   showCreatePanel.value = false
   activeRuleIndex.value = -1
   draftRule.value = next
-  baseline.value = JSON.stringify(draftRule.value)
+  baseline.value = ''
   if (seed) clearDraftRecovery()
   else await restoreDraftRecovery(-1)
   resetDraftHistory()
@@ -574,6 +574,15 @@ function processTestEvents() {
     } else if (ev.name.startsWith('run.recovery.')) {
       const step = t.steps.find(step => step.stepId === ev.data.step_id)
       if (step) step.recovery = { groupId: ev.data.recovery_group_id, status: ev.name.endsWith('entered') ? 'running' : ev.name.endsWith('completed') ? 'succeeded' : 'failed' }
+    } else if (ev.name === 'run_dropped') {
+      const matches = t.runId
+        ? ev.data?.run_id === t.runId
+        : !!t.ruleId && ev.data?.rule_id === t.ruleId
+      if (!matches) continue
+      t.outcome = 'dropped'
+      t.steps = t.steps.filter(step => !['waiting', 'running'].includes(step.status))
+      const reason = typeof ev.data?.reason === 'string' ? ev.data.reason.trim() : ''
+      finishTestWatch(reason ? `运行已丢弃：${reason}` : '运行已丢弃')
     } else if (ev.name === 'workflow_completed') {
       t.outcome = ev.data.status
       let note = ''
@@ -592,6 +601,7 @@ function processTestEvents() {
 function finishTestWatch(note = '') {
   const t = testResult.value
   if (!t) return
+  if (t.runId && store.activeManualRun?.runId === t.runId) store.activeManualRun = null
   t.note = note
   t.done = true
   t.cancelling = false
@@ -683,7 +693,19 @@ async function openCandidateRule(rule) {
       if (!approval?.cancelled && !approval?.notified) await alertDialog('草稿无法打开', approval?.error || '规则审批失败')
       return
     }
-    await addRule(rule)
+    const targetIndex = store.configData.rules.findIndex(item => item.rule_id === rule.rule_id)
+    const editingTarget = targetIndex >= 0 && draftRule.value?.rule_id === rule.rule_id
+    if (targetIndex >= 0 && !editingTarget) await openRule(targetIndex)
+    if (targetIndex >= 0) {
+      if (draftRule.value?.rule_id !== rule.rule_id) return
+      const next = ensureRuleBindingIds(validateRuleGraph(clone(rule)))
+      normalizeWorkflow(next)
+      commitDraftHistory()
+      draftRule.value = next
+      commitDraftHistory()
+    } else {
+      await addRule(rule)
+    }
     editorAdminKeyPassword = approval.adminKeyPassword || ''
   } catch (error) { await alertDialog('草稿无法打开', error.message || '无法连接后台服务') }
 }
@@ -811,7 +833,7 @@ onMounted(() => {
           <button v-if="store.aiDrafting.enabled" class="btn btn-tonal" @click="createWithAi"><span class="material-symbols-outlined">auto_awesome</span>AI 起草</button>
           <button class="btn btn-text" @click="addRule"><span class="material-symbols-outlined">edit_note</span>空白规则</button>
           <button class="btn btn-tonal" @click="openQuickCreate"><span class="material-symbols-outlined">account_tree</span>自己搭一个</button>
-          <button v-if="store.configData.rules.length" class="icon-btn" title="收起创建区" @click="showCreatePanel = false"><span class="material-symbols-outlined">close</span></button>
+          <button v-if="store.configData.rules.length" class="icon-btn" aria-label="收起创建区" title="收起创建区" @click="showCreatePanel = false"><span class="material-symbols-outlined" aria-hidden="true">close</span></button>
         </div>
       </header>
       <div class="automation-template-grid">
@@ -828,7 +850,7 @@ onMounted(() => {
     </section>
     <div v-if="store.configData.rules.length" class="rules-folders">
       <div class="automation-list-toolbar"><h3 class="automation-list-title">已保存的自动化 <small>{{ matchingRules.length }} / {{ store.configData.rules.length }}</small></h3>
-        <label class="automation-search"><span class="material-symbols-outlined">search</span><input v-model="ruleQuery" type="search" aria-label="搜索自动化" placeholder="搜索名称、文件夹或插件"><button v-if="ruleQuery" class="icon-btn" aria-label="清空自动化搜索" @click="ruleQuery = ''"><span class="material-symbols-outlined">close</span></button></label>
+        <label class="automation-search"><span class="material-symbols-outlined" aria-hidden="true">search</span><input v-model="ruleQuery" type="search" aria-label="搜索自动化" placeholder="搜索名称、文件夹或插件"><button v-if="ruleQuery" class="icon-btn" aria-label="清空自动化搜索" @click="ruleQuery = ''"><span class="material-symbols-outlined" aria-hidden="true">close</span></button></label>
       </div>
       <div v-if="!matchingRules.length" class="empty-state"><span class="material-symbols-outlined">search_off</span><h3>没有匹配的自动化</h3><p>试试其他名称、文件夹或插件。</p><button class="btn btn-text" @click="ruleQuery = ''">清空搜索</button></div>
       <section v-for="([folder, entries]) in ruleFolders" :key="folder" class="rules-folder">
@@ -842,7 +864,7 @@ onMounted(() => {
               <span v-else class="material-symbols-outlined">experiment</span>
               {{ runningRuleIndex === index ? '测试中…' : '测试' }}
             </button>
-            <button class="icon-btn icon-btn-danger" :aria-label="`删除${rule.name || '未命名规则'}`" title="删除规则" @click.stop="deleteRule(index)"><span class="material-symbols-outlined">delete</span></button>
+            <button class="icon-btn icon-btn-danger" :aria-label="`删除${rule.name || '未命名规则'}`" title="删除规则" @click.stop="deleteRule(index)"><span class="material-symbols-outlined" aria-hidden="true">delete</span></button>
           </div>
         </article>
       </section>
@@ -901,7 +923,7 @@ onMounted(() => {
         </div>
       </div>
       <p v-if="testSummary" class="test-summary"
-        :class="!testResult.done ? '' : !testResult.steps.some(s => ['fail', 'cancelled', 'timed_out'].includes(s.status)) && (!testResult.assertions?.total || testResult.assertions.passed === testResult.assertions.total) ? 'test-summary-ok' : 'test-summary-err'">{{ testSummary }}</p>
+        :class="!testResult.done ? '' : testResult.outcome !== 'dropped' && !testResult.steps.some(s => ['fail', 'cancelled', 'timed_out'].includes(s.status)) && (!testResult.assertions?.total || testResult.assertions.passed === testResult.assertions.total) ? 'test-summary-ok' : 'test-summary-err'">{{ testSummary }}</p>
       <div class="dialog-actions">
         <button class="btn btn-text" @click="goLogs">
           <span class="material-symbols-outlined">description</span>查看日志

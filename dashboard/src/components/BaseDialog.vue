@@ -67,7 +67,11 @@ function handleKeydown(event) {
   }
   const first = items[0]
   const last = items.at(-1)
-  if (event.shiftKey && (document.activeElement === first || !backdrop.value.contains(document.activeElement))) {
+  if (event.shiftKey && (
+    document.activeElement === backdrop.value
+    || document.activeElement === first
+    || !backdrop.value.contains(document.activeElement)
+  )) {
     event.preventDefault()
     last.focus()
   } else if (!event.shiftKey && document.activeElement === last) {

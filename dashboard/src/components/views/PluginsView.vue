@@ -85,6 +85,7 @@ const previewLoading = ref(false)
 const previewError = ref('')
 const fileForUpload = ref(null)
 const installError = ref('')
+const installing = ref(false)
 const showRegistry = ref(false)
 let savedRegistryUrl = ''
 try { savedRegistryUrl = localStorage.getItem('nmf-plugin-registry-url') || '' } catch {}
@@ -403,43 +404,49 @@ async function uploadPreview(file) {
 }
 
 async function doInstall() {
-  if (!preview.value) return
-  const p = preview.value
-
-  if (!signingPassword.value) {
-    try {
-      const r = await apiRead('/api/plugins/key-status')
-      if (r.ok) {
-        const ks = await r.json()
-        if (disposed) return
-        if (ks.encrypted) {
-          signingPassword.value = ''
-          showKey.value = true
-          const ok = await new Promise(res => { keyResolve = res })
-          if (!ok) return
-        }
-      }
-    } catch (e) { /* 引擎离线时无法读取密钥状态，继续安装请求。 */ }
-  }
-
-  if (disposed) return
-  const fd = new FormData()
-  fd.append('preview_token', p.preview_token)
-  fd.append('confirmed_risk_ids', JSON.stringify(confirmedRiskIds.value))
-  if (signingPassword.value) fd.append('signing_password', signingPassword.value)
-  if (forceInstall.value) fd.append('force', 'true')
-  signingPassword.value = ''
+  if (!preview.value || installing.value) return
+  installing.value = true
   try {
-    const r = await apiWrite('/api/plugins/install', 'POST', fd, true)
-    const d = await r.json()
-    if (d.ok) {
-      showInstall.value = false
-      preview.value = null
-      forceInstall.value = false
-      await refresh()
-      await promptRestart('插件 "' + d.id + '" 已安装，引擎重启后即可使用。')
-    } else { installError.value = d.error || '安装失败，请重试' }
-  } catch (e) { alertDialog('请求失败', e.message) }
+    const p = preview.value
+
+    if (!signingPassword.value) {
+      try {
+        const r = await apiRead('/api/plugins/key-status')
+        if (r.ok) {
+          const ks = await r.json()
+          if (disposed) return
+          if (ks.encrypted) {
+            signingPassword.value = ''
+            showKey.value = true
+            const ok = await new Promise(res => { keyResolve = res })
+            if (!ok) return
+          }
+        }
+      } catch (e) { /* 引擎离线时无法读取密钥状态，继续安装请求。 */ }
+    }
+
+    if (disposed) return
+    const fd = new FormData()
+    fd.append('preview_token', p.preview_token)
+    fd.append('confirmed_risk_ids', JSON.stringify(confirmedRiskIds.value))
+    if (fileForUpload.value) fd.append('file', fileForUpload.value)
+    if (signingPassword.value) fd.append('signing_password', signingPassword.value)
+    if (forceInstall.value) fd.append('force', 'true')
+    signingPassword.value = ''
+    try {
+      const r = await apiWrite('/api/plugins/install', 'POST', fd, true)
+      const d = await r.json()
+      if (d.ok) {
+        showInstall.value = false
+        preview.value = null
+        forceInstall.value = false
+        await refresh()
+        await promptRestart('插件 "' + d.id + '" 已安装，引擎重启后即可使用。')
+      } else { installError.value = d.error || '安装失败，请重试' }
+    } catch (e) { alertDialog('请求失败', e.message) }
+  } finally {
+    installing.value = false
+  }
 }
 
 function onFilePicked(e) {
@@ -713,9 +720,9 @@ onUnmounted(() => clearTimeout(refreshTimer))
           <span class="material-symbols-outlined dialog-ico">install_desktop</span>
           <h3 class="dialog-title">安装插件</h3>
           <p class="dialog-sub">选择 .nmfp 插件包</p>
-          <div class="dropzone" @click="fileInput && fileInput.click()">
-            <span class="material-symbols-outlined">cloud_upload</span>点击选择 .nmfp 文件
-          </div>
+          <button type="button" class="dropzone" @click="fileInput && fileInput.click()">
+            <span class="material-symbols-outlined" aria-hidden="true">cloud_upload</span>点击选择 .nmfp 文件
+          </button>
           <input ref="fileInput" type="file" accept=".nmfp" class="hidden" @change="onFilePicked">
           <button class="btn btn-text" @click="showInstall = false">取消</button>
         </div>
@@ -866,7 +873,7 @@ onUnmounted(() => clearTimeout(refreshTimer))
             <div class="preview-foot-actions">
               <button class="btn btn-text" @click="showInstall = false">取消</button>
               <button class="btn btn-filled" @click="doInstall"
-                :disabled="(!preview.permission_conform && store.engineStatus?.security_mode === 'strict')
+                :disabled="installing || (!preview.permission_conform && store.engineStatus?.security_mode === 'strict')
                   || !risksConfirmed">
                 <span class="material-symbols-outlined">download</span>安装
               </button>

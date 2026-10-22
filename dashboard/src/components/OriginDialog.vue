@@ -11,6 +11,8 @@ const emit = defineEmits(['close'])
 const saving = ref(false)
 
 function clone(value) { return JSON.parse(JSON.stringify(value)) }
+function ruleTrigger(rule) { return rule.workflow.nodes.find(node => node.type === 'trigger')?.trigger }
+function ruleActionCount(rule) { return rule.workflow.nodes.filter(node => node.type !== 'trigger').length }
 
 // 点规则卡片：已存在就跳去编辑，缺的几条一次性追加保存后再跳。
 async function openOriginRule(rule) {
@@ -51,8 +53,8 @@ function jumpToRule(rule) {
 <template>
   <BaseDialog :open="open" @close="emit('close')">
     <div class="origin-dialog">
-      <button class="icon-btn origin-close" title="关闭" @click="emit('close')">
-        <span class="material-symbols-outlined">close</span>
+      <button class="icon-btn origin-close" aria-label="关闭起源介绍" title="关闭" @click="emit('close')">
+        <span class="material-symbols-outlined" aria-hidden="true">close</span>
       </button>
       <header class="origin-head">
         <span class="material-symbols-outlined origin-head-ico">history_edu</span>
@@ -67,7 +69,7 @@ function jumpToRule(rule) {
           <span class="material-symbols-outlined">rule</span>
           <div>
             <b>{{ rule.name }}</b>
-            <p>当 {{ rule.condition.params.process_name }} {{ rule.condition.params.state === 'running' ? '运行' : '退出' }} · {{ rule.actions.length }} 个动作</p>
+            <p>当 {{ ruleTrigger(rule)?.params.process_name }} {{ ruleTrigger(rule)?.params.state === 'running' ? '运行' : '退出' }} · {{ ruleActionCount(rule) }} 个动作</p>
           </div>
           <span class="material-symbols-outlined origin-rule-go">arrow_forward</span>
         </button>

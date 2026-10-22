@@ -4,7 +4,7 @@ import { store } from '../lib/store'
 import { computeChangeSet } from '../lib/ruleDiff'
 import {
   actionNames, conditionLabel, draftEditsCurrentRule, hasHighImpactActions,
-  nodeIdForChange, ruleNodeCount, ruleParamRows,
+  draftTriggers, nodeIdForChange, ruleNodeCount, ruleParamRows,
 } from '../lib/naturalDraftRules'
 
 const props = defineProps({
@@ -17,7 +17,7 @@ watch(() => props.message.id, () => { ruleDetailsOpen.value = false })
 const draft = computed(() => props.message.result?.draft)
 const changeSet = computed(() => draftEditsCurrentRule(draft.value, props.fullRule)
   ? computeChangeSet(props.fullRule, draft.value, store.schema) : [])
-const conditionName = computed(() => conditionLabel(draft.value?.condition, store.schema))
+const conditionName = computed(() => conditionLabel(draftTriggers(draft.value)[0], store.schema))
 const actions = computed(() => actionNames(draft.value, store.schema))
 const nodeCount = computed(() => ruleNodeCount(draft.value))
 const paramRows = computed(() => ruleParamRows(draft.value, store.schema))
@@ -80,7 +80,7 @@ function applyDraft() {
         <span class="material-symbols-outlined">bolt</span>
         <span class="min-w-0 flex-1 truncate">{{ conditionName }}</span>
       </div>
-      <div v-for="name in actions" :key="`action-${name}`" class="ai-mini-node">
+      <div v-for="(name, index) in actions" :key="`action-${index}-${name}`" class="ai-mini-node">
         <span class="material-symbols-outlined">play_arrow</span>
         <span class="min-w-0 flex-1 truncate">{{ name }}</span>
       </div>
@@ -95,12 +95,12 @@ function applyDraft() {
     </div>
   </template>
   <div v-if="issues.length" class="ai-issues">
-    <div v-for="issue in issues" :key="`${issue.code}-${issue.message}`" class="ai-issue">
+    <div v-for="(issue, index) in issues" :key="`${issue.code}-${issue.message}-${index}`" class="ai-issue">
       <span class="material-symbols-outlined">{{ issue.severity === 'warning' ? 'warning' : 'error' }}</span>{{ issue.message }}
     </div>
   </div>
   <div v-if="ruleDetailsOpen" class="ai-rule-params">
-    <div v-for="row in paramRows" :key="`${row.node}-${row.key}`" class="ai-rule-param-row">
+    <div v-for="(row, index) in paramRows" :key="`${row.node}-${row.key}-${index}`" class="ai-rule-param-row">
       <span>{{ row.node }}</span>
       <code>{{ row.key }} = {{ row.value }}</code>
     </div>

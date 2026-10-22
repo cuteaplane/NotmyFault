@@ -1,4 +1,34 @@
-// 项目起源彩蛋的静态内容，运行时后端不再生成这些规则。
+import { createBindingId } from './bindings.js'
+import { createGraphAction, createTriggerStep } from './workflowGraph.js'
+
+function connectedOriginRule(name, processName, state, volume, notificationTitle, message) {
+  const triggerId = createBindingId('trigger')
+  const nodes = [
+    createTriggerStep({
+      binding_id: triggerId,
+      type: 'process_state',
+      params: { process_name: processName, state },
+    }),
+    createGraphAction('set_volume', { action: volume }),
+    createGraphAction('notify', { title: notificationTitle, message }),
+  ]
+  nodes.forEach((node, index) => { node.position = { x: 64 + index * 340, y: 118 } })
+  return {
+    name,
+    folder: '未分类',
+    workflow: {
+      entry: null,
+      nodes,
+      edges: nodes.slice(0, -1).map((node, index) => ({
+        source: node.binding_id,
+        port: index ? 'next' : 'event',
+        target: nodes[index + 1].binding_id,
+        channel: 'control',
+      })),
+    },
+  }
+}
+
 export const ORIGIN_STORY = {
   title: 'NotmyFault 的起源',
   paragraphs: [
@@ -9,88 +39,10 @@ export const ORIGIN_STORY = {
 }
 
 export const ORIGIN_RULES = [
-  {
-    name: '微信音量规则',
-    condition: {
-      type: 'process_state',
-      params: { process_name: 'WeChat.exe', state: 'running' },
-    },
-    actions: [
-      { type: 'set_volume', params: { action: 'max' } },
-      {
-        type: 'notify',
-        params: { title: '微信正在运行', message: '音量已设置为100%' },
-      },
-    ],
-  },
-  {
-    name: 'PPT音量规则',
-    condition: {
-      type: 'process_state',
-      params: { process_name: 'POWERPNT.EXE', state: 'running' },
-    },
-    actions: [
-      { type: 'set_volume', params: { action: 'max' } },
-      {
-        type: 'notify',
-        params: { title: 'PowerPoint正在运行', message: '音量已设置为100%' },
-      },
-    ],
-  },
-  {
-    name: '媒体播放器规则',
-    condition: {
-      type: 'process_state',
-      params: { process_name: 'wmplayer.exe', state: 'running' },
-    },
-    actions: [
-      { type: 'set_volume', params: { action: 'half' } },
-      {
-        type: 'notify',
-        params: { title: '媒体播放器检测', message: '音量已调整为50%' },
-      },
-    ],
-  },
-  {
-    name: '微信退出-恢复音量',
-    condition: {
-      type: 'process_state',
-      params: { process_name: 'WeChat.exe', state: 'stopped' },
-    },
-    actions: [
-      { type: 'set_volume', params: { action: 'half' } },
-      {
-        type: 'notify',
-        params: { title: '微信已退出', message: '音量已恢复至50%' },
-      },
-    ],
-  },
-  {
-    name: 'PPT退出-恢复音量',
-    condition: {
-      type: 'process_state',
-      params: { process_name: 'POWERPNT.EXE', state: 'stopped' },
-    },
-    actions: [
-      { type: 'set_volume', params: { action: 'half' } },
-      {
-        type: 'notify',
-        params: { title: 'PowerPoint已退出', message: '音量已恢复至50%' },
-      },
-    ],
-  },
-  {
-    name: '媒体播放器退出-恢复音量',
-    condition: {
-      type: 'process_state',
-      params: { process_name: 'wmplayer.exe', state: 'stopped' },
-    },
-    actions: [
-      { type: 'set_volume', params: { action: 'half' } },
-      {
-        type: 'notify',
-        params: { title: '媒体播放器已退出', message: '音量已恢复至50%' },
-      },
-    ],
-  },
+  connectedOriginRule('微信音量规则', 'WeChat.exe', 'running', 'max', '微信正在运行', '音量已设置为100%'),
+  connectedOriginRule('PPT音量规则', 'POWERPNT.EXE', 'running', 'max', 'PowerPoint正在运行', '音量已设置为100%'),
+  connectedOriginRule('媒体播放器规则', 'wmplayer.exe', 'running', 'half', '媒体播放器检测', '音量已调整为50%'),
+  connectedOriginRule('微信退出-恢复音量', 'WeChat.exe', 'stopped', 'half', '微信已退出', '音量已恢复至50%'),
+  connectedOriginRule('PPT退出-恢复音量', 'POWERPNT.EXE', 'stopped', 'half', 'PowerPoint已退出', '音量已恢复至50%'),
+  connectedOriginRule('媒体播放器退出-恢复音量', 'wmplayer.exe', 'stopped', 'half', '媒体播放器已退出', '音量已恢复至50%'),
 ]

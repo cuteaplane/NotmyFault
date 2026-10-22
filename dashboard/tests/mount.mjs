@@ -7,12 +7,13 @@ import { pathToFileURL } from 'url'
 import { buildRunExport } from '../src/lib/runExport.js'
 import { aiProviderIdFor } from '../src/lib/providers.js'
 import { templateAvailability } from '../src/lib/automationTemplates.js'
-import { streamRuleDraftWithAI } from '../src/lib/api.js'
+import { getAIDraftingSetting, getConfigSecurityStatus, streamRuleDraftWithAI } from '../src/lib/api.js'
 import { computeChangeSet, summarizeRuleChanges } from '../src/lib/ruleDiff.js'
-import { ensureParams } from '../src/lib/utils.js'
+import { ensureParams, validateRuleGraph } from '../src/lib/utils.js'
 import { actionOutputDefs, bindingSourceFor, buildNodeDataPorts, collectReferences, parameterAllowsBinding } from '../src/lib/bindings.js'
 import { getGraphTriggers, walkGraphActions, copyGraphNode } from '../src/lib/workflowGraph.js'
 import { compatibleTypes, formatTypedInput, isOpaqueValue, parseTypedInput, typeAtPath } from '../src/lib/valueTypes.js'
+import { ORIGIN_RULES } from '../src/lib/origin.js'
 
 import { sequentialRule, ruleWith, wire, eventGroup, trigger } from './canvas-fixtures.mjs'
 
@@ -45,6 +46,18 @@ const bindingPolicyOk = parameterAllowsBinding(bindingPolicyMeta, 'source')
 console.log((bindingPolicyOk?'PASS':'FAIL')+' - literal-only parameters stay out of graph binding ports')
 if (!bindingPolicyOk) process.exitCode = 1
 
+const originRulesUseWorkflow = ORIGIN_RULES.length === 6 && ORIGIN_RULES.every(rule => {
+  try {
+    validateRuleGraph(rule)
+    return !Object.hasOwn(rule, 'condition')
+      && !Object.hasOwn(rule, 'actions')
+      && rule.workflow.nodes.filter(node => node.type === 'trigger').length === 1
+      && rule.workflow.edges.length === 2
+  } catch { return false }
+})
+console.log((originRulesUseWorkflow?'PASS':'FAIL')+' - origin rules use valid workflow graphs')
+if (!originRulesUseWorkflow) process.exitCode = 1
+
 const copiedGroup = { type:'action_group', binding_id:'a_branch01', exports:{} }
 const copiedQuery = { type:'query', binding_id:'a_query001', parent:copiedGroup.binding_id, params:{} }
 const copiedNotify = { type:'notify', binding_id:'a_notify01', parent:copiedGroup.binding_id, params:{ message:{ $ref:{ scope:'step', node:'a_query001', path:['text'] } } } }
@@ -71,6 +84,10 @@ let requireEarlyApproval = false
 const earlyApprovalAttempts = []
 const aiDraftCalls = []
 const pluginInstallForms = []
+let failNextPluginInstall = false
+let failNextExtensionClose = false
+let delayHistoricalLogReads = false
+const pendingHistoricalLogReads = []
 let mockAiDraftResultType = 'assistant_message'
 let mockAiDraftDelay = 0
 let mockAiDraftError = ''
@@ -89,6 +106,8 @@ let mockAdminAuthorization = 'per_execution'
 let mockAdminRuleVerification = true
 let mockAiDrafting = { enabled: false, endpoint_url: '', model: '', api_format: 'chat_completions' }
 let mockConfigSecurity = { status:'ok', reason:'', summary:null }
+let failConfigSecurityRead = false
+let failAIDraftingRead = false
 let mockAiApiKeyStatus = 'none'
 let mockBluetoothInstalled = false
 let mockResidentOnClose = true
@@ -98,10 +117,12 @@ let exportedRunFileName = ''
 const exportedFileNames = []
 const textEncoder = new TextEncoder()
 let engineEventController = null
+let engineEventControllerClosed = true
 let engineConnections = 0
 let engineRequestHeaders = null
 let recoveredRun = null
 let additionalRuns = []
+let completeManualRunBeforeResponse = false
 
 function pause(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -144,6 +165,15 @@ function mockAiDraftResult() {
     return {
       ok:true, source:'ai', result_type:'assistant_message',
       message:'已检查的最终文案不应覆盖流式内容。',
+    }
+  }
+  if (mockAiDraftResultType === 'existing_rule_draft') {
+    return {
+      ok:true, source:'ai', result_type:'rule_draft',
+      draft:sequentialRule([{ type:'notify', params:{ title:'NotmyFault', message:'AI 更新已有规则' } }], {
+        rule_id:'r_mount001', name:'AI 更新已有规则', folder:'测试',
+      }),
+      validation:{ valid:true, issues:[] },
     }
   }
   return {
@@ -277,7 +307,9 @@ window.pywebview = { api: {
     bridgeCalls.push({ path, method, data })
     if (path === '/api/rules' && method === 'GET') return window.pywebview.api.get_config()
     if (path === '/api/rules' && method === 'PUT') return window.pywebview.api.save_config(data.rules, data.admin_key_password)
-    if (path === '/api/config/security-status') return mockConfigSecurity
+    if (path === '/api/config/security-status') return failConfigSecurityRead
+      ? { ok:false, status:0, error:'后台不可用' } : mockConfigSecurity
+    if (path.startsWith('/api/engine/logs')) return { status:0 }
     if (path === '/api/platform') return {
       platform:'windows', session_type:'desktop', capabilities:{
         'audio.control':{ available:true, degraded:false, backend:'pycaw', reason:'' },
@@ -285,6 +317,7 @@ window.pywebview = { api: {
       },
     }
     if (path === '/api/settings/ai-drafting' && method === 'GET') {
+      if (failAIDraftingRead) return { ok:false, status:0, error:'后台不可用' }
       return { ...mockAiDrafting, api_key_status: mockAiApiKeyStatus }
     }
     if (path === '/api/settings/ai-drafting' && method === 'PUT') {
@@ -323,7 +356,13 @@ window.pywebview = { api: {
       return { ok:true }
     }
     if (path === '/api/rules/validate') return { ok:true, valid:true, issues:[], summary:{ errors:0, warnings:0 } }
-    if (/^\/api\/rules\/\d+\/run$/.test(path) && method === 'POST') return { ok:true, action_count:1, run_id:'run_test001' }
+    if (/^\/api\/rules\/\d+\/run$/.test(path) && method === 'POST') {
+      if (completeManualRunBeforeResponse) {
+        emitTestEvent('workflow_completed', { run_id:'run_test001', status:'succeeded' })
+        await pause(60)
+      }
+      return { ok:true, action_count:1, run_id:'run_test001' }
+    }
     if (path === '/api/runs/run_test001/cancel' && method === 'POST') return { ok:true, message:'已请求停止这次运行' }
     if (path.startsWith('/api/runs?')) return { runs:[{
       run_id:'run_mount001', rule_id:'r_mount001', rule_name:'挂载测试规则', event_type:'manual',
@@ -384,6 +423,10 @@ window.pywebview = { api: {
       }
     }
     if (path === '/api/plugins/macro_run/extensions/sessions/s_macro' && method === 'DELETE') {
+      if (failNextExtensionClose) {
+        failNextExtensionClose = false
+        return { ok:false, error:'模拟会话清理失败' }
+      }
       return { ok:true }
     }
     if (path === '/api/plugins/hotkey/extensions/commands/capture_hotkey/invoke' && method === 'POST') {
@@ -397,6 +440,16 @@ window.pywebview = { api: {
     return { ok:true }
   },
 } }
+window.pywebview.api.list_log_files = async () => [
+  { name:'latest.log', mtime:3, lines:1 },
+  { name:'A.log', mtime:2, lines:1 },
+  { name:'B.log', mtime:1, lines:1 },
+]
+window.pywebview.api.read_log_entries = async () => []
+window.pywebview.api.read_log_file_entries = async name => {
+  if (delayHistoricalLogReads) return await new Promise(resolve => pendingHistoricalLogReads.push({ name, resolve }))
+  return [{ text:name }]
+}
 const T = {
   window_title: { id:'window_title', name:'窗口标题检测', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['native_api','admin'], params:[{ name:'title', label:'窗口标题', type:'string', default:'' }], outputs:[{ name:'matched_title', label:'匹配标题', type:'string', sensitive:true }, { name:'state', label:'窗口状态', type:'string' }] },
   window_title_alt: { id:'window_title_alt', name:'窗口标题备用', description:'d', origin:'builtin', enabled:true, version_code:1, permissions:['native_api'], params:[], outputs:[{ name:'matched_title', label:'匹配标题', type:'string', sensitive:true }] },
@@ -421,15 +474,23 @@ window.fetch = async (url, options = {}) => {
   if (u.endsWith('/api/events')) {
     engineConnections++
     engineRequestHeaders = options.headers || {}
+    let streamController = null
     return {
       ok: true,
       status: 200,
       body: new ReadableStream({
         start(controller) {
+          streamController = controller
           engineEventController = controller
+          engineEventControllerClosed = false
           options.signal?.addEventListener('abort', () => controller.error(new DOMException('已停止', 'AbortError')), { once:true })
         },
-        cancel() { engineEventController = null },
+        cancel() {
+          if (engineEventController === streamController) {
+            engineEventController = null
+            engineEventControllerClosed = true
+          }
+        },
       }),
     }
   }
@@ -458,6 +519,10 @@ window.fetch = async (url, options = {}) => {
   })
   if (u.endsWith('/api/plugins/install')) {
     pluginInstallForms.push(Object.fromEntries(options.body.entries()))
+    if (failNextPluginInstall) {
+      failNextPluginInstall = false
+      return j({ ok:false, error:'版本较低，请强制覆盖后重试' })
+    }
     return j({ ok:true, id:'author_signed', restart_required:true })
   }
   if (u.includes('/api/plugins/list')) {
@@ -612,6 +677,16 @@ window.pywebview = desktopBridge
 window.dispatchEvent(new window.Event('pywebviewready'))
 await new Promise(r => setTimeout(r, 100))
 
+failConfigSecurityRead = true
+const securityReadFailureIsUnavailable = (await getConfigSecurityStatus()).status === 'unavailable'
+failConfigSecurityRead = false
+failAIDraftingRead = true
+let aiSettingsReadFailureThrows = false
+try { await getAIDraftingSetting() } catch { aiSettingsReadFailureThrows = true }
+failAIDraftingRead = false
+console.log((securityReadFailureIsUnavailable && aiSettingsReadFailureThrows?'PASS':'FAIL')+' - settings getters reject unsuccessful bridge responses')
+if (!securityReadFailureIsUnavailable || !aiSettingsReadFailureThrows) process.exitCode = 1
+
 const offlineHtml = document.getElementById('app').innerHTML
 const offlineStateOk = offlineHtml.includes('引擎未运行')
   && offlineHtml.includes('启动引擎')
@@ -732,9 +807,24 @@ const quickCreateDraftOk = document.querySelector('.rule-title-capsule')?.textCo
 console.log((quickCreateSecondStepOk && quickCreateDraftOk?'PASS':'FAIL')+' - automation page opens a real prefilled rule draft')
 if (!quickCreateSecondStepOk || !quickCreateDraftOk) process.exitCode = 1
 document.querySelector('.rule-back-btn')?.click()
-await new Promise(r => setTimeout(r, 50))
-document.querySelector('.rule-library-row')?.click()
-await new Promise(r => setTimeout(r, 50))
+const quickCreateLeavePrompt = await waitFor(() => {
+  const dialog = document.querySelector('.app-dialog')
+  return dialog?.textContent.includes('要放弃这些修改吗？') ? dialog : null
+})
+if (!quickCreateLeavePrompt) throw new Error('Quick Create 返回后未显示离开确认框')
+const discardQuickCreate = [...quickCreateLeavePrompt.querySelectorAll('button')].find(
+  button => button.textContent.trim() === '放弃',
+)
+if (!discardQuickCreate) throw new Error('Quick Create 离开确认框缺少“放弃”按钮')
+discardQuickCreate.click()
+const ruleLibraryAfterQuickCreate = await waitFor(() => (
+  !document.querySelector('.rule-editor-page') && document.querySelector('.rule-library-row')
+))
+if (!ruleLibraryAfterQuickCreate || document.querySelector('.app-dialog')) {
+  throw new Error('确认放弃 Quick Create 草稿后未返回规则库')
+}
+ruleLibraryAfterQuickCreate.click()
+if (!await waitFor('.rule-title-capsule')) throw new Error('点击规则库行后未打开规则编辑器')
 document.querySelector('.rule-title-edit')?.click()
 await new Promise(r => setTimeout(r, 20))
 const ruleNameInput = document.querySelector('.rule-title-capsule input')
@@ -894,7 +984,10 @@ const manualTestStayedLocked = [...document.querySelectorAll('button')].find(
   button => button.textContent.includes('测试中'),
 )?.disabled === true
 recoveredRun = { run_id:'run_test001', status:'cancelled' }
-engineEventController?.close()
+const recoveredTestController = engineEventController
+engineEventController = null
+engineEventControllerClosed = true
+recoveredTestController?.close()
 await waitFor(() => [...document.querySelectorAll('button')].find(
   button => button.textContent.includes('测试规则') && !button.disabled,
 ), 2000)
@@ -964,6 +1057,29 @@ async function closeTestDialog() {
 }
 const observedEventData = { run_id:'run_test001', step_id:'a_mount001', action_type:'notify' }
 
+recoveredRun = null
+const readyEventController = await waitFor(
+  () => !engineEventControllerClosed && engineEventController,
+  3000,
+)
+if (!readyEventController) throw new Error('early terminal 测试开始前 SSE 连接未恢复')
+completeManualRunBeforeResponse = true
+saveRun.click()
+await waitFor(() => document.querySelector('.test-prep-dialog'), 2000)
+if (!document.querySelector('.test-prep-dialog')) throw new Error('终态先于响应测试未打开测试准备窗口：' + document.querySelector('.app-dialog')?.textContent)
+;[...document.querySelectorAll('.test-prep-dialog button')].find(
+  button => button.textContent.includes('用这些数据运行'),
+).click()
+await waitFor(() => document.querySelector('.test-result-dialog .test-summary'), 2000)
+if (!document.querySelector('.test-result-dialog .test-summary')) throw new Error('终态先于响应测试未显示结果摘要：' + document.querySelector('.app-dialog')?.textContent)
+completeManualRunBeforeResponse = false
+const earlyTerminalUnlocksManualTest = [...document.querySelectorAll('button')].some(
+  button => button.textContent.includes('测试规则') && !button.disabled,
+)
+console.log((earlyTerminalUnlocksManualTest?'PASS':'FAIL')+' - a terminal event before the run response clears the manual test lock')
+if (!earlyTerminalUnlocksManualTest) process.exitCode = 1
+await closeTestDialog()
+
 for (const [eventName, runStatus, stepStatus] of [
   ['action_executed', 'succeeded', 'ok'],
   ['action_cancelled', 'cancelled', 'cancelled'],
@@ -987,6 +1103,35 @@ for (const [eventName, runStatus, stepStatus] of [
     && ![...terminalDialog.querySelectorAll('button')].some(button => button.textContent.includes('停止测试'))
   console.log((terminalReplacesWaiting?'PASS':'FAIL') + ` - ${runStatus} replaces the pending step and long-running hint`)
   if (!terminalReplacesWaiting) process.exitCode = 1
+  await closeTestDialog()
+}
+
+// 排队中的测试运行被丢弃时立即结束等待并显示原因。
+{
+  await startObservedTest()
+  emitTestEvent('run.step.waiting', { ...observedEventData })
+  await waitFor(() => document.querySelector('.test-step-waiting'), 2000)
+  emitTestEvent('run_dropped', {
+    run_id:'run_other', rule_id:'r_mount001', status:'dropped', reason:'其他运行的丢弃原因',
+  })
+  await pause(50)
+  const otherRunIgnored = !!document.querySelector('.test-step-waiting')
+    && !document.querySelector('.test-result-dialog .test-summary')?.textContent
+    && [...document.querySelectorAll('.test-result-dialog button')].some(button => button.textContent.includes('停止测试'))
+  console.log((otherRunIgnored?'PASS':'FAIL')+' - run_dropped for another run leaves the test dialog untouched')
+  if (!otherRunIgnored) process.exitCode = 1
+
+  emitTestEvent('run_dropped', {
+    run_id:'run_test001', rule_id:'r_mount001', status:'dropped', reason:'规则已被修改',
+  })
+  await waitFor(() => document.querySelector('.test-result-dialog .test-summary')?.textContent.includes('运行已丢弃'), 2000)
+  const droppedDialog = document.querySelector('.test-result-dialog')
+  const droppedEndsTest = droppedDialog.textContent.includes('运行已丢弃：规则已被修改')
+    && droppedDialog.querySelector('.test-summary')?.classList.contains('test-summary-err')
+    && !droppedDialog.querySelector('.test-step-waiting, .test-step-running')
+    && ![...droppedDialog.querySelectorAll('button')].some(button => button.textContent.includes('停止测试'))
+  console.log((droppedEndsTest?'PASS':'FAIL')+' - run_dropped ends the test dialog with the drop reason before the long-running hint')
+  if (!droppedEndsTest) process.exitCode = 1
   await closeTestDialog()
 }
 
@@ -1677,6 +1822,10 @@ if (earlyPasswordInput) {
 await new Promise(r => setTimeout(r, 60))
 const earlyApprovalOpensEditor = earlyApprovalAttempts.join('|') === '|wrong-secret|dashboard-secret'
   && document.querySelector('.rule-title-capsule')?.textContent.includes('定时后关闭电脑')
+const newQuickDraftCanSaveImmediately = [...document.querySelectorAll('.rule-editor-actions button')]
+  .find(button => button.textContent.includes('保存规则'))?.disabled === false
+console.log((newQuickDraftCanSaveImmediately?'PASS':'FAIL')+' - a new quick draft can be saved without a prior edit')
+if (!newQuickDraftCanSaveImmediately) process.exitCode = 1
 console.log((earlyApprovalBlocksEditor && earlyApprovalRejectsWrongKey && earlyApprovalOpensEditor?'PASS':'FAIL')+' - high-risk quick drafts require a real key approval before the editor')
 if (!earlyApprovalBlocksEditor || !earlyApprovalRejectsWrongKey || !earlyApprovalOpensEditor) {
   console.error(JSON.stringify({ earlyApprovalAttempts, earlyApprovalBlocksEditor, earlyApprovalRejectsWrongKey, earlyApprovalOpensEditor, quickDialog:document.querySelector('.quick-create-dialog')?.textContent, dialog:document.querySelector('.app-dialog')?.textContent }))
@@ -1870,6 +2019,7 @@ if (macroFrame?.contentWindow) {
     },
   }))
   await new Promise(r => setTimeout(r, 30))
+  failNextExtensionClose = true
   window.dispatchEvent(new window.MessageEvent('message', {
     source: macroFrame.contentWindow,
     data: {
@@ -1879,6 +2029,8 @@ if (macroFrame?.contentWindow) {
   }))
 }
 await new Promise(r => setTimeout(r, 50))
+const extensionClosesAfterCleanupFailure = !document.querySelector('body > .extension-page-layer')
+  && document.querySelector('.snackbar')?.textContent.includes('会话清理失败')
 const macroCaptured = bridgeCalls.some(call => (
   call.path === '/api/plugins/macro_run/extensions/commands/start_recording/invoke'
   && call.data?.session_id === 's_macro'
@@ -1893,6 +2045,8 @@ const macroPageOk = macroPageSource.includes('操作宏插件页面')
   && macroPageSource.includes("connect-src 'none'")
 console.log((macroCaptured && macroPageOk && macroFullPageOpen?'PASS':'FAIL')+' - private macro data is edited through the full-page plugin extension view')
 if (!macroCaptured || !macroPageOk || !macroFullPageOpen) process.exitCode = 1
+console.log((extensionClosesAfterCleanupFailure?'PASS':'FAIL')+' - extension view closes after session cleanup fails and reports the error')
+if (!extensionClosesAfterCleanupFailure) process.exitCode = 1
 
 await pause(350)
 const viewport = document.querySelector('.node-canvas-viewport')
@@ -2317,6 +2471,30 @@ if (!listRetryCleared) process.exitCode = 1
 mockPluginListRuntime = null
 mockPluginListExtraActions = null
 
+rulesNav?.click()
+await waitFor('.rules-library')
+document.querySelector('.rule-library-row-main')?.click()
+await waitFor('.rule-title-capsule')
+document.querySelector('button[aria-label="打开 AI 起草"]')?.click()
+await waitFor('.ai-editor-panel')
+mockAiDraftResultType = 'existing_rule_draft'
+await sendNaturalDraft('更新当前自动化的提醒内容')
+const applyExistingDraft = await waitFor(() => [...document.querySelectorAll('.ai-rule-card button')]
+  .find(button => button.textContent.includes('全部应用')))
+applyExistingDraft?.click()
+await waitFor(() => document.querySelector('.rule-title-capsule')?.textContent.includes('AI 更新已有规则'))
+const existingDraftAppliedInEditor = [...document.querySelectorAll('.rule-editor-actions button')]
+  .find(button => button.textContent.includes('保存规则'))?.disabled === false
+document.querySelector('.rule-history-actions button[aria-label="撤销"]')?.click()
+await waitFor(() => document.querySelector('.rule-title-capsule')?.textContent.includes('挂载测试规则'))
+const existingDraftUndoRestoresSavedBaseline = [...document.querySelectorAll('.rule-editor-actions button')]
+  .find(button => button.textContent.includes('保存规则'))?.disabled === true
+console.log((existingDraftAppliedInEditor && existingDraftUndoRestoresSavedBaseline?'PASS':'FAIL')+' - applying an AI draft to an existing rule preserves identity and undo history')
+if (!existingDraftAppliedInEditor || !existingDraftUndoRestoresSavedBaseline) process.exitCode = 1
+document.querySelector('.rule-back-btn')?.click()
+await waitFor('.rules-library')
+mockAiDraftResultType = 'rule_draft'
+
 // 删除最后一条自动化后，首页只显示一次去往自动化页的首次引导。
 rulesNav?.click()
 await new Promise(r => setTimeout(r, 60))
@@ -2350,6 +2528,16 @@ registryButton.click()
   button => button.textContent.includes('安装插件'),
 )?.click()
 await pause(20)
+const installDialogBackdrop = document.querySelector('.nmf-dialog-backdrop')
+const installDropzone = document.querySelector('.preview-step .dropzone')
+installDialogBackdrop?.focus()
+const shiftTabFromBackdrop = new window.KeyboardEvent('keydown', { key:'Tab', shiftKey:true, bubbles:true, cancelable:true })
+installDialogBackdrop?.dispatchEvent(shiftTabFromBackdrop)
+const dialogFocusWrapsBackward = shiftTabFromBackdrop.defaultPrevented
+  && document.activeElement === installDialogBackdrop?.querySelector('.preview-step button:last-of-type')
+const pluginUploadIsKeyboardButton = installDropzone?.tagName === 'BUTTON' && installDropzone.type === 'button'
+console.log((dialogFocusWrapsBackward && pluginUploadIsKeyboardButton?'PASS':'FAIL')+' - plugin upload dialog traps reverse focus and exposes a keyboard upload button')
+if (!dialogFocusWrapsBackward || !pluginUploadIsKeyboardButton) process.exitCode = 1
 const packageInput = document.querySelector('input[type="file"][accept=".nmfp"]')
 Object.defineProperty(packageInput, 'files', {
   configurable:true,
@@ -2357,6 +2545,8 @@ Object.defineProperty(packageInput, 'files', {
 })
 packageInput.dispatchEvent(new window.Event('change', { bubbles:true }))
 await pause(80)
+failNextPluginInstall = true
+document.querySelector('.preview-foot-actions .btn-filled')?.click()
 document.querySelector('.preview-foot-actions .btn-filled')?.click()
 await pause(40)
 const signingPasswordInput = document.querySelector('.install-dialog input[type="password"]')
@@ -2372,6 +2562,44 @@ const signingPasswordUsesDedicatedField = pluginInstallForms.length === 1
   && !('password' in pluginInstallForms[0])
 console.log((signingPasswordUsesDedicatedField?'PASS':'FAIL')+' - author counter-signing uses the signing_password form field')
 if (!signingPasswordUsesDedicatedField) process.exitCode = 1
+const retryForceCheckbox = document.querySelector('.preview-foot input[type="checkbox"]')
+retryForceCheckbox?.click()
+document.querySelector('.preview-foot-actions .btn-filled')?.click()
+await waitFor(() => document.querySelector('.app-dialog')?.textContent.includes('重启引擎使更改生效？'), 2000)
+const pluginInstallRetryReuploadsFile = pluginInstallForms.length === 2
+  && pluginInstallForms.every(form => form.file?.name === 'author-signed.nmfp')
+  && pluginInstallForms[1]?.force === 'true'
+  && !document.querySelector('.install-dialog')
+console.log((pluginInstallRetryReuploadsFile?'PASS':'FAIL')+' - plugin install retry resends its package and prevents duplicate submission')
+if (!pluginInstallRetryReuploadsFile) process.exitCode = 1
+;[...document.querySelectorAll('.app-dialog button')].find(button => button.textContent.trim() === '取消')?.click()
+
+settingsNav?.click()
+await waitFor('.settings-root-list')
+;[...document.querySelectorAll('.settings-root-list button')].find(button => button.textContent.includes('系统与诊断'))?.click()
+await waitFor('.log-file-select')
+delayHistoricalLogReads = true
+const logFileSelect = document.querySelector('.log-file-select')
+function selectHistoricalLog(name) {
+  logFileSelect.value = name
+  logFileSelect.dispatchEvent(new window.Event('change', { bubbles:true }))
+}
+selectHistoricalLog('A.log')
+await waitFor(() => pendingHistoricalLogReads.some(request => request.name === 'A.log'))
+selectHistoricalLog('B.log')
+await waitFor(() => pendingHistoricalLogReads.some(request => request.name === 'B.log'))
+selectHistoricalLog('A.log')
+await pause(20)
+pendingHistoricalLogReads.find(request => request.name === 'B.log')?.resolve([
+  { ts:'00:00:02', level:'INFO', text:'日志 B' },
+])
+pendingHistoricalLogReads.find(request => request.name === 'A.log')?.resolve([
+  { ts:'00:00:01', level:'INFO', text:'日志 A' },
+])
+const latestSelectionWinsLogRace = await waitFor(() => document.querySelector('.log-text')?.textContent === '日志 A')
+delayHistoricalLogReads = false
+console.log((latestSelectionWinsLogRace?'PASS':'FAIL')+' - returning to an in-flight log file displays its latest response')
+if (!latestSelectionWinsLogRace) process.exitCode = 1
 
 const sseDeclaresEventStream = engineRequestHeaders?.Accept === 'text/event-stream'
 console.log((sseDeclaresEventStream?'PASS':'FAIL')+' - SSE 请求声明 text/event-stream，避开 30 秒通用超时')
