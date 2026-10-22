@@ -436,7 +436,7 @@ class DashboardAPI:
         """通过 pywebview bridge 转发 Dashboard 的 JSON API 请求"""
         if not isinstance(path, str) or not path.startswith("/api/"):
             return {"ok": False, "error": "无效的 API 路径", "status": 400}
-        timeout = 30 if path == "/api/rules/draft/ai" else 5
+        timeout = 125 if path == "/api/rules/draft/ai" else 30
         return self._auth_request(path, method.upper(), data, timeout=timeout, value_encoding=value_encoding)
 
     def get_engine_status(self) -> dict:
@@ -526,12 +526,25 @@ class _DashboardStaticHandler(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
 
+class _DashboardStaticHTTPServer(http.server.ThreadingHTTPServer):
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_EXCLUSIVEADDRUSE,
+                1,
+            )
+        super().server_bind()
+
+
 def _start_static_server(directory, port=DASHBOARD_PORT):
     """pywebview 从 file:// 加载 ES 模块会被 CORS 拦截，因此用本地 HTTP 服务托管并在端口占用时递增重试"""
     Handler = functools.partial(_DashboardStaticHandler, directory=directory)
     for p in range(port, port + 20):
         try:
-            httpd = http.server.ThreadingHTTPServer(("127.0.0.1", p), Handler)
+            httpd = _DashboardStaticHTTPServer(("127.0.0.1", p), Handler)
             httpd.daemon_threads = True
             threading.Thread(target=httpd.serve_forever, daemon=True).start()
             version = int(os.path.getmtime(os.path.join(directory, "index.html")))
@@ -629,107 +642,121 @@ def main():
     if control_server is None:
         return
 
-    # 每次启动都调用协议注册器，注册器内部保持幂等
+    static_httpd = None
     try:
-        from Win_toaster.AUMID_Register import register_protocol
-        register_protocol()
-    except Exception:
-        pass
-
-    dashboard_url, _static_httpd = _resolve_dashboard_url()
-    if not dashboard_url:
-        print("[Dashboard] 找不到 dashboard/dist 构建产物", file=sys.stderr)
-        control_server.shutdown()
-        control_server.server_close()
-        _remove_control_secret(paths.dashboard_control_token_file, control_secret)
-        return
-    if "--first-run" in sys.argv:
-        dashboard_url += "&first_run=1"
-
-    preload.join()
-    import webview
-
-    api = DashboardAPI(paths)
-
-    window = webview.create_window(
-        title="NotmyFault",
-        url=dashboard_url,
-        js_api=api,
-        width=960,
-        height=720,
-        min_size=(640, 480),
-        confirm_close=False,
-        background_color='#1b1b21',
-    )
-    api._window = window
-
-    def watch_show_requests():
-        while True:
-            show_requested.wait()
-            show_requested.clear()
-            try:
-                window.restore()
-                window.show()
-            except Exception:
-                pass
-
-    threading.Thread(target=watch_show_requests, daemon=True).start()
-
-    def watch_quit_requests():
-        quit_requested.wait()
+        # 每次启动都调用协议注册器，注册器内部保持幂等
         try:
-            window.destroy()
-        except Exception as error:
-            print(f"[Dashboard] 关闭窗口失败: {error}", file=sys.stderr)
-
-    threading.Thread(target=watch_quit_requests, daemon=True).start()
-
-    if os.name == "nt":
-        try:
-            import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "notmyfault.dashboard"
-            )
+            from Win_toaster.AUMID_Register import register_protocol
+            register_protocol()
         except Exception:
             pass
 
-    def on_closing():
-        print("[Dashboard] 窗口正在关闭...")
-        if quit_requested.is_set():
+        dashboard_url, static_httpd = _resolve_dashboard_url()
+        if not dashboard_url:
+            print("[Dashboard] 找不到 dashboard/dist 构建产物", file=sys.stderr)
             return
+        if "--first-run" in sys.argv:
+            dashboard_url += "&first_run=1"
+
+        preload.join()
+        import webview
+
+        api = DashboardAPI(paths)
+
+        window = webview.create_window(
+            title="NotmyFault",
+            url=dashboard_url,
+            js_api=api,
+            width=960,
+            height=720,
+            min_size=(640, 480),
+            confirm_close=False,
+            background_color='#1b1b21',
+        )
+        api._window = window
+
+        def watch_show_requests():
+            while True:
+                show_requested.wait()
+                show_requested.clear()
+                try:
+                    window.restore()
+                    window.show()
+                except Exception:
+                    pass
+
+        threading.Thread(target=watch_show_requests, daemon=True).start()
+
+        def watch_quit_requests():
+            quit_requested.wait()
+            try:
+                window.destroy()
+            except Exception as error:
+                print(f"[Dashboard] 关闭窗口失败: {error}", file=sys.stderr)
+
+        threading.Thread(target=watch_quit_requests, daemon=True).start()
+
         if os.name == "nt":
             try:
                 import ctypes
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                    "notmyfault.dashboard"
+                )
+            except Exception:
+                pass
 
-                if ctypes.windll.user32.GetSystemMetrics(0x2000):
+        def on_closing():
+            print("[Dashboard] 窗口正在关闭...")
+            if quit_requested.is_set():
+                return
+            if os.name == "nt":
+                try:
+                    import ctypes
+
+                    if ctypes.windll.user32.GetSystemMetrics(0x2000):
+                        return
+                except Exception as error:
+                    print(f"[Dashboard] 无法检查 Windows 关机状态: {error}", file=sys.stderr)
                     return
-            except Exception as error:
-                print(f"[Dashboard] 无法检查 Windows 关机状态: {error}", file=sys.stderr)
-                return
-        with api._dashboard_settings_lock:
-            if not api._dashboard_settings["resident_on_close"]:
-                return
-        window.hide()
-        print("[Dashboard] 窗口已隐藏")
-        return False
-    window.events.closing += on_closing
-    window.events.closed += lambda: print("[Dashboard] 窗口已关闭")
+            with api._dashboard_settings_lock:
+                if not api._dashboard_settings["resident_on_close"]:
+                    return
+            window.hide()
+            print("[Dashboard] 窗口已隐藏")
+            return False
+        window.events.closing += on_closing
+        window.events.closed += lambda: print("[Dashboard] 窗口已关闭")
 
-    try:
-        webview_options = {
-            "private_mode": False,
-            "storage_path": str(paths.config_dir / "dashboard-webview"),
-        }
-        if sys.platform.startswith("linux"):
-            webview.start(gui="qt", **webview_options)
-        else:
-            webview.start(**webview_options)
-    except KeyboardInterrupt:
-        pass
-    control_server.shutdown()
-    control_server.server_close()
-    _remove_control_secret(paths.dashboard_control_token_file, control_secret)
-    print("[Dashboard] 已退出")
+        try:
+            webview_options = {
+                "private_mode": False,
+                "storage_path": str(paths.config_dir / "dashboard-webview"),
+            }
+            if sys.platform.startswith("linux"):
+                webview.start(gui="qt", **webview_options)
+            else:
+                webview.start(**webview_options)
+        except KeyboardInterrupt:
+            pass
+        print("[Dashboard] 已退出")
+    finally:
+        try:
+            if static_httpd is not None:
+                try:
+                    static_httpd.shutdown()
+                finally:
+                    static_httpd.server_close()
+        finally:
+            try:
+                control_server.shutdown()
+            finally:
+                try:
+                    control_server.server_close()
+                finally:
+                    _remove_control_secret(
+                        paths.dashboard_control_token_file,
+                        control_secret,
+                    )
 
 
 if __name__ == "__main__":
