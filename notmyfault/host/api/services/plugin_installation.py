@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict
@@ -38,9 +39,8 @@ from notmyfault.security.plugin_schema import (
 from notmyfault.security.plugin_package import PluginPackageLimits, extract_nmfp
 from notmyfault.security.plugins import plugin_signature_kind
 from notmyfault.security.plugin_checks import (
-    inspect_plugin, inspection_report, is_plugin_platform_compatible,
+    evaluate_plugin, inspect_plugin, inspection_report, is_plugin_platform_compatible,
     current_platform_name,
-    validate_plugin_signature,
 )
 from notmyfault.security.security import detect_security_mode
 
@@ -81,6 +81,7 @@ class PluginInstallationService:
         self._temporary_storage = temporary_storage or PluginTemporaryStorage()
         self._package_limits = package_limits or PluginPackageLimits()
         self._build_hook = build_hook or self._run_build_hook
+        self._operation_lock = threading.RLock()
 
     @property
     def max_upload_bytes(self) -> int:
@@ -147,22 +148,26 @@ class PluginInstallationService:
         else:
             self._fail(404, "插件不存在")
         try:
-            config = self._load_config_for_update()
-            disabled = config.get("disabled_plugins", {})
-            if not isinstance(disabled, dict):
-                disabled = {"triggers": [], "actions": []}
-            disabled_list = disabled.get(plugin_kind, [])
-            if not isinstance(disabled_list, list):
-                disabled_list = []
-            if plugin_id in disabled_list:
-                disabled_list.remove(plugin_id)
-                enabled = True
-            else:
-                disabled_list.append(plugin_id)
-                enabled = False
-            disabled[plugin_kind] = disabled_list
-            config["disabled_plugins"] = disabled
-            if not self._store.save_config(config):
+            enabled = False
+
+            def update(config: Dict[str, Any]) -> None:
+                nonlocal enabled
+                disabled = config.get("disabled_plugins", {})
+                if not isinstance(disabled, dict):
+                    disabled = {"triggers": [], "actions": []}
+                disabled_list = disabled.get(plugin_kind, [])
+                if not isinstance(disabled_list, list):
+                    disabled_list = []
+                if plugin_id in disabled_list:
+                    disabled_list.remove(plugin_id)
+                    enabled = True
+                else:
+                    disabled_list.append(plugin_id)
+                    enabled = False
+                disabled[plugin_kind] = disabled_list
+                config["disabled_plugins"] = disabled
+
+            if self._store.update_config(update) is None:
                 self._fail(500, "无法保存配置")
             return {
                 "ok": True,
@@ -178,6 +183,10 @@ class PluginInstallationService:
             self._fail(500, "切换插件状态失败")
 
     def uninstall(self, plugin_kind: str, plugin_id: str) -> Dict[str, Any]:
+        with self._operation_lock:
+            return self._uninstall_locked(plugin_kind, plugin_id)
+
+    def _uninstall_locked(self, plugin_kind: str, plugin_id: str) -> Dict[str, Any]:
         if plugin_kind not in ("triggers", "actions"):
             self._fail(400, "type 必须为 triggers 或 actions")
         if not self._safe_plugin_id(plugin_id):
@@ -275,6 +284,10 @@ class PluginInstallationService:
         return risks
 
     def preview(self, data: bytes, password: str = "") -> Dict[str, Any]:
+        with self._operation_lock:
+            return self._preview_locked(data, password)
+
+    def _preview_locked(self, data: bytes, password: str = "") -> Dict[str, Any]:
         self._previews.purge_expired()
         if len(data) > self._package_limits.max_upload_bytes:
             self._fail(
@@ -395,26 +408,49 @@ class PluginInstallationService:
         force: bool = False,
         confirmed_risk_ids: Any = None,
     ) -> Dict[str, Any]:
+        with self._operation_lock:
+            return self._install_locked(
+                data,
+                preview_token=preview_token,
+                password=password,
+                signing_password=signing_password,
+                force=force,
+                confirmed_risk_ids=confirmed_risk_ids,
+            )
+
+    def _install_locked(
+        self,
+        data: bytes | None,
+        preview_token: str = "",
+        password: str = "",
+        signing_password: str = "",
+        force: bool = False,
+        confirmed_risk_ids: Any = None,
+    ) -> Dict[str, Any]:
         self._previews.purge_expired()
+        if preview_token and self._previews.was_consumed(preview_token):
+            self._fail(400, "插件预览已使用，请重新预览后安装")
         extract_dir: Path | None = None
         archive_path: Path | None = None
         accepted_risk_ids: set[Any] = set()
-        preview_owned = False
+        preview_data: dict[str, Any] | None = None
+        installation_committed = False
         try:
             if preview_token and preview_token in self._previews:
-                preview = self._previews[preview_token]
-                root_path = Path(preview["root_path"])
-                plugin_kind = preview["ptype"]
-                json_name = preview["json_name"]
-                extract_dir = Path(preview["extract_dir"])
-                accepted_risk_ids = set(preview.get("risk_ids") or [])
+                preview_data = self._previews[preview_token]
+                root_path = Path(preview_data["root_path"])
+                plugin_kind = preview_data["ptype"]
+                json_name = preview_data["json_name"]
+                extract_dir = Path(preview_data["extract_dir"])
+                accepted_risk_ids = set(preview_data.get("risk_ids") or [])
                 current_snapshot = snapshot_plugin_directory(str(root_path))
                 if (
                     current_snapshot is None
-                    or current_snapshot != preview.get("file_snapshot")
+                    or current_snapshot != preview_data.get("file_snapshot")
                 ):
                     self._previews.discard(preview_token)
                     extract_dir = None
+                    preview_data = None
                     self._fail(409, "插件预览内容已经变化，请重新预览")
                 meta = self._read_manifest(root_path / json_name, preview=True)
                 plugin_type = (
@@ -424,6 +460,7 @@ class PluginInstallationService:
                 if not valid:
                     self._previews.discard(preview_token)
                     extract_dir = None
+                    preview_data = None
                     self._fail(400, "插件元数据未通过校验，请重新预览")
                 current_risks = self.scan_install_risks(
                     str(root_path), json_name, meta
@@ -434,6 +471,7 @@ class PluginInstallationService:
                 ):
                     self._previews.discard(preview_token)
                     extract_dir = None
+                    preview_data = None
                     self._fail(409, "插件安全检查结果已经变化，请重新预览")
                 confirmed = self._parse_confirmed_risk_ids(confirmed_risk_ids)
                 current_risk_ids = {
@@ -459,8 +497,6 @@ class PluginInstallationService:
                         "ok": False, "code": "risk_confirmation_required",
                         "error": "安装插件前需要确认列出的风险", "required_risk_ids": sorted(missing),
                     })
-                self._previews.pop(preview_token)
-                preview_owned = True
             else:
                 if data is None:
                     self._fail(400, "缺少上传文件或 preview_token 无效")
@@ -535,14 +571,55 @@ class PluginInstallationService:
                 if old_destination != destination:
                     obsolete = (old_destination,)
 
+            mode = detect_security_mode()
+            inspection = inspect_plugin(root_path, plugin_type)
+            if inspection.errors or inspection.schema_errors:
+                self._fail(
+                    400,
+                    "插件安全检查失败: "
+                    + "; ".join((inspection.errors + inspection.schema_errors)[:3]),
+                )
+            has_author_key = (root_path / "public_key.pem").is_file()
+            if has_author_key:
+                if inspection.signature.kind != "author":
+                    self._fail(400, "作者插件签名无效，无法副签")
+                counter_error = self._counter_sign_author_key(
+                    root_path, signing_password
+                )
+                if counter_error:
+                    self._fail(400, counter_error)
+                inspection = inspect_plugin(root_path, plugin_type)
+            evaluation = evaluate_plugin(inspection, mode)
+            if not evaluation["allowed"]:
+                self._fail(400, "插件安全检查失败: " + "; ".join(evaluation["errors"][:3]))
+
+            build_meta = meta.get("build") if isinstance(meta.get("build"), dict) else {}
+            build_commands = build_meta.get("command") or []
+            local_signing_key = None
+            if build_commands:
+                local_signing_key, key_error = self._load_trusted_local_signing_key(
+                    signing_password
+                )
+                if key_error:
+                    self._fail(400, key_error)
             self._build_hook(root_path, meta)
             built_meta = self._read_manifest(root_path / json_name)
             if built_meta != meta:
                 self._fail(400, "插件构建命令不得修改 manifest")
+            built_inspection = inspect_plugin(root_path, plugin_type)
+            built_evaluation = evaluate_plugin(
+                built_inspection, mode, check_signature=not bool(build_commands)
+            )
+            if not built_evaluation["allowed"]:
+                self._fail(
+                    400,
+                    "构建产物未通过安全检查: "
+                    + "; ".join(built_evaluation["errors"][:3]),
+                )
             post_build_risks = [
                 risk
                 for risk in self.scan_install_risks(
-                    str(root_path), json_name, built_meta
+                    str(root_path), json_name, built_meta, built_inspection
                 )
                 if risk.get("id") not in accepted_risk_ids
             ]
@@ -555,20 +632,29 @@ class PluginInstallationService:
                         "risks": post_build_risks,
                     },
                 )
-            if (root_path / "public_key.pem").exists():
-                counter_error = self._counter_sign_author_key(
-                    root_path, signing_password
+            if build_commands:
+                from notmyfault.security.signing import (
+                    counter_sign_author_key,
+                    self_sign_plugin,
                 )
-                if counter_error:
-                    self._fail(400, counter_error)
+
+                self_sign_plugin(root_path, private_key=local_signing_key)
+                counter_sign_author_key(root_path, local_signing_key)
+                final_inspection = inspect_plugin(root_path, plugin_type)
+                final_evaluation = evaluate_plugin(final_inspection, mode)
+                if not final_evaluation["allowed"]:
+                    self._fail(
+                        400,
+                        "构建产物签名校验失败: "
+                        + "; ".join(final_evaluation["errors"][:3]),
+                    )
 
             installed_hashes: dict[str, str] = {}
 
             def validate_staging(staging: Path) -> None:
                 written_meta = self._read_manifest(staging / json_name)
                 inspection = inspect_plugin(staging, plugin_type)
-                written_errors = inspection.errors + inspection.schema_errors
-                written_ok = not written_errors
+                staging_evaluation = evaluate_plugin(inspection, mode)
                 new_risks = [
                     risk
                     for risk in self.scan_install_risks(
@@ -576,10 +662,10 @@ class PluginInstallationService:
                     )
                     if risk.get("id") not in accepted_risk_ids
                 ]
-                if not written_ok:
+                if not staging_evaluation["allowed"]:
                     raise ValueError(
                         "安装后校验失败，已恢复旧版本: "
-                        + "; ".join(written_errors[:3])
+                        + "; ".join(staging_evaluation["errors"][:3])
                     )
                 if new_risks:
                     error = ValueError(
@@ -587,9 +673,6 @@ class PluginInstallationService:
                     )
                     error.risks = new_risks
                     raise error
-                validate_plugin_signature(
-                    staging, written_meta, "user", detect_security_mode(), inspection.signature.kind
-                )
                 installed_hashes.update(inspection.tree.file_snapshot)
 
             try:
@@ -605,6 +688,7 @@ class PluginInstallationService:
                         obsolete_plugin_ids=tuple(path.name for path in obsolete),
                     ),
                 )
+                installation_committed = True
             except ValueError as error:
                 body: Dict[str, Any] = {"ok": False, "error": str(error)}
                 risks = getattr(error, "risks", None)
@@ -654,10 +738,18 @@ class PluginInstallationService:
         finally:
             if archive_path is not None:
                 self._temporary_storage.remove_file(archive_path)
+            if preview_data is not None and preview_token:
+                current_snapshot = snapshot_plugin_directory(preview_data["root_path"])
+                if installation_committed:
+                    self._previews.consume(preview_token)
+                    extract_dir = None
+                elif current_snapshot is None or current_snapshot != preview_data.get("file_snapshot"):
+                    self._previews.discard(preview_token)
+                    extract_dir = None
+                else:
+                    extract_dir = None
             if extract_dir is not None:
                 self._file_system.discard_tree(extract_dir)
-            if preview_token and not preview_owned and preview_token in self._previews:
-                self._previews.discard(preview_token)
 
     @staticmethod
     def _parse_confirmed_risk_ids(value: Any) -> set[str]:
@@ -701,28 +793,44 @@ class PluginInstallationService:
     def _counter_sign_author_key(
         self, plugin_dir: Path, password: str
     ) -> str | None:
-        from notmyfault.security.signing import (
-            counter_sign_author_key,
-            load_private_key,
-        )
+        from notmyfault.security.signing import counter_sign_author_key
 
-        private_key_path = self._paths.plugin_private_key_file
-        if not private_key_path.exists():
-            return "缺少签名私钥，无法信任作者自签插件"
-        encrypted = private_key_path.read_bytes()[:20].startswith(
-            b"-----BEGIN ENCRYPTED"
-        )
-        if encrypted and not password:
-            return "安装作者自签插件需要输入签名私钥密码"
+        private_key, error = self._load_trusted_local_signing_key(password)
+        if error:
+            return error
         try:
-            private_key = load_private_key(
-                private_key_path, password=password or None
-            )
             counter_sign_author_key(plugin_dir, private_key)
         except Exception as error:
             self._log_exception("counter_sign_author_key", error)
             return "签名私钥密码错误或副签失败"
         return None
+
+    def _load_trusted_local_signing_key(self, password: str):
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        from notmyfault.security.signing import load_private_key
+        from notmyfault.security.signing_keys import get_public_keys
+
+        private_key_path = self._paths.plugin_private_key_file
+        if not private_key_path.exists():
+            return None, "缺少签名私钥，无法信任作者自签插件"
+        encrypted = private_key_path.read_bytes()[:20].startswith(
+            b"-----BEGIN ENCRYPTED"
+        )
+        if encrypted and not password:
+            return None, "安装作者自签插件需要输入签名私钥密码"
+        try:
+            private_key = load_private_key(
+                private_key_path, password=password or None
+            )
+            public_key = private_key.public_key().public_bytes(
+                Encoding.Raw, PublicFormat.Raw
+            )
+        except Exception as error:
+            self._log_exception("load_local_signing_key", error)
+            return None, "签名私钥密码错误或副签失败"
+        if public_key not in get_public_keys():
+            return None, "签名私钥与本地受信任公钥不匹配"
+        return private_key, None
 
     def _record_installed_hashes(
         self,
@@ -920,12 +1028,6 @@ class PluginInstallationService:
                 return "author:" + hashlib.sha256(file.read()).hexdigest()[:16]
         except OSError:
             return "trusted-local"
-
-    def _load_config_for_update(self) -> Dict[str, Any]:
-        if not os.path.exists(self._store.config_path):
-            if not self._store.save_config({}):
-                raise ConfigValidationError("无法创建配置文件")
-        return self._store.load_verified_config()
 
     def _backups_for_package(self, package_name: str) -> list[Path]:
         backups = []

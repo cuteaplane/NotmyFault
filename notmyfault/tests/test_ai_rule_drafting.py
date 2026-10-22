@@ -100,6 +100,22 @@ class TimeoutOpener:
         raise socket.timeout(f"timeout after {timeout}")
 
 
+class WaitingProvider:
+    def __init__(self):
+        self.started = threading.Event()
+        self.cancelled = threading.Event()
+
+    def stream(self, _messages, _schema, should_stop=None):
+        self.started.set()
+        self.cancelled.wait(3)
+        if should_stop is not None and should_stop():
+            return
+        yield "result", {"result_type": "assistant_message", "message": "done"}
+
+    def cancel(self):
+        self.cancelled.set()
+
+
 def build_service(tmp_path, provider=None, key_store=None):
     store = make_store(make_paths(tmp_path))
     assert store.save_config(enabled_config())
@@ -212,7 +228,7 @@ def test_stream_disconnect_stops_without_done(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ai_provider, "resolve_public_http_url", lambda *_args, **_kwargs: (None, ("8.8.8.8",)))
     monkeypatch.setattr(ai_provider, "_is_private_host", lambda _host: False)
-    monkeypatch.setattr(ai_provider, "_build_request_opener", lambda _addresses: SimpleNamespace(open=lambda *_args, **_kwargs: Response()))
+    monkeypatch.setattr(ai_provider, "_build_request_opener", lambda _addresses, **_kwargs: SimpleNamespace(open=lambda *_args, **_kwargs: Response()))
     provider = OpenAICompatibleDraftProvider("https://example.invalid/v1", "test-model", "test-key")
     service, _store = build_service(tmp_path / "blocking", provider)
     plan = service.prepare_stream({"messages": [{"role": "user", "content": "提醒"}]})
@@ -222,6 +238,24 @@ def test_stream_disconnect_stops_without_done(tmp_path, monkeypatch):
 
     assert asyncio.run(collect_blocking()) == [("status", {"status": "started"})]
     assert released.is_set() and finished.is_set()
+
+
+def test_service_shutdown_cancels_active_ai_stream(tmp_path):
+    provider = WaitingProvider()
+    service, _store = build_service(tmp_path, provider)
+    plan = service.prepare_stream({"messages": [{"role": "user", "content": "提醒"}]})
+
+    async def collect():
+        stream = service.stream(plan, lambda: asyncio.sleep(0, False))
+        first = await anext(stream)
+        assert first == ("status", {"status": "started"})
+        assert await asyncio.to_thread(provider.started.wait, 2)
+        service.begin_shutdown()
+        return [item async for item in stream]
+
+    events = asyncio.run(collect())
+    assert provider.cancelled.is_set()
+    assert all(kind != "result" for kind, _payload in events)
 
 
 def test_stream_reports_120_second_idle_timeout(tmp_path):
@@ -259,7 +293,7 @@ def test_stream_reports_120_second_idle_timeout(tmp_path):
 
 def test_provider_stream_translates_socket_timeout(monkeypatch):
     monkeypatch.setattr(ai_provider, "resolve_public_http_url", lambda url, **kwargs: (None, ("203.0.113.10",)))
-    monkeypatch.setattr(ai_provider, "_build_request_opener", lambda addresses: TimeoutOpener())
+    monkeypatch.setattr(ai_provider, "_build_request_opener", lambda addresses, **_kwargs: TimeoutOpener())
     provider = OpenAICompatibleDraftProvider("https://example.test/v1", "test-model", "test-key")
     monkeypatch.setattr(ai_provider, "_is_private_host", lambda _host: False)
 
@@ -271,6 +305,75 @@ def test_provider_stream_translates_socket_timeout(monkeypatch):
                 idle_timeout=1,
             )
         )
+
+
+def test_provider_cancel_interrupts_waiting_for_response_headers(monkeypatch):
+    client_socket, server_socket = socket.socketpair()
+    request_received = threading.Event()
+    peer_closed = threading.Event()
+    failures = []
+
+    class PlaintextTLSContext:
+        check_hostname = False
+
+        def wrap_socket(self, sock, server_hostname, do_handshake_on_connect=True):
+            class PlaintextSocket:
+                def do_handshake(self):
+                    return None
+
+                def __getattr__(self, name):
+                    return getattr(sock, name)
+
+            return PlaintextSocket()
+
+    def read_until_closed():
+        try:
+            assert server_socket.recv(4096)
+            request_received.set()
+            try:
+                while server_socket.recv(4096):
+                    pass
+            except OSError:
+                pass
+        finally:
+            peer_closed.set()
+
+    def consume_headers(provider):
+        try:
+            next(provider.stream(
+                [{"role": "user", "content": "提醒"}],
+                {"triggers": {}, "actions": {}},
+                idle_timeout=30,
+            ))
+        except Exception as error:
+            failures.append(error)
+
+    monkeypatch.setattr(ai_provider, "resolve_public_http_url", lambda *_args, **_kwargs: (None, ("203.0.113.10",)))
+    monkeypatch.setattr(ai_provider, "_is_private_host", lambda _host: False)
+    monkeypatch.setattr(ai_provider.ssl, "create_default_context", PlaintextTLSContext)
+    monkeypatch.setattr(
+        ai_provider.socket,
+        "create_connection",
+        lambda _address, _timeout, _source_address: client_socket,
+    )
+    provider = OpenAICompatibleDraftProvider(
+        "https://example.test/v1", "test-model", "test-key"
+    )
+    server = threading.Thread(target=read_until_closed, daemon=True)
+    consumer = threading.Thread(target=consume_headers, args=(provider,), daemon=True)
+    server.start()
+    consumer.start()
+    try:
+        assert request_received.wait(2)
+        provider.cancel()
+        assert peer_closed.wait(2)
+        consumer.join(timeout=2)
+        assert not consumer.is_alive()
+        assert failures
+    finally:
+        provider.cancel()
+        client_socket.close()
+        server_socket.close()
 
 
 def test_api_key_endpoints_use_injected_store(tmp_path):

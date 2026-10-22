@@ -66,11 +66,39 @@ def _open_pinned_socket(addresses: tuple[str, ...], port: int, timeout, source_a
 
 
 class _PinnedHTTPSConnection(HTTPSConnection):
-    def __init__(self, host: str, addresses: tuple[str, ...], **kwargs):
+    def __init__(
+        self,
+        host: str,
+        addresses: tuple[str, ...],
+        *,
+        on_connection=None,
+        cancelled=None,
+        **kwargs,
+    ):
         self._addresses = addresses
+        self._on_connection = on_connection
+        self._cancelled = cancelled or (lambda: False)
+        self._closed_for_cancel = False
         super().__init__(host, **kwargs)
+        if self._on_connection is not None:
+            self._on_connection(self)
+
+    def cancel(self) -> None:
+        self._closed_for_cancel = True
+        sock = self.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     def connect(self):
+        if self._closed_for_cancel or self._cancelled():
+            raise OSError("AI 草稿请求已取消")
         raw_socket = _open_pinned_socket(
             self._addresses,
             self.port,
@@ -80,29 +108,52 @@ class _PinnedHTTPSConnection(HTTPSConnection):
         self.sock = self._context.wrap_socket(
             raw_socket,
             server_hostname=self.host,
+            do_handshake_on_connect=False,
         )
+        if self._closed_for_cancel or self._cancelled():
+            self.cancel()
+            raise OSError("AI 草稿请求已取消")
+        self.sock.do_handshake()
+        if self._closed_for_cancel or self._cancelled():
+            self.cancel()
+            raise OSError("AI 草稿请求已取消")
 
 
 class _PinnedHTTPSHandler(request.HTTPSHandler):
-    def __init__(self, addresses: tuple[str, ...]):
+    def __init__(self, addresses: tuple[str, ...], on_connection=None, cancelled=None):
         self._addresses = addresses
+        self._on_connection = on_connection
+        self._cancelled = cancelled
         super().__init__(context=ssl.create_default_context())
 
     def https_open(self, req):
+        def create_connection(host, **kwargs):
+            return _PinnedHTTPSConnection(
+                host,
+                self._addresses,
+                on_connection=self._on_connection,
+                cancelled=self._cancelled,
+                **kwargs,
+            )
+
         return self.do_open(
-            lambda host, **kwargs: _PinnedHTTPSConnection(
-                host, self._addresses, **kwargs,
-            ),
+            create_connection,
             req,
+            context=self._context,
         )
 
 
-def _build_request_opener(addresses: tuple[str, ...]) -> request.OpenerDirector:
+def _build_request_opener(
+    addresses: tuple[str, ...],
+    *,
+    on_connection=None,
+    cancelled=None,
+) -> request.OpenerDirector:
     # 单独包一层，测试会把它整个换成假网络。
     return request.build_opener(
         request.ProxyHandler({}),
         _NoRedirects(),
-        _PinnedHTTPSHandler(addresses),
+        _PinnedHTTPSHandler(addresses, on_connection, cancelled),
     )
 
 
@@ -428,25 +479,42 @@ class OpenAICompatibleDraftProvider:
         self._model = model
         self._api_key = api_key
         self._request_host = parsed.hostname or ""
-        self._opener = _build_request_opener(addresses)
         self._response_lock = threading.Lock()
         self._stream_response = None
+        self._stream_connection = None
         self._cancelled = threading.Event()
+        self._opener = _build_request_opener(
+            addresses,
+            on_connection=self._register_stream_connection,
+            cancelled=self._cancelled.is_set,
+        )
+
+    def _register_stream_connection(self, connection) -> None:
+        with self._response_lock:
+            self._stream_connection = connection
+            should_cancel = self._cancelled.is_set()
+        if should_cancel:
+            connection.cancel()
 
     def cancel(self) -> None:
         self._cancelled.set()
         with self._response_lock:
             response = self._stream_response
-        if response is None:
-            return
-        raw = getattr(getattr(response, "fp", None), "raw", None)
-        connection = getattr(raw, "_sock", None)
+            connection = self._stream_connection
         if connection is not None:
+            connection.cancel()
+        if response is not None:
+            raw = getattr(getattr(response, "fp", None), "raw", None)
+            response_socket = getattr(raw, "_sock", None)
+            if response_socket is not None:
+                try:
+                    response_socket.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
             try:
-                connection.shutdown(socket.SHUT_RDWR)
+                response.close()
             except OSError:
                 pass
-        response.close()
 
     def __call__(
         self,
@@ -548,6 +616,10 @@ class OpenAICompatibleDraftProvider:
             with self._opener.open(req, timeout=idle_timeout) as response:
                 with self._response_lock:
                     self._stream_response = response
+                    cancelled = self._cancelled.is_set()
+                if cancelled or (should_stop is not None and should_stop()):
+                    self.cancel()
+                    return
                 while True:
                     if self._cancelled.is_set() or (should_stop is not None and should_stop()):
                         return
@@ -578,6 +650,7 @@ class OpenAICompatibleDraftProvider:
         finally:
             with self._response_lock:
                 self._stream_response = None
+                self._stream_connection = None
 
         body = accumulator.body()
         if self._api_format == "responses":

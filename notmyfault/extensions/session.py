@@ -12,6 +12,10 @@ from notmyfault.extensions.protocol import make_owned_value, value_matches_type
 SESSION_TTL_SECONDS = 30 * 60
 
 
+class ExtensionSessionBusyError(RuntimeError):
+    pass
+
+
 class ExtensionSession:
     """保存一次插件页面交互的数据和可调用命令。"""
 
@@ -92,7 +96,7 @@ class ExtensionSession:
                 raise RuntimeError("扩展会话已经关闭")
             self.updated_at = time.time()
         if not self._invoke_lock.acquire(blocking=False):
-            raise RuntimeError("扩展会话正在处理另一个命令")
+            raise ExtensionSessionBusyError("扩展会话正在处理另一个命令")
         try:
             return handler(context, payload)
         finally:

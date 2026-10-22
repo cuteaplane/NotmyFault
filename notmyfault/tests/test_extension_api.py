@@ -411,6 +411,54 @@ def test_extension_command_session_and_private_value(tmp_path, isolated, request
     assert expired.status_code == 404
 
 
+def test_concurrent_extension_command_keeps_busy_session(tmp_path):
+    engine = ExtensionEngine(tmp_path)
+    client, headers = make_client(tmp_path, engine)
+    opened = client.post(
+        "/api/plugins/sample/extensions/commands/open/invoke",
+        headers=headers,
+        json={"source_kind": "parameter_editors", "source_id": "document_editor"},
+    )
+    assert opened.status_code == 200
+    session_id = opened.json()["session_id"]
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_save(context, _payload):
+        started.set()
+        assert release.wait(3)
+        return context.result({"saved": True})
+
+    engine.extensions.register_command("sample", "save", slow_save, engine)
+    first_result = {}
+
+    def invoke_first():
+        first_result["response"] = client.post(
+            "/api/plugins/sample/extensions/commands/save/invoke",
+            headers=headers,
+            json={"session_id": session_id, "payload": {}},
+        )
+
+    first = threading.Thread(target=invoke_first)
+    first.start()
+    try:
+        assert started.wait(2)
+        busy = client.post(
+            "/api/plugins/sample/extensions/commands/save/invoke",
+            headers=headers,
+            json={"session_id": session_id, "payload": {}},
+        )
+        assert busy.status_code == 409
+        assert busy.json()["code"] == "extension_busy"
+        assert busy.json()["session_id"] == session_id
+    finally:
+        release.set()
+        first.join(timeout=3)
+
+    assert not first.is_alive()
+    assert first_result["response"].status_code == 200
+
+
 @pytest.mark.parametrize("isolated", [False, True])
 def test_extension_command_commits_native_value(tmp_path, isolated, request):
     engine = make_isolated_engine(tmp_path, native_editor_meta(), (

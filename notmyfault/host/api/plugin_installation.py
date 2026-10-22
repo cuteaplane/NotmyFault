@@ -415,6 +415,7 @@ class PendingPreviewStore(MutableMapping[str, dict[str, Any]]):
         self._ttl_seconds = ttl_seconds
         self._token_factory = token_factory or (lambda: secrets.token_hex(16))
         self._items: dict[str, dict[str, Any]] = {}
+        self._consumed: dict[str, float] = {}
         self._lock = threading.RLock()
 
     def __getitem__(self, key: str) -> dict[str, Any]:
@@ -450,6 +451,13 @@ class PendingPreviewStore(MutableMapping[str, dict[str, Any]]):
                 extract_dir = preview.get("extract_dir")
                 if isinstance(extract_dir, str) and extract_dir:
                     self._remove_tree(Path(extract_dir))
+            expired_consumed = [
+                token
+                for token, created_at in self._consumed.items()
+                if now - created_at > self._ttl_seconds
+            ]
+            for token in expired_consumed:
+                self._consumed.pop(token, None)
 
     def create(self, preview: dict[str, Any]) -> str:
         with self._lock:
@@ -457,8 +465,22 @@ class PendingPreviewStore(MutableMapping[str, dict[str, Any]]):
             token = self._token_factory()
             item = dict(preview)
             item["created_at"] = self._clock()
+            self._consumed.pop(token, None)
             self._items[token] = item
             return token
+
+    def was_consumed(self, token: str) -> bool:
+        with self._lock:
+            self.purge_expired()
+            return token in self._consumed
+
+    def consume(self, token: str) -> None:
+        with self._lock:
+            preview = self._items.pop(token, None)
+            extract_dir = preview.get("extract_dir") if preview else None
+            if isinstance(extract_dir, str) and extract_dir:
+                self._remove_tree(Path(extract_dir))
+            self._consumed[token] = self._clock()
 
     def discard(self, token: str) -> None:
         with self._lock:

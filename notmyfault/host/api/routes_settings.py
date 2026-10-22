@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
@@ -18,7 +20,7 @@ def create_settings_router(service: SettingsService) -> APIRouter:
     router = APIRouter()
 
     @router.get("/api/config/security-status")
-    async def config_security_status():
+    def config_security_status():
         return service.security_status()
 
     @router.post("/api/config/security-approve")
@@ -31,7 +33,7 @@ def create_settings_router(service: SettingsService) -> APIRouter:
             body.get("admin_key_password") if isinstance(body, dict) else None
         )
         try:
-            return service.approve_security(password)
+            return await asyncio.to_thread(service.approve_security, password)
         except SettingsServiceError as error:
             return _settings_error(error)
         except Exception:

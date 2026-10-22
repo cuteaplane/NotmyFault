@@ -30,11 +30,11 @@ def create_plugins_router(
                 return None
 
     @router.get("/api/plugins")
-    async def plugin_schema():
+    def plugin_schema():
         return catalog.schema()
 
     @router.get("/api/plugins/list")
-    async def plugin_list():
+    def plugin_list():
         return catalog.list_all()
 
     @router.post("/api/plugins/registry")
@@ -82,7 +82,8 @@ def create_plugins_router(
         except Exception:
             body = {}
         try:
-            return installation.toggle(
+            return await asyncio.to_thread(
+                installation.toggle,
                 body.get("type", "") if isinstance(body, dict) else "",
                 body.get("id", "") if isinstance(body, dict) else "",
             )
@@ -143,13 +144,13 @@ def create_plugins_router(
             return JSONResponse(error.body, status_code=error.status_code)
 
     @router.get("/api/plugins/key-status")
-    async def plugin_key_status():
+    def plugin_key_status():
         return installation.key_status()
 
     @router.delete("/api/plugins/{ptype}/{pid}")
     async def plugin_uninstall(ptype: str, pid: str):
         try:
-            return installation.uninstall(ptype, pid)
+            return await asyncio.to_thread(installation.uninstall, ptype, pid)
         except PluginInstallationError as error:
             return JSONResponse(error.body, status_code=error.status_code)
 

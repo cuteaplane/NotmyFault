@@ -155,6 +155,31 @@ def test_options_preflight_is_allowed_for_dashboard_port(tmp_path):
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:19218"
 
+    rejected = env.client.get(
+        "/api/engine/status",
+        headers={
+            "Origin": "http://127.0.0.1:19218",
+            "Authorization": "Bearer invalid",
+        },
+    )
+    assert rejected.status_code == 403
+    assert rejected.headers["access-control-allow-origin"] == "http://127.0.0.1:19218"
+
+    oversized = env.client.post(
+        "/api/engine/start",
+        content=b"x" * (1024 * 1024 + 1),
+        headers={**env.headers, "Origin": "http://127.0.0.1:19218"},
+    )
+    assert oversized.status_code == 413
+    assert oversized.headers["access-control-allow-origin"] == "http://127.0.0.1:19218"
+
+    headers = {**env.headers, "Origin": "http://127.0.0.1:19218"}
+    for _ in range(300):
+        assert env.client.get("/api/engine/status", headers=headers).status_code == 200
+    limited = env.client.get("/api/engine/status", headers=headers)
+    assert limited.status_code == 429
+    assert limited.headers["access-control-allow-origin"] == "http://127.0.0.1:19218"
+
 
 def test_wrong_token_does_not_write_the_shared_token_file(tmp_path):
     env = make_api_env(tmp_path)
@@ -368,10 +393,15 @@ def test_api_server_stop_ends_event_streams(tmp_path):
     async def exercise():
         env = make_api_env(tmp_path)
         subscription = env.event_broker.subscribe()
+        shutdowns = []
+        env.server._application._ai_service = SimpleNamespace(
+            begin_shutdown=lambda: shutdowns.append("ai")
+        )
 
         env.server.stop()
 
         assert await asyncio.wait_for(subscription.queue.get(), timeout=1) is None
+        assert shutdowns == ["ai"]
 
     asyncio.run(exercise())
 
