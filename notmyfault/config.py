@@ -8,7 +8,7 @@ import stat
 import sys
 import tempfile
 import threading
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 from notmyfault.application_paths import ApplicationPaths
 from notmyfault.core.rule_model import (
@@ -188,7 +188,7 @@ def _default_v2_config() -> Dict[str, Any]:
 class SignedConfigStore:
     def __init__(self, paths: ApplicationPaths) -> None:
         self.paths = paths
-        self._secret_cache: bytes | None = None
+        self.config_lock = threading.RLock()
         self.rules_lock = threading.RLock()
 
     def rules_revision(self) -> str:
@@ -214,8 +214,6 @@ class SignedConfigStore:
         return str(self.paths.config_secret_file)
 
     def _get_or_create_secret(self) -> bytes:
-        if self._secret_cache is not None:
-            return self._secret_cache
         self.paths.config_dir.mkdir(parents=True, exist_ok=True)
         created = False
         try:
@@ -233,8 +231,7 @@ class SignedConfigStore:
             raise ConfigValidationError("配置签名密钥格式无效")
         if not created:
             _validate_secret_permissions(self._secret_path)
-        self._secret_cache = secret
-        return self._secret_cache
+        return secret
 
     def _sign(self, data: Dict[str, Any]) -> str:
         content = json.dumps(data, sort_keys=True, ensure_ascii=False, default=str)
@@ -303,15 +300,28 @@ class SignedConfigStore:
             return False
 
     def save_config(self, config: Dict[str, Any]) -> bool:
-        normalized = _normalize_config(config)
-        if not isinstance(normalized, dict):
-            print("[Config] 保存配置失败: 配置根节点必须是对象", file=sys.stderr)
-            return False
-        return self._write_signed_json(
-            self.config_path,
-            self.config_path + ".bak",
-            normalized,
-        )
+        with self.config_lock:
+            normalized = _normalize_config(config)
+            if not isinstance(normalized, dict):
+                print("[Config] 保存配置失败: 配置根节点必须是对象", file=sys.stderr)
+                return False
+            return self._write_signed_json(
+                self.config_path,
+                self.config_path + ".bak",
+                normalized,
+            )
+
+    def update_config(
+        self,
+        mutator: Callable[[Dict[str, Any]], Any],
+    ) -> Dict[str, Any] | None:
+        with self.config_lock:
+            if not os.path.exists(self.config_path):
+                if not self.save_config({}):
+                    return None
+            config = self.load_verified_config()
+            mutator(config)
+            return config if self.save_config(config) else None
 
     def save_rules(self, rules: List[Dict[str, Any]]) -> bool:
         with self.rules_lock:
@@ -368,10 +378,11 @@ class SignedConfigStore:
             raise ConfigValidationError(str(error)) from error
 
     def load_verified_config(self) -> Dict[str, Any]:
-        normalized = _normalize_config(self._read_signed(self.config_path, "配置"))
-        if not isinstance(normalized, dict):
-            raise ConfigValidationError("规范化后的配置必须是对象")
-        return normalized
+        with self.config_lock:
+            normalized = _normalize_config(self._read_signed(self.config_path, "配置"))
+            if not isinstance(normalized, dict):
+                raise ConfigValidationError("规范化后的配置必须是对象")
+            return normalized
 
     @classmethod
     def _normalize_rules_data(cls, data) -> List[Dict[str, Any]]:
@@ -388,7 +399,10 @@ class SignedConfigStore:
         return normalized
 
     def load_verified_rules(self) -> List[Dict[str, Any]]:
-        return self._normalize_rules_data(self._read_signed(self.rules_path, "规则"))
+        with self.rules_lock:
+            return self._normalize_rules_data(
+                self._read_signed(self.rules_path, "规则")
+            )
 
     def _recover_config(self) -> Dict[str, Any] | None:
         backup = self.config_path + ".bak"
@@ -433,39 +447,45 @@ class SignedConfigStore:
         return rules if self.save_rules(rules) else None
 
     def load_config(self) -> Dict[str, Any]:
-        self.paths.config_dir.mkdir(parents=True, exist_ok=True)
-        if not os.path.exists(self.config_path):
-            default = _default_v2_config()
-            self.save_config(default)
-            return default
-        try:
-            config = self.load_verified_config()
-        except ConfigValidationError as error:
-            if not error.recoverable:
+        with self.config_lock:
+            self.paths.config_dir.mkdir(parents=True, exist_ok=True)
+            if not os.path.exists(self.config_path):
+                default = _default_v2_config()
+                self.save_config(default)
+                return default
+            try:
+                config = self.load_verified_config()
+            except ConfigValidationError as error:
+                if not error.recoverable:
+                    raise
+                recovered = self._recover_config()
+                if recovered is not None:
+                    return recovered
                 raise
-            recovered = self._recover_config()
-            if recovered is not None:
-                return recovered
-            raise
-        return config
+            return config
 
     def load_rules(self) -> List[Dict[str, Any]]:
-        self.paths.config_dir.mkdir(parents=True, exist_ok=True)
-        if not os.path.exists(self.rules_path):
-            self.save_rules([])
-            return []
-        try:
-            rules = self.load_verified_rules()
-        except ConfigValidationError as error:
-            if not error.recoverable:
+        with self.rules_lock:
+            self.paths.config_dir.mkdir(parents=True, exist_ok=True)
+            if not os.path.exists(self.rules_path):
+                self.save_rules([])
+                return []
+            try:
+                rules = self.load_verified_rules()
+            except ConfigValidationError as error:
+                if not error.recoverable:
+                    raise
+                recovered = self._recover_rules()
+                if recovered is not None:
+                    return recovered
                 raise
-            recovered = self._recover_rules()
-            if recovered is not None:
-                return recovered
-            raise
-        return rules
+            return rules
 
     def inspect_files(self) -> Dict[str, Any]:
+        with self.config_lock, self.rules_lock:
+            return self._inspect_files()
+
+    def _inspect_files(self) -> Dict[str, Any]:
         status: Dict[str, Any] = {"status": "ok", "reason": "", "summary": None}
         has_secret = self.paths.config_secret_file.is_file()
         if not has_secret:
@@ -481,12 +501,17 @@ class SignedConfigStore:
         if not isinstance(config, dict):
             return {"status": "unreadable", "reason": "配置根节点不是对象", "summary": None}
         signature = config.pop(_SIGNATURE_KEY, "")
-        if has_secret and (not signature or not self._verify(config, signature)):
-            status["status"] = "tampered"
-            status["reason"] = (
-                "配置签名校验失败，文件可能被篡改。"
-                "引擎已暂停，请核对下方配置摘要后选择处理方式。"
-            )
+        if has_secret:
+            try:
+                valid_signature = bool(signature) and self._verify(config, signature)
+            except ConfigValidationError:
+                return {"status": "unreadable", "reason": "配置签名密钥无法验证文件", "summary": None}
+            if not valid_signature:
+                status["status"] = "tampered"
+                status["reason"] = (
+                    "配置签名校验失败，文件可能被篡改。"
+                    "引擎已暂停，请核对下方配置摘要后选择处理方式。"
+                )
 
         rules: List[Any] = []
         if os.path.exists(self.rules_path):
@@ -497,14 +522,17 @@ class SignedConfigStore:
             if not isinstance(rules_data, dict):
                 return {"status": "unreadable", "reason": "规则文件根节点不是对象", "summary": None}
             rules_signature = rules_data.pop(_SIGNATURE_KEY, "")
-            if has_secret and (
-                not rules_signature or not self._verify(rules_data, rules_signature)
-            ):
-                status["status"] = "tampered"
-                status["reason"] = (
-                    "规则签名校验失败，文件可能被篡改。"
-                    "引擎已暂停，请核对下方规则摘要后选择处理方式。"
-                )
+            if has_secret:
+                try:
+                    valid_rules_signature = bool(rules_signature) and self._verify(rules_data, rules_signature)
+                except ConfigValidationError:
+                    return {"status": "unreadable", "reason": "配置签名密钥无法验证文件", "summary": None}
+                if not valid_rules_signature:
+                    status["status"] = "tampered"
+                    status["reason"] = (
+                        "规则签名校验失败，文件可能被篡改。"
+                        "引擎已暂停，请核对下方规则摘要后选择处理方式。"
+                    )
             loaded = rules_data.get("rules", [])
             if isinstance(loaded, list):
                 rules = loaded
@@ -513,6 +541,10 @@ class SignedConfigStore:
         return status
 
     def load_unsigned_files(self) -> tuple[dict, list[dict] | None]:
+        with self.config_lock, self.rules_lock:
+            return self._load_unsigned_files()
+
+    def _load_unsigned_files(self) -> tuple[dict, list[dict] | None]:
         config = self._read_json(self.config_path, "配置")
         if not isinstance(config, dict):
             raise ConfigValidationError("配置根节点不是对象")

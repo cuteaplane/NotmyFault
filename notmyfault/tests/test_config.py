@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 
 import pytest
 
@@ -108,6 +109,71 @@ def test_reopened_store_rejects_world_readable_secret(tmp_path):
 
     with pytest.raises(ConfigValidationError, match="权限过宽"):
         SignedConfigStore(paths).load_verified_config()
+
+
+def test_existing_store_revalidates_secret_permissions(tmp_path):
+    paths = make_paths(tmp_path)
+    store = make_store(paths)
+    if os.name == "nt":
+        pytest.skip("此测试需要 POSIX 文件权限")
+    paths.config_secret_file.chmod(0o644)
+
+    with pytest.raises(ConfigValidationError, match="权限过宽"):
+        store.load_verified_config()
+
+
+def test_approval_recreates_missing_secret_and_verifies_saved_files(tmp_path):
+    paths = make_paths(tmp_path)
+    store = make_store(paths)
+    paths.config_secret_file.unlink()
+
+    SettingsService(store).approve_security()
+
+    assert paths.config_secret_file.is_file()
+    store.load_verified_config()
+    store.load_verified_rules()
+
+
+def test_inspect_files_reports_secret_validation_error_without_details(tmp_path, monkeypatch):
+    from notmyfault import config as config_module
+
+    paths = make_paths(tmp_path)
+    store = make_store(paths)
+    def reject_permissions(_path):
+        raise ConfigValidationError("private path detail")
+
+    monkeypatch.setattr(config_module, "_validate_secret_permissions", reject_permissions)
+
+    result = store.inspect_files()
+
+    assert result["status"] == "unreadable"
+    assert "private path detail" not in result["reason"]
+    assert str(paths.config_secret_file) not in result["reason"]
+
+
+def test_concurrent_config_updates_preserve_both_changes(tmp_path):
+    paths = make_paths(tmp_path)
+    store = make_store(paths)
+    barrier = threading.Barrier(3)
+    results = []
+
+    def update(field):
+        barrier.wait()
+        result = store.update_config(lambda config: config.update({field: True}))
+        results.append(result)
+
+    workers = [threading.Thread(target=update, args=(field,)) for field in ("first", "second")]
+    for worker in workers:
+        worker.start()
+    barrier.wait()
+    for worker in workers:
+        worker.join(timeout=3)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert all(result is not None for result in results)
+    saved = store.load_verified_config()
+    assert saved["first"] is True
+    assert saved["second"] is True
 
 
 def test_loading_does_not_rotate_signed_backups(tmp_path):
