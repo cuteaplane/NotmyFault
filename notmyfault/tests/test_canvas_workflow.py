@@ -213,6 +213,25 @@ def test_branch_output_keeps_order_when_used_as_nested_condition():
     assert program.evaluate(outer['binding_id'], {}, occurred={'t_source_bbbbbb'}) is True
 
 
+def test_malformed_graph_returns_errors_instead_of_raising():
+    trigger = {'binding_id': 'a_schedule01', 'type': 'trigger',
+               'trigger': {'binding_id': 't_schedule01', 'type': 'time_schedule', 'params': {}}}
+    cases = [
+        {'nodes': [dict(trigger, type=['trigger'])], 'edges': []},
+        {'nodes': [{'binding_id': 'a_group0001', 'type': 'event_group',
+                    'group_type': 'if', 'branches': [{'label': '缺少 id'}]}], 'edges': []},
+        {'nodes': [{'binding_id': 'a_unknown01'}, {'binding_id': 'a_end00001', 'type': 'end'}],
+         'edges': [{'source': 'a_unknown01', 'target': 'a_end00001', 'channel': 'control', 'port': 'next'}]},
+        {'nodes': [{'binding_id': 'a_unknown01'},
+                   {'binding_id': 'a_end00001', 'type': 'end', 'parent': 'a_unknown01'}],
+         'edges': [{'source': 'a_end00001', 'target': 'a_end00001', 'channel': 'control', 'port': 'next'}]},
+    ]
+    for graph in cases:
+        errors = validate_canvas_graph(graph)
+        assert isinstance(errors, list)
+        assert errors
+
+
 @pytest.mark.parametrize('port', ['missing', 'next', 'entry'])
 def test_invalid_trigger_source_port_is_rejected(port):
     source = example()

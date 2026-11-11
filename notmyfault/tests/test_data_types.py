@@ -132,6 +132,19 @@ def test_explicit_conversion_never_uses_python_truthiness_or_silent_truncation()
     assert types.convert_value(encoded, "bytes", options={"encoding": "base64"}) == b"\x00\xff"
 
 
+def test_extreme_decimal_exponents_are_rejected():
+    from notmyfault.core.value_codec import decode_value
+
+    for value in ("1e1000000", "1e-1000000"):
+        with pytest.raises(types.DataTypeError):
+            types.convert_value(value, "int")
+        with pytest.raises(types.DataTypeError):
+            types.convert_value(value, "decimal")
+        with pytest.raises(types.DataTypeError):
+            decode_value({"$nmf_value": {"type": "decimal", "data": value}})
+    assert types.convert_value("1e4000", "int") == 10**4000
+
+
 @pytest.mark.parametrize(("decimal_precision", "trap_inexact"), [(28, False), (4, False), (4, True)])
 def test_time_conversions_require_units_and_timezone_and_preserve_instants(decimal_precision, trap_inexact):
     seconds = {"type": "timestamp", "unit": "seconds"}

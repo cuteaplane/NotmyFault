@@ -24,7 +24,7 @@ def test_state_is_copied_and_survives_reopen(tmp_path):
         assert reopened.close()
 
 
-def test_writer_failure_reaches_caller_and_shutdown_closes_connection(tmp_path):
+def test_writer_failure_reaches_caller_and_store_still_reads(tmp_path):
     import sqlite3
     from contextlib import closing
 
@@ -37,8 +37,18 @@ def test_writer_failure_reaches_caller_and_shutdown_closes_connection(tmp_path):
     try:
         with pytest.raises(RuntimeError, match="状态写入失败"):
             store.set("demo", "baseline", 2, durable=True)
-        with pytest.raises(RuntimeError, match="状态读取失败"):
-            store.get("demo", "baseline")
+        assert store.get("demo", "baseline") == 2
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute(
+                "CREATE TABLE trigger_state (scope TEXT, key TEXT, value TEXT, PRIMARY KEY(scope,key))"
+            )
+            connection.commit()
+        store.set("demo", "baseline", 3, durable=True)
+        restored = StateStore(path)
+        try:
+            assert restored.get("demo", "baseline") == 3
+        finally:
+            assert restored.close()
     finally:
         assert store.close()
     path.unlink()

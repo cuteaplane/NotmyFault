@@ -30,6 +30,21 @@ def rule_args(**overrides):
     return args
 
 
+@pytest.mark.parametrize("mutate", [
+    lambda args: args['workflow']['nodes'][0].update(type=['trigger']),
+    lambda args: args['workflow']['nodes'].append(
+        {'binding_id': 'a_group0001', 'type': 'event_group', 'group_type': 'if',
+         'branches': [{'label': '缺少 id'}]}
+    ),
+])
+def test_malformed_workflow_is_reported_as_tool_error(mutate):
+    args = rule_args()
+    mutate(args)
+    with pytest.raises(ToolCallError) as caught:
+        parse_rule_draft(args, make_catalog())
+    assert caught.value.code == "rule_invalid"
+
+
 def test_valid_rule_returns_normalized_draft():
     original = rule_args()
     assert parse_rule_draft(original, make_catalog()) == original

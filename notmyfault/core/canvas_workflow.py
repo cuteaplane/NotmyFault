@@ -53,7 +53,7 @@ def validate_canvas_graph(graph):
         obsolete = set(node) & {'activation', 'condition_graph', 'workflow', 'then', 'elif', 'else', 'triggers', 'failure_actions'}
         if kind == 'if' or obsolete:
             errors.append(f'{path} 使用了已移除的条件模型: {", ".join(sorted(obsolete)) or "if"}')
-        if kind in CANVAS_NODES:
+        if isinstance(kind, str) and kind in CANVAS_NODES:
             unsupported = set(node) & {'params', 'retry', 'retry_delay_seconds', 'retry_backoff'}
             if kind != 'action_group' and 'on_error' in node:
                 unsupported.add('on_error')
@@ -114,7 +114,10 @@ def validate_canvas_graph(graph):
                     errors.append(f'{path} 的分支使用了已移除的条件模型')
             if node.get('group_type') == 'if' and (else_count != 1 or len(values) < 2):
                 errors.append(f'{path} 必须包含 IF 和唯一 ELSE')
-            branches[identity] = {branch['id']: branch for branch in values}
+            branches[identity] = {
+                branch['id']: branch for branch in values
+                if isinstance(branch, dict) and isinstance(branch.get('id'), str)
+            }
         for field in ('duration_seconds', 'within_seconds'):
             if field in node:
                 value = node[field]
@@ -156,7 +159,7 @@ def validate_canvas_graph(graph):
         seen = set()
         while isinstance(parent, str) and parent in nodes and parent not in seen:
             seen.add(parent)
-            if nodes[parent]['type'] == 'action_group':
+            if nodes[parent].get('type') == 'action_group':
                 return parent
             parent = nodes[parent].get('parent')
         return None
@@ -177,7 +180,8 @@ def validate_canvas_graph(graph):
         pairs.add(key)
         if channel not in ('control', 'condition'):
             errors.append(f'{path}.channel 必须是 control 或 condition')
-        valid_ports = branches.get(edge['source'], {}) if source.get('group_type') == 'if' else ('event',) if source['type'] == 'trigger' else ('result',) if source['type'] in ('logic', 'condition', 'event_group') else ('next', 'entry') if source['type'] == 'action_group' else () if source['type'] == 'end' else ('next',) if source['type'] == 'merge' else ('next', 'failure')
+        source_kind, target_kind = source.get('type'), target.get('type')
+        valid_ports = branches.get(edge['source'], {}) if source.get('group_type') == 'if' else ('event',) if source_kind == 'trigger' else ('result',) if source_kind in ('logic', 'condition', 'event_group') else ('next', 'entry') if source_kind == 'action_group' else () if source_kind == 'end' else ('next',) if source_kind == 'merge' else ('next', 'failure')
         if port not in valid_ports:
             errors.append(f'{path} 的来源端口不存在')
         if channel == 'condition':
@@ -202,11 +206,11 @@ def validate_canvas_graph(graph):
             if input_port != 'input':
                 errors.append(f'{path} 控制流只能连接执行入口')
             if port == 'entry':
-                if source['type'] != 'action_group' or action_scope(edge['target']) != edge['source']:
+                if source_kind != 'action_group' or action_scope(edge['target']) != edge['source']:
                     errors.append(f'{path} 动作组入口只能连接组内节点')
             elif action_scope(edge['source']) != action_scope(edge['target']):
                 errors.append(f'{path} 控制流不能跨越动作组边界')
-            if port == 'failure' and target['type'] != 'action_group':
+            if port == 'failure' and target_kind != 'action_group':
                 errors.append(f'{path} 失败出口只能连接动作组')
         adjacency[edge['source']].append(edge['target'])
     handlers = {edge['target'] for edge in graph['edges'] if isinstance(edge, dict)

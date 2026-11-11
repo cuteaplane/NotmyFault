@@ -95,8 +95,9 @@ def rule_binding_types(rule, triggers_meta, actions_meta):
         action = groups[identity]
         for usage in iter_references(action.get("exports", {})):
             reference = usage.reference
-            if reference.get("scope") == "step" and reference.get("node") in groups:
-                exports(reference["node"])
+            node = reference.get("node")
+            if reference.get("scope") == "step" and isinstance(node, str) and node in groups:
+                exports(node)
         fields = {}
         for name, expression in action.get("exports", {}).items():
             try:
@@ -221,6 +222,9 @@ def check_rule_bindings(rule, triggers_meta, actions_meta):
             validate_reference_fields(reference, location)
         except BindingResolutionError as error:
             add(error.code, location, str(error), reference)
+            return None
+        if scope != "event" and (not isinstance(scope, str) or not isinstance(node, str)):
+            add("invalid_reference", location, "引用的数据源节点无效", reference)
             return None
         policy = reference.get("on_missing")
         if scope in ("trigger", "trigger_config"):
