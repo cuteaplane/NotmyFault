@@ -10,10 +10,6 @@
     "requires_capabilities": [
         "window.pin"
     ],
-    "platforms": [
-        "windows",
-        "linux"
-    ],
     "permissions": [
         "native_api",
         "external_binary"
@@ -25,17 +21,9 @@
             "type": "string"
         },
         {
-            "name": "hwnd",
-            "label": "窗口句柄",
-            "type": "number",
-            "value_type": "int",
-            "required": false
-        },
-        {
             "name": "window_id",
-            "label": "Linux 窗口 ID",
-            "type": "string",
-            "required": false
+            "label": "窗口 ID",
+            "type": "string"
         }
     ],
     "params": [

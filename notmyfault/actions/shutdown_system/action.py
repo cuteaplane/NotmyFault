@@ -1,94 +1,12 @@
 """系统关机、重启、注销、休眠和睡眠动作
 force 默认关闭，params.confirm 必须为 true，执行失败时抛异常
 """
-from notmyfault.plugin_api import action_values
+from notmyfault.plugin_api import action_values, platform
 
-import ctypes
-import os
-import subprocess
 import time
 
-from notmyfault.plugin_api import native_lock
-
-EWX_LOGOFF = 0
-EWX_SHUTDOWN = 0x00000001
-EWX_REBOOT = 0x00000002
-EWX_FORCE = 0x00000004
-EWX_POWEROFF = 0x00000008
-
-SE_SHUTDOWN_NAME = "SeShutdownPrivilege"
 
 _ALLOWED_ACTIONS = ("shutdown", "restart", "logoff", "hibernate", "sleep")
-
-_LINUX_COMMANDS = {
-    "shutdown": ["systemctl", "poweroff"],
-    "restart": ["systemctl", "reboot"],
-    "logoff": ["loginctl", "terminate-session"],
-    "hibernate": ["systemctl", "hibernate"],
-    "sleep": ["systemctl", "suspend"],
-}
-
-
-def _enable_shutdown_privilege():
-    try:
-        TOKEN_ADJUST_PRIVILEGES = 0x0020
-        TOKEN_QUERY = 0x0008
-        SE_PRIVILEGE_ENABLED = 0x2
-
-        class LUID(ctypes.Structure):
-            _fields_ = [("LowPart", ctypes.c_ulong), ("HighPart", ctypes.c_long)]
-
-        class TOKEN_PRIVILEGES(ctypes.Structure):
-            _fields_ = [
-                ("PrivilegeCount", ctypes.c_ulong),
-                ("Luid", LUID),
-                ("Attributes", ctypes.c_ulong),
-            ]
-
-        with native_lock():
-            advapi32 = ctypes.windll.advapi32
-            kernel32 = ctypes.windll.kernel32
-            kernel32.GetCurrentProcess.argtypes = []
-            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
-            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-            kernel32.CloseHandle.restype = ctypes.c_int
-            advapi32.OpenProcessToken.argtypes = [
-                ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p),
-            ]
-            advapi32.OpenProcessToken.restype = ctypes.c_int
-            advapi32.LookupPrivilegeValueW.argtypes = [
-                ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.POINTER(LUID),
-            ]
-            advapi32.LookupPrivilegeValueW.restype = ctypes.c_int
-            advapi32.AdjustTokenPrivileges.argtypes = [
-                ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(TOKEN_PRIVILEGES),
-                ctypes.c_uint32, ctypes.POINTER(TOKEN_PRIVILEGES),
-                ctypes.POINTER(ctypes.c_uint32),
-            ]
-            advapi32.AdjustTokenPrivileges.restype = ctypes.c_int
-
-            token = ctypes.c_void_p()
-            if not advapi32.OpenProcessToken(
-                kernel32.GetCurrentProcess(),
-                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-                ctypes.byref(token),
-            ):
-                raise RuntimeError("无法打开当前进程的关机权限令牌")
-            try:
-                luid = LUID()
-                if not advapi32.LookupPrivilegeValueW(
-                    None, SE_SHUTDOWN_NAME, ctypes.byref(luid)
-                ):
-                    raise RuntimeError("无法查询 Windows 关机权限")
-                tp = TOKEN_PRIVILEGES(1, luid, SE_PRIVILEGE_ENABLED)
-                kernel32.SetLastError(0)
-                if not advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None) or kernel32.GetLastError():
-                    raise RuntimeError("无法启用 Windows 关机权限")
-            finally:
-                kernel32.CloseHandle(token)
-    except Exception as error:
-        raise RuntimeError(f"启用关机权限失败: {error}") from error
-
 
 def _execute(params, cancellation=None):
     action = params.get("action", "shutdown")
@@ -127,57 +45,7 @@ def _execute(params, cancellation=None):
 
     print(f"[Action:shutdown_system] 执行: {action} (force={force})")
 
-    if os.name != "nt":
-        command = _LINUX_COMMANDS[action]
-        if action == "logoff":
-            from notmyfault.platform.linux_support import current_session_id
-
-            session = current_session_id()
-            if not session:
-                raise RuntimeError("当前系统无法获取会话 ID，不能注销")
-            command = command + [session]
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=15,
-            )
-        except (OSError, subprocess.SubprocessError) as error:
-            raise RuntimeError(f"执行系统电源操作失败: {error}") from error
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"操作失败: {result.stderr.strip() or f'退出码 {result.returncode}'}"
-            )
-        return
-
-    if action != "logoff":
-        _enable_shutdown_privilege()
-    with native_lock():
-        if action in ("hibernate", "sleep"):
-            powrprof = ctypes.windll.powrprof
-            powrprof.SetSuspendState.argtypes = [ctypes.c_ubyte] * 3
-            powrprof.SetSuspendState.restype = ctypes.c_ubyte
-            ok = powrprof.SetSuspendState(action == "hibernate", False, False)
-        else:
-            flags = {
-                "shutdown": EWX_SHUTDOWN | EWX_POWEROFF,
-                "restart": EWX_REBOOT,
-                "logoff": EWX_LOGOFF,
-            }[action]
-            if force:
-                flags |= EWX_FORCE
-            user32 = ctypes.windll.user32
-            user32.ExitWindowsEx.argtypes = [ctypes.c_uint, ctypes.c_uint32]
-            user32.ExitWindowsEx.restype = ctypes.c_int
-            ok = user32.ExitWindowsEx(flags, 0)
-    if not ok:
-        raise RuntimeError(
-            f"系统未能执行 {action}（可能被其他程序阻止或权限不足）"
-        )
-
-
+    platform.power.system(action, force=force)
 
 
 def run_with_context(action_info, params, context):

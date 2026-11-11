@@ -43,5 +43,9 @@
             "type": "bool",
             "default": true
         }
+    ],
+    "optional_capabilities": [
+        "window.enumerate",
+        "file.lock"
     ]
 }
