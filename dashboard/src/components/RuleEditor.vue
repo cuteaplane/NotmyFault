@@ -412,7 +412,7 @@ function onEditorKeydown(event) {
     </div>
 
     <Transition name="ai-panel-slide">
-      <aside v-if="aiEnabled && aiPanelOpen" class="ai-editor-panel" :style="{ '--ai-panel-width': aiPanelWidth + 'px' }"
+      <aside v-if="aiEnabled" v-show="aiPanelOpen" class="ai-editor-panel" :style="{ '--ai-panel-width': aiPanelWidth + 'px' }"
         role="complementary" aria-label="AI 助手">
         <div class="ai-panel-resize" title="拖动调整宽度" @pointerdown="startAiPanelResize"></div>
         <header class="ai-editor-panel-head">

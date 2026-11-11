@@ -14,8 +14,14 @@ import { actionOutputDefs, bindingSourceFor, buildNodeDataPorts, collectReferenc
 import { getGraphTriggers, walkGraphActions, copyGraphNode } from '../src/lib/workflowGraph.js'
 import { compatibleTypes, formatTypedInput, isOpaqueValue, parseTypedInput, typeAtPath } from '../src/lib/valueTypes.js'
 import { ORIGIN_RULES } from '../src/lib/origin.js'
+import { formatParamValue } from '../src/lib/rulePresentation.js'
 
 import { sequentialRule, ruleWith, wire, eventGroup, trigger } from './canvas-fixtures.mjs'
+
+const sensitiveParamHidden = formatParamValue('hunter2', { name: 'password', sensitive: true }) === '已设置'
+  && formatParamValue('hunter2', { name: 'password', type: 'string' }) === 'hunter2'
+console.log((sensitiveParamHidden ? 'PASS' : 'FAIL') + ' - sensitive parameters are hidden on canvas cards')
+if (!sensitiveParamHidden) process.exitCode = 1
 
 function ruleActions(rule) {
   if (!rule?.workflow) return []
@@ -1744,7 +1750,8 @@ const savedConversation = JSON.parse(window.sessionStorage.getItem('nmf_ai_conve
 const conversationPersistsAfterRetry = savedConversation.length > 0
   && savedConversation.at(-1)?.error === true
   && savedConversation.at(-1)?.retryPrompt === '继续说明这个草稿'
-  && savedConversation.every(message => !('result' in message) && !('reasoning' in message))
+  && savedConversation.every(message => !('reasoning' in message))
+  && savedConversation.some(message => message.result?.result_type === 'rule_draft')
   && !window.localStorage.getItem('nmf_ai_conversation')
 console.log((requestHasNoRemovedPluginFields && errorAnnouncedOnce && conversationPersistsAfterRetry?'PASS':'FAIL')+' - AI errors can be retried without removed plugin fields')
 if (!requestHasNoRemovedPluginFields || !errorAnnouncedOnce || !conversationPersistsAfterRetry) {
@@ -2640,6 +2647,41 @@ if (!latestSelectionWinsLogRace) process.exitCode = 1
 const sseDeclaresEventStream = engineRequestHeaders?.Accept === 'text/event-stream'
 console.log((sseDeclaresEventStream?'PASS':'FAIL')+' - SSE 请求声明 text/event-stream，避开 30 秒通用超时')
 if (!sseDeclaresEventStream) process.exitCode = 1
+
+rulesNav?.click()
+await waitFor('.rules-library')
+;[...document.querySelectorAll('.rules-library button')].find(button => button.textContent.includes('创建自动化'))?.click()
+await waitFor('.automation-create-panel')
+openBlankRule()?.click()
+if (!await waitFor('.rule-title-capsule')) throw new Error('空白规则按钮没有打开编辑器')
+const aiPanelToggle = () => [...document.querySelectorAll('.rule-editor-actions button')].find(
+  button => (button.title || '').includes('AI 起草'),
+)
+let aiPanelStaysMounted = true
+if (aiPanelToggle()) {
+  aiPanelToggle()?.click()
+  await pause(50)
+  aiPanelToggle()?.click()
+  await pause(50)
+  aiPanelStaysMounted = !!document.querySelector('.ai-editor-panel')
+}
+console.log((aiPanelStaysMounted ? 'PASS' : 'FAIL') + ' - collapsing the AI panel keeps its conversation mounted')
+if (!aiPanelStaysMounted) process.exitCode = 1
+document.querySelector('.rule-title-edit')?.click()
+const blankRuleNameInput = await waitFor('.rule-title-capsule input')
+if (!blankRuleNameInput) throw new Error('规则名称输入框没有打开')
+blankRuleNameInput.value = '临时新规则'
+blankRuleNameInput.dispatchEvent(new window.Event('input', { bubbles: true }))
+await pause(400)
+const newRuleRecovery = JSON.parse(window.localStorage.getItem('notmyfault.ruleDraft.v1') || 'null')
+const newRuleRecoveryOk = newRuleRecovery?.isNew === true
+  && newRuleRecovery?.draft?.name === '临时新规则'
+console.log((newRuleRecoveryOk ? 'PASS' : 'FAIL') + ' - unsaved new rule drafts are persisted for recovery')
+if (!newRuleRecoveryOk) process.exitCode = 1
+document.querySelector('.rule-back-btn')?.click()
+const leaveNewRule = await waitFor(() => document.querySelector('.app-dialog'))
+;[...leaveNewRule.querySelectorAll('button')].find(button => button.textContent.trim() === '放弃')?.click()
+await waitFor(() => !document.querySelector('.rule-editor-page'))
 
 const connectionsBeforeUnmount = engineConnections
 document.getElementById('app').__vue_app__.unmount()

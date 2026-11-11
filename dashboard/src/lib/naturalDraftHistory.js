@@ -50,8 +50,8 @@ export function saveConversation(messages) {
     const toSave = messages
       .filter(m => !m.transient)
       .slice(-MAX_HISTORY_ITEMS)
-      .map(({ id, role, timestamp, content, stopped, error, requestMessageId, retryPrompt }) => ({
-        id, role, timestamp, content, stopped, error, requestMessageId, retryPrompt,
+      .map(({ id, role, timestamp, content, stopped, error, requestMessageId, retryPrompt, result }) => ({
+        id, role, timestamp, content, stopped, error, requestMessageId, retryPrompt, result,
       }))
     if (toSave.length) sessionStorage.setItem(STORAGE_KEY, JSON.stringify(toSave))
     else sessionStorage.removeItem(STORAGE_KEY)

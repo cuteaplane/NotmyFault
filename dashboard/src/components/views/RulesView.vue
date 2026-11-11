@@ -190,8 +190,22 @@ function readDraftRecovery() {
 function clearDraftRecovery() {
   try { localStorage.removeItem(DRAFT_RECOVERY_KEY) } catch {}
 }
+function isBlankNewRule(rule) {
+  return !rule.workflow?.nodes?.length
+    && !rule.workflow?.edges?.length
+    && !rule.variables?.length
+    && !rule.constants?.length
+    && !rule.concurrency
+    && (!rule.name || rule.name === '新规则')
+    && (!rule.folder || rule.folder === '未分类')
+}
 function persistDraftRecovery() {
-  if (!draftRule.value || !baseline.value || JSON.stringify(draftRule.value) === baseline.value) {
+  if (!draftRule.value) {
+    clearDraftRecovery()
+    return
+  }
+  const snapshot = JSON.stringify(draftRule.value)
+  if (baseline.value ? snapshot === baseline.value : isBlankNewRule(draftRule.value)) {
     clearDraftRecovery()
     return
   }
@@ -837,7 +851,7 @@ onActivated(consumePendingNavigation)
         </div>
         <div class="actions">
           <button v-if="store.aiDrafting.enabled" class="btn btn-tonal" @click="createWithAi"><span class="material-symbols-outlined">auto_awesome</span>AI 起草</button>
-          <button class="btn btn-text" @click="addRule"><span class="material-symbols-outlined">edit_note</span>空白规则</button>
+          <button class="btn btn-text" @click="addRule()"><span class="material-symbols-outlined">edit_note</span>空白规则</button>
           <button class="btn btn-tonal" @click="openQuickCreate"><span class="material-symbols-outlined">account_tree</span>自己搭一个</button>
           <button v-if="store.configData.rules.length" class="icon-btn" aria-label="收起创建区" title="收起创建区" @click="showCreatePanel = false"><span class="material-symbols-outlined" aria-hidden="true">close</span></button>
         </div>

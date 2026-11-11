@@ -851,7 +851,7 @@ onUnmounted(() => clearTimeout(refreshTimer))
               <div class="preview-section-title">
                 <span class="material-symbols-outlined">check_circle</span>安全检查
               </div>
-              <p class="safe-notice">未发现安全风险，权限符合规范</p>
+              <p class="safe-notice">未发现已知危险写法，权限符合规范</p>
             </div>
           </div>
 
