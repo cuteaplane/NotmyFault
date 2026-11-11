@@ -1,51 +1,5 @@
-import ctypes
-import os
-
-from notmyfault.plugin_api import native_lock, platform_services
+from notmyfault.plugin_api import platform
 from notmyfault.triggers.base import PollingTrigger
-
-CF_UNICODETEXT = 13
-
-if os.name == "nt":
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
-    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
-    user32.OpenClipboard.restype = ctypes.c_bool
-    user32.CloseClipboard.argtypes = []
-    user32.CloseClipboard.restype = ctypes.c_bool
-    user32.GetClipboardData.argtypes = [ctypes.c_uint]
-    user32.GetClipboardData.restype = ctypes.c_void_p
-    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
-    kernel32.GlobalLock.restype = ctypes.c_void_p
-    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
-    kernel32.GlobalUnlock.restype = ctypes.c_bool
-
-
-def _get_clipboard_text():
-    if os.name != "nt":
-        return platform_services().read_clipboard()
-    # NATIVE_LOCK 保护 ctypes 调用，共享引用表在多线程下存在竞态
-    with native_lock():
-        return _get_clipboard_text_locked()
-
-
-def _get_clipboard_text_locked():
-    if not user32.OpenClipboard(None):
-        return None
-    try:
-        handle = user32.GetClipboardData(CF_UNICODETEXT)
-        if not handle:
-            return None
-        ptr = kernel32.GlobalLock(handle)
-        if not ptr:
-            return None
-        try:
-            # CF_UNICODETEXT 以 NUL 结尾，传入 GlobalSize 会把终止符也读入
-            return ctypes.wstring_at(ptr)
-        finally:
-            kernel32.GlobalUnlock(handle)
-    finally:
-        user32.CloseClipboard()
 
 
 class ClipboardTrigger(PollingTrigger):
@@ -56,11 +10,11 @@ class ClipboardTrigger(PollingTrigger):
 
     def setup(self):
         self.match_text = str(self.config.get("match_text", "")).strip()
-        self._last_content = _get_clipboard_text()
+        self._last_content = platform.clipboard.read()
         self.log("剪贴板监控启动")
 
     def poll(self):
-        current = _get_clipboard_text()
+        current = platform.clipboard.read()
         if current is None or current == self._last_content:
             return
         if not self.match_text:

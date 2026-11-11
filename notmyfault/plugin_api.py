@@ -8,63 +8,26 @@ from threading import Event
 from typing import Any, Callable, Mapping, Protocol
 
 from notmyfault.core.run_context import RunContext
+from notmyfault.platform.errors import PlatformServiceError
+from notmyfault.platform.models import CapabilityStatus
 from notmyfault.values import Blob, Secret, action_values
 
 
 HOST_API_VERSION = 1
 
 
-@dataclass(frozen=True)
-class CapabilityStatus:
-    id: str
-    available: bool
-    backend: str | None
-    reason: str | None
-    degraded: bool
+def __getattr__(name: str):
+    if name == "platform":
+        from notmyfault.platform.services import platform
 
-
-class PlatformServiceError(RuntimeError):
-    def __init__(self, capability: str, kind: str, reason: str) -> None:
-        self.capability = capability
-        self.kind = kind
-        self.reason = reason
-        super().__init__(f"{capability}: {reason}")
-
-
-def platform_services():
-    from notmyfault.platform.services import PlatformServices
-
-    return PlatformServices()
+        return platform
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def native_lock():
-    from notmyfault.native import NATIVE_LOCK
+    from notmyfault.platform._native import NATIVE_LOCK
 
     return NATIVE_LOCK
-
-
-def platform_backend_api():
-    from notmyfault.platform.backends import (
-        BackendError,
-        BackendMissingError,
-        DisplayBackend,
-        PowerProfileBackend,
-        ScreenshotBackend,
-        SleepResumeBackend,
-        WindowBackend,
-        default_runner,
-    )
-
-    return SimpleNamespace(
-        BackendError=BackendError,
-        BackendMissingError=BackendMissingError,
-        DisplayBackend=DisplayBackend,
-        PowerProfileBackend=PowerProfileBackend,
-        ScreenshotBackend=ScreenshotBackend,
-        SleepResumeBackend=SleepResumeBackend,
-        WindowBackend=WindowBackend,
-        default_runner=default_runner,
-    )
 
 
 def network_security_api():

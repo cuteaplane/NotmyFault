@@ -51,7 +51,7 @@ def set_battery(monkeypatch, mod, percent, plugged):
 def test_audio_device_emits_only_on_change(monkeypatch, device_type, fail_at):
     mod = load_plugin("triggers", "audio_device")
     devices = {"render": "A", "capture": "C"}
-    monkeypatch.setattr(mod, "_query_default_devices", lambda: dict(devices))
+    monkeypatch.setattr(mod.platform.audio, "default_devices", lambda: dict(devices))
     events = []
     attempts = 0
 
@@ -191,115 +191,46 @@ def test_battery_level_validate_rejects_bad_config(config):
         trigger.validate()
 
 
-def test_power_state_creates_message_window_only_for_resume(monkeypatch):
-    mod = load_plugin("triggers", "power_state")
-    window = object()
-    created = []
-    monkeypatch.setattr(mod, "os", SimpleNamespace(name="nt"))
-    monkeypatch.setattr(mod, "_is_on_battery", lambda: (False, 100))
-    monkeypatch.setattr(
-        mod,
-        "_create_power_event_window",
-        lambda: created.append(True) or window,
-    )
-
-    ac_trigger = mod.PowerStateTrigger(
-        {"id": "power_state"},
-        {"state": "ac"},
-        lambda payload: None,
-        threading.Event(),
-    )
-    ac_trigger.setup()
-    resume_trigger = mod.PowerStateTrigger(
-        {"id": "power_state"},
-        {"state": "resume"},
-        lambda payload: None,
-        threading.Event(),
-    )
-    resume_trigger.setup()
-
-    assert ac_trigger.power_window is None
-    assert resume_trigger.power_window is window
-    assert created == [True]
-    resume_trigger.validate()
-
-
-def test_power_state_resume_uses_linux_monitor(monkeypatch):
+@pytest.mark.parametrize("percent", [88, None])
+def test_power_state_resume_emits_once_and_stops_monitor(monkeypatch, percent):
     mod = load_plugin("triggers", "power_state")
     monitor = MagicMock()
-    monitor.consume_resume.return_value = True
-    monkeypatch.setattr(mod, "os", SimpleNamespace(name="posix"))
-    monkeypatch.setattr(mod, "sys", SimpleNamespace(platform="linux"))
-    monkeypatch.setattr(mod, "_is_on_battery", lambda: (False, 88))
-    monkeypatch.setattr(mod, "_create_linux_resume_monitor", lambda: monitor)
+    monitor.consume_resume.side_effect = [True, False]
+    monkeypatch.setattr(mod.platform.power, "battery", lambda: {"on_battery": False, "percent": percent})
+    monkeypatch.setattr(mod.platform.power, "resume_monitor", lambda: monitor)
     events = []
     trigger = hosted_sampler(mod, "PowerStateTrigger", {"state": "resume"}, events)
     trigger.validate()
     trigger.setup()
-    assert trigger.power_window is None
-    assert trigger.resume_monitor is monitor
     trigger.poll()
-    assert events == [{"state": "resume", "battery_percent": 88}]
+    trigger.poll()
+    assert events == [{"state": "resume", "battery_percent": percent}]
     trigger.teardown()
     monitor.stop.assert_called_once()
 
 
-@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 GetSystemPowerStatus")
-@pytest.mark.parametrize("success,ac,flags,percent,expected", [
-    (0, 0, 0, 0, None), (1, 255, 255, 255, None),
-    (1, 1, 255, 255, None), (1, 1, 128, 255, (False, 100)),
-    (1, 0, 1, 20, (True, 20)),
-])
-def test_power_read_preserves_unknown_state(monkeypatch, success, ac, flags, percent, expected):
+def test_power_state_low_battery_excludes_unknown_and_rearms_after_absence(monkeypatch):
     mod = load_plugin("triggers", "power_state")
-    def query(status):
-        status[0], status[1], status[2] = ac, flags, percent
-        return success
-    monkeypatch.setattr(mod.ctypes.windll.kernel32, "GetSystemPowerStatus", query)
-    if expected is None:
-        with pytest.raises(RuntimeError):
-            mod._is_on_battery()
-    else:
-        assert mod._is_on_battery() == expected
+    values = iter([
+        {"on_battery": False, "percent": None},
+        {"on_battery": True, "percent": None},
+        {"on_battery": True, "percent": 19},
+        {"on_battery": True, "percent": 22},
+        {"on_battery": False, "percent": None},
+        {"on_battery": True, "percent": 18},
+    ])
+    monkeypatch.setattr(mod.platform.power, "battery", lambda: next(values))
+    trigger, events = make_trigger(mod, "PowerStateTrigger", {"state": "low_battery"})
+    trigger.setup()
+    for _ in range(6):
+        trigger.poll()
+    trigger.teardown()
+    assert events == [
+        {"state": "low_battery", "battery_percent": 19},
+        {"state": "low_battery", "battery_percent": 18},
+    ]
 
 
-@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 创建电源消息窗口")
-def test_power_state_keeps_native_callback_until_window_is_destroyed(monkeypatch):
-    mod = load_plugin("triggers", "power_state")
-    user32 = MagicMock()
-    kernel32 = MagicMock()
-    user32.RegisterClassW.return_value = 1
-    user32.CreateWindowExW.return_value = 99
-    user32.DestroyWindow.return_value = 1
-    user32.UnregisterClassW.return_value = 1
-    kernel32.GetModuleHandleW.return_value = 88
-    kernel32.GetCurrentThreadId.return_value = 123
-    monkeypatch.setattr(mod.ctypes.windll, "user32", user32)
-    monkeypatch.setattr(mod.ctypes.windll, "kernel32", kernel32)
-
-    window = mod._create_power_event_window()
-
-    def peek_message(message, *_args):
-        ctypes.POINTER(mod.wintypes.MSG).from_param(message)
-        return 0
-
-    user32.PeekMessageW.side_effect = peek_message
-    window["wnd_proc"](99, mod.WM_POWERBROADCAST, mod.PBT_APMRESUMEAUTOMATIC, 0)
-    assert mod._pump_power_messages(window) is True
-
-    def destroy_window(hwnd):
-        assert window["wnd_proc"] in mod._WND_PROC_HOLD
-        assert window["wnd_proc"](hwnd, mod.WM_POWERBROADCAST, mod.PBT_APMRESUMEAUTOMATIC, 0) == 0
-        return 1
-
-    user32.DestroyWindow.side_effect = destroy_window
-    mod._destroy_power_event_window(window)
-    assert window["state"]["resume"] is True
-    user32.DestroyWindow.assert_called_once_with(99)
-    user32.UnregisterClassW.assert_called_once_with(
-        window["class_name"], 88
-    )
-    assert window["wnd_proc"] not in mod._WND_PROC_HOLD
 
 
 @pytest.mark.parametrize("mode,next_date", [("daily", 2), ("weekly", 8)])
@@ -405,7 +336,7 @@ def test_cron_schedule_weekly_respects_weekdays(monkeypatch):
 
 def test_session_lock_emits_after_debounce(monkeypatch):
     mod = load_plugin("triggers", "session_lock")
-    scripted(monkeypatch, mod, "_is_locked", [False, True, True])
+    scripted(monkeypatch, mod.platform.session, "is_locked", [False, True, True])
     trigger, events = make_trigger(mod, "SessionLockTrigger", {})
     trigger.poll()
     trigger.poll()
@@ -417,7 +348,7 @@ def test_session_lock_emits_after_debounce(monkeypatch):
 
 def test_session_lock_debounce_reverts_before_confirmation(monkeypatch):
     mod = load_plugin("triggers", "session_lock")
-    scripted(monkeypatch, mod, "_is_locked", [False, True, False])
+    scripted(monkeypatch, mod.platform.session, "is_locked", [False, True, False])
     trigger, events = make_trigger(mod, "SessionLockTrigger", {})
     trigger.poll()
     trigger.poll()
@@ -427,7 +358,7 @@ def test_session_lock_debounce_reverts_before_confirmation(monkeypatch):
 
 def test_session_lock_filters_by_target_state(monkeypatch):
     mod = load_plugin("triggers", "session_lock")
-    scripted(monkeypatch, mod, "_is_locked", [True, False, False, True, True])
+    scripted(monkeypatch, mod.platform.session, "is_locked", [True, False, False, True, True])
     trigger, events = make_trigger(mod, "SessionLockTrigger", {"state": "locked"})
     trigger.poll()
     trigger.poll()
@@ -459,39 +390,10 @@ def test_system_startup_fires_once_after_delay(monkeypatch):
     assert events[0]["delay_seconds"] == 5.0
 
 
-@pytest.mark.parametrize("platform", ["nt", "posix"])
 @pytest.mark.parametrize("ssid", ["Home", '"家中:WiFi"', r"Lab\WiFi", "Cafe:WiFi", 'Home"', " Home ", " ", "\u3000Home\u3000"])
-@pytest.mark.parametrize("locale_env", [
-    {"LANG": "C", "LC_ALL": "C"}, {"LANG": "zh_CN.UTF-8"},
-    {"LANG": "C", "LC_ALL": "zh_CN.UTF-8"},
-])
-def test_wifi_network_emits_on_target_connect(monkeypatch, platform, ssid, locale_env):
-    from notmyfault.platform import windows_wifi
-
+def test_wifi_network_emits_on_target_connect(monkeypatch, ssid):
     mod = load_plugin("triggers", "wifi_network")
-    monkeypatch.delenv("LC_ALL", raising=False)
-    monkeypatch.delenv("LC_MESSAGES", raising=False)
-    for key, value in locale_env.items():
-        monkeypatch.setenv(key, value)
-    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
-    monkeypatch.setattr(mod, "os", SimpleNamespace(name=platform, environ=os.environ))
-    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/nmcli")
-    states = iter(["", ssid])
-    monkeypatch.setattr(windows_wifi, "current_ssid", lambda: next(states))
-
-    def query(*args, **kwargs):
-        assert platform == "posix"
-        current = next(states)
-        encoded = current.replace("\\", "\\\\").replace(":", "\\:")
-        environment = kwargs.get("env", os.environ)
-        english = (environment.get("LC_ALL") or environment.get("LANG")) == "C"
-        active = "yes" if english else "是"
-        inactive = "no" if english else "否"
-        output = f"{active}:{encoded}\n" if current else f"{inactive}:Other\n"
-        assert environment["DBUS_SESSION_BUS_ADDRESS"] == os.environ["DBUS_SESSION_BUS_ADDRESS"]
-        return SimpleNamespace(returncode=0, stdout=output)
-
-    monkeypatch.setattr(mod.subprocess, "run", query)
+    scripted(monkeypatch, mod.platform.wifi, "current_ssid", [None, ssid])
     trigger, events = make_trigger(
         mod, "WifiNetworkTrigger", {"direction": "connected", "ssid": ssid}
     )
@@ -500,18 +402,17 @@ def test_wifi_network_emits_on_target_connect(monkeypatch, platform, ssid, local
     assert events == [
         {"ssid": ssid, "previous_ssid": "", "connected": True, "target": ssid}
     ]
-    assert dict(os.environ).get("LC_ALL") == locale_env.get("LC_ALL")
 
 
-@pytest.mark.parametrize("next_ssid", ["", "Office"])
+@pytest.mark.parametrize("next_ssid", [None, "Office"])
 def test_wifi_network_emits_on_leaving_target(monkeypatch, next_ssid):
     mod = load_plugin("triggers", "wifi_network")
-    scripted(monkeypatch, mod, "_current_ssid", ["Home", next_ssid])
+    scripted(monkeypatch, mod.platform.wifi, "current_ssid", ["Home", next_ssid])
     trigger, events = make_trigger(
         mod, "WifiNetworkTrigger", {"direction": "disconnected", "ssid": "Home"}
     )
     trigger.poll()
     trigger.poll()
     assert events == [
-        {"ssid": next_ssid, "previous_ssid": "Home", "connected": bool(next_ssid), "target": "Home"}
+        {"ssid": next_ssid or "", "previous_ssid": "Home", "connected": bool(next_ssid), "target": "Home"}
     ]
