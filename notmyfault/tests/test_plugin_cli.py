@@ -71,6 +71,31 @@ def test_check_reports_all_plugin_surfaces(tmp_path, monkeypatch):
     }
 
 
+def test_check_distinguishes_required_and_optional_capabilities(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(plugin_cli, "probe_capabilities", lambda: {
+        "media.control": {
+            "available": True, "backend": "playerctl", "reason": "", "degraded": False,
+        },
+        "audio.control": {
+            "available": False, "backend": None, "reason": "未安装音量工具", "degraded": False,
+        },
+    })
+    root = write_action(
+        tmp_path / "optional",
+        requires_capabilities=["media.control"],
+        optional_capabilities=["audio.control"],
+    )
+    report = plugin_cli.check_plugin(root)
+    assert report["ok"] is True
+    assert [(item["id"], item["required"]) for item in report["capabilities"]] == [
+        ("media.control", True), ("audio.control", False),
+    ]
+    plugin_cli._print_report(report)
+    text = capsys.readouterr().out
+    assert "capability: media.control (必需) ok" in text
+    assert "capability: audio.control (可选) 未安装音量工具" in text
+
+
 def test_check_handles_malformed_manifest(tmp_path):
     root = tmp_path / "broken"
     root.mkdir()

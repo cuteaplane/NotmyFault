@@ -7,10 +7,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import notmyfault.platform
+
 from notmyfault.platform.capabilities import probe_capabilities
 from notmyfault.security.plugin_schema import (
     check_permissions_conform,
-    current_platform_name,
     get_permission_info,
     validate_plugin_meta,
 )
@@ -45,19 +46,23 @@ def check_plugin(plugin_dir: str | Path) -> dict[str, Any]:
     meta = inspection.meta
     schema_errors = inspection.schema_errors
     schema_ok = not schema_errors
-    platform = current_platform_name()
+    platform = notmyfault.platform.current()
     platform_ok = inspection.platform_compatible
     required = meta.get("requires_capabilities") or []
     if not isinstance(required, list):
         required = []
+    optional = meta.get("optional_capabilities") or []
+    if not isinstance(optional, list):
+        optional = []
     capabilities = [
-        {"id": capability, **capability_report.get(capability, {
+        {"id": capability, "required": is_required, **capability_report.get(capability, {
             "available": False,
             "backend": None,
             "reason": "未知能力 id",
             "degraded": False,
         })}
-        for capability in required
+        for values, is_required in ((required, True), (optional, False))
+        for capability in values
     ]
     permissions = meta.get("permissions") or []
     if not isinstance(permissions, list):
@@ -149,7 +154,8 @@ def _print_report(report: dict[str, Any]) -> None:
         print(f"platform: 未检查（{platform.get('reason', '检查未执行')}）")
     for item in report["capabilities"]:
         state = "ok" if item["available"] else item.get("reason") or "unavailable"
-        print(f"capability: {item['id']} {state}")
+        kind = "必需" if item["required"] else "可选"
+        print(f"capability: {item['id']} ({kind}) {state}")
     for item in report["permissions"]["items"]:
         print(f"permission: {item['id']} {item['risk']}")
     print(f"signature: {report['signature']}")
