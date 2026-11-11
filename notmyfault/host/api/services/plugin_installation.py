@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict
 
+import notmyfault.platform
 from notmyfault.application_paths import ApplicationPaths
 from notmyfault.config import ConfigValidationError, SignedConfigStore
 from notmyfault.core.logging import engine_error
@@ -40,7 +41,6 @@ from notmyfault.security.plugin_package import PluginPackageLimits, extract_nmfp
 from notmyfault.security.plugins import plugin_signature_kind
 from notmyfault.security.plugin_checks import (
     evaluate_plugin, inspect_plugin, inspection_report, is_plugin_platform_compatible,
-    current_platform_name,
 )
 from notmyfault.security.security import detect_security_mode
 
@@ -580,11 +580,25 @@ class PluginInstallationService:
                     + "; ".join((inspection.errors + inspection.schema_errors)[:3]),
                 )
             has_author_key = (root_path / "public_key.pem").is_file()
+            build_meta = meta.get("build") if isinstance(meta.get("build"), dict) else {}
+            build_commands = build_meta.get("command") or []
+            local_signing_key = None
+            if (
+                self._paths.plugin_private_key_file.exists()
+                or signing_password
+                or has_author_key
+                or build_commands
+            ):
+                local_signing_key, key_error = self._load_trusted_local_signing_key(
+                    signing_password
+                )
+                if key_error:
+                    self._fail(400, key_error)
             if has_author_key:
                 if inspection.signature.kind != "author":
                     self._fail(400, "作者插件签名无效，无法副签")
                 counter_error = self._counter_sign_author_key(
-                    root_path, signing_password
+                    root_path, local_signing_key
                 )
                 if counter_error:
                     self._fail(400, counter_error)
@@ -593,15 +607,6 @@ class PluginInstallationService:
             if not evaluation["allowed"]:
                 self._fail(400, "插件安全检查失败: " + "; ".join(evaluation["errors"][:3]))
 
-            build_meta = meta.get("build") if isinstance(meta.get("build"), dict) else {}
-            build_commands = build_meta.get("command") or []
-            local_signing_key = None
-            if build_commands:
-                local_signing_key, key_error = self._load_trusted_local_signing_key(
-                    signing_password
-                )
-                if key_error:
-                    self._fail(400, key_error)
             self._build_hook(root_path, meta)
             built_meta = self._read_manifest(root_path / json_name)
             if built_meta != meta:
@@ -791,13 +796,10 @@ class PluginInstallationService:
         return value
 
     def _counter_sign_author_key(
-        self, plugin_dir: Path, password: str
+        self, plugin_dir: Path, private_key
     ) -> str | None:
         from notmyfault.security.signing import counter_sign_author_key
 
-        private_key, error = self._load_trusted_local_signing_key(password)
-        if error:
-            return error
         try:
             counter_sign_author_key(plugin_dir, private_key)
         except Exception as error:
@@ -812,12 +814,12 @@ class PluginInstallationService:
 
         private_key_path = self._paths.plugin_private_key_file
         if not private_key_path.exists():
-            return None, "缺少签名私钥，无法信任作者自签插件"
+            return None, "缺少签名私钥，无法验证插件安装权限"
         encrypted = private_key_path.read_bytes()[:20].startswith(
             b"-----BEGIN ENCRYPTED"
         )
         if encrypted and not password:
-            return None, "安装作者自签插件需要输入签名私钥密码"
+            return None, "安装插件需要输入签名私钥密码"
         try:
             private_key = load_private_key(
                 private_key_path, password=password or None
@@ -827,7 +829,7 @@ class PluginInstallationService:
             )
         except Exception as error:
             self._log_exception("load_local_signing_key", error)
-            return None, "签名私钥密码错误或副签失败"
+            return None, "签名私钥密码错误或私钥无法读取"
         if public_key not in get_public_keys():
             return None, "签名私钥与本地受信任公钥不匹配"
         return private_key, None
@@ -1006,7 +1008,7 @@ class PluginInstallationService:
         declared = "、".join(str(item) for item in platforms) or "未声明"
         PluginInstallationService._fail(
             400,
-            f"插件只支持 {declared}，当前平台是 {current_platform_name()}，不能安装",
+            f"插件只支持 {declared}，当前平台是 {notmyfault.platform.current()}，不能安装",
         )
 
     @staticmethod

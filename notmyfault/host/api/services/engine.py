@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Protocol
 
@@ -132,19 +131,9 @@ class EngineService:
         }
 
     def platform_status(self) -> Dict[str, Any]:
-        from notmyfault.platform.capabilities import probe_capabilities
+        from notmyfault.platform.capabilities import platform_report
 
-        if sys.platform.startswith("linux"):
-            from notmyfault.platform.linux_support import capability_report
-
-            return capability_report()
-        return {
-            "platform": "windows" if sys.platform == "win32" else sys.platform,
-            "desktop": None,
-            "session_type": None,
-            "capabilities": probe_capabilities(),
-            "limitations": {},
-        }
+        return platform_report()
 
     def diagnostics(self) -> Dict[str, Any]:
         current_engine = self._engine.current_engine

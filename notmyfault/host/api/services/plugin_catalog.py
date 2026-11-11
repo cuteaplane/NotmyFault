@@ -256,11 +256,19 @@ class PluginCatalogService:
             f"{problem['capability']}: {problem['reason']}"
             for problem in problems
         ]
+        optional_missing = [
+            f"部分功能不可用：{capability_id}: {entry.get('reason') or '能力不可用'}"
+            for capability_id in meta.get("optional_capabilities", [])
+            if not (entry := capability_report.get(
+                capability_id, {"available": False, "reason": "未知能力 id"}
+            )).get("available", False)
+        ]
+        reasons.extend(optional_missing)
         meta["platform_compatible"] = platform_compatible
         meta["capability_compatible"] = capability_ok
         if not platform_compatible:
             meta["availability"] = "unavailable"
-            meta["unavailable_reasons"] = ["当前平台不支持"]
+            meta["unavailable_reasons"] = ["当前平台不支持", *reasons]
         elif not capability_ok:
             meta["availability"] = "unavailable"
             meta["unavailable_reasons"] = reasons
@@ -271,8 +279,8 @@ class PluginCatalogService:
                 for capability_id, entry in capability_report.items()
                 if entry["degraded"] and capability_id in required
             ]
-            meta["availability"] = "partial" if degraded else "available"
-            meta["unavailable_reasons"] = degraded
+            meta["availability"] = "partial" if degraded or optional_missing else "available"
+            meta["unavailable_reasons"] = degraded + optional_missing
 
     def _include_unscannable_plugins(
         self,

@@ -100,6 +100,64 @@ def test_safe_nmfp_installs_to_injected_user_plugin_path(tmp_path):
     assert (installed / "action.py").is_file()
 
 
+@pytest.mark.parametrize("use_preview", [False, True])
+@pytest.mark.parametrize("signed", [False, True])
+def test_install_requires_local_key_password_without_build_or_author_key(
+    tmp_path, monkeypatch, use_preview, signed,
+):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from notmyfault.security import signing, signing_keys
+
+    env = make_api_env(tmp_path)
+    owner = Ed25519PrivateKey.generate()
+    password = "local-plugin-install-password"
+    public_key = install_local_signing_key(env, monkeypatch, owner, password)
+    root = tmp_path / "ordinary-plugin"
+    root.mkdir()
+    meta = make_meta("actions")
+    (root / "action.json").write_text(json.dumps(meta), encoding="utf-8")
+    source = b"def run_with_context(meta, params, context): return {'ok': True}\n"
+    (root / "action.py").write_bytes(source)
+    if signed:
+        signing.sign_plugin(root, owner)
+    archive = archive_plugin_folder(root, tmp_path / "ordinary-plugin.nmfp")
+    data = {}
+    if use_preview:
+        preview = post_archive(env, "/api/plugins/preview", archive).json()
+        data = {
+            "preview_token": preview["preview_token"],
+            "confirmed_risk_ids": json.dumps(preview["installation"]["required_risk_ids"]),
+        }
+
+    def install(supplied_password):
+        fields = {**data, "signing_password": supplied_password}
+        if use_preview:
+            return env.client.post("/api/plugins/install", headers=env.headers, data=fields)
+        return post_archive(env, "/api/plugins/install", archive, fields)
+
+    installed = env.paths.user_plugins_dir / "actions" / meta["id"]
+    for supplied_password in ("", "wrong password"):
+        rejected = install(supplied_password)
+        assert rejected.status_code == 400
+        assert "密码" in rejected.json()["error"]
+        assert not installed.exists()
+        assert not env.paths.plugin_manifest_file.exists()
+
+    other_key = Ed25519PrivateKey.generate()
+    install_local_signing_key(env, monkeypatch, other_key, password)
+    monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [public_key])
+    rejected = install(password)
+    assert rejected.status_code == 400
+    assert "公钥不匹配" in rejected.json()["error"]
+    assert not installed.exists()
+    install_local_signing_key(env, monkeypatch, owner, password)
+    accepted = install(password)
+    assert accepted.status_code == 200
+    assert (installed / "action.py").read_bytes() == source
+    if signed:
+        assert (installed / "signature.sig").read_bytes() == (root / "signature.sig").read_bytes()
+
+
 def test_schema_failure_does_not_create_plugin_directory(tmp_path):
     env = make_api_env(tmp_path)
     archive = build_nmfp(tmp_path, {"id": "broken"}, "actions", "broken")
@@ -442,7 +500,7 @@ def test_build_output_retries_and_local_signing_cover_generated_tree(tmp_path, m
 
 def test_evaluate_rejects_forbidden_code_and_missing_entry_without_replacing_old_plugin(tmp_path):
     from notmyfault.host.api.services import plugin_installation
-    from notmyfault.security.plugin_checks import current_platform_name
+    from notmyfault.platform import current as current_platform_name
 
     env = make_api_env(tmp_path)
     service = make_installation_service(env)
