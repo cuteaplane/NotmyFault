@@ -1,6 +1,6 @@
 <script setup>
 import { findGraphNode } from '../../lib/workflowGraph'
-import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, watch, onActivated, onDeactivated, onMounted, onUnmounted, nextTick } from 'vue'
 import { listRuns, readLogEntries, readLogFileEntries, listLogFiles } from '../../lib/api'
 import { store } from '../../lib/store'
 import { snackbar } from '../../lib/notify'
@@ -28,9 +28,10 @@ const searchText = ref('')
 const autoRefresh = ref(true)
 const expandedRunId = ref('')
 let timer = null
+let hidden = false
 let runsLoading = false
 let logsGeneration = 0
-const loadingLogFiles = new Set()
+const loadingLogFiles = new Map()
 let disposed = false
 const runsError = ref('')
 
@@ -245,14 +246,21 @@ async function refreshRuns() {
 
 async function refreshLogs() {
   const file = currentFile.value
-  if (disposed || loadingLogFiles.has(file)) return
-  loadingLogFiles.add(file)
+  if (disposed) return
   const generation = ++logsGeneration
+  let request = loadingLogFiles.get(file)
+  if (!request) {
+    request = Promise.resolve().then(() => file === ''
+      ? readLogEntries(600)
+      : readLogFileEntries(file, 600))
+    loadingLogFiles.set(file, request)
+    request.finally(() => {
+      if (loadingLogFiles.get(file) === request) loadingLogFiles.delete(file)
+    }).catch(() => {})
+  }
   try {
     const nearBottom = isNearBottom()
-    const list = file === ''
-      ? await readLogEntries(600)
-      : await readLogFileEntries(file, 600)
+    const list = await request
     if (disposed || generation !== logsGeneration || file !== currentFile.value) return
     entries.value = Array.isArray(list) ? list : []
     logsError.value = ''
@@ -260,8 +268,6 @@ async function refreshLogs() {
     if (nearBottom) scrollToEnd()
   } catch (error) {
     if (!disposed && generation === logsGeneration) logsError.value = error.message
-  } finally {
-    loadingLogFiles.delete(file)
   }
 }
 
@@ -333,7 +339,7 @@ function onFileChange() {
 
 function syncTimer() {
   const shouldRefresh = autoRefresh.value && (activeTab.value === 'runs' || isLatest.value)
-  if (shouldRefresh && !timer) timer = setInterval(refresh, 3000)
+  if (shouldRefresh && !timer && !hidden) timer = setInterval(refresh, 3000)
   else if (!shouldRefresh && timer) {
     clearInterval(timer)
     timer = null
@@ -356,6 +362,21 @@ onMounted(async () => {
     expandedRunId.value = store.pendingRunId
     store.pendingRunId = ''
   }
+  syncTimer()
+})
+onDeactivated(() => {
+  hidden = true
+  if (timer) clearInterval(timer)
+  timer = null
+})
+onActivated(() => {
+  if (!hidden) return
+  hidden = false
+  if (store.pendingRunId) {
+    expandedRunId.value = store.pendingRunId
+    store.pendingRunId = ''
+  }
+  refresh()
   syncTimer()
 })
 onUnmounted(() => {
@@ -381,10 +402,8 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <div v-if="showTabs" class="tabs run-center-tabs" role="tablist" aria-label="运行记录和原始日志">
-      <button class="tab" :class="{ active: activeTab === 'runs' }" role="tab" @click="activeTab = 'runs'">运行记录</button>
-      <button class="tab" :class="{ active: activeTab === 'logs' }" role="tab" @click="activeTab = 'logs'">原始日志</button>
-    </div>
+    <SegmentedTabs v-if="showTabs" v-model="activeTab" class="run-center-tabs" label="运行记录和原始日志"
+      :options="[{ value: 'runs', label: '运行记录' }, { value: 'logs', label: '原始日志' }]" />
 
     <template v-if="activeTab === 'runs'">
       <p v-if="runsError" class="danger-text" role="status">{{ runsError }}，可刷新重试。</p>

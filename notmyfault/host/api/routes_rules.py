@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 from fastapi import APIRouter, Request
@@ -21,7 +22,7 @@ def create_rules_router(
     router = APIRouter()
 
     @router.get("/api/rules")
-    async def rules_list():
+    def rules_list():
         return value_response(service.list_rules())
 
     @router.post("/api/rules/validate")
@@ -38,7 +39,7 @@ def create_rules_router(
                 {"ok": False, "error": "请求体必须包含 rule 对象"},
                 status_code=400,
             )
-        return value_response(service.validate_draft(body["rule"]))
+        return value_response(await asyncio.to_thread(service.validate_draft, body["rule"]))
 
     @router.post("/api/rules/approve")
     async def rules_approve(request: Request):
@@ -54,7 +55,7 @@ def create_rules_router(
             body.get("admin_key_password") if isinstance(body, dict) else None
         )
         try:
-            return value_response(service.approve(rules, password))
+            return value_response(await asyncio.to_thread(service.approve, rules, password))
         except RuleServiceError as error:
             return JSONResponse(error.body, status_code=error.status_code)
 
@@ -73,7 +74,8 @@ def create_rules_router(
                 status_code=400,
             )
         try:
-            return value_response(service.save(
+            return value_response(await asyncio.to_thread(
+                service.save,
                 body.get("rules"),
                 body.get("admin_key_password"),
                 body.get("expected_revision"),
@@ -104,7 +106,7 @@ def create_rules_router(
                     status_code=400,
                 )
         try:
-            return run_service.run(rule_index, body)
+            return await asyncio.to_thread(run_service.run, rule_index, body)
         except RuleRunServiceError as error:
             return JSONResponse(error.body, status_code=error.status_code)
 

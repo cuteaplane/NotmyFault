@@ -36,7 +36,7 @@ class CronScheduleTrigger(PollingTrigger):
             if not match:
                 raise ValueError(f"无效的触发时间: {raw_time!r}（应为 HH:MM）")
             self.hour, self.minute = int(match.group(1)), int(match.group(2))
-            self._fired_date: str | None = None
+            self._fired_date: str | None = self.state.get("fired_date") if self.state is not None else None
 
         if mode == "weekly":
             self.days = self._parse_days(self.config.get("days", "1,2,3,4,5"))
@@ -113,6 +113,8 @@ class CronScheduleTrigger(PollingTrigger):
         self._last_fired = sampled_at
 
     def _emit(self, now: datetime, mode: str) -> None:
+        if mode in ("daily", "weekly") and self.state is not None:
+            self.state.set("fired_date", now.strftime("%Y-%m-%d"), durable=True)
         self.log(f"计划触发: mode={mode}, time={now.strftime('%H:%M')}")
         self.emit({
             "triggered_at": now.strftime("%Y-%m-%d %H:%M:%S"),

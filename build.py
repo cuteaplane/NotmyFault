@@ -102,32 +102,31 @@ def cmd_init_keys(args):
     print(f"+ 用户公钥: {pub_file}（不检入 git）")
     print(f"+ 公钥指纹: {hashlib.sha256(pub_bytes).hexdigest()[:16]}...")
     
-    # 指定 --builtin 或缺少 signing_keys.py 时写入内置公钥
-    if args.get("builtin") or not SIGNING_MODULE.exists() or SIGNING_MODULE.stat().st_size < 50:
-        code = '"""保存内置公钥和从 .private/signing_public.pem 读取的用户公钥。"""\n'
-        code += '\nimport os\nfrom typing import Optional\n\n'
-        code += 'from notmyfault.security.signing import load_public_key_bytes\n\n'
-        code += 'CURDIR = os.path.dirname(os.path.abspath(__file__))\n'
-        code += '_PRIVATE_DIR = os.path.normpath(os.path.join(CURDIR, "..", "..", ".private"))\n\n'
-        code += f'BUILTIN_PUBLIC_KEY: bytes = {pub_bytes!r}\n\n'
-        code += '_USER_PUBLIC_KEY_PATH = os.path.join(_PRIVATE_DIR, "signing_public.pem")\n\n\n'
-        code += 'def _load_user_public_key() -> Optional[bytes]:\n'
-        code += '    try:\n'
-        code += '        with open(_USER_PUBLIC_KEY_PATH, "rb") as f:\n'
-        code += '            return load_public_key_bytes(f.read())\n'
-        code += '    except (OSError, ValueError, TypeError):\n'
-        code += '        return None\n\n\n'
-        code += 'USER_PUBLIC_KEY: Optional[bytes] = _load_user_public_key()\n\n\n'
-        code += 'def get_public_keys() -> list[bytes]:\n'
-        code += '    keys: list[bytes] = []\n'
-        code += '    if BUILTIN_PUBLIC_KEY:\n'
-        code += '        keys.append(BUILTIN_PUBLIC_KEY)\n'
-        code += '    if USER_PUBLIC_KEY:\n'
-        code += '        keys.append(USER_PUBLIC_KEY)\n'
-        code += '    return keys\n'
-        with open(SIGNING_MODULE, "w", encoding="utf-8") as f:
-            f.write(code)
+    pin_user_public_key(pub_bytes)
+    if args.get("builtin"):
+        _write_public_key("BUILTIN_PUBLIC_KEY", "bytes", pub_bytes)
         print(f"+ 内置公钥: {SIGNING_MODULE}（检入 git）")
+
+
+def _write_public_key(name: str, annotation: str, public_key: bytes) -> None:
+    import re
+
+    source = SIGNING_MODULE.read_text(encoding="utf-8")
+    pattern = rf"(?m)^{name}: [^\n]+$"
+    source, count = re.subn(pattern, lambda _match: f"{name}: {annotation} = {public_key!r}", source)
+    if count != 1:
+        raise ValueError("签名公钥常量缺失或重复")
+    SIGNING_MODULE.write_text(source, encoding="utf-8")
+
+
+def pin_user_public_key(public_key: bytes) -> None:
+    from notmyfault.security.signing import load_public_key_bytes
+
+    public_key = load_public_key_bytes(public_key)
+    _write_public_key("USER_PUBLIC_KEY", "Optional[bytes]", public_key)
+    from notmyfault.security import signing_keys
+    signing_keys.USER_PUBLIC_KEY = public_key
+
 
 def cmd_sign(args):
     """签名所有插件并返回供构建签名复用的私钥"""
@@ -135,7 +134,10 @@ def cmd_sign(args):
         print("! 私钥不存在，请先运行 build.py init-keys")
         raise SystemExit(1)
 
-    private_key = load_private_key(PRIVATE_KEY_FILE)
+    try:
+        private_key = load_private_key(PRIVATE_KEY_FILE)
+    finally:
+        os.environ.pop("NOTMYFAULT_SIGNING_PASSPHRASE", None)
     plugins = _collect_plugins()
     signed = 0
     for plugin_dir, json_name in plugins:
@@ -254,17 +256,11 @@ def cmd_build(args):
 
 def _build_integrity_manifest(private_key) -> None:
     """生成核心 Python 文件的哈希清单并用 Ed25519 签名"""
+    from notmyfault.security.security import core_source_files
+
     pkg_dir = ROOT / "notmyfault"
-    files = {}
-    # 清单覆盖根包和核心子包，跳过测试、模拟器、动作插件、触发器插件及缓存目录
-    for p in sorted(pkg_dir.rglob("*.py")):
-        rel = p.relative_to(pkg_dir).as_posix()
-        parts = rel.split("/")
-        if parts[0] in ("tests", "simulator", "actions", "__pycache__") or "__pycache__" in parts:
-            continue
-        if parts[0] == "triggers" and rel not in ("triggers/__init__.py", "triggers/base.py"):
-            continue
-        files[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+    files = {name: hashlib.sha256(path.read_bytes()).hexdigest()
+             for name, path in core_source_files(pkg_dir).items()}
     manifest_path = pkg_dir / "integrity.json"
     manifest_path.write_text(
         json.dumps({"files": files}, indent=2, sort_keys=True), encoding="utf-8"

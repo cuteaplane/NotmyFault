@@ -8,12 +8,11 @@
     "requires_capabilities": ["audio.device_query"],
     "execution_api": "context-v1",
     "idempotent": true,
-    "platforms": ["windows", "linux"],
     "permissions": ["audio", "external_binary", "native_api"],
     "outputs": [
         {"name": "device_type", "label": "设备类型", "type": "string"},
         {"name": "device_id", "label": "当前设备", "type": "string"},
-        {"name": "device_name", "label": "设备名称", "type": "string", "required": false},
+        {"name": "device_name", "label": "设备名称", "type": "string"},
         {"name": "previous_device_id", "label": "上一个设备", "type": "string"},
         {"name": "changed", "label": "是否发生切换", "type": "bool"},
         {"name": "method", "label": "控制方式", "type": "string"}

@@ -2,13 +2,57 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import py7zr
 import pytest
 
 from notmyfault.host.api.plugin_installation import PluginFileSystem
+from notmyfault.host.api.plugin_installation import PendingPreviewStore
+from notmyfault.host.api.services.plugin_catalog import PluginCatalogService
+from notmyfault.host.api.services.plugin_installation import PluginInstallationService
+from notmyfault.host.plugin_registry import PluginRegistryClient
 from notmyfault.tests.api_support import make_api_env
 from notmyfault.tests.plugin_support import build_nmfp, make_meta, post_archive
+
+
+def install_local_signing_key(env, monkeypatch, private_key, password: str):
+    from cryptography.hazmat.primitives.serialization import (
+        BestAvailableEncryption, Encoding, PrivateFormat, PublicFormat,
+    )
+    from notmyfault.security import signing_keys
+
+    public_key = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    private_path = env.paths.plugin_private_key_file
+    private_path.parent.mkdir(parents=True, exist_ok=True)
+    private_path.write_bytes(private_key.private_bytes(
+        Encoding.PEM,
+        PrivateFormat.PKCS8,
+        BestAvailableEncryption(password.encode("utf-8")),
+    ))
+    monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [public_key])
+    return public_key
+
+
+def make_installation_service(env, *, previews=None, build_hook=None):
+    return PluginInstallationService(
+        env.paths,
+        env.store,
+        PluginCatalogService(env.paths, env.store, env.runner),
+        PluginFileSystem(),
+        previews or PendingPreviewStore(),
+        PluginRegistryClient(),
+        build_hook=build_hook,
+    )
+
+
+def archive_plugin_folder(root, archive):
+    with py7zr.SevenZipFile(archive, "w") as output:
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                output.write(path, f"{root.name}/{path.relative_to(root).as_posix()}")
+    return archive
 
 
 @pytest.fixture(autouse=True)
@@ -54,6 +98,64 @@ def test_safe_nmfp_installs_to_injected_user_plugin_path(tmp_path):
     installed = env.paths.user_plugins_dir / "actions" / "demo_actions"
     assert (installed / "action.json").is_file()
     assert (installed / "action.py").is_file()
+
+
+@pytest.mark.parametrize("use_preview", [False, True])
+@pytest.mark.parametrize("signed", [False, True])
+def test_install_requires_local_key_password_without_build_or_author_key(
+    tmp_path, monkeypatch, use_preview, signed,
+):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from notmyfault.security import signing, signing_keys
+
+    env = make_api_env(tmp_path)
+    owner = Ed25519PrivateKey.generate()
+    password = "local-plugin-install-password"
+    public_key = install_local_signing_key(env, monkeypatch, owner, password)
+    root = tmp_path / "ordinary-plugin"
+    root.mkdir()
+    meta = make_meta("actions")
+    (root / "action.json").write_text(json.dumps(meta), encoding="utf-8")
+    source = b"def run_with_context(meta, params, context): return {'ok': True}\n"
+    (root / "action.py").write_bytes(source)
+    if signed:
+        signing.sign_plugin(root, owner)
+    archive = archive_plugin_folder(root, tmp_path / "ordinary-plugin.nmfp")
+    data = {}
+    if use_preview:
+        preview = post_archive(env, "/api/plugins/preview", archive).json()
+        data = {
+            "preview_token": preview["preview_token"],
+            "confirmed_risk_ids": json.dumps(preview["installation"]["required_risk_ids"]),
+        }
+
+    def install(supplied_password):
+        fields = {**data, "signing_password": supplied_password}
+        if use_preview:
+            return env.client.post("/api/plugins/install", headers=env.headers, data=fields)
+        return post_archive(env, "/api/plugins/install", archive, fields)
+
+    installed = env.paths.user_plugins_dir / "actions" / meta["id"]
+    for supplied_password in ("", "wrong password"):
+        rejected = install(supplied_password)
+        assert rejected.status_code == 400
+        assert "密码" in rejected.json()["error"]
+        assert not installed.exists()
+        assert not env.paths.plugin_manifest_file.exists()
+
+    other_key = Ed25519PrivateKey.generate()
+    install_local_signing_key(env, monkeypatch, other_key, password)
+    monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [public_key])
+    rejected = install(password)
+    assert rejected.status_code == 400
+    assert "公钥不匹配" in rejected.json()["error"]
+    assert not installed.exists()
+    install_local_signing_key(env, monkeypatch, owner, password)
+    accepted = install(password)
+    assert accepted.status_code == 200
+    assert (installed / "action.py").read_bytes() == source
+    if signed:
+        assert (installed / "signature.sig").read_bytes() == (root / "signature.sig").read_bytes()
 
 
 def test_schema_failure_does_not_create_plugin_directory(tmp_path):
@@ -129,9 +231,9 @@ def test_non_object_manifest_is_rejected_by_preview_and_reported_in_catalog(tmp_
 
 def test_strict_install_validates_signature_before_replacing_installed_plugin(tmp_path, monkeypatch):
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
     from notmyfault.host.api.services import plugin_installation
-    from notmyfault.security import signing, signing_keys
+    from notmyfault.security import signing
+    from notmyfault.security import signing_keys
     from notmyfault.security.security import SecurityMode
 
     env = make_api_env(tmp_path)
@@ -144,12 +246,9 @@ def test_strict_install_validates_signature_before_replacing_installed_plugin(tm
     author = Ed25519PrivateKey.generate()
     owner = Ed25519PrivateKey.generate()
     signing.self_sign_plugin(root, author)
-    monkeypatch.setattr(signing_keys, "get_public_keys", lambda: [
-        owner.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    ])
+    password = "local-owner-password"
+    install_local_signing_key(env, monkeypatch, owner, password)
     monkeypatch.setattr(plugin_installation, "detect_security_mode", lambda: SecurityMode.STRICT)
-    monkeypatch.setattr(plugin_installation.PluginInstallationService, "_counter_sign_author_key",
-                        lambda self, path, password: signing.counter_sign_author_key(path, owner) and None)
 
     def install(tag):
         archive = tmp_path / f"{tag}.nmfp"
@@ -161,6 +260,7 @@ def test_strict_install_validates_signature_before_replacing_installed_plugin(tm
         return env.client.post("/api/plugins/install", headers=env.headers, data={
             "preview_token": preview.json()["preview_token"],
             "confirmed_risk_ids": '["build_hook"]',
+            "signing_password": password,
         })
 
     assert install("valid").status_code == 200
@@ -301,6 +401,206 @@ def test_build_command_runs_as_argv_without_shell(tmp_path, monkeypatch):
     )
     assert captured["shell"] is False
     assert captured["command"] == ["python", "setup.py"]
+
+
+def test_build_output_retries_and_local_signing_cover_generated_tree(tmp_path, monkeypatch):
+    from pathlib import Path
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from notmyfault.host.api.services import plugin_installation
+    from notmyfault.security import signing
+
+    env = make_api_env(tmp_path)
+    service = make_installation_service(env)
+    high = build_nmfp(
+        tmp_path,
+        make_meta("actions", version_code=3, version="3.0"),
+        "actions",
+        "local-build-high",
+    )
+    assert service.install(high.read_bytes())["ok"] is True
+
+    owner = Ed25519PrivateKey.generate()
+    password = "temporary-plugin-owner-password"
+    local_public_key = install_local_signing_key(env, monkeypatch, owner, password)
+    author = Ed25519PrivateKey.generate()
+    root = tmp_path / "authored-build"
+    root.mkdir()
+    meta = make_meta(
+        "actions",
+        version_code=2,
+        version="2.0",
+        build={"command": ["python build.py"], "outputs": ["generated.py"]},
+    )
+    (root / "action.json").write_text(json.dumps(meta), encoding="utf-8")
+    (root / "action.py").write_text(
+        "def run_with_context(meta, params, context): return {'ok': True}\n",
+        encoding="utf-8",
+    )
+    signing.self_sign_plugin(root, author)
+    archive = archive_plugin_folder(root, tmp_path / "authored-build.nmfp")
+    preview = service.preview(archive.read_bytes())
+    token = preview["preview_token"]
+    preview_data = service._previews[token]
+    initial_snapshot = preview_data["file_snapshot"]
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        (Path(kwargs["cwd"]) / "generated.py").write_text(
+            "generated_value = 42\n", encoding="utf-8"
+        )
+        from types import SimpleNamespace
+
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(plugin_installation.subprocess, "run", fake_run)
+    confirmed = ["build_hook"]
+    with pytest.raises(plugin_installation.PluginInstallationError) as downgrade:
+        service.install(
+            None,
+            preview_token=token,
+            confirmed_risk_ids=confirmed,
+        )
+    assert "强制覆盖" in downgrade.value.body["error"]
+    assert token in service._previews
+
+    with pytest.raises(plugin_installation.PluginInstallationError) as bad_password:
+        service.install(
+            None,
+            preview_token=token,
+            signing_password="wrong password",
+            force=True,
+            confirmed_risk_ids=confirmed,
+        )
+    assert "密码错误" in bad_password.value.body["error"]
+    assert calls == []
+    assert token in service._previews
+    assert service._previews[token]["file_snapshot"] == initial_snapshot
+
+    result = service.install(
+        None,
+        preview_token=token,
+        signing_password=password,
+        force=True,
+        confirmed_risk_ids=confirmed,
+    )
+    assert result["ok"] is True
+    assert len(calls) == 1
+    installed = env.paths.user_plugins_dir / "actions" / meta["id"]
+    assert (installed / "generated.py").read_text(encoding="utf-8") == "generated_value = 42\n"
+    from notmyfault.security.plugins import plugin_signature_kind
+
+    assert plugin_signature_kind(str(installed), "user") == "author"
+    assert signing.verify_author_key_counter_signature(installed, [local_public_key])
+    hashes = json.loads(env.paths.plugin_manifest_file.read_text(encoding="utf-8"))[meta["id"]]
+    assert "generated.py" in hashes
+    assert token not in service._previews
+    assert service._previews.was_consumed(token)
+
+
+def test_evaluate_rejects_forbidden_code_and_missing_entry_without_replacing_old_plugin(tmp_path):
+    from notmyfault.host.api.services import plugin_installation
+    from notmyfault.platform import current as current_platform_name
+
+    env = make_api_env(tmp_path)
+    service = make_installation_service(env)
+    baseline = build_nmfp(tmp_path, make_meta("actions"), "actions", "evaluate-base")
+    assert service.install(baseline.read_bytes())["ok"] is True
+    installed = env.paths.user_plugins_dir / "actions" / "demo_actions"
+    baseline_bytes = (installed / "action.py").read_bytes()
+
+    for tag, meta, source, expected in [
+        (
+            "forbidden",
+            make_meta("actions", version_code=2, version="2.0"),
+            "exec('value = 1')\n",
+            "禁止能力",
+        ),
+        (
+            "missing-entry",
+            make_meta(
+                "actions",
+                version_code=2,
+                version="2.0",
+                platforms=[current_platform_name()],
+                entrypoints={current_platform_name(): "missing.py"},
+            ),
+            "def run_with_context(meta, params, context): return {'ok': True}\n",
+            "入口不存在",
+        ),
+    ]:
+        root = tmp_path / f"evaluate-{tag}"
+        root.mkdir()
+        (root / "action.json").write_text(json.dumps(meta), encoding="utf-8")
+        (root / "action.py").write_text(source, encoding="utf-8")
+        archive = archive_plugin_folder(root, tmp_path / f"evaluate-{tag}.nmfp")
+        preview = service.preview(archive.read_bytes())
+        with pytest.raises(plugin_installation.PluginInstallationError) as rejected:
+            service.install(
+                None,
+                preview_token=preview["preview_token"],
+                confirmed_risk_ids=preview["installation"]["required_risk_ids"],
+            )
+        assert expected in rejected.value.body["error"]
+        assert json.loads((installed / "action.json").read_text(encoding="utf-8"))["version_code"] == 1
+        assert (installed / "action.py").read_bytes() == baseline_bytes
+
+
+def test_same_preview_token_commits_at_most_once(tmp_path):
+    env = make_api_env(tmp_path)
+    service = make_installation_service(env)
+    archive = build_nmfp(tmp_path, make_meta("actions"), "actions", "same-token")
+    preview = service.preview(archive.read_bytes())
+    token = preview["preview_token"]
+    confirmed = preview["installation"]["required_risk_ids"]
+
+    def install_once():
+        try:
+            return service.install(
+                None, preview_token=token, confirmed_risk_ids=confirmed
+            )
+        except Exception as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: install_once(), range(2)))
+
+    assert sum(isinstance(result, dict) and result.get("ok") for result in results) == 1
+    assert sum(isinstance(result, Exception) for result in results) == 1
+    assert service._previews.was_consumed(token)
+    assert (env.paths.user_plugins_dir / "actions" / "demo_actions").is_dir()
+
+
+def test_uninstall_waits_for_install_transaction(tmp_path):
+    entered_hook = threading.Event()
+    release_hook = threading.Event()
+
+    def blocking_hook(root, meta):
+        entered_hook.set()
+        assert release_hook.wait(timeout=5)
+
+    env = make_api_env(tmp_path)
+    service = make_installation_service(env, build_hook=blocking_hook)
+    archive = build_nmfp(tmp_path, make_meta("actions"), "actions", "install-uninstall")
+    preview = service.preview(archive.read_bytes())
+    confirmed = preview["installation"]["required_risk_ids"]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        install_future = pool.submit(
+            service.install,
+            None,
+            preview_token=preview["preview_token"],
+            confirmed_risk_ids=confirmed,
+        )
+        assert entered_hook.wait(timeout=5)
+        uninstall_future = pool.submit(service.uninstall, "actions", "demo_actions")
+        release_hook.set()
+        installed = install_future.result(timeout=5)
+        removed = uninstall_future.result(timeout=5)
+
+    assert installed["ok"] is True
+    assert removed["ok"] is True
+    assert not (env.paths.user_plugins_dir / "actions" / "demo_actions").exists()
 
 
 def test_downgrade_requires_force_and_keeps_backup(tmp_path):

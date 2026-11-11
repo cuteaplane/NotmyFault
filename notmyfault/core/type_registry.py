@@ -5,6 +5,7 @@ from __future__ import annotations
 from notmyfault.values import FrozenDict, FrozenList, Secret, hold_value, protect, secret_value
 
 import copy
+import threading
 import weakref
 
 from notmyfault.core.data_types import (
@@ -21,6 +22,7 @@ class TypeRegistry:
     def __init__(self, definitions=None):
         self._definitions = copy.deepcopy(definitions or {})
         self._binding_values = {}
+        self._binding_values_lock = threading.RLock()
         for identity, definition in self._definitions.items():
             if not is_custom_type(identity):
                 raise DataTypeError("自定义类型必须使用完整包名、类型名和版本", code="invalid_type")
@@ -124,7 +126,8 @@ class TypeRegistry:
             return value if result is secret_value(value) else protect(result)
         frozen = isinstance(value, (FrozenDict, FrozenList))
         if frozen:
-            previous = self._binding_values.get(id(value))
+            with self._binding_values_lock:
+                previous = self._binding_values.get(id(value))
             if previous is not None and previous[0]() is value:
                 return value if previous[1] is None else previous[1]
         source = value
@@ -144,11 +147,13 @@ class TypeRegistry:
             identity = id(source)
 
             def discard(reference):
-                cached = self._binding_values.get(identity)
-                if cached is not None and cached[0] is reference:
-                    self._binding_values.pop(identity, None)
+                with self._binding_values_lock:
+                    cached = self._binding_values.get(identity)
+                    if cached is not None and cached[0] is reference:
+                        self._binding_values.pop(identity, None)
 
-            self._binding_values[identity] = (weakref.ref(source, discard), None if result is source else result)
+            with self._binding_values_lock:
+                self._binding_values[identity] = (weakref.ref(source, discard), None if result is source else result)
         return result
 
     def snapshot(self):

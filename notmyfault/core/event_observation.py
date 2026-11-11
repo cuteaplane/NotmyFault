@@ -20,7 +20,9 @@ class EventWait:
         self.program = build_matcher(self.rule, roots=(identity,))
         if not self.program.leaves:
             raise ValueError('等待事件组必须连接触发器')
-        self.runtime.register_rule(identity, self.rule, now, program=self.program)
+        absence_since = observation._absence_starts(self.program, now)
+        self.runtime.register_rule(identity, self.rule, now, program=self.program,
+            absence_since=absence_since)
         self.deadline = None if timeout is None else now + float(timeout)
         self.ready = False
         self.timed_out = False
@@ -76,10 +78,18 @@ class RunEventObservation:
         self._waits = {}
         self._lock = threading.RLock()
         self._closed = False
+        self._absence_evidence = set()
+        self._composite_absence_runtime = None
+        self._composite_absence_key = '__composite_absence__'
+        self._composite_absences = ()
+        self._prepare_composite_absences()
 
     def seed(self, events):
         with self._lock:
-            for entry in events:
+            for entry in sorted(events, key=lambda item: item.get('timestamp', self._started_at)):
+                absence_node_id = entry.get('absence_node_id')
+                if absence_node_id is not None:
+                    self._absence_evidence.add(absence_node_id)
                 identity = entry.get('binding_id')
                 if identity in self._fingerprints:
                     if entry.get('absence'):
@@ -87,6 +97,9 @@ class RunEventObservation:
                         continue
                     self._occurred.add(identity)
                     self._latest[identity] = hold_value(entry)
+                    event = entry.get('event', {})
+                    self._feed_composite_event(event.get('type'), entry.get('payload', {}),
+                        entry.get('timestamp', self._started_at), {'config': event.get('params', {})})
 
     def record(self, event_type, payload, instance=None):
         fingerprint = (instance.get('fingerprint') or config_fingerprint(instance.get('config'))) if instance is not None else None
@@ -102,6 +115,7 @@ class RunEventObservation:
                     self._absence_completed.pop(identity, None)
                     self._occurred.add(identity)
                     self._latest[identity] = hold_value({'binding_id': identity, 'event': {'type': event_type, 'params': leaf.get('params', {})}, 'payload': payload, 'timestamp': now})
+            self._record_composite_absences(event_type, payload, now, instance)
             for waiter in self._waits.values():
                 if waiter.ready:
                     continue
@@ -127,15 +141,20 @@ class RunEventObservation:
             program = waiter.program
             now = self.clock.monotonic()
             retention_by_id = {program.graph.nodes[node_id]['trigger']['binding_id']: program.retention.get(program.keys[node_id]) for leaves in program.leaves.values() for node_id in leaves}
+            bindings = {program.graph.nodes[node_id]['trigger']['binding_id']
+                for leaves in program.leaves.values() for node_id in leaves}
             for entry in sorted(self._latest.values(), key=lambda event: event['timestamp']):
+                if entry['binding_id'] not in bindings:
+                    continue
                 retention = retention_by_id.get(entry['binding_id'])
                 if retention is not None and (now > entry['timestamp'] + retention.seconds or now == entry['timestamp'] + retention.seconds and not retention.inclusive):
                     continue
                 event = entry['event']
-                matches = waiter.runtime.match_and_take(identity, waiter.rule, event['type'], entry['payload'], now=entry['timestamp'], instance={'config': event.get('params', {})})
-                if matches:
-                    waiter.matches = matches
+                waiter.runtime.match(identity, waiter.rule, event['type'], entry['payload'],
+                    now=entry['timestamp'], instance={'config': event.get('params', {})})
             now = self.clock.monotonic()
+            waiter.runtime.take_due(now, consume=False)
+            waiter.matches = waiter.runtime.current_match(identity, now, consume=True)
             if waiter.matches:
                 waiter.ready = True
             waiter.check(now)
@@ -146,6 +165,7 @@ class RunEventObservation:
         callbacks = []
         with self._lock:
             timestamp = self.clock.monotonic() if now is None else now
+            self._process_composite_absence_timers(timestamp)
             for waiter in self._waits.values():
                 was_ready = waiter.ready
                 waiter.check(timestamp)
@@ -157,7 +177,88 @@ class RunEventObservation:
     def next_deadline(self):
         with self._lock:
             values = [deadline for waiter in self._waits.values() if (deadline := waiter.next_deadline()) is not None]
+            if self._composite_absence_runtime is not None:
+                deadline = self._composite_absence_runtime.next_deadline()
+                if deadline is not None:
+                    values.append(deadline)
             return min(values) if values else None
+
+    def capture_wait_matches(self, matches):
+        with self._lock:
+            self._absence_evidence.update(entry['absence_node_id'] for entry in matches
+                if entry.get('absence_node_id') is not None)
+
+    def absence_matched(self, node_id):
+        with self._lock:
+            if node_id in self._absence_evidence:
+                return True
+            return self._composite_absence_runtime is not None and self._composite_absence_runtime.current_node_match(
+                self._composite_absence_key, node_id, self.clock.monotonic())
+
+    def _prepare_composite_absences(self):
+        from notmyfault.core.canvas_workflow import CanvasProgram
+        from notmyfault.core.condition_program import build_matcher
+
+        graph = CanvasProgram({'workflow': self.rule['workflow']})
+        candidates = []
+        for identity, node in graph.nodes.items():
+            if node.get('op', node.get('group_type')) != 'not' or 'duration_seconds' not in node:
+                continue
+            children = graph.dependencies(identity)
+            if len(children) == 1 and len(graph.event_dependencies(children[0])) > 1:
+                candidates.append(identity)
+        if not candidates:
+            return
+        program = build_matcher(self.rule, roots=tuple(candidates))
+        self._composite_absences = program.absences
+        self._composite_absence_runtime = ConditionRuntime(clock=self.clock)
+        now = self.clock.monotonic()
+        self._composite_absence_runtime.register_rule(self._composite_absence_key, self.rule, now,
+            program=program, absence_since=self._absence_starts(program, now))
+
+    def _absence_starts(self, program, now):
+        starts = {}
+        for absence in program.absences:
+            trigger_ids = set()
+            for root in absence.reset_roots:
+                trigger_ids.update(program.graph.event_dependencies(root))
+            bindings = [program.graph.nodes[node_id]['trigger']['binding_id'] for node_id in trigger_ids]
+            latest_times = [self._latest[identity]['timestamp'] for identity in bindings
+                if identity in self._latest]
+            if latest_times:
+                starts[absence.key] = max(latest_times)
+            elif len(bindings) == 1 and self._absence_completed.get(bindings[0], 0) >= absence.seconds:
+                starts[absence.key] = now - absence.seconds
+            else:
+                starts[absence.key] = self._started_at
+        return starts
+
+    def _record_composite_absences(self, event_type, payload, now, instance):
+        runtime = self._composite_absence_runtime
+        if runtime is None:
+            return
+        due = runtime.take_due(now, consume=False)
+        self.capture_wait_matches([entry for _key, events in due for entry in events])
+        self._feed_composite_event(event_type, payload, now, instance)
+
+    def _feed_composite_event(self, event_type, payload, now, instance):
+        runtime = self._composite_absence_runtime
+        if runtime is None or event_type is None:
+            return
+        previous = {absence.key: runtime.absence_token(self._composite_absence_key, absence.key)
+            for absence in self._composite_absences}
+        runtime.match(self._composite_absence_key, self.rule, event_type, payload,
+            now=now, instance=instance)
+        for absence in self._composite_absences:
+            token = runtime.absence_token(self._composite_absence_key, absence.key)
+            if token != previous[absence.key]:
+                self._absence_evidence.discard(absence.node_id)
+
+    def _process_composite_absence_timers(self, timestamp):
+        if self._composite_absence_runtime is None:
+            return
+        due = self._composite_absence_runtime.take_due(timestamp, consume=False)
+        self.capture_wait_matches([entry for _key, events in due for entry in events])
 
     def snapshot(self):
         with self._lock:

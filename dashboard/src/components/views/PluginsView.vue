@@ -1,12 +1,14 @@
 <script setup>
-import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
+import CircularProgress from '../CircularProgress.vue'
+import { ref, computed, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, watch } from 'vue'
 import { store } from '../../lib/store'
-import { apiRead, apiWrite, loadPlugins, getSchema } from '../../lib/api'
+import { apiDownload, apiRead, apiWrite, loadPlugins, getSchema } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
 import { alertDialog, confirmDialog } from '../../lib/dialog'
 import { useEngineControl } from '../../composables/useEngineControl'
 import { permissionLabels } from '../../lib/permissions'
 import BaseDialog from '../BaseDialog.vue'
+import SegmentedTabs from '../SegmentedTabs.vue'
 
 const { restartEngine } = useEngineControl()
 
@@ -85,6 +87,78 @@ const previewLoading = ref(false)
 const previewError = ref('')
 const fileForUpload = ref(null)
 const installError = ref('')
+const installing = ref(false)
+const showRegistry = ref(false)
+let savedRegistryUrl = ''
+try { savedRegistryUrl = localStorage.getItem('nmf-plugin-registry-url') || '' } catch {}
+const registryUrl = ref(savedRegistryUrl)
+const registryPlugins = ref([])
+const registryLoading = ref(false)
+const registryError = ref('')
+const registryDownloading = ref('')
+const installedPackages = computed(() => new Set(
+  Object.values(store.pluginsData.triggers || {}).concat(Object.values(store.pluginsData.actions || {}))
+    .map(meta => meta?.package_name)
+    .filter(Boolean),
+))
+
+async function loadRegistry() {
+  const url = registryUrl.value.trim()
+  if (!url) {
+    registryError.value = '请输入插件索引地址'
+    return
+  }
+  try { if (new URL(url).protocol !== 'https:') throw new Error() }
+  catch { registryError.value = '请输入有效的 HTTPS 插件索引地址'; return }
+  registryLoading.value = true
+  registryError.value = ''
+  try {
+    const response = await apiWrite('/api/plugins/registry', 'POST', { url })
+    const data = await response.json()
+    if (!data.ok) {
+      registryError.value = data.error || '读取插件索引失败'
+      return
+    }
+    try { localStorage.setItem('nmf-plugin-registry-url', url) } catch {}
+    registryPlugins.value = data.plugins || []
+  } catch (error) {
+    registryError.value = error.message || '读取插件索引失败'
+  } finally {
+    registryLoading.value = false
+  }
+}
+
+async function previewRegistryPlugin(entry) {
+  const identity = `${entry.package_name}@${entry.version}`
+  registryDownloading.value = identity
+  registryError.value = ''
+  try {
+    const response = await apiDownload('/api/plugins/registry/download', {
+      url: registryUrl.value.trim(),
+      package_name: entry.package_name,
+      version: entry.version,
+    })
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}))
+      registryError.value = data.error || '下载插件包失败'
+      return
+    }
+    const archive = await response.blob()
+    const file = new File(
+      [archive],
+      `${entry.package_name}-${entry.version}.nmfp`,
+      { type: 'application/octet-stream' },
+    )
+    openInstall()
+    fileForUpload.value = file
+    await uploadPreview(file)
+  } catch (error) {
+    registryError.value = error.message || '下载插件包失败'
+  } finally {
+    registryDownloading.value = ''
+  }
+}
+
 async function refresh() {
   try {
     const [plugins, sch] = await Promise.all([
@@ -332,43 +406,49 @@ async function uploadPreview(file) {
 }
 
 async function doInstall() {
-  if (!preview.value) return
-  const p = preview.value
-
-  if (!signingPassword.value) {
-    try {
-      const r = await apiRead('/api/plugins/key-status')
-      if (r.ok) {
-        const ks = await r.json()
-        if (disposed) return
-        if (ks.encrypted) {
-          signingPassword.value = ''
-          showKey.value = true
-          const ok = await new Promise(res => { keyResolve = res })
-          if (!ok) return
-        }
-      }
-    } catch (e) { /* 引擎离线时无法读取密钥状态，继续安装请求。 */ }
-  }
-
-  if (disposed) return
-  const fd = new FormData()
-  fd.append('preview_token', p.preview_token)
-  fd.append('confirmed_risk_ids', JSON.stringify(confirmedRiskIds.value))
-  if (signingPassword.value) fd.append('signing_password', signingPassword.value)
-  if (forceInstall.value) fd.append('force', 'true')
-  signingPassword.value = ''
+  if (!preview.value || installing.value) return
+  installing.value = true
   try {
-    const r = await apiWrite('/api/plugins/install', 'POST', fd, true)
-    const d = await r.json()
-    if (d.ok) {
-      showInstall.value = false
-      preview.value = null
-      forceInstall.value = false
-      await refresh()
-      await promptRestart('插件 "' + d.id + '" 已安装，引擎重启后即可使用。')
-    } else { installError.value = d.error || '安装失败，请重试' }
-  } catch (e) { alertDialog('请求失败', e.message) }
+    const p = preview.value
+
+    if (!signingPassword.value) {
+      try {
+        const r = await apiRead('/api/plugins/key-status')
+        if (r.ok) {
+          const ks = await r.json()
+          if (disposed) return
+          if (ks.encrypted) {
+            signingPassword.value = ''
+            showKey.value = true
+            const ok = await new Promise(res => { keyResolve = res })
+            if (!ok) return
+          }
+        }
+      } catch (e) { /* 引擎离线时无法读取密钥状态，继续安装请求。 */ }
+    }
+
+    if (disposed) return
+    const fd = new FormData()
+    fd.append('preview_token', p.preview_token)
+    fd.append('confirmed_risk_ids', JSON.stringify(confirmedRiskIds.value))
+    if (fileForUpload.value) fd.append('file', fileForUpload.value)
+    if (signingPassword.value) fd.append('signing_password', signingPassword.value)
+    if (forceInstall.value) fd.append('force', 'true')
+    signingPassword.value = ''
+    try {
+      const r = await apiWrite('/api/plugins/install', 'POST', fd, true)
+      const d = await r.json()
+      if (d.ok) {
+        showInstall.value = false
+        preview.value = null
+        forceInstall.value = false
+        await refresh()
+        await promptRestart('插件 "' + d.id + '" 已安装，引擎重启后即可使用。')
+      } else { installError.value = d.error || '安装失败，请重试' }
+    } catch (e) { alertDialog('请求失败', e.message) }
+  } finally {
+    installing.value = false
+  }
 }
 
 function onFilePicked(e) {
@@ -418,26 +498,60 @@ onMounted(async () => {
   await consumePluginFocus()
 })
 
+let hidden = false
+onDeactivated(() => { hidden = true })
+onActivated(() => {
+  if (!hidden) return
+  hidden = false
+  consumePluginFocus()
+})
 onUnmounted(() => clearTimeout(refreshTimer))
 </script>
 
 <template>
   <section class="page active plugin-management-page">
     <div class="page-head"><div><h2>插件管理</h2><p class="page-subtitle">异常插件优先显示；选择插件查看状态、权限和来源。</p></div><div class="actions">
+      <button class="btn btn-outlined" :aria-expanded="showRegistry" @click="showRegistry = !showRegistry">插件索引</button>
       <button class="btn btn-filled" @click="openInstall"><span class="material-symbols-outlined">install_desktop</span>安装插件</button>
     </div></div>
     <div class="plugin-workbench" :class="{ 'has-selection': selectedPlugin }">
       <div class="plugin-list-view">
-        <div class="plugin-origin-switch" :class="{ 'user-active': originTab === 'user' }" role="tablist" aria-label="插件来源">
-          <button type="button" role="tab" :aria-selected="originTab === 'builtin'"
-            :class="{ active: originTab === 'builtin' }" @click="originTab = 'builtin'">
-            内置<span>{{ originCounts.builtin }}</span>
-          </button>
-          <button type="button" role="tab" :aria-selected="originTab === 'user'"
-            :class="{ active: originTab === 'user' }" @click="originTab = 'user'">
-            用户<span>{{ originCounts.user }}</span>
-          </button>
-        </div>
+        <section v-if="showRegistry" class="plugin-registry-panel">
+          <div class="plugin-registry-head">
+            <div>
+              <h3>只读插件索引</h3>
+              <p>填写 registry.json 的 HTTPS 地址。下载后仍会进入本地安全预览，不会直接安装。</p>
+            </div>
+            <div class="plugin-registry-load">
+              <input v-model="registryUrl" class="text-field" type="url" spellcheck="false" placeholder="https://raw.githubusercontent.com/.../registry.json" @keyup.enter="loadRegistry">
+              <button class="btn btn-filled" :disabled="registryLoading" @click="loadRegistry">{{ registryLoading ? '读取中…' : '读取索引' }}</button>
+            </div>
+          </div>
+          <p v-if="registryError" class="plugin-registry-error"><span class="material-symbols-outlined">warning</span>{{ registryError }}</p>
+          <div v-if="registryPlugins.length" class="plugin-registry-grid">
+            <article v-for="entry in registryPlugins" :key="entry.package_name + '@' + entry.version" class="plugin-registry-card">
+              <div>
+                <h4>{{ entry.name }}</h4>
+                <p>{{ entry.package_name }}</p>
+              </div>
+              <div class="preview-meta">
+                <span class="chip">v{{ entry.version }}</span>
+                <span v-for="platform in entry.supported_platforms" :key="platform" class="chip">{{ platform }}</span>
+                <span class="chip" :class="installedPackages.has(entry.package_name) ? 'chip-clean' : ''">{{ installedPackages.has(entry.package_name) ? '已安装' : '未安装' }}</span>
+              </div>
+              <div class="plugin-registry-actions">
+                <a class="btn btn-text" :href="entry.homepage" target="_blank" rel="noreferrer">主页</a>
+                <button class="btn btn-filled btn-sm" :disabled="registryDownloading === entry.package_name + '@' + entry.version" @click="previewRegistryPlugin(entry)">
+                  {{ registryDownloading === entry.package_name + '@' + entry.version ? '下载中…' : installedPackages.has(entry.package_name) ? '检查更新' : '下载并检查' }}
+                </button>
+              </div>
+            </article>
+          </div>
+          <p v-else-if="!registryLoading && !registryError" class="plugin-registry-empty">索引尚未读取。</p>
+        </section>
+
+        <SegmentedTabs v-model="originTab" class="plugin-origin-switch" label="插件来源" block
+          :options="[{ value: 'builtin', label: '内置', count: originCounts.builtin }, { value: 'user', label: '用户', count: originCounts.user }]" />
 
         <div v-if="visibleProblemCount" class="plugin-problem-summary">
           <span class="material-symbols-outlined">report</span>
@@ -607,15 +721,15 @@ onUnmounted(() => clearTimeout(refreshTimer))
           <span class="material-symbols-outlined dialog-ico">install_desktop</span>
           <h3 class="dialog-title">安装插件</h3>
           <p class="dialog-sub">选择 .nmfp 插件包</p>
-          <div class="dropzone" @click="fileInput && fileInput.click()">
-            <span class="material-symbols-outlined">cloud_upload</span>点击选择 .nmfp 文件
-          </div>
+          <button type="button" class="dropzone" @click="fileInput && fileInput.click()">
+            <span class="material-symbols-outlined" aria-hidden="true">cloud_upload</span>点击选择 .nmfp 文件
+          </button>
           <input ref="fileInput" type="file" accept=".nmfp" class="hidden" @change="onFilePicked">
           <button class="btn btn-text" @click="showInstall = false">取消</button>
         </div>
 
         <div v-else-if="previewLoading" key="loading" class="preview-loading">
-          <div class="spinner my-6 mx-auto"></div>
+          <CircularProgress class="!block my-6 mx-auto text-primary" :size="40" />
           <p>正在解析插件...</p>
         </div>
 
@@ -737,7 +851,7 @@ onUnmounted(() => clearTimeout(refreshTimer))
               <div class="preview-section-title">
                 <span class="material-symbols-outlined">check_circle</span>安全检查
               </div>
-              <p class="safe-notice">未发现安全风险，权限符合规范</p>
+              <p class="safe-notice">未发现已知危险写法，权限符合规范</p>
             </div>
           </div>
 
@@ -760,7 +874,7 @@ onUnmounted(() => clearTimeout(refreshTimer))
             <div class="preview-foot-actions">
               <button class="btn btn-text" @click="showInstall = false">取消</button>
               <button class="btn btn-filled" @click="doInstall"
-                :disabled="(!preview.permission_conform && store.engineStatus?.security_mode === 'strict')
+                :disabled="installing || (!preview.permission_conform && store.engineStatus?.security_mode === 'strict')
                   || !risksConfirmed">
                 <span class="material-symbols-outlined">download</span>安装
               </button>

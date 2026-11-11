@@ -68,6 +68,7 @@ class ApiApplication:
         self._pending_previews = pending_previews
         self._plugin_temporary_storage = plugin_temporary_storage
         self._plugin_registry = plugin_registry
+        self._ai_service: AIDraftingService | None = None
 
         self.app = FastAPI(
             title="NotmyFault Engine API",
@@ -103,6 +104,8 @@ class ApiApplication:
 
     def begin_shutdown(self) -> None:
         """先结束事件流连接，uvicorn 才等得到连接清空并跑到 lifespan 收尾"""
+        if self._ai_service is not None:
+            self._ai_service.begin_shutdown()
         self._events.close()
 
     def _setup_routes(self):
@@ -161,11 +164,8 @@ class ApiApplication:
                 RuleRunService(self._engine, self._store),
             )
         )
-        self.app.include_router(
-            create_ai_router(
-                self._create_ai_service(plugin_catalog, rule_service)
-            )
-        )
+        self._ai_service = self._create_ai_service(plugin_catalog, rule_service)
+        self.app.include_router(create_ai_router(self._ai_service))
 
     def _create_ai_service(
         self,

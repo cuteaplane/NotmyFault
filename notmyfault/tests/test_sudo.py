@@ -108,7 +108,7 @@ class TestRunAsAdmin:
                 "cmd.exe",
             ).replace("'", "''")
             + "'"
-            " -ArgumentList '/c dir' -Verb RunAs -Wait -PassThru; "
+            " -ArgumentList '/c dir' -Verb RunAs -ErrorAction Stop -Wait -PassThru; "
             "exit $process.ExitCode",
         ]
 
@@ -124,6 +124,26 @@ class TestRunAsAdmin:
         call_from(module, sudo.run_as_admin, ["notepad.exe", "it's a test"])
         # PowerShell 单引号内的单引号必须双写转义
         assert "'\"it''s a test\"'" in captured["cmd"][3]
+
+    @WINDOWS_ONLY
+    @pytest.mark.parametrize("quote", ["'", "\u2018", "\u2019", "\u201a", "\u201b"])
+    def test_unicode_argument_is_data_and_uac_failure_is_not_success(self, authorized_plugin, quote):
+        module, captured = authorized_plugin
+        argument = f"value{quote}; throw 'injected' #"
+        call_from(module, sudo.run_as_admin, ["tool.exe", argument])
+        script = captured["cmd"][3]
+        prefix = (
+            "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);"
+            "function Start-Process { [CmdletBinding()]param($FilePath,$ArgumentList,$Verb,[switch]$Wait,[switch]$PassThru);"
+            "[Console]::Out.Write($ArgumentList); Write-Error 'UAC declined' };"
+        )
+        process = subprocess.Popen(
+            [*captured["cmd"][:3], prefix + script],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        )
+        stdout, _stderr = process.communicate(timeout=10)
+        assert stdout == subprocess.list2cmdline([argument])
+        assert process.returncode != 0
 
     @WINDOWS_ONLY
     def test_ps_quote_empty_argument(self, authorized_plugin):
@@ -144,7 +164,7 @@ class TestRunAsAdmin:
         )
         assert script == (
             f"$process = Start-Process -FilePath '{executable}'"
-            " -Verb RunAs -Wait -PassThru; exit $process.ExitCode"
+            " -Verb RunAs -ErrorAction Stop -Wait -PassThru; exit $process.ExitCode"
         )
 
     @WINDOWS_ONLY

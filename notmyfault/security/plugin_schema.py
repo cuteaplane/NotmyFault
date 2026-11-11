@@ -1,9 +1,10 @@
 import json
 import os
 import re
-import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+import notmyfault.platform
 
 from notmyfault.core.data_types import (
     BUILTIN_TYPES, DataTypeError, field_type, normalize_type,
@@ -14,7 +15,7 @@ _REQUIRED_META_FIELDS = {"id", "name", "description", "version_code", "version",
 _TRIGGER_OPTIONAL_FIELDS = {
     "semantic", "params", "permissions", "origin", "trigger_api", "platforms",
     "entrypoints", "outputs", "build", "contributes",
-    "requires_capabilities", "engines", "security", "author",
+    "requires_capabilities", "optional_capabilities", "engines", "security", "author",
     "lifecycle", "state_key", "state_filter", "previous_state_output",
     "debounce_seconds", "event_queue_size", "overflow", "coalesce_key",
     "state_mode", "state_initial_value", "state_partition_key", "state_untracked", "state_hysteresis",
@@ -23,7 +24,7 @@ _TRIGGER_OPTIONAL_FIELDS = {
 _ACTION_OPTIONAL_FIELDS = {
     "params", "permissions", "origin", "execution_api",
     "outputs", "platforms", "entrypoints", "build", "idempotent",
-    "cancellation_api", "contributes", "requires_capabilities",
+    "cancellation_api", "contributes", "requires_capabilities", "optional_capabilities",
     "execution_mode", "engines", "security", "author",
 }
 _ALLOWED_EXECUTION_MODES = {"in-process", "isolated"}
@@ -111,15 +112,6 @@ def admin_executables(meta: Any) -> set[str]:
         if isinstance(name, str) and name
     }
 
-
-def current_platform_name() -> str:
-    if sys.platform == "win32":
-        return "windows"
-    if sys.platform.startswith("linux"):
-        return "linux"
-    if sys.platform == "darwin":
-        return "macos"
-    return sys.platform
 
 PERM_RISK_NONE = "none"
 PERM_RISK_LOW = "low"
@@ -391,7 +383,7 @@ def _validate_contributes_field(
             errors.append(f"{prefix}.commands 必须是数组")
         else:
             for command_id in allowed_commands:
-                if command_id not in command_ids:
+                if not isinstance(command_id, str) or command_id not in command_ids:
                     errors.append(
                         f"{prefix}.commands 引用了未声明命令: {command_id!r}"
                     )
@@ -411,7 +403,7 @@ def _validate_contributes_field(
         if not isinstance(version, int) or isinstance(version, bool) or version < 1:
             errors.append(f"{prefix}.version 必须是大于 0 的整数")
         binding = data_type.get("binding", "private")
-        if binding not in _DATA_BINDING_POLICIES:
+        if not isinstance(binding, str) or binding not in _DATA_BINDING_POLICIES:
             errors.append(f"{prefix}.binding 必须为 private 或 shared")
         if binding == "shared" and "schema" not in data_type:
             errors.append(f"{prefix}.schema 是共享类型的必填字段")
@@ -430,7 +422,7 @@ def _validate_contributes_field(
             ),
             None,
         ) if isinstance(params, list) else None
-        if parameter not in param_names:
+        if not isinstance(parameter, str) or parameter not in param_names:
             errors.append(f"{prefix}.parameter 引用了未声明参数: {parameter!r}")
         elif parameter in editor_params:
             errors.append(f"参数 {parameter!r} 声明了多个 parameter_editor")
@@ -442,7 +434,7 @@ def _validate_contributes_field(
         if is_plugin_data:
             if not has_data_type:
                 errors.append(f"{prefix}.data_type 是 plugin_data 参数的必填字段")
-            elif editor.get("data_type") not in data_type_ids:
+            elif not isinstance(editor.get("data_type"), str) or editor.get("data_type") not in data_type_ids:
                 errors.append(
                     f"{prefix}.data_type 引用了未声明数据类型: {editor.get('data_type')!r}"
                 )
@@ -459,11 +451,11 @@ def _validate_contributes_field(
                 errors.append(
                     f"{prefix}.value_type 必须与参数 {parameter!r} 的 value_type 一致"
                 )
-        if editor.get("command") not in command_ids:
+        if not isinstance(editor.get("command"), str) or editor.get("command") not in command_ids:
             errors.append(
                 f"{prefix}.command 引用了未声明命令: {editor.get('command')!r}"
             )
-        if "view" in editor and editor.get("view") not in view_ids:
+        if "view" in editor and (not isinstance(editor.get("view"), str) or editor.get("view") not in view_ids):
             errors.append(
                 f"{prefix}.view 引用了未声明视图: {editor.get('view')!r}"
             )
@@ -474,7 +466,7 @@ def _validate_contributes_field(
             for key in ui:
                 if key not in _PARAMETER_EDITOR_UI_FIELDS:
                     errors.append(f"{prefix}.ui 包含未知字段: '{key}'")
-            if ui.get("control", "button") not in _EDITOR_CONTROLS:
+            if not isinstance(ui.get("control", "button"), str) or ui.get("control", "button") not in _EDITOR_CONTROLS:
                 errors.append(f"{prefix}.ui.control 目前仅支持 button")
             for key in ("icon", "label", "busy_label", "empty_label", "description"):
                 if key in ui and not isinstance(ui[key], str):
@@ -484,12 +476,12 @@ def _validate_contributes_field(
         for index, param in enumerate(params):
             if not isinstance(param, dict) or param.get("type") != "plugin_data":
                 continue
-            if param.get("data_type") not in data_type_ids:
+            if not isinstance(param.get("data_type"), str) or param.get("data_type") not in data_type_ids:
                 errors.append(
                     f"params[{index}].data_type 引用了未声明数据类型: "
                     f"{param.get('data_type')!r}"
                 )
-            if param.get("name") not in editor_params:
+            if not isinstance(param.get("name"), str) or param.get("name") not in editor_params:
                 errors.append(
                     f"params[{index}] (type=plugin_data) 必须声明 parameter_editor"
                 )
@@ -638,11 +630,11 @@ def validate_plugin_meta(
                     )
 
     if "origin" in meta:
-        if meta["origin"] not in _ALLOWED_ORIGINS:
-            errors.append("origin invalid: " + meta["origin"])
+        if not isinstance(meta["origin"], str) or meta["origin"] not in _ALLOWED_ORIGINS:
+            errors.append(f"origin invalid: {meta['origin']}")
 
     if "execution_mode" in meta:
-        if meta.get("execution_mode") not in _ALLOWED_EXECUTION_MODES:
+        if not isinstance(meta.get("execution_mode"), str) or meta.get("execution_mode") not in _ALLOWED_EXECUTION_MODES:
             errors.append(
                 "execution_mode 必须是 in-process 或 isolated，实际: "
                 f"{meta.get('execution_mode')!r}"
@@ -656,7 +648,7 @@ def validate_plugin_meta(
                 if key not in _ACTION_SECURITY_FIELDS:
                     errors.append(f"security 包含未知字段: {key!r}")
             approval = security.get("rule_approval")
-            if approval is not None and approval not in _RULE_APPROVAL_MODES:
+            if approval is not None and (not isinstance(approval, str) or approval not in _RULE_APPROVAL_MODES):
                 errors.append("security.rule_approval 目前仅支持 admin_key")
             literal_params = security.get("literal_only_params")
             if literal_params is not None:
@@ -749,29 +741,39 @@ def validate_plugin_meta(
             errors.append("字段 'platforms' 必须是非空数组")
         else:
             for platform in platforms:
-                if platform not in _ALLOWED_PLATFORMS:
+                if not isinstance(platform, str) or platform not in _ALLOWED_PLATFORMS:
                     errors.append(
                         f"platforms 包含无效平台: {platform!r}"
                         f"（允许: {', '.join(sorted(_ALLOWED_PLATFORMS))}）"
                     )
 
-    if "requires_capabilities" in meta:
+    declared_capabilities = {}
+    for field in ("requires_capabilities", "optional_capabilities"):
+        if field not in meta:
+            continue
         from notmyfault.platform.capabilities import CAPABILITY_IDS
 
-        required = meta["requires_capabilities"]
-        if not isinstance(required, list) or not required:
-            errors.append("字段 'requires_capabilities' 必须是非空数组")
-        else:
-            for capability in required:
-                if not isinstance(capability, str):
-                    errors.append(
-                        f"requires_capabilities 中的值必须是字符串，实际: {type(capability).__name__}"
-                    )
-                elif capability not in CAPABILITY_IDS:
-                    errors.append(
-                        f"未知能力 id: {capability!r}"
-                        f"（允许: {', '.join(sorted(CAPABILITY_IDS))}）"
-                    )
+        values = meta[field]
+        if not isinstance(values, list) or not values:
+            errors.append(f"字段 '{field}' 必须是非空数组")
+            continue
+        seen = set()
+        for capability in values:
+            if not isinstance(capability, str) or not capability.strip():
+                errors.append(f"{field} 中的值必须是非空字符串")
+                continue
+            if capability in seen:
+                errors.append(f"{field} 包含重复能力 id: {capability!r}")
+            seen.add(capability)
+            if capability not in CAPABILITY_IDS:
+                errors.append(
+                    f"未知能力 id: {capability!r}"
+                    f"（允许: {', '.join(sorted(CAPABILITY_IDS))}）"
+                )
+        declared_capabilities[field] = seen
+    overlap = declared_capabilities.get("requires_capabilities", set()) & declared_capabilities.get("optional_capabilities", set())
+    if overlap:
+        errors.append(f"requires_capabilities 与 optional_capabilities 不能重复: {', '.join(sorted(overlap))}")
 
     if "entrypoints" in meta:
         entrypoints = meta["entrypoints"]
@@ -839,7 +841,8 @@ def validate_plugin_meta(
                         errors.append(f"outputs[{i}].{flag} 必须为布尔值")
                 if (
                     "summary" in output
-                    and output["summary"] not in _ALLOWED_SUMMARY_POLICIES
+                    and (not isinstance(output["summary"], str)
+                         or output["summary"] not in _ALLOWED_SUMMARY_POLICIES)
                 ):
                     errors.append(
                         f"outputs[{i}].summary 无效: {output['summary']!r}"
@@ -878,7 +881,7 @@ def validate_plugin_meta(
                 ):
                     errors.append(f"params[{i}].name 不是安全字段名")
                 ptype = param.get("type", "")
-                if ptype and ptype not in _ALLOWED_PARAM_TYPES:
+                if ptype and (not isinstance(ptype, str) or ptype not in _ALLOWED_PARAM_TYPES):
                     errors.append(
                         f"params[{i}].type 无效: '{ptype}'"
                         f"（允许: {', '.join(sorted(_ALLOWED_PARAM_TYPES))}）"
@@ -896,7 +899,8 @@ def validate_plugin_meta(
                         errors.append(f"params[{i}].{flag} 必须为布尔值")
                 if (
                     "summary" in param
-                    and param["summary"] not in _ALLOWED_SUMMARY_POLICIES
+                    and (not isinstance(param["summary"], str)
+                         or param["summary"] not in _ALLOWED_SUMMARY_POLICIES)
                 ):
                     errors.append(f"params[{i}].summary 无效: {param['summary']!r}")
                 if ptype == "select":
@@ -985,7 +989,7 @@ def scan_plugins(
         result[meta["id"]] = {
             **meta,
             "platform_compatible": is_plugin_platform_compatible(meta),
-            "current_platform": current_platform_name(),
-            "selected_entrypoint": (meta.get("entrypoints") or {}).get(current_platform_name()),
+            "current_platform": notmyfault.platform.current(),
+            "selected_entrypoint": (meta.get("entrypoints") or {}).get(notmyfault.platform.current()),
         }
     return result

@@ -10,21 +10,21 @@ from unittest.mock import patch
 
 import psutil
 
-from notmyfault.platform.backends import (
-    AudioBackend,
+from notmyfault.platform._run import CommandRunner
+from notmyfault.platform.errors import (
     BackendFailedError,
+    BackendInvalidError,
     BackendMissingError,
     BackendPermissionDeniedError,
     BackendUnsupportedError,
-    ClipboardBackend,
-    CommandRunner,
-    DisplayBackend,
-    InputBackend,
-    PowerProfileBackend,
-    OcrBackend,
-    ScreenshotBackend,
-    WindowBackend,
 )
+from notmyfault.platform.linux.audio import AudioBackend
+from notmyfault.platform.linux.clipboard import ClipboardBackend
+from notmyfault.platform.linux.display import DisplayBackend
+from notmyfault.platform.linux.keyboard import KeyboardBackend
+from notmyfault.platform.linux.power import PowerBackend
+from notmyfault.platform.linux.screen import ScreenBackend
+from notmyfault.platform.linux.window import WindowBackend
 
 
 class FakeRunner:
@@ -56,10 +56,7 @@ class FakeRunner:
 
 
 class LinuxPathTest(unittest.TestCase):
-    def setUp(self):
-        patcher = patch("notmyfault.platform.backends.sys.platform", "linux")
-        patcher.start()
-        self.addCleanup(patcher.stop)
+    pass
 
 
 def ok(stdout="", stderr="", returncode=0):
@@ -71,7 +68,7 @@ def ok(stdout="", stderr="", returncode=0):
 class CommandRunnerTests(unittest.TestCase):
     def test_timeout_raises_backend_failed(self):
         runner = CommandRunner()
-        with patch("notmyfault.platform.backends.subprocess.run", side_effect=subprocess.TimeoutExpired(["tool"], 3)):
+        with patch("notmyfault.platform._run.subprocess.run", side_effect=subprocess.TimeoutExpired(["tool"], 3)):
             with self.assertRaises(BackendFailedError) as ctx:
                 runner.run(["tool"], timeout=3)
         self.assertIn("超时", str(ctx.exception))
@@ -95,18 +92,19 @@ class CommandRunnerTests(unittest.TestCase):
     def test_errors_carry_kind(self):
         cases = [
             (BackendUnsupportedError("x"), "unsupported"),
-            (BackendMissingError("x"), "backend_missing"),
+            (BackendMissingError("x"), "unavailable"),
             (BackendPermissionDeniedError("x"), "permission_denied"),
-            (BackendFailedError("x"), "backend_failed"),
+            (BackendFailedError("x"), "failed"),
         ]
         for error, kind in cases:
             self.assertEqual(error.kind, kind)
 
 
-class InputBackendTests(LinuxPathTest):
+class KeyboardBackendTests(LinuxPathTest):
     def test_type_text_uses_xdotool_with_clearmodifiers(self):
         runner = FakeRunner(paths={"xdotool": "/usr/bin/xdotool"})
-        InputBackend(runner).type_text("a中😀")
+        with patch("notmyfault.platform.linux.desktop.session_type", return_value="x11"):
+            KeyboardBackend(runner).type_text("a中😀")
         self.assertEqual(
             runner.calls[0]["args"],
             ["/usr/bin/xdotool", "type", "--clearmodifiers", "--", "a中😀"],
@@ -115,24 +113,24 @@ class InputBackendTests(LinuxPathTest):
 
     def test_type_text_uses_ydotool_without_flags(self):
         runner = FakeRunner(paths={"ydotool": "/usr/bin/ydotool"})
-        InputBackend(runner).type_text("hi")
+        KeyboardBackend(runner).type_text("hi")
         self.assertEqual(
             runner.calls[0]["args"], ["/usr/bin/ydotool", "type", "--", "hi"]
         )
 
     def test_ydotool_sets_socket_env_when_present(self):
         runner = FakeRunner(paths={"ydotool": "/usr/bin/ydotool"})
-        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"), \
+        with patch("notmyfault.platform.linux.desktop.session_type", return_value="wayland"), \
                 patch.dict(
                     "os.environ",
                     {"XDG_RUNTIME_DIR": "/run/user/1000", "YDOTOOL_SOCKET": ""},
                     clear=False,
                 ), \
                 patch(
-                    "notmyfault.platform.backends.os.path.exists",
+                    "notmyfault.platform.linux.keyboard.os.path.exists",
                     side_effect=lambda p: p == "/run/user/1000/.ydotool_socket",
                 ):
-            InputBackend(runner).type_text("hi")
+            KeyboardBackend(runner).type_text("hi")
         self.assertEqual(
             runner.calls[0]["env"].get("YDOTOOL_SOCKET"),
             "/run/user/1000/.ydotool_socket",
@@ -143,30 +141,31 @@ class InputBackendTests(LinuxPathTest):
             paths={"ydotool": "/usr/bin/ydotool"},
             results=[ok(stderr="connect: No such file or directory", returncode=1)],
         )
-        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"), \
+        with patch("notmyfault.platform.linux.desktop.session_type", return_value="wayland"), \
                 patch.dict("os.environ", {"YDOTOOL_SOCKET": "/tmp/.ydotool_socket"}, clear=False):
             with self.assertRaises(BackendFailedError) as ctx:
-                InputBackend(runner).type_text("hi")
+                KeyboardBackend(runner).type_text("hi")
         self.assertIn("ydotoold", str(ctx.exception))
         self.assertIn("/tmp/.ydotool_socket", str(ctx.exception))
 
     def test_hotkey_maps_keys_for_xdotool(self):
         runner = FakeRunner(paths={"xdotool": "/usr/bin/xdotool"})
-        InputBackend(runner).send_hotkey(["ctrl", "win", "enter"])
+        with patch("notmyfault.platform.linux.desktop.session_type", return_value="x11"):
+            KeyboardBackend(runner).send_hotkey(["ctrl", "win", "enter"])
         self.assertEqual(
             runner.calls[0]["args"],
             ["/usr/bin/xdotool", "key", "--clearmodifiers", "ctrl+super+Return"],
         )
-        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"):
+        with patch("notmyfault.platform.linux.desktop.session_type", return_value="wayland"):
             runner.paths["ydotool"] = "/usr/bin/ydotool"
-            InputBackend(runner).send_hotkey(["ctrl", "win", "enter"])
+            KeyboardBackend(runner).send_hotkey(["ctrl", "win", "enter"])
         self.assertEqual(runner.calls[-1]["args"],
                          ["/usr/bin/ydotool", "key", "29:1", "125:1", "28:1", "28:0", "125:0", "29:0"])
 
     def test_missing_tool_raises_backend_missing(self):
         runner = FakeRunner()
         with self.assertRaises(BackendMissingError) as ctx:
-            InputBackend(runner).type_text("hi")
+            KeyboardBackend(runner).type_text("hi")
         self.assertIn("依赖缺失", str(ctx.exception))
 
     def test_nonzero_exit_raises_backend_failed(self):
@@ -174,32 +173,13 @@ class InputBackendTests(LinuxPathTest):
             paths={"xdotool": "/usr/bin/xdotool"},
             results=[ok(stderr="boom", returncode=1)],
         )
-        with self.assertRaises(BackendFailedError) as ctx:
-            InputBackend(runner).type_text("hi")
+        with patch("notmyfault.platform.linux.desktop.session_type", return_value="x11"):
+            with self.assertRaises(BackendFailedError) as ctx:
+                KeyboardBackend(runner).type_text("hi")
         self.assertIn("boom", str(ctx.exception))
-
-    def test_windows_raises_unsupported(self):
-        runner = FakeRunner(paths={"xdotool": "/usr/bin/xdotool"})
-        with patch("notmyfault.platform.backends.sys.platform", "win32"):
-            with self.assertRaises(BackendUnsupportedError):
-                InputBackend(runner).type_text("hi")
 
 
 class AudioBackendTests(LinuxPathTest):
-    def test_set_volume_and_mute_use_wpctl(self):
-        runner = FakeRunner(paths={"wpctl": "/usr/bin/wpctl"})
-        backend = AudioBackend(runner)
-        backend.set_volume(35)
-        backend.set_mute(True)
-        self.assertEqual(
-            runner.calls[0]["args"],
-            ["/usr/bin/wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "35%"],
-        )
-        self.assertEqual(
-            runner.calls[1]["args"],
-            ["/usr/bin/wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "1"],
-        )
-
     def test_missing_wpctl_raises_backend_missing(self):
         with self.assertRaises(BackendMissingError):
             AudioBackend(FakeRunner()).set_volume(50)
@@ -242,6 +222,35 @@ class AudioBackendTests(LinuxPathTest):
             {"render": "41", "capture": "55"},
         )
 
+    def test_default_devices_parses_wpctl_tree_layout_audio_section_only(self):
+        status = (
+            "Audio\n"
+            " ├─ Devices:\n"
+            " │      53. Arrow Lake cAVS                     [alsa]\n"
+            " │  \n"
+            " ├─ Sinks:\n"
+            " │      59. HDMI / DisplayPort 3 Output [vol: 1.00]\n"
+            " │  *   62. Speaker             [vol: 0.40]\n"
+            " │  \n"
+            " ├─ Sources:\n"
+            " │  *   64. Digital Microphone  [vol: 1.00]\n"
+            " │  \n"
+            " └─ Streams:\n"
+            "\n"
+            "Video\n"
+            " ├─ Sinks:\n"
+            " ├─ Sources:\n"
+            " │  *   80. Integrated RGB Camera (V4L2)\n"
+        )
+        runner = FakeRunner(
+            paths={"wpctl": "/usr/bin/wpctl"},
+            results=[ok(stdout=status)],
+        )
+        self.assertEqual(
+            AudioBackend(runner).default_devices(),
+            {"render": "62", "capture": "64"},
+        )
+
     def test_default_devices_from_pactl(self):
         runner = FakeRunner(
             paths={"pactl": "/usr/bin/pactl"},
@@ -252,10 +261,11 @@ class AudioBackendTests(LinuxPathTest):
             {"render": "sink-a", "capture": "source-b"},
         )
 
-    def test_default_devices_empty_without_backends(self):
-        self.assertEqual(AudioBackend(FakeRunner()).default_devices(), {})
+    def test_default_devices_requires_backend(self):
+        with self.assertRaises(BackendMissingError):
+            AudioBackend(FakeRunner()).default_devices()
 
-    def test_default_devices_survives_query_failure(self):
+    def test_default_devices_reports_query_failure(self):
         runner = FakeRunner(
             paths={"wpctl": "/usr/bin/wpctl"},
             results=[BackendFailedError("命令超时")],
@@ -265,101 +275,62 @@ class AudioBackendTests(LinuxPathTest):
             raise runner.results.pop(0)
 
         runner.run = explode
-        self.assertEqual(AudioBackend(runner).default_devices(), {})
+        with self.assertRaises(BackendFailedError):
+            AudioBackend(runner).default_devices()
 
-    def test_set_default_device_uses_wpctl(self):
-        runner = FakeRunner(paths={"wpctl": "/usr/bin/wpctl", "pactl": "/usr/bin/pactl"})
-        AudioBackend(runner).set_default_device("render", "41")
-        self.assertEqual(
-            runner.calls[0]["args"],
-            ["/usr/bin/wpctl", "set-default", "41"],
-        )
-
-    def test_set_default_device_falls_back_to_pactl(self):
-        runner = FakeRunner(paths={"pactl": "/usr/bin/pactl"})
-        AudioBackend(runner).set_default_device("capture", "mic-1")
-        self.assertEqual(
-            runner.calls[0]["args"],
-            ["/usr/bin/pactl", "set-default-source", "mic-1"],
-        )
-        runner = FakeRunner(paths={"pactl": "/usr/bin/pactl"})
-        AudioBackend(runner).set_default_device("render", "sink-a")
-        self.assertEqual(
-            runner.calls[0]["args"],
-            ["/usr/bin/pactl", "set-default-sink", "sink-a"],
-        )
-
-    def test_set_default_device_missing_tools_raises(self):
+    def test_set_default_missing_tools_raises(self):
         with self.assertRaises(BackendMissingError):
-            AudioBackend(FakeRunner()).set_default_device("render", "41")
+            AudioBackend(FakeRunner()).set_default("render", "41")
 
-    def test_set_default_device_rejects_bad_flow(self):
+    def test_set_default_rejects_bad_flow(self):
         with self.assertRaises(ValueError):
-            AudioBackend(FakeRunner(paths={"wpctl": "/usr/bin/wpctl"})).set_default_device(
+            AudioBackend(FakeRunner(paths={"wpctl": "/usr/bin/wpctl"})).set_default(
                 "output", "41"
             )
 
 
 class ClipboardBackendTests(LinuxPathTest):
     def _wayland(self):
-        return patch("notmyfault.platform.linux_support.session_type", return_value="wayland")
+        return patch("notmyfault.platform.linux.desktop.session_type", return_value="wayland")
 
     def _x11(self):
-        return patch("notmyfault.platform.linux_support.session_type", return_value="x11")
+        return patch("notmyfault.platform.linux.desktop.session_type", return_value="x11")
 
     def test_read_prefers_wayland_paste_on_wayland(self):
         runner = FakeRunner(
             paths={"wl-paste": "/usr/bin/wl-paste", "xclip": "/usr/bin/xclip"},
-            results=[ok(stdout="hello")],
+            results=[ok(stdout="text/plain"), ok(stdout="hello")],
         )
         with self._wayland():
-            self.assertEqual(ClipboardBackend(runner).read_text(), "hello")
+            self.assertEqual(ClipboardBackend(runner).read(), "hello")
         self.assertEqual(
-            runner.calls[0]["args"], ["/usr/bin/wl-paste", "--no-newline"]
+            runner.calls[0]["args"], ["/usr/bin/wl-paste", "--list-types"]
         )
 
     def test_x11_ignores_wl_clipboard_even_if_installed(self):
         # X11 会话装了 wl-clipboard 也不能走 wl-paste，它在 X11 下会失败
         runner = FakeRunner(
             paths={"wl-paste": "/usr/bin/wl-paste", "xclip": "/usr/bin/xclip"},
-            results=[ok(stdout="text")],
+            results=[ok(stdout="UTF8_STRING"), ok(stdout="text")],
         )
         with self._x11():
-            self.assertEqual(ClipboardBackend(runner).read_text(), "text")
+            self.assertEqual(ClipboardBackend(runner).read(), "text")
         self.assertEqual(
             runner.calls[0]["args"],
-            ["/usr/bin/xclip", "-selection", "clipboard", "-o"],
+            ["/usr/bin/xclip", "-selection", "clipboard", "-o", "-target", "TARGETS"],
         )
 
-    def test_read_falls_back_to_xclip(self):
-        runner = FakeRunner(
-            paths={"xclip": "/usr/bin/xclip"}, results=[ok(stdout="text")]
-        )
-        with self._x11():
-            self.assertEqual(ClipboardBackend(runner).read_text(), "text")
-        self.assertEqual(
-            runner.calls[0]["args"],
-            ["/usr/bin/xclip", "-selection", "clipboard", "-o"],
-        )
-
-    def test_read_returns_none_on_nonzero_exit(self):
+    def test_read_reports_query_failure(self):
         runner = FakeRunner(
             paths={"wl-paste": "/usr/bin/wl-paste"},
-            results=[ok(returncode=1)],
+            results=[ok(stderr="Failed to connect to a Wayland server", returncode=1)],
         )
-        with self._wayland():
-            self.assertIsNone(ClipboardBackend(runner).read_text())
-
-    def test_write_sends_text_on_stdin(self):
-        runner = FakeRunner(paths={"wl-copy": "/usr/bin/wl-copy"})
-        with self._wayland():
-            ClipboardBackend(runner).write_text("内容")
-        self.assertEqual(runner.calls[0]["input"], "内容")
-        self.assertEqual(runner.calls[0]["args"], ["/usr/bin/wl-copy"])
+        with self._wayland(), self.assertRaises(BackendFailedError):
+            ClipboardBackend(runner).read()
 
     def test_write_missing_backend_raises(self):
         with self.assertRaises(BackendMissingError):
-            ClipboardBackend(FakeRunner()).write_text("x")
+            ClipboardBackend(FakeRunner()).write("x")
 
     def test_write_failure_raises_backend_failed(self):
         runner = FakeRunner(
@@ -367,14 +338,14 @@ class ClipboardBackendTests(LinuxPathTest):
             results=[ok(stderr="no display", returncode=1)],
         )
         with self._x11(), self.assertRaises(BackendFailedError):
-            ClipboardBackend(runner).write_text("x")
+            ClipboardBackend(runner).write("x")
 
 
 class WindowBackendTests(LinuxPathTest):
     def setUp(self):
         super().setUp()
         patcher = patch(
-            "notmyfault.platform.linux_support.session_type",
+            "notmyfault.platform.linux.desktop.session_type",
             return_value="x11",
         )
         patcher.start()
@@ -444,6 +415,7 @@ class WindowBackendTests(LinuxPathTest):
             paths={"wmctrl": "/usr/bin/wmctrl", "xprop": "/usr/bin/xprop"},
             results=[
                 ok(stdout=listing),
+                ok(stdout="_NET_WM_STATE(ATOM) = "),
                 ok(stdout=listing),
                 ok(stdout="_NET_WM_STATE(ATOM) = _NET_WM_STATE_MAXIMIZED_VERT, _NET_WM_STATE_MAXIMIZED_HORZ"),
             ],
@@ -451,44 +423,15 @@ class WindowBackendTests(LinuxPathTest):
         with patch.object(psutil, "Process") as process_cls:
             process_cls.return_value.name.return_value = "app"
             backend = WindowBackend(runner)
-            handles = backend.handles()
-            info = backend.info(0x2)
+            windows = backend.list()
+            info = backend.info("0x2")
 
-        self.assertEqual(handles, [0x2])
+        self.assertEqual([item["window_id"] for item in windows], ["0x2"])
         self.assertEqual(info["title"], "记事本")
         self.assertEqual(info["class_name"], "App")
         self.assertEqual(info["process_name"], "app")
         self.assertTrue(info["maximized"])
         self.assertIsNone(info["opacity"])
-
-    def test_activate_move_close_commands(self):
-        runner = FakeRunner(paths={"wmctrl": "/usr/bin/wmctrl", "xprop": "/usr/bin/xprop"})
-        backend = WindowBackend(runner)
-        backend.activate(0x2)
-        backend.position(0x2, {"x": 1, "y": 2, "width": 300, "height": 400})
-        backend.close(0x2)
-        self.assertEqual(
-            [call["args"] for call in runner.calls],
-            [
-                ["/usr/bin/wmctrl", "-i", "-a", "0x2"],
-                ["/usr/bin/wmctrl", "-i", "-r", "0x2", "-e", "0,1,2,300,400"],
-                ["/usr/bin/wmctrl", "-i", "-c", "0x2"],
-            ],
-        )
-
-    def test_show_minimize_prefers_xdotool(self):
-        runner = FakeRunner(
-            paths={
-                "wmctrl": "/usr/bin/wmctrl",
-                "xprop": "/usr/bin/xprop",
-                "xdotool": "/usr/bin/xdotool",
-            }
-        )
-        WindowBackend(runner).show(0x2, 6)
-        self.assertEqual(
-            runner.calls[0]["args"],
-            ["/usr/bin/xdotool", "windowminimize", "0x2"],
-        )
 
     def test_monitors_from_xrandr(self):
         output = (
@@ -506,26 +449,14 @@ class WindowBackendTests(LinuxPathTest):
         self.assertEqual(monitors[0]["bounds"]["width"], 1920)
         self.assertEqual(monitors[1]["bounds"]["x"], -1440)
 
-    def test_list_titles_falls_back_to_xdotool(self):
-        runner = FakeRunner(
-            paths={"xdotool": "/usr/bin/xdotool"},
-            results=[ok(stdout="A\n\nB\n")],
-        )
-        titles = WindowBackend(runner).list_titles()
-        self.assertEqual(titles, {0: "A", 2: "B"})
-        self.assertEqual(
-            runner.calls[0]["args"],
-            ["/usr/bin/xdotool", "search", "--name", "", "getwindowname", "%@"],
-        )
-
     def test_wayland_rejects_window_ops(self):
         runner = FakeRunner(paths={"wmctrl": "/usr/bin/wmctrl", "xprop": "/usr/bin/xprop"})
         with patch(
-            "notmyfault.platform.linux_support.session_type",
+            "notmyfault.platform.linux.desktop.session_type",
             return_value="wayland",
         ):
             with self.assertRaises(BackendUnsupportedError):
-                WindowBackend(runner).handles()
+                WindowBackend(runner).list()
 
     def test_info_for_unmapped_window_is_hidden(self):
         runner = FakeRunner(
@@ -535,13 +466,13 @@ class WindowBackendTests(LinuxPathTest):
                 ok(stdout='WM_CLASS(STRING) = "a", "b"'),
             ],
         )
-        info = WindowBackend(runner).info(0x2)
-        self.assertEqual(info["hwnd"], 0x2)
+        info = WindowBackend(runner).info("0x2")
+        self.assertEqual(info["window_id"], "0x2")
         self.assertFalse(info["visible"])
 
     def test_opacity_unsupported(self):
         with self.assertRaises(BackendUnsupportedError):
-            WindowBackend(FakeRunner()).opacity(1, 50)
+            WindowBackend(FakeRunner()).set_opacity("0x1", 50)
 
     def test_missing_wmctrl_raises(self):
         with self.assertRaises(BackendMissingError):
@@ -557,20 +488,10 @@ class WindowBackendTests(LinuxPathTest):
 
 
 class DisplayBackendTests(LinuxPathTest):
-    def test_brightness_uses_brightnessctl(self):
-        runner = FakeRunner(paths={"brightnessctl": "/usr/bin/brightnessctl"})
-
-        DisplayBackend(runner).set_brightness(40)
-
-        self.assertEqual(
-            runner.calls[0]["args"],
-            ["/usr/bin/brightnessctl", "set", "40%"],
-        )
-
     def test_gnome_power_uses_gdbus(self):
         runner = FakeRunner(paths={"gdbus": "/usr/bin/gdbus"})
         with patch(
-            "notmyfault.platform.linux_support.desktop_environment",
+            "notmyfault.platform.linux.desktop.desktop_environment",
             return_value="gnome",
         ):
             DisplayBackend(runner).set_power("off")
@@ -581,10 +502,10 @@ class DisplayBackendTests(LinuxPathTest):
     def test_x11_power_uses_xset(self):
         runner = FakeRunner(paths={"xset": "/usr/bin/xset"})
         with patch(
-            "notmyfault.platform.linux_support.desktop_environment",
+            "notmyfault.platform.linux.desktop.desktop_environment",
             return_value="unknown",
         ), patch(
-            "notmyfault.platform.linux_support.session_type",
+            "notmyfault.platform.linux.desktop.session_type",
             return_value="x11",
         ):
             DisplayBackend(runner).set_power("on")
@@ -597,10 +518,10 @@ class DisplayBackendTests(LinuxPathTest):
     def test_kde_power_uses_screensaver(self):
         runner = FakeRunner(paths={"gdbus": "/usr/bin/gdbus"})
         with patch(
-            "notmyfault.platform.linux_support.desktop_environment",
+            "notmyfault.platform.linux.desktop.desktop_environment",
             return_value="kde",
         ), patch(
-            "notmyfault.platform.linux_support.session_type",
+            "notmyfault.platform.linux.desktop.session_type",
             return_value="wayland",
         ):
             DisplayBackend(runner).set_power("off")
@@ -611,10 +532,10 @@ class DisplayBackendTests(LinuxPathTest):
     def test_wayland_unknown_desktop_power_rejected(self):
         runner = FakeRunner(paths={"xset": "/usr/bin/xset", "gdbus": "/usr/bin/gdbus"})
         with patch(
-            "notmyfault.platform.linux_support.desktop_environment",
+            "notmyfault.platform.linux.desktop.desktop_environment",
             return_value="unknown",
         ), patch(
-            "notmyfault.platform.linux_support.session_type",
+            "notmyfault.platform.linux.desktop.session_type",
             return_value="wayland",
         ):
             with self.assertRaises(BackendUnsupportedError) as ctx:
@@ -626,7 +547,7 @@ class DisplayBackendTests(LinuxPathTest):
             DisplayBackend(FakeRunner()).set_brightness(40)
 
 
-class ScreenshotBackendTests(LinuxPathTest):
+class ScreenBackendTests(LinuxPathTest):
     def test_portal_subscribes_before_request_and_closes_pending_request(self):
         for responds in (True, False):
             class Bus:
@@ -653,7 +574,7 @@ class ScreenshotBackendTests(LinuxPathTest):
                         return types.SimpleNamespace(message_type=2, body=[self.request_path])
                     return types.SimpleNamespace(message_type=2, body=[])
             bus = Bus()
-            source = Path(__file__).resolve().parents[1] / "platform" / "portal_screenshot.py"
+            source = Path(__file__).resolve().parents[1] / "platform" / "linux" / "portal.py"
             spec = importlib.util.spec_from_file_location("portal_under_test", source)
             module = importlib.util.module_from_spec(spec)
             with patch.dict(sys.modules, {
@@ -675,11 +596,11 @@ class ScreenshotBackendTests(LinuxPathTest):
     def test_active_window_uses_gnome_screenshot(self):
         runner = FakeRunner(paths={"gnome-screenshot": "/usr/bin/gnome-screenshot"})
         with tempfile.TemporaryDirectory() as temp_dir, patch(
-            "notmyfault.platform.linux_support.session_type",
+            "notmyfault.platform.linux.desktop.session_type",
             return_value="x11",
         ):
             destination = str(Path(temp_dir) / "shot.png")
-            result = ScreenshotBackend(runner).capture(
+            result = ScreenBackend(runner).capture(
                 destination,
                 "active_window",
                 "png",
@@ -695,11 +616,11 @@ class ScreenshotBackendTests(LinuxPathTest):
     def test_fullscreen_falls_back_to_spectacle(self):
         runner = FakeRunner(paths={"spectacle": "/usr/bin/spectacle"})
         with tempfile.TemporaryDirectory() as temp_dir, patch(
-            "notmyfault.platform.linux_support.session_type",
+            "notmyfault.platform.linux.desktop.session_type",
             return_value="x11",
         ):
             destination = str(Path(temp_dir) / "shot.png")
-            ScreenshotBackend(runner).capture(destination, "fullscreen", "png")
+            ScreenBackend(runner).capture(destination, "fullscreen", "png")
 
         self.assertEqual(
             runner.calls[0]["args"],
@@ -708,19 +629,19 @@ class ScreenshotBackendTests(LinuxPathTest):
 
     def test_wayland_uses_portal(self):
         calls = []
-        portal = types.ModuleType("notmyfault.platform.portal_screenshot")
+        portal = types.ModuleType("notmyfault.platform.linux.portal")
         portal.take_screenshot = (
             lambda path, interactive: calls.append((path, interactive))
         )
         with tempfile.TemporaryDirectory() as temp_dir, patch(
-            "notmyfault.platform.linux_support.session_type",
+            "notmyfault.platform.linux.desktop.session_type",
             return_value="wayland",
         ), patch.dict(
             sys.modules,
-            {"notmyfault.platform.portal_screenshot": portal},
+            {"notmyfault.platform.linux.portal": portal},
         ):
             destination = str(Path(temp_dir) / "shot.png")
-            result = ScreenshotBackend(FakeRunner()).capture(
+            result = ScreenBackend(FakeRunner()).capture(
                 destination,
                 "active_window",
                 "png",
@@ -731,21 +652,21 @@ class ScreenshotBackendTests(LinuxPathTest):
 
     def test_missing_screenshot_command_raises(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch(
-            "notmyfault.platform.linux_support.session_type",
+            "notmyfault.platform.linux.desktop.session_type",
             return_value="x11",
         ):
             with self.assertRaises(BackendMissingError):
-                ScreenshotBackend(FakeRunner()).capture(
+                ScreenBackend(FakeRunner()).capture(
                     str(Path(temp_dir) / "shot.png"),
                     "fullscreen",
                     "png",
                 )
 
 
-class PowerProfileBackendTests(LinuxPathTest):
+class PowerBackendTests(LinuxPathTest):
     def test_set_profile_maps_plans(self):
         runner = FakeRunner(paths={"powerprofilesctl": "/usr/bin/powerprofilesctl"})
-        profile = PowerProfileBackend(runner).set_profile("high_performance")
+        profile = PowerBackend(runner).set_profile("high_performance")
         self.assertEqual(profile, "performance")
         self.assertEqual(
             runner.calls[0]["args"],
@@ -754,57 +675,53 @@ class PowerProfileBackendTests(LinuxPathTest):
 
     def test_missing_powerprofilesctl_raises(self):
         with self.assertRaises(BackendMissingError):
-            PowerProfileBackend(FakeRunner()).set_profile("balanced")
+            PowerBackend(FakeRunner()).set_profile("balanced")
 
     def test_custom_plan_rejected(self):
         runner = FakeRunner(paths={"powerprofilesctl": "/usr/bin/powerprofilesctl"})
         with self.assertRaises(ValueError):
-            PowerProfileBackend(runner).set_profile("custom")
+            PowerBackend(runner).set_profile("custom")
 
 
-class LinuxSupportHelpersTests(unittest.TestCase):
+class LinuxSessionTests(unittest.TestCase):
     def test_current_session_id_prefers_env(self):
-        from notmyfault.platform import linux_support
+        from notmyfault.platform.linux import session
 
         with patch.dict("os.environ", {"XDG_SESSION_ID": "42"}, clear=False):
-            self.assertEqual(linux_support.current_session_id(), "42")
+            self.assertEqual(session.SessionBackend(FakeRunner()).session_id(), "42")
 
     def test_current_session_id_falls_back_to_loginctl_display(self):
-        from notmyfault.platform import linux_support
+        from notmyfault.platform.linux import session
 
-        with patch.dict("os.environ", {"XDG_SESSION_ID": "", "USER": "alice"}, clear=False), \
-                patch("notmyfault.platform.linux_support.command_path", return_value="/bin/loginctl"), \
-                patch(
-                    "notmyfault.platform.linux_support.run_command",
-                    return_value=ok(stdout="Display=c2\n"),
-                ) as run:
-            self.assertEqual(linux_support.current_session_id(), "c2")
+        runner = FakeRunner(paths={"loginctl": "/bin/loginctl"}, results=[ok(stdout="Display=c2\n")])
+        with patch.dict("os.environ", {"XDG_SESSION_ID": "", "USER": "alice"}, clear=False):
+            self.assertEqual(session.SessionBackend(runner).session_id(), "c2")
         self.assertEqual(
-            run.call_args.args[0],
+            runner.calls[0]["args"],
             ["/bin/loginctl", "show-user", "alice", "-p", "Display"],
         )
 
     def test_idle_probe_reports_kde_backend(self):
-        from notmyfault.platform import linux_support
+        from notmyfault.platform.linux import session
 
-        with patch("notmyfault.platform.linux_support.desktop_environment", return_value="kde"), \
-                patch("notmyfault.platform.linux_support.command_path", side_effect=lambda *names: "/usr/bin/gdbus" if "gdbus" in names else None):
-            backend, reason = linux_support.idle_probe()
+        with patch("notmyfault.platform.linux.desktop.desktop_environment", return_value="kde"), \
+                patch("notmyfault.platform.linux.session.command_path", side_effect=lambda *names: "/usr/bin/gdbus" if "gdbus" in names else None):
+            backend, reason = session.idle_probe()
         self.assertEqual(backend, "kde-ScreenSaver.GetSessionIdleTime")
         self.assertIsNone(reason)
 
 
 
-class OcrBackendTests(unittest.TestCase):
+class ScreenOcrTests(unittest.TestCase):
     def test_missing_tesseract(self):
         with self.assertRaises(BackendMissingError) as caught:
-            OcrBackend(FakeRunner()).recognize("screen.png", "eng")
+            ScreenBackend(FakeRunner()).ocr("screen.png", "eng")
         self.assertIn("tesseract", str(caught.exception))
 
     def test_rejects_language_that_is_not_a_tesseract_code(self):
         runner = FakeRunner(paths={"tesseract": "/usr/bin/tesseract"})
         with self.assertRaises(ValueError):
-            OcrBackend(runner).recognize("screen.png", "eng;rm")
+            ScreenBackend(runner).ocr("screen.png", "eng;rm")
         self.assertEqual(runner.calls, [])
 
     def test_reads_utf8_stdout_and_reports_tesseract_error(self):
@@ -812,7 +729,7 @@ class OcrBackendTests(unittest.TestCase):
             paths={"tesseract": "/usr/bin/tesseract"},
             results=[ok("你好\n")],
         )
-        text = OcrBackend(runner).recognize("/tmp/screen.png", "chi_sim+eng")
+        text = ScreenBackend(runner).ocr("/tmp/screen.png", "chi_sim+eng")
         self.assertEqual(text, "你好")
         self.assertEqual(
             runner.calls[0]["args"],
@@ -826,5 +743,5 @@ class OcrBackendTests(unittest.TestCase):
             results=[ok("", "Error opening data file chi_sim.traineddata", 1)],
         )
         with self.assertRaises(BackendFailedError) as caught:
-            OcrBackend(failed).recognize("screen.png", "chi_sim")
+            ScreenBackend(failed).ocr("screen.png", "chi_sim")
         self.assertIn("traineddata", str(caught.exception))

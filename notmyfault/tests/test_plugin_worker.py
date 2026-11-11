@@ -2,6 +2,7 @@ import hashlib
 import json
 import io
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -19,6 +20,7 @@ from notmyfault.core.plugin_worker import (
     PluginWorkerStartupTimeout,
     PluginWorkerTimeout,
 )
+from notmyfault.core.workflow import ActionCancelled, ActionCancellation
 
 
 def write_action(tmp_path, name, source):
@@ -96,10 +98,17 @@ def run_with_context(action_info, params, context):
 """
 
 PLUGIN_API_ACTION = """
-from notmyfault.plugin_api import platform_services
+from notmyfault.plugin_api import platform
 
 def run_with_context(action_info, params, context):
-    return {"platform": platform_services().platform}
+    return {"platform": platform.name}
+"""
+
+PLATFORM_ERROR_ACTION = """
+from notmyfault.plugin_api import PlatformServiceError
+
+def run_with_context(action_info, params, context):
+    raise PlatformServiceError("clipboard.read", "unavailable", "未安装 wl-paste")
 """
 
 READY_THEN_SLEEP_WORKER = """
@@ -180,6 +189,18 @@ class TestRunIsolatedAction:
         assert ok is True
         assert result["platform"] in {"windows", "linux", "macos"}
 
+    def test_platform_service_error_keeps_fields_across_process(self, tmp_path, monkeypatch):
+        from notmyfault.platform.errors import PlatformServiceError
+
+        monkeypatch.setenv("NOTMYFAULT_MODE", "stable")
+        entry = write_action(tmp_path, "platform_error", PLATFORM_ERROR_ACTION)
+        ok, error = run_isolated_action(entry, {"id": "platform_error"}, {}, {})
+        assert ok is False
+        assert isinstance(error, PlatformServiceError)
+        assert (error.capability, error.kind, error.reason) == (
+            "clipboard.read", "unavailable", "未安装 wl-paste",
+        )
+
     def test_worker_imports_sibling_module(self, tmp_path):
         (tmp_path / "helper.py").write_text(
             "def triple(value):\n    return value * 3\n",
@@ -208,6 +229,47 @@ class TestRunIsolatedAction:
         assert ok is True
         assert result == {"completed": True}
         assert len(logs.getvalue()) >= 262144
+
+    def test_protocol_reader_reports_queue_overflow_without_blocking(self):
+        messages = queue.Queue(maxsize=4)
+        reader = threading.Thread(
+            target=plugin_worker._read_protocol,
+            args=(io.StringIO("line\n" * 8), messages),
+            daemon=True,
+        )
+
+        reader.start()
+        reader.join(timeout=1)
+
+        assert not reader.is_alive()
+        assert messages.get_nowait() is plugin_worker._PROTOCOL_QUEUE_FULL
+
+    def test_cancelled_isolated_action_stops_worker_without_crash_event(self, tmp_path, monkeypatch):
+        entry = write_action(tmp_path, "sleepy_cancel", SLEEPY_ACTION)
+        cancelled = threading.Event()
+        cancellation = ActionCancellation(run_event=cancelled)
+        crashes = []
+        outcome = {}
+        monkeypatch.setattr(plugin_worker, "_on_crash", lambda *args: crashes.append(args))
+
+        def run():
+            try:
+                run_isolated_action(entry, {}, {}, {}, execute_timeout=30, cancellation=cancellation)
+            except BaseException as error:
+                outcome["error"] = error
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        deadline = time.time() + 5
+        while not plugin_worker._live_processes and time.time() < deadline:
+            time.sleep(0.02)
+        assert plugin_worker._live_processes
+        cancelled.set()
+        worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert isinstance(outcome.get("error"), ActionCancelled)
+        assert not crashes
 
     @pytest.mark.parametrize("load_only", [False, True])
     def test_raising_action_reports_error(self, tmp_path, load_only):

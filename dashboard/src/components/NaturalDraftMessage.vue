@@ -1,4 +1,5 @@
 <script setup>
+import CircularProgress from './CircularProgress.vue'
 import { renderMarkdown } from '../lib/markdown'
 import NaturalDraftRuleCard from './NaturalDraftRuleCard.vue'
 
@@ -65,7 +66,7 @@ function activityHeadline(message) {
           @click="message.activity.open = !message.activity.open">
           <span v-if="message.activity.failed" class="material-symbols-outlined">error</span>
           <span v-else-if="message.activity.finished" class="material-symbols-outlined">check_circle</span>
-          <span v-else class="material-symbols-outlined ai-activity-spin">progress_activity</span>
+          <CircularProgress v-else :size="18" />
           <span>{{ activityHeadline(message) }}</span>
           <span v-if="message.activity.finished" class="material-symbols-outlined ai-activity-chevron">expand_more</span>
         </button>
@@ -73,7 +74,7 @@ function activityHeadline(message) {
           <div class="ai-activity-steps">
             <div v-for="(step, index) in message.activity.steps" :key="index" class="ai-activity-step" :class="step.state">
               <span v-if="step.state === 'done'" class="material-symbols-outlined">check</span>
-              <span v-else class="material-symbols-outlined ai-activity-spin">progress_activity</span>
+              <CircularProgress v-else :size="18" />
               <span>{{ step.label }}</span>
             </div>
           </div>
@@ -135,8 +136,6 @@ function activityHeadline(message) {
 .ai-activity-toggle>.material-symbols-outlined{flex:none;font-size:15px}
 .ai-activity.finished .ai-activity-toggle>.material-symbols-outlined:first-child{color:var(--md-success)}
 .ai-activity.failed .ai-activity-toggle>.material-symbols-outlined:first-child{color:var(--md-error)}
-.ai-activity-spin{animation:ai-activity-rotate 1.6s linear infinite}
-@keyframes ai-activity-rotate{to{transform:rotate(360deg)}}
 .ai-activity-chevron{margin-left:auto;font-size:16px;transition:transform .2s ease}
 .ai-activity.open .ai-activity-chevron{transform:rotate(180deg)}
 .ai-activity-body{display:grid;grid-template-rows:0fr;transition:grid-template-rows .2s ease;overflow:hidden}
@@ -167,5 +166,5 @@ function activityHeadline(message) {
 .ai-error-retry .material-symbols-outlined{flex:none;font-size:15px}
 .ai-stopped{display:flex;align-items:center;gap:5px;font:var(--ts-label-m);color:var(--md-on-surface-variant)}
 .ai-stopped .material-symbols-outlined{flex:none;font-size:14px}
-@media (prefers-reduced-motion:reduce){.ai-activity-chevron,.ai-activity-body,.ai-reasoning-chevron,.ai-reasoning-body,.ai-stream-cursor,.ai-activity-spin{transition:none;animation:none}}
+@media (prefers-reduced-motion:reduce){.ai-activity-chevron,.ai-activity-body,.ai-reasoning-chevron,.ai-reasoning-body,.ai-stream-cursor{transition:none;animation:none}}
 </style>

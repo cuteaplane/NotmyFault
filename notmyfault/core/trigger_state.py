@@ -52,7 +52,9 @@ class StateDetector:
             direction = hysteresis.get("direction", self.parameter(hysteresis.get("direction_param")))
             active = hysteresis.get("active_value", True)
             margin = hysteresis["margin"] if previous == active else 0
-            hit = actual <= threshold + margin if direction == "below" else actual >= threshold - margin
+            hit = actual is not None and (
+                actual <= threshold + margin if direction == "below" else actual >= threshold - margin
+            )
             hit &= all(payload.get(name) == expected for name, expected in hysteresis.get("guard", {}).items())
             value = active if hit else (payload[key] if "active_value" in hysteresis else False)
             payload = freeze({**payload, key: value})

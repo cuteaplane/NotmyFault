@@ -8,7 +8,6 @@
     "execution_api": "context-v1",
     "idempotent": false,
     "requires_capabilities": ["input.send"],
-    "platforms": ["windows", "linux"],
     "permissions": ["native_api","external_binary"],
     "outputs": [
         {"name": "mode", "label": "发送模式", "type": "string"}

@@ -9,10 +9,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from notmyfault.security.plugin_schema import (
-    current_platform_name,
-    validate_plugin_meta,
-)
+import notmyfault.platform
+
+from notmyfault.security.plugin_schema import validate_plugin_meta
 from notmyfault.security.plugins import (
     analyze_plugin_source, plugin_integrity_problems, plugin_signature_kind_from_digest,
 )
@@ -41,13 +40,13 @@ def is_plugin_platform_compatible(meta: dict) -> bool:
     entrypoints = meta.get("entrypoints")
     platforms = meta.get("platforms")
     if isinstance(entrypoints, dict) and entrypoints:
-        return current_platform_name() in entrypoints
-    return not platforms or current_platform_name() in platforms
+        return notmyfault.platform.current() in entrypoints
+    return not platforms or notmyfault.platform.current() in platforms
 
 
 def resolve_plugin_entrypoint(folder_path: str, meta: dict, default_filename: str) -> str:
     entrypoints = meta.get("entrypoints") or {}
-    relative_path = entrypoints.get(current_platform_name(), default_filename)
+    relative_path = entrypoints.get(notmyfault.platform.current(), default_filename)
     path_api = posixpath if sys.platform.startswith("linux") else os.path
     plugin_root = path_api.realpath(folder_path)
     entrypoint = path_api.realpath(path_api.join(plugin_root, relative_path))
@@ -133,7 +132,9 @@ class PluginInspection:
     errors: list[str] = field(default_factory=list)
     schema_errors: list[str] = field(default_factory=list)
     platform_compatible: bool = False
+    platform_checked: bool = False
     entrypoint: str | None = None
+    entrypoint_checked: bool = False
     capability_problems: list[dict] = field(default_factory=list)
     capabilities: set[str] = field(default_factory=set)
     uses_sudo: bool = False
@@ -177,10 +178,12 @@ def inspect_plugin(root: str | Path, kind: PluginKind, origin: str = "user", *, 
     if result.errors or result.schema_errors:
         return result
     result.platform_compatible = is_plugin_platform_compatible(meta)
+    result.platform_checked = True
     try:
         result.entrypoint = resolve_plugin_entrypoint(str(root), meta, f"{kind}.py")
     except ValueError as error:
         result.errors.append(str(error))
+    result.entrypoint_checked = True
     from notmyfault.platform.capabilities import is_capability_compatible
     from notmyfault.plugin_api import engines_compatibility
 

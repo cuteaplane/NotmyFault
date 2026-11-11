@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 import pytest
 
-from notmyfault.actions.create_shortcut import action as create_shortcut
+from notmyfault.platform.linux.desktop import DesktopBackend
 from notmyfault.actions.http_request import action as http_request
 from notmyfault.actions.download_file import action as download_file
 from notmyfault.core.workflow import ActionCancellation, ActionCancelled
@@ -456,35 +456,22 @@ def test_pinned_socket_never_resolves_the_hostname_again(monkeypatch):
 
 
 def test_linux_shortcut_rejects_multiline_fields(monkeypatch):
-    monkeypatch.setattr(create_shortcut.sys, "platform", "linux")
     with pytest.raises(ValueError, match="换行"):
-        create_shortcut.run_with_context(
-            {},
-            {
-                "name": "safe",
-                "target_path": "/usr/bin/tool\nX-GNOME-Autostart-enabled=true",
-                "location": "start_menu",
-            },
-        {})
+        DesktopBackend().create_shortcut(
+            "/usr/bin/tool\nX-GNOME-Autostart-enabled=true", "start_menu", "safe",
+        )
 
 
 @pytest.mark.parametrize("prefix,escaped_prefix", [("", ""), (" ", r"\s"), ("\t", r"\t")])
 def test_linux_shortcut_quotes_exec_tokens(tmp_path, monkeypatch, prefix, escaped_prefix):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-    monkeypatch.setattr(create_shortcut.sys, "platform", "linux")
-    result = create_shortcut.run_with_context(
-        {},
-        {
-            "name": "safe",
-            "target_path": " ./My Tool/tool\u3000",
-            "arguments": "--label 'two words' --dollar '$HOME' --slash '\\part' --tab 'a\tb'",
-            "location": "start_menu",
-            "working_directory": prefix + "/tmp/work\\folder ",
-            "icon_path": prefix + "/tmp/icon.png ",
-        },
-    {})
+    result = DesktopBackend().create_shortcut(
+        " ./My Tool/tool\u3000", "start_menu", "safe",
+        arguments="--label 'two words' --dollar '$HOME' --slash '\\part' --tab 'a\tb'",
+        icon=prefix + "/tmp/icon.png ",
+    )
     content = Path(result["shortcut_path"]).read_text(encoding="utf-8")
-    assert f"Path={escaped_prefix}/tmp/work\\\\folder\\s\n" in content
+    assert "Path=" not in content
     assert f"Icon={escaped_prefix}/tmp/icon.png\\s\n" in content
     assert 'Exec=" ./My Tool/tool\u3000" "--label" "two words"' in content
     assert '"\\\\$HOME"' in content

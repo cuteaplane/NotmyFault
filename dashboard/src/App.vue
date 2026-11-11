@@ -14,6 +14,7 @@ const { init: initTheme } = useTheme()
 const currentPage = ref('home')
 const pageTransitioning = ref(false)
 let queuedPage = ''
+const pageScroll = new Map()
 const FirstRunSetup = defineAsyncComponent(() => import('./components/FirstRunSetup.vue'))
 let savedFirstRun = ''
 try { savedFirstRun = localStorage.getItem('nmf-first-run') || '' } catch {}
@@ -43,13 +44,14 @@ function switchPage(p) {
     queuedPage = p
     return
   }
+  pageScroll.set(currentPage.value, document.querySelector('.app-main')?.scrollTop || 0)
   currentPage.value = p
 }
 
 function finishPageTransition() {
   pageTransitioning.value = false
   const main = document.querySelector('.app-main')
-  if (main) main.scrollTop = 0
+  if (main) main.scrollTop = pageScroll.get(currentPage.value) || 0
   nextTick(() => main?.focus({ preventScroll: true }))
   if (!queuedPage) return
   const page = queuedPage
@@ -75,6 +77,14 @@ const CONFIG_LOAD_ATTEMPTS = 30
 const CONFIG_LOAD_INTERVAL = 150
 const REFRESH_SIGNAL_DELAY = 100
 let configLoadPromise = null
+
+function syncAppStatus(status) {
+  updateStatus(status)
+  if (store.engineStatus.engine_running === false
+    && ['stopped', 'failed', 'offline'].includes(store.engineStatus.engine_state)) {
+    store.activeManualRun = null
+  }
+}
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -120,7 +130,7 @@ async function loadConfigAtStartup() {
 
 async function refreshAll(status = null) {
   const currentStatus = status || await getEngineStatus().catch(() => OFFLINE_STATUS)
-  updateStatus(currentStatus)
+  syncAppStatus(currentStatus)
   if (!currentStatus.api_alive) return
   void loadAISettingsOnce()
   const configPromise = loadConfigData().catch(() => {})
@@ -137,7 +147,7 @@ async function refreshAll(status = null) {
 async function refreshStatus() {
   const wasOnline = store.controllerOnline
   const status = await getEngineStatus().catch(() => OFFLINE_STATUS)
-  updateStatus(status)
+  syncAppStatus(status)
   if (!status.api_alive) return
   if (!wasOnline) {
     refreshAll(status)
@@ -168,7 +178,7 @@ async function connectSSE() {
   if (disposed || generation !== sseGeneration) return
   if (hasBridge() && !token) {
     // 后台服务重启时 token 文件可能尚未发布，这里按退避重连直到 token 出现。
-    updateStatus({ engine_running: false })
+    syncAppStatus({ engine_running: false })
     sseRetry++
     const delay = Math.min(1000 * 2 ** Math.min(sseRetry - 1, 4), 15000)
     sseReconnectTimer = setTimeout(connectSSE, delay)
@@ -206,7 +216,7 @@ async function connectSSE() {
 function scheduleSSEReconnect() {
   if (disposed) return
   sseRetry++
-  if (sseRetry > SSE_MAX) updateStatus({ engine_running: false })
+  if (sseRetry > SSE_MAX) syncAppStatus({ engine_running: false })
   // 长时间休眠、WebView 网络栈重置或 token 重新发布期间都可能连续失败，超过阈值仍会继续按退避重连。
   const delay = Math.min(1000 * 2 ** Math.min(sseRetry - 1, 4), 15000)
   if (sseReconnectTimer) clearTimeout(sseReconnectTimer)
@@ -225,7 +235,7 @@ function dispatchSSEEvent(eventName, dataText) {
   if (eventName === 'engine_state_changed') {
     let d = {}
     try { d = JSON.parse(dataText) } catch (err) { return }
-    updateStatus({
+    syncAppStatus({
       api_alive: true,
       engine_state: d.state,
       engine_running: d.state === 'running',
@@ -301,7 +311,7 @@ watch(() => store.controllerOnline, (on) => {
 })
 
 // 子视图在引擎启停后调用这里暴露的刷新入口。
-window.__nmf = { refreshAll, updateStatus, switchPage }
+window.__nmf = { refreshAll, updateStatus: syncAppStatus, switchPage }
 
 onMounted(async () => {
   window.addEventListener('pywebviewready', refreshStatus)
@@ -309,7 +319,7 @@ onMounted(async () => {
   void loadConfigAtStartup()
   const status = await getEngineStatus().catch(() => OFFLINE_STATUS)
   if (disposed) return
-  updateStatus(status)
+  syncAppStatus(status)
   if (status.api_alive) {
     await refreshAll(status)
     if (disposed) return
@@ -336,7 +346,9 @@ onUnmounted(() => {
   <NavRail :current="currentPage" @switch="switchPage" />
   <main class="app-main" tabindex="-1" aria-label="页面内容">
     <Transition name="page" mode="out-in" @before-leave="pageTransitioning = true" @after-enter="finishPageTransition">
-      <component :is="views[currentPage]" :key="currentPage" />
+      <KeepAlive>
+        <component :is="views[currentPage]" :key="currentPage" />
+      </KeepAlive>
     </Transition>
   </main>
   </template>

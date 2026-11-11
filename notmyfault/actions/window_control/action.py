@@ -1,17 +1,7 @@
-from notmyfault.plugin_api import action_values
+from notmyfault.plugin_api import action_values, platform
 import math
-import os
 import re
-import sys
 import time
-
-from notmyfault.plugin_api import platform_backend_api
-
-_platform_backend = platform_backend_api()
-BackendError = _platform_backend.BackendError
-WindowBackend = _platform_backend.WindowBackend
-default_runner = _platform_backend.default_runner
-
 
 _ACTIONS = {"list", "list_monitors", "get_info", "bring_to_front", "minimize", "maximize",
             "restore", "show", "hide", "move", "resize", "move_resize", "center", "snap",
@@ -19,13 +9,6 @@ _ACTIONS = {"list", "list_monitors", "get_info", "bring_to_front", "minimize", "
 _LAYOUTS = {"left": (0, 0, 1, 2), "right": (1, 0, 2, 2), "top": (0, 0, 2, 1),
             "bottom": (0, 1, 2, 2), "top_left": (0, 0, 1, 1), "top_right": (1, 0, 2, 1),
             "bottom_left": (0, 1, 1, 2), "bottom_right": (1, 1, 2, 2)}
-
-
-def _backend():
-    if os.name == "nt":
-        from .win32 import Windows
-        return Windows()
-    return WindowBackend(default_runner)
 
 
 def _number(params, name, default, low, high, *, integer=False):
@@ -47,7 +30,7 @@ def _options(params):
     monitor = params.get("monitor", "current")
     if action not in _ACTIONS:
         raise ValueError(f"未知窗口操作: {action}")
-    if target not in {"active", "title", "process", "pid", "class_name", "hwnd", "all"}:
+    if target not in {"active", "title", "process", "pid", "class_name", "window_id", "all"}:
         raise ValueError(f"未知窗口目标: {target}")
     if match not in {"unique", "first", "all"} or mode not in {"contains", "exact", "regex"}:
         raise ValueError("窗口匹配方式无效")
@@ -71,8 +54,12 @@ def _options(params):
                 except re.error as error:
                     raise ValueError(f"窗口匹配正则无效: {error}") from error
             result["text"] = text
-        elif target in {"pid", "hwnd"}:
-            result[target] = _number(params, target, 0, 1, 2**32 - 1 if target == "pid" else 2**53 - 1, integer=True)
+        elif target == "pid":
+            result[target] = _number(params, target, 0, 1, 2**32 - 1, integer=True)
+        elif target == "window_id":
+            result[target] = str(params.get("window_id", "") or "").strip()
+            if not result[target]:
+                raise ValueError("必须填写窗口 ID")
     if action in {"move", "move_resize"}:
         for name in ("x", "y"):
             result[name] = _number(params, name, 0, -(2**31), 2**31 - 1, integer=True)
@@ -100,17 +87,14 @@ def validate_params(_meta, params):
 
 def _matches(info, options):
     target = options["target"]
-    if target in {"active", "hwnd", "all"}:
+    if target in {"active", "window_id", "all"}:
         return True
     if target == "pid":
         return info["pid"] == options["pid"]
     text = options["text"]
     if target == "process":
         actual = info["process_name"]
-        if os.name == "nt":
-            name = text if text.lower().endswith(".exe") else text + ".exe"
-            return actual.casefold() == name.casefold()
-        return actual.casefold() == text.casefold()
+        return actual.casefold().removesuffix(".exe") == text.casefold().removesuffix(".exe")
     value = info[target]
     if options["match_mode"] == "regex":
         return bool(options["pattern"].search(value))
@@ -119,11 +103,11 @@ def _matches(info, options):
 
 def _select(backend, options):
     target = options["target"]
-    handles = [backend.foreground()] if target == "active" else [options["hwnd"]] if target == "hwnd" else backend.handles()
+    handles = [backend.foreground()] if target == "active" else [options["window_id"]] if target == "window_id" else [item["window_id"] for item in backend.list()]
     result = []
     for hwnd in handles:
-        info = backend.info(hwnd)
-        if info is None or not info["visible"] and not options["include_hidden"] and target != "hwnd":
+        info = backend.info(hwnd) if hwnd is not None else None
+        if info is None or not info["visible"] and not options["include_hidden"] and target != "window_id":
             continue
         if _matches(info, options):
             result.append(info)
@@ -154,8 +138,12 @@ def _monitor(backend, hwnd, options):
     monitors = backend.monitors()
     if not monitors:
         raise RuntimeError("没有可用显示器")
-    current_handle = backend.monitor_for(hwnd)
-    current = next((i for i, item in enumerate(monitors) if item["handle"] == current_handle), 0)
+    info = backend.info(hwnd)
+    cx = info["x"] + info["width"] // 2
+    cy = info["y"] + info["height"] // 2
+    current = next((i for i, item in enumerate(monitors)
+                    if item["bounds"]["x"] <= cx < item["bounds"]["x"] + item["bounds"]["width"]
+                    and item["bounds"]["y"] <= cy < item["bounds"]["y"] + item["bounds"]["height"]), 0)
     mode = options["monitor"]
     index = {"current": current, "primary": 0, "next": (current + 1) % len(monitors),
              "previous": (current - 1) % len(monitors), "index": options.get("monitor_index", 1) - 1}[mode]
@@ -165,7 +153,7 @@ def _monitor(backend, hwnd, options):
 
 
 def _operate(backend, before, options, deadline, cancellation):
-    hwnd, action = before["hwnd"], options["action"]
+    hwnd, action = before["window_id"], options["action"]
 
     def await_info(check, message):
         def probe():
@@ -179,29 +167,29 @@ def _operate(backend, before, options, deadline, cancellation):
         return before
     if action == "close":
         backend.close(hwnd)
-        _wait(lambda: not backend.exists(hwnd), deadline, cancellation, "窗口未在时限内关闭，可能正在等待保存确认")
+        _wait(lambda: backend.info(hwnd) is None, deadline, cancellation, "窗口未在时限内关闭，可能正在等待保存确认")
         return {**before, "closed": True}
     if action in {"minimize", "maximize", "restore", "show", "hide"}:
-        backend.show(hwnd, {"minimize": 6, "maximize": 3, "restore": 9, "show": 8, "hide": 0}[action])
+        backend.show(hwnd, action)
         checks = {"minimize": lambda info: info["minimized"], "maximize": lambda info: info["maximized"],
                   "restore": lambda info: info["visible"] and not info["minimized"] and not info["maximized"],
                   "show": lambda info: info["visible"], "hide": lambda info: not info["visible"]}
         return await_info(checks[action], "窗口未在时限内完成状态切换")
     if action == "bring_to_front":
         if before["minimized"] or not before["visible"]:
-            backend.show(hwnd, 9 if before["minimized"] else 8)
+            backend.show(hwnd, "restore" if before["minimized"] else "show")
             await_info(lambda info: info["visible"] and not info["minimized"], "窗口未能恢复显示")
         backend.activate(hwnd)
         return await_info(lambda _: backend.foreground() == hwnd, "窗口未能切换到前台")
     if action in {"pin", "unpin", "toggle_pin"}:
         enabled = not before["topmost"] if action == "toggle_pin" else action == "pin"
-        backend.pin(hwnd, enabled)
+        backend.set_pinned("pin" if enabled else "unpin", hwnd)
         return await_info(lambda info: info["topmost"] == enabled, "窗口置顶状态未生效")
     if action == "set_opacity":
-        backend.opacity(hwnd, options["opacity"])
+        backend.set_opacity(hwnd, options["opacity"])
         return await_info(lambda info: info["opacity"] == options["opacity"], "窗口透明度未生效")
     if before["minimized"] or before["maximized"]:
-        backend.show(hwnd, 9)
+        backend.show(hwnd, "restore")
         before = await_info(lambda info: not info["minimized"] and not info["maximized"], "窗口未能恢复正常大小")
     rect = {key: before[key] for key in ("x", "y", "width", "height")}
     if action in {"move", "move_resize"}:
@@ -219,42 +207,37 @@ def _operate(backend, before, options, deadline, cancellation):
             rect["width"], rect["height"] = min(rect["width"], work["width"]), min(rect["height"], work["height"])
             rect["x"] = work["x"] + (work["width"] - rect["width"]) // 2
             rect["y"] = work["y"] + (work["height"] - rect["height"]) // 2
-    backend.position(hwnd, rect)
+    backend.move(hwnd, rect)
     return await_info(lambda info: all(abs(info[key] - value) <= 1 for key, value in rect.items()),
                       "窗口未达到指定位置或大小，应用可能限制了窗口尺寸")
 
 
 def run_with_context(_meta, params, context):
     params = action_values(params)
-    if os.name != "nt" and not sys.platform.startswith("linux"):
-        raise RuntimeError("window_control 仅支持 Windows 和 Linux")
     options = _options(params)
     cancellation = context.get("runtime", {}).get("cancellation")
     if cancellation:
         cancellation.raise_if_cancelled()
-    try:
-        backend = _backend()
-        action = options["action"]
-        if action == "list_monitors":
-            monitors = backend.monitors()
-            return {"action": action, "count": len(monitors), "hwnd": 0, "windows": [], "monitors": monitors}
-        selected = _select(backend, options)
-        if not selected and options["wait_seconds"]:
-            selected = _wait(lambda: _select(backend, options), time.monotonic() + options["wait_seconds"],
-                             cancellation, "等待窗口超时")
-        if not selected and action != "list":
-            raise RuntimeError("没有找到匹配的顶层窗口")
-        if action == "bring_to_front" and len(selected) > 1:
-            raise ValueError("前台激活只能选择一个窗口")
-        deadline = time.monotonic() + options["timeout_seconds"]
-        result = []
-        for info in selected:
-            if cancellation:
-                cancellation.raise_if_cancelled()
-            if time.monotonic() >= deadline:
-                raise RuntimeError(f"窗口操作超过总时限，已完成 {len(result)}/{len(selected)} 个窗口")
-            result.append(info if action == "list" else _operate(backend, info, options, deadline, cancellation))
-        return {"action": action, "count": len(result), "hwnd": result[0]["hwnd"] if len(result) == 1 else 0,
-                "windows": result, "monitors": []}
-    except BackendError as error:
-        raise RuntimeError(str(error)) from error
+    backend = platform.window
+    action = options["action"]
+    if action == "list_monitors":
+        monitors = backend.monitors()
+        return {"action": action, "count": len(monitors), "window_id": "", "windows": [], "monitors": monitors}
+    selected = _select(backend, options)
+    if not selected and options["wait_seconds"]:
+        selected = _wait(lambda: _select(backend, options), time.monotonic() + options["wait_seconds"],
+                         cancellation, "等待窗口超时")
+    if not selected and action != "list":
+        raise RuntimeError("没有找到匹配的顶层窗口")
+    if action == "bring_to_front" and len(selected) > 1:
+        raise ValueError("前台激活只能选择一个窗口")
+    deadline = time.monotonic() + options["timeout_seconds"]
+    result = []
+    for info in selected:
+        if cancellation:
+            cancellation.raise_if_cancelled()
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"窗口操作超过总时限，已完成 {len(result)}/{len(selected)} 个窗口")
+        result.append(info if action == "list" else _operate(backend, info, options, deadline, cancellation))
+    return {"action": action, "count": len(result), "window_id": result[0]["window_id"] if len(result) == 1 else "",
+            "windows": result, "monitors": []}

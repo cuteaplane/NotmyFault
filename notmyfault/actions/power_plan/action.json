@@ -10,10 +10,6 @@
     ],
     "execution_api": "context-v1",
     "idempotent": true,
-    "platforms": [
-        "windows",
-        "linux"
-    ],
     "permissions": [
         "external_binary"
     ],
@@ -24,17 +20,10 @@
             "type": "string"
         },
         {
-            "name": "guid",
-            "label": "计划 GUID",
-            "type": "string",
-            "value_type": "uuid",
-            "required": false
-        },
-        {
             "name": "profile",
-            "label": "Linux 电源模式",
+            "label": "系统电源模式",
             "type": "string",
-            "required": false
+            "required": true
         }
     ],
     "params": [

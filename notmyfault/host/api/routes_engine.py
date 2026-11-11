@@ -26,60 +26,60 @@ def create_engine_router(
     router = APIRouter()
 
     @router.post("/api/engine/start")
-    async def engine_start():
+    def engine_start():
         try:
             return service.start()
         except EngineServiceError as error:
             return _service_error(error)
 
     @router.post("/api/engine/stop")
-    async def engine_stop():
+    def engine_stop():
         return service.stop()
 
     @router.post("/api/engine/shutdown")
-    async def engine_shutdown():
+    def engine_shutdown():
         return service.shutdown()
 
     @router.get("/api/engine/status")
-    async def engine_status():
+    def engine_status():
         return service.status()
 
     @router.get("/api/platform")
-    async def platform_status():
+    def platform_status():
         return service.platform_status()
 
     @router.get("/api/engine/diagnostics")
-    async def engine_diagnostics():
+    def engine_diagnostics():
         return service.diagnostics()
 
     @router.get("/api/runs")
-    async def runs_list(limit: int = 100):
+    def runs_list(limit: int = 100):
         return value_response(service.runs(limit))
 
     @router.get("/api/runs/{run_id}")
-    async def run_detail(run_id: str):
+    def run_detail(run_id: str):
         run = service.run_detail(run_id)
         if run is None:
             return JSONResponse({"detail": "运行记录不存在"}, status_code=404)
         return value_response(run)
 
     @router.post("/api/runs/{run_id}/cancel")
-    async def run_cancel(run_id: str):
+    def run_cancel(run_id: str):
         try:
             return service.cancel_run(run_id)
         except EngineServiceError as error:
             return _service_error(error)
 
     @router.get("/api/engine/logs")
-    async def engine_logs(lines: int = 200):
+    def engine_logs(lines: int = 200):
         return service.logs(lines)
 
     @router.get("/api/engine/logs/files")
-    async def engine_log_files():
+    def engine_log_files():
         return service.log_files()
 
     @router.get("/api/engine/logs/entries")
-    async def engine_log_entries(lines: int = 600, name: str = ""):
+    def engine_log_entries(lines: int = 600, name: str = ""):
         try:
             return service.log_entries(lines, name)
         except ValueError as error:

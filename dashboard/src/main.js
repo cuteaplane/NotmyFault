@@ -1,6 +1,7 @@
 import { createApp } from 'vue'
 import App from './App.vue'
 import { appLogoUrl } from './lib/branding'
+import { installRipple } from './lib/ripple'
 import './styles.css'
 
 const favicon = document.querySelector('link[rel="icon"]') || document.createElement('link')
@@ -10,6 +11,7 @@ favicon.href = appLogoUrl
 if (!favicon.parentNode) document.head.appendChild(favicon)
 
 function start() {
+  installRipple()
   createApp(App).mount('#app')
 }
 

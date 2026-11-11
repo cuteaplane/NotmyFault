@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 from fastapi import APIRouter, Request
@@ -17,7 +18,7 @@ def create_ai_router(service: AIDraftingService) -> APIRouter:
     router = APIRouter()
 
     @router.get("/api/settings/ai-drafting")
-    async def ai_drafting_settings():
+    def ai_drafting_settings():
         return service.settings()
 
     @router.put("/api/settings/ai-drafting/api-key")
@@ -31,14 +32,14 @@ def create_ai_router(service: AIDraftingService) -> APIRouter:
             )
         key = body.get("api_key") if isinstance(body, dict) else None
         try:
-            return service.save_api_key(key)
+            return await asyncio.to_thread(service.save_api_key, key)
         except AIDraftingError as error:
             return _error_response(error)
 
     @router.delete("/api/settings/ai-drafting/api-key")
     async def delete_ai_api_key():
         try:
-            return service.delete_api_key()
+            return await asyncio.to_thread(service.delete_api_key)
         except AIDraftingError as error:
             return _error_response(error)
 
@@ -57,7 +58,7 @@ def create_ai_router(service: AIDraftingService) -> APIRouter:
                 status_code=400,
             )
         try:
-            return service.update_settings(body)
+            return await asyncio.to_thread(service.update_settings, body)
         except AIDraftingError as error:
             return _error_response(error)
 
@@ -95,7 +96,7 @@ def create_ai_router(service: AIDraftingService) -> APIRouter:
                 status_code=400,
             )
         try:
-            plan = service.prepare_stream(body)
+            plan = await asyncio.to_thread(service.prepare_stream, body)
         except AIDraftingError as error:
             return _error_response(error)
 

@@ -284,6 +284,7 @@ internal static class Scenarios
         CheckShortcuts(root);
         CheckLaunch(root);
         CheckUninstallHandoff(root);
+        CheckPreservedCoreFiles(root);
         CheckUpgradeRecovery(root);
         foreach (string failure in new[] { "move", "delete", "registration", "marker" })
         {
@@ -409,6 +410,68 @@ internal static class Scenarios
             Registry.CurrentUser.DeleteSubKeyTree(Registration, false);
             Console.WriteLine("PASS: upgrade recovery after process exit at " + stage);
         }
+    }
+
+    private static void CheckPreservedCoreFiles(string root)
+    {
+        foreach (string rejectedFile in new[] {
+            "app/legacy.pyw",
+            "app/notmyfault/legacy.pyd",
+            "app/Win_toaster/legacy.exe"
+        })
+        {
+            string rejectedPath = rejectedFile.Replace('/', Path.DirectorySeparatorChar);
+            string name = rejectedFile.Replace('/', '-');
+            string directory = Path.Combine(root, "preserved-core-" + name);
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(directory, rejectedPath)));
+            File.WriteAllText(Path.Combine(directory, ".notmyfault-install"), "NotmyFault Windows installer 1\nold\n");
+            File.WriteAllText(Path.Combine(directory, rejectedPath), "old core file");
+            string plugin = "app/user_plugins/sample/action.py".Replace('/', Path.DirectorySeparatorChar);
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(directory, plugin)));
+            File.WriteAllText(Path.Combine(directory, plugin), "user plugin");
+            File.WriteAllText(Path.Combine(directory, "keep.txt"), "user data");
+            InstallMaintenance.WriteState(directory, "old", new HashSet<string> { rejectedPath, plugin, "keep.txt" });
+
+            bool refused = false;
+            bool copiedBeforeRefusal = false;
+            using (var transaction = new InstallMaintenance.Transaction(directory, true))
+            {
+                try { transaction.RestoreUserFiles(); }
+                catch (IOException error)
+                {
+                    refused = error.Message.IndexOf(rejectedPath, StringComparison.OrdinalIgnoreCase) >= 0
+                        && error.Message.Contains("请先将其移出安装目录")
+                        && error.Message.Contains("重试");
+                }
+                copiedBeforeRefusal = File.Exists(Path.Combine(directory, plugin))
+                    || File.Exists(Path.Combine(directory, "keep.txt"));
+            }
+            Check(refused, "upgrade restored an unlisted core file: " + rejectedFile);
+            Check(!copiedBeforeRefusal, "upgrade copied preserved user files before checking every core path");
+            Check(File.ReadAllText(Path.Combine(directory, rejectedPath)) == "old core file", "failed upgrade changed a preserved core file");
+            Check(File.ReadAllText(Path.Combine(directory, plugin)) == "user plugin", "failed upgrade changed a user plugin");
+            Check(File.ReadAllText(Path.Combine(directory, "keep.txt")) == "user data", "failed upgrade changed user data");
+        }
+
+        string allowedDirectory = Path.Combine(root, "preserved-user-files");
+        string allowedPlugin = "app/user_plugins/sample/action.py".Replace('/', Path.DirectorySeparatorChar);
+        string privateNote = "app/.private/notes.txt".Replace('/', Path.DirectorySeparatorChar);
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(allowedDirectory, allowedPlugin)));
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(allowedDirectory, privateNote)));
+        File.WriteAllText(Path.Combine(allowedDirectory, ".notmyfault-install"), "NotmyFault Windows installer 1\nold\n");
+        File.WriteAllText(Path.Combine(allowedDirectory, allowedPlugin), "user plugin");
+        File.WriteAllText(Path.Combine(allowedDirectory, privateNote), "private note");
+        File.WriteAllText(Path.Combine(allowedDirectory, "keep.txt"), "user data");
+        InstallMaintenance.WriteState(allowedDirectory, "old", new HashSet<string> { allowedPlugin, privateNote, "keep.txt" });
+        using (var transaction = new InstallMaintenance.Transaction(allowedDirectory, true))
+        {
+            transaction.RestoreUserFiles();
+            Check(File.ReadAllText(Path.Combine(allowedDirectory, allowedPlugin)) == "user plugin", "upgrade did not restore a user plugin");
+            Check(File.ReadAllText(Path.Combine(allowedDirectory, privateNote)) == "private note", "upgrade did not restore private data");
+            Check(File.ReadAllText(Path.Combine(allowedDirectory, "keep.txt")) == "user data", "upgrade did not restore user data");
+            transaction.Commit();
+        }
+        Console.WriteLine("PASS: upgrade rejects preserved core code and retains user files");
     }
 
     private static InstallResult Install(string directory, bool upgrade, string password, CancellationToken token, Progress progress)

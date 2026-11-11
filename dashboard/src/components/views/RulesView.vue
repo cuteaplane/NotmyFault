@@ -1,6 +1,7 @@
 <script setup>
+import CircularProgress from '../CircularProgress.vue'
 import { normalizeWorkflow, walkGraphActions, getGraphTriggers } from '../../lib/workflowGraph'
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onMounted, onUnmounted, ref, watch } from 'vue'
 import { store } from '../../lib/store'
 import { cancelRun, runRule } from '../../lib/api'
 import { approveRuleBeforeEditing, saveRulesWithApproval } from '../../lib/ruleSave'
@@ -15,6 +16,7 @@ import QuickCreateDialog from '../QuickCreateDialog.vue'
 import TestRunDialog from '../TestRunDialog.vue'
 import BaseDialog from '../BaseDialog.vue'
 import LogsView from './LogsView.vue'
+import SegmentedTabs from '../SegmentedTabs.vue'
 
 const automationSection = ref(store.pendingAutomationSection || 'rules')
 const activeRuleIndex = ref(null)
@@ -188,8 +190,22 @@ function readDraftRecovery() {
 function clearDraftRecovery() {
   try { localStorage.removeItem(DRAFT_RECOVERY_KEY) } catch {}
 }
+function isBlankNewRule(rule) {
+  return !rule.workflow?.nodes?.length
+    && !rule.workflow?.edges?.length
+    && !rule.variables?.length
+    && !rule.constants?.length
+    && !rule.concurrency
+    && (!rule.name || rule.name === '新规则')
+    && (!rule.folder || rule.folder === '未分类')
+}
 function persistDraftRecovery() {
-  if (!draftRule.value || !baseline.value || JSON.stringify(draftRule.value) === baseline.value) {
+  if (!draftRule.value) {
+    clearDraftRecovery()
+    return
+  }
+  const snapshot = JSON.stringify(draftRule.value)
+  if (baseline.value ? snapshot === baseline.value : isBlankNewRule(draftRule.value)) {
     clearDraftRecovery()
     return
   }
@@ -301,7 +317,7 @@ async function addRule(seed = null) {
   showCreatePanel.value = false
   activeRuleIndex.value = -1
   draftRule.value = next
-  baseline.value = JSON.stringify(draftRule.value)
+  baseline.value = ''
   if (seed) clearDraftRecovery()
   else await restoreDraftRecovery(-1)
   resetDraftHistory()
@@ -574,6 +590,15 @@ function processTestEvents() {
     } else if (ev.name.startsWith('run.recovery.')) {
       const step = t.steps.find(step => step.stepId === ev.data.step_id)
       if (step) step.recovery = { groupId: ev.data.recovery_group_id, status: ev.name.endsWith('entered') ? 'running' : ev.name.endsWith('completed') ? 'succeeded' : 'failed' }
+    } else if (ev.name === 'run_dropped') {
+      const matches = t.runId
+        ? ev.data?.run_id === t.runId
+        : !!t.ruleId && ev.data?.rule_id === t.ruleId
+      if (!matches) continue
+      t.outcome = 'dropped'
+      t.steps = t.steps.filter(step => !['waiting', 'running'].includes(step.status))
+      const reason = typeof ev.data?.reason === 'string' ? ev.data.reason.trim() : ''
+      finishTestWatch(reason ? `运行已丢弃：${reason}` : '运行已丢弃')
     } else if (ev.name === 'workflow_completed') {
       t.outcome = ev.data.status
       let note = ''
@@ -592,6 +617,8 @@ function processTestEvents() {
 function finishTestWatch(note = '') {
   const t = testResult.value
   if (!t) return
+  if (t.runId && activeManualRun.value?.runId === t.runId) activeManualRun.value = null
+  if (t.runId && store.activeManualRun?.runId === t.runId) store.activeManualRun = null
   t.note = note
   t.done = true
   t.cancelling = false
@@ -683,7 +710,19 @@ async function openCandidateRule(rule) {
       if (!approval?.cancelled && !approval?.notified) await alertDialog('草稿无法打开', approval?.error || '规则审批失败')
       return
     }
-    await addRule(rule)
+    const targetIndex = store.configData.rules.findIndex(item => item.rule_id === rule.rule_id)
+    const editingTarget = targetIndex >= 0 && draftRule.value?.rule_id === rule.rule_id
+    if (targetIndex >= 0 && !editingTarget) await openRule(targetIndex)
+    if (targetIndex >= 0) {
+      if (draftRule.value?.rule_id !== rule.rule_id) return
+      const next = ensureRuleBindingIds(validateRuleGraph(clone(rule)))
+      normalizeWorkflow(next)
+      commitDraftHistory()
+      draftRule.value = next
+      commitDraftHistory()
+    } else {
+      await addRule(rule)
+    }
     editorAdminKeyPassword = approval.adminKeyPassword || ''
   } catch (error) { await alertDialog('草稿无法打开', error.message || '无法连接后台服务') }
 }
@@ -745,8 +784,8 @@ watch(() => store.pendingAutomationSection, section => {
   store.pendingAutomationSection = ''
 })
 
-onMounted(() => {
-  if (!store.configData.rules) store.configData.rules = []
+// 页面被缓存后再切回来不会重新挂载，首页留下的跳转请求在这里处理。
+function consumePendingNavigation() {
   if (store.pendingAutomationSection) {
     automationSection.value = store.pendingAutomationSection
     store.pendingAutomationSection = ''
@@ -762,7 +801,12 @@ onMounted(() => {
     createAutomation()
   }
   openPendingRule()
+}
+onMounted(() => {
+  if (!store.configData.rules) store.configData.rules = []
+  consumePendingNavigation()
 })
+onActivated(consumePendingNavigation)
 </script>
 
 <template>
@@ -783,10 +827,8 @@ onMounted(() => {
         <button class="btn btn-filled" @click="createAutomation"><span class="material-symbols-outlined">add</span>创建自动化</button>
       </div>
     </div>
-    <div class="tabs automation-section-tabs" role="group" aria-label="自动化页面">
-      <button class="tab" :class="{ active: automationSection === 'rules' }" :aria-pressed="automationSection === 'rules'" @click="automationSection = 'rules'"><span class="material-symbols-outlined">account_tree</span>规则<span class="section-count">{{ store.configData.rules.length }}</span></button>
-      <button class="tab" :class="{ active: automationSection === 'runs' }" :aria-pressed="automationSection === 'runs'" @click="automationSection = 'runs'"><span class="material-symbols-outlined">history</span>运行记录</button>
-    </div>
+    <SegmentedTabs v-model="automationSection" class="automation-section-tabs" role="group" label="自动化页面"
+      :options="[{ value: 'rules', label: '规则', icon: 'account_tree', count: store.configData.rules.length }, { value: 'runs', label: '运行记录', icon: 'history' }]" />
     <Transition name="automation-section" mode="out-in">
     <div v-if="automationSection === 'rules'" key="rules" class="automation-rules-section">
     <section v-if="store.configError" class="rules-integrity-error" role="alert">
@@ -809,9 +851,9 @@ onMounted(() => {
         </div>
         <div class="actions">
           <button v-if="store.aiDrafting.enabled" class="btn btn-tonal" @click="createWithAi"><span class="material-symbols-outlined">auto_awesome</span>AI 起草</button>
-          <button class="btn btn-text" @click="addRule"><span class="material-symbols-outlined">edit_note</span>空白规则</button>
+          <button class="btn btn-text" @click="addRule()"><span class="material-symbols-outlined">edit_note</span>空白规则</button>
           <button class="btn btn-tonal" @click="openQuickCreate"><span class="material-symbols-outlined">account_tree</span>自己搭一个</button>
-          <button v-if="store.configData.rules.length" class="icon-btn" title="收起创建区" @click="showCreatePanel = false"><span class="material-symbols-outlined">close</span></button>
+          <button v-if="store.configData.rules.length" class="icon-btn" aria-label="收起创建区" title="收起创建区" @click="showCreatePanel = false"><span class="material-symbols-outlined" aria-hidden="true">close</span></button>
         </div>
       </header>
       <div class="automation-template-grid">
@@ -828,7 +870,7 @@ onMounted(() => {
     </section>
     <div v-if="store.configData.rules.length" class="rules-folders">
       <div class="automation-list-toolbar"><h3 class="automation-list-title">已保存的自动化 <small>{{ matchingRules.length }} / {{ store.configData.rules.length }}</small></h3>
-        <label class="automation-search"><span class="material-symbols-outlined">search</span><input v-model="ruleQuery" type="search" aria-label="搜索自动化" placeholder="搜索名称、文件夹或插件"><button v-if="ruleQuery" class="icon-btn" aria-label="清空自动化搜索" @click="ruleQuery = ''"><span class="material-symbols-outlined">close</span></button></label>
+        <label class="automation-search"><span class="material-symbols-outlined" aria-hidden="true">search</span><input v-model="ruleQuery" type="search" aria-label="搜索自动化" placeholder="搜索名称、文件夹或插件"><button v-if="ruleQuery" class="icon-btn" aria-label="清空自动化搜索" @click="ruleQuery = ''"><span class="material-symbols-outlined" aria-hidden="true">close</span></button></label>
       </div>
       <div v-if="!matchingRules.length" class="empty-state"><span class="material-symbols-outlined">search_off</span><h3>没有匹配的自动化</h3><p>试试其他名称、文件夹或插件。</p><button class="btn btn-text" @click="ruleQuery = ''">清空搜索</button></div>
       <section v-for="([folder, entries]) in ruleFolders" :key="folder" class="rules-folder">
@@ -838,11 +880,11 @@ onMounted(() => {
           <div class="rule-library-actions">
             <button class="btn btn-text btn-sm rule-run-btn" :disabled="runningRuleIndex !== null"
               title="真实执行一次这条规则中的动作" @click.stop="runManualRule(index, rule)">
-              <span v-if="runningRuleIndex === index" class="spinner"></span>
+              <CircularProgress v-if="runningRuleIndex === index" />
               <span v-else class="material-symbols-outlined">experiment</span>
               {{ runningRuleIndex === index ? '测试中…' : '测试' }}
             </button>
-            <button class="icon-btn icon-btn-danger" :aria-label="`删除${rule.name || '未命名规则'}`" title="删除规则" @click.stop="deleteRule(index)"><span class="material-symbols-outlined">delete</span></button>
+            <button class="icon-btn icon-btn-danger" :aria-label="`删除${rule.name || '未命名规则'}`" title="删除规则" @click.stop="deleteRule(index)"><span class="material-symbols-outlined" aria-hidden="true">delete</span></button>
           </div>
         </article>
       </section>
@@ -866,7 +908,7 @@ onMounted(() => {
       <p class="dialog-sub">{{ testResult.ruleName }}</p>
       <div class="test-steps">
         <div v-if="!testResult.steps.length && !testResult.done" class="test-step test-step-wait">
-          <span class="spinner"></span><span>已启动执行，等待结果…</span>
+          <CircularProgress /><span>已启动执行，等待结果…</span>
         </div>
         <div v-for="(s, i) in testResult.steps" :key="i" class="test-step" :class="'test-step-' + s.status">
           <span class="material-symbols-outlined">{{ stepIcon(s.status) }}</span>
@@ -901,7 +943,7 @@ onMounted(() => {
         </div>
       </div>
       <p v-if="testSummary" class="test-summary"
-        :class="!testResult.done ? '' : !testResult.steps.some(s => ['fail', 'cancelled', 'timed_out'].includes(s.status)) && (!testResult.assertions?.total || testResult.assertions.passed === testResult.assertions.total) ? 'test-summary-ok' : 'test-summary-err'">{{ testSummary }}</p>
+        :class="!testResult.done ? '' : testResult.outcome !== 'dropped' && !testResult.steps.some(s => ['fail', 'cancelled', 'timed_out'].includes(s.status)) && (!testResult.assertions?.total || testResult.assertions.passed === testResult.assertions.total) ? 'test-summary-ok' : 'test-summary-err'">{{ testSummary }}</p>
       <div class="dialog-actions">
         <button class="btn btn-text" @click="goLogs">
           <span class="material-symbols-outlined">description</span>查看日志

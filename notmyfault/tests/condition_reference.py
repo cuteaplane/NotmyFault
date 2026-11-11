@@ -8,12 +8,15 @@ class ReferenceConditionRuntime:
         graph = rule['workflow']
         self.nodes = {node['binding_id']: node for node in graph['nodes']}
         self.inputs = {}
+        self.entries = {}
         incoming = set()
         sources = set()
         for edge in graph['edges']:
             if edge['channel'] == 'condition':
                 self.inputs.setdefault(edge['target'], []).append(edge['source'])
             else:
+                if edge.get('port') == 'entry':
+                    self.entries[edge['source']] = edge['target']
                 incoming.add(edge['target'])
                 sources.add(edge['source'])
         self.root = next(identity for identity in sorted(sources) if identity not in incoming)
@@ -35,6 +38,11 @@ class ReferenceConditionRuntime:
         node = self.nodes[identity]
         if node['type'] == 'trigger':
             yield self._key(node), min(limits or ((3600, False),), key=lambda item: (item[0], item[1]))
+            return
+        if node['type'] == 'action_group':
+            child = self.entries.get(identity)
+            if child is not None:
+                yield from self._lifetimes(child, limits)
             return
         if node.get('op') == 'all':
             if 'within_seconds' in node:
@@ -69,7 +77,8 @@ class ReferenceConditionRuntime:
             if emitted or now < deadline:
                 continue
             seconds = float(node['duration_seconds'])
-            self._record(key, {"binding_id": node['trigger']['binding_id'], "absence": True, "event": {"type": "absence", "params": {}},
+            self._record(key, {"binding_id": node['trigger']['binding_id'], "absence_node_id": node['binding_id'],
+                               "absence": True, "event": {"type": "absence", "params": {}},
                                "payload": {"wait_seconds": seconds}, "timestamp": now})
             if node.get("repeat", "once_until_seen") == "every_window":
                 self.schedule_order += 1
@@ -106,6 +115,9 @@ class ReferenceConditionRuntime:
         node = self.nodes[identity]
         if node['type'] == 'trigger':
             return {self._key(node)}
+        if node['type'] == 'action_group':
+            child = self.entries.get(identity)
+            return self._owned(child) if child is not None else set()
         return set().union(*(self._owned(child) for child in self.inputs.get(identity, ())))
 
     def _evaluate(self, identity):
@@ -116,6 +128,9 @@ class ReferenceConditionRuntime:
                 return None
             return {'keys': {key}, 'marks': [self.records[key]['event']['timestamp']],
                     'consume': {key}, 'retain': set()}
+        if node['type'] == 'action_group':
+            child = self.entries.get(identity)
+            return self._evaluate(child) if child is not None else None
         results = [self._evaluate(child) for child in self.inputs.get(identity, ())]
         if node.get('op') == 'any':
             choices = [result for result in results if result is not None]

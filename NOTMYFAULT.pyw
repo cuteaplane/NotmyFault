@@ -3,6 +3,7 @@ import os
 import signal
 import socket
 import threading
+import time
 from datetime import datetime
 from notmyfault.platform.platform_support import launch_python_entry
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -145,9 +146,8 @@ def setup_logging(log_dir: str) -> str:
 
     sys.stdout = _TimestampWriter(log_fp, sys.__stdout__, _log_io_lock)
     sys.stderr = _TimestampWriter(log_fp, sys.__stderr__, _log_io_lock)
-    print(f"--------     NotmyFault Engine     --------")
-    print(f"------ {datetime.now().isoformat()} ------")
-    print(f"------     Welcome to NotmyFault!    ------")
+    print(f"[Log] 会话日志: {log_path}")
+    print(f"[Log] Welcome to NotmyFault!")
     return log_path
 
 
@@ -166,6 +166,11 @@ class EngineRunner:
         self._tray = None
         self._api_socket = None
         self._force_exit_armed = threading.Event()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_deadline = None
+        self._cleanup_lock = threading.Lock()
+        self._cleanup_done = threading.Event()
+        self._worker_shutdown_lock = threading.Lock()
         self._runtime = RuntimeController(
             lambda on_event=None: engine_factory(
                 store=self._store,
@@ -240,29 +245,82 @@ class EngineRunner:
     def _tray_exit(self):
         """退出时依次关闭引擎、HTTP 服务、Dashboard 和进程"""
         print("[Tray] 用户请求退出")
+        self.request_process_shutdown()
         _send_dashboard_command(_DASHBOARD_QUIT)
-        self.stop_engine()
-        self.request_process_shutdown(force_after=5)
 
-    def request_process_shutdown(self, force_after: float = 10) -> None:
-        """关闭托盘和 API，等待超时后强制结束进程"""
-        if self.engine_thread and self.engine_thread.is_alive():
-            self._runtime.request_stop()
-        else:
-            self.shutdown_event.set()
-        if self._api:
-            self._api.stop()
-        if self._tray:
-            self._tray.stop()
-        if self._force_exit_armed.is_set():
+    def _remaining_shutdown_time(self) -> float:
+        with self._shutdown_lock:
+            deadline = self._shutdown_deadline
+        if deadline is None:
+            return 15.0
+        return max(0.0, deadline - time.monotonic())
+
+    def _shutdown_workers(self) -> None:
+        if not self._worker_shutdown_lock.acquire(blocking=False):
             return
-        self._force_exit_armed.set()
+        try:
+            from notmyfault.core import plugin_worker
 
-        def _force():
-            import time
-            time.sleep(force_after)
-            os._exit(0)
-        threading.Thread(target=_force, daemon=True).start()
+            plugin_worker.shutdown_all()
+        except Exception as error:
+            print(f"[Cleanup] 插件 worker 清理失败: {error}", file=sys.stderr)
+        finally:
+            self._worker_shutdown_lock.release()
+
+    def _force_shutdown(self, deadline: float) -> None:
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining:
+            time.sleep(remaining)
+        if self._cleanup_done.is_set():
+            return
+        self._shutdown_workers()
+        self._remove_api_token_file()
+        if self._run_history is not None:
+            try:
+                self._run_history.flush(timeout=0.5)
+            except Exception:
+                pass
+        os._exit(0)
+
+    def _remove_api_token_file(self) -> None:
+        try:
+            self._paths.api_token_file.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            print(f"[Cleanup] 删除 API 令牌失败: {error}", file=sys.stderr)
+
+    def request_process_shutdown(self, force_after: float = 15) -> None:
+        """统一取消运行任务并按一个绝对截止时间关闭进程。"""
+        with self._shutdown_lock:
+            if self._shutdown_deadline is None:
+                self._shutdown_deadline = time.monotonic() + max(0.0, force_after)
+            deadline = self._shutdown_deadline
+            if not self._force_exit_armed.is_set():
+                self._force_exit_armed.set()
+                threading.Thread(
+                    target=self._force_shutdown,
+                    args=(deadline,),
+                    daemon=True,
+                    name="process-force-shutdown",
+                ).start()
+
+        try:
+            self._runtime.request_stop()
+        except Exception as error:
+            print(f"[Cleanup] 引擎取消失败: {error}", file=sys.stderr)
+        if self._api:
+            try:
+                self._api.stop()
+            except Exception as error:
+                print(f"[Cleanup] API 停止失败: {error}", file=sys.stderr)
+        self._remove_api_token_file()
+        if self._tray:
+            try:
+                self._tray.stop()
+            except Exception as error:
+                print(f"[Cleanup] 托盘停止失败: {error}", file=sys.stderr)
+        self._shutdown_workers()
 
     @staticmethod
     def _check_already_running(port: int = 19198) -> bool:
@@ -328,7 +386,7 @@ class EngineRunner:
             return
 
         try:
-            api_token_store = ApiTokenStore(self._paths.api_token_file)
+            api_token_store = ApiTokenStore(self._paths.api_token_file, rotate=True)
             ai_key_store = AIKeyStore(self._paths.ai_api_key_file)
             run_history = RunHistory(str(self._paths.run_history_file))
             self._run_history = run_history
@@ -386,30 +444,39 @@ class EngineRunner:
             self._cleanup()
 
     def _cleanup(self):
+        if self._cleanup_done.is_set() or not self._cleanup_lock.acquire(blocking=False):
+            return
         print("\n[Cleanup] 正在关闭...")
-        self._runtime.request_stop()
-        if self._tray:
-            self._tray.stop()
-        stopped = self._runtime.stop(timeout=5)
-        if not stopped:
-            print("[Cleanup] 引擎动作仍未退出，已安排强制终止", file=sys.stderr)
-            # 引擎线程收不干净时走不到它自己的 worker 清理，这里补上，别留下孤儿子进程
-            from notmyfault.core import plugin_worker
-
-            plugin_worker.shutdown_all()
-            self.request_process_shutdown(force_after=5)
-        if self._run_history is not None and not self._run_history.flush():
-            print("[Cleanup] 运行历史写入超时", file=sys.stderr)
-        if self._tray and stopped:
-            self._tray.show_balloon("NotmyFault", "引擎已停止", 1)
-        if self._api_socket is not None:
+        try:
+            self.request_process_shutdown()
             try:
-                self._api_socket.close()
-            except OSError:
-                pass
-            self._api_socket = None
-        print("[Cleanup] Done! ")
-        print(f"--- 引擎关闭! {datetime.now().isoformat()} ---")
+                stopped = self._runtime.stop(timeout=self._remaining_shutdown_time())
+            except Exception as error:
+                stopped = False
+                print(f"[Cleanup] 引擎收尾失败: {error}", file=sys.stderr)
+            if not stopped:
+                print("[Cleanup] 引擎动作仍未退出，已安排强制终止", file=sys.stderr)
+            if self._run_history is not None:
+                try:
+                    if not self._run_history.flush(
+                        timeout=self._remaining_shutdown_time()
+                    ):
+                        print("[Cleanup] 运行历史写入超时", file=sys.stderr)
+                except Exception as error:
+                    print(f"[Cleanup] 运行历史落盘失败: {error}", file=sys.stderr)
+            if self._tray and stopped:
+                self._tray.show_balloon("NotmyFault", "引擎已停止", 1)
+            if self._api_socket is not None:
+                try:
+                    self._api_socket.close()
+                except OSError:
+                    pass
+                self._api_socket = None
+            print("[Cleanup] Done! ")
+            print(f"--- 引擎关闭! {datetime.now().isoformat()} ---")
+        finally:
+            self._cleanup_done.set()
+            self._cleanup_lock.release()
 
 
 def main():

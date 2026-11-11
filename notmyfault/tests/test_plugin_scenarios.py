@@ -20,46 +20,6 @@ from notmyfault.tests.plugin_support import load_plugin
 PKG_ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize("platform", ["nt", "posix"])
-@pytest.mark.parametrize("text", ["中文 café😀", "-1", "--version", "--help", "--", "-C"])
-@pytest.mark.parametrize("rate,volume,voice", [(0, 100, ""), (2, 50, "en-US"), (-10, 0, "Microsoft Xiaoxiao")])
-def test_speech_passes_text_and_controls_to_platform_backend(monkeypatch, platform, text, rate, volume, voice):
-    from notmyfault.platform import linux_support
-
-    module = load_plugin("actions", "text_to_speech")
-    meta = json.loads((PKG_ROOT / "actions" / "text_to_speech" / "action.json").read_text(encoding="utf-8"))
-    monkeypatch.setattr(module, "os", SimpleNamespace(name=platform))
-    monkeypatch.setattr(linux_support, "require_command", lambda *args: "/usr/bin/spd-say")
-    calls = []
-
-    def speak(command, **kwargs):
-        calls.append(command)
-        if platform == "nt":
-            assert command[:2] == [module.sys.executable, "-c"]
-            assert json.loads(kwargs["input"].decode("utf-8")) == {
-                "text": text, "rate": rate, "volume": volume, "voice": voice,
-            }
-            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
-
-        assert command[0] == "/usr/bin/spd-say"
-        options, messages = getopt.gnu_getopt(
-            command[1:], "wr:i:l:vhCS",
-            ["wait", "rate=", "volume=", "language=", "version", "help", "cancel", "stop"],
-        )
-        assert messages == [text]
-        expected = [("--wait", "")]
-        if rate:
-            expected.append(("--rate", str(rate * 10)))
-        if volume != 100:
-            expected.append(("--volume", str(volume - 100)))
-        if voice == "en-US":
-            expected.append(("--language", voice))
-        assert options == expected
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(module.subprocess, "run", speak)
-    invoke_action(module.run_with_context, module, meta, {"text": text, "rate": rate, "volume": volume, "voice": voice}, {})
-    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("cancel", [False, True])
@@ -353,17 +313,16 @@ def test_launch_program_association_preserves_arguments_and_directory(monkeypatc
     assert popen.call_args.kwargs["cwd"] == directory
 
 
-@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 广播显示器电源命令")
 @pytest.mark.parametrize("operation, power", [("off", 2), ("on", -1)])
 def test_display_power_allows_receiver_to_acquire_native_lock(monkeypatch, operation, power):
-    mod = load_plugin("actions", "display_control")
+    from notmyfault.platform.windows import display as mod
     queued = threading.Event()
     received = threading.Event()
     messages = []
 
     def receive():
         if queued.wait(1):
-            with mod.native_lock():
+            with mod.NATIVE_LOCK:
                 received.set()
 
     def send(*message, synchronous=False):
@@ -377,87 +336,53 @@ def test_display_power_allows_receiver_to_acquire_native_lock(monkeypatch, opera
         SendNotifyMessageW=MagicMock(side_effect=send),
         SendMessageW=MagicMock(side_effect=lambda *args: send(*args, synchronous=True)),
     )
-    monkeypatch.setattr(mod, "ctypes", SimpleNamespace(
-        windll=SimpleNamespace(user32=user32),
-        c_ssize_t=ctypes.c_ssize_t,
-    ))
+    monkeypatch.setattr(mod._win32, "user32", lambda: user32)
     receiver = threading.Thread(target=receive, daemon=True)
     receiver.start()
     try:
-        assert mod.run_with_context({}, {"action": operation}, {}) == {"action": operation}
+        assert mod.DisplayBackend().set_power(operation) == {"methods": ["SendNotifyMessageW"], "warnings": []}
         assert received.wait(1)
-        assert messages == [(mod.HWND_BROADCAST, mod.WM_SYSCOMMAND, mod.SC_MONITORPOWER, power)]
+        assert messages == [(0xFFFF, 0x0112, 0xF170, power)]
     finally:
         queued.set()
         receiver.join(timeout=1)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 WMI 亮度脚本")
+def test_display_wmi_preserves_chinese_error(monkeypatch):
+    from notmyfault.platform.windows import display as mod
+    import subprocess
+    run = subprocess.run
+    monkeypatch.setattr("locale.getencoding", lambda: "utf-8")
+
+    def without_monitors(command, **kwargs):
+        command = list(command)
+        command[-1] = "function Get-CimInstance { @() };" + command[-1]
+        return run(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", without_monitors)
+    with pytest.raises(RuntimeError) as caught:
+        mod.DisplayBackend()._set_wmi_brightness(50)
+    assert "未发现支持 WMI 亮度控制的显示器" in str(caught.value)
+    assert "\ufffd" not in str(caught.value)
+
+
 # ------------------------------------------------------------- clipboard_clear
 
 
-@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 走剪贴板 API")
-def test_clipboard_clear_windows_flow(monkeypatch):
-    mod = load_plugin("actions", "clipboard_clear")
-    user32 = MagicMock()
-    user32.OpenClipboard.return_value = True
-    user32.EmptyClipboard.return_value = True
-    fake_ctypes = SimpleNamespace(
-        windll=SimpleNamespace(user32=user32),
-        c_void_p=ctypes.c_void_p,
-        c_int=ctypes.c_int,
-    )
-    monkeypatch.setattr(mod, "ctypes", fake_ctypes)
-    result = mod.run_with_context({}, {}, {})
-    assert result == {"cleared": True}
-    user32.OpenClipboard.assert_called_once_with(None)
-    user32.EmptyClipboard.assert_called_once()
-    user32.CloseClipboard.assert_called_once()
 
 
 # ------------------------------------------------------------ create_shortcut
 
 
-@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 创建 lnk")
-@pytest.mark.parametrize("target", ["C:\\x.exe", " relative.exe", "C:\\x.exe\u3000"])
-def test_create_shortcut_preserves_values_and_unicode_result(tmp_path, monkeypatch, target):
+
+
+def test_create_shortcut_rejects_unrepresentable_working_directory():
+    from notmyfault.plugin_api import PlatformServiceError
     mod = load_plugin("actions", "create_shortcut")
-    captured = {}
-    destination = tmp_path / "桌面😀"
-    destination.mkdir()
-    original_run = mod.subprocess.run
-
-    def fake_run(cmd, **kwargs):
-        captured["env"] = kwargs["env"]
-        env = {**kwargs["env"], "NMF_TEST_LINK_ROOT": str(destination)}
-        script = cmd[-1]
-        for folder in ("StartMenu", "Desktop"):
-            expression = f"[Environment]::GetFolderPath('{folder}')"
-            assert expression in script
-            script = script.replace(expression, "$env:NMF_TEST_LINK_ROOT")
-        return original_run([*cmd[:-1], script], **{**kwargs, "env": env})
-
-    monkeypatch.setattr(mod.subprocess, "run", fake_run)
-    result = mod.run_with_context(
-        {},
-        {
-            "name": "快捷",
-            "target_path": target,
-            "arguments": "--fast",
-            "working_directory": "C:\\",
-            "icon_path": "C:\\i.ico",
-            "location": "start_menu",
-        },
-    {})
-    expected = destination / "快捷.lnk"
-    assert result == {"shortcut_path": str(expected)}
-    assert expected.is_file()
-    env = captured["env"]
-    assert env["NMF_LNK_NAME"] == "快捷"
-    assert env["NMF_LNK_TARGET"] == target
-    assert env["NMF_LNK_ARGS"] == "--fast"
-    assert env["NMF_LNK_WORKDIR"] == "C:\\"
-    assert env["NMF_LNK_ICON"] == "C:\\i.ico"
-    assert env["NMF_LNK_LOCATION"] == "start_menu"
+    with pytest.raises(PlatformServiceError) as error:
+        mod.run_with_context({}, {"working_directory": "C:\\"}, {})
+    assert error.value.kind == "invalid"
 
 
 # -------------------------------------------------------------- media_control
@@ -468,32 +393,24 @@ def _patch_media_user32(monkeypatch, mod):
     user32.GetForegroundWindow.return_value = 123
     user32.FindWindowW.return_value = 456
     user32.SendMessageTimeoutW.return_value = 1
-    fake_ctypes = SimpleNamespace(
-        windll=SimpleNamespace(user32=user32),
-        c_ssize_t=ctypes.c_ssize_t,
-        c_size_t=ctypes.c_size_t,
-        POINTER=lambda x: x,
-        byref=lambda x: x,
-    )
-    monkeypatch.setattr(mod, "ctypes", fake_ctypes)
+    monkeypatch.setattr(mod._win32, "user32", lambda: user32)
     return user32
 
 
-@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 发送 APPCOMMAND")
 @pytest.mark.parametrize("accepted,targets", [([1], [123]), ([0, 1], [123, 456]), ([0, 0], [123, 456])])
 def test_media_control_dispatches_appcommand(monkeypatch, accepted, targets):
-    mod = load_plugin("actions", "media_control")
+    from notmyfault.platform.windows import media as mod
     user32 = _patch_media_user32(monkeypatch, mod)
     user32.SendMessageTimeoutW.side_effect = accepted
     if any(accepted):
-        assert mod.run_with_context({}, {"command": "next"}, {}) == {"command": "next"}
+        mod.MediaBackend().send("next")
     else:
         with pytest.raises(RuntimeError, match="没有窗口接受媒体命令"):
-            mod.run_with_context({}, {"command": "next"}, {})
+            mod.MediaBackend().send("next")
     calls = user32.SendMessageTimeoutW.call_args_list
     assert [call.args[0] for call in calls] == targets
     assert all(call.args[1] == 0x0319 and call.args[3] == (11 << 16) for call in calls)
-    assert all(ctypes.sizeof(call.args[-1]) == ctypes.sizeof(ctypes.c_void_p) for call in calls)
+    assert all(ctypes.sizeof(call.args[-1]._obj) == ctypes.sizeof(ctypes.c_void_p) for call in calls)
     if len(targets) == 1:
         user32.FindWindowW.assert_not_called()
 
@@ -504,13 +421,12 @@ def test_media_control_rejects_unknown_command():
         mod.run_with_context({}, {"command": "warp"}, {})
 
 
-@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 GDI 截图")
 @pytest.mark.parametrize("mode", ["active_window", "fullscreen"])
 def test_screenshot_deselects_active_window_bitmap_before_reading(
     tmp_path, monkeypatch, mode
 ):
     monkeypatch.chdir(tmp_path)
-    mod = load_plugin("actions", "screenshot")
+    from notmyfault.platform.windows import screen as mod
     user32 = MagicMock()
     gdi32 = MagicMock()
     calls = []
@@ -549,16 +465,11 @@ def test_screenshot_deselects_active_window_bitmap_before_reading(
 
     gdi32.SelectObject.side_effect = select_object
     gdi32.GetDIBits.side_effect = get_dibits
-    monkeypatch.setattr(mod, "user32", user32)
-    monkeypatch.setattr(mod, "gdi32", gdi32)
+    monkeypatch.setattr(mod._win32, "user32", lambda: user32)
+    monkeypatch.setattr(mod._win32, "gdi32", lambda: gdi32)
     target = tmp_path / " active.bmp\u3000"
 
-    meta = json.loads((PKG_ROOT / "actions/screenshot/action.json").read_text(encoding="utf-8"))
-    assert invoke_action(
-        mod.run_with_context, mod, meta,
-        {"mode": mode, "output_path": target.name, "format": "bmp"},
-        {},
-    ) == {"file": target.name}
+    assert mod.ScreenBackend().capture(target.name, mode, "bmp") == target.name
     gdi32.CreateCompatibleBitmap.assert_called_once_with(201, 320, 180)
     if mode == "active_window":
         user32.PrintWindow.assert_called_once_with(101, 202, 0)
@@ -605,60 +516,6 @@ def test_open_url_requires_input():
 # ---------------------------------------------------------------- power_plan
 
 
-def test_power_plan_runs_powercfg(monkeypatch):
-    mod = load_plugin("actions", "power_plan")
-    monkeypatch.setattr(mod.sys, "platform", "win32")
-    captured = {}
-
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(mod.subprocess, "run", fake_run)
-    result = mod.run_with_context({}, {"plan": "high_performance"}, {})
-    assert result["plan"] == "high_performance"
-    assert captured["cmd"][:2] == ["powercfg", "/setactive"]
-    assert captured["cmd"][2] == result["guid"]
-
-
-def test_power_plan_custom_guid_required(monkeypatch):
-    mod = load_plugin("actions", "power_plan")
-    monkeypatch.setattr(mod.sys, "platform", "win32")
-    with pytest.raises(ValueError, match="必须提供 GUID"):
-        mod.run_with_context({}, {"plan": "custom"}, {})
-
-
-def test_power_plan_failure_raises(monkeypatch):
-    mod = load_plugin("actions", "power_plan")
-    monkeypatch.setattr(mod.sys, "platform", "win32")
-    monkeypatch.setattr(
-        mod.subprocess,
-        "run",
-        lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="boom"),
-    )
-    with pytest.raises(RuntimeError, match="切换电源计划失败"):
-        mod.run_with_context({}, {"plan": "balanced"}, {})
-
-
-def test_power_plan_linux_uses_powerprofilesctl(monkeypatch):
-    mod = load_plugin("actions", "power_plan")
-    monkeypatch.setattr(mod.sys, "platform", "linux")
-    class FakeBackend:
-        def __init__(self, runner):
-            self.runner = runner
-        def set_profile(self, plan):
-            assert plan == "power_saver"
-            return "power-saver"
-    monkeypatch.setattr(mod, "PowerProfileBackend", FakeBackend)
-    result = mod.run_with_context({}, {"plan": "power_saver"}, {})
-    assert result == {"plan": "power_saver", "profile": "power-saver"}
-
-
-def test_power_plan_linux_rejects_custom_guid(monkeypatch):
-    mod = load_plugin("actions", "power_plan")
-    monkeypatch.setattr(mod.sys, "platform", "linux")
-    with pytest.raises(ValueError, match="不支持自定义 GUID"):
-        mod.run_with_context({}, {"plan": "custom", "custom_guid": "381b4222-f694-41f0-9685-ff5bb260df2e"}, {})
 
 
 # ------------------------------------------------------------------- run_shell
@@ -755,27 +612,11 @@ def test_run_shell_reports_exit_code_and_stderr(monkeypatch):
 # ------------------------------------------------------------------ send_keys
 
 
-@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 SendInput ABI")
-def test_send_keys_hotkey_order_and_modifiers(monkeypatch):
-    mod = load_plugin("actions", "send_keys")
-    sent = []
-    monkeypatch.setattr(mod, "_send", sent.extend)
-    mod.run_with_context({}, {"mode": "hotkey", "keys": "ctrl+shift+a"}, {})
-    sequence = [(inp.ki.wVk, inp.ki.dwFlags) for inp in sent]
-    assert sequence == [
-        (0x11, 0),
-        (0x10, 0),
-        (0x41, 0),
-        (0x41, mod.KEYEVENTF_KEYUP),
-        (0x10, mod.KEYEVENTF_KEYUP),
-        (0x11, mod.KEYEVENTF_KEYUP),
-    ]
 
 
-@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 SendInput ABI")
 @pytest.mark.parametrize("sent", [0, 1, 3])
 def test_send_keys_partial_input_releases_pressed_keys_without_repeating(monkeypatch, sent):
-    mod = load_plugin("actions", "send_keys")
+    from notmyfault.platform.windows import keyboard as mod
     batches = []
 
     def send_input(count, inputs, size):
@@ -783,180 +624,82 @@ def test_send_keys_partial_input_releases_pressed_keys_without_repeating(monkeyp
         return sent if len(batches) == 1 else count
 
     user32 = SimpleNamespace(SendInput=send_input)
-    monkeypatch.setattr(mod, "ctypes", SimpleNamespace(
-        windll=SimpleNamespace(user32=user32),
-        POINTER=ctypes.POINTER,
-        sizeof=ctypes.sizeof,
-        c_int=ctypes.c_int,
-    ))
+    monkeypatch.setattr(mod._win32, "user32", lambda: user32)
 
     with pytest.raises(RuntimeError, match="SendInput"):
-        mod.run_with_context({}, {"mode": "hotkey", "keys": "ctrl+a"}, {})
+        mod.KeyboardBackend().send_hotkey(["ctrl", "a"])
 
-    assert batches[0] == [(0x11, 0), (0x41, 0), (0x41, mod.KEYEVENTF_KEYUP), (0x11, mod.KEYEVENTF_KEYUP)]
-    assert batches[1:] == ([] if sent == 0 else [[(0x11, mod.KEYEVENTF_KEYUP)]])
+    assert batches[0] == [(0x11, 0), (0x41, 0), (0x41, 2), (0x11, 2)]
+    assert batches[1:] == ([] if sent == 0 else [[(0x11, 2)]])
 
 
-def test_send_keys_linux_dispatches_input_tool(monkeypatch):
-    mod = load_plugin("actions", "send_keys")
-    calls = []
-
-    class FakeInputBackend:
-        def __init__(self):
-            pass
-
-        def type_text(self, text):
-            calls.append(("type", text))
-
-        def send_hotkey(self, parts):
-            calls.append(("hotkey", list(parts)))
-
-    monkeypatch.setattr(mod, "os", SimpleNamespace(name="posix"))
-    monkeypatch.setattr(mod, "platform_services", FakeInputBackend)
-    assert mod.run_with_context({}, {"mode": "hotkey", "keys": "ctrl+win+enter"}, {}) == {
-        "mode": "hotkey"
-    }
-    # 动作只负责拆分和校验，按键名翻译在 InputBackend 里
-    assert calls[-1] == ("hotkey", ["ctrl", "win", "enter"])
-    assert mod.run_with_context({}, {"mode": "type_text", "text": "a中😀"}, {}) == {
-        "mode": "type_text"
-    }
-    assert calls[-1] == ("type", "a中😀")
 
 
 # ---------------------------------------------------------------- window_pin
 
 
-def _patch_pin_user32(monkeypatch, mod, exstyle=0):
-    user32 = MagicMock()
-    user32.GetForegroundWindow.return_value = 777
-    user32.GetWindowLongW.return_value = exstyle
-    def set_window_pos(_hwnd, insert_after, *_args):
-        user32.GetWindowLongW.return_value = mod.WS_EX_TOPMOST if insert_after == mod.HWND_TOPMOST else 0
-        return 1
-    user32.SetWindowPos.side_effect = set_window_pos
-    monkeypatch.setattr(mod, "user32", user32)
-    return user32
-
-
-@pytest.mark.skipif(os.name != "nt", reason="仅 Windows 使用 user32 ABI")
-def test_window_pin_toggle_pins_active_window(monkeypatch):
-    mod = load_plugin("actions", "window_pin")
-    user32 = _patch_pin_user32(monkeypatch, mod)
-    result = mod.run_with_context({}, {"action": "toggle"}, {})
-    assert result == {"state": "pinned", "hwnd": 777}
-    assert user32.SetWindowPos.call_args.args[1] == mod.HWND_TOPMOST
-
-
-def test_window_pin_linux_dispatches_wmctrl(monkeypatch):
-    mod = load_plugin("actions", "window_pin")
-    calls = []
-
-    class FakeWindowBackend:
-        def __init__(self, runner):
-            calls.append(runner)
-
-        def set_pinned(self, action, target, title):
-            calls.append((action, target, title))
-            return {"state": "pinned", "window_id": "0x2a"}
-
-    monkeypatch.setattr(mod, "os", SimpleNamespace(name="posix"))
-    monkeypatch.setattr(mod, "WindowBackend", FakeWindowBackend)
-    meta = json.loads((PKG_ROOT / "actions/window_pin/action.json").read_text(encoding="utf-8"))
-    assert invoke_action(mod.run_with_context, mod, meta, {"action": "pin", "target": "title", "title": "记事本"}, {}) == {
-        "state": "pinned",
-        "window_id": "0x2a",
-    }
-    assert calls == [mod.default_runner, ("pin", "title", "记事本")]
-
-
-
-def test_window_control_linux_uses_window_backend(monkeypatch):
-    module = load_plugin("actions", "window_control")
-    calls = []
-
-    class FakeLinuxBackend:
-        def __init__(self, runner):
-            calls.append(("init", runner))
-
-        def monitors(self):
-            calls.append("monitors")
-            return [{"handle": 1, "device": "HDMI-1", "primary": True, "index": 1,
-                     "bounds": {"x": 0, "y": 0, "width": 1920, "height": 1080},
-                     "work": {"x": 0, "y": 0, "width": 1920, "height": 1080}}]
-
-    monkeypatch.setattr(module, "os", SimpleNamespace(name="posix"))
-    monkeypatch.setattr(module, "sys", SimpleNamespace(platform="linux"))
-    monkeypatch.setattr(module, "WindowBackend", FakeLinuxBackend)
-    meta = json.loads((PKG_ROOT / "actions/window_control/action.json").read_text(encoding="utf-8"))
-    assert "linux" in meta["platforms"]
-    result = invoke_action(module.run_with_context, module, meta, {"action": "list_monitors"}, {})
-    assert result["count"] == 1
-    assert result["monitors"][0]["device"] == "HDMI-1"
-    assert calls == [("init", module.default_runner), "monitors"]
 
 
 class WindowControlBackend:
     def __init__(self):
         self.windows = {
-            22: {"hwnd": 22, "title": "文档 — App", "pid": 88, "process_name": "app.exe", "class_name": "AppWindow",
+            "22": {"window_id": "22", "title": "文档 — App", "pid": 88, "process_name": "app.exe", "class_name": "AppWindow",
                  "x": 20, "y": 30, "width": 800, "height": 600, "visible": True, "minimized": False,
                  "maximized": False, "topmost": False, "opacity": 100},
-            11: {"hwnd": 11, "title": "草稿 — App", "pid": 88, "process_name": "app.exe", "class_name": "AppWindow",
+            "11": {"window_id": "11", "title": "草稿 — App", "pid": 88, "process_name": "app.exe", "class_name": "AppWindow",
                  "x": 10, "y": 10, "width": 400, "height": 300, "visible": False, "minimized": False,
                  "maximized": False, "topmost": False, "opacity": 100},
         }
         self.changed = []
 
     def foreground(self):
-        return 22
+        return "22"
 
-    def handles(self):
-        return list(self.windows)
+    def list(self):
+        return [dict(window) for window in self.windows.values()]
 
     def info(self, hwnd):
         return dict(self.windows[hwnd]) if hwnd in self.windows else None
 
-    def show(self, hwnd, command):
+    def show(self, hwnd, state):
         self.changed.append((hwnd, "show"))
-        self.windows[hwnd].update(visible=command != 0, minimized=command == 6, maximized=command == 3)
+        self.windows[hwnd].update(visible=state != "hide", minimized=state == "minimize", maximized=state == "maximize")
 
-    def pin(self, hwnd, enabled):
-        self.changed.append((hwnd, "pin"))
-        self.windows[hwnd]["topmost"] = enabled
+    def set_pinned(self, action, window_id, title=""):
+        self.changed.append((window_id, "pin"))
+        self.windows[window_id]["topmost"] = action == "pin"
+        return {"state": "pinned" if action == "pin" else "unpinned", "window_id": window_id}
 
-    def position(self, hwnd, rect):
+    def move(self, hwnd, rect):
         self.changed.append((hwnd, "position"))
         self.windows[hwnd].update(rect)
 
-    def monitor_for(self, hwnd):
-        return 1
-
     def monitors(self):
-        return [{"handle": 1, "work": {"x": 0, "y": 0, "width": 1920, "height": 1040}},
-                {"handle": 2, "work": {"x": -1441, "y": -100, "width": 1441, "height": 1001}}]
+        return [{"handle": 1, "bounds": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+                 "work": {"x": 0, "y": 0, "width": 1920, "height": 1040}},
+                {"handle": 2, "bounds": {"x": -1441, "y": -100, "width": 1441, "height": 1001},
+                 "work": {"x": -1441, "y": -100, "width": 1441, "height": 1001}}]
 
 
 def window_control(monkeypatch):
     module = load_plugin("actions", "window_control")
     backend = WindowControlBackend()
-    monkeypatch.setattr(module, "os", SimpleNamespace(name="nt"))
-    monkeypatch.setattr(module, "_backend", lambda: backend)
+    monkeypatch.setattr(module, "platform", SimpleNamespace(window=backend))
     meta = json.loads((PKG_ROOT / "actions/window_control/action.json").read_text(encoding="utf-8"))
     return module, backend, meta
 
 
 @pytest.mark.parametrize("selector,expected", [
-    ({"target": "title", "title": "app"}, [22]),
-    ({"target": "class_name", "class_name": "^appwindow$", "match_mode": "regex"}, [22]),
-    ({"target": "process", "process_name": "APP", "include_hidden": True}, [22, 11]),
-    ({"target": "pid", "pid": 88, "include_hidden": True}, [22, 11]),
-    ({"target": "hwnd", "hwnd": 11}, [11]),
+    ({"target": "title", "title": "app"}, ["22"]),
+    ({"target": "class_name", "class_name": "^appwindow$", "match_mode": "regex"}, ["22"]),
+    ({"target": "process", "process_name": "APP", "include_hidden": True}, ["22", "11"]),
+    ({"target": "pid", "pid": 88, "include_hidden": True}, ["22", "11"]),
+    ({"target": "window_id", "window_id": "11"}, ["11"]),
 ])
 def test_window_control_selection_and_output_contract(monkeypatch, selector, expected):
     module, backend, meta = window_control(monkeypatch)
     result = invoke_action(module.run_with_context, module, meta, {"action": "list", **selector}, {})
-    assert [item["hwnd"] for item in result["windows"]] == expected
+    assert [item["window_id"] for item in result["windows"]] == expected
     assert result["count"] == len(expected)
     assert backend.changed == []
 
@@ -968,12 +711,12 @@ def test_window_control_requires_explicit_multiple_match_policy(monkeypatch):
         module.run_with_context({}, params, {})
     assert backend.changed == []
     result = module.run_with_context({}, {**params, "match": "first"}, {})
-    assert result["hwnd"] == 22
-    assert backend.changed == [(22, "pin")]
+    assert result["window_id"] == "22"
+    assert backend.changed == [("22", "pin")]
     backend.changed.clear()
     result = module.run_with_context({}, {**params, "match": "all"}, {})
-    assert result["count"] == 2 and result["hwnd"] == 0
-    assert backend.changed == [(22, "pin"), (11, "pin")]
+    assert result["count"] == 2 and result["window_id"] == ""
+    assert backend.changed == [("22", "pin"), ("11", "pin")]
 
 
 @pytest.mark.parametrize("options,expected", [
@@ -985,12 +728,12 @@ def test_window_control_requires_explicit_multiple_match_policy(monkeypatch):
 ])
 def test_window_control_restores_and_positions_in_monitor_work_area(monkeypatch, options, expected):
     module, backend, meta = window_control(monkeypatch)
-    backend.windows[22]["minimized"] = True
+    backend.windows["22"]["minimized"] = True
     result = invoke_action(module.run_with_context, module, meta, {**options, "monitor": "next"}, {})
     window = result["windows"][0]
     assert {key: window[key] for key in expected} == expected
     assert not window["minimized"]
-    assert backend.changed == [(22, "show"), (22, "position")]
+    assert backend.changed == [("22", "show"), ("22", "position")]
 
 
 def test_window_control_wait_can_be_cancelled(monkeypatch):
@@ -999,7 +742,7 @@ def test_window_control_wait_can_be_cancelled(monkeypatch):
     def disappear():
         cancelled.set()
         return []
-    monkeypatch.setattr(backend, "handles", disappear)
+    monkeypatch.setattr(backend, "list", disappear)
     with pytest.raises(ActionCancelled):
         invoke_action(module.run_with_context, module, meta, {"target": "all", "wait_seconds": 30},
                       {"runtime": {"cancellation": ActionCancellation(cancelled)}})
@@ -1009,15 +752,15 @@ def test_window_control_wait_can_be_cancelled(monkeypatch):
 def test_window_control_batch_uses_one_deadline(monkeypatch):
     module, backend, _ = window_control(monkeypatch)
     clock = [0]
-    original = backend.pin
-    def slow_pin(hwnd, enabled):
-        original(hwnd, enabled)
+    original = backend.set_pinned
+    def slow_pin(action, window_id, title=""):
+        original(action, window_id, title)
         clock[0] += 2
-    monkeypatch.setattr(backend, "pin", slow_pin)
+    monkeypatch.setattr(backend, "set_pinned", slow_pin)
     monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     with pytest.raises(RuntimeError, match="已完成 1/2"):
         module.run_with_context({}, {"action": "pin", "target": "all", "match": "all", "include_hidden": True, "timeout_seconds": 1}, {})
-    assert backend.changed == [(22, "pin")]
+    assert backend.changed == [("22", "pin")]
 
 
 def test_shutdown_system_delay_can_be_cancelled_before_system_call():

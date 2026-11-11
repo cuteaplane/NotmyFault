@@ -153,6 +153,11 @@ class TestInvalidKey:
         with pytest.raises(store.KeyStoreInvalidKeyError):
             key_store.save_api_key("x" * (store._MAX_KEY_LENGTH + 1))
 
+    @pytest.mark.parametrize("key", ["clé", "sk-test\nkey", "sk-test\x00key", "sk-test\x7fkey"])
+    def test_non_header_characters_are_rejected(self, key_store, key):
+        with pytest.raises(store.KeyStoreInvalidKeyError):
+            key_store.save_api_key(key)
+
     def test_max_length_key_accepted(self, key_store, fake_dpapi):
         key = "x" * store._MAX_KEY_LENGTH
         key_store.save_api_key(key)

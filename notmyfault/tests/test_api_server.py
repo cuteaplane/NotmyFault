@@ -155,6 +155,31 @@ def test_options_preflight_is_allowed_for_dashboard_port(tmp_path):
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:19218"
 
+    rejected = env.client.get(
+        "/api/engine/status",
+        headers={
+            "Origin": "http://127.0.0.1:19218",
+            "Authorization": "Bearer invalid",
+        },
+    )
+    assert rejected.status_code == 403
+    assert rejected.headers["access-control-allow-origin"] == "http://127.0.0.1:19218"
+
+    oversized = env.client.post(
+        "/api/engine/start",
+        content=b"x" * (1024 * 1024 + 1),
+        headers={**env.headers, "Origin": "http://127.0.0.1:19218"},
+    )
+    assert oversized.status_code == 413
+    assert oversized.headers["access-control-allow-origin"] == "http://127.0.0.1:19218"
+
+    headers = {**env.headers, "Origin": "http://127.0.0.1:19218"}
+    for _ in range(300):
+        assert env.client.get("/api/engine/status", headers=headers).status_code == 200
+    limited = env.client.get("/api/engine/status", headers=headers)
+    assert limited.status_code == 429
+    assert limited.headers["access-control-allow-origin"] == "http://127.0.0.1:19218"
+
 
 def test_wrong_token_does_not_write_the_shared_token_file(tmp_path):
     env = make_api_env(tmp_path)
@@ -293,6 +318,15 @@ def test_rule_save_rejects_missing_binding_source(tmp_path):
     assert env.store.load_verified_rules() == []
 
 
+def test_rule_save_rejects_malformed_graph_with_400(tmp_path):
+    env = make_api_env(tmp_path)
+    rule = native_rule({"type": "hotkey", "params": {"hotkey": "ctrl+k"}}, [])
+    rule["workflow"]["nodes"][0]["type"] = ["trigger"]
+    response = env.client.put("/api/rules", headers=env.headers, json={"rules": [rule]})
+    assert response.status_code == 400
+    assert env.store.load_verified_rules() == []
+
+
 def test_rules_transport_preserves_typed_constants_and_literal_objects(tmp_path):
     from decimal import Decimal
     from notmyfault.core.value_codec import encode_value, decode_value
@@ -368,10 +402,15 @@ def test_api_server_stop_ends_event_streams(tmp_path):
     async def exercise():
         env = make_api_env(tmp_path)
         subscription = env.event_broker.subscribe()
+        shutdowns = []
+        env.server._application._ai_service = SimpleNamespace(
+            begin_shutdown=lambda: shutdowns.append("ai")
+        )
 
         env.server.stop()
 
         assert await asyncio.wait_for(subscription.queue.get(), timeout=1) is None
+        assert shutdowns == ["ai"]
 
     asyncio.run(exercise())
 
@@ -452,3 +491,12 @@ def test_api_server_shutdown_with_open_event_stream(tmp_path, monkeypatch):
         assert flushes, "服务退出时没跑到运行历史落盘"
     finally:
         connection.close()
+
+
+def test_token_store_rotation_replaces_persisted_token(tmp_path):
+    path = tmp_path / ".api_token"
+    original = ApiTokenStore(path).token
+    rotated = ApiTokenStore(path, rotate=True)
+    assert rotated.token != original
+    assert path.read_text(encoding="utf-8") == rotated.token
+    assert ApiTokenStore(path).token == rotated.token

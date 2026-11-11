@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from notmyfault.core.logging import engine_error, engine_info, engine_warn
 from notmyfault.extensions.registry import ExtensionRegistry
+from notmyfault.platform.errors import PlatformServiceError
 from notmyfault.security.plugin_schema import admin_executables
 from notmyfault.security.plugin_imports import PluginImports
 from notmyfault.security.plugin_checks import (
@@ -439,8 +440,11 @@ class PluginLoader:
                     ok, result = run_isolated_action(
                         _entry, _entry_hash, _info, params, context,
                         plugin_root=folder_path, file_snapshot=tree.file_snapshot,
+                        cancellation=context.get("runtime", {}).get("cancellation"),
                     )
                     if not ok:
+                        if isinstance(result, PlatformServiceError):
+                            raise result
                         raise RuntimeError(f"isolated worker 执行失败: {result}")
                     return result
 

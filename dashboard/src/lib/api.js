@@ -1,5 +1,7 @@
 // pywebview 桌面客户端，普通 JSON 请求经 Python bridge 代理，包含 File 的 FormData 上传直接由 WebView 发送。
 export const API = 'http://127.0.0.1:19198'
+const DEFAULT_REQUEST_TIMEOUT_MS = 30000
+const AI_DRAFT_TIMEOUT_MS = 130000
 
 export function hasBridge() {
   return !!(window.pywebview && window.pywebview.api)
@@ -17,9 +19,11 @@ async function authHeaders() {
 
 async function fetchAuthenticated(path, options = {}) {
   const streaming = options.headers?.Accept === 'text/event-stream'
+  const timeoutMs = path === '/api/rules/draft/ai/stream'
+    ? AI_DRAFT_TIMEOUT_MS : DEFAULT_REQUEST_TIMEOUT_MS
   const timeoutController = streaming ? new AbortController() : null
-  const timer = streaming ? setTimeout(() => timeoutController.abort(new DOMException('请求超时，请重试', 'TimeoutError')), 30000) : null
-  const timeout = timeoutController?.signal || AbortSignal.timeout(30000)
+  const timer = streaming ? setTimeout(() => timeoutController.abort(new DOMException('请求超时，请重试', 'TimeoutError')), timeoutMs) : null
+  const timeout = timeoutController?.signal || AbortSignal.timeout(timeoutMs)
   const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout
   const request = async () => {
     const headers = { ...(options.headers || {}), ...await authHeaders() }
@@ -68,6 +72,16 @@ export async function apiWrite(path, method, body, isForm) {
       body: body == null ? null : JSON.stringify(body),
     }
   const res = await fetchAuthenticated(path, options)
+  if (res.status === 403) throw new Error('Dashboard 与后台服务认证不同步')
+  return res
+}
+
+export async function apiDownload(path, body) {
+  const res = await fetchAuthenticated(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  })
   if (res.status === 403) throw new Error('Dashboard 与后台服务认证不同步')
   return res
 }
@@ -254,19 +268,31 @@ export async function streamRuleDraftWithAI(messages, {
   signal,
   onEvent = () => {},
 } = {}) {
-  const response = await fetchAuthenticated('/api/rules/draft/ai/stream', {
-    method: 'POST',
-    headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
-    body: JSON.stringify(aiDraftRequestBody(messages, apiKey)),
-    signal,
-  })
-  if (!response.ok || !response.body) {
-    let message = `AI 草稿服务请求失败（${response.status}）`
-    const data = await response.json().catch(() => null)
-    if (typeof data?.error === 'string' && data.error) message = data.error
-    throw new Error(message)
+  const timeoutController = new AbortController()
+  const requestSignal = signal
+    ? AbortSignal.any([signal, timeoutController.signal])
+    : timeoutController.signal
+  const timer = setTimeout(() => {
+    timeoutController.abort(new DOMException('请求超时，请重试', 'TimeoutError'))
+  }, AI_DRAFT_TIMEOUT_MS)
+  try {
+    const response = await fetchAuthenticated('/api/rules/draft/ai/stream', {
+      method: 'POST',
+      headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
+      body: JSON.stringify(aiDraftRequestBody(messages, apiKey)),
+      signal: requestSignal,
+    })
+    if (!response.ok || !response.body) {
+      let message = `AI 草稿服务请求失败（${response.status}）`
+      const data = await response.json().catch(() => null)
+      if (typeof data?.error === 'string' && data.error) message = data.error
+      throw new Error(message)
+    }
+    await consumeAIDraftSSE(response.body, onEvent, requestSignal)
+    if (timeoutController.signal.aborted) throw timeoutController.signal.reason
+  } finally {
+    clearTimeout(timer)
   }
-  await consumeAIDraftSSE(response.body, onEvent, signal)
 }
 
 export async function loadPlugins() {
@@ -289,6 +315,7 @@ export async function getEngineStatus() {
 export async function getConfigSecurityStatus() {
   try {
     const r = await apiRead('/api/config/security-status')
+    if (!r.ok) throw new Error('读取配置安全状态失败（HTTP ' + r.status + '）')
     return await r.json()
   } catch (e) {
     return { status: 'unavailable', reason: '无法获取配置安全状态', summary: null }
@@ -306,6 +333,7 @@ export async function approveConfigSecurity(adminKeyPassword = '') {
 
 export async function getAIDraftingSetting() {
   const r = await apiRead('/api/settings/ai-drafting')
+  if (!r.ok) throw new Error('读取 AI 设置失败（HTTP ' + r.status + '）')
   return await r.json()
 }
 

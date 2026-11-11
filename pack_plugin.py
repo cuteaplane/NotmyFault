@@ -26,6 +26,8 @@ def _collect_files(plugin_dir: Path) -> list[tuple[Path, str]]:
     """归档保留作者签名和公钥，运行缓存不参与分发。"""
     result = []
     for p in sorted(plugin_dir.rglob("*")):
+        if p.is_symlink() or getattr(p, "is_junction", lambda: False)():
+            raise ValueError("插件目录不能包含文件或目录链接")
         if not p.is_file():
             continue
         if any(part in _IGNORE_NAMES for part in p.relative_to(plugin_dir).parts):
@@ -36,6 +38,8 @@ def _collect_files(plugin_dir: Path) -> list[tuple[Path, str]]:
 
 def pack_plugin(plugin_dir: Path, output_dir: Path = DIST_DIR, arc_prefix: str | None = None) -> Path | None:
     """打包单个插件目录为 .nmfp，arc_prefix 指定归档内路径前缀，返回输出路径"""
+    if plugin_dir.is_symlink() or getattr(plugin_dir, "is_junction", lambda: False)():
+        raise ValueError("插件目录不能包含文件或目录链接")
     plugin_dir = plugin_dir.resolve()
     if not plugin_dir.is_dir():
         print(f"! 目录不存在: {plugin_dir}", file=sys.stderr)

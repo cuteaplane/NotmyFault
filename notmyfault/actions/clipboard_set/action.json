@@ -10,10 +10,6 @@
     ],
     "execution_api": "context-v1",
     "idempotent": true,
-    "platforms": [
-        "windows",
-        "linux"
-    ],
     "permissions": [
         "clipboard",
         "native_api"

@@ -1,39 +1,7 @@
-import ctypes
 import math
-import os
 
 from notmyfault.triggers.base import PollingTrigger
-from notmyfault.plugin_api import native_lock
-
-
-class _LASTINPUTINFO(ctypes.Structure):
-    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
-
-
-if os.name == "nt":
-    # dwTime 是 32 位 tick，差值按 DWORD 回绕
-    ctypes.windll.kernel32.GetTickCount.argtypes = []
-    ctypes.windll.kernel32.GetTickCount.restype = ctypes.c_uint
-    ctypes.windll.user32.GetLastInputInfo.argtypes = [ctypes.POINTER(_LASTINPUTINFO)]
-    ctypes.windll.user32.GetLastInputInfo.restype = ctypes.c_bool
-
-
-def _tick_delta_seconds(tick: int, last_input: int) -> float:
-    return ((tick - last_input) & 0xFFFFFFFF) / 1000.0
-
-
-def _get_idle_seconds() -> float:
-    """返回自最后输入事件起的系统空闲秒数"""
-    if os.name != "nt":
-        from notmyfault.platform.linux_support import get_idle_seconds
-        return get_idle_seconds()
-    lii = _LASTINPUTINFO()
-    lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)
-    with native_lock():
-        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
-            raise RuntimeError("读取用户空闲时间失败")
-        tick = ctypes.windll.kernel32.GetTickCount()
-    return _tick_delta_seconds(tick, lii.dwTime)
+from notmyfault.plugin_api import platform
 
 
 class IdleDetectTrigger(PollingTrigger):
@@ -54,7 +22,7 @@ class IdleDetectTrigger(PollingTrigger):
         self.log(f"开始监视空闲状态，阈值: {self.threshold} 秒")
 
     def poll(self):
-        idle_secs = _get_idle_seconds()
+        idle_secs = platform.session.idle_seconds()
         idle = idle_secs >= self.threshold
         self.emit({"state": "idle" if idle else "active", "idle_seconds": idle_secs})
 

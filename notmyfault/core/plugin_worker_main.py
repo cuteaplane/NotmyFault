@@ -16,6 +16,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from notmyfault.core.type_registry import TypeRegistry
 from notmyfault.core.value_codec import decode_value, encode_value
+from notmyfault.platform.errors import PlatformServiceError
 from notmyfault.core.workflow import invoke_action
 from notmyfault.core.plugin_worker import MAX_EXTENSION_PROTOCOL_LINE, MAX_PROTOCOL_LINE
 from notmyfault.security.plugin_imports import PluginImports
@@ -79,7 +80,10 @@ def _serve_extension(request, protocol, importer, module, entry, tree):
                 "current_value": encode_value(session.current_value),
             })
         except BaseException as error:
-            send({"type": "result", "ok": False, "error": f"{type(error).__name__}: {error}"})
+            reply = {"type": "result", "ok": False, "error": f"{type(error).__name__}: {error}"}
+            if isinstance(error, PlatformServiceError):
+                reply["platform_error"] = error.to_dict()
+            send(reply)
 
     active = None
     try:
@@ -167,6 +171,8 @@ def main() -> None:
             "ok": False,
             "error": f"{type(exc).__name__}: {exc}",
         }
+        if isinstance(exc, PlatformServiceError):
+            payload["platform_error"] = exc.to_dict()
     sys.stdout = protocol
     protocol.write(json.dumps(payload, ensure_ascii=False) + "\n")
     protocol.flush()

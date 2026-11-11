@@ -1,5 +1,6 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import CircularProgress from '../CircularProgress.vue'
+import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from 'vue'
 import { getEngineStatus, hasBridge, listRuns, readDiagnostics } from '../../lib/api'
 import { store } from '../../lib/store'
 import { snackbar } from '../../lib/notify'
@@ -12,6 +13,7 @@ const diag = ref(null)
 const recentRuns = ref([])
 const runsError = ref('')
 let statsLoading = false
+let statsRefreshPending = false
 let disposed = false
 let diagTimer = null
 
@@ -130,8 +132,13 @@ function statsForStatus(status) {
     : { rules: '-', triggers: '-', actions: '-' }
 }
 async function loadStats(status = null) {
-  if (statsLoading || disposed) return
+  if (disposed) return
+  if (statsLoading) {
+    statsRefreshPending = true
+    return
+  }
   statsLoading = true
+  let diagnosticsRequested = false
   try {
     const current = status ?? await getEngineStatus()
     statusError.value = ''
@@ -152,7 +159,8 @@ async function loadStats(status = null) {
         runsError.value = error.message
       })
       : Promise.resolve()
-    const diagnosticsRead = isRunning.value
+    diagnosticsRequested = isRunning.value
+    const diagnosticsRead = diagnosticsRequested
       ? readDiagnostics().then(data => {
         if (disposed || !isRunning.value) return
         diag.value = data
@@ -160,12 +168,16 @@ async function loadStats(status = null) {
       : Promise.resolve()
     await Promise.all([runsRead, diagnosticsRead])
     if (disposed) return
-    if (isRunning.value && !diag.value) statusError.value = '无法读取诊断数据，请刷新重试'
+    if (diagnosticsRequested && isRunning.value && !diag.value) statusError.value = '无法读取诊断数据，请刷新重试'
   } catch (error) {
     statusError.value = error.message || '无法读取引擎状态，请刷新重试'
     stats.value = { rules: '-', triggers: '-', actions: '-' }
   } finally {
     statsLoading = false
+    if (statsRefreshPending && !disposed) {
+      statsRefreshPending = false
+      void loadStats()
+    }
   }
 }
 
@@ -186,9 +198,24 @@ watch(isRunning, running => {
   else loadStats(store.engineStatus)
 })
 
+function startDiagTimer() {
+  if (hasBridge() && !diagTimer) diagTimer = setInterval(() => loadStats(), 30000)
+}
+let hidden = false
 onMounted(() => {
   if (isControllerOnline.value) loadStats(store.engineStatus)
-  if (hasBridge()) diagTimer = setInterval(() => loadStats(), 30000)
+  startDiagTimer()
+})
+onDeactivated(() => {
+  hidden = true
+  if (diagTimer) clearInterval(diagTimer)
+  diagTimer = null
+})
+onActivated(() => {
+  if (!hidden) return
+  hidden = false
+  if (isControllerOnline.value) loadStats(store.engineStatus)
+  startDiagTimer()
 })
 onUnmounted(() => { disposed = true; if (diagTimer) clearInterval(diagTimer) })
 </script>
@@ -221,9 +248,9 @@ onUnmounted(() => { disposed = true; if (diagTimer) clearInterval(diagTimer) })
         <button v-if="!isRunning && !isStarting && !isStopping" class="btn btn-filled" @click="startEngine">
           <span class="material-symbols-outlined">play_arrow</span>{{ isControllerOnline ? '启动自动化' : '启动引擎' }}
         </button>
-        <button v-else-if="isStarting" class="btn btn-filled" disabled><span class="spinner"></span>启动中…</button>
+        <button v-else-if="isStarting" class="btn btn-filled" disabled><CircularProgress />启动中…</button>
         <button v-else-if="isRunning && !isStopping" class="btn btn-tonal" @click="stopEngine"><span class="material-symbols-outlined">pause</span>暂停</button>
-        <button v-else class="btn btn-tonal" disabled><span class="spinner"></span>暂停中…</button>
+        <button v-else class="btn btn-tonal" disabled><CircularProgress />暂停中…</button>
         <button v-if="isControllerOnline && !isRunning && !isStarting && !isStopping" class="btn btn-text btn-danger" :disabled="shuttingDown" @click="shutdownEngine">
           {{ shuttingDown ? '停止中…' : '彻底停止' }}
         </button>

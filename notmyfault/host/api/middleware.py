@@ -26,13 +26,6 @@ def install_api_middleware(app: FastAPI, token_store: ApiTokenStore) -> None:
     rate_limit = 300
     last_token_check = 0.0
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=DASHBOARD_ORIGINS,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
     @app.middleware("http")
     async def authenticate(request: Request, call_next):
         nonlocal last_token_check
@@ -78,3 +71,10 @@ def install_api_middleware(app: FastAPI, token_store: ApiTokenStore) -> None:
             last_token_check = now
             await asyncio.to_thread(token_store.repair_file)
         return await call_next(request)
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=DASHBOARD_ORIGINS,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )

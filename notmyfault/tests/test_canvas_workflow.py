@@ -121,6 +121,27 @@ def test_timed_absence_is_false_before_duration_and_resets_on_event():
     assert observation._waits == {}
 
 
+def test_timed_not_logic_uses_latest_trigger_observation_window():
+    class Clock:
+        time = 0
+        def monotonic(self):
+            return self.time
+    clock = Clock()
+    source = example()
+    logic = {'binding_id': 'a_timednot01', 'type': 'logic', 'op': 'not', 'duration_seconds': 5}
+    source['workflow']['nodes'].append(logic)
+    source['workflow']['edges'].append({'source': 'a_source_aaaaaa', 'port': 'event',
+        'target': logic['binding_id'], 'channel': 'condition'})
+    observation = RunEventObservation(SimpleNamespace(source=source), clock=clock)
+    program = CanvasProgram(source)
+    context = {'_event_observation': observation}
+
+    assert program.evaluate(logic['binding_id'], context) is False
+    observation.record('event_aaaaaa', {})
+    clock.time = 6
+    assert program.evaluate(logic['binding_id'], context) is True
+
+
 def test_and_and_nested_not_are_derived_from_explicit_connections():
     source = example()
     logic = {'binding_id': 'a_logic_000001', 'type': 'logic', 'op': 'all'}
@@ -190,6 +211,25 @@ def test_branch_output_keeps_order_when_used_as_nested_condition():
     program = CanvasProgram(source)
     assert program.evaluate(outer['binding_id'], {}, occurred={'t_source_aaaaaa', 't_source_bbbbbb'}) is False
     assert program.evaluate(outer['binding_id'], {}, occurred={'t_source_bbbbbb'}) is True
+
+
+def test_malformed_graph_returns_errors_instead_of_raising():
+    trigger = {'binding_id': 'a_schedule01', 'type': 'trigger',
+               'trigger': {'binding_id': 't_schedule01', 'type': 'time_schedule', 'params': {}}}
+    cases = [
+        {'nodes': [dict(trigger, type=['trigger'])], 'edges': []},
+        {'nodes': [{'binding_id': 'a_group0001', 'type': 'event_group',
+                    'group_type': 'if', 'branches': [{'label': '缺少 id'}]}], 'edges': []},
+        {'nodes': [{'binding_id': 'a_unknown01'}, {'binding_id': 'a_end00001', 'type': 'end'}],
+         'edges': [{'source': 'a_unknown01', 'target': 'a_end00001', 'channel': 'control', 'port': 'next'}]},
+        {'nodes': [{'binding_id': 'a_unknown01'},
+                   {'binding_id': 'a_end00001', 'type': 'end', 'parent': 'a_unknown01'}],
+         'edges': [{'source': 'a_end00001', 'target': 'a_end00001', 'channel': 'control', 'port': 'next'}]},
+    ]
+    for graph in cases:
+        errors = validate_canvas_graph(graph)
+        assert isinstance(errors, list)
+        assert errors
 
 
 @pytest.mark.parametrize('port', ['missing', 'next', 'entry'])

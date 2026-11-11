@@ -7,7 +7,7 @@ export function normalizeDraftResult(result) {
 }
 
 function draftActions(draft) { const result = []; walkGraphActions(draft?.workflow, node => { if (!['trigger', 'logic', 'condition', 'event_group', 'action_group', 'merge', 'end', 'set_variable'].includes(node.type)) result.push(node) }); return result }
-function draftTriggers(draft) { return getGraphTriggers(draft || {}) }
+export function draftTriggers(draft) { return getGraphTriggers(draft || {}) }
 export function conditionLabel(node, schema) { return node ? schema.triggers?.[node.type]?.name || node.type : '待连接触发器' }
 
 export function actionNames(draft, schema) {

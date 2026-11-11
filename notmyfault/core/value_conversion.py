@@ -18,7 +18,7 @@ from notmyfault.core.data_types import (
     normalize_type,
     normalize_value,
 )
-from notmyfault.core.value_codec import decode_value, encode_value
+from notmyfault.core.value_codec import MAX_DECIMAL_ADJUSTED, decode_value, encode_value
 
 
 def convert_value(value, target, registry=None, *, source=None, options=None, location="$"):
@@ -96,6 +96,8 @@ def convert_value(value, target, registry=None, *, source=None, options=None, lo
             number = Decimal(value.strip()) if isinstance(value, str) else Decimal(str(value))
             if not number.is_finite():
                 invalid("数字必须是有限值")
+            if abs(number.adjusted()) > MAX_DECIMAL_ADJUSTED:
+                invalid("数字超出可转换范围")
             if kind == "int":
                 rounding = options.get("rounding", "exact")
                 if rounding not in ("exact", "truncate", "floor", "ceil", "round"):

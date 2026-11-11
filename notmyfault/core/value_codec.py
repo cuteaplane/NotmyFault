@@ -15,6 +15,8 @@ from notmyfault.values import Blob, Secret
 
 WIRE_KEY = "$nmf_value"
 MAX_SAFE_INTEGER = 2**53 - 1
+# Decimal 转 int 的耗时随位数急剧增长，超过这个量级的数字直接拒绝。
+MAX_DECIMAL_ADJUSTED = 10000
 
 
 def encode_value(value, *, _transport=False):
@@ -93,7 +95,7 @@ def decode_value(value, *, _transport=False):
                 return number if kind == "int" else timedelta(microseconds=number)
             if kind == "decimal":
                 number = Decimal(data)
-                if not number.is_finite():
+                if not number.is_finite() or abs(number.adjusted()) > MAX_DECIMAL_ADJUSTED:
                     raise ValueError()
                 return number
             if kind == "bytes":

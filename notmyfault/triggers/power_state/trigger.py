@@ -1,206 +1,10 @@
-"""电源状态触发器：轮询交流、电池和低电量状态
-Windows 用隐藏窗口收 WM_POWERBROADCAST；Linux 用 logind PrepareForSleep(False)
-"""
+"""电源状态轮询与睡眠恢复监听"""
 
-import ctypes
-import os
-import sys
-
-import psutil
-
-from notmyfault.plugin_api import native_lock
+from notmyfault.plugin_api import platform
 from notmyfault.triggers.base import PollingTrigger
-
-if os.name == "nt":
-    from ctypes import wintypes
-    _kernel32 = ctypes.windll.kernel32
-    _user32 = ctypes.windll.user32
-    _kernel32.GetSystemPowerStatus.argtypes = [ctypes.c_void_p]
-    _kernel32.GetSystemPowerStatus.restype = wintypes.BOOL
-    _kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
-    _kernel32.GetModuleHandleW.restype = wintypes.HMODULE
-    _user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
-                                     wintypes.UINT, wintypes.UINT, wintypes.UINT]
-    _user32.PeekMessageW.restype = wintypes.BOOL
-    _user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
-    _user32.TranslateMessage.restype = wintypes.BOOL
-    _user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
-    _user32.DispatchMessageW.restype = ctypes.c_ssize_t
-    _user32.DestroyWindow.argtypes = [wintypes.HWND]
-    _user32.DestroyWindow.restype = wintypes.BOOL
-    _user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
-    _user32.UnregisterClassW.restype = wintypes.BOOL
-
-WM_POWERBROADCAST = 0x0218
-PBT_APMRESUMEAUTOMATIC = 0x0012
-PBT_APMRESUMESUSPEND = 0x0007
-PBT_APMSUSPEND = 0x0004
-
-# WNDPROC 回调必须保持引用存活，ctypes 才能继续调用它
-_WND_PROC_HOLD: list = []
-
-
-def _is_on_battery():
-    if os.name != "nt":
-        battery = psutil.sensors_battery()
-        if battery is None:
-            return False, 100
-        return not battery.power_plugged, round(battery.percent)
-    SYSTEM_POWER_STATUS = ctypes.c_uint8 * 12
-    sps = SYSTEM_POWER_STATUS()
-    with native_lock():
-        if not ctypes.windll.kernel32.GetSystemPowerStatus(sps):
-            raise RuntimeError("读取系统电源状态失败")
-    ac_line = sps[0]
-    battery_life = sps[2]
-    if sps[1] == 128 and ac_line == 1:
-        battery_life = 100
-    if ac_line not in (0, 1) or battery_life > 100:
-        raise RuntimeError("系统电源状态未知")
-    return ac_line == 0, battery_life
-
-
-def _create_power_event_window():
-    """创建隐藏窗口接收电源广播，失败时返回 None"""
-    callback = None
-    try:
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-
-        WNDPROC = ctypes.WINFUNCTYPE(
-            ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint,
-            ctypes.c_size_t, ctypes.c_size_t,
-        )
-
-        class WNDCLASSW(ctypes.Structure):
-            _fields_ = [
-                ("style", ctypes.c_uint),
-                ("lpfnWndProc", WNDPROC),
-                ("cbClsExtra", ctypes.c_int),
-                ("cbWndExtra", ctypes.c_int),
-                ("hInstance", ctypes.c_void_p),
-                ("hIcon", ctypes.c_void_p),
-                ("hCursor", ctypes.c_void_p),
-                ("hbrBackground", ctypes.c_void_p),
-                ("lpszMenuName", ctypes.c_wchar_p),
-                ("lpszClassName", ctypes.c_wchar_p),
-            ]
-
-        state = {"resume": False}
-
-        def wnd_proc(hwnd, msg, wparam, lparam):
-            if msg == WM_POWERBROADCAST:
-                if wparam in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND):
-                    state["resume"] = True
-                return 0
-            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
-
-        callback = WNDPROC(wnd_proc)
-        _WND_PROC_HOLD.append(callback)
-
-        user32.DefWindowProcW.argtypes = [
-            wintypes.HWND,
-            wintypes.UINT,
-            wintypes.WPARAM,
-            wintypes.LPARAM,
-        ]
-        user32.DefWindowProcW.restype = ctypes.c_ssize_t
-        user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
-        user32.RegisterClassW.restype = ctypes.c_ushort
-        user32.CreateWindowExW.argtypes = [
-            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            wintypes.HWND, ctypes.c_void_p, wintypes.HINSTANCE, ctypes.c_void_p,
-        ]
-        user32.CreateWindowExW.restype = wintypes.HWND
-        kernel32.GetCurrentThreadId.argtypes = []
-        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
-
-        class_name = f"NotmyFaultPowerState_{kernel32.GetCurrentThreadId()}"
-        wc = WNDCLASSW()
-        wc.lpfnWndProc = callback
-        wc.hInstance = kernel32.GetModuleHandleW(None)
-        wc.lpszClassName = class_name
-        if not user32.RegisterClassW(ctypes.byref(wc)):
-            _WND_PROC_HOLD.remove(callback)
-            return None
-
-        hwnd = user32.CreateWindowExW(
-            0, class_name, class_name, 0, 0, 0, 0, 0,
-            None, None, wc.hInstance, None,
-        )
-        if not hwnd:
-            user32.UnregisterClassW(class_name, wc.hInstance)
-            _WND_PROC_HOLD.remove(callback)
-            return None
-        return {
-            "hwnd": hwnd,
-            "state": state,
-            "user32": user32,
-            "msg_cls": wintypes.MSG,
-            "class_name": class_name,
-            "hinstance": wc.hInstance,
-            "wnd_proc": callback,
-        }
-    except Exception:
-        if callback in _WND_PROC_HOLD:
-            _WND_PROC_HOLD.remove(callback)
-        return None
-
-
-def _pump_power_messages(window) -> bool:
-    """处理消息队列中的电源广播；返回本轮是否发生了 resume"""
-    if window is None:
-        return False
-    try:
-        user32 = window["user32"]
-        msg = window["msg_cls"]()
-        while user32.PeekMessageW(ctypes.byref(msg), window["hwnd"], 0, 0, 1):
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
-        resumed = window["state"]["resume"]
-        window["state"]["resume"] = False
-        return resumed
-    except Exception:
-        return False
-
-
-def _destroy_power_event_window(window) -> None:
-    """销毁隐藏窗口并注销窗口类，在线程退出时调用"""
-    if window is None:
-        return
-    wnd_proc = None
-    try:
-        hwnd = window.get("hwnd")
-        class_name = window.get("class_name")
-        wnd_proc = window.get("wnd_proc")
-        if hwnd:
-            window["user32"].DestroyWindow(hwnd)
-        if class_name:
-            window["user32"].UnregisterClassW(
-                class_name, window.get("hinstance")
-            )
-    except Exception:
-        pass
-    finally:
-        if wnd_proc in _WND_PROC_HOLD:
-            _WND_PROC_HOLD.remove(wnd_proc)
-
-
-def _create_linux_resume_monitor():
-    from notmyfault.platform.backends import BackendError, SleepResumeBackend
-
-    monitor = SleepResumeBackend()
-    try:
-        monitor.start()
-    except BackendError as error:
-        raise RuntimeError(str(error)) from error
-    return monitor
 
 
 class PowerStateTrigger(PollingTrigger):
-    """电源状态监测：交流/电池/低电量轮询 + 睡眠恢复事件监听"""
-
     interval = 2.0
     native = False
 
@@ -213,40 +17,25 @@ class PowerStateTrigger(PollingTrigger):
             )
 
     def setup(self):
-        self.power_window = None
         self.resume_monitor = None
         self.target_state = self.config.get("state", "ac")
         self.log(f"开始监控电源状态，目标: {self.target_state}")
         if self.target_state == "resume":
-            if os.name == "nt":
-                with native_lock():
-                    self.power_window = _create_power_event_window()
-                if self.power_window is None:
-                    raise RuntimeError("无法创建睡眠恢复事件监听窗口")
-            elif sys.platform.startswith("linux"):
-                self.resume_monitor = _create_linux_resume_monitor()
-            else:
-                raise RuntimeError("当前平台不支持睡眠恢复监听")
+            self.resume_monitor = platform.power.resume_monitor()
+            self.resume_monitor.start()
+
     def poll(self):
-        resumed = False
-        if self.power_window is not None:
-            with native_lock():
-                resumed = _pump_power_messages(self.power_window)
-        elif self.resume_monitor is not None:
-            resumed = self.resume_monitor.consume_resume()
+        resumed = self.resume_monitor is not None and self.resume_monitor.consume_resume()
+        battery = platform.power.battery()
         if resumed and self.target_state == "resume":
             self.log("系统从睡眠中恢复")
-            _, resume_pct = _is_on_battery()
-            self.emit({"state": "resume", "battery_percent": resume_pct})
-
-        on_battery, battery_pct = _is_on_battery()
-        current = "battery" if on_battery else "ac"
-
-        self.emit({"state": current, "battery_percent": battery_pct})
+            self.emit({"state": "resume", "battery_percent": battery["percent"]})
+        self.emit({
+            "state": "battery" if battery["on_battery"] else "ac",
+            "battery_percent": battery["percent"],
+        })
 
     def teardown(self):
-        with native_lock():
-            _destroy_power_event_window(self.power_window)
         monitor = getattr(self, "resume_monitor", None)
         if monitor is not None:
             monitor.stop()

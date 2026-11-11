@@ -639,6 +639,102 @@ class TestExecuteAction:
             "message": "动作 consume 执行失败",
         }
 
+    def test_summary_failures_do_not_change_action_outcome(self):
+        events, called = [], []
+        engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
+
+        class BadSummaryValue(str):
+            def __str__(self):
+                raise RuntimeError("摘要值不能转成字符串")
+
+        register_action(
+            engine,
+            "bad_source",
+            lambda meta, params, _run_context: {"value": BadSummaryValue("probe")},
+            meta={"outputs": [{"name": "value", "label": "值", "type": "any", "value_type": "any"}]},
+        )
+        register_action(
+            engine,
+            "sink",
+            lambda meta, params, _run_context: called.append(params["value"]),
+            meta={"params": [{
+                "name": "value", "label": "值", "type": "string",
+                "summary": "value", "value_type": "any",
+            }]},
+        )
+        register_action(
+            engine,
+            "bad_output",
+            lambda meta, params, _run_context: {"value": BadSummaryValue("probe")},
+            meta={"outputs": [{
+                "name": "value", "label": "值", "type": "any",
+                "value_type": "any", "summary": "value",
+            }]},
+        )
+        register_action(engine, "after", lambda meta, params, _run_context: called.append("after"))
+
+        context = _context()
+        ok = execute_sequence(engine, [
+            {"type": "bad_source", "binding_id": "a_source0001", "params": {}},
+            {"type": "sink", "binding_id": "a_sink00001", "params": {
+                "value": {"$ref": {"scope": "step", "node": "a_source0001", "path": ["value"]}},
+            }},
+            {"type": "bad_output", "binding_id": "a_output001", "params": {}},
+            {"type": "after", "binding_id": "a_after0001", "params": {}},
+        ], "规则", context)
+
+        assert ok
+        assert len(called) == 2 and called[1] == "after"
+        assert all(context["steps"][identity]["status"] == "ok" for identity in (
+            "a_source0001", "a_sink00001", "a_output001", "a_after0001"))
+        assert engine.events.flush()
+        succeeded = {data["step_id"]: data for name, data in events if name == "run.step.succeeded"}
+        assert succeeded["a_sink00001"]["input_summary"] == []
+        assert succeeded["a_output001"]["output_summary"] == []
+
+    def test_input_summary_failure_keeps_original_action_error(self):
+        events = []
+        engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
+
+        class BadSummaryValue(str):
+            def __str__(self):
+                raise RuntimeError("摘要值不能转成字符串")
+
+        register_action(
+            engine,
+            "bad_source",
+            lambda meta, params, _run_context: {"value": BadSummaryValue("probe")},
+            meta={"outputs": [{"name": "value", "label": "值", "type": "any", "value_type": "any"}]},
+        )
+
+        def fail(meta, params, _run_context):
+            raise RuntimeError("原始动作异常")
+
+        register_action(
+            engine,
+            "fail_with_bad_summary",
+            fail,
+            meta={"params": [{
+                "name": "value", "label": "值", "type": "string",
+                "summary": "value", "value_type": "any",
+            }]},
+        )
+
+        context = _context()
+        ok = execute_sequence(engine, [
+            {"type": "bad_source", "binding_id": "a_source0001", "params": {}},
+            {"type": "fail_with_bad_summary", "binding_id": "a_fail00001", "params": {
+                "value": {"$ref": {"scope": "step", "node": "a_source0001", "path": ["value"]}},
+            }},
+        ], "规则", context)
+
+        assert not ok
+        assert context["steps"]["a_fail00001"]["status"] == "failed"
+        assert engine.events.flush()
+        failed = next(data for name, data in events if name == "run.step.failed")
+        assert failed["error"]["code"] == "action_execution_failed"
+        assert all("UnboundLocalError" not in str(event) for event in events)
+
     def test_pipeline_passes_step_result_to_context_action(self):
         engine = make_engine()
         received = {}
@@ -1093,6 +1189,27 @@ class TestExecuteAction:
         if matched:
             assert context["steps"]["a_failed01"]["status"] == "failed"
 
+    def test_preparation_failure_records_one_failed_step_event(self):
+        events = []
+        engine = make_engine(on_event=lambda event: events.append((event.type, event_fields(event))))
+        register_action(engine, "integer_only", lambda *_args: None, meta={
+            "params": [{"name": "count", "type": "int"}],
+            "security": {"literal_only_params": ["count"]},
+        })
+        context = _context()
+
+        ok = execute_sequence(engine, [{
+            "type": "integer_only", "binding_id": "a_invalid01", "params": {
+                "count": {"$ref": {"scope": "event", "path": ["count"]}},
+            },
+        }], "规则", context)
+
+        assert not ok
+        assert context["steps"]["a_invalid01"]["status"] == "failed"
+        failures = [data for name, data in events if name == "run.step.failed"]
+        assert len(failures) == 1
+        assert failures[0]["step_id"] == "a_invalid01"
+
     @pytest.mark.parametrize("validation", [[], ["参数无效"], RuntimeError("校验异常")])
     def test_validate_params_called(self, validation):
         engine = make_engine()
@@ -1128,6 +1245,7 @@ class TestExecuteAction:
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         mod._observations.clear()
+        monkeypatch.setattr(mod.platform, "capability", lambda _: types.SimpleNamespace(available=True))
 
         (tmp_path / "a.txt").write_text("x", encoding="utf-8")
         params = {
@@ -1192,6 +1310,27 @@ class TestExecuteAction:
         mod._observations.clear()
         with pytest.raises(RuntimeError):
             mod.run_with_context({}, params, {})
+
+    def test_document_quiescent_detects_open_document_without_window_enumeration(self, tmp_path, monkeypatch):
+        from notmyfault.actions.document_quiescent import action
+        from notmyfault.platform.linux.desktop import DesktopBackend
+
+        document = tmp_path / "正在编辑.docx"
+        document.write_bytes(b"document")
+        process = types.SimpleNamespace(info={
+            "name": "soffice.bin", "pid": 42,
+            "open_files": [types.SimpleNamespace(path=str(document))],
+        })
+        monkeypatch.setattr("psutil.process_iter", lambda attrs: iter([process]))
+        monkeypatch.setattr(action.platform, "capability", lambda _: types.SimpleNamespace(available=False))
+        monkeypatch.setattr(action.platform.desktop, "file_in_use", DesktopBackend().file_in_use)
+        action._observations.clear()
+        params = {"source_folder": str(tmp_path), "quiet_seconds": 0}
+        assert action.check_precondition({}, params, {})["ok"] is False
+        assert action.check_precondition({}, params, {})["ok"] is False
+        monkeypatch.setattr("psutil.process_iter", lambda attrs: iter([]))
+        assert action.check_precondition({}, params, {}) == {"ok": True}
+        action._observations.clear()
 
 
 class TestErrorIsolation:
@@ -1352,54 +1491,6 @@ class TestErrorIsolation:
         thread.join(timeout=5)
 
 
-def _load_display_module(monkeypatch=None):
-    path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "actions", "display_control", "action.py",
-    )
-    spec = importlib.util.spec_from_file_location("display_control_under_test", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_display_brightness_accepts_one_verified_backend(monkeypatch):
-    mod = _load_display_module()
-    monkeypatch.setattr(mod, "_set_wmi_brightness", lambda level: 2)
-
-    def broken(level):
-        raise RuntimeError("DDC 不可用")
-
-    monkeypatch.setattr(mod, "_set_ddc_brightness", broken)
-    result = mod._set_brightness(50)
-    assert result["brightness"] == 50
-    assert result["methods"] == ["WMI 2 台"]
-    assert result["warnings"] == ["DDC/CI: DDC 不可用"]
-
-
-def test_display_brightness_fails_without_verified_backend(monkeypatch):
-    mod = _load_display_module()
-
-    def broken(level):
-        raise RuntimeError("不支持")
-
-    monkeypatch.setattr(mod, "_set_wmi_brightness", broken)
-    monkeypatch.setattr(mod, "_set_ddc_brightness", broken)
-    with pytest.raises(RuntimeError) as excinfo:
-        mod._set_brightness(50)
-    assert "不支持可验证的亮度控制" in str(excinfo.value)
-
-
-def test_display_action_propagates_brightness_failure(monkeypatch):
-    mod = _load_display_module()
-
-    def broken(level):
-        raise RuntimeError("不支持")
-
-    monkeypatch.setattr(mod, "_set_wmi_brightness", broken)
-    monkeypatch.setattr(mod, "_set_ddc_brightness", broken)
-    with pytest.raises(RuntimeError):
-        mod.run_with_context({}, {"action": "set_brightness", "brightness": 40}, {})
 
 
 def test_excel_append_rows_consumes_pipeline_output():
@@ -1482,6 +1573,127 @@ def test_manual_rule_with_trigger_constants_runs_selected_actions(partial):
         assert received == ([("folder", "folder")] if partial else [("first", "folder"), ("folder", "folder")])
         assert "$ref" in rule["workflow"]["nodes"][0]["trigger"]["params"]["path"]
     finally:
+        engine.shutdown(2)
+
+
+def _two_root_manual_rule(shared_action=False):
+    nodes, edges, actions = [], [], []
+
+    def chain(suffix, value):
+        trigger_node = {
+            "binding_id": f"a_signal_{suffix}",
+            "type": "trigger",
+            "trigger": {"binding_id": f"t_manual_{suffix}", "type": "manual_signal", "params": {}},
+        }
+        action = {"binding_id": f"a_record_{suffix}", "type": "record", "params": {"value": value}}
+        nodes.extend([trigger_node, action])
+        edges.append({"source": trigger_node["binding_id"], "port": "event", "target": action["binding_id"], "channel": "control"})
+        actions.append((suffix, action))
+
+    chain("aaaaaa", "a")
+    chain("bbbbbb", "b")
+    if shared_action:
+        merge = {"binding_id": "a_merge_0001", "type": "merge"}
+        shared = {"binding_id": "a_shared001", "type": "record", "params": {"value": "shared"}}
+        end = {"binding_id": "a_end_000001", "type": "end"}
+        nodes.extend([merge, shared, end])
+        edges.extend([
+            {"source": actions[0][1]["binding_id"], "port": "next", "target": merge["binding_id"], "channel": "control"},
+            {"source": actions[1][1]["binding_id"], "port": "next", "target": merge["binding_id"], "channel": "control"},
+            {"source": merge["binding_id"], "port": "next", "target": shared["binding_id"], "channel": "control"},
+            {"source": shared["binding_id"], "port": "next", "target": end["binding_id"], "channel": "control"},
+        ])
+    else:
+        for suffix, action in actions:
+            end = {"binding_id": f"a_end_{suffix}", "type": "end"}
+            nodes.append(end)
+            edges.append({"source": action["binding_id"], "port": "next", "target": end["binding_id"], "channel": "control"})
+    return {
+        "rule_id": "r_manual_two",
+        "name": "双入口手动运行",
+        "workflow": {"entry": None, "nodes": nodes, "edges": edges},
+    }
+
+
+@pytest.mark.parametrize(("payloads", "expected"), [
+    ({"t_manual_bbbbbb": {}}, ["b"]),
+    ({"t_manual_aaaaaa": {}, "t_manual_bbbbbb": {}}, ["a", "b"]),
+])
+def test_manual_rule_runs_every_supplied_trigger_root(payloads, expected):
+    received = []
+    engine = make_engine()
+    register_action(engine, "record", lambda meta, params, _context: received.append(params["value"]))
+    try:
+        ok, _, run_id = engine.run_manual_rule_snapshot(_two_root_manual_rule(), 0, trigger_payloads=payloads)
+        assert ok
+        assert engine._run_manager.wait_for_idle(2)
+        assert engine._run_manager.state(run_id) == "succeeded"
+        assert received == expected
+    finally:
+        engine.shutdown(2)
+
+
+def test_manual_rule_runs_shared_suffix_after_merge_once():
+    received = []
+    engine = make_engine()
+    register_action(engine, "record", lambda meta, params, _context: received.append(params["value"]))
+    try:
+        ok, _, run_id = engine.run_manual_rule_snapshot(
+            _two_root_manual_rule(shared_action=True), 0,
+            trigger_payloads={"t_manual_aaaaaa": {}, "t_manual_bbbbbb": {}})
+        assert ok
+        assert engine._run_manager.wait_for_idle(2)
+        assert engine._run_manager.state(run_id) == "succeeded"
+        assert received == ["a", "shared", "b"]
+    finally:
+        engine.shutdown(2)
+
+
+def test_manual_rule_continues_roots_after_action_failure():
+    received = []
+    engine = make_engine()
+
+    def record(meta, params, _context):
+        if params["value"] == "a":
+            raise RuntimeError("first root failed")
+        received.append(params["value"])
+
+    register_action(engine, "record", record)
+    try:
+        ok, _, run_id = engine.run_manual_rule_snapshot(
+            _two_root_manual_rule(), 0,
+            trigger_payloads={"t_manual_aaaaaa": {}, "t_manual_bbbbbb": {}})
+        assert ok
+        assert engine._run_manager.wait_for_idle(2)
+        assert engine._run_manager.state(run_id) == "failed"
+        assert received == ["b"]
+    finally:
+        engine.shutdown(2)
+
+
+def test_manual_rule_cancel_stops_remaining_trigger_roots():
+    received = []
+    entered, release = threading.Event(), threading.Event()
+    engine = make_engine()
+
+    def record(meta, params, _context):
+        received.append(params["value"])
+        entered.set()
+        release.wait(3)
+
+    register_action(engine, "record", record)
+    try:
+        ok, _, run_id = engine.run_manual_rule_snapshot(
+            _two_root_manual_rule(), 0,
+            trigger_payloads={"t_manual_aaaaaa": {}, "t_manual_bbbbbb": {}})
+        assert ok and entered.wait(2)
+        assert engine.cancel_run(run_id)
+        release.set()
+        assert engine._run_manager.wait_for_idle(2)
+        assert engine._run_manager.state(run_id) == "cancelled"
+        assert received == ["a"]
+    finally:
+        release.set()
         engine.shutdown(2)
 
 

@@ -1,4 +1,5 @@
 <script setup>
+import CircularProgress from '../CircularProgress.vue'
 import { ref, computed, onMounted } from 'vue'
 import { store, syncEngineStatus } from '../../lib/store'
 import { getEngineStatus, getConfigSecurityStatus, approveConfigSecurity, loadPlugins } from '../../lib/api'
@@ -94,7 +95,7 @@ onMounted(refresh)
     <div v-if="!props.embedded" class="page-head"><h2>安全与权限</h2></div>
     <p v-if="pluginsError" class="danger-text" role="alert">{{ pluginsError }}</p>
     <header class="security-overview" :class="{ 'needs-attention': installationInvalid || configProblem }" aria-live="polite">
-      <span class="material-symbols-outlined security-emblem">{{ heading.icon }}</span>
+      <span class="material-symbols-outlined security-emblem"><CircularProgress v-if="loading" :size="24" /><template v-else>{{ heading.icon }}</template></span>
       <div class="security-overview-copy"><h3>{{ heading.title }}</h3><p>{{ heading.text }}</p></div>
       <button class="btn btn-outlined" :disabled="loading" @click="refresh"><span class="material-symbols-outlined">refresh</span>{{ loading ? '检查中…' : '重新检查' }}</button>
     </header>

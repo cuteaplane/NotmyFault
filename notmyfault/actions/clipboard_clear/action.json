@@ -8,7 +8,6 @@
     "requires_capabilities": ["clipboard.write"],
     "execution_api": "context-v1",
     "idempotent": true,
-    "platforms": ["windows", "linux"],
     "permissions": ["clipboard", "native_api"],
     "outputs": [
         {"name": "cleared", "label": "是否清空成功", "type": "bool"}

@@ -5,12 +5,11 @@
     "version_code": 2,
     "version": "1.1",
     "package_name": "io.github.notmyfault.window_control",
-    "platforms": [
-        "windows",
-        "linux"
-    ],
     "requires_capabilities": [
-        "window.enumerate",
+        "window.enumerate"
+    ],
+    "optional_capabilities": [
+        "window.control",
         "window.pin"
     ],
     "permissions": [
@@ -34,10 +33,10 @@
             "value_type": "int"
         },
         {
-            "name": "hwnd",
-            "label": "唯一结果的窗口句柄",
-            "type": "number",
-            "value_type": "int"
+            "name": "window_id",
+            "label": "唯一结果的窗口 ID",
+            "type": "string",
+            "value_type": "string"
         },
         {
             "name": "windows",
@@ -48,7 +47,7 @@
                 "items": {
                     "type": "object",
                     "properties": {
-                        "hwnd": "int",
+                        "window_id": "string",
                         "title": "string",
                         "class_name": "string",
                         "pid": "int",
@@ -68,7 +67,7 @@
                         "closed": "bool"
                     },
                     "required": [
-                        "hwnd",
+                        "window_id",
                         "title",
                         "class_name",
                         "pid",
@@ -274,7 +273,7 @@
                     "process",
                     "pid",
                     "class_name",
-                    "hwnd",
+                    "window_id",
                     "all"
                 ]
             },
@@ -301,7 +300,7 @@
                     "label": "按窗口类名"
                 },
                 {
-                    "value": "hwnd",
+                    "value": "window_id",
                     "label": "按窗口句柄"
                 },
                 {
@@ -391,20 +390,14 @@
             }
         },
         {
-            "name": "hwnd",
-            "label": "窗口句柄",
-            "type": "number",
-            "value_type": {
-                "type": "int",
-                "min": 0,
-                "max": 9007199254740991
-            },
-            "default": 0,
-            "min": 0,
-            "max": 9007199254740991,
+            "name": "window_id",
+            "label": "窗口 ID",
+            "type": "string",
+            "value_type": "string",
+            "default": "",
             "visible_when": {
                 "target": [
-                    "hwnd"
+                    "window_id"
                 ]
             }
         },

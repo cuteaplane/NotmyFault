@@ -9,7 +9,6 @@
     "execution_api": "context-v1",
     "idempotent": true,
     "execution_mode": "isolated",
-    "platforms": ["windows", "linux"],
     "permissions": ["audio", "external_binary", "native_api"],
     "params": [
         {

@@ -125,6 +125,10 @@ class SettingsService:
         return status
 
     def _approve_files(self, admin_key_password: str | None) -> None:
+        with self._store.config_lock, self._store.rules_lock:
+            self._approve_files_locked(admin_key_password)
+
+    def _approve_files_locked(self, admin_key_password: str | None) -> None:
         normalized_config, normalized_rules = self._store.load_unsigned_files()
         schema = self._plugin_schema()
         if normalized_rules is not None:
@@ -174,6 +178,11 @@ class SettingsService:
             raise ConfigValidationError("重新签名失败")
         if normalized_rules is not None and not self._store.save_rules(normalized_rules):
             raise ConfigValidationError("规则重新签名失败")
+        if not self._store.paths.config_secret_file.is_file():
+            raise ConfigValidationError("配置签名密钥未能保存")
+        self._store.load_verified_config()
+        if normalized_rules is not None:
+            self._store.load_verified_rules()
 
     def approve_security(self, admin_key_password: Any = None) -> Dict[str, Any]:
         try:

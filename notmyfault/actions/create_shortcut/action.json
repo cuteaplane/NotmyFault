@@ -1,16 +1,13 @@
 {
     "id": "create_shortcut",
     "name": "创建快捷方式",
-    "description": "在桌面或开始菜单创建 .lnk 快捷方式",
+    "description": "在桌面、开始菜单或自启动目录创建快捷方式",
     "version_code": 1,
     "version": "1.0",
     "package_name": "io.github.notmyfault.create_shortcut",
     "execution_api": "context-v1",
     "idempotent": true,
-    "platforms": [
-        "windows",
-        "linux"
-    ],
+    "requires_capabilities": ["desktop.shortcut"],
     "permissions": [
         "external_binary",
         "filesystem"
@@ -63,6 +60,10 @@
                 {
                     "value": "start_menu",
                     "label": "开始菜单"
+                },
+                {
+                    "value": "startup",
+                    "label": "自启动"
                 }
             ]
         },

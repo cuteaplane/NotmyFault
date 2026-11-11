@@ -10,10 +10,6 @@
     "requires_capabilities": [
         "window.enumerate"
     ],
-    "platforms": [
-        "windows",
-        "linux"
-    ],
     "permissions": [
         "native_api",
         "external_binary",

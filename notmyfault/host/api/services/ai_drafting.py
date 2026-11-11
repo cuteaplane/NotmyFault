@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import inspect
 import threading
 from dataclasses import dataclass
@@ -68,6 +67,48 @@ class AIDraftingService:
         self._validate_rule = validate_rule
         self._provider = provider
         self._key_store = key_store
+        self._streams_lock = threading.Lock()
+        self._active_streams: dict[threading.Event, Any] = {}
+        self._shutting_down = threading.Event()
+
+    def begin_shutdown(self) -> None:
+        self._shutting_down.set()
+        with self._streams_lock:
+            active = list(self._active_streams.items())
+        for cancel_event, provider in active:
+            cancel_event.set()
+            self._cancel_provider(provider)
+
+    def _register_stream(self, cancel_event: threading.Event) -> None:
+        with self._streams_lock:
+            self._active_streams[cancel_event] = None
+
+    def _set_stream_provider(
+        self,
+        cancel_event: threading.Event,
+        provider: Any,
+    ) -> None:
+        with self._streams_lock:
+            self._active_streams[cancel_event] = provider
+            should_cancel = (
+                self._shutting_down.is_set() or cancel_event.is_set()
+            )
+        if should_cancel:
+            cancel_event.set()
+            self._cancel_provider(provider)
+
+    def _unregister_stream(self, cancel_event: threading.Event) -> None:
+        with self._streams_lock:
+            self._active_streams.pop(cancel_event, None)
+
+    @staticmethod
+    def _cancel_provider(provider: Any) -> None:
+        cancel = getattr(provider, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                pass
 
     def settings(self) -> Dict[str, Any]:
         settings = get_ai_drafting_settings(self._load_config())
@@ -108,47 +149,53 @@ class AIDraftingService:
 
     def update_settings(self, body: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            config = self._load_config_for_update()
+            updated_config = None
+
+            def update(config):
+                nonlocal updated_config
+                settings = config.get("settings")
+                settings = dict(settings) if isinstance(settings, dict) else {}
+                old_endpoint = get_ai_drafting_settings(config)["endpoint_url"]
+                new_endpoint = body.get("endpoint_url") if isinstance(body.get("endpoint_url"), str) else ""
+                if new_endpoint != old_endpoint and self._api_key_status_label() == "saved":
+                    self.delete_api_key()
+                settings["ai_drafting"] = {
+                    "enabled": (
+                        body.get("enabled")
+                        if isinstance(body.get("enabled"), bool)
+                        else False
+                    ),
+                    "endpoint_url": (
+                        body.get("endpoint_url")
+                        if isinstance(body.get("endpoint_url"), str)
+                        else ""
+                    ),
+                    "model": (
+                        body.get("model")
+                        if isinstance(body.get("model"), str)
+                        else ""
+                    ),
+                    "api_format": (
+                        body.get("api_format")
+                        if body.get("api_format") in {"chat_completions", "responses"}
+                        else "chat_completions"
+                    ),
+                }
+                config["settings"] = settings
+                updated_config = config
+
+            updated_config = self._store.update_config(update)
         except ConfigValidationError as error:
             raise AIDraftingError(
                 409,
                 {"ok": False, "error": "配置未通过完整性校验"},
             ) from error
-        settings = config.get("settings")
-        settings = dict(settings) if isinstance(settings, dict) else {}
-        old_endpoint = get_ai_drafting_settings(config)["endpoint_url"]
-        new_endpoint = body.get("endpoint_url") if isinstance(body.get("endpoint_url"), str) else ""
-        if new_endpoint != old_endpoint and self._api_key_status_label() == "saved":
-            self.delete_api_key()
-        settings["ai_drafting"] = {
-            "enabled": (
-                body.get("enabled")
-                if isinstance(body.get("enabled"), bool)
-                else False
-            ),
-            "endpoint_url": (
-                body.get("endpoint_url")
-                if isinstance(body.get("endpoint_url"), str)
-                else ""
-            ),
-            "model": (
-                body.get("model")
-                if isinstance(body.get("model"), str)
-                else ""
-            ),
-            "api_format": (
-                body.get("api_format")
-                if body.get("api_format") in {"chat_completions", "responses"}
-                else "chat_completions"
-            ),
-        }
-        config["settings"] = settings
-        if not self._store.save_config(config):
+        if updated_config is None:
             self._fail(500, "无法保存配置")
-        return {"ok": True, "settings": {**get_ai_drafting_settings(config), "api_key_status": self._api_key_status_label()}}
+        return {"ok": True, "settings": {**get_ai_drafting_settings(updated_config), "api_key_status": self._api_key_status_label()}}
 
     async def draft(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        plan = self._prepare(body)
+        plan = await asyncio.to_thread(self._prepare, body)
         try:
             if callable(self._provider):
                 provider_result = await asyncio.to_thread(
@@ -157,9 +204,14 @@ class AIDraftingService:
                     plan.schema,
                 )
             else:
+                provider = await asyncio.to_thread(
+                    self._build_configured_provider,
+                    plan.body,
+                    plan.settings,
+                )
                 provider_result = await asyncio.to_thread(
                     draft_from_openai_compatible,
-                    self._build_configured_provider(plan.body, plan.settings),
+                    provider,
                     plan.messages,
                     plan.schema,
                 )
@@ -173,7 +225,7 @@ class AIDraftingService:
                 },
             ) from error
         try:
-            return self._finalize(provider_result)
+            return await asyncio.to_thread(self._finalize, provider_result)
         except Exception as error:
             raise AIDraftingError(
                 502,
@@ -192,6 +244,10 @@ class AIDraftingService:
         plan: AIStreamPlan,
         is_disconnected: Callable[[], Awaitable[bool]],
     ) -> AsyncIterator[tuple[str, Dict[str, Any]]]:
+        if self._shutting_down.is_set():
+            yield "error", {"code": "shutting_down", "error": "服务正在关闭"}
+            yield "done", {"status": "done"}
+            return
         if not self._stream_slots.acquire(blocking=False):
             yield "error", {"code": "ai_busy", "error": "AI 请求仍在结束，请稍后重试"}
             yield "done", {"status": "done"}
@@ -199,6 +255,7 @@ class AIDraftingService:
         items: asyncio.Queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
         cancel_event = threading.Event()
+        self._register_stream(cancel_event)
         active_provider = None
 
         def enqueue(item):
@@ -209,6 +266,7 @@ class AIDraftingService:
             nonlocal active_provider
             active_provider = self._provider
             if self._provider is not None:
+                self._set_stream_provider(cancel_event, active_provider)
                 provider_stream = getattr(self._provider, "stream", None)
                 if callable(provider_stream):
                     parameters = inspect.signature(provider_stream).parameters
@@ -234,6 +292,7 @@ class AIDraftingService:
                 plan.settings,
             )
             active_provider = configured
+            self._set_stream_provider(cancel_event, configured)
             return configured.stream(
                 plan.messages,
                 plan.schema,
@@ -298,7 +357,7 @@ class AIDraftingService:
                     elif kind == "result":
                         finalized = True
                         try:
-                            result = self._finalize(payload)
+                            result = await asyncio.to_thread(self._finalize, payload)
                         except Exception as error:
                             yield "error", {
                                 "code": "ai_provider_failed",
@@ -332,10 +391,11 @@ class AIDraftingService:
                     break
         finally:
             cancel_event.set()
-            cancel = getattr(active_provider, "cancel", None)
-            if callable(cancel):
-                await asyncio.to_thread(cancel)
-            await asyncio.to_thread(worker.join, 1.0)
+            self._cancel_provider(active_provider)
+            try:
+                await asyncio.to_thread(worker.join, 1.0)
+            finally:
+                self._unregister_stream(cancel_event)
         if not disconnected:
             yield "done", {"status": "done"}
 
@@ -434,12 +494,6 @@ class AIDraftingService:
             return self._store.load_verified_config()
         except ConfigValidationError:
             return {"rules": []}
-
-    def _load_config_for_update(self) -> Dict[str, Any]:
-        if not os.path.exists(self._store.config_path):
-            if not self._store.save_config({}):
-                raise ConfigValidationError("无法创建配置文件")
-        return self._store.load_verified_config()
 
     @staticmethod
     def _error_detail(error: Exception | None) -> str:

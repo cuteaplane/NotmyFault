@@ -88,8 +88,15 @@ def build_matcher(rule, default_ttl=DEFAULT_TTL_SECONDS, *, roots=None):
                 window = node.get('within_seconds')
                 limits = (*limits, Retention(float(window), True) if window is not None
                     else Retention(float(node.get('ttl_seconds', default_ttl))))
-            children = graph.dependencies(identity)
+            if op == 'if':
+                child_edges = tuple(edge for branch in node.get('branches', ())
+                    for edge in graph.operands(identity, branch['id']))
+                children = tuple(edge['source'] for edge in child_edges)
+            else:
+                children = graph.dependencies(identity)
             if kind == 'action_group':
+                owned = frozenset(key for child in children for key in visit(child, limits))
+            elif op == 'if':
                 owned = frozenset(key for child in children for key in visit(child, limits))
             elif op == 'not':
                 if len(children) != 1:

@@ -1,4 +1,5 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from decimal import Decimal, Inexact, localcontext
 from pathlib import PurePosixPath, PureWindowsPath
@@ -8,9 +9,20 @@ import pytest
 
 from notmyfault.plugin_api import data_types_api
 from notmyfault.core.workflow import invoke_action
+from notmyfault.core.data_types import copy_value
+from notmyfault.values import FrozenDict, FrozenList, Secret
 
 
 types = data_types_api()
+
+
+@pytest.mark.parametrize("value", [
+    Secret(Decimal("NaN")),
+    FrozenDict({"nested": FrozenList([Decimal("NaN")])}),
+])
+def test_copy_value_checks_nonfinite_values_inside_wrappers(value):
+    with pytest.raises(types.DataTypeError, match="有限值"):
+        copy_value(value)
 
 
 def test_legacy_field_declarations_and_numeric_contracts():
@@ -118,6 +130,19 @@ def test_explicit_conversion_never_uses_python_truthiness_or_silent_truncation()
     assert types.convert_value(typed_text, "object", options={"encoding": "typed-v1"}) == structured
     encoded = types.convert_value(b"\x00\xff", "text", options={"encoding": "base64"})
     assert types.convert_value(encoded, "bytes", options={"encoding": "base64"}) == b"\x00\xff"
+
+
+def test_extreme_decimal_exponents_are_rejected():
+    from notmyfault.core.value_codec import decode_value
+
+    for value in ("1e1000000", "1e-1000000"):
+        with pytest.raises(types.DataTypeError):
+            types.convert_value(value, "int")
+        with pytest.raises(types.DataTypeError):
+            types.convert_value(value, "decimal")
+        with pytest.raises(types.DataTypeError):
+            decode_value({"$nmf_value": {"type": "decimal", "data": value}})
+    assert types.convert_value("1e4000", "int") == 10**4000
 
 
 @pytest.mark.parametrize(("decimal_precision", "trap_inexact"), [(28, False), (4, False), (4, True)])
@@ -280,3 +305,13 @@ def test_type_dependencies_private_values_and_disabled_plugins_are_explicit():
     conflicting["contributes"]["data_types"][0]["schema"] = "text"
     with pytest.raises(types.DataTypeError):
         types.TypeRegistry.from_plugins([shared_meta(), conflicting])
+
+
+def test_type_registry_binding_value_cache_handles_concurrent_reads():
+    registry = types.TypeRegistry.from_plugins([shared_meta()])
+    value = FrozenDict({"name": "甲", "amount": Decimal("1.20")})
+
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        results = list(workers.map(lambda _index: registry.binding_value(value), range(200)))
+
+    assert all(result is value for result in results)

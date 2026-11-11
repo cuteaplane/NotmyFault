@@ -12,7 +12,11 @@ from notmyfault.extensions.protocol import (
     unpack_owned_value,
     value_matches_type,
 )
-from notmyfault.extensions.session import ExtensionContext, ExtensionSessionManager
+from notmyfault.extensions.session import (
+    ExtensionContext,
+    ExtensionSessionBusyError,
+    ExtensionSessionManager,
+)
 from notmyfault.host.api.ports import EngineControlPort
 from notmyfault.core.data_types import DataTypeError, normalize_value
 from notmyfault.core.type_registry import TypeRegistry
@@ -159,6 +163,16 @@ class PluginInteractionService:
             result = await asyncio.to_thread(invoke_handler)
         except PluginInteractionError:
             raise
+        except ExtensionSessionBusyError as error:
+            raise PluginInteractionError(
+                409,
+                {
+                    "ok": False,
+                    "code": "extension_busy",
+                    "error": "扩展会话正在处理另一个命令",
+                    "session_id": session.session_id,
+                },
+            ) from error
         except Exception as error:
             from notmyfault.core.logging import engine_error
 

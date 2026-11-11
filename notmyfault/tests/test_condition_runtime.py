@@ -64,6 +64,35 @@ def test_none_retains_but_unchanged_combination_does_not_repeat():
     assert len(runtime.snapshot()["r"].seen) == 2
 
 
+def test_if_matcher_uses_branch_ports_and_branch_negation():
+    source = {"rule_id": "r_if000001", "name": "分支匹配", "workflow": {
+        "entry": None,
+        "nodes": [
+            {"binding_id": "a_if000001", "type": "event_group", "group_type": "if",
+             "branches": [{"id": "b_first01", "negated": True}, {"id": "b_second1"},
+                          {"id": "b_else001", "else": True}]},
+            {"binding_id": "a_a000001", "type": "trigger", "trigger": leaf("a")},
+            {"binding_id": "a_b000001", "type": "trigger", "trigger": leaf("b")},
+            {"binding_id": "a_end00001", "type": "end"},
+            {"binding_id": "a_end00002", "type": "end"},
+        ],
+        "edges": [
+            {"source": "a_a000001", "port": "event", "target": "a_if000001",
+             "target_port": "b_first01", "channel": "condition"},
+            {"source": "a_b000001", "port": "event", "target": "a_if000001",
+             "target_port": "b_second1", "channel": "condition"},
+            {"source": "a_if000001", "port": "b_second1", "target": "a_end00001", "channel": "control"},
+            {"source": "a_if000001", "port": "b_else001", "target": "a_end00002", "channel": "control"},
+        ],
+    }}
+    runtime = ConditionRuntime(clock=FakeClock())
+    runtime.register_rule("r", source)
+
+    assert runtime.match_and_take("r", source, "a", {}) is None
+    matched = runtime.match_and_take("r", source, "b", {})
+    assert [entry["event"]["type"] for entry in matched] == ["b"]
+
+
 def test_nested_none_retains_its_subtree_under_consuming_parent():
     runtime, clock, rule = runtime_for({"op": "all", "consume": "all", "children": [
         {"op": "all", "consume": "none", "children": [leaf("a"), leaf("b")]}, leaf("gate"),

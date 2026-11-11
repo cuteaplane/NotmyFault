@@ -482,6 +482,54 @@ def test_deleted_rule_late_completion_cannot_replace_recreated_rule_status():
         assert manager.stats()["r_recreated"] == {"running": 0, "queued": 0}
     finally:
         manager.shutdown()
+
+
+def test_generation_change_before_suspension_cancels_without_arming_wait():
+    from types import SimpleNamespace
+
+    from notmyfault.core.run_manager import RunSuspension
+
+    class Wait:
+        def __init__(self):
+            self.armed = False
+            self.closed = False
+
+        def arm(self, callback):
+            self.armed = True
+
+        def close(self):
+            self.closed = True
+
+    old_generation = SimpleNamespace(
+        id="old",
+        snapshot=SimpleNamespace(compiled={"r_reload001": SimpleNamespace(digest="old")}),
+        retain=lambda: None,
+        release=lambda: None,
+    )
+    new_generation = SimpleNamespace(
+        id="new",
+        snapshot=SimpleNamespace(compiled={"r_reload001": SimpleNamespace(digest="new")}),
+    )
+    wait = Wait()
+    manager = None
+
+    def execute(*_args):
+        manager.activate_generation(new_generation)
+        return RunSuspension(wait)
+
+    jobs = []
+    manager = RunManager(execute, max_workers=1, spawn_thread_fn=jobs.append)
+    manager._generation = old_generation
+    context = make_context("r_reload001", "run_reload001")
+    context["_generation"] = old_generation
+    try:
+        assert manager.submit("r_reload001", {"rule_id": "r_reload001"}, "规则", context) == "started"
+        jobs.pop()()
+        assert manager.state("run_reload001") == "cancelled"
+        assert wait.closed
+        assert not wait.armed
+    finally:
+        manager.shutdown()
 class TestEngineWiring:
     def _make_engine(self, rule, on_event):
         from notmyfault.tests.api_support import create_test_engine

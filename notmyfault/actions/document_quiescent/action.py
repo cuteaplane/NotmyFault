@@ -1,5 +1,4 @@
 """文档归档前的目录变化、文件读取和编辑窗口检查"""
-import ctypes
 import math
 import os
 import time
@@ -7,7 +6,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
-from notmyfault.plugin_api import native_lock, action_values
+from notmyfault.plugin_api import action_values, platform
 
 
 _MAX_FILES = 5000
@@ -24,11 +23,6 @@ _EDITING_PROCESS_NAMES = {
     "acrobat.exe", "acrord32.exe",
     "libreoffice", "soffice.bin", "onlyoffice-desktopeditors", "wps", "et", "wpp",
 }
-_DOCUMENT_EXTENSIONS = {
-    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp",
-    ".pdf",
-}
-
 
 def _snapshot(folder: Path) -> Tuple[Tuple[str, int, int], ...]:
     files: List[Tuple[str, int, int]] = []
@@ -47,100 +41,15 @@ def _snapshot(folder: Path) -> Tuple[Tuple[str, int, int], ...]:
 
 
 def _can_open_exclusively(path: str) -> bool:
-    """Windows 下以零共享模式打开文件，失败时返回 False"""
-    if os.name != "nt":
-        try:
-            with open(path, "rb"):
-                return True
-        except OSError:
-            return False
-
-    with native_lock():
-        kernel32 = ctypes.windll.kernel32
-        kernel32.CreateFileW.argtypes = [
-            ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
-            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
-        ]
-        kernel32.CreateFileW.restype = ctypes.c_void_p
-        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-        kernel32.CloseHandle.restype = ctypes.c_int
-        handle = kernel32.CreateFileW(
-            path,
-            0x80000000,  # GENERIC_READ
-            0,           # 共享参数为 0，其他进程持有句柄时 CreateFileW 会失败
-            None,
-            3,           # OPEN_EXISTING
-            0x80,        # FILE_ATTRIBUTE_NORMAL
-            None,
-        )
-        invalid = ctypes.c_void_p(-1).value
-        if handle == invalid:
-            return False
-        try:
-            return True
-        finally:
-            kernel32.CloseHandle(handle)
+    return not platform.desktop.file_in_use(path)
 
 
 def _visible_editing_windows() -> Iterable[str]:
     """返回疑似正在编辑文档的可见窗口标题，后台进程没有文档窗口时不返回标题"""
-    if os.name != "nt":
-        try:
-            import psutil
-        except ImportError as exc:
-            raise RuntimeError("缺少 psutil，无法检查文档进程") from exc
-        editing: List[str] = []
-        for process in psutil.process_iter(["pid", "name", "open_files"]):
-            try:
-                process_name = (process.info["name"] or "").lower()
-                if process_name not in _EDITING_PROCESS_NAMES:
-                    continue
-                document_paths = [
-                    item.path
-                    for item in (process.info["open_files"] or [])
-                    if Path(item.path).suffix.lower() in _DOCUMENT_EXTENSIONS
-                ]
-                if document_paths:
-                    editing.append(
-                        f"{process_name}: {Path(document_paths[0]).name}"
-                    )
-            except (psutil.Error, OSError):
-                continue
-        return editing
-    try:
-        import psutil
-    except ImportError as exc:
-        raise RuntimeError("缺少 psutil，无法检查文档窗口") from exc
-
-    from notmyfault.native import NATIVE_LOCK, WNDENUMPROC, typed_user32
-
-    user32 = typed_user32()
-    titles: List[str] = []
-
-    def visit(hwnd, _lparam):
-        if not user32.IsWindowVisible(hwnd):
-            return True
-        length = user32.GetWindowTextLengthW(hwnd)
-        if length <= 0:
-            return True
-        buffer = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buffer, len(buffer))
-        pid = ctypes.c_uint32()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        try:
-            process_name = psutil.Process(pid.value).name().lower()
-        except (psutil.Error, OSError):
-            return True
-        title = buffer.value.strip()
-        if process_name in _EDITING_PROCESS_NAMES and title and title.lower() not in _GENERIC_TITLES:
-            titles.append(f"{process_name}: {title}")
-        return True
-
-    # ctypes 共享函数对象的调用约定要持 NATIVE_LOCK
-    with NATIVE_LOCK:
-        if not user32.EnumWindows(WNDENUMPROC(visit), 0):
-            raise RuntimeError("EnumWindows 失败")
-    return titles
+    return [f"{item['process_name']}: {item['title']}"
+            for item in platform.window.list()
+            if item["visible"] and item["process_name"].lower() in _EDITING_PROCESS_NAMES
+            and item["title"].strip() and item["title"].strip().lower() not in _GENERIC_TITLES]
 
 
 def check_precondition(_meta: Dict[str, Any], params: Dict[str, Any], _context: Dict[str, Any]):
@@ -191,7 +100,7 @@ def check_precondition(_meta: Dict[str, Any], params: Dict[str, Any], _context: 
             if not _can_open_exclusively(path):
                 return {"ok": False, "reason": f"无法独占读取文件，请检查占用状态和读取权限: {path}", "retry_after_seconds": 60}
 
-    if params.get("check_document_windows", True):
+    if params.get("check_document_windows", True) and platform.capability("window.enumerate").available:
         try:
             editing = list(_visible_editing_windows())
         except Exception as exc:

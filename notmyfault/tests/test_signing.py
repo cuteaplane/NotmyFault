@@ -58,6 +58,40 @@ def test_file_signature_uses_valid_key_when_another_key_is_malformed(tmp_path, m
     assert not signing.verify_file(path)
 
 
+def test_unpinned_key_file_does_not_add_a_trusted_signer(tmp_path, monkeypatch):
+    import runpy
+    from pathlib import Path
+    from notmyfault.security import signing_keys
+
+    attacker = make_key()
+    module = tmp_path / "notmyfault" / "security" / "signing_keys.py"
+    module.parent.mkdir(parents=True)
+    module.write_bytes(Path(signing_keys.__file__).read_bytes())
+    private = tmp_path / ".private"
+    private.mkdir()
+    (private / "signing_public.pem").write_bytes(attacker.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
+    target = tmp_path / "build.json"
+    target.write_bytes(b'{}')
+    signing.sign_file(target, attacker)
+    isolated = runpy.run_path(str(module))
+    monkeypatch.setattr(signing_keys, "get_public_keys", isolated["get_public_keys"])
+    assert not signing.verify_file(target)
+
+
+def test_build_unlock_removes_password_before_signing(tmp_path, monkeypatch):
+    import build
+
+    key = make_key()
+    path = tmp_path / "key.pem"
+    path.write_bytes(key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, BestAvailableEncryption(b"temporary-password")))
+    monkeypatch.setattr(build, "PRIVATE_KEY_FILE", path)
+    monkeypatch.setattr(build, "_collect_plugins", lambda: [])
+    monkeypatch.setenv("NOTMYFAULT_SIGNING_PASSPHRASE", "temporary-password")
+    loaded = build.cmd_sign({})
+    assert loaded.public_key() == key.public_key()
+    assert "NOTMYFAULT_SIGNING_PASSPHRASE" not in os.environ
+
+
 class TestPluginFiles:
     def test_empty_dir(self, tmp_path):
         assert signing.plugin_files(tmp_path) == []

@@ -28,6 +28,47 @@ def make_meta(**overrides):
     return meta
 
 
+@pytest.mark.parametrize("kind", ["action", "trigger"])
+def test_required_and_optional_capabilities_validate(kind):
+    overrides = {"trigger_api": "event-v2"} if kind == "trigger" else {}
+    meta = make_meta(
+        requires_capabilities=["media.control"],
+        optional_capabilities=["audio.control"],
+        **overrides,
+    )
+    assert validate_plugin_meta(meta, kind) == (True, [])
+
+
+@pytest.mark.parametrize("field", ["requires_capabilities", "optional_capabilities"])
+@pytest.mark.parametrize("value", [
+    None, "display.power", [], [None], [""], [" "], [["display.power"]],
+    ["unknown.capability"], ["display.power", "display.power"],
+])
+def test_capability_declarations_reject_invalid_values(field, value):
+    valid, errors = validate_plugin_meta(make_meta(**{field: value}), "action")
+    assert not valid
+    assert errors
+
+
+def test_required_and_optional_capabilities_must_not_overlap():
+    valid, errors = validate_plugin_meta(make_meta(
+        requires_capabilities=["display.power"],
+        optional_capabilities=["display.power"],
+    ), "action")
+    assert not valid
+    assert any("不能重复" in error for error in errors)
+
+
+@pytest.mark.parametrize("kind", ["action", "trigger"])
+def test_builtin_manifests_validate(kind):
+    root = Path(__file__).resolve().parents[1] / f"{kind}s"
+    paths = sorted(root.glob(f"*/{kind}.json"))
+    assert paths
+    for path in paths:
+        valid, errors = validate_plugin_meta(json.loads(path.read_text(encoding="utf-8")), kind)
+        assert valid, f"{path}: {errors}"
+
+
 def test_builtin_action_manifests_declare_retry_safety_and_valid_contracts():
     manifests = sorted((Path(__file__).resolve().parents[1] / "actions").glob("*/action.json"))
     assert manifests
@@ -46,7 +87,8 @@ def test_validate_plugin_meta_reports_instead_of_raising():
     fields = (
         "id", "name", "description", "version_code", "version",
         "package_name", "platforms", "permissions", "params", "outputs",
-        "security", "contributes", "requires_capabilities", "engines",
+        "security", "contributes", "requires_capabilities", "optional_capabilities", "engines",
+        "origin", "execution_mode",
     )
     for field in fields:
         for value in BAD_FIELD_VALUES:
@@ -58,6 +100,25 @@ def test_validate_plugin_meta_reports_instead_of_raising():
     valid, errors = validate_plugin_meta(
         make_meta(params=None, security={"literal_only_params": ["p"]}), "action"
     )
+    assert valid is False
+    assert errors
+
+
+@pytest.mark.parametrize("overrides", [
+    {"outputs": [{"name": "value", "type": "string", "summary": []}]},
+    {"params": [{"name": "value", "type": [], "description": "x"}]},
+    {"params": [{"name": "value", "type": "string", "summary": []}]},
+    {"security": {"rule_approval": [], "literal_only_params": [], "admin_executables": []}},
+    {"platforms": [[]]},
+    {"requires_capabilities": [[]]},
+    {"contributes": {"commands": [{"id": "c1", "title": "t", "handler": "a.py:f"}],
+                     "views": [{"id": "v1", "title": "t", "page": "a.html", "commands": [[]]}],
+                     "data_types": [{"id": "d1", "version": 1, "binding": []}],
+                     "parameter_editors": [{"id": "e1", "parameter": [], "command": "c1",
+                                            "ui": {"control": []}}]}},
+])
+def test_nested_malformed_metadata_reports_instead_of_raising(overrides):
+    valid, errors = validate_plugin_meta(make_meta(**overrides), "action")
     assert valid is False
     assert errors
 

@@ -95,8 +95,9 @@ def rule_binding_types(rule, triggers_meta, actions_meta):
         action = groups[identity]
         for usage in iter_references(action.get("exports", {})):
             reference = usage.reference
-            if reference.get("scope") == "step" and reference.get("node") in groups:
-                exports(reference["node"])
+            node = reference.get("node")
+            if reference.get("scope") == "step" and isinstance(node, str) and node in groups:
+                exports(node)
         fields = {}
         for name, expression in action.get("exports", {}).items():
             try:
@@ -174,6 +175,9 @@ def protect_context_inputs(context, triggers_meta, registry=None):
         names = {field["name"] for trigger in context.get("triggers", {}).values()
                  for field in triggers_meta.get(trigger.get("type"), {}).get("outputs", [])
                  if isinstance(field, dict) and field.get("sensitive") and "name" in field}
+        names.update(field["name"] for trigger_type in manual.get("candidate_trigger_types", ())
+                     for field in triggers_meta.get(trigger_type, {}).get("outputs", [])
+                     if isinstance(field, dict) and field.get("sensitive") and "name" in field)
         fields = [{"name": name, "type": "any", "sensitive": True} for name in names]
     event["payload"] = hold_value(normalize_fields(event.get("payload", {}), fields, registry, wrap_sensitive=True, partial=manual is not None))
     for identity, trigger in context.get("triggers", {}).items():
@@ -218,6 +222,9 @@ def check_rule_bindings(rule, triggers_meta, actions_meta):
             validate_reference_fields(reference, location)
         except BindingResolutionError as error:
             add(error.code, location, str(error), reference)
+            return None
+        if scope != "event" and (not isinstance(scope, str) or not isinstance(node, str)):
+            add("invalid_reference", location, "引用的数据源节点无效", reference)
             return None
         policy = reference.get("on_missing")
         if scope in ("trigger", "trigger_config"):

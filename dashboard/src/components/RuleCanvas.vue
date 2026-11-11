@@ -4,7 +4,8 @@ const canvasViews = new WeakMap()
 </script>
 
 <script setup>
-import { computed, nextTick, ref, watch, onMounted, onUnmounted } from 'vue'
+import { computed, nextTick, ref, watch, onActivated, onDeactivated, onMounted, onUnmounted } from 'vue'
+import { useWindowListener } from '../composables/useWindowListener'
 import { store } from '../lib/store'
 import { FLOW_DATA_PORT_STEP, FLOW_DATA_PORT_Y, FLOW_DATA_SUMMARY_HEIGHT, FLOW_NODE_ADMIN_EXTRA_HEIGHT,
   FLOW_NODE_BASE_HEIGHT, FLOW_NODE_WIDTH, routeFlowEdge } from '../lib/flowGraph'
@@ -735,22 +736,24 @@ function observeViewport() {
 onMounted(() => {
   restoreView()
   observeViewport()
-  window.addEventListener('pointermove', moveGesture)
-  window.addEventListener('pointerup', endGesture)
-  window.addEventListener('pointercancel', cancelGesture)
-  window.addEventListener('blur', cancelGesture)
-  window.addEventListener('keydown', trackKeyboard, true)
-  window.addEventListener('pointerdown', trackPointer, true)
+})
+useWindowListener('pointermove', moveGesture)
+useWindowListener('pointerup', endGesture)
+useWindowListener('pointercancel', cancelGesture)
+useWindowListener('blur', cancelGesture)
+useWindowListener('keydown', trackKeyboard, true)
+useWindowListener('pointerdown', trackPointer, true)
+onDeactivated(() => {
+  cancelGesture()
+  contextMenu.value = null
+  saveView()
+})
+onActivated(() => {
+  if (viewportRef.value) viewportSize.value = { w: viewportRef.value.clientWidth, h: viewportRef.value.clientHeight }
 })
 onUnmounted(() => {
   saveView()
   cancelGesture()
-  window.removeEventListener('pointermove', moveGesture)
-  window.removeEventListener('pointerup', endGesture)
-  window.removeEventListener('pointercancel', cancelGesture)
-  window.removeEventListener('blur', cancelGesture)
-  window.removeEventListener('keydown', trackKeyboard, true)
-  window.removeEventListener('pointerdown', trackPointer, true)
   resizeObserver?.disconnect()
   if (camAnimTimer) clearTimeout(camAnimTimer)
   if (layoutFrame !== null) cancelAnimationFrame(layoutFrame)
@@ -904,7 +907,7 @@ defineExpose({ nodes: layoutNodes, targetNodes: targetLayoutNodes, inspectionNod
           <div class="node-canvas" :class="{ 'cam-anim': camAnim }" :style="cameraStyle">
             <div v-if="selectionBox" class="canvas-selection-box" :style="{ left: `${selectionBox.x}px`, top: `${selectionBox.y}px`, width: `${selectionBox.width}px`, height: `${selectionBox.height}px` }"></div>
             <!-- 画布和 SVG 共用逻辑像素坐标，overflow:visible 让连线绘制到容器外，设置 viewBox 会让端口错位。 -->
-            <svg class="node-links" role="group" aria-label="流程连线">
+            <svg class="node-links" :class="{ tracing: !!highlightedIds }" role="group" aria-label="流程连线">
               <defs>
                 <marker id="node-link-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
                   <path d="M 0 0 L 8 4 L 0 8 z" />

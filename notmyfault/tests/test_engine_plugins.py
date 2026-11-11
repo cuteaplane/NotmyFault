@@ -351,6 +351,25 @@ class TestLoadPlugins:
         assert registry.get_module("plug_a") is not None
         assert errors == []
 
+    def test_missing_optional_capability_still_loads(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "notmyfault.platform.capabilities.probe_capabilities",
+            lambda: {"display.power": {
+                "available": False, "backend": None,
+                "reason": "未安装屏幕控制工具", "degraded": False,
+            }},
+        )
+        loader, registry, errors, _ = make_loader(tmp_path)
+        write_plugin(
+            tmp_path / "actions", "optional",
+            make_meta(optional_capabilities=["display.power"]), CLEAN_RUN,
+        )
+        loaded, failed, meta_store, _ = load_actions(loader, tmp_path)
+        assert (loaded, failed) == (1, 0)
+        assert meta_store["plug_a"]["optional_capabilities"] == ["display.power"]
+        assert callable(registry.resolve_action("plug_a"))
+        assert errors == []
+
     def test_setup_raises_exception(self, tmp_path):
         loader, registry, errors, _ = make_loader(tmp_path)
         code = (

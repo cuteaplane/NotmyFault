@@ -52,8 +52,9 @@ class PluginImports:
             fullname = importlib.util.resolve_name("." * level + name, package)
             internal = fullname == self.namespace or fullname.startswith(self.namespace + ".")
         else:
-            internal = self._has_module(name.split(".", 1)[0])
-            fullname = f"{self.namespace}.{name}" if internal else name
+            own_namespace = name == self.namespace or name.startswith(self.namespace + ".")
+            internal = own_namespace or self._has_module(name.split(".", 1)[0])
+            fullname = name if own_namespace or not internal else f"{self.namespace}.{name}"
         if not internal:
             return builtins.__import__(name, globals, locals, fromlist, level)
         with self._lock:
@@ -67,6 +68,13 @@ class PluginImports:
                         self._load(child_name)
             if fromlist or level:
                 return module
+            if own_namespace:
+                view = self._load(self.namespace)
+                parent_name, _, child = self.namespace.rpartition('.')
+                while parent_name:
+                    view = _module_view(sys.modules[parent_name], **{child: view})
+                    parent_name, _, child = parent_name.rpartition('.')
+                return view
             return self._load(self.namespace + "." + name.split(".", 1)[0])
 
     def _load(self, fullname: str) -> types.ModuleType:
@@ -87,18 +95,23 @@ class PluginImports:
         parent_name, _, child = fullname.rpartition(".")
         parent = self._load(parent_name) if fullname != self.namespace else None
         module = types.ModuleType(fullname)
-        directory = self.root / fullname[len(self.namespace) + 1:].replace(".", "/")
         module.__package__ = fullname if is_package else parent_name
         module.__builtins__ = self._builtins
         module.__spec__ = importlib.util.spec_from_loader(fullname, loader=None, is_package=is_package)
         if is_package:
-            module.__path__ = [str(directory)]
+            module.__path__ = []
         self.modules[fullname] = module
         sys.modules[fullname] = module
         try:
             if relative is not None:
                 module.__file__ = str(self.root / relative)
-                exec(compile(self.sources[relative], module.__file__, "exec"), module.__dict__)
+                code = compile(self.sources[relative], module.__file__, "exec")
+                for prefix in ("notmyfault.action_", "notmyfault.trigger_"):
+                    if self.namespace.startswith(prefix):
+                        from notmyfault.security.sudo import register_plugin_code
+                        register_plugin_code(code, self.namespace[len(prefix):].split(".", 1)[0])
+                        break
+                exec(code, module.__dict__)
         except BaseException:
             self.modules.pop(fullname, None)
             sys.modules.pop(fullname, None)

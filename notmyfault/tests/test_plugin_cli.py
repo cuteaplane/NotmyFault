@@ -54,6 +54,8 @@ def test_check_reports_all_plugin_surfaces(tmp_path, monkeypatch):
     assert report["ok"] is True
     assert report["schema"] == {"ok": True, "errors": []}
     assert report["platform"]["compatible"] is True
+    assert report["platform"]["checked"] is True
+    assert "reason" not in report["platform"]
     assert report["capabilities"] == []
     assert report["permissions"]["items"] == []
     assert report["risks"] == []
@@ -62,9 +64,36 @@ def test_check_reports_all_plugin_surfaces(tmp_path, monkeypatch):
     assert report["checks"]["load_policy"]["allowed"] is False
     assert "签名无效" in report["checks"]["load_policy"]["errors"]
     assert report["entrypoints"]["selected"] == "action.py"
+    assert report["entrypoints"]["checked"] is True
+    assert "reason" not in report["entrypoints"]
     assert set(report["contributions"]) == {
         "commands", "views", "parameter_editors", "data_types"
     }
+
+
+def test_check_distinguishes_required_and_optional_capabilities(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(plugin_cli, "probe_capabilities", lambda: {
+        "media.control": {
+            "available": True, "backend": "playerctl", "reason": "", "degraded": False,
+        },
+        "audio.control": {
+            "available": False, "backend": None, "reason": "未安装音量工具", "degraded": False,
+        },
+    })
+    root = write_action(
+        tmp_path / "optional",
+        requires_capabilities=["media.control"],
+        optional_capabilities=["audio.control"],
+    )
+    report = plugin_cli.check_plugin(root)
+    assert report["ok"] is True
+    assert [(item["id"], item["required"]) for item in report["capabilities"]] == [
+        ("media.control", True), ("audio.control", False),
+    ]
+    plugin_cli._print_report(report)
+    text = capsys.readouterr().out
+    assert "capability: media.control (必需) ok" in text
+    assert "capability: audio.control (可选) 未安装音量工具" in text
 
 
 def test_check_handles_malformed_manifest(tmp_path):
@@ -88,6 +117,46 @@ def test_check_reports_ast_risks(tmp_path):
     report = plugin_cli.check_plugin(root)
 
     assert any(risk["id"] == "dynamic_import" for risk in report["risks"])
+
+
+def test_check_text_report_explains_development_errors_and_unchecked_checks(tmp_path, capsys):
+    missing = write_action(tmp_path / "missing_permission")
+    (missing / "action.py").write_text(
+        "import subprocess\n\n\n"
+        "def run_with_context(action_info, params, context):\n"
+        "    subprocess.run(['true'], check=False)\n"
+        "    return {'ok': True}\n",
+        encoding="utf-8",
+    )
+
+    result = plugin_cli.main(["plugin", "check", str(missing)])
+    captured = capsys.readouterr()
+    assert result == 1
+    assert "开发检查错误: 未声明能力，使用了未在清单声明的能力: external_binary" in captured.out
+
+    pack_result = plugin_cli.main([
+        "plugin", "pack", str(missing), "--output-dir", str(tmp_path / "output")
+    ])
+    pack_captured = capsys.readouterr()
+    assert pack_result == 1
+    assert "开发检查错误: 未声明能力，使用了未在清单声明的能力: external_binary" in pack_captured.out
+
+    invalid = write_action(tmp_path / "invalid_outputs", outputs=["result"])
+    report = plugin_cli.check_plugin(invalid)
+    assert report["platform"]["checked"] is False
+    assert report["platform"]["compatible"] is False
+    assert report["platform"]["reason"] == "schema 未通过"
+    assert report["entrypoints"]["checked"] is False
+    assert report["entrypoints"]["selected"] is None
+    assert report["entrypoints"]["reason"] == "schema 未通过"
+
+    result = plugin_cli.main(["plugin", "check", str(invalid)])
+    captured = capsys.readouterr()
+    assert result == 1
+    assert "platform: 未检查（schema 未通过）" in captured.out
+    assert "entrypoint: 未检查（schema 未通过）" in captured.out
+    assert "platform: linux unavailable" not in captured.out
+    assert "entrypoint: none missing" not in captured.out
 
 
 def test_pack_writes_installable_nmfp(tmp_path):

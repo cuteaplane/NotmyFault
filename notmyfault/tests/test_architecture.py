@@ -4,21 +4,7 @@ from pathlib import Path
 
 PACKAGE = Path(__file__).resolve().parents[1]
 EXISTING_IMPORTS = {
-    "notmyfault.native": {
-        "actions/document_quiescent/action.py", "actions/media_control/action.py",
-        "actions/window_pin/action.py", "triggers/window_title/trigger.py",
-    },
-    "notmyfault.platform.backends": {"triggers/power_state/trigger.py"},
-    "notmyfault.platform.linux_support": {
-        "actions/lock_screen/action.py", "actions/screenshot/action.py",
-        "actions/shutdown_system/action.py", "actions/text_to_speech/action.py",
-        "actions/wallpaper/action.py", "triggers/idle_detect/trigger.py",
-        "triggers/session_lock/trigger.py",
-    },
     "notmyfault.platform.platform_support": {"actions/notify/action.py"},
-    "notmyfault.platform.windows_wifi": {
-        "actions/wifi_connect/action.py", "triggers/wifi_network/trigger.py",
-    },
     "notmyfault.triggers.base": {
         f"triggers/{identity}/trigger.py" for identity in (
             "audio_device", "battery_level", "clipboard", "cron_schedule",
@@ -55,7 +41,7 @@ def test_builtin_plugins_use_public_api_without_new_private_imports():
                     continue
                 if relative not in EXISTING_IMPORTS.get(module, ()):
                     violations.append(f"{relative}: {module}")
-    assert not violations, "内置插件只能导入 notmyfault.plugin_api:\n" + "\n".join(violations)
+    assert not violations, "内置插件导入了非公开模块:\n" + "\n".join(violations)
 
 
 def test_core_does_not_import_kernel():
@@ -64,3 +50,12 @@ def test_core_does_not_import_kernel():
         if any(module == "notmyfault.core.kernel" for module in imports(path))
     ]
     assert not violations, f"核心组件不能导入 Kernel: {violations}"
+
+
+def test_platform_does_not_import_plugin_api():
+    violations = [
+        path.relative_to(PACKAGE).as_posix()
+        for path in (PACKAGE / "platform").rglob("*.py")
+        if any(module == "notmyfault.plugin_api" for module in imports(path))
+    ]
+    assert not violations, f"平台层不能导入插件 API: {violations}"

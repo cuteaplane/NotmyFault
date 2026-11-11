@@ -34,7 +34,7 @@
   .rule-route-enter-active,.rule-route-leave-active,
   .dialog-stage-enter-active,.dialog-stage-leave-active,
   .status-strip-enter-active,.status-strip-leave-active,
-  .plugin-origin-switch::before,.plugin-list-next-enter-active,.plugin-list-next-leave-active,.plugin-list-prev-enter-active,.plugin-list-prev-leave-active,
+  .plugin-list-next-enter-active,.plugin-list-next-leave-active,.plugin-list-prev-enter-active,.plugin-list-prev-leave-active,
   .nmf-dialog-enter-active,.nmf-dialog-leave-active,.nmf-dialog-enter-active>*,.nmf-dialog-leave-active>*{transition:none}
   .nav-item.active .nav-ind,.status-dot.running,.editor-mode-active,dialog,dialog::backdrop,.stagger>*{animation:none}
 }
@@ -66,7 +66,7 @@
   .rule-library-row-main .rule-library-meta { align-items: flex-start; gap: 4px; }
   .rule-library-actions .btn { padding: 0 8px; }
   .rule-library-actions .icon-btn { width: 32px; height: 40px; }
-  .automation-section-tabs .tab { padding-inline: 14px; }
+  .seg-item { padding-inline: 14px; }
   .plugin-workbench .plugin-list-view, .plugin-workbench .plugin-detail-view { padding: 16px; }
   .snackbar { bottom: 92px; }
 }

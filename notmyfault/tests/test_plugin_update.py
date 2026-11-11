@@ -163,7 +163,9 @@ def test_manifest_save_failure_preserves_plugins_and_backups(
 ):
     import py7zr
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding, NoEncryption, PrivateFormat, PublicFormat,
+    )
     from notmyfault.host.api.services import plugin_installation
     from notmyfault.security import plugins as security_plugins, signing, signing_keys
     from notmyfault.security.security import SecurityMode
@@ -175,9 +177,14 @@ def test_manifest_save_failure_preserves_plugins_and_backups(
     monkeypatch.setattr(
         plugin_installation, "detect_security_mode", lambda: SecurityMode(mode)
     )
-    monkeypatch.setattr(plugin_installation.PluginInstallationService, "_counter_sign_author_key",
-                        lambda self, path, password: signing.counter_sign_author_key(path, key) and None)
     env = make_api_env(tmp_path)
+    private_path = env.paths.plugin_private_key_file
+    private_path.parent.mkdir(parents=True, exist_ok=True)
+    private_path.write_bytes(key.private_bytes(
+        Encoding.PEM,
+        PrivateFormat.PKCS8,
+        NoEncryption(),
+    ))
 
     def signed_archive(meta, tag):
         archive = build_nmfp(tmp_path, meta, "actions", tag)

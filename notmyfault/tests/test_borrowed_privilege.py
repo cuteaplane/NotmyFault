@@ -49,9 +49,10 @@ def test_from_import_of_engine_plugin_module():
     )
 
 
-def test_sys_modules_access():
+@pytest.mark.parametrize("lookup", ["sys.modules['notmyfault.action_victim']", "sys.modules.get('notmyfault.action_victim')"])
+def test_sys_modules_access(lookup):
     findings = scan(
-        "import sys\nvictim = sys.modules['notmyfault.action_victim']\n"
+        f"import sys\nvictim = {lookup}\n"
     )
     assert any(
         "通过 sys.modules 获取引擎插件模块 notmyfault.action_victim" in f
@@ -107,9 +108,58 @@ def test_getattr_unrelated_no_findings():
     assert scan('name = getattr(obj, "name")\n') == []
 
 
-def test_builtins_subscript_exec_bypass_detected():
-    analysis = analyze_plugin_source('f = __builtins__["exec"]\nf("print(1)")\n', "action.py")
+@pytest.mark.parametrize("lookup", ['__builtins__["exec"]', 'builtins.__dict__["exec"]', '__builtins__.__dict__["eval"]'])
+def test_builtins_subscript_exec_bypass_detected(lookup):
+    analysis = analyze_plugin_source(f'import builtins\nf = {lookup}\nf("print(1)")\n', "action.py")
     assert "dynamic_exec" in analysis.capabilities
+    assert "code_injection" in {risk["id"] for risk in analysis.risks}
+
+
+@pytest.mark.parametrize("source", ["from runpy import run_path", "import runpy\nrunpy.run_path('file.py')", "import runpy as rp\nrp.run_module('example')"])
+def test_runpy_is_reported_as_dynamic_execution(source):
+    analysis = analyze_plugin_source(source, "action.py")
+    assert "dynamic_exec" in analysis.capabilities
+    assert "code_injection" in {risk["id"] for risk in analysis.risks}
+
+    imported = analyze_plugin_source("import runpy", "action.py")
+    assert "dynamic_exec" not in imported.capabilities
+    assert "code_injection" not in {risk["id"] for risk in imported.risks}
+
+
+@pytest.mark.parametrize("method", ["renamed", "borrowed_globals"])
+def test_runtime_rejects_changed_name_and_borrowed_globals(tmp_path, monkeypatch, method):
+    import types
+    from notmyfault.security import sudo
+    from notmyfault.security.plugin_imports import PluginImports
+
+    source = b"from notmyfault.security.sudo import run_as_admin\ndef execute():\n    return run_as_admin(['tool.exe'])\n"
+    victim_path = tmp_path / "victim.py"
+    victim_path.write_bytes(source)
+    attacker_path = tmp_path / "attacker.py"
+    attacker_source = b"def execute():\n    return helper()\n" if method == "renamed" else source
+    attacker_path.write_bytes(attacker_source)
+    victim_imports = PluginImports(str(tmp_path), "notmyfault.action_victim", {str(victim_path): source})
+    attacker_imports = PluginImports(str(tmp_path), "notmyfault.action_attacker", {str(attacker_path): attacker_source})
+    token = sudo.begin_engine_session()
+    try:
+        victim = victim_imports.load_entry(str(victim_path))
+        attacker = attacker_imports.load_entry(str(attacker_path))
+        sudo.authorize_plugin("victim", token, module=victim, allowed_executables={"tool.exe"})
+        called = []
+        monkeypatch.setattr(sudo, "_run_with_uac", lambda *args, **kwargs: called.append(args))
+        if method == "renamed":
+            attacker.__name__ = "main"
+            attacker.helper = victim.execute
+            operation = attacker.execute
+        else:
+            operation = types.FunctionType(attacker.execute.__code__, victim.__dict__)
+        with pytest.raises(PermissionError, match="attacker"):
+            operation()
+        assert called == []
+    finally:
+        sudo.end_engine_session(token)
+        victim_imports.close()
+        attacker_imports.close()
 
 
 def test_builtins_subscript_benign_key_no_false_positive():

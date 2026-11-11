@@ -5,7 +5,7 @@ import pytest
 from notmyfault.plugin_api import (
     CapabilityStatus,
     PlatformServiceError,
-    platform_services,
+    platform,
 )
 
 
@@ -19,11 +19,11 @@ def available(backend="test-backend"):
 
 
 def test_capability_returns_public_status():
-    with patch("notmyfault.platform.services._platform_name", return_value="linux"), patch(
+    with patch("notmyfault.platform.current", return_value="linux"), patch(
         "notmyfault.platform.capabilities.probe_capability",
         return_value=available("/usr/bin/wl-copy"),
     ):
-        status = platform_services().capability("clipboard.write")
+        status = platform.capability("clipboard.write")
     assert status == CapabilityStatus(
         id="clipboard.write",
         available=True,
@@ -35,35 +35,9 @@ def test_capability_returns_public_status():
 
 def test_unknown_capability_uses_public_error():
     with pytest.raises(PlatformServiceError) as caught:
-        platform_services().capability("third.party.unknown")
+        platform.capability("third.party.unknown")
     assert caught.value.capability == "third.party.unknown"
-    assert caught.value.kind == "unsupported"
-
-
-def test_service_calls_linux_implementation_without_public_backend():
-    calls = []
-
-    class Clipboard:
-        def write_text(self, text):
-            calls.append(text)
-
-    with (
-        patch("notmyfault.platform.services.os.name", "posix"),
-        patch("notmyfault.platform.services.sys.platform", "linux"),
-        patch(
-            "notmyfault.platform.capabilities.probe_capability",
-            return_value=available(),
-        ),
-        patch(
-            "notmyfault.platform.services._linux_backend",
-            return_value=Clipboard(),
-        ),
-    ):
-        services = platform_services()
-        services.write_clipboard("hello")
-
-    assert calls == ["hello"]
-    assert not hasattr(services, "backend")
+    assert caught.value.kind == "invalid"
 
 
 def test_unavailable_service_uses_capability_reason():
@@ -73,38 +47,37 @@ def test_unavailable_service_uses_capability_reason():
         "reason": "未安装 wl-copy",
         "degraded": False,
     }
-    with patch("notmyfault.platform.services._platform_name", return_value="linux"), patch(
+    with patch("notmyfault.platform.current", return_value="linux"), patch(
         "notmyfault.platform.capabilities.probe_capability",
         return_value=value,
     ):
         with pytest.raises(PlatformServiceError) as caught:
-            platform_services().write_clipboard("hello")
+            platform.clipboard.write("hello")
     assert caught.value.capability == "clipboard.write"
     assert caught.value.kind == "unavailable"
     assert caught.value.reason == "未安装 wl-copy"
 
 
 def test_internal_error_is_translated_to_public_error():
-    from notmyfault.platform.backends import BackendPermissionDeniedError
+    from notmyfault.platform.errors import BackendPermissionDeniedError
 
     class DeniedClipboard:
-        def write_text(self, text):
+        def __init__(self, runner):
+            pass
+
+        def write(self, text):
             raise BackendPermissionDeniedError(f"拒绝写入：{text}")
 
     with (
-        patch("notmyfault.platform.services.os.name", "posix"),
-        patch("notmyfault.platform.services.sys.platform", "linux"),
+        patch("notmyfault.platform.current", return_value="linux"),
         patch(
             "notmyfault.platform.capabilities.probe_capability",
             return_value=available(),
         ),
-        patch(
-            "notmyfault.platform.services._linux_backend",
-            return_value=DeniedClipboard(),
-        ),
+        patch.dict("notmyfault.platform.linux.BACKENDS", {"clipboard": DeniedClipboard}),
     ):
         with pytest.raises(PlatformServiceError) as caught:
-            platform_services().write_clipboard("secret")
+            platform.clipboard.write("secret")
 
     assert caught.value.capability == "clipboard.write"
     assert caught.value.kind == "permission_denied"
@@ -112,53 +85,19 @@ def test_internal_error_is_translated_to_public_error():
     assert isinstance(caught.value.__cause__, BackendPermissionDeniedError)
 
 
-@pytest.mark.parametrize("platform", ["windows", "macos"])
-def test_service_reports_unavailable_when_only_system_capability_exists(platform):
-    with (
-        patch("notmyfault.platform.services._platform_name", return_value=platform),
-        patch("notmyfault.platform.capabilities.probe_capability", return_value=available()),
-    ):
-        from notmyfault.platform.capabilities import probe_capability
-
-        assert probe_capability("clipboard.write")["available"] is True
-        services = platform_services()
-        assert services.capability("clipboard.write").available is False
-        with pytest.raises(PlatformServiceError) as caught:
-            services.write_clipboard("hello")
-        assert caught.value.kind == "unsupported"
-
-
-@pytest.mark.parametrize("platform", ["windows", "linux"])
-def test_recognize_image_uses_ocr_backend(platform):
-    calls = []
-
-    class Ocr:
-        def recognize(self, image_path, language):
-            calls.append((image_path, language))
-            return "文字"
-
-    with (
-        patch("notmyfault.platform.services._platform_name", return_value=platform),
-        patch("notmyfault.platform.capabilities.probe_capability", return_value=available("tesseract")),
-        patch("notmyfault.platform.services._linux_backend", return_value=Ocr()),
-    ):
-        assert platform_services().recognize_image("shot.png", "eng") == "文字"
-    assert calls == [("shot.png", "eng")]
-
-
-def test_recognize_image_reports_missing_tesseract():
+def test_screen_ocr_reports_missing_tesseract():
     value = {
         "available": False,
         "backend": None,
         "reason": "未安装 tesseract",
         "degraded": False,
     }
-    with patch("notmyfault.platform.services._platform_name", return_value="linux"), patch(
+    with patch("notmyfault.platform.current", return_value="linux"), patch(
         "notmyfault.platform.capabilities.probe_capability",
         return_value=value,
     ):
         with pytest.raises(PlatformServiceError) as caught:
-            platform_services().recognize_image("shot.png", "eng")
+            platform.screen.ocr("shot.png", "eng")
     assert caught.value.capability == "screen.ocr"
     assert caught.value.kind == "unavailable"
     assert caught.value.reason == "未安装 tesseract"

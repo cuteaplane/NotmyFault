@@ -21,7 +21,7 @@ def create_interactions_router(service: PluginInteractionService) -> APIRouter:
     router = APIRouter()
 
     @router.get("/api/plugins/extensions")
-    async def plugins_extensions_list():
+    def plugins_extensions_list():
         return service.extensions()
 
     @router.post(
@@ -57,14 +57,14 @@ def create_interactions_router(service: PluginInteractionService) -> APIRouter:
     @router.delete(
         "/api/plugins/{plugin_id}/extensions/sessions/{session_id}"
     )
-    async def plugin_extension_session_close(plugin_id: str, session_id: str):
+    def plugin_extension_session_close(plugin_id: str, session_id: str):
         try:
             return service.close_extension_session(plugin_id, session_id)
         except PluginInteractionError as error:
             return _error_response(error)
 
     @router.get("/api/plugins/{plugin_id}/extensions/views/{view_id}/page")
-    async def plugin_extension_view_page(plugin_id: str, view_id: str):
+    def plugin_extension_view_page(plugin_id: str, view_id: str):
         try:
             return service.view_page(plugin_id, view_id)
         except PluginInteractionError as error:

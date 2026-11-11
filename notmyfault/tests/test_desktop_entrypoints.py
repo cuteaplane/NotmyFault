@@ -220,6 +220,12 @@ def test_static_server_handles_parallel_requests_and_caches_hashed_assets(dashbo
     server, _url = dashboard._start_static_server(str(tmp_path), port=0)
     idle = socket.create_connection(server.server_address, timeout=2)
     try:
+        assert server.allow_reuse_address is False
+        if os.name == "nt":
+            assert server.socket.getsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_EXCLUSIVEADDRUSE,
+            ) == 1
         origin = f"http://127.0.0.1:{server.server_address[1]}"
         for path, expected in (("/", "no-store"), ("/assets/main-a1b2c3d4.js", "immutable")):
             with urllib.request.urlopen(origin + path, timeout=2) as response:
@@ -229,6 +235,23 @@ def test_static_server_handles_parallel_requests_and_caches_hashed_assets(dashbo
         idle.close()
         server.shutdown()
         server.server_close()
+
+
+def test_dashboard_bridge_uses_backend_request_timeouts(dashboard, tmp_path):
+    paths = ApplicationPaths(tmp_path / "config", tmp_path / "package", tmp_path)
+    api = dashboard.DashboardAPI(paths=paths)
+    timeouts = []
+    api._auth_request = lambda path, method, data, timeout, value_encoding: (
+        timeouts.append((path, timeout)) or {"ok": True}
+    )
+
+    api.request_api("/api/plugins/list")
+    api.request_api("/api/rules/draft/ai")
+
+    assert timeouts == [
+        ("/api/plugins/list", 30),
+        ("/api/rules/draft/ai", 125),
+    ]
 
 
 def test_media_permissions_require_local_page(dashboard, monkeypatch):

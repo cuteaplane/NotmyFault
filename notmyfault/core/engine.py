@@ -35,7 +35,7 @@ from notmyfault.security.security import (
 from notmyfault.core.trigger_host import TriggerHost
 from notmyfault.core.state_store import StateStore
 from pathlib import Path
-from notmyfault.platform.boot_identity import boot_id
+from notmyfault.platform.platform_support import boot_id
 from notmyfault.core.workflow import build_context
 from notmyfault.core.binding_schema import prepare_binding_context, rule_step_output_fields
 from notmyfault.core.bindings import BindingResolutionError
@@ -498,6 +498,10 @@ class AutomationEngine:
                 "end_step_id": end_step_id,
                 "assertions": copy.deepcopy(test_assertions or []),
                 "provided_trigger_ids": tuple(trigger_payloads or {}),
+                "candidate_trigger_types": tuple(dict.fromkeys(
+                    event.get("type", "") for event in get_all_rule_events(rule)
+                    if isinstance(event.get("type"), str)
+                )),
             }
             if isinstance(step_outputs, dict):
                 provided_actions = []
@@ -531,13 +535,12 @@ class AutomationEngine:
             context["triggers"] = {
                 event.get("binding_id"): {
                     "type": event.get("type", ""),
-                    "payload": copy.deepcopy(
-                        supplied_trigger_payloads.get(event.get("binding_id"), {})
-                    ),
+                    "payload": copy.deepcopy(supplied_trigger_payloads[event.get("binding_id")]),
                     "config": copy.deepcopy(event.get("params", {})),
                 }
                 for event in get_all_rule_events(rule)
                 if isinstance(event.get("binding_id"), str)
+                and event.get("binding_id") in supplied_trigger_payloads
             }
             context["manual_test"]["variable_values"] = variable_values
             try:
@@ -686,6 +689,7 @@ class AutomationEngine:
             cancel_pending_admin_requests()
             self._rule_watcher.stop()
             self._run_manager.shutdown()
+            plugin_worker.shutdown_all()
             self._trigger_host.request_stop_all()
             deadline = time.monotonic() + max(0.0, timeout)
             stopped = self._stop_trigger_threads(timeout=min(30.0, max(0.0, timeout)))
@@ -693,7 +697,6 @@ class AutomationEngine:
                 timeout=max(0.0, deadline - time.monotonic())
             )
             self._shutdown_clean = bool(stopped and scheduled_stopped and drained)
-            plugin_worker.shutdown_all()
             self.close()
             if not self._shutdown_clean:
                 return

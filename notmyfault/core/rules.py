@@ -102,7 +102,8 @@ def validate_rule_structure(rule: Any) -> List[str]:
     errors.extend(validate_canvas_graph(rule.get('workflow')))
 
     def validate_action(action: Dict[str, Any], path: str) -> None:
-        if action.get("type") in NON_ACTION_NODES:
+        action_type = action.get("type")
+        if isinstance(action_type, str) and action_type in NON_ACTION_NODES:
             return
         if action.get("type") == "set_variable":
             if not isinstance(action.get("variable"), str):
@@ -455,7 +456,8 @@ def validate_rules(
         for action, action_path in iter_rule_actions(rule):
             if action["binding_id"] not in active:
                 continue
-            if action.get("type") in NATIVE_NODES:
+            action_type_value = action.get("type")
+            if isinstance(action_type_value, str) and action_type_value in NATIVE_NODES:
                 continue
             action_type = action.get("type", "")
             if not action_type:

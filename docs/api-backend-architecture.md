@@ -58,7 +58,8 @@ HMAC-SHA256 密钥。
 6. 引擎启动后通过 `publish_event()` 把状态和运行事件交给 `EventBroker`。
 7. Uvicorn 使用已经独占的监听 socket 提供 HTTP 服务。
 
-`ApiTokenStore` 创建和修复 token 文件。除 `OPTIONS` 外，所有 `/api/` 请求都要带
+`ApiTokenStore` 在引擎每次启动时生成新 token 并覆盖 token 文件，正常退出时删除该文件。
+除 `OPTIONS` 外，所有 `/api/` 请求都要带
 `Authorization: Bearer <token>`。令牌缺失或不匹配时返回 403。认证通过的请求每秒最多检查一次 token 文件，
 文件检查和修复在线程中执行。
 

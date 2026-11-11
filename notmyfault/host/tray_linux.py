@@ -14,7 +14,7 @@ from notmyfault.platform.platform_support import (
     set_linux_autostart,
     show_notification,
 )
-from notmyfault.platform.linux_support import session_type
+from notmyfault.platform.linux.desktop import session_type
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ICON_PATH = PROJECT_ROOT / "logo.png"

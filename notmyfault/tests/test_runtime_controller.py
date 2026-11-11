@@ -5,6 +5,7 @@ import time
 import runpy
 import signal
 from pathlib import Path
+from types import SimpleNamespace
 
 from notmyfault.core.runtime_controller import RuntimeController, _STALE_CLEANUP_TIMEOUT
 from notmyfault.security.security import SecurityMode
@@ -102,9 +103,52 @@ def test_desktop_runner_forwards_event_sink_to_engine_factory(monkeypatch, tmp_p
         stop=lambda timeout: cleanup.append("engine_stop") or True,
     )
     runner._tray.stop = lambda: cleanup.append("tray_stop")
-    runner._run_history = SimpleNamespace(flush=lambda: cleanup.append("history_flush") or True)
+    runner._shutdown_workers = lambda: cleanup.append("worker_shutdown")
+    runner._run_history = SimpleNamespace(
+        flush=lambda timeout=5.0: cleanup.append("history_flush") or True
+    )
     runner._cleanup()
-    assert cleanup == ["request_stop", "tray_stop", "engine_stop", "history_flush"]
+    assert cleanup == [
+        "request_stop",
+        "tray_stop",
+        "worker_shutdown",
+        "engine_stop",
+        "history_flush",
+    ]
+
+
+def test_force_shutdown_flushes_history_after_worker_shutdown(monkeypatch, tmp_path):
+    launcher_path = Path(__file__).resolve().parents[2] / "NOTMYFAULT.pyw"
+    namespace = runpy.run_path(str(launcher_path), run_name="notmyfault_force_shutdown_test")
+    monkeypatch.setattr(signal, "signal", lambda *args: None)
+    paths = namespace["ApplicationPaths"](
+        config_dir=tmp_path / "config",
+        package_root=tmp_path / "package",
+        project_root=tmp_path,
+    )
+    runner = namespace["EngineRunner"](
+        paths,
+        namespace["SignedConfigStore"](paths),
+        lambda **_kwargs: None,
+    )
+    operations = []
+    exited = threading.Event()
+    runner._runtime = SimpleNamespace(request_stop=lambda: operations.append("runtime_stop"))
+    runner._shutdown_workers = lambda: operations.append("workers")
+    runner._run_history = SimpleNamespace(
+        flush=lambda timeout=5.0: operations.append("flush") or True
+    )
+
+    def fake_exit(code):
+        operations.append(("exit", code))
+        exited.set()
+
+    monkeypatch.setattr(namespace["os"], "_exit", fake_exit)
+    runner.request_process_shutdown(force_after=0)
+
+    assert exited.wait(2)
+    exit_index = operations.index(("exit", 0))
+    assert operations.index("workers") < operations.index("flush") < exit_index
 
 
 def test_runtime_controller_rejects_restart_while_old_thread_is_stopping():

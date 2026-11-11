@@ -28,10 +28,14 @@ def plugin_files(plugin_dir) -> list[Path]:
     """返回插件目录内全部常规文件，sign_plugin 与 plugin_payload 必须使用同一清单。"""
     files = []
     plugin_root = Path(plugin_dir)
+    if plugin_root.is_symlink() or getattr(plugin_root, "is_junction", lambda: False)():
+        raise ValueError("插件目录不能包含文件或目录链接")
     for f in sorted(
         plugin_root.rglob("*"),
         key=lambda path: path.relative_to(plugin_root).as_posix(),
     ):
+        if f.is_symlink() or getattr(f, "is_junction", lambda: False)():
+            raise ValueError("插件目录不能包含文件或目录链接")
         if not f.is_file():
             continue
         if f.name in _SIGNATURE_ARTIFACT_NAMES:
