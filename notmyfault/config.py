@@ -55,8 +55,10 @@ _SIGNATURE_KEY = "_signature"
 def _secure_write_secret(path: str, data: bytes) -> None:
     """写入配置密钥并把文件权限限制为当前用户"""
     fd = -1
+    created = False
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
         if os.name == "nt":
             from notmyfault.security.api_key_store import _restrict_key_file
 
@@ -69,10 +71,11 @@ def _secure_write_secret(path: str, data: bytes) -> None:
     except Exception:
         if fd >= 0:
             os.close(fd)
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
+        if created:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
         raise
 
 

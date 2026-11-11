@@ -543,3 +543,13 @@ def test_rejected_rule_fields_are_not_converted_on_read_or_recovery(tmp_path, in
     assert target.read_bytes() == before
     if reader == "backup":
         assert paths.rules_file.read_text(encoding="utf-8") == "{broken"
+
+
+def test_secure_write_secret_keeps_file_created_by_another_process(tmp_path):
+    from notmyfault.config import _secure_write_secret
+
+    path = tmp_path / "signing.key"
+    path.write_bytes(b"winner")
+    with pytest.raises(FileExistsError):
+        _secure_write_secret(str(path), b"loser")
+    assert path.read_bytes() == b"winner"
