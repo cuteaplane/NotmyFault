@@ -730,6 +730,23 @@ if (!pausedControlsOk || !startupAlertOk) process.exitCode = 1
 const rulesNav = [...document.querySelectorAll('.nav-item')].find(
   button => button.textContent.includes('自动化'),
 )
+
+// 页面切换会保留自动化页的状态，需要规则库时先退出仍开着的编辑器。
+async function openRuleLibrary() {
+  rulesNav?.click()
+  await pause(50)
+  if (document.querySelector('.rule-editor-page')) {
+    document.querySelector('.rule-back-btn')?.click()
+    const prompt = await waitFor(() => {
+      const dialog = document.querySelector('.app-dialog')
+      return dialog?.textContent.includes('要放弃这些修改吗？') ? dialog : null
+    }, 300)
+    ;[...(prompt?.querySelectorAll('button') || [])].find(button => button.textContent.trim() === '放弃')?.click()
+  }
+  await waitFor('.automation-section-tabs')
+  ;[...document.querySelectorAll('.automation-section-tabs button')].find(button => button.textContent.includes('规则'))?.click()
+  return waitFor('.automation-rules-section')
+}
 rulesNav?.click()
 await waitFor('.rules-library')
 const automationPageOk = document.querySelector('.rules-library')?.textContent.includes('创建、测试和管理这台电脑上的自动化')
@@ -759,6 +776,12 @@ if (!automationPageOk || !disabledAiCreateOk || !compactValidationOk || !validat
 invalidName.value = '新规则'; invalidName.dispatchEvent(new window.Event('input', { bubbles:true }))
 await pause(30)
 document.querySelector('.rule-back-btn')?.click()
+const earlyLeavePrompt = await waitFor(() => {
+  const dialog = document.querySelector('.app-dialog')
+  return dialog?.textContent.includes('要放弃这些修改吗？') ? dialog : null
+}, 300)
+;[...(earlyLeavePrompt?.querySelectorAll('button') || [])].find(button => button.textContent.trim() === '放弃')?.click()
+await waitFor('.rules-library')
 await new Promise(r => setTimeout(r, 50))
 const earlySettingsNav = [...document.querySelectorAll('.nav-item')].find(
   button => button.textContent.includes('设置'),
@@ -1585,6 +1608,16 @@ await new Promise(r => setTimeout(r, 20))
 
 rulesNav?.click()
 await new Promise(r => setTimeout(r, 50))
+const editorKeptAcrossPages = document.querySelector('.rule-title-capsule')?.textContent.includes('挂载测试规则')
+console.log((editorKeptAcrossPages?'PASS':'FAIL')+' - switching to settings and back keeps the open rule editor')
+if (!editorKeptAcrossPages) process.exitCode = 1
+document.querySelector('.rule-back-btn')?.click()
+const keptEditorLeavePrompt = await waitFor(() => {
+  const dialog = document.querySelector('.app-dialog')
+  return dialog?.textContent.includes('要放弃这些修改吗？') ? dialog : null
+}, 300)
+;[...(keptEditorLeavePrompt?.querySelectorAll('button') || [])].find(button => button.textContent.trim() === '放弃')?.click()
+await waitFor('.rules-library')
 ;[...document.querySelectorAll('.rules-library button')].find(
   button => button.textContent.includes('创建自动化'),
 )?.click()
@@ -1788,8 +1821,7 @@ const keyDeleteHasNoRuleOrPluginEffects = !aiKeyDeleteCalls.some(call => (
 ))
 console.log((savedKeyDeleted && keyDeleteHasNoRuleOrPluginEffects?'PASS':'FAIL')+' - deleting a saved AI key updates status without rule or plugin side effects')
 if (!savedKeyDeleted || !keyDeleteHasNoRuleOrPluginEffects) process.exitCode = 1
-rulesNav?.click()
-await new Promise(r => setTimeout(r, 50))
+await openRuleLibrary()
 ;[...document.querySelectorAll('.rules-library button')].find(button => button.textContent.includes('创建自动化'))?.click()
 await new Promise(r => setTimeout(r, 50))
 requireEarlyApproval = true
@@ -1866,8 +1898,7 @@ additionalRuns = ['queued', 'timed_out', 'dropped', 'toString', 'running', 'succ
   duration_ms:['timed_out', 'dropped', 'succeeded', 'recovered'].includes(status) ? 200 : null,
   action_count:0, steps:status === 'recovered' ? [{ step_id:'a_failedoriginal', action_type:'notify', status:'failed', error:'动作失败', recovery:{ group_id:'a_recoverygroup', status:'succeeded' } }] : status === 'succeeded' ? [{ step_id:'a_loggedgroup', action_type:'event_group', status:'succeeded', branch:'b_chosen01', evaluated_branches:[{ branch_id:'b_false001', result:false, predicates:[{ node_id:'a_checked01', op:'eq', result:false }] }, { branch_id:'b_chosen01', result:true, predicates:[{ node_id:'a_checked02', op:'event_occurred', result:true }] }] }] : [],
 }))
-rulesNav?.click()
-await waitFor('.rules-library')
+await openRuleLibrary()
 ;[...document.querySelectorAll('.automation-section-tabs button')].find(
   button => button.textContent.includes('运行记录'),
 )?.click()
@@ -2347,8 +2378,7 @@ console.log((homeRunStatusesOk ? 'PASS' : 'FAIL') + ' - 首页显示排队、超
 if (!homeRunStatusesOk) process.exitCode = 1
 
 // 创建入口和用途示例只在自动化页出现，缺少插件时定向到插件页。
-rulesNav?.click()
-await new Promise(r => setTimeout(r, 50))
+await openRuleLibrary()
 ;[...document.querySelectorAll('button')].find(
   button => button.textContent.includes('创建自动化'),
 )?.click()
@@ -2472,8 +2502,7 @@ if (!listRetryCleared) process.exitCode = 1
 mockPluginListRuntime = null
 mockPluginListExtraActions = null
 
-rulesNav?.click()
-await waitFor('.rules-library')
+await openRuleLibrary()
 document.querySelector('.rule-library-row-main')?.click()
 await waitFor('.rule-title-capsule')
 document.querySelector('button[aria-label="打开 AI 起草"]')?.click()
@@ -2497,8 +2526,7 @@ await waitFor('.rules-library')
 mockAiDraftResultType = 'rule_draft'
 
 // 删除最后一条自动化后，首页只显示一次去往自动化页的首次引导。
-rulesNav?.click()
-await new Promise(r => setTimeout(r, 60))
+await openRuleLibrary()
 document.querySelector('.rule-library-row .icon-btn-danger')?.click()
 await new Promise(r => setTimeout(r, 30))
 ;[...document.querySelectorAll('.app-dialog button')].find(button => button.textContent.trim() === '删除')?.click()

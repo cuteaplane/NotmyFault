@@ -1,6 +1,7 @@
 <script setup>
+import CircularProgress from '../CircularProgress.vue'
 import { normalizeWorkflow, walkGraphActions, getGraphTriggers } from '../../lib/workflowGraph'
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onMounted, onUnmounted, ref, watch } from 'vue'
 import { store } from '../../lib/store'
 import { cancelRun, runRule } from '../../lib/api'
 import { approveRuleBeforeEditing, saveRulesWithApproval } from '../../lib/ruleSave'
@@ -15,6 +16,7 @@ import QuickCreateDialog from '../QuickCreateDialog.vue'
 import TestRunDialog from '../TestRunDialog.vue'
 import BaseDialog from '../BaseDialog.vue'
 import LogsView from './LogsView.vue'
+import SegmentedTabs from '../SegmentedTabs.vue'
 
 const automationSection = ref(store.pendingAutomationSection || 'rules')
 const activeRuleIndex = ref(null)
@@ -768,8 +770,8 @@ watch(() => store.pendingAutomationSection, section => {
   store.pendingAutomationSection = ''
 })
 
-onMounted(() => {
-  if (!store.configData.rules) store.configData.rules = []
+// 页面被缓存后再切回来不会重新挂载，首页留下的跳转请求在这里处理。
+function consumePendingNavigation() {
   if (store.pendingAutomationSection) {
     automationSection.value = store.pendingAutomationSection
     store.pendingAutomationSection = ''
@@ -785,7 +787,12 @@ onMounted(() => {
     createAutomation()
   }
   openPendingRule()
+}
+onMounted(() => {
+  if (!store.configData.rules) store.configData.rules = []
+  consumePendingNavigation()
 })
+onActivated(consumePendingNavigation)
 </script>
 
 <template>
@@ -806,10 +813,8 @@ onMounted(() => {
         <button class="btn btn-filled" @click="createAutomation"><span class="material-symbols-outlined">add</span>创建自动化</button>
       </div>
     </div>
-    <div class="tabs automation-section-tabs" role="group" aria-label="自动化页面">
-      <button class="tab" :class="{ active: automationSection === 'rules' }" :aria-pressed="automationSection === 'rules'" @click="automationSection = 'rules'"><span class="material-symbols-outlined">account_tree</span>规则<span class="section-count">{{ store.configData.rules.length }}</span></button>
-      <button class="tab" :class="{ active: automationSection === 'runs' }" :aria-pressed="automationSection === 'runs'" @click="automationSection = 'runs'"><span class="material-symbols-outlined">history</span>运行记录</button>
-    </div>
+    <SegmentedTabs v-model="automationSection" class="automation-section-tabs" role="group" label="自动化页面"
+      :options="[{ value: 'rules', label: '规则', icon: 'account_tree', count: store.configData.rules.length }, { value: 'runs', label: '运行记录', icon: 'history' }]" />
     <Transition name="automation-section" mode="out-in">
     <div v-if="automationSection === 'rules'" key="rules" class="automation-rules-section">
     <section v-if="store.configError" class="rules-integrity-error" role="alert">
@@ -861,7 +866,7 @@ onMounted(() => {
           <div class="rule-library-actions">
             <button class="btn btn-text btn-sm rule-run-btn" :disabled="runningRuleIndex !== null"
               title="真实执行一次这条规则中的动作" @click.stop="runManualRule(index, rule)">
-              <span v-if="runningRuleIndex === index" class="spinner"></span>
+              <CircularProgress v-if="runningRuleIndex === index" />
               <span v-else class="material-symbols-outlined">experiment</span>
               {{ runningRuleIndex === index ? '测试中…' : '测试' }}
             </button>
@@ -889,7 +894,7 @@ onMounted(() => {
       <p class="dialog-sub">{{ testResult.ruleName }}</p>
       <div class="test-steps">
         <div v-if="!testResult.steps.length && !testResult.done" class="test-step test-step-wait">
-          <span class="spinner"></span><span>已启动执行，等待结果…</span>
+          <CircularProgress /><span>已启动执行，等待结果…</span>
         </div>
         <div v-for="(s, i) in testResult.steps" :key="i" class="test-step" :class="'test-step-' + s.status">
           <span class="material-symbols-outlined">{{ stepIcon(s.status) }}</span>

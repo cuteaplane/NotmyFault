@@ -1,5 +1,6 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import CircularProgress from '../CircularProgress.vue'
+import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from 'vue'
 import { getEngineStatus, hasBridge, listRuns, readDiagnostics } from '../../lib/api'
 import { store } from '../../lib/store'
 import { snackbar } from '../../lib/notify'
@@ -197,9 +198,24 @@ watch(isRunning, running => {
   else loadStats(store.engineStatus)
 })
 
+function startDiagTimer() {
+  if (hasBridge() && !diagTimer) diagTimer = setInterval(() => loadStats(), 30000)
+}
+let hidden = false
 onMounted(() => {
   if (isControllerOnline.value) loadStats(store.engineStatus)
-  if (hasBridge()) diagTimer = setInterval(() => loadStats(), 30000)
+  startDiagTimer()
+})
+onDeactivated(() => {
+  hidden = true
+  if (diagTimer) clearInterval(diagTimer)
+  diagTimer = null
+})
+onActivated(() => {
+  if (!hidden) return
+  hidden = false
+  if (isControllerOnline.value) loadStats(store.engineStatus)
+  startDiagTimer()
 })
 onUnmounted(() => { disposed = true; if (diagTimer) clearInterval(diagTimer) })
 </script>
@@ -232,9 +248,9 @@ onUnmounted(() => { disposed = true; if (diagTimer) clearInterval(diagTimer) })
         <button v-if="!isRunning && !isStarting && !isStopping" class="btn btn-filled" @click="startEngine">
           <span class="material-symbols-outlined">play_arrow</span>{{ isControllerOnline ? '启动自动化' : '启动引擎' }}
         </button>
-        <button v-else-if="isStarting" class="btn btn-filled" disabled><span class="spinner"></span>启动中…</button>
+        <button v-else-if="isStarting" class="btn btn-filled" disabled><CircularProgress />启动中…</button>
         <button v-else-if="isRunning && !isStopping" class="btn btn-tonal" @click="stopEngine"><span class="material-symbols-outlined">pause</span>暂停</button>
-        <button v-else class="btn btn-tonal" disabled><span class="spinner"></span>暂停中…</button>
+        <button v-else class="btn btn-tonal" disabled><CircularProgress />暂停中…</button>
         <button v-if="isControllerOnline && !isRunning && !isStarting && !isStopping" class="btn btn-text btn-danger" :disabled="shuttingDown" @click="shutdownEngine">
           {{ shuttingDown ? '停止中…' : '彻底停止' }}
         </button>

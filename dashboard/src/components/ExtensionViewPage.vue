@@ -1,4 +1,5 @@
 <script setup>
+import CircularProgress from './CircularProgress.vue'
 import { nextTick, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import { closeExtensionSession, getExtensionViewPage, invokeExtensionCommand } from '../lib/api'
 import { snackbar } from '../lib/notify'
@@ -213,7 +214,7 @@ onBeforeUnmount(() => {
         <h1>{{ title }}</h1>
       </header>
       <section class="extension-page-body">
-        <p v-if="loading" class="extension-page-message"><span class="spinner"></span>正在打开插件编辑器…</p>
+        <p v-if="loading" class="extension-page-message"><CircularProgress />正在打开插件编辑器…</p>
         <p v-else-if="error" class="extension-page-message error"><span class="material-symbols-outlined">error</span>{{ error }}</p>
         <iframe v-else-if="html" ref="frameRef" class="extension-page-frame"
           :srcdoc="html" sandbox="allow-scripts" @load="initializeView"></iframe>

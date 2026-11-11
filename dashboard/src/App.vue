@@ -14,6 +14,7 @@ const { init: initTheme } = useTheme()
 const currentPage = ref('home')
 const pageTransitioning = ref(false)
 let queuedPage = ''
+const pageScroll = new Map()
 const FirstRunSetup = defineAsyncComponent(() => import('./components/FirstRunSetup.vue'))
 let savedFirstRun = ''
 try { savedFirstRun = localStorage.getItem('nmf-first-run') || '' } catch {}
@@ -43,13 +44,14 @@ function switchPage(p) {
     queuedPage = p
     return
   }
+  pageScroll.set(currentPage.value, document.querySelector('.app-main')?.scrollTop || 0)
   currentPage.value = p
 }
 
 function finishPageTransition() {
   pageTransitioning.value = false
   const main = document.querySelector('.app-main')
-  if (main) main.scrollTop = 0
+  if (main) main.scrollTop = pageScroll.get(currentPage.value) || 0
   nextTick(() => main?.focus({ preventScroll: true }))
   if (!queuedPage) return
   const page = queuedPage
@@ -344,7 +346,9 @@ onUnmounted(() => {
   <NavRail :current="currentPage" @switch="switchPage" />
   <main class="app-main" tabindex="-1" aria-label="页面内容">
     <Transition name="page" mode="out-in" @before-leave="pageTransitioning = true" @after-enter="finishPageTransition">
-      <component :is="views[currentPage]" :key="currentPage" />
+      <KeepAlive>
+        <component :is="views[currentPage]" :key="currentPage" />
+      </KeepAlive>
     </Transition>
   </main>
   </template>

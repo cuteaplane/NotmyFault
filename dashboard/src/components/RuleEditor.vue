@@ -1,5 +1,7 @@
 <script setup>
+import CircularProgress from './CircularProgress.vue'
 import { computed, nextTick, ref, toRef, watch, onMounted, onUnmounted } from 'vue'
+import { useWindowListener } from '../composables/useWindowListener'
 import RuleCanvas from './RuleCanvas.vue'
 import WorkflowNodeInspector from './WorkflowNodeInspector.vue'
 import { alertDialog } from '../lib/dialog'
@@ -284,8 +286,8 @@ function focusInitialNode(id) {
 watch([() => props.initialNodeId, canvasRef], ([id]) => focusInitialNode(id), { immediate: true })
 
 
+useWindowListener('keydown', onEditorKeydown)
 onMounted(() => {
-  window.addEventListener('keydown', onEditorKeydown)
   aiPanelOpen.value = store.pendingAiPanel === true
   store.pendingAiPanel = false
   let savedWidth = 0
@@ -299,7 +301,6 @@ onMounted(() => {
   wideLayoutMedia.addEventListener?.('change', syncWideLayout)
 })
 onUnmounted(() => {
-  window.removeEventListener('keydown', onEditorKeydown)
   wideLayoutMedia?.removeEventListener?.('change', syncWideLayout)
   stopAiPanelResize()
 })
@@ -359,7 +360,7 @@ function onEditorKeydown(event) {
           <button class="icon-btn" :disabled="!canRedo" aria-label="重做" title="重做（Ctrl+Y）" @click="emit('redo')"><span class="material-symbols-outlined" aria-hidden="true">redo</span></button>
         </div>
         <button class="btn btn-text rule-check-btn" :disabled="checkingRule" title="立即检查当前草稿" @click="runRuleCheck">
-          <span v-if="checkingRule" class="spinner"></span>
+          <CircularProgress v-if="checkingRule" />
           <span v-else class="material-symbols-outlined">fact_check</span>
           {{ checkingRule ? '检查中…' : '规则检查' }}
           <span v-if="validationErrorCount" class="rule-check-count">{{ validationErrorCount }}</span>
@@ -367,7 +368,7 @@ function onEditorKeydown(event) {
         <button class="btn btn-text danger-text" @click="emit('delete')"><span class="material-symbols-outlined">delete</span>删除</button>
         <button class="btn btn-outlined rule-test-btn" :disabled="validationErrorCount || testing"
           title="保存当前修改，并真实执行一次规则中的动作" @click="saveFromEditor($event, true)">
-          <span v-if="testing" class="spinner"></span>
+          <CircularProgress v-if="testing" />
           <span v-else class="material-symbols-outlined">experiment</span>
           {{ testing ? '测试中…' : '测试规则' }}
         </button>

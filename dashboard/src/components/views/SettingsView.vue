@@ -1,5 +1,6 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onDeactivated, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useWindowListener } from '../../composables/useWindowListener'
 import { store } from '../../lib/store'
 import {
   API,
@@ -213,6 +214,10 @@ function cancelAIKeyEdit() {
   aiKeyEditorOpen.value = false
 }
 
+// 页面切走后设置页会被缓存，没保存的 API 密钥不能跟着留在内存里。
+watch(currentPage, (page, previous) => { if (previous === 'ai-key') cancelAIKeyEdit() })
+onDeactivated(cancelAIKeyEdit)
+
 async function saveAIKey() {
   if (savingAIKey.value || aiApiKeyPersistenceUnsupported.value || !aiApiKeyDraft.value) return
   savingAIKey.value = true
@@ -276,12 +281,11 @@ onMounted(async () => {
   load()
   loadDesktopSettings()
   platformReport.value = await readPlatformCapabilities()
-  window.addEventListener('keydown', onKonamiKey)
 })
+useWindowListener('keydown', onKonamiKey)
 onUnmounted(() => {
   desktopSettingsDisposed = true
   aiApiKeyDraft.value = ''
-  window.removeEventListener('keydown', onKonamiKey)
 })
 </script>
 

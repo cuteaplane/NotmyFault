@@ -1,5 +1,6 @@
 <script setup>
-import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
+import CircularProgress from '../CircularProgress.vue'
+import { ref, computed, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, watch } from 'vue'
 import { store } from '../../lib/store'
 import { apiDownload, apiRead, apiWrite, loadPlugins, getSchema } from '../../lib/api'
 import { snackbar } from '../../lib/notify'
@@ -7,6 +8,7 @@ import { alertDialog, confirmDialog } from '../../lib/dialog'
 import { useEngineControl } from '../../composables/useEngineControl'
 import { permissionLabels } from '../../lib/permissions'
 import BaseDialog from '../BaseDialog.vue'
+import SegmentedTabs from '../SegmentedTabs.vue'
 
 const { restartEngine } = useEngineControl()
 
@@ -496,6 +498,13 @@ onMounted(async () => {
   await consumePluginFocus()
 })
 
+let hidden = false
+onDeactivated(() => { hidden = true })
+onActivated(() => {
+  if (!hidden) return
+  hidden = false
+  consumePluginFocus()
+})
 onUnmounted(() => clearTimeout(refreshTimer))
 </script>
 
@@ -541,16 +550,8 @@ onUnmounted(() => clearTimeout(refreshTimer))
           <p v-else-if="!registryLoading && !registryError" class="plugin-registry-empty">索引尚未读取。</p>
         </section>
 
-        <div class="plugin-origin-switch" :class="{ 'user-active': originTab === 'user' }" role="tablist" aria-label="插件来源">
-          <button type="button" role="tab" :aria-selected="originTab === 'builtin'"
-            :class="{ active: originTab === 'builtin' }" @click="originTab = 'builtin'">
-            内置<span>{{ originCounts.builtin }}</span>
-          </button>
-          <button type="button" role="tab" :aria-selected="originTab === 'user'"
-            :class="{ active: originTab === 'user' }" @click="originTab = 'user'">
-            用户<span>{{ originCounts.user }}</span>
-          </button>
-        </div>
+        <SegmentedTabs v-model="originTab" class="plugin-origin-switch" label="插件来源" block
+          :options="[{ value: 'builtin', label: '内置', count: originCounts.builtin }, { value: 'user', label: '用户', count: originCounts.user }]" />
 
         <div v-if="visibleProblemCount" class="plugin-problem-summary">
           <span class="material-symbols-outlined">report</span>
@@ -728,7 +729,7 @@ onUnmounted(() => clearTimeout(refreshTimer))
         </div>
 
         <div v-else-if="previewLoading" key="loading" class="preview-loading">
-          <div class="spinner my-6 mx-auto"></div>
+          <CircularProgress class="!block my-6 mx-auto text-primary" :size="40" />
           <p>正在解析插件...</p>
         </div>
 
