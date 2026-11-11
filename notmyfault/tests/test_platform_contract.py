@@ -696,7 +696,8 @@ def test_speech_desktop_plasma_unsupported(monkeypatch, tmp_path, style):
 @pytest.mark.parametrize("location", ["desktop", "start_menu", "startup", "path"])
 def test_speech_desktop_shortcut(speech_desktop_platform, monkeypatch, tmp_path, location):
     name, runner, _ = speech_desktop_platform
-    monkeypatch.setenv("HOME", str(tmp_path))
+    from pathlib import Path
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     (tmp_path / "Desktop").mkdir()
@@ -710,7 +711,6 @@ def test_speech_desktop_shortcut(speech_desktop_platform, monkeypatch, tmp_path,
     assert set(result) == {"shortcut_path"}
     assert isinstance(result["shortcut_path"], str)
     if name == "linux":
-        from pathlib import Path
         path = Path(result["shortcut_path"])
         expected = {"desktop": tmp_path / "Desktop", "start_menu": tmp_path / "data/applications", "startup": tmp_path / "config/autostart"}[location]
         assert path.parent == expected
@@ -719,7 +719,8 @@ def test_speech_desktop_shortcut(speech_desktop_platform, monkeypatch, tmp_path,
         assert "%%file" in content
         assert "Icon=/tmp/icon\\spath" in content
         assert "Path=" not in content
-        assert path.stat().st_mode & 0o777 == 0o755
+        if sys.platform != "win32":
+            assert path.stat().st_mode & 0o777 == 0o755
     else:
         args, kwargs = runner.calls[-1]
         assert kwargs["env"]["NMF_LNK_TARGET"] == '/tmp/a "b" %file'
@@ -1353,6 +1354,7 @@ class _P3WifiRunner:
         self.active = None
         self.calls = []
         self.secret_paths = []
+        self.secret_modes = []
         self.query_fail = False
         self.readback_stuck = False
 
@@ -1378,7 +1380,9 @@ class _P3WifiRunner:
                 assert "ifname" in args and args[args.index("ifname") + 1] == "wifi2"
                 path = Path(args[args.index("passwd-file") + 1])
                 self.secret_paths.append(path)
-                assert stat.S_IMODE(path.stat().st_mode) == 0o600
+                assert self.secret_modes == [0o600]
+                if os.name != "nt":
+                    assert stat.S_IMODE(path.stat().st_mode) == 0o600
                 assert path.read_text(encoding="utf-8") == f"wifi.psk:{self.password}\n"
                 if self.failure:
                     raise BackendFailedError(f"unexpected diagnostic {self.password}")
@@ -1390,7 +1394,8 @@ class _P3WifiRunner:
             assert "user=current" in args
             path = Path(next(value.split("=", 1)[1] for value in args if value.startswith("filename=")))
             self.secret_paths.append(path)
-            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+            if os.name != "nt":
+                assert stat.S_IMODE(path.stat().st_mode) == 0o600
             root = ET.fromstring(path.read_bytes())
             assert root.findtext("./{*}SSIDConfig/{*}SSID/{*}hex") == self.target.encode("utf-8").hex().upper()
             assert root.findtext("./{*}SSIDConfig/{*}SSID/{*}name") == self.target
@@ -1415,6 +1420,19 @@ def p3_wifi_backend(request, monkeypatch, tmp_path):
     target = ' 家中:WiFi\\"2 '
     runner = _P3WifiRunner(name, target=target, password=password)
     backend = module.WifiBackend(runner)
+    if name == "linux":
+        def private_mode(descriptor, mode):
+            assert os.fstat(descriptor).st_size == 0
+            runner.secret_modes.append(mode)
+            if os.name != "nt":
+                os.fchmod(descriptor, mode)
+
+        monkeypatch.setattr(module, "os", SimpleNamespace(
+            environ=os.environ, fdopen=os.fdopen, fchmod=private_mode, unlink=os.unlink,
+        ))
+        monkeypatch.setattr(module, "tempfile", SimpleNamespace(
+            mkstemp=lambda **kwargs: tempfile.mkstemp(dir=tmp_path, **kwargs),
+        ))
     if name == "windows":
         monkeypatch.setattr(module.w, "kernel32", lambda: SimpleNamespace(GetConsoleOutputCP=lambda: 65001, GetOEMCP=lambda: 437))
         guid = "00000002-0000-0000-0000-000000000000"

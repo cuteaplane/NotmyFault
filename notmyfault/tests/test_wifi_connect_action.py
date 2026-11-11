@@ -3,7 +3,6 @@
 import ctypes
 import json
 import os
-import stat
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -198,10 +197,14 @@ def test_windows_secret_file_has_private_acl_before_write(monkeypatch, tmp_path,
         assert not Path(path).exists()
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         opened.append(Path(path))
-        return SimpleNamespace(fd=fd, Close=lambda: (os.close(fd), closed.append(path)))
+        return SimpleNamespace(
+            fd=fd, security_descriptor=attributes.SECURITY_DESCRIPTOR,
+            Close=lambda: (os.close(fd), closed.append(path)),
+        )
 
     def write_file(handle, content):
-        assert stat.S_IMODE(opened[-1].stat().st_mode) == 0o600
+        assert handle.security_descriptor is descriptor
+        assert os.fstat(handle.fd).st_size == 0
         assert content == b"<profile>example-pass</profile>"
         os.write(handle.fd, content)
         if failure:
