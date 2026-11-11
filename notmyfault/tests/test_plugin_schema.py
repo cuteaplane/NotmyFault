@@ -88,6 +88,7 @@ def test_validate_plugin_meta_reports_instead_of_raising():
         "id", "name", "description", "version_code", "version",
         "package_name", "platforms", "permissions", "params", "outputs",
         "security", "contributes", "requires_capabilities", "optional_capabilities", "engines",
+        "origin", "execution_mode",
     )
     for field in fields:
         for value in BAD_FIELD_VALUES:
@@ -99,6 +100,25 @@ def test_validate_plugin_meta_reports_instead_of_raising():
     valid, errors = validate_plugin_meta(
         make_meta(params=None, security={"literal_only_params": ["p"]}), "action"
     )
+    assert valid is False
+    assert errors
+
+
+@pytest.mark.parametrize("overrides", [
+    {"outputs": [{"name": "value", "type": "string", "summary": []}]},
+    {"params": [{"name": "value", "type": [], "description": "x"}]},
+    {"params": [{"name": "value", "type": "string", "summary": []}]},
+    {"security": {"rule_approval": [], "literal_only_params": [], "admin_executables": []}},
+    {"platforms": [[]]},
+    {"requires_capabilities": [[]]},
+    {"contributes": {"commands": [{"id": "c1", "title": "t", "handler": "a.py:f"}],
+                     "views": [{"id": "v1", "title": "t", "page": "a.html", "commands": [[]]}],
+                     "data_types": [{"id": "d1", "version": 1, "binding": []}],
+                     "parameter_editors": [{"id": "e1", "parameter": [], "command": "c1",
+                                            "ui": {"control": []}}]}},
+])
+def test_nested_malformed_metadata_reports_instead_of_raising(overrides):
+    valid, errors = validate_plugin_meta(make_meta(**overrides), "action")
     assert valid is False
     assert errors
 
