@@ -9,6 +9,7 @@ from collections.abc import Mapping
 
 from notmyfault.core.data_types import DataTypeError, copy_value
 from notmyfault.core.value_codec import decode_value, encode_value
+from notmyfault.platform.errors import PlatformServiceError
 
 
 STARTUP_TIMEOUT = 10.0
@@ -329,6 +330,8 @@ class ExtensionWorker:
             if payload.get("type") != "result":
                 _fail_protocol(self._process, "扩展 worker 执行结果不符合协议")
             if payload.get("ok") is not True:
+                if isinstance(payload.get("platform_error"), dict):
+                    raise PlatformServiceError.from_dict(payload["platform_error"])
                 raise RuntimeError(payload.get("error") or "扩展命令执行失败")
             try:
                 result = decode_value(payload.get("result"))
@@ -404,6 +407,8 @@ def _drive(process, messages, request, execute_timeout, *, cancellation=None):
             except DataTypeError:
                 _fail_protocol(process, "worker 返回的数据编码无效")
         return True, result
+    if isinstance(payload.get("platform_error"), dict):
+        return False, PlatformServiceError.from_dict(payload["platform_error"])
     return False, payload.get("error") or "worker 执行失败"
 
 

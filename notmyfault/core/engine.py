@@ -35,7 +35,7 @@ from notmyfault.security.security import (
 from notmyfault.core.trigger_host import TriggerHost
 from notmyfault.core.state_store import StateStore
 from pathlib import Path
-from notmyfault.platform.boot_identity import boot_id
+from notmyfault.platform.platform_support import boot_id
 from notmyfault.core.workflow import build_context
 from notmyfault.core.binding_schema import prepare_binding_context, rule_step_output_fields
 from notmyfault.core.bindings import BindingResolutionError

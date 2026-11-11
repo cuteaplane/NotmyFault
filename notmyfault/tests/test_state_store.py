@@ -46,7 +46,7 @@ def test_writer_failure_reaches_caller_and_shutdown_closes_connection(tmp_path):
 
 
 def test_boot_identity_is_stable_for_current_system():
-    from notmyfault.platform.boot_identity import boot_id
+    from notmyfault.platform.platform_support import boot_id
 
     identity = boot_id()
     assert identity

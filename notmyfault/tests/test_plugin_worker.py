@@ -98,10 +98,17 @@ def run_with_context(action_info, params, context):
 """
 
 PLUGIN_API_ACTION = """
-from notmyfault.plugin_api import platform_services
+from notmyfault.plugin_api import platform
 
 def run_with_context(action_info, params, context):
-    return {"platform": platform_services().platform}
+    return {"platform": platform.name}
+"""
+
+PLATFORM_ERROR_ACTION = """
+from notmyfault.plugin_api import PlatformServiceError
+
+def run_with_context(action_info, params, context):
+    raise PlatformServiceError("clipboard.read", "unavailable", "未安装 wl-paste")
 """
 
 READY_THEN_SLEEP_WORKER = """
@@ -181,6 +188,18 @@ class TestRunIsolatedAction:
         ok, result = run_isolated_action(entry, {"id": "plugin_api"}, {}, {})
         assert ok is True
         assert result["platform"] in {"windows", "linux", "macos"}
+
+    def test_platform_service_error_keeps_fields_across_process(self, tmp_path, monkeypatch):
+        from notmyfault.platform.errors import PlatformServiceError
+
+        monkeypatch.setenv("NOTMYFAULT_MODE", "stable")
+        entry = write_action(tmp_path, "platform_error", PLATFORM_ERROR_ACTION)
+        ok, error = run_isolated_action(entry, {"id": "platform_error"}, {}, {})
+        assert ok is False
+        assert isinstance(error, PlatformServiceError)
+        assert (error.capability, error.kind, error.reason) == (
+            "clipboard.read", "unavailable", "未安装 wl-paste",
+        )
 
     def test_worker_imports_sibling_module(self, tmp_path):
         (tmp_path / "helper.py").write_text(

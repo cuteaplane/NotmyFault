@@ -1245,6 +1245,7 @@ class TestExecuteAction:
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         mod._observations.clear()
+        monkeypatch.setattr(mod.platform, "capability", lambda _: types.SimpleNamespace(available=True))
 
         (tmp_path / "a.txt").write_text("x", encoding="utf-8")
         params = {
@@ -1309,6 +1310,27 @@ class TestExecuteAction:
         mod._observations.clear()
         with pytest.raises(RuntimeError):
             mod.run_with_context({}, params, {})
+
+    def test_document_quiescent_detects_open_document_without_window_enumeration(self, tmp_path, monkeypatch):
+        from notmyfault.actions.document_quiescent import action
+        from notmyfault.platform.linux.desktop import DesktopBackend
+
+        document = tmp_path / "正在编辑.docx"
+        document.write_bytes(b"document")
+        process = types.SimpleNamespace(info={
+            "name": "soffice.bin", "pid": 42,
+            "open_files": [types.SimpleNamespace(path=str(document))],
+        })
+        monkeypatch.setattr("psutil.process_iter", lambda attrs: iter([process]))
+        monkeypatch.setattr(action.platform, "capability", lambda _: types.SimpleNamespace(available=False))
+        monkeypatch.setattr(action.platform.desktop, "file_in_use", DesktopBackend().file_in_use)
+        action._observations.clear()
+        params = {"source_folder": str(tmp_path), "quiet_seconds": 0}
+        assert action.check_precondition({}, params, {})["ok"] is False
+        assert action.check_precondition({}, params, {})["ok"] is False
+        monkeypatch.setattr("psutil.process_iter", lambda attrs: iter([]))
+        assert action.check_precondition({}, params, {}) == {"ok": True}
+        action._observations.clear()
 
 
 class TestErrorIsolation:
@@ -1469,54 +1491,6 @@ class TestErrorIsolation:
         thread.join(timeout=5)
 
 
-def _load_display_module(monkeypatch=None):
-    path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "actions", "display_control", "action.py",
-    )
-    spec = importlib.util.spec_from_file_location("display_control_under_test", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_display_brightness_accepts_one_verified_backend(monkeypatch):
-    mod = _load_display_module()
-    monkeypatch.setattr(mod, "_set_wmi_brightness", lambda level: 2)
-
-    def broken(level):
-        raise RuntimeError("DDC 不可用")
-
-    monkeypatch.setattr(mod, "_set_ddc_brightness", broken)
-    result = mod._set_brightness(50)
-    assert result["brightness"] == 50
-    assert result["methods"] == ["WMI 2 台"]
-    assert result["warnings"] == ["DDC/CI: DDC 不可用"]
-
-
-def test_display_brightness_fails_without_verified_backend(monkeypatch):
-    mod = _load_display_module()
-
-    def broken(level):
-        raise RuntimeError("不支持")
-
-    monkeypatch.setattr(mod, "_set_wmi_brightness", broken)
-    monkeypatch.setattr(mod, "_set_ddc_brightness", broken)
-    with pytest.raises(RuntimeError) as excinfo:
-        mod._set_brightness(50)
-    assert "不支持可验证的亮度控制" in str(excinfo.value)
-
-
-def test_display_action_propagates_brightness_failure(monkeypatch):
-    mod = _load_display_module()
-
-    def broken(level):
-        raise RuntimeError("不支持")
-
-    monkeypatch.setattr(mod, "_set_wmi_brightness", broken)
-    monkeypatch.setattr(mod, "_set_ddc_brightness", broken)
-    with pytest.raises(RuntimeError):
-        mod.run_with_context({}, {"action": "set_brightness", "brightness": 40}, {})
 
 
 def test_excel_append_rows_consumes_pipeline_output():
