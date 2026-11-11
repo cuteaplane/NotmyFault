@@ -630,7 +630,7 @@ def main():
         if os.name == "nt":
             try:
                 import ctypes
-                ctypes.windll.user32.MessageBoxW(
+                ctypes.windll.user32.MessageBoxW( # oh no no no!!!
                     None,
                     str(error),
                     "NotmyFault Dashboard",

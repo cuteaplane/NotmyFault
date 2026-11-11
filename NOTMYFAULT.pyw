@@ -146,9 +146,8 @@ def setup_logging(log_dir: str) -> str:
 
     sys.stdout = _TimestampWriter(log_fp, sys.__stdout__, _log_io_lock)
     sys.stderr = _TimestampWriter(log_fp, sys.__stderr__, _log_io_lock)
-    print(f"--------     NotmyFault Engine     --------")
-    print(f"------ {datetime.now().isoformat()} ------")
-    print(f"------     Welcome to NotmyFault!    ------")
+    print(f"[Log] 会话日志: {log_path}")
+    print(f"[Log] Welcome to NotmyFault!")
     return log_path
 
 
