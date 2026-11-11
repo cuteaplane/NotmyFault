@@ -1,9 +1,10 @@
 import json
 import os
 import re
-import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+import notmyfault.platform
 
 from notmyfault.core.data_types import (
     BUILTIN_TYPES, DataTypeError, field_type, normalize_type,
@@ -14,7 +15,7 @@ _REQUIRED_META_FIELDS = {"id", "name", "description", "version_code", "version",
 _TRIGGER_OPTIONAL_FIELDS = {
     "semantic", "params", "permissions", "origin", "trigger_api", "platforms",
     "entrypoints", "outputs", "build", "contributes",
-    "requires_capabilities", "engines", "security", "author",
+    "requires_capabilities", "optional_capabilities", "engines", "security", "author",
     "lifecycle", "state_key", "state_filter", "previous_state_output",
     "debounce_seconds", "event_queue_size", "overflow", "coalesce_key",
     "state_mode", "state_initial_value", "state_partition_key", "state_untracked", "state_hysteresis",
@@ -23,7 +24,7 @@ _TRIGGER_OPTIONAL_FIELDS = {
 _ACTION_OPTIONAL_FIELDS = {
     "params", "permissions", "origin", "execution_api",
     "outputs", "platforms", "entrypoints", "build", "idempotent",
-    "cancellation_api", "contributes", "requires_capabilities",
+    "cancellation_api", "contributes", "requires_capabilities", "optional_capabilities",
     "execution_mode", "engines", "security", "author",
 }
 _ALLOWED_EXECUTION_MODES = {"in-process", "isolated"}
@@ -111,15 +112,6 @@ def admin_executables(meta: Any) -> set[str]:
         if isinstance(name, str) and name
     }
 
-
-def current_platform_name() -> str:
-    if sys.platform == "win32":
-        return "windows"
-    if sys.platform.startswith("linux"):
-        return "linux"
-    if sys.platform == "darwin":
-        return "macos"
-    return sys.platform
 
 PERM_RISK_NONE = "none"
 PERM_RISK_LOW = "low"
@@ -755,23 +747,33 @@ def validate_plugin_meta(
                         f"（允许: {', '.join(sorted(_ALLOWED_PLATFORMS))}）"
                     )
 
-    if "requires_capabilities" in meta:
+    declared_capabilities = {}
+    for field in ("requires_capabilities", "optional_capabilities"):
+        if field not in meta:
+            continue
         from notmyfault.platform.capabilities import CAPABILITY_IDS
 
-        required = meta["requires_capabilities"]
-        if not isinstance(required, list) or not required:
-            errors.append("字段 'requires_capabilities' 必须是非空数组")
-        else:
-            for capability in required:
-                if not isinstance(capability, str):
-                    errors.append(
-                        f"requires_capabilities 中的值必须是字符串，实际: {type(capability).__name__}"
-                    )
-                elif capability not in CAPABILITY_IDS:
-                    errors.append(
-                        f"未知能力 id: {capability!r}"
-                        f"（允许: {', '.join(sorted(CAPABILITY_IDS))}）"
-                    )
+        values = meta[field]
+        if not isinstance(values, list) or not values:
+            errors.append(f"字段 '{field}' 必须是非空数组")
+            continue
+        seen = set()
+        for capability in values:
+            if not isinstance(capability, str) or not capability.strip():
+                errors.append(f"{field} 中的值必须是非空字符串")
+                continue
+            if capability in seen:
+                errors.append(f"{field} 包含重复能力 id: {capability!r}")
+            seen.add(capability)
+            if capability not in CAPABILITY_IDS:
+                errors.append(
+                    f"未知能力 id: {capability!r}"
+                    f"（允许: {', '.join(sorted(CAPABILITY_IDS))}）"
+                )
+        declared_capabilities[field] = seen
+    overlap = declared_capabilities.get("requires_capabilities", set()) & declared_capabilities.get("optional_capabilities", set())
+    if overlap:
+        errors.append(f"requires_capabilities 与 optional_capabilities 不能重复: {', '.join(sorted(overlap))}")
 
     if "entrypoints" in meta:
         entrypoints = meta["entrypoints"]
@@ -985,7 +987,7 @@ def scan_plugins(
         result[meta["id"]] = {
             **meta,
             "platform_compatible": is_plugin_platform_compatible(meta),
-            "current_platform": current_platform_name(),
-            "selected_entrypoint": (meta.get("entrypoints") or {}).get(current_platform_name()),
+            "current_platform": notmyfault.platform.current(),
+            "selected_entrypoint": (meta.get("entrypoints") or {}).get(notmyfault.platform.current()),
         }
     return result
