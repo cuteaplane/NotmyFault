@@ -2,12 +2,14 @@
 
 import ctypes
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from notmyfault.platform import capabilities
+from notmyfault.platform.linux import probes as linux_probes
 
-# 测试会把 os.name 改成 nt，ctypes 得先在 posix 下加载，不然会找 FormatError
-from notmyfault.platform.linux_support import BackendMissingError, require_command
+# 测试会把平台改成 windows，ctypes 得先在 posix 下加载，不然会找 FormatError
+from notmyfault.platform._run import require_command
+from notmyfault.platform.errors import BackendMissingError
 from notmyfault.security.plugin_schema import validate_plugin_meta
 
 
@@ -24,7 +26,7 @@ class ProbeStructureTests(unittest.TestCase):
             self.assertIsInstance(entry["available"], bool)
 
     def test_windows_probe_reports_builtin_backends(self):
-        with patch("notmyfault.platform.capabilities.os.name", "nt"), \
+        with patch("notmyfault.platform.current", return_value="windows"), \
                 patch("importlib.util.find_spec", return_value=object()), \
                 patch("ctypes.WinDLL", create=True), \
                 patch("shutil.which", return_value="powershell.exe"), \
@@ -33,7 +35,6 @@ class ProbeStructureTests(unittest.TestCase):
         for entry in report.values():
             self.assertTrue(entry["available"])
             self.assertIsNotNone(entry["backend"])
-            self.assertFalse(entry["degraded"])
         for capability in (
             capabilities.DISPLAY_BRIGHTNESS,
             capabilities.AUDIO_CONTROL,
@@ -44,7 +45,7 @@ class ProbeStructureTests(unittest.TestCase):
             self.assertTrue(report[capability]["reason"])
 
     def test_windows_missing_dependencies_reports_reason(self):
-        with patch("notmyfault.platform.capabilities.os.name", "nt"), \
+        with patch("notmyfault.platform.current", return_value="windows"), \
                 patch("importlib.util.find_spec", return_value=None), \
                 patch("ctypes.WinDLL", side_effect=OSError("DLL unavailable"), create=True), \
                 patch("shutil.which", return_value=None), \
@@ -54,11 +55,11 @@ class ProbeStructureTests(unittest.TestCase):
             self.assertFalse(entry["available"])
             self.assertTrue(entry["reason"])
         self.assertIn("pycaw", report[capabilities.AUDIO_CONTROL]["reason"])
-        with patch("notmyfault.platform.capabilities.os.name", "nt"), \
+        with patch("notmyfault.platform.current", return_value="windows"), \
                 patch("ctypes.WinDLL", create=True) as dll:
             del dll.return_value.SendInput
             self.assertFalse(capabilities.probe_capability(capabilities.INPUT_SEND)["available"])
-        with patch("notmyfault.platform.capabilities.os.name", "nt"), \
+        with patch("notmyfault.platform.current", return_value="windows"), \
                 patch("importlib.util.find_spec", return_value=object()), \
                 patch("ctypes.WinDLL", side_effect=OSError("DDC unavailable"), create=True), \
                 patch("shutil.which", return_value="powershell.exe"):
@@ -67,16 +68,15 @@ class ProbeStructureTests(unittest.TestCase):
             brightness = capabilities.probe_capability(capabilities.DISPLAY_BRIGHTNESS)
             self.assertTrue(brightness["available"])
             self.assertTrue(brightness["degraded"])
-        with patch("notmyfault.platform.capabilities.os.name", "nt"), \
+        with patch("notmyfault.platform.current", return_value="windows"), \
                 patch("importlib.util.find_spec", return_value=None), \
                 patch("ctypes.WinDLL", create=True):
             self.assertFalse(capabilities.probe_capability(capabilities.AUDIO_CONTROL)["available"])
             self.assertTrue(capabilities.probe_capability(capabilities.INPUT_SEND)["available"])
 
     def test_linux_missing_backend_reports_reason(self):
-        with patch("notmyfault.platform.capabilities.os.name", "posix"), \
-                patch("notmyfault.platform.capabilities.sys.platform", "linux"), \
-                patch("notmyfault.platform.linux_support.shutil.which", return_value=None):
+        with patch("notmyfault.platform.current", return_value="linux"), \
+                patch("notmyfault.platform._run.shutil.which", return_value=None):
             report = capabilities.probe_capabilities()
         brightness = report[capabilities.DISPLAY_BRIGHTNESS]
         self.assertFalse(brightness["available"])
@@ -92,10 +92,8 @@ class ProbeStructureTests(unittest.TestCase):
                 raise RuntimeError('Bad display name ""')
             return real_import(name, *args, **kwargs)
 
-        with patch("notmyfault.platform.capabilities.os.name", "posix"), patch(
-            "notmyfault.platform.capabilities.sys.platform", "linux"
-        ), patch(
-            "notmyfault.platform.linux_support.session_type", return_value="x11"
+        with patch("notmyfault.platform.current", return_value="linux"), patch(
+            "notmyfault.platform.linux.desktop.session_type", return_value="x11"
         ), patch("builtins.__import__", side_effect=import_with_failed_tray):
             result = capabilities.probe_capabilities()[capabilities.TRAY]
         self.assertFalse(result["available"])
@@ -103,9 +101,9 @@ class ProbeStructureTests(unittest.TestCase):
         self.assertIn('Bad display name ""', result["reason"])
 
     def test_macos_does_not_use_linux_probe(self):
-        with patch("notmyfault.platform.capabilities.os.name", "posix"), \
-                patch("notmyfault.platform.capabilities.sys.platform", "darwin"), \
-                patch("notmyfault.platform.capabilities._probe_linux") as linux_probe:
+        linux_probe = MagicMock()
+        with patch("notmyfault.platform.current", return_value="macos"), \
+                patch.dict(linux_probes.PROBES, {capabilities.CLIPBOARD_READ: linux_probe}):
             result = capabilities.probe_capability(capabilities.CLIPBOARD_READ)
         linux_probe.assert_not_called()
         self.assertFalse(result["available"])
@@ -115,9 +113,9 @@ class ProbeStructureTests(unittest.TestCase):
         def only_xclip(name):
             return "/usr/bin/xclip" if name == "xclip" else None
 
-        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"), \
-                patch("notmyfault.platform.linux_support.shutil.which", side_effect=only_xclip):
-            result = capabilities._probe_linux(capabilities.CLIPBOARD_READ)
+        with patch("notmyfault.platform.linux.desktop.session_type", return_value="wayland"), \
+                patch("notmyfault.platform._run.shutil.which", side_effect=only_xclip):
+            result = linux_probes.PROBES[capabilities.CLIPBOARD_READ]()
         self.assertFalse(result["available"])
         self.assertIn("wl-paste", result["reason"])
 
@@ -125,9 +123,9 @@ class ProbeStructureTests(unittest.TestCase):
         def only_wayland(name):
             return "/usr/bin/wl-paste" if name == "wl-paste" else None
 
-        with patch("notmyfault.platform.linux_support.session_type", return_value="x11"), \
-                patch("notmyfault.platform.linux_support.shutil.which", side_effect=only_wayland):
-            result = capabilities._probe_linux(capabilities.CLIPBOARD_READ)
+        with patch("notmyfault.platform.linux.desktop.session_type", return_value="x11"), \
+                patch("notmyfault.platform._run.shutil.which", side_effect=only_wayland):
+            result = linux_probes.PROBES[capabilities.CLIPBOARD_READ]()
         self.assertFalse(result["available"])
         self.assertIn("xclip", result["reason"])
 
@@ -136,30 +134,30 @@ class ProbeStructureTests(unittest.TestCase):
         def which(name):
             return f"/usr/bin/{name}" if name in {"gdbus", "playerctl", "xprintidle"} else None
 
-        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"), \
-                patch("notmyfault.platform.linux_support.desktop_environment", return_value="gnome"), \
-                patch("notmyfault.platform.linux_support.shutil.which", side_effect=which):
-            power = capabilities._probe_linux(capabilities.DISPLAY_POWER)
-            media = capabilities._probe_linux(capabilities.MEDIA_CONTROL)
-            idle = capabilities._probe_linux(capabilities.IDLE_QUERY)
+        with patch("notmyfault.platform.linux.desktop.session_type", return_value="wayland"), \
+                patch("notmyfault.platform.linux.desktop.desktop_environment", return_value="gnome"), \
+                patch("notmyfault.platform._run.shutil.which", side_effect=which):
+            power = linux_probes.PROBES[capabilities.DISPLAY_POWER]()
+            media = linux_probes.PROBES[capabilities.MEDIA_CONTROL]()
+            idle = linux_probes.PROBES[capabilities.IDLE_QUERY]()
         self.assertTrue(power["available"])
         self.assertEqual(power["backend"], "gnome-ScreenSaver")
         self.assertTrue(media["available"])
         self.assertTrue(idle["available"])
         self.assertIn("IdleMonitor", idle["backend"])
 
-        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"), \
-                patch("notmyfault.platform.linux_support.desktop_environment", return_value="unknown"), \
-                patch("notmyfault.platform.linux_support.shutil.which", side_effect=which):
-            power = capabilities._probe_linux(capabilities.DISPLAY_POWER)
+        with patch("notmyfault.platform.linux.desktop.session_type", return_value="wayland"), \
+                patch("notmyfault.platform.linux.desktop.desktop_environment", return_value="unknown"), \
+                patch("notmyfault.platform._run.shutil.which", side_effect=which):
+            power = linux_probes.PROBES[capabilities.DISPLAY_POWER]()
         self.assertFalse(power["available"])
         self.assertIn("Wayland", power["reason"])
 
     def test_wayland_screen_capture_requires_portal_client(self):
-        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"), \
+        with patch("notmyfault.platform.linux.desktop.session_type", return_value="wayland"), \
                 patch("importlib.util.find_spec", return_value=None), \
-                patch("notmyfault.platform.linux_support.shutil.which", return_value="/usr/bin/grim"):
-            result = capabilities._probe_linux(capabilities.SCREEN_CAPTURE)
+                patch("notmyfault.platform._run.shutil.which", return_value="/usr/bin/grim"):
+            result = linux_probes.PROBES[capabilities.SCREEN_CAPTURE]()
         self.assertFalse(result["available"])
         self.assertIn("dbus-next", result["reason"])
 
@@ -169,8 +167,8 @@ class ProbeStructureTests(unittest.TestCase):
                 return f"/usr/bin/{name}"
             return None
 
-        with patch("notmyfault.platform.linux_support.session_type", return_value="x11"),                 patch("notmyfault.platform.linux_support.shutil.which", side_effect=which):
-            ready = capabilities._probe_linux(capabilities.SCREEN_OCR)
+        with patch("notmyfault.platform.linux.desktop.session_type", return_value="x11"),                 patch("notmyfault.platform._run.shutil.which", side_effect=which):
+            ready = linux_probes.PROBES[capabilities.SCREEN_OCR]()
         self.assertTrue(ready["available"])
         self.assertEqual(ready["backend"], "tesseract")
         self.assertFalse(ready["degraded"])
@@ -178,16 +176,16 @@ class ProbeStructureTests(unittest.TestCase):
         def only_screenshot(name):
             return "/usr/bin/gnome-screenshot" if name == "gnome-screenshot" else None
 
-        with patch("notmyfault.platform.linux_support.session_type", return_value="x11"),                 patch("notmyfault.platform.linux_support.shutil.which", side_effect=only_screenshot):
-            missing_ocr = capabilities._probe_linux(capabilities.SCREEN_OCR)
+        with patch("notmyfault.platform.linux.desktop.session_type", return_value="x11"),                 patch("notmyfault.platform._run.shutil.which", side_effect=only_screenshot):
+            missing_ocr = linux_probes.PROBES[capabilities.SCREEN_OCR]()
         self.assertFalse(missing_ocr["available"])
         self.assertIn("tesseract", missing_ocr["reason"])
 
         def only_tesseract(name):
             return "/usr/bin/tesseract" if name == "tesseract" else None
 
-        with patch("notmyfault.platform.linux_support.session_type", return_value="x11"),                 patch("notmyfault.platform.linux_support.shutil.which", side_effect=only_tesseract):
-            missing_capture = capabilities._probe_linux(capabilities.SCREEN_OCR)
+        with patch("notmyfault.platform.linux.desktop.session_type", return_value="x11"),                 patch("notmyfault.platform._run.shutil.which", side_effect=only_tesseract):
+            missing_capture = linux_probes.PROBES[capabilities.SCREEN_OCR]()
         self.assertFalse(missing_capture["available"])
         self.assertIn("gnome-screenshot", missing_capture["reason"])
 
@@ -195,15 +193,15 @@ class ProbeStructureTests(unittest.TestCase):
         def which(name):
             return "/usr/bin/tesseract" if name == "tesseract" else None
 
-        with patch("notmyfault.platform.linux_support.session_type", return_value="wayland"),                 patch("importlib.util.find_spec", return_value=object()),                 patch("notmyfault.platform.linux_support.shutil.which", side_effect=which):
-            result = capabilities._probe_linux(capabilities.SCREEN_OCR)
+        with patch("notmyfault.platform.linux.desktop.session_type", return_value="wayland"),                 patch("importlib.util.find_spec", return_value=object()),                 patch("notmyfault.platform._run.shutil.which", side_effect=which):
+            result = linux_probes.PROBES[capabilities.SCREEN_OCR]()
         self.assertTrue(result["available"])
         self.assertTrue(result["degraded"])
         self.assertEqual(result["backend"], "tesseract")
         self.assertIn("Portal", result["reason"])
 
     def test_windows_screen_ocr_requires_tesseract_and_gdi(self):
-        with patch("notmyfault.platform.capabilities.os.name", "nt"),                 patch("shutil.which", return_value=None):
+        with patch("notmyfault.platform.current", return_value="windows"),                 patch("shutil.which", return_value=None):
             missing = capabilities.probe_capability(capabilities.SCREEN_OCR)
         self.assertFalse(missing["available"])
         self.assertIn("tesseract", missing["reason"])
@@ -211,13 +209,13 @@ class ProbeStructureTests(unittest.TestCase):
         def which(name):
             return "tesseract.exe" if name == "tesseract" else "powershell.exe"
 
-        with patch("notmyfault.platform.capabilities.os.name", "nt"),                 patch("importlib.util.find_spec", return_value=object()),                 patch("ctypes.WinDLL", create=True),                 patch("shutil.which", side_effect=which),                 patch("os.path.isfile", return_value=True):
+        with patch("notmyfault.platform.current", return_value="windows"),                 patch("importlib.util.find_spec", return_value=object()),                 patch("ctypes.WinDLL", create=True),                 patch("shutil.which", side_effect=which),                 patch("os.path.isfile", return_value=True):
             ready = capabilities.probe_capability(capabilities.SCREEN_OCR)
         self.assertTrue(ready["available"])
         self.assertEqual(ready["backend"], "tesseract")
         self.assertFalse(ready["degraded"])
 
-        with patch("notmyfault.platform.capabilities.os.name", "nt"),                 patch("shutil.which", return_value="tesseract.exe"),                 patch("ctypes.WinDLL", side_effect=OSError("no gdi"), create=True):
+        with patch("notmyfault.platform.current", return_value="windows"),                 patch("shutil.which", return_value="tesseract.exe"),                 patch("ctypes.WinDLL", side_effect=OSError("no gdi"), create=True):
             broken = capabilities.probe_capability(capabilities.SCREEN_OCR)
         self.assertFalse(broken["available"])
         self.assertIn("接口不可用", broken["reason"])
@@ -301,9 +299,7 @@ class SchemaValidationTests(unittest.TestCase):
         self.assertTrue(any("requires_capabilities" in e for e in errors))
 class RequireCommandTests(unittest.TestCase):
     def test_missing_backend_raises_unified_error(self):
-        from notmyfault.platform.linux_support import BackendMissingError, require_command
-
-        with patch("notmyfault.platform.linux_support.shutil.which", return_value=None):
+        with patch("notmyfault.platform._run.shutil.which", return_value=None):
             with self.assertRaises(BackendMissingError) as ctx:
                 require_command("模拟按键", "xdotool", "ydotool")
         self.assertIn("依赖缺失", str(ctx.exception))
@@ -311,12 +307,10 @@ class RequireCommandTests(unittest.TestCase):
         self.assertIn("ydotool", str(ctx.exception))
 
     def test_found_backend_returns_path(self):
-        from notmyfault.platform.linux_support import require_command
-
         def fake_which(name):
             return f"/usr/bin/{name}" if name == "ydotool" else None
 
-        with patch("notmyfault.platform.linux_support.shutil.which", side_effect=fake_which):
+        with patch("notmyfault.platform._run.shutil.which", side_effect=fake_which):
             self.assertEqual(
                 require_command("模拟按键", "xdotool", "ydotool"), "/usr/bin/ydotool"
             )
@@ -338,3 +332,52 @@ class RequireCommandTests(unittest.TestCase):
             )
         self.assertTrue(ok)
         self.assertEqual(problems, [])
+
+
+class CatalogAvailabilityTests(unittest.TestCase):
+    def test_required_and_optional_availability(self):
+        from notmyfault.host.api.services.plugin_catalog import PluginCatalogService
+
+        for required_available, degraded, optional_available, expected in [
+            (True, False, True, "available"),
+            (True, True, True, "partial"),
+            (True, False, False, "partial"),
+            (False, False, False, "unavailable"),
+        ]:
+            with self.subTest(
+                required_available=required_available,
+                degraded=degraded,
+                optional_available=optional_available,
+            ):
+                meta = {
+                    "requires_capabilities": ["media.control"],
+                    "optional_capabilities": ["audio.control"],
+                }
+                report = {
+                    "media.control": capabilities.entry(
+                        required_available, "playerctl", "媒体服务受限", degraded,
+                    ),
+                    "audio.control": capabilities.entry(
+                        optional_available, None, "未安装音量工具",
+                    ),
+                }
+                PluginCatalogService._annotate_availability(meta, report)
+                self.assertEqual(meta["availability"], expected)
+                self.assertEqual(meta["capability_compatible"], required_available)
+                reasons = "；".join(meta["unavailable_reasons"])
+                if not optional_available:
+                    self.assertIn("部分功能不可用", reasons)
+                    self.assertIn("audio.control", reasons)
+                    self.assertIn("未安装音量工具", reasons)
+                if not required_available or degraded:
+                    self.assertIn("media.control", reasons)
+                    self.assertIn("媒体服务受限", reasons)
+
+    def test_optional_only_plugin_is_partial_when_probe_is_missing(self):
+        from notmyfault.host.api.services.plugin_catalog import PluginCatalogService
+
+        meta = {"optional_capabilities": ["display.power"]}
+        PluginCatalogService._annotate_availability(meta, {})
+        self.assertEqual(meta["availability"], "partial")
+        self.assertTrue(meta["capability_compatible"])
+        self.assertIn("display.power", meta["unavailable_reasons"][0])

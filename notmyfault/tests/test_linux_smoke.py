@@ -4,7 +4,7 @@ import sys
 import pytest
 
 from notmyfault.platform import capabilities
-from notmyfault.platform.linux_support import session_type
+from notmyfault.platform.linux.desktop import session_type
 
 
 @pytest.mark.linux_smoke
