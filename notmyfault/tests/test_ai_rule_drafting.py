@@ -447,3 +447,79 @@ def test_status_maps_injected_key_state(tmp_path):
     env = make_api_env(tmp_path, ai_key_store=key_store)
     response = env.client.get("/api/settings/ai-drafting", headers=env.headers)
     assert response.json()["api_key_status"] == "unsupported"
+
+
+def test_sse_decoder_handles_split_frames_comments_and_done():
+    decoder = ai_provider._SSEDecoder()
+    first = decoder.feed(b'data: {"value": 1}\n\ndata: {"value":')
+    second = decoder.feed(b' 2}\n\n: keepalive\n\ndata: [DONE]\n\n')
+    assert first + second == [{"value": 1}, {"value": 2}, ai_provider._STREAM_DONE]
+
+    crlf = ai_provider._SSEDecoder()
+    assert crlf.feed(b'data: {"value": 3}\r\n\r\n') == [{"value": 3}]
+
+    unfinished = ai_provider._SSEDecoder()
+    assert unfinished.feed(b'data: {"value": 4}') == []
+    assert unfinished.finish() == [{"value": 4}]
+
+
+def test_chat_accumulator_defaults_missing_index_and_deduplicates_names():
+    accumulator = ai_provider._ChatStreamAccumulator()
+    accumulator.feed({"choices": [{"delta": {"tool_calls": [
+        {"function": {"name": "draft_", "arguments": '{"a":'}}
+    ]}}]})
+    accumulator.feed({"choices": [{"delta": {"tool_calls": [
+        {"function": {"name": "rule", "arguments": "1}"}}
+    ]}}]})
+    accumulator.feed({"choices": [{"delta": {"tool_calls": [
+        {"function": {"name": "draft_rule", "arguments": ""}}
+    ]}}]})
+    call = accumulator.body()["choices"][0]["message"]["tool_calls"][0]["function"]
+    assert call == {"name": "draft_rule", "arguments": '{"a":1}'}
+
+
+class _FakeStreamOpener:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def open(self, _request, timeout):
+        payload = self.payload
+
+        class Response:
+            def __init__(self):
+                self.sent = False
+
+            def read(self, _size):
+                if self.sent:
+                    return b""
+                self.sent = True
+                return payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        return Response()
+
+
+def test_stream_limit_counts_content_not_sse_framing(monkeypatch):
+    import json
+
+    event = {"choices": [{"delta": {"content": "x" * 40}}]}
+    payload = f"data: {json.dumps(event)}\n\n".encode()
+    monkeypatch.setattr(ai_provider, "resolve_public_http_url", lambda *_a, **_k: (None, ("203.0.113.10",)))
+    monkeypatch.setattr(ai_provider, "_is_private_host", lambda _host: False)
+    monkeypatch.setattr(ai_provider, "_MAX_STREAM_CONTENT_CHARS", 20)
+    monkeypatch.setattr(
+        ai_provider, "_build_request_opener",
+        lambda *_a, **_k: _FakeStreamOpener(payload),
+    )
+    provider = OpenAICompatibleDraftProvider("https://example.test/v1", "test-model", "test-key")
+    with pytest.raises(ai_provider.AIProviderRequestError, match="内容过大"):
+        list(provider.stream(
+            [{"role": "user", "content": "提醒"}],
+            {"triggers": {}, "actions": {}},
+            idle_timeout=1,
+        ))

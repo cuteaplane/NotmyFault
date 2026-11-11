@@ -318,6 +318,15 @@ def test_rule_save_rejects_missing_binding_source(tmp_path):
     assert env.store.load_verified_rules() == []
 
 
+def test_rule_save_rejects_malformed_graph_with_400(tmp_path):
+    env = make_api_env(tmp_path)
+    rule = native_rule({"type": "hotkey", "params": {"hotkey": "ctrl+k"}}, [])
+    rule["workflow"]["nodes"][0]["type"] = ["trigger"]
+    response = env.client.put("/api/rules", headers=env.headers, json={"rules": [rule]})
+    assert response.status_code == 400
+    assert env.store.load_verified_rules() == []
+
+
 def test_rules_transport_preserves_typed_constants_and_literal_objects(tmp_path):
     from decimal import Decimal
     from notmyfault.core.value_codec import encode_value, decode_value
@@ -482,3 +491,12 @@ def test_api_server_shutdown_with_open_event_stream(tmp_path, monkeypatch):
         assert flushes, "服务退出时没跑到运行历史落盘"
     finally:
         connection.close()
+
+
+def test_token_store_rotation_replaces_persisted_token(tmp_path):
+    path = tmp_path / ".api_token"
+    original = ApiTokenStore(path).token
+    rotated = ApiTokenStore(path, rotate=True)
+    assert rotated.token != original
+    assert path.read_text(encoding="utf-8") == rotated.token
+    assert ApiTokenStore(path).token == rotated.token

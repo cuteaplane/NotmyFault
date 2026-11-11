@@ -34,6 +34,9 @@ _MAX_RESPONSE_BYTES = 1024 * 1024
 # 流式读每次阻塞等待的上限；上游停住这么久就判超时。
 _IDLE_TIMEOUT_SECONDS = 120
 _STREAM_CHUNK_BYTES = 8192
+# SSE 每块带事件框架，线上字节数比正文大很多；正文单独限流，线上只防无休止的事件流。
+_MAX_STREAM_BYTES = 8 * _MAX_RESPONSE_BYTES
+_MAX_STREAM_CONTENT_CHARS = _MAX_RESPONSE_BYTES
 
 
 class AIProviderIdleTimeoutError(ValueError):
@@ -308,6 +311,7 @@ class _ChatStreamAccumulator:
     def __init__(self) -> None:
         self._text = ""
         self._tool_calls: dict[int, dict] = {}
+        self.content_chars = 0
 
     def feed(self, event: dict) -> list[tuple[str, Any]]:
         deltas: list[tuple[str, Any]] = []
@@ -318,10 +322,12 @@ class _ChatStreamAccumulator:
             return deltas
         reasoning = delta.get("reasoning_content")
         if isinstance(reasoning, str) and reasoning:
+            self.content_chars += len(reasoning)
             deltas.append(("reasoning", reasoning))
         content = delta.get("content")
         if isinstance(content, str) and content:
             self._text += content
+            self.content_chars += len(content)
             deltas.append(("text", content))
         tool_calls = delta.get("tool_calls")
         if isinstance(tool_calls, list):
@@ -331,16 +337,17 @@ class _ChatStreamAccumulator:
                     continue
                 index = call.get("index")
                 if not isinstance(index, int):
-                    continue
+                    index = 0
                 slot = self._tool_calls.setdefault(index, {"name": "", "arguments": ""})
                 function = call.get("function")
                 if isinstance(function, dict):
                     name = function.get("name")
-                    if isinstance(name, str):
-                        slot["name"] += name
+                    if isinstance(name, str) and name:
+                        self._merge_tool_name(slot, name)
                     arguments = function.get("arguments")
                     if isinstance(arguments, str):
                         slot["arguments"] += arguments
+                        self.content_chars += len(arguments)
                     saw_tool_delta = True
             if saw_tool_delta:
                 received = sum(len(item["arguments"]) for item in self._tool_calls.values())
@@ -349,6 +356,19 @@ class _ChatStreamAccumulator:
                     "received": received,
                 }))
         return deltas
+
+    @staticmethod
+    def _merge_tool_name(slot: dict, name: str) -> None:
+        # 有的网关只在首块发名字，有的每块重发完整名字，还有的把名字拆开。
+        current = slot["name"]
+        if not current:
+            slot["name"] = name
+        elif name == current or current.endswith(name):
+            return
+        elif name.startswith(current):
+            slot["name"] = name
+        else:
+            slot["name"] += name
 
     def body(self) -> dict:
         message: dict = {"role": "assistant", "content": self._text}
@@ -367,6 +387,7 @@ class _ResponsesStreamAccumulator:
         self._text = ""
         self._call: dict = {"name": "", "arguments": "", "call_id": None}
         self._completed: dict | None = None
+        self.content_chars = 0
 
     def feed(self, event: dict) -> list[tuple[str, Any]]:
         deltas: list[tuple[str, Any]] = []
@@ -375,6 +396,7 @@ class _ResponsesStreamAccumulator:
             delta = event.get("delta")
             if isinstance(delta, str) and delta:
                 self._text += delta
+                self.content_chars += len(delta)
                 deltas.append(("text", delta))
         elif event_type in (
             "response.reasoning_text.delta",
@@ -382,11 +404,13 @@ class _ResponsesStreamAccumulator:
         ):
             delta = event.get("delta")
             if isinstance(delta, str) and delta:
+                self.content_chars += len(delta)
                 deltas.append(("reasoning", delta))
         elif event_type == "response.function_call_arguments.delta":
             delta = event.get("delta")
             if isinstance(delta, str):
                 self._call["arguments"] += delta
+                self.content_chars += len(delta)
                 deltas.append(("progress", {
                     "phase": "drafting",
                     "received": len(self._call["arguments"]),
@@ -394,7 +418,7 @@ class _ResponsesStreamAccumulator:
         elif event_type == "response.function_call_arguments.done":
             arguments = event.get("arguments")
             if isinstance(arguments, str):
-                self._call["arguments"] = arguments
+                self._set_arguments(arguments)
         elif event_type == "response.output_item.done":
             item = event.get("item")
             if isinstance(item, dict) and item.get("type") == "function_call":
@@ -406,7 +430,7 @@ class _ResponsesStreamAccumulator:
                     self._call["call_id"] = call_id
                 arguments = item.get("arguments")
                 if isinstance(arguments, str):
-                    self._call["arguments"] = arguments
+                    self._set_arguments(arguments)
                 deltas.append(("progress", {
                     "phase": "assembled",
                     "received": len(self._call["arguments"]),
@@ -423,6 +447,10 @@ class _ResponsesStreamAccumulator:
             if isinstance(response, dict):
                 self._completed = response
         return deltas
+
+    def _set_arguments(self, arguments: str) -> None:
+        self.content_chars += max(0, len(arguments) - len(self._call["arguments"]))
+        self._call["arguments"] = arguments
 
     def body(self) -> dict:
         if self._completed is not None:
@@ -627,13 +655,16 @@ class OpenAICompatibleDraftProvider:
                     if not chunk:
                         break
                     total_bytes += len(chunk)
-                    if total_bytes > _MAX_RESPONSE_BYTES:
+                    if total_bytes > _MAX_STREAM_BYTES:
                         raise AIProviderRequestError("AI 返回内容过大")
                     for event in decoder.feed(chunk):
                         if event is _STREAM_DONE:
                             finished = True
                             break
-                        for delta in accumulator.feed(event):
+                        deltas = accumulator.feed(event)
+                        if accumulator.content_chars > _MAX_STREAM_CONTENT_CHARS:
+                            raise AIProviderRequestError("AI 返回内容过大")
+                        for delta in deltas:
                             yield delta
                     if finished:
                         break
@@ -641,7 +672,10 @@ class OpenAICompatibleDraftProvider:
                     for event in decoder.finish():
                         if event is _STREAM_DONE:
                             break
-                        for delta in accumulator.feed(event):
+                        deltas = accumulator.feed(event)
+                        if accumulator.content_chars > _MAX_STREAM_CONTENT_CHARS:
+                            raise AIProviderRequestError("AI 返回内容过大")
+                        for delta in deltas:
                             yield delta
         except (socket.timeout, TimeoutError) as error:
             raise AIProviderIdleTimeoutError("AI 草稿请求超时") from error

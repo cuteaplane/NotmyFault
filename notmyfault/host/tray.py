@@ -1,6 +1,7 @@
 """提供 Windows 系统托盘图标、菜单、通知和开机自启管理。"""
 
 import ctypes
+from ctypes import wintypes
 import os
 import subprocess
 import sys
@@ -129,16 +130,15 @@ class TrayIcon:
 
         self._add_icon()
 
-        import ctypes
         user32 = ctypes.windll.user32
         # 显式声明这些函数的参数和返回类型。
-        msg_type = ctypes.wintypes.MSG
-        user32.PeekMessageW.argtypes = [ctypes.POINTER(msg_type), ctypes.wintypes.HWND,
-                                        ctypes.wintypes.UINT, ctypes.wintypes.UINT,
-                                        ctypes.wintypes.UINT]
-        user32.PeekMessageW.restype = ctypes.wintypes.BOOL
+        msg_type = wintypes.MSG
+        user32.PeekMessageW.argtypes = [ctypes.POINTER(msg_type), wintypes.HWND,
+                                        wintypes.UINT, wintypes.UINT,
+                                        wintypes.UINT]
+        user32.PeekMessageW.restype = wintypes.BOOL
         user32.TranslateMessage.argtypes = [ctypes.POINTER(msg_type)]
-        user32.TranslateMessage.restype = ctypes.wintypes.BOOL
+        user32.TranslateMessage.restype = wintypes.BOOL
         user32.DispatchMessageW.argtypes = [ctypes.POINTER(msg_type)]
         user32.DispatchMessageW.restype = ctypes.c_long
 

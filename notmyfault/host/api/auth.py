@@ -19,11 +19,18 @@ class ApiTokenStore:
         token: str | None = None,
         writer: Callable[[str], None] | None = None,
         permission_restrictor: Callable[[str], None] = restrict_token_file,
+        rotate: bool = False,
     ) -> None:
         self.path = path
         self._writer = writer
         self._permission_restrictor = permission_restrictor
-        self._token = token or self._load_or_create()
+        if token is not None:
+            self._token = token
+        elif rotate:
+            self._token = secrets.token_hex(32)
+            self._secure_write(self._token)
+        else:
+            self._token = self._load_or_create()
 
     @property
     def token(self) -> str:

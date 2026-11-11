@@ -101,7 +101,8 @@ class RuleService:
                 )
 
             for action_item, location in iter_rule_actions(normalized):
-                if action_item.get("type") in NATIVE_NODES:
+                action_type = action_item.get("type")
+                if isinstance(action_type, str) and action_type in NATIVE_NODES:
                     continue
                 item_label = f"动作 {location}"
                 plugin = schema["actions"].get(

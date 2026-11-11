@@ -274,12 +274,21 @@ class EngineRunner:
         if self._cleanup_done.is_set():
             return
         self._shutdown_workers()
+        self._remove_api_token_file()
         if self._run_history is not None:
             try:
                 self._run_history.flush(timeout=0.5)
             except Exception:
                 pass
         os._exit(0)
+
+    def _remove_api_token_file(self) -> None:
+        try:
+            self._paths.api_token_file.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            print(f"[Cleanup] 删除 API 令牌失败: {error}", file=sys.stderr)
 
     def request_process_shutdown(self, force_after: float = 15) -> None:
         """统一取消运行任务并按一个绝对截止时间关闭进程。"""
@@ -305,6 +314,7 @@ class EngineRunner:
                 self._api.stop()
             except Exception as error:
                 print(f"[Cleanup] API 停止失败: {error}", file=sys.stderr)
+        self._remove_api_token_file()
         if self._tray:
             try:
                 self._tray.stop()
@@ -376,7 +386,7 @@ class EngineRunner:
             return
 
         try:
-            api_token_store = ApiTokenStore(self._paths.api_token_file)
+            api_token_store = ApiTokenStore(self._paths.api_token_file, rotate=True)
             ai_key_store = AIKeyStore(self._paths.ai_api_key_file)
             run_history = RunHistory(str(self._paths.run_history_file))
             self._run_history = run_history
